@@ -1,0 +1,192 @@
+name: ci
+
+# Verifies every push and PR. The whole point of M0 is that this workflow
+# turns red the moment we type-drift the workspace, the UI, or the
+# Dockerfile — without needing rustup on anyone's mac.
+#
+# Default features are empty everywhere on purpose (gstreamer + ort are
+# optional cargo features) so the standard ubuntu-latest runner does real
+# work without dragging in system libs. The `system-libs` job below opts
+# the heavy features in on a runner that does have them installed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref. Keeps the queue honest.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Note: -D warnings is applied per-step on `cargo clippy`, not globally,
+  # so dependency-side warnings on a future rustc don't break our CI.
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Rust workspace (default features only — no GStreamer, no ORT system libs).
+  # ---------------------------------------------------------------------
+  rust:
+    name: rust (check / fmt / clippy / test)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rustup show active-toolchain || rustup toolchain install` is the
+      # canonical way to make rustup honor rust-toolchain.toml (which pins
+      # the version + components rustfmt/clippy). The dtolnay action with
+      # `@stable` would override the pin, which we don't want.
+      - name: install rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo check (workspace, all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test (workspace)
+        run: cargo test --workspace --no-fail-fast
+
+  # ---------------------------------------------------------------------
+  # ts-rs roundtrip — when nexus-types `ts` feature is wired (M1 task), the
+  # generated bindings under ui/src/api/types/ must match what's checked in.
+  # Today this just verifies the `ts` feature compiles.
+  # ---------------------------------------------------------------------
+  rust-ts-feature:
+    name: rust (nexus-types ts feature)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+      - name: cargo check -p nexus-types --features ts
+        run: cargo check -p nexus-types --features ts
+
+  # ---------------------------------------------------------------------
+  # UI — TypeScript typecheck + production build. Uploads dist/ so the
+  # docker job (and humans clicking "Download artifact") can grab it.
+  # ---------------------------------------------------------------------
+  ui:
+    name: ui (typecheck / build)
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          # No package-lock.json yet — switch to "npm" once it's checked in.
+
+      - name: npm install
+        run: npm install --no-audit --no-fund
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: build
+        run: npm run build
+
+      - name: upload ui dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Dockerfile smoke build. Doesn't push; just proves the multi-stage
+  # build still wires together. Only runs on push to main + PRs that
+  # touch deploy/ or root manifests, to keep iteration fast.
+  # ---------------------------------------------------------------------
+  docker:
+    name: docker (build, no push)
+    runs-on: ubuntu-22.04
+    needs: [rust, ui]
+    if: |
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'docker')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build (no push, gha cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          load: false
+          tags: nexus-engine:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------
+  # Optional: build with the heavy `gstreamer` + `ort` features enabled.
+  # Costs ~3 min extra on first run (apt install gstreamer dev libs +
+  # download onnxruntime tarball). Triggered by adding the `system-libs`
+  # label to a PR, or any push to main. Failures here block release but
+  # not normal PR iteration.
+  # ---------------------------------------------------------------------
+  system-libs:
+    name: rust (gstreamer + ort features)
+    runs-on: ubuntu-22.04
+    if: |
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'system-libs')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-system-libs
+
+      - name: install gstreamer + ssl dev libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav \
+            libssl-dev
+
+      - name: download onnxruntime shared lib
+        run: |
+          ORT_VERSION=1.20.0
+          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
+            | sudo tar -xz -C /opt
+          sudo mv /opt/onnxruntime-linux-x64-${ORT_VERSION} /opt/onnxruntime
+          echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
+          echo "ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
+
+      - name: cargo check (gstreamer + ort)
+        run: |
+          cargo check -p nexus-pipeline  --features gstreamer
+          cargo check -p nexus-inference --features ort,ep-cpu
+          cargo check -p nexus-engine    --features gstreamer
