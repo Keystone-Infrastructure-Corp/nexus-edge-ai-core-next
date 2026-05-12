@@ -153,7 +153,9 @@ jobs:
   # ---------------------------------------------------------------------
   system-libs:
     name: rust (gstreamer + ort features)
-    runs-on: ubuntu-22.04
+    # ubuntu-24.04: cleaner gstreamer packaging; ubuntu-22.04 hits a
+    # libunwind-dev resolver conflict on libgstreamer1.0-dev install.
+    runs-on: ubuntu-24.04
     if: |
       github.event_name == 'push' ||
       contains(github.event.pull_request.labels.*.name, 'system-libs')
@@ -169,8 +171,11 @@ jobs:
       - name: install gstreamer + ssl dev libs
         run: |
           sudo apt-get update
+          # libunwind-dev installed explicitly so libgstreamer1.0-dev's
+          # transitive dep resolves on minimal images.
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
+            libunwind-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-libav \

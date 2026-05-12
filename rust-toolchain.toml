@@ -1,4 +1,6 @@
 [toolchain]
-channel = "1.82"
+# 1.85 is the minimum that can parse edition-2024 dependency manifests
+# (getrandom 0.4.2, etc). Bumped from 1.82 after the first CI run failed.
+channel = "1.85"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
