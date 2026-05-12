@@ -1,0 +1,40 @@
+# T24 — GMKtec M3 Ultra (Intel i7-12700H, Iris Xe 96 EU, 32 GB DDR4)
+# Soak target: 4–6 cameras at 1080p / 15 fps.
+
+[runtime]
+worker_threads = 8
+blocking_threads = 8
+
+[server]
+api_bind = "0.0.0.0:8089"
+ui_root = "/usr/share/nexus/ui"
+
+[store]
+url = "sqlite:///var/lib/nexus/nexus.db?mode=rwc"
+
+[telemetry]
+log_level = "info,nexus=debug"
+
+[inference]
+backend = "pool"
+workers = 2                     # Iris Xe 96 EU comfortably runs two parallel sessions
+restart_backoff_ms = 2000
+fail_soft = true
+ep_priority = ["openvino", "cpu"]
+
+[inference.model]
+kind = "yolo"
+preset = "640"                  # default operating point per models-manifest.json
+input_width = 640
+input_height = 640
+score_threshold = 0.30
+
+[tracker]
+backend = "iou_naive"
+
+[rules]
+backend = "cel"
+
+[bus]
+backend = "broadcast"
+capacity = 1024

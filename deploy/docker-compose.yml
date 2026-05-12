@@ -1,0 +1,26 @@
+# Single-service deploy. The engine container holds the API, the UI, and
+# the per-camera pipelines. No admin sidecar, no viewer sidecar.
+services:
+  engine:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ghcr.io/andboyer/nexus-engine:dev
+    container_name: nexus-engine
+    restart: unless-stopped
+    ports:
+      - "8089:8089"
+    volumes:
+      - ../config:/etc/nexus:ro
+      - nexus-state:/var/lib/nexus
+    environment:
+      - NEXUS_CONFIG=/etc/nexus/nexus.toml
+      - RUST_LOG=info,nexus=debug
+    # GPU passthrough is config-by-target. Examples:
+    #   Intel iGPU / Arc:   devices: ["/dev/dri:/dev/dri"]
+    #   NVIDIA:             runtime: nvidia, deploy.resources.reservations.devices ...
+    #   Intel NPU:          devices: ["/dev/accel/accel0:/dev/accel/accel0"]
+    # Leave commented in dev — virtual source needs no acceleration.
+
+volumes:
+  nexus-state: {}

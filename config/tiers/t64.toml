@@ -1,0 +1,42 @@
+# T64 — Lenovo P3 Tower / HP Z2 G9 + NVIDIA RTX 4060 8 GB (dGPU)
+# Soak target: 12–20 cameras at 1080p / 15 fps.
+# Status: post-beta. CUDA / TensorRT EPs land in M5; until then the engine
+# will fall through to CPU, which is *not* a meaningful T64 deployment.
+
+[runtime]
+worker_threads = 16
+blocking_threads = 16
+
+[server]
+api_bind = "0.0.0.0:8089"
+ui_root = "/usr/share/nexus/ui"
+
+[store]
+url = "sqlite:///var/lib/nexus/nexus.db?mode=rwc"
+
+[telemetry]
+log_level = "info,nexus=debug"
+
+[inference]
+backend = "pool"
+workers = 3                     # 8 GB VRAM holds three FP16 sessions comfortably
+restart_backoff_ms = 2000
+fail_soft = true
+ep_priority = ["tensorrt", "cuda", "cpu"]
+
+[inference.model]
+kind = "yolo"
+preset = "640"
+input_width = 640
+input_height = 640
+score_threshold = 0.30
+
+[tracker]
+backend = "iou_naive"
+
+[rules]
+backend = "cel"
+
+[bus]
+backend = "broadcast"
+capacity = 4096

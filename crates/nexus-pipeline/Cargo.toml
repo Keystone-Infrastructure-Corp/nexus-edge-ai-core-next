@@ -1,0 +1,39 @@
+[package]
+name = "nexus-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+
+[dependencies]
+nexus-types = { workspace = true }
+nexus-config = { workspace = true }
+nexus-bus = { workspace = true }
+nexus-inference = { workspace = true }
+nexus-tracker = { workspace = true }
+nexus-rules = { workspace = true }
+nexus-store = { workspace = true }
+
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+once_cell = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
+
+gstreamer = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }

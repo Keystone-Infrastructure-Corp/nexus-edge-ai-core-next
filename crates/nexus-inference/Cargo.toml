@@ -1,0 +1,37 @@
+[package]
+name = "nexus-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Per-EP feature flags. Off by default so the workspace builds without ORT installed.
+ep-cpu      = []
+ep-openvino = []
+ep-cuda     = []
+ep-coreml   = []
+ep-tensorrt = []
+ep-directml = []
+# Wire ORT itself only when at least one EP is selected. M1 enables ep-cpu in
+# the engine's release profile.
+ort         = ["dep:ort", "dep:ndarray"]
+
+[dependencies]
+nexus-types = { workspace = true }
+nexus-config = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+crossbeam-channel = { workspace = true }
+once_cell = { workspace = true }
+chrono = { workspace = true }
+
+ort = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }

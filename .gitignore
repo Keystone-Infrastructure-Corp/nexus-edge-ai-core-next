@@ -1,0 +1,36 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea
+.vscode
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/build
+/dist
+/data
+/models
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# UI
+node_modules
+ui/dist
+
+# Tooling caches
+.venv
+.venv-*
+__pycache__
+*.pyc
+
+# OTEL
+otel.log

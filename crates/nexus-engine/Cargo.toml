@@ -1,0 +1,48 @@
+[package]
+name = "nexus-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+gstreamer = ["nexus-pipeline/gstreamer"]
+
+[[bin]]
+name = "nexus-engine"
+path = "src/main.rs"
+
+[dependencies]
+nexus-types = { workspace = true }
+nexus-config = { workspace = true }
+nexus-bus = { workspace = true }
+nexus-telemetry = { workspace = true }
+nexus-store = { workspace = true }
+nexus-rules = { workspace = true }
+nexus-tracker = { workspace = true }
+nexus-inference = { workspace = true }
+nexus-pipeline = { workspace = true }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+futures = { workspace = true }
+
+axum = { workspace = true }
+tower-http = { workspace = true }
+tower = { workspace = true }
+
+image = { workspace = true }
+async-stream = "0.3"

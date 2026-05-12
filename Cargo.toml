@@ -1,0 +1,117 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nexus-types",
+    "crates/nexus-config",
+    "crates/nexus-bus",
+    "crates/nexus-telemetry",
+    "crates/nexus-store",
+    "crates/nexus-rules",
+    "crates/nexus-tracker",
+    "crates/nexus-inference",
+    "crates/nexus-pipeline",
+    "crates/nexus-engine",
+    "crates/nexus-probe",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "AGPL-3.0-or-later"
+authors = ["Nexus Edge AI <opensource@nexusedge.ai>"]
+repository = "https://github.com/andboyer/nexus-edge-ai-core-next"
+publish = false
+
+[workspace.dependencies]
+# Async + concurrency
+tokio = { version = "1.41", features = ["full", "tracing"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+arc-swap = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bytes = "1"
+
+# Errors / IDs / time
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Tracing / OTEL
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP
+axum = { version = "0.8", features = ["macros", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "fs"] }
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "chrono", "uuid"] }
+
+# Rules
+cel-interpreter = "0.10"
+
+# Inference + image
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "ndarray"] }
+ndarray = "0.16"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Media
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+
+# IPC for worker-process backend
+interprocess = { version = "2", features = ["tokio"] }
+shared_memory = "0.12"
+raw_sync = "0.1"
+
+# TS bindings
+ts-rs = { version = "10", features = ["serde-compat", "uuid-impl", "chrono-impl"] }
+
+once_cell = "1"
+url = { version = "2", features = ["serde"] }
+
+# Internal
+nexus-types = { path = "crates/nexus-types" }
+nexus-config = { path = "crates/nexus-config" }
+nexus-bus = { path = "crates/nexus-bus" }
+nexus-telemetry = { path = "crates/nexus-telemetry" }
+nexus-store = { path = "crates/nexus-store" }
+nexus-rules = { path = "crates/nexus-rules" }
+nexus-tracker = { path = "crates/nexus-tracker" }
+nexus-inference = { path = "crates/nexus-inference" }
+nexus-pipeline = { path = "crates/nexus-pipeline" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.bench]
+inherits = "release"
+debug = true

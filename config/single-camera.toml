@@ -1,0 +1,50 @@
+# Smoke-test config — single virtual camera, mock detector. Used by
+# `cargo run --bin nexus-engine -- --config config/single-camera.toml --mock-detector`.
+
+[server]
+api_bind = "0.0.0.0:8089"
+ui_root = "ui/dist"
+
+[store]
+url = "sqlite:./data/nexus.db?mode=rwc"
+seed_from_config = true
+
+[telemetry]
+log_level = "info,nexus=debug"
+
+[inference]
+backend = "in_process"
+workers = 1
+
+[inference.model]
+kind = "mock"
+input_width = 640
+input_height = 480
+
+[tracker]
+backend = "iou_naive"
+
+[rules]
+backend = "cel"
+
+[[rules.inline]]
+id = "any_person"
+name = "Any person"
+when = "object.label == 'person'"
+severity = "low"
+min_track_age_ms = 0
+consecutive_frames = 1
+cooldown_ms = 5000
+enabled = true
+
+[bus]
+backend = "broadcast"
+capacity = 256
+
+[[cameras]]
+id = 1
+name = "Virtual"
+url = "virtual://local"
+enabled = true
+prompts = ["person"]
+max_fps = 5

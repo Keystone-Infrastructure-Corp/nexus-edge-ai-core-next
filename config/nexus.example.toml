@@ -1,0 +1,116 @@
+# nexus.example.toml — fully annotated reference.
+#
+# Defaults below are sized for the **T24** tier (GMKtec M3 Ultra, Iris Xe
+# 96 EU). For other documented hardware tiers (T10 Beelink Mini S13, T36
+# Arc A380, T36-S Lunar Lake, T64 RTX 4060) copy one of the per-tier
+# files in `config/tiers/` instead. See [docs/HARDWARE_TIERS.md](../docs/HARDWARE_TIERS.md).
+#
+# Every backend-selectable layer exposes a `backend` knob. Everything else
+# under that section configures the chosen backend.
+
+[runtime]
+# 0 = use available_parallelism().
+worker_threads = 0
+blocking_threads = 8
+
+[server]
+api_bind = "0.0.0.0:8089"
+# In the container the UI is at /usr/share/nexus/ui. Locally use ui/dist.
+ui_root = "/usr/share/nexus/ui"
+
+[store]
+url = "sqlite:///var/lib/nexus/nexus.db?mode=rwc"
+seed_from_config = true
+duckdb_attach = false
+duckdb_path = "/var/lib/nexus/analytics.duckdb"
+
+[telemetry]
+log_level = "info,nexus=debug"
+json_logs = false
+# [telemetry.otlp]
+# endpoint = "http://otel-collector:4317"
+# service_name = "nexus-engine"
+# sample_ratio = 0.05
+
+[auth]
+mode = "none"             # none | dev_token | oidc
+# dev_token = "change-me"
+# [auth.oidc]
+# issuer   = "https://auth.example.com/application/o/nexus"
+# audience = "nexus-engine"
+# jwks_uri = "https://auth.example.com/application/o/nexus/jwks/"
+
+# -----------------------------------------------------------------
+# Inference — the trait + pool + scale-factor pattern lives here.
+# Per-tier defaults live in config/tiers/. The values below are T24.
+# -----------------------------------------------------------------
+[inference]
+backend = "pool"          # in_process | pool
+workers = 2
+restart_backoff_ms = 2000
+fail_soft = true
+# Default order for Intel-based tiers (T10/T24/T36/T36-S). T64 leads with
+# tensorrt; T36-S inserts "npu" between openvino and cpu. coreml is dev-only.
+ep_priority = ["openvino", "cpu"]
+
+[inference.model]
+# yolo (default, closed-vocab yolo26n_dynamic.onnx) | open_vocab | classifier_ensemble | mock
+kind = "yolo"
+# Pack preset — "320" / "640" / "1280" from models-manifest.json.
+#   T10 → 320 (lowest latency)
+#   T24 / T36 / T36-S / T64 → 640 (default operating point)
+#   regional refinement → 1280 (per-frame second pass on uncertain regions)
+preset = "640"
+# pack_path = "/var/lib/nexus/models/yolo26n"
+input_width = 640
+input_height = 640
+score_threshold = 0.30
+
+# -----------------------------------------------------------------
+# Tracker
+# -----------------------------------------------------------------
+[tracker]
+backend = "iou_naive"     # iou_naive | bytetrack
+track_ttl_ms = 2000
+iou_threshold = 0.30
+
+# -----------------------------------------------------------------
+# Rules — CEL by default, legacy_json available for v1 migration.
+# -----------------------------------------------------------------
+[rules]
+backend = "cel"           # cel | legacy_json
+
+[[rules.inline]]
+id = "person_in_zone"
+name = "Person seen"
+when = "object.label == 'person' && object.confidence > 0.4"
+severity = "medium"
+min_track_age_ms = 500
+consecutive_frames = 2
+cooldown_ms = 30000
+enabled = true
+
+# -----------------------------------------------------------------
+# Bus
+# -----------------------------------------------------------------
+[bus]
+backend = "broadcast"     # broadcast | nats
+capacity = 1024
+# nats_url = "nats://nats:4222"
+
+# -----------------------------------------------------------------
+# Cameras (DB is the source of truth; this seeds an empty DB)
+# -----------------------------------------------------------------
+[[cameras]]
+id = 1
+name = "Front Door"
+url = "rtsp://demo:demo@front-door.local:554/Streaming/Channels/101"
+enabled = true
+prompts = ["person", "package", "vehicle"]
+max_fps = 10
+
+[[cameras.zones]]
+id = "porch"
+name = "Porch"
+polygon = [[0.1, 0.5], [0.9, 0.5], [0.9, 1.0], [0.1, 1.0]]
+kind = "inclusion"

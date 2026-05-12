@@ -1,0 +1,43 @@
+# T10 — Beelink Mini S13 (Intel N150, UHD 24EU iGPU, 16 GB DDR4)
+# Soak target: 1–2 cameras at 1080p / 15 fps.
+
+[runtime]
+worker_threads = 4
+blocking_threads = 4
+
+[server]
+api_bind = "0.0.0.0:8089"
+ui_root = "/usr/share/nexus/ui"
+
+[store]
+url = "sqlite:///var/lib/nexus/nexus.db?mode=rwc"
+
+[telemetry]
+log_level = "info,nexus=debug"
+
+[inference]
+backend = "pool"
+workers = 1                     # one OpenVINO session is the right size for UHD 24EU
+restart_backoff_ms = 2000
+fail_soft = true
+ep_priority = ["openvino", "cpu"]
+
+[inference.model]
+kind = "yolo"                   # closed-vocab (yolo26n_dynamic.onnx)
+preset = "320"                  # T10 picks the lowest-latency model-pack preset
+input_width = 320
+input_height = 320
+score_threshold = 0.30
+
+[tracker]
+backend = "iou_naive"
+
+[rules]
+backend = "cel"
+
+[bus]
+backend = "broadcast"
+capacity = 256                  # ~half of T24; matches expected sub/pub volume
+
+# Cameras are normally seeded from the admin UI / DB on first boot;
+# leave [[cameras]] empty here and add via PUT /api/cameras/:id.
