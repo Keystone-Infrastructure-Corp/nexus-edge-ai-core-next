@@ -19,6 +19,7 @@
 pub mod backends;
 pub mod detectors;
 pub mod pool;
+pub mod router;
 pub mod worker_proto;
 #[cfg(feature = "ort")]
 pub mod yolo;
@@ -32,6 +33,7 @@ pub use detectors::{
     ClassifierEnsembleDetector, Detector, InferenceError, MockDetector, OpenVocabDetector,
 };
 pub use pool::{BackendStatus, DetectorPool};
+pub use router::InferenceRouter;
 #[cfg(feature = "ort")]
 pub use yolo::YoloOrtDetector;
 #[cfg(feature = "ort")]

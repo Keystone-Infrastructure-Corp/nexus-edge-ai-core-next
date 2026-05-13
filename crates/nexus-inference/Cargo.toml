@@ -47,3 +47,4 @@ path = "src/bin/nexus-inference-worker.rs"
 
 [dev-dependencies]
 tokio = { workspace = true }
+url = { workspace = true }

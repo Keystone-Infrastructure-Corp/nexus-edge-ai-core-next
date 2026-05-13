@@ -155,6 +155,45 @@ The worker binary picks up the open-vocab model with
 `NEXUS_WORKER_MODEL_PACK=$PWD/models` (so it can find the manifest +
 load the baked vocab).
 
+## Per-camera model selection (`InferenceRouter`)
+
+The global `inference.model` block in `core-config.toml` is the
+*default* model — every camera uses it unless it sets a per-camera
+override:
+
+```toml
+[[cameras]]
+id = 7
+name = "loading-dock-east"
+url = "rtsp://…"
+enabled = true
+
+# This camera runs YOLO-World instead of the default closed-vocab
+# YOLOv26-nano. The override only swaps the model substruct — backend,
+# pool worker kind, worker count, and EP priority are inherited from
+# the global `inference` block.
+[cameras.model_override]
+kind = "yolo_world"
+preset = "vga"
+input_width = 640
+input_height = 640
+score_threshold = 0.25
+```
+
+At boot, `InferenceRouter::build` walks the camera list, dedups
+overrides by `kind`, and builds one `InferenceLayer` per *kind
+referenced by any camera* (default + each unique override). Each
+camera spawn calls `router.detector_for_camera(&cam)` to get its
+`Arc<dyn Detector>`. The default kind's pool is what `/api/backends`
+shows; per-kind pool visibility is a future expansion.
+
+Two cameras that pick the same `kind` but different thresholds today
+share one detector — per-camera score thresholds are honored at the
+rule layer, not in the detector. If we ever need per-camera
+*detector instances* (separate ORT sessions for separate models of the
+same kind), the router's layer-key shape can be reved without changing
+callers.
+
 ## See also
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — trait + pool + fail-soft pattern,

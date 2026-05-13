@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nexus_bus::build_bus;
 use nexus_config::{Config, InferenceConfig};
-use nexus_inference::InferenceLayer;
+use nexus_inference::InferenceRouter;
 use nexus_pipeline::{spawn_camera, LatestFrameCache};
 use nexus_rules::RuleEvaluator;
 use nexus_store::{EventStore, Store};
@@ -81,23 +81,30 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
 
     let bus = build_bus(&cfg.bus);
 
-    let InferenceLayer { detector, pool } =
-        nexus_inference::build(&cfg.inference).context("building inference layer")?;
-    log_inference_summary(&cfg.inference, pool.is_some());
+    let cameras = store.list_cameras().await?;
+
+    // Router builds one InferenceLayer per kind referenced by any
+    // camera (default + each unique override). Keeping disabled cameras
+    // in the build set means re-enabling at runtime doesn't require a
+    // process restart.
+    let router =
+        InferenceRouter::build(&cfg.inference, &cameras).context("building inference router")?;
+    let pool = router.default_pool();
+    log_inference_summary(&cfg.inference, pool.is_some(), &router);
 
     let tracker: Arc<dyn nexus_tracker::Tracker> = Arc::from(build_tracker(&cfg.tracker));
     let cache = Arc::new(LatestFrameCache::new());
 
-    let cameras = store.list_cameras().await?;
     let mut handles = Vec::new();
     for cam in cameras {
         if !cam.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
             continue;
         }
+        let detector = router.detector_for_camera(&cam);
         let h = spawn_camera(
             cam,
-            detector.clone(),
+            detector,
             tracker.clone(),
             evaluator.clone(),
             store.clone() as Arc<dyn EventStore>,
@@ -138,15 +145,17 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn log_inference_summary(cfg: &InferenceConfig, has_pool: bool) {
+fn log_inference_summary(cfg: &InferenceConfig, has_pool: bool, router: &InferenceRouter) {
+    let kinds: Vec<String> = router.detectors().into_iter().map(|(k, _)| k).collect();
     info!(
         backend = ?cfg.backend,
         workers = cfg.workers,
-        model = %cfg.model.kind,
+        default_kind = %cfg.model.kind,
+        active_kinds = ?kinds,
         ep_priority = ?cfg.ep_priority,
         fail_soft = cfg.fail_soft,
         pool = has_pool,
-        "inference layer built"
+        "inference router built"
     );
 }
 
