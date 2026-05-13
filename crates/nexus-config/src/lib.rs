@@ -192,7 +192,7 @@ fn default_duckdb_path() -> PathBuf {
 // Telemetry
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     #[serde(default = "default_log_level")]
@@ -201,6 +201,20 @@ pub struct TelemetryConfig {
     pub json_logs: bool,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
+}
+
+// Hand-written so `Default` agrees with serde. The derive would give
+// `log_level = ""`, which silently drops every log line because tracing's
+// EnvFilter treats an empty directive as "deny everything". See
+// /memories/repo/nexus-config-default-debt.md for the broader pattern.
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            log_level: default_log_level(),
+            json_logs: false,
+            otlp: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,9 +418,11 @@ pub struct TrackerConfig {
 // iou_threshold = 0.0), which silently breaks the IoU tracker because every
 // active track expires immediately on the next update.
 //
-// TODO(M1): the same mismatch exists on most other Config structs in this
-// file. Sweep them once we have a Linux-side `cargo test` baseline so the
-// fix can be validated end-to-end instead of one struct at a time.
+// This is the canonical example of the pattern; the same fix is applied to
+// every other Config substruct in this file that uses
+// `#[serde(default = "fn")]`. New substructs MUST follow the same rule:
+// either no per-field default fns (so derive is correct) or a hand-written
+// `impl Default` that calls the same fns serde uses.
 impl Default for TrackerConfig {
     fn default() -> Self {
         Self {
