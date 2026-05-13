@@ -1,7 +1,9 @@
 //! Object trackers behind a single trait.
 //!
-//! * [`IouNaiveTracker`] — nearest-IoU + TTL. Default for M0.
-//! * [`ByteTrackTracker`] — full ByteTrack. Stub in M0; finished in M4.
+//! * [`IouNaiveTracker`] — nearest-IoU + TTL. Cheapest, used as a
+//!   fallback / smoke-test path.
+//! * [`ByteTrackTracker`] — full ByteTrack (real impl in
+//!   [`bytetrack`]). Default backend at v1 parity from M4 onward.
 //!
 //! Trackers are per-camera (one instance per pipeline). All state is owned
 //! inside the implementation; the pipeline only calls `update`.
@@ -15,6 +17,9 @@ use nexus_config::TrackerConfig;
 use nexus_types::{BBox, Detection, TrackId, TrackedObject};
 use parking_lot::Mutex;
 
+pub mod bytetrack;
+pub use bytetrack::ByteTrackTracker;
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -27,7 +32,9 @@ pub trait Tracker: Send + Sync {
 pub fn build_tracker(cfg: &TrackerConfig) -> Box<dyn Tracker> {
     match cfg.backend {
         nexus_config::TrackerBackendKind::IouNaive => Box::new(IouNaiveTracker::new(cfg)),
-        nexus_config::TrackerBackendKind::Bytetrack => Box::new(ByteTrackTracker::new(cfg)),
+        nexus_config::TrackerBackendKind::Bytetrack => {
+            Box::new(ByteTrackTracker::new(cfg.bytetrack.clone()))
+        }
     }
 }
 
@@ -145,28 +152,6 @@ impl Tracker for IouNaiveTracker {
 
     fn name(&self) -> &'static str {
         "iou-naive"
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ByteTrack — stub. Falls back to IoU until M4.
-// ---------------------------------------------------------------------------
-
-pub struct ByteTrackTracker(IouNaiveTracker);
-
-impl ByteTrackTracker {
-    pub fn new(cfg: &TrackerConfig) -> Self {
-        tracing::warn!("ByteTrack tracker not implemented yet (M4); using IoU naive");
-        Self(IouNaiveTracker::new(cfg))
-    }
-}
-
-impl Tracker for ByteTrackTracker {
-    fn update(&self, detections: Vec<Detection>) -> Vec<TrackedObject> {
-        self.0.update(detections)
-    }
-    fn name(&self) -> &'static str {
-        "bytetrack-stub"
     }
 }
 

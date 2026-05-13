@@ -434,6 +434,12 @@ pub struct TrackerConfig {
     pub track_ttl_ms: u64,
     #[serde(default = "default_iou_threshold")]
     pub iou_threshold: f32,
+    /// ByteTrack-specific tuning. Ignored when `backend != Bytetrack`.
+    /// All fields default to v1 (`event_filter.cpp`) values so a config
+    /// that simply flips `backend = "bytetrack"` runs at v1 parity
+    /// without further keys.
+    #[serde(default)]
+    pub bytetrack: ByteTrackConfig,
 }
 
 // Hand-written so `Default` agrees with the `#[serde(default = "...")]`
@@ -452,6 +458,7 @@ impl Default for TrackerConfig {
             backend: TrackerBackendKind::default(),
             track_ttl_ms: default_track_ttl_ms(),
             iou_threshold: default_iou_threshold(),
+            bytetrack: ByteTrackConfig::default(),
         }
     }
 }
@@ -464,11 +471,80 @@ pub enum TrackerBackendKind {
     Bytetrack,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ByteTrackConfig {
+    /// Detections at or above this confidence enter the first-pass
+    /// association. v1 default: 0.5.
+    #[serde(default = "default_bytetrack_high_confidence")]
+    pub high_confidence: f32,
+    /// Detections in `[low_confidence, high_confidence)` enter the
+    /// second-pass recovery match. v1 default: 0.1.
+    #[serde(default = "default_bytetrack_low_confidence")]
+    pub low_confidence: f32,
+    /// Minimum IoU for a (track, detection) to be considered the same
+    /// object during association. v1 default: 0.3.
+    #[serde(default = "default_bytetrack_match_iou_threshold")]
+    pub match_iou_threshold: f32,
+    /// Frames a confirmed/lost track may go without a match before being
+    /// retired. v1 default: 30.
+    #[serde(default = "default_bytetrack_max_lost_frames")]
+    pub max_lost_frames: u32,
+    /// Hit streak required for a tentative track to be promoted to
+    /// confirmed. v1 default: 1 (promote on first hit — keeps event
+    /// suppression off when detections are intermittent).
+    #[serde(default = "default_bytetrack_confirm_frames")]
+    pub confirm_frames: u32,
+    /// Frames a tentative (still-unconfirmed) track may go without a
+    /// match before being culled. v1 default: 3.
+    #[serde(default = "default_bytetrack_tentative_max_missed_frames")]
+    pub tentative_max_missed_frames: u32,
+    /// EMA blend factor for the smoothed display bbox. New box weighs
+    /// `alpha`, prior smoothed box weighs `1 - alpha`. v1 default: 0.6.
+    #[serde(default = "default_bytetrack_display_smoothing_alpha")]
+    pub display_smoothing_alpha: f32,
+}
+
+impl Default for ByteTrackConfig {
+    fn default() -> Self {
+        Self {
+            high_confidence: default_bytetrack_high_confidence(),
+            low_confidence: default_bytetrack_low_confidence(),
+            match_iou_threshold: default_bytetrack_match_iou_threshold(),
+            max_lost_frames: default_bytetrack_max_lost_frames(),
+            confirm_frames: default_bytetrack_confirm_frames(),
+            tentative_max_missed_frames: default_bytetrack_tentative_max_missed_frames(),
+            display_smoothing_alpha: default_bytetrack_display_smoothing_alpha(),
+        }
+    }
+}
+
 fn default_track_ttl_ms() -> u64 {
     2_000
 }
 fn default_iou_threshold() -> f32 {
     0.3
+}
+fn default_bytetrack_high_confidence() -> f32 {
+    0.5
+}
+fn default_bytetrack_low_confidence() -> f32 {
+    0.1
+}
+fn default_bytetrack_match_iou_threshold() -> f32 {
+    0.3
+}
+fn default_bytetrack_max_lost_frames() -> u32 {
+    30
+}
+fn default_bytetrack_confirm_frames() -> u32 {
+    1
+}
+fn default_bytetrack_tentative_max_missed_frames() -> u32 {
+    3
+}
+fn default_bytetrack_display_smoothing_alpha() -> f32 {
+    0.6
 }
 
 // ---------------------------------------------------------------------------
