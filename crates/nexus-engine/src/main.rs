@@ -13,6 +13,7 @@ use nexus_tracker::build_tracker;
 use tracing::{info, warn};
 
 mod api;
+mod storage_safety;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -117,6 +118,44 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         handles.push(h);
     }
 
+    // Storage safety floor (M2.1 Stage A PR 4). Spawned even before
+    // the supervisor wiring (PR 5) is in place: the recorder is
+    // constructed up here so the watermark sampler can flip its
+    // panic flag in advance of anything actually opening clips. The
+    // safety floor is a per-process singleton — clip writes elsewhere
+    // hold the same recorder Arc.
+    let clips_dir = cfg.runtime.clips.clips_dir.clone();
+    if let Err(e) = tokio::fs::create_dir_all(&clips_dir).await {
+        warn!(path = %clips_dir.display(), error = %e, "could not pre-create clips_dir");
+    }
+    let _recorder: std::sync::Arc<dyn nexus_pipeline::ClipRecorder> = std::sync::Arc::new(
+        nexus_pipeline::StubClipRecorder::new(store.clone(), clips_dir.clone()),
+    );
+    let safety_cfg = storage_safety::StorageSafetyConfig {
+        clips_dir: clips_dir.clone(),
+        low_watermark_pct: cfg.runtime.clips.low_watermark_pct,
+        panic_watermark_pct: cfg.runtime.clips.panic_watermark_pct,
+        sample_interval: std::time::Duration::from_secs(
+            cfg.runtime.clips.watermark_sample_interval_secs.max(1) as u64,
+        ),
+    };
+    let probe: std::sync::Arc<dyn storage_safety::FreeSpaceProbe> =
+        std::sync::Arc::new(storage_safety::StatvfsProbe {
+            path: clips_dir.clone(),
+        });
+    let safety_handle = {
+        let recorder = _recorder.clone();
+        let store = store.clone();
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                storage_safety::run_storage_safety(safety_cfg, probe, recorder, store, bus).await
+            {
+                tracing::error!(error = %e, "storage safety loop exited");
+            }
+        })
+    };
+
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),
@@ -142,6 +181,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         wait_for_signal().await;
     }
 
+    safety_handle.abort();
     for h in handles {
         h.task.abort();
     }

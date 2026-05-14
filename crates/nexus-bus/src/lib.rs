@@ -26,6 +26,11 @@ pub mod topic {
     pub const ALERT_EVENT: &str = "alert.event";
     pub const CONFIG_CHANGED: &str = "config.changed";
     pub const PIPELINE_STATUS: &str = "pipeline.status";
+    /// Watermark sampler crossed `panic_watermark_pct`. Payload is
+    /// `StoragePanicEvent` (free pct + reason). Emitted ONCE per
+    /// Ok→Panic transition (debounced); the matching exit event is
+    /// emitted on Panic→Ok.
+    pub const STORAGE_PANIC: &str = "storage.panic";
 }
 
 // ---------------------------------------------------------------------------
