@@ -104,6 +104,10 @@ pub struct RuntimeConfig {
     pub worker_threads: usize,
     #[serde(default = "default_blocking_threads")]
     pub blocking_threads: usize,
+    /// Writable directory for per-camera persisted state
+    /// (static-object registries, etc.). Created on demand.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: PathBuf,
 }
 
 impl Default for RuntimeConfig {
@@ -111,12 +115,17 @@ impl Default for RuntimeConfig {
         Self {
             worker_threads: 0,
             blocking_threads: default_blocking_threads(),
+            state_dir: default_state_dir(),
         }
     }
 }
 
 fn default_blocking_threads() -> usize {
     8
+}
+
+fn default_state_dir() -> PathBuf {
+    PathBuf::from("/var/lib/nexus/state")
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +453,11 @@ pub struct TrackerConfig {
     /// All fields default to v1 (`track_annotator.hpp`) values.
     #[serde(default)]
     pub annotator: AnnotatorConfig,
+    /// Static-object filter tuning (parked-vehicle suppression).
+    /// All fields default to v1 (`event_filter.cpp`) values. Activated
+    /// per-camera via `cameras[*].parking_lot_mode = true`.
+    #[serde(default)]
+    pub static_object: StaticObjectConfig,
 }
 
 // Hand-written so `Default` agrees with the `#[serde(default = "...")]`
@@ -464,6 +478,7 @@ impl Default for TrackerConfig {
             iou_threshold: default_iou_threshold(),
             bytetrack: ByteTrackConfig::default(),
             annotator: AnnotatorConfig::default(),
+            static_object: StaticObjectConfig::default(),
         }
     }
 }
@@ -648,6 +663,71 @@ fn default_annotator_stale_state_frames() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Static-object filter (v1 EventFilter::staticVehicle*)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticObjectConfig {
+    /// Frames a vehicle track must dwell below
+    /// `significant_movement_pixels` (EMA-smoothed) before promoting
+    /// to "static" and being suppressed from the rule eval slice.
+    /// v1 default: 150 (~5 s @ 30 fps).
+    #[serde(default = "default_static_object_dwell_frames")]
+    pub dwell_frames: u32,
+    /// Px-EMA threshold above which a static track is considered
+    /// "moving again". v1 default: 36.
+    #[serde(default = "default_static_object_significant_movement_pixels")]
+    pub significant_movement_pixels: u32,
+    /// Consecutive moving frames required to demote a previously
+    /// promoted track and erase its persistent anchor. v1 default: 3.
+    #[serde(default = "default_static_object_significant_movement_frames")]
+    pub significant_movement_frames: u32,
+    /// EMA blend factor for the per-track movement signal. New value
+    /// weighs `alpha`, prior smoothed value weighs `1 - alpha`. v1
+    /// default: 0.35.
+    #[serde(default = "default_static_object_movement_ema_alpha")]
+    pub movement_ema_alpha: f32,
+    /// Pixel radius for matching a fresh observation to an existing
+    /// persistent anchor. v1 default: 40.
+    #[serde(default = "default_static_object_match_distance_pixels")]
+    pub match_distance_pixels: u32,
+    /// When true, write/load the per-camera anchor registry to disk
+    /// under `runtime.state_dir`. v1 default: true.
+    #[serde(default = "default_true")]
+    pub persistence_enabled: bool,
+}
+
+impl Default for StaticObjectConfig {
+    fn default() -> Self {
+        Self {
+            dwell_frames: default_static_object_dwell_frames(),
+            significant_movement_pixels: default_static_object_significant_movement_pixels(),
+            significant_movement_frames: default_static_object_significant_movement_frames(),
+            movement_ema_alpha: default_static_object_movement_ema_alpha(),
+            match_distance_pixels: default_static_object_match_distance_pixels(),
+            persistence_enabled: true,
+        }
+    }
+}
+
+fn default_static_object_dwell_frames() -> u32 {
+    150
+}
+fn default_static_object_significant_movement_pixels() -> u32 {
+    36
+}
+fn default_static_object_significant_movement_frames() -> u32 {
+    3
+}
+fn default_static_object_movement_ema_alpha() -> f32 {
+    0.35
+}
+fn default_static_object_match_distance_pixels() -> u32 {
+    40
+}
+
+// ---------------------------------------------------------------------------
 // Rules
 // ---------------------------------------------------------------------------
 
@@ -759,6 +839,12 @@ pub struct CameraConfig {
     /// Per-camera FPS cap. 0 = unbounded.
     #[serde(default)]
     pub max_fps: u32,
+    /// When true, this camera enables the static-object filter
+    /// (`tracker.static_object.*`). Vehicles that promote to "static"
+    /// are dropped from the rule-eval slice and persisted to the
+    /// per-camera registry at `runtime.state_dir`. Default: false.
+    #[serde(default)]
+    pub parking_lot_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

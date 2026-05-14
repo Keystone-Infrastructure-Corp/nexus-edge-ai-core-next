@@ -207,6 +207,7 @@ mod tests {
             }),
             zones: vec![],
             max_fps: 0,
+            parking_lot_mode: false,
         }
     }
 

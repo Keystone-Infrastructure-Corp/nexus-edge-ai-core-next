@@ -95,12 +95,15 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         model_override: None,
         zones: vec![],
         max_fps: 5,
+        parking_lot_mode: false,
     };
     let handle = spawn_camera(
         cam,
         detector,
         tracker,
         tracker_cfg.annotator.clone(),
+        tracker_cfg.static_object.clone(),
+        std::env::temp_dir(),
         evaluator,
         store.clone(),
         bus.clone(),

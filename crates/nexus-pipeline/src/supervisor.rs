@@ -5,14 +5,15 @@
 //! that opens child spans for `decode/gate/infer/track/rules`. That's how
 //! the `trace_id` field on [`nexus_types::Frame`] is actually backed.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use nexus_bus::{topic, Bus, BusExt};
-use nexus_config::{AnnotatorConfig, CameraConfig};
+use nexus_config::{AnnotatorConfig, CameraConfig, StaticObjectConfig};
 use nexus_inference::Detector;
 use nexus_rules::RuleEvaluator;
 use nexus_store::EventStore;
-use nexus_tracker::{TrackAnnotator, Tracker};
+use nexus_tracker::{StaticObjectFilter, TrackAnnotator, Tracker};
 use nexus_types::{CameraId, Frame, FrameMetadata, PipelineState, PipelineStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -35,6 +36,8 @@ pub fn spawn_camera(
     detector: Arc<dyn Detector>,
     tracker: Arc<dyn Tracker>,
     annotator_cfg: AnnotatorConfig,
+    static_object_cfg: StaticObjectConfig,
+    state_dir: PathBuf,
     evaluator: Arc<RuleEvaluator>,
     store: Arc<dyn EventStore>,
     bus: Arc<dyn Bus>,
@@ -46,6 +49,8 @@ pub fn spawn_camera(
         detector,
         tracker,
         annotator_cfg,
+        static_object_cfg,
+        state_dir,
         evaluator,
         store,
         bus,
@@ -60,6 +65,8 @@ async fn run_camera(
     detector: Arc<dyn Detector>,
     tracker: Arc<dyn Tracker>,
     annotator_cfg: AnnotatorConfig,
+    static_object_cfg: StaticObjectConfig,
+    state_dir: PathBuf,
     evaluator: Arc<RuleEvaluator>,
     store: Arc<dyn EventStore>,
     bus: Arc<dyn Bus>,
@@ -101,6 +108,22 @@ async fn run_camera(
         let prompts = cfg.prompts.clone();
         let zones = cfg.zones.clone();
         let mut annotator = TrackAnnotator::new(annotator_cfg);
+        // Static-object filter is only built when the camera opted in.
+        // We always pass the persistence path (under state_dir) so a
+        // toggle from off → on picks up any registry that may already
+        // exist on disk.
+        let mut static_filter = if cfg.parking_lot_mode {
+            let path = state_dir
+                .join("static_objects")
+                .join(format!("cam-{}.json", cfg.id));
+            Some(StaticObjectFilter::new(
+                static_object_cfg,
+                cfg.id,
+                Some(path),
+            ))
+        } else {
+            None
+        };
 
         info!(camera_id = cfg.id, "pipeline running");
 
@@ -145,6 +168,10 @@ async fn run_camera(
             {
                 let _g = info_span!("frame.annotate", annotator = annotator.name()).entered();
                 annotator.annotate(&frame, &zones, &mut tracked);
+            }
+            if let Some(sf) = static_filter.as_mut() {
+                let _g = info_span!("frame.static_filter", filter = sf.name()).entered();
+                sf.filter(&frame, &mut tracked);
             }
             let tracked_arc = Arc::new(tracked.clone());
 
