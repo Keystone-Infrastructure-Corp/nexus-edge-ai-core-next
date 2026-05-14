@@ -652,4 +652,203 @@ mod tests {
 
         handle.abort();
     }
+
+    // ---------------------------------------------------------------
+    // B6 acceptance test — drive the *real* StatvfsProbe against an
+    // operator-prepared low-disk filesystem (tmpfs on Linux,
+    // hdiutil-backed RAM disk on macOS, or any small partition).
+    //
+    // Skipped by default. To run:
+    //
+    //   # Linux
+    //   sudo mkdir -p /mnt/nexus-test-tmpfs
+    //   sudo mount -t tmpfs -o size=64M tmpfs /mnt/nexus-test-tmpfs
+    //   sudo chown $USER /mnt/nexus-test-tmpfs
+    //   NEXUS_LOW_DISK_TEST_DIR=/mnt/nexus-test-tmpfs \
+    //     cargo test -p nexus-engine -- --ignored \
+    //       tmpfs_acceptance_panic_then_recover --nocapture
+    //
+    //   # macOS (creates an in-memory 64MB HFS+ disk)
+    //   DEV=$(hdiutil attach -nomount ram://131072 | xargs)
+    //   diskutil erasevolume HFS+ nexus-test "$DEV"
+    //   NEXUS_LOW_DISK_TEST_DIR=/Volumes/nexus-test \
+    //     cargo test -p nexus-engine -- --ignored \
+    //       tmpfs_acceptance_panic_then_recover --nocapture
+    //
+    // The test refuses to run on a filesystem ≥ 1 GiB so a misset
+    // env var can never fill someone's real disk.
+    // ---------------------------------------------------------------
+
+    /// Wall-clock budget for the panic / recovery transitions. The
+    /// loop's sample interval is 200ms, so 3s gives us ~15 ticks of
+    /// slack — more than enough on a busy CI runner without
+    /// masking real bugs.
+    const TMPFS_TRANSITION_BUDGET: Duration = Duration::from_secs(3);
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires NEXUS_LOW_DISK_TEST_DIR pointing at a small (<1 GiB) tmpfs / ramdisk"]
+    async fn tmpfs_acceptance_panic_then_recover() {
+        let Ok(raw) = std::env::var("NEXUS_LOW_DISK_TEST_DIR") else {
+            eprintln!(
+                "skip: set NEXUS_LOW_DISK_TEST_DIR=<small-tmpfs-mountpoint> to run this acceptance test"
+            );
+            return;
+        };
+        let test_dir = PathBuf::from(raw);
+        assert!(
+            test_dir.is_dir(),
+            "{} must exist and be a directory",
+            test_dir.display()
+        );
+
+        // Hard refuse on anything that looks like a real disk. tmpfs
+        // / ramdisk for this test should be tens of MiB, not gigs.
+        let stat0 = nix::sys::statvfs::statvfs(test_dir.as_path()).unwrap();
+        let frag = stat0.fragment_size() as u64;
+        let blocks = stat0.blocks() as u64;
+        let avail_blocks = stat0.blocks_available() as u64;
+        let total_bytes = blocks * frag;
+        let avail_bytes = avail_blocks * frag;
+        assert!(
+            total_bytes < 1024 * 1024 * 1024,
+            "NEXUS_LOW_DISK_TEST_DIR points at a {} byte fs; expected < 1 GiB so we don't fill a real disk",
+            total_bytes
+        );
+        assert!(
+            avail_bytes > 64 * 1024,
+            "test fs needs at least 64 KiB free to seed the sentinel file; only {} bytes free",
+            avail_bytes
+        );
+
+        // Spin up store + recorder + bus rooted at the test fs so
+        // sqlite's WAL also lives on the small mount (matches the
+        // production layout — clips_dir + db share a partition).
+        let db_path = test_dir.join("nexus-acceptance.db");
+        let _ = tokio::fs::remove_file(&db_path).await;
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!("sqlite:{}?mode=rwc", db_path.display()),
+                seed_from_config: false,
+                duckdb_attach: false,
+                duckdb_path: PathBuf::from("/tmp/unused.duckdb"),
+            })
+            .await
+            .unwrap(),
+        );
+        let clips_dir = test_dir.join("acceptance-clips");
+        let _ = tokio::fs::remove_dir_all(&clips_dir).await;
+        tokio::fs::create_dir_all(&clips_dir).await.unwrap();
+
+        let recorder: Arc<dyn ClipRecorder> =
+            Arc::new(StubClipRecorder::new(store.clone(), clips_dir.clone()));
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
+        let probe: Arc<dyn FreeSpaceProbe> = Arc::new(StatvfsProbe {
+            path: test_dir.clone(),
+        });
+
+        // Sample fast so the test runs end-to-end in seconds.
+        let cfg = StorageSafetyConfig {
+            clips_dir: clips_dir.clone(),
+            low_watermark_pct: 15,
+            panic_watermark_pct: 5,
+            sample_interval: Duration::from_millis(200),
+        };
+
+        let recorder_for_loop = recorder.clone();
+        let store_for_loop = store.clone();
+        let bus_for_loop = bus.clone();
+        let cfg_for_loop = cfg.clone();
+        let probe_for_loop = probe.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_storage_safety(
+                cfg_for_loop,
+                probe_for_loop,
+                recorder_for_loop,
+                store_for_loop,
+                bus_for_loop,
+            )
+            .await;
+        });
+
+        // Baseline: tmpfs is fresh, free pct should be > panic
+        // threshold, and the recorder must not be in panic mode
+        // after the first sample tick.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !recorder.is_panic(),
+            "recorder should NOT be panicked at baseline (free fs just mounted)"
+        );
+
+        // Flood the fs to <= 2% free. Reserve a small headroom
+        // below total so the kernel's tmpfs accounting doesn't
+        // refuse the write outright (we want the *engine* to
+        // observe panic via statvfs, not get an ENOSPC mid-write).
+        let sentinel_path = test_dir.join("nexus-acceptance.fill");
+        let target_consume = avail_bytes.saturating_sub(total_bytes / 100); // leave ~1% headroom
+        write_sentinel(&sentinel_path, target_consume).await;
+
+        // Within one sample interval (with slack), the loop must
+        // observe the new free% and flip the recorder.
+        let panicked = wait_for(TMPFS_TRANSITION_BUDGET, || recorder.is_panic()).await;
+        assert!(
+            panicked,
+            "recorder.is_panic() never became true after filling fs to <{}% within {:?}",
+            cfg.panic_watermark_pct, TMPFS_TRANSITION_BUDGET
+        );
+
+        // Drop the sentinel — free space jumps back. Eviction may
+        // also be running in the background and removing test
+        // clips, but with no clips seeded it's a no-op.
+        tokio::fs::remove_file(&sentinel_path).await.unwrap();
+        let recovered = wait_for(TMPFS_TRANSITION_BUDGET, || !recorder.is_panic()).await;
+        assert!(
+            recovered,
+            "recorder.is_panic() never cleared after freeing the sentinel within {:?}",
+            TMPFS_TRANSITION_BUDGET
+        );
+
+        handle.abort();
+
+        // Best-effort cleanup so the operator's tmpfs is left tidy
+        // for the next run.
+        let _ = tokio::fs::remove_dir_all(&clips_dir).await;
+        let _ = tokio::fs::remove_file(&db_path).await;
+        let _ = tokio::fs::remove_file(test_dir.join("nexus-acceptance.db-wal")).await;
+        let _ = tokio::fs::remove_file(test_dir.join("nexus-acceptance.db-shm")).await;
+    }
+
+    /// Write `bytes` zeroes to `path`. Uses 1 MiB chunks so we
+    /// don't allocate a giant buffer for multi-MiB sentinels.
+    async fn write_sentinel(path: &Path, bytes: u64) {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::File::create(path).await.unwrap();
+        let chunk = vec![0u8; 1024 * 1024];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len() as u64) as usize;
+            f.write_all(&chunk[..n]).await.unwrap();
+            remaining -= n as u64;
+        }
+        f.flush().await.unwrap();
+        // sync_all so statvfs sees the new occupancy on the next
+        // sample. Without this the kernel may still be lazily
+        // accounting the writes when the loop ticks.
+        f.sync_all().await.unwrap();
+    }
+
+    /// Polls `pred` every 50ms up to `budget`. Returns whether the
+    /// predicate ever returned true.
+    async fn wait_for<F: Fn() -> bool>(budget: Duration, pred: F) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if pred() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
