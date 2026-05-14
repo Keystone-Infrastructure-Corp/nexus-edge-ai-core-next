@@ -75,10 +75,10 @@ track_ttl_ms = 2000
 iou_threshold = 0.30
 
 # -----------------------------------------------------------------
-# Rules — CEL by default, legacy_json available for v1 migration.
+# Rules — CEL.
 # -----------------------------------------------------------------
 [rules]
-backend = "cel"           # cel | legacy_json
+backend = "cel"           # cel
 
 [[rules.inline]]
 id = "person_in_zone"

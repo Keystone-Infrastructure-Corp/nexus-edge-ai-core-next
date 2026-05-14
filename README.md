@@ -20,7 +20,7 @@ level instead of being defaults nobody can change.
    Detector              in-process / thread-isolated /          pool: N workers
                          worker-process / open-vocab / ensemble
    Tracker               iou-naive / bytetrack                   per-camera
-   RuleEngine            cel / legacy-json                       single
+   RuleEngine            cel                                     single
    EventStore            sqlite                                  single
    Bus                   broadcast / nats                        capacity knob
 ```
@@ -61,7 +61,7 @@ crates/
 ├── nexus-bus/          Bus trait + BroadcastBus + NatsBus (feature)
 ├── nexus-telemetry/    OTEL init; the `frame.*` span family lives here
 ├── nexus-store/        SQLite via sqlx + DuckDB attach for analytics
-├── nexus-rules/        RuleEngine trait + CelEngine + LegacyJsonEngine
+├── nexus-rules/        RuleEngine trait + CelEngine
 ├── nexus-tracker/      Tracker trait + ByteTrack + IouNaive
 ├── nexus-inference/    Detector + DetectorBackend + DetectorPool
 │                         ├── InProcessBackend (synchronous)

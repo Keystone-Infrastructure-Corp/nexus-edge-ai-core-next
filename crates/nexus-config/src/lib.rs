@@ -746,7 +746,6 @@ pub struct RulesConfig {
 pub enum RulesBackendKind {
     #[default]
     Cel,
-    LegacyJson,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -755,7 +754,8 @@ pub struct RuleConfig {
     pub id: String,
     pub name: String,
     pub camera_filter: Option<Vec<CameraId>>,
-    /// CEL expression (or JSON-AST string when `RulesBackendKind::LegacyJson`).
+    /// CEL expression evaluated against the per-frame `object` / `camera` /
+    /// `now` context.
     pub when: String,
     pub severity: String,
     #[serde(default = "default_min_track_age_ms")]

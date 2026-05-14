@@ -1,9 +1,6 @@
-//! Rule evaluator with two interchangeable backends:
-//!
-//! * [`CelEngine`] — first-class, default. Uses `cel-interpreter`.
-//! * [`LegacyJsonEngine`] — migration path for existing JSON-AST predicates
-//!   from `nexus-edge-ai-core` v1. Behind the same trait, so the pipeline
-//!   doesn't know which is running.
+//! Rule evaluator. Currently a single backend ([`CelEngine`]) behind a
+//! [`RuleEngine`] trait so future engines (Wasm, hosted JS, etc.) can
+//! drop in without churn at the call site.
 //!
 //! Pipeline behaviour (gates, cooldowns, per-track state) is handled by
 //! [`RuleEvaluator`] — the engine implementations only answer "does this
@@ -55,8 +52,8 @@ pub trait RuleEngine: Send + Sync {
     fn kind(&self) -> RulesBackendKind;
 }
 
-/// Output of `compile`. Holds the parsed program (for CEL) or AST (for legacy)
-/// alongside the original config — the pipeline needs the gates.
+/// Output of `compile`. Holds the parsed program alongside the original
+/// config — the pipeline needs the gates.
 pub struct CompiledRule {
     pub config: RuleConfig,
     program: ProgramRepr,
@@ -64,7 +61,6 @@ pub struct CompiledRule {
 
 enum ProgramRepr {
     Cel(Program),
-    LegacyJson(JsonValue),
 }
 
 // ---------------------------------------------------------------------------
@@ -97,12 +93,7 @@ impl RuleEngine for CelEngine {
         object: &TrackedObject,
         camera_id: CameraId,
     ) -> Result<bool, RulesError> {
-        let ProgramRepr::Cel(program) = &compiled.program else {
-            return Err(RulesError::Evaluate(
-                compiled.config.id.clone(),
-                "non-CEL compiled rule passed to CelEngine".into(),
-            ));
-        };
+        let ProgramRepr::Cel(program) = &compiled.program;
 
         let mut ctx = Context::default();
         ctx.add_variable("object", object_to_cel(object))
@@ -196,104 +187,6 @@ fn json_to_cel(v: &JsonValue) -> CelValue {
 }
 
 // ---------------------------------------------------------------------------
-// LegacyJsonEngine — direct migration from v1's JSON predicates
-// ---------------------------------------------------------------------------
-
-/// Tiny AST evaluator. Supported nodes:
-/// ```json
-///   { "and": [ … ] }
-///   { "or":  [ … ] }
-///   { "not": { … } }
-///   { "label_eq": "person" }
-///   { "confidence_gte": 0.5 }
-///   { "age_ms_gte": 1000 }
-///   { "attribute": { "key": "motion.speed_class", "eq": "fast" } }
-/// ```
-#[derive(Default)]
-pub struct LegacyJsonEngine;
-
-impl LegacyJsonEngine {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl RuleEngine for LegacyJsonEngine {
-    fn compile(&self, rule: &RuleConfig) -> Result<CompiledRule, RulesError> {
-        let ast: JsonValue = serde_json::from_str(&rule.when)
-            .map_err(|e| RulesError::Compile(rule.id.clone(), e.to_string()))?;
-        Ok(CompiledRule {
-            config: rule.clone(),
-            program: ProgramRepr::LegacyJson(ast),
-        })
-    }
-
-    fn matches(
-        &self,
-        compiled: &CompiledRule,
-        object: &TrackedObject,
-        _camera_id: CameraId,
-    ) -> Result<bool, RulesError> {
-        let ProgramRepr::LegacyJson(ast) = &compiled.program else {
-            return Err(RulesError::Evaluate(
-                compiled.config.id.clone(),
-                "non-legacy compiled rule passed to LegacyJsonEngine".into(),
-            ));
-        };
-        eval_legacy(ast, object).map_err(|e| RulesError::Evaluate(compiled.config.id.clone(), e))
-    }
-
-    fn kind(&self) -> RulesBackendKind {
-        RulesBackendKind::LegacyJson
-    }
-}
-
-fn eval_legacy(node: &JsonValue, o: &TrackedObject) -> Result<bool, String> {
-    let obj = node
-        .as_object()
-        .ok_or_else(|| "node is not an object".to_string())?;
-    if let Some(arr) = obj.get("and").and_then(|v| v.as_array()) {
-        for n in arr {
-            if !eval_legacy(n, o)? {
-                return Ok(false);
-            }
-        }
-        return Ok(true);
-    }
-    if let Some(arr) = obj.get("or").and_then(|v| v.as_array()) {
-        for n in arr {
-            if eval_legacy(n, o)? {
-                return Ok(true);
-            }
-        }
-        return Ok(false);
-    }
-    if let Some(n) = obj.get("not") {
-        return Ok(!eval_legacy(n, o)?);
-    }
-    if let Some(s) = obj.get("label_eq").and_then(|v| v.as_str()) {
-        return Ok(o.label == s);
-    }
-    if let Some(t) = obj.get("confidence_gte").and_then(|v| v.as_f64()) {
-        return Ok((o.confidence as f64) >= t);
-    }
-    if let Some(t) = obj.get("age_ms_gte").and_then(|v| v.as_u64()) {
-        return Ok(o.age_ms >= t);
-    }
-    if let Some(a) = obj.get("attribute").and_then(|v| v.as_object()) {
-        let key = a
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or("attribute.key missing")?;
-        let want = a.get("eq").ok_or("attribute.eq missing")?;
-        let got = o.attributes.get(key);
-        return Ok(got.is_some_and(|g| g == want));
-    }
-    Err(format!("unknown legacy AST node: {}", node))
-}
-
-// ---------------------------------------------------------------------------
 // Pipeline-facing wrapper: gates, cooldowns, per-track state, hot-reload.
 // ---------------------------------------------------------------------------
 
@@ -314,7 +207,6 @@ impl RuleEvaluator {
     pub fn new(cfg: &RulesConfig, rules: &[RuleConfig]) -> Result<Self, RulesError> {
         let engine: Arc<dyn RuleEngine> = match cfg.backend {
             RulesBackendKind::Cel => Arc::new(CelEngine::new()),
-            RulesBackendKind::LegacyJson => Arc::new(LegacyJsonEngine::new()),
         };
         let compiled = compile_all(&*engine, rules)?;
         Ok(Self {
@@ -476,28 +368,5 @@ mod tests {
             .matches(&compiled, &obj("person", 0.9, 1000), 1)
             .unwrap());
         assert!(!eng.matches(&compiled, &obj("dog", 0.9, 1000), 1).unwrap());
-    }
-
-    #[test]
-    fn legacy_label_and_confidence() {
-        let cfg = RuleConfig {
-            id: "r2".into(),
-            name: "fast person".into(),
-            camera_filter: None,
-            when: r#"{"and":[{"label_eq":"person"},{"confidence_gte":0.5}]}"#.into(),
-            severity: "medium".into(),
-            min_track_age_ms: 0,
-            consecutive_frames: 1,
-            cooldown_ms: 0,
-            enabled: true,
-        };
-        let eng = LegacyJsonEngine::new();
-        let compiled = eng.compile(&cfg).unwrap();
-        assert!(eng
-            .matches(&compiled, &obj("person", 0.7, 1000), 1)
-            .unwrap());
-        assert!(!eng
-            .matches(&compiled, &obj("person", 0.3, 1000), 1)
-            .unwrap());
     }
 }
