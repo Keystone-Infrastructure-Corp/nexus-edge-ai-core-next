@@ -99,6 +99,7 @@ ts-rs = { version = "10", features = ["serde-compat", "uuid-impl", "chrono-impl"
 
 once_cell = "1"
 url = { version = "2", features = ["serde"] }
+tempfile = "3"
 
 # Internal
 nexus-types = { path = "crates/nexus-types" }
