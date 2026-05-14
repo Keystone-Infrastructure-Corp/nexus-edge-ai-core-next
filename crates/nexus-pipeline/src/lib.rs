@@ -23,6 +23,9 @@ pub mod supervisor;
 #[cfg(feature = "gstreamer")]
 pub mod gst_clip_recorder;
 
+#[cfg(feature = "gstreamer")]
+pub mod thumbnail;
+
 pub use cache::{LatestEntry, LatestFrameCache};
 pub use gate::MotionGate;
 pub use recorder::{

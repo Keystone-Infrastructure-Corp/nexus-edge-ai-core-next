@@ -81,7 +81,8 @@ pub fn router(state: ApiState) -> Router {
         // M2.1 Stage A — motion + clips + storage health.
         .route("/v1/storage/local", get(get_storage_local))
         .route("/v1/cameras/:id/motion", get(list_motion_for_camera))
-        .route("/v1/clips/:id", get(get_clip));
+        .route("/v1/clips/:id", get(get_clip))
+        .route("/v1/clips/:id/thumbnail", get(get_clip_thumbnail));
 
     let static_dir = ServeDir::new(state.ui_root.clone()).append_index_html_on_directories(true);
 
@@ -456,6 +457,7 @@ async fn list_motion_for_camera(
 
 async fn get_clip(
     State(s): State<ApiState>,
+    headers: axum::http::HeaderMap,
     Path(clip_id): Path<i64>,
 ) -> Result<Response, ApiError> {
     let clip = s
@@ -468,8 +470,8 @@ async fn get_clip(
     // Stage A: recorder is `stub` and the on-disk file is 0 bytes —
     // serving it would be misleading. Return 503 with an explicit
     // body so the UI can render "playback unavailable" instead of
-    // a broken video element. Stage B switches this to a streaming
-    // 200 response.
+    // a broken video element. Stage B (this PR) switches non-stub
+    // recorders to a streaming 200 response with HTTP Range support.
     if s.recorder.kind() == "stub" {
         let body = serde_json::json!({
             "error": "playback unavailable",
@@ -485,14 +487,278 @@ async fn get_clip(
         return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
     }
 
-    // Stage B will implement the real streaming response here. For
-    // now, still 503 if some future build sets a non-stub kind but
-    // hasn't implemented this branch yet.
+    // Resolve the clip path. `motion_clips.path` is stored relative
+    // to `clips_dir`; reject any traversal attempt before touching
+    // the filesystem (clips_dir is the security boundary).
+    let rel = std::path::PathBuf::from(&clip.path);
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("clip path contains '..': {}", clip.path),
+        ));
+    }
+    let abs = s.clips_dir.join(&rel);
+    let canonical_root = std::fs::canonicalize(&s.clips_dir).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("canonicalize clips_dir: {e}"),
+        )
+    })?;
+    let canonical_clip = match std::fs::canonicalize(&abs) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                format!("clip file missing on disk: {}", abs.display()),
+            ));
+        }
+        Err(e) => {
+            return Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("canonicalize clip: {e}"),
+            ));
+        }
+    };
+    if !canonical_clip.starts_with(&canonical_root) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "clip path escapes clips_dir".to_string(),
+        ));
+    }
+
+    let file_size = match tokio::fs::metadata(&canonical_clip).await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            return Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("stat clip: {e}"),
+            ));
+        }
+    };
+    if file_size == 0 {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "clip file is empty (recorder may still be opening it)".to_string(),
+        ));
+    }
+
+    // Parse `Range:` header. Only `bytes=` units are honoured; missing
+    // or malformed headers fall through to a 200 full-body response.
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_byte_range(s, file_size));
+
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(&canonical_clip)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("open clip: {e}")))?;
+
+    let content_type = match clip.container.as_str() {
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        _ => "application/octet-stream",
+    };
+
+    if let Some((start, end)) = range {
+        // RFC 7233 partial content. end is INCLUSIVE.
+        if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+            return Err(ApiError(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                format!("seek failed for range {start}-{end}"),
+            ));
+        }
+        let len = end - start + 1;
+        let limited = file.take(len);
+        let stream = tokio_util::io::ReaderStream::new(limited);
+        let body = axum::body::Body::from_stream(stream);
+        let resp = Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_LENGTH, len)
+            .header(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{file_size}"),
+            )
+            .body(body)
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(resp);
+    }
+
+    // Full-body 200.
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, file_size)
+        .body(body)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(resp)
+}
+
+/// Parse a single-range `bytes=START-END` value, clamped to the
+/// file size. Returns `(start, end_inclusive)`. Multi-range and
+/// suffix-range (`bytes=-N`) are intentionally unsupported — browsers
+/// only need single-byte-range for `<video>` element seeking.
+fn parse_byte_range(raw: &str, file_size: u64) -> Option<(u64, u64)> {
+    let raw = raw.trim();
+    let rest = raw.strip_prefix("bytes=")?;
+    // First range only.
+    let first = rest.split(',').next()?.trim();
+    let (start_str, end_str) = first.split_once('-')?;
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
+    if start_str.is_empty() {
+        // Suffix form `bytes=-N` — not implemented.
+        return None;
+    }
+    let start: u64 = start_str.parse().ok()?;
+    if start >= file_size {
+        return None;
+    }
+    let end: u64 = if end_str.is_empty() {
+        file_size - 1
+    } else {
+        end_str.parse().ok()?
+    };
+    let end = end.min(file_size - 1);
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+async fn get_clip_thumbnail(
+    State(s): State<ApiState>,
+    Path(clip_id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let clip = s
+        .store
+        .get_clip(clip_id)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("clip {clip_id} not found")))?;
+
+    if s.recorder.kind() == "stub" {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "thumbnails unavailable for stub recorder".to_string(),
+        ));
+    }
+
+    let rel = std::path::PathBuf::from(&clip.path);
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("clip path contains '..': {}", clip.path),
+        ));
+    }
+    let clip_path = s.clips_dir.join(&rel);
+    if !clip_path.is_file() {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("clip file missing on disk: {}", clip_path.display()),
+        ));
+    }
+    // Co-locate thumbnail next to the clip with `.jpg` suffix so the
+    // retention sweeper deletes both atoms together.
+    let thumb_path = clip_path.with_extension("mp4.jpg");
+
+    let thumb = generate_thumbnail_or_err(&clip_path, &thumb_path).await?;
+    let bytes = tokio::fs::read(&thumb).await.map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read thumb: {e}"),
+        )
+    })?;
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "public, max-age=300")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(resp)
+}
+
+#[cfg(feature = "gstreamer")]
+async fn generate_thumbnail_or_err(
+    clip_path: &std::path::Path,
+    thumb_path: &std::path::Path,
+) -> Result<std::path::PathBuf, ApiError> {
+    let clip_owned = clip_path.to_path_buf();
+    let thumb_owned = thumb_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        nexus_pipeline::thumbnail::ensure_thumbnail(&clip_owned, &thumb_owned)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("thumbnail: {e}")))
+}
+
+#[cfg(not(feature = "gstreamer"))]
+async fn generate_thumbnail_or_err(
+    _clip_path: &std::path::Path,
+    _thumb_path: &std::path::Path,
+) -> Result<std::path::PathBuf, ApiError> {
     Err(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
-        format!(
-            "clip streaming not implemented for recorder kind '{}'",
-            s.recorder.kind()
-        ),
+        "thumbnails require the 'gstreamer' feature".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_range;
+
+    #[test]
+    fn parse_simple_range() {
+        assert_eq!(parse_byte_range("bytes=0-499", 1000), Some((0, 499)));
+        assert_eq!(parse_byte_range("bytes=500-999", 1000), Some((500, 999)));
+    }
+
+    #[test]
+    fn parse_open_ended_range_clamps_to_file_size() {
+        assert_eq!(parse_byte_range("bytes=200-", 1000), Some((200, 999)));
+    }
+
+    #[test]
+    fn parse_clamps_end_to_eof() {
+        assert_eq!(parse_byte_range("bytes=900-99999", 1000), Some((900, 999)));
+    }
+
+    #[test]
+    fn parse_rejects_suffix_range() {
+        assert!(parse_byte_range("bytes=-500", 1000).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_start_past_eof() {
+        assert!(parse_byte_range("bytes=2000-2500", 1000).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_inverted_range() {
+        assert!(parse_byte_range("bytes=500-100", 1000).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_unit() {
+        assert!(parse_byte_range("items=0-9", 1000).is_none());
+    }
+
+    #[test]
+    fn parse_takes_only_first_of_multi_range() {
+        // Multi-range gets the first range and drops the rest.
+        assert_eq!(parse_byte_range("bytes=0-99,200-299", 1000), Some((0, 99)));
+    }
 }

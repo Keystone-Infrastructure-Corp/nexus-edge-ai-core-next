@@ -28,7 +28,7 @@ publish = false
 tokio = { version = "1.41", features = ["full", "tracing"] }
 # `sync` feature is required for BroadcastStream / WatchStream wrappers.
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 async-trait = "0.1"
 futures = "0.3"
 crossbeam-channel = "0.5"
