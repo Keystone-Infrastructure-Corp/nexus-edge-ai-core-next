@@ -111,6 +111,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         store.clone(),
         &clips_dir,
         &cameras,
+        cfg.runtime.clips.pre_roll_secs,
     )?;
     info!(kind = recorder.kind(), "clip recorder constructed");
 
@@ -251,12 +252,13 @@ fn build_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     cameras: &[CameraConfig],
+    pre_roll_secs: u32,
 ) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
     match kind {
         RecorderKind::Stub => Ok(Arc::new(nexus_pipeline::StubClipRecorder::new(
             store, clips_dir,
         ))),
-        RecorderKind::Gstreamer => build_gst_recorder(store, clips_dir, cameras),
+        RecorderKind::Gstreamer => build_gst_recorder(store, clips_dir, cameras, pre_roll_secs),
     }
 }
 
@@ -265,10 +267,36 @@ fn build_gst_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     cameras: &[CameraConfig],
+    pre_roll_secs: u32,
 ) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
-    let urls: std::collections::HashMap<i64, String> =
-        cameras.iter().map(|c| (c.id, c.url.to_string())).collect();
-    let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, urls)
+    // Build one always-on PreRollIngester per enabled camera. The
+    // ingester holds the only RTSP connection for that camera; the
+    // recorder consumes from its broadcast channel + ring snapshot.
+    let mut ingesters: std::collections::HashMap<i64, Arc<nexus_pipeline::PreRollIngester>> =
+        std::collections::HashMap::new();
+    for cam in cameras {
+        if !cam.enabled {
+            continue;
+        }
+        match nexus_pipeline::PreRollIngester::new(cam.id, cam.url.to_string(), pre_roll_secs) {
+            Ok(ing) => {
+                tracing::info!(
+                    camera_id = cam.id,
+                    pre_roll_secs,
+                    "pre-roll ingester started"
+                );
+                ingesters.insert(cam.id, ing);
+            }
+            Err(e) => {
+                tracing::error!(
+                    camera_id = cam.id,
+                    error = %e,
+                    "failed to start pre-roll ingester; this camera will refuse clips"
+                );
+            }
+        }
+    }
+    let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, ingesters)
         .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?;
     Ok(Arc::new(rec))
 }
@@ -278,6 +306,7 @@ fn build_gst_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     _cameras: &[CameraConfig],
+    _pre_roll_secs: u32,
 ) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
     tracing::error!(
         "config selected RecorderKind::Gstreamer but this build was compiled without \

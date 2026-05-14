@@ -195,6 +195,19 @@ pub struct ClipsConfig {
     /// moment `live_track_count` hits zero, matching pre-B3 behaviour).
     #[serde(default = "default_post_roll_secs")]
     pub post_roll_secs: u32,
+    /// Pre-roll buffer length in seconds — how much encoded H.264
+    /// the always-on ingester keeps in RAM ahead of motion. When a
+    /// new clip opens, the ring buffer's snapshot is prepended to
+    /// the file so the operator sees the moment leading up to
+    /// motion onset, not just the moment after.
+    ///
+    /// 0 disables pre-roll entirely; the recorder behaves exactly
+    /// as it did before B8 (clips start at the first sample taken
+    /// AFTER the open call). Default 5s matches the M2.1 spec; the
+    /// per-camera RAM cost is roughly `bitrate * pre_roll_secs`,
+    /// e.g. ~2 MB for a 4 Mbps 1080p camera.
+    #[serde(default = "default_pre_roll_secs")]
+    pub pre_roll_secs: u32,
 }
 
 impl Default for ClipsConfig {
@@ -208,6 +221,7 @@ impl Default for ClipsConfig {
             panic_watermark_pct: default_panic_watermark_pct(),
             watermark_sample_interval_secs: default_watermark_sample_interval_secs(),
             post_roll_secs: default_post_roll_secs(),
+            pre_roll_secs: default_pre_roll_secs(),
         }
     }
 }
@@ -238,6 +252,10 @@ fn default_watermark_sample_interval_secs() -> u32 {
 
 fn default_post_roll_secs() -> u32 {
     10
+}
+
+fn default_pre_roll_secs() -> u32 {
+    5
 }
 
 // ---------------------------------------------------------------------------

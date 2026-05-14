@@ -16,6 +16,7 @@
 pub mod cache;
 pub mod gate;
 pub mod post_roll;
+pub mod preroll;
 pub mod recorder;
 pub mod source;
 pub mod supervisor;
@@ -24,10 +25,14 @@ pub mod supervisor;
 pub mod gst_clip_recorder;
 
 #[cfg(feature = "gstreamer")]
+pub mod preroll_ingester;
+
+#[cfg(feature = "gstreamer")]
 pub mod thumbnail;
 
 pub use cache::{LatestEntry, LatestFrameCache};
 pub use gate::MotionGate;
+pub use preroll::{NalRingBuffer, NalSample};
 pub use recorder::{
     ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError, StubClipRecorder,
 };
@@ -36,6 +41,9 @@ pub use supervisor::{spawn_camera, CameraHandle};
 
 #[cfg(feature = "gstreamer")]
 pub use gst_clip_recorder::GstClipRecorder;
+
+#[cfg(feature = "gstreamer")]
+pub use preroll_ingester::PreRollIngester;
 
 #[cfg(feature = "gstreamer")]
 pub use source::RtspSource;
