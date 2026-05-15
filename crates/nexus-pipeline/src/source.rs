@@ -92,8 +92,9 @@ impl FrameSource for FailingSource {
 //
 // Pipeline:
 //   rtspsrc location=URL latency=200 protocols=tcp+udp
-//   ! decodebin force-sw-decoders=true ! videoconvert ! videorate
-//   ! video/x-raw,format=RGB,framerate=N/1
+//   ! decodebin force-sw-decoders=true
+//   ! videoconvert ! videoscale ! videorate
+//   ! video/x-raw,format=RGB,width=960,height=540,framerate=N/1
 //   ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4
 //
 // `parse::launch` handles the dynamic pad-added linking on rtspsrc and
@@ -110,6 +111,15 @@ impl FrameSource for FailingSource {
 // We don't run an NSApplication (we're a headless engine), so software
 // decode is the only path that produces frames. avdec_h264/avdec_h265 from
 // gst-libav handle every realistic camera codec at the FPS rates we use.
+//
+// Resolution is capped at 960×540 because every realistic downstream
+// consumer is much smaller: the YOLO detector resizes to 640×640, the
+// viewer renders into a card that's <800px wide, and the snapshot
+// JPEG endpoint re-encodes per request (so smaller is faster everywhere).
+// Source 1920×1080 RGB = 6.2 MB/frame; capped 960×540 = 1.5 MB/frame
+// — 4× less channel bandwidth and JPEG encode time. videoscale's
+// `add-borders` default is true since gst 1.6, so non-16:9 sources
+// letterbox cleanly instead of distorting.
 //
 // Bus is pumped on a `spawn_blocking` task because gst-rs's `iter_timed`
 // blocks the calling thread. EOS / Error end the session; the outer
@@ -187,8 +197,9 @@ impl RtspSource {
         let fr = if self.max_fps == 0 { 15 } else { self.max_fps };
         let desc = format!(
             "rtspsrc location=\"{url_safe}\" latency=200 protocols=tcp+udp \
-             ! decodebin force-sw-decoders=true ! videoconvert ! videorate \
-             ! video/x-raw,format=RGB,framerate={fr}/1 \
+             ! decodebin force-sw-decoders=true \
+             ! videoconvert ! videoscale ! videorate \
+             ! video/x-raw,format=RGB,width=960,height=540,framerate={fr}/1 \
              ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4"
         );
 
@@ -216,6 +227,40 @@ impl RtspSource {
                     let caps = sample.caps().ok_or(gst::FlowError::Error)?;
                     let info = VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
                     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+
+                    // GStreamer pads each row to a SIMD-aligned stride
+                    // (typically 16- or 64-byte boundaries). Downstream
+                    // consumers — image::JpegEncoder for the snapshot
+                    // endpoint, ndarray for the YOLO detector — all
+                    // expect a tightly packed `width * height * 3` buffer.
+                    // Copy row-by-row using `info.stride()[0]` so we
+                    // never ship a misaligned frame. Symptom of the bug
+                    // when this was missing: greyscale-looking output
+                    // (RGB triplets smear across rows) plus a truncated
+                    // bottom edge (data runs out before the last rows).
+                    let map_slice = map.as_slice();
+                    let stride = info.stride()[0] as usize;
+                    let width = info.width() as usize;
+                    let height = info.height() as usize;
+                    let row_bytes = width * 3;
+                    let mut data = Vec::with_capacity(row_bytes * height);
+                    if stride == row_bytes {
+                        // Hot path: no padding, single bulk copy.
+                        let end = row_bytes * height;
+                        if map_slice.len() < end {
+                            return Err(gst::FlowError::Error);
+                        }
+                        data.extend_from_slice(&map_slice[..end]);
+                    } else {
+                        if map_slice.len() < stride * height {
+                            return Err(gst::FlowError::Error);
+                        }
+                        for y in 0..height {
+                            let start = y * stride;
+                            data.extend_from_slice(&map_slice[start..start + row_bytes]);
+                        }
+                    }
+
                     let frame_id = {
                         let mut g = counter_cb.lock();
                         *g = g.saturating_add(1);
@@ -228,7 +273,7 @@ impl RtspSource {
                         width: info.width(),
                         height: info.height(),
                         format: PixelFormat::Rgb24,
-                        data: Arc::new(map.as_slice().to_vec()),
+                        data: Arc::new(data),
                         trace_id: Uuid::now_v7().to_string(),
                     };
                     // Never block streaming threads — the gate/pool drop policy
