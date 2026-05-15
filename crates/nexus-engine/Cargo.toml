@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# `nexus-engine` is the primary binary; `nexus-doctor` is an op-tool.
+# Pin the default so `cargo run -p nexus-engine` doesn't error with
+# "could not determine which binary to run".
+default-run = "nexus-engine"
 
 [features]
 default = []
