@@ -50,7 +50,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use nexus_storage::{BackendError, ColdBackend, HealthStatus, PutReceipt, VolumeInfo};
+use futures::stream::{StreamExt, TryStreamExt};
+use nexus_storage::{BackendError, ByteStream, ColdBackend, HealthStatus, PutReceipt, VolumeInfo};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, warn};
@@ -451,6 +452,54 @@ impl ColdBackend for GoogleDriveBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<ByteStream, BackendError> {
+        // Headers + initial connect can fail with 401; the upload
+        // path's retry-on-auth pattern would have to refresh the
+        // token and rebuild the entire stream. Cheaper to do that
+        // synchronously here: build the response once, retry once
+        // on Auth, then hand the body stream out.
+        let build = || async {
+            let file = self.find_by_name(path).await?.ok_or_else(|| {
+                BackendError::Other(format!("Drive get_range_stream: {path} not found"))
+            })?;
+            let url = format!(
+                "{}/files/{}?alt=media&supportsAllDrives=true",
+                self.endpoints.api_base, file.id
+            );
+            let resp = self
+                .authed_get(&url)
+                .await?
+                .header("Range", format!("bytes={start}-{end_inclusive}"))
+                .send()
+                .await
+                .map_err(|e| BackendError::Unreachable(format!("Drive download: {e}")))?;
+            let resp = self.unwrap_401(resp).await?;
+            Ok::<reqwest::Response, BackendError>(resp)
+        };
+
+        let resp = match build().await {
+            Ok(r) => r,
+            Err(BackendError::Auth(_)) => {
+                self.oauth.invalidate();
+                build().await?
+            }
+            Err(e) => return Err(e),
+        };
+        // Stream body chunks straight through. Errors map into our
+        // Unreachable bucket — a mid-stream EOF or TLS reset is
+        // exactly the same class of failure as a connect failure
+        // from the replicator's POV.
+        let s = resp
+            .bytes_stream()
+            .map_err(|e| BackendError::Unreachable(format!("Drive download body: {e}")));
+        Ok(s.boxed())
     }
 
     async fn delete(&self, path: &str) -> Result<bool, BackendError> {

@@ -445,8 +445,16 @@ pub async fn exchange_code(
         .build()
         .map_err(|e| BackendError::Other(format!("reqwest client build: {e}")))?;
     let url = token_url(provider);
-    exchange_code_with_client(provider, code, redirect_uri, client_id, client_secret, &url, &http)
-        .await
+    exchange_code_with_client(
+        provider,
+        code,
+        redirect_uri,
+        client_id,
+        client_secret,
+        &url,
+        &http,
+    )
+    .await
 }
 
 /// Internal exchange implementation that takes an externally-owned
@@ -703,7 +711,9 @@ mod tests {
         let a = new_state();
         let b = new_state();
         assert_eq!(a.len(), 43, "32 bytes → base64url-no-pad → 43 chars");
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
         assert_ne!(a, b, "two calls must produce distinct tokens");
     }
 
@@ -736,8 +746,7 @@ mod tests {
         // Microsoft requires `offline_access` to grant a refresh
         // token. Encoded form of the space-separated scope:
         assert!(
-            url.contains("Files.ReadWrite.AppFolder")
-                && url.contains("offline_access"),
+            url.contains("Files.ReadWrite.AppFolder") && url.contains("offline_access"),
             "url: {url}"
         );
         assert!(url.contains("state=STATE-2"));

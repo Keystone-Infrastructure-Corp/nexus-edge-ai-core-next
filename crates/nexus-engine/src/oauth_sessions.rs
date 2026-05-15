@@ -218,7 +218,10 @@ mod tests {
         // Backdate so is_expired() reports true.
         stale.created_at = Instant::now() - (SESSION_TTL + Duration::from_secs(1));
         s.insert("old".into(), stale);
-        assert!(s.get("old").is_none(), "expired session must not be returned");
+        assert!(
+            s.get("old").is_none(),
+            "expired session must not be returned"
+        );
         assert_eq!(s.len(), 0, "expired session must be removed on get");
     }
 

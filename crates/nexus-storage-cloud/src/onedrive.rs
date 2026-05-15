@@ -46,7 +46,8 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use nexus_storage::{BackendError, ColdBackend, HealthStatus, PutReceipt, VolumeInfo};
+use futures::stream::{StreamExt, TryStreamExt};
+use nexus_storage::{BackendError, ByteStream, ColdBackend, HealthStatus, PutReceipt, VolumeInfo};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, warn};
@@ -408,6 +409,45 @@ impl ColdBackend for OneDriveBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<ByteStream, BackendError> {
+        // Mirror of `gdrive.rs::get_range_stream`: retry-on-401 the
+        // synchronous "build response" leg so the body stream we
+        // return cannot itself need a token refresh mid-flight.
+        let build = || async {
+            let url = format!(
+                "{}/me/drive/special/approot:/{}:/content",
+                self.endpoints.api_base,
+                Self::encode_path(path)
+            );
+            let resp = self
+                .authed_get(&url)
+                .await?
+                .header("Range", format!("bytes={start}-{end_inclusive}"))
+                .send()
+                .await
+                .map_err(|e| BackendError::Unreachable(format!("Graph download: {e}")))?;
+            let resp = self.unwrap_401(resp).await?;
+            Ok::<reqwest::Response, BackendError>(resp)
+        };
+        let resp = match build().await {
+            Ok(r) => r,
+            Err(BackendError::Auth(_)) => {
+                self.oauth.invalidate();
+                build().await?
+            }
+            Err(e) => return Err(e),
+        };
+        let s = resp
+            .bytes_stream()
+            .map_err(|e| BackendError::Unreachable(format!("Graph download body: {e}")));
+        Ok(s.boxed())
     }
 
     async fn delete(&self, path: &str) -> Result<bool, BackendError> {

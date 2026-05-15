@@ -174,10 +174,7 @@ pub fn router(state: ApiState) -> Router {
         // Registered OUTSIDE the admin gate (provider redirects a
         // browser here; authentication is via the unguessable
         // `state` token from the matching `start` request).
-        .route(
-            "/v1/admin/oauth/{provider}/callback",
-            get(oauth_callback),
-        )
+        .route("/v1/admin/oauth/{provider}/callback", get(oauth_callback))
         // Admin writes (gated) merged in last so they share state.
         .merge(admin);
 
@@ -737,11 +734,6 @@ async fn serve_from_cold_inner(
     }
     let file_size = clip.size_bytes as u64;
 
-    // Fire the rehydrate BEFORE we read so it can land while the
-    // viewer is watching. `spawn` is idempotent (deduped by clip_id)
-    // and a no-op when the watermark is not Ok.
-    cache_jobs.spawn(clip.id);
-
     let backend = registry.get(cold_handle).ok_or_else(|| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -757,21 +749,38 @@ async fn serve_from_cold_inner(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| parse_byte_range(s, file_size));
 
+    // M2.2 perf P1.5 — only kick a rehydrate when this is a
+    // full-clip fetch. A viewer scrubbing the timeline issues a
+    // sequence of short Range requests for the SAME clip; without
+    // this gate each one would start (and the dedup map would
+    // promptly cancel) a fresh download — doubling LAN reads / API
+    // quota / cloud egress for a clip the operator may never
+    // finish watching. Full-clip fetches (no Range header) are the
+    // signal that the operator wants the whole file local, so
+    // that's where we pay the rehydrate cost.
+    if range.is_none() {
+        cache_jobs.spawn(clip.id);
+    }
+
     let (start, end_inclusive, status) = match range {
         Some((s, e)) => (s, e, StatusCode::PARTIAL_CONTENT),
         None => (0u64, file_size - 1, StatusCode::OK),
     };
 
-    let bytes = backend
-        .get_range(cold_path, start, end_inclusive)
+    // M2.2 perf P2 — stream the cold-tier bytes directly to the
+    // HTTP client instead of buffering the whole range as
+    // `Vec<u8>`. Eliminates the 4 × clip-size transient buffer
+    // that 4 concurrent viewers used to cost.
+    let stream = backend
+        .get_range_stream(cold_path, start, end_inclusive)
         .await
         .map_err(|e| {
             ApiError(
                 StatusCode::BAD_GATEWAY,
-                format!("cold backend '{cold_handle}' get_range: {e}"),
+                format!("cold backend '{cold_handle}' get_range_stream: {e}"),
             )
         })?;
-    let len = bytes.len() as u64;
+    let len = end_inclusive - start + 1;
 
     let content_type = match clip.container.as_str() {
         "mp4" => "video/mp4",
@@ -792,7 +801,7 @@ async fn serve_from_cold_inner(
         );
     }
     builder
-        .body(axum::body::Body::from(bytes))
+        .body(axum::body::Body::from_stream(stream))
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
@@ -1261,11 +1270,8 @@ async fn get_storage(State(s): State<ApiState>) -> Result<Json<StorageResponse>,
                     // replicator will continue probing on its own
                     // tick and the next page load will reflect
                     // the recovered state.
-                    let probe = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        b.health(),
-                    )
-                    .await;
+                    let probe =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), b.health()).await;
                     let h = match probe {
                         Ok(nexus_storage::HealthStatus::Ok) => ColdHealthOut::Ok,
                         Ok(nexus_storage::HealthStatus::ReadOnly { reason }) => {
@@ -1431,15 +1437,13 @@ async fn put_storage_backend(
     if !is_valid_handle(&handle) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            format!(
-                "handle '{handle}' must match ^[a-z0-9][a-z0-9_-]*$ and not be 'local'"
-            ),
+            format!("handle '{handle}' must match ^[a-z0-9][a-z0-9_-]*$ and not be 'local'"),
         ));
     }
     // For cloud kinds, the API accepts either:
     //   1. `refresh_token: "<cleartext>"` (synthesised by the
-      //      engine's own OAuth callback handler, or supplied by an
-      //      external admin tool) — we encrypt before persist.
+    //      engine's own OAuth callback handler, or supplied by an
+    //      external admin tool) — we encrypt before persist.
     //   2. `refresh_token: { ciphertext, nonce, ... }` — already-
     //      encrypted from a prior round-trip (e.g. re-PUT of an
     //      unchanged config) — we leave it alone.
@@ -1459,15 +1463,18 @@ async fn put_storage_backend(
     // (e.g. `lan` without `root`, or a cloud config whose
     // already-encrypted token won't decrypt with the current
     // admin secret) at the API boundary.
-    let _probe =
-        build_any_backend(&handle, &req.kind, &config_json, s.admin_auth.admin_secret()).map_err(
-            |e| {
-                ApiError(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid backend config: {e}"),
-                )
-            },
-        )?;
+    let _probe = build_any_backend(
+        &handle,
+        &req.kind,
+        &config_json,
+        s.admin_auth.admin_secret(),
+    )
+    .map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid backend config: {e}"),
+        )
+    })?;
     s.store
         .upsert_storage_backend(&handle, &req.kind, &config_json)
         .await?;
@@ -1656,8 +1663,8 @@ fn encrypt_cloud_refresh_token_in_place(
                 "cloud backend `config.refresh_token` must be non-empty".to_string(),
             ));
         }
-        let encrypted = nexus_storage::token_crypto::encrypt(admin_secret, cleartext)
-            .map_err(|e| {
+        let encrypted =
+            nexus_storage::token_crypto::encrypt(admin_secret, cleartext).map_err(|e| {
                 ApiError(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("refresh-token encryption failed: {e}"),
@@ -1856,10 +1863,10 @@ async fn start_oauth(
             "client_secret is required".to_string(),
         ));
     }
-    if !req
-        .redirect_uri
-        .ends_with(&format!("/api/v1/admin/oauth/{}/callback", provider.as_str()))
-    {
+    if !req.redirect_uri.ends_with(&format!(
+        "/api/v1/admin/oauth/{}/callback",
+        provider.as_str()
+    )) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             format!(
@@ -1956,7 +1963,11 @@ async fn oauth_callback(
     // below must therefore validate the state before touching
     // anything else.
     let Some(state_token) = q.state else {
-        return oauth_html_response("Missing state", "OAuth callback missing required `state` parameter.", false);
+        return oauth_html_response(
+            "Missing state",
+            "OAuth callback missing required `state` parameter.",
+            false,
+        );
     };
     let Some(mut session) = s.oauth_sessions.get(&state_token) else {
         return oauth_html_response(
@@ -2021,15 +2032,12 @@ async fn oauth_callback(
                 message: msg.clone(),
             },
         );
-        return oauth_html_response(
-            "Consent declined or failed",
-            &msg,
-            false,
-        );
+        return oauth_html_response("Consent declined or failed", &msg, false);
     }
 
     let Some(code) = q.code else {
-        let msg = "OAuth callback missing both `code` and `error` — provider misbehaved".to_string();
+        let msg =
+            "OAuth callback missing both `code` and `error` — provider misbehaved".to_string();
         s.oauth_sessions.set_status(
             &state_token,
             crate::oauth_sessions::SessionStatus::Error {
@@ -2080,7 +2088,10 @@ async fn oauth_callback(
     let mut extra = serde_json::Map::new();
     if matches!(provider, nexus_storage_cloud::Provider::Gdrive) {
         if let Some(root) = session.root_folder_id.clone() {
-            extra.insert("root_folder_id".to_string(), serde_json::Value::String(root));
+            extra.insert(
+                "root_folder_id".to_string(),
+                serde_json::Value::String(root),
+            );
         }
     }
     let mut config = serde_json::json!({
@@ -2104,9 +2115,12 @@ async fn oauth_callback(
 
     let config_json = config.to_string();
     let kind = provider.as_str();
-    if let Err(e) =
-        build_any_backend(&session.handle, kind, &config_json, s.admin_auth.admin_secret())
-    {
+    if let Err(e) = build_any_backend(
+        &session.handle,
+        kind,
+        &config_json,
+        s.admin_auth.admin_secret(),
+    ) {
         let msg = format!("invalid backend config after exchange: {e}");
         s.oauth_sessions.set_status(
             &state_token,
@@ -2304,7 +2318,9 @@ fn is_valid_handle(s: &str) -> bool {
         return false;
     }
     let mut chars = s.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !first.is_ascii_alphanumeric() {
         return false;
     }
@@ -2630,6 +2646,54 @@ mod tests {
         assert_eq!(body.as_ref(), &payload[10..=19]);
     }
 
+    /// M2.2 perf P1.5 — a partial-range fetch must NOT trigger a
+    /// rehydrate. A viewer scrubbing the timeline emits a stream
+    /// of short Range requests for the same clip; pre-gate, each
+    /// one started + cancelled a fresh download (doubling LAN
+    /// read or cloud egress). Post-gate, the spawn is reserved
+    /// for full-clip fetches.
+    #[tokio::test]
+    async fn serve_from_cold_partial_range_does_not_spawn_rehydrate() {
+        let payload = (0..256u32).map(|i| (i & 0xff) as u8).collect::<Vec<u8>>();
+        let (store, registry, clips_dir, clip_id, _tmp) = seed_cold_only(payload.clone()).await;
+        let watermark = WatermarkSignal::new();
+        watermark.set(WatermarkLevel::Ok);
+        let cache_jobs = CacheJobs::new(store.clone(), registry.clone(), clips_dir, watermark);
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::RANGE,
+            HeaderValue::from_static("bytes=10-19"),
+        );
+        let resp = serve_from_cold_inner(&registry, &cache_jobs, &clip, &headers)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        // Drain the body so the range read actually completes.
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        // Give any (incorrect) spawned rehydrate a chance to land.
+        // If the gate is doing its job, inflight_count() stays at 0
+        // and the hot_path stays NULL.
+        for _ in 0..20 {
+            if cache_jobs.inflight_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cache_jobs.inflight_count(),
+            0,
+            "partial-range fetches must not spawn a rehydrate job"
+        );
+        let row = store.get_clip(clip_id).await.unwrap().unwrap();
+        assert!(
+            row.hot_path.is_none(),
+            "partial-range fetches must not repopulate the hot pointer"
+        );
+    }
+
     // ===============================================================
     // M2.2 closeout — admin-auth gate + refresh-token at-rest sweep
     // ===============================================================
@@ -2681,8 +2745,12 @@ mod tests {
         let registry = Registry::new();
         let watermark = WatermarkSignal::new();
         watermark.set(WatermarkLevel::Ok);
-        let cache_jobs =
-            CacheJobs::new(store.clone(), registry.clone(), clips_dir.clone(), watermark);
+        let cache_jobs = CacheJobs::new(
+            store.clone(),
+            registry.clone(),
+            clips_dir.clone(),
+            watermark,
+        );
         let usb_registry = UsbRegistry::new();
         let preferred_usb_label = nexus_pipeline::recorder::PreferredUsbLabel::new(None);
         let admin_auth = Arc::new(AdminAuthState::from_secret_bytes(admin_secret, false));

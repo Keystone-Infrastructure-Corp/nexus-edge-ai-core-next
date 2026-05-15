@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -57,6 +58,16 @@ pub mod token_crypto;
 
 pub use lan::LanFsBackend;
 pub use throttle::TokenBucket;
+
+// Re-export `bytes::Bytes` so downstream crates can talk to
+// [`ColdBackend::get_range_stream`] without depending on the
+// `bytes` crate directly.
+pub use bytes::Bytes;
+
+/// Boxed byte-stream returned by [`ColdBackend::get_range_stream`].
+/// Items together cover the requested range in order; chunk
+/// boundaries are an implementation detail.
+pub type ByteStream = BoxStream<'static, Result<Bytes, BackendError>>;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -186,6 +197,31 @@ pub trait ColdBackend: Send + Sync {
         start: u64,
         end_inclusive: u64,
     ) -> Result<Vec<u8>, BackendError>;
+
+    /// Streaming variant of [`Self::get_range`]. The default impl
+    /// buffers the whole range and wraps it as a single-frame
+    /// stream — correct but allocates the full clip in RAM.
+    /// Implementations SHOULD override this:
+    ///
+    /// * `LanFsBackend` reads the file in fixed chunks so peak RAM
+    ///   per request stays at one chunk regardless of clip size.
+    /// * The cloud backends pipe `reqwest::Response::bytes_stream()`
+    ///   straight through so a 50 MB clip × 4 concurrent viewers
+    ///   no longer means a 200 MB transient buffer in the engine.
+    ///
+    /// Callers MUST NOT assume the chunk boundaries are stable
+    /// between impls; the stream's items are an opaque sequence of
+    /// `Bytes` slices that together cover the requested range in
+    /// order.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<ByteStream, BackendError> {
+        let buf = self.get_range(path, start, end_inclusive).await?;
+        Ok(stream::once(async move { Ok(Bytes::from(buf)) }).boxed())
+    }
 
     /// Permanently remove a clip from cold. Operator-driven only;
     /// the replicator never calls this. Returns `Ok(false)` when

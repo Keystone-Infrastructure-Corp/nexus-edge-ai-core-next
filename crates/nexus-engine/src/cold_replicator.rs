@@ -121,6 +121,15 @@ pub async fn run_cold_replicator(
     // unreachable" state.
     let mut last_health_was_ok = true;
 
+    // One persistent throttle, kept alive across every tick. Pre-
+    // M2.2-closeout the bucket was constructed fresh on every entry
+    // to `tick()` (see git blame), which silently dropped any
+    // credit a quiet interval would have accrued. We now build it
+    // once and call `set_rate` at the top of each tick so a live
+    // admin config change still takes effect immediately while the
+    // accumulated burst budget survives.
+    let throttle = TokenBucket::new(0);
+
     // Kick a first tick immediately at startup so any backlog from
     // a previous engine run gets attention without waiting for
     // either an event or the first 5-min interval.
@@ -147,7 +156,7 @@ pub async fn run_cold_replicator(
             }
             _ = interval.tick() => {
                 debug!("cold replicator: polling backstop tick");
-                tick(&cfg, &store, &bus, &registry, &mut last_health_was_ok).await;
+                tick(&cfg, &store, &bus, &registry, &throttle, &mut last_health_was_ok).await;
             }
             ev = events.next() => {
                 match ev {
@@ -166,13 +175,13 @@ pub async fn run_cold_replicator(
                     }
                     Some(Ok(_hint)) => {
                         debug!("cold replicator: CLIP_CLOSED event received");
-                        tick(&cfg, &store, &bus, &registry, &mut last_health_was_ok).await;
+                        tick(&cfg, &store, &bus, &registry, &throttle, &mut last_health_was_ok).await;
                     }
                 }
             }
             _ = &mut kick_fut => {
                 debug!("cold replicator: boot kick");
-                tick(&cfg, &store, &bus, &registry, &mut last_health_was_ok).await;
+                tick(&cfg, &store, &bus, &registry, &throttle, &mut last_health_was_ok).await;
             }
         }
     }
@@ -188,6 +197,7 @@ async fn tick(
     store: &Arc<Store>,
     bus: &Arc<dyn Bus>,
     registry: &Registry,
+    throttle: &TokenBucket,
     last_health_was_ok: &mut bool,
 ) {
     // 1. Read active cold target.
@@ -270,13 +280,19 @@ async fn tick(
         return;
     }
 
-    let throttle = TokenBucket::new(policy.throttle_bps.max(0) as u64);
+    // Sync the persistent bucket to the current admin throttle.
+    // `set_rate` preserves whatever credit accrued during the quiet
+    // interval, so a normal "one clip every 30 s" workload is
+    // effectively unthrottled at the moment of upload — and a burst
+    // after a long quiet period is still smoothed by the bucket's
+    // 1-second capacity ceiling.
+    throttle.set_rate(policy.throttle_bps.max(0) as u64).await;
     let backend_handle = backend.handle().to_string();
 
     let mut uploaded = 0usize;
     let mut failed = 0usize;
     for clip in pending {
-        match upload_one(cfg, store, &*backend, &throttle, &backend_handle, &clip).await {
+        match upload_one(cfg, store, &*backend, throttle, &backend_handle, &clip).await {
             Ok(()) => uploaded += 1,
             Err(e) => {
                 failed += 1;

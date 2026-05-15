@@ -32,15 +32,23 @@ use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
+use futures::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
-use super::{BackendError, ColdBackend, HealthStatus, PutReceipt, VolumeInfo};
+use super::{BackendError, ByteStream, ColdBackend, HealthStatus, PutReceipt, VolumeInfo};
 
 const SPOT_CHECK_BYTES: u64 = 64 * 1024;
+
+/// Chunk size handed back from [`LanFsBackend::get_range_stream`].
+/// 64 KiB matches the kernel readahead window on every tier and
+/// keeps the per-request transient buffer fixed regardless of
+/// clip size.
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 pub struct LanFsBackend {
     handle: String,
@@ -224,6 +232,54 @@ impl ColdBackend for LanFsBackend {
         let mut buf = vec![0u8; len as usize];
         f.read_exact(&mut buf).await?;
         Ok(buf)
+    }
+
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<ByteStream, BackendError> {
+        let abs = self.resolve(path)?;
+        let mut f = fs::File::open(&abs).await?;
+        f.seek(SeekFrom::Start(start)).await?;
+        let remaining: u64 = end_inclusive
+            .checked_sub(start)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| {
+                BackendError::InvalidPath(format!("bad range {start}..={end_inclusive}"))
+            })?;
+        // try_unfold over (file, remaining). Each poll reads up to
+        // STREAM_CHUNK_BYTES and yields a `Bytes` chunk; EOF arrives
+        // exactly when remaining hits zero. We avoid `read_exact`
+        // so a short read on the last chunk still flushes the data
+        // we already have.
+        let s = stream::try_unfold((f, remaining), |(mut f, remaining)| async move {
+            if remaining == 0 {
+                return Ok::<Option<(Bytes, _)>, BackendError>(None);
+            }
+            let want = std::cmp::min(remaining as usize, STREAM_CHUNK_BYTES);
+            let mut buf = vec![0u8; want];
+            let mut filled = 0usize;
+            while filled < want {
+                let n = f.read(&mut buf[filled..]).await?;
+                if n == 0 {
+                    // EOF mid-range — surface as IO error so callers
+                    // know the range claim was wrong.
+                    return Err(BackendError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "get_range_stream: short read at offset, expected {want} bytes, got {filled}"
+                        ),
+                    )));
+                }
+                filled += n;
+            }
+            buf.truncate(filled);
+            let chunk = Bytes::from(buf);
+            Ok(Some((chunk, (f, remaining - filled as u64))))
+        });
+        Ok(s.boxed())
     }
 
     async fn delete(&self, path: &str) -> Result<bool, BackendError> {
@@ -437,5 +493,59 @@ mod tests {
         matches!(backend.health().await, HealthStatus::Ok)
             .then_some(())
             .expect("fresh tempdir backend should report Ok");
+    }
+
+    /// M2.2 perf P2 — `get_range_stream` must yield the same bytes
+    /// as `get_range` but spread across multiple chunks for a
+    /// payload larger than `STREAM_CHUNK_BYTES`. We assert both
+    /// the content equality (must be identical to the buffered
+    /// path) AND that at least two chunks arrived (otherwise the
+    /// streaming win is theoretical only).
+    #[tokio::test]
+    async fn get_range_stream_chunks_large_payload() {
+        use futures::stream::StreamExt;
+
+        let (backend, _dir) = fixture();
+        // 192 KiB → exactly 3 × 64 KiB chunks.
+        let bytes: Vec<u8> = (0..3 * STREAM_CHUNK_BYTES)
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        let hash = sha256_hex(&bytes);
+        backend.put("cam1/big.mp4", &bytes, &hash).await.unwrap();
+
+        let mut stream = backend
+            .get_range_stream("cam1/big.mp4", 0, (bytes.len() - 1) as u64)
+            .await
+            .unwrap();
+
+        let mut collected = Vec::new();
+        let mut chunks = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            chunks += 1;
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(collected, bytes, "streamed body must equal source");
+        assert!(
+            chunks >= 2,
+            "expected multiple chunks for a payload > {STREAM_CHUNK_BYTES} bytes, got {chunks}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_range_stream_honours_subrange() {
+        use futures::stream::StreamExt;
+
+        let (backend, _dir) = fixture();
+        let bytes: Vec<u8> = (0..1024u32).map(|i| (i & 0xff) as u8).collect();
+        let hash = sha256_hex(&bytes);
+        backend.put("a.mp4", &bytes, &hash).await.unwrap();
+
+        let mut stream = backend.get_range_stream("a.mp4", 100, 199).await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, &bytes[100..=199]);
     }
 }
