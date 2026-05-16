@@ -10,9 +10,21 @@
     <div id="app">
       <header class="topbar">
         <span class="brand">Nexus Edge AI</span>
-        <nav id="tabs"></nav>
+        <div class="topbar-spacer"></div>
+        <div class="topbar-auth">
+          <input
+            id="admin-token"
+            class="token-input"
+            type="password"
+            placeholder="Admin token (loopback if empty)"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span id="token-pill" class="token-pill token-pill-unknown" title="Auth status: unknown"></span>
+        </div>
         <span id="health-dot" class="dot dot-unknown" title="status"></span>
       </header>
+      <nav id="sidebar" class="sidebar"></nav>
       <main id="main"></main>
       <aside id="alert-ticker"></aside>
     </div>

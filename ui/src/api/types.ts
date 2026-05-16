@@ -103,6 +103,12 @@ export interface CameraConfig {
   model_override?: ModelConfig | null;
   zones?: ZoneConfig[];
   max_fps?: number;
+  /// When true, the static-object tracker filter
+  /// (`tracker.static_object.*`) is enabled for this camera. Vehicles
+  /// that promote to "static" are dropped from rule eval and
+  /// persisted to the per-camera registry at `runtime.state_dir`.
+  /// Defaults to false on the engine side.
+  parking_lot_mode?: boolean;
 }
 
 export interface ModelConfig {

@@ -708,3 +708,476 @@ button.ghost.danger {
   color: var(--crit);
   border: 1px solid var(--crit);
 }
+
+/* ==========================================================
+   M-Admin Phase 0 — sidebar shell + shared primitive styles.
+   Reuses the v1-admin palette tokens (`--bg`, `--accent`, …)
+   defined at the top of this file so the new surfaces drop
+   in without restyling anything already shipping.
+   ========================================================== */
+
+/* App grid: was 2x2 (topbar / main+alerts).
+   Now 2x3 (topbar / sidebar+main+alerts), with `.no-alerts`
+   collapsing the right-hand pane on Configuration / System
+   views where the live alert stream isn't the point. */
+#app {
+  grid-template-columns: 220px 1fr 320px;
+  grid-template-areas:
+    "topbar topbar topbar"
+    "sidebar main alerts";
+}
+
+#app.no-alerts {
+  grid-template-columns: 220px 1fr;
+  grid-template-areas:
+    "topbar topbar"
+    "sidebar main";
+}
+
+#app.no-alerts #alert-ticker {
+  display: none;
+}
+
+.sidebar {
+  grid-area: sidebar;
+  background: var(--bg-elev);
+  border-right: 1px solid var(--line);
+  padding: 12px 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.sidebar-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-section-label {
+  padding: 4px 16px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.sidebar-link {
+  padding: 7px 16px;
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 13px;
+  border-left: 2px solid transparent;
+  transition: background 0.08s ease, color 0.08s ease;
+}
+
+.sidebar-link:hover {
+  background: var(--bg-elev-2);
+  color: var(--text);
+}
+
+.sidebar-link.active {
+  background: var(--bg-elev-2);
+  color: var(--text);
+  border-left-color: var(--accent);
+}
+
+/* Topbar token field. Sits between the brand and the health dot
+   per `M_ADMIN.md` Auth-token UX section. */
+.topbar-spacer {
+  flex: 1;
+}
+
+.topbar-auth {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.token-input {
+  width: 220px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
+}
+
+.token-input:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.token-pill {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #555;
+  display: inline-block;
+}
+
+.token-pill-ok       { background: var(--ok);   box-shadow: 0 0 6px var(--ok); }
+.token-pill-bad      { background: var(--crit); box-shadow: 0 0 6px var(--crit); }
+.token-pill-unknown  { background: #555; }
+
+/* Dialog ----------------------------------------------------- */
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+}
+
+.dialog {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  width: 560px;
+  max-width: 92vw;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-elev-2);
+}
+
+.dialog-head h2 {
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.dialog-close {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.dialog-close:hover {
+  color: var(--text);
+}
+
+.dialog-body {
+  padding: 16px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-elev-2);
+}
+
+/* Toast ------------------------------------------------------ */
+.toast-container {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 9500;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  padding: 10px 14px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 13px;
+  min-width: 240px;
+  max-width: 380px;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  opacity: 0;
+  transform: translateX(20px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.toast-in {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.toast-out {
+  opacity: 0;
+  transform: translateX(20px);
+}
+
+.toast-success { border-left: 3px solid var(--ok); }
+.toast-error   { border-left: 3px solid var(--crit); }
+.toast-info    { border-left: 3px solid var(--accent); }
+
+/* Form primitives ------------------------------------------- */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.field-label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.field-req {
+  color: var(--crit);
+}
+
+.field input[type="text"],
+.field input[type="number"],
+.field input[type="password"],
+.field input[type="email"],
+.field input[type="url"],
+.field select,
+.field textarea {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 3px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.field input:focus,
+.field select:focus,
+.field textarea:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.field-help {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.field-error-msg {
+  font-size: 11px;
+  color: var(--crit);
+}
+
+.field.field-error input,
+.field.field-error textarea,
+.field.field-error select {
+  border-color: var(--crit);
+}
+
+.field-toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.field-label-inline {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.field-row > .field {
+  flex: 1 1 200px;
+}
+
+.form-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+
+.form-section:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.form-section-title {
+  margin: 0;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+/* Chip input ------------------------------------------------ */
+.chip-input {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 4px;
+  align-items: center;
+  min-height: 32px;
+}
+
+.chip-list {
+  display: contents;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 2px 4px 2px 8px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: default;
+  font-family: inherit;
+}
+
+.chip.chip-on {
+  background: rgba(56, 225, 255, 0.18);
+  border-color: var(--accent);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button.chip {
+  cursor: pointer;
+}
+
+.chip-x {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 4px;
+  line-height: 1;
+  border-radius: 50%;
+}
+
+.chip-x:hover {
+  color: var(--crit);
+}
+
+.chip-input-text {
+  flex: 1 1 120px;
+  min-width: 80px;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px;
+  outline: none;
+}
+
+.chip-input-text:focus {
+  outline: 0;
+}
+
+/* ==========================================================
+   M-Admin Phase 1 — Cameras CRUD additions.
+   ========================================================== */
+
+.page-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.page-toolbar-title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.page-toolbar-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.page-toolbar-actions button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Cameras edit-form — reuse `.field-row` + `.form-section` from
+   Phase 0; this just gives the Advanced expander a sensible look. */
+.camera-form-advanced[open] > summary.form-section-title {
+  margin-bottom: 6px;
+}
+
+.camera-form-advanced > summary.form-section-title {
+  cursor: pointer;
+  list-style: revert;
+  user-select: none;
+}
+
+.camera-form-advanced > summary.form-section-title:hover {
+  color: var(--text);
+}
+
+/* Snapshot-preview dialog body — keep the image bounded to the
+   dialog's max-height so the close ✕ remains reachable on small
+   browser windows. */
+.camera-snapshot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  border-radius: 3px;
+  min-height: 200px;
+}
+
+.camera-snapshot-img {
+  max-width: 100%;
+  max-height: 70vh;
+  display: block;
+  object-fit: contain;
+}
+
+.camera-snapshot-error {
+  padding: 24px;
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+}

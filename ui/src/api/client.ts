@@ -2,6 +2,7 @@
 // `./types.ts`, so callers can never confuse the API shape with the UI's
 // own state.
 
+import { authHeader, reportRequestOutcome } from "../lib/auth.js";
 import type {
   AlertEvent,
   BackendsResponse,
@@ -26,13 +27,16 @@ import type {
 const BASE = "/api";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
   const res = await fetch(BASE + path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...authHeader(),
       ...(init?.headers ?? {}),
     },
   });
+  reportRequestOutcome(method, res.status);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`${res.status} ${res.statusText}: ${text}`);
