@@ -9,15 +9,20 @@ import type {
   CameraConfig,
   CameraId,
   ClipId,
+  DiscoverySession,
   MotionEventRow,
   MotionHistogramBucket,
   OAuthStartReq,
   OAuthStartResp,
   OAuthStatusResp,
+  ProbeRtspReq,
+  ProbeRtspResult,
   PutBackendReq,
   PutColdReq,
   RuleConfig,
   RuleId,
+  ScanReq,
+  SessionCreatedResp,
   StorageBackendOut,
   StorageLocalResponse,
   StorageResponse,
@@ -205,5 +210,43 @@ export const api = {
     streamUrl: (clipId: ClipId) => `${BASE}/v1/clips/${clipId}`,
     thumbnailUrl: (clipId: ClipId) =>
       `${BASE}/v1/clips/${clipId}/thumbnail`,
+  },
+
+  // M-Admin Phase 1B — camera discovery. Mirrors the four admin
+  // routes under `/api/v1/admin/discovery/*`. All four go through
+  // the admin-auth layer (loopback or `Authorization: Bearer …`
+  // depending on env), so `authHeader()` is already applied above.
+  discovery: {
+    /// Kick off WS-Discovery on the engine's LAN. Returns a fresh
+    /// session id the caller polls with `getSession`. The engine
+    /// caps the listen window at 5 s and finishes the session
+    /// automatically.
+    startOnvif: () =>
+      request<SessionCreatedResp>("/v1/admin/discovery/onvif", {
+        method: "POST",
+        body: "{}",
+      }),
+    /// Kick off a bounded CIDR sweep. The engine rejects prefixes
+    /// shorter than /22 outright; /22 requires `confirm: true`
+    /// because that's 1022 hosts × N ports.
+    startScan: (req: ScanReq) =>
+      request<SessionCreatedResp>("/v1/admin/discovery/scan", {
+        method: "POST",
+        body: JSON.stringify(req),
+      }),
+    /// Poll a session for progress + accumulated `found[]`.
+    /// Returns 404 once the session is past `SESSION_TTL`.
+    getSession: (id: string) =>
+      request<DiscoverySession>(
+        `/v1/admin/discovery/${encodeURIComponent(id)}`,
+      ),
+    /// Inline Verify probe — RTSP OPTIONS + DESCRIBE with optional
+    /// Digest auth. `sessionId` exists purely so the engine can
+    /// audit the probe under the same correlation id.
+    probeRtsp: (sessionId: string, req: ProbeRtspReq) =>
+      request<ProbeRtspResult>(
+        `/v1/admin/discovery/${encodeURIComponent(sessionId)}/probe-rtsp`,
+        { method: "POST", body: JSON.stringify(req) },
+      ),
   },
 };

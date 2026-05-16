@@ -151,6 +151,75 @@ export interface BackendsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// M-Admin Phase 1B — camera discovery.
+// Mirrors crates/nexus-engine/src/discovery/mod.rs verbatim. Keep
+// additive-only on the engine side so the UI can survive a partial
+// rollout.
+// ---------------------------------------------------------------------------
+
+export type DiscoveryKind = "onvif" | "scan";
+export type DiscoveryState = "running" | "done" | "error";
+export type DeviceKind = "rtsp" | "onvif";
+
+export interface DiscoveredDevice {
+  ip: string;
+  port: number;
+  kind: DeviceKind;
+  vendor: string | null;
+  model: string | null;
+  hardware: string | null;
+  firmware: string | null;
+  mac: string | null;
+  rtsp_paths: string[];
+}
+
+export interface DiscoverySession {
+  id: string;
+  kind: DiscoveryKind;
+  state: DiscoveryState;
+  started_at: string;
+  finished_at: string | null;
+  progress_scanned: number;
+  progress_total: number;
+  found: DiscoveredDevice[];
+  /// Present only when `state === "error"`.
+  error?: string | null;
+}
+
+export interface ScanReq {
+  cidr: string;
+  ports?: number[];
+  concurrency?: number;
+  /// Required by the engine for CIDR prefixes ≤22 (i.e. ≥1024 hosts).
+  confirm?: boolean;
+}
+
+export interface SessionCreatedResp {
+  session_id: string;
+  estimated_total: number;
+}
+
+export interface ProbeRtspReq {
+  host: string;
+  port: number;
+  path: string;
+  username?: string;
+  password?: string;
+}
+
+export interface SdpStream {
+  codec: string;
+  resolution?: string;
+  control?: string;
+}
+
+export interface ProbeRtspResult {
+  ok: boolean;
+  status: number;
+  sdp_streams: SdpStream[];
+}
+
+// ---------------------------------------------------------------------------
 // M2.1 Stage B (B5) — motion timeline + on-disk clip storage.
 // Wire shapes mirror crates/nexus-engine/src/api.rs and
 // crates/nexus-store/src/motion.rs verbatim. Keep additive-only on the

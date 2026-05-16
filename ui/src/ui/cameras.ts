@@ -16,6 +16,7 @@ import { clear, h } from "../lib/el.js";
 import { openDialog, dialogFooter, type DialogHandle } from "../lib/dialog.js";
 import { toast } from "../lib/toast.js";
 import { openCameraForm } from "./cameras-form.js";
+import { openDiscoveryDialog } from "./cameras-discovery.js";
 import type { CameraConfig, CameraId } from "../api/types.js";
 
 export async function renderCameras(root: HTMLElement): Promise<void> {
@@ -60,8 +61,16 @@ function buildToolbar(onChange: () => Promise<void>): HTMLElement[] {
     {
       class: "ghost",
       type: "button",
-      disabled: true,
-      title: "Discovery lands in M-Admin Phase 1B (ONVIF + CIDR scan)",
+      title: "ONVIF + CIDR sweep, then pre-fill the Add form.",
+      on: {
+        click: async () => {
+          const list = await api.cameras.list();
+          const added = await openDiscoveryDialog({
+            existingIds: list.map((c) => c.id),
+          });
+          if (added) await onChange();
+        },
+      },
     },
     "🔍 Discover",
   );

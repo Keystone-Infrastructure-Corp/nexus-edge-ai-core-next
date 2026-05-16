@@ -1181,3 +1181,77 @@ button.chip {
   font-size: 13px;
   text-align: center;
 }
+
+/* M-Admin Phase 1B Step 4 — Camera Discover modal. */
+
+.discovery-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.discovery-controls .admin-section {
+  padding: 12px 14px;
+}
+
+.discovery-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.discovery-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.discovery-progress-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 200px;
+  gap: 10px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.discovery-label {
+  color: var(--text-dim);
+}
+
+.discovery-bar {
+  height: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.discovery-bar-fill {
+  height: 100%;
+  background: var(--accent, #4cc9f0);
+  transition: width 250ms linear;
+}
+
+.discovery-counts {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.discovery-results .admin-table {
+  margin-top: 4px;
+}
+
+.discovery-row-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.discovery-ok {
+  color: var(--ok, #06d6a0);
+  font-weight: 500;
+}
+
+.discovery-fail {
+  color: var(--crit, #ef476f);
+  font-weight: 500;
+}

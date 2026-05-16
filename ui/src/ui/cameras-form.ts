@@ -39,6 +39,14 @@ export interface OpenCameraFormOpts {
   /// All camera ids currently in the table, used to pick the next
   /// suggested id on create AND to flag duplicate-id collisions.
   existingIds: ReadonlyArray<CameraId>;
+  /// Optional create-mode pre-fill (M-Admin Phase 1B Step 4).
+  /// The Discover dialog uses this to drop a vendor/model-derived
+  /// name and a guessed RTSP URL into the create form so the
+  /// operator only has to confirm + Save.
+  prefill?: {
+    name?: string;
+    url?: string;
+  };
 }
 
 interface FormState {
@@ -150,8 +158,8 @@ function buildInitialState(opts: OpenCameraFormOpts): FormState {
     opts.existingIds.length === 0 ? 1 : Math.max(...opts.existingIds) + 1;
   return {
     id: nextId,
-    name: "",
-    url: "",
+    name: opts.prefill?.name ?? "",
+    url: opts.prefill?.url ?? "",
     enabled: true,
     prompts: [],
     max_fps: 0,
