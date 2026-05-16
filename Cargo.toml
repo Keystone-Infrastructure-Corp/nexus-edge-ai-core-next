@@ -161,6 +161,11 @@ hex = "0.4"
 # eviction sweep. Both are pure Rust, dependency-light.
 ipnet = "2"
 dashmap = "6"
+# Pull-parser used by `discovery::onvif` to read WS-Discovery
+# `ProbeMatch` envelopes (we don't need a writer — the Probe
+# request is a static envelope built from `format!`). Pure Rust,
+# allocation-light.
+quick-xml = "0.36"
 
 # HTTP mocking — only pulled in by `nexus-storage-cloud` tests so
 # the Drive / OneDrive integration tests don't need real cloud
