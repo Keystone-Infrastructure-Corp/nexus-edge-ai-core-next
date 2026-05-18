@@ -56,7 +56,7 @@ json_logs = false
 # on first boot and prints it once at WARN. Clients send
 # `Authorization: Bearer <token>`. See INSTALL.md §8.3 for the
 # `mode = "none"` (loopback-only) and `mode = "oidc"` alternatives.
-mode = "dev_token"        # none | dev_token | oidc
+mode = "dev_token" # none | dev_token | oidc
 # dev_token = "change-me"  # pin a value here to skip auto-provisioning
 # [auth.oidc]
 # issuer   = "https://auth.example.com/application/o/nexus"
@@ -93,7 +93,7 @@ score_threshold = 0.30
 # Tracker
 # -----------------------------------------------------------------
 [tracker]
-backend = "iou_naive"     # iou_naive | bytetrack
+backend = "iou_naive" # iou_naive | bytetrack
 track_ttl_ms = 2000
 iou_threshold = 0.30
 
@@ -101,7 +101,7 @@ iou_threshold = 0.30
 # Rules — CEL.
 # -----------------------------------------------------------------
 [rules]
-backend = "cel"           # cel
+backend = "cel" # cel
 
 [[rules.inline]]
 id = "person_in_zone"
@@ -117,7 +117,7 @@ enabled = true
 # Bus
 # -----------------------------------------------------------------
 [bus]
-backend = "broadcast"     # broadcast | nats
+backend = "broadcast" # broadcast | nats
 capacity = 1024
 # nats_url = "nats://nats:4222"
 
