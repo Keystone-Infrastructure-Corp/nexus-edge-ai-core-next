@@ -12,6 +12,7 @@
 //! * `PUT  /api/rules/:id`
 //! * `DELETE /api/rules/:id`
 //! * `POST /api/rules/validate`                  — compile-only CEL check
+//! * `POST /api/rules/preview`                   — replay against motion_events
 //! * `GET  /api/events?limit=N`
 //! * `GET  /api/stream/metadata`                  — SSE
 //! * `GET  /api/stream/events`                    — SSE
@@ -196,6 +197,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/rules/{id}", put(upsert_rule))
         .route("/rules/{id}", delete(delete_rule))
         .route("/rules/validate", axum::routing::post(validate_rule))
+        .route("/rules/preview", axum::routing::post(preview_rule))
         .route("/events", get(list_events))
         .route("/stream/metadata", get(stream_metadata))
         .route("/stream/events", get(stream_events))
@@ -421,6 +423,279 @@ fn compile_cel_safely(rule: &RuleConfig) -> Result<(), String> {
         Ok(Err(other)) => Err(other.to_string()),
         Err(_) => Err("CEL parser panicked on this input (malformed expression).".into()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// POST /rules/preview — "what would this rule have fired on?"
+//
+// Replays the candidate rule against the last N hours of
+// `motion_events` (the per-track lifecycle table from M2.1) and
+// returns the rows whose synthetic TrackedObject matches the
+// rule's CEL predicate AND zone gate. Lets operators tune a rule
+// against real data before saving it.
+//
+// Approximations vs. the live pipeline:
+//   * Debounce gates (min_track_age_ms, consecutive_frames,
+//     cooldown_ms) are NOT applied — the preview wants to surface
+//     every raw match so the operator can see what gets filtered.
+//     The "Debounce" panel still lets them tune those numbers
+//     separately; the preview is for the predicate + zone work.
+//   * `age_ms` on the synthetic object is set to 0 because we
+//     can't reconstruct true track-age from a single row. Rules
+//     that read `object.age_ms` will see 0 in preview — call out
+//     in the UI hint.
+//   * `now.*` reflects the wall-clock at preview time, not the
+//     historical timestamp the row came from. Time-of-day rules
+//     (e.g. "after 22:00") preview against the operator's current
+//     hour, which matches what they're about to deploy.
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /rules/preview`.
+#[derive(serde::Deserialize)]
+struct PreviewRuleReq {
+    /// The candidate rule. Compiled fresh per request; never
+    /// persisted. The pipeline's loaded ruleset is unaffected.
+    rule: RuleConfig,
+    /// Window start, milliseconds since the Unix epoch. Defaults
+    /// to `until_ms - 24h` when omitted.
+    #[serde(default)]
+    since_ms: Option<i64>,
+    /// Window end, milliseconds since the Unix epoch. Defaults to
+    /// "now" when omitted.
+    #[serde(default)]
+    until_ms: Option<i64>,
+    /// Hard cap on rows scanned + returned. Default 500; clamped
+    /// to `[1, 5000]`. The UI shows "stopped at N — widen the
+    /// window to see more" rather than paginating.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// One past detection that would have matched the candidate rule.
+/// Fields mirror the columns of `motion_events` plus the camera
+/// name (joined client-side via the cameras list the caller
+/// already has cached). `clip_id` lets the UI deep-link into the
+/// existing clip playback view.
+#[derive(serde::Serialize)]
+struct PreviewMatch {
+    motion_event_id: nexus_store::MotionEventId,
+    camera_id: CameraId,
+    clip_id: nexus_store::ClipId,
+    track_id: nexus_types::TrackId,
+    captured_at: String,
+    label: String,
+    confidence: f32,
+    bbox: nexus_types::BBox,
+}
+
+/// Response body for `POST /rules/preview`.
+#[derive(serde::Serialize)]
+struct PreviewRuleResp {
+    /// Matching rows, most-recent-first.
+    matches: Vec<PreviewMatch>,
+    /// Total `motion_events` rows scanned (i.e. the SQL result
+    /// length before predicate filtering). Lets the UI show
+    /// "scanned 500 of 12,431 in the last 24h".
+    scanned: u32,
+    /// The window the scan actually used, echoed back as ISO-8601
+    /// so the UI can render "from <X> to <Y>" without re-parsing
+    /// the operator's input.
+    window_start: String,
+    window_end: String,
+    /// `true` if `scanned == limit` — i.e. there were more rows
+    /// in the window than the cap allowed. The UI nudges the
+    /// operator to either widen the window or accept the truncation.
+    limit_hit: bool,
+    /// Compile / validation error if the rule's CEL didn't parse.
+    /// When set, `matches` is empty and the UI shows the error
+    /// inline (same pattern as `/rules/validate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn preview_rule(
+    State(s): State<ApiState>,
+    Json(req): Json<PreviewRuleReq>,
+) -> Result<Json<PreviewRuleResp>, ApiError> {
+    use chrono::TimeZone;
+
+    // Default window: last 24h. Caller may override either bound.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let until_ms = req.until_ms.unwrap_or(now_ms);
+    let since_ms = req.since_ms.unwrap_or(until_ms - 24 * 3600 * 1000);
+    if since_ms >= until_ms {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "since_ms must be < until_ms".into(),
+        ));
+    }
+    let limit = req.limit.unwrap_or(500).clamp(1, 5000);
+
+    // Compile first so a bad CEL string is reported immediately
+    // (and we avoid scanning motion_events on a doomed request).
+    if let Err(msg) = compile_cel_safely(&req.rule) {
+        let window_start = chrono::Utc
+            .timestamp_millis_opt(since_ms)
+            .single()
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        let window_end = chrono::Utc
+            .timestamp_millis_opt(until_ms)
+            .single()
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        return Ok(Json(PreviewRuleResp {
+            matches: vec![],
+            scanned: 0,
+            window_start,
+            window_end,
+            limit_hit: false,
+            error: Some(msg),
+        }));
+    }
+
+    // Build a one-rule RuleEvaluator. We bypass it on purpose for
+    // the per-object loop (we want raw predicate matches, no
+    // debounce), but the compile path is the same.
+    let engine = CelEngine::new();
+    let compiled = engine
+        .compile(&req.rule)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Resolve the camera scope: `camera_filter` on the rule wins.
+    // We also need every camera's zones so the per-row zone gate
+    // can look them up by id (same logic as RuleEvaluator).
+    let all_cameras = s.store.list_cameras().await?;
+    let camera_scope: Option<Vec<CameraId>> = req.rule.camera_filter.clone();
+
+    let from = chrono::Utc
+        .timestamp_millis_opt(since_ms)
+        .single()
+        .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "since_ms out of range".into()))?;
+    let to = chrono::Utc
+        .timestamp_millis_opt(until_ms)
+        .single()
+        .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "until_ms out of range".into()))?;
+
+    let rows = s
+        .store
+        .list_motion_events_across_cameras(camera_scope.as_deref(), from, to, limit as i64)
+        .await?;
+    let scanned = rows.len() as u32;
+    let limit_hit = scanned == limit;
+
+    // Build a camera_id → &[ZoneConfig] lookup once so the
+    // per-row zone gate is O(1) instead of O(cameras).
+    let zones_by_camera: std::collections::HashMap<CameraId, &[nexus_config::ZoneConfig]> =
+        all_cameras
+            .iter()
+            .map(|c| (c.id, c.zones.as_slice()))
+            .collect();
+
+    let mut matches: Vec<PreviewMatch> = Vec::new();
+    for row in &rows {
+        let synthetic = nexus_types::TrackedObject {
+            track_id: row.track_id,
+            label: row.label.clone(),
+            confidence: row.confidence,
+            bbox: row.bbox,
+            age_frames: 0,
+            age_ms: 0,
+            attributes: Default::default(),
+        };
+
+        // Apply the zone gate the same way RuleEvaluator does —
+        // we want preview parity for the gate path even though we
+        // deliberately skip the debounce/cooldown gates.
+        if let Some(zone_ids) = req.rule.zones.as_ref().filter(|ids| !ids.is_empty()) {
+            let cam_zones = zones_by_camera.get(&row.camera_id).copied().unwrap_or(&[]);
+            let resolved: Vec<&nexus_config::ZoneConfig> = zone_ids
+                .iter()
+                .filter_map(|id| cam_zones.iter().find(|z| &z.id == id))
+                .collect();
+            // Mirror the "all-unresolved ⇒ suppress everywhere"
+            // semantics from RuleEvaluator. We need the frame
+            // dims to normalise; motion_events doesn't carry
+            // them, so fall back to the camera's most recent
+            // cached frame (almost always present once the
+            // pipeline has been running for a few seconds). If
+            // no cache entry exists yet, default to (1920,1080)
+            // — operator-facing preview, not security-critical
+            // path; the only cost of a wrong default is a
+            // slight bbox-centre offset.
+            let (fw, fh) = s
+                .cache
+                .get(row.camera_id)
+                .map(|e| (e.frame.width.max(1), e.frame.height.max(1)))
+                .unwrap_or((1920, 1080));
+            let (cx, cy) = synthetic.bbox.center();
+            let nx = (cx / fw as f32).clamp(0.0, 1.0);
+            let ny = (cy / fh as f32).clamp(0.0, 1.0);
+            let inside_any = resolved
+                .iter()
+                .any(|z| preview_point_in_polygon(nx, ny, &z.polygon));
+            if !inside_any {
+                continue;
+            }
+        }
+
+        match engine.matches(&compiled, &synthetic, row.camera_id) {
+            Ok(true) => {
+                matches.push(PreviewMatch {
+                    motion_event_id: row.id,
+                    camera_id: row.camera_id,
+                    clip_id: row.clip_id,
+                    track_id: row.track_id,
+                    captured_at: row.captured_at.to_rfc3339(),
+                    label: row.label.clone(),
+                    confidence: row.confidence,
+                    bbox: row.bbox,
+                });
+            }
+            Ok(false) => {}
+            // Per-row errors are intentionally swallowed in
+            // preview — a single malformed attribute shouldn't
+            // poison the whole result set. The CEL compile path
+            // above already caught the common breakage modes.
+            Err(_) => {}
+        }
+    }
+
+    Ok(Json(PreviewRuleResp {
+        matches,
+        scanned,
+        window_start: from.to_rfc3339(),
+        window_end: to.to_rfc3339(),
+        limit_hit,
+        error: None,
+    }))
+}
+
+/// Even-odd winding on a normalised polygon. Inlined here (copy of
+/// the helper inside `nexus-rules`) so the preview path doesn't
+/// have to expose its internals or pull in nexus-tracker.
+fn preview_point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let n = poly.len();
+    let xd = x as f64;
+    let yd = y as f64;
+    for i in 0..n {
+        let (p1x, p1y) = poly[i];
+        let (p2x, p2y) = poly[(i + 1) % n];
+        let p1x = p1x as f64;
+        let p1y = p1y as f64;
+        let p2x = p2x as f64;
+        let p2y = p2y as f64;
+        let intersects = ((p1y > yd) != (p2y > yd))
+            && (xd < ((p2x - p1x) * (yd - p1y) / ((p2y - p1y) + 1e-9) + p1x));
+        if intersects {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 #[derive(serde::Deserialize)]
@@ -2545,6 +2820,138 @@ mod tests {
                 "panic-inducing input {input:?} must carry an error message",
             );
         }
+    }
+
+    // POST /api/rules/preview — exercises the full HTTP round-trip
+    // (router + state) because the handler reads from `ApiState`
+    // (store + frame cache + cameras). Two slices:
+    //   * happy path: insert a couple of motion_events; CEL filters
+    //     to the one with label=='person'; matches.len() == 1.
+    //   * bad CEL: 200 OK with `error` populated, `matches` empty.
+    #[tokio::test]
+    async fn preview_rule_matches_historical_motion_events() {
+        use axum::body::to_bytes;
+        use nexus_config::CameraConfig;
+        use nexus_types::BBox;
+
+        const ADMIN_SECRET: &[u8] = b"preview-rule-test-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+
+        // Camera + one open clip so motion_events FK is satisfied.
+        store
+            .upsert_camera(&CameraConfig {
+                id: 1,
+                name: "front".into(),
+                url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                enabled: true,
+                prompts: vec![],
+                model_override: None,
+                zones: vec![],
+                max_fps: 0,
+                parking_lot_mode: false,
+            })
+            .await
+            .unwrap();
+        let clip_id = store
+            .open_clip(&nexus_store::NewClip {
+                camera_id: 1,
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+                hot_path: "cam1/test.mp4".into(),
+                codec: "h264".into(),
+                container: "mp4".into(),
+                hot_handle: "local".into(),
+            })
+            .await
+            .unwrap();
+
+        // Two events: one matches (person), one doesn't (vehicle).
+        let now = chrono::Utc::now();
+        for (track, label, when_off) in [(10u64, "person", 30i64), (11, "vehicle", 20)] {
+            store
+                .insert_motion_event(&nexus_store::NewMotionEvent {
+                    camera_id: 1,
+                    clip_id,
+                    track_id: track,
+                    kind: nexus_store::MotionEventKind::Born,
+                    captured_at: now - chrono::Duration::seconds(when_off),
+                    bbox: BBox {
+                        x1: 100.0,
+                        y1: 100.0,
+                        x2: 200.0,
+                        y2: 300.0,
+                    },
+                    label: label.into(),
+                    confidence: 0.9,
+                    attributes_json: "{}".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let body = serde_json::json!({
+            "rule": {
+                "id": "p",
+                "name": "p",
+                "when": "object.label == 'person'",
+                "severity": "low",
+                "enabled": true,
+            },
+            "limit": 100,
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/rules/preview")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            resp["error"].is_null(),
+            "valid CEL must not surface an error: {resp:#}"
+        );
+        let matches = resp["matches"].as_array().expect("matches array");
+        assert_eq!(matches.len(), 1, "exactly one person match: {resp:#}");
+        assert_eq!(matches[0]["label"], "person");
+        assert_eq!(matches[0]["clip_id"], clip_id);
+        assert!(resp["scanned"].as_u64().unwrap() >= 2);
+    }
+
+    #[tokio::test]
+    async fn preview_rule_surfaces_cel_compile_error_as_ok_with_error_field() {
+        use axum::body::to_bytes;
+
+        const ADMIN_SECRET: &[u8] = b"preview-rule-bad-cel-secret";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+
+        let body = serde_json::json!({
+            "rule": {
+                "id": "p",
+                "name": "p",
+                "when": "(object.label",
+                "severity": "low",
+                "enabled": true,
+            }
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/rules/preview")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        // 200 OK + error in body — mirrors /rules/validate posture
+        // so the form can render the parser message inline.
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            resp["error"].is_string(),
+            "bad CEL must surface error: {resp:#}"
+        );
+        assert_eq!(resp["matches"].as_array().unwrap().len(), 0);
     }
 
     #[test]
