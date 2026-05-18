@@ -11,16 +11,30 @@
 #   ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
 #   cargo run --release -p nexus-engine \
 #       --features ort,ep-cpu,ep-coreml,gstreamer \
-#       --bin nexus-engine -- --config config/single-camera.youtube.toml
+#       -- --config config/single-camera.youtube.toml
 #
 # `gstreamer` is REQUIRED for rtsp:// URLs — without it the engine silently
 # falls back to a 640x480 black-frame VirtualSource.
+#
+# To add a second LAN camera, copy this file to single-camera.youtube.local.toml
+# (gitignored) and append a `[[cameras]]` block with the camera's RTSP URL.
+# Never commit credentials.
 
 [runtime]
 state_dir = "./data/state"
 
 [runtime.clips]
 clips_dir = "./data/clips"
+# Real H.264-passthrough mp4 via GstClipRecorder. Requires the engine to
+# be built with `--features gstreamer` (it is, for this config). Omit
+# this line or set "stub" to get 0-byte placeholder files instead.
+recorder = "gstreamer"
+# Seconds of pre-motion footage kept in RAM and prepended to each clip.
+pre_roll_secs = 5
+# Seconds the recorder keeps a clip open after the last live track
+# disappears, so brief detection gaps don't split one event into two
+# clips. 0 disables post-roll.
+post_roll_secs = 5
 
 [server]
 api_bind = "127.0.0.1:8089"
@@ -73,4 +87,8 @@ name = "Lofi Girl (RTSP)"
 url = "rtsp://127.0.0.1:8554/cam1"
 enabled = true
 prompts = ["person"]
-max_fps = 5
+# 15 fps strikes the smooth-motion/CPU sweet spot. Below 10 the live
+# viewer looks visibly choppy; above 20 the inference backlog grows on
+# slower hardware. The viewer polls metadata at 10 Hz, so anything ≥10
+# is indistinguishable to a human.
+max_fps = 15
