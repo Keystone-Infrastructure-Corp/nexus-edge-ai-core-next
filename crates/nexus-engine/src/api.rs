@@ -388,13 +388,16 @@ async fn validate_rule(Json(req): Json<ValidateRuleReq>) -> Json<ValidateRuleRes
     let stub = RuleConfig {
         id: "__validate__".into(),
         name: "validate".into(),
-        camera_filter: None,
-        zones: None,
-        when: req.when,
-        severity: "low".into(),
-        min_track_age_ms: 0,
-        consecutive_frames: 1,
-        cooldown_ms: 0,
+        predicate: nexus_config::RulePredicate {
+            when: req.when,
+            severity: "low".into(),
+        },
+        gates: nexus_config::RuleGates::default(),
+        debounce: nexus_config::RuleDebounce {
+            min_track_age_ms: 0,
+            consecutive_frames: 1,
+            cooldown_ms: 0,
+        },
         enabled: true,
     };
     match compile_cel_safely(&stub) {
@@ -566,7 +569,7 @@ async fn preview_rule(
     // We also need every camera's zones so the per-row zone gate
     // can look them up by id (same logic as RuleEvaluator).
     let all_cameras = s.store.list_cameras().await?;
-    let camera_scope: Option<Vec<CameraId>> = req.rule.camera_filter.clone();
+    let camera_scope: Option<Vec<CameraId>> = req.rule.gates.camera_filter.clone();
 
     let from = chrono::Utc
         .timestamp_millis_opt(since_ms)
@@ -607,7 +610,7 @@ async fn preview_rule(
         // Apply the zone gate the same way RuleEvaluator does —
         // we want preview parity for the gate path even though we
         // deliberately skip the debounce/cooldown gates.
-        if let Some(zone_ids) = req.rule.zones.as_ref().filter(|ids| !ids.is_empty()) {
+        if let Some(zone_ids) = req.rule.gates.zones.as_ref().filter(|ids| !ids.is_empty()) {
             let cam_zones = zones_by_camera.get(&row.camera_id).copied().unwrap_or(&[]);
             let resolved: Vec<&nexus_config::ZoneConfig> = zone_ids
                 .iter()
@@ -2842,13 +2845,19 @@ mod tests {
             .upsert_camera(&CameraConfig {
                 id: 1,
                 name: "front".into(),
-                url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
-                enabled: true,
-                prompts: vec![],
-                model_override: None,
+                ingest: nexus_config::CameraIngest {
+                    url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    enabled: true,
+                    max_fps: 0,
+                },
+                detector: nexus_config::CameraDetector {
+                    prompts: vec![],
+                    model_override: None,
+                },
+                behavior: nexus_config::CameraBehavior {
+                    parking_lot_mode: false,
+                },
                 zones: vec![],
-                max_fps: 0,
-                parking_lot_mode: false,
             })
             .await
             .unwrap();
@@ -3094,13 +3103,19 @@ mod tests {
             .upsert_camera(&CameraConfig {
                 id: 3,
                 name: "cam3".into(),
-                url: Url::parse("rtsp://127.0.0.1/stream3").unwrap(),
-                enabled: true,
-                prompts: vec![],
-                model_override: None,
+                ingest: nexus_config::CameraIngest {
+                    url: Url::parse("rtsp://127.0.0.1/stream3").unwrap(),
+                    enabled: true,
+                    max_fps: 0,
+                },
+                detector: nexus_config::CameraDetector {
+                    prompts: vec![],
+                    model_override: None,
+                },
+                behavior: nexus_config::CameraBehavior {
+                    parking_lot_mode: false,
+                },
                 zones: vec![],
-                max_fps: 0,
-                parking_lot_mode: false,
             })
             .await
             .unwrap();

@@ -232,13 +232,19 @@ mod tests {
             .upsert_camera(&CameraConfig {
                 id: 1,
                 name: "front".into(),
-                url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
-                enabled: true,
-                prompts: vec![],
-                model_override: None,
+                ingest: nexus_config::CameraIngest {
+                    url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    enabled: true,
+                    max_fps: 0,
+                },
+                detector: nexus_config::CameraDetector {
+                    prompts: vec![],
+                    model_override: None,
+                },
+                behavior: nexus_config::CameraBehavior {
+                    parking_lot_mode: false,
+                },
                 zones: vec![],
-                max_fps: 0,
-                parking_lot_mode: false,
             })
             .await
             .unwrap();

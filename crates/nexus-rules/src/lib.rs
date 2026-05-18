@@ -79,7 +79,7 @@ impl CelEngine {
 #[async_trait]
 impl RuleEngine for CelEngine {
     fn compile(&self, rule: &RuleConfig) -> Result<CompiledRule, RulesError> {
-        let prog = Program::compile(&rule.when)
+        let prog = Program::compile(&rule.predicate.when)
             .map_err(|e| RulesError::Compile(rule.id.clone(), e.to_string()))?;
         Ok(CompiledRule {
             config: rule.clone(),
@@ -274,7 +274,7 @@ impl RuleEvaluator {
             if !cfg.enabled {
                 continue;
             }
-            if let Some(filter) = &cfg.camera_filter {
+            if let Some(filter) = &cfg.gates.camera_filter {
                 if !filter.contains(&camera_id) {
                     continue;
                 }
@@ -304,7 +304,7 @@ impl RuleEvaluator {
             // security alerts). Empty Vec ⇒ inside-any test
             // returns false ⇒ rule suppresses everywhere on this
             // camera until the operator fixes the config.
-            let rule_zones: Option<Vec<&ZoneConfig>> = match &cfg.zones {
+            let rule_zones: Option<Vec<&ZoneConfig>> = match &cfg.gates.zones {
                 None => None,
                 Some(ids) if ids.is_empty() => None,
                 Some(ids) => {
@@ -322,7 +322,7 @@ impl RuleEvaluator {
             };
 
             for o in objects {
-                if o.age_ms < cfg.min_track_age_ms {
+                if o.age_ms < cfg.debounce.min_track_age_ms {
                     continue;
                 }
 
@@ -356,15 +356,15 @@ impl RuleEvaluator {
                 }
                 entry.consecutive_hits = entry.consecutive_hits.saturating_add(1);
 
-                if entry.consecutive_hits < cfg.consecutive_frames {
+                if entry.consecutive_hits < cfg.debounce.consecutive_frames {
                     continue;
                 }
-                if now_ms - entry.last_emitted_unix_ms < cfg.cooldown_ms as i64 {
+                if now_ms - entry.last_emitted_unix_ms < cfg.debounce.cooldown_ms as i64 {
                     continue;
                 }
                 entry.last_emitted_unix_ms = now_ms;
 
-                let severity = parse_severity(&cfg.severity);
+                let severity = parse_severity(&cfg.predicate.severity);
                 debug!(rule = %cfg.id, label = %o.label, "rule fired");
                 out.push(AlertEvent {
                     event_id: Uuid::now_v7(),
@@ -463,13 +463,19 @@ mod tests {
         let cfg = RuleConfig {
             id: "r1".into(),
             name: "person".into(),
-            camera_filter: None,
-            zones: None,
-            when: "object.label == 'person'".into(),
-            severity: "high".into(),
-            min_track_age_ms: 0,
-            consecutive_frames: 1,
-            cooldown_ms: 0,
+            predicate: nexus_config::RulePredicate {
+                when: "object.label == 'person'".into(),
+                severity: "high".into(),
+            },
+            gates: nexus_config::RuleGates {
+                camera_filter: None,
+                zones: None,
+            },
+            debounce: nexus_config::RuleDebounce {
+                min_track_age_ms: 0,
+                consecutive_frames: 1,
+                cooldown_ms: 0,
+            },
             enabled: true,
         };
         let eng = CelEngine::new();
@@ -503,13 +509,19 @@ mod tests {
         RuleConfig {
             id: "zone_gated".into(),
             name: "zone-gated person".into(),
-            camera_filter: None,
-            zones,
-            when: "object.label == 'person'".into(),
-            severity: "high".into(),
-            min_track_age_ms: 0,
-            consecutive_frames: 1,
-            cooldown_ms: 0,
+            predicate: nexus_config::RulePredicate {
+                when: "object.label == 'person'".into(),
+                severity: "high".into(),
+            },
+            gates: nexus_config::RuleGates {
+                camera_filter: None,
+                zones,
+            },
+            debounce: nexus_config::RuleDebounce {
+                min_track_age_ms: 0,
+                consecutive_frames: 1,
+                cooldown_ms: 0,
+            },
             enabled: true,
         }
     }

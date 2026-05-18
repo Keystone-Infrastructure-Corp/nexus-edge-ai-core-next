@@ -233,8 +233,8 @@ impl Store {
             )
             .bind(cam.id)
             .bind(&cam.name)
-            .bind(cam.url.to_string())
-            .bind(cam.enabled as i64)
+            .bind(cam.ingest.url.to_string())
+            .bind(cam.ingest.enabled as i64)
             .bind(&json)
             .execute(&mut *tx)
             .await?;
@@ -287,8 +287,8 @@ impl Store {
         )
         .bind(cam.id)
         .bind(&cam.name)
-        .bind(cam.url.to_string())
-        .bind(cam.enabled as i64)
+        .bind(cam.ingest.url.to_string())
+        .bind(cam.ingest.enabled as i64)
         .bind(&json)
         .execute(&self.pool)
         .await?;

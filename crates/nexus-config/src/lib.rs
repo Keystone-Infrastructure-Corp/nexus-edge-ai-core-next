@@ -142,15 +142,15 @@ impl Config {
                     cam.id
                 )));
             }
-            if cam.url.scheme() != "rtsp"
-                && cam.url.scheme() != "rtsps"
-                && cam.url.scheme() != "file"
-                && cam.url.scheme() != "virtual"
+            if cam.ingest.url.scheme() != "rtsp"
+                && cam.ingest.url.scheme() != "rtsps"
+                && cam.ingest.url.scheme() != "file"
+                && cam.ingest.url.scheme() != "virtual"
             {
                 return Err(ConfigError::Validation(format!(
                     "camera {} url has unsupported scheme '{}'",
                     cam.id,
-                    cam.url.scheme()
+                    cam.ingest.url.scheme()
                 )));
             }
         }
@@ -974,11 +974,24 @@ pub enum RulesBackendKind {
     Cel,
 }
 
+/// The CEL predicate plus its severity tag — i.e. "what is this
+/// rule actually checking, and how loudly does it alert". Grouped
+/// so a refactor that adds a sibling predicate field (alternate
+/// expression language, alternate severity ramp) lands in one
+/// place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuleConfig {
-    pub id: String,
-    pub name: String,
+pub struct RulePredicate {
+    /// CEL expression evaluated against the per-frame `object` /
+    /// `camera` / `now` context.
+    pub when: String,
+    pub severity: String,
+}
+
+/// Scope filters — which cameras + zones the rule applies to.
+/// Both gates short-circuit at the start of the evaluator.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuleGates {
+    #[serde(default)]
     pub camera_filter: Option<Vec<CameraId>>,
     /// Zone-id allow-list. When `Some` and non-empty, an object only
     /// matches the rule if its bbox centre falls inside at least one
@@ -991,16 +1004,53 @@ pub struct RuleConfig {
     /// rule config only stores ids, never the polygons themselves.
     #[serde(default)]
     pub zones: Option<Vec<String>>,
-    /// CEL expression evaluated against the per-frame `object` / `camera` /
-    /// `now` context.
-    pub when: String,
-    pub severity: String,
+}
+
+/// Debounce + cooldown — the three knobs that suppress runaway
+/// alerts on noisy detectors. All three default to the
+/// production-tested values from the original flat config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleDebounce {
     #[serde(default = "default_min_track_age_ms")]
     pub min_track_age_ms: u64,
     #[serde(default = "default_consecutive_frames")]
     pub consecutive_frames: u32,
     #[serde(default = "default_cooldown_ms")]
     pub cooldown_ms: u64,
+}
+
+impl Default for RuleDebounce {
+    fn default() -> Self {
+        Self {
+            min_track_age_ms: default_min_track_age_ms(),
+            consecutive_frames: default_consecutive_frames(),
+            cooldown_ms: default_cooldown_ms(),
+        }
+    }
+}
+
+/// One configured alerting rule. Wire shape is flat — `predicate`,
+/// `gates`, and `debounce` are `#[serde(flatten)]`'d so every
+/// existing TOML rule and every payload the admin UI sends remains
+/// bit-for-bit compatible. The nested Rust groups are purely a
+/// code-organisation refactor: the supervisor / preview pipeline
+/// can take `&RulePredicate` when it only needs the CEL, and
+/// readers can tell at a glance which fields belong to the
+/// scope-gate vs. the debounce ladder vs. the predicate itself.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted
+/// — it's incompatible with `#[serde(flatten)]` (same trade-off as
+/// `CameraConfig`; see its doc-comment).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(flatten)]
+    pub predicate: RulePredicate,
+    #[serde(flatten)]
+    pub gates: RuleGates,
+    #[serde(flatten)]
+    pub debounce: RuleDebounce,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -1056,32 +1106,79 @@ fn default_bus_capacity() -> usize {
 // Cameras
 // ---------------------------------------------------------------------------
 
+/// Ingest plumbing for a camera — the bits the supervisor and the
+/// source backend need to actually pull frames. Grouped so adding
+/// a new ingest knob (e.g. transport hints, auth) lands in one
+/// place and helpers that only need ingest can take `&Ingest`
+/// instead of `&CameraConfig`.
+///
+/// Serialised flat into `CameraConfig` via `#[serde(flatten)]`,
+/// so the wire shape — every TOML in `config/`, every payload the
+/// admin UI sends — is unchanged. The nested Rust type is purely
+/// an organisational refactor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CameraConfig {
-    pub id: CameraId,
-    pub name: String,
+pub struct CameraIngest {
     pub url: Url,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Per-camera FPS cap. 0 = unbounded.
+    #[serde(default)]
+    pub max_fps: u32,
+}
+
+/// Detector-side knobs — open-vocab prompts and model overrides.
+/// Anything that changes WHAT the inference layer is asked to
+/// look for, vs. CameraIngest which controls how frames get there.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CameraDetector {
     /// Open-vocab prompts, or labels-of-interest for ensemble.
     #[serde(default)]
     pub prompts: Vec<String>,
     /// Per-camera overrides for the inference model (kind, pack, thresholds).
     #[serde(default)]
     pub model_override: Option<ModelConfig>,
-    /// Polygon zones used by motion gate / dwell rules.
-    #[serde(default)]
-    pub zones: Vec<ZoneConfig>,
-    /// Per-camera FPS cap. 0 = unbounded.
-    #[serde(default)]
-    pub max_fps: u32,
+}
+
+/// Tracker / rules-pipeline behavior overrides — everything that
+/// changes how the downstream pipeline reacts to detections, not
+/// how detections get produced.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CameraBehavior {
     /// When true, this camera enables the static-object filter
     /// (`tracker.static_object.*`). Vehicles that promote to "static"
     /// are dropped from the rule-eval slice and persisted to the
     /// per-camera registry at `runtime.state_dir`. Default: false.
     #[serde(default)]
     pub parking_lot_mode: bool,
+}
+
+/// One configured camera. Wire shape (TOML + JSON) is flat — every
+/// field of the nested groups (`ingest`, `detector`, `behavior`)
+/// appears at the top level thanks to `#[serde(flatten)]`. The
+/// nesting is purely a code-organisation refactor; existing
+/// TOML and admin-API payloads remain bit-for-bit compatible.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted.
+/// Serde does not support `deny_unknown_fields` together with
+/// `#[serde(flatten)]` (the flattened keys can't be distinguished
+/// from "unknown" at deserialise time). Operators who typo a
+/// camera field will see the behaviour silently default instead of
+/// hitting a load-time error; the trade-off is acceptable because
+/// the structural ergonomics inside the engine matter more here
+/// than catching field-name typos.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraConfig {
+    pub id: CameraId,
+    pub name: String,
+    #[serde(flatten)]
+    pub ingest: CameraIngest,
+    #[serde(flatten)]
+    pub detector: CameraDetector,
+    #[serde(flatten)]
+    pub behavior: CameraBehavior,
+    /// Polygon zones used by motion gate / dwell rules.
+    #[serde(default)]
+    pub zones: Vec<ZoneConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1190,5 +1287,88 @@ mod tests {
         let (cfg, notice) = Config::load_with_compat(&path).unwrap();
         assert!(!notice.auth_grandfathered);
         assert_eq!(cfg.auth.mode, AuthMode::DevToken);
+    }
+
+    /// Wire-shape lock for the camera/rule refactor: the public TOML
+    /// keys for every shipped config under `config/` must still parse
+    /// after the `#[serde(flatten)]` regrouping (no nested `[ingest]`,
+    /// `[detector]`, `[gates]`, etc. tables introduced). Every camera
+    /// keeps reading `url`, `enabled`, `max_fps`, `prompts`,
+    /// `model_override`, `parking_lot_mode` at the top of the
+    /// `[[cameras]]` array; every rule keeps reading `when`,
+    /// `severity`, `camera_filter`, `zones`, `min_track_age_ms`,
+    /// `consecutive_frames`, `cooldown_ms` at the top of `[[rules]]`.
+    /// If this test ever needs a fixture update, you have broken
+    /// every existing operator's nexus.toml — back out the change.
+    #[test]
+    fn shipped_configs_round_trip_flat_wire_shape() {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = crate_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root above crates/nexus-config");
+        let config_dir = repo_root.join("config");
+        let entries = std::fs::read_dir(&config_dir)
+            .unwrap_or_else(|e| panic!("read_dir {}: {e}", config_dir.display()));
+        let mut checked = 0usize;
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let cfg = Config::load(&path)
+                .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+            // Validate via the same path the engine uses on boot.
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("validate {}: {e}", path.display()));
+            for cam in &cfg.cameras {
+                let v = serde_json::to_value(cam).unwrap();
+                let obj = v.as_object().expect("CameraConfig serializes as an object");
+                // Top-level keys must be flat — no `ingest`/`detector`/`behavior` envelopes.
+                for forbidden in ["ingest", "detector", "behavior"] {
+                    assert!(
+                        !obj.contains_key(forbidden),
+                        "{}: CameraConfig leaked a `{forbidden}` envelope to the wire \
+                         (broke #[serde(flatten)] guarantee)",
+                        path.display()
+                    );
+                }
+                // Anchor a few must-stay-flat keys so an accidental
+                // un-flatten in the future tips this test over loudly.
+                for required in ["id", "name", "url", "enabled"] {
+                    assert!(
+                        obj.contains_key(required),
+                        "{}: CameraConfig dropped flat key `{required}`",
+                        path.display()
+                    );
+                }
+            }
+            for rule in &cfg.rules.inline {
+                let v = serde_json::to_value(rule).unwrap();
+                let obj = v.as_object().expect("RuleConfig serializes as an object");
+                for forbidden in ["predicate", "gates", "debounce"] {
+                    assert!(
+                        !obj.contains_key(forbidden),
+                        "{}: RuleConfig leaked a `{forbidden}` envelope to the wire \
+                         (broke #[serde(flatten)] guarantee)",
+                        path.display()
+                    );
+                }
+                for required in ["id", "name", "when", "severity"] {
+                    assert!(
+                        obj.contains_key(required),
+                        "{}: RuleConfig dropped flat key `{required}`",
+                        path.display()
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected to round-trip at least 2 TOMLs from {} (found {checked})",
+            config_dir.display()
+        );
     }
 }

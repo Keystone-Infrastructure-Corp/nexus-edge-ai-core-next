@@ -69,7 +69,7 @@ impl InferenceRouter {
         // If we ever need per-camera-thresholds-in-the-detector, we'll
         // rev the key shape here without changing callers.
         for cam in cameras {
-            let Some(override_cfg) = cam.model_override.as_ref() else {
+            let Some(override_cfg) = cam.detector.model_override.as_ref() else {
                 continue;
             };
             let kind = override_cfg.kind.clone();
@@ -109,6 +109,7 @@ impl InferenceRouter {
     /// can be called, so the fallback is total.
     pub fn detector_for_camera(&self, cam: &CameraConfig) -> Arc<dyn Detector> {
         let kind = cam
+            .detector
             .model_override
             .as_ref()
             .map(|m| m.kind.as_str())
@@ -198,16 +199,22 @@ mod tests {
         CameraConfig {
             id,
             name: format!("cam-{id}"),
-            url: Url::parse("virtual://test").unwrap(),
-            enabled: true,
-            prompts: vec![],
-            model_override: override_kind.map(|k| ModelConfig {
-                kind: k.into(),
-                ..Default::default()
-            }),
+            ingest: nexus_config::CameraIngest {
+                url: Url::parse("virtual://test").unwrap(),
+                enabled: true,
+                max_fps: 0,
+            },
+            detector: nexus_config::CameraDetector {
+                prompts: vec![],
+                model_override: override_kind.map(|k| ModelConfig {
+                    kind: k.into(),
+                    ..Default::default()
+                }),
+            },
+            behavior: nexus_config::CameraBehavior {
+                parking_lot_mode: false,
+            },
             zones: vec![],
-            max_fps: 0,
-            parking_lot_mode: false,
         }
     }
 

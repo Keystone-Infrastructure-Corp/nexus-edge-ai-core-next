@@ -51,13 +51,19 @@ async fn cel_rule_emits_alert_for_virtual_person() {
     let rule = RuleConfig {
         id: "any_person".into(),
         name: "Any person".into(),
-        camera_filter: None,
-        zones: None,
-        when: "object.label == 'person'".into(),
-        severity: "low".into(),
-        min_track_age_ms: 0,
-        consecutive_frames: 1,
-        cooldown_ms: 0,
+        predicate: nexus_config::RulePredicate {
+            when: "object.label == 'person'".into(),
+            severity: "low".into(),
+        },
+        gates: nexus_config::RuleGates {
+            camera_filter: None,
+            zones: None,
+        },
+        debounce: nexus_config::RuleDebounce {
+            min_track_age_ms: 0,
+            consecutive_frames: 1,
+            cooldown_ms: 0,
+        },
         enabled: true,
     };
     let rules_cfg = RulesConfig {
@@ -86,13 +92,19 @@ async fn cel_rule_emits_alert_for_virtual_person() {
     let cam = CameraConfig {
         id: 1,
         name: "virtual-smoke".into(),
-        url: Url::parse("virtual://local").unwrap(),
-        enabled: true,
-        prompts: vec!["person".into()],
-        model_override: None,
+        ingest: nexus_config::CameraIngest {
+            url: Url::parse("virtual://local").unwrap(),
+            enabled: true,
+            max_fps: 5,
+        },
+        detector: nexus_config::CameraDetector {
+            prompts: vec!["person".into()],
+            model_override: None,
+        },
+        behavior: nexus_config::CameraBehavior {
+            parking_lot_mode: false,
+        },
         zones: vec![],
-        max_fps: 5,
-        parking_lot_mode: false,
     };
     // Recorder + clips_dir under the same tempdir so artefacts are
     // cleaned up when the test ends.

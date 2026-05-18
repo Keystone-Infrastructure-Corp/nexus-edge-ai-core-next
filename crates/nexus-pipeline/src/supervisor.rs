@@ -89,7 +89,7 @@ async fn run_camera(
         "camera.pipeline",
         camera_id = cfg.id,
         camera_name = %cfg.name,
-        scheme = %cfg.url.scheme(),
+        scheme = %cfg.ingest.url.scheme(),
     );
     async {
         let _ = bus
@@ -118,14 +118,14 @@ async fn run_camera(
         let gate = MotionGate::new();
         let mut decoded: u64 = 0;
         let mut detected: u64 = 0;
-        let prompts = cfg.prompts.clone();
+        let prompts = cfg.detector.prompts.clone();
         let zones = cfg.zones.clone();
         let mut annotator = TrackAnnotator::new(annotator_cfg);
         // Static-object filter is only built when the camera opted in.
         // We always pass the persistence path (under state_dir) so a
         // toggle from off → on picks up any registry that may already
         // exist on disk.
-        let mut static_filter = if cfg.parking_lot_mode {
+        let mut static_filter = if cfg.behavior.parking_lot_mode {
             let path = state_dir
                 .join("static_objects")
                 .join(format!("cam-{}.json", cfg.id));
@@ -456,12 +456,12 @@ async fn run_camera(
 }
 
 fn build_source(cfg: &CameraConfig) -> Box<dyn FrameSource + Send> {
-    match cfg.url.scheme() {
+    match cfg.ingest.url.scheme() {
         #[cfg(feature = "gstreamer")]
         "rtsp" | "rtsps" => Box::new(crate::source::RtspSource {
             camera_id: cfg.id,
-            url: cfg.url.to_string(),
-            max_fps: cfg.max_fps,
+            url: cfg.ingest.url.to_string(),
+            max_fps: cfg.ingest.max_fps,
         }),
         // Without the `gstreamer` feature there is no real RTSP backend.
         // Refuse to silently fall back to a 640x480 black VirtualSource —
@@ -474,16 +474,20 @@ fn build_source(cfg: &CameraConfig) -> Box<dyn FrameSource + Send> {
             let msg = format!(
                 "camera {} url {} requires the `gstreamer` feature; rebuild \
                  nexus-engine with `cargo build --features gstreamer,...`",
-                cfg.id, cfg.url
+                cfg.id, cfg.ingest.url
             );
-            error!(camera_id = cfg.id, url = %cfg.url, "{}", msg);
+            error!(camera_id = cfg.id, url = %cfg.ingest.url, "{}", msg);
             Box::new(crate::source::FailingSource { message: msg })
         }
         _ => Box::new(VirtualSource {
             camera_id: cfg.id,
             width: 640,
             height: 480,
-            fps: if cfg.max_fps == 0 { 5 } else { cfg.max_fps },
+            fps: if cfg.ingest.max_fps == 0 {
+                5
+            } else {
+                cfg.ingest.max_fps
+            },
         }),
     }
 }

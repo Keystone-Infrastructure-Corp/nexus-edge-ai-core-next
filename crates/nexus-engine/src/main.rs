@@ -249,7 +249,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
 
     let mut handles = Vec::new();
     for cam in cameras {
-        if !cam.enabled {
+        if !cam.ingest.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
             continue;
         }

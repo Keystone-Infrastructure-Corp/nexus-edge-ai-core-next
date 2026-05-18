@@ -178,13 +178,19 @@ fn corpus_to_rule_configs() -> Vec<RuleConfig> {
         .map(|r| RuleConfig {
             id: r.id.into(),
             name: r.name.into(),
-            camera_filter: None,
-            zones: None,
-            when: r.when.into(),
-            severity: r.severity.into(),
-            min_track_age_ms: 0,
-            consecutive_frames: 1,
-            cooldown_ms: 0,
+            predicate: nexus_config::RulePredicate {
+                when: r.when.into(),
+                severity: r.severity.into(),
+            },
+            gates: nexus_config::RuleGates {
+                camera_filter: None,
+                zones: None,
+            },
+            debounce: nexus_config::RuleDebounce {
+                min_track_age_ms: 0,
+                consecutive_frames: 1,
+                cooldown_ms: 0,
+            },
             enabled: true,
         })
         .collect()
@@ -708,13 +714,19 @@ fn every_corpus_rule_compiles() {
         let cfg = RuleConfig {
             id: spec.id.into(),
             name: spec.name.into(),
-            camera_filter: None,
-            zones: None,
-            when: spec.when.into(),
-            severity: spec.severity.into(),
-            min_track_age_ms: 0,
-            consecutive_frames: 1,
-            cooldown_ms: 0,
+            predicate: nexus_config::RulePredicate {
+                when: spec.when.into(),
+                severity: spec.severity.into(),
+            },
+            gates: nexus_config::RuleGates {
+                camera_filter: None,
+                zones: None,
+            },
+            debounce: nexus_config::RuleDebounce {
+                min_track_age_ms: 0,
+                consecutive_frames: 1,
+                cooldown_ms: 0,
+            },
             enabled: true,
         };
         if let Err(e) = engine.compile(&cfg) {
@@ -751,13 +763,19 @@ fn golden_fixtures_match_expected_verdicts() {
         let cfg = RuleConfig {
             id: spec.id.into(),
             name: spec.name.into(),
-            camera_filter: None,
-            zones: None,
-            when: spec.when.into(),
-            severity: spec.severity.into(),
-            min_track_age_ms: 0,
-            consecutive_frames: 1,
-            cooldown_ms: 0,
+            predicate: nexus_config::RulePredicate {
+                when: spec.when.into(),
+                severity: spec.severity.into(),
+            },
+            gates: nexus_config::RuleGates {
+                camera_filter: None,
+                zones: None,
+            },
+            debounce: nexus_config::RuleDebounce {
+                min_track_age_ms: 0,
+                consecutive_frames: 1,
+                cooldown_ms: 0,
+            },
             enabled: true,
         };
         let compiled = engine
