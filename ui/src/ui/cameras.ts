@@ -3,9 +3,12 @@
 // shared primitives (`openDialog`, `toast`, `forms.ts`).
 //
 // Layout:
-//   page-toolbar: title + "+ New camera" + "🔍 Discover" (disabled
-//                 until Phase 1B lands; the title attribute explains).
-//   admin-table : id / name / url / prompts / status / actions
+//   page-toolbar: title + "+ New camera" + "Discover" buttons.
+//   admin-table : snapshot / name / prompts / status / actions
+//                 (id and url are intentionally NOT columns —
+//                 operators don't memorise camera ids, and the
+//                 URL contains creds we shouldn't display in a
+//                 list view; click the row's gear to see them).
 //
 // All mutations refresh the table in-place via `reloadTable()`. No
 // `location.reload()`; that was the worst UX bug in the old version
@@ -15,6 +18,7 @@ import { api } from "../api/client.js";
 import { clear, h } from "../lib/el.js";
 import { openDialog, dialogFooter, type DialogHandle } from "../lib/dialog.js";
 import { toast } from "../lib/toast.js";
+import { icon, iconButton } from "../lib/icons.js";
 import { openCameraForm } from "./cameras-form.js";
 import { openDiscoveryDialog } from "./cameras-discovery.js";
 import type { CameraConfig, CameraId } from "../api/types.js";
@@ -41,7 +45,7 @@ function buildToolbar(onChange: () => Promise<void>): HTMLElement[] {
   const newBtn = h(
     "button",
     {
-      class: "primary",
+      class: "primary btn-with-icon",
       type: "button",
       on: {
         click: async () => {
@@ -54,12 +58,13 @@ function buildToolbar(onChange: () => Promise<void>): HTMLElement[] {
         },
       },
     },
-    "+ New camera",
+    icon("plus"),
+    "New camera",
   );
   const discoverBtn = h(
     "button",
     {
-      class: "ghost",
+      class: "ghost btn-with-icon",
       type: "button",
       title: "ONVIF + CIDR sweep, then pre-fill the Add form.",
       on: {
@@ -72,7 +77,8 @@ function buildToolbar(onChange: () => Promise<void>): HTMLElement[] {
         },
       },
     },
-    "🔍 Discover",
+    icon("search"),
+    "Discover",
   );
   return [newBtn, discoverBtn];
 }
@@ -118,9 +124,8 @@ async function renderTable(
       h(
         "tr",
         null,
-        h("th", null, "ID"),
+        h("th", null, ""),
         h("th", null, "Name"),
-        h("th", null, "URL"),
         h("th", null, "Prompts"),
         h("th", null, "Status"),
         h("th", null, ""),
@@ -160,56 +165,60 @@ function row(
   return h(
     "tr",
     null,
-    h("td", null, String(cam.id)),
+    h("td", { class: "camera-thumb-cell" }, snapshotThumb(cam)),
     h("td", null, cam.name),
-    h("td", null, h("code", { class: "mono" }, cam.url)),
     h("td", null, promptCell),
     h("td", null, statusPill),
     h(
       "td",
-      null,
-      h(
-        "button",
-        {
-          class: "ghost",
-          type: "button",
-          on: {
-            click: async () => {
-              const ok = await openCameraForm({
-                mode: "edit",
-                existing: cam,
-                existingIds: list.map((c) => c.id),
-              });
-              if (ok) await onChange();
-            },
-          },
+      { class: "actions" },
+      iconButton("gear", {
+        title: `Edit camera ${cam.name}`,
+        onClick: async () => {
+          const ok = await openCameraForm({
+            mode: "edit",
+            existing: cam,
+            existingIds: list.map((c) => c.id),
+          });
+          if (ok) await onChange();
         },
-        "Edit",
-      ),
-      h(
-        "button",
-        {
-          class: "ghost",
-          type: "button",
-          on: {
-            click: () => openSnapshotPreview(cam),
-          },
-        },
-        "Snapshot",
-      ),
-      h(
-        "button",
-        {
-          class: "ghost danger",
-          type: "button",
-          on: {
-            click: () => void confirmDelete(cam, onChange),
-          },
-        },
-        "Delete",
-      ),
+      }),
+      iconButton("trash", {
+        title: `Delete camera ${cam.name}`,
+        danger: true,
+        onClick: () => void confirmDelete(cam, onChange),
+      }),
     ),
   );
+}
+
+/// Render the in-row snapshot thumbnail. Falls back to a dashed
+/// placeholder if no frame has been cached yet for this camera
+/// (common when the pipeline just started or the camera is
+/// disabled). Clicking the thumbnail opens the full-size preview
+/// dialog — the cell intentionally has no separate Snapshot
+/// button anymore.
+function snapshotThumb(cam: CameraConfig): HTMLElement {
+  const placeholder = h(
+    "div",
+    { class: "camera-thumb-placeholder", title: "No snapshot yet" },
+    "no\nframe",
+  );
+  // If the camera is disabled, don't even try to load — the
+  // pipeline isn't running and the request will 404/timeout.
+  if (!cam.enabled) {
+    return placeholder;
+  }
+  const img = h("img", {
+    class: "camera-thumb",
+    src: api.cameras.latestSnapshotUrl(cam.id),
+    alt: `Snapshot of ${cam.name}`,
+    title: `${cam.name} — click to enlarge`,
+    on: { click: () => openSnapshotPreview(cam) },
+  });
+  // Swap to placeholder on load failure (404 / decode error).
+  img.addEventListener("error", () => img.replaceWith(placeholder));
+  return img;
 }
 
 async function confirmDelete(
