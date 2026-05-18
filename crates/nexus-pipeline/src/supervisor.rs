@@ -14,7 +14,8 @@ use nexus_inference::Detector;
 use nexus_rules::RuleEvaluator;
 use nexus_store::{EventStore, MotionEventKind, NewMotionEvent, Store};
 use nexus_tracker::{
-    MotionDecision, MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
+    filter_excluded_zones, MotionDecision, MotionEventEmitter, MotionKind, StaticObjectFilter,
+    TrackAnnotator, Tracker,
 };
 use nexus_types::{CameraId, Frame, FrameMetadata, PipelineState, PipelineStatus};
 use tokio::sync::mpsc;
@@ -240,6 +241,23 @@ async fn run_camera(
                 let _g = info_span!("frame.track", tracker = tracker.name()).entered();
                 tracker.update(detections)
             };
+            // M-Admin Phase 2 Step 1 — exclusion-zone enforcement.
+            // Drop any tracked object whose bbox centre lies inside
+            // a `ZoneKind::Exclusion` polygon for this camera, BEFORE
+            // the annotator runs so excluded objects never enter
+            // per-track state, the L7 cache, the FRAME_METADATA bus
+            // event, or the rule evaluator. No-op when the camera
+            // has no exclusion zones (the common case).
+            {
+                let _g = info_span!("frame.zone_filter").entered();
+                let dropped = filter_excluded_zones(&frame, &zones, &mut tracked);
+                if dropped > 0 {
+                    debug!(
+                        camera_id = cfg.id,
+                        frame_id, dropped, "exclusion zone filter dropped objects"
+                    );
+                }
+            }
             {
                 let _g = info_span!("frame.annotate", annotator = annotator.name()).entered();
                 annotator.annotate(&frame, &zones, &mut tracked);

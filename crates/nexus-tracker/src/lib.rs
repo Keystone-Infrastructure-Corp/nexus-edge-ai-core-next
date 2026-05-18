@@ -26,10 +26,12 @@ pub mod annotator;
 pub mod bytetrack;
 pub mod motion;
 pub mod static_object;
+pub mod zone_filter;
 pub use annotator::TrackAnnotator;
 pub use bytetrack::ByteTrackTracker;
 pub use motion::{MotionDecision, MotionEventEmitter, MotionKind};
 pub use static_object::StaticObjectFilter;
+pub use zone_filter::filter_excluded_zones;
 
 // ---------------------------------------------------------------------------
 // Trait

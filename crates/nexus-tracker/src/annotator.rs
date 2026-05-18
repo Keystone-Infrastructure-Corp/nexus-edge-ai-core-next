@@ -275,7 +275,7 @@ fn compass8(dx: f64, dy: f64) -> &'static str {
 /// Even-odd winding on a normalized (0..1) polygon, evaluated at a
 /// normalized point. Returns false if the polygon has fewer than 3
 /// vertices.
-fn point_in_normalized_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+pub(crate) fn point_in_normalized_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
     if poly.len() < 3 {
         return false;
     }
