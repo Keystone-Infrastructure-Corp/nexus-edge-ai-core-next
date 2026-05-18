@@ -56,10 +56,12 @@
 //!
 //! Per-camera ingester resolution: the recorder is constructed with
 //! a snapshot of `HashMap<CameraId, Arc<PreRollIngester>>` from the
-//! engine boot. A camera added at runtime that isn't in the snapshot
-//! triggers a `Refused` with a one-shot warn log; the operator
-//! restarts the engine to pick up the new camera. (Same hot-reload
-//! limitation as everything else upstream.)
+//! engine boot, but the map is wrapped in a `parking_lot::RwLock` so
+//! the engine's `config.changed` reconciler can add / remove
+//! per-camera ingesters live via [`Self::add_camera_ingester`] and
+//! [`Self::remove_camera_ingester`]. A camera that wasn't reconciled
+//! in (e.g. ingester build error) still triggers a `Refused` with a
+//! one-shot warn log at `open()` time.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,7 +75,7 @@ use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppStreamType};
 use nexus_store::{ClipClose, ClipId, NewClip, Store};
 use nexus_types::CameraId;
-use parking_lot::Mutex as PlMutex;
+use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -101,7 +103,15 @@ pub struct GstClipRecorder {
     /// connection. A None lookup at `open()` triggers a Refused so
     /// the supervisor doesn't end up writing a `motion_clips` row
     /// that points at a never-opened file.
-    ingesters: HashMap<CameraId, Arc<PreRollIngester>>,
+    ///
+    /// Wrapped in `parking_lot::RwLock` so the engine's
+    /// `config.changed` reconciler can hot-add / hot-remove
+    /// ingesters without a restart. Reads (one per `open()`) take
+    /// the shared lock; reconciler writes take the exclusive lock.
+    /// Contention is negligible: clip opens fire at most a few
+    /// times per minute per camera and the reconciler only writes
+    /// on admin actions.
+    ingesters: PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>,
     panic: PlMutex<bool>,
     /// Per-clip GStreamer + pump state. Held under a tokio Mutex
     /// because the close path awaits on the pump shutdown and the
@@ -160,7 +170,7 @@ impl GstClipRecorder {
         Ok(Self {
             store,
             clips_dir: clips_dir.as_ref().to_path_buf(),
-            ingesters,
+            ingesters: PlRwLock::new(ingesters),
             panic: PlMutex::new(false),
             open: Mutex::new(HashMap::new()),
             bus: None,
@@ -286,13 +296,14 @@ impl ClipRecorder for GstClipRecorder {
         if *self.panic.lock() {
             return Err(RecorderError::Refused);
         }
-        let ingester = match self.ingesters.get(&args.camera_id) {
+        let ingester = match self.ingesters.read().get(&args.camera_id) {
             Some(i) => i.clone(),
             None => {
                 warn!(
                     camera_id = args.camera_id,
                     "GstClipRecorder: no PreRollIngester for this camera; refusing open. \
-                     Restart the engine to pick up cameras added after boot."
+                     The engine's config.changed reconciler should have built one — \
+                     check the engine log for `failed to start pre-roll ingester` warnings."
                 );
                 return Err(RecorderError::Refused);
             }
@@ -683,6 +694,51 @@ impl ClipRecorder for GstClipRecorder {
     fn kind(&self) -> &'static str {
         "gstreamer"
     }
+
+    fn add_camera_ingester(
+        &self,
+        camera_id: CameraId,
+        url: &str,
+        pre_roll_secs: u32,
+    ) -> Result<(), RecorderError> {
+        // Idempotent + URL-aware: if we already have an ingester for
+        // this camera with the same URL, do nothing. If the URL
+        // changed (e.g. operator re-pointed the camera), tear down
+        // the old one before building the new — running two RTSP
+        // sessions against one camera tends to make the camera-side
+        // session counter pop.
+        {
+            let read = self.ingesters.read();
+            if let Some(existing) = read.get(&camera_id) {
+                if existing.url() == url {
+                    debug!(
+                        camera_id,
+                        "add_camera_ingester: ingester already running for this URL — skipping"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        let new_ing = PreRollIngester::new(camera_id, url.to_string(), pre_roll_secs)
+            .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
+        // Insert under the exclusive lock; dropping the previous
+        // `Arc<PreRollIngester>` here triggers its supervisor
+        // shutdown via Drop, which cleans up the GStreamer pipeline
+        // and reconnect task synchronously.
+        let prev = self.ingesters.write().insert(camera_id, new_ing);
+        if prev.is_some() {
+            info!(camera_id, %url, "pre-roll ingester replaced (URL changed)");
+        } else {
+            info!(camera_id, %url, pre_roll_secs, "pre-roll ingester started (hot-add)");
+        }
+        Ok(())
+    }
+
+    fn remove_camera_ingester(&self, camera_id: CameraId) {
+        if self.ingesters.write().remove(&camera_id).is_some() {
+            info!(camera_id, "pre-roll ingester removed (hot-remove)");
+        }
+    }
 }
 
 /// Compute the lower-case hex sha256 of `path`. Reads the file in
@@ -839,13 +895,14 @@ mod tests {
             .upsert_camera(&CameraConfig {
                 id: 1,
                 name: "front".into(),
-                url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
-                enabled: true,
-                prompts: vec![],
-                model_override: None,
+                ingest: nexus_config::CameraIngest {
+                    url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    enabled: true,
+                    max_fps: 0,
+                },
+                detector: nexus_config::CameraDetector::default(),
+                behavior: nexus_config::CameraBehavior::default(),
                 zones: vec![],
-                max_fps: 0,
-                parking_lot_mode: false,
             })
             .await
             .unwrap();

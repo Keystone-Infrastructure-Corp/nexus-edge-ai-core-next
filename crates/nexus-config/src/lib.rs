@@ -1317,8 +1317,8 @@ mod tests {
             if path.extension().and_then(|s| s.to_str()) != Some("toml") {
                 continue;
             }
-            let cfg = Config::load(&path)
-                .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+            let cfg =
+                Config::load(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
             // Validate via the same path the engine uses on boot.
             cfg.validate()
                 .unwrap_or_else(|e| panic!("validate {}: {e}", path.display()));

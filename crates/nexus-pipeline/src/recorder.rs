@@ -137,6 +137,32 @@ pub trait ClipRecorder: Send + Sync {
     /// Identifier for OPS dashboards / health endpoints (`stub`,
     /// `gstreamer`, etc.).
     fn kind(&self) -> &'static str;
+
+    /// Hot-add a per-camera ingester. Called by the engine's
+    /// `config.changed` reconciler when a camera is added or its
+    /// ingest URL changes, so the GStreamer recorder can start a
+    /// fresh always-on `PreRollIngester` without a process restart.
+    ///
+    /// Default impl is a no-op so the stub recorder (and any future
+    /// non-pre-roll backend) doesn't have to opt in. The GStreamer
+    /// recorder overrides it; failure to build the ingester is
+    /// logged + swallowed (the camera will refuse clips, but the
+    /// rest of the engine keeps running).
+    #[allow(unused_variables)]
+    fn add_camera_ingester(
+        &self,
+        camera_id: CameraId,
+        url: &str,
+        pre_roll_secs: u32,
+    ) -> Result<(), RecorderError> {
+        Ok(())
+    }
+
+    /// Hot-remove a per-camera ingester. Mirror of
+    /// [`Self::add_camera_ingester`]. Called when a camera is
+    /// deleted or disabled. Default impl is a no-op.
+    #[allow(unused_variables)]
+    fn remove_camera_ingester(&self, camera_id: CameraId) {}
 }
 
 // ---------------------------------------------------------------------------

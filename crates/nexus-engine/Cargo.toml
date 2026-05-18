@@ -111,8 +111,11 @@ md-5 = { workspace = true }
 
 # statvfs for the watermark sampler. Unix-only — non-unix builds
 # fall back to a never-panic probe (see storage_safety.rs).
+# `resource` enables getrlimit/setrlimit so we can raise the
+# per-process file-descriptor cap at startup before the LAN
+# discovery sweep opens ~3× concurrency sockets in parallel.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", default-features = false, features = ["fs"] }
+nix = { version = "0.29", default-features = false, features = ["fs", "resource"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

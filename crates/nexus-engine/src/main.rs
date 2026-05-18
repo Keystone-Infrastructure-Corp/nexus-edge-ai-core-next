@@ -18,7 +18,10 @@ mod auth_bootstrap;
 mod cold_read_cache;
 mod cold_replicator;
 mod discovery;
+#[cfg(unix)]
+mod fd_limit;
 mod oauth_sessions;
+mod reconciler;
 mod retention;
 mod storage_safety;
 mod usb_watch;
@@ -130,6 +133,19 @@ fn main() -> Result<()> {
         cfg.inference.model.kind = "mock".into();
     }
 
+    // Raise the per-process file-descriptor cap BEFORE tokio spins
+    // up any I/O. The LAN discovery sweep can open 100s of sockets
+    // in parallel; the macOS default `ulimit -n` of 256 caused
+    // GLib's GWakeup helper (used internally by gstreamer pipelines)
+    // to call `g_error("Creating pipes for GWakeup: …")` and abort
+    // the entire process with SIGTRAP partway through a scan. The
+    // bump is best-effort — on failure we keep the original limit
+    // and let `discovery::scan` clamp its concurrency accordingly.
+    #[cfg(unix)]
+    {
+        let _ = fd_limit::raise_fd_soft_limit();
+    }
+
     // Apply M-Install Checkpoint 2 auth posture rules:
     // - WARN about grandfathered missing-[auth]-section configs
     // - auto-provision dev_token at <state_dir>/dev-token when needed
@@ -182,8 +198,9 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // camera (default + each unique override). Keeping disabled cameras
     // in the build set means re-enabling at runtime doesn't require a
     // process restart.
-    let router =
-        InferenceRouter::build(&cfg.inference, &cameras).context("building inference router")?;
+    let router = Arc::new(
+        InferenceRouter::build(&cfg.inference, &cameras).context("building inference router")?,
+    );
     let pool = router.default_pool();
     log_inference_summary(&cfg.inference, pool.is_some(), &router);
 
@@ -247,12 +264,21 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         "clip recorder constructed"
     );
 
-    let mut handles = Vec::new();
+    // Shared map of running supervisors keyed by camera id. Populated
+    // here for cameras that exist at boot and mutated by the
+    // `reconciler` task in response to `topic::CONFIG_CHANGED` events.
+    // The shutdown sweep at the bottom of `main()` iterates this map
+    // to abort every supervisor — no separate `Vec<CameraHandle>`
+    // because the reconciler may add/remove entries at any time.
+    let running: reconciler::HandleMap =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     for cam in cameras {
         if !cam.ingest.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
             continue;
         }
+        let cam_id = cam.id;
+        let cam_url = cam.ingest.url.to_string();
         let detector = router.detector_for_camera(&cam);
         let h = spawn_camera(
             cam,
@@ -268,7 +294,13 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             bus.clone(),
             cache.clone(),
         );
-        handles.push(h);
+        running.lock().insert(
+            cam_id,
+            reconciler::RunningCameraEntry {
+                task: Arc::new(h.task),
+                url: cam_url,
+            },
+        );
     }
 
     // Storage safety floor (M2.1 Stage A PR 4). Watermark sampler
@@ -380,6 +412,28 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         })
     };
 
+    // Camera hot-reload reconciler — subscribes to
+    // `topic::CONFIG_CHANGED` and converges the live camera set
+    // (DB) with the in-process supervisor / ingester set. Without
+    // this, cameras added via the discovery UI (or `PUT /api/cameras/{id}`)
+    // persist to disk but never get a pipeline until the next
+    // engine restart.
+    let reconciler_handle = reconciler::spawn(reconciler::ReconcilerArgs {
+        router: router.clone(),
+        tracker: tracker.clone(),
+        annotator: cfg.tracker.annotator.clone(),
+        static_object: cfg.tracker.static_object.clone(),
+        clips: cfg.runtime.clips.clone(),
+        state_dir: cfg.runtime.state_dir.clone(),
+        evaluator: evaluator.clone(),
+        store: store.clone(),
+        recorder: recorder.clone(),
+        bus: bus.clone(),
+        cache: cache.clone(),
+        pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
+        handles: running.clone(),
+    });
+
     let cache_jobs = cold_read_cache::CacheJobs::new(
         store.clone(),
         registry.clone(),
@@ -459,8 +513,12 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retention_handle).await;
     let _ = usb_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), usb_watch_handle).await;
-    for h in handles {
-        h.task.abort();
+    reconciler_handle.abort();
+    // Abort every per-camera supervisor. `drain()` empties the map
+    // under one lock acquisition; the reconciler is already aborted
+    // above so nothing will re-populate it.
+    for (_, entry) in running.lock().drain() {
+        entry.task.abort();
     }
     Ok(())
 }
@@ -536,10 +594,14 @@ fn build_gst_recorder(
     let mut ingesters: std::collections::HashMap<i64, Arc<nexus_pipeline::PreRollIngester>> =
         std::collections::HashMap::new();
     for cam in cameras {
-        if !cam.enabled {
+        if !cam.ingest.enabled {
             continue;
         }
-        match nexus_pipeline::PreRollIngester::new(cam.id, cam.url.to_string(), pre_roll_secs) {
+        match nexus_pipeline::PreRollIngester::new(
+            cam.id,
+            cam.ingest.url.to_string(),
+            pre_roll_secs,
+        ) {
             Ok(ing) => {
                 tracing::info!(
                     camera_id = cam.id,
