@@ -124,7 +124,7 @@ export interface RuleConfig {
   name: string;
   camera_filter?: CameraId[] | null;
   when: string;
-  severity: string;
+  severity: Severity;
   min_track_age_ms?: number;
   consecutive_frames?: number;
   cooldown_ms?: number;

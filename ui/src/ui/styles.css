@@ -1431,3 +1431,32 @@ button.chip {
   margin: 8px 0 0;
   line-height: 1.5;
 }
+
+
+/* ----- M-Admin Phase 3 — rules admin table polish ----- */
+
+/* Severity pill — same shape as the state-pill, different palette. */
+.severity-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: lowercase;
+}
+.severity-pill.sev-low      { background: rgba(56, 225, 255, 0.14); color: var(--accent); }
+.severity-pill.sev-medium   { background: rgba(255, 209, 102, 0.18); color: var(--warn); }
+.severity-pill.sev-high     { background: rgba(255, 159, 28,  0.22); color: var(--warn); }
+.severity-pill.sev-critical { background: rgba(239, 71, 111,  0.22); color: var(--crit); }
+
+/* Keep the CEL column from blowing up the row height — clip with
+   ellipsis but show the full expression on hover. */
+.rule-when-cell {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-when-cell code {
+  font-size: 12px;
+}
