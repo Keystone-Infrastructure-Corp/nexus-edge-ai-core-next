@@ -100,9 +100,40 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
 
   const formHost = h("div", { class: "rule-form" });
 
+  // M-Admin Phase 5 — debounce + race-guard for the on-blur CEL
+  // validation. Each blur bumps `validateSeq`; only the latest
+  // response is allowed to mutate `errors.when` so a slow request
+  // can't clobber a fresher result.
+  let validateSeq = 0;
+  async function validateWhen(value: string): Promise<void> {
+    const seq = ++validateSeq;
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      // Empty-string is caught by the synchronous required check on save.
+      // Don't fire a network call for it; just clear any stale error.
+      if (errors.when !== undefined) {
+        errors.when = undefined;
+        rerender();
+      }
+      return;
+    }
+    try {
+      const res = await api.rules.validate(trimmed);
+      if (seq !== validateSeq) return; // stale response
+      const next = res.ok ? undefined : (res.error ?? "Invalid CEL expression.");
+      if (errors.when !== next) {
+        errors.when = next;
+        rerender();
+      }
+    } catch {
+      // Network failure — don't spam the user; Save will surface the
+      // real upstream error if the engine is reachable then.
+    }
+  }
+
   function rerender(): void {
     while (formHost.firstChild) formHost.removeChild(formHost.firstChild);
-    formHost.append(buildForm(state, errors, opts));
+    formHost.append(buildForm(state, errors, opts, validateWhen));
   }
 
   async function onSave(): Promise<void> {
@@ -180,6 +211,7 @@ function buildForm(
   state: FormState,
   errors: Record<string, string | undefined>,
   opts: OpenRuleFormOpts,
+  validateWhen: (value: string) => void,
 ): HTMLElement {
   const idField =
     opts.mode === "edit"
@@ -262,6 +294,10 @@ function buildForm(
         ...(errors["when"] !== undefined ? { error: errors["when"] } : {}),
         onChange: (v) => {
           state.when = v;
+        },
+        onBlur: (v) => {
+          state.when = v;
+          void validateWhen(v);
         },
       }),
     ),

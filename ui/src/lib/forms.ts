@@ -76,7 +76,15 @@ export function NumberField(
   return wrap(opts.label, input, opts);
 }
 
-export function TextArea(opts: FieldOpts<string> & { rows?: number }): HTMLElement {
+export function TextArea(
+  opts: FieldOpts<string> & {
+    rows?: number;
+    /// M-Admin Phase 5 — optional blur callback so callers can run
+    /// expensive validation (e.g. server-side CEL compile) without
+    /// firing on every keystroke. Receives the current value.
+    onBlur?: (value: string) => void;
+  },
+): HTMLElement {
   const ta = h("textarea", {
     rows: opts.rows ?? 4,
     placeholder: opts.placeholder ?? "",
@@ -86,6 +94,13 @@ export function TextArea(opts: FieldOpts<string> & { rows?: number }): HTMLEleme
       input: (ev) => {
         opts.onChange((ev.currentTarget as HTMLTextAreaElement).value);
       },
+      ...(opts.onBlur
+        ? {
+            blur: (ev: FocusEvent) => {
+              opts.onBlur!((ev.currentTarget as HTMLTextAreaElement).value);
+            },
+          }
+        : {}),
     },
   });
   return wrap(opts.label, ta, opts);

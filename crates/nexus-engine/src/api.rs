@@ -11,6 +11,7 @@
 //! * `GET  /api/rules`
 //! * `PUT  /api/rules/:id`
 //! * `DELETE /api/rules/:id`
+//! * `POST /api/rules/validate`                  — compile-only CEL check
 //! * `GET  /api/events?limit=N`
 //! * `GET  /api/stream/metadata`                  — SSE
 //! * `GET  /api/stream/events`                    — SSE
@@ -35,6 +36,7 @@ use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{CameraConfig, RuleConfig};
 use nexus_inference::{BackendStatus, DetectorPool};
 use nexus_pipeline::LatestFrameCache;
+use nexus_rules::{CelEngine, RuleEngine, RulesError};
 use nexus_store::Store;
 use nexus_types::{AlertEvent, CameraId, FrameMetadata, PixelFormat, RuleId};
 use tower_http::compression::CompressionLayer;
@@ -182,6 +184,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/rules", get(list_rules))
         .route("/rules/{id}", put(upsert_rule))
         .route("/rules/{id}", delete(delete_rule))
+        .route("/rules/validate", axum::routing::post(validate_rule))
         .route("/events", get(list_events))
         .route("/stream/metadata", get(stream_metadata))
         .route("/stream/events", get(stream_events))
@@ -301,6 +304,21 @@ async fn upsert_rule(
     Json(mut rule): Json<RuleConfig>,
 ) -> Result<Json<RuleConfig>, ApiError> {
     rule.id = id.clone();
+    // M-Admin Phase 5 — compile the CEL before we touch the store.
+    // Pre-Phase-5 a bad `when` field was silently accepted and only
+    // crashed the engine on next restart (compile happens at load).
+    // Returning 400 here lets the admin UI surface the precise
+    // parser error instead of a generic 500/timeout. The upstream
+    // `cel-interpreter` parser panics on some malformed inputs
+    // (e.g. trailing operators), so the call is wrapped in
+    // `catch_unwind` to convert that into a clean 400 instead of
+    // tearing down the worker.
+    if let Err(msg) = compile_cel_safely(&rule) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid CEL in `when`: {msg}"),
+        ));
+    }
     s.store.upsert_rule(&rule).await?;
     s.store
         .write_audit(
@@ -327,6 +345,70 @@ async fn delete_rule(
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// M-Admin Phase 5 — compile-only CEL validation endpoint.
+///
+/// Lets the admin UI surface "is this `when` expression syntactically
+/// valid + references only known fields" on textarea blur, without
+/// having to PUT the whole rule (which would also persist + audit).
+///
+/// Always returns 200 with a `{ok, error?}` body so the UI can render
+/// the error inline; a 4xx would force the caller to special-case
+/// "valid response" vs "invalid input" vs "transport failure".
+#[derive(serde::Deserialize)]
+struct ValidateRuleReq {
+    when: String,
+}
+
+#[derive(serde::Serialize)]
+struct ValidateRuleResp {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn validate_rule(Json(req): Json<ValidateRuleReq>) -> Json<ValidateRuleResp> {
+    // Build a stub RuleConfig — only `when` is read by the compiler;
+    // every other field is filled with a harmless default so we can
+    // reuse the exact `CelEngine::compile()` path the loader uses.
+    let stub = RuleConfig {
+        id: "__validate__".into(),
+        name: "validate".into(),
+        camera_filter: None,
+        when: req.when,
+        severity: "low".into(),
+        min_track_age_ms: 0,
+        consecutive_frames: 1,
+        cooldown_ms: 0,
+        enabled: true,
+    };
+    match compile_cel_safely(&stub) {
+        Ok(()) => Json(ValidateRuleResp {
+            ok: true,
+            error: None,
+        }),
+        Err(msg) => Json(ValidateRuleResp {
+            ok: false,
+            error: Some(msg),
+        }),
+    }
+}
+
+/// Wrap [`CelEngine::compile`] in `catch_unwind` so a user-supplied
+/// CEL string can't take down a worker thread. The upstream
+/// `cel-interpreter` parser (built on `antlr4rust`) panics on some
+/// malformed-but-balanced inputs (e.g. trailing operators); we want
+/// those to land as a clean validation error, not a 500/hung
+/// connection. Returns the parser's error message on `Err`.
+fn compile_cel_safely(rule: &RuleConfig) -> Result<(), String> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    match catch_unwind(AssertUnwindSafe(|| CelEngine::new().compile(rule))) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(RulesError::Compile(_, m))) => Err(m),
+        Ok(Err(other)) => Err(other.to_string()),
+        Err(_) => Err("CEL parser panicked on this input (malformed expression).".into()),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2395,6 +2477,62 @@ mod tests {
     #[test]
     fn parse_rejects_inverted_range() {
         assert!(parse_byte_range("bytes=500-100", 1000).is_none());
+    }
+
+    // M-Admin Phase 5 — POST /api/rules/validate.
+    //
+    // The handler is intentionally `async fn` over `Json<T>`, so we
+    // can drive it directly here without standing up a Router or a
+    // Store. Both branches must round-trip 200 OK; the `ok` flag
+    // (not the HTTP status) tells the UI whether the CEL parsed.
+
+    #[tokio::test]
+    async fn validate_rule_accepts_well_formed_cel() {
+        let req = axum::Json(super::ValidateRuleReq {
+            when: "object.label == 'person'".into(),
+        });
+        let resp = super::validate_rule(req).await;
+        assert!(
+            resp.0.ok,
+            "well-formed CEL must validate; got {:?}",
+            resp.0.error
+        );
+        assert!(resp.0.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn validate_rule_rejects_unclosed_paren_with_inline_error() {
+        // Reliably hits the cel-interpreter `Err` path (vs the
+        // panic path covered separately below).
+        let req = axum::Json(super::ValidateRuleReq {
+            when: "(object.label".into(),
+        });
+        let resp = super::validate_rule(req).await;
+        assert!(!resp.0.ok, "unclosed paren must not validate");
+        let err = resp.0.error.expect("error message present on !ok");
+        assert!(!err.is_empty(), "compile error message must not be empty");
+    }
+
+    /// cel-interpreter's antlr4rust grammar panics on some
+    /// malformed-but-balanced inputs (e.g. trailing operators,
+    /// stray `@@@`). The validate endpoint must convert those to a
+    /// clean `ok: false` so a single bad POST can't kill a worker.
+    #[tokio::test]
+    async fn validate_rule_catches_parser_panics() {
+        for input in &["@@@", "object.label ===", "&&&"] {
+            let req = axum::Json(super::ValidateRuleReq {
+                when: (*input).to_string(),
+            });
+            let resp = super::validate_rule(req).await;
+            assert!(
+                !resp.0.ok,
+                "panic-inducing input {input:?} must surface as ok=false",
+            );
+            assert!(
+                resp.0.error.is_some(),
+                "panic-inducing input {input:?} must carry an error message",
+            );
+        }
     }
 
     #[test]

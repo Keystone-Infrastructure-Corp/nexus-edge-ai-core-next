@@ -131,6 +131,13 @@ export interface RuleConfig {
   enabled?: boolean;
 }
 
+/// M-Admin Phase 5 — `POST /api/rules/validate` response shape.
+/// Always 200 OK; `ok=false` carries the CEL parser message.
+export interface RuleValidateResponse {
+  ok: boolean;
+  error?: string;
+}
+
 // /api/backends shape.
 export type BackendStateString =
   | "initializing"

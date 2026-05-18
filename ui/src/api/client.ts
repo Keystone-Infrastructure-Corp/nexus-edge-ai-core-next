@@ -21,6 +21,7 @@ import type {
   PutColdReq,
   RuleConfig,
   RuleId,
+  RuleValidateResponse,
   ScanReq,
   SessionCreatedResp,
   StorageBackendOut,
@@ -79,6 +80,15 @@ export const api = {
       }),
     remove: (id: RuleId) =>
       request<void>(`/rules/${id}`, { method: "DELETE" }),
+    /// M-Admin Phase 5 — compile-only CEL validation. Always
+    /// resolves with `{ok, error?}`; the engine returns 200 even
+    /// for invalid expressions so the form can render the parser
+    /// message inline. Network failures still reject the promise.
+    validate: (when: string) =>
+      request<RuleValidateResponse>("/rules/validate", {
+        method: "POST",
+        body: JSON.stringify({ when }),
+      }),
   },
 
   events: {
