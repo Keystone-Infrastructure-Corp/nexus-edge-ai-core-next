@@ -1,19 +1,37 @@
 # ---------------------------------------------------------------------------
 # Release pipeline — M-Install Checkpoint 3a (image scope).
 #
-# Triggered on `v*` tag push. Builds the kitchen-sink all-EPs Docker image
-# (same FEATURES set as the .github/workflows/ci.yml `docker-all-eps` job)
-# and pushes it to GHCR as:
+# Triggered on `release: published`. Builds the kitchen-sink all-EPs Docker
+# image (same FEATURES set as the .github/workflows/ci.yml `docker-all-eps`
+# job) and pushes it to GHCR as:
 #
-#   ghcr.io/<owner>/nexus-engine:vX.Y.Z   (the literal git tag)
+#   ghcr.io/<owner>/nexus-engine:vX.Y.Z   (the literal release tag)
 #   ghcr.io/<owner>/nexus-engine:<sha>    (the commit sha, immutable)
 #   ghcr.io/<owner>/nexus-engine:latest   (always rolls forward — pin to a
 #                                          specific vX.Y.Z in prod)
 #
+# Why `release: published` and not `push: tags`:
+#   The image bakes in the default model pack (yolo26n_dynamic.onnx,
+#   yolo_world_v2_s.onnx, models-manifest.json) which is gitignored. We
+#   ship those files as **GitHub Release assets** attached to the same
+#   tag, and the "stage model pack" step below `gh release download`s
+#   them into `models/` before `docker build`. Using `release: published`
+#   guarantees the assets are present when the workflow runs — a plain
+#   `push: tags` would race the asset upload (`gh release create` pushes
+#   the tag *before* uploading assets, so a workflow keyed on tag-push
+#   starts against an asset-less release and the download step fails).
+#
+# To cut a release:
+#   gh release create vX.Y.Z --target main \
+#     --title "vX.Y.Z" --generate-notes \
+#     models/yolo26n_dynamic.onnx \
+#     models/yolo_world_v2_s.onnx \
+#     models/models-manifest.json
+#
 # Why this is its own workflow and not a job under ci.yml: the push needs
 # `packages: write` (which ci.yml deliberately doesn't grant on PRs) and a
-# different trigger (`tags`, not `push`/`pull_request`). Keeping them split
-# means a broken release workflow can never block PR iteration.
+# different trigger. Keeping them split means a broken release workflow
+# can never block PR iteration.
 #
 # Scope deliberately left at "image only" for now. Binary artifacts
 # (nexus-engine / nexus-probe / nexus-doctor standalone) and the signed
@@ -25,13 +43,12 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (e.g. v0.1.0). Must already exist."
+        description: "Tag to (re-)publish (e.g. v0.1.0). The GitHub Release with this tag must already exist *with* the three model assets attached."
         required: true
         type: string
 
@@ -43,11 +60,49 @@ jobs:
   image:
     name: build + push GHCR image
     runs-on: ubuntu-22.04
+    env:
+      # On release: published, github.event.release.tag_name is set.
+      # On workflow_dispatch, the operator supplies inputs.tag explicitly.
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           # On workflow_dispatch, allow re-publishing a previous tag.
+          # On release events, github.ref is already refs/tags/<tag>.
           ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # ----------------------------------------------------------------
+      # Stage the default model pack from the release's own assets.
+      # The three files are gitignored (see .gitignore: /models/*), so
+      # they have to be materialised into the build context BEFORE the
+      # `COPY models/ /usr/share/nexus/models/` line in deploy/Dockerfile
+      # runs. Without this step the image would build (Dockerfile copies
+      # whatever is in `models/`, which is just `.gitkeep` post-checkout)
+      # but ship with no inference weights — defeating the "fresh docker
+      # compose up works" promise documented inline in deploy/Dockerfile.
+      # ----------------------------------------------------------------
+      - name: stage model pack from release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'yolo26n_dynamic.onnx' \
+            --pattern 'yolo_world_v2_s.onnx' \
+            --pattern 'models-manifest.json' \
+            --dir models/
+          echo "Staged model pack:"
+          ls -la models/
+          # Fail loudly (rather than silently shipping a no-weights image)
+          # if any of the three required files is missing.
+          for f in yolo26n_dynamic.onnx yolo_world_v2_s.onnx models-manifest.json; do
+            if [ ! -s "models/$f" ]; then
+              echo "::error::Required model asset 'models/$f' missing from release $TAG. Re-upload via 'gh release upload $TAG models/$f'."
+              exit 1
+            fi
+          done
 
       - name: set up docker buildx
         uses: docker/setup-buildx-action@v3
@@ -64,8 +119,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/nexus-engine
+          # Use the resolved $TAG env (works for both `release: published`
+          # and `workflow_dispatch`) rather than `type=ref,event=tag` —
+          # the latter resolves to empty on workflow_dispatch where
+          # github.ref is `refs/heads/main`.
           tags: |
-            type=ref,event=tag
+            type=raw,value=${{ env.TAG }}
             type=sha,format=long,prefix=
             type=raw,value=latest
 
