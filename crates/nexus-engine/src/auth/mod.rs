@@ -43,6 +43,7 @@
 //! a god-module.
 
 pub mod admin_audit;
+pub mod audit_admin;
 pub mod bootstrap;
 pub mod lockout;
 pub mod login;

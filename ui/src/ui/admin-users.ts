@@ -26,6 +26,7 @@ import { api } from "../api/client.js";
 import { clear, h } from "../lib/el.js";
 import { getSession } from "../lib/auth.js";
 import { toast } from "../lib/toast.js";
+import { renderAuditHistory } from "./audit-history.js";
 import type {
   CreateUserResponse,
   Role,
@@ -353,6 +354,19 @@ function renderRow(u: UserView, reload: () => Promise<void>): HTMLElement {
     actions.append(deleteBtn);
   }
 
+  // M6 Phase 4 Step 4.2 — always-visible "History" button (even
+  // for soft-deleted users, since their audit trail is preserved).
+  // Opens a modal with the per-user audit feed.
+  const historyBtn = h(
+    "button",
+    {
+      class: "ghost",
+      on: { click: () => openHistoryModal(u) },
+    },
+    "History",
+  );
+  actions.append(historyBtn);
+
   // Tombstoned username (`<id>:deleted-<iso>`) is hard to read;
   // strip the prefix for display when the row is deleted.
   const displayName =
@@ -582,4 +596,46 @@ function openOtpModal(username: string, otp: string): void {
     otpField.focus();
     otpField.select();
   }, 0);
+}
+
+// M6 Phase 4 Step 4.2 — per-user audit history modal. Opens
+// `renderAuditHistory` inside a dialog backdrop so the operator
+// can scan the user's recent activity without leaving the /admin/users
+// page. The panel is pre-expanded since the whole point of opening
+// this modal is to view the history.
+function openHistoryModal(u: UserView): void {
+  const backdrop = h("div", { class: "dialog-backdrop" });
+  const dialog = h("div", { class: "dialog dialog-wide" });
+
+  const title = h("h3", null, `Audit history — ${u.username}`);
+  const panel = renderAuditHistory({
+    resourceKind: "user",
+    resourceId: String(u.id),
+    open: true,
+    limit: 100,
+  });
+  const close = h(
+    "button",
+    {
+      type: "button",
+      class: "primary",
+      on: { click: () => document.body.removeChild(backdrop) },
+    },
+    "Close",
+  );
+
+  dialog.append(title, panel, h("div", { class: "dialog-footer" }, close));
+  backdrop.append(dialog);
+  document.body.append(backdrop);
+
+  // ESC closes the modal.
+  const onKey = (ev: KeyboardEvent): void => {
+    if (ev.key === "Escape") {
+      document.removeEventListener("keydown", onKey);
+      if (backdrop.parentNode === document.body) {
+        document.body.removeChild(backdrop);
+      }
+    }
+  };
+  document.addEventListener("keydown", onKey);
 }

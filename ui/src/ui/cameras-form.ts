@@ -25,6 +25,7 @@ import {
   FieldRow,
 } from "../lib/forms.js";
 import { toast } from "../lib/toast.js";
+import { renderAuditHistory } from "./audit-history.js";
 import type {
   CameraConfig,
   CameraId,
@@ -179,9 +180,22 @@ export function openCameraForm(opts: OpenCameraFormOpts): Promise<boolean> {
     onConfirm: () => void onSave(),
   });
 
+  // M6 Phase 4 Step 4.2 — surface the audit trail for an existing
+  // camera below the form. Closed by default; lazy-loads on
+  // expand. No-op for create mode (the row doesn't exist yet).
+  const bodyHost = h("div", null, formHost);
+  if (opts.mode === "edit" && opts.existing) {
+    bodyHost.append(
+      renderAuditHistory({
+        resourceKind: "camera",
+        resourceId: String(opts.existing.id),
+      }),
+    );
+  }
+
   dlg = openDialog({
     title: opts.mode === "create" ? "Add camera" : `Edit camera ${state.id}`,
-    body: formHost,
+    body: bodyHost,
     footer,
     width: "640px",
   });

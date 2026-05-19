@@ -264,6 +264,23 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/users/{id}/unlock",
             axum::routing::post(crate::auth::users_admin::unlock_user),
         )
+        // M6 Phase 4 Step 4.2 + 4.3 — read access to the audit
+        // log. Per-resource history powers the "History" panel in
+        // the camera / rule / sink / user detail views; the
+        // global filtered feed powers the `/admin/audit` table.
+        // Both behind the admin gate AND the per-handler
+        // `AdminContext` extractor (Phase 2 pattern: gate
+        // authenticates, extractor authorises). No new migration
+        // — the `audit_log` table + `idx_audit_resource` index
+        // are present since Phase 1.
+        .route(
+            "/v1/admin/audit",
+            get(crate::auth::audit_admin::get_global_audit),
+        )
+        .route(
+            "/v1/admin/audit/resource/{kind}/{id}",
+            get(crate::auth::audit_admin::get_resource_audit),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.admin_auth.clone(),
             admin_auth::admin_auth_layer,
@@ -2567,7 +2584,7 @@ async fn put_storage_cold(
             peer.ip(),
             "storage.cold.put",
             "admin/storage/cold",
-            None,
+            Some("singleton"),
             nexus_store::audit::AuditOutcome::Failure,
             before_str.as_deref(),
             None,
@@ -2582,7 +2599,7 @@ async fn put_storage_cold(
         peer.ip(),
         "storage.cold.put",
         "admin/storage/cold",
-        None,
+        Some("singleton"),
         nexus_store::audit::AuditOutcome::Success,
         before_str.as_deref(),
         after_str.as_deref(),
@@ -2996,7 +3013,7 @@ async fn put_usb_preferred(
                     peer.ip(),
                     "runtime.usb_preferred.put",
                     "admin/runtime/usb_preferred",
-                    None,
+                    Some("singleton"),
                     nexus_store::audit::AuditOutcome::Failure,
                     None,
                     None,
@@ -3036,7 +3053,7 @@ async fn put_usb_preferred(
             peer.ip(),
             "runtime.usb_preferred.put",
             "admin/runtime/usb_preferred",
-            None,
+            Some("singleton"),
             nexus_store::audit::AuditOutcome::Failure,
             before_str.as_deref(),
             None,
@@ -3052,7 +3069,7 @@ async fn put_usb_preferred(
         peer.ip(),
         "runtime.usb_preferred.put",
         "admin/runtime/usb_preferred",
-        None,
+        Some("singleton"),
         nexus_store::audit::AuditOutcome::Success,
         before_str.as_deref(),
         after_str.as_deref(),
@@ -3124,7 +3141,7 @@ async fn put_admin_delivery(
             peer.ip(),
             "delivery.settings.put",
             "admin/delivery",
-            None,
+            Some("singleton"),
             nexus_store::audit::AuditOutcome::Failure,
             None,
             None,
@@ -3157,7 +3174,7 @@ async fn put_admin_delivery(
             peer.ip(),
             "delivery.settings.put",
             "admin/delivery",
-            None,
+            Some("singleton"),
             nexus_store::audit::AuditOutcome::Failure,
             before_str.as_deref(),
             None,
@@ -3172,7 +3189,7 @@ async fn put_admin_delivery(
         peer.ip(),
         "delivery.settings.put",
         "admin/delivery",
-        None,
+        Some("singleton"),
         nexus_store::audit::AuditOutcome::Success,
         before_str.as_deref(),
         after_str.as_deref(),
@@ -5315,5 +5332,161 @@ mod tests {
         assert_eq!(v["mode"], "dev_token");
         assert_eq!(v["allows_local"], false);
         assert_eq!(v["allows_oidc"], false);
+    }
+
+    // ---------------------------------------------------------------
+    // M6 Phase 4 Step 4.2 + 4.3 — audit read endpoints.
+    // ---------------------------------------------------------------
+
+    /// `GET /api/v1/admin/audit/resource/{kind}/{id}` is gated by
+    /// the admin bearer and returns rows for the requested
+    /// (resource_kind, resource_id) pair newest-first.
+    #[tokio::test]
+    async fn audit_resource_endpoint_returns_rows_for_admin() {
+        use axum::body::to_bytes;
+        use nexus_store::audit::{AuditActorKind, AuditOutcome, NewAuditEntry};
+
+        const SECRET: &[u8] = b"m6-audit-read-resource-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+
+        // Seed two audit rows against `camera/42` directly via
+        // the store (we don't need the full mutation pipeline —
+        // we're testing the read path).
+        let mut tx = store.pool().begin().await.unwrap();
+        for action in ["camera.upsert", "camera.delete"] {
+            store
+                .record_audit_event(
+                    &mut tx,
+                    &NewAuditEntry {
+                        actor_kind: Some(AuditActorKind::LocalUser),
+                        actor_id: Some("7"),
+                        actor_label: "user:7",
+                        action,
+                        resource_kind: Some("camera"),
+                        resource_id: Some("42"),
+                        before_json: None,
+                        after_json: Some("{\"name\":\"cam\"}"),
+                        outcome: AuditOutcome::Success,
+                        ip: None,
+                        user_agent: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/audit/resource/camera/42?limit=10")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = rows.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        // Newest-first: camera.delete then camera.upsert.
+        assert_eq!(arr[0]["action"], "camera.delete");
+        assert_eq!(arr[1]["action"], "camera.upsert");
+        assert_eq!(arr[0]["actor_kind"], "local_user");
+        assert_eq!(arr[0]["outcome"], "success");
+    }
+
+    /// `GET /api/v1/admin/audit/resource/...` without a bearer is
+    /// 401 even from loopback (a secret is configured).
+    #[tokio::test]
+    async fn audit_resource_endpoint_requires_bearer() {
+        const SECRET: &[u8] = b"m6-audit-read-resource-no-bearer";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/audit/resource/camera/42")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `GET /api/v1/admin/audit` filters by outcome.
+    #[tokio::test]
+    async fn audit_global_endpoint_filters_by_outcome() {
+        use axum::body::to_bytes;
+        use nexus_store::audit::{AuditActorKind, AuditOutcome, NewAuditEntry};
+
+        const SECRET: &[u8] = b"m6-audit-read-global-outcome";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+
+        let mut tx = store.pool().begin().await.unwrap();
+        for outcome in [
+            AuditOutcome::Success,
+            AuditOutcome::Failure,
+            AuditOutcome::Failure,
+        ] {
+            store
+                .record_audit_event(
+                    &mut tx,
+                    &NewAuditEntry {
+                        actor_kind: Some(AuditActorKind::LocalUser),
+                        actor_id: Some("1"),
+                        actor_label: "user:1",
+                        action: "rule.upsert",
+                        resource_kind: Some("rule"),
+                        resource_id: Some("r1"),
+                        before_json: None,
+                        after_json: None,
+                        outcome,
+                        ip: None,
+                        user_agent: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/audit?outcome=failure&limit=10")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["limit"], 10);
+        assert_eq!(v["offset"], 0);
+        let rows = v["rows"].as_array().expect("rows array");
+        assert_eq!(rows.len(), 2);
+        for r in rows {
+            assert_eq!(r["outcome"], "failure");
+        }
+    }
+
+    /// `GET /api/v1/admin/audit?outcome=bogus` returns 400 so a
+    /// typo in the URL surfaces immediately rather than being
+    /// silently dropped.
+    #[tokio::test]
+    async fn audit_global_endpoint_rejects_unknown_outcome() {
+        const SECRET: &[u8] = b"m6-audit-read-bad-outcome";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/audit?outcome=bogus")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -885,3 +885,61 @@ export interface ResetPasswordResponse {
   one_time_password: string;
 }
 
+// ---------------------------------------------------------------------------
+// M6 Phase 4 — audit log.
+// ---------------------------------------------------------------------------
+
+/// `local_user`: human signed in via local-user roster.
+/// `oidc_user`: human signed in via OIDC.
+/// `dev_token`: legacy shared-secret bearer (DevToken mode).
+/// `system`: engine-internal actor (retention sweeper, etc.).
+export type AuditActorKind =
+  | "local_user"
+  | "oidc_user"
+  | "dev_token"
+  | "system";
+
+export type AuditOutcome = "success" | "failure" | "denied";
+
+/// One row of the `audit_log` table. Newest-first ordering.
+/// `before_json` / `after_json` are raw stringified JSON the
+/// caller can JSON.parse + diff for a "what changed" panel.
+export interface AuditRow {
+  id: number;
+  actor_kind: AuditActorKind;
+  actor_id: string | null;
+  actor_label: string;
+  action: string;
+  resource_kind: string | null;
+  resource_id: string | null;
+  before_json: string | null;
+  after_json: string | null;
+  outcome: AuditOutcome;
+  ip: string | null;
+  user_agent: string | null;
+  /// RFC 3339 UTC.
+  created_at: string;
+}
+
+/// `GET /admin/audit` paged result.
+export interface AuditPage {
+  rows: AuditRow[];
+  limit: number;
+  offset: number;
+}
+
+/// Filters for `GET /admin/audit`. Every field is optional.
+export interface AuditGlobalFilter {
+  actor_id?: string;
+  action?: string;
+  resource_kind?: string;
+  resource_id?: string;
+  outcome?: AuditOutcome;
+  /// RFC 3339 lower bound (inclusive).
+  since?: string;
+  /// RFC 3339 upper bound (inclusive).
+  until?: string;
+  limit?: number;
+  offset?: number;
+}
+

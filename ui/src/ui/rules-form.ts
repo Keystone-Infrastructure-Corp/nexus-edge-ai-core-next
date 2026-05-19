@@ -43,6 +43,7 @@ import {
   type ScheduleGrid,
 } from "../lib/schedule-editor.js";
 import { toast } from "../lib/toast.js";
+import { renderAuditHistory } from "./audit-history.js";
 import {
   compileBuilder,
   defaultRow,
@@ -319,9 +320,21 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
     onConfirm: () => void onSave(),
   });
 
+  // M6 Phase 4 Step 4.2 — audit trail panel for an existing rule.
+  // Closed by default; lazy-loads on expand.
+  const bodyHost = h("div", null, formHost);
+  if (opts.mode === "edit" && opts.existing) {
+    bodyHost.append(
+      renderAuditHistory({
+        resourceKind: "rule",
+        resourceId: String(opts.existing.id),
+      }),
+    );
+  }
+
   dlg = openDialog({
     title: opts.mode === "create" ? "Add rule" : `Edit rule ${state.id}`,
-    body: formHost,
+    body: bodyHost,
     footer,
     width: "640px",
   });

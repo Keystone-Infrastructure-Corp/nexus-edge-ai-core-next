@@ -5,6 +5,9 @@
 import { authHeader, reportRequestOutcome, tryRefresh, getSession } from "../lib/auth.js";
 import type {
   AlertEvent,
+  AuditGlobalFilter,
+  AuditPage,
+  AuditRow,
   BackendsResponse,
   CameraConfig,
   CameraId,
@@ -445,5 +448,39 @@ export const api = {
     /// refresh chain. Last-admin protection applies.
     remove: (id: number) =>
       request<void>(`/v1/admin/users/${id}`, { method: "DELETE" }),
+  },
+
+  // M6 Phase 4 Step 4.2 + 4.3 — audit-log read API. Admin-gated.
+  // Per-resource feed powers the "History" panel on each detail
+  // view; global filtered feed powers the `/admin/audit` table.
+  adminAudit: {
+    /// Last N rows for `(resource_kind, resource_id)`,
+    /// newest-first. `limit` defaults to 50 server-side, max 200.
+    forResource: (kind: string, id: string, limit = 50) => {
+      const qs = `?limit=${encodeURIComponent(String(limit))}`;
+      const enc = `${encodeURIComponent(kind)}/${encodeURIComponent(id)}`;
+      return request<AuditRow[]>(`/v1/admin/audit/resource/${enc}${qs}`);
+    },
+
+    /// Global filtered audit feed. Every filter field is
+    /// optional; `limit` defaults to 50 server-side (max 500),
+    /// `offset` defaults to 0.
+    list: (filter: AuditGlobalFilter = {}) => {
+      const qs = new URLSearchParams();
+      if (filter.actor_id) qs.set("actor_id", filter.actor_id);
+      if (filter.action) qs.set("action", filter.action);
+      if (filter.resource_kind) qs.set("resource_kind", filter.resource_kind);
+      if (filter.resource_id) qs.set("resource_id", filter.resource_id);
+      if (filter.outcome) qs.set("outcome", filter.outcome);
+      if (filter.since) qs.set("since", filter.since);
+      if (filter.until) qs.set("until", filter.until);
+      if (filter.limit !== undefined)
+        qs.set("limit", String(filter.limit));
+      if (filter.offset !== undefined)
+        qs.set("offset", String(filter.offset));
+      const query = qs.toString();
+      const path = query ? `/v1/admin/audit?${query}` : "/v1/admin/audit";
+      return request<AuditPage>(path);
+    },
   },
 };

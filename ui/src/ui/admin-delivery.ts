@@ -29,6 +29,7 @@ import {
   type ScheduleGrid,
 } from "../lib/schedule-editor.js";
 import { toast } from "../lib/toast.js";
+import { renderAuditHistory } from "./audit-history.js";
 import type {
   DeliverySettings,
   PutAdminDeliveryRequest,
@@ -244,6 +245,14 @@ async function renderPolicyCard(host: HTMLElement): Promise<void> {
     scheduleHost,
     h("div", { class: "field-row" }, saveBtn, resetBtn, dirtyBadge),
     updatedAtLine,
+    // M6 Phase 4 Step 4.2 — audit trail for changes to the global
+    // delivery policy. resource_kind = "admin/delivery" with id
+    // "singleton" matches what the PUT handler records.
+    renderAuditHistory({
+      resourceKind: "admin/delivery",
+      resourceId: "singleton",
+      title: "Change history",
+    }),
   );
 }
 
