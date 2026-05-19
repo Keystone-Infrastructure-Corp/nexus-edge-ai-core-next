@@ -99,6 +99,10 @@ tower = { workspace = true }
 # HS256 bearer verifier for admin writes (M2.2 Phase 2 step 12).
 jsonwebtoken = { workspace = true }
 
+# M6 Phase 2 Step 2.2 — argon2id password hashing for local user
+# accounts. Used by `auth::passwords::{hash_password, verify_password}`.
+argon2 = { workspace = true }
+
 # HTTP client for `nexus-doctor` (M-Install Checkpoint 1). Uses the
 # `blocking` API so the doctor binary can stay sync — no tokio runtime
 # required for an 8-step smoke test against `http://localhost:8089`.

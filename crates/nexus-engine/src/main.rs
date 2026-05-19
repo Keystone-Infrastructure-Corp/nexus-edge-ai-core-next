@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 mod admin_auth;
 mod api;
+mod auth;
 mod auth_bootstrap;
 mod cold_read_cache;
 mod cold_replicator;

@@ -145,6 +145,12 @@ zeroize = { version = "1", features = ["derive"] }
 # Version 9 is the current major; tracks aws-lc-rs underneath.
 jsonwebtoken = "9"
 
+# M6 Phase 2 Step 2.2 — argon2id password hashing for local user
+# accounts. v0.5 defaults already match the OWASP-2024 baseline
+# (m_cost=19 MiB, t_cost=2, p=1); we pin defaults and add a unit
+# test that fires if a future bump weakens them.
+argon2 = "0.5"
+
 # HTTP client for cloud cold backends (M2.2 Phase 2 step 10).
 # `rustls-tls` keeps us off openssl; `json` and `stream` are what
 # we actually use against Google Drive / Microsoft Graph.

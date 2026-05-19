@@ -241,19 +241,11 @@ fn default_state_dir() -> PathBuf {
 /// Operators override these in `nexus.toml` under
 /// `[runtime.auth.lockout]`. All defaults match the M6 design
 /// (5 fails in 15 minutes → 15-minute lockout).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeAuthConfig {
     #[serde(default)]
     pub lockout: LockoutConfig,
-}
-
-impl Default for RuntimeAuthConfig {
-    fn default() -> Self {
-        Self {
-            lockout: LockoutConfig::default(),
-        }
-    }
 }
 
 /// Failed-login lockout policy. The FSM lives in

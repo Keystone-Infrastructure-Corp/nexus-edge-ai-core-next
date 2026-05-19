@@ -369,6 +369,36 @@ impl Store {
         Ok(())
     }
 
+    /// Legacy 4-arg audit-write retained as a shim while we
+    /// migrate every M2/M5/M7 call site to the M6 audit API.
+    /// Translates the old `(actor, action, resource, diff)`
+    /// shape into a [`NewAuditEntry`] and inserts via
+    /// [`Store::record_audit_event_standalone`] so the row
+    /// satisfies the M6 schema's CHECK constraints. Once
+    /// Phase 2 Step 2.5 ships (`require_role` extractor that
+    /// puts the session on the request), every handler will
+    /// build its own `NewAuditEntry` with real `actor_kind` +
+    /// `actor_id` + `ip` + `user_agent`, and this shim goes
+    /// away.
+    ///
+    /// Compatibility choices baked in:
+    ///
+    /// * `actor` is denormalised into `actor_label`. The string
+    ///   `"api"` / `"ui"` / `"discovery"` that today's callers
+    ///   pass in is not a real user; it identifies the engine
+    ///   subsystem that initiated the write. We tag it as
+    ///   [`AuditActorKind::System`] so the M6 dashboards don't
+    ///   surface these rows as if a human did them.
+    /// * `resource` is split on the first `/` so the existing
+    ///   `"admin/delivery"` and `"camera/abc"` strings populate
+    ///   `(resource_kind, resource_id)` cleanly. A bare
+    ///   `"runtime"` becomes `(resource_kind = "runtime",
+    ///   resource_id = None)`.
+    /// * `diff` lands in `after_json` (the legacy callers only
+    ///   call this on the success path, post-write).
+    /// * `outcome` is always `Success` — the legacy callers
+    ///   bail with `?` on the audit insert as a non-fatal step
+    ///   that runs after the actual mutation already committed.
     pub async fn write_audit(
         &self,
         actor: &str,
@@ -376,15 +406,22 @@ impl Store {
         resource: &str,
         diff: &serde_json::Value,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO audit_log (actor, action, resource, diff_json) VALUES (?, ?, ?, ?)",
-        )
-        .bind(actor)
-        .bind(action)
-        .bind(resource)
-        .bind(diff.to_string())
-        .execute(&self.pool)
-        .await?;
+        let (resource_kind, resource_id) = match resource.split_once('/') {
+            Some((kind, id)) if !id.is_empty() => (Some(kind), Some(id)),
+            _ => (Some(resource), None),
+        };
+        let diff_str = diff.to_string();
+        let entry = crate::audit::NewAuditEntry {
+            actor_kind: Some(crate::audit::AuditActorKind::System),
+            actor_label: actor,
+            action,
+            resource_kind,
+            resource_id,
+            after_json: Some(diff_str.as_str()),
+            outcome: crate::audit::AuditOutcome::Success,
+            ..Default::default()
+        };
+        self.record_audit_event_standalone(&entry).await?;
         Ok(())
     }
 
