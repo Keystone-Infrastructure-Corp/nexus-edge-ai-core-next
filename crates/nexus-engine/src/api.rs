@@ -21,11 +21,12 @@
 //! Everything else is served from the UI directory via [`tower_http::services::ServeDir`].
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, put};
@@ -463,18 +464,60 @@ async fn list_cameras(State(s): State<ApiState>) -> Result<Json<Vec<CameraConfig
 async fn upsert_camera(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
     Json(mut cam): Json<CameraConfig>,
 ) -> Result<Json<CameraConfig>, ApiError> {
     cam.id = id;
-    s.store.upsert_camera(&cam).await?;
-    s.store
-        .write_audit(
-            "api",
-            "upsert",
-            &format!("camera/{id}"),
-            &serde_json::to_value(&cam).unwrap_or(serde_json::Value::Null),
-        )
-        .await?;
+    // M6 Phase 4 Step 4.1 — capture pre-state for the audit row so
+    // operators can diff before/after on the per-resource history
+    // panel. `None` on a create; `Some(prev)` on update. The list
+    // walk is cheap (rules / cameras are tens of rows), but if it
+    // becomes hot we'd switch to a `get_camera(id)` shortcut.
+    let before = s
+        .store
+        .list_cameras()
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().find(|c| c.id == id));
+    let after_str = serde_json::to_string(&cam).ok();
+    let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
+    let resource_id = id.to_string();
+    let outcome = match s.store.upsert_camera(&cam).await {
+        Ok(()) => nexus_store::audit::AuditOutcome::Success,
+        Err(e) => {
+            // Failure-path audit — record the attempt + error
+            // before bubbling so operators can investigate.
+            crate::auth::admin_audit::audit_admin_action(
+                &s.store,
+                session.as_ref(),
+                &headers,
+                peer.ip(),
+                "camera.upsert",
+                "camera",
+                Some(resource_id.as_str()),
+                nexus_store::audit::AuditOutcome::Failure,
+                before_str.as_deref(),
+                None,
+            )
+            .await;
+            return Err(e.into());
+        }
+    };
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        session.as_ref(),
+        &headers,
+        peer.ip(),
+        "camera.upsert",
+        "camera",
+        Some(resource_id.as_str()),
+        outcome,
+        before_str.as_deref(),
+        after_str.as_deref(),
+    )
+    .await;
     // Fire-and-forget: the engine's `config.changed` reconciler
     // listens for this and hot-starts a supervisor + pre-roll
     // ingester for the new (or modified) camera. `action` lets the
@@ -492,16 +535,47 @@ async fn upsert_camera(
 async fn delete_camera(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
 ) -> Result<StatusCode, ApiError> {
-    s.store.delete_camera(id).await?;
-    s.store
-        .write_audit(
-            "api",
-            "delete",
-            &format!("camera/{id}"),
-            &serde_json::json!({}),
+    let before = s
+        .store
+        .list_cameras()
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().find(|c| c.id == id));
+    let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
+    let resource_id = id.to_string();
+    if let Err(e) = s.store.delete_camera(id).await {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "camera.delete",
+            "camera",
+            Some(resource_id.as_str()),
+            nexus_store::audit::AuditOutcome::Failure,
+            before_str.as_deref(),
+            None,
         )
-        .await?;
+        .await;
+        return Err(e.into());
+    }
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        session.as_ref(),
+        &headers,
+        peer.ip(),
+        "camera.delete",
+        "camera",
+        Some(resource_id.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        before_str.as_deref(),
+        None,
+    )
+    .await;
     // Same channel as upsert — the reconciler diffs the live set
     // against the DB and aborts the supervisor for any removed id.
     let _ = s
@@ -521,6 +595,9 @@ async fn list_rules(State(s): State<ApiState>) -> Result<Json<Vec<RuleConfig>>, 
 async fn upsert_rule(
     State(s): State<ApiState>,
     Path(id): Path<RuleId>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
     Json(mut rule): Json<RuleConfig>,
 ) -> Result<Json<RuleConfig>, ApiError> {
     rule.id = id.clone();
@@ -534,20 +611,66 @@ async fn upsert_rule(
     // `catch_unwind` to convert that into a clean 400 instead of
     // tearing down the worker.
     if let Err(msg) = compile_cel_safely(&rule) {
+        // M6 Phase 4 Step 4.1 — record validation failures too so
+        // operators can see "user tried to ship a broken CEL"
+        // events in the audit log without scraping engine logs.
+        let rule_id_str = id.to_string();
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.upsert",
+            "rule",
+            Some(rule_id_str.as_str()),
+            nexus_store::audit::AuditOutcome::Failure,
+            None,
+            None,
+        )
+        .await;
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             format!("invalid CEL in `when`: {msg}"),
         ));
     }
-    s.store.upsert_rule(&rule).await?;
-    s.store
-        .write_audit(
-            "api",
-            "upsert",
-            &format!("rule/{id}"),
-            &serde_json::to_value(&rule).unwrap_or(serde_json::Value::Null),
+    let before = s
+        .store
+        .list_rules()
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().find(|r| r.id == id));
+    let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
+    let after_str = serde_json::to_string(&rule).ok();
+    let rule_id_str = id.to_string();
+    if let Err(e) = s.store.upsert_rule(&rule).await {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.upsert",
+            "rule",
+            Some(rule_id_str.as_str()),
+            nexus_store::audit::AuditOutcome::Failure,
+            before_str.as_deref(),
+            None,
         )
-        .await?;
+        .await;
+        return Err(e.into());
+    }
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        session.as_ref(),
+        &headers,
+        peer.ip(),
+        "rule.upsert",
+        "rule",
+        Some(rule_id_str.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        before_str.as_deref(),
+        after_str.as_deref(),
+    )
+    .await;
     reload_rules_into_evaluator(&s, "upsert", &id).await;
     Ok(Json(rule))
 }
@@ -555,16 +678,47 @@ async fn upsert_rule(
 async fn delete_rule(
     State(s): State<ApiState>,
     Path(id): Path<RuleId>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
 ) -> Result<StatusCode, ApiError> {
-    s.store.delete_rule(&id).await?;
-    s.store
-        .write_audit(
-            "api",
-            "delete",
-            &format!("rule/{id}"),
-            &serde_json::json!({}),
+    let before = s
+        .store
+        .list_rules()
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().find(|r| r.id == id));
+    let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
+    let rule_id_str = id.to_string();
+    if let Err(e) = s.store.delete_rule(&id).await {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.delete",
+            "rule",
+            Some(rule_id_str.as_str()),
+            nexus_store::audit::AuditOutcome::Failure,
+            before_str.as_deref(),
+            None,
         )
-        .await?;
+        .await;
+        return Err(e.into());
+    }
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        session.as_ref(),
+        &headers,
+        peer.ip(),
+        "rule.delete",
+        "rule",
+        Some(rule_id_str.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        before_str.as_deref(),
+        None,
+    )
+    .await;
     reload_rules_into_evaluator(&s, "delete", &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2373,13 +2527,27 @@ struct PutColdReq {
 
 async fn put_storage_cold(
     State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: crate::auth::require_role::SessionContext,
     Json(req): Json<PutColdReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Default throttle: keep whatever's already set so the caller
     // can switch handles without re-specifying bandwidth.
     let current = s.store.read_cold_replica().await?;
     let throttle = req.throttle_bps.unwrap_or(current.throttle_bps);
-    s.store
+    let after_json = serde_json::json!({
+        "handle": req.handle,
+        "throttle_bps": throttle,
+    });
+    let after_str = serde_json::to_string(&after_json).ok();
+    let before_str = serde_json::to_string(&serde_json::json!({
+        "handle": current.backend_handle,
+        "throttle_bps": current.throttle_bps,
+    }))
+    .ok();
+    if let Err(e) = s
+        .store
         .write_cold_replica(req.handle.as_deref(), throttle)
         .await
         .map_err(|e| match e {
@@ -2390,18 +2558,36 @@ async fn put_storage_cold(
                 )
             }
             other => other.into(),
-        })?;
-    s.store
-        .write_audit(
-            "api",
-            "put",
+        })
+    {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "storage.cold.put",
             "admin/storage/cold",
-            &serde_json::json!({
-                "handle": req.handle,
-                "throttle_bps": throttle,
-            }),
+            None,
+            nexus_store::audit::AuditOutcome::Failure,
+            before_str.as_deref(),
+            None,
         )
-        .await?;
+        .await;
+        return Err(e);
+    }
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&session),
+        &headers,
+        peer.ip(),
+        "storage.cold.put",
+        "admin/storage/cold",
+        None,
+        nexus_store::audit::AuditOutcome::Success,
+        before_str.as_deref(),
+        after_str.as_deref(),
+    )
+    .await;
     let _ = s
         .bus
         .publish(
@@ -2409,10 +2595,7 @@ async fn put_storage_cold(
             &serde_json::json!({ "reason": "cold_replica_updated" }),
         )
         .await;
-    Ok(Json(serde_json::json!({
-        "handle": req.handle,
-        "throttle_bps": throttle,
-    })))
+    Ok(Json(after_json))
 }
 
 /// `PUT /api/v1/admin/storage/backends/:handle` — register or
@@ -2433,6 +2616,9 @@ struct PutBackendReq {
 async fn put_storage_backend(
     State(s): State<ApiState>,
     Path(handle): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: crate::auth::require_role::SessionContext,
     Json(req): Json<PutBackendReq>,
 ) -> Result<Json<StorageBackendOut>, ApiError> {
     // Validate the URL-path handle BEFORE touching the DB. Same
@@ -2486,22 +2672,47 @@ async fn put_storage_backend(
             format!("invalid backend config: {e}"),
         )
     })?;
-    s.store
+    let audited_config = redacted_config_for_audit(&config);
+    let after_str =
+        serde_json::to_string(&serde_json::json!({ "kind": req.kind, "config": audited_config }))
+            .ok();
+    if let Err(e) = s
+        .store
         .upsert_storage_backend(&handle, &req.kind, &config_json)
-        .await?;
+        .await
+    {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "storage.backend.put",
+            "admin/storage/backend",
+            Some(handle.as_str()),
+            nexus_store::audit::AuditOutcome::Failure,
+            None,
+            None,
+        )
+        .await;
+        return Err(e.into());
+    }
     rebuild_registry(&s).await?;
     // Audit log: redact the encrypted refresh token blob even though
     // it's only ciphertext — it's still operator credential material
     // and ops logs should not carry it.
-    let audited_config = redacted_config_for_audit(&config);
-    s.store
-        .write_audit(
-            "api",
-            "put",
-            &format!("admin/storage/backends/{handle}"),
-            &serde_json::json!({ "kind": req.kind, "config": audited_config }),
-        )
-        .await?;
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&session),
+        &headers,
+        peer.ip(),
+        "storage.backend.put",
+        "admin/storage/backend",
+        Some(handle.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        None,
+        after_str.as_deref(),
+    )
+    .await;
     let _ = s
         .bus
         .publish(
@@ -2533,8 +2744,12 @@ async fn put_storage_backend(
 async fn delete_storage_backend(
     State(s): State<ApiState>,
     Path(handle): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: crate::auth::require_role::SessionContext,
 ) -> Result<StatusCode, ApiError> {
-    s.store
+    if let Err(e) = s
+        .store
         .delete_storage_backend(&handle)
         .await
         .map_err(|e| match e {
@@ -2553,16 +2768,37 @@ async fn delete_storage_backend(
                 format!("backend '{h}' is the implicit local backend and cannot be deleted"),
             ),
             nexus_store::DeleteBackendError::Store(e) => e.into(),
-        })?;
-    rebuild_registry(&s).await?;
-    s.store
-        .write_audit(
-            "api",
-            "delete",
-            &format!("admin/storage/backends/{handle}"),
-            &serde_json::json!({}),
+        })
+    {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "storage.backend.delete",
+            "admin/storage/backend",
+            Some(handle.as_str()),
+            nexus_store::audit::AuditOutcome::Failure,
+            None,
+            None,
         )
-        .await?;
+        .await;
+        return Err(e);
+    }
+    rebuild_registry(&s).await?;
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&session),
+        &headers,
+        peer.ip(),
+        "storage.backend.delete",
+        "admin/storage/backend",
+        Some(handle.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        None,
+        None,
+    )
+    .await;
     let _ = s
         .bus
         .publish(
@@ -2744,12 +2980,28 @@ struct UsbPreferredOut {
 
 async fn put_usb_preferred(
     State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: crate::auth::require_role::SessionContext,
     Json(req): Json<UsbPreferredReq>,
 ) -> Result<Json<UsbPreferredOut>, ApiError> {
     let normalised = match req.label {
         Some(raw) => {
             let trimmed = raw.trim().to_string();
             if trimmed.is_empty() {
+                crate::auth::admin_audit::audit_admin_action(
+                    &s.store,
+                    Some(&session),
+                    &headers,
+                    peer.ip(),
+                    "runtime.usb_preferred.put",
+                    "admin/runtime/usb_preferred",
+                    None,
+                    nexus_store::audit::AuditOutcome::Failure,
+                    None,
+                    None,
+                )
+                .await;
                 return Err(ApiError(
                     StatusCode::BAD_REQUEST,
                     "label must be non-empty (send null to clear)".to_string(),
@@ -2760,21 +3012,52 @@ async fn put_usb_preferred(
         None => None,
     };
 
+    let before_label = s
+        .store
+        .read_runtime_setting("preferred_usb_label")
+        .await
+        .ok()
+        .flatten();
+    let before_str = serde_json::to_string(&serde_json::json!({ "label": before_label })).ok();
+    let after_str = serde_json::to_string(&serde_json::json!({ "label": normalised })).ok();
+
     // Persist first so a crash between the in-memory flip and the
     // SQLite write doesn't leave the recorder pointed at a label
     // the next boot won't reconstruct.
-    s.store
+    if let Err(e) = s
+        .store
         .write_runtime_setting("preferred_usb_label", normalised.as_deref())
-        .await?;
-    s.preferred_usb_label.set(normalised.clone());
-    s.store
-        .write_audit(
-            "api",
-            "put",
+        .await
+    {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "runtime.usb_preferred.put",
             "admin/runtime/usb_preferred",
-            &serde_json::json!({ "label": normalised }),
+            None,
+            nexus_store::audit::AuditOutcome::Failure,
+            before_str.as_deref(),
+            None,
         )
-        .await?;
+        .await;
+        return Err(e.into());
+    }
+    s.preferred_usb_label.set(normalised.clone());
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&session),
+        &headers,
+        peer.ip(),
+        "runtime.usb_preferred.put",
+        "admin/runtime/usb_preferred",
+        None,
+        nexus_store::audit::AuditOutcome::Success,
+        before_str.as_deref(),
+        after_str.as_deref(),
+    )
+    .await;
     Ok(Json(UsbPreferredOut { label: normalised }))
 }
 
@@ -2820,6 +3103,9 @@ async fn get_admin_delivery(
 
 async fn put_admin_delivery(
     State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: crate::auth::require_role::SessionContext,
     Json(req): Json<PutAdminDeliveryReq>,
 ) -> Result<Json<nexus_types::DeliverySettings>, ApiError> {
     let timezone = req
@@ -2831,31 +3117,67 @@ async fn put_admin_delivery(
     // silently fall back to UTC inside the policy with a warn.
     // 400'ing here surfaces operator typos at form-submit time.
     if timezone.parse::<chrono_tz::Tz>().is_err() {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "delivery.settings.put",
+            "admin/delivery",
+            None,
+            nexus_store::audit::AuditOutcome::Failure,
+            None,
+            None,
+        )
+        .await;
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             format!("unknown IANA timezone: {timezone:?}"),
         ));
     }
+    let before = s.store.delivery_settings_get().await.ok();
+    let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
     let settings = nexus_types::DeliverySettings {
         enabled: req.enabled,
         schedule: req.schedule,
         timezone,
         updated_at: chrono::Utc::now(),
     };
+    let after_str = serde_json::to_string(&settings).ok();
     // `delivery_settings_put` re-validates the schedule grid
     // (7 × 48) and surfaces a 500 on shape mismatch via the
     // default StoreError conversion — that's fine because the
     // caller has no way to produce a malformed grid through a
     // well-formed JSON body unless they bypassed the UI.
-    s.store.delivery_settings_put(&settings).await?;
-    s.store
-        .write_audit(
-            "api",
-            "put",
+    if let Err(e) = s.store.delivery_settings_put(&settings).await {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "delivery.settings.put",
             "admin/delivery",
-            &serde_json::to_value(&settings).unwrap_or(serde_json::Value::Null),
+            None,
+            nexus_store::audit::AuditOutcome::Failure,
+            before_str.as_deref(),
+            None,
         )
-        .await?;
+        .await;
+        return Err(e.into());
+    }
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&session),
+        &headers,
+        peer.ip(),
+        "delivery.settings.put",
+        "admin/delivery",
+        None,
+        nexus_store::audit::AuditOutcome::Success,
+        before_str.as_deref(),
+        after_str.as_deref(),
+    )
+    .await;
     // Sentinel payload — the reload task always re-reads the
     // store. `_ =`d so a saturated bus doesn't fail the write.
     let _ = s
@@ -2923,23 +3245,52 @@ struct PutRuleDeliveryReq {
 async fn put_rule_delivery(
     State(s): State<ApiState>,
     Path(rule_id): Path<RuleId>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
     Json(req): Json<PutRuleDeliveryReq>,
 ) -> Result<StatusCode, ApiError> {
-    s.store
+    let rule_id_str = rule_id.to_string();
+    let before = s.store.rule_delivery_policy_get(&rule_id).await.ok();
+    let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
+    let after_str = serde_json::to_string(&req.policy).ok();
+    if let Err(e) = s
+        .store
         .rule_delivery_policy_put(&rule_id, req.policy.as_ref())
         .await
         .map_err(|e| match e {
             nexus_store::StoreError::NotFound(msg) => ApiError(StatusCode::NOT_FOUND, msg),
             other => other.into(),
-        })?;
-    s.store
-        .write_audit(
-            "api",
-            "put",
-            &format!("rules/{rule_id}/delivery"),
-            &serde_json::to_value(&req.policy).unwrap_or(serde_json::Value::Null),
+        })
+    {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.delivery.put",
+            "rule/delivery",
+            Some(rule_id_str.as_str()),
+            nexus_store::audit::AuditOutcome::Failure,
+            before_str.as_deref(),
+            None,
         )
-        .await?;
+        .await;
+        return Err(e);
+    }
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        session.as_ref(),
+        &headers,
+        peer.ip(),
+        "rule.delivery.put",
+        "rule/delivery",
+        Some(rule_id_str.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        before_str.as_deref(),
+        after_str.as_deref(),
+    )
+    .await;
     let _ = s
         .bus
         .publish(
@@ -3244,6 +3595,8 @@ struct OAuthCallbackQuery {
 async fn oauth_callback(
     State(s): State<ApiState>,
     Path(provider_str): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(q): Query<OAuthCallbackQuery>,
 ) -> Response {
     // The callback runs without an admin bearer; the unguessable
@@ -3444,20 +3797,31 @@ async fn oauth_callback(
     }
 
     let audited = redacted_config_for_audit(&config);
-    let _ = s
-        .store
-        .write_audit(
-            "api",
-            "oauth_callback",
-            &format!("admin/oauth/{kind}/callback"),
-            &serde_json::json!({
-                "handle": session.handle,
-                "kind": kind,
-                "config": audited,
-                "scope": tokens.scope,
-            }),
-        )
-        .await;
+    let resource_id = format!("{kind}/{}", session.handle);
+    let after_str = serde_json::to_string(&serde_json::json!({
+        "handle": session.handle,
+        "kind": kind,
+        "config": audited,
+        "scope": tokens.scope,
+    }))
+    .ok();
+    // No SessionContext: this endpoint runs outside the admin
+    // gate (state token is the proof-of-authorisation). Helper
+    // will record actor as `system:unknown`. Audit failures are
+    // logged but do not fail the request.
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        None,
+        &headers,
+        peer.ip(),
+        "oauth.callback",
+        "admin/oauth",
+        Some(resource_id.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        None,
+        after_str.as_deref(),
+    )
+    .await;
     let _ = s
         .bus
         .publish(
@@ -4729,12 +5093,13 @@ mod tests {
         let put_body = serde_json::json!({
             "policy": { "enabled": true, "schedule": { "grid": grid } }
         });
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::PUT)
             .uri("/api/v1/rules/rule_put/delivery")
             .header("content-type", "application/json")
             .body(Body::from(put_body.to_string()))
             .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
@@ -4792,12 +5157,13 @@ mod tests {
             serde_json::json!({"policy":{"enabled":false}}),
             serde_json::json!({"policy": null}),
         ] {
-            let req = Request::builder()
+            let mut req = Request::builder()
                 .method(Method::PUT)
                 .uri("/api/v1/rules/rule_clear/delivery")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
             let res = app.clone().oneshot(req).await.unwrap();
             assert_eq!(res.status(), StatusCode::NO_CONTENT);
         }
@@ -4822,7 +5188,7 @@ mod tests {
     async fn rule_delivery_put_unknown_rule_returns_404() {
         const SECRET: &[u8] = b"m7-rule-delivery-404-secret";
         let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::PUT)
             .uri("/api/v1/rules/no_such_rule/delivery")
             .header("content-type", "application/json")
@@ -4830,6 +5196,7 @@ mod tests {
                 serde_json::json!({"policy":{"enabled":false}}).to_string(),
             ))
             .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }

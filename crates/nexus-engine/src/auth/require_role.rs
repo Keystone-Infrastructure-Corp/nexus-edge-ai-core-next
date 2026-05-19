@@ -339,6 +339,33 @@ where
     }
 }
 
+// M6 Phase 4 Step 4.1 — `Option<SessionContext>` for handlers that
+// live OUTSIDE the admin gate (e.g. `/api/v1/rules/{id}/delivery`
+// PUT, `/api/cameras/{id}` PUT/DELETE). These routes are not yet
+// behind `admin_auth_layer`, so a request may legitimately arrive
+// without a bearer. The audit-hooks Step 4.1 then records the
+// mutation with actor `system:unknown` rather than 401'ing — the
+// route's existing auth posture is preserved while still surfacing
+// the attempt in the audit log. Any auth *failure* (bad/expired
+// JWT, decode error) collapses to `None` as well so the route stays
+// permissive in axum 0.8's `OptionalFromRequestParts` contract.
+impl<S> axum::extract::OptionalFromRequestParts<S> for SessionContext
+where
+    S: Send + Sync,
+    Arc<AdminAuthState>: FromRef<S>,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        let auth = Arc::<AdminAuthState>::from_ref(state);
+        let bearer = extract_bearer(parts);
+        Ok(authorise(&auth, bearer).ok())
+    }
+}
+
 macro_rules! impl_role_extractor {
     ($name:ident, $role:expr) => {
         impl<S> FromRequestParts<S> for $name

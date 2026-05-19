@@ -42,6 +42,7 @@
 //! lets the login handler set compose them without pulling in
 //! a god-module.
 
+pub mod admin_audit;
 pub mod bootstrap;
 pub mod lockout;
 pub mod login;

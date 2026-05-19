@@ -318,9 +318,20 @@ fn verify_token(token: &str, key: &DecodingKey) -> Result<AdminClaims, AdminAuth
 pub async fn admin_auth_layer(
     State(state): State<Arc<AdminAuthState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, AdminAuthError> {
+    // M6 Phase 4 Step 4.1 — every successful auth path injects a
+    // `SessionContext` extension that downstream handlers extract
+    // via `req.extensions().get::<SessionContext>()` to populate
+    // the actor columns of every `audit_log` row. The HS256 path
+    // captures `sub` (when present) as the actor label; the
+    // loopback bypass + remote-bypass paths tag a synthetic actor
+    // so the audit row still reflects the *mode* the engine was
+    // configured in.
+    use crate::auth::require_role::SessionContext;
+    use nexus_types::Role;
+
     // Path 1 + 2 (secret configured): JWT-or-bust.
     if let Some(key) = &state.key {
         let token = extract_bearer(&req).ok_or(AdminAuthError::Missing)?;
@@ -332,12 +343,26 @@ pub async fn admin_auth_layer(
             method = %req.method(),
             "admin write authorised by HS256 bearer"
         );
+        let ctx = SessionContext {
+            user_id: 0,
+            role: Role::Admin,
+            jti: claims.sub.clone().unwrap_or_else(|| "legacy".to_string()),
+            is_legacy_admin: true,
+        };
+        req.extensions_mut().insert(ctx);
         return Ok(next.run(req).await);
     }
 
     // Path 3 + 4 + 5 (no secret): loopback or escape-hatch.
     if peer_is_loopback(&peer) {
         tracing::debug!(peer = %peer, "admin write allowed: loopback peer (no secret configured)");
+        let ctx = SessionContext {
+            user_id: 0,
+            role: Role::Admin,
+            jti: "loopback".to_string(),
+            is_legacy_admin: true,
+        };
+        req.extensions_mut().insert(ctx);
         return Ok(next.run(req).await);
     }
     if state.allow_remote {
@@ -345,6 +370,13 @@ pub async fn admin_auth_layer(
             peer = %peer,
             "admin write allowed via NEXUS_ADMIN_BEARER_ALLOW_REMOTE=1 — production deployments should configure auth.admin_secret_path"
         );
+        let ctx = SessionContext {
+            user_id: 0,
+            role: Role::Admin,
+            jti: "allow-remote".to_string(),
+            is_legacy_admin: true,
+        };
+        req.extensions_mut().insert(ctx);
         return Ok(next.run(req).await);
     }
     Err(AdminAuthError::Missing)
