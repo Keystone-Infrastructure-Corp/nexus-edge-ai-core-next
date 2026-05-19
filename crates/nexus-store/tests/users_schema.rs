@@ -369,9 +369,9 @@ async fn login_success_resets_lockout_counters() {
         .unwrap();
 
     let lock = Utc::now() + Duration::minutes(15);
-    store.record_login_failure(id, None).await.unwrap();
-    store.record_login_failure(id, None).await.unwrap();
-    store.record_login_failure(id, Some(lock)).await.unwrap();
+    store.record_login_failure(id, 1, None).await.unwrap();
+    store.record_login_failure(id, 2, None).await.unwrap();
+    store.record_login_failure(id, 3, Some(lock)).await.unwrap();
 
     let before = store.get_user_by_id(id).await.unwrap().unwrap();
     assert_eq!(before.failed_login_count, 3);
@@ -400,11 +400,11 @@ async fn clear_lockout_zeroes_failed_counter() {
         .await
         .unwrap();
     store
-        .record_login_failure(id, Some(Utc::now() + Duration::minutes(15)))
+        .record_login_failure(id, 1, Some(Utc::now() + Duration::minutes(15)))
         .await
         .unwrap();
     store
-        .record_login_failure(id, Some(Utc::now() + Duration::minutes(15)))
+        .record_login_failure(id, 2, Some(Utc::now() + Duration::minutes(15)))
         .await
         .unwrap();
 

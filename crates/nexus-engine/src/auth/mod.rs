@@ -5,10 +5,11 @@
 //!
 //! * [`passwords`] — argon2id hashing + password policy
 //!   (Phase 2 Step 2.2).
+//! * [`lockout`] — failed-login lockout FSM
+//!   (Phase 2 Step 2.3).
 //!
 //! Future siblings (planned in [`docs/M6_IDENTITY.md`](../../../docs/M6_IDENTITY.md)):
 //!
-//! * `lockout` — 5-fails-in-15-min FSM (Phase 2 Step 2.3).
 //! * `sessions` — HS256 JWT issue/verify + refresh-token
 //!   rotation (Phase 2 Step 2.4).
 //! * `require_role` — axum extractor that pulls the session
@@ -24,6 +25,8 @@
 // functions, every public item below is unreferenced in the
 // engine binary. Tests inside each module exercise the API end
 // to end; we just need to silence dead_code until the wiring
-// catches up. Drop this allow the moment 2.7 lands.
+// catches up. Drop these allows the moment 2.7 lands.
 #[allow(dead_code)]
 pub mod passwords;
+#[allow(dead_code)]
+pub mod lockout;

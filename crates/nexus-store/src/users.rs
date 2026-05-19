@@ -434,24 +434,33 @@ impl Store {
         Ok(())
     }
 
-    /// Record a failed password attempt and optionally set
-    /// `locked_until`. The caller (the lockout FSM in
-    /// `nexus-engine::auth::lockout`) decides whether this
-    /// failure crosses the threshold and supplies a
-    /// `lock_until` accordingly — the store stays policy-free.
+    /// Record a failed password attempt. The caller (the
+    /// lockout FSM in `nexus-engine::auth::lockout`) computes
+    /// `new_count` (which may reset to 1 when the failure
+    /// window has expired) and `lock_until` (which is `Some`
+    /// only on the attempt that trips the lockout). The store
+    /// stays policy-free: it just writes what it's told.
+    ///
+    /// `new_count` overwrites `failed_login_count` rather than
+    /// incrementing — the FSM cannot express "reset and start
+    /// over at 1" through an increment-only API, and folding
+    /// reset semantics into the SQL would couple the store to
+    /// the policy.
     pub async fn record_login_failure(
         &self,
         id: UserId,
+        new_count: i64,
         lock_until: Option<DateTime<Utc>>,
     ) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE users
-                SET failed_login_count = failed_login_count + 1,
+                SET failed_login_count = ?,
                     last_failed_login_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     locked_until = ?,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?",
         )
+        .bind(new_count)
         .bind(lock_until.map(|t| t.to_rfc3339()))
         .bind(id)
         .execute(&self.pool)
