@@ -24,6 +24,8 @@ import type {
   ChangePasswordRequest,
   LoginRequest,
   LogoutRequest,
+  OidcStartRequest,
+  OidcStartResponse,
   RefreshRequest,
   TokenResponse,
 } from "./types.js";
@@ -94,5 +96,19 @@ export const auth = {
       method: "POST",
       body: JSON.stringify(req),
       headers: { Authorization: `Bearer ${accessToken}` },
+    }),
+
+  /// M6 Phase 3 Step 3.3 UI — mint PKCE verifier + state +
+  /// nonce server-side, get back the authorization URL to
+  /// redirect the browser to. The engine ALSO sets a
+  /// `__Host-nexus_oidc_state` cookie that the callback
+  /// verifies; we don't have to do anything with the returned
+  /// `state` string. On success the caller should
+  /// `window.location.assign(authorization_url)` to hand off
+  /// the browser.
+  oidcStart: (req: OidcStartRequest = {}) =>
+    rawRequest<OidcStartResponse>("/v1/auth/oidc/start", {
+      method: "POST",
+      body: JSON.stringify(req),
     }),
 };

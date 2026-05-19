@@ -165,6 +165,15 @@ pub struct ApiState {
     /// via `FromRef`; the router only mounts those routes when
     /// this Option is `Some`, so the handlers can `.expect()`.
     pub oidc_login: Option<crate::auth::oidc_login::OidcLoginState>,
+    /// M6 Phase 3 Step 3.3 UI — display label for the
+    /// "Sign in with X" button on the login overlay.
+    /// `Some(label)` only when `oidc_login.is_some()` (i.e.
+    /// the OIDC routes are actually mounted); falls back to
+    /// `"single sign-on"` when the operator left
+    /// `[auth.oidc.display_name]` unset. `None` whenever the
+    /// SPA must NOT render the OIDC button — discovery
+    /// failed, no `[auth.oidc]` block, or mode disallows OIDC.
+    pub oidc_display_name: Option<String>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -472,6 +481,13 @@ async fn get_auth_info(State(s): State<ApiState>) -> Json<serde_json::Value> {
         },
         "allows_local": s.auth_mode.allows_local(),
         "allows_oidc": s.auth_mode.allows_oidc(),
+        // M6 Phase 3 Step 3.3 UI — non-null only when the
+        // OIDC routes are actually mounted (discovery
+        // succeeded). The SPA uses this as the single signal
+        // to render the "Sign in with X" button, so a
+        // misconfigured / unreachable IdP doesn't surface a
+        // button that 404s on click.
+        "oidc_display_name": s.oidc_display_name,
     }))
 }
 
@@ -4686,6 +4702,7 @@ mod tests {
             // tests; the dedicated oidc_login tests live in
             // their own module against a wiremock IdP.
             oidc_login: None,
+            oidc_display_name: None,
         };
         let app = super::router(state);
         (app, store, dir)
@@ -5349,6 +5366,10 @@ mod tests {
         assert_eq!(v["mode"], "dev_token");
         assert_eq!(v["allows_local"], false);
         assert_eq!(v["allows_oidc"], false);
+        // M6 Phase 3 Step 3.3 UI — when OIDC isn't wired the
+        // field is JSON null, NOT missing, so the SPA can rely
+        // on `"oidc_display_name" in info` everywhere.
+        assert!(v["oidc_display_name"].is_null());
     }
 
     /// M6 Phase 4 Step 4.5 — release-build equivalent. With
@@ -5373,6 +5394,7 @@ mod tests {
         assert_eq!(v["mode"], "none");
         assert_eq!(v["allows_local"], false);
         assert_eq!(v["allows_oidc"], false);
+        assert!(v["oidc_display_name"].is_null());
     }
 
     // ---------------------------------------------------------------

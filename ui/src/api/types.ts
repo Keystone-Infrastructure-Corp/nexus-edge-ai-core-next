@@ -778,6 +778,15 @@ export interface AuthInfoResponse {
   mode: AuthMode;
   allows_local: boolean;
   allows_oidc: boolean;
+  /// Display label for the "Sign in with X" button on the
+  /// login overlay. Non-null only when the engine has a live
+  /// OIDC client (discovery succeeded + `[auth.oidc]` set +
+  /// mode allows OIDC). The SPA renders the OIDC button iff
+  /// this is non-null — i.e. don't surface a button that
+  /// would 404 on click. Falls back to `"single sign-on"`
+  /// engine-side when the operator left
+  /// `auth.oidc.display_name` unset.
+  oidc_display_name: string | null;
 }
 
 export type Role = "admin" | "operator" | "viewer";
@@ -824,6 +833,23 @@ export interface TokenResponse {
   expires_in: number;
   refresh_expires_in: number;
   user: SessionUser;
+}
+
+/// `POST /api/v1/auth/oidc/start` body. `redirect_to` must be a
+/// same-origin relative path beginning with `/` and NOT `//`
+/// — the engine sanitises it back to `/` if violated, but
+/// the SPA already only ever sends `/` or hash-routes.
+export interface OidcStartRequest {
+  redirect_to?: string;
+}
+
+/// `POST /api/v1/auth/oidc/start` response. The SPA navigates
+/// to `authorization_url` to hand the user off to the IdP;
+/// `state` is mirrored in a cookie by the engine, the SPA
+/// doesn't need to do anything with it.
+export interface OidcStartResponse {
+  authorization_url: string;
+  state: string;
 }
 
 // ---------------------------------------------------------------------------

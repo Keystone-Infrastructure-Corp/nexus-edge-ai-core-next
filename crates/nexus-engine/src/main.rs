@@ -660,6 +660,17 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // above. `None` when OIDC isn't enabled or discovery
         // failed; the router skips the auth-code routes in
         // that case.
+        oidc_display_name: oidc_login_state.as_ref().map(|_| {
+            // The display-name is sourced from the OIDC
+            // config but only surfaced when the routes are
+            // actually mounted — otherwise the UI would
+            // render a button that 404s on click.
+            cfg.auth
+                .oidc
+                .as_ref()
+                .and_then(|o| o.display_name.clone())
+                .unwrap_or_else(|| "single sign-on".to_string())
+        }),
         oidc_login: oidc_login_state,
     };
 

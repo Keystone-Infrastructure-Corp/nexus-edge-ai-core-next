@@ -15,6 +15,7 @@ import { api } from "./api/client.js";
 import {
   getSession,
   getToken,
+  hydrateFromOidcHandoff,
   loadAuthInfo,
   logout,
   onAuthStatusChange,
@@ -311,6 +312,14 @@ function setShellVisible(visible: boolean): void {
 async function main() {
   mountTopbarAuth();
 
+  // M6 Phase 3 Step 3.3 UI — the OIDC callback handler lands
+  // the browser back on `/` with a short-lived
+  // `nexus_oidc_handoff` cookie. Decode it BEFORE the
+  // auth-info probe + `hasUsableSession()` check so the
+  // session is in place by the time we decide whether to
+  // render the login overlay vs. mount the shell.
+  hydrateFromOidcHandoff();
+
   // Probe the engine to learn which login surface to render.
   // On network failure we fall back to "show the shell" — that
   // keeps the dev_token paste-field reachable so the operator
@@ -318,7 +327,14 @@ async function main() {
   // unreachable.
   const info = await loadAuthInfo();
   const mode = info?.mode ?? "dev_token";
-  const needsSessionLogin = mode === "local" || mode === "hybrid";
+  // M6 Phase 3 Step 3.3 UI — pure `oidc` mode also needs the
+  // overlay; there's no username+password field but the user
+  // still has to click "Sign in with X" before the shell is
+  // reachable. `hybrid` and `local` already required the
+  // overlay; `dev_token` / `none` fall through to the shell
+  // (paste-field topbar widget for dev_token).
+  const needsSessionLogin =
+    mode === "local" || mode === "hybrid" || mode === "oidc";
 
   if (needsSessionLogin && !hasUsableSession()) {
     // No session yet — render the overlay first; mount the

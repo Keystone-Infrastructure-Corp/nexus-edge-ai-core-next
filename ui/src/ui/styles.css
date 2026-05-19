@@ -2611,6 +2611,60 @@ button.chip {
   font-size: 12px;
 }
 
+/* M6 Phase 3 Step 3.3 UI — OIDC "Sign in with X" button on
+   the login overlay. Rendered alone in pure-oidc mode and
+   below the local form (with a divider) in hybrid mode. */
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 4px 0 2px 0;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--line);
+}
+
+.auth-oidc-btn {
+  background: var(--bg-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: inherit;
+  width: 100%;
+}
+
+.auth-oidc-btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.auth-oidc-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.auth-oidc-btn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.auth-error.auth-error-oidc {
+  margin-bottom: 8px;
+}
+
 /* Topbar session widget (current-user chip + sign-out
    button) — sits between the dev-token paste-field and the
    auth-status pill. Only rendered when a session exists. */

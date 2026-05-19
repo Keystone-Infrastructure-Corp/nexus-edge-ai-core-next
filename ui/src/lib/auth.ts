@@ -299,6 +299,141 @@ function publishStatus(next: AuthStatus): void {
 }
 
 // ---------------------------------------------------------------------------
+// M6 Phase 3 Step 3.3 UI — OIDC handoff-cookie hydration.
+//
+// After a successful OIDC callback, the engine 302-redirects
+// the browser back to `/` (or whatever `redirect_to` was) and
+// attaches a short-lived `nexus_oidc_handoff` cookie containing
+// the same `TokenResponse` shape the local-login JSON endpoint
+// returns. The cookie is base64url-no-pad-encoded JSON, NOT
+// HttpOnly (the SPA needs to read it from JS).
+//
+// On first paint we look for the cookie, decode it, install
+// the session in localStorage, and immediately delete the
+// cookie so a reload doesn't re-hydrate a stale token.
+//
+// Posture choices:
+//
+// * Silently no-op on any failure path (cookie absent,
+//   malformed base64, JSON parse error, missing fields). A
+//   bad handoff cookie shouldn't crash the boot sequence; the
+//   user just falls through to the login overlay and tries
+//   again.
+// * Decode + validate FULLY before calling `setSession` so a
+//   half-formed handoff can't half-populate localStorage.
+// * Clear the cookie unconditionally on the success path so a
+//   page reload during the 60s TTL window doesn't re-fire the
+//   onSessionChange listeners with the same value.
+// ---------------------------------------------------------------------------
+
+const HANDOFF_COOKIE = "nexus_oidc_handoff";
+
+/// Read the OIDC handoff cookie (if any), install the resulting
+/// session, and clear the cookie. Returns true iff a session
+/// was successfully installed. Safe to call unconditionally on
+/// every boot — a no-op when the cookie isn't present.
+export function hydrateFromOidcHandoff(): boolean {
+  const raw = readCookie(HANDOFF_COOKIE);
+  if (raw == null) return false;
+  // Whatever happens below, drop the cookie so it can't fire
+  // twice. Set this BEFORE decoding so a malformed payload
+  // doesn't leave a poison value in the jar.
+  clearCookie(HANDOFF_COOKIE);
+  try {
+    const json = base64UrlDecodeToString(raw);
+    const tr = JSON.parse(json) as TokenResponse;
+    if (
+      typeof tr !== "object" ||
+      tr == null ||
+      typeof tr.access_token !== "string" ||
+      typeof tr.refresh_token !== "string" ||
+      typeof tr.expires_in !== "number" ||
+      typeof tr.refresh_expires_in !== "number" ||
+      typeof tr.user !== "object" ||
+      tr.user == null
+    ) {
+      return false;
+    }
+    setSession(sessionFromTokenResponse(tr));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  const cookies = document.cookie ? document.cookie.split(";") : [];
+  for (const c of cookies) {
+    const trimmed = c.trim();
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    if (trimmed.slice(0, eq) === name) {
+      return trimmed.slice(eq + 1);
+    }
+  }
+  return null;
+}
+
+function clearCookie(name: string): void {
+  if (typeof document === "undefined") return;
+  // Mirror the engine's `Path=/` so the deletion actually
+  // targets the same cookie. `Max-Age=0` and a past
+  // `Expires=` are belt-and-suspenders for older browsers.
+  document.cookie =
+    `${name}=; Path=/; Max-Age=0; ` +
+    `Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax`;
+}
+
+function base64UrlDecodeToString(input: string): string {
+  // RFC 4648 §5: url-safe base64 swaps `+` -> `-`, `/` -> `_`,
+  // and the engine emits the no-padding variant. atob() needs
+  // standard base64 with padding.
+  let b64 = input.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4;
+  if (pad === 2) b64 += "==";
+  else if (pad === 3) b64 += "=";
+  else if (pad !== 0) throw new Error("invalid base64url length");
+  const bin = atob(b64);
+  // Decode the UTF-8 bytes back to a JS string. `atob` gives
+  // us a binary string; we need to walk it byte-by-byte to
+  // reconstruct the original codepoints.
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// M6 Phase 3 Step 3.3 UI — surface `?oidc_error=...` from the
+// callback URL exactly once per page load. The engine
+// 302-redirects to `/?oidc_error=<code>` on IdP-side cancel /
+// failure so the SPA can render a friendly toast.
+// ---------------------------------------------------------------------------
+
+/// Pluck `?oidc_error=<code>` out of the current URL and strip
+/// it from the address bar. Returns the raw error code (e.g.
+/// `access_denied`, `bad_request`, `unmapped_role`) or null
+/// when not present. Safe to call multiple times — only the
+/// first call returns a value; subsequent calls return null
+/// because the query string is rewritten.
+export function consumeOidcError(): string | null {
+  if (typeof window === "undefined") return null;
+  const url = new URL(window.location.href);
+  const err = url.searchParams.get("oidc_error");
+  if (err == null) return null;
+  url.searchParams.delete("oidc_error");
+  // Preserve hash (route) but strip the now-empty query so
+  // hitting back doesn't re-trigger the toast.
+  const next = url.pathname + (url.search || "") + url.hash;
+  try {
+    window.history.replaceState(null, "", next);
+  } catch {
+    // Some embeds disable history mutation; silently skip.
+  }
+  return err;
+}
+
+// ---------------------------------------------------------------------------
 // Top-level logout helper. Best-effort POST + always clear the
 // local session.
 // ---------------------------------------------------------------------------
