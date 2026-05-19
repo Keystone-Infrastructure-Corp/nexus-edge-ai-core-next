@@ -16,6 +16,7 @@ mod admin_auth;
 mod api;
 mod auth;
 mod auth_bootstrap;
+mod audit_retention;
 mod cold_read_cache;
 mod cold_replicator;
 mod delivery_reload;
@@ -487,6 +488,27 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         })
     };
 
+    // M6 Phase 4 Step 4.4 — audit-log retention sweeper. Daily
+    // task that deletes `audit_log` rows older than
+    // `runtime.audit.retention_days`. retention_days=0 keeps the
+    // task alive but disables the sweep (operators who ship to an
+    // external SIEM).
+    let (audit_retention_shutdown_tx, audit_retention_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let audit_retention_cfg = audit_retention::AuditRetentionConfig {
+        retention_days: cfg.runtime.audit.retention_days,
+        interval: std::time::Duration::from_secs(24 * 60 * 60),
+    };
+    let audit_retention_handle = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            audit_retention::run_audit_retention(audit_retention_cfg, store, async {
+                let _ = audit_retention_shutdown_rx.await;
+            })
+            .await;
+        })
+    };
+
     // M2.2 Phase 3: USB hot-plug watcher. Polls `<clips_dir>/usb/`
     // for `NEXUS_*`-labeled subdirectories every 5s and updates
     // `usb_registry` so the recorder + API see attach/detach
@@ -677,6 +699,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cold_handle).await;
     let _ = retention_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retention_handle).await;
+    let _ = audit_retention_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), audit_retention_handle).await;
     let _ = usb_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), usb_watch_handle).await;
     let _ = dispatcher_shutdown_tx.send(());
