@@ -139,8 +139,11 @@ jobs:
           # Kitchen sink — same FEATURES set as ci.yml `docker-all-eps`
           # so the released image is a superset of every tier's needs.
           # Drop EPs one at a time only if a release-blocker surfaces.
+          # `gstreamer` is mandatory — without it the engine fails loud
+          # on any `rtsp://` / `youtube://` URL via the fail-loud branch
+          # in nexus-pipeline::supervisor (see v0.1.4 release notes).
           build-args: |
-            FEATURES=ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt
+            FEATURES=gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt
           # Reuse the docker-all-eps gha cache scope — first release on
           # a branch warm-starts from the most recent CI build of the
           # same scope, cuts ~15 min off cold publishing.

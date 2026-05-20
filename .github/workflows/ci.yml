@@ -204,9 +204,12 @@ jobs:
           tags: nexus-engine:ci-all-eps
           # Kitchen sink. Drop one EP at a time if a release-blocker
           # surfaces; do NOT split into per-EP jobs without weighing
-          # the matrix-cost first (each adds ~8 min cold).
+          # the matrix-cost first (each adds ~8 min cold). `gstreamer`
+          # is mandatory — without it the engine fails loud on any
+          # `rtsp://` / `youtube://` URL via the fail-loud branch in
+          # nexus-pipeline::supervisor.
           build-args: |
-            FEATURES=ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt
+            FEATURES=gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt
           cache-from: type=gha,scope=docker-all-eps
           cache-to: type=gha,scope=docker-all-eps,mode=max
 
