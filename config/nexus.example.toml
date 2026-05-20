@@ -12,6 +12,14 @@
 # 0 = use available_parallelism().
 worker_threads = 0
 blocking_threads = 8
+# M3.1 — where the engine writes uploaded YOLOE visual-prompt
+# reference images. Each upload to POST /v1/admin/visual-prompts
+# is content-addressed (SHA256 over the bytes) and stored as
+# `<sha>.<ext>`; the embedding lives in the database. Default
+# `/var/lib/nexus/visual_prompts`. Created on demand. Operators
+# who put `clips_dir` on a separate disk usually want this on
+# the same disk (uploads are small but admin-only writes).
+# visual_prompts_dir = "/var/lib/nexus/visual_prompts"
 
 [runtime.clips]
 # Where the recorder writes mp4 files. Created on demand.
@@ -51,17 +59,63 @@ json_logs = false
 # sample_ratio = 0.05
 
 [auth]
-# Default since M-Install Checkpoint 2. The engine auto-provisions a
-# 32-byte URL-safe token at `<runtime.state_dir>/dev-token` (mode 0600)
-# on first boot and prints it once at WARN. Clients send
-# `Authorization: Bearer <token>`. See INSTALL.md §8.3 for the
-# `mode = "none"` (loopback-only) and `mode = "oidc"` alternatives.
-mode = "dev_token" # none | dev_token | oidc
-# dev_token = "change-me"  # pin a value here to skip auto-provisioning
+# Customer-facing default since M6. First boot creates a single
+# `admin` user with a one-time password printed once at WARN;
+# sign in at `/login` and set a real password. The HS256 session-
+# signing secret auto-provisions to `<runtime.state_dir>/admin-secret`
+# (mode 0600). See `docs/ARCHITECTURE.md §11` for the full identity
+# model and `docs/INSTALL.md §8.3` for the alternatives below.
+mode = "local" # none | dev_token | local | oidc | hybrid
+# admin_secret_path = "/var/lib/nexus/state/admin-secret"  # pin to skip autoprovision
+# dev_token = "change-me"  # only relevant when mode = "dev_token"
+#
+# --- Identity architecture (read before changing `mode`) ----------
+# The shipping product authenticates end users at the cloud-console
+# (nexus-cloud-console repo) — one Entra External ID app, one secret,
+# held in YOUR Azure Key Vault. Edge cores accept short-lived
+# `actor_token` JWTs minted by the cloud-console and forwarded over
+# the mTLS tunnel. See `docs/ARCHITECTURE.md §11`.
+#
+# That means edge boxes do NOT need per-deployment OIDC config:
+#
+#   * `mode = "local"`  — default for a fresh install. Boots with a
+#                         one-time admin OTP printed at WARN; admin
+#                         sets a password on first login. This is
+#                         ALSO the offline escape hatch when the
+#                         cloud-console tunnel is unreachable.
+#   * `mode = "oidc"`   — EXPERT MODE for the rare on-prem deployment
+#                         that wants to point a single edge box at a
+#                         site-local Authentik / Keycloak / AD FS.
+#                         Not the customer-facing default; ships
+#                         unconfigured. See `docs/M6_IDENTITY.md`.
+#   * `mode = "hybrid"` — both local + OIDC; OIDC for normal sign-in,
+#                         a single local `breakglass` admin for IdP
+#                         outages. Same expert-mode caveat applies.
+#
+# Below: the OIDC block stays as a reference template for the expert
+# path. It is intentionally commented out — leaving `[auth.oidc]`
+# defined while `mode != "oidc" | "hybrid"` is harmless but pointless.
+#
 # [auth.oidc]
-# issuer   = "https://auth.example.com/application/o/nexus"
-# audience = "nexus-engine"
-# jwks_uri = "https://auth.example.com/application/o/nexus/jwks/"
+# issuer        = "https://auth.example.com/application/o/nexus"
+# audience      = "nexus-engine"
+# client_id     = "nexus-engine"
+# display_name  = "Corporate SSO"
+# # `redirect_uri` is OPTIONAL for Authentik / Keycloak / Okta / Google
+# # (they accept the relative path `/api/v1/auth/oidc/callback`).
+# # REQUIRED for Microsoft Entra ID, which mandates a full HTTPS URL.
+# # redirect_uri = "https://nexus.example.com/api/v1/auth/oidc/callback"
+# # Confidential client? Wire the secret via ONE of these (mutually
+# # exclusive). See `docs/M6_IDENTITY.md` for k8s / Docker / systemd
+# # patterns that avoid hand-installing the secret file on every box.
+# # client_secret_file = "/run/secrets/oidc"
+# # client_secret_env  = "NEXUS_OIDC_CLIENT_SECRET"
+# scopes        = ["openid", "profile", "email", "groups"]
+#
+# [auth.oidc.role_map]
+# admin    = ["nexus-admins"]
+# operator = ["nexus-operators"]
+# viewer   = ["nexus-viewers"]
 
 # -----------------------------------------------------------------
 # Inference — the trait + pool + scale-factor pattern lives here.

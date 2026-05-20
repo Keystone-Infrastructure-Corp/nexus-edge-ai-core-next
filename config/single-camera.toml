@@ -11,7 +11,9 @@ clips_dir = "./data/clips"
 
 [server]
 # Loopback by default — required by M-Install Checkpoint 2 when
-# auth.mode = "none". Flip to 0.0.0.0 only with auth.mode = "dev_token".
+# auth.mode = "none". For a LAN-reachable bind, switch to
+# auth.mode = "local" (or "dev_token" for a closed-lab one-box rig).
+# See docs/ARCHITECTURE.md §11 for the full identity matrix.
 api_bind = "127.0.0.1:8089"
 ui_root = "ui/dist"
 

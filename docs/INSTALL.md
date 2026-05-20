@@ -1400,40 +1400,55 @@ manually).
 
 ### 8.3 Authentication
 
-M-Install Checkpoint 2 made the engine secure-by-default. Three modes
-are supported; pick the one that matches the deployment posture.
+M-Install Checkpoint 2 made the engine secure-by-default. Read
+[docs/ARCHITECTURE.md §11](ARCHITECTURE.md#11-identity--authentication)
+for the full identity model. Short version: the customer-facing
+identity path is **cloud-console-mediated** (one Entra app, one
+secret, held in the cloud-console's Azure Key Vault, minting
+short-lived `actor_token` JWTs that the edge verifies over the
+mTLS tunnel). Edge boxes therefore do not ship with per-deployment
+IdP configuration. The on-edge `auth.mode` exists for two reasons:
+the pre-enrollment local-admin path, and the offline escape hatch.
 
 | `auth.mode`   | When to use it                                                                  | Behaviour |
 | ------------- | ------------------------------------------------------------------------------- | --------- |
-| `"dev_token"` | **Default.** Single-box / single-operator install on a trusted LAN.             | On first boot the engine generates a 32-byte URL-safe random token, persists it to `/var/lib/nexus/state/dev-token` (mode 0600), and prints it once at WARN. Clients send `Authorization: Bearer <token>`. Rotate by stopping the engine, deleting the file, and restarting. |
+| `"local"`     | **Customer-facing default.** Also the offline escape hatch when the cloud-console tunnel is unreachable. | First boot creates a single `admin` user with a one-time password printed at WARN. Set a real password on first login; create operator/viewer users from the UI. The HS256 session-signing secret auto-provisions to `<state_dir>/admin-secret` (mode 0600) — pin `auth.admin_secret_path = ...` to override with a k8s/Docker/systemd-managed file. |
+| `"dev_token"` | Single-box dev / closed-lab rig on a trusted LAN.                               | On first boot the engine generates a 32-byte URL-safe random token, persists it to `<state_dir>/dev-token` (mode 0600), and prints it once at WARN. Clients send `Authorization: Bearer <token>`. **Compile-removed under `--features prod-auth`** so a release binary cannot ship a shared-secret bearer. |
 | `"none"`      | Closed-lab / regression rigs that bind only to loopback.                        | Engine **refuses to boot** unless `[server].api_bind` is `127.0.0.1:*`, `[::1]:*`, or `localhost:*`. Use this only when an upstream reverse proxy / SSH tunnel is doing the auth. |
-| `"oidc"`      | Multi-operator deployments behind a corporate IdP.                              | OIDC bearer tokens validated against the issuer's JWKS at every request. |
+| `"oidc"`      | **Expert mode.** Rare on-prem deployment pointed at a site-local IdP (Authentik / Keycloak / AD FS).         | OIDC auth-code + PKCE; bearer tokens validated against the issuer's JWKS at every request. Not the customer-facing default — ships unconfigured. |
+| `"hybrid"`    | **Expert mode.** OIDC + a single local `breakglass` admin for IdP outages.       | Same as `oidc` plus the local-users login path. Same expert-mode caveat. |
 
-Tier configs in [config/tiers/](../config/tiers/) intentionally omit
-the `[auth]` block; the engine grandfathers a missing block to
-`mode = "none"` for 7 days at boot, with a WARN that names the
-deprecation deadline. Add an explicit `[auth]` block to
-`/etc/nexus/nexus.toml` before the deadline:
+Tier configs in [config/tiers/](../config/tiers/) currently default
+to `mode = "dev_token"` for installer convenience; flip to `"local"`
+as soon as the box has more than one operator. Add an explicit
+`[auth]` block to `/etc/nexus/nexus.toml`:
 
 ```toml
-# Most installs — auth.mode = "dev_token".
+# Recommended for any multi-operator install — auth.mode = "local".
+[auth]
+mode = "local"
+# The HS256 session-signing secret auto-provisions to
+# `<state_dir>/admin-secret` on first boot. Pin to override:
+# admin_secret_path = "/run/secrets/nexus-admin-secret"
+
+# One-box dev / closed lab — auth.mode = "dev_token".
 [auth]
 mode = "dev_token"
-# dev_token is auto-provisioned at /var/lib/nexus/state/dev-token
-# unless you pin it explicitly here.
+# Auto-provisioned at <state_dir>/dev-token unless pinned here.
 
-# Multi-operator deployments behind an IdP — auth.mode = "oidc".
+# Expert mode — on-prem IdP. See docs/M6_IDENTITY.md before enabling.
 [auth]
 mode = "oidc"
 [auth.oidc]
-issuer   = "https://auth.example.com/application/o/nexus"
-audience = "nexus-engine"
-jwks_uri = "https://auth.example.com/application/o/nexus/jwks/"
+issuer    = "https://auth.example.com/application/o/nexus"
+audience  = "nexus-engine"
+client_id = "nexus-engine"
+# client_secret_file = "/run/secrets/oidc"   # confidential clients only
 ```
 
 `dev_token = "..."` pinned in TOML is acceptable as a shared secret
-in a closed lab but never in production. Always prefer the
-auto-provisioned on-disk file.
+in a closed lab but never in production. Always prefer `mode = "local"`
+for any deployment with more than one human operator.
 
 ---
 
@@ -1608,19 +1623,21 @@ modes:
 #### Bearer-token auth (LAN / Tailscale access)
 
 Loopback (`127.0.0.1`) requires no token. Over LAN or Tailscale,
-paste a bearer token into the topbar field — the SPA stores it in
-`localStorage` and adds `Authorization: Bearer …` to every gated
-write. The token value depends on the `[auth]` config block:
+the login path depends on the `[auth]` config block:
 
-- `mode = "dev_token"` (default per §8.3) — read the
-  auto-generated token from `data/state/dev-token` (or the path
-  configured under `state_dir`) on the engine host. The engine
-  prints it once at WARN level on first boot.
-- `mode = "oidc"` — use an access token from your IdP (see §8.3.2
-  for the discovery URL setup).
+- `mode = "local"` (recommended per §8.3) — sign in via the
+  `/login` page with the username + password you set on first
+  boot. The SPA stores a session JWT in `localStorage`; no
+  bearer-token paste field is shown.
+- `mode = "dev_token"` — paste the auto-generated token from
+  `<state_dir>/dev-token` into the topbar field. The engine
+  prints it once at WARN on first boot.
+- `mode = "oidc"` / `"hybrid"` — click the "Sign in with $provider"
+  button on `/login`. The engine completes the auth-code + PKCE
+  exchange and issues a session JWT. (Expert mode — see §8.3.)
 
-Any 401 from a gated write will surface as a toast; clearing the
-token field and refreshing reverts to loopback-only mode.
+Any 401 from a gated write surfaces as a toast and bounces the
+SPA back to the login page.
 
 ### 10.1 Logs
 

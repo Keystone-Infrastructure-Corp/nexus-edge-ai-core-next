@@ -6,12 +6,14 @@ worker_threads = 8
 blocking_threads = 8
 
 [auth]
-# Auto-provisions a 32-byte URL-safe token at
-# `/var/lib/nexus/state/dev-token` (mode 0600) on first boot and
-# prints it once at WARN. Clients send `Authorization: Bearer <token>`.
-# Required because `api_bind` below is non-loopback — the engine
-# refuses to run with `mode = "none"` on a LAN-reachable bind.
-mode = "dev_token"
+# Customer-facing default since M6 (see docs/ARCHITECTURE.md §11).
+# First boot creates a single `admin` user with a one-time password
+# printed once at WARN; sign in at `/login` and set a real password.
+# The HS256 session-signing secret auto-provisions to
+# `/var/lib/nexus/state/admin-secret` (mode 0600). Required because
+# `api_bind` below is non-loopback — the engine refuses to run
+# with `mode = "none"` on a LAN-reachable bind.
+mode = "local"
 
 [server]
 api_bind = "0.0.0.0:8089"
