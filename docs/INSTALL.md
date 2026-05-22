@@ -43,6 +43,7 @@
    - [5.5 GStreamer hardware decode (bare-metal only)](#55-gstreamer-hardware-decode-bare-metal-only)
 6. [Install path A — Docker Compose (recommended)](#6-install-path-a--docker-compose-recommended)
 7. [Install path B — Bare-metal systemd (advanced)](#7-install-path-b--bare-metal-systemd-advanced)
+   - [7.0 Bare-metal from release tarball (recommended)](#70-bare-metal-from-release-tarball-recommended)
 8. [Configure cameras + first boot](#8-configure-cameras--first-boot)
 9. [Verification — smoke test](#9-verification--smoke-test)
 10. [Operating + day-2 essentials](#10-operating--day-2-essentials)
@@ -1226,7 +1227,195 @@ This path is mandatory for **T36-S** (NPU passthrough is unreliable
 in containers) and useful when you want a smaller attack surface or
 need to install custom GStreamer plugins.
 
-### 7.1 Install Rust
+**Two sub-paths** below:
+
+- **§7.0** — install from a pre-built release tarball. **Recommended
+  for every bare-metal box.** No `git clone`, no `cargo build`, no
+  Node toolchain. Drops a self-contained release into
+  `/opt/nexus/releases/<version>/`, flips an atomic-swap symlink at
+  `/opt/nexus/current`, and starts the systemd unit. The layout is
+  the same one the future M-OTA updater uses to roll cohorts
+  forward (see [M_OTA.md Step 8](M_OTA.md)) — so when the cloud
+  control plane lands, this install is OTA-ready without any
+  migration on your part.
+- **§7.1–§7.7** — build from source. Use this if you've patched the
+  engine locally or you're tracking `main` between releases. Same
+  on-disk layout as §7.0 (so an `install.sh` run from a custom
+  tarball drops into the same slot).
+
+### 7.0 Bare-metal from release tarball (recommended)
+
+#### 7.0.1 What you'll install
+
+Every release published by [.github/workflows/release.yml](../.github/workflows/release.yml)
+attaches a self-contained tarball:
+
+```text
+nexus-edge-vX.Y.Z-linux-x86_64.tar.gz   (~250 MB — engine, ORT-OpenVINO, models, UI)
+nexus-edge-vX.Y.Z-linux-x86_64.tar.gz.sha256
+install.sh                              (= scripts/bootstrap.sh, renamed for the curl-pipe one-liner)
+```
+
+The tarball contains:
+
+```text
+bin/
+├── nexus-engine             # FEATURES=gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt
+├── nexus-probe
+└── nexus-doctor
+lib/onnxruntime/             # libonnxruntime.so + OpenVINO EP + intel CPU/GPU/NPU plugins
+share/
+├── ui/                      # SPA bundle
+└── models/                  # default 4-file model pack (~100 MB)
+etc-templates/
+├── nexus.example.toml
+├── tiers/{t10,t24,t36,t36s,t64}.toml
+└── systemd/nexus-engine.service
+scripts/
+├── install.sh               # idempotent, handles upgrades + rollback
+├── uninstall.sh
+└── lib/install-common.sh
+VERSION
+MANIFEST.json                # every file + sha256 (used by install.sh + future OTA tamper check)
+```
+
+#### 7.0.2 Install (or upgrade)
+
+Same command does first install AND every subsequent upgrade — it's
+idempotent and the `--tier` flag is only consulted on first install
+(so re-running with the wrong tier won't clobber a tuned
+`/etc/nexus/nexus.toml`).
+
+```bash
+curl -fsSL https://github.com/andboyer/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+  | sudo bash -s -- --tier t24      # swap t24 for your tier from §1
+```
+
+The bootstrap script:
+
+1. Resolves the release tag (or use `--version vX.Y.Z`).
+2. Downloads `nexus-edge-...-linux-x86_64.tar.gz` + its `.sha256`.
+3. Hands off to the in-tarball `scripts/install.sh`, which:
+   - Re-verifies the sha256 sidecar.
+   - Extracts to `/opt/nexus/releases/<version>/`.
+   - Verifies every file against `MANIFEST.json` (catches mid-flight corruption).
+   - Creates the `nexus` system user + `/etc/nexus` + `/var/lib/nexus`.
+   - Stages `/etc/nexus/nexus.toml` from the tier template **only if
+     the file doesn't already exist** (operator edits survive
+     upgrades forever).
+   - Installs `/etc/systemd/system/nexus-engine.service`.
+   - Atomically flips `/opt/nexus/current → releases/<version>` and
+     records the previous version into `/etc/nexus/install-state.json`.
+   - Enables + starts the unit and waits up to 60 s for
+     `/api/health` to return 200.
+
+Expected runtime on a T24-class box: ~90 s end-to-end on a clean
+network (most of which is the 250 MB tarball download).
+
+#### 7.0.3 Resulting on-disk layout
+
+```text
+/opt/nexus/
+├── releases/
+│   ├── v0.1.9/          # whatever you installed first
+│   └── v0.2.0/          # the next release you upgrade to
+├── current -> releases/v0.2.0   # atomic-swap symlink (rollback = flip)
+└── (nothing else)
+
+/etc/nexus/
+├── nexus.toml               # operator-editable; survives every upgrade
+└── install-state.json       # current_version, previous_good_version, systemd_unit_sha256
+
+/var/lib/nexus/
+├── nexus.db                 # SQLite (cameras, rules, events, motion)
+├── clips/                   # recorded MP4s
+└── state/
+    ├── dev-token            # bearer token (auth.mode="none" only)
+    └── admin-secret         # HS256 session key (auth.mode="local")
+```
+
+The key idea: **immutable, versioned releases under `/opt/nexus/releases/`
+and a single mutable symlink at `/opt/nexus/current`**. Upgrades and
+rollbacks are symlink flips followed by `systemctl restart
+nexus-engine`. No `cargo build`, no `git pull`, no shared mutable
+binary directory.
+
+#### 7.0.4 Upgrade to a new release
+
+```bash
+# Idempotent — same one-liner as first install.
+curl -fsSL https://github.com/andboyer/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+  | sudo bash -s --       # no --tier; existing /etc/nexus/nexus.toml is preserved
+```
+
+Or pin a specific version:
+
+```bash
+curl -fsSL https://github.com/andboyer/nexus-edge-ai-core-next/releases/download/v0.2.0/install.sh \
+  | sudo bash -s -- --version v0.2.0
+```
+
+Keeps the old release dir at `/opt/nexus/releases/<previous>/` for
+rollback (see §7.0.5). Run `sudo /opt/nexus/current/scripts/uninstall.sh
+--keep-releases` then re-install to garbage-collect.
+
+#### 7.0.5 Rollback
+
+The installer records the previous good version on every upgrade.
+Flip back with one command:
+
+```bash
+sudo /opt/nexus/current/scripts/install.sh --rollback
+```
+
+This re-points `/opt/nexus/current` at the previous release dir
+(no download needed) and restarts the engine. If you've upgraded
+twice since the version you want, run `--rollback` twice.
+
+#### 7.0.6 Uninstall
+
+```bash
+# Default: stop + remove the unit and /opt/nexus, but preserve
+# /etc/nexus + /var/lib/nexus so a re-install picks up where you
+# left off.
+sudo /opt/nexus/current/scripts/uninstall.sh
+
+# Destructive: also wipes db, clips, configs, and the `nexus` user.
+sudo /opt/nexus/current/scripts/uninstall.sh --purge
+```
+
+#### 7.0.7 What the tarball does NOT include
+
+Operator must still install these manually before §7.0.2:
+
+- **GStreamer runtime plugins** (§7.3 below — `apt install` is fine,
+  same package set as the source-build path).
+- **GPU drivers** per tier (§5.1–§5.4) — Intel iHD / Compute Runtime,
+  NVIDIA driver + CUDA / TensorRT for T64, Lunar Lake NPU userspace
+  for T36-S. The tarball binary is compiled with every EP enabled,
+  but each EP only activates if its system libs are present.
+- **Ubuntu prerequisites** from §3 and §4 (`tini`, firewall, etc.).
+
+If you're missing any of the above, the engine will start but
+specific cameras or codecs will fail at runtime. Run
+`sudo /opt/nexus/current/bin/nexus-doctor` to see exactly what's
+missing — it's the same smoke-test runner the verify step in §9
+uses.
+
+---
+
+### 7.1 Install Rust _(build-from-source path; skip if you used §7.0)_
+
+§§7.1–7.7 are only for operators who want to compile the engine
+themselves — patched branches, untagged commits, custom feature
+sets. For shipping releases, **prefer §7.0** — it lands the same
+on-disk layout (`/opt/nexus/releases/<v>/` + atomic-swap
+`/opt/nexus/current` symlink) without a Rust + Node toolchain on
+the box, and is what the future OTA updater (M_OTA.md Step 8)
+will operate against. If you build from source, you can install
+into the same layout by running `sudo scripts/install.sh --tier
+t24` against a tarball you build yourself with `tools/build-tarball.sh`
+(planned follow-up; for now, follow §§7.1–7.7).
 
 The toolchain pin lives in [rust-toolchain.toml](../rust-toolchain.toml)
 (`channel = "stable"`).
@@ -1338,51 +1527,25 @@ Identical to §6.3 + §6.4. The bare-metal engine reads from the same
 
 ### 7.7 systemd unit
 
+The canonical unit file is checked in at
+[deploy/systemd/nexus-engine.service](../deploy/systemd/nexus-engine.service).
+For the build-from-source path, install it and adjust the
+`ExecStart` path to point at the `/usr/local/bin/` binaries you
+just installed in §7.5 (the unit file as shipped assumes the §7.0
+atomic-swap layout under `/opt/nexus/current/bin/`):
+
 ```bash
-sudo tee /etc/systemd/system/nexus-engine.service >/dev/null <<'EOF'
-[Unit]
-Description=Nexus Edge AI engine
-After=network-online.target
-Wants=network-online.target
+sudo install -o root -g root -m 0644 \
+    /opt/nexus/deploy/systemd/nexus-engine.service \
+    /etc/systemd/system/nexus-engine.service
 
-[Service]
-Type=simple
-User=nexus
-Group=nexus
-WorkingDirectory=/var/lib/nexus
-Environment=ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
-Environment=RUST_LOG=info,nexus=debug
-# Uncomment for T64 once M5 lands:
-# Environment=LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64
-ExecStart=/usr/local/bin/nexus-engine --config /etc/nexus/nexus.toml
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=65535
-
-# Allow the `nexus` user (UID 1000, non-root) to bind the UI alias
-# on port 80. `api_bind` defaults to 8089 and does not need this;
-# `ui_bind = "0.0.0.0:80"` (default in every tier config) does.
-# Comment both lines out if you remove `ui_bind` from nexus.toml.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-# Hardening — keep the engine boxed in.
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/nexus /tmp
-PrivateTmp=true
-ProtectKernelTunables=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-DevicePolicy=closed
-# Allow the accelerator devices the tier needs:
-DeviceAllow=/dev/dri rw
-DeviceAllow=/dev/accel/accel0 rw   # T36-S only; harmless on others
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# Build-from-source layout: binaries live in /usr/local/bin/, not
+# /opt/nexus/current/bin/. ORT was installed under /opt/onnxruntime
+# in §7.4, not /opt/nexus/current/lib/onnxruntime.
+sudo sed -i \
+    -e 's#/opt/nexus/current/bin/nexus-engine#/usr/local/bin/nexus-engine#' \
+    -e 's#/opt/nexus/current/lib/onnxruntime#/opt/onnxruntime/lib#g' \
+    /etc/systemd/system/nexus-engine.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now nexus-engine
@@ -1390,8 +1553,12 @@ sudo journalctl -u nexus-engine -f
 # Ctrl-C to detach.
 ```
 
-The `DeviceAllow` lines are a no-op when the device doesn't exist
-on this host; leave them in so the unit is portable across tiers.
+The `DeviceAllow` lines in the unit are a no-op when the device
+doesn't exist on this host; leave them in so the unit is portable
+across tiers. The two `sed` rewrites above are the *only*
+difference between the build-from-source layout and the §7.0
+tarball layout — everything else (config path, state dir, hardening
+stanza, `CAP_NET_BIND_SERVICE` for the :80 UI alias) is identical.
 
 ---
 

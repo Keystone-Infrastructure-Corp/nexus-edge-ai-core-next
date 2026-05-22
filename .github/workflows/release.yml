@@ -34,11 +34,17 @@
 # different trigger. Keeping them split means a broken release workflow
 # can never block PR iteration.
 #
-# Scope deliberately left at "image only" for now. Binary artifacts
-# (nexus-engine / nexus-probe / nexus-doctor standalone) and the signed
-# `models-pack-vX.Y.Z.tar.gz` are the bare-metal + customer-ops parts of
-# Checkpoint 3a; not needed for the Docker-Compose path on our dogfooding
-# fleet, will land before M8 customer migration.
+# Two jobs:
+#   * image   — builds + pushes ghcr.io/<owner>/nexus-engine:vX.Y.Z et al
+#               (original M-Install Checkpoint 3a scope).
+#   * tarball — assembles nexus-edge-vX.Y.Z-linux-x86_64.tar.gz (binaries
+#               + UI dist + ORT-OpenVINO libs + models pack + tier
+#               templates + systemd unit + install.sh) and attaches it
+#               to the GitHub Release alongside its .sha256 sidecar and
+#               a top-level install.sh bootstrap (M-Install Checkpoint
+#               3a.2). install.sh / bootstrap.sh live in scripts/ in
+#               the repo for review; they are copied byte-for-byte
+#               into the tarball at build time.
 # ---------------------------------------------------------------------------
 
 name: release
@@ -151,3 +157,261 @@ jobs:
           # same scope, cuts ~15 min off cold publishing.
           cache-from: type=gha,scope=docker-all-eps
           cache-to: type=gha,scope=docker-all-eps,mode=max
+
+  # -------------------------------------------------------------------------
+  # tarball — M-Install Checkpoint 3a.2 / 3b
+  #
+  # Builds a self-contained bare-metal release tarball:
+  #
+  #   nexus-edge-vX.Y.Z-linux-x86_64.tar.gz
+  #   ├── VERSION                         (just "vX.Y.Z\n")
+  #   ├── MANIFEST.json                   (every file + sha256)
+  #   ├── bin/
+  #   │   ├── nexus-engine                (FEATURES=gstreamer,ort,ep-cpu,
+  #   │   │                                ep-openvino,ep-cuda,ep-tensorrt)
+  #   │   ├── nexus-probe
+  #   │   └── nexus-doctor
+  #   ├── lib/onnxruntime/                (libonnxruntime.so + OpenVINO
+  #   │                                    EP + intel CPU/GPU/NPU plugins,
+  #   │                                    extracted from the wheel — same
+  #   │                                    layout the docker runtime uses)
+  #   ├── share/
+  #   │   ├── ui/                         (ui/dist/)
+  #   │   └── models/                     (default 4-file model pack)
+  #   ├── etc-templates/
+  #   │   ├── nexus.example.toml
+  #   │   ├── tiers/{t10,t24,t36,t36s,t64}.toml
+  #   │   └── systemd/nexus-engine.service
+  #   └── scripts/
+  #       ├── install.sh                  (in-tarball installer)
+  #       ├── uninstall.sh
+  #       └── lib/install-common.sh
+  #
+  # Outputs three release assets:
+  #   * the tarball itself
+  #   * <tarball>.sha256 (sha256sum format)
+  #   * install.sh       (= scripts/bootstrap.sh, lets operators do
+  #                        `curl -fsSL ...release/.../install.sh | sudo bash`)
+  #
+  # No Ed25519 signing yet — that's a follow-up PR that prepends a
+  # signature step before "attach to release" and slots verification
+  # into scripts/install.sh next to verify_sha256().  Sha256 + GitHub
+  # Release HTTPS gets us most of the way; signing closes the
+  # MITM / compromised-uploader gap.
+  # -------------------------------------------------------------------------
+  tarball:
+    name: build + attach bare-metal tarball
+    runs-on: ubuntu-22.04
+    needs: image    # cheap dependency: forces serial execution so a
+                    # failed image build aborts the workflow before
+                    # burning ~15 min of compile time on the tarball.
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      ORT_VERSION: "1.22.0"
+      FEATURES: "gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt"
+    permissions:
+      contents: write   # required to `gh release upload`
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Same model-pack stage as the image job — release assets are
+      # the source of truth, we don't keep the .onnx files in git.
+      - name: stage model pack from release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'yolo26n_dynamic.onnx' \
+            --pattern 'yolo_world_v2_s.onnx' \
+            --pattern 'yoloe26_s.onnx' \
+            --pattern 'models-manifest.json' \
+            --dir models/
+          for f in yolo26n_dynamic.onnx yolo_world_v2_s.onnx yoloe26_s.onnx models-manifest.json; do
+            test -s "models/$f" || { echo "::error::missing models/$f"; exit 1; }
+          done
+
+      # GStreamer + ORT headers for the cargo build.  Same package set
+      # as deploy/Dockerfile stage 2 (rust-build).
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config build-essential cmake \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav gstreamer1.0-tools \
+            libssl-dev jq
+
+      - name: install ONNX Runtime ${{ env.ORT_VERSION }} (for cargo link)
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
+            | sudo tar -xz -C /opt
+          sudo mv "/opt/onnxruntime-linux-x64-${ORT_VERSION}" /opt/onnxruntime
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-toolchain.toml pins the channel; this just makes sure
+          # rustup is on PATH and cached.
+          components: ""
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tarball-${{ env.FEATURES }}
+
+      - name: cargo build (release, all EPs)
+        env:
+          ORT_LIB_LOCATION: /opt/onnxruntime/lib
+        run: |
+          set -euo pipefail
+          cargo build --release -p nexus-engine \
+            --features "$FEATURES" \
+            --bin nexus-engine --bin nexus-doctor
+          cargo build --release -p nexus-probe --bin nexus-probe
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+
+      - name: build UI
+        run: |
+          set -euo pipefail
+          cd ui
+          npm ci --no-fund --no-audit
+          npm run build
+
+      # Pull the OpenVINO-enabled libonnxruntime.so (and the intel
+      # CPU/GPU/NPU plugins + TBB) out of the matching-ABI Python
+      # wheel.  Same trick deploy/Dockerfile stage 2b uses.
+      - name: stage ONNX Runtime + OpenVINO libs
+        run: |
+          set -euo pipefail
+          python3 -m pip install --target /tmp/ovwheel \
+            "onnxruntime-openvino==${ORT_VERSION}"
+          mkdir -p stage/lib/onnxruntime
+          cp -aP /tmp/ovwheel/onnxruntime/capi/*.so* stage/lib/onnxruntime/
+          # The ort crate dlopens libonnxruntime.so (unversioned);
+          # the wheel only ships the .so.${ORT_VERSION} soname.
+          if [ ! -e "stage/lib/onnxruntime/libonnxruntime.so" ]; then
+            ln -s "libonnxruntime.so.${ORT_VERSION}" \
+                  "stage/lib/onnxruntime/libonnxruntime.so"
+          fi
+
+      - name: assemble release tree
+        run: |
+          set -euo pipefail
+          R="stage"
+          mkdir -p "$R/bin" "$R/share/ui" "$R/share/models" \
+                   "$R/etc-templates/tiers" "$R/etc-templates/systemd" \
+                   "$R/scripts/lib"
+
+          install -m 0755 target/release/nexus-engine "$R/bin/"
+          install -m 0755 target/release/nexus-probe  "$R/bin/"
+          install -m 0755 target/release/nexus-doctor "$R/bin/"
+
+          cp -a ui/dist/. "$R/share/ui/"
+          cp -a models/yolo26n_dynamic.onnx \
+                models/yolo_world_v2_s.onnx \
+                models/yoloe26_s.onnx \
+                models/models-manifest.json "$R/share/models/"
+
+          cp config/nexus.example.toml   "$R/etc-templates/nexus.example.toml"
+          cp config/tiers/t10.toml       "$R/etc-templates/tiers/"
+          cp config/tiers/t24.toml       "$R/etc-templates/tiers/"
+          cp config/tiers/t36.toml       "$R/etc-templates/tiers/"
+          cp config/tiers/t36s.toml      "$R/etc-templates/tiers/"
+          cp config/tiers/t64.toml       "$R/etc-templates/tiers/"
+
+          cp deploy/systemd/nexus-engine.service \
+             "$R/etc-templates/systemd/nexus-engine.service"
+
+          cp scripts/install.sh   "$R/scripts/"
+          cp scripts/uninstall.sh "$R/scripts/"
+          cp scripts/lib/install-common.sh "$R/scripts/lib/"
+          chmod +x "$R/scripts/install.sh" "$R/scripts/uninstall.sh"
+
+          echo "$TAG" > "$R/VERSION"
+
+          echo "--- staged tree ---"
+          find "$R" -maxdepth 3 -type f | sort | head -40
+          echo "--- size ---"
+          du -sh "$R"
+
+      - name: write MANIFEST.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, stat
+          root = "stage"
+          files = []
+          for dp, _, fns in os.walk(root):
+              for fn in fns:
+                  if fn in ("MANIFEST.json",):
+                      continue
+                  p = os.path.join(dp, fn)
+                  rel = os.path.relpath(p, root)
+                  h = hashlib.sha256()
+                  with open(p, "rb") as f:
+                      for chunk in iter(lambda: f.read(1 << 20), b""):
+                          h.update(chunk)
+                  st = os.stat(p)
+                  files.append({
+                      "path":   rel,
+                      "sha256": h.hexdigest(),
+                      "size":   st.st_size,
+                      "mode":   stat.S_IMODE(st.st_mode),
+                  })
+          files.sort(key=lambda e: e["path"])
+          with open(os.path.join(root, "VERSION")) as f:
+              version = f.read().strip()
+          manifest = {
+              "version":     version,
+              "files":       files,
+              "file_count":  len(files),
+              "total_bytes": sum(e["size"] for e in files),
+          }
+          with open(os.path.join(root, "MANIFEST.json"), "w") as f:
+              json.dump(manifest, f, indent=2, sort_keys=True)
+              f.write("\n")
+          print(f"manifest: {len(files)} files, "
+                f"{manifest['total_bytes']/1e6:.1f} MB")
+          PY
+
+      - name: package tarball
+        id: pack
+        run: |
+          set -euo pipefail
+          name="nexus-edge-${TAG}-linux-x86_64"
+          # Rename stage/ -> <name>/ so the tarball has a sensible
+          # top-level directory; tar's --transform would also work
+          # but a mv is harder to misread.
+          mv stage "$name"
+          tar -czf "${name}.tar.gz" "$name"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          ls -lh "${name}.tar.gz" "${name}.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: attach assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NAME: ${{ steps.pack.outputs.name }}
+        run: |
+          set -euo pipefail
+          # --clobber so a workflow re-run replaces existing assets
+          # instead of failing.  The boostrap script we ship as
+          # `install.sh` is the same scripts/bootstrap.sh checked
+          # into the repo; we rename on upload so the operator-facing
+          # URL is the obvious one.
+          gh release upload "$TAG" \
+            --repo "${{ github.repository }}" \
+            --clobber \
+            "${NAME}.tar.gz" \
+            "${NAME}.tar.gz.sha256"
+          gh release upload "$TAG" \
+            --repo "${{ github.repository }}" \
+            --clobber \
+            "scripts/bootstrap.sh#install.sh"
