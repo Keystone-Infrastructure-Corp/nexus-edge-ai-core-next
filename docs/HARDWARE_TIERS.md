@@ -77,7 +77,20 @@ desk so a clean install picks sensible defaults out of the box.
 The Lunar Lake iGPU + NPU 4 stack is the prize tier (~115 TOPS combined)
 but requires a kernel ≥ 6.10, OpenVINO ≥ 2024.4, and the Intel NPU
 driver trio installed out-of-band — see
+[INSTALL.md §5.3](INSTALL.md#53-tier-t36-s-lunar-lake--add-igpu--npu) and
 [nexus-edge-deploy OS_INSTALL.md §6.3](../../nexus-edge-deploy/docs/OS_INSTALL.md).
 The tier config `t36s.toml` lists `npu` second in `ep_priority`; if the
 NPU driver isn't present yet the engine falls through to `openvino`
 (iGPU) automatically — that's the whole point of EP priority lists.
+
+> **2025-Q3 Intel package rename — heads-up for stale install scripts.**
+> The historical `repositories.intel.com/gpu/ubuntu noble unified` apt
+> recipe is now **data-center-only** (Flex/Max) and hard-fails on
+> client Lunar Lake / Arc / Battlemage / Panther Lake silicon with
+> `intel-level-zero-gpu : Depends: libigc1 ... but it is not
+> installable`. The new path is `ppa:kobuk-team/intel-graphics`, and
+> two packages were renamed in the cutover:
+> `intel-level-zero-gpu` → `libze-intel-gpu1`,
+> `level-zero` → `libze1`. INSTALL.md §5.3 is current; any third-party
+> install transcript citing the old repo or old package names is wrong
+> for any T36-S box delivered after 2025-Q3.

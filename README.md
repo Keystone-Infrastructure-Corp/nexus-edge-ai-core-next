@@ -1,13 +1,20 @@
 # nexus-edge-ai-core-next
 
-> **Status:** v2 architectural rewrite, beta. M0–M4 + M-Install
-> Checkpoints 1–2 + M-Admin Phases 0–6 all complete. Suitable for
+> **Status:** v2 architectural rewrite, beta. **M0–M4, M2.1, M2.2,
+> M-Install Ckpts 1–3a.1, M-Admin (all 6 phases), M3.1–M3.3, M6
+> (identity + audit), and M7 Phase 1 (webhook sinks + cascading
+> delivery policy + UI + e2e) all shipped on `main`.** Suitable for
 > dogfooding on the reference hardware tiers; production deployment
-> blocked on M7 (alert delivery) + M8 (first customer trial) per
+> blocked on M5 (CUDA/TensorRT EPs), M7 Phase 2 (SureView), and M8
+> (bare-metal install + first customer trial) per
 > [`docs/ROADMAP.md`](docs/ROADMAP.md). Full operator CRUD UI shipped:
 > cameras (ONVIF + CIDR discovery), rules (visual + raw CEL),
-> polygon zones, storage backends. The shell is at
-> `http://<engine-host>:8089/` — see [`docs/INSTALL.md`](docs/INSTALL.md) §10.0.
+> polygon zones, storage backends, delivery policy, users, audit log.
+> The shell is at `http://<engine-host>:8089/` — see
+> [`docs/INSTALL.md`](docs/INSTALL.md) §10.0. New here? Read
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the L0–L7 model,
+> then [`docs/PIPELINE.md`](docs/PIPELINE.md) for the full
+> end-to-end engine walk-through with mermaid diagrams.
 
 A streaming-DAG edge-AI pipeline for surveillance video.
 

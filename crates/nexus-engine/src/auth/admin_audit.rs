@@ -59,18 +59,6 @@ use nexus_store::{SqliteTx, Store, StoreError};
 
 use super::require_role::SessionContext;
 
-/// Pull a [`SessionContext`] out of the request extensions, if
-/// the `admin_auth_layer` installed one. Useful for read paths
-/// that want to surface the actor without forcing a re-extract
-/// of the bearer. Currently unused by the in-tree call sites
-/// (which take `SessionContext` directly via the existing
-/// `FromRequestParts` impl) but kept public so future handlers
-/// that already accept `Request` can avoid the round-trip.
-#[allow(dead_code)]
-pub fn session_from_extensions(ext: &axum::http::Extensions) -> Option<&SessionContext> {
-    ext.get::<SessionContext>()
-}
-
 /// Best-effort `(actor_kind, actor_id, actor_label)` triple for
 /// the audit row.
 ///
