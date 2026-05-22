@@ -187,6 +187,15 @@ fi
 
 verify_manifest_files "$RELEASE_DIR"
 
+# --- Verify the operator-key Ed25519 signature -------------------------------
+#
+# Optional today (loud warning if absent — see verify_signature()
+# notes in install-common.sh) so the first-cut release tarball that
+# ships before the GH signing secret is onboarded still installs.
+# Set NEXUS_REQUIRE_SIGNATURE=1 to flip this to strict.
+
+verify_signature "$RELEASE_DIR"
+
 # --- User + dirs --------------------------------------------------------------
 
 ensure_user
@@ -207,7 +216,20 @@ if [[ -n "$TIER" ]]; then
     fi
     stage_tier_config "$TIER" "$RELEASE_DIR"
 elif [[ ! -e "$NEXUS_CONFIG_DIR/nexus.toml" ]]; then
-    die "no /etc/nexus/nexus.toml and no --tier given — pass --tier t{10,24,36,36s,64}"
+    # First install + no explicit --tier: ask nexus-probe what this
+    # box looks like and use its `recommended_tier`. Falls back to
+    # the original "please pass --tier" error if probe doesn't
+    # produce a usable answer (no GPU on a recent CPU might still
+    # land on the right tier; an ancient box without AVX2 might
+    # not).
+    auto_tier="$(auto_detect_tier "$RELEASE_DIR")"
+    if [[ -n "$auto_tier" ]]; then
+        log "nexus-probe recommends --tier $auto_tier; using it (override with --tier on re-run)"
+        TIER="$auto_tier"
+        stage_tier_config "$TIER" "$RELEASE_DIR"
+    else
+        die "no /etc/nexus/nexus.toml, no --tier given, and nexus-probe could not auto-detect — pass --tier t{10,24,36,36s,64}"
+    fi
 else
     log "preserving existing config: $NEXUS_CONFIG_DIR/nexus.toml"
 fi

@@ -174,6 +174,101 @@ PY
     log "manifest sha256 OK ($(jq -r '.files | length' "$manifest" 2>/dev/null || echo '?') files)"
 }
 
+# --- Ed25519 signature verification ------------------------------------------
+
+# Verify MANIFEST.json against MANIFEST.json.sig using the
+# operator-onboarded public key committed at
+# `scripts/lib/release-pubkey.pem`.
+#
+# Three outcomes:
+#
+#   1. Both .sig + pubkey present + signature valid     -> OK, log + return 0
+#   2. Both .sig + pubkey present + signature INVALID   -> die (always fatal)
+#   3. .sig OR pubkey absent
+#        - NEXUS_REQUIRE_SIGNATURE=1 in env             -> die (paranoid mode)
+#        - otherwise                                    -> warn + return 0
+#
+# Outcome 3's warning-without-die is intentional: it lets the very
+# first release cut (before the GH signing secret is onboarded) ship
+# a tarball without breaking install.sh. Once both halves are in
+# place every subsequent release verifies strictly.
+verify_signature() {
+    local release_dir="$1"
+    local manifest="$release_dir/MANIFEST.json"
+    local sig="$release_dir/MANIFEST.json.sig"
+    local pubkey="$release_dir/scripts/lib/release-pubkey.pem"
+
+    [[ -r "$manifest" ]] || die "release MANIFEST.json missing: $manifest"
+
+    if [[ ! -r "$pubkey" ]]; then
+        if [[ "${NEXUS_REQUIRE_SIGNATURE:-0}" == "1" ]]; then
+            die "NEXUS_REQUIRE_SIGNATURE=1 but no public key bundled in release: $pubkey"
+        fi
+        warn "release-pubkey.pem missing from release; cannot verify signature"
+        return 0
+    fi
+
+    if [[ ! -r "$sig" ]]; then
+        if [[ "${NEXUS_REQUIRE_SIGNATURE:-0}" == "1" ]]; then
+            die "NEXUS_REQUIRE_SIGNATURE=1 but tarball is unsigned (no MANIFEST.json.sig)"
+        fi
+        warn "release is UNSIGNED (no MANIFEST.json.sig); skipping signature check"
+        warn "  to enforce signatures, re-run with NEXUS_REQUIRE_SIGNATURE=1"
+        return 0
+    fi
+
+    require_cmd openssl
+    # Ed25519 raw-message verification (no pre-hash). Output goes
+    # to /dev/null because openssl prints "Signature Verified
+    # Successfully" on success which we duplicate in log() below.
+    if ! openssl pkeyutl -verify -pubin -inkey "$pubkey" -rawin \
+            -in "$manifest" -sigfile "$sig" >/dev/null 2>&1; then
+        die "MANIFEST.json signature did NOT verify against bundled pubkey — refusing to install"
+    fi
+    log "MANIFEST.json signature OK (Ed25519, $(wc -c < "$sig") bytes)"
+}
+
+# --- nexus-probe auto-tier ----------------------------------------------------
+
+# Run the staged `nexus-probe` binary, parse its JSON manifest, and
+# echo the `recommended_tier` (e.g. "t24"). Returns empty string on
+# any failure (missing binary, non-zero exit, malformed JSON, tier
+# not in the known set) so the caller can fall back to demanding an
+# explicit `--tier`.
+auto_detect_tier() {
+    local release_dir="$1"
+    local probe="$release_dir/bin/nexus-probe"
+
+    if [[ ! -x "$probe" ]]; then
+        return 0
+    fi
+    require_cmd python3
+
+    local json
+    if ! json="$("$probe" --out - 2>/dev/null)"; then
+        return 0
+    fi
+    local tier
+    # Prefer `recommended_tier_config` (e.g. "config/tiers/t24.toml")
+    # over `recommended_tier` because the latter is upper-case with
+    # punctuation ("T10", "T36-S") while the file stem is the exact
+    # lower-case CLI tier we want ("t10", "t36s"). Falls through
+    # silently for the "dev" / "config/single-camera.toml" case
+    # which has no production tier mapping.
+    tier="$(printf '%s' "$json" | python3 -c '
+import json, os, sys
+try:
+    m = json.load(sys.stdin)
+    cfg = m.get("recommended_tier_config", "")
+    stem = os.path.splitext(os.path.basename(cfg))[0]
+    if stem in ("t10","t24","t36","t36s","t64"):
+        print(stem)
+except Exception:
+    pass
+' 2>/dev/null || true)"
+    printf '%s' "$tier"
+}
+
 # --- install-state.json -------------------------------------------------------
 
 # Single-row state file the M-OTA updater (and rollback) read.  Path

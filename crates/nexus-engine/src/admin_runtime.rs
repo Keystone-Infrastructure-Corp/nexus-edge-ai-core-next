@@ -304,7 +304,9 @@ pub async fn put_server_bind(
         match &ui_decision {
             None => {}
             Some(UiBindDecision::Reset) => {
-                s.store.delete_runtime_setting_tx(&mut tx, KEY_UI_BIND).await?;
+                s.store
+                    .delete_runtime_setting_tx(&mut tx, KEY_UI_BIND)
+                    .await?;
             }
             Some(UiBindDecision::Clear) => {
                 // SQL NULL = operator-persisted "off" (see resolver).
@@ -1759,8 +1761,7 @@ mod tests {
     fn put_server_bind_req_accepts_omitted_ui_bind() {
         // Pre-extension callers (and the UI's `noop` action) PUT
         // just `{addr}` — must still deserialise.
-        let req: PutServerBindReq =
-            serde_json::from_str(r#"{"addr":"0.0.0.0:8089"}"#).unwrap();
+        let req: PutServerBindReq = serde_json::from_str(r#"{"addr":"0.0.0.0:8089"}"#).unwrap();
         assert_eq!(req.addr, "0.0.0.0:8089");
         assert!(req.ui_bind.is_none());
     }

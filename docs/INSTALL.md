@@ -1284,11 +1284,13 @@ MANIFEST.json                # every file + sha256 (used by install.sh + future 
 Same command does first install AND every subsequent upgrade — it's
 idempotent and the `--tier` flag is only consulted on first install
 (so re-running with the wrong tier won't clobber a tuned
-`/etc/nexus/nexus.toml`).
+`/etc/nexus/nexus.toml`). If you omit `--tier` on a first install the
+script runs `nexus-probe` from the staged release and auto-selects
+the recommended tier; pass `--tier` explicitly to override.
 
 ```bash
 curl -fsSL https://github.com/andboyer/nexus-edge-ai-core-next/releases/latest/download/install.sh \
-  | sudo bash -s -- --tier t24      # swap t24 for your tier from §1
+  | sudo bash -s -- --tier t24      # swap t24 for your tier from §1, or omit for auto
 ```
 
 The bootstrap script:
@@ -1299,7 +1301,13 @@ The bootstrap script:
    - Re-verifies the sha256 sidecar.
    - Extracts to `/opt/nexus/releases/<version>/`.
    - Verifies every file against `MANIFEST.json` (catches mid-flight corruption).
+   - Verifies the Ed25519 signature on `MANIFEST.json` against the
+     committed `scripts/lib/release-pubkey.pem` (or warns and
+     continues if the release predates signing; set
+     `NEXUS_REQUIRE_SIGNATURE=1` to enforce strictly).
    - Creates the `nexus` system user + `/etc/nexus` + `/var/lib/nexus`.
+   - On first install with no `--tier`, runs `bin/nexus-probe` to
+     auto-detect the tier from CPU + accelerator features.
    - Stages `/etc/nexus/nexus.toml` from the tier template **only if
      the file doesn't already exist** (operator edits survive
      upgrades forever).

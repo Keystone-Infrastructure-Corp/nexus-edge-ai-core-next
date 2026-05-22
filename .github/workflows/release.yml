@@ -332,6 +332,7 @@ jobs:
           cp scripts/install.sh   "$R/scripts/"
           cp scripts/uninstall.sh "$R/scripts/"
           cp scripts/lib/install-common.sh "$R/scripts/lib/"
+          cp scripts/lib/release-pubkey.pem "$R/scripts/lib/"
           chmod +x "$R/scripts/install.sh" "$R/scripts/uninstall.sh"
 
           echo "$TAG" > "$R/VERSION"
@@ -381,6 +382,39 @@ jobs:
                 f"{manifest['total_bytes']/1e6:.1f} MB")
           PY
 
+      # Ed25519 sign MANIFEST.json with the operator-held private key
+      # stored in the `NEXUS_RELEASE_SIGNING_KEY` GH secret. The
+      # matching public key is committed at
+      # `scripts/lib/release-pubkey.pem`; `install.sh` verifies the
+      # signature before installing. Skipped (loud warning, NOT a
+      # failure) when the secret is unset so the very first release
+      # cut before key onboarding still ships a tarball — `install.sh`
+      # in that case warns about unsigned releases but proceeds unless
+      # `NEXUS_REQUIRE_SIGNATURE=1` is exported by the operator.
+      - name: sign MANIFEST.json (Ed25519)
+        env:
+          NEXUS_RELEASE_SIGNING_KEY: ${{ secrets.NEXUS_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${NEXUS_RELEASE_SIGNING_KEY:-}" ]]; then
+            echo "::warning::NEXUS_RELEASE_SIGNING_KEY secret is unset; release tarball will be UNSIGNED. Configure the secret to enable signing."
+            exit 0
+          fi
+          # Round-trip via a 0600 tempfile (`openssl pkeyutl -sign`
+          # needs a file path, not stdin) and shred it after.
+          umask 077
+          keyfile="$(mktemp)"
+          trap 'shred -u "$keyfile" 2>/dev/null || rm -f "$keyfile"' EXIT
+          printf '%s\n' "$NEXUS_RELEASE_SIGNING_KEY" > "$keyfile"
+          openssl pkeyutl -sign -inkey "$keyfile" -rawin \
+            -in stage/MANIFEST.json -out stage/MANIFEST.json.sig
+          # Sanity-check round trip with the committed pubkey so a
+          # mismatched secret fails the workflow, not the operator.
+          openssl pkeyutl -verify -pubin \
+            -inkey scripts/lib/release-pubkey.pem -rawin \
+            -in stage/MANIFEST.json -sigfile stage/MANIFEST.json.sig
+          echo "MANIFEST.json signed and self-verified ($(wc -c < stage/MANIFEST.json.sig) bytes)"
+
       - name: package tarball
         id: pack
         run: |
@@ -393,12 +427,22 @@ jobs:
           tar -czf "${name}.tar.gz" "$name"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
           ls -lh "${name}.tar.gz" "${name}.tar.gz.sha256"
+          # Hoist the in-tarball MANIFEST.json.sig (if signing ran)
+          # out to a sibling asset so operators can grab it without
+          # extracting the tarball first — same shape as .sha256.
+          if [[ -f "${name}/MANIFEST.json.sig" ]]; then
+            cp "${name}/MANIFEST.json.sig" "${name}.tar.gz.manifest.sig"
+            echo "have_sig=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_sig=0" >> "$GITHUB_OUTPUT"
+          fi
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - name: attach assets to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NAME: ${{ steps.pack.outputs.name }}
+          HAVE_SIG: ${{ steps.pack.outputs.have_sig }}
         run: |
           set -euo pipefail
           # --clobber so a workflow re-run replaces existing assets
@@ -411,6 +455,12 @@ jobs:
             --clobber \
             "${NAME}.tar.gz" \
             "${NAME}.tar.gz.sha256"
+          if [[ "$HAVE_SIG" == "1" ]]; then
+            gh release upload "$TAG" \
+              --repo "${{ github.repository }}" \
+              --clobber \
+              "${NAME}.tar.gz.manifest.sig"
+          fi
           gh release upload "$TAG" \
             --repo "${{ github.repository }}" \
             --clobber \
