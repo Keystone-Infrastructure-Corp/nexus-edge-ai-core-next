@@ -214,6 +214,115 @@ fn build_detector_with_context(
         }
         // PPE-style attribute heads (`ppe_v1.onnx` is the v1 ship).
         "classifier_ensemble" | "ppe" => Ok(Arc::new(ClassifierEnsembleDetector::new(cfg)?)),
+        // M3.1 — yoloe (open-vocab text-prompt detector). Real ORT path
+        // requires the `ort` feature AND inference.model.pack_path; mock
+        // fallback otherwise so the engine still boots on a bare dev box.
+        "yoloe" => {
+            #[cfg(feature = "ort")]
+            #[allow(clippy::needless_return)]
+            {
+                return crate::yoloe::build_detector_for_yoloe(cfg);
+            }
+            #[cfg(not(feature = "ort"))]
+            {
+                warn!(
+                    kind = %cfg.model.kind,
+                    "ort feature not compiled in; using mock for yoloe kind"
+                );
+                Ok(Arc::new(MockDetector::new()))
+            }
+        }
+        // M3.1 — yoloe_visual (visual-prompt detector). Needs both the
+        // `ort` feature AND a VisualPromptStore plumbed through
+        // BuildContext; mock fallback when either is missing so the
+        // engine still boots without tripping the pool/router on a dev
+        // box that has no embeddings table.
+        "yoloe_visual" => {
+            #[cfg(feature = "ort")]
+            {
+                if let (Some(store), Some(dim)) = (
+                    _ctx.visual_prompt_store.clone(),
+                    _ctx.visual_embedding_dim,
+                ) {
+                    match crate::yoloe_visual::YoloeVisualDetector::from_config(cfg, dim, store) {
+                        Ok(d) => return Ok(Arc::new(d)),
+                        Err(e) => {
+                            warn!(
+                                "yoloe_visual ORT detector unavailable, \
+                                 falling back to mock: {e}"
+                            );
+                            return Ok(Arc::new(MockDetector::new()));
+                        }
+                    }
+                }
+                warn!(
+                    "yoloe_visual requires a VisualPromptStore + embedding_dim \
+                     in BuildContext; falling back to mock"
+                );
+                Ok(Arc::new(MockDetector::new()))
+            }
+            #[cfg(not(feature = "ort"))]
+            {
+                warn!(
+                    kind = %cfg.model.kind,
+                    "ort feature not compiled in; using mock for yoloe_visual kind"
+                );
+                Ok(Arc::new(MockDetector::new()))
+            }
+        }
+        // M3.3 — yoloe_promptfree wraps an inner yoloe (or mock) with a
+        // top-k post-NMS truncation. The wrapper's name() is what the
+        // router reports, so dispatch must produce it even when the
+        // inner falls back to mock.
+        "yoloe_promptfree" => {
+            let inner: Arc<dyn Detector> = {
+                #[cfg(feature = "ort")]
+                {
+                    crate::yoloe::build_detector_for_yoloe(cfg)
+                        .unwrap_or_else(|_| Arc::new(MockDetector::new()))
+                }
+                #[cfg(not(feature = "ort"))]
+                {
+                    Arc::new(MockDetector::new())
+                }
+            };
+            Ok(Arc::new(YoloePromptFreeDetector::new(
+                inner,
+                cfg.model.top_k,
+            )))
+        }
+        // M3.2 — same-camera detector ensemble. Each member is itself a
+        // ModelConfig; build them by recursion via a derived
+        // InferenceConfig that swaps in the member's model. Nested
+        // ensembles are skipped with a warning rather than recursed
+        // into — matches the "ensemble member skips nested ensemble"
+        // acceptance test and the worker's identical guard.
+        "ensemble" => {
+            let mut members: Vec<Arc<dyn Detector>> =
+                Vec::with_capacity(cfg.model.members.len());
+            for member_cfg in &cfg.model.members {
+                if member_cfg.kind == "ensemble" {
+                    warn!(
+                        "ensemble member with kind=\"ensemble\" skipped \
+                         (no nested ensembles)"
+                    );
+                    continue;
+                }
+                let mut derived = cfg.clone();
+                derived.model = member_cfg.clone();
+                match build_detector_with_context(&derived, _ctx) {
+                    Ok(det) => members.push(det),
+                    Err(e) => warn!(
+                        member_kind = %member_cfg.kind,
+                        "ensemble member build failed; skipped: {e}"
+                    ),
+                }
+            }
+            Ok(Arc::new(crate::ensemble::EnsembleDetector::new(
+                members,
+                crate::ensemble::DEFAULT_ENSEMBLE_NMS_IOU,
+            )))
+        }
         "mock" => Ok(Arc::new(MockDetector::new())),
         other => {
             warn!(kind = %other, "unknown model kind, falling back to mock");
