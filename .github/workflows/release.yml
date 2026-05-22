@@ -26,6 +26,7 @@
 #     --title "vX.Y.Z" --generate-notes \
 #     models/yolo26n_dynamic.onnx \
 #     models/yolo_world_v2_s.onnx \
+#     models/yoloe26_s.onnx \
 #     models/models-manifest.json
 #
 # Why this is its own workflow and not a job under ci.yml: the push needs
@@ -91,13 +92,14 @@ jobs:
             --repo "${{ github.repository }}" \
             --pattern 'yolo26n_dynamic.onnx' \
             --pattern 'yolo_world_v2_s.onnx' \
+            --pattern 'yoloe26_s.onnx' \
             --pattern 'models-manifest.json' \
             --dir models/
           echo "Staged model pack:"
           ls -la models/
           # Fail loudly (rather than silently shipping a no-weights image)
-          # if any of the three required files is missing.
-          for f in yolo26n_dynamic.onnx yolo_world_v2_s.onnx models-manifest.json; do
+          # if any of the required files is missing.
+          for f in yolo26n_dynamic.onnx yolo_world_v2_s.onnx yoloe26_s.onnx models-manifest.json; do
             if [ ! -s "models/$f" ]; then
               echo "::error::Required model asset 'models/$f' missing from release $TAG. Re-upload via 'gh release upload $TAG models/$f'."
               exit 1

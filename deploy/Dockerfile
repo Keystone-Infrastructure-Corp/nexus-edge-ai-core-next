@@ -169,9 +169,9 @@ COPY --from=rust-build /work/target/release/nexus-probe  /usr/local/bin/nexus-pr
 COPY --from=ui-build /work/ui/dist /usr/share/nexus/ui
 
 # Default model pack — baked into the image so a fresh `docker compose up`
-# works without §6.4 host-side model staging. ~58 MB total (yolo26n ~10 MB,
-# yolo_world ~48 MB, manifest ~8 KB). Mounted read-only via the image
-# layer; the tier configs in `config/tiers/` point `pack_path` here.
+# works without §6.4 host-side model staging. ~100 MB total (yolo26n ~10 MB,
+# yolo_world ~48 MB, yoloe26_s ~42 MB, manifest ~7 KB). Mounted read-only via
+# the image layer; the tier configs in `config/tiers/` point `pack_path` here.
 # Operators with custom model packs override by setting
 # `[inference.model].pack_path = "/var/lib/nexus/models"` in their
 # nexus.toml and bind-mounting `/var/lib/nexus/models/` over the read-only

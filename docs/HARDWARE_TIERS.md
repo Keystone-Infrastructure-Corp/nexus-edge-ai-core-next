@@ -24,8 +24,6 @@ tiers are first-class M1 targets.
 - 15 fps capture, motion-gated to the detector.
 - One `nexus-engine` process per host. Internal fan-out via
   `[inference].workers`; **do not** stack engines on one box.
-- The PPE attribute classifier (`ppe_v1.onnx`) runs as a
-  `ClassifierEnsembleDetector` slot when enabled per camera.
 
 If your cameras don't fit this profile (4K, sub-stream only, GB1 fps,
 JPEG snapshot mode) document it in the per-camera config and don't

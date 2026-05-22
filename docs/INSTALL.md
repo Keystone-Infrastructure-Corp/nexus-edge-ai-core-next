@@ -818,7 +818,7 @@ sudo install -o nexus -g nexus -m 0644 \
 > **When you need this section:**
 >
 > - **Pulling GHCR (§6.7 Option A):** skip — the published image bakes
->   the default pack (~58 MB) into `/usr/share/nexus/models/` and all
+>   the default pack (~100 MB) into `/usr/share/nexus/models/` and all
 >   five tier configs already point `pack_path` there.
 > - **Building from source (§6.7 Option B):** required, because
 >   `models/` is gitignored — your fresh clone has an empty `models/`
@@ -841,6 +841,9 @@ sudo install -o nexus -g nexus -m 0644 \
     /path/to/yolo_world_v2_s.onnx \
     /var/lib/nexus/models/yolo_world_v2_s.onnx
 sudo install -o nexus -g nexus -m 0644 \
+    /path/to/yoloe26_s.onnx \
+    /var/lib/nexus/models/yoloe26_s.onnx
+sudo install -o nexus -g nexus -m 0644 \
     /path/to/models-manifest.json \
     /var/lib/nexus/models/models-manifest.json
 
@@ -861,7 +864,7 @@ sudo sed -i \
 > ```bash
 > # From the machine that ran `tools/models/gen_*.py`:
 > ssh nexus 'sudo mkdir -p /var/lib/nexus/models && sudo chown -R nexus:nexus /var/lib/nexus/models'
-> scp models/{yolo26n_dynamic.onnx,yolo_world_v2_s.onnx,models-manifest.json} \
+> scp models/{yolo26n_dynamic.onnx,yolo_world_v2_s.onnx,yoloe26_s.onnx,models-manifest.json} \
 >     nexus:/tmp/models-pack/
 > ssh nexus 'sudo install -o nexus -g nexus -m 0644 /tmp/models-pack/* /var/lib/nexus/models/'
 > ```
@@ -1830,7 +1833,37 @@ sudo install -o nexus -g nexus -m 0644 \
 The gen script also writes `models-manifest.json` with refreshed
 sha256 entries — copy it across alongside the `.onnx` file.
 
-### 12.5 Custom prompt vocabulary
+### 12.5 Generate `yoloe26_s.onnx` (open-vocab, M3.1 successor)
+
+YOLOE is the open-vocabulary detector line that supersedes
+YOLO-World in the ultralytics ecosystem. Same prompt-baking flow as
+§12.4; smaller artifact (~42 MB vs ~48 MB).
+
+```bash
+sudo -u nexus-admin bash <<'EOF'
+cd /opt/nexus
+source .venv-modelgen/bin/activate
+# If the ultralytics PyPI release lacks the `YOLOE` symbol, upgrade:
+#   pip install -U 'git+https://github.com/ultralytics/ultralytics@main'
+python tools/models/gen_yoloe.py \
+    --prompts tools/models/yoloe_default_prompts.txt
+EOF
+
+sudo install -o nexus -g nexus -m 0644 \
+    /opt/nexus/models/yoloe26_s.onnx \
+    /var/lib/nexus/models/yoloe26_s.onnx
+# Manifest was upserted by the gen script — re-copy:
+sudo install -o nexus -g nexus -m 0644 \
+    /opt/nexus/models/models-manifest.json \
+    /var/lib/nexus/models/models-manifest.json
+```
+
+The per-camera prompt subset is configured at runtime via
+`[[cameras]].prompts` in `nexus.toml`; every prompt in that list
+MUST also appear in `tools/models/yoloe_default_prompts.txt`
+before regeneration.
+
+### 12.6 Custom prompt vocabulary
 
 To change what YOLO-World can detect, edit
 [tools/models/yolo_world_default_prompts.txt](../tools/models/yolo_world_default_prompts.txt)
