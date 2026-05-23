@@ -2312,8 +2312,7 @@ async fn list_motion_for_camera(
     let rows = s
         .store
         .list_motion_events_for_camera(camera_id, from, to, limit)
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .await?;
     Ok(Json(rows))
 }
 
@@ -2357,8 +2356,7 @@ async fn list_motion_histogram_for_camera(
     let buckets = s
         .store
         .list_motion_histogram_for_camera(camera_id, from, to, bucket_seconds)
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .await?;
     Ok(Json(buckets))
 }
 
@@ -2488,8 +2486,7 @@ async fn get_clip(
     let clip = s
         .store
         .get_clip(clip_id)
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .await?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("clip {clip_id} not found")))?;
 
     // Stage A: recorder is `stub` and the on-disk file is 0 bytes —
@@ -2734,8 +2731,7 @@ async fn get_clip_thumbnail(
     let clip = s
         .store
         .get_clip(clip_id)
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .await?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("clip {clip_id} not found")))?;
 
     if s.recorder.kind() == "stub" {
@@ -2887,15 +2883,13 @@ async fn get_clip_tracks(
     let clip = s
         .store
         .get_clip(clip_id)
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .await?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("clip {clip_id} not found")))?;
 
     let events = s
         .store
         .list_motion_events_for_clip(clip_id)
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .await?;
 
     let trigger_track_ids = s
         .store
