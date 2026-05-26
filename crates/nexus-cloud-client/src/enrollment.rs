@@ -12,16 +12,14 @@
 //!    the enrollment artifact directory.
 //! 5. Pins `gateway_url` for the [`crate::tunnel::TunnelClient`].
 //!
-//! ## Deferred — actor_token verifying-key bundling
+//! ## actor_token verifying-key bundling
 //!
-//! The cloud-side `EnrollResponse` does NOT yet include the entitlement
-//! signer's public key. Until that lands (a small follow-up slice on the
-//! cloud-console enrollment-svc), the engine reads the verifying key
-//! from a sidecar file at boot. The optional
-//! [`EnrollmentResponse::entitlement_signing_key_pem`] field is left in
-//! the struct so the response can be wire-compatible the moment the
-//! cloud adds it; today it deserialises to `None` for every real
-//! response.
+//! The cloud-side `EnrollResponse` includes the entitlement signer's
+//! public key (PEM) and its `kid` so the engine's
+//! [`crate::rpc::RpcDispatcher`] can be seeded at enrollment time
+//! without an out-of-band key fetch. Both fields remain `Option<T>` on
+//! the wire for forward / backward compatibility with older cloud
+//! deployments that pre-date Phase 1.7c.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,9 +45,11 @@ pub struct EnrollmentRequest {
 /// file under the enrollment artifact directory.
 ///
 /// Matches `EnrollResponse` in
-/// `nexus-cloud-console/services/enrollment-svc/src/handlers.rs` plus
-/// two forward-compat optional fields for the actor_token verifying key
-/// (see module docs).
+/// `nexus-cloud-console/services/enrollment-svc/src/handlers.rs`. The
+/// `entitlement_signing_*` fields are typed `Option<String>` for wire
+/// compatibility with cloud deployments older than Phase 1.7c (where
+/// they may legitimately be absent); a Phase 1.7c+ cloud always
+/// populates them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentResponse {
     /// PEM-encoded leaf mTLS certificate signed by the internal CA.
@@ -63,13 +63,13 @@ pub struct EnrollmentResponse {
     pub gateway_url: String,
     /// UUID the cloud-console assigned to this core (`cores.id`).
     pub core_id: String,
-    /// Forward-compat — PEM-encoded Ed25519 public key the engine uses
-    /// to verify `actor_token` JWTs and the inbound `EntitlementUpdate`
-    /// JWT. Currently always absent on the cloud side; bundled in a
-    /// Phase 1.7.x follow-up.
+    /// SPKI PEM of the Ed25519 public key the engine uses to verify
+    /// `actor_token` JWTs (cloud → edge mutating RPCs) and the inbound
+    /// `EntitlementUpdate` JWT. Cloud populates this starting at Phase
+    /// 1.7c; older deployments may omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement_signing_key_pem: Option<String>,
-    /// Forward-compat — optional `kid` to bind the bundled key to.
+    /// JWS `kid` paired with `entitlement_signing_key_pem`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement_signing_kid: Option<String>,
 }
