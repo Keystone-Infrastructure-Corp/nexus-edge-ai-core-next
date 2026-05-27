@@ -180,6 +180,43 @@ impl Verifier {
         envelope: EnvelopeContext<'_>,
         request_id: Option<&str>,
     ) -> Result<VerifiedActor, RejectReason> {
+        let actor = self.verify_no_replay(token, envelope)?;
+        // Replay cache — last check so that bad sig / claims rejections
+        // don't pollute the cache (otherwise an attacker could flood it).
+        if !self.inner.replay.insert_keyed(&actor.jti, request_id) {
+            return Err(RejectReason::Invalid(InvalidReason::Replay));
+        }
+        Ok(actor)
+    }
+
+    /// Phase 1.16 — perform every check in [`Self::verify_with_request_id`]
+    /// **except** the [`JtiReplayCache`] insert. Returns the
+    /// [`VerifiedActor`] (with the resolved `jti`) so the caller can
+    /// make its own replay decision.
+    ///
+    /// Used by [`crate::dispatcher::RpcDispatcher`] when it has been
+    /// configured with an [`crate::response_cache::RpcResponseCache`]
+    /// so that the dispatcher can serve the cached response for a
+    /// legitimate retry instead of rejecting it as a replay. The
+    /// dispatcher still consults the replay cache as a safety net for
+    /// the (rare) case where a response was evicted before its retry
+    /// arrived.
+    ///
+    /// Callers that do NOT operate a response cache should keep
+    /// using [`Self::verify_with_request_id`] — bypassing the replay
+    /// check without compensating dedup machinery would re-open the
+    /// replay-attack surface the cache exists to close.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::verify_with_request_id`] minus
+    /// [`InvalidReason::Replay`] (the caller must guard against that
+    /// case on its own).
+    pub fn verify_no_replay(
+        &self,
+        token: &str,
+        envelope: EnvelopeContext<'_>,
+    ) -> Result<VerifiedActor, RejectReason> {
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
             return Err(RejectReason::Invalid(InvalidReason::MalformedJws));
@@ -265,12 +302,6 @@ impl Verifier {
         }
         if exp_i <= now - CLOCK_SKEW_SECS {
             return Err(RejectReason::Invalid(InvalidReason::Expired));
-        }
-
-        // Replay cache — last check so that bad sig / claims rejections
-        // don't pollute the cache (otherwise an attacker could flood it).
-        if !self.inner.replay.insert_keyed(&claims.jti, request_id) {
-            return Err(RejectReason::Invalid(InvalidReason::Replay));
         }
 
         Ok(VerifiedActor {

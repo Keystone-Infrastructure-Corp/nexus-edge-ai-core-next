@@ -38,6 +38,7 @@ pub mod enrollment;
 pub mod entitlements;
 pub mod error;
 pub mod jti_cache;
+pub mod response_cache;
 pub mod sink;
 pub mod tunnel;
 
@@ -47,4 +48,5 @@ pub use dispatcher::{AuditSink, Handler, NullAuditSink, RpcDispatcher, SystemMet
 pub use enrollment::{EnrollmentClient, EnrollmentError, EnrollmentRequest, EnrollmentResponse};
 pub use error::{DispatchError, InvalidReason, RejectReason};
 pub use jti_cache::JtiReplayCache;
+pub use response_cache::RpcResponseCache;
 pub use tunnel::{TunnelClient, TunnelError, TunnelHandle};

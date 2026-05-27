@@ -13,6 +13,7 @@ use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody, RpcCallPayload, RpcRespon
 
 use crate::actor_token::{EnvelopeContext, VerifiedActor, Verifier};
 use crate::error::{DispatchError, InvalidReason, RejectReason};
+use crate::response_cache::RpcResponseCache;
 
 /// Logical operation name extracted by the engine from
 /// `rpc_call.payload.path`. Phase 1.7 keeps the contract simple — the
@@ -147,6 +148,13 @@ pub struct RpcDispatcher<H: Handler> {
     policy: SystemMethodPolicy,
     audit: Arc<dyn AuditSink>,
     handler: H,
+    /// Phase 1.16: optional response-replay cache. When configured
+    /// (and the inbound envelope carries a `request_id`), the
+    /// dispatcher serves the cached `rpc_response` body byte-identically
+    /// instead of running the handler a second time — closing the
+    /// engine half of the 1.16 acceptance criterion. See
+    /// [`RpcResponseCache`] for the storage contract.
+    response_cache: Option<Arc<RpcResponseCache>>,
 }
 
 impl<H: Handler> RpcDispatcher<H> {
@@ -158,6 +166,7 @@ impl<H: Handler> RpcDispatcher<H> {
             policy,
             audit: Arc::new(NullAuditSink),
             handler,
+            response_cache: None,
         }
     }
 
@@ -165,6 +174,17 @@ impl<H: Handler> RpcDispatcher<H> {
     #[must_use]
     pub fn with_audit_sink(mut self, audit: Arc<dyn AuditSink>) -> Self {
         self.audit = audit;
+        self
+    }
+
+    /// Phase 1.16: install a response-replay cache. When set, the
+    /// dispatcher replays the cached `rpc_response` byte-identically
+    /// for any retry that carries the same `(jti, request_id)`.
+    /// Default is no cache (preserves the v1.7 contract of rejecting
+    /// replays with [`InvalidReason::Replay`]).
+    #[must_use]
+    pub fn with_response_cache(mut self, cache: Arc<RpcResponseCache>) -> Self {
+        self.response_cache = Some(cache);
         self
     }
 
@@ -260,10 +280,68 @@ impl<H: Handler> RpcDispatcher<H> {
         body: Option<&[u8]>,
     ) -> Result<Vec<u8>, DispatchError> {
         let token = token.ok_or(DispatchError::Reject(RejectReason::Missing))?;
+
+        // Phase 1.16: the response-cache-equipped path verifies WITHOUT
+        // touching the [`crate::jti_cache::JtiReplayCache`] so a
+        // legitimate retry (same `request_id`, possibly fresh `jti`)
+        // can be served the byte-identical cached body instead of
+        // being rejected as a replay. The replay cache is still
+        // consulted as a safety net AFTER the response-cache miss
+        // path, so a retry whose response was evicted before it
+        // arrived is still rejected rather than silently re-run.
+        if let (Some(cache), Some(rid)) = (self.response_cache.as_ref(), request_id) {
+            let actor = self.verifier.verify_no_replay(token, envelope)?;
+            if let Some(cached) = cache.get(&actor.jti, rid) {
+                // Byte-identical replay — bypass handler, audit, and
+                // system-sub gate. The original call already ran them.
+                return Ok(cached);
+            }
+            // Cache miss. Admit-or-reject via the replay cache: if
+            // the tuple was already admitted (i.e. response evicted
+            // before retry arrived), refuse rather than re-run.
+            if !self
+                .verifier
+                .replay_cache()
+                .insert_keyed(&actor.jti, Some(rid))
+            {
+                return Err(DispatchError::Reject(RejectReason::Invalid(
+                    InvalidReason::Replay,
+                )));
+            }
+            self.check_system_sub_and_audit(method, envelope, &actor)
+                .await?;
+            let body_out = self
+                .handler
+                .handle(method, envelope, &actor, body)
+                .await
+                .map_err(DispatchError::Handler)?;
+            cache.insert(&actor.jti, rid, body_out.clone());
+            return Ok(body_out);
+        }
+
+        // v1.7 path — no response cache OR no request_id. The
+        // verifier's `verify_with_request_id` handles dedup-and-reject
+        // for us (request_id may be `None`).
         let actor = self
             .verifier
             .verify_with_request_id(token, envelope, request_id)?;
+        self.check_system_sub_and_audit(method, envelope, &actor)
+            .await?;
+        self.handler
+            .handle(method, envelope, &actor, body)
+            .await
+            .map_err(DispatchError::Handler)
+    }
 
+    /// System-sub gate + audit hook. Extracted so both the v1.7 and
+    /// the Phase 1.16 response-cache paths run the same pre-handler
+    /// checks in the same order.
+    async fn check_system_sub_and_audit(
+        &self,
+        method: &str,
+        envelope: EnvelopeContext<'_>,
+        actor: &VerifiedActor,
+    ) -> Result<(), DispatchError> {
         // System-sub gate. We check AFTER signature verification so the
         // policy decision is bound to a cryptographically authenticated
         // `sub` — never to an attacker-supplied claim.
@@ -272,14 +350,9 @@ impl<H: Handler> RpcDispatcher<H> {
                 InvalidReason::SystemSubNotPermittedForMethod,
             )));
         }
-
         // Audit BEFORE dispatch — Phase 1.7 acceptance bullet.
-        self.audit.record(method, envelope, &actor).await;
-
-        self.handler
-            .handle(method, envelope, &actor, body)
-            .await
-            .map_err(DispatchError::Handler)
+        self.audit.record(method, envelope, actor).await;
+        Ok(())
     }
 }
 
