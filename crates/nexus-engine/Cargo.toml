@@ -97,6 +97,12 @@ nexus-cloud-client = { workspace = true }
 # heartbeat pump.
 nexus-cloud-protocol = { workspace = true }
 
+# Phase 2 Step 2.1c — engine_rpc.rs builds an Ed25519 trusted-key
+# verifier from the enrollment-bundled SPKI public-key PEM so the
+# WSS inbound RPC dispatcher can authenticate the cloud's signed
+# actor_tokens. `pkcs8` enables `VerifyingKey::from_public_key_pem`.
+ed25519-dalek = { workspace = true }
+
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

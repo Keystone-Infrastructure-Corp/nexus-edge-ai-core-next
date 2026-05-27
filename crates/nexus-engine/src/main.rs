@@ -28,6 +28,7 @@ mod cold_read_cache;
 mod cold_replicator;
 mod delivery_reload;
 mod discovery;
+mod engine_rpc;
 #[cfg(unix)]
 mod fd_limit;
 mod gpu;

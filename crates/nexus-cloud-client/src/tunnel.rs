@@ -31,9 +31,12 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 use tracing::{debug, info, warn};
 
-/// Handle the engine talks to. Phase 1.8 keeps the surface minimal:
-/// fire-and-forget `send`. A future slice will add an inbound dispatch
-/// channel.
+/// Handle the engine talks to. Phase 1.8 keeps the outbound surface
+/// minimal: fire-and-forget `send`. Phase 2 (Step 2.1c) introduces
+/// inbound dispatch, but the receiver is owned by [`Connection`]
+/// directly \u2014 only the `send` half is shared via this trait so
+/// arbitrary engine subsystems can hold an `Arc<dyn TunnelHandle>`
+/// without competing for inbound frames.
 #[async_trait]
 pub trait TunnelHandle: Send + Sync {
     /// Send an outbound envelope (edge → cloud). Returns when the frame
@@ -79,8 +82,17 @@ pub struct TunnelClient {
 /// sends; spawns its own reader + writer task under the hood. Dropping
 /// the [`Connection`] closes the underlying WebSocket via the oneshot
 /// close signal.
+///
+/// Phase 2 Step 2.1c: the reader task forwards parsed inbound
+/// [`Envelope`]s onto a bounded channel exposed via
+/// [`Self::take_inbound`]. The first caller takes ownership of the
+/// receiver; subsequent callers get `None`. If no one drains the
+/// channel, the bounded capacity backpressures the reader \u2014 the
+/// reader logs and drops any frame that can't be queued so the WSS
+/// pump never stalls on slow handlers.
 pub struct Connection {
     out_tx: mpsc::Sender<Envelope>,
+    in_rx: Option<mpsc::Receiver<Envelope>>,
     _close_tx: tokio::sync::oneshot::Sender<()>,
     _join: tokio::task::JoinHandle<()>,
 }
@@ -134,6 +146,7 @@ impl TunnelClient {
 
         let (mut writer, mut reader) = ws_stream.split();
         let (out_tx, mut out_rx) = mpsc::channel::<Envelope>(32);
+        let (in_tx, in_rx) = mpsc::channel::<Envelope>(32);
         let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
 
         let join = tokio::spawn(async move {
@@ -161,10 +174,24 @@ impl TunnelClient {
                         match incoming {
                             Some(Ok(Message::Text(text))) => {
                                 match serde_json::from_str::<Envelope>(&text) {
-                                    Ok(env) => info!(
-                                        kind = ?std::mem::discriminant(&env.body),
-                                        "tunnel inbound envelope",
-                                    ),
+                                    Ok(env) => {
+                                        debug!(
+                                            kind = ?std::mem::discriminant(&env.body),
+                                            "tunnel inbound envelope",
+                                        );
+                                        // Backpressure: if the engine
+                                        // hasn't taken the inbound
+                                        // receiver, or is dispatching
+                                        // slower than frames arrive,
+                                        // drop with a warn rather
+                                        // than stall the reader.
+                                        if let Err(e) = in_tx.try_send(env) {
+                                            warn!(
+                                                error = %e,
+                                                "tunnel inbound queue full or dropped; envelope discarded",
+                                            );
+                                        }
+                                    }
                                     Err(e) => warn!(error = %e, "tunnel inbound parse failed"),
                                 }
                             }
@@ -193,9 +220,21 @@ impl TunnelClient {
 
         Ok(Connection {
             out_tx,
+            in_rx: Some(in_rx),
             _close_tx: close_tx,
             _join: join,
         })
+    }
+}
+
+impl Connection {
+    /// Take ownership of the inbound envelope receiver. Returns
+    /// `Some` exactly once per connection; subsequent calls return
+    /// `None`. Engine dispatcher loops call this once at
+    /// connect-time and select on it alongside the heartbeat pump.
+    #[must_use]
+    pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Envelope>> {
+        self.in_rx.take()
     }
 }
 

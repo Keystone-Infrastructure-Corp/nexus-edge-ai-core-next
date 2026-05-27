@@ -21,19 +21,28 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::pkcs8::DecodePublicKey;
+use ed25519_dalek::VerifyingKey;
 use nexus_cloud_client::trace_uploader::{
     Span, TraceUploader, TraceUploaderConfig, DEFAULT_BATCH_SIZE, DEFAULT_FLUSH_INTERVAL,
     DEFAULT_QUEUE_CAPACITY,
 };
-use nexus_cloud_client::{TunnelClient, TunnelHandle};
+use nexus_cloud_client::{
+    RpcDispatcher, RpcResponseCache, SystemMethodPolicy, TrustedKey, TunnelClient, TunnelHandle,
+    VerifierBuilder,
+};
 use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload};
 use nexus_storage::Registry;
 use nexus_storage_cloud::{AzureBlobBackend, GatewaySasIssuer};
 use nexus_store::cloud::CloudEnrollment;
 use nexus_store::Store;
 use tokio::sync::{mpsc, oneshot, Notify};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+use crate::engine_rpc::{
+    build_rpc_response_envelope, engine_rpc_response, EngineAuditSink, EngineRpcHandler,
+};
 
 /// Heartbeat cadence. Matches the cloud edge-gateway's `liveness_timeout / 2`
 /// expectation.
@@ -99,9 +108,87 @@ pub fn spawn_tunnel(
         if let Some(rx) = trace_rx {
             spawn_trace_uploader(&enrollment, rx);
         }
-        run(enrollment, rx).await;
+        let dispatcher = build_rpc_dispatcher(&enrollment, &store, &replicator_kick);
+        run(enrollment, dispatcher, rx).await;
     });
     (tx, handle)
+}
+
+/// Build the inbound `rpc_call` dispatcher from the
+/// enrollment-bundled Ed25519 trusted-key PEM. Returns `None` (the
+/// supervisor falls back to heartbeat-only mode) when:
+///   * the enrollment artefact does not carry a `signing_key_pem`
+///     (legacy enrollments minted before Phase 1.7 — should never
+///     happen in practice because re-enrollment is a forced
+///     migration, but the supervisor is fail-open per Hard Rule 5),
+///   * the PEM does not parse as SPKI Ed25519 (corrupted artefact;
+///     log + skip and let the operator re-enroll),
+///   * `signing_kid` is missing (the cloud always emits one;
+///     defensive).
+fn build_rpc_dispatcher(
+    enrollment: &CloudEnrollment,
+    store: &Arc<Store>,
+    replicator_kick: &Arc<Notify>,
+) -> Option<Arc<RpcDispatcher<EngineRpcHandler>>> {
+    let signing_pem = enrollment.signing_key_pem.as_deref().or_else(|| {
+        warn!(
+            core_id = %enrollment.core_id,
+            "enrollment artefact missing signing_key_pem; inbound RPC dispatch disabled (heartbeat-only mode)",
+        );
+        None
+    })?;
+    let kid = enrollment.signing_kid.as_deref().or_else(|| {
+        warn!(
+            core_id = %enrollment.core_id,
+            "enrollment artefact missing signing_kid; inbound RPC dispatch disabled (heartbeat-only mode)",
+        );
+        None
+    })?;
+    let key = match VerifyingKey::from_public_key_pem(signing_pem) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(
+                core_id = %enrollment.core_id,
+                error = %e,
+                "enrollment signing_key_pem failed to parse as Ed25519 SPKI; inbound RPC dispatch disabled",
+            );
+            return None;
+        }
+    };
+    let trusted = TrustedKey {
+        kid: kid.to_string(),
+        key,
+    };
+    let Some(verifier) = VerifierBuilder::new(enrollment.core_id.clone())
+        .trusted_key(trusted)
+        .build()
+    else {
+        warn!(
+            core_id = %enrollment.core_id,
+            "verifier construction returned None despite a trusted_key present; bug?",
+        );
+        return None;
+    };
+
+    // System-sub policy: the only `system:` lane we admit today is
+    // the existing `entitlement_update`. The Phase 2 Expedite path
+    // is on the human-actor lane (owner/admin/operator).
+    let policy = SystemMethodPolicy::default();
+    let handler = EngineRpcHandler {
+        store: store.clone(),
+        replicator_kick: replicator_kick.clone(),
+    };
+    let dispatcher = RpcDispatcher::new(verifier, policy, handler)
+        .with_audit_sink(Arc::new(EngineAuditSink {
+            store: store.clone(),
+        }))
+        .with_response_cache(Arc::new(RpcResponseCache::new()));
+    info!(
+        core_id = %enrollment.core_id,
+        kid = %kid,
+        "inbound RPC dispatcher ready (Ed25519 verifier + replay cache wired)",
+    );
+    Some(Arc::new(dispatcher))
 }
 
 /// Build the cloud `AzureBlobBackend` from the enrollment artefact
@@ -185,7 +272,10 @@ async fn install_cloud_blob_backend(
     match store.read_cold_replica().await {
         Ok(cur) => {
             if cur.backend_handle.is_none() {
-                if let Err(e) = store.write_cold_replica(Some("cloud"), cur.throttle_bps).await {
+                if let Err(e) = store
+                    .write_cold_replica(Some("cloud"), cur.throttle_bps)
+                    .await
+                {
                     warn!(
                         error = %e,
                         "cloud blob backend: write_cold_replica(\"cloud\") failed; replication will stay disabled until operator picks one",
@@ -314,7 +404,11 @@ fn spawn_trace_uploader(enrollment: &CloudEnrollment, rx: mpsc::Receiver<Span>) 
     }
 }
 
-async fn run(enrollment: CloudEnrollment, mut shutdown: oneshot::Receiver<()>) {
+async fn run(
+    enrollment: CloudEnrollment,
+    dispatcher: Option<Arc<RpcDispatcher<EngineRpcHandler>>>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
     let client = TunnelClient::new(
         enrollment.gateway_url.clone(),
         enrollment.cert_pem.clone(),
@@ -330,9 +424,11 @@ async fn run(enrollment: CloudEnrollment, mut shutdown: oneshot::Receiver<()>) {
             return;
         }
         match client.connect().await {
-            Ok(conn) => {
+            Ok(mut conn) => {
                 backoff = BACKOFF_MIN;
+                let inbound = conn.take_inbound();
                 let pump = pump_heartbeats(&conn, &core_id);
+                let dispatch = pump_rpc_dispatch(&conn, inbound, dispatcher.as_deref(), &core_id);
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
@@ -341,7 +437,11 @@ async fn run(enrollment: CloudEnrollment, mut shutdown: oneshot::Receiver<()>) {
                     }
                     _ = pump => {
                         // pump returns when send fails -> tunnel down -> reconnect.
-                        warn!(core_id = %core_id, "cloud tunnel pump exited; will reconnect");
+                        warn!(core_id = %core_id, "cloud tunnel heartbeat pump exited; will reconnect");
+                    }
+                    _ = dispatch => {
+                        // Inbound channel closed (reader task ended) -> tunnel down.
+                        warn!(core_id = %core_id, "cloud tunnel inbound dispatch ended; will reconnect");
                     }
                 }
             }
@@ -364,6 +464,84 @@ async fn run(enrollment: CloudEnrollment, mut shutdown: oneshot::Receiver<()>) {
         }
         backoff = std::cmp::min(backoff * 2, BACKOFF_MAX);
     }
+}
+
+/// Drain inbound envelopes off the tunnel reader's channel. For
+/// every `rpc_call`, build the response envelope (with the
+/// `EngineRpcHandler`-derived status code) and send it back through
+/// the same `TunnelHandle`. Non-RpcCall envelopes (entitlement_update,
+/// clip_replicated_ack, future cloud→edge variants) are debug-logged
+/// and skipped — those have their own consumers wired elsewhere or
+/// are not yet handled.
+///
+/// Returns when:
+///   * the inbound channel is closed (tunnel reader exited),
+///   * we have no dispatcher (heartbeat-only mode — we still drain
+///     the channel so `try_send` doesn't backpressure-drop the next
+///     non-RpcCall envelope that does have a consumer).
+///   * the outbound `handle.send` errors (tunnel writer died) —
+///     supervisor reconnects.
+async fn pump_rpc_dispatch<H: TunnelHandle>(
+    handle: &H,
+    inbound: Option<mpsc::Receiver<Envelope>>,
+    dispatcher: Option<&RpcDispatcher<EngineRpcHandler>>,
+    core_id: &str,
+) {
+    let Some(mut rx) = inbound else {
+        debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
+        // Park forever so the supervisor's tokio::select! arm
+        // doesn't fire spuriously. The select dropping the future
+        // on shutdown is fine.
+        std::future::pending::<()>().await;
+        return;
+    };
+    while let Some(env) = rx.recv().await {
+        match &env.body {
+            EnvelopeBody::RpcCall(_) => {
+                let Some(disp) = dispatcher else {
+                    // No dispatcher (heartbeat-only mode) — reply with
+                    // a synthetic 503 so the cloud's send_mutating_rpc
+                    // surfaces the misconfiguration cleanly instead of
+                    // timing out.
+                    let payload = nexus_cloud_protocol::v1::RpcResponsePayload {
+                        body: serde_json::json!({
+                            "error": "rpc_disabled",
+                            "message": "inbound RPC dispatch disabled on this engine (missing enrollment signing key)",
+                        }),
+                        status: 503,
+                    };
+                    let resp = build_rpc_response_envelope(&env, payload);
+                    if let Err(e) = handle.send(resp).await {
+                        warn!(
+                            core_id = %core_id,
+                            error = %e,
+                            "rpc dispatch (no-op) send failed; tunnel writer down",
+                        );
+                        return;
+                    }
+                    continue;
+                };
+                let payload = engine_rpc_response(disp, &env).await;
+                let resp = build_rpc_response_envelope(&env, payload);
+                if let Err(e) = handle.send(resp).await {
+                    warn!(
+                        core_id = %core_id,
+                        error = %e,
+                        "rpc dispatch send failed; tunnel writer down",
+                    );
+                    return;
+                }
+            }
+            other => {
+                debug!(
+                    core_id = %core_id,
+                    kind = ?std::mem::discriminant(other),
+                    "inbound envelope is not rpc_call; no engine consumer wired",
+                );
+            }
+        }
+    }
+    debug!(core_id = %core_id, "inbound channel closed; dispatch pump exiting");
 }
 
 async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str) {

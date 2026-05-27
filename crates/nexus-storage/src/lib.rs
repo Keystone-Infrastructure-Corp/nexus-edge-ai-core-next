@@ -443,11 +443,7 @@ mod registry_tests {
         async fn delete(&self, _path: &str) -> Result<bool, BackendError> {
             unimplemented!("stub")
         }
-        async fn exists(
-            &self,
-            _path: &str,
-            _expected_sha256: &str,
-        ) -> Result<bool, BackendError> {
+        async fn exists(&self, _path: &str, _expected_sha256: &str) -> Result<bool, BackendError> {
             unimplemented!("stub")
         }
         async fn volume_info(&self) -> Result<VolumeInfo, BackendError> {
@@ -465,15 +461,24 @@ mod registry_tests {
         reg.replace_all(vec![StubBackend::make("lan-archive", "lan")]);
 
         // User-managed `lan-archive` is visible.
-        assert_eq!(reg.get("lan-archive").map(|b| b.kind().to_string()), Some("lan".to_string()));
+        assert_eq!(
+            reg.get("lan-archive").map(|b| b.kind().to_string()),
+            Some("lan".to_string())
+        );
         // Reserved `cloud` survived the replace_all swap.
-        assert_eq!(reg.get("cloud").map(|b| b.kind().to_string()), Some("azure_blob".to_string()));
+        assert_eq!(
+            reg.get("cloud").map(|b| b.kind().to_string()),
+            Some("azure_blob".to_string())
+        );
 
         // A subsequent replace_all that removes `lan-archive` does
         // not affect `cloud`.
         reg.replace_all(Vec::<Arc<dyn ColdBackend>>::new());
         assert!(reg.get("lan-archive").is_none());
-        assert_eq!(reg.get("cloud").map(|b| b.kind().to_string()), Some("azure_blob".to_string()));
+        assert_eq!(
+            reg.get("cloud").map(|b| b.kind().to_string()),
+            Some("azure_blob".to_string())
+        );
     }
 
     #[test]
@@ -486,7 +491,10 @@ mod registry_tests {
         reg.insert_reserved(StubBackend::make("cloud", "azure_blob"));
         reg.replace_all(vec![StubBackend::make("cloud", "lan")]);
 
-        assert_eq!(reg.get("cloud").map(|b| b.kind().to_string()), Some("azure_blob".to_string()));
+        assert_eq!(
+            reg.get("cloud").map(|b| b.kind().to_string()),
+            Some("azure_blob".to_string())
+        );
 
         let snap = reg.snapshot();
         let kinds: Vec<_> = snap

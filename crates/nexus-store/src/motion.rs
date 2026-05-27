@@ -139,6 +139,11 @@ pub struct ClipRow {
     pub cold_path: Option<String>,
     pub cold_uploaded_at: Option<DateTime<Utc>>,
     pub sha256: Option<String>,
+    /// Phase 2 Step 2.1c — cold-replicator priority lane. `0`
+    /// (default) keeps the existing FIFO behaviour; the cloud
+    /// Expedite RPC handler bumps this to `1` so the clip jumps to
+    /// the head of the next replicator tick.
+    pub priority: i64,
 }
 
 /// Args for [`Store::mark_cold_replicated`]. All three fields are
@@ -813,9 +818,15 @@ impl Store {
 
     /// Closed clips that are NOT yet replicated to cold and have a
     /// non-NULL `sha256` (the replicator gates upload on the hash).
-    /// Oldest-first so backlogs drain in stream order. The
-    /// `idx_motion_clips_pending_cold` partial index makes this an
-    /// O(log n) scan over just the pending subset.
+    /// Highest `priority` first, then oldest-first within the same
+    /// priority so backlogs drain in stream order. Phase 2 Step 2.1c
+    /// added the priority lane so the cloud-side Expedite RPC can
+    /// jump a single clip to the head of the queue without
+    /// disrupting the rest of the backfill. The
+    /// `idx_motion_clips_pending_cold` partial index makes the WHERE
+    /// clause an O(log n) scan over just the pending subset; the
+    /// `ORDER BY` is satisfied by an in-memory sort over that small
+    /// result set (at `LIMIT 32` per tick, trivially fast).
     pub async fn clips_pending_cold_upload(&self, limit: i64) -> Result<Vec<ClipRow>, StoreError> {
         let rows = sqlx::query(&format!(
             "{CLIP_SELECT_COLUMNS_BASE}
@@ -824,13 +835,68 @@ impl Store {
                 AND sha256 IS NOT NULL
                 AND hot_handle IS NOT NULL
                 AND hot_path IS NOT NULL
-              ORDER BY ended_at ASC
+              ORDER BY priority DESC, ended_at ASC
               LIMIT ?"
         ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(clip_row_from_row).collect()
+    }
+
+    /// Position (1-indexed) of `clip_id` in the cold-upload pending
+    /// queue if it is still pending, or `None` if it has already
+    /// been replicated, was never closed, or does not exist.
+    /// Used by the Phase 2 Step 2.1c Expedite RPC handler to return
+    /// the post-expedite queue depth to the cloud caller. The query
+    /// shape mirrors [`Self::clips_pending_cold_upload`] one-for-one
+    /// (same WHERE + ORDER BY) so the position is computed against
+    /// the same view the replicator will see on its next tick.
+    pub async fn pending_cold_upload_position(
+        &self,
+        clip_id: ClipId,
+    ) -> Result<Option<u32>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id FROM motion_clips
+              WHERE cold_handle IS NULL
+                AND ended_at IS NOT NULL
+                AND sha256 IS NOT NULL
+                AND hot_handle IS NOT NULL
+                AND hot_path IS NOT NULL
+              ORDER BY priority DESC, ended_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .position(|r| r.get::<i64, _>(0) == clip_id)
+            .map(|i| (i + 1) as u32))
+    }
+
+    /// Phase 2 Step 2.1c — bump the cold-replicator priority on a
+    /// single clip. Idempotent: the partial UPDATE only writes when
+    /// the row exists AND the new `priority` is strictly greater
+    /// than the current one, so repeated expedites from the cloud
+    /// don't generate spurious writes. Returns `Ok(false)` if the
+    /// clip id does not exist OR the current priority is already
+    /// at least `new_priority` (caller can treat both as no-op).
+    pub async fn bump_clip_priority(
+        &self,
+        clip_id: ClipId,
+        new_priority: i64,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            "UPDATE motion_clips
+                SET priority = ?
+              WHERE id = ?
+                AND priority < ?",
+        )
+        .bind(new_priority)
+        .bind(clip_id)
+        .bind(new_priority)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// Aggregate cold-mirror counters for the storage admin UI. See
@@ -1294,19 +1360,21 @@ impl Store {
 // Row decoders
 // ---------------------------------------------------------------------------
 
-/// The 14 ClipRow columns in stable bind-index order. Centralised so
+/// The 15 ClipRow columns in stable bind-index order. Centralised so
 /// the row decoder below can index by position instead of carrying a
 /// fragile column-name lookup. Every helper that returns
 /// `Result<ClipRow, _>` must SELECT these in this exact order.
 const CLIP_SELECT_COLUMNS_BASE: &str = "SELECT id, camera_id, started_at, ended_at, duration_ms,
             size_bytes, codec, container,
-            hot_handle, hot_path, cold_handle, cold_path, cold_uploaded_at, sha256
+            hot_handle, hot_path, cold_handle, cold_path, cold_uploaded_at, sha256,
+            priority
        FROM motion_clips";
 
 const CLIP_SELECT_COLUMNS_WHERE_ID: &str =
     "SELECT id, camera_id, started_at, ended_at, duration_ms,
             size_bytes, codec, container,
-            hot_handle, hot_path, cold_handle, cold_path, cold_uploaded_at, sha256
+            hot_handle, hot_path, cold_handle, cold_path, cold_uploaded_at, sha256,
+            priority
        FROM motion_clips WHERE id = ?";
 
 fn clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ClipRow, StoreError> {
@@ -1334,6 +1402,7 @@ fn clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ClipRow, StoreError
         cold_path: row.try_get::<Option<String>, _>(11)?,
         cold_uploaded_at,
         sha256: row.try_get::<Option<String>, _>(13)?,
+        priority: row.get::<i64, _>(14),
     })
 }
 
