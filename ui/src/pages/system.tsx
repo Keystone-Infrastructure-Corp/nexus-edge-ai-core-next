@@ -226,14 +226,6 @@ export function SystemPage() {
                   }
                 />
               </div>
-              {m.gpu.utilization_pct === null ||
-              m.gpu.utilization_pct === undefined ? (
-                <p className="text-xs text-muted-foreground">
-                  Real-time utilization and memory are unavailable on this
-                  platform without elevated privileges. Device detection is
-                  still reported.
-                </p>
-              ) : null}
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">
