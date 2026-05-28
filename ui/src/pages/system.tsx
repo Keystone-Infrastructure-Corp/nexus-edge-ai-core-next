@@ -179,18 +179,18 @@ export function SystemPage() {
                   {m.gpu.kind}
                 </Badge>
               </div>
-              {m.gpu.utilisation_pct !== null &&
-              m.gpu.utilisation_pct !== undefined ? (
+              {m.gpu.utilization_pct !== null &&
+              m.gpu.utilization_pct !== undefined ? (
                 <div>
                   <div className="flex items-baseline justify-between">
                     <span className="text-3xl font-semibold tabular-nums">
-                      {m.gpu.utilisation_pct.toFixed(0)}%
+                      {m.gpu.utilization_pct.toFixed(0)}%
                     </span>
                     <span className="text-xs text-muted-foreground">
-                      GPU utilisation
+                      GPU utilization
                     </span>
                   </div>
-                  <Progress value={m.gpu.utilisation_pct} className="mt-2" />
+                  <Progress value={m.gpu.utilization_pct} className="mt-2" />
                 </div>
               ) : null}
               <div className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
@@ -217,19 +217,19 @@ export function SystemPage() {
                   }
                 />
                 <Field
-                  label="Utilisation"
+                  label="Utilization"
                   value={
-                    m.gpu.utilisation_pct !== null &&
-                    m.gpu.utilisation_pct !== undefined
-                      ? `${m.gpu.utilisation_pct.toFixed(0)}%`
+                    m.gpu.utilization_pct !== null &&
+                    m.gpu.utilization_pct !== undefined
+                      ? `${m.gpu.utilization_pct.toFixed(0)}%`
                       : "—"
                   }
                 />
               </div>
-              {m.gpu.utilisation_pct === null ||
-              m.gpu.utilisation_pct === undefined ? (
+              {m.gpu.utilization_pct === null ||
+              m.gpu.utilization_pct === undefined ? (
                 <p className="text-xs text-muted-foreground">
-                  Real-time utilisation and memory are unavailable on this
+                  Real-time utilization and memory are unavailable on this
                   platform without elevated privileges. Device detection is
                   still reported.
                 </p>

@@ -62,9 +62,9 @@ pub struct HostInfo {
 pub struct CpuInfo {
     /// Logical core count.
     pub count: usize,
-    /// Aggregate CPU utilisation across all cores, 0–100.
+    /// Aggregate CPU utilization across all cores, 0–100.
     pub usage_pct: f32,
-    /// Per-core utilisation, 0–100. Same length as `count`.
+    /// Per-core utilization, 0–100. Same length as `count`.
     pub per_core_pct: Vec<f32>,
     /// Frequency MHz from the first core (cores are usually
     /// homogeneous; if not, this is good-enough for a chip-style
@@ -92,7 +92,7 @@ pub struct GpuInfo {
     pub name: String,
     pub mem_total_bytes: Option<u64>,
     pub mem_used_bytes: Option<u64>,
-    pub utilisation_pct: Option<f32>,
+    pub utilization_pct: Option<f32>,
     pub temp_c: Option<f32>,
 }
 

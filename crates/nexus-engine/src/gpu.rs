@@ -6,14 +6,14 @@
 //!   * **Linux NVIDIA** — `nvml-wrapper` dynamically loads
 //!     `libnvidia-ml.so` at first call. On a box without an NVIDIA
 //!     driver the `Nvml::init()` returns Err; we fall through.
-//!     Everything is queryable: name, memory totals, utilisation,
+//!     Everything is queryable: name, memory totals, utilization,
 //!     temperature.
 //!
 //!   * **Linux Intel iGPU** (T10 N100, T24 Iris Xe, T36 Arc A380,
 //!     T36-S Lunar Lake) — read `/sys/class/drm/card*/device/`:
 //!     `vendor` (must be `0x8086`), `device` PCI ID for the
 //!     family name. Frequency is exposed at
-//!     `gt/gt0/rps_cur_freq_mhz` but utilisation requires
+//!     `gt/gt0/rps_cur_freq_mhz` but utilization requires
 //!     CAP_PERFMON via `intel_gpu_top` (perf events), which we
 //!     don't gate behind sudo for an unprivileged engine. So
 //!     util/mem/temp are `None`; the operator still sees the
@@ -22,11 +22,11 @@
 //!   * **macOS Apple Silicon (dev only)** — shell
 //!     `system_profiler SPDisplaysDataType -json`, parse the
 //!     first `sppci_model`. IOReport private framework gives
-//!     real utilisation but requires unsafe IOKit FFI; we
+//!     real utilization but requires unsafe IOKit FFI; we
 //!     report device name only.
 //!
 //! Static info (name, kind, total memory) is cached at process
-//! start. Dynamic info (utilisation, used memory, temperature)
+//! start. Dynamic info (utilization, used memory, temperature)
 //! is re-queried per snapshot when the backend supports it
 //! (NVIDIA only today). Sysinfo's `MetricsCache` already wraps
 //! us in a 1 second TTL so we don't hammer NVML.
@@ -166,7 +166,7 @@ mod nvidia {
                 name: self.name.clone(),
                 mem_total_bytes: mem.as_ref().map(|m| m.total).or(self.mem_total),
                 mem_used_bytes: mem.map(|m| m.used),
-                utilisation_pct: util,
+                utilization_pct: util,
                 temp_c: temp,
             })
         }
@@ -240,7 +240,7 @@ mod intel {
                 name: display,
                 mem_total_bytes: None,
                 mem_used_bytes: None,
-                utilisation_pct: None,
+                utilization_pct: None,
                 temp_c: None,
             }
         }
@@ -323,14 +323,14 @@ mod apple {
         pub(super) fn snapshot(&self) -> GpuInfo {
             // Apple Silicon GPUs share unified memory with the
             // CPU, so a discrete "VRAM" figure isn't meaningful;
-            // utilisation/temp require IOReport private API.
+            // utilization/temp require IOReport private API.
             // We honestly report just the model name.
             GpuInfo {
                 kind: "apple".to_string(),
                 name: self.name.clone(),
                 mem_total_bytes: None,
                 mem_used_bytes: None,
-                utilisation_pct: None,
+                utilization_pct: None,
                 temp_c: None,
             }
         }

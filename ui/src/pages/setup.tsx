@@ -51,8 +51,6 @@ import { useAuth } from "@/lib/auth";
 
 type Step = "welcome" | "password" | "cameras" | "rules" | "finish";
 
-const STEP_ORDER: Step[] = ["welcome", "password", "cameras", "rules", "finish"];
-
 const STEP_LABELS: Record<Step, string> = {
   welcome: "Welcome",
   password: "Password",
@@ -82,20 +80,29 @@ export function SetupPage() {
   const mustChangePassword =
     status.data?.session_force_password_reset ?? Boolean(session?.user.force_password_reset);
 
+  // Only show the password step when the operator is on the
+  // installer-minted bootstrap OTP. Operators who chose their
+  // own password via the UI first-run-setup flow already picked
+  // a permanent one — asking them to "change" it immediately
+  // after creation is just busywork.
+  const stepOrder: Step[] = mustChangePassword
+    ? ["welcome", "password", "cameras", "rules", "finish"]
+    : ["welcome", "cameras", "rules", "finish"];
+
   const [step, setStep] = useState<Step>("welcome");
 
   const goNext = () => {
-    const i = STEP_ORDER.indexOf(step);
-    if (i >= 0 && i < STEP_ORDER.length - 1) {
-      const next = STEP_ORDER[i + 1];
+    const i = stepOrder.indexOf(step);
+    if (i >= 0 && i < stepOrder.length - 1) {
+      const next = stepOrder[i + 1];
       if (next) setStep(next);
     }
   };
 
   const goBack = () => {
-    const i = STEP_ORDER.indexOf(step);
+    const i = stepOrder.indexOf(step);
     if (i > 0) {
-      const prev = STEP_ORDER[i - 1];
+      const prev = stepOrder[i - 1];
       if (prev) setStep(prev);
     }
   };
@@ -113,7 +120,7 @@ export function SetupPage() {
   return (
     <div className="min-h-screen bg-background p-4 sm:p-8">
       <div className="mx-auto max-w-2xl space-y-6">
-        <StepRail current={step} mustChangePassword={mustChangePassword} />
+        <StepRail current={step} order={stepOrder} mustChangePassword={mustChangePassword} />
 
         {status.isPending ? (
           <Card>
@@ -196,12 +203,14 @@ export function SetupPage() {
 
 function StepRail({
   current,
+  order,
   mustChangePassword,
 }: {
   current: Step;
+  order: Step[];
   mustChangePassword: boolean;
 }) {
-  const currentIdx = STEP_ORDER.indexOf(current);
+  const currentIdx = order.indexOf(current);
   return (
     <div className="flex items-center gap-2 text-primary">
       <ShieldCheck className="h-5 w-5" />
@@ -209,7 +218,7 @@ function StepRail({
         Nexus Edge AI &mdash; first-boot setup
       </span>
       <div className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
-        {STEP_ORDER.map((s, i) => {
+        {order.map((s, i) => {
           const done = i < currentIdx;
           const isCurrent = i === currentIdx;
           const label =
@@ -227,7 +236,7 @@ function StepRail({
               >
                 {label}
               </span>
-              {i < STEP_ORDER.length - 1 ? (
+              {i < order.length - 1 ? (
                 <ChevronRight className="h-3 w-3 text-muted-foreground/60" />
               ) : null}
             </span>

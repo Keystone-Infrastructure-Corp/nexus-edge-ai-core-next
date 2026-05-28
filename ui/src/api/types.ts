@@ -425,7 +425,7 @@ export interface SystemGpuInfo {
   name: string;
   mem_total_bytes: number | null;
   mem_used_bytes: number | null;
-  utilisation_pct: number | null;
+  utilization_pct: number | null;
   temp_c: number | null;
 }
 
