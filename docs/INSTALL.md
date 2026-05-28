@@ -994,7 +994,11 @@ If the second command fails:
 - Port 80 is taken by another process — `sudo ss -ltnp | grep ':80 '`.
 - The unit is missing `AmbientCapabilities=CAP_NET_BIND_SERVICE`
   (engine log will say `failed to bind server.ui_bind; … Permission
-  denied`). The shipped unit has it.
+  denied`). The shipped unit has it. The same `AmbientCapabilities=`
+  line also grants `CAP_PERFMON` so the engine can read Intel iGPU
+  utilization via the `i915` PMU; if you removed it the system
+  metrics endpoint will simply return `utilization_pct: null` and
+  log a one-shot info line about `EACCES`.
 
 ### 7.2 UI loads in a browser
 

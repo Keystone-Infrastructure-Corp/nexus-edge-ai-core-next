@@ -55,11 +55,24 @@ Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65535
 
-# Allow the `nexus` user (non-root) to bind the UI alias on :80.
-# api_bind defaults to :8089 and does not need this; ui_bind = "0.0.0.0:80"
-# (default in every tier config since v0.1.9) does.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Capabilities granted to the (non-root) `nexus` user:
+#
+#   * CAP_NET_BIND_SERVICE — bind the UI alias on :80. api_bind
+#     defaults to :8089 and does not need this; ui_bind =
+#     "0.0.0.0:80" (default in every tier config since v0.1.9)
+#     does.
+#
+#   * CAP_PERFMON — open the `i915` PMU via `perf_event_open(2)`
+#     so the system metrics endpoint can return real Intel iGPU
+#     utilization. The engine opens 4-6 fds at boot (one per
+#     `<engine>-busy` event), reads each on demand. Without
+#     this cap the open returns EACCES and the engine silently
+#     falls back to reporting no utilization (Linux 5.8+ moved
+#     PMU access from CAP_SYS_ADMIN to CAP_PERFMON; on older
+#     kernels we'd need CAP_SYS_ADMIN, but every tier ships
+#     Ubuntu 24.04 + HWE >= 6.8).
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_PERFMON
 
 # Hardening — keep the engine boxed in.
 NoNewPrivileges=true

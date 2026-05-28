@@ -214,7 +214,21 @@ nix = { version = "0.29", default-features = false, features = [
 # (`nvml.dll` / no support) that we don't target on the edge box.
 [target.'cfg(target_os = "linux")'.dependencies]
 nvml-wrapper = "0.10"
-# Linux-only: `network::apply` stages netplan YAML into a tempfile
+# Intel iGPU utilization — `perf_event_open(2)` against the
+# `i915` PMU events (`<engine>-busy`). Reads system-wide engine
+# busy-time counters so we can compute % utilization across all
+# render/blitter/video engines. Needs `CAP_PERFMON` at runtime
+# (granted by `deploy/systemd/nexus-engine.service`); without
+# the cap the open returns EACCES and we gracefully fall back
+# to the no-utilization sysfs path. Direct, unsafe FFI bindings
+# only — Apache-2.0 OR MIT, both already on the cargo-deny
+# allowlist.
+perf-event-open-sys = "6"# Used directly by `gpu::intel::IntelPmu` for `read(2)` on the
+# perf event fds and the `EACCES` errno constant. Already in
+# the transitive graph via `nix` and `perf-event-open-sys`;
+# declared explicitly so the call sites don't reach through
+# another crate's re-export.
+libc = "0.2"# Linux-only: `network::apply` stages netplan YAML into a tempfile
 # before invoking the sudo helper. Windows/macOS never compile that
 # branch, so tempfile is gated to Linux too. Tests on every platform
 # also need it (see [dev-dependencies] below) — workspace dep means

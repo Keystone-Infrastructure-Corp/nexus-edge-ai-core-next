@@ -174,12 +174,36 @@ mod nvidia {
 }
 
 // ---------------------------------------------------------------------------
-// Linux Intel iGPU backend (sysfs).
+// Linux Intel iGPU backend.
+//
+// Two sources, layered:
+//
+//   * **sysfs** (always available, unprivileged) — friendly
+//     device name from PCI ID + live clock from
+//     `gt/gt0/rps_cur_freq_mhz`.
+//
+//   * **`i915` PMU via `perf_event_open(2)`** (requires
+//     `CAP_PERFMON` — granted by the shipped systemd unit) —
+//     per-engine `*-busy` counters in nanoseconds. We open one
+//     fd per engine at init, sample on each snapshot, and
+//     compute % utilization as `(busy_ns_delta / (n_engines *
+//     elapsed_ns)) * 100`. The denominator divides by engine
+//     count so a fully-saturated render engine on a chip whose
+//     blitter is idle still reads ~25% (1/4 engines), matching
+//     `intel_gpu_top -L`'s reporting convention.
+//
+// If perf_event_open fails (`EACCES` on a kernel that requires
+// the cap but the binary doesn't have it, or `ENOSYS` on
+// ancient kernels), we log once at INFO and fall through to the
+// sysfs-only path so the operator still sees the device name.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 mod intel {
-    use std::path::PathBuf;
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Instant;
 
     use super::{read_sysfs_string, GpuInfo};
 
@@ -189,6 +213,10 @@ mod intel {
         // Path to `gt/gt0/rps_cur_freq_mhz` if present; we read
         // it per-snapshot so the operator sees current clock.
         freq_path: Option<PathBuf>,
+        // i915 PMU state. `None` when perf_event_open returned
+        // `EACCES` / `ENOSYS` at init, or when the kernel
+        // doesn't expose the `i915` event source at all.
+        pmu: Option<Mutex<IntelPmu>>,
     }
 
     pub(super) fn try_init() -> Option<IntelSysfs> {
@@ -215,18 +243,28 @@ mod intel {
                 .map(|p| base.join(p))
                 .find(|p| p.exists());
 
-            tracing::info!(name = %name, "GPU backend: Intel iGPU (sysfs)");
-            return Some(IntelSysfs { name, freq_path });
+            let pmu = IntelPmu::try_open().map(Mutex::new);
+
+            tracing::info!(
+                name = %name,
+                pmu_open = pmu.is_some(),
+                "GPU backend: Intel iGPU (sysfs + PMU)",
+            );
+            return Some(IntelSysfs {
+                name,
+                freq_path,
+                pmu,
+            });
         }
         None
     }
 
     impl IntelSysfs {
         pub(super) fn snapshot(&self) -> GpuInfo {
-            // Stitch current frequency into the name when we have
-            // it so the operator dashboard isn't completely
-            // static. Memory/util/temp truly aren't readable
-            // without elevated caps so we honestly return None.
+            // Stitch current frequency into the name when we
+            // have it so the operator dashboard isn't completely
+            // static. Memory/temp truly aren't readable without
+            // elevated caps so we honestly return None.
             let mut display = self.name.clone();
             if let Some(p) = &self.freq_path {
                 if let Ok(s) = read_sysfs_string(p) {
@@ -235,16 +273,224 @@ mod intel {
                     }
                 }
             }
+            let utilization_pct = self.pmu.as_ref().and_then(|m| {
+                let mut guard = m.lock().ok()?;
+                guard.snapshot()
+            });
             GpuInfo {
                 kind: "intel".to_string(),
                 name: display,
                 mem_total_bytes: None,
                 mem_used_bytes: None,
-                utilization_pct: None,
+                utilization_pct,
                 temp_c: None,
             }
         }
     }
+
+    /// Open and sample the `i915` PMU. Holds one fd per engine
+    /// busy event plus the previous sample so we can compute
+    /// deltas.
+    pub(super) struct IntelPmu {
+        // Each fd is an open `perf_event_open(2)` handle for an
+        // `i915:<engine>-busy` event. Counter value is total
+        // engine busy nanoseconds since fd creation; deltas give
+        // us per-second utilization.
+        engine_fds: Vec<OwnedFd>,
+        // (Sample wall time, busy-ns per engine from the
+        // previous read). `None` until the first snapshot warms
+        // the baseline.
+        last_sample: Option<(Instant, Vec<u64>)>,
+    }
+
+    impl IntelPmu {
+        fn try_open() -> Option<Self> {
+            let base = Path::new("/sys/bus/event_source/devices/i915");
+            if !base.exists() {
+                tracing::debug!(
+                    "i915 PMU not exposed at /sys/bus/event_source/devices/i915 \
+                     (no kernel module or pre-4.14 kernel); skipping",
+                );
+                return None;
+            }
+            let type_id: u32 = read_sysfs_u32(&base.join("type"))?;
+
+            // Enumerate engine-busy events. Each event file
+            // (e.g. `rcs0-busy`, `bcs0-busy`, `vcs0-busy`,
+            // `vecs0-busy`) contains `event=0x...` with the raw
+            // PMU config value. Variants depend on the chip:
+            // a UHD 770 has 1 render + 1 blit + 2 video + 1
+            // VEnh = 5 engines; Lunar Lake has different counts.
+            let events_dir = base.join("events");
+            let mut event_files: Vec<PathBuf> = std::fs::read_dir(&events_dir)
+                .ok()?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    // Only the plain `<engine>-busy` events,
+                    // not the `*.unit` / `*.scale` metadata
+                    // sidecar files the kernel writes next to
+                    // each one.
+                    name.ends_with("-busy") && !name.contains('.')
+                })
+                .collect();
+            // Deterministic order so per-engine reads pair up
+            // across samples even if readdir order shifts.
+            event_files.sort();
+
+            let mut engine_fds = Vec::with_capacity(event_files.len());
+            for path in &event_files {
+                let Some(config) = read_event_config(path) else {
+                    continue;
+                };
+                match open_i915_event(type_id, config) {
+                    Ok(fd) => engine_fds.push(fd),
+                    Err(e) => {
+                        if e == nix_eaccess() {
+                            tracing::info!(
+                                "i915 PMU open returned EACCES; the engine \
+                                 process lacks CAP_PERFMON. GPU utilization will \
+                                 be unavailable. Grant the cap via the systemd \
+                                 unit (AmbientCapabilities=CAP_PERFMON) or run \
+                                 with `--cap-add=PERFMON` under Docker.",
+                            );
+                            return None;
+                        }
+                        tracing::debug!(
+                            error = e,
+                            event = %path.display(),
+                            "i915 PMU event open failed; skipping engine",
+                        );
+                    }
+                }
+            }
+            if engine_fds.is_empty() {
+                return None;
+            }
+            tracing::info!(
+                engines = engine_fds.len(),
+                "i915 PMU opened; sampling utilization on each /system/metrics call",
+            );
+            Some(IntelPmu {
+                engine_fds,
+                last_sample: None,
+            })
+        }
+
+        fn snapshot(&mut self) -> Option<f32> {
+            let now = Instant::now();
+            let mut values = Vec::with_capacity(self.engine_fds.len());
+            for fd in &self.engine_fds {
+                let mut buf = [0u8; 8];
+                // SAFETY: `read(2)` on a perf_event_open fd
+                // always returns 8 bytes (single u64 counter)
+                // when `read_format == 0` (our default). EINTR
+                // isn't possible on a non-blocking sample read.
+                let n = unsafe {
+                    libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                };
+                if n != buf.len() as isize {
+                    return None;
+                }
+                values.push(u64::from_ne_bytes(buf));
+            }
+            let result = match &self.last_sample {
+                Some((prev_t, prev_v)) if prev_v.len() == values.len() => {
+                    let elapsed_ns = now.duration_since(*prev_t).as_nanos() as u64;
+                    // <100 ms apart is too noisy (and the 1 s
+                    // cache TTL above us should normally space
+                    // them ~1 s).
+                    if elapsed_ns < 100_000_000 {
+                        None
+                    } else {
+                        let busy_ns: u64 = values
+                            .iter()
+                            .zip(prev_v.iter())
+                            .map(|(c, p)| c.saturating_sub(*p))
+                            .sum();
+                        let n_engines = values.len() as u64;
+                        let pct = (busy_ns as f64
+                            / (n_engines as f64 * elapsed_ns as f64))
+                            * 100.0;
+                        Some((pct.clamp(0.0, 100.0)) as f32)
+                    }
+                }
+                _ => None,
+            };
+            self.last_sample = Some((now, values));
+            result
+        }
+    }
+
+    /// Read a sysfs file and parse a single `u32`.
+    fn read_sysfs_u32(p: &Path) -> Option<u32> {
+        read_sysfs_string(p).ok()?.trim().parse().ok()
+    }
+
+    /// Parse the `event=0xNN` (or `event=0xNN,...`) line that
+    /// lives in each `events/<name>` file under the PMU's sysfs
+    /// directory. Only the `event=` term contributes to the
+    /// PMU's `config` u64; other terms (when present) like
+    /// `umask=` are folded into bits we don't use today.
+    fn read_event_config(p: &Path) -> Option<u64> {
+        let raw = read_sysfs_string(p).ok()?;
+        for token in raw.trim().split(',') {
+            if let Some(rest) = token.trim().strip_prefix("event=") {
+                let rest = rest.trim();
+                if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+                    return u64::from_str_radix(hex, 16).ok();
+                }
+                return rest.parse().ok();
+            }
+        }
+        None
+    }
+
+    /// Returns the `EACCES` errno value so the caller can
+    /// compare without leaking the `nix` crate's `Errno` enum
+    /// through the public surface.
+    fn nix_eaccess() -> i32 {
+        libc::EACCES
+    }
+
+    /// Open one `i915` PMU event. Modelled after `intel_gpu_top`:
+    ///   `pid = -1` (system-wide)
+    ///   `cpu = 0`  (uncore PMU is per-device, attach to CPU 0)
+    ///   `disabled = 0` (start counting immediately)
+    fn open_i915_event(type_id: u32, config: u64) -> Result<OwnedFd, i32> {
+        use perf_event_open_sys as pes;
+        // SAFETY: zero-init is the documented baseline for
+        // `perf_event_attr`. All bitfields (`disabled`,
+        // `exclude_*`, ...) default to 0 which matches the
+        // "start enabled, count kernel + hv" mode we want for
+        // an uncore PMU counter.
+        let mut attr: pes::bindings::perf_event_attr =
+            unsafe { std::mem::zeroed() };
+        attr.size = std::mem::size_of::<pes::bindings::perf_event_attr>() as u32;
+        attr.type_ = type_id;
+        attr.config = config;
+
+        // SAFETY: `attr` has been zero-initialised and only
+        // populated with the fields we care about. `pid=-1`,
+        // `cpu=0`, `group_fd=-1`, `flags=0` is the standard
+        // single-event uncore PMU invocation (same parameters
+        // `intel_gpu_top` uses).
+        let raw = unsafe { pes::perf_event_open(&mut attr, -1, 0, -1, 0) };
+        if raw < 0 {
+            // SAFETY: glibc / musl both expose `__errno_location`
+            // as a thread-local pointer; the deref is always
+            // valid on a live thread.
+            let errno = unsafe { *libc::__errno_location() };
+            return Err(errno);
+        }
+        // SAFETY: `raw` is a fresh, valid file descriptor we
+        // just obtained from the syscall. Wrapping in `OwnedFd`
+        // transfers close-on-drop ownership.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) })
+    }
+
+    use std::os::fd::FromRawFd;
 
     /// Map a handful of common Intel iGPU PCI device IDs to
     /// friendly names. Anything unknown falls back to "Intel
