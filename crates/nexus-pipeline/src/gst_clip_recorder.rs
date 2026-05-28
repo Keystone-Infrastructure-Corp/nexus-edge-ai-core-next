@@ -812,9 +812,15 @@ impl ClipRecorder for GstClipRecorder {
         // SharedRtspSource can consume detector frames off the same
         // RTSP session — required for cameras whose firmware caps
         // concurrent sessions at 1 per stream path (InSight et al).
-        let new_ing =
-            PreRollIngester::new_with_rgb(camera_id, url.to_string(), pre_roll_secs, max_fps, rgb_w, rgb_h)
-                .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
+        let new_ing = PreRollIngester::new_with_rgb(
+            camera_id,
+            url.to_string(),
+            pre_roll_secs,
+            max_fps,
+            rgb_w,
+            rgb_h,
+        )
+        .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
         // Insert under the exclusive lock; dropping the previous
         // `Arc<PreRollIngester>` here triggers its supervisor
         // shutdown via Drop, which cleans up the GStreamer pipeline

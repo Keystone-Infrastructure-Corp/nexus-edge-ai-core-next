@@ -242,12 +242,7 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     args.frame_stats.clear(cam_id);
 }
 
-fn start_camera(
-    args: &ReconcilerArgs,
-    cam: CameraConfig,
-    url: &str,
-    supervisor_dims: (u32, u32),
-) {
+fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str, supervisor_dims: (u32, u32)) {
     let cam_id = cam.id;
     let (sup_w, sup_h) = supervisor_dims;
     // Pre-roll ingester first so the recorder is ready by the time

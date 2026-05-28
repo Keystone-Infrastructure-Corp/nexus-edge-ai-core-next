@@ -38,8 +38,8 @@ pub use preroll::{NalRingBuffer, NalSample};
 pub use recorder::{
     ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError, StubClipRecorder,
 };
-pub use source::{FailingSource, FrameSource, FrameSourceError, VirtualSource};
 pub use source::{supervisor_frame_for, RTSP_SOURCE_FRAME_HEIGHT, RTSP_SOURCE_FRAME_WIDTH};
+pub use source::{FailingSource, FrameSource, FrameSourceError, VirtualSource};
 pub use static_clear::StaticAnchorClearRegistry;
 pub use stats::{CameraFrameStats, FrameStatsRegistry};
 pub use supervisor::{spawn_camera, CameraHandle};
