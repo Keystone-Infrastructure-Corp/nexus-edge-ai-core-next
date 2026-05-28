@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import {
+  BrainCircuit,
   Cpu,
   Gauge,
   HardDrive,
@@ -239,6 +240,92 @@ export function SystemPage() {
               No GPU detected. NVIDIA cards require the proprietary driver;
               Intel iGPUs require the i915 kernel module; macOS reports
               integrated graphics via system_profiler.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* NPU ---------------------------------------------------------- */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <BrainCircuit className="h-4 w-4" />
+            NPU
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {m.npu ? (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-baseline gap-3">
+                <span className="text-lg font-semibold">{m.npu.name}</span>
+                <Badge variant="outline" className="uppercase">
+                  {m.npu.kind}
+                </Badge>
+              </div>
+              {m.npu.utilization_pct !== null &&
+              m.npu.utilization_pct !== undefined ? (
+                <div>
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-3xl font-semibold tabular-nums">
+                      {m.npu.utilization_pct.toFixed(0)}%
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      NPU utilization
+                    </span>
+                  </div>
+                  <Progress value={m.npu.utilization_pct} className="mt-2" />
+                </div>
+              ) : null}
+              <div className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
+                <Field
+                  label="Frequency"
+                  value={
+                    m.npu.current_freq_mhz !== null &&
+                    m.npu.current_freq_mhz !== undefined
+                      ? m.npu.max_freq_mhz !== null &&
+                        m.npu.max_freq_mhz !== undefined
+                        ? `${m.npu.current_freq_mhz} / ${m.npu.max_freq_mhz} MHz`
+                        : `${m.npu.current_freq_mhz} MHz`
+                      : m.npu.max_freq_mhz !== null &&
+                          m.npu.max_freq_mhz !== undefined
+                        ? `— / ${m.npu.max_freq_mhz} MHz`
+                        : "—"
+                  }
+                />
+                <Field
+                  label="Memory in use"
+                  value={
+                    m.npu.memory_bytes !== null &&
+                    m.npu.memory_bytes !== undefined
+                      ? formatBytes(m.npu.memory_bytes)
+                      : "—"
+                  }
+                />
+                <Field
+                  label="Utilization"
+                  value={
+                    m.npu.utilization_pct !== null &&
+                    m.npu.utilization_pct !== undefined
+                      ? `${m.npu.utilization_pct.toFixed(0)}%`
+                      : "—"
+                  }
+                />
+              </div>
+              {(m.npu.utilization_pct === null ||
+                m.npu.utilization_pct === undefined) &&
+              m.npu.utilization_status ? (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  {m.npu.utilization_status}
+                </p>
+              ) : null}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              No NPU detected. Intel NPUs (Meteor Lake / Arrow Lake / Lunar
+              Lake) require the <code>intel_vpu</code> kernel driver and
+              expose telemetry via <code>/sys/class/accel/</code>. Other
+              platforms (Apple Neural Engine, NVIDIA Tensor Cores) are not
+              reported here.
             </p>
           )}
         </CardContent>

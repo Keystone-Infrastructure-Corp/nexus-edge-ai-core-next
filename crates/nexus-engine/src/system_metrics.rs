@@ -40,6 +40,11 @@ pub struct SystemMetrics {
     pub cpu: CpuInfo,
     pub memory: MemoryInfo,
     pub gpu: Option<GpuInfo>,
+    /// Intel NPU telemetry when an `intel_vpu`-bound device is
+    /// visible via `/sys/class/accel/`. `None` on macOS, on Linux
+    /// without the `intel_vpu` driver, and on non-Intel hosts.
+    /// See the sibling `npu` module for the sysfs layout.
+    pub npu: Option<crate::npu::NpuInfo>,
     pub disks: Vec<DiskInfo>,
     pub process: ProcessInfo,
     /// Wall-clock instant the snapshot was refreshed at, ISO 8601.
@@ -263,6 +268,7 @@ fn render() -> Arc<SystemMetrics> {
         cpu,
         memory,
         gpu: crate::gpu::snapshot(),
+        npu: crate::npu::snapshot(),
         disks,
         process,
         captured_at: chrono::Utc::now(),

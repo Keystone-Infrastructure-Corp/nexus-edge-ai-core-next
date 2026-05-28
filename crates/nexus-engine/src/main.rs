@@ -35,6 +35,7 @@ mod fd_limit;
 mod gpu;
 mod models_catalog;
 mod network;
+mod npu;
 mod oauth_sessions;
 mod reconciler;
 mod retention;

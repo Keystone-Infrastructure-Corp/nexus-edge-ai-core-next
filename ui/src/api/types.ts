@@ -389,6 +389,7 @@ export interface SystemMetrics {
   cpu: SystemCpuInfo;
   memory: SystemMemoryInfo;
   gpu: SystemGpuInfo | null;
+  npu: SystemNpuInfo | null;
   disks: SystemDiskInfo[];
   process: SystemProcessInfo;
   captured_at: string;
@@ -431,6 +432,28 @@ export interface SystemGpuInfo {
   /// Populated by the engine when PMU init or sampling failed
   /// (e.g. "missing CAP_PERFMON", "i915 PMU not exposed");
   /// `null` when utilization is being reported normally.
+  utilization_status?: string | null;
+}
+
+export interface SystemNpuInfo {
+  /// Backend identifier, currently `"intel-npu"` when present.
+  kind: string;
+  /// Friendly NPU name (PCI-ID → marketing name where known).
+  name: string;
+  /// 0–100; `null` while the first-sample baseline is warming up
+  /// or when the sysfs read failed. Reason is in
+  /// `utilization_status` when `null`.
+  utilization_pct: number | null;
+  /// Current NPU operating freq (MHz). `0` when power-gated.
+  current_freq_mhz: number | null;
+  /// Max NPU frequency exposed by the driver (MHz). Constant for
+  /// the lifetime of the device.
+  max_freq_mhz: number | null;
+  /// Currently-allocated NPU memory (bytes). Sum of buffer
+  /// objects; the kernel does not expose a "total" figure.
+  memory_bytes: number | null;
+  /// Operator-facing reason when `utilization_pct` is `null`
+  /// (e.g. `"NPU baseline warming up"`).
   utilization_status?: string | null;
 }
 
