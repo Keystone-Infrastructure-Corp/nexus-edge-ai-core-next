@@ -238,7 +238,7 @@ mod linux {
             "0xad1d" => "Intel AI Boost NPU 3.7 (Arrow Lake)".to_string(),
             // Lunar Lake (NPU 4) — Core Ultra (Series 2, mobile).
             "0x643e" => "Intel AI Boost NPU 4 (Lunar Lake)".to_string(),
-            other if other.is_empty() => "Intel NPU".to_string(),
+            "" => "Intel NPU".to_string(),
             other => format!("Intel NPU ({other})"),
         }
     }
