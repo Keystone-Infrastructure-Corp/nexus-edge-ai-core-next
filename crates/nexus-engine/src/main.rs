@@ -858,18 +858,24 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // `cloud_enrollment` row (populated by `nexus-engine enroll`),
     // this spawns a long-running task that maintains the WSS+mTLS
     // tunnel to `edge-gateway`, sending heartbeats every 30s. When
-    // no enrollment is present, the task logs and exits — the engine
-    // continues to serve locally (fail-open per Hard Rule 5).
+    // no enrollment is present, the task parks on
+    // `cloud_enrollment_changed` (Phase 1.16) — the engine continues
+    // to serve locally (fail-open per Hard Rule 5) and the admin
+    // `POST /v1/admin/cloud/enroll` handler fires the Notify after
+    // persisting the row so the tunnel activates within seconds
+    // without an engine restart.
     //
     // Phase 2 Step 2.1b — also receives the shared `registry` +
     // `cold_kick` so post-enrollment it can install the cloud
     // `AzureBlobBackend` under the reserved handle `"cloud"`, bind
     // `storage_cold_replica` to it if still NULL, and kick the
     // replicator immediately.
+    let cloud_enrollment_changed = std::sync::Arc::new(tokio::sync::Notify::new());
     let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(
         store.clone(),
         registry.clone(),
         cold_kick.clone(),
+        cloud_enrollment_changed.clone(),
         cloud_outbox.clone(),
         Some(trace_rx),
     );
@@ -1002,6 +1008,10 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // Cheap to clone; the API state and any future
         // background revert task share the same Arc.
         network_apply: network::apply::ApplyRegistry::new(),
+        // M-Cloud Phase 1.16 — handed to the tunnel supervisor
+        // above so a post-boot admin enrollment hot-activates
+        // the WSS tunnel without an engine restart.
+        cloud_enrollment_changed: cloud_enrollment_changed.clone(),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds

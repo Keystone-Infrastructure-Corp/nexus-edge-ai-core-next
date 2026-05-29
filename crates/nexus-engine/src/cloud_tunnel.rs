@@ -52,19 +52,34 @@ const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Spawn the tunnel supervisor. The task probes
-/// `cloud_enrollment` itself; if the row is missing it logs and
-/// exits immediately. Returns the shutdown sender + join handle pair
-/// so the engine shutdown sequence can clean it up the same way it
-/// cleans up the other long-running tasks.
+/// `cloud_enrollment`; if the row is missing it parks on
+/// `enrollment_changed` and re-probes on every notification, so a
+/// post-boot admin enrollment (`POST /v1/admin/cloud/enroll` or the
+/// `nexus-engine enroll` CLI re-using the same store path) activates
+/// the WSS tunnel within seconds — no engine restart required. The
+/// task only exits when the shutdown signal fires.
+///
+/// Note: re-enrollment *while the tunnel is already running* still
+/// requires a restart to swap the live cert/key material. The
+/// notification path is only consulted while the supervisor is in
+/// the "no enrollment yet" wait state. Switching cloud hosts /
+/// rotating an enrollment is a deliberate operation today; first-
+/// time enrollment is the hot path.
+///
+/// Returns the shutdown sender + join handle pair so the engine
+/// shutdown sequence can clean it up the same way it cleans up the
+/// other long-running tasks.
 ///
 /// `trace_rx`, when provided, is the consumer half of the
 /// boot-time-allocated trace-uploader channel. After enrollment is
 /// successfully read, a [`TraceUploader::run_with_mtls`] task is
 /// spawned to drain the channel and ship batches to the edge-gateway.
-/// When no enrollment is present (local-only mode), the receiver is
-/// dropped: the bounded channel fills at `queue_capacity` and further
-/// pushes from the `TraceLayer` fail silently per the fail-open
-/// posture in Hard Rule 5.
+/// While the supervisor is waiting for enrollment the receiver is
+/// held but not drained: the bounded channel fills at
+/// `queue_capacity` and further pushes from the `TraceLayer` fail
+/// silently per the fail-open posture in Hard Rule 5. Once
+/// enrollment lands, the drain task takes over and ships any spans
+/// the channel could still hold.
 ///
 /// `registry` and `replicator_kick` are wired by Phase 2 Step 2.1b:
 /// post-enrollment we construct a [`GatewaySasIssuer`] + [`AzureBlobBackend`]
@@ -82,22 +97,41 @@ pub fn spawn_tunnel(
     store: Arc<Store>,
     registry: Registry,
     replicator_kick: Arc<Notify>,
+    enrollment_changed: Arc<Notify>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
     trace_rx: Option<mpsc::Receiver<Span>>,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = oneshot::channel::<()>();
+    let (tx, mut rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
-        let enrollment = match store.get_cloud_enrollment().await {
-            Ok(Some(e)) => e,
-            Ok(None) => {
-                info!("no cloud enrollment present; cloud tunnel disabled");
-                // trace_rx is dropped here — `TraceLayer` pushes fail
-                // closed once the bounded channel fills.
-                return;
+        // Outer wait-for-enrollment loop. The Phase 1.8 supervisor
+        // exited immediately when no row was present, forcing the
+        // operator to restart the engine after enrolling. Phase 1.16:
+        // park on `enrollment_changed` so a post-boot enrollment
+        // (admin POST or CLI) hot-activates the tunnel within seconds.
+        let enrollment = loop {
+            match store.get_cloud_enrollment().await {
+                Ok(Some(e)) => break e,
+                Ok(None) => {
+                    info!(
+                        "no cloud enrollment present; cloud tunnel idle until admin enrolls (POST /v1/admin/cloud/enroll) or engine restart",
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "could not read cloud_enrollment; will retry on next enrollment notification",
+                    );
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "could not read cloud_enrollment; cloud tunnel disabled");
-                return;
+            tokio::select! {
+                biased;
+                _ = &mut rx => {
+                    info!("cloud tunnel shutdown requested before enrollment");
+                    return;
+                }
+                _ = enrollment_changed.notified() => {
+                    info!("enrollment change notification received; re-probing cloud_enrollment");
+                }
             }
         };
         info!(
@@ -106,8 +140,8 @@ pub fn spawn_tunnel(
             "starting cloud tunnel supervisor",
         );
         install_cloud_blob_backend(&enrollment, &store, &registry, &replicator_kick).await;
-        if let Some(rx) = trace_rx {
-            spawn_trace_uploader(&enrollment, rx);
+        if let Some(trace_rx) = trace_rx {
+            spawn_trace_uploader(&enrollment, trace_rx);
         }
         let dispatcher = build_rpc_dispatcher(&enrollment, &store, &replicator_kick);
         run(enrollment, dispatcher, cloud_outbox, rx).await;

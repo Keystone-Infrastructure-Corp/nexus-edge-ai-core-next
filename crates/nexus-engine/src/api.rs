@@ -248,6 +248,17 @@ pub struct ApiState {
     /// operator calls `POST /v1/admin/network/plan/confirm`.
     /// Cheap to clone (`Arc<Mutex<...>>` internally).
     pub network_apply: crate::network::apply::ApplyRegistry,
+    /// M-Cloud Phase 1.16 — wake the
+    /// [`crate::cloud_tunnel::spawn_tunnel`] supervisor when the
+    /// admin `POST /v1/admin/cloud/enroll` handler persists a fresh
+    /// `cloud_enrollment` row. The supervisor parks on this Notify
+    /// while no enrollment is present, so a first-time enrollment
+    /// activates the WSS tunnel within seconds without an engine
+    /// restart. Re-enrollment of an *already-connected* engine
+    /// still requires a restart to swap the live cert material —
+    /// the Notify is only consulted in the supervisor's
+    /// pre-connection wait state.
+    pub cloud_enrollment_changed: Arc<tokio::sync::Notify>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -446,9 +457,12 @@ pub fn router(state: ApiState) -> Router {
         // M-Cloud Phase 1 — UI-driven cloud enrollment. GET returns
         // a redacted status view (no PEMs, no JWT); POST runs the
         // same `cloud_enroll::perform_enrollment` flow as the
-        // `nexus-engine enroll` CLI subcommand. Restart-required:
-        // the WSS tunnel is spawned once at boot from the persisted
-        // `cloud_enrollment` row.
+        // `nexus-engine enroll` CLI subcommand. Phase 1.16: POST
+        // fires `ApiState::cloud_enrollment_changed` so the tunnel
+        // supervisor activates the WSS tunnel within seconds
+        // without an engine restart (first-time enrollment only;
+        // re-enrolling an already-connected engine still requires
+        // a restart to swap the live cert/key material).
         .route(
             "/v1/admin/cloud/enrollment",
             get(crate::admin_cloud::get_cloud_enrollment),
@@ -5577,6 +5591,10 @@ mod tests {
             // network plan/apply endpoints; an empty registry is
             // the documented "no apply in flight" state.
             network_apply: crate::network::apply::ApplyRegistry::new(),
+            // M-Cloud Phase 1.16 — unit tests don't drive the
+            // tunnel supervisor; a stand-alone Notify is the
+            // satisfied-dependency form (nothing observes it).
+            cloud_enrollment_changed: Arc::new(tokio::sync::Notify::new()),
         };
         let app = super::router(state);
         (app, store, dir)

@@ -14,8 +14,15 @@
 //! 2. **Enroll** — `POST /v1/admin/cloud/enroll`. Wraps the same
 //!    [`crate::cloud_enroll::perform_enrollment`] helper the
 //!    `nexus-engine enroll` CLI uses, so the two paths can never drift.
-//!    Restart-required: the WSS tunnel is spawned exactly once at
-//!    boot from the persisted enrollment row.
+//!    Phase 1.16: after the row is persisted the handler fires
+//!    [`ApiState::cloud_enrollment_changed`] so the tunnel supervisor
+//!    parked in its pre-connection wait state hot-activates the WSS
+//!    tunnel within seconds — no engine restart required for the
+//!    first-time enrollment case. Re-enrolling an already-connected
+//!    engine still requires a restart to swap the live cert material
+//!    (the tunnel client, trace uploader, and RPC dispatcher are
+//!    built once from the artefact and reused for the rest of the
+//!    process lifetime).
 //!
 //! ## Why no DELETE
 //!
@@ -222,7 +229,7 @@ pub async fn post_cloud_enroll(
     // ---- audit (fire-and-forget by design — the enrollment is
     //      already persisted, and `audit_admin_action` swallows write
     //      failures internally with a `warn!` so the operator still
-    //      sees a 200 OK and the "restart engine" affordance) ----
+    //      sees a 200 OK) ----
     let after_audit = serde_json::json!({
         "core_id": persisted.core_id,
         "gateway_url": persisted.gateway_url,
@@ -244,10 +251,19 @@ pub async fn post_cloud_enroll(
     )
     .await;
 
-    tracing::warn!(
+    // Phase 1.16 — wake the tunnel supervisor. If it's currently
+    // parked in the pre-connection wait state (no prior
+    // enrollment), it will re-probe `cloud_enrollment` and dial the
+    // gateway within seconds. If it's already connected to a prior
+    // enrollment, the notification is a no-op — re-enrollment of a
+    // running engine still requires a restart to swap the live
+    // cert/key material baked into the in-process TunnelClient.
+    s.cloud_enrollment_changed.notify_one();
+
+    tracing::info!(
         core_id = %persisted.core_id,
         gateway_url = %persisted.gateway_url,
-        "admin enrolled this core with the cloud; restart required to activate the WSS tunnel",
+        "admin enrolled this core with the cloud; tunnel supervisor notified, WSS tunnel will activate within seconds",
     );
 
     Ok(Json(CloudEnrollmentStatus {
