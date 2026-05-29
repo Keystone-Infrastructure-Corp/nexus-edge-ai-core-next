@@ -760,7 +760,11 @@ impl From<nexus_store::StoreError> for ApiError {
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
+        // `NEXUS_BUILD_VERSION` is computed in `build.rs` from the
+        // release tag (`NEXUS_RELEASE_VERSION`, e.g. `v0.1.27` →
+        // `0.1.27`) at CI build-time, falling back to
+        // `CARGO_PKG_VERSION` for local dev builds.
+        "version": env!("NEXUS_BUILD_VERSION"),
     }))
 }
 

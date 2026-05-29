@@ -104,6 +104,53 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       # ----------------------------------------------------------------
+      # Bump every version sink in the working tree to match the release
+      # tag BEFORE any compile or `npm ci` runs.
+      #
+      # Why this instead of relying on `build.rs`'s NEXUS_RELEASE_VERSION
+      # path alone: build.rs only feeds `nexus-engine`. The release
+      # tarball also ships
+      #
+      #   * `nexus-sinks` (outbound webhook `User-Agent`)
+      #   * `nexus-telemetry` (OTel `service.version` resource attr)
+      #   * `nexus-doctor` / `nexus-probe` (`--version` flag)
+      #   * the UI bundle (`ui/package.json` version)
+      #
+      # all of which read `CARGO_PKG_VERSION` / `package.json` directly.
+      # Sed-bumping the workspace + UI version makes every one of those
+      # surfaces report the same `X.Y.Z` automatically, with zero
+      # runtime knobs to keep in sync.
+      #
+      # The tree edits are local to the runner; nothing is committed
+      # back, so the canonical `Cargo.toml` stays at `0.1.0` for dev.
+      # ----------------------------------------------------------------
+      - name: bump workspace + UI version to ${{ env.TAG }}
+        run: |
+          set -euo pipefail
+          version_no_v="${TAG#v}"
+          version_no_v="${version_no_v#V}"
+          echo "Bumping every version sink to $version_no_v (TAG=$TAG)"
+          # workspace.package.version — `sed -E` is GNU on the runner;
+          # the address restricts the substitution to the
+          # `[workspace.package]` section so transitive dep versions
+          # in `[workspace.dependencies]` are left alone.
+          sed -i -E "/^\[workspace\.package\]/,/^\[/ s/^version = \"[^\"]+\"$/version = \"$version_no_v\"/" Cargo.toml
+          grep -E '^version = "' Cargo.toml | head -1
+          # UI package.json — jq for surgical, portable replacement
+          # (sed's `0,/regex/` first-match address is GNU-only and
+          # we'd rather not depend on a runner-specific sed extension
+          # when jq is already installed on every GH-hosted runner).
+          jq --arg v "$version_no_v" '.version = $v' ui/package.json > ui/package.json.tmp
+          mv ui/package.json.tmp ui/package.json
+          grep '"version":' ui/package.json | head -1
+          # Cargo.lock will be regenerated transparently by the next
+          # `cargo build` because the workspace members' `version`
+          # fields changed. We deliberately do NOT run
+          # `cargo update --workspace` here — that would also bump
+          # every transitive dep to its latest semver-compatible
+          # version, defeating the point of a pinned `Cargo.lock`.
+
+      # ----------------------------------------------------------------
       # Stage the model pack from the dedicated `models-${PACK_VERSION}`
       # release. PACK_VERSION is read from `models/models-manifest.json`
       # (committed at the repo root), so an engine cut just inherits
@@ -213,6 +260,14 @@ jobs:
       - name: cargo build (release, all EPs)
         env:
           ORT_LIB_LOCATION: /opt/onnxruntime/lib
+          # Surfaced as `env!("NEXUS_BUILD_VERSION")` in
+          # `crates/nexus-engine/build.rs` so the engine reports the
+          # release tag (stripped of the leading `v`) on
+          # `GET /healthz`, the cloud-tunnel handshake, the setup
+          # endpoint, the tracing boot line, and the diagnostics
+          # bundle's `build-info.json` instead of the placeholder
+          # `0.1.0` from `CARGO_PKG_VERSION`.
+          NEXUS_RELEASE_VERSION: ${{ env.TAG }}
         run: |
           set -euo pipefail
           cargo build --release -p nexus-engine \

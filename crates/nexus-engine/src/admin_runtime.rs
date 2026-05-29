@@ -928,7 +928,9 @@ async fn build_snapshot(s: &ApiState, audit_limit: i64, motion_limit: i64) -> Di
     };
 
     let build_info_json = serde_json::to_string_pretty(&serde_json::json!({
-        "engine_version": env!("CARGO_PKG_VERSION"),
+        // See `build.rs` — release-tag at CI build-time, falls back
+        // to `CARGO_PKG_VERSION` for local dev builds.
+        "engine_version": env!("NEXUS_BUILD_VERSION"),
         "generated_at": now.to_rfc3339(),
         "current_bind": s.current_bind,
         "auth_mode": format!("{:?}", s.auth_mode),

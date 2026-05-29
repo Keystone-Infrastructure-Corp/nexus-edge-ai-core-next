@@ -619,7 +619,9 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str) {
                 release: None,
                 tier: "dev".to_string(),
                 uptime_s: start.elapsed().as_secs(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                // See `build.rs` — release-tag at CI build-time, falls
+                // back to `CARGO_PKG_VERSION` for local dev builds.
+                version: env!("NEXUS_BUILD_VERSION").to_string(),
             }),
         };
         if let Err(e) = handle.send(env).await {

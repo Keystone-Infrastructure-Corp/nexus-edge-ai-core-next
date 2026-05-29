@@ -255,7 +255,12 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     );
 
     let _telemetry = nexus_telemetry::init(&cfg.telemetry, Some(trace_handle))?;
-    info!(version = env!("CARGO_PKG_VERSION"), "nexus-engine starting");
+    info!(
+        // See `build.rs` — release-tag at CI build-time, falls back
+        // to `CARGO_PKG_VERSION` for local dev builds.
+        version = env!("NEXUS_BUILD_VERSION"),
+        "nexus-engine starting"
+    );
 
     let store = Arc::new(Store::open(&cfg.store).await?);
     if cfg.store.seed_from_config {

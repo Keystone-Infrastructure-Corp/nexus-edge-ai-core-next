@@ -130,7 +130,9 @@ pub async fn get_status(
         cameras_count,
         rules_count,
         admin_count,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        // See `build.rs` — release-tag at CI build-time, falls back
+        // to `CARGO_PKG_VERSION` for local dev builds.
+        version: env!("NEXUS_BUILD_VERSION").to_string(),
         hostname: read_hostname(),
         // The session.force_password_reset bit on SessionContext
         // is *not* currently surfaced \u2014 fetch the user row to
