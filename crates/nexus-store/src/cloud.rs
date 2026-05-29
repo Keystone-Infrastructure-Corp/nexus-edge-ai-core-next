@@ -156,6 +156,32 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// Delete the single `cloud_enrollment` row. Idempotent: no-op
+    /// when the row is already absent. The next `serve` boot will
+    /// see no enrollment and skip the WSS tunnel supervisor.
+    ///
+    /// Used by the cloud-initiated detach flow (`DELETE
+    /// /v1/admin/cloud/enrollment`) and the operator-driven local
+    /// "Disconnect from cloud" affordance. An already-running tunnel
+    /// is NOT torn down by this call — the in-process TunnelClient
+    /// holds the cert/key material it was built from and persists
+    /// until the engine restarts. The handler advertises that
+    /// restart-required behaviour in its tracing output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::StoreError::Sqlx`] on database failure.
+    pub async fn clear_cloud_enrollment(&self) -> Result<(), crate::StoreError> {
+        sqlx::query(
+            r#"
+            DELETE FROM cloud_enrollment WHERE id = 1
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +273,23 @@ mod tests {
         store.clear_attach_replay_after().await.unwrap();
         let still_clear = store.get_cloud_enrollment().await.unwrap().expect("row");
         assert!(still_clear.attach_replay_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_cloud_enrollment_removes_row_and_is_idempotent() {
+        let (store, _tmp) = fresh_store().await;
+        // Empty → clearing is a no-op, not an error.
+        store.clear_cloud_enrollment().await.unwrap();
+        assert!(store.get_cloud_enrollment().await.unwrap().is_none());
+
+        // Populated → clearing returns the table to empty.
+        store.set_cloud_enrollment(&sample()).await.unwrap();
+        assert!(store.get_cloud_enrollment().await.unwrap().is_some());
+        store.clear_cloud_enrollment().await.unwrap();
+        assert!(store.get_cloud_enrollment().await.unwrap().is_none());
+
+        // Second clear on already-empty is still a no-op.
+        store.clear_cloud_enrollment().await.unwrap();
+        assert!(store.get_cloud_enrollment().await.unwrap().is_none());
     }
 }

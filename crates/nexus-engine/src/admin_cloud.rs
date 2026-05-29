@@ -24,22 +24,31 @@
 //!    built once from the artefact and reused for the rest of the
 //!    process lifetime).
 //!
-//! ## Why no DELETE
+//! ## DELETE — cloud-initiated detach
 //!
-//! Disconnecting from the cloud is a heavy-handed operation that
-//! should be deliberate; today the operator does it by stopping the
-//! engine and clearing the SQLite row (or wiping the appliance via
-//! `nexus-engine factory-reset` once that lands). Adding a one-click
-//! "unlink" button now would invite accidental disconnections in
-//! production. Re-enrollment via POST overwrites the existing row
-//! atomically.
+//! `DELETE /v1/admin/cloud/enrollment` clears the persisted
+//! enrollment row. The cloud console's "Delete core" flow calls this
+//! over the existing rpc_call passthrough so the edge stops trying
+//! to reconnect after the cloud-side `cores` row is gone. The local
+//! engine continues to operate offline (fail-open per
+//! REPO_BOUNDARY R6); the operator can re-enroll against a fresh
+//! code at any time.
+//!
+//! Restart-required for an already-connected tunnel: the in-process
+//! TunnelClient was built once at boot from the cert/key material
+//! and will keep its current WSS session up until the engine
+//! restarts. The handler logs a WARN to surface this. The cloud-
+//! side revoke (recorded in `revoked_certs` by the api-gateway in
+//! the same transaction as the `cores` DELETE) means the gateway
+//! will reject any new TLS handshake from this leaf once the
+//! current session drops.
 //!
 //! ## Audit trail
 //!
-//! `cloud.enroll.put` audit row is written in the same transaction as
-//! the `cloud_enrollment` row update so a failed audit insert rolls
-//! back the enrollment. `before`/`after` capture `core_id` +
-//! `gateway_url` only — never any PEM, never the entitlement JWT.
+//! `cloud.enroll.put` (POST) and `cloud.enroll.delete` (DELETE)
+//! audit rows are written in the same flow as the underlying row
+//! mutation. `before`/`after` capture `core_id` + `gateway_url`
+//! only — never any PEM, never the entitlement JWT.
 
 use std::net::SocketAddr;
 
@@ -272,4 +281,79 @@ pub async fn post_cloud_enroll(
         gateway_url: Some(persisted.gateway_url),
         enrolled_at: Some(persisted.enrolled_at),
     }))
+}
+
+/// `DELETE /v1/admin/cloud/enrollment` — clear the persisted cloud
+/// enrollment so the next `serve` boot skips the WSS tunnel. The
+/// cloud console reaches this endpoint via the existing `rpc_call`
+/// passthrough when the operator deletes the core from the
+/// per-core detail page.
+///
+/// Idempotent: returns 204 whether or not a row was present. An
+/// already-connected tunnel is NOT torn down here (the in-process
+/// `TunnelClient` keeps its WSS session up until engine restart);
+/// the cloud-side cert revoke recorded in `revoked_certs` ensures
+/// no new handshake will succeed for this leaf once the current
+/// session drops.
+pub async fn delete_cloud_enrollment(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    admin: AdminContext,
+) -> Result<StatusCode, ApiError> {
+    // Capture the non-sensitive snapshot for the audit row before we
+    // clear, so the deleted row survives the operation in the audit
+    // trail.
+    let before_row = s
+        .store
+        .get_cloud_enrollment()
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let before_audit = before_row.as_ref().map(|e| {
+        serde_json::json!({
+            "core_id": e.core_id,
+            "gateway_url": e.gateway_url,
+            "enrolled_at": e.enrolled_at.to_rfc3339(),
+        })
+    });
+
+    s.store
+        .clear_cloud_enrollment()
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Audit (best-effort by design — clearing already succeeded).
+    let before_audit_str = before_audit.as_ref().map(ToString::to_string);
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&admin.0),
+        &headers,
+        peer.ip(),
+        "cloud.enroll.delete",
+        "admin/cloud/enrollment",
+        Some("singleton"),
+        nexus_store::audit::AuditOutcome::Success,
+        before_audit_str.as_deref(),
+        None,
+    )
+    .await;
+
+    // Notify the tunnel supervisor — useful if it's parked in the
+    // pre-connection wait state (it will re-probe and remain
+    // parked). For an already-connected supervisor this is a no-op;
+    // the WSS session is held by the in-process TunnelClient and
+    // only drops on engine restart.
+    s.cloud_enrollment_changed.notify_one();
+
+    if before_row.is_some() {
+        tracing::warn!(
+            "cloud enrollment cleared by admin; an active WSS tunnel (if any) \
+             will keep running until the next engine restart, after which the \
+             engine will operate offline and no longer attempt to reconnect",
+        );
+    } else {
+        tracing::info!("cloud enrollment delete requested but no row was present");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }

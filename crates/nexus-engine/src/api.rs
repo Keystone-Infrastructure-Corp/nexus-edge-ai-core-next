@@ -477,7 +477,8 @@ pub fn router(state: ApiState) -> Router {
         // a restart to swap the live cert/key material).
         .route(
             "/v1/admin/cloud/enrollment",
-            get(crate::admin_cloud::get_cloud_enrollment),
+            get(crate::admin_cloud::get_cloud_enrollment)
+                .delete(crate::admin_cloud::delete_cloud_enrollment),
         )
         .route(
             "/v1/admin/cloud/enroll",
