@@ -122,8 +122,9 @@ impl EnrollmentClient {
     ///   (typically a JSON error envelope from the enrollment-svc).
     /// * [`EnrollmentError::Deserialize`] — server returned 2xx but the
     ///   body could not be parsed as [`EnrollmentResponse`]. Most
-    ///   likely cause: a wire version skew between this crate's vendored
-    ///   `proto/v1.json` and the cloud-side schema.
+    ///   likely cause: a wire version skew between this crate's
+    ///   generated bindings (`nexus-cloud-protocol/src/v1.rs`) and the
+    ///   cloud-side schema.
     pub async fn enroll(
         &self,
         req: &EnrollmentRequest,

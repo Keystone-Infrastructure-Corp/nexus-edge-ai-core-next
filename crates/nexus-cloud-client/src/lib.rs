@@ -26,8 +26,9 @@
 //!
 //! Per `nexus-cloud-console/docs/REPO_BOUNDARY.md` R1 this crate MUST NOT
 //! import any service from the cloud-console repo. The only contract is
-//! the wire envelope in [`nexus_cloud_protocol::v1`], which this repo
-//! vendors as a byte-identical mirror of `proto/v1.json`.
+//! the wire envelope in [`nexus_cloud_protocol::v1`], whose generated
+//! Rust bindings are synced byte-for-byte from the cloud-console
+//! `proto/v1.json` source schema via `cargo xtask sync-cloud-protocol`.
 
 #![forbid(unsafe_code)]
 

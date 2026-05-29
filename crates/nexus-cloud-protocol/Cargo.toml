@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Edge-side typed views of the proto/v1.json wire envelope. Mirror of the same crate in the cloud-console repo."
+description = "Edge-side typed views of the cloud's wire envelope (synced from nexus-cloud-console/proto/v1.json via xtask sync-cloud-protocol). Mirror of the same crate in the cloud-console repo."
 
 [lib]
 name = "nexus_cloud_protocol"

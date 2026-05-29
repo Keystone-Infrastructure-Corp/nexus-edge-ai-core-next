@@ -67,14 +67,20 @@ The wedge plan that drives the next three phases of work is
    clothing appearance is the v1 substrate (DINOv2-S default, OSNet-x1.0 opt-in).
 3. **Repo boundary is sacred.** This repo MUST NOT import any cloud-side crate or Azure
    SDK. The cloud repo MUST NOT depend on this one. The only sanctioned cross-repo
-   artifact is the wire schema (`proto/v1.json`) vendored into
-   [crates/nexus-cloud-protocol](crates/nexus-cloud-protocol) with a checksum that CI
-   verifies against the cloud-side source of truth. See
+   artifact is the generated Rust view of the wire schema vendored into
+   [crates/nexus-cloud-protocol/src/v1.rs](crates/nexus-cloud-protocol/src/v1.rs)
+   alongside a SHA-256 checksum (`v1.CHECKSUM`) that CI verifies against the cloud-side
+   source of truth at
+   [nexus-cloud-console/proto/v1.json](../nexus-cloud-console/proto/v1.json). The edge
+   itself does NOT carry a copy of `proto/v1.json` — only the generated bindings. See
    [REPO_BOUNDARY R1–R3 in the cloud repo](../nexus-cloud-console/docs/REPO_BOUNDARY.md).
 4. **Wire protocol version pinned to the cloud's `v`.** The engine speaks the version
-   declared in its vendored `proto/v1.json`. Breaking changes happen in the cloud repo
-   and propagate into this one via `cargo xtask sync-cloud-protocol`. Never hand-edit
-   the vendored copy. See [WIRE_PROTOCOL.md](../nexus-cloud-console/docs/WIRE_PROTOCOL.md).
+   declared in the generated `crates/nexus-cloud-protocol/src/v1.rs`. Breaking changes
+   happen in the cloud repo and propagate into this one via
+   `cargo xtask sync-cloud-protocol --core <path>` (run from the cloud repo, which writes
+   the regenerated file + a fresh `v1.CHECKSUM` into this repo). Never hand-edit the
+   vendored copy. See
+   [WIRE_PROTOCOL.md](../nexus-cloud-console/docs/WIRE_PROTOCOL.md).
 5. **Fail-open locally.** The engine MUST continue to detect, record, evaluate rules,
    and serve its local admin/UI without any cloud connectivity (see
    [REPO_BOUNDARY R6](../nexus-cloud-console/docs/REPO_BOUNDARY.md#r6-edges-fail-open-locally-when-the-cloud-is-gone)).

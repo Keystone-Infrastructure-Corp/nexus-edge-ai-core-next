@@ -112,11 +112,7 @@ async fn build_envelope(store: &Store, revision: u64) -> anyhow::Result<Envelope
 }
 
 /// Try one publish. Returns true on success, false otherwise.
-async fn try_publish(
-    store: &Store,
-    outbox: &TunnelOutbox,
-    revision_counter: &AtomicU64,
-) -> bool {
+async fn try_publish(store: &Store, outbox: &TunnelOutbox, revision_counter: &AtomicU64) -> bool {
     if !outbox.is_connected() {
         return false;
     }
@@ -153,11 +149,7 @@ async fn try_publish(
 /// Spawn the long-running roster publisher task. Returns its join
 /// handle so the engine shutdown path can abort it alongside the
 /// other long-lived tasks.
-pub fn spawn(
-    store: Arc<Store>,
-    bus: Arc<dyn Bus>,
-    outbox: Arc<TunnelOutbox>,
-) -> JoinHandle<()> {
+pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, outbox: Arc<TunnelOutbox>) -> JoinHandle<()> {
     let revision_counter = Arc::new(AtomicU64::new(seed_revision()));
     let dirty = Arc::new(AtomicBool::new(true));
     tokio::spawn(async move {
@@ -255,6 +247,9 @@ mod tests {
     #[test]
     fn seed_revision_is_positive_and_recent() {
         let r = seed_revision();
-        assert!(r > 1_700_000_000_000, "expected a recent millis seed, got {r}");
+        assert!(
+            r > 1_700_000_000_000,
+            "expected a recent millis seed, got {r}"
+        );
     }
 }
