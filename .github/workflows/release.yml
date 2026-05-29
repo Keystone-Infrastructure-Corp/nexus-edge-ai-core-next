@@ -126,7 +126,7 @@ jobs:
       # the gen scripts.
       # ----------------------------------------------------------------
       - name: read model pack version
-        id: pack
+        id: model_pack
         run: |
           set -euo pipefail
           v="$(jq -r '.pack_version // empty' models/models-manifest.json)"
@@ -137,10 +137,10 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Engine release $TAG will pull models from 'models-$v' release."
 
-      - name: stage model pack from models-${{ steps.pack.outputs.version }} release
+      - name: stage model pack from models-${{ steps.model_pack.outputs.version }} release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PACK_TAG: models-${{ steps.pack.outputs.version }}
+          PACK_TAG: models-${{ steps.model_pack.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p models
