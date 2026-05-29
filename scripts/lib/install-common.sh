@@ -372,8 +372,9 @@ install_drivers() {
         _drivers_intel_graphics
     fi
 
-    # NPU comes after iGPU (the Level Zero loader from the PPA is a
-    # transitive dep of the NPU runtime).
+    # NPU after iGPU is fine but no longer required: _drivers_intel_npu
+    # explicitly calls _ensure_libze1 itself so an NPU-only box (no
+    # iGPU at all) still gets the Level Zero loader.
     if (( has_npu )); then
         _drivers_intel_npu
     fi
@@ -453,6 +454,51 @@ _kernel_at_least() {
     return 1
 }
 
+# Add ppa:kobuk-team/intel-graphics if it isn't already configured.
+# Idempotent. Returns 0 on success, 1 on failure (caller decides
+# whether the failure is fatal or warn-and-continue).
+_ensure_kobuk_ppa() {
+    if grep -rq 'kobuk-team/intel-graphics' /etc/apt/sources.list.d/ 2>/dev/null; then
+        return 0
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        software-properties-common >/dev/null 2>&1 || {
+            warn "software-properties-common install failed; cannot add kobuk-team PPA"
+            return 1
+        }
+    log "adding ppa:kobuk-team/intel-graphics"
+    add-apt-repository -y ppa:kobuk-team/intel-graphics || {
+        warn "PPA add failed; libze1/iHD packages unavailable"
+        return 1
+    }
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+}
+
+# Ensure libze1 (oneAPI Level Zero loader, libze_loader.so.1) is
+# installed. Required by the OpenVINO NPU and GPU plugins to
+# enumerate devices. Without it, OV reports "wrong configuration
+# value for the key 'device_type'" at session-create time and ORT
+# silently falls back to CPU while still reporting the NPU EP as
+# registered — a difficult-to-diagnose regression seen on T36-S
+# Lunar Lake boxes provisioned before this helper existed.
+#
+# Idempotent. Called from both `_drivers_intel_graphics` and
+# `_drivers_intel_npu` so a box with only an NPU (no display iGPU
+# path through OV) still gets the loader.
+_ensure_libze1() {
+    if dpkg-query -W -f='${Status}' libze1 2>/dev/null \
+        | grep -q 'install ok installed'; then
+        return 0
+    fi
+    log "installing libze1 (oneAPI Level Zero loader)"
+    _ensure_kobuk_ppa || return 1
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libze1; then
+        warn "libze1 install failed; OpenVINO NPU/GPU plugins will fail to enumerate devices"
+        return 1
+    fi
+    log "libze1 installed"
+}
+
 # Install Intel iGPU / Arc dGPU stack from the kobuk-team PPA.
 # Idempotent: rerunning checks for vainfo presence first.
 #
@@ -462,6 +508,13 @@ _kernel_at_least() {
 # PPA is Ubuntu's blessed client-class staging area for the same
 # packages (libze-intel-gpu1, iHD 25.x, etc).
 _drivers_intel_graphics() {
+    # libze1 (oneAPI Level Zero loader) is required by both the
+    # OpenVINO NPU and GPU plugins to enumerate devices. Ensure it
+    # before the vainfo-based early-return so a partially-installed
+    # box (vainfo reports iHD, but libze1 was never pulled in) gets
+    # repaired rather than silently short-circuited.
+    _ensure_libze1
+
     if command -v vainfo >/dev/null 2>&1 \
         && vainfo --display drm --device /dev/dri/renderD128 2>/dev/null \
              | grep -q 'Intel iHD'; then
@@ -470,21 +523,7 @@ _drivers_intel_graphics() {
     fi
 
     log "installing Intel iGPU/dGPU drivers (kobuk-team PPA)"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        software-properties-common || {
-            warn "software-properties-common install failed; skipping Intel graphics"
-            return 0
-        }
-
-    # add-apt-repository is idempotent: re-adding the same PPA is a no-op.
-    if ! grep -rq 'kobuk-team/intel-graphics' /etc/apt/sources.list.d/ 2>/dev/null; then
-        log "adding ppa:kobuk-team/intel-graphics"
-        add-apt-repository -y ppa:kobuk-team/intel-graphics || {
-            warn "PPA add failed; skipping Intel graphics"
-            return 0
-        }
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    fi
+    _ensure_kobuk_ppa || return 0
 
     # The package list mirrors docs/INSTALL.md §5.1 exactly.
     # vainfo at the end is the canonical "did it work" probe.
@@ -531,6 +570,15 @@ _drivers_intel_graphics() {
 # the latest version verified for Lunar Lake on kernel >= 6.10.
 # Updating the pin is a one-line change here.
 _drivers_intel_npu() {
+    # The OpenVINO NPU plugin (libopenvino_intel_npu_plugin.so) needs
+    # the oneAPI Level Zero loader (libze1 → libze_loader.so.1) to
+    # enumerate the NPU device. Without it, OV reports "wrong
+    # configuration value for device_type" at session-create time and
+    # silently falls back to CPU — even though the back-end driver
+    # (intel-level-zero-npu) IS installed. Ensure it first; rest of
+    # this function depends on the loader being present.
+    _ensure_libze1
+
     if [[ -e /dev/accel/accel0 ]] \
         && dpkg-query -W -f='${Status}' intel-driver-compiler-npu 2>/dev/null \
              | grep -q 'install ok installed'; then

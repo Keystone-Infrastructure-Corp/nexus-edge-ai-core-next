@@ -233,7 +233,7 @@ fn tally(outcomes: &[Outcome]) -> (usize, usize, usize, usize) {
 // ---------------------------------------------------------------------------
 
 fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
-    let mut out = Vec::with_capacity(9);
+    let mut out = Vec::with_capacity(10);
 
     // 9.0 — local clock sync posture (Phase 1.15). Runs first so
     // an operator sees the row even when the engine HTTP listener
@@ -265,6 +265,11 @@ fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
                 "skipped — engine HTTP not reachable".into(),
             ));
         }
+        // NPU runtime check is platform-only (doesn't need the
+        // engine to be up) — still run it so the operator gets
+        // the libze1 hint on a box where the engine is wedged
+        // for unrelated reasons.
+        out.push(check_npu_runtime());
         return out;
     }
 
@@ -282,6 +287,7 @@ fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
     out.push(check_storage_local(client, base));
     out.push(check_motion_recent(client, base, &enabled_ids));
     out.push(check_events_recent(client, base));
+    out.push(check_npu_runtime());
 
     out
 }
@@ -893,6 +899,96 @@ fn check_events_recent(client: &Client, base: &str) -> Outcome {
             "INSTALL.md §11 row 1 (engine HTTP unreachable).",
         ),
     }
+}
+
+/// 9.9 — Intel NPU runtime is wired correctly for OpenVINO.
+///
+/// When the box has an NPU (`/dev/accel/accel0` present) the OpenVINO
+/// NPU plugin needs the oneAPI Level Zero loader (`libze1` →
+/// `libze_loader.so.1`) to enumerate the device. Without it,
+/// `OpenVINOExecutionProvider` registers fine — ORT happily logs
+/// `ep_registered=["npu(via-openvino)", "cpu"]` — but the first
+/// inference falls back to CPU because OV can't open the NPU. The
+/// only journal hint is a single line:
+///
+/// ```text
+/// [OpenVINO] You have selected wrong configuration value for the key 'device_type'.
+/// ```
+///
+/// Verified in the field on T36-S Lunar Lake boxes provisioned with
+/// the pre-libze1 install.sh. `scripts/lib/install-common.sh` now
+/// installs `libze1` from `ppa:kobuk-team/intel-graphics`; this
+/// check is the operator-visible repair signal for boxes that were
+/// already provisioned before that landed.
+///
+/// Skips on non-Linux and on Linux boxes without `/dev/accel/accel0`
+/// (no NPU hardware).
+fn check_npu_runtime() -> Outcome {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Outcome::skip("9.9", "npu_runtime", "skipped — Linux-only check".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !std::path::Path::new("/dev/accel/accel0").exists() {
+            return Outcome::skip(
+                "9.9",
+                "npu_runtime",
+                "skipped — no Intel NPU detected (/dev/accel/accel0 absent)".into(),
+            );
+        }
+        if libze_loader_present() {
+            Outcome::pass(
+                "9.9",
+                "npu_runtime",
+                "libze1 (Level Zero loader) installed",
+                "libze_loader.so.1 resolvable".into(),
+            )
+        } else {
+            Outcome::fail(
+                "9.9",
+                "npu_runtime",
+                "libze1 (Level Zero loader) installed",
+                "/dev/accel/accel0 present but libze1 missing — OpenVINO NPU plugin will fall back to CPU".into(),
+                "sudo apt install libze1 (from ppa:kobuk-team/intel-graphics) && sudo systemctl restart nexus-engine — see INSTALL.md §5.3.",
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn libze_loader_present() -> bool {
+    // Prefer dpkg-query — it's the canonical Debian/Ubuntu interface
+    // for "is this package installed" and matches how install.sh
+    // gates the installation.
+    if let Ok(out) = std::process::Command::new("dpkg-query")
+        .args(["-W", "-f=${Status}", "libze1"])
+        .output()
+    {
+        if out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("install ok installed")
+        {
+            return true;
+        }
+    }
+    // Fallback for non-dpkg distros (Fedora / NixOS / a manual
+    // /opt install) — probe the dynamic linker's cache directly.
+    if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output() {
+        if out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("libze_loader.so.1")
+        {
+            return true;
+        }
+    }
+    // Last-resort direct path check for the file the linker would
+    // resolve, in case `ldconfig` is unavailable.
+    [
+        "/usr/lib/x86_64-linux-gnu/libze_loader.so.1",
+        "/usr/lib64/libze_loader.so.1",
+        "/usr/lib/libze_loader.so.1",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists())
 }
 
 // ---------------------------------------------------------------------------
