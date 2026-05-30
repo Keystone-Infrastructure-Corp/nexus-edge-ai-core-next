@@ -87,7 +87,11 @@ DevicePolicy=closed
 
 # Allow accelerator devices per tier. No-op when the device doesn't
 # exist on this host; leave them all in so the unit is portable.
-DeviceAllow=/dev/dri rw
+# DRM uses the device-class form (char-drm = major 226, all card*/renderD*).
+# The path form `DeviceAllow=/dev/dri rw` is a no-op because /dev/dri is a
+# directory, not a device node — without this the OpenVINO GPU plugin sees
+# "Device GPU is not available" and silently falls back to CPU.
+DeviceAllow=char-drm rw
 DeviceAllow=/dev/accel/accel0 rw
 DeviceAllow=/dev/nvidia0 rw
 DeviceAllow=/dev/nvidiactl rw

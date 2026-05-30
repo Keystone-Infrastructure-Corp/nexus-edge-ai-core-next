@@ -394,6 +394,169 @@ install_drivers() {
     fi
 }
 
+# Probe each accelerator class the engine will try to attach to.
+# Re-detects via lspci so the caller doesn't have to thread the
+# hardware tags through. Call AFTER ensure_user + ensure_accelerator_groups
+# so the service-user open() probe is meaningful.
+#
+# Non-fatal — every check emits a `warn` with a remediation hint
+# instead of die(). Rationale: the engine has `fail_soft=true` and
+# will fall back to the CPU EP, so a missing-userspace situation
+# should produce a loud install banner but not block the install.
+verify_accelerators() {
+    if ! command -v lspci >/dev/null 2>&1; then
+        log "verify_accelerators: lspci unavailable; skipping accelerator probes"
+        return 0
+    fi
+
+    local tags
+    tags="$(_detect_hardware 2>/dev/null)" || return 0
+    if [[ -z "$tags" ]]; then
+        log "verify_accelerators: no accelerators detected; CPU-only install (nothing to verify)"
+        return 0
+    fi
+
+    local has_igpu=0 has_arc=0 has_npu=0
+    while IFS= read -r tag; do
+        case "$tag" in
+            intel-igpu)     has_igpu=1 ;;
+            intel-arc-dgpu) has_arc=1 ;;
+            intel-npu)      has_npu=1 ;;
+        esac
+    done <<<"$tags"
+
+    log ""
+    log "===== Accelerator verification ====="
+    if (( has_igpu || has_arc )); then
+        _verify_intel_gpu_userspace || true
+    fi
+    if (( has_npu )); then
+        _verify_intel_npu_userspace || true
+    fi
+    log "===================================="
+    log ""
+}
+
+# Verify the iGPU / Arc dGPU userspace the engine will load:
+#   1. intel-opencl-icd (NEO compute runtime) enumerates the device
+#      \u2014 this is the ground-truth probe the engine's OpenVINO GPU
+#      plugin uses internally. A missing ICD here is the 192.168.1.99
+#      bug.
+#   2. libze_loader.so.1 (oneAPI Level Zero) is in ldconfig's cache
+#      \u2014 required by OV 2025.4.x GPU/NPU plugins for device init.
+#   3. The systemd service user can actually open
+#      /dev/dri/renderD128 \u2014 catches a missing `render` group
+#      membership that would otherwise only surface at engine
+#      startup as `Device GPU is not available`.
+# Returns 0 if every required probe passes, 1 otherwise. VA-API
+# (vainfo) is a *bonus* probe \u2014 hardware-decode is optional, the
+# engine works without it \u2014 so we log success/warn without
+# affecting the return code.
+_verify_intel_gpu_userspace() {
+    local ok=1
+
+    log "verifying Intel GPU userspace..."
+
+    if ! command -v clinfo >/dev/null 2>&1; then
+        warn "  [FAIL] clinfo not installed (intel-opencl-icd / clinfo packages missing)"
+        warn "         fix: sudo apt-get install -y intel-opencl-icd clinfo"
+        ok=0
+    elif ! clinfo -l 2>/dev/null \
+            | grep -qE 'Intel\(R\) (Iris|HD|UHD|Arc|Graphics)'; then
+        warn "  [FAIL] OpenCL ICD does not enumerate any Intel GPU device"
+        warn "         (clinfo -l finds no platform \u2014 intel-opencl-icd missing,"
+        warn "         broken, or i915/xe kernel module not bound to the device)"
+        warn "         OpenVINO GPU plugin will report 'Device GPU is not available'"
+        warn "         and the engine will silently fall back to the CPU EP."
+        warn "         fix: sudo apt-get install -y --reinstall intel-opencl-icd libze-intel-gpu1"
+        ok=0
+    else
+        local dev
+        dev="$(clinfo -l 2>/dev/null | grep -oE 'Intel\(R\) [A-Z][^[:space:]]+( [A-Z][^[:space:]]+)*' | head -n1)"
+        log "  [ OK ] OpenCL ICD enumerates Intel GPU: ${dev:-Intel device}"
+    fi
+
+    if ! ldconfig -p 2>/dev/null | grep -q 'libze_loader.so.1'; then
+        warn "  [FAIL] libze_loader.so.1 not in ldconfig cache (libze1 missing)"
+        warn "         OpenVINO GPU/NPU plugins will fail to enumerate devices."
+        warn "         fix: sudo apt-get install -y libze1   (from kobuk-team PPA)"
+        ok=0
+    else
+        log "  [ OK ] libze_loader.so.1 present (oneAPI Level Zero loader)"
+    fi
+
+    if [[ -e /dev/dri/renderD128 ]]; then
+        if sudo -u "$NEXUS_SERVICE_USER" \
+                bash -c 'exec 9</dev/dri/renderD128 && exec 9<&-' 2>/dev/null; then
+            log "  [ OK ] service user $NEXUS_SERVICE_USER can open /dev/dri/renderD128"
+        else
+            warn "  [FAIL] service user $NEXUS_SERVICE_USER cannot open /dev/dri/renderD128"
+            warn "         (missing render-group membership or wrong device perms)"
+            warn "         fix: sudo usermod -aG render $NEXUS_SERVICE_USER && sudo systemctl restart nexus-engine"
+            ok=0
+        fi
+    else
+        warn "  [WARN] /dev/dri/renderD128 missing \u2014 GPU driver may not be bound"
+        warn "         (i915/xe kernel module didn't claim the device; check dmesg)"
+        ok=0
+    fi
+
+    # VA-API hardware decode \u2014 bonus, doesn't affect return code.
+    if command -v vainfo >/dev/null 2>&1 \
+        && vainfo --display drm --device /dev/dri/renderD128 2>/dev/null \
+             | grep -q 'Intel iHD'; then
+        log "  [ OK ] VA-API iHD driver active (hardware decode available)"
+    else
+        log "  [info] VA-API iHD not active (hardware decode unavailable; engine still works on software decode)"
+    fi
+
+    return $(( ok ? 0 : 1 ))
+}
+
+# Verify the NPU userspace the engine will load. Same three classes
+# of probe as the GPU path:
+#   1. /dev/accel/accel0 exists (kernel driver bound)
+#   2. libze_loader.so.1 is in ldconfig cache (OV NPU plugin needs L0)
+#   3. The service user can open the NPU device node
+_verify_intel_npu_userspace() {
+    local ok=1
+
+    log "verifying Intel NPU userspace..."
+
+    if [[ ! -e /dev/accel/accel0 ]]; then
+        warn "  [FAIL] /dev/accel/accel0 missing"
+        warn "         NPU kernel driver (intel_vpu) not bound. Most common cause"
+        warn "         is HWE kernel install pending a reboot."
+        warn "         fix: sudo reboot, then re-run install.sh"
+        return 1
+    fi
+    log "  [ OK ] /dev/accel/accel0 present"
+
+    if ! ldconfig -p 2>/dev/null | grep -q 'libze_loader.so.1'; then
+        warn "  [FAIL] libze_loader.so.1 not in ldconfig cache (libze1 missing)"
+        warn "         OpenVINO NPU plugin cannot initialise without the L0 loader."
+        warn "         fix: sudo apt-get install -y libze1   (from kobuk-team PPA)"
+        ok=0
+    else
+        log "  [ OK ] libze_loader.so.1 present (oneAPI Level Zero loader)"
+    fi
+
+    if id -u "$NEXUS_SERVICE_USER" >/dev/null 2>&1 \
+        && sudo -u "$NEXUS_SERVICE_USER" \
+            bash -c 'exec 9</dev/accel/accel0 && exec 9<&-' 2>/dev/null; then
+        log "  [ OK ] service user $NEXUS_SERVICE_USER can open /dev/accel/accel0"
+    elif id -u "$NEXUS_SERVICE_USER" >/dev/null 2>&1; then
+        warn "  [FAIL] service user $NEXUS_SERVICE_USER cannot open /dev/accel/accel0"
+        warn "         (missing render-group membership or wrong device perms)"
+        warn "         fix: sudo usermod -aG render $NEXUS_SERVICE_USER && sudo systemctl restart nexus-engine"
+        ok=0
+    else
+        log "  [skip] service user $NEXUS_SERVICE_USER not yet created; device-open probe deferred"
+    fi
+
+    return $(( ok ? 0 : 1 ))
+}
+
 # Detect accelerator hardware via lspci. Outputs one tag per line:
 #   intel-igpu | intel-arc-dgpu | intel-npu | nvidia-gpu
 # Empty output = nothing recognised (engine still installs CPU-only).
@@ -523,33 +686,85 @@ _ensure_libze1() {
 # data-center channel which doesn't carry libigc1. The kobuk-team
 # PPA is Ubuntu's blessed client-class staging area for the same
 # packages (libze-intel-gpu1, iHD 25.x, etc).
+# The canonical package set for the Intel iGPU / Arc dGPU stack.
+# Kept in one place so the install path and the idempotency check
+# can't drift apart. Mirrors docs/INSTALL.md §5.1.
+#
+# Why every entry matters at runtime (don't trim this list without
+# proving the engine still attaches the OpenVINO GPU plugin):
+#   intel-opencl-icd                 NEO compute runtime — required
+#                                    by OpenVINO GPU plugin to JIT
+#                                    kernels onto /dev/dri/renderD128.
+#                                    Missing this is the bug we hit
+#                                    on 192.168.1.99: vainfo reported
+#                                    iHD (because intel-media-va-driver
+#                                    was somehow pre-installed) and the
+#                                    old early-return skipped the rest
+#                                    of this package set. Engine then
+#                                    silently fell back to CPU EP.
+#   libze-intel-gpu1 / libze1        oneAPI Level Zero loader + Intel
+#                                    backend. OV 2025.4 GPU plugin
+#                                    enumerates via L0 first.
+#   intel-media-va-driver-non-free   iHD VA-API driver (hardware decode).
+#   intel-metrics-discovery          libmd_metrics — read by intel_gpu_top
+#                                    AND by the engine's GPU PMU code path.
+#   intel-gsc                        Graphics System Controller userspace
+#                                    (firmware loader for Arc / Lunar Lake).
+#   clinfo                           OpenCL probe — used by the post-install
+#                                    verification below.
+#   vainfo / intel-gpu-tools         operator-facing probes; intel_gpu_top
+#                                    is what we tell operators to use to
+#                                    confirm the engine is actually using
+#                                    the iGPU.
+_INTEL_GRAPHICS_PKGS=(
+    libze-intel-gpu1 libze1
+    intel-metrics-discovery intel-opencl-icd intel-gsc clinfo
+    intel-media-va-driver-non-free
+    libmfx-gen1 libvpl2 libvpl-tools
+    libva-glx2 va-driver-all vainfo
+    intel-gpu-tools
+)
+
+# Returns 0 if every package in the array argument is installed.
+_all_dpkg_installed() {
+    local pkg
+    for pkg in "$@"; do
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null \
+                | grep -q 'install ok installed'; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 _drivers_intel_graphics() {
     # libze1 (oneAPI Level Zero loader) is required by both the
     # OpenVINO NPU and GPU plugins to enumerate devices. Ensure it
-    # before the vainfo-based early-return so a partially-installed
-    # box (vainfo reports iHD, but libze1 was never pulled in) gets
-    # repaired rather than silently short-circuited.
+    # before the package-set early-return so a partially-installed
+    # box (intel-opencl-icd present but libze1 still on the Ubuntu
+    # archive 1.16.1) gets repaired rather than silently short-
+    # circuited.
     _ensure_libze1
 
-    if command -v vainfo >/dev/null 2>&1 \
+    # Idempotency: only skip the full install when every package in
+    # the canonical list is already there AND vainfo confirms iHD.
+    # The previous gate was vainfo-only, which let intel-opencl-icd
+    # / libze-intel-gpu1 stay missing on boxes where iHD got pulled
+    # in transitively (e.g. by a desktop-environment metapackage on
+    # the base image).
+    if _all_dpkg_installed "${_INTEL_GRAPHICS_PKGS[@]}" \
+        && command -v vainfo >/dev/null 2>&1 \
         && vainfo --display drm --device /dev/dri/renderD128 2>/dev/null \
              | grep -q 'Intel iHD'; then
-        log "Intel iGPU/dGPU stack already installed (vainfo: iHD present)"
+        log "Intel iGPU/dGPU stack already installed (all ${#_INTEL_GRAPHICS_PKGS[@]} packages present; vainfo: iHD)"
         return 0
     fi
 
     log "installing Intel iGPU/dGPU drivers (kobuk-team PPA)"
     _ensure_kobuk_ppa || return 0
 
-    # The package list mirrors docs/INSTALL.md §5.1 exactly.
-    # vainfo at the end is the canonical "did it work" probe.
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        libze-intel-gpu1 libze1 \
-        intel-metrics-discovery intel-opencl-icd intel-gsc clinfo \
-        intel-media-va-driver-non-free \
-        libmfx-gen1 libvpl2 libvpl-tools \
-        libva-glx2 va-driver-all vainfo \
-        intel-gpu-tools \
+        "${_INTEL_GRAPHICS_PKGS[@]}" \
         || {
             warn "Intel graphics package install failed; engine will fall back to CPU EP"
             return 0
@@ -585,6 +800,16 @@ _drivers_intel_graphics() {
 # Install Intel NPU driver from upstream GitHub release. Pinned to
 # the latest version verified for Lunar Lake on kernel >= 6.10.
 # Updating the pin is a one-line change here.
+# Every .deb the NPU tarball ships. Each one is load-bearing for
+# the OpenVINO NPU plugin's runtime path — checking only one of
+# them (as the old early-return did) let a partial install slip
+# through and present as `Device NPU is not available` from OV.
+_INTEL_NPU_PKGS=(
+    intel-driver-compiler-npu
+    intel-fw-npu
+    intel-level-zero-npu
+)
+
 _drivers_intel_npu() {
     # The OpenVINO NPU plugin (libopenvino_intel_npu_plugin.so) needs
     # the oneAPI Level Zero loader (libze1 → libze_loader.so.1) to
@@ -596,9 +821,8 @@ _drivers_intel_npu() {
     _ensure_libze1
 
     if [[ -e /dev/accel/accel0 ]] \
-        && dpkg-query -W -f='${Status}' intel-driver-compiler-npu 2>/dev/null \
-             | grep -q 'install ok installed'; then
-        log "Intel NPU driver already installed (/dev/accel/accel0 + deb present)"
+        && _all_dpkg_installed "${_INTEL_NPU_PKGS[@]}"; then
+        log "Intel NPU driver already installed (/dev/accel/accel0 + all ${#_INTEL_NPU_PKGS[@]} packages present)"
         return 0
     fi
 
@@ -940,4 +1164,109 @@ wait_for_health() {
         i=$((i + 1))
     done
     return 1
+}
+
+# Returns 0 if process $1 has any open fd whose symlink target
+# starts with $2. Avoids `ls | grep` (SC2010) on /proc/PID/fd.
+_proc_has_fd_to() {
+    local pid="$1" prefix="$2" fd target
+    for fd in /proc/"$pid"/fd/*; do
+        target="$(readlink "$fd" 2>/dev/null)" || continue
+        case "$target" in
+            "$prefix"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Once the engine is up, prove via /proc/$PID/maps that the
+# OpenVINO accelerator plugin .so actually loaded \u2014 i.e. that ORT
+# successfully attached the OpenVINO EP to the GPU/NPU and not just
+# the CPU fallback. This is the runtime complement to the install-
+# time `verify_accelerators` probe.
+#
+# Why /proc/$PID/maps instead of grepping logs for `ep_registered`:
+# `ep_registered` reports the EPs the engine *requested*, not the
+# ones ORT actually bound. A box where OpenVINO falls back to CPU
+# silently (e.g. libze1 ABI mismatch with bundled OV) still logs
+# `ep_registered=[openvino(GPU)]` but never dlopens
+# libopenvino_intel_gpu_plugin.so. Maps doesn't lie.
+verify_engine_runtime_eps() {
+    if ! command -v lspci >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local tags
+    tags="$(_detect_hardware 2>/dev/null)" || return 0
+    [[ -z "$tags" ]] && return 0
+
+    local has_igpu=0 has_arc=0 has_npu=0
+    while IFS= read -r tag; do
+        case "$tag" in
+            intel-igpu|intel-arc-dgpu) has_igpu=1 ;;
+            intel-npu)                 has_npu=1 ;;
+        esac
+    done <<<"$tags"
+
+    local pid
+    pid="$(systemctl show -p MainPID --value nexus-engine 2>/dev/null)"
+    if [[ -z "$pid" || "$pid" == "0" || ! -r "/proc/$pid/maps" ]]; then
+        warn "verify_engine_runtime_eps: nexus-engine MainPID unreadable; skipping runtime EP probe"
+        return 0
+    fi
+
+    log ""
+    log "===== Engine runtime EP attachment ====="
+    log "nexus-engine PID=$pid"
+
+    local maps
+    maps="$(cat /proc/"$pid"/maps 2>/dev/null)" || {
+        warn "could not read /proc/$pid/maps (engine may have just restarted)"
+        return 0
+    }
+
+    if (( has_igpu || has_arc )); then
+        if grep -q 'libopenvino_intel_gpu_plugin\.so' <<<"$maps"; then
+            log "  [ OK ] libopenvino_intel_gpu_plugin.so loaded \u2014 OpenVINO attached to GPU"
+            if grep -q 'libigdrcl\.so' <<<"$maps"; then
+                log "  [ OK ] libigdrcl.so (Intel NEO compute runtime) loaded"
+            else
+                warn "  [WARN] libigdrcl.so not in process map \u2014 GPU plugin may not have dlopened the OpenCL ICD yet"
+            fi
+            if _proc_has_fd_to "$pid" '/dev/dri/renderD'; then
+                log "  [ OK ] engine has an open fd on /dev/dri/renderD* (GPU device in use)"
+            else
+                warn "  [WARN] engine has no /dev/dri/renderD* fd open \u2014 GPU plugin loaded but no device attached"
+            fi
+        else
+            warn "  [FAIL] libopenvino_intel_gpu_plugin.so NOT loaded in engine process"
+            warn "         OpenVINO failed to attach to the GPU; engine is running on CPU EP."
+            warn "         Common causes:"
+            warn "           - intel-opencl-icd missing (see install-time verification above)"
+            warn "           - libze1 ABI mismatch (need kobuk-team PPA 1.30+, not Ubuntu archive 1.16.1)"
+            warn "           - OV_DEVICE not set to GPU in nexus.toml or systemd drop-in"
+            warn "         debug: sudo journalctl -u nexus-engine -n 200 | grep -iE 'openvino|gpu|ep_registered'"
+        fi
+    fi
+
+    if (( has_npu )); then
+        if grep -q 'libopenvino_intel_npu_plugin\.so' <<<"$maps"; then
+            log "  [ OK ] libopenvino_intel_npu_plugin.so loaded \u2014 OpenVINO attached to NPU"
+            if _proc_has_fd_to "$pid" '/dev/accel/accel'; then
+                log "  [ OK ] engine has an open fd on /dev/accel/accel* (NPU device in use)"
+            else
+                warn "  [WARN] engine has no /dev/accel/accel* fd open \u2014 NPU plugin loaded but no device attached"
+            fi
+        else
+            warn "  [FAIL] libopenvino_intel_npu_plugin.so NOT loaded in engine process"
+            warn "         OpenVINO failed to attach to the NPU; engine is running on CPU EP for NPU work."
+            warn "         Common causes:"
+            warn "           - intel-driver-compiler-npu / intel-fw-npu / intel-level-zero-npu missing"
+            warn "           - libze1 ABI mismatch (need kobuk-team PPA 1.30+)"
+            warn "           - HWE kernel < 6.10 (NPU uAPI not present)"
+            warn "         debug: sudo journalctl -u nexus-engine -n 200 | grep -iE 'openvino|npu|ep_registered'"
+        fi
+    fi
+    log "========================================"
+    log ""
 }

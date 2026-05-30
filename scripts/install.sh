@@ -283,6 +283,14 @@ ensure_user
 ensure_dirs
 ensure_accelerator_groups
 
+# --- Post-install accelerator verification -----------------------------------
+# Re-probes the userspace stack we just installed to confirm the
+# OpenVINO plugins will actually find a device. Catches the class
+# of bug where a partial install left vainfo happy but intel-opencl-icd
+# missing — the engine would then silently fall back to the CPU EP
+# and report success. Non-fatal: produces a loud banner with a fix.
+verify_accelerators
+
 # --- Stage tier config (first install only, or --force-tier) ------------------
 
 if [[ -n "$TIER" ]]; then
@@ -415,6 +423,15 @@ if ! wait_for_health 60; then
     err "to roll back: sudo $0 --rollback"
     exit 1
 fi
+
+# --- Runtime EP attachment check ----------------------------------------------
+# The engine logs `ep_registered=["openvino(GPU)", ...]` once it has
+# successfully attached the OpenVINO EP to a device. On boxes where
+# the userspace verification above passed but OpenVINO still falls
+# back to CPU at runtime (e.g. ABI mismatch between bundled OV and
+# host libze1), this surfaces the problem at install time instead of
+# the operator discovering it via `intel_gpu_top` showing 0% busy.
+verify_engine_runtime_eps
 
 log ""
 log "================================================================"
