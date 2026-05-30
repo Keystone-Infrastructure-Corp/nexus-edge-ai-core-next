@@ -601,6 +601,36 @@ pub async fn engine_rpc_response<H: Handler>(
     match dispatcher.dispatch_envelope(env).await {
         Ok(payload) => payload,
         Err(DispatchError::Reject(reason)) => {
+            // The wire body intentionally only carries `actor_token_missing`
+            // vs `actor_token_invalid` (see `RejectReason::wire_code`) so an
+            // attacker can't probe individual checks. Surface the granular
+            // `InvalidReason` + the JWS `kid` to the local engine logs so the
+            // operator can tell `UnknownKeyId` (kid mismatch / rotation drift
+            // between enrollment-svc and entitlement-svc) from `BadSignature`
+            // (ephemeral signer drift) from `PathMismatch` / `WrongCoreId`
+            // (cloud-side bug) without having to attach a debugger.
+            let (method, path, jws_kid) = if let EnvelopeBody::RpcCall(payload) = &env.body {
+                (
+                    payload.method.as_str(),
+                    payload.path.as_str(),
+                    payload
+                        .actor_token
+                        .as_deref()
+                        .and_then(extract_jws_kid)
+                        .unwrap_or_else(|| "<unextractable>".to_string()),
+                )
+            } else {
+                ("<not-rpc-call>", "<not-rpc-call>", "<no-token>".to_string())
+            };
+            warn!(
+                envelope_id = %env.meta.id,
+                method = method,
+                path = path,
+                jws_kid = %jws_kid,
+                wire_code = reason.wire_code(),
+                reason = ?reason,
+                "cloud->edge rpc rejected by actor_token verifier",
+            );
             let body = json!({
                 "error": reason.wire_code(),
                 "message": reason.to_string(),
@@ -612,6 +642,18 @@ pub async fn engine_rpc_response<H: Handler>(
         }
         Err(DispatchError::Handler(msg)) => parse_handler_error(&msg),
     }
+}
+
+/// Pull the JWS `kid` header out of a compact JWT without verifying the
+/// signature. Returns `None` if the token is malformed; logging-only —
+/// the actual verification still happens in [`nexus_cloud_client::Verifier`].
+fn extract_jws_kid(token: &str) -> Option<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let header_b64 = token.split('.').next()?;
+    let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+    header.get("kid")?.as_str().map(str::to_string)
 }
 
 /// Translate a [`RejectReason`] into the engine-stamped HTTP status
