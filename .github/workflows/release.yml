@@ -23,6 +23,7 @@
 #   4. `gh release create models-vN --prerelease --title "Model pack vN"`
 #      `gh release upload models-vN models/yolo26n_*.onnx \`
 #         `models/yolo_world_v2_s_*.onnx models/yoloe26_s.onnx \`
+#         `models/dinov2_s_224.onnx \`
 #         `models/models-manifest.json`
 #
 # `yolo26n.pt` is not a public ultralytics checkpoint, so the operator
@@ -163,6 +164,7 @@ jobs:
       #   4. `gh release create models-vN --prerelease --title "Model pack vN"`
       #      `gh release upload models-vN models/yolo26n_*.onnx \`
       #         `models/yolo_world_v2_s_*.onnx models/yoloe26_s.onnx \`
+      #         `models/dinov2_s_224.onnx \`
       #         `models/models-manifest.json`
       #
       # `--prerelease` on the models-* tag keeps it off the "Latest"
@@ -203,6 +205,7 @@ jobs:
             --pattern 'yolo_world_v2_s_640.onnx' \
             --pattern 'yolo_world_v2_s_960.onnx' \
             --pattern 'yoloe26_s.onnx' \
+            --pattern 'dinov2_s_224.onnx' \
             --pattern 'models-manifest.json' \
             --dir models/ \
             --clobber
@@ -213,7 +216,11 @@ jobs:
           # per-camera UI override for plate/face work. Static shapes are
           # mandatory for the Intel NPU plugin (silent CPU fallback on
           # dynamic shapes, observed on Lunar Lake k13 under v0.1.18).
-          for f in yolo26n_640.onnx yolo26n_960.onnx yolo26n_1280.onnx yolo_world_v2_s_640.onnx yolo_world_v2_s_960.onnx yoloe26_s.onnx models-manifest.json; do
+          #
+          # dinov2_s_224.onnx is the Phase 5.6 appearance-embedding
+          # backbone (Meta facebook/dinov2-small, Apache-2.0). 384-dim
+          # CLS token per 224x224 RGB crop. Added in pack v2.
+          for f in yolo26n_640.onnx yolo26n_960.onnx yolo26n_1280.onnx yolo_world_v2_s_640.onnx yolo_world_v2_s_960.onnx yoloe26_s.onnx dinov2_s_224.onnx models-manifest.json; do
             if [ ! -s "models/$f" ]; then
               echo "::error::Required model asset 'models/$f' missing from release $PACK_TAG. Upload via 'gh release upload $PACK_TAG models/$f' (or bump pack_version in models/models-manifest.json to a release that has it)."
               exit 1

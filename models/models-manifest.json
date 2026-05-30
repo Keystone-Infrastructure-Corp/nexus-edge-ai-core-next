@@ -1,6 +1,6 @@
 {
   "version": "v2",
-  "pack_version": "v1",
+  "pack_version": "v2",
   "_pack_version_comment": "Bumped only when ONNX bytes change. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX -> bump this field -> commit -> `gh release create models-v2 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build.",
   "_comment": "Model pack v2 manifest. See models/MODEL_PACK_V2.md for the schema reference. Paths are resolved relative to this file. sha256 is verified at engine load time when artifact verification is wired up (W-DETECT D5).",
   "_generated_by": "models/tools/generate_model_pack.py (or hand-edited at the repo root for the ship-in-tree models below)",
@@ -231,6 +231,38 @@
         "jersey barrier",
         "scaffolding"
       ]
+    },
+    {
+      "id": "dinov2-s-v1",
+      "task": "embed",
+      "_comment": "DINOv2-S backbone export (Meta facebook/dinov2-small). Powers Phase 5.6 wedge identity graph: per-track 224x224 RGB crop -> 384-dim CLS-token appearance fingerprint. Apache-2.0 weights, LVD-142M curated-public-web training set (no PII targeting). Static batch=1 for NPU/OpenVINO blob-cache hits. Regenerate via `python tools/models/gen_dinov2.py`; the script patches the sha256 below in place and writes the .sha256 sidecar that the engine release workflow downloads from the models-v2 GitHub release.",
+      "license": "Apache-2.0",
+      "weights_dataset_license": "LVD-142M:curated-public-web",
+      "input": {
+        "width": 224,
+        "height": 224,
+        "channels": 3,
+        "format": "RGB"
+      },
+      "artifacts": [
+        {
+          "backend": "onnx",
+          "path": "dinov2_s_224.onnx",
+          "preset": "224",
+          "sha256": "1dcd1f60417bf2e9966c9500b27a453fd1ab1463c478f055d40c1d8956d0b0d4"
+        }
+      ],
+      "presets": [
+        {
+          "name": "224",
+          "_comment": "Only operating point. DINOv2 ViTs are trained at 224 and the engine doesn't benefit from larger crops for a per-track appearance fingerprint.",
+          "inputWidth": 224,
+          "inputHeight": 224,
+          "artifact": "dinov2_s_224.onnx"
+        }
+      ],
+      "default_preset": "224",
+      "embedding_dim": 384
     }
   ]
 }
