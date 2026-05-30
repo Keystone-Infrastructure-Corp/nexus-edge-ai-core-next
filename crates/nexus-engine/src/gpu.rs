@@ -399,10 +399,13 @@ mod intel {
 
             // Enumerate engine-busy events. Each event file
             // (e.g. `rcs0-busy`, `bcs0-busy`, `vcs0-busy`,
-            // `vecs0-busy`) contains `event=0x...` with the raw
-            // PMU config value. Variants depend on the chip:
-            // a UHD 770 has 1 render + 1 blit + 2 video + 1
-            // VEnh = 5 engines; Lunar Lake has different counts.
+            // `vecs0-busy`) contains either `event=0x...` or
+            // `config=0x...` with the raw PMU config value
+            // (i915 on kernel 6.x emits the `config=` form;
+            // standard CPU/uncore PMUs use `event=`). Variants
+            // depend on the chip: a UHD 770 has 1 render + 1
+            // blit + 2 video + 1 VEnh = 5 engines; Lunar Lake
+            // has different counts.
             let events_dir = base.join("events");
             let mut event_files: Vec<PathBuf> = std::fs::read_dir(&events_dir)
                 .map_err(|e| format!("could not enumerate {}: {e}", events_dir.display()))?
@@ -821,15 +824,25 @@ mod intel {
         read_sysfs_string(p).ok()?.trim().parse().ok()
     }
 
-    /// Parse the `event=0xNN` (or `event=0xNN,...`) line that
-    /// lives in each `events/<name>` file under the PMU's sysfs
-    /// directory. Only the `event=` term contributes to the
-    /// PMU's `config` u64; other terms (when present) like
-    /// `umask=` are folded into bits we don't use today.
+    /// Parse the value line that lives in each `events/<name>`
+    /// file under the PMU's sysfs directory and return what
+    /// goes into `perf_event_attr.config`. Two prefixes are
+    /// recognised:
+    ///   * `event=0xNN` — CPU / uncore PMUs (Intel cstate,
+    ///     Intel uncore_imc, AMD core, etc.).
+    ///   * `config=0xNN` — Intel i915 PMU (its only format
+    ///     field is `i915_eventid` mapped to `config:0-20`,
+    ///     and the kernel emits per-engine `<engine>-busy`
+    ///     files using the raw `config=` form on 6.x).
+    /// Other terms (`umask=`, ...) when present are ignored.
     fn read_event_config(p: &Path) -> Option<u64> {
         let raw = read_sysfs_string(p).ok()?;
         for token in raw.trim().split(',') {
-            if let Some(rest) = token.trim().strip_prefix("event=") {
+            let token = token.trim();
+            let rest = token
+                .strip_prefix("event=")
+                .or_else(|| token.strip_prefix("config="));
+            if let Some(rest) = rest {
                 let rest = rest.trim();
                 if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
                     return u64::from_str_radix(hex, 16).ok();
