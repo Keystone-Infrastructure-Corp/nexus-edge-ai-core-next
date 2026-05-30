@@ -563,6 +563,7 @@ mod tests {
                     url: Url::parse("rtsp://127.0.0.1/stream9").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],

@@ -42,7 +42,7 @@ use nexus_pipeline::{
 use nexus_rules::RuleEvaluator;
 use nexus_store::Store;
 use nexus_tracker::Tracker;
-use nexus_types::CameraId;
+use nexus_types::{CameraId, CodecKind};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -270,6 +270,14 @@ async fn start_camera(
     // the supervisor opens its first motion clip. Failure is logged
     // but non-fatal: detection still runs; clip opens for this
     // camera return Refused until the next reconcile pass.
+    let codec = cam.ingest.codec.unwrap_or_else(|| {
+        warn!(
+            camera_id = cam_id,
+            %url,
+            "camera codec unspecified; defaulting to h264 — set `ingest.codec` in the camera config to silence"
+        );
+        CodecKind::H264
+    });
     if let Err(e) = args.recorder.add_camera_ingester(
         cam_id,
         url,
@@ -277,6 +285,7 @@ async fn start_camera(
         cam.ingest.max_fps,
         sup_w,
         sup_h,
+        codec,
     ) {
         error!(
             camera_id = cam_id,

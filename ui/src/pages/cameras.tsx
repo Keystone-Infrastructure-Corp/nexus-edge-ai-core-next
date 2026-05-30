@@ -46,6 +46,7 @@ import {
 } from "@/api/system";
 import type {
   CameraConfig,
+  CodecKind,
   DiscoveredDevice,
   DiscoverySessionView,
   ModelOverride,
@@ -154,6 +155,11 @@ export function CamerasPage() {
         ? `${device.vendor} ${device.model ?? ""}`.trim()
         : device.ip,
       url: rtsp,
+      // Seed the codec from discovery so the operator doesn't
+      // have to re-pick. `null` here means "let the admin API
+      // autodetect" — if the probe also failed during discovery
+      // we leave it unset rather than guessing H.264.
+      codec: device.codec ?? null,
     });
     setDiscoveryOpen(false);
     setEditorOpen(true);
@@ -542,6 +548,37 @@ function CameraEditor({
                 Enabled
               </label>
             </div>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="cam-codec">Codec</Label>
+            <select
+              id="cam-codec"
+              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm"
+              value={draft.codec ?? "auto"}
+              onChange={(e) => {
+                const v = e.target.value;
+                // "auto" maps to undefined / null so the engine's
+                // admin-API autodetect (RTSP DESCRIBE) decides. The
+                // explicit kinds bypass autodetect and pin the
+                // pipeline's decoder branch (h264 ↔ h265). The `_plus`
+                // variants are vendor SVC labels for Hikvision /
+                // Dahua / Uniview — picking them tells the engine the
+                // wire bitstream is still standard H.26x but the
+                // camera advertises an SVC tag.
+                set("codec", v === "auto" ? null : (v as CodecKind));
+              }}
+            >
+              <option value="auto">Auto-detect (recommended)</option>
+              <option value="h264">H.264</option>
+              <option value="h264_plus">H.264+ (Hikvision/Dahua SVC)</option>
+              <option value="h265">H.265 / HEVC</option>
+              <option value="h265_plus">H.265+ (Hikvision/Dahua SVC)</option>
+            </select>
+            <p className="text-xs text-muted-foreground">
+              Auto-detect runs a one-shot RTSP DESCRIBE when you save. Pick a
+              specific codec only if autodetect fails (camera requires Digest
+              auth or speaks a non-H.26x codec).
+            </p>
           </div>
         </SheetSection>
 
@@ -1575,6 +1612,11 @@ function DiscoveredItem({
             {probedOk ? (
               <Badge variant="success">
                 {probedViaOnvif ? "verified · ONVIF" : "verified"}
+              </Badge>
+            ) : null}
+            {device.codec ? (
+              <Badge variant="outline" className="font-mono uppercase">
+                {device.codec.replace("_plus", "+")}
               </Badge>
             ) : null}
           </div>

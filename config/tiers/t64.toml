@@ -38,6 +38,13 @@ ui_root = "/usr/share/nexus/ui"
 https_bind = "0.0.0.0:443"
 tls_cert_path = "/etc/nexus/tls/cert.pem"
 tls_key_path  = "/etc/nexus/tls/key.pem"
+# v0.1.36 — HSTS max-age. Runtime-gated: the engine emits the
+# Strict-Transport-Security header ONLY when the leaf is the
+# cloud-issued cert minted by enrollment-svc (M-HTTPS Phase 3).
+# Self-signed bootstrap leaves never advertise HSTS, so this
+# value is safe to leave on even before the appliance is
+# enrolled with the cloud.
+hsts_max_age_seconds = 31536000
 
 [store]
 url = "sqlite:///var/lib/nexus/nexus.db?mode=rwc"

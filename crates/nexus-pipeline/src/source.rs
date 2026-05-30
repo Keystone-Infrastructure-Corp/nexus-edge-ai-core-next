@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
+#[cfg(feature = "gstreamer")]
+use nexus_types::CodecKind;
 use nexus_types::{CameraId, Frame, PixelFormat};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -209,6 +211,15 @@ pub struct RtspSource {
     pub frame_width: u32,
     /// Companion to [`Self::frame_width`].
     pub frame_height: u32,
+    /// Operator-configured codec for this camera, if known. Used
+    /// only for observability: the pipeline runs `decodebin` which
+    /// is codec-agnostic and will handle whatever the camera
+    /// actually publishes. When set, we compare against the
+    /// `encoding-name` we observe on `rtspsrc`'s pad-added caps and
+    /// warn on mismatch so operators can spot stale config (e.g.
+    /// camera switched from H.264 to H.265 on the NVR side).
+    /// `None` means autodetect / unknown — we still log what we saw.
+    pub expected_codec: Option<CodecKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +373,7 @@ impl RtspSource {
         // reasoning. latency=500 matches the recorder so both feeds
         // recover from the same hiccups at the same time.
         let desc = format!(
-            "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
+            "rtspsrc name=src location=\"{url_safe}\" latency=500 protocols=tcp \
              ! decodebin force-sw-decoders=true \
              ! videoconvert ! videoscale ! videorate \
              ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
@@ -381,6 +392,65 @@ impl RtspSource {
             .ok_or_else(|| FrameSourceError::Backend("appsink 'sink' not found".into()))?
             .downcast::<AppSink>()
             .map_err(|_| FrameSourceError::Backend("downcast AppSink".into()))?;
+
+        // Snoop the RTP encoding-name as soon as rtspsrc adds its
+        // first src pad. Pure observability — we DO NOT switch
+        // decoders here, decodebin handles whatever shows up. The
+        // log line lets operators correlate "camera I configured as
+        // H.264" against "what the camera actually publishes".
+        if let Some(rtspsrc) = pipeline.by_name("src") {
+            let camera_id_snoop = self.camera_id;
+            let expected_snoop = self.expected_codec;
+            let logged_codec = Arc::new(AtomicBool::new(false));
+            rtspsrc.connect_pad_added(move |_elem, pad| {
+                if logged_codec.swap(true, Ordering::Relaxed) {
+                    return;
+                }
+                let Some(caps) = pad.current_caps().or_else(|| pad.allowed_caps()) else {
+                    return;
+                };
+                let Some(s) = caps.structure(0) else {
+                    return;
+                };
+                let encoding = s.get::<String>("encoding-name").ok();
+                let observed = encoding
+                    .as_deref()
+                    .and_then(|e| match e.to_uppercase().as_str() {
+                        "H264" => Some(CodecKind::H264),
+                        "H265" | "HEVC" => Some(CodecKind::H265),
+                        _ => None,
+                    });
+                match (expected_snoop, observed) {
+                    (Some(exp), Some(obs)) if exp.base() != obs.base() => {
+                        tracing::warn!(
+                            camera_id = camera_id_snoop,
+                            expected = %exp,
+                            observed = %obs,
+                            encoding_name = ?encoding,
+                            "rtspsrc codec mismatch: stream advertises a different \
+                             codec than the camera config; decodebin will still handle it, \
+                             but operator should update the config to match"
+                        );
+                    }
+                    (_, Some(obs)) => {
+                        tracing::info!(
+                            camera_id = camera_id_snoop,
+                            expected = ?expected_snoop.map(|c| c.to_string()),
+                            observed = %obs,
+                            "rtspsrc negotiated codec"
+                        );
+                    }
+                    (_, None) => {
+                        tracing::info!(
+                            camera_id = camera_id_snoop,
+                            expected = ?expected_snoop.map(|c| c.to_string()),
+                            encoding_name = ?encoding,
+                            "rtspsrc pad-added: unrecognised encoding-name"
+                        );
+                    }
+                }
+            });
+        }
 
         let camera_id = self.camera_id;
         let counter = Arc::new(parking_lot::Mutex::new(0u64));

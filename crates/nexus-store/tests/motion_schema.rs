@@ -48,6 +48,7 @@ fn sample_camera(id: i64, name: &str) -> CameraConfig {
             url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
             enabled: true,
             max_fps: 0,
+            codec: None,
         },
         detector: nexus_config::CameraDetector {
             prompts: vec![],
@@ -647,6 +648,8 @@ async fn schema_migrations_table_records_apply_order() {
             "0016_cloud_enrollment_attach_replay".to_string(),
             "0017_motion_clips_frame_size".to_string(),
             "0018_entity_local_state".to_string(),
+            "0019_auth_refresh_idle".to_string(),
+            "0020_cloud_enrollment_server_cert".to_string(),
         ]
     );
 }

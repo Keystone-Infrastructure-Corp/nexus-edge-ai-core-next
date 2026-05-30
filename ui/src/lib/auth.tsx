@@ -15,6 +15,7 @@ import type { ReactNode } from "react";
 
 import { configureClient } from "@/api/client";
 import type { AuthUser, TokenResponse } from "@/api/types";
+import { useIdleLogout } from "@/lib/idle";
 
 const STORAGE_KEY = "nexus_session";
 
@@ -97,6 +98,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       onClear: () => clearSession(),
     });
   }, [session, setSessionFromTokens, clearSession]);
+
+  // v0.1.36 — 20-minute client-side idle nudge. Server is the
+  // authoritative gate; this just clears local state slightly
+  // before the next refresh would have been refused so the UX
+  // is a clean redirect to /login instead of a failed request.
+  useIdleLogout(session !== null, clearSession);
+
+  // Also listen for the global idle_expired event the api client
+  // dispatches when the refresh endpoint returned the 401 first
+  // (e.g. the user came back after a long lunch with a stale tab).
+  useEffect(() => {
+    const handler = () => clearSession();
+    window.addEventListener("nexus:idle-expired", handler);
+    return () => window.removeEventListener("nexus:idle-expired", handler);
+  }, [clearSession]);
 
   const value = useMemo(
     () => ({ session, setSessionFromTokens, clearSession }),

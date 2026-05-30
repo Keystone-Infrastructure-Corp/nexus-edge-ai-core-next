@@ -35,6 +35,7 @@ fn cam(id: i64, override_kind: Option<&str>, top_k: Option<usize>) -> CameraConf
             url: Url::parse("virtual://test").unwrap(),
             enabled: true,
             max_fps: 0,
+            codec: None,
         },
         detector: CameraDetector {
             prompts: vec![],

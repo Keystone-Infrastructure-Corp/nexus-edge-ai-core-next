@@ -185,6 +185,7 @@ async fn probe_rtsp_options(host: IpAddr, port: u16) -> Option<DiscoveredDevice>
         // remains the only option.
         onvif_xaddrs: None,
         rtsp_paths: Vec::new(),
+        codec: None,
     })
 }
 
@@ -263,6 +264,7 @@ async fn probe_onvif_soap(host: IpAddr, port: u16) -> Option<DiscoveredDevice> {
         // URL. Acceptable: CIDR scan is the fallback path.
         onvif_xaddrs: Some(format!("http://{host}:{port}/onvif/device_service")),
         rtsp_paths: Vec::new(),
+        codec: None,
     })
 }
 

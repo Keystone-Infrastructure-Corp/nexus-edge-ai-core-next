@@ -742,6 +742,7 @@ mod tests {
             ADMIN_SECRET,
             now,
             chrono::Duration::minutes(15),
+            None,
         )
         .expect("token")
     }
@@ -828,6 +829,7 @@ mod tests {
             ADMIN_SECRET,
             Utc::now(),
             chrono::Duration::minutes(15),
+            None,
         )
         .unwrap();
         let app = build_app(state);

@@ -70,10 +70,13 @@ ui_root = "/usr/share/nexus/ui"
 # https_bind = "0.0.0.0:443"
 # tls_cert_path = "/etc/nexus/tls/cert.pem"
 # tls_key_path  = "/etc/nexus/tls/key.pem"
-# Enable HSTS only AFTER the operator has trusted the cert chain
-# (a browser that caches HSTS against a self-signed leaf cannot
-# later override the warning page).
-# hsts_max_age_seconds = 15552000
+# Enable HSTS. v0.1.36 onward the engine gates this on cert
+# source: the `Strict-Transport-Security` header is emitted ONLY
+# when the leaf is the cloud-issued cert minted by enrollment-svc
+# (M-HTTPS Phase 3). Self-signed bootstrap leaves never advertise
+# HSTS, so this value is safe to set even before the appliance is
+# enrolled with the cloud.
+# hsts_max_age_seconds = 31536000
 
 [store]
 url = "sqlite:///var/lib/nexus/nexus.db?mode=rwc"

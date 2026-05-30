@@ -72,7 +72,7 @@ use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSinkCallbacks};
 use gstreamer_video::prelude::*;
 use gstreamer_video::{VideoFormat, VideoFrameRef, VideoInfo};
-use nexus_types::{CameraId, Frame, PixelFormat};
+use nexus_types::{CameraId, CodecKind, Frame, PixelFormat};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -146,6 +146,14 @@ struct FrameTap {
 pub struct PreRollIngester {
     camera_id: CameraId,
     url: String,
+    /// Wire codec carried by the upstream RTSP feed. Selects
+    /// `rtph264depay`/`h264parse`/`avdec_h264` vs the H.265
+    /// equivalents in the generated pipeline string. The vendor
+    /// `_plus` variants (Hikvision H.264+/H.265+, Dahua Smart
+    /// Codec) collapse to their base via [`CodecKind::base`] —
+    /// GStreamer's stock parsers handle the SVC bitstream as
+    /// plain H.264/H.265.
+    codec: CodecKind,
     /// `pre_roll_secs == 0` is a valid disable knob — we still run
     /// the always-on pipeline (so the broadcast channel is alive
     /// for recording) but the ring buffer never accumulates.
@@ -184,8 +192,9 @@ impl PreRollIngester {
         camera_id: CameraId,
         url: impl Into<String>,
         pre_roll_secs: u32,
+        codec: CodecKind,
     ) -> Result<Arc<Self>, IngesterError> {
-        Self::build(camera_id, url, pre_roll_secs, None)
+        Self::build(camera_id, url, pre_roll_secs, codec, None)
     }
 
     /// Variant of [`Self::new`] that also exposes a decoded RGB
@@ -209,17 +218,25 @@ impl PreRollIngester {
         camera_id: CameraId,
         url: impl Into<String>,
         pre_roll_secs: u32,
+        codec: CodecKind,
         max_fps: u32,
         rgb_w: u32,
         rgb_h: u32,
     ) -> Result<Arc<Self>, IngesterError> {
-        Self::build(camera_id, url, pre_roll_secs, Some((max_fps, rgb_w, rgb_h)))
+        Self::build(
+            camera_id,
+            url,
+            pre_roll_secs,
+            codec,
+            Some((max_fps, rgb_w, rgb_h)),
+        )
     }
 
     fn build(
         camera_id: CameraId,
         url: impl Into<String>,
         pre_roll_secs: u32,
+        codec: CodecKind,
         rgb_params: Option<(u32, u32, u32)>,
     ) -> Result<Arc<Self>, IngesterError> {
         gst_init::ensure().map_err(|e| IngesterError::GstInit(e.to_string()))?;
@@ -252,6 +269,7 @@ impl PreRollIngester {
             run_supervisor(
                 camera_id,
                 task_url,
+                codec,
                 task_ring,
                 task_tx,
                 task_frame_tap,
@@ -264,6 +282,7 @@ impl PreRollIngester {
         Ok(Arc::new(Self {
             camera_id,
             url,
+            codec,
             ring,
             live_tx,
             frame_tap,
@@ -279,6 +298,14 @@ impl PreRollIngester {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Wire codec the ingester's GStreamer pipeline is parsing.
+    /// Used by the recorder at `open()` to capture into
+    /// `OpenState.codec` so the per-clip mp4mux chain spins up
+    /// the matching parser without an extra config lookup.
+    pub fn codec(&self) -> CodecKind {
+        self.codec
     }
 
     /// Subscribe to every live H.264 NAL sample arriving from this
@@ -333,6 +360,7 @@ impl PreRollIngester {
 async fn run_supervisor(
     camera_id: CameraId,
     url: String,
+    codec: CodecKind,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
     frame_tap: Option<(broadcast::Sender<Frame>, u32, u32, u32)>,
@@ -342,6 +370,7 @@ async fn run_supervisor(
     info!(
         camera_id,
         url,
+        codec = %codec,
         rgb_tap = frame_tap.is_some(),
         "preroll ingester supervisor starting (always-on)"
     );
@@ -353,6 +382,7 @@ async fn run_supervisor(
         match run_session(
             camera_id,
             &url,
+            codec,
             ring.clone(),
             live_tx.clone(),
             frame_tap.clone(),
@@ -385,6 +415,7 @@ async fn run_supervisor(
 async fn run_session(
     camera_id: CameraId,
     url: &str,
+    codec: CodecKind,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
     frame_tap: Option<(broadcast::Sender<Frame>, u32, u32, u32)>,
@@ -392,61 +423,62 @@ async fn run_session(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), IngesterError> {
     let url_safe = url.replace('"', "");
+    // Codec-specific element names: rtp{depay}, {parse}, video/x-{base},
+    // and the {decoder} used by the optional RGB tap branch. The base
+    // collapse (`_plus` -> base) is intentional \u2014 Hikvision H.264+ /
+    // Dahua Smart Codec are SVC-tagged but the bitstream still parses
+    // through the stock H.264/H.265 elements.
+    let (rtp_depay, parse, base_caps, decoder) = match codec.base() {
+        "h265" => ("rtph265depay", "h265parse", "video/x-h265", "avdec_h265"),
+        _ => ("rtph264depay", "h264parse", "video/x-h264", "avdec_h264"),
+    };
     // protocols=tcp (NOT tcp+udp) so rtspsrc never falls back to UDP.
     // UDP packet loss on a contended link (WiFi / busy switch / bursty
-    // CPU on the receiver) shows up as 2–4 s gaps in the recorded clip
+    // CPU on the receiver) shows up as 2\u20134 s gaps in the recorded clip
     // where the camera OSD clock visibly jumps. TCP gives guaranteed
     // in-order delivery; the camera buffers send-side rather than
     // silently dropping. Latency bumped to 500 ms to absorb the
     // resulting in-band re-tx jitter.
-    // h264parse config-interval=0 (trust the source). See module
+    // {parse} config-interval=0 (trust the source). See module
     // docstring for the multi-paragraph explanation of why -1
     // catastrophically breaks recording on cameras that already
-    // include SPS/PPS in every keyframe access unit.
+    // include SPS/PPS (or H.265 VPS/SPS/PPS) in every keyframe access
+    // unit.
     //
     // When `frame_tap` is `Some`, the pipeline grows a `tee` after
-    // the h264parse caps filter, with two queued branches:
-    //   * `tap`  — the existing byte-stream H.264 appsink that
-    //              feeds the ring buffer + recorder broadcast.
-    //   * `rgb`  — `avdec_h264 → videoconvert → videoscale →
-    //              videorate → appsink RGB` at the camera's
-    //              per-camera supervisor-frame resolution
-    //              (derived from the camera's resolved detector
-    //              input size via
-    //              [`crate::source::supervisor_frame_for`]; see
-    //              the engine spawn site in
-    //              `nexus-engine/src/{main,reconciler}.rs`). The
+    // the parser caps filter, with two queued branches:
+    //   * `tap`  \u2014 the existing byte-stream appsink that feeds the
+    //              ring buffer + recorder broadcast.
+    //   * `rgb`  \u2014 `{decoder} \u2192 videoconvert \u2192 videoscale \u2192
+    //              videorate \u2192 appsink RGB` at the camera's
+    //              per-camera supervisor-frame resolution. The
     //              detector subscribes via
     //              [`PreRollIngester::subscribe_frames`] and never
     //              opens its own RTSP connection. Queues sit at
-    //              both branch heads (mandatory for `tee` — without
-    //              them the upstream pad serialises both downstream
-    //              sinks on one thread and the slower one wedges
-    //              the faster one). `tap` queue is lossless (we
-    //              must record every NAL); `rgb` queue is
-    //              `leaky=downstream` so a slow detector drops the
-    //              oldest decoded frame instead of stalling the
-    //              shared upstream parser.
+    //              both branch heads (mandatory for `tee`); `tap` queue
+    //              is lossless and `rgb` queue is `leaky=downstream`
+    //              so a slow detector drops the oldest decoded frame
+    //              instead of stalling the shared upstream parser.
     let desc = match &frame_tap {
         None => format!(
             "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
-             ! rtph264depay \
-             ! h264parse config-interval=0 \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! {rtp_depay} \
+             ! {parse} config-interval=0 \
+             ! {base_caps},stream-format=byte-stream,alignment=au \
              ! appsink name=tap emit-signals=true sync=false \
                  max-buffers=200 drop=false"
         ),
         Some((_, max_fps, rgb_w, rgb_h)) => format!(
             "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
-             ! rtph264depay \
-             ! h264parse config-interval=0 \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! {rtp_depay} \
+             ! {parse} config-interval=0 \
+             ! {base_caps},stream-format=byte-stream,alignment=au \
              ! tee name=t \
              t. ! queue max-size-buffers=200 max-size-bytes=0 max-size-time=0 \
                 ! appsink name=tap emit-signals=true sync=false \
                     max-buffers=200 drop=false \
              t. ! queue leaky=downstream max-size-buffers=8 max-size-bytes=0 max-size-time=0 \
-                ! avdec_h264 \
+                ! {decoder} \
                 ! videoconvert ! videoscale ! videorate \
                 ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
                 ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4",

@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use nexus_types::{CameraId, VisualPromptId};
+use nexus_types::{CameraId, CodecKind, VisualPromptId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -1651,6 +1651,15 @@ pub struct CameraIngest {
     /// Per-camera FPS cap. 0 = unbounded.
     #[serde(default)]
     pub max_fps: u32,
+    /// Video codec carried by the RTSP stream. `None` means
+    /// "unknown — let the pipeline default to H.264 and warn at
+    /// spawn". Populated by the admin API's autodetect (RTSP
+    /// DESCRIBE / ONVIF Media) at camera-create time, or
+    /// hand-picked by the operator. The `_plus` variants are
+    /// vendor SVC labels (Hikvision H.264+/H.265+, Dahua Smart
+    /// Codec, Uniview U-Code); autodetect never emits them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<CodecKind>,
 }
 
 /// Detector-side knobs — open-vocab prompts and model overrides.

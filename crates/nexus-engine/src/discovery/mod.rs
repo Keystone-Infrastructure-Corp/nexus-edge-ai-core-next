@@ -142,6 +142,15 @@ pub struct DiscoveredDevice {
     /// undefined (reading '0')" on every initial-probe device.
     #[serde(default)]
     pub rtsp_paths: Vec<String>,
+    /// Typed video codec captured opportunistically during the
+    /// CIDR scan / ONVIF media probe. `None` until autodetect
+    /// resolves it (e.g. the host answered RTSP `OPTIONS` but
+    /// hasn't been DESCRIBE-probed yet, or it required creds).
+    /// Seeded into the camera-create form's codec selector by
+    /// the UI; the operator can still override with the
+    /// `_plus` SVC labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<nexus_types::CodecKind>,
 }
 
 /// Request body for `POST /api/v1/admin/discovery/scan`.
@@ -250,6 +259,15 @@ pub struct ProbeOnvifResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct SdpStream {
     pub codec: String,
+    /// Typed codec parsed from `a=rtpmap:` lines
+    /// (`H264/90000` → `H264`, `HEVC/90000` and `H265/90000`
+    /// → `H265`). `None` for codecs we don't enumerate
+    /// (`JPEG`, `MPEG4-GENERIC`, audio, …) so the UI can show
+    /// the raw string in `codec` but skip the typed selector.
+    /// Autodetect never emits a `_plus` variant — vendor SVC
+    /// shares the base wire format with H.264 / H.265.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec_kind: Option<nexus_types::CodecKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,6 +287,10 @@ pub struct ProbeStream {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<String>,
+    /// Typed codec from the first video track of this path's
+    /// SDP. Mirrors `SdpStream::codec_kind`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec_kind: Option<nexus_types::CodecKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
 }
@@ -278,6 +300,12 @@ pub struct ProbeRtspResult {
     pub ok: bool,
     pub status: u16,
     pub sdp_streams: Vec<SdpStream>,
+    /// Typed codec of the winning path's first video track, lifted
+    /// out of `streams[0].codec_kind` so the UI can seed the codec
+    /// selector without iterating. `None` when the probe failed or
+    /// the camera publishes only codecs we don't enumerate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<nexus_types::CodecKind>,
     /// RTSP path that actually answered with a 200 + SDP body.
     /// `Some("/cam/realmonitor?channel=1&subtype=0")` when path
     /// discovery succeeded (or when the operator's explicit path
@@ -958,6 +986,7 @@ mod tests {
                 mac: None,
                 onvif_xaddrs: None,
                 rtsp_paths: Vec::new(),
+                codec: None,
             });
         }
         let view = reg.get(&id).unwrap();

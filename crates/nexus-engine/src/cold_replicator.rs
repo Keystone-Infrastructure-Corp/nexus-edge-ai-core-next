@@ -705,6 +705,7 @@ mod tests {
                     url: Url::parse("rtsp://127.0.0.1/stream1").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
@@ -1012,6 +1013,8 @@ mod tests {
             signing_kid: None,
             enrolled_at: Utc::now(), // overwritten by DB default
             attach_replay_after: None,
+            server_cert_pem: None,
+            server_private_key_pem: None,
         };
         store.set_cloud_enrollment(&enrollment).await.unwrap();
         // Reload to capture the DB-default enrolled_at.
@@ -1082,6 +1085,8 @@ mod tests {
             signing_kid: None,
             enrolled_at: Utc::now(),
             attach_replay_after: Some(Utc::now() - ChronoDuration::days(30)),
+            server_cert_pem: None,
+            server_private_key_pem: None,
         };
         store.set_cloud_enrollment(&enrollment).await.unwrap();
 

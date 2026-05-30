@@ -27,7 +27,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nexus_store::{ClipClose, ClipId, NewClip, Store};
-use nexus_types::CameraId;
+use nexus_types::{CameraId, CodecKind};
 use thiserror::Error;
 use tokio::fs;
 use tokio::sync::Mutex;
@@ -175,6 +175,7 @@ pub trait ClipRecorder: Send + Sync {
     /// logged + swallowed (the camera will refuse clips, but the
     /// rest of the engine keeps running).
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     fn add_camera_ingester(
         &self,
         camera_id: CameraId,
@@ -183,6 +184,7 @@ pub trait ClipRecorder: Send + Sync {
         max_fps: u32,
         rgb_w: u32,
         rgb_h: u32,
+        codec: CodecKind,
     ) -> Result<(), RecorderError> {
         Ok(())
     }
@@ -749,6 +751,7 @@ mod tests {
                     url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],

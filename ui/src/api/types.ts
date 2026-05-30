@@ -58,6 +58,14 @@ export interface TokenResponse {
 // Source of truth: crates/nexus-config/src/lib.rs CameraConfig.
 // ---------------------------------------------------------------------------
 
+/// Video codec carried by an RTSP stream. Mirrors
+/// `nexus_types::CodecKind`. The `_plus` variants are vendor SVC
+/// labels (Hikvision H.264+/H.265+, Dahua Smart Codec, Uniview
+/// U-Code) that the operator picks manually — RTSP / ONVIF
+/// autodetect never emits them because the SVC tag rides outside
+/// the standard SDP `rtpmap` field.
+export type CodecKind = "h264" | "h264_plus" | "h265" | "h265_plus";
+
 export interface VisualPromptRef {
   id: string;
   label: string;
@@ -95,6 +103,11 @@ export interface CameraConfig {
   url: string;
   enabled?: boolean;
   max_fps?: number;
+  /// Codec carried by the RTSP stream. `null` / undefined means
+  /// "unknown" — the engine warns at spawn time and defaults to
+  /// H.264. Set by the admin API's autodetect on camera-create,
+  /// or picked from the dropdown by the operator.
+  codec?: CodecKind | null;
   prompts?: string[];
   visual_prompts?: VisualPromptRef[];
   model_override?: ModelOverride | null;
@@ -238,6 +251,12 @@ export interface DiscoveredDevice {
   firmware?: string | null;
   mac?: string | null;
   rtsp_paths: string[];
+  /// Top observed codec across this device's enumerated streams
+  /// (RTSP DESCRIBE `rtpmap` or ONVIF VideoEncoderConfiguration
+  /// `Encoding`). Carried into the camera editor as the initial
+  /// codec selection so the operator doesn't have to re-pick. May
+  /// be absent on devices whose probes never returned a 200 OK.
+  codec?: CodecKind | null;
   /// Verbatim WS-Discovery `XAddrs` URL (e.g.
   /// `http://192.168.1.66/onvif/device_service`). Present
   /// only when `kind === "onvif"` AND the camera advertised

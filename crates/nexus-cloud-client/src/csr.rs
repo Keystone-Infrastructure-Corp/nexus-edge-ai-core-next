@@ -33,7 +33,10 @@
 //! per-core signing key from enrollment) are untouched — those
 //! never participate in a TLS handshake.
 
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+    KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
+};
 
 /// Successful CSR build — PEMs the engine persists + POSTs.
 #[derive(Debug, Clone)]
@@ -54,6 +57,11 @@ pub enum CsrError {
     /// serialisation failure, etc.).
     #[error("CSR generation: {0}")]
     Rcgen(#[from] rcgen::Error),
+    /// v0.1.36 — a DNS SAN supplied by the caller failed IA5String
+    /// validation (non-ASCII, control bytes, or > 253 chars). Carries
+    /// the offending string verbatim so the caller can log + skip.
+    #[error("CSR DNS SAN invalid (IA5 violation): {0:?}")]
+    InvalidDnsSan(String),
 }
 
 /// Generate a fresh ECDSA P-256 keypair + matching PKCS#10 CSR with
@@ -75,6 +83,66 @@ pub fn generate_keypair_and_csr(common_name: &str) -> Result<CsrBundle, CsrError
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, common_name.to_string());
     params.distinguished_name = dn;
+    let csr = params.serialize_request(&key_pair)?;
+    Ok(CsrBundle {
+        csr_pem: csr.pem()?,
+        private_key_pem: key_pair.serialize_pem(),
+    })
+}
+
+/// v0.1.36 (M-HTTPS Phase 3) — generate a fresh ECDSA P-256 keypair +
+/// CSR earmarked for the engine's local HTTPS *server* leaf.
+/// Companion to [`generate_keypair_and_csr`] (which mints the mTLS
+/// *client* leaf for the WSS tunnel).
+///
+/// Different from the client CSR in three ways:
+///
+/// 1. CSR carries `subjectAltName` extensions for every DNS name and
+///    IP literal the browser might hit (`hostname`, `hostname.local`,
+///    `nexus.local`, `localhost`, `127.0.0.1`, `::1`, plus every
+///    non-link-local interface IP). The cloud re-asserts them
+///    cloud-side (after sanitisation) before signing.
+/// 2. CSR's `key_usages` advertise `DigitalSignature` +
+///    `KeyEncipherment` (RSA forward-compat).
+/// 3. CSR's `extended_key_usages` advertise `ServerAuth` only.
+///
+/// The cloud's signing path enforces all three regardless of what
+/// the CSR claims — see
+/// `services/enrollment-svc/src/ca.rs::sign_csr_server` — so these
+/// are advisory, not authoritative. We still set them so the CSR
+/// is self-describing and works with non-cloud signers in dev.
+///
+/// # Errors
+///
+/// Returns [`CsrError::Rcgen`] when keypair generation or CSR
+/// serialisation fails.
+pub fn generate_server_keypair_and_csr(
+    common_name: &str,
+    dns_sans: &[String],
+    ip_sans: &[std::net::IpAddr],
+) -> Result<CsrBundle, CsrError> {
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, common_name.to_string());
+    params.distinguished_name = dn;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
+    let mut sans: Vec<SanType> = Vec::with_capacity(dns_sans.len() + ip_sans.len());
+    for d in dns_sans {
+        let ia5 = rcgen::Ia5String::try_from(d.as_str())
+            .map_err(|_| CsrError::InvalidDnsSan(d.clone()))?;
+        sans.push(SanType::DnsName(ia5));
+    }
+    for ip in ip_sans {
+        sans.push(SanType::IpAddress(*ip));
+    }
+    params.subject_alt_names = sans;
+
     let csr = params.serialize_request(&key_pair)?;
     Ok(CsrBundle {
         csr_pem: csr.pem()?,

@@ -62,6 +62,7 @@ fn sample_camera(id: i64, name: &str) -> CameraConfig {
             url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
             enabled: true,
             max_fps: 0,
+            codec: None,
         },
         detector: nexus_config::CameraDetector {
             prompts: vec![],

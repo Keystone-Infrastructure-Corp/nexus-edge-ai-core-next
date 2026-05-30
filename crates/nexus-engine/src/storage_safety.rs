@@ -768,6 +768,7 @@ mod tests {
                     url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
@@ -943,6 +944,7 @@ mod tests {
                         url: Url::parse(&format!("rtsp://127.0.0.1/stream{cam_id}")).unwrap(),
                         enabled: true,
                         max_fps: 0,
+                        codec: None,
                     },
                     detector: nexus_config::CameraDetector {
                         prompts: vec![],
@@ -1337,6 +1339,7 @@ mod tests {
                     url: Url::parse(&format!("rtsp://127.0.0.1/stream{cam}")).unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],

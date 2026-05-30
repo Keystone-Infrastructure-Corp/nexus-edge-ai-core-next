@@ -48,6 +48,9 @@ async fn enroll_roundtrips_against_canonical_cloud_shape() {
         csr_pem: "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n-----END CERTIFICATE REQUEST-----\n"
             .to_string(),
         fingerprint: "tpm:0xdeadbeef".to_string(),
+        server_csr_pem: None,
+        server_dns_sans: Vec::new(),
+        server_ip_sans: Vec::new(),
     };
 
     let resp = client.enroll(&req).await.expect("enrollment succeeds");
@@ -81,6 +84,9 @@ async fn enroll_surfaces_server_error_payload() {
             code: "USED".into(),
             csr_pem: "csr".into(),
             fingerprint: "fp".into(),
+            server_csr_pem: None,
+            server_dns_sans: Vec::new(),
+            server_ip_sans: Vec::new(),
         })
         .await
         .expect_err("non-2xx surfaces");
@@ -125,6 +131,9 @@ async fn enroll_handles_forward_compat_actor_token_key_bundle() {
             code: "X".into(),
             csr_pem: "Y".into(),
             fingerprint: "Z".into(),
+            server_csr_pem: None,
+            server_dns_sans: Vec::new(),
+            server_ip_sans: Vec::new(),
         })
         .await
         .expect("enrollment succeeds");

@@ -237,6 +237,7 @@ mod tests {
             role: Role::Admin,
             jti: "admin-cli".to_string(),
             is_legacy_admin: true,
+            chain_id: None,
         };
         let (kind, id, label) = actor_triple(Some(&ctx));
         assert_eq!(kind, AuditActorKind::LocalUser);
@@ -251,6 +252,7 @@ mod tests {
             role: Role::Admin,
             jti: "abc".to_string(),
             is_legacy_admin: false,
+            chain_id: None,
         };
         let (kind, id, label) = actor_triple(Some(&ctx));
         assert_eq!(kind, AuditActorKind::LocalUser);
@@ -273,6 +275,7 @@ mod tests {
             role: Role::Admin,
             jti: "loopback".to_string(),
             is_legacy_admin: true,
+            chain_id: None,
         };
         let (_, _, label) = actor_triple(Some(&ctx));
         assert_eq!(label, "system:legacy-admin:loopback");

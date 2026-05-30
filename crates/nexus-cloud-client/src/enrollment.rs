@@ -39,6 +39,29 @@ pub struct EnrollmentRequest {
     /// computes this from CPU serial / TPM EK / equivalent at first
     /// boot and stores it under the enrollment artifact directory.
     pub fingerprint: String,
+    /// v0.1.36 (M-HTTPS Phase 3) — optional PEM-encoded PKCS#10 CSR
+    /// for the engine's local HTTPS *server* leaf. When present, the
+    /// cloud mints a `serverAuth`-EKU leaf alongside the mTLS client
+    /// leaf and returns it as [`EnrollmentResponse::server_cert_pem`].
+    /// Pre-v0.1.36 engines omit this; pre-v0.1.36 clouds ignore it.
+    /// The keypair backing this CSR is generated edge-side so the
+    /// private key never leaves the appliance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_csr_pem: Option<String>,
+    /// v0.1.36 (M-HTTPS Phase 3) — DNS names the engine wants on its
+    /// server leaf. Typically `hostname`, `hostname.local`,
+    /// `nexus.local`, `localhost`. Empty when [`Self::server_csr_pem`]
+    /// is `None`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_dns_sans: Vec<String>,
+    /// v0.1.36 (M-HTTPS Phase 3) — IP literals the engine wants on its
+    /// server leaf. Typically `127.0.0.1`, `::1`, plus every
+    /// non-link-local interface IP. Strings on the wire so the
+    /// schema is stable across `std::net` revisions; cloud-side we
+    /// parse via [`std::net::IpAddr::from_str`] and drop any entry
+    /// that fails to round-trip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_ip_sans: Vec<String>,
 }
 
 /// Enrollment response. The engine writes each PEM field to a separate
@@ -72,6 +95,19 @@ pub struct EnrollmentResponse {
     /// JWS `kid` paired with `entitlement_signing_key_pem`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement_signing_kid: Option<String>,
+    /// v0.1.36 (M-HTTPS Phase 3) — PEM-encoded `serverAuth`-EKU leaf
+    /// minted for the engine's local HTTPS listener. `None` when the
+    /// request omitted [`EnrollmentRequest::server_csr_pem`], when
+    /// the cloud-side mint failed, or when the cloud predates v0.1.36.
+    /// In all three cases the engine falls back to its self-signed
+    /// leaf and continues normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert_pem: Option<String>,
+    /// v0.1.36 (M-HTTPS Phase 3) — hex-encoded serial of the server
+    /// leaf. Present iff `server_cert_pem` is. The engine persists
+    /// it for future revocation lookups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert_serial: Option<String>,
 }
 
 /// Phase 1.7 client. The constructor pins the cloud-console base URL;

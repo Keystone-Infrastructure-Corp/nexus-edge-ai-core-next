@@ -126,6 +126,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0018_entity_local_state",
         include_str!("../migrations/0018_entity_local_state.sql"),
     ),
+    (
+        "0019_auth_refresh_idle",
+        include_str!("../migrations/0019_auth_refresh_idle.sql"),
+    ),
+    (
+        "0020_cloud_enrollment_server_cert",
+        include_str!("../migrations/0020_cloud_enrollment_server_cert.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

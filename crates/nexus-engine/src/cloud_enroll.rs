@@ -17,11 +17,13 @@
 //! untouched.
 
 use anyhow::{anyhow, Context, Result};
-use nexus_cloud_client::{generate_keypair_and_csr, EnrollmentClient, EnrollmentRequest};
+use nexus_cloud_client::{
+    generate_keypair_and_csr, generate_server_keypair_and_csr, EnrollmentClient, EnrollmentRequest,
+};
 use nexus_config::Config;
 use nexus_store::cloud::CloudEnrollment;
 use nexus_store::Store;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::time_sync;
 
@@ -135,6 +137,21 @@ pub async fn perform_enrollment(
     let csr = generate_keypair_and_csr(&label).context("generate CSR")?;
     info!(label = %label, "generated local ECDSA P-256 keypair + CSR");
 
+    // 1b. v0.1.36 (M-HTTPS Phase 3) — second keypair + CSR for the
+    //     engine's local HTTPS *server* leaf. The cloud signs both
+    //     CSRs in one round-trip (mTLS client + serverAuth server),
+    //     so the engine can stand up a browser-trusted HTTPS
+    //     listener as soon as the operator imports the cloud's CA
+    //     root once. The cloud will return `server_cert_pem = None`
+    //     if it can't mint (older cloud, signing failure), and the
+    //     engine then falls back to its self-signed leaf in tls.rs.
+    let (server_csr, server_dns_sans, server_ip_sans) = build_server_csr(&label)?;
+    info!(
+        dns_sans = ?server_dns_sans,
+        ip_sans = ?server_ip_sans,
+        "generated local server CSR for HTTPS listener",
+    );
+
     // 2. Hardware fingerprint. Best-effort; the cloud accepts any
     //    stable opaque string today. Salt with the CSR's public key
     //    SHA-256 so even a perfectly cloned VM ends up with a distinct
@@ -148,6 +165,9 @@ pub async fn perform_enrollment(
         code: code.to_string(),
         csr_pem: csr.csr_pem.clone(),
         fingerprint,
+        server_csr_pem: Some(server_csr.csr_pem.clone()),
+        server_dns_sans: server_dns_sans.clone(),
+        server_ip_sans: server_ip_sans.iter().map(|ip| ip.to_string()).collect(),
     };
     let resp = client
         .enroll(&req)
@@ -156,6 +176,7 @@ pub async fn perform_enrollment(
     info!(
         core_id = %resp.core_id,
         gateway_url = %resp.gateway_url,
+        server_cert_minted = resp.server_cert_pem.is_some(),
         "enrollment accepted by cloud",
     );
 
@@ -196,7 +217,24 @@ pub async fn perform_enrollment(
         signing_kid: resp.entitlement_signing_kid,
         enrolled_at: chrono::Utc::now(),
         attach_replay_after,
+        // v0.1.36 — only persist the server keypair when the cloud
+        // actually returned a signed leaf. Without that, the engine
+        // would have a private key with no matching cert and the
+        // tls.rs preference logic would treat it as configured-but-
+        // broken.
+        server_cert_pem: resp.server_cert_pem.clone(),
+        server_private_key_pem: resp
+            .server_cert_pem
+            .as_ref()
+            .map(|_| server_csr.private_key_pem),
     };
+    if persisted.server_cert_pem.is_none() {
+        warn!(
+            "cloud did not return a server cert; the engine will continue \
+             using its self-signed HTTPS leaf (operators will see the usual \
+             browser TLS warning until the cloud is upgraded to v0.1.36+)"
+        );
+    }
     store
         .set_cloud_enrollment(&persisted)
         .await
@@ -209,6 +247,24 @@ fn hostname_or(default: &str) -> String {
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// v0.1.36 (M-HTTPS Phase 3) — build the local server CSR + collect
+/// the SAN list the cloud needs to re-assert on the leaf. Shares the
+/// SAN derivation with [`crate::tls::derive_local_sans`] so the
+/// cloud-issued cert advertises exactly the same names the self-
+/// signed bootstrap leaf did.
+fn build_server_csr(
+    label: &str,
+) -> Result<(
+    nexus_cloud_client::CsrBundle,
+    Vec<String>,
+    Vec<std::net::IpAddr>,
+)> {
+    let (dns_sans, ip_sans) = crate::tls::derive_local_sans();
+    let bundle = generate_server_keypair_and_csr(label, &dns_sans, &ip_sans)
+        .context("generate server CSR")?;
+    Ok((bundle, dns_sans, ip_sans))
 }
 
 fn compute_fingerprint(csr_pem: &str) -> String {

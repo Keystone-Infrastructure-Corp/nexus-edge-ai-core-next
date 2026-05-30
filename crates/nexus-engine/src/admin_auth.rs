@@ -181,6 +181,12 @@ pub struct AdminAuthState {
     /// cloud-backend admin writes then fail closed.
     secret: Option<String>,
     allow_remote: bool,
+    /// v0.1.36 — channel into the background idle-bump drain
+    /// task. `None` when the engine is started without auth
+    /// (tests, dev-mode no-secret) so the bump pipeline is a
+    /// no-op. Wired in `main.rs` after `AdminAuthState` is built
+    /// via `with_idle_bump_tx`.
+    idle_bump_tx: Option<tokio::sync::mpsc::Sender<crate::auth::require_role::IdleBump>>,
 }
 
 impl AdminAuthState {
@@ -205,6 +211,7 @@ impl AdminAuthState {
             key,
             secret,
             allow_remote,
+            idle_bump_tx: None,
         })
     }
 
@@ -216,6 +223,30 @@ impl AdminAuthState {
         self.secret.as_deref()
     }
 
+    /// v0.1.36 — wire the per-request idle-bump channel into the
+    /// auth state after construction. Builder-style so the test
+    /// constructors don't change shape. The drained channel lands
+    /// in `bump_refresh_chain_active_at` on each (chain_id, ts)
+    /// pair the request extractor produces.
+    #[must_use]
+    pub fn with_idle_bump_tx(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<crate::auth::require_role::IdleBump>,
+    ) -> Self {
+        self.idle_bump_tx = Some(tx);
+        self
+    }
+
+    /// Read-only accessor used by [`crate::auth::require_role`]
+    /// to emit an idle-bump for the current refresh chain when
+    /// the request authenticates with a v0.1.36+ access token
+    /// (one that carries `chain_id` in its claims).
+    pub fn idle_bump_tx(
+        &self,
+    ) -> Option<&tokio::sync::mpsc::Sender<crate::auth::require_role::IdleBump>> {
+        self.idle_bump_tx.as_ref()
+    }
+
     /// Test-only constructor — used by the integration tests to
     /// avoid touching the filesystem.
     #[cfg(test)]
@@ -225,6 +256,7 @@ impl AdminAuthState {
             key: secret.map(DecodingKey::from_secret),
             secret: secret_str,
             allow_remote,
+            idle_bump_tx: None,
         }
     }
 }
@@ -350,6 +382,7 @@ pub async fn admin_auth_layer(
             role: Role::Admin,
             jti: claims.sub.clone().unwrap_or_else(|| "legacy".to_string()),
             is_legacy_admin: true,
+            chain_id: None,
         };
         req.extensions_mut().insert(ctx);
         return Ok(next.run(req).await);
@@ -363,6 +396,7 @@ pub async fn admin_auth_layer(
             role: Role::Admin,
             jti: "loopback".to_string(),
             is_legacy_admin: true,
+            chain_id: None,
         };
         req.extensions_mut().insert(ctx);
         return Ok(next.run(req).await);
@@ -377,6 +411,7 @@ pub async fn admin_auth_layer(
             role: Role::Admin,
             jti: "allow-remote".to_string(),
             is_legacy_admin: true,
+            chain_id: None,
         };
         req.extensions_mut().insert(ctx);
         return Ok(next.run(req).await);

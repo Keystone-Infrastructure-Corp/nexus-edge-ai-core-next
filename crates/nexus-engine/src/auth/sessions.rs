@@ -93,6 +93,14 @@ pub struct AccessClaims {
     /// mutating request so an admin can correlate a row to a
     /// specific access bearer (e.g. for incident response).
     pub jti: String,
+    /// v0.1.36 — the refresh-chain this access token belongs
+    /// to. UUIDv7. Lets [`crate::auth::require_role`] tag a
+    /// per-request idle-bump message without a follow-up DB
+    /// lookup. `None` for tokens issued by pre-v0.1.36 engine
+    /// builds (the field is `#[serde(default)]` so old tokens
+    /// still decode); the idle-bump task no-ops on `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
 }
 
 /// Build + sign an access JWT for `(user_id, role)` valid from
@@ -106,6 +114,7 @@ pub fn issue_access_token(
     secret: &[u8],
     now: DateTime<Utc>,
     ttl: Duration,
+    chain_id: Option<&str>,
 ) -> Result<String, SessionError> {
     let iat = now.timestamp();
     let exp = (now + ttl).timestamp();
@@ -115,6 +124,7 @@ pub fn issue_access_token(
         iat,
         exp,
         jti: Uuid::now_v7().to_string(),
+        chain_id: chain_id.map(str::to_owned),
     };
     let key = EncodingKey::from_secret(secret);
     Ok(jsonwebtoken::encode(
@@ -248,8 +258,15 @@ mod tests {
 
     #[test]
     fn access_jwt_round_trips_claims() {
-        let token =
-            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15)).unwrap();
+        let token = issue_access_token(
+            42,
+            Role::Operator,
+            secret(),
+            now(),
+            Duration::minutes(15),
+            None,
+        )
+        .unwrap();
         let claims = verify_access_token(&token, secret(), now()).unwrap();
         assert_eq!(claims.sub, "42");
         assert_eq!(claims.role, Role::Operator);
@@ -262,8 +279,15 @@ mod tests {
 
     #[test]
     fn access_jwt_rejected_when_signed_with_wrong_secret() {
-        let token =
-            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15)).unwrap();
+        let token = issue_access_token(
+            42,
+            Role::Operator,
+            secret(),
+            now(),
+            Duration::minutes(15),
+            None,
+        )
+        .unwrap();
         let err = verify_access_token(&token, b"other-secret", now()).unwrap_err();
         // Should be a JWT decode error, not Rng or anything else.
         assert!(matches!(err, SessionError::Jwt(_)), "{err:?}");
@@ -271,8 +295,15 @@ mod tests {
 
     #[test]
     fn access_jwt_rejected_when_expired() {
-        let token =
-            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15)).unwrap();
+        let token = issue_access_token(
+            42,
+            Role::Operator,
+            secret(),
+            now(),
+            Duration::minutes(15),
+            None,
+        )
+        .unwrap();
         let future = now() + Duration::hours(1);
         let err = verify_access_token(&token, secret(), future).unwrap_err();
         match err {
@@ -289,8 +320,15 @@ mod tests {
     #[test]
     fn access_jwt_at_exact_exp_is_rejected() {
         // Boundary: `<=`, so `now == exp` is expired.
-        let token =
-            issue_access_token(42, Role::Operator, secret(), now(), Duration::seconds(1)).unwrap();
+        let token = issue_access_token(
+            42,
+            Role::Operator,
+            secret(),
+            now(),
+            Duration::seconds(1),
+            None,
+        )
+        .unwrap();
         let at_exp = now() + Duration::seconds(1);
         assert!(verify_access_token(&token, secret(), at_exp).is_err());
     }
@@ -300,8 +338,10 @@ mod tests {
         // Defence-in-depth: two issues at the "same" time still
         // produce distinct jtis because UUIDv7 has a per-call
         // randomness tail.
-        let a = issue_access_token(1, Role::Viewer, secret(), now(), Duration::minutes(1)).unwrap();
-        let b = issue_access_token(1, Role::Viewer, secret(), now(), Duration::minutes(1)).unwrap();
+        let a = issue_access_token(1, Role::Viewer, secret(), now(), Duration::minutes(1), None)
+            .unwrap();
+        let b = issue_access_token(1, Role::Viewer, secret(), now(), Duration::minutes(1), None)
+            .unwrap();
         let ca = verify_access_token(&a, secret(), now()).unwrap();
         let cb = verify_access_token(&b, secret(), now()).unwrap();
         assert_ne!(ca.jti, cb.jti);
@@ -321,6 +361,7 @@ mod tests {
             iat: now().timestamp(),
             exp: (now() + Duration::minutes(1)).timestamp(),
             jti: Uuid::now_v7().to_string(),
+            chain_id: None,
         };
         // Sign with a known-wrong key to make sure verify fails
         // (alg=none rejection happens at decode-time via
@@ -339,7 +380,8 @@ mod tests {
         // login handler depends on Role::serialize for the
         // claim, and the verify path depends on the inverse.
         let token =
-            issue_access_token(7, Role::Admin, secret(), now(), Duration::minutes(15)).unwrap();
+            issue_access_token(7, Role::Admin, secret(), now(), Duration::minutes(15), None)
+                .unwrap();
         let claims = verify_access_token(&token, secret(), now()).unwrap();
         let json = serde_json::to_value(&claims).unwrap();
         assert_eq!(json["role"], "admin");

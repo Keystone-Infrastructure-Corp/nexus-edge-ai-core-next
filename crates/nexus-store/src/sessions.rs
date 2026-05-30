@@ -82,6 +82,20 @@ pub struct RefreshToken {
     pub user_agent: Option<String>,
     pub ip: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// v0.1.36 — sliding-window inactivity timestamp. Bumped
+    /// by the idle-bump task on every authenticated request
+    /// for any token in this chain. `None` only on rows that
+    /// pre-date migration 0019 (the migration backfills
+    /// `last_active_at = created_at` for existing rows, so
+    /// `None` in practice means "the row was inserted by an
+    /// engine build older than v0.1.36"; treat it as
+    /// `created_at` via [`Self::effective_last_active_at`]).
+    pub last_active_at: Option<DateTime<Utc>>,
+    /// v0.1.36 — `Some` iff the chain was killed by idle
+    /// expiry (as opposed to logout / replay / admin revoke,
+    /// which use `revoked_at`). Lets the audit log surface
+    /// expired sessions distinctly without a follow-up join.
+    pub idle_revoked_at: Option<DateTime<Utc>>,
 }
 
 impl RefreshToken {
@@ -90,7 +104,22 @@ impl RefreshToken {
     /// handler still calls into `revoke_chain` on a replay,
     /// but `is_live_at` is the cheap pre-check.
     pub fn is_live_at(&self, now: DateTime<Utc>) -> bool {
-        self.rotated_at.is_none() && self.revoked_at.is_none() && self.expires_at > now
+        self.rotated_at.is_none()
+            && self.revoked_at.is_none()
+            && self.idle_revoked_at.is_none()
+            && self.expires_at > now
+    }
+
+    /// `last_active_at` with the pre-v0.1.36 fallback applied:
+    /// rows inserted by an older engine never get a non-NULL
+    /// `last_active_at` from the write path, so the idle check
+    /// uses `created_at` for those (i.e. they expire 20 min
+    /// after creation if nothing bumps them). Practically all
+    /// such rows are also already past the 30-day TTL, so this
+    /// fallback only matters for the immediate post-upgrade
+    /// window.
+    pub fn effective_last_active_at(&self) -> DateTime<Utc> {
+        self.last_active_at.unwrap_or(self.created_at)
     }
 }
 
@@ -129,7 +158,7 @@ pub enum SessionsError {
 }
 
 const REFRESH_SELECT_PREFIX_SQL: &str = "SELECT id, token_hash, user_id, chain_id, parent_id, \
-    expires_at, rotated_at, revoked_at, user_agent, ip, created_at \
+    expires_at, rotated_at, revoked_at, user_agent, ip, created_at, last_active_at, idle_revoked_at \
     FROM auth_refresh_tokens";
 
 impl Store {
@@ -143,8 +172,8 @@ impl Store {
     ) -> Result<RefreshToken, SessionsError> {
         let res = sqlx::query(
             "INSERT INTO auth_refresh_tokens \
-                (token_hash, user_id, chain_id, parent_id, expires_at, user_agent, ip) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (token_hash, user_id, chain_id, parent_id, expires_at, user_agent, ip, last_active_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(token.token_hash)
         .bind(token.user_id)
@@ -153,6 +182,7 @@ impl Store {
         .bind(token.expires_at.to_rfc3339())
         .bind(token.user_agent)
         .bind(token.ip)
+        .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await;
 
@@ -304,6 +334,89 @@ impl Store {
         .await?;
         Ok(res.rows_affected())
     }
+
+    /// v0.1.36 — sliding-window activity bump. Updates
+    /// `last_active_at` on every row in the chain that's still
+    /// live (not rotated, not revoked, not idle-revoked) and
+    /// where the new timestamp is actually newer. The "newer"
+    /// guard makes the call idempotent for the batched bump
+    /// pipeline: the idle-bump task coalesces multiple
+    /// requests against the same chain into one UPDATE every
+    /// 250 ms, but a stale message arriving out-of-order
+    /// doesn't roll the timestamp backwards.
+    ///
+    /// Returns the number of rows touched — 0 means the chain
+    /// is already dead and the caller can drop the bump on the
+    /// floor instead of retrying.
+    pub async fn bump_refresh_chain_active_at(
+        &self,
+        chain_id: &str,
+        active_at: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
+        let res = sqlx::query(
+            "UPDATE auth_refresh_tokens \
+                SET last_active_at = ? \
+              WHERE chain_id = ? \
+                AND revoked_at IS NULL \
+                AND idle_revoked_at IS NULL \
+                AND (last_active_at IS NULL OR last_active_at < ?)",
+        )
+        .bind(active_at.to_rfc3339())
+        .bind(chain_id)
+        .bind(active_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// v0.1.36 — mark a chain dead due to idle expiry. Sets
+    /// `idle_revoked_at` on every row that shares this
+    /// `chain_id` and hasn't already been killed for some
+    /// other reason. Distinct from [`Self::revoke_chain`] so
+    /// the audit log can differentiate "user walked away" from
+    /// "stolen token replay".
+    pub async fn idle_revoke_chain(
+        &self,
+        chain_id: &str,
+        idle_revoked_at: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
+        let res = sqlx::query(
+            "UPDATE auth_refresh_tokens \
+                SET idle_revoked_at = ? \
+              WHERE chain_id = ? \
+                AND idle_revoked_at IS NULL \
+                AND revoked_at IS NULL",
+        )
+        .bind(idle_revoked_at.to_rfc3339())
+        .bind(chain_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// v0.1.36 — newest `last_active_at` across the chain.
+    /// Used by the refresh handler to decide whether the chain
+    /// is still inside the idle window without needing to load
+    /// every row.
+    pub async fn max_chain_last_active_at(
+        &self,
+        chain_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, StoreError> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT MAX(COALESCE(last_active_at, created_at)) \
+               FROM auth_refresh_tokens \
+              WHERE chain_id = ? \
+                AND revoked_at IS NULL \
+                AND idle_revoked_at IS NULL",
+        )
+        .bind(chain_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((Some(s),)) = row else {
+            return Ok(None);
+        };
+        parse_ts(&s).map(Some)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +442,8 @@ fn decode_refresh_token_row(row: sqlx::sqlite::SqliteRow) -> Result<RefreshToken
         user_agent: row.try_get("user_agent")?,
         ip: row.try_get("ip")?,
         created_at: parse_ts(row.try_get::<String, _>("created_at")?.as_str())?,
+        last_active_at: parse_optional_ts(row.try_get("last_active_at")?)?,
+        idle_revoked_at: parse_optional_ts(row.try_get("idle_revoked_at")?)?,
     })
 }
 

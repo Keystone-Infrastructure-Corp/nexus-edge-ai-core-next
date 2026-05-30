@@ -608,6 +608,119 @@ pub enum TypesError {
     InvalidSchedule(String),
     #[error("invalid role: {0:?} (expected admin|operator|viewer)")]
     InvalidRole(String),
+    #[error("invalid codec: {0:?} (expected h264|h264_plus|h265|h265_plus)")]
+    InvalidCodec(String),
+}
+
+// ---------------------------------------------------------------------------
+// Codec
+// ---------------------------------------------------------------------------
+
+/// Video codec carried by a camera's RTSP stream.
+///
+/// The `_plus` variants are operator-selected labels for vendor SVC
+/// configurations (Hikvision H.264+/H.265+, Dahua Smart Codec, Uniview
+/// U-Code). Autodetect (ONVIF / SDP) never produces a `_plus` variant —
+/// SVC is wire-compatible with the base codec, so the depayloader,
+/// parser, and decoder are identical. `.base()` collapses to the wire
+/// label the cloud and the pipeline care about (`"h264"` or `"h265"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub enum CodecKind {
+    H264,
+    H264Plus,
+    H265,
+    H265Plus,
+}
+
+impl CodecKind {
+    /// Wire label for cloud envelopes and GStreamer element prefixes
+    /// (`rtph{base}depay`, `h{base}parse`, `avdec_h{base}`).
+    pub fn base(self) -> &'static str {
+        match self {
+            CodecKind::H264 | CodecKind::H264Plus => "h264",
+            CodecKind::H265 | CodecKind::H265Plus => "h265",
+        }
+    }
+
+    /// All variants in display order; used by UI dropdowns and tests.
+    pub fn all() -> [CodecKind; 4] {
+        [
+            CodecKind::H264,
+            CodecKind::H264Plus,
+            CodecKind::H265,
+            CodecKind::H265Plus,
+        ]
+    }
+}
+
+impl std::fmt::Display for CodecKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CodecKind::H264 => "h264",
+            CodecKind::H264Plus => "h264_plus",
+            CodecKind::H265 => "h265",
+            CodecKind::H265Plus => "h265_plus",
+        })
+    }
+}
+
+impl std::str::FromStr for CodecKind {
+    type Err = TypesError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "h264" => Ok(CodecKind::H264),
+            "h264_plus" => Ok(CodecKind::H264Plus),
+            "h265" => Ok(CodecKind::H265),
+            "h265_plus" => Ok(CodecKind::H265Plus),
+            other => Err(TypesError::InvalidCodec(other.to_string())),
+        }
+    }
+}
+
+/// Operator's choice on the camera-create form. `Auto` defers to the
+/// edge admin API's RTSP DESCRIBE probe; a concrete `Kind` is honoured
+/// as-is. Untagged so JSON `"auto"` and `"h264"` both round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CodecSelector {
+    /// String literal `"auto"` on the wire.
+    Auto(AutoTag),
+    /// One of the four `CodecKind` snake_case literals.
+    Kind(CodecKind),
+}
+
+/// One-variant helper enum so [`CodecSelector::Auto`] only accepts the
+/// exact string `"auto"` (and nothing else like `"AUTO"` or `"Auto"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoTag {
+    Auto,
+}
+
+/// How the edge admin API resolved a camera's codec. Returned on
+/// create/update responses so the UI can surface a warning banner when
+/// autodetect failed and we fell back to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub enum CodecSource {
+    /// Operator picked a specific codec.
+    Operator,
+    /// Resolved by RTSP DESCRIBE / ONVIF probe.
+    Autodetect,
+    /// Probe failed and we defaulted to H.264.
+    DefaultFallback,
 }
 
 #[cfg(test)]
@@ -771,5 +884,51 @@ mod tests {
         assert!(Role::from_str("Admin").is_err());
         assert!(Role::from_str("ADMIN").is_err());
         assert!(Role::from_str("").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Codec
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn codec_round_trip_serde() {
+        use std::str::FromStr;
+        for c in CodecKind::all() {
+            let s = c.to_string();
+            assert_eq!(serde_json::to_string(&c).unwrap(), format!("\"{s}\""));
+            assert_eq!(CodecKind::from_str(&s).unwrap(), c);
+            let back: CodecKind = serde_json::from_str(&format!("\"{s}\"")).unwrap();
+            assert_eq!(back, c);
+        }
+    }
+
+    #[test]
+    fn codec_base_collapses_plus_variants() {
+        assert_eq!(CodecKind::H264.base(), "h264");
+        assert_eq!(CodecKind::H264Plus.base(), "h264");
+        assert_eq!(CodecKind::H265.base(), "h265");
+        assert_eq!(CodecKind::H265Plus.base(), "h265");
+    }
+
+    #[test]
+    fn codec_from_str_rejects_unknown() {
+        use std::str::FromStr;
+        assert!(CodecKind::from_str("H264").is_err());
+        assert!(CodecKind::from_str("hevc").is_err());
+        assert!(CodecKind::from_str("av1").is_err());
+        assert!(CodecKind::from_str("").is_err());
+    }
+
+    #[test]
+    fn codec_selector_round_trips() {
+        let auto: CodecSelector = serde_json::from_str("\"auto\"").unwrap();
+        assert!(matches!(auto, CodecSelector::Auto(AutoTag::Auto)));
+        assert_eq!(serde_json::to_string(&auto).unwrap(), "\"auto\"");
+
+        let h265: CodecSelector = serde_json::from_str("\"h265\"").unwrap();
+        assert!(matches!(h265, CodecSelector::Kind(CodecKind::H265)));
+        assert_eq!(serde_json::to_string(&h265).unwrap(), "\"h265\"");
+
+        assert!(serde_json::from_str::<CodecSelector>("\"unknown\"").is_err());
     }
 }

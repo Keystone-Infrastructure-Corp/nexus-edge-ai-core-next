@@ -473,17 +473,18 @@ pub async fn get_callback(
         .ok_or(OidcLoginError::AuthNotConfigured)?
         .to_string();
 
+    let chain_id = Uuid::now_v7().to_string();
     let access_token = issue_access_token(
         user.id,
         user.role,
         admin_secret.as_bytes(),
         now,
         ACCESS_TOKEN_TTL,
+        Some(&chain_id),
     )?;
 
     // Refresh row — single chain per OIDC login, same as the
     // local-password login path.
-    let chain_id = Uuid::now_v7().to_string();
     let refresh_secret = new_refresh_secret().map_err(OidcLoginError::from)?;
     let token_hash = hash_refresh_secret(&refresh_secret);
     let expires_at = now + REFRESH_TOKEN_TTL;

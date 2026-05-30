@@ -47,7 +47,7 @@ pub mod trace_uploader;
 pub mod tunnel;
 
 pub use actor_token::{EnvelopeContext, TrustedKey, VerifiedActor, Verifier, VerifierBuilder};
-pub use csr::{generate_keypair_and_csr, CsrBundle, CsrError};
+pub use csr::{generate_keypair_and_csr, generate_server_keypair_and_csr, CsrBundle, CsrError};
 pub use dispatcher::{AuditSink, Handler, NullAuditSink, RpcDispatcher, SystemMethodPolicy};
 pub use enrollment::{EnrollmentClient, EnrollmentError, EnrollmentRequest, EnrollmentResponse};
 pub use error::{DispatchError, InvalidReason, RejectReason};

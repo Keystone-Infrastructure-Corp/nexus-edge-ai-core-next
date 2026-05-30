@@ -96,6 +96,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
             url: Url::parse("virtual://local").unwrap(),
             enabled: true,
             max_fps: 5,
+            codec: None,
         },
         detector: nexus_config::CameraDetector {
             prompts: vec!["person".into()],

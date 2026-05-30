@@ -110,7 +110,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppStreamType};
 use nexus_store::{ClipClose, ClipId, NewClip, Store};
-use nexus_types::CameraId;
+use nexus_types::{CameraId, CodecKind};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -126,8 +126,6 @@ use crate::source::gst_init;
 /// well under a second once it sees EOS at the appsrc head.
 const EOS_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Codec stamped on every row this recorder writes.
-const CODEC: &str = "h264";
 /// Container stamped on every row this recorder writes.
 const CONTAINER: &str = "mp4";
 
@@ -181,6 +179,13 @@ struct OpenState {
     /// `"local"` or `"usb-<label>"`. Stamped on the row at open and
     /// repeated on the `CLIP_CLOSED` bus event.
     hot_handle: String,
+    /// Wire codec captured from the per-camera ingester at
+    /// `open()`. Stamped on the `motion_clips` row via
+    /// [`CodecKind::base`] (collapses `_plus` vendor SVC labels
+    /// to their base) and used by the live pump / coalesce path
+    /// to dispatch slice-NAL detection (H.264 NAL header is 1 byte,
+    /// H.265 NAL header is 2 bytes).
+    codec: CodecKind,
     pipeline: gst::Pipeline,
     appsrc: AppSrc,
     /// Signals the live-pump task to stop forwarding broadcast
@@ -255,14 +260,21 @@ impl GstClipRecorder {
     /// invariant that the recorder is a strict codec passthrough
     /// (no encoder, no raw-video conversion). Keep this aligned
     /// with [`Self::build_pipeline`].
-    fn pipeline_desc(location: &Path) -> String {
+    fn pipeline_desc(location: &Path, codec: CodecKind) -> String {
         let location_safe = location.to_string_lossy().replace('"', "");
+        // Codec-specific parser + mp4mux stream-format. `avc` for
+        // H.264, `hvc1` for H.265 — both accepted by mp4mux without
+        // any other knob changes.
+        let (parse, stream_format, caps_name) = match codec.base() {
+            "h265" => ("h265parse", "hvc1", "video/x-h265"),
+            _ => ("h264parse", "avc", "video/x-h264"),
+        };
         // appsrc max-bytes=64 MiB ≈ 128 s headroom at 4 Mbps. The bigger
         // the queue, the longer push_buffer can stay non-blocking under
         // disk stalls, which keeps the upstream broadcast channel from
         // filling up and dropping samples (the most common cause of
         // visibly choppy clips).
-        // h264parse config-interval=0 (trust the source). See module
+        // {parse} config-interval=0 (trust the source). See module
         // docstring: -1 doubles SPS/PPS because the upstream ingester
         // already includes them per-keyframe, which makes mp4mux drop
         // every buffer with "Buffer has no PTS." and the output is
@@ -270,14 +282,17 @@ impl GstClipRecorder {
         format!(
             "appsrc name=src is-live=false format=time do-timestamp=false \
                      stream-type=stream max-bytes=67108864 block=true \
-             ! h264parse config-interval=0 \
-             ! video/x-h264,stream-format=avc,alignment=au \
+             ! {parse} config-interval=0 \
+             ! {caps_name},stream-format={stream_format},alignment=au \
              ! mp4mux fragment-duration=5000 streamable=true faststart=true \
              ! filesink location=\"{location_safe}\" sync=false"
         )
     }
 
-    fn build_pipeline(location: &Path) -> Result<(gst::Pipeline, AppSrc), RecorderError> {
+    fn build_pipeline(
+        location: &Path,
+        codec: CodecKind,
+    ) -> Result<(gst::Pipeline, AppSrc), RecorderError> {
         // location came from clips_dir + a deterministic timestamp
         // template; strip embedded `"` before splicing into launch
         // string so a pathological path can't break the parser.
@@ -304,7 +319,7 @@ impl GstClipRecorder {
         //                     deliberately large because any push
         //                     stall propagates back to the broadcast
         //                     channel and starts dropping frames.
-        let desc = Self::pipeline_desc(location);
+        let desc = Self::pipeline_desc(location, codec);
         let pipeline = gst::parse::launch(&desc)
             .map_err(|e| RecorderError::Io(std::io::Error::other(format!("parse::launch: {e}"))))?
             .downcast::<gst::Pipeline>()
@@ -318,10 +333,14 @@ impl GstClipRecorder {
             })?
             .downcast::<AppSrc>()
             .map_err(|_| RecorderError::Io(std::io::Error::other("downcast AppSrc".to_string())))?;
-        // Tell appsrc the caps explicitly — mp4mux + h264parse can't
-        // negotiate without knowing this is byte-stream H.264. We
-        // don't claim a framerate (mp4mux infers from PTS).
-        let caps = gst::Caps::builder("video/x-h264")
+        // Tell appsrc the caps explicitly — mp4mux + {parse} can't
+        // negotiate without knowing the byte-stream codec. We don't
+        // claim a framerate (mp4mux infers from PTS).
+        let caps_name = match codec.base() {
+            "h265" => "video/x-h265",
+            _ => "video/x-h264",
+        };
+        let caps = gst::Caps::builder(caps_name)
             .field("stream-format", "byte-stream")
             .field("alignment", "au")
             .build();
@@ -349,6 +368,7 @@ impl ClipRecorder for GstClipRecorder {
                 return Err(RecorderError::Refused);
             }
         };
+        let codec = ingester.codec();
 
         // Resolve USB hot-tier routing once at open(). The choice
         // is captured into `OpenState` so close() finishes the clip
@@ -370,7 +390,7 @@ impl ClipRecorder for GstClipRecorder {
             fs::create_dir_all(parent).await?;
         }
 
-        let (pipeline, appsrc) = Self::build_pipeline(&path)?;
+        let (pipeline, appsrc) = Self::build_pipeline(&path, codec)?;
         // set_state(Playing) returns Async; appsrc starts accepting
         // pushes immediately. We push the pre-roll snapshot before
         // even waiting for the state change to complete — the queue
@@ -418,7 +438,7 @@ impl ClipRecorder for GstClipRecorder {
             let mut pending: Option<NalSample> = None;
             let mut out: Vec<NalSample> = Vec::with_capacity(snapshot.len());
             for s in snapshot {
-                if let Some(flushed) = coalesce_same_pts(&mut pending, s) {
+                if let Some(flushed) = coalesce_same_pts(&mut pending, s, codec) {
                     out.push(flushed);
                 }
             }
@@ -427,7 +447,7 @@ impl ClipRecorder for GstClipRecorder {
             // 35-byte "missing picture" pathology we're guarding
             // against.
             if let Some(last) = pending.take() {
-                if contains_slice_nal(&last.data) {
+                if contains_slice_nal(&last.data, codec) {
                     out.push(last);
                 } else {
                     debug!(
@@ -483,7 +503,7 @@ impl ClipRecorder for GstClipRecorder {
             camera_id: args.camera_id,
             started_at: args.started_at,
             hot_path: rel,
-            codec: CODEC.into(),
+            codec: codec.base().into(),
             container: CONTAINER.into(),
             // M2.2: "local" or "usb-<label>" depending on the hot
             // tier resolution above. Cold pointer is left null for
@@ -510,6 +530,7 @@ impl ClipRecorder for GstClipRecorder {
         let pump_handle = tokio::spawn(run_live_pump(
             args.camera_id,
             clip_id,
+            codec,
             pump_appsrc,
             live_rx,
             base_pts,
@@ -526,6 +547,7 @@ impl ClipRecorder for GstClipRecorder {
                 path,
                 effective_dir,
                 hot_handle,
+                codec,
                 pipeline,
                 appsrc,
                 pump_stop: Some(pump_stop_tx),
@@ -801,6 +823,7 @@ impl ClipRecorder for GstClipRecorder {
         max_fps: u32,
         rgb_w: u32,
         rgb_h: u32,
+        codec: CodecKind,
     ) -> Result<(), RecorderError> {
         // Idempotent + URL-aware: if we already have an ingester for
         // this camera with the same URL, do nothing. If the URL
@@ -811,10 +834,10 @@ impl ClipRecorder for GstClipRecorder {
         {
             let read = self.ingesters.read();
             if let Some(existing) = read.get(&camera_id) {
-                if existing.url() == url {
+                if existing.url() == url && existing.codec() == codec {
                     debug!(
                         camera_id,
-                        "add_camera_ingester: ingester already running for this URL — skipping"
+                        "add_camera_ingester: ingester already running for this URL+codec — skipping"
                     );
                     return Ok(());
                 }
@@ -828,6 +851,7 @@ impl ClipRecorder for GstClipRecorder {
             camera_id,
             url.to_string(),
             pre_roll_secs,
+            codec,
             max_fps,
             rgb_w,
             rgb_h,
@@ -839,9 +863,9 @@ impl ClipRecorder for GstClipRecorder {
         // and reconnect task synchronously.
         let prev = self.ingesters.write().insert(camera_id, new_ing);
         if prev.is_some() {
-            info!(camera_id, %url, "pre-roll ingester replaced (URL changed)");
+            info!(camera_id, %url, codec = %codec, "pre-roll ingester replaced (URL or codec changed)");
         } else {
-            info!(camera_id, %url, pre_roll_secs, max_fps, "pre-roll ingester started (hot-add)");
+            info!(camera_id, %url, pre_roll_secs, max_fps, codec = %codec, "pre-roll ingester started (hot-add)");
         }
         Ok(())
     }
@@ -921,7 +945,11 @@ async fn hash_file_sha256(path: &Path) -> std::io::Result<String> {
 /// samples are coming (end of snapshot, stop signal, inactivity
 /// timer). Returning `None` does **not** mean "drop this sample";
 /// it means "still buffering".
-fn coalesce_same_pts(pending: &mut Option<NalSample>, incoming: NalSample) -> Option<NalSample> {
+fn coalesce_same_pts(
+    pending: &mut Option<NalSample>,
+    incoming: NalSample,
+    codec: CodecKind,
+) -> Option<NalSample> {
     match pending.take() {
         None => {
             *pending = Some(incoming);
@@ -953,7 +981,7 @@ fn coalesce_same_pts(pending: &mut Option<NalSample>, incoming: NalSample) -> Op
             // legitimately emits multiple PTS-less complete
             // frames in a row.
             let same_pts = prev.pts.is_some() && prev.pts == incoming.pts;
-            let prev_incomplete = !contains_slice_nal(&prev.data);
+            let prev_incomplete = !contains_slice_nal(&prev.data, codec);
             if same_pts || prev_incomplete {
                 let mut merged = prev;
                 merged.data.extend_from_slice(&incoming.data);
@@ -983,37 +1011,49 @@ fn coalesce_same_pts(pending: &mut Option<NalSample>, incoming: NalSample) -> Op
     }
 }
 
-/// Scan an annex-B byte-stream for at least one VCL slice NAL
-/// (type 1 = non-IDR slice, type 5 = IDR slice). Returns `true` if
-/// any slice NAL is present, `false` if the buffer carries only
-/// non-VCL units (AUD=9, SEI=6, SPS=7, PPS=8, etc.). A buffer
-/// without a slice is by definition NOT a complete access unit
-/// and must not be muxed on its own — see [`coalesce_same_pts`]
-/// for the rationale.
-fn contains_slice_nal(data: &[u8]) -> bool {
+/// Scan an annex-B byte-stream for at least one VCL slice NAL.
+///
+/// For **H.264**, that's nal_unit_type 1 (non-IDR slice) or 5 (IDR
+/// slice). The NAL unit header is 1 byte; type is bits [4:0] of the
+/// byte immediately after the start code.
+///
+/// For **H.265**, that's any nal_unit_type 0..=31 (trailing /
+/// leading / IRAP slice NALs are all in this range; non-VCL units
+/// are 32..=63). The NAL unit header is 2 bytes; type is bits [6:1]
+/// of the FIRST byte after the start code, i.e. `(byte >> 1) & 0x3F`.
+///
+/// Returns `true` if any slice NAL is present, `false` if the buffer
+/// carries only non-VCL units (AUD, SEI, VPS/SPS/PPS, etc.). A buffer
+/// without a slice is by definition NOT a complete access unit and
+/// must not be muxed on its own — see [`coalesce_same_pts`] for the
+/// rationale.
+fn contains_slice_nal(data: &[u8], codec: CodecKind) -> bool {
+    let is_h265 = codec.base() == "h265";
     let mut i = 0;
     while i + 3 < data.len() {
         let four = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
         let three = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
-        if four {
-            if i + 4 < data.len() {
-                let nal_type = data[i + 4] & 0x1f;
-                if nal_type == 1 || nal_type == 5 {
-                    return true;
-                }
-            }
-            i += 4;
+        let header_off = if four {
+            i + 4
         } else if three {
-            if i + 3 < data.len() {
-                let nal_type = data[i + 3] & 0x1f;
-                if nal_type == 1 || nal_type == 5 {
-                    return true;
-                }
-            }
-            i += 3;
+            i + 3
         } else {
             i += 1;
+            continue;
+        };
+        if header_off < data.len() {
+            let is_slice = if is_h265 {
+                let nal_type = (data[header_off] >> 1) & 0x3f;
+                nal_type <= 31
+            } else {
+                let nal_type = data[header_off] & 0x1f;
+                nal_type == 1 || nal_type == 5
+            };
+            if is_slice {
+                return true;
+            }
         }
+        i = header_off;
     }
     false
 }
@@ -1137,6 +1177,7 @@ const FALLBACK_FRAME_INTERVAL_NS: u64 = 33_333_333;
 async fn run_live_pump(
     camera_id: CameraId,
     clip_id: ClipId,
+    codec: CodecKind,
     appsrc: AppSrc,
     mut live_rx: broadcast::Receiver<NalSample>,
     base_pts: Duration,
@@ -1202,7 +1243,7 @@ async fn run_live_pump(
             _ = &mut stop => {
                 debug!(camera_id, clip_id, "live pump received stop signal");
                 if let Some(last) = pending.take() {
-                    if contains_slice_nal(&last.data) {
+                    if contains_slice_nal(&last.data, codec) {
                         let _ = push_one(
                             camera_id, clip_id, &appsrc, last, base_pts,
                             &mut last_pushed_pts, &mut last_written_pts_ns,
@@ -1228,7 +1269,7 @@ async fn run_live_pump(
                 // macroblocks in downstream playback until the
                 // next IDR).
                 if let Some(last) = pending.take() {
-                    if !contains_slice_nal(&last.data) {
+                    if !contains_slice_nal(&last.data, codec) {
                         debug!(
                             camera_id, clip_id,
                             size = last.data.len(),
@@ -1251,7 +1292,7 @@ async fn run_live_pump(
                             continue;
                         }
                     }
-                    if let Some(to_push) = coalesce_same_pts(&mut pending, sample) {
+                    if let Some(to_push) = coalesce_same_pts(&mut pending, sample, codec) {
                         if push_one(
                             camera_id, clip_id, &appsrc, to_push, base_pts,
                             &mut last_pushed_pts, &mut last_written_pts_ns,
@@ -1320,16 +1361,43 @@ mod tests {
 
     #[test]
     fn contains_slice_nal_detects_type_1_and_5() {
-        assert!(!contains_slice_nal(&header_only_au()));
-        assert!(contains_slice_nal(&slice_au(10)));
-        assert!(contains_slice_nal(&idr_au(10)));
+        assert!(!contains_slice_nal(&header_only_au(), CodecKind::H264));
+        assert!(contains_slice_nal(&slice_au(10), CodecKind::H264));
+        assert!(contains_slice_nal(&idr_au(10), CodecKind::H264));
         // Mixed: header + slice → has slice.
         let mut mixed = header_only_au();
         mixed.extend_from_slice(&slice_au(10));
-        assert!(contains_slice_nal(&mixed));
+        assert!(contains_slice_nal(&mixed, CodecKind::H264));
         // Empty / too short → no slice.
-        assert!(!contains_slice_nal(&[]));
-        assert!(!contains_slice_nal(&[0, 0, 0, 1]));
+        assert!(!contains_slice_nal(&[], CodecKind::H264));
+        assert!(!contains_slice_nal(&[0, 0, 0, 1], CodecKind::H264));
+    }
+
+    /// H.265 NAL header is 2 bytes, nal_unit_type = (byte0 >> 1) & 0x3F.
+    /// VCL slice types are 0..=31; non-VCL (VPS=32, SPS=33, PPS=34,
+    /// AUD=35, SEI_PREFIX=39, SEI_SUFFIX=40, etc.) live in 32..=63.
+    #[test]
+    fn contains_slice_nal_h265_detects_vcl_range() {
+        // VCL slice type 1 (TRAIL_N) -> byte0 = (1 << 1) = 0x02.
+        let vcl_trail = vec![0u8, 0, 0, 1, 0x02, 0x01, 0xAA, 0xBB];
+        assert!(contains_slice_nal(&vcl_trail, CodecKind::H265));
+        // VCL slice type 19 (IDR_W_RADL) -> byte0 = (19 << 1) = 0x26.
+        let vcl_idr = vec![0u8, 0, 0, 1, 0x26, 0x01, 0xCC, 0xDD];
+        assert!(contains_slice_nal(&vcl_idr, CodecKind::H265));
+        // VPS (type 32) -> byte0 = (32 << 1) = 0x40. NOT a slice.
+        let vps = vec![0u8, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01];
+        assert!(!contains_slice_nal(&vps, CodecKind::H265));
+        // SEI prefix (type 39) -> byte0 = (39 << 1) = 0x4E. NOT a slice.
+        let sei = vec![0u8, 0, 0, 1, 0x4E, 0x01, 0x05, 0x00];
+        assert!(!contains_slice_nal(&sei, CodecKind::H265));
+        // Mixed VPS + slice → slice wins.
+        let mut mixed = vps.clone();
+        mixed.extend_from_slice(&vcl_idr);
+        assert!(contains_slice_nal(&mixed, CodecKind::H265));
+        // H.265 stream parsed as H.264 with byte 0x02 -> H.264
+        // nal_type = 0x02 & 0x1f = 2 (DPA slice partition), NOT
+        // 1 or 5 → false. Confirms the dispatch matters.
+        assert!(!contains_slice_nal(&vcl_trail, CodecKind::H264));
     }
 
     #[test]
@@ -1339,15 +1407,15 @@ mod tests {
         let mut pending: Option<NalSample> = None;
         // First arrival: just buffered, nothing to flush yet.
         let header = sample(Some(66), &header_only_au(), false);
-        assert!(coalesce_same_pts(&mut pending, header).is_none());
+        assert!(coalesce_same_pts(&mut pending, header, CodecKind::H264).is_none());
         assert!(pending.is_some());
         // Second arrival with the same pts: merges into pending, still
         // nothing to flush.
         let slice = sample(Some(66), &slice_au(20), true);
-        assert!(coalesce_same_pts(&mut pending, slice).is_none());
+        assert!(coalesce_same_pts(&mut pending, slice, CodecKind::H264).is_none());
         let merged = pending.as_ref().unwrap();
         assert_eq!(merged.pts, Some(Duration::from_millis(66)));
-        assert!(contains_slice_nal(&merged.data));
+        assert!(contains_slice_nal(&merged.data, CodecKind::H264));
         assert!(merged.is_keyframe, "keyframe flag must OR-combine");
     }
 
@@ -1355,7 +1423,7 @@ mod tests {
     fn coalesce_different_pts_flushes_previous_when_both_have_slices() {
         let mut pending: Option<NalSample> = None;
         let first = sample(Some(33), &slice_au(10), false);
-        assert!(coalesce_same_pts(&mut pending, first).is_none());
+        assert!(coalesce_same_pts(&mut pending, first, CodecKind::H264).is_none());
         // Different PTS — previous gets flushed, new one buffered.
         // Both have slices so the header-only-merge path doesn't fire.
         let second = sample(Some(66), &slice_au(10), false);
@@ -1374,10 +1442,10 @@ mod tests {
         // in push_sample handles them individually.
         let mut pending: Option<NalSample> = None;
         let a = sample(None, &slice_au(10), false);
-        assert!(coalesce_same_pts(&mut pending, a).is_none());
+        assert!(coalesce_same_pts(&mut pending, a, CodecKind::H264).is_none());
         let b = sample(None, &slice_au(15), false);
-        let flushed =
-            coalesce_same_pts(&mut pending, b).expect("two None-PTS slice samples must NOT merge");
+        let flushed = coalesce_same_pts(&mut pending, b, CodecKind::H264)
+            .expect("two None-PTS slice samples must NOT merge");
         assert_eq!(flushed.data.len(), 15); // first one was 10+5 header
         assert!(pending.is_some());
     }
@@ -1391,14 +1459,14 @@ mod tests {
         // rule must still merge them.
         let mut pending: Option<NalSample> = None;
         let header = sample(Some(66), &header_only_au(), false);
-        assert!(coalesce_same_pts(&mut pending, header).is_none());
+        assert!(coalesce_same_pts(&mut pending, header, CodecKind::H264).is_none());
         let slice = sample(Some(99), &slice_au(20), false);
         assert!(
-            coalesce_same_pts(&mut pending, slice).is_none(),
+            coalesce_same_pts(&mut pending, slice, CodecKind::H264).is_none(),
             "header-only stub MUST be merged with following slice regardless of PTS"
         );
         let merged = pending.as_ref().unwrap();
-        assert!(contains_slice_nal(&merged.data));
+        assert!(contains_slice_nal(&merged.data, CodecKind::H264));
         // PTS should still be the original Some(66) (prev's), not
         // overwritten by incoming's — earlier PTS is the source's
         // truth for this AU.
@@ -1411,12 +1479,12 @@ mod tests {
         // arrives PTS-less. Merged buffer should keep Some(pts).
         let mut pending: Option<NalSample> = None;
         let header = sample(Some(66), &header_only_au(), false);
-        coalesce_same_pts(&mut pending, header);
+        coalesce_same_pts(&mut pending, header, CodecKind::H264);
         let slice = sample(None, &slice_au(20), false);
-        assert!(coalesce_same_pts(&mut pending, slice).is_none());
+        assert!(coalesce_same_pts(&mut pending, slice, CodecKind::H264).is_none());
         let merged = pending.as_ref().unwrap();
         assert_eq!(merged.pts, Some(Duration::from_millis(66)));
-        assert!(contains_slice_nal(&merged.data));
+        assert!(contains_slice_nal(&merged.data, CodecKind::H264));
     }
 
     #[test]
@@ -1426,9 +1494,9 @@ mod tests {
         // must adopt incoming's pts so mp4mux can mux it.
         let mut pending: Option<NalSample> = None;
         let header = sample(None, &header_only_au(), false);
-        coalesce_same_pts(&mut pending, header);
+        coalesce_same_pts(&mut pending, header, CodecKind::H264);
         let slice = sample(Some(66), &slice_au(20), false);
-        assert!(coalesce_same_pts(&mut pending, slice).is_none());
+        assert!(coalesce_same_pts(&mut pending, slice, CodecKind::H264).is_none());
         let merged = pending.as_ref().unwrap();
         assert_eq!(
             merged.pts,
@@ -1447,8 +1515,8 @@ mod tests {
         a.dts = Some(Duration::from_millis(60));
         let mut b = sample(Some(66), &slice_au(10), false);
         b.dts = Some(Duration::from_millis(70));
-        coalesce_same_pts(&mut pending, a);
-        coalesce_same_pts(&mut pending, b);
+        coalesce_same_pts(&mut pending, a, CodecKind::H264);
+        coalesce_same_pts(&mut pending, b, CodecKind::H264);
         assert_eq!(
             pending.as_ref().unwrap().dts,
             Some(Duration::from_millis(60))
@@ -1476,6 +1544,7 @@ mod tests {
                     url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector::default(),
                 behavior: nexus_config::CameraBehavior::default(),
@@ -1587,7 +1656,7 @@ mod tests {
         // least one keyframe so the pre-roll snapshot is non-empty
         // (otherwise the recording starts only at the first live
         // sample after open(), which is what pre-B8 did).
-        let ingester = PreRollIngester::new(1, url, 5).expect("build ingester");
+        let ingester = PreRollIngester::new(1, url, 5, CodecKind::H264).expect("build ingester");
         for _ in 0..50 {
             if ingester.is_buffering() {
                 break;

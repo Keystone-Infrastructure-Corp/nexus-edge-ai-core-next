@@ -157,7 +157,21 @@ async function tryRefresh(): Promise<boolean> {
       body: JSON.stringify({ refresh_token: currentRefreshToken }),
     });
     if (!res.ok) {
+      // v0.1.36 — distinguish idle_expired from generic refresh
+      // failure so the AuthProvider can show a friendlier toast
+      // ("signed out after 20 min idle") instead of the generic
+      // "session expired" copy.
+      let code: string | null = null;
+      try {
+        const body = (await res.clone().json()) as { code?: unknown };
+        if (typeof body.code === "string") code = body.code;
+      } catch {
+        // body wasn't JSON
+      }
       onSessionCleared?.();
+      if (code === "idle_expired") {
+        window.dispatchEvent(new CustomEvent("nexus:idle-expired"));
+      }
       return false;
     }
     const tokens = (await res.json()) as TokenResponse;

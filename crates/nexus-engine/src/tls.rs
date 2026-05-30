@@ -37,26 +37,21 @@ use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use tracing::{info, warn};
 
-/// Generate a self-signed leaf at `cert_path`/`key_path` if one is
-/// not already present. Returns `Ok(true)` when a new cert was
-/// written, `Ok(false)` when an existing cert was kept.
+/// v0.1.36 — DNS + IP SAN list the engine's local HTTPS listener
+/// should be reachable as. Shared between [`init_self_signed_cert`]
+/// (the bootstrap path) and `cloud_enroll::build_server_csr` (which
+/// asks the cloud to sign a leaf with these same names). Keeping
+/// both call sites on one helper means a fleet upgrade can't end
+/// up with a self-signed leaf advertising different names than
+/// the cloud-issued replacement.
 ///
-/// SAN list includes:
-///   * the system hostname (`gethostname`)
-///   * `<hostname>.local` (the mDNS form most LAN browsers reach)
-///   * `nexus.local` (the project's well-known mDNS alias)
-///   * `localhost`
-///   * every non-loopback IPv4 address bound on any local interface
-///   * every globally-scoped IPv6 address bound on any local interface
-///   * `127.0.0.1` and `::1` (so loopback HTTPS works for tests)
-///
-/// `force = true` regenerates even when a cert is already present
-/// (used by the `tls init --force` operator escape hatch).
-pub fn init_self_signed_cert(cert_path: &Path, key_path: &Path, force: bool) -> Result<bool> {
-    if !force && cert_path.exists() && key_path.exists() {
-        return Ok(false);
-    }
-
+/// Returns `(dns_sans, ip_sans)`. The DNS list always contains
+/// `nexus.local` and `localhost`; the local hostname (+ its
+/// `.local` mDNS form for un-qualified names) is appended when
+/// available. The IP list always contains `127.0.0.1` and `::1`;
+/// every non-loopback, non-link-local interface IP is appended.
+#[must_use]
+pub fn derive_local_sans() -> (Vec<String>, Vec<IpAddr>) {
     let mut sans: Vec<String> = Vec::new();
     if let Ok(host) = hostname::get() {
         let host = host.to_string_lossy().to_string();
@@ -87,6 +82,35 @@ pub fn init_self_signed_cert(cert_path: &Path, key_path: &Path, force: bool) -> 
             }
         }
     }
+
+    sans.sort();
+    sans.dedup();
+    ip_sans.sort();
+    ip_sans.dedup();
+    (sans, ip_sans)
+}
+
+/// Generate a self-signed leaf at `cert_path`/`key_path` if one is
+/// not already present. Returns `Ok(true)` when a new cert was
+/// written, `Ok(false)` when an existing cert was kept.
+///
+/// SAN list includes:
+///   * the system hostname (`gethostname`)
+///   * `<hostname>.local` (the mDNS form most LAN browsers reach)
+///   * `nexus.local` (the project's well-known mDNS alias)
+///   * `localhost`
+///   * every non-loopback IPv4 address bound on any local interface
+///   * every globally-scoped IPv6 address bound on any local interface
+///   * `127.0.0.1` and `::1` (so loopback HTTPS works for tests)
+///
+/// `force = true` regenerates even when a cert is already present
+/// (used by the `tls init --force` operator escape hatch).
+pub fn init_self_signed_cert(cert_path: &Path, key_path: &Path, force: bool) -> Result<bool> {
+    if !force && cert_path.exists() && key_path.exists() {
+        return Ok(false);
+    }
+
+    let (mut sans, ip_sans) = derive_local_sans();
     for ip in &ip_sans {
         sans.push(ip.to_string());
     }
@@ -188,6 +212,35 @@ pub async fn load_rustls_config(cert_path: &Path, key_path: &Path) -> Result<Rus
                 key_path.display()
             )
         })
+}
+
+/// v0.1.36 \u2014 build `RustlsConfig` directly from in-memory PEM
+/// bytes (cloud-issued path). The cloud-issued leaf is stored in
+/// `cloud_enrollment.server_cert_pem` / `.server_private_key_pem`
+/// (M-HTTPS Phase 3) and rotates only on re-enrollment, so no
+/// disk-watching mechanism is needed.
+pub async fn load_rustls_config_from_pems(cert_pem: &[u8], key_pem: &[u8]) -> Result<RustlsConfig> {
+    RustlsConfig::from_pem(cert_pem.to_vec(), key_pem.to_vec())
+        .await
+        .context("build RustlsConfig from in-memory cloud-issued PEM")
+}
+
+/// v0.1.36 \u2014 origin of the TLS leaf currently bound to the
+/// HTTPS listener. Drives the HSTS gate: only a cloud-issued
+/// leaf earns HSTS headers, because shipping HSTS on top of a
+/// browser-untrusted self-signed leaf would trap the operator's
+/// browser for `max-age` seconds even after they accepted a
+/// proper cert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertSource {
+    /// Cert was minted in-process by [`init_self_signed_cert`].
+    /// HSTS MUST NOT be advertised.
+    SelfSigned,
+    /// Cert was minted by the cloud's enrollment-svc CA (M-HTTPS
+    /// Phase 3, v0.1.36). The leaf chains to a CA root the
+    /// operator's browser can be configured to trust; HSTS is
+    /// safe to advertise.
+    CloudIssued,
 }
 
 /// Spawn a background task that re-reads the cert+key PEM whenever

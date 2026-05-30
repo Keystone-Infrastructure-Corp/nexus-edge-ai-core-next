@@ -95,7 +95,19 @@ pub struct SessionContext {
     /// `AdminClaims` shape (no `role` claim). The audit log
     /// surfaces this so an operator can spot stale callers.
     pub is_legacy_admin: bool,
+    /// v0.1.36 — refresh-chain id this access token belongs to,
+    /// when present. Populated from `AccessClaims.chain_id`;
+    /// `None` for legacy / dev-mode tokens. Used by the idle-
+    /// bump pipeline to identify which refresh chain to roll
+    /// `last_active_at` forward on.
+    pub chain_id: Option<String>,
 }
+
+/// v0.1.36 — message shape the request extractor sends into the
+/// background idle-bump drain task. The drain coalesces by
+/// chain_id so a 60-req/s SPA produces 1 UPDATE per chain per
+/// 250 ms tick.
+pub type IdleBump = (String, chrono::DateTime<chrono::Utc>);
 
 impl SessionContext {
     /// `true` iff the caller's role satisfies `required`. See
@@ -128,6 +140,7 @@ impl SessionContext {
             role: Role::Admin,
             jti: "test".into(),
             is_legacy_admin: true,
+            chain_id: None,
         }
     }
 }
@@ -218,6 +231,11 @@ struct EitherClaims {
     iat: Option<i64>,
     #[serde(default)]
     jti: Option<String>,
+    /// v0.1.36 — added to `AccessClaims`. `Option` because
+    /// legacy tokens (pre-v0.1.36, the bootstrap dev token,
+    /// any future ad-hoc impersonation token) won't carry it.
+    #[serde(default)]
+    chain_id: Option<String>,
 }
 
 /// Decode `token` against `key` and produce a [`SessionContext`]
@@ -255,6 +273,7 @@ fn decode_to_context(token: &str, key: &DecodingKey) -> Result<SessionContext, S
         role,
         jti,
         is_legacy_admin: is_legacy,
+        chain_id: data.claims.chain_id,
     })
 }
 
@@ -286,6 +305,7 @@ fn authorise(
             role: Role::Admin,
             jti: "dev-no-secret".into(),
             is_legacy_admin: true,
+            chain_id: None,
         }),
         // No secret configured BUT bearer present → still
         // dev-mode admin. The token's signature can't be
@@ -298,6 +318,7 @@ fn authorise(
             role: Role::Admin,
             jti: "dev-no-secret".into(),
             is_legacy_admin: true,
+            chain_id: None,
         }),
         // Secret configured BUT no bearer → 401.
         (Some(_), None) => Err(SessionRejection::Missing),
@@ -323,7 +344,9 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let auth = Arc::<AdminAuthState>::from_ref(state);
         let bearer = extract_bearer(parts);
-        authorise(&auth, bearer)
+        let ctx = authorise(&auth, bearer)?;
+        emit_idle_bump(&auth, &ctx);
+        Ok(ctx)
     }
 }
 
@@ -350,8 +373,27 @@ where
     ) -> Result<Option<Self>, Self::Rejection> {
         let auth = Arc::<AdminAuthState>::from_ref(state);
         let bearer = extract_bearer(parts);
-        Ok(authorise(&auth, bearer).ok())
+        let ctx = authorise(&auth, bearer).ok();
+        if let Some(ref c) = ctx {
+            emit_idle_bump(&auth, c);
+        }
+        Ok(ctx)
     }
+}
+
+/// v0.1.36 \u2014 try-send a `(chain_id, now)` bump into the drain
+/// channel. No-op when:
+///
+/// * the channel isn't wired (tests, dev-mode no-secret),
+/// * the session has no `chain_id` (legacy token, dev bypass), or
+/// * the channel is full (per-tick coalescing already handles
+///   the storm \u2014 dropping a tick of bumps just means
+///   `last_active_at` lags by one tick).
+fn emit_idle_bump(auth: &AdminAuthState, ctx: &SessionContext) {
+    let (Some(tx), Some(chain_id)) = (auth.idle_bump_tx(), ctx.chain_id.as_deref()) else {
+        return;
+    };
+    let _ = tx.try_send((chain_id.to_owned(), chrono::Utc::now()));
 }
 
 macro_rules! impl_role_extractor {
@@ -450,6 +492,7 @@ mod tests {
             secret_bytes(),
             now,
             Duration::minutes(15),
+            None,
         )
         .unwrap();
         let ctx = authorise(&auth_with_secret(), Some(&token)).unwrap();
@@ -466,8 +509,15 @@ mod tests {
         // really sleep in a unit test, but issuing with negative
         // TTL produces an already-expired token.
         let now = Utc::now() - Duration::hours(1);
-        let token =
-            issue_access_token(42, Role::Admin, secret_bytes(), now, Duration::minutes(1)).unwrap();
+        let token = issue_access_token(
+            42,
+            Role::Admin,
+            secret_bytes(),
+            now,
+            Duration::minutes(1),
+            None,
+        )
+        .unwrap();
         let err = authorise(&auth_with_secret(), Some(&token)).unwrap_err();
         assert!(matches!(err, SessionRejection::Invalid), "{err:?}");
     }
@@ -476,8 +526,15 @@ mod tests {
     fn wrong_signature_rejected_as_invalid() {
         let now = Utc::now();
         // Sign with one secret, verify with another.
-        let token = issue_access_token(1, Role::Admin, b"other-secret", now, Duration::minutes(15))
-            .unwrap();
+        let token = issue_access_token(
+            1,
+            Role::Admin,
+            b"other-secret",
+            now,
+            Duration::minutes(15),
+            None,
+        )
+        .unwrap();
         let err = authorise(&auth_with_secret(), Some(&token)).unwrap_err();
         assert!(matches!(err, SessionRejection::Invalid), "{err:?}");
     }
@@ -523,6 +580,7 @@ mod tests {
             iat: Utc::now().timestamp(),
             exp: (Utc::now() + Duration::minutes(15)).timestamp(),
             jti: Uuid::now_v7().to_string(),
+            chain_id: None,
         };
         let token = encode(
             &Header::new(Algorithm::HS256),
@@ -553,6 +611,7 @@ mod tests {
             role: Role::Viewer,
             jti: "x".into(),
             is_legacy_admin: false,
+            chain_id: None,
         };
         let err = viewer.require(Role::Operator).unwrap_err();
         match err {

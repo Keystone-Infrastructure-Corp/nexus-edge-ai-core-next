@@ -99,11 +99,31 @@ pub struct MediaStream {
     /// `GetProfiles` (rare).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<String>,
+    /// Typed codec parsed from `<tt:Encoding>` (Media1) or
+    /// `<tt:EncoderConfiguration><tt:Encoding>` (Media2). `None`
+    /// when the camera reports a codec we don't enumerate
+    /// (`JPEG`, `MPEG4`, ...) so the UI can render the raw
+    /// `codec` string but keep the typed selector empty.
+    /// Autodetect never emits `_plus` SVC variants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec_kind: Option<nexus_types::CodecKind>,
     /// Resolution in `"WIDTHxHEIGHT"` form (e.g. `"1920x1080"`).
     /// `None` when the camera omits resolution from
     /// `GetProfiles` (rare).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
+}
+
+/// Map an ONVIF `<tt:Encoding>` token to [`nexus_types::CodecKind`].
+/// Accepts both the Media1 set (`H264`, `H265`, `JPEG`, `MPEG4`)
+/// and casual variants (`HEVC`). Returns `None` for codecs we
+/// don't enumerate so the typed selector stays empty.
+fn codec_kind_from_onvif(s: &str) -> Option<nexus_types::CodecKind> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "H264" => Some(nexus_types::CodecKind::H264),
+        "H265" | "HEVC" => Some(nexus_types::CodecKind::H265),
+        _ => None,
+    }
 }
 
 /// Top-level entry point. Resolves the camera's profiles via
@@ -259,6 +279,7 @@ async fn collect_stream_uris(
                     p.name.clone()
                 },
                 uri,
+                codec_kind: p.codec.as_deref().and_then(codec_kind_from_onvif),
                 codec: p.codec.clone(),
                 resolution: p.resolution.clone(),
             }),
@@ -768,5 +789,19 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn codec_kind_from_onvif_maps_known_encodings() {
+        use nexus_types::CodecKind;
+        assert_eq!(codec_kind_from_onvif("H264"), Some(CodecKind::H264));
+        assert_eq!(codec_kind_from_onvif("h264"), Some(CodecKind::H264));
+        assert_eq!(codec_kind_from_onvif("H265"), Some(CodecKind::H265));
+        assert_eq!(codec_kind_from_onvif("HEVC"), Some(CodecKind::H265));
+        assert_eq!(codec_kind_from_onvif("  H265  "), Some(CodecKind::H265));
+        // Out-of-scope codecs surface the raw string but no typed kind.
+        assert_eq!(codec_kind_from_onvif("JPEG"), None);
+        assert_eq!(codec_kind_from_onvif("MPEG4"), None);
+        assert_eq!(codec_kind_from_onvif(""), None);
     }
 }

@@ -92,6 +92,15 @@ pub const ACCESS_TOKEN_TTL: Duration = Duration::minutes(15);
 /// moment anyone is idle for > 30 days OR a replay is detected.
 pub const REFRESH_TOKEN_TTL: Duration = Duration::days(30);
 
+/// v0.1.36 — server-side sliding-window idle ceiling. A refresh
+/// chain whose most-recent activity is older than this is
+/// killed by [`post_refresh`] (NOT by [`post_login`]; the
+/// fresh row's `last_active_at` is `now()` so login can't trip
+/// the gate). Mirrors the cloud's `IDLE_TIMEOUT` in
+/// `api-gateway/src/auth.rs` so a user sees the same drop-out
+/// behaviour on the appliance UI and the cloud console.
+pub const IDLE_TIMEOUT: Duration = Duration::minutes(20);
+
 /// `__Host-` prefix forbids any non-`Path=/` cookie + forces
 /// `Secure`. Browsers reject the cookie outright if either
 /// constraint is violated, so this prefix is defence-in-depth
@@ -223,6 +232,13 @@ pub enum AuthApiError {
     /// (we translate NotFound → InvalidCredentials upstream).
     #[error("users: {0}")]
     Users(#[from] UsersError),
+    /// v0.1.36 — HTTP 401. The refresh chain's last activity is
+    /// older than [`IDLE_TIMEOUT`]; the chain is killed and the
+    /// user must re-authenticate. Carries the actual idle
+    /// duration in seconds so the UI can log "signed out after
+    /// 20m of inactivity" rather than a generic 401.
+    #[error("idle_expired: {idle_seconds}s")]
+    IdleExpired { idle_seconds: i64 },
 }
 
 impl From<PasswordError> for AuthApiError {
@@ -274,6 +290,14 @@ impl IntoResponse for AuthApiError {
             AuthApiError::FirstRunModeDisallowed => (
                 StatusCode::FORBIDDEN,
                 serde_json::json!({"error": "first_run_mode_disallowed"}),
+            ),
+            AuthApiError::IdleExpired { idle_seconds } => (
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({
+                    "error": format!("session idle: {idle_seconds}s since last activity"),
+                    "code": "idle_expired",
+                    "idle_seconds": idle_seconds,
+                }),
             ),
             AuthApiError::PasswordHash(_)
             | AuthApiError::SessionInternal(_)
@@ -582,8 +606,15 @@ pub async fn post_login(
     record_login_success_audit(&state.store, id, &username, &ip, ua).await;
     tracing::info!(username = %username, ip = %ip, "login success");
 
-    let access_token = issue_access_token(id, user.role, secret.as_bytes(), now, ACCESS_TOKEN_TTL)?;
     let chain_id = Uuid::now_v7().to_string();
+    let access_token = issue_access_token(
+        id,
+        user.role,
+        secret.as_bytes(),
+        now,
+        ACCESS_TOKEN_TTL,
+        Some(&chain_id),
+    )?;
     let (refresh_secret, _row_id) =
         mint_refresh_row(&state.store, id, &chain_id, None, now, &ip, ua).await?;
 
@@ -627,6 +658,34 @@ pub async fn post_refresh(
         return Err(AuthApiError::InvalidCredentials);
     };
 
+    // v0.1.36 \u2014 sliding-window idle check FIRST. We compare the
+    // peak `last_active_at` across the whole live chain (not just
+    // the row presented) so a stale tab can't refresh while a sibling
+    // tab kept the user active. If the peak is older than
+    // `IDLE_TIMEOUT`, kill the whole chain and 401 with `code:
+    // idle_expired`. Done BEFORE replay detection so that an idle
+    // chain that's also been replayed still reports `idle_expired`
+    // (more useful to the SPA) rather than collapsing to
+    // `invalid_credentials`.
+    if let Some(peak) = state.store.max_chain_last_active_at(&row.chain_id).await? {
+        let idle = now.signed_duration_since(peak);
+        if idle > IDLE_TIMEOUT {
+            if let Err(e) = state.store.idle_revoke_chain(&row.chain_id, now).await {
+                tracing::error!(error = %e, "failed to idle-revoke chain");
+            }
+            tracing::warn!(
+                chain_id = %row.chain_id,
+                user_id = row.user_id,
+                ip = %ip,
+                idle_seconds = idle.num_seconds(),
+                "refresh rejected: idle timeout exceeded, chain revoked"
+            );
+            return Err(AuthApiError::IdleExpired {
+                idle_seconds: idle.num_seconds(),
+            });
+        }
+    }
+
     // Replay detection FIRST. If the row is already rotated
     // OR already revoked, the chain is dead — revoke every
     // sibling generation and 401.
@@ -667,8 +726,14 @@ pub async fn post_refresh(
     }
 
     // Mint new pair.
-    let access_token =
-        issue_access_token(user.id, user.role, secret.as_bytes(), now, ACCESS_TOKEN_TTL)?;
+    let access_token = issue_access_token(
+        user.id,
+        user.role,
+        secret.as_bytes(),
+        now,
+        ACCESS_TOKEN_TTL,
+        Some(&row.chain_id),
+    )?;
     let (new_secret, new_row_id) = mint_refresh_row(
         &state.store,
         user.id,
@@ -973,14 +1038,15 @@ pub async fn post_first_run_setup(
         "FIRST-RUN ADMIN PROVISIONED via UI setup endpoint",
     );
 
+    let chain_id = Uuid::now_v7().to_string();
     let access_token = issue_access_token(
         user_id,
         Role::Admin,
         secret.as_bytes(),
         now,
         ACCESS_TOKEN_TTL,
+        Some(&chain_id),
     )?;
-    let chain_id = Uuid::now_v7().to_string();
     let (refresh_secret, _row_id) =
         mint_refresh_row(&state.store, user_id, &chain_id, None, now, &ip, ua).await?;
 

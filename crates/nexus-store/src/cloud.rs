@@ -47,6 +47,18 @@ pub struct CloudEnrollment {
     /// the same cutoff, idempotent via the cloud-side
     /// `ON CONFLICT (core_id, edge_clip_id) DO UPDATE`.
     pub attach_replay_after: Option<DateTime<Utc>>,
+    /// v0.1.36 (M-HTTPS Phase 3) — PEM-encoded `serverAuth`-EKU
+    /// leaf the cloud minted for the engine's local HTTPS listener.
+    /// `None` for pre-v0.1.36 enrollments and for any enrollment
+    /// where the cloud-side mint failed (the engine falls back to
+    /// its self-signed leaf in both cases). The paired private key
+    /// lives in [`Self::server_private_key_pem`].
+    pub server_cert_pem: Option<String>,
+    /// v0.1.36 (M-HTTPS Phase 3) — PEM-encoded PKCS#8 private key
+    /// pairing with [`Self::server_cert_pem`]. Generated
+    /// edge-side during enrollment so the key never leaves the
+    /// appliance. Always paired: both `Some` or both `None`.
+    pub server_private_key_pem: Option<String>,
 }
 
 impl Store {
@@ -61,19 +73,21 @@ impl Store {
             INSERT INTO cloud_enrollment
                 (id, core_id, gateway_url, cert_pem, private_key_pem,
                  ca_chain_pem, entitlement_jwt, signing_key_pem, signing_kid,
-                 attach_replay_after)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 attach_replay_after, server_cert_pem, server_private_key_pem)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                core_id              = excluded.core_id,
-                gateway_url          = excluded.gateway_url,
-                cert_pem             = excluded.cert_pem,
-                private_key_pem      = excluded.private_key_pem,
-                ca_chain_pem         = excluded.ca_chain_pem,
-                entitlement_jwt      = excluded.entitlement_jwt,
-                signing_key_pem      = excluded.signing_key_pem,
-                signing_kid          = excluded.signing_kid,
-                attach_replay_after  = excluded.attach_replay_after,
-                enrolled_at          = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                core_id                = excluded.core_id,
+                gateway_url            = excluded.gateway_url,
+                cert_pem               = excluded.cert_pem,
+                private_key_pem        = excluded.private_key_pem,
+                ca_chain_pem           = excluded.ca_chain_pem,
+                entitlement_jwt        = excluded.entitlement_jwt,
+                signing_key_pem        = excluded.signing_key_pem,
+                signing_kid            = excluded.signing_kid,
+                attach_replay_after    = excluded.attach_replay_after,
+                server_cert_pem        = excluded.server_cert_pem,
+                server_private_key_pem = excluded.server_private_key_pem,
+                enrolled_at            = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             "#,
         )
         .bind(&e.core_id)
@@ -85,6 +99,8 @@ impl Store {
         .bind(e.signing_key_pem.as_deref())
         .bind(e.signing_kid.as_deref())
         .bind(e.attach_replay_after.map(|ts| ts.to_rfc3339()))
+        .bind(e.server_cert_pem.as_deref())
+        .bind(e.server_private_key_pem.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -100,7 +116,8 @@ impl Store {
             r#"
             SELECT core_id, gateway_url, cert_pem, private_key_pem,
                    ca_chain_pem, entitlement_jwt, signing_key_pem,
-                   signing_kid, enrolled_at, attach_replay_after
+                   signing_kid, enrolled_at, attach_replay_after,
+                   server_cert_pem, server_private_key_pem
               FROM cloud_enrollment
              WHERE id = 1
             "#,
@@ -133,6 +150,8 @@ impl Store {
             signing_kid: row.try_get("signing_kid")?,
             enrolled_at,
             attach_replay_after,
+            server_cert_pem: row.try_get("server_cert_pem")?,
+            server_private_key_pem: row.try_get("server_private_key_pem")?,
         }))
     }
 
@@ -216,6 +235,8 @@ mod tests {
             signing_kid: Some("kid-1".into()),
             enrolled_at: Utc::now(), // overwritten by the DB default
             attach_replay_after: None,
+            server_cert_pem: None,
+            server_private_key_pem: None,
         }
     }
 

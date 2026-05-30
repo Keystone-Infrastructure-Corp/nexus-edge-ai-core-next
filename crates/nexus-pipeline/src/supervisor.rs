@@ -650,6 +650,7 @@ fn build_source(
             max_fps: cfg.ingest.max_fps,
             frame_width: supervisor_w,
             frame_height: supervisor_h,
+            expected_codec: cfg.ingest.codec,
         }),
         // Without the `gstreamer` feature there is no real RTSP backend.
         // Refuse to silently fall back to a 640x480 black VirtualSource —

@@ -301,6 +301,20 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         store.seed_from_config_if_empty(&cfg).await?;
     }
 
+    // v0.1.36 — bootstrap the 20-min idle-timeout pipeline.
+    // The bounded channel decouples the request hot path (try_send,
+    // never blocks) from the background drain that batches updates
+    // into a single UPDATE per chain per 250 ms tick. Capacity 4096
+    // absorbs ~16k req/s for a tick before a single bump is dropped;
+    // dropping a bump just lags `last_active_at` by one tick, which
+    // is acceptable against a 20-min ceiling.
+    let (idle_bump_tx, idle_bump_rx) =
+        tokio::sync::mpsc::channel::<auth::require_role::IdleBump>(4096);
+    {
+        let drain_store = store.clone();
+        tokio::spawn(idle_bump_drain(drain_store, idle_bump_rx));
+    }
+
     // M-Admin Phase 0 — apply any operator-persisted auth
     // override BEFORE we touch `cfg.auth` for bootstrap, OIDC
     // discovery, or the admin-auth-state builder. Mirrors the
@@ -466,7 +480,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
                         store: store.clone(),
                         admin_auth: std::sync::Arc::new(
                             admin_auth::AdminAuthState::from_config(&cfg.auth)
-                                .context("building admin-auth state for oidc login")?,
+                                .context("building admin-auth state for oidc login")?
+                                .with_idle_bump_tx(idle_bump_tx.clone()),
                         ),
                         oidc_client: client,
                         cfg: oidc_cfg.clone(),
@@ -1143,7 +1158,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // state for LAN-only / single-box deployments.
         admin_auth: std::sync::Arc::new(
             admin_auth::AdminAuthState::from_config(&cfg.auth)
-                .context("building admin-auth state")?,
+                .context("building admin-auth state")?
+                .with_idle_bump_tx(idle_bump_tx.clone()),
         ),
         // M-Admin Phase 1B — empty registry at boot; populated by
         // the four `/api/v1/admin/discovery/*` handlers. The
@@ -1329,32 +1345,113 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             rustls: axum_server::tls_rustls::RustlsConfig,
             cert_path: std::path::PathBuf,
             key_path: std::path::PathBuf,
+            /// v0.1.36 \u2014 origin of the leaf. Only `CloudIssued`
+            /// turns on HSTS; self-signed never advertises HSTS
+            /// because a browser caching HSTS against an
+            /// untrusted leaf is trapped for `max-age` seconds.
+            cert_source: tls::CertSource,
+            /// v0.1.36 \u2014 `true` when the leaf is loaded directly
+            /// from in-memory PEM bytes (cloud-issued path). The
+            /// cert watcher is skipped in that mode; rotation
+            /// happens on engine restart after re-enrollment.
+            in_memory: bool,
         }
+        // v0.1.36 \u2014 prefer a cloud-issued leaf if the appliance
+        // has been enrolled AND enrollment-svc minted a server cert.
+        // The DB row carries both the cert PEM and the matching
+        // private key (CSR was generated edge-side, so the key never
+        // left this process).
+        let cloud_tls_pems: Option<(Vec<u8>, Vec<u8>)> = match store.get_cloud_enrollment().await {
+            Ok(Some(enr)) => match (enr.server_cert_pem, enr.server_private_key_pem) {
+                (Some(c), Some(k)) => Some((c.into_bytes(), k.into_bytes())),
+                _ => None,
+            },
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read cloud_enrollment for TLS bootstrap");
+                None
+            }
+        };
+
         let tls_listener: Option<TlsListener> = match (
             cfg.server.https_bind.as_deref(),
             cfg.server.tls_cert_path.as_deref(),
             cfg.server.tls_key_path.as_deref(),
         ) {
             (Some(b), Some(cert), Some(key)) => match b.parse::<std::net::SocketAddr>() {
-                Ok(addr) => match tls::load_rustls_config(cert, key).await {
-                    Ok(rc) => Some(TlsListener {
-                        bind: b.to_string(),
-                        addr,
-                        rustls: rc,
-                        cert_path: cert.to_path_buf(),
-                        key_path: key.to_path_buf(),
-                    }),
-                    Err(e) => {
-                        tracing::error!(
-                            bind = %b,
-                            cert = %cert.display(),
-                            key = %key.display(),
-                            error = %e,
-                            "TLS cert load failed; HTTPS listener disabled, plain HTTP only",
-                        );
-                        None
+                Ok(addr) => {
+                    // Path A \u2014 cloud-issued in-memory leaf wins.
+                    if let Some((cert_pem, key_pem)) = cloud_tls_pems.as_ref() {
+                        match tls::load_rustls_config_from_pems(cert_pem, key_pem).await {
+                            Ok(rc) => {
+                                tracing::info!(
+                                    bind = %b,
+                                    "TLS leaf loaded from cloud_enrollment.server_cert_pem (HSTS will be advertised)",
+                                );
+                                Some(TlsListener {
+                                    bind: b.to_string(),
+                                    addr,
+                                    rustls: rc,
+                                    cert_path: cert.to_path_buf(),
+                                    key_path: key.to_path_buf(),
+                                    cert_source: tls::CertSource::CloudIssued,
+                                    in_memory: true,
+                                })
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "cloud-issued TLS PEM failed to load; falling back to on-disk self-signed leaf",
+                                );
+                                match tls::load_rustls_config(cert, key).await {
+                                    Ok(rc) => Some(TlsListener {
+                                        bind: b.to_string(),
+                                        addr,
+                                        rustls: rc,
+                                        cert_path: cert.to_path_buf(),
+                                        key_path: key.to_path_buf(),
+                                        cert_source: tls::CertSource::SelfSigned,
+                                        in_memory: false,
+                                    }),
+                                    Err(e2) => {
+                                        tracing::error!(
+                                            bind = %b,
+                                            cert = %cert.display(),
+                                            key = %key.display(),
+                                            error = %e2,
+                                            "self-signed fallback also failed; HTTPS listener disabled",
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Path B \u2014 no cloud leaf; fall back to the
+                        // on-disk self-signed bootstrap cert.
+                        match tls::load_rustls_config(cert, key).await {
+                            Ok(rc) => Some(TlsListener {
+                                bind: b.to_string(),
+                                addr,
+                                rustls: rc,
+                                cert_path: cert.to_path_buf(),
+                                key_path: key.to_path_buf(),
+                                cert_source: tls::CertSource::SelfSigned,
+                                in_memory: false,
+                            }),
+                            Err(e) => {
+                                tracing::error!(
+                                    bind = %b,
+                                    cert = %cert.display(),
+                                    key = %key.display(),
+                                    error = %e,
+                                    "TLS cert load failed; HTTPS listener disabled, plain HTTP only",
+                                );
+                                None
+                            }
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     tracing::error!(
                         bind = %b,
@@ -1401,7 +1498,16 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         let cert_watcher_token = tokio_util::sync::CancellationToken::new();
         let (https_server, cert_watcher) = if let Some(t) = tls_listener.as_ref() {
             let mut tls_app = app.clone();
-            if let Some(max_age) = cfg.server.hsts_max_age_seconds {
+            // v0.1.36 \u2014 HSTS gate. The middleware only emits a
+            // `Strict-Transport-Security` header when the leaf is
+            // cloud-issued. Self-signed leaves never advertise HSTS,
+            // because a browser that caches HSTS against an
+            // untrusted leaf is trapped for `max-age` seconds
+            // \u2014 even an operator who later installs a trusted
+            // cert can't downgrade their own browser's HSTS cache.
+            if let (Some(max_age), tls::CertSource::CloudIssued) =
+                (cfg.server.hsts_max_age_seconds, t.cert_source)
+            {
                 let hsts_value = format!("max-age={max_age}; includeSubDomains");
                 tls_app = tls_app.layer(axum::middleware::from_fn(
                     move |req: axum::extract::Request, next: axum::middleware::Next| {
@@ -1415,8 +1521,18 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
                         }
                     },
                 ));
+            } else if cfg.server.hsts_max_age_seconds.is_some()
+                && t.cert_source == tls::CertSource::SelfSigned
+            {
+                tracing::info!(
+                    "hsts_max_age_seconds configured but leaf is self-signed; HSTS NOT emitted (would trap browsers)",
+                );
             }
-            info!(bind = %t.bind, "HTTPS API + UI listening (TLS)");
+            info!(
+                bind = %t.bind,
+                cert_source = ?t.cert_source,
+                "HTTPS API + UI listening (TLS)",
+            );
             let addr = t.addr;
             let rustls = t.rustls.clone();
             let handle = tokio::spawn(async move {
@@ -1427,13 +1543,22 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
                     tracing::error!("axum-server error (https): {e}");
                 }
             });
-            let watcher = tls::spawn_cert_watcher(
-                t.rustls.clone(),
-                t.cert_path.clone(),
-                t.key_path.clone(),
-                cert_watcher_token.clone(),
-            );
-            (Some(handle), Some(watcher))
+            let watcher = if t.in_memory {
+                // Cloud-issued leaf is loaded from `cloud_enrollment`
+                // in memory; rotation requires a re-enrollment (which
+                // restarts the engine). Skip the disk-mtime watcher
+                // because the on-disk file is the stale self-signed
+                // fallback, not the live cert.
+                None
+            } else {
+                Some(tls::spawn_cert_watcher(
+                    t.rustls.clone(),
+                    t.cert_path.clone(),
+                    t.key_path.clone(),
+                    cert_watcher_token.clone(),
+                ))
+            };
+            (Some(handle), watcher)
         } else {
             (None, None)
         };
@@ -1770,4 +1895,62 @@ fn build_gst_recorder(
 
 async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// v0.1.36 — background sliding-window idle-bump drain.
+///
+/// Receives `(chain_id, activity_ts)` from every authenticated
+/// request and coalesces them into one `UPDATE auth_refresh_tokens
+/// SET last_active_at = ?` per chain per 250 ms tick. Coalescing
+/// keeps a 60 req/s SPA from issuing 60 UPDATEs per second; only
+/// the most recent timestamp per chain is forwarded.
+///
+/// The task lives for the lifetime of the engine process. It exits
+/// cleanly when the last sender is dropped (i.e. the engine has
+/// already begun shutdown).
+async fn idle_bump_drain(
+    store: Arc<Store>,
+    mut rx: tokio::sync::mpsc::Receiver<auth::require_role::IdleBump>,
+) {
+    use std::collections::HashMap;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pending: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = tick.tick() => {
+                if pending.is_empty() { continue; }
+                for (chain_id, ts) in pending.drain() {
+                    if let Err(e) = store.bump_refresh_chain_active_at(&chain_id, ts).await {
+                        tracing::debug!(
+                            error = %e,
+                            chain_id = %chain_id,
+                            "idle-bump UPDATE failed (chain may have been revoked)",
+                        );
+                    }
+                }
+            }
+            msg = rx.recv() => {
+                match msg {
+                    Some((chain_id, ts)) => {
+                        // Keep only the latest ts per chain. The
+                        // entry replaces an older ts if one is
+                        // already queued for this tick.
+                        let entry = pending.entry(chain_id).or_insert(ts);
+                        if ts > *entry { *entry = ts; }
+                    }
+                    None => {
+                        // Sender side dropped \u2014 flush whatever we
+                        // have and exit.
+                        for (chain_id, ts) in pending.drain() {
+                            let _ = store.bump_refresh_chain_active_at(&chain_id, ts).await;
+                        }
+                        tracing::debug!("idle-bump drain shutting down");
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }

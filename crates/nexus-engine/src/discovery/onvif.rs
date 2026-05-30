@@ -205,6 +205,7 @@ impl ProbeMatch {
             mac: scopes.mac,
             onvif_xaddrs: xaddrs,
             rtsp_paths: Vec::new(),
+            codec: None,
         })
     }
 }

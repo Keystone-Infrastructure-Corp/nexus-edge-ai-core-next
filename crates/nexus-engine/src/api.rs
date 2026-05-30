@@ -993,6 +993,34 @@ async fn create_camera(
     // regardless, but zeroing here keeps the placeholder JSON
     // honest before the post-insert rewrite.
     cam.id = 0;
+    // Codec autodetect: if the operator didn't specify a codec
+    // and the source is rtsp/rtsps, run one RTSP DESCRIBE probe
+    // against the URL and stamp the result. Best-effort — if
+    // the probe fails (auth challenge URL creds didn't satisfy,
+    // network unreachable, non-H26x codec) we leave codec=None
+    // and the reconciler's spawn-time warning fires instead.
+    if cam.ingest.codec.is_none() {
+        let scheme = cam.ingest.url.scheme();
+        if scheme == "rtsp" || scheme == "rtsps" {
+            match crate::discovery::rtsp_probe::probe_codec_for_url(&cam.ingest.url).await {
+                Some(codec) => {
+                    tracing::info!(
+                        url = %cam.ingest.url,
+                        codec = %codec,
+                        "codec autodetected at camera-create"
+                    );
+                    cam.ingest.codec = Some(codec);
+                }
+                None => {
+                    tracing::info!(
+                        url = %cam.ingest.url,
+                        "codec autodetect failed; leaving codec unspecified \
+                         — pipeline will default to H.264 at spawn"
+                    );
+                }
+            }
+        }
+    }
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
         s.store.create_camera_tx(&mut tx, &mut cam).await?;
@@ -5135,6 +5163,7 @@ mod tests {
                     url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
@@ -5397,6 +5426,7 @@ mod tests {
                     url: Url::parse("rtsp://127.0.0.1/stream3").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
@@ -6315,6 +6345,7 @@ mod tests {
                     url: url::Url::parse("rtsp://127.0.0.1/s").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],

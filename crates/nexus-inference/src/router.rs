@@ -274,6 +274,7 @@ mod tests {
                 url: Url::parse("virtual://test").unwrap(),
                 enabled: true,
                 max_fps: 0,
+                codec: None,
             },
             detector: nexus_config::CameraDetector {
                 prompts: vec![],
@@ -408,6 +409,7 @@ mod tests {
                     url: Url::parse("virtual://test").unwrap(),
                     enabled: true,
                     max_fps: 0,
+                    codec: None,
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],

@@ -49,6 +49,22 @@ use tracing::{debug, info};
 
 use super::{ProbeRtspReq, ProbeRtspResult, ProbeStream, SdpStream};
 
+/// Map an SDP `a=rtpmap:` codec name to [`nexus_types::CodecKind`].
+///
+/// Accepts both `H265` (RFC 7798 §7.1, common in vendor SDPs) and
+/// `HEVC` (the IANA-registered name). Anything outside H.264 / H.265
+/// (`JPEG`, `MPEG4-GENERIC`, audio codecs, future AV1) returns
+/// `None` so the typed selector stays empty and the operator's UI
+/// surfaces the raw string instead. Autodetect never emits the
+/// `_plus` SVC variants; they're operator-supplied labels only.
+fn codec_kind_from_rtpmap(name: &str) -> Option<nexus_types::CodecKind> {
+    match name.to_ascii_uppercase().as_str() {
+        "H264" => Some(nexus_types::CodecKind::H264),
+        "H265" | "HEVC" => Some(nexus_types::CodecKind::H265),
+        _ => None,
+    }
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
 const READ_TIMEOUT: Duration = Duration::from_millis(3_000);
 const MAX_RESPONSE: usize = 64 * 1024;
@@ -207,15 +223,18 @@ pub(crate) async fn probe(req: &ProbeRtspReq) -> ProbeRtspResult {
                 ProbeStream {
                     path: path.clone(),
                     codec: video.map(|s| s.codec.clone()),
+                    codec_kind: video.and_then(|s| s.codec_kind),
                     resolution: video.and_then(|s| s.resolution.clone()),
                 }
             })
             .collect();
+        let top_codec_kind = streams.first().and_then(|s| s.codec_kind);
         let (first_path, first_sdp) = winners.into_iter().next().expect("non-empty");
         return ProbeRtspResult {
             ok: true,
             status: 200,
             sdp_streams: first_sdp,
+            codec: top_codec_kind,
             path: Some(first_path),
             streams,
         };
@@ -229,9 +248,47 @@ pub(crate) async fn probe(req: &ProbeRtspReq) -> ProbeRtspResult {
         ok: false,
         status: auth_status.or(other_status).unwrap_or(0),
         sdp_streams: Vec::new(),
+        codec: None,
         path: None,
         streams: Vec::new(),
     }
+}
+
+/// URL-based codec autodetect wrapper around [`probe`].
+///
+/// Parses host/port/path/creds out of an `rtsp://` or `rtsps://`
+/// URL and returns the top observed [`nexus_types::CodecKind`], or
+/// `None` if the probe couldn't reach a `200 OK` (auth challenge
+/// the URL's embedded creds didn't satisfy, network failure, or a
+/// codec outside our enum like JPEG / AV1).
+///
+/// Used by `POST /cameras` when the operator omits `ingest.codec`
+/// — we attempt one autodetect pass against the supplied URL; if
+/// it succeeds, the camera persists with the detected codec; if
+/// not, we leave `codec=None` and the reconciler's spawn-time
+/// warning kicks in.
+pub async fn probe_codec_for_url(url: &url::Url) -> Option<nexus_types::CodecKind> {
+    let scheme = url.scheme();
+    if scheme != "rtsp" && scheme != "rtsps" {
+        return None;
+    }
+    let host = url.host_str()?.to_string();
+    let port = url.port().unwrap_or(554);
+    let path = url.path().to_string();
+    let username = if url.username().is_empty() {
+        None
+    } else {
+        Some(url.username().to_string())
+    };
+    let password = url.password().map(|p| p.to_string());
+    let req = ProbeRtspReq {
+        host,
+        port,
+        path,
+        username,
+        password,
+    };
+    probe(&req).await.codec
 }
 
 async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
@@ -282,6 +339,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
             ok: true,
             status: 200,
             sdp_streams: parse_sdp(body_1),
+            codec: None,
             // Filled in by the caller in `probe()` once it knows
             // which candidate path won — leave None here.
             path: None,
@@ -343,6 +401,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                         ok: true,
                         status: 200,
                         sdp_streams: parse_sdp(body_2),
+                        codec: None,
                         path: None,
                         streams: Vec::new(),
                     });
@@ -376,6 +435,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                         ok: true,
                         status: 200,
                         sdp_streams: parse_sdp(body_2),
+                        codec: None,
                         path: None,
                         streams: Vec::new(),
                     });
@@ -387,6 +447,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                 ok: false,
                 status: last_status,
                 sdp_streams: Vec::new(),
+                codec: None,
                 path: None,
                 streams: Vec::new(),
             });
@@ -404,6 +465,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
             status_1
         },
         sdp_streams: Vec::new(),
+        codec: None,
         path: None,
         streams: Vec::new(),
     })
@@ -827,6 +889,7 @@ fn parse_sdp(body: &str) -> Vec<SdpStream> {
             let kind = media.split_whitespace().next().unwrap_or("?");
             current = Some(SdpStream {
                 codec: kind.to_string(),
+                codec_kind: None,
                 resolution: None,
                 control: None,
             });
@@ -834,11 +897,12 @@ fn parse_sdp(body: &str) -> Vec<SdpStream> {
             if let Some(rest) = line.strip_prefix("a=rtpmap:") {
                 // `96 H264/90000` — pull the codec name.
                 if let Some(codec) = rest.split_whitespace().nth(1) {
-                    if let Some((c, _)) = codec.split_once('/') {
-                        track.codec = c.to_string();
-                    } else {
-                        track.codec = codec.to_string();
-                    }
+                    let name = match codec.split_once('/') {
+                        Some((c, _)) => c.to_string(),
+                        None => codec.to_string(),
+                    };
+                    track.codec_kind = codec_kind_from_rtpmap(&name);
+                    track.codec = name;
                 }
             } else if let Some(rest) = line.strip_prefix("a=framesize:") {
                 // `96 1280-720` (some cameras use `-`, some `x`).
@@ -982,9 +1046,12 @@ mod tests {
         let tracks = parse_sdp(body);
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].codec, "H264");
+        assert_eq!(tracks[0].codec_kind, Some(nexus_types::CodecKind::H264));
         assert_eq!(tracks[0].resolution.as_deref(), Some("1920x1080"));
         assert_eq!(tracks[0].control.as_deref(), Some("trackID=0"));
         assert_eq!(tracks[1].codec, "MPEG4-GENERIC");
+        // MPEG4-GENERIC is audio — we don't enumerate it.
+        assert_eq!(tracks[1].codec_kind, None);
     }
 
     #[test]
@@ -993,7 +1060,29 @@ mod tests {
         let tracks = parse_sdp(body);
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].codec, "H265");
+        assert_eq!(tracks[0].codec_kind, Some(nexus_types::CodecKind::H265));
         assert_eq!(tracks[0].resolution.as_deref(), Some("3840x2160"));
+    }
+
+    #[test]
+    fn parse_sdp_accepts_hevc_alias_for_h265() {
+        // RFC 7798 §7.1 — the IANA-registered name is `HEVC`.
+        // Several Bosch / Hanwha firmwares emit that instead of `H265`.
+        let body = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 HEVC/90000\r\n";
+        let tracks = parse_sdp(body);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec_kind, Some(nexus_types::CodecKind::H265));
+    }
+
+    #[test]
+    fn parse_sdp_lowercase_rtpmap_is_accepted() {
+        // Some test SDPs and OBS-rtsp use lowercase — the
+        // uppercase normalisation in `codec_kind_from_rtpmap`
+        // should handle either.
+        let body = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 h264/90000\r\n";
+        let tracks = parse_sdp(body);
+        assert_eq!(tracks[0].codec, "h264");
+        assert_eq!(tracks[0].codec_kind, Some(nexus_types::CodecKind::H264));
     }
 
     #[test]
