@@ -25,6 +25,7 @@ mod auth;
 mod auth_bootstrap;
 mod cloud_audit;
 mod cloud_enroll;
+mod cloud_sighting;
 mod cloud_tunnel;
 mod cold_read_cache;
 mod cold_replicator;
@@ -582,6 +583,49 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // anchor state + on-disk registry. See `static_clear.rs` in
     // nexus-pipeline for the polled-counter rationale.
     let static_clear = StaticAnchorClearRegistry::new();
+
+    // Phase 2 · Step 2.8 + Phase 5.6 · slice 4c-ii — shared tunnel
+    // outbox slot. Hoisted ABOVE the per-camera supervisor spawn
+    // loop so the cloud entity-sighting hook (which closes over an
+    // `Arc<TunnelOutbox>`) can be constructed before the first
+    // `spawn_camera` call. The cloud-tunnel reconnect loop installs
+    // the active handle into this slot post-enrollment; the cold
+    // replicator + the sighting hook both read it.
+    let cloud_outbox = std::sync::Arc::new(nexus_cloud_client::TunnelOutbox::new());
+
+    // Phase 5.6 · slice 4c-ii — build the per-engine entity-sighting
+    // hook + scheduler config. Always built, even when the cloud is
+    // unreachable: the hook drops snapshots silently when the outbox
+    // has no handle, and the supervisor's per-frame tick is cheap
+    // when the underlying [`NoopSightingHook`] is installed.
+    let (sighting_hook, sighting_cfg): (
+        Arc<dyn nexus_pipeline::SightingHook>,
+        nexus_pipeline::supervisor::SightingSchedulerConfig,
+    ) = if cfg.reid.enabled {
+        let extractor = build_reid_extractor(&cfg.reid);
+        let hook =
+            cloud_sighting::CloudEntitySightingHook::spawn(extractor, cloud_outbox.clone(), 64);
+        let scheduler_cfg = nexus_pipeline::supervisor::SightingSchedulerConfig {
+            min_track_age_frames: cfg.reid.min_track_age_frames,
+            emit_interval: std::time::Duration::from_secs(cfg.reid.emit_interval_s),
+        };
+        info!(
+            model_id = %cfg.reid.model_id,
+            dim = cfg.reid.dim,
+            emit_interval_s = cfg.reid.emit_interval_s,
+            min_track_age_frames = cfg.reid.min_track_age_frames,
+            model_path = ?cfg.reid.model_path,
+            "reid enabled — entity-sighting hook installed"
+        );
+        (Arc::new(hook), scheduler_cfg)
+    } else {
+        info!("reid disabled — noop sighting hook installed");
+        (
+            Arc::new(nexus_pipeline::NoopSightingHook),
+            nexus_pipeline::supervisor::SightingSchedulerConfig::default(),
+        )
+    };
+
     for cam in cameras {
         if !cam.ingest.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
@@ -622,6 +666,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             static_clear.clone(),
             sup_w,
             sup_h,
+            sighting_hook.clone(),
+            sighting_cfg,
         );
         running.lock().insert(
             cam_id,
@@ -714,7 +760,11 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // replicator publishes `clip_replicated` envelopes through it
     // as a best-effort, fire-and-forget side effect after each
     // successful upload + cold-pointer commit.
-    let cloud_outbox = std::sync::Arc::new(nexus_cloud_client::TunnelOutbox::new());
+    //
+    // (`cloud_outbox` itself was constructed BEFORE the supervisor
+    // spawn loop in Phase 5.6 · slice 4c-ii so the per-camera
+    // entity-sighting hook could share it; the cold replicator just
+    // clones the existing Arc here.)
     let cold_handle = {
         let store = store.clone();
         let bus = bus.clone();
@@ -857,6 +907,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         static_clear: static_clear.clone(),
         pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
         default_detector_width: cfg.inference.model.input_width,
+        sighting_hook: sighting_hook.clone(),
+        sighting_cfg,
         handles: running.clone(),
     });
 
@@ -1227,6 +1279,62 @@ fn log_inference_summary(cfg: &InferenceConfig, has_pool: bool, router: &Inferen
         pool = has_pool,
         "inference router built"
     );
+}
+
+/// Build the per-engine appearance-embedding extractor used by the
+/// Phase 5.6 entity-sighting hook.
+///
+/// Selection rules:
+///
+/// * When the `ort` feature AND a `model_path` are present, attempt
+///   to open the real `DinoV2Extractor` (DINOv2-S 224, 384-dim,
+///   Apache-2.0 weights). Failure falls back to a `MockExtractor`
+///   parameterised with the configured `model_id` + `dim` so the
+///   engine still boots — the cloud-side allowlist gate will then
+///   reject the mock submissions (which is the correct behaviour
+///   when the operator misconfigured the model path).
+/// * Otherwise (feature off OR no `model_path`), build a
+///   `MockExtractor` directly. The wire-submission path in
+///   `cloud_sighting::run_worker` short-circuits when the
+///   extractor's `model_id` starts with `"mock_"`, so no cloud
+///   round-trip is wasted.
+fn build_reid_extractor(cfg: &nexus_config::ReidConfig) -> Arc<dyn nexus_reid::Extractor> {
+    #[cfg(feature = "ort")]
+    {
+        if let Some(path) = cfg.model_path.as_ref() {
+            match nexus_reid::ort_dinov2::DinoV2Extractor::open(
+                path,
+                cfg.model_id.clone(),
+                cfg.ep_priority.as_slice(),
+            ) {
+                Ok(x) => {
+                    info!(
+                        model_path = %path.display(),
+                        model_id = %cfg.model_id,
+                        dim = cfg.dim,
+                        "reid: DinoV2 extractor opened"
+                    );
+                    return Arc::new(x);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        model_path = %path.display(),
+                        error = %e,
+                        "reid: DinoV2 extractor failed to open; falling back to mock (cloud will reject)"
+                    );
+                }
+            }
+        }
+    }
+    info!(
+        model_id = %cfg.model_id,
+        dim = cfg.dim,
+        "reid: using MockExtractor (no model_path configured or `ort` feature off); cloud publish disabled"
+    );
+    Arc::new(nexus_reid::MockExtractor::with_config(
+        format!("mock_{}", cfg.model_id),
+        cfg.dim,
+    ))
 }
 
 /// Build the per-process clip recorder according to

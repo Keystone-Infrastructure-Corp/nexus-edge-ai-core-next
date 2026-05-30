@@ -106,6 +106,14 @@ pub struct Config {
     /// runs and the outbox stays empty.
     #[serde(default)]
     pub sinks: Vec<SinkConfig>,
+    /// Phase 5.6 — cross-camera re-identification. Disabled by
+    /// default. When enabled, the per-camera supervisor mints a
+    /// per-stable-track UUIDv7 and emits an `entity_sighting` wire
+    /// envelope through the cloud tunnel every `emit_interval_s`
+    /// seconds (plus once on first-stable). See `WEDGE_PLAN.md` and
+    /// `nexus_pipeline::SightingScheduler` for the per-track FSM.
+    #[serde(default)]
+    pub reid: ReidConfig,
 }
 
 impl Config {
@@ -1723,6 +1731,89 @@ pub struct CameraConfigUpdate {
     pub visual_prompts: Vec<VisualPromptRef>,
     pub model: ModelConfig,
     pub generation: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5.6 — cross-camera re-identification
+// ---------------------------------------------------------------------------
+
+/// `[reid]` block. Disabled by default. When `enabled = true`, the
+/// per-camera supervisor runs the configured [`nexus_reid::Extractor`]
+/// on each stable track once on first-stable and again every
+/// `emit_interval_s` of wall-clock, publishing `entity_sighting`
+/// envelopes through the cloud tunnel. See
+/// `crates/nexus-pipeline/src/entity_sighting.rs` for the per-track
+/// FSM and `WEDGE_PLAN.md §4` for the wire contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReidConfig {
+    /// Master switch. `false` keeps the supervisor's per-frame
+    /// scheduler tick alive (it's cheap) but installs the
+    /// [`nexus_pipeline::NoopSightingHook`] so nothing reaches the
+    /// cloud.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional ONNX model path. When `Some(_)` AND the engine is
+    /// built with `--features ort`, the engine loads
+    /// `nexus_reid::DinoV2Extractor`. When `None` (or `ort` feature
+    /// off), the engine falls back to
+    /// `nexus_reid::MockExtractor::with_config(model_id, dim)` —
+    /// useful for end-to-end wire tests against a real cloud without
+    /// shipping ONNX weights to the dev box.
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
+    /// Model id string. MUST match the cloud's wire allowlist —
+    /// "dinov2-s-v1" (384-dim, default) or "osnet-x1.0-v1" (512-dim).
+    /// Anything else is rejected by the edge-gateway at ingest time.
+    #[serde(default = "default_reid_model_id")]
+    pub model_id: String,
+    /// Embedding dimension. Must match `model_id`'s declared dim
+    /// (384 for dinov2-s-v1, 512 for osnet-x1.0-v1).
+    #[serde(default = "default_reid_dim")]
+    pub dim: usize,
+    /// Periodic re-emit cadence in seconds. After the first
+    /// stable-track emit, the scheduler waits this long before
+    /// firing again. Default 5s — bandwidth-friendly at ~7-10
+    /// concurrent tracks per camera.
+    #[serde(default = "default_reid_emit_interval_s")]
+    pub emit_interval_s: u64,
+    /// Minimum tracker `age_frames` before the first emit fires.
+    /// Filters out single-frame false positives that the tracker
+    /// would otherwise let through. Default 5 frames (~165 ms at
+    /// 30 fps; ~1 s at 5 fps).
+    #[serde(default = "default_reid_min_track_age_frames")]
+    pub min_track_age_frames: u32,
+    /// EP priority list for the ORT session. Ignored when
+    /// `model_path` is `None`. Default mirrors `[inference].ep_priority`.
+    #[serde(default = "default_ep_priority")]
+    pub ep_priority: Vec<String>,
+}
+
+impl Default for ReidConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: None,
+            model_id: default_reid_model_id(),
+            dim: default_reid_dim(),
+            emit_interval_s: default_reid_emit_interval_s(),
+            min_track_age_frames: default_reid_min_track_age_frames(),
+            ep_priority: default_ep_priority(),
+        }
+    }
+}
+
+fn default_reid_model_id() -> String {
+    "dinov2-s-v1".into()
+}
+fn default_reid_dim() -> usize {
+    384
+}
+fn default_reid_emit_interval_s() -> u64 {
+    5
+}
+fn default_reid_min_track_age_frames() -> u32 {
+    5
 }
 
 #[cfg(test)]

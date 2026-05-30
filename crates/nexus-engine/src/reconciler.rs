@@ -102,6 +102,14 @@ pub struct ReconcilerArgs {
     /// supervisor frame size via
     /// [`nexus_pipeline::supervisor_frame_for`].
     pub default_detector_width: u32,
+    /// Phase 5.6 · slice 4c-ii — engine-built hook that turns
+    /// per-stable-track [`nexus_pipeline::SightingSnapshot`]s into
+    /// `entity_sighting` wire envelopes. Cloned per `start_camera`
+    /// call so the reconciler picks up a freshly-spawned camera
+    /// with the same emit fan-out as the boot-time ones.
+    pub sighting_hook: Arc<dyn nexus_pipeline::SightingHook>,
+    /// Tunables for the per-camera [`nexus_pipeline::SightingScheduler`].
+    pub sighting_cfg: nexus_pipeline::supervisor::SightingSchedulerConfig,
     pub handles: HandleMap,
 }
 
@@ -286,6 +294,8 @@ fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str, supervisor_
         args.static_clear.clone(),
         sup_w,
         sup_h,
+        args.sighting_hook.clone(),
+        args.sighting_cfg,
     );
     args.handles.lock().insert(
         cam_id,

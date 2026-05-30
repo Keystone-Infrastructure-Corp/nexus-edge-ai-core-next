@@ -16,13 +16,13 @@ gstreamer = ["nexus-pipeline/gstreamer"]
 # nexus-inference. The release pipeline (and the kitchen-sink Docker
 # image) selects `ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt`; lighter
 # builds (LAN dev box, CI smoke) leave them off and pay zero cost.
-ort = ["nexus-inference/ort"]
-ep-cpu = ["nexus-inference/ep-cpu"]
-ep-openvino = ["nexus-inference/ep-openvino"]
-ep-cuda = ["nexus-inference/ep-cuda"]
-ep-tensorrt = ["nexus-inference/ep-tensorrt"]
-ep-coreml = ["nexus-inference/ep-coreml"]
-ep-directml = ["nexus-inference/ep-directml"]
+ort = ["nexus-inference/ort", "nexus-reid/ort"]
+ep-cpu = ["nexus-inference/ep-cpu", "nexus-reid/ep-cpu"]
+ep-openvino = ["nexus-inference/ep-openvino", "nexus-reid/ep-openvino"]
+ep-cuda = ["nexus-inference/ep-cuda", "nexus-reid/ep-cuda"]
+ep-tensorrt = ["nexus-inference/ep-tensorrt", "nexus-reid/ep-tensorrt"]
+ep-coreml = ["nexus-inference/ep-coreml", "nexus-reid/ep-coreml"]
+ep-directml = ["nexus-inference/ep-directml", "nexus-reid/ep-directml"]
 # M7 Step 6F2 — dev-only event-injection endpoint at
 # `POST /api/v1/_test/inject_event`. Lets the Playwright e2e suite
 # fire AlertEvents into the outbox without needing a live RTSP
@@ -96,6 +96,12 @@ nexus-cloud-client = { workspace = true }
 # Phase 1.8 — wire envelope shapes for the cloud tunnel
 # heartbeat pump.
 nexus-cloud-protocol = { workspace = true }
+# Phase 5.6 — appearance-embedding extractor used by the
+# per-stable-track entity-sighting hook. The `Extractor` trait + the
+# default `MockExtractor` are always available; the real ONNX
+# `DinoV2Extractor` is gated behind the engine's `ort` feature
+# (re-exported as `nexus-reid/ort` + a matching `ep-*`).
+nexus-reid = { workspace = true }
 
 # Phase 2 Step 2.1c — engine_rpc.rs builds an Ed25519 trusted-key
 # verifier from the enrollment-bundled SPKI public-key PEM so the

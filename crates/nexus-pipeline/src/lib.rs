@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod entity_sighting;
 pub mod gate;
 pub mod post_roll;
 pub mod preroll;
@@ -33,6 +34,7 @@ pub mod preroll_ingester;
 pub mod thumbnail;
 
 pub use cache::{LatestEntry, LatestFrameCache};
+pub use entity_sighting::{NoopSightingHook, SightingHook, SightingScheduler, SightingSnapshot};
 pub use gate::MotionGate;
 pub use preroll::{NalRingBuffer, NalSample};
 pub use recorder::{

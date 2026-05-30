@@ -193,6 +193,31 @@ capacity = 1024
 # nats_url = "nats://nats:4222"
 
 # -----------------------------------------------------------------
+# Re-identification (Phase 5.6 — wedge identity graph)
+# -----------------------------------------------------------------
+# Disabled by default. When enabled the per-camera supervisor emits
+# an `entity_sighting` envelope per stable track (first sighting +
+# every `emit_interval_s` thereafter) carrying an appearance
+# embedding. Cloud-side allowlist accepts ONLY `dinov2-s-v1` or
+# `osnet-x1.0-v1`; with no `model_path` (or no `ort` cargo feature)
+# the engine falls back to a `MockExtractor` and SKIPS the cloud
+# publish entirely (logged at debug).
+#
+# [reid]
+# enabled = false
+# # ONNX path. Ship via the model-pack release (models-v2+) into
+# # /opt/nexus/current/models/dinov2_s_224.onnx. Omit to force
+# # mock-only / disable cloud submissions.
+# # model_path = "models/dinov2_s_224.onnx"
+# model_id = "dinov2-s-v1"
+# dim = 384
+# emit_interval_s = 5
+# min_track_age_frames = 5
+# # ep_priority = ["coreml", "cpu"]   # macOS dev
+# # ep_priority = ["openvino", "cpu"] # Intel iGPU/NPU
+# # ep_priority = ["cuda", "cpu"]     # NVIDIA
+
+# -----------------------------------------------------------------
 # Cameras (DB is the source of truth; this seeds an empty DB)
 # -----------------------------------------------------------------
 [[cameras]]

@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::cache::LatestFrameCache;
+use crate::entity_sighting::{SightingHook, SightingScheduler};
 use crate::gate::MotionGate;
 use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{
@@ -31,6 +32,25 @@ use crate::recorder::{
 use crate::source::{FrameSource, VirtualSource};
 use crate::static_clear::StaticAnchorClearRegistry;
 use crate::stats::FrameStatsRegistry;
+
+/// Tunables for the per-camera [`SightingScheduler`]. Constructed
+/// at the engine boot site so all per-camera supervisors share the
+/// same cadence + minimum-stability thresholds. Passed by value into
+/// [`spawn_camera`].
+#[derive(Debug, Clone, Copy)]
+pub struct SightingSchedulerConfig {
+    pub min_track_age_frames: u32,
+    pub emit_interval: std::time::Duration,
+}
+
+impl Default for SightingSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            min_track_age_frames: 5,
+            emit_interval: std::time::Duration::from_secs(5),
+        }
+    }
+}
 
 pub struct CameraHandle {
     pub camera_id: CameraId,
@@ -65,6 +85,8 @@ pub fn spawn_camera(
     static_clear: Arc<StaticAnchorClearRegistry>,
     supervisor_w: u32,
     supervisor_h: u32,
+    sighting_hook: Arc<dyn SightingHook>,
+    sighting_cfg: SightingSchedulerConfig,
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
@@ -84,6 +106,8 @@ pub fn spawn_camera(
         static_clear,
         supervisor_w,
         supervisor_h,
+        sighting_hook,
+        sighting_cfg,
     ));
     CameraHandle { camera_id, task }
 }
@@ -106,6 +130,8 @@ async fn run_camera(
     static_clear: Arc<StaticAnchorClearRegistry>,
     supervisor_w: u32,
     supervisor_h: u32,
+    sighting_hook: Arc<dyn SightingHook>,
+    sighting_cfg: SightingSchedulerConfig,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -178,6 +204,16 @@ async fn run_camera(
         // last live track disappears. clip_id is stamped on every
         // motion_events row before insert (schema invariant).
         let mut emitter = MotionEventEmitter::new(clips_cfg.motion_events_sample_hz);
+        // Phase 5.6 · slice 4c-ii — per-camera entity-sighting
+        // scheduler. Drives the engine's [`SightingHook`] (default
+        // [`NoopSightingHook`]) once per stable track per
+        // `emit_interval`. Cheap when the hook is the noop — just a
+        // HashMap probe + counter bump per frame.
+        let mut sighting_scheduler = SightingScheduler::new(
+            cfg.id,
+            sighting_cfg.min_track_age_frames,
+            sighting_cfg.emit_interval,
+        );
         let mut current_clip: Option<ClipHandle> = None;
         // Wall-clock anchor for the currently-open clip. Used to
         // enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
@@ -360,7 +396,8 @@ async fn run_camera(
             let tracked_arc = Arc::new(tracked.clone());
 
             // L7 cache update — see ARCHITECTURE.md.
-            cache.put(cfg.id, Arc::new(frame.clone()), tracked_arc.clone());
+            let frame_arc = Arc::new(frame.clone());
+            cache.put(cfg.id, frame_arc.clone(), tracked_arc.clone());
 
             // Lightweight metadata onto the bus.
             let meta = FrameMetadata {
@@ -391,6 +428,17 @@ async fn run_camera(
             } else {
                 tracked.clone()
             };
+
+            // Phase 5.6 · slice 4c-ii — fire stable-track sightings
+            // into the engine hook. Skips parked-car tracks the
+            // static-object filter has masked off (same partition
+            // as rule eval + motion lifecycle).
+            sighting_scheduler.tick(
+                &frame_arc,
+                &dynamic_tracked,
+                frame.captured_at,
+                sighting_hook.as_ref(),
+            );
 
             let events = {
                 let _g = info_span!("frame.rules").entered();
