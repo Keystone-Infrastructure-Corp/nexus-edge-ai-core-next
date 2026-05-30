@@ -135,6 +135,12 @@ The wedge plan that drives the next three phases of work is
 
 ## Workflow
 
+0. **Always rebase before committing.** Before staging any commit, run
+   `git fetch && git rebase origin/main` (or `git pull --rebase origin main`). Never
+   `git pull` (default merge) into a working branch — it creates noisy merge commits
+   that the squash-merge model cannot collapse cleanly. If you have local work in
+   progress, `git stash` first or use `git pull --rebase --autostash`. Resolve any
+   rebase conflicts before continuing.
 1. Pick a step from the wedge plan or a milestone doc in the cloud repo's docs index
    (linked above). Cross-repo work that lands in both repos in the same PR pair is
    common — open companion PRs.
