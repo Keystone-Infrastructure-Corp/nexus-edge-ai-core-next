@@ -678,7 +678,7 @@ impl ClipRecorder for GstClipRecorder {
                 path: state.path,
                 duration_ms,
                 size_bytes: 0,
-                codec: CODEC.into(),
+                codec: state.codec.base().into(),
                 container: CONTAINER.into(),
                 discarded: true,
             });
@@ -793,7 +793,7 @@ impl ClipRecorder for GstClipRecorder {
             path: final_used,
             duration_ms,
             size_bytes,
-            codec: CODEC.into(),
+            codec: state.codec.base().into(),
             container: CONTAINER.into(),
             discarded: false,
         })
