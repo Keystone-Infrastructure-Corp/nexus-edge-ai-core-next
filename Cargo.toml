@@ -59,7 +59,15 @@ chrono-tz = { version = "0.10", features = ["serde"] }
 
 # Tracing / OTEL
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Pinned to 0.3.20: versions 0.3.22+ regressed with a `clone_span`
+# panic on spans entered across `.await` points (tokio-rs/tracing#3514,
+# caused by PR #3289 removing the defensive clone in `enter`). The
+# supervisor's per-frame pipeline uses `info_span!(...).entered()` for
+# sub-span timing inside an outer `.instrument(span)` async block that
+# survives across `rx.recv().await`, which trips the regression and
+# core-dumps the engine every ~30 s under live RTSP load. Revisit when
+# tokio-rs/tracing#3514 is fixed.
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
