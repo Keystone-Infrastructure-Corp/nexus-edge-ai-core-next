@@ -617,7 +617,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         bus.clone(),
         usb_resolver.clone(),
         preferred_usb_label.clone(),
-    )?;
+    )
+    .await?;
     info!(
         kind = recorder.kind(),
         preferred_usb_label = ?initial_label,
@@ -1773,7 +1774,7 @@ fn build_reid_extractor(cfg: &nexus_config::ReidConfig) -> Arc<dyn nexus_reid::E
 // Single internal scaffolding fn — pulling the eight wires through a
 // struct just to satisfy the lint costs more clarity than it buys.
 #[allow(clippy::too_many_arguments)]
-fn build_recorder(
+async fn build_recorder(
     kind: &RecorderKind,
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
@@ -1790,22 +1791,25 @@ fn build_recorder(
                 .with_bus(bus)
                 .with_usb(usb_resolver, preferred_usb_label),
         )),
-        RecorderKind::Gstreamer => build_gst_recorder(
-            store,
-            clips_dir,
-            cameras,
-            default_detector_width,
-            pre_roll_secs,
-            bus,
-            usb_resolver,
-            preferred_usb_label,
-        ),
+        RecorderKind::Gstreamer => {
+            build_gst_recorder(
+                store,
+                clips_dir,
+                cameras,
+                default_detector_width,
+                pre_roll_secs,
+                bus,
+                usb_resolver,
+                preferred_usb_label,
+            )
+            .await
+        }
     }
 }
 
 #[cfg(feature = "gstreamer")]
 #[allow(clippy::too_many_arguments)]
-fn build_gst_recorder(
+async fn build_gst_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     cameras: &[CameraConfig],
@@ -1841,14 +1845,40 @@ fn build_gst_recorder(
             .map(|m| m.input_width)
             .unwrap_or(default_detector_width);
         let (rgb_w, rgb_h) = nexus_pipeline::supervisor_frame_for(det_w);
-        let codec = cam.ingest.codec.unwrap_or_else(|| {
-            tracing::warn!(
-                camera_id = cam.id,
-                url = %cam.ingest.url,
-                "camera codec unspecified; defaulting to h264 — set `ingest.codec` in the camera config to silence"
-            );
-            nexus_types::CodecKind::H264
-        });
+        // Autodetect codec for cameras stored with `codec=None`
+        // (operator picked "auto", or row predates the column).
+        // Mirrors what `create_camera` does at create-time; needed
+        // at boot for legacy rows + per-boot re-probe of "auto".
+        let codec = match cam.ingest.codec {
+            Some(c) => c,
+            None => {
+                let scheme = cam.ingest.url.scheme();
+                let probed = if scheme == "rtsp" || scheme == "rtsps" {
+                    crate::discovery::rtsp_probe::probe_codec_for_url(&cam.ingest.url).await
+                } else {
+                    None
+                };
+                match probed {
+                    Some(c) => {
+                        tracing::info!(
+                            camera_id = cam.id,
+                            url = %cam.ingest.url,
+                            codec = %c,
+                            "codec autodetected at boot"
+                        );
+                        c
+                    }
+                    None => {
+                        tracing::warn!(
+                            camera_id = cam.id,
+                            url = %cam.ingest.url,
+                            "camera codec unspecified and autodetect probe failed; defaulting to h264 — set `ingest.codec` in the camera config to silence"
+                        );
+                        nexus_types::CodecKind::H264
+                    }
+                }
+            }
+        };
         match nexus_pipeline::PreRollIngester::new_with_rgb(
             cam.id,
             cam.ingest.url.to_string(),
@@ -1887,7 +1917,7 @@ fn build_gst_recorder(
 
 #[cfg(not(feature = "gstreamer"))]
 #[allow(clippy::too_many_arguments)]
-fn build_gst_recorder(
+async fn build_gst_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     _cameras: &[CameraConfig],

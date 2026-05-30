@@ -270,14 +270,39 @@ async fn start_camera(
     // the supervisor opens its first motion clip. Failure is logged
     // but non-fatal: detection still runs; clip opens for this
     // camera return Refused until the next reconcile pass.
-    let codec = cam.ingest.codec.unwrap_or_else(|| {
-        warn!(
-            camera_id = cam_id,
-            %url,
-            "camera codec unspecified; defaulting to h264 — set `ingest.codec` in the camera config to silence"
-        );
-        CodecKind::H264
-    });
+    let codec = match cam.ingest.codec {
+        Some(c) => c,
+        None => {
+            // Same boot-time autodetect as build_gst_recorder so a
+            // hot-added "auto" camera (operator left codec=None)
+            // gets probed instead of silently defaulting to h264.
+            let scheme = cam.ingest.url.scheme();
+            let probed = if scheme == "rtsp" || scheme == "rtsps" {
+                crate::discovery::rtsp_probe::probe_codec_for_url(&cam.ingest.url).await
+            } else {
+                None
+            };
+            match probed {
+                Some(c) => {
+                    info!(
+                        camera_id = cam_id,
+                        %url,
+                        codec = %c,
+                        "codec autodetected at hot-add"
+                    );
+                    c
+                }
+                None => {
+                    warn!(
+                        camera_id = cam_id,
+                        %url,
+                        "camera codec unspecified and autodetect probe failed; defaulting to h264 — set `ingest.codec` in the camera config to silence"
+                    );
+                    CodecKind::H264
+                }
+            }
+        }
+    };
     if let Err(e) = args.recorder.add_camera_ingester(
         cam_id,
         url,
