@@ -263,6 +263,14 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 # Cryptographic RNG for ed25519-dalek test key generation. Workspace
 # dep so test crates that mint Ed25519 keys can share the version pin.
 rand_core = { version = "0.6", features = ["getrandom"] }
+# M_PERF_CROWD B3 — per-scheduler PRNG used by the entity-sighting
+# scheduler to jitter the first-emit timestamp so freshly-stable
+# tracks don't lock-step their periodic re-emit with their siblings
+# on the same camera. `small_rng` selects the lightweight Xoshiro
+# generator; we do not need cryptographic strength here. Already
+# present transitively in Cargo.lock; promoting to a direct workspace
+# dep avoids a second resolved version when more crates pick it up.
+rand = { version = "0.8", features = ["small_rng"] }
 
 # Phase 1.8 — engine `enroll` subcommand. `rcgen` builds the PKCS#10
 # CSR around an Ed25519 keypair we feed it; `tokio-tungstenite` +

@@ -40,6 +40,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use nexus_types::{BBox, CameraId, Frame, TrackId, TrackedObject};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 
 /// One persisted `(camera_id, track_id) -> entity_local_id` record
 /// loaded from `nexus-store` at supervisor boot. Passed to
@@ -155,6 +156,14 @@ pub struct SightingScheduler {
     /// they would have hydrated.
     seed: HashMap<TrackId, EntityLocalSeed>,
     persist: Arc<dyn EntityLocalPersist>,
+    /// M_PERF_CROWD B3 — per-scheduler PRNG used to jitter the
+    /// first-emit `last_emit_at` stamp so newly-stable tracks don't
+    /// lock-step their periodic re-emit with their siblings on the
+    /// same camera. Only consulted when `jitter_first_emit` is true;
+    /// callers opt in via [`Self::with_first_emit_jitter`] (prod) or
+    /// [`Self::with_rng_seed`] (deterministic tests).
+    rng: SmallRng,
+    jitter_first_emit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +230,31 @@ impl SightingScheduler {
             tracks: HashMap::new(),
             seed,
             persist,
+            rng: SmallRng::seed_from_u64(0),
+            jitter_first_emit: false,
         }
+    }
+
+    /// M_PERF_CROWD B3 — enable the first-emit jitter using a PRNG
+    /// seeded from system entropy. Production callers (engine
+    /// supervisor) should chain this on; the constructors leave
+    /// jitter disabled so unit tests stay deterministic by default.
+    #[must_use]
+    pub fn with_first_emit_jitter(mut self) -> Self {
+        self.rng = SmallRng::from_entropy();
+        self.jitter_first_emit = true;
+        self
+    }
+
+    /// M_PERF_CROWD B3 — enable the first-emit jitter with a
+    /// deterministic PRNG seed. Tests use this to make the jitter
+    /// stream reproducible; production callers should prefer
+    /// [`Self::with_first_emit_jitter`].
+    #[must_use]
+    pub fn with_rng_seed(mut self, seed: u64) -> Self {
+        self.rng = SmallRng::seed_from_u64(seed);
+        self.jitter_first_emit = true;
+        self
     }
 
     /// M_PERF_CROWD B2 — enable the adaptive re-emit cadence. When
@@ -314,9 +347,26 @@ impl SightingScheduler {
                     is_first: plan.is_first,
                 });
                 emitted += 1;
+                // M_PERF_CROWD B3 — back-date the first-emit stamp
+                // by a random offset in [0, emit_interval) so this
+                // track's next periodic re-emit phase-shifts away
+                // from its siblings'. Periodic re-emits use `now`
+                // unchanged so the jitter doesn't compound. Jitter
+                // is opt-in via `with_first_emit_jitter` / seed.
+                let stamp = if plan.is_first && self.jitter_first_emit {
+                    let interval_ms = self.emit_interval.as_millis().min(i64::MAX as u128) as i64;
+                    if interval_ms > 0 {
+                        let jitter_ms = self.rng.gen_range(0..interval_ms);
+                        now - chrono::Duration::milliseconds(jitter_ms)
+                    } else {
+                        now
+                    }
+                } else {
+                    now
+                };
                 // Re-borrow to stamp last_emit_at now that submit returned.
                 if let Some(entry) = self.tracks.get_mut(&obj.track_id) {
-                    entry.last_emit_at = Some(now);
+                    entry.last_emit_at = Some(stamp);
                 }
                 self.persist.upsert(EntityLocalUpdate {
                     camera_id: self.camera_id,
@@ -761,5 +811,78 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert!(seen[0].is_first);
         assert_eq!(seen[0].track_id, 99);
+    }
+
+    // ------------------------------------------------------------------
+    // M_PERF_CROWD B3 — first-emit timestamp jitter.
+    // ------------------------------------------------------------------
+
+    /// Drive a single track to its first emit at `t0`, then tick at
+    /// `t0 + step` for step in 1..emit_interval_ms and return the
+    /// offset (ms after t0) at which the second emit fires. Returns
+    /// `None` if no second emit fires within `emit_interval_ms`.
+    fn second_emit_offset_ms(sched: &mut SightingScheduler) -> Option<i64> {
+        let hook = CaptureHook::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let frame = dummy_frame(7, t0);
+        // First emit at t0 (age=2 > min_track_age=1).
+        assert_eq!(sched.tick(&frame, &[tracked(1, 2)], t0, &hook), 1);
+        hook.seen.lock().clear();
+        for ms in 1..=5_000 {
+            let t = t0 + chrono::Duration::milliseconds(ms);
+            if sched.tick(&frame, &[tracked(1, 3)], t, &hook) == 1 {
+                return Some(ms);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn b3_first_emit_back_dates_so_second_emit_fires_early() {
+        // With a fixed seed, the first emit's `last_emit_at` is
+        // back-dated by some 0..5000ms offset, so the next periodic
+        // emit fires strictly before 5000ms after `t0` (assuming the
+        // RNG didn't draw exactly 0 — seed 0xB3 below draws > 0).
+        let mut sched = SightingScheduler::new(7, 1, Duration::from_secs(5)).with_rng_seed(0xB3);
+        let offset = second_emit_offset_ms(&mut sched).expect("second emit must fire");
+        assert!(
+            offset < 5_000,
+            "back-dated first-emit should make second emit fire before full interval, got {offset}ms",
+        );
+        assert!(
+            offset > 0,
+            "second emit can't fire at the same tick as first"
+        );
+    }
+
+    #[test]
+    fn b3_seeded_jitter_is_deterministic() {
+        // Two schedulers with the same seed must produce identical
+        // second-emit offsets — that's the contract the supervisor
+        // relies on for reproducible test scenarios.
+        let mut a = SightingScheduler::new(7, 1, Duration::from_secs(5)).with_rng_seed(0xB3);
+        let mut b = SightingScheduler::new(7, 1, Duration::from_secs(5)).with_rng_seed(0xB3);
+        assert_eq!(second_emit_offset_ms(&mut a), second_emit_offset_ms(&mut b));
+    }
+
+    #[test]
+    fn b3_different_seeds_produce_different_phase_offsets() {
+        // The whole point of B3 is that sibling tracks land on
+        // different jitter offsets. Two distinct seeds must produce
+        // distinct second-emit offsets for the same input.
+        let mut a = SightingScheduler::new(7, 1, Duration::from_secs(5)).with_rng_seed(0xB3);
+        let mut b = SightingScheduler::new(7, 1, Duration::from_secs(5)).with_rng_seed(0xC4);
+        assert_ne!(second_emit_offset_ms(&mut a), second_emit_offset_ms(&mut b));
+    }
+
+    #[test]
+    fn b3_zero_emit_interval_does_not_panic() {
+        // Defensive: if a config bug ever lands `emit_interval = 0`,
+        // the jitter call must not panic on `gen_range(0..0)`.
+        let hook = CaptureHook::default();
+        let mut sched = SightingScheduler::new(7, 1, Duration::ZERO).with_rng_seed(0xB3);
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let frame = dummy_frame(7, t0);
+        assert_eq!(sched.tick(&frame, &[tracked(1, 2)], t0, &hook), 1);
     }
 }

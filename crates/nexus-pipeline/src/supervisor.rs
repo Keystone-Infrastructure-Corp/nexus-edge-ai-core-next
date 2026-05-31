@@ -236,7 +236,8 @@ async fn run_camera(
         .with_crowded_cadence(
             sighting_cfg.crowded_track_threshold,
             sighting_cfg.crowded_emit_interval,
-        );
+        )
+        .with_first_emit_jitter();
         let mut current_clip: Option<ClipHandle> = None;
         // Wall-clock anchor for the currently-open clip. Used to
         // enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the

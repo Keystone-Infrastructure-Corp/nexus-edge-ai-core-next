@@ -33,6 +33,7 @@ bytes = { workspace = true }
 once_cell = { workspace = true }
 url = { workspace = true }
 futures = { workspace = true }
+rand = { workspace = true }
 
 gstreamer = { workspace = true, optional = true }
 gstreamer-app = { workspace = true, optional = true }

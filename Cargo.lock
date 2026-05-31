@@ -2328,6 +2328,7 @@ dependencies = [
  "nexus-types",
  "once_cell",
  "parking_lot",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2",
