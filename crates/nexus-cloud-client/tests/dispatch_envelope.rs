@@ -233,3 +233,114 @@ async fn dispatch_envelope_rejects_non_rpc_call() {
         DispatchError::Reject(RejectReason::Invalid(InvalidReason::MalformedClaims))
     ));
 }
+
+/// Spy handler that records the actor passed to it. Used to confirm
+/// the dispatcher synthesises the `anonymous:cloud-read` actor for
+/// token-less read-only RPCs (ARCHITECTURE.md §5.7).
+struct ArcSpyHandler {
+    seen: Arc<std::sync::Mutex<Option<VerifiedActor>>>,
+}
+
+#[async_trait]
+impl Handler for ArcSpyHandler {
+    async fn handle(
+        &self,
+        _method: &str,
+        _envelope: EnvelopeContext<'_>,
+        actor: &VerifiedActor,
+        _body: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        *self.seen.lock().unwrap() = Some(actor.clone());
+        Ok(b"{}".to_vec())
+    }
+}
+
+fn build_dispatcher_with_spy() -> (
+    RpcDispatcher<ArcSpyHandler>,
+    Arc<std::sync::Mutex<Option<VerifiedActor>>>,
+) {
+    let sk = SigningKey::generate(&mut OsRng);
+    let trusted = TrustedKey {
+        kid: "k1".into(),
+        key: sk.verifying_key(),
+    };
+    let verifier = VerifierBuilder::new(CORE_ID)
+        .trusted_key(trusted)
+        .replay(Arc::new(JtiReplayCache::new()))
+        .build()
+        .expect("verifier");
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let handler = ArcSpyHandler { seen: seen.clone() };
+    let dispatcher = RpcDispatcher::new(verifier, SystemMethodPolicy::default(), handler);
+    (dispatcher, seen)
+}
+
+#[tokio::test]
+async fn dispatch_envelope_anonymous_get_without_actor_token_accepted() {
+    let (dispatcher, seen) = build_dispatcher_with_spy();
+    let env = rpc_envelope(RpcCallPayload {
+        actor_token: None,
+        body: None,
+        headers: None,
+        method: "GET".into(),
+        path: "/admin/discovery/sessions/abc".into(),
+        request_id: Some(uuid::Uuid::now_v7().to_string()),
+    });
+
+    let resp = dispatcher
+        .dispatch_envelope(&env)
+        .await
+        .expect("token-less GET accepted as anonymous read");
+    assert_eq!(resp.status, 200);
+
+    let captured = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler observed the synthesised actor");
+    assert_eq!(captured.sub, "anonymous:cloud-read");
+    assert_eq!(captured.role, "anonymous");
+}
+
+#[tokio::test]
+async fn dispatch_envelope_anonymous_head_and_options_also_accepted() {
+    for method in ["HEAD", "OPTIONS", "get", "Head"] {
+        let (dispatcher, _seen) = build_dispatcher_with_spy();
+        let env = rpc_envelope(RpcCallPayload {
+            actor_token: None,
+            body: None,
+            headers: None,
+            method: method.into(),
+            path: "/admin/anything".into(),
+            request_id: Some(uuid::Uuid::now_v7().to_string()),
+        });
+        let resp = dispatcher
+            .dispatch_envelope(&env)
+            .await
+            .unwrap_or_else(|e| panic!("method {method} should be accepted, got {e:?}"));
+        assert_eq!(resp.status, 200, "method {method}");
+    }
+}
+
+#[tokio::test]
+async fn dispatch_envelope_mutating_without_actor_token_still_rejected() {
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        let (dispatcher, _seen) = build_dispatcher_with_spy();
+        let env = rpc_envelope(RpcCallPayload {
+            actor_token: None,
+            body: None,
+            headers: None,
+            method: method.into(),
+            path: "/admin/v1/cameras".into(),
+            request_id: Some(uuid::Uuid::now_v7().to_string()),
+        });
+        let err = dispatcher
+            .dispatch_envelope(&env)
+            .await
+            .expect_err("mutating method without token must reject");
+        assert!(
+            matches!(err, DispatchError::Reject(RejectReason::Missing)),
+            "method {method}: expected RejectReason::Missing, got {err:?}"
+        );
+    }
+}

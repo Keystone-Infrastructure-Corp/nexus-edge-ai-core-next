@@ -279,7 +279,25 @@ impl<H: Handler> RpcDispatcher<H> {
         request_id: Option<&str>,
         body: Option<&[u8]>,
     ) -> Result<Vec<u8>, DispatchError> {
-        let token = token.ok_or(DispatchError::Reject(RejectReason::Missing))?;
+        let token = match token {
+            Some(t) => t,
+            None => {
+                // ARCHITECTURE.md §5.7: read-only RPCs MAY omit
+                // `actor_token` for v1; the engine treats them as
+                // anonymous reads served from the loopback admin API.
+                // Mutating methods without a token continue to reject
+                // with `actor_token_missing`.
+                if is_safe_http_method(envelope.method) {
+                    let actor = anonymous_read_actor();
+                    return self
+                        .handler
+                        .handle(method, envelope, &actor, body)
+                        .await
+                        .map_err(DispatchError::Handler);
+                }
+                return Err(DispatchError::Reject(RejectReason::Missing));
+            }
+        };
 
         // Phase 1.16: the response-cache-equipped path verifies WITHOUT
         // touching the [`crate::jti_cache::JtiReplayCache`] so a
@@ -380,4 +398,30 @@ fn derive_method_name(payload: &RpcCallPayload) -> &str {
         .rsplit('/')
         .find(|s| !s.is_empty())
         .unwrap_or("_root")
+}
+
+/// `sub` claim stamped onto the synthesised actor for token-less
+/// read-only RPCs (ARCHITECTURE.md §5.7). Engine handlers that want
+/// to special-case the anonymous-read path can match on this value.
+pub const ANONYMOUS_READ_SUB: &str = "anonymous:cloud-read";
+
+/// `role` claim stamped onto the synthesised actor for token-less
+/// read-only RPCs. Sits below `viewer` in the engine's role lattice
+/// so it cannot accidentally satisfy any privileged-role gate.
+pub const ANONYMOUS_READ_ROLE: &str = "anonymous";
+
+fn is_safe_http_method(method: &str) -> bool {
+    matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS"
+    )
+}
+
+fn anonymous_read_actor() -> VerifiedActor {
+    VerifiedActor {
+        sub: ANONYMOUS_READ_SUB.to_string(),
+        role: ANONYMOUS_READ_ROLE.to_string(),
+        jti: String::new(),
+        org_id: String::new(),
+    }
 }
