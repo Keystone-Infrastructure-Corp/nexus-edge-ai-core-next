@@ -469,6 +469,7 @@ mod tests {
             name: "z1".into(),
             polygon: vec![(0.0, 0.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5)],
             kind: ZoneKind::Inclusion,
+            min_bbox_area_px_override: None,
         };
         let zones = vec![zone];
 
@@ -501,6 +502,7 @@ mod tests {
             name: "x".into(),
             polygon: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
             kind: ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
         };
         let mut o = vec![obj(1, "person", 100.0, 100.0)];
         a.annotate(&frame_at(0, 1920, 1080), &[zone], &mut o);
@@ -521,18 +523,21 @@ mod tests {
                 name: "parking".into(),
                 polygon: vec![(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)],
                 kind: ZoneKind::Inclusion,
+                min_bbox_area_px_override: None,
             },
             ZoneConfig {
                 id: "loading_dock".into(),
                 name: "loading_dock".into(),
                 polygon: vec![(0.2, 0.2), (0.6, 0.2), (0.6, 0.6), (0.2, 0.6)],
                 kind: ZoneKind::Inclusion,
+                min_bbox_area_px_override: None,
             },
             ZoneConfig {
                 id: "should_never_appear".into(),
                 name: "x".into(),
                 polygon: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
                 kind: ZoneKind::Exclusion,
+                min_bbox_area_px_override: None,
             },
         ];
 

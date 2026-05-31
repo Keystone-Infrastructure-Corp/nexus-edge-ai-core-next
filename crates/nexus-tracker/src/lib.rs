@@ -34,7 +34,7 @@ pub use static_object::{
     is_object_static, StaticObjectFilter, EMA_ATTRIBUTE_KEY, MOVING_FRAMES_ATTRIBUTE_KEY,
     STATIC_ATTRIBUTE_KEY, STATIC_FRAMES_ATTRIBUTE_KEY,
 };
-pub use zone_filter::filter_excluded_zones;
+pub use zone_filter::{filter_excluded_zones, filter_zone_min_area};
 
 // ---------------------------------------------------------------------------
 // Trait

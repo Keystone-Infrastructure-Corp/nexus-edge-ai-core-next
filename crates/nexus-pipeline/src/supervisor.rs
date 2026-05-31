@@ -14,8 +14,8 @@ use nexus_inference::{label_matches_any_prompt, Detector};
 use nexus_rules::RuleEvaluator;
 use nexus_store::{EventStore, MotionEventKind, NewMotionEvent, Store};
 use nexus_tracker::{
-    filter_excluded_zones, is_object_static, MotionDecision, MotionEventEmitter, MotionKind,
-    StaticObjectFilter, TrackAnnotator, Tracker,
+    filter_excluded_zones, filter_zone_min_area, is_object_static, MotionDecision,
+    MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
 };
 use nexus_types::{CameraId, Frame, FrameMetadata, PipelineState, PipelineStatus, TrackedObject};
 use tokio::sync::mpsc;
@@ -386,6 +386,21 @@ async fn run_camera(
                     debug!(
                         camera_id = cfg.id,
                         frame_id, dropped, "exclusion zone filter dropped objects"
+                    );
+                }
+                // M_PERF_CROWD Phase B1 — per-zone min-bbox-area
+                // override. Fast path no-op when no zone declares
+                // `min_bbox_area_px_override`; otherwise drops tracked
+                // objects whose centre lies in an override zone and
+                // whose bbox area is below that zone's threshold.
+                // Layered on top of the global
+                // `ModelConfig::min_bbox_area_px` (which fires at the
+                // inference wrapper before tracking).
+                let dropped = filter_zone_min_area(&frame, &zones, &mut tracked);
+                if dropped > 0 {
+                    debug!(
+                        camera_id = cfg.id,
+                        frame_id, dropped, "per-zone min-area override dropped objects"
                     );
                 }
             }
