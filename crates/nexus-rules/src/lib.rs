@@ -551,6 +551,7 @@ mod tests {
             name: "top-left".into(),
             polygon: vec![(0.0, 0.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5)],
             kind: nexus_config::ZoneKind::Inclusion,
+            min_bbox_area_px_override: None,
         }
     }
 

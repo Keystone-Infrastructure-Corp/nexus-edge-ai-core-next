@@ -17,6 +17,7 @@
 #![deny(unsafe_code)]
 
 pub mod backends;
+pub mod caps;
 pub mod detectors;
 #[cfg(feature = "ort")]
 pub mod encoder;
@@ -41,6 +42,7 @@ pub mod yoloe_visual;
 pub use backends::{
     BackendState, DetectorBackend, InProcessBackend, ThreadIsolatedBackend, WorkerProcessBackend,
 };
+pub use caps::{MinBBoxAreaDetector, TopKDetector};
 pub use detectors::{
     label_matches_any_prompt, ClassifierEnsembleDetector, Detector, InferenceError, MockDetector,
     OpenVocabDetector,
@@ -164,6 +166,36 @@ pub fn build_with_context(
 }
 
 fn build_detector_with_context(
+    cfg: &InferenceConfig,
+    ctx: &BuildContext,
+) -> Result<Arc<dyn Detector>, InferenceError> {
+    // M_PERF_CROWD Phase B1 — wrap whatever the per-kind dispatch
+    // returns with the universal per-frame caps. Order: inner →
+    // MinBBoxArea → TopK. The area filter runs first so it can prune
+    // tiny far-field noise before the top-k truncation makes its
+    // confidence-ranked cut on what remains.
+    let inner = build_detector_kind(cfg, ctx)?;
+    let inner = if let Some(min_area) = cfg.model.min_bbox_area_px {
+        if min_area > 0 {
+            Arc::new(MinBBoxAreaDetector::new(inner, min_area)) as Arc<dyn Detector>
+        } else {
+            inner
+        }
+    } else {
+        inner
+    };
+    let inner = if let Some(k) = cfg.model.top_k {
+        // yoloe_promptfree already applies top_k internally; the outer
+        // wrapper is idempotent (already sorted+truncated input stays
+        // sorted+truncated) so we don't special-case the kind here.
+        Arc::new(TopKDetector::new(inner, k)) as Arc<dyn Detector>
+    } else {
+        inner
+    };
+    Ok(inner)
+}
+
+fn build_detector_kind(
     cfg: &InferenceConfig,
     _ctx: &BuildContext,
 ) -> Result<Arc<dyn Detector>, InferenceError> {

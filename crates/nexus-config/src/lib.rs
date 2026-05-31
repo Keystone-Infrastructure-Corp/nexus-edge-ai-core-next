@@ -961,13 +961,29 @@ pub struct ModelConfig {
     /// `serde(default)` so existing configs round-trip unchanged).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<ModelConfig>,
-    /// M3.3 — per-frame cap on detections returned by the
-    /// `yoloe_promptfree` prompt-free detector. `None` keeps every
-    /// detection that survives NMS; `Some(k)` truncates to the
-    /// K most-confident objects after the inner detector returns.
-    /// Ignored for every other `kind`.
+    /// Per-frame cap on detections returned by **any** detector kind.
+    /// `None` keeps every detection that survives the inner pipeline;
+    /// `Some(k)` sorts by confidence desc and truncates to the K most-
+    /// confident objects. Wired at construction time via
+    /// [`crate::caps::TopKDetector`] — see
+    /// `crates/nexus-inference/src/caps.rs`.
+    ///
+    /// History: this field originated as the M3.3 yoloe_promptfree-only
+    /// cap and was promoted to a universal knob in M_PERF_CROWD Phase B1
+    /// without renaming so existing configs round-trip unchanged. The
+    /// open-vocab `yoloe_promptfree` kind also applies it internally
+    /// (its baseline behaviour); the outer wrapper is idempotent in
+    /// that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
+    /// M_PERF_CROWD Phase B1 — drop any detection whose bbox area
+    /// (`(x2 − x1) × (y2 − y1)` in supervisor-frame pixels) is below
+    /// this threshold. Primary far-field noise knob for closed-vocab
+    /// `yolo` on wide-angle lenses. `None` disables (current
+    /// behaviour). Per-zone tighter overrides land via
+    /// [`ZoneConfig::min_bbox_area_px_override`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_bbox_area_px: Option<u32>,
 }
 
 impl Default for ModelConfig {
@@ -981,6 +997,7 @@ impl Default for ModelConfig {
             score_threshold: default_score_threshold(),
             members: Vec::new(),
             top_k: None,
+            min_bbox_area_px: None,
         }
     }
 }
@@ -1761,6 +1778,17 @@ pub struct ZoneConfig {
     pub polygon: Vec<(f32, f32)>,
     #[serde(default)]
     pub kind: ZoneKind,
+    /// M_PERF_CROWD Phase B1 — per-zone minimum bbox area, in pixels of
+    /// the supervisor analysis frame. When `Some(N)`, tracked objects
+    /// whose centre lies inside this polygon are dropped if their bbox
+    /// area is below `N`. Layered on top of the global
+    /// [`ModelConfig::min_bbox_area_px`] (applied at the detector
+    /// wrapper). Typical use: keep the global threshold low so a
+    /// doorway zone with no override still admits tiny boxes, while
+    /// non-doorway zones tighten the threshold to suppress distant
+    /// noise. `None` = inherit the global threshold (no extra filter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_bbox_area_px_override: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
