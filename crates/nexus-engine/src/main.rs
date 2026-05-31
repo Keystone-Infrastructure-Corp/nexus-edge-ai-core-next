@@ -1099,6 +1099,24 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     let loopback_admin_base = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
         crate::engine_rpc::loopback_admin_url_from_bind(&cfg.server.api_bind),
     ));
+    // Snapshot the admin secret once (from the same `cfg.auth`
+    // both `admin_auth_layer` and the OIDC login state consume)
+    // so the cloud-tunnel passthrough can mint short-lived HS256
+    // bearers when forwarding cloud→edge admin envelopes onto
+    // the engine's own loopback admin API. Without this, the
+    // M6 `auth.mode = "local"` default — which auto-provisions
+    // an admin secret to `<state_dir>/admin-secret` — makes
+    // strict-mode bearer-or-bust fire on every loopback call,
+    // returning 401 for every cloud-initiated admin operation
+    // (camera discovery, create, edit, etc.). See
+    // `admin_auth::mint_internal_passthrough_bearer`.
+    let cloud_passthrough_admin_secret: Option<std::sync::Arc<String>> = {
+        let bootstrap_state = admin_auth::AdminAuthState::from_config(&cfg.auth)
+            .context("building admin-auth state for cloud passthrough")?;
+        bootstrap_state
+            .admin_secret()
+            .map(|s| std::sync::Arc::new(s.to_string()))
+    };
     let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(
         store.clone(),
         registry.clone(),
@@ -1107,6 +1125,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         cloud_outbox.clone(),
         Some(trace_rx),
         loopback_admin_base.clone(),
+        cloud_passthrough_admin_secret,
     );
 
     let cache_jobs = cold_read_cache::CacheJobs::new(
