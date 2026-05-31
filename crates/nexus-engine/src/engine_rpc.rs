@@ -335,7 +335,22 @@ impl EngineRpcHandler {
         // open the surface to viewers. NotFound (not Forbidden) so
         // we don't leak the existence of the surface to lower-role
         // tokens.
-        if !is_priviledged_role(&actor.role) {
+        //
+        // Read-only methods accept the synthesised `anonymous`
+        // actor too — ARCHITECTURE.md §5.7 lets the cloud's
+        // `send_read_rpc` omit `actor_token`, and the dispatcher
+        // synthesises an `anonymous:cloud-read` actor in that case.
+        // Mutating methods always require a privileged role.
+        let is_safe = matches!(
+            envelope.method.to_ascii_uppercase().as_str(),
+            "GET" | "HEAD" | "OPTIONS"
+        );
+        let role_ok = if is_safe {
+            is_read_capable_role(&actor.role)
+        } else {
+            is_priviledged_role(&actor.role)
+        };
+        if !role_ok {
             return Err(
                 EngineRpcError::NotFound("no handler for this path".to_string()).into_wire_json(),
             );
@@ -748,6 +763,17 @@ fn is_priviledged_role(role: &str) -> bool {
     matches!(role, "owner" | "admin" | "operator")
 }
 
+/// Role lattice for the read-side of the admin passthrough. Mirrors
+/// the cloud's owner/admin/viewer gate on GETs, plus the synthesised
+/// `anonymous` actor that the dispatcher hands us when the cloud's
+/// `send_read_rpc` omits `actor_token` (ARCHITECTURE.md §5.7).
+fn is_read_capable_role(role: &str) -> bool {
+    matches!(
+        role,
+        "owner" | "admin" | "operator" | "viewer" | "anonymous"
+    )
+}
+
 /// Build an outbound `rpc_response` envelope that replies to `req`
 /// with `payload`. Shared by the cloud-tunnel dispatch pump and any
 /// future inbound RPC test harness.
@@ -833,6 +859,21 @@ mod tests {
         assert!(!is_priviledged_role("viewer"));
         assert!(!is_priviledged_role("system:foo"));
         assert!(!is_priviledged_role(""));
+    }
+
+    #[test]
+    fn read_capable_role_gate() {
+        // Mutating side: only privileged roles. Safe side: viewer +
+        // synthesised `anonymous` actor are also allowed so the
+        // dispatcher's token-less read carve-out (ARCHITECTURE §5.7)
+        // doesn't trip the defence-in-depth gate.
+        assert!(is_read_capable_role("owner"));
+        assert!(is_read_capable_role("admin"));
+        assert!(is_read_capable_role("operator"));
+        assert!(is_read_capable_role("viewer"));
+        assert!(is_read_capable_role("anonymous"));
+        assert!(!is_read_capable_role("system:foo"));
+        assert!(!is_read_capable_role(""));
     }
 
     #[test]
