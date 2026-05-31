@@ -518,6 +518,17 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cloud/enroll",
             axum::routing::post(crate::admin_cloud::post_cloud_enroll),
         )
+        // Phase C — operator-set display name for this engine.
+        // Persisted in `engine_runtime_settings.display_name` and
+        // stamped into every cloud heartbeat so the cloud console
+        // can render a friendly name in the cores list. No restart
+        // required — the heartbeat builder reads the row on each
+        // tick.
+        .route(
+            "/v1/admin/server/identity",
+            get(crate::admin_runtime::get_server_identity)
+                .put(crate::admin_runtime::put_server_identity),
+        )
         // M-Admin Phase 0 follow-up — graceful self-restart.
         // Returns 202 immediately, then `execv()`s a fresh
         // copy of the same binary (preserving PID + argv) so

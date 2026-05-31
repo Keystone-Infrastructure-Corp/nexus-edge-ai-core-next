@@ -234,6 +234,9 @@ pub struct HeartbeatPayload {
     /// Phase 1.15: edge wall-clock for skew tracking (gateway writes EMA to cores.last_skew_ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_ts_unix_ms: Option<u64>,
+    /// Phase C: operator-set engine display name (admin/server/identity). Gateway upserts into cores.name as a cache; UI renders this everywhere a core is listed. Omitted by pre-Phase-C edges; empty string is treated identically to omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub online_cameras: u64,
     pub queued_alerts: u64,
     /// Phase 7: OTA-update status block. Omitted by pre-Phase-7 edges.

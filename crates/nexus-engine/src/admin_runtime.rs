@@ -78,6 +78,14 @@ const KEY_UI_BIND: &str = "ui_bind";
 const KEY_AUTH_CONFIG: &str = "auth_config_json";
 const KEY_LOW_WATERMARK_PCT: &str = "low_watermark_pct";
 const KEY_PANIC_WATERMARK_PCT: &str = "panic_watermark_pct";
+/// Operator-set display name for this engine instance. Surfaced
+/// in the local UI header and stamped into every cloud heartbeat
+/// (see `pump_heartbeats` in `cloud_tunnel.rs`) so the cloud
+/// console can render a friendly name instead of the fingerprint
+/// suffix. Stored as a single row in `engine_runtime_settings`;
+/// absent row = no name set (cloud renders the fingerprint
+/// fallback).
+pub(crate) const KEY_DISPLAY_NAME: &str = "display_name";
 
 #[derive(Debug, Deserialize)]
 pub struct PutServerBindReq {
@@ -1738,6 +1746,117 @@ fn do_self_exec(exe: &std::path::Path) {
 // rename or `#[serde(rename_all = ...)]` regression caught by
 // the UI's typed client lights up here first.
 // ============================================================
+
+// ===========================================================
+// Section 9 — Engine display name (operator-set identity)
+// ===========================================================
+//
+// One row in `engine_runtime_settings` keyed on
+// [`KEY_DISPLAY_NAME`]. Surfaced in the local UI header and
+// stamped into every cloud heartbeat. The cloud uses it as a
+// cache for `cores.name` and renders it everywhere a core is
+// listed, falling back to a fingerprint suffix when unset.
+
+const DISPLAY_NAME_MAX_CHARS: usize = 80;
+
+#[derive(Debug, Serialize)]
+pub struct IdentityOut {
+    /// `None` when no operator has set a name. The cloud falls
+    /// back to a fingerprint suffix for display.
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutIdentityReq {
+    /// Operator-supplied name. `None` (or empty string after
+    /// trim) clears the persisted row.
+    pub display_name: Option<String>,
+}
+
+pub async fn get_server_identity(
+    State(s): State<ApiState>,
+    _admin: AdminContext,
+) -> Result<Json<IdentityOut>, ApiError> {
+    let display_name = read_display_name(&s.store).await;
+    Ok(Json(IdentityOut { display_name }))
+}
+
+/// Cheap helper shared with `cloud_tunnel::pump_heartbeats` so
+/// the heartbeat builder doesn't reach into the K/V row layout.
+pub(crate) async fn read_display_name(store: &Store) -> Option<String> {
+    store
+        .read_runtime_setting(KEY_DISPLAY_NAME)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+}
+
+pub async fn put_server_identity(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    admin: AdminContext,
+    Json(req): Json<PutIdentityReq>,
+) -> Result<Json<IdentityOut>, ApiError> {
+    let normalised: Option<String> = req
+        .display_name
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref n) = normalised {
+        if n.chars().count() > DISPLAY_NAME_MAX_CHARS {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("display_name exceeds {DISPLAY_NAME_MAX_CHARS} characters"),
+            ));
+        }
+    }
+
+    let before = read_display_name(&s.store).await;
+    let before_str = serde_json::to_string(&serde_json::json!({"display_name": before})).ok();
+    let after_str = serde_json::to_string(&serde_json::json!({"display_name": &normalised})).ok();
+
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store
+            .write_runtime_setting_tx(&mut tx, KEY_DISPLAY_NAME, normalised.as_deref())
+            .await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            Some(&admin.0),
+            &headers,
+            peer.ip(),
+            "server.identity.put",
+            "admin/server/identity",
+            Some("singleton"),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
+        .await?;
+        Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = tx_res {
+        return Err(ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist failed: {e}"),
+        ));
+    }
+
+    tracing::info!(
+        new_display_name = ?normalised,
+        "admin set server identity; heartbeats will include the new name on next tick",
+    );
+
+    Ok(Json(IdentityOut {
+        display_name: normalised,
+    }))
+}
 
 #[cfg(test)]
 mod tests {

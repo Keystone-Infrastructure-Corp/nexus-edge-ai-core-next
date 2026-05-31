@@ -169,7 +169,7 @@ pub fn spawn_tunnel(
             &admin_http_client,
             admin_secret.as_ref(),
         );
-        run(enrollment, dispatcher, cloud_outbox, rx).await;
+        run(enrollment, dispatcher, cloud_outbox, store, rx).await;
     });
     (tx, handle)
 }
@@ -474,6 +474,7 @@ async fn run(
     enrollment: CloudEnrollment,
     dispatcher: Option<Arc<RpcDispatcher<EngineRpcHandler>>>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
+    store: Arc<Store>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let client = TunnelClient::new(
@@ -506,7 +507,7 @@ async fn run(
                 cloud_outbox.set_handle(Some(
                     conn.clone() as Arc<dyn nexus_cloud_client::TunnelHandle>
                 ));
-                let pump = pump_heartbeats(&*conn, &core_id);
+                let pump = pump_heartbeats(&*conn, &core_id, store.clone());
                 let dispatch = pump_rpc_dispatch(&*conn, inbound, dispatcher.as_deref(), &core_id);
                 tokio::select! {
                     biased;
@@ -626,7 +627,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     debug!(core_id = %core_id, "inbound channel closed; dispatch pump exiting");
 }
 
-async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str) {
+async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc<Store>) {
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let start = std::time::Instant::now();
@@ -634,6 +635,13 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str) {
     loop {
         interval.tick().await;
         seq = seq.wrapping_add(1);
+        // Phase C: stamp the operator-set display name on every
+        // heartbeat so the cloud gateway can refresh its
+        // `cores.name` cache. Read on each tick — operators can
+        // change the name in the local UI and the cloud sees it
+        // within ~30 s with no engine restart. A failure here is
+        // logged but never blocks the heartbeat itself.
+        let name = crate::admin_runtime::read_display_name(&store).await;
         let env = Envelope {
             meta: EnvelopeMeta {
                 id: uuid::Uuid::now_v7().to_string(),
@@ -645,6 +653,7 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str) {
             },
             body: EnvelopeBody::Heartbeat(HeartbeatPayload {
                 edge_ts_unix_ms: Some(now_unix_ms()),
+                name,
                 online_cameras: 0,
                 queued_alerts: 0,
                 release: None,

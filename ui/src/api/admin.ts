@@ -270,6 +270,23 @@ export function putWatermarks(low_pct: number, panic_pct: number) {
 }
 
 
+// --- Phase C: operator-set engine display name ----------------------------
+
+export interface IdentityOut {
+  /** `null` when no name set — the cloud falls back to the
+   * fingerprint suffix for display. */
+  display_name: string | null;
+}
+
+export function getServerIdentity() {
+  return api.get<IdentityOut>("/admin/server/identity");
+}
+
+export function putServerIdentity(display_name: string | null) {
+  return api.put<IdentityOut>("/admin/server/identity", { display_name });
+}
+
+
 // --- Phase 5.6 · R7 — re-identification local diagnostic -----------------
 //
 // `GET /v1/admin/reid/status` pairs the boot-time `[reid]` config

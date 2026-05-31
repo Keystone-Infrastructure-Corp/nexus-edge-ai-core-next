@@ -24,6 +24,7 @@ import {
   Power,
   Save,
   Settings,
+  Tag,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -32,10 +33,12 @@ import {
   getCloudEnrollment,
   getInferenceModel,
   getServerBind,
+  getServerIdentity,
   getWatermarks,
   postCloudEnroll,
   putInferenceModel,
   putServerBind,
+  putServerIdentity,
   putWatermarks,
   restartEngine,
 } from "@/api/admin";
@@ -146,6 +149,34 @@ export function AdminServerPage() {
     // p.action === "set"
     return p.addr !== bindQuery.data?.ui_current;
   })();
+
+  // Identity (engine display name) ---------------------------------------
+  const identityQuery = useQuery({
+    queryKey: ["admin", "server", "identity"],
+    queryFn: () => getServerIdentity(),
+  });
+  const [identityDraft, setIdentityDraft] = useState<string>("");
+  useEffect(() => {
+    if (identityQuery.data && identityDraft === "") {
+      setIdentityDraft(identityQuery.data.display_name ?? "");
+    }
+  }, [identityQuery.data, identityDraft]);
+  const identityMutation = useMutation({
+    mutationFn: (display_name: string | null) =>
+      putServerIdentity(display_name),
+    onSuccess: (res) => {
+      toast.success(
+        res.display_name === null
+          ? "Display name cleared."
+          : `Display name set to \u201c${res.display_name}\u201d.`,
+      );
+      qc.invalidateQueries({ queryKey: ["admin", "server", "identity"] });
+    },
+    onError: (e: unknown) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast.error(`Failed to save display name: ${msg}`);
+    },
+  });
 
   // Watermarks --------------------------------------------------------------
   const wmQuery = useQuery({
@@ -346,6 +377,68 @@ export function AdminServerPage() {
           watermark thresholds take effect on the next engine restart.
         </p>
       </header>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Tag className="h-4 w-4 text-muted-foreground" />
+            Identity
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4 text-sm">
+          <p className="text-xs text-muted-foreground">
+            Friendly name surfaced in the cloud console&apos;s cores
+            list (and in this engine&apos;s local UI header). Takes
+            effect on the next cloud heartbeat — no restart required.
+          </p>
+          <div className="grid gap-2">
+            <Label htmlFor="display-name">Display name</Label>
+            <Input
+              id="display-name"
+              data-testid="identity-display-name"
+              value={identityDraft}
+              onChange={(e) => setIdentityDraft(e.target.value)}
+              placeholder="e.g. Front Office Cam Tower"
+              maxLength={80}
+              disabled={identityQuery.isLoading || identityMutation.isPending}
+            />
+          </div>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              size="sm"
+              data-testid="identity-save"
+              disabled={
+                identityQuery.isLoading
+                || identityMutation.isPending
+                || identityDraft.trim() === (identityQuery.data?.display_name ?? "")
+              }
+              onClick={() => {
+                const next = identityDraft.trim();
+                identityMutation.mutate(next === "" ? null : next);
+              }}
+            >
+              <Save className="mr-1 h-3.5 w-3.5" />
+              Save
+            </Button>
+            {identityQuery.data?.display_name ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                data-testid="identity-clear"
+                disabled={identityMutation.isPending}
+                onClick={() => {
+                  setIdentityDraft("");
+                  identityMutation.mutate(null);
+                }}
+              >
+                Clear
+              </Button>
+            ) : null}
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
