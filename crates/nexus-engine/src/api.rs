@@ -288,6 +288,12 @@ pub fn router(state: ApiState) -> Router {
     // on these routes; `route_layer` (vs `layer`) keeps 404s
     // outside the gate.
     let admin = Router::new()
+        // Storage snapshot mirror under `/v1/admin/storage` — same
+        // handler as the public `/v1/storage` GET below, surfaced
+        // under the admin gate so the cloud console (which only
+        // proxies `/admin/*` paths) can render the Storage tab in
+        // a single round-trip. Read-only.
+        .route("/v1/admin/storage", get(get_storage))
         .route("/v1/admin/storage/cold", put(put_storage_cold))
         .route(
             "/v1/admin/storage/backends/{handle}",
