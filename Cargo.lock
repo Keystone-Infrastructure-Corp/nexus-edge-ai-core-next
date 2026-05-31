@@ -2252,6 +2252,7 @@ dependencies = [
  "nix",
  "nvml-wrapper",
  "parking_lot",
+ "percent-encoding",
  "perf-event-open-sys",
  "quick-xml",
  "rcgen",
