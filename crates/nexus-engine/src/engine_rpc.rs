@@ -52,13 +52,18 @@ use tracing::{debug, warn};
 /// `/admin/*` envelope is forwarded verbatim to the local API
 /// (Phase A Step 5 — see `handle_admin_passthrough`).
 ///
-/// The passthrough relies on the `admin_auth_layer` loopback-bypass
-/// rule (`admin_auth.rs` decision matrix item 3): connecting from
-/// `127.0.0.1` is implicitly trusted, so we don't have to mint an
-/// admin bearer token for each forwarded call. The dispatcher has
-/// already verified the cloud-issued `actor_token` and the audit
-/// sink has already recorded the cloud actor BEFORE this handler
-/// runs, so the audit chain is preserved end-to-end.
+/// When `admin_secret` is `Some`, the passthrough mints a fresh
+/// short-lived HS256 bearer per loopback request via
+/// [`crate::admin_auth::mint_internal_passthrough_bearer`] and
+/// attaches it as `Authorization: Bearer …`. This is required
+/// whenever the engine has an admin secret configured (the M6
+/// `auth.mode = "local"` default auto-provisions one), because
+/// strict-mode then makes the bearer mandatory on every admin
+/// write — the historic loopback bypass only applies when the
+/// secret is unset. The dispatcher has already verified the
+/// cloud-issued `actor_token` and the audit sink has already
+/// recorded the cloud actor BEFORE this handler runs, so the
+/// audit chain is preserved end-to-end.
 pub struct EngineRpcHandler {
     pub store: Arc<Store>,
     pub replicator_kick: Arc<Notify>,
@@ -69,6 +74,14 @@ pub struct EngineRpcHandler {
     /// runs before the listener actually binds).
     pub loopback_admin_base: Arc<ArcSwap<String>>,
     pub http_client: reqwest::Client,
+    /// Snapshot of the engine's admin secret (loaded once at
+    /// supervisor boot from `auth.admin_secret_path`). `None`
+    /// when no secret is configured — in that case the engine's
+    /// `admin_auth_layer` still allows loopback peers without a
+    /// bearer (decision-matrix item 3). When `Some`, every
+    /// loopback admin call must carry an HS256 bearer signed by
+    /// this secret.
+    pub admin_secret: Option<Arc<String>>,
 }
 
 /// Granular handler error. Each variant maps to an HTTP status code
@@ -335,6 +348,7 @@ impl EngineRpcHandler {
             envelope.method,
             envelope.path,
             body,
+            self.admin_secret.as_deref().map(String::as_str),
         )
         .await;
 
@@ -378,6 +392,7 @@ async fn forward_admin_request(
     method_str: &str,
     path: &str,
     body: Option<&[u8]>,
+    admin_secret: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let method = match method_str.to_ascii_uppercase().as_str() {
         "GET" => reqwest::Method::GET,
@@ -398,6 +413,25 @@ async fn forward_admin_request(
     let url = format!("{}/api/v1{}", loopback_base.trim_end_matches('/'), path);
 
     let mut req = http_client.request(method, &url);
+    if let Some(secret) = admin_secret {
+        match crate::admin_auth::mint_internal_passthrough_bearer(secret) {
+            Ok(token) => {
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            Err(e) => {
+                warn!(
+                    method = %method_str,
+                    path = %path,
+                    error = %e,
+                    "admin passthrough: minting internal HS256 bearer failed",
+                );
+                return Err(EngineRpcError::Internal(format!(
+                    "minting internal admin bearer failed: {e}"
+                ))
+                .into_wire_json());
+            }
+        }
+    }
     if let Some(b) = body {
         req = req
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -961,7 +995,7 @@ mod tests {
     async fn forward_admin_request_get_2xx_round_trips_body() {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
-        let body = forward_admin_request(&client, &base, "GET", "/admin/cameras", None)
+        let body = forward_admin_request(&client, &base, "GET", "/admin/cameras", None, None)
             .await
             .expect("expected success");
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -980,6 +1014,7 @@ mod tests {
             "POST",
             "/admin/cameras",
             Some(body.as_slice()),
+            None,
         )
         .await
         .expect("expected success");
@@ -994,7 +1029,7 @@ mod tests {
     async fn forward_admin_request_404_json_round_trips_status_and_message() {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
-        let wire = forward_admin_request(&client, &base, "DELETE", "/admin/cameras/999", None)
+        let wire = forward_admin_request(&client, &base, "DELETE", "/admin/cameras/999", None, None)
             .await
             .expect_err("expected 404");
         // Round-trip the wire JSON back into a RpcResponsePayload
@@ -1016,7 +1051,7 @@ mod tests {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
         let wire =
-            forward_admin_request(&client, &base, "GET", "/admin/discovery/sessions/abc", None)
+            forward_admin_request(&client, &base, "GET", "/admin/discovery/sessions/abc", None, None)
                 .await
                 .expect_err("expected non-2xx");
         let resp = parse_handler_error(&wire);
@@ -1036,7 +1071,7 @@ mod tests {
     async fn forward_admin_request_unknown_method_returns_bad_request_wire() {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
-        let wire = forward_admin_request(&client, &base, "OPTIONS", "/admin/cameras", None)
+        let wire = forward_admin_request(&client, &base, "OPTIONS", "/admin/cameras", None, None)
             .await
             .expect_err("OPTIONS not supported by passthrough");
         let resp = parse_handler_error(&wire);
@@ -1060,6 +1095,7 @@ mod tests {
             "GET",
             "/admin/cameras",
             None,
+            None,
         )
         .await
         .expect_err("expected connection error");
@@ -1069,5 +1105,132 @@ mod tests {
             resp.body.get("error").and_then(Value::as_str),
             Some("internal_error")
         );
+    }
+
+    /// Regression for the v0.1.41 production 401 — when the
+    /// engine has an admin secret configured (the M6 `auth.mode
+    /// = "local"` default auto-provisions one), the loopback
+    /// admin API enforces JWT-or-bust and rejects bare loopback
+    /// requests. The passthrough must mint and present an HS256
+    /// bearer signed with the same secret on every call.
+    #[tokio::test]
+    async fn forward_admin_request_with_secret_attaches_internal_bearer() {
+        use axum::extract::Request as AxumRequest;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Json;
+        use axum::Router;
+        use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+        const TEST_SECRET: &str = "shared-with-admin-auth-do-not-leak";
+
+        async fn echo_auth(req: AxumRequest) -> (StatusCode, Json<serde_json::Value>) {
+            let auth = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            (StatusCode::OK, Json(json!({ "authorization": auth })))
+        }
+
+        let app = Router::new().nest(
+            "/api/v1",
+            Router::new().route("/admin/echo-auth", post(echo_auth)),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        tokio::task::yield_now().await;
+        let base = format!("http://{addr}");
+
+        let client = reqwest::Client::new();
+        let body = forward_admin_request(
+            &client,
+            &base,
+            "POST",
+            "/admin/echo-auth",
+            Some(b"{}"),
+            Some(TEST_SECRET),
+        )
+        .await
+        .expect("expected success");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let auth = parsed["authorization"]
+            .as_str()
+            .expect("Authorization header should have been forwarded");
+        let token = auth
+            .strip_prefix("Bearer ")
+            .expect("expected Bearer scheme");
+
+        // Verify the engine signed it with the same secret and
+        // tagged the sub as the documented system principal.
+        #[derive(serde::Deserialize)]
+        struct Claims {
+            sub: String,
+            #[allow(dead_code)]
+            exp: u64,
+        }
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.leeway = 30;
+        let decoded = decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(TEST_SECRET.as_bytes()),
+            &validation,
+        )
+        .expect("token should verify against the same secret");
+        assert_eq!(
+            decoded.claims.sub,
+            crate::admin_auth::INTERNAL_PASSTHROUGH_SUB
+        );
+    }
+
+    /// When no admin secret is configured, the passthrough must
+    /// NOT attach an Authorization header — the engine relies on
+    /// the `admin_auth_layer` loopback bypass (decision-matrix
+    /// item 3) in that mode.
+    #[tokio::test]
+    async fn forward_admin_request_without_secret_omits_authorization() {
+        use axum::extract::Request as AxumRequest;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Json;
+        use axum::Router;
+
+        async fn echo_auth(req: AxumRequest) -> (StatusCode, Json<serde_json::Value>) {
+            let auth = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            (StatusCode::OK, Json(json!({ "authorization": auth })))
+        }
+
+        let app = Router::new().nest(
+            "/api/v1",
+            Router::new().route("/admin/echo-auth", post(echo_auth)),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        tokio::task::yield_now().await;
+        let base = format!("http://{addr}");
+
+        let client = reqwest::Client::new();
+        let body = forward_admin_request(
+            &client,
+            &base,
+            "POST",
+            "/admin/echo-auth",
+            Some(b"{}"),
+            None,
+        )
+        .await
+        .expect("expected success");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["authorization"].is_null());
     }
 }

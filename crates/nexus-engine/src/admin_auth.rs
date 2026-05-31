@@ -83,7 +83,7 @@ use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 /// Env-var escape hatch: when set to exactly `"1"`, the engine
@@ -332,6 +332,63 @@ fn verify_token(token: &str, key: &DecodingKey) -> Result<AdminClaims, AdminAuth
             tracing::debug!(error = %e, "JWT verification failed");
             AdminAuthError::Invalid
         })
+}
+
+/// Subject used by [`mint_internal_passthrough_bearer`] — surfaced
+/// into the engine's own audit log via the HS256 path's
+/// `SessionContext::jti`. Kept as a `system:` prefix so audit
+/// queries can filter machine-issued bearers from operator-issued
+/// ones.
+pub const INTERNAL_PASSTHROUGH_SUB: &str = "system:rpc-passthrough";
+
+/// TTL for the in-process bearer minted by
+/// [`mint_internal_passthrough_bearer`]. Short — the bearer is
+/// consumed in the same tokio task that issued it and never
+/// leaves the box. 60 s gives plenty of headroom for the local
+/// loopback round-trip while keeping the replay window tiny.
+const INTERNAL_PASSTHROUGH_TTL_SECS: u64 = 60;
+
+/// Mint a short-lived HS256 bearer that the cloud-tunnel admin
+/// passthrough ([`crate::engine_rpc::forward_admin_request`])
+/// presents to the engine's own loopback admin API when an
+/// `auth.admin_secret_path` is configured.
+///
+/// **Why this exists.** The M6 `auth.mode = "local"` default
+/// auto-provisions an `admin-secret` file under `<state_dir>/`,
+/// which causes [`AdminAuthState::from_config`] to populate
+/// `state.key = Some(_)` even when the operator never set
+/// `admin_secret_path` explicitly. Decision-matrix item 2 then
+/// fires for the loopback passthrough ("secret configured →
+/// JWT-or-bust"), bypassing the loopback shortcut the passthrough
+/// originally relied on. Rather than punch a per-source-IP hole
+/// in the strict-mode rule, the engine signs its own bearer
+/// in-process — same secret, same alg, same gate.
+///
+/// **Threat surface.** This minting helper is private to the
+/// engine binary: the only caller is [`forward_admin_request`]
+/// inside the same process. There is no HTTP endpoint that mints
+/// bearers (the "no JWT issuance" rule in the module preamble
+/// still holds for external callers). A compromise of the engine
+/// process already grants the attacker read access to the secret
+/// file on disk, so there is no new privilege escalation surface.
+pub fn mint_internal_passthrough_bearer(
+    secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let claims = AdminClaims {
+        exp: now + INTERNAL_PASSTHROUGH_TTL_SECS,
+        sub: Some(INTERNAL_PASSTHROUGH_SUB.to_string()),
+        iat: Some(now),
+    };
+    jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
 }
 
 /// Axum middleware applied to admin write routes. Lives at

@@ -93,6 +93,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// backstop. Any error in this block is logged and the supervisor
 /// continues — the engine remains fully functional locally (Hard
 /// Rule 5 / fail-open).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_tunnel(
     store: Arc<Store>,
     registry: Registry,
@@ -101,8 +102,8 @@ pub fn spawn_tunnel(
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-    let (tx, mut rx) = oneshot::channel::<()>();
+    admin_secret: Option<Arc<String>>,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {    let (tx, mut rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         // Shared HTTP client for the admin-passthrough RPC handler.
         // Cheap to clone (internal `Arc`); reusing one client keeps
@@ -165,6 +166,7 @@ pub fn spawn_tunnel(
             &replicator_kick,
             &loopback_admin_base,
             &admin_http_client,
+            admin_secret.as_ref(),
         );
         run(enrollment, dispatcher, cloud_outbox, rx).await;
     });
@@ -188,6 +190,7 @@ fn build_rpc_dispatcher(
     replicator_kick: &Arc<Notify>,
     loopback_admin_base: &Arc<arc_swap::ArcSwap<String>>,
     http_client: &reqwest::Client,
+    admin_secret: Option<&Arc<String>>,
 ) -> Option<Arc<RpcDispatcher<EngineRpcHandler>>> {
     let signing_pem = enrollment.signing_key_pem.as_deref().or_else(|| {
         warn!(
@@ -238,6 +241,7 @@ fn build_rpc_dispatcher(
         replicator_kick: replicator_kick.clone(),
         loopback_admin_base: loopback_admin_base.clone(),
         http_client: http_client.clone(),
+        admin_secret: admin_secret.cloned(),
     };
     let dispatcher = RpcDispatcher::new(verifier, policy, handler)
         .with_audit_sink(Arc::new(EngineAuditSink {
