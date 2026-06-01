@@ -913,6 +913,80 @@ impl ClipRecorder for GstClipRecorder {
             ingester: ing.clone(),
         }))
     }
+
+    fn resize_camera_rgb_tap(
+        &self,
+        camera_id: CameraId,
+        new_rgb_w: u32,
+        new_rgb_h: u32,
+    ) -> Result<bool, RecorderError> {
+        // Snapshot the existing ingester's identity + connection
+        // params under a short read lock so we can drop it before
+        // doing the slow PreRollIngester::new_with_rgb call.
+        let snapshot = {
+            let read = self.ingesters.read();
+            read.get(&camera_id).map(|ing| {
+                (
+                    ing.url().to_string(),
+                    ing.codec(),
+                    ing.pre_roll_secs(),
+                    ing.max_fps(),
+                    ing.rgb_w(),
+                    ing.rgb_h(),
+                    ing.has_rgb_tap(),
+                )
+            })
+        };
+        let Some((url, codec, pre_roll_secs, max_fps, cur_w, cur_h, had_rgb)) = snapshot else {
+            debug!(
+                camera_id,
+                new_rgb_w, new_rgb_h, "resize_camera_rgb_tap: no ingester registered"
+            );
+            return Ok(false);
+        };
+        if !had_rgb {
+            // Ingester was built via `new` (no RGB tap). Resizing it
+            // would change observable behaviour for callers that
+            // built the legacy path on purpose; refuse instead.
+            debug!(
+                camera_id,
+                "resize_camera_rgb_tap: existing ingester has no RGB tap, skipping"
+            );
+            return Ok(false);
+        }
+        if cur_w == new_rgb_w && cur_h == new_rgb_h {
+            return Ok(false);
+        }
+        let new_ing = PreRollIngester::new_with_rgb(
+            camera_id,
+            url.clone(),
+            pre_roll_secs,
+            codec,
+            max_fps,
+            new_rgb_w,
+            new_rgb_h,
+        )
+        .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
+        let prev = self.ingesters.write().insert(camera_id, new_ing);
+        if let Some(prev_ing) = prev {
+            // Same justification as the URL-change replace path in
+            // `add_camera_ingester`: any stale `SharedRtspSource`
+            // clones must NOT keep the previous supervisor
+            // reconnecting against the old (now-superseded) RGB
+            // dims indefinitely.
+            prev_ing.shutdown();
+        }
+        info!(
+            camera_id,
+            %url,
+            prev_w = cur_w,
+            prev_h = cur_h,
+            new_w = new_rgb_w,
+            new_h = new_rgb_h,
+            "pre-roll ingester RGB tap resized (crowd hysteresis)"
+        );
+        Ok(true)
+    }
 }
 
 /// Compute the lower-case hex sha256 of `path`. Reads the file in

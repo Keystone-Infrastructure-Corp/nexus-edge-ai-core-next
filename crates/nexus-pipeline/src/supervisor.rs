@@ -176,14 +176,17 @@ async fn run_camera(
             )
             .await;
 
-        let (tx, mut rx) = mpsc::channel::<Frame>(8);
-        let source = build_source(&cfg, &recorder, supervisor_w, supervisor_h);
-        let cam_id = cfg.id;
-        let source_task = tokio::spawn(async move {
-            if let Err(e) = source.run(tx).await {
-                warn!(camera_id = cam_id, "frame source ended: {e}");
-            }
-        });
+        // M_PERF_CROWD Phase E2 — the supervisor may rebuild its
+        // FrameSource under sustained crowd to consume a
+        // recorder-side RGB tap that has been resized to
+        // `supervisor_downscale_to_width`. The originals are the
+        // engine-spawn-time dims (high-res); the `current_*`
+        // mirror what the active source is producing right now.
+        // Both are equal until the first E2 flip.
+        let original_supervisor_w = supervisor_w;
+        let original_supervisor_h = supervisor_h;
+        let mut current_supervisor_w = supervisor_w;
+        let mut current_supervisor_h = supervisor_h;
 
         let gate = MotionGate::new();
         // M_PERF_CROWD Phase E1 — adaptive detector cadence under crowd.
@@ -205,8 +208,25 @@ async fn run_camera(
         let mut crowd_hysteresis = CrowdHysteresis::new(
             cfg.behavior.detector_downscale_crowded_threshold,
             cfg.behavior.detector_downscale_sustained_secs,
+            None,
         );
         let mut detector_downscaled = false;
+        // M_PERF_CROWD Phase E2 — adaptive *supervisor frame*
+        // downscale under crowd (sibling of E3's detector input
+        // downscale). Tracked independently so operators can tune
+        // each lever on its own. Asymmetric up/down windows: the
+        // up-trigger fires quickly (typical 60s) but the
+        // upscale-back trigger is intentionally slower (typical
+        // 300s) because each flip rebuilds the recorder's
+        // pre-roll ingester at new RGB dims and closes any open
+        // clip. No-op (always returns `false`) unless the camera
+        // opts in via the four `supervisor_downscale_*` knobs.
+        let mut supervisor_hysteresis = CrowdHysteresis::new(
+            cfg.behavior.supervisor_downscale_crowded_threshold,
+            cfg.behavior.supervisor_downscale_sustained_secs,
+            cfg.behavior.supervisor_upscale_clear_secs,
+        );
+        let mut supervisor_downscaled = false;
         let mut decoded: u64 = 0;
         let mut detected: u64 = 0;
         let prompts = cfg.detector.prompts.clone();
@@ -274,6 +294,28 @@ async fn run_camera(
         let mut post_roll = PostRoll::new(clips_cfg.post_roll_secs);
 
         info!(camera_id = cfg.id, "pipeline running");
+
+        'outer: loop {
+        let (tx, mut rx) = mpsc::channel::<Frame>(8);
+        let source = build_source(
+            &cfg,
+            &recorder,
+            current_supervisor_w,
+            current_supervisor_h,
+        );
+        let cam_id = cfg.id;
+        let source_task = tokio::spawn(async move {
+            if let Err(e) = source.run(tx).await {
+                warn!(camera_id = cam_id, "frame source ended: {e}");
+            }
+        });
+        // M_PERF_CROWD Phase E2 — set true when the per-frame body
+        // requests an RGB-tap rebuild (the recorder's pre-roll
+        // ingester has been replaced at new dims; the old source's
+        // broadcast channel is closed). On exit from the inner
+        // `while`, the outer loop spawns a fresh source against the
+        // new RGB dims.
+        let mut rebuild_source = false;
 
         while let Some(frame) = rx.recv().await {
             decoded += 1;
@@ -454,6 +496,88 @@ async fn run_camera(
             // No-op when the policy is disabled.
             detector_downscaled =
                 crowd_hysteresis.observe(tracked.len(), std::time::Instant::now());
+            // M_PERF_CROWD Phase E2 — sustained-crowd supervisor
+            // frame downscale. Independent hysteresis (asymmetric
+            // up/down windows) over the same tracked-object EMA. On
+            // a state flip and only when the camera opted in via
+            // `behavior.supervisor_downscale_to_width`, ask the
+            // recorder to rebuild its pre-roll ingester at the new
+            // RGB dims; on success, close any open clip (so its
+            // recorded `frame_width` matches the pixels going
+            // forward), update `current_supervisor_*`, and break to
+            // the outer loop which will spawn a fresh
+            // `FrameSource` against the new shared RGB tap. No-op
+            // when the policy is disabled or when the recorder has
+            // no RGB-tap ingester for this camera (e.g. stub
+            // recorder in tests).
+            let want_supervisor_downscale =
+                supervisor_hysteresis.observe(tracked.len(), std::time::Instant::now());
+            if want_supervisor_downscale != supervisor_downscaled {
+                if let Some(downscale_w) = cfg.behavior.supervisor_downscale_to_width {
+                    let (target_w, target_h) = if want_supervisor_downscale {
+                        crate::source::supervisor_frame_for(downscale_w)
+                    } else {
+                        (original_supervisor_w, original_supervisor_h)
+                    };
+                    match recorder.resize_camera_rgb_tap(cfg.id, target_w, target_h) {
+                        Ok(true) => {
+                            info!(
+                                camera_id = cfg.id,
+                                target_w,
+                                target_h,
+                                downscaled = want_supervisor_downscale,
+                                "supervisor frame size flipped (crowd hysteresis); rebuilding source"
+                            );
+                            supervisor_downscaled = want_supervisor_downscale;
+                            current_supervisor_w = target_w;
+                            current_supervisor_h = target_h;
+                            if let Some(handle) = current_clip.take() {
+                                if let Err(e) = recorder
+                                    .close(
+                                        handle,
+                                        ClipFinal {
+                                            ended_at: frame.captured_at,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        camera_id = cfg.id,
+                                        "recorder.close (RGB tap resize) failed: {e}"
+                                    );
+                                }
+                                clip_opened_at = None;
+                                post_roll.reset();
+                            }
+                            rebuild_source = true;
+                            break;
+                        }
+                        Ok(false) => {
+                            // Recorder reports no rebuild needed
+                            // (stub recorder, ingester absent, or
+                            // dims already match). Record the new
+                            // desired state so we don't re-poll the
+                            // recorder every frame, but don't
+                            // restart the source.
+                            supervisor_downscaled = want_supervisor_downscale;
+                        }
+                        Err(e) => {
+                            warn!(
+                                camera_id = cfg.id,
+                                "resize_camera_rgb_tap failed: {e}; staying on current dims"
+                            );
+                            supervisor_downscaled = want_supervisor_downscale;
+                        }
+                    }
+                } else {
+                    // Threshold + sustained-secs are set but the
+                    // operator forgot the target width. Record the
+                    // state so we don't log every frame; the
+                    // operator's `nexus-doctor` config check should
+                    // surface this misconfiguration.
+                    supervisor_downscaled = want_supervisor_downscale;
+                }
+            }
             // M-Admin Phase 2 Step 1 — exclusion-zone enforcement.
             // Drop any tracked object whose bbox centre lies inside
             // a `ZoneKind::Exclusion` polygon for this camera, BEFORE
@@ -594,8 +718,8 @@ async fn run_camera(
                         .open(OpenClip {
                             camera_id: cfg.id,
                             started_at: d.captured_at,
-                            frame_width: supervisor_w,
-                            frame_height: supervisor_h,
+                            frame_width: current_supervisor_w,
+                            frame_height: current_supervisor_h,
                         })
                         .await
                     {
@@ -682,6 +806,20 @@ async fn run_camera(
             }
         }
 
+        // Inner `while let Some(frame) = rx.recv().await` ended.
+        // Either the source died naturally (channel closed) or the
+        // E2 hysteresis path requested a rebuild. In the rebuild
+        // case the recorder has already swapped its pre-roll
+        // ingester; we abort the now-stale source task, drain it,
+        // and continue the outer loop to spawn a fresh source that
+        // will subscribe to the new shared RGB tap.
+        source_task.abort();
+        let _ = source_task.await;
+        if !rebuild_source {
+            break 'outer;
+        }
+        }
+
         // Pipeline ended — close any clip still open so its row
         // doesn't sit forever with NULL ended_at.
         post_roll.reset();
@@ -715,7 +853,6 @@ async fn run_camera(
             )
             .await;
         warn!(camera_id = cfg.id, decoded, detected, "pipeline stopped");
-        let _ = source_task.await;
     }
     .instrument(span)
     .await

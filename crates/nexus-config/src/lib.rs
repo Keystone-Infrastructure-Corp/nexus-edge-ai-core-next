@@ -1814,6 +1814,45 @@ pub struct CameraBehavior {
     /// composite semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector_downscale_to_height: Option<u32>,
+    /// M_PERF_CROWD Phase E2 — adaptive supervisor frame downscale
+    /// under crowd. Threshold (number of currently-tracked objects,
+    /// EMA-smoothed) at or above which the per-camera supervisor
+    /// begins counting toward a *frame-level* downscale (sibling of
+    /// E3's detector-level downscale). Tracked independently from E1
+    /// / E3 so operators can tune each lever on its own. `None`
+    /// disables the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_downscale_crowded_threshold: Option<u32>,
+    /// M_PERF_CROWD Phase E2 — sustained-crowd window before the
+    /// supervisor requests a fresh `PreRollIngester` RGB tap at
+    /// `supervisor_downscale_to_width`. Typical value: 60.
+    /// `supervisor_upscale_clear_secs` controls the (typically
+    /// longer) clear-side window; when that field is `None` the
+    /// hysteresis is symmetric and falls back to this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_downscale_sustained_secs: Option<u32>,
+    /// M_PERF_CROWD Phase E2 — asymmetric clear-side hysteresis
+    /// window. Crowd EMA must sit *below*
+    /// `supervisor_downscale_crowded_threshold` continuously for this
+    /// many seconds before the supervisor rebuilds the RGB tap back
+    /// at high res. Typical value: 300 (5 min), longer than the
+    /// 60s down-trigger because each rebuild closes any open clip
+    /// and re-spawns the source. `None` reuses
+    /// `supervisor_downscale_sustained_secs` (symmetric).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_upscale_clear_secs: Option<u32>,
+    /// M_PERF_CROWD Phase E2 — target *square* width for the RGB tap
+    /// while in the downscaled state. Height is derived via
+    /// [`nexus_pipeline::supervisor_frame_for`] (16:9, even). When
+    /// the camera flips to downscaled the supervisor calls the
+    /// recorder's `resize_camera_rgb_tap` with this width; the
+    /// underlying `PreRollIngester` is rebuilt at the new dims and
+    /// the supervisor re-spawns its `FrameSource` against the new
+    /// shared RGB stream. Set together with the threshold +
+    /// sustained-secs knobs above to enable. `None` disables.
+    /// Typical pairing: 960 → 640 (T36) or 1280 → 960 (T36-S).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_downscale_to_width: Option<u32>,
 }
 
 /// One configured camera. Wire shape (TOML + JSON) is flat — every

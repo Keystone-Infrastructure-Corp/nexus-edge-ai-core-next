@@ -154,6 +154,12 @@ pub struct PreRollIngester {
     /// GStreamer's stock parsers handle the SVC bitstream as
     /// plain H.264/H.265.
     codec: CodecKind,
+    /// Pre-roll window the ring buffer was sized for. Stored on the
+    /// struct so the recorder can read it back when it needs to
+    /// rebuild this ingester at new RGB dims without losing the
+    /// originally-configured pre-roll length (see
+    /// `GstClipRecorder::resize_camera_rgb_tap` — M_PERF_CROWD E2).
+    pre_roll_secs: u32,
     /// `pre_roll_secs == 0` is a valid disable knob — we still run
     /// the always-on pipeline (so the broadcast channel is alive
     /// for recording) but the ring buffer never accumulates.
@@ -283,6 +289,7 @@ impl PreRollIngester {
             camera_id,
             url,
             codec,
+            pre_roll_secs,
             ring,
             live_tx,
             frame_tap,
@@ -306,6 +313,32 @@ impl PreRollIngester {
     /// the matching parser without an extra config lookup.
     pub fn codec(&self) -> CodecKind {
         self.codec
+    }
+
+    /// Pre-roll window the ring was sized for at construction. Used
+    /// by the recorder when it needs to rebuild this ingester at
+    /// new RGB dims (M_PERF_CROWD E2). `0` is a valid disable
+    /// value, see [`Self::new`].
+    pub fn pre_roll_secs(&self) -> u32 {
+        self.pre_roll_secs
+    }
+
+    /// Max-fps cap the RGB tap's `videorate` was built with, or
+    /// `0` if this ingester has no RGB tap. Same use case as
+    /// [`Self::pre_roll_secs`] — ingester rebuild at new dims.
+    pub fn max_fps(&self) -> u32 {
+        self.frame_tap.as_ref().map(|t| t.max_fps).unwrap_or(0)
+    }
+
+    /// RGB-tap width the ingester is publishing decoded frames at,
+    /// or `0` if this ingester has no RGB tap.
+    pub fn rgb_w(&self) -> u32 {
+        self.frame_tap.as_ref().map(|t| t.width).unwrap_or(0)
+    }
+
+    /// Companion to [`Self::rgb_w`].
+    pub fn rgb_h(&self) -> u32 {
+        self.frame_tap.as_ref().map(|t| t.height).unwrap_or(0)
     }
 
     /// Subscribe to every live H.264 NAL sample arriving from this
