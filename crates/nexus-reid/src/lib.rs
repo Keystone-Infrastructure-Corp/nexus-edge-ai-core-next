@@ -187,6 +187,95 @@ pub trait Extractor: Send + Sync {
         }
         out
     }
+
+    /// M_PERF_CROWD D2 — preferred `(width, height)` of the
+    /// pre-cropped RGB24 buffer this extractor expects. Callers
+    /// that crop inline (e.g. the engine's `CloudEntitySightingHook`
+    /// in [`extract_crop`](Self::extract_crop) /
+    /// [`extract_crop_batch`](Self::extract_crop_batch)) should size
+    /// their `crop_and_resize` output to these dims so the extractor
+    /// fast path can skip its own resize pass.
+    ///
+    /// Default is `(224, 224)` — DINOv2-S input shape — so any
+    /// extractor whose preprocessing pipeline expects 224×224 RGB
+    /// (i.e. essentially every ViT-family backbone) inherits this
+    /// for free.
+    fn expected_crop_dims(&self) -> (u32, u32) {
+        (224, 224)
+    }
+
+    /// M_PERF_CROWD D2 — embed a pre-cropped + pre-resized RGB24
+    /// buffer. Lets the supervisor crop once on the per-frame hot
+    /// path, drop its frame ref immediately, and hand the cheap
+    /// 150 KB (224×224×3) buffer down a bounded queue to the
+    /// worker. Cuts the per-snapshot frame retention from
+    /// `O(queue × 1.5 MB)` to `O(queue × 150 KB)`.
+    ///
+    /// `crop` MUST be `crop_w * crop_h * 3` bytes of RGB24. The
+    /// default impl synthesises a 1-frame `Frame` around `crop` and
+    /// delegates to [`extract`](Self::extract) with a bbox spanning
+    /// the whole synthetic frame, so existing extractors remain
+    /// correct without code changes; extractors with a real fast
+    /// path (e.g. [`ort_dinov2::DinoV2Extractor`]) override this
+    /// to skip the redundant `crop_and_resize` pass.
+    async fn extract_crop(
+        &self,
+        crop: &[u8],
+        crop_w: u32,
+        crop_h: u32,
+    ) -> Result<Embedding, ExtractorError> {
+        let expected = (crop_w as usize) * (crop_h as usize) * 3;
+        if crop.len() != expected {
+            return Err(ExtractorError::FrameBufferSize {
+                got: crop.len(),
+                expected,
+                width: crop_w,
+                height: crop_h,
+                format: PixelFormat::Rgb24,
+            });
+        }
+        // Synthetic frame for the default delegation. Bbox spans
+        // the whole synthetic frame; the inner extract impl will
+        // call `crop_and_resize` over the full buffer with the same
+        // dst dims, yielding (modulo bilinear rounding) the input
+        // unchanged. Overrides in real extractors skip this round-trip.
+        let frame = Frame {
+            camera_id: 0,
+            frame_id: 0,
+            captured_at: chrono::Utc::now(),
+            width: crop_w,
+            height: crop_h,
+            format: PixelFormat::Rgb24,
+            data: Arc::new(crop.to_vec()),
+            trace_id: String::new(),
+        };
+        let bbox = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: crop_w as f32,
+            y2: crop_h as f32,
+        };
+        self.extract(&frame, &bbox).await
+    }
+
+    /// M_PERF_CROWD D2 — batched companion of
+    /// [`extract_crop`](Self::extract_crop). Same per-item /
+    /// whole-batch error semantics as [`extract_batch`].
+    ///
+    /// Default impl loops over `extract_crop` so existing extractors
+    /// stay correct; ORT-backed extractors override this to stack
+    /// the per-item buffers into a single `(B, 3, H, W)` tensor and
+    /// issue one batched session run.
+    async fn extract_crop_batch(
+        &self,
+        items: &[(Arc<Vec<u8>>, u32, u32)],
+    ) -> Vec<Result<Embedding, ExtractorError>> {
+        let mut out = Vec::with_capacity(items.len());
+        for (crop, w, h) in items {
+            out.push(self.extract_crop(crop.as_slice(), *w, *h).await);
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +342,37 @@ impl Extractor for MockExtractor {
         let crop = crop_and_resize(rgb.as_slice(), frame.width, frame.height, bbox, 224, 224)?;
         // Hash bucket each pixel byte into a slot. Cheap, no dep, and
         // stable across runs. Then L2-normalise.
+        let mut vec = vec![0f32; self.dim];
+        for (i, &b) in crop.iter().enumerate() {
+            vec[i % self.dim] += b as f32;
+        }
+        l2_normalise_mut(&mut vec);
+        Ok(Embedding {
+            model_id: self.model_id.clone(),
+            dim: self.dim,
+            vec,
+        })
+    }
+
+    async fn extract_crop(
+        &self,
+        crop: &[u8],
+        crop_w: u32,
+        crop_h: u32,
+    ) -> Result<Embedding, ExtractorError> {
+        let expected = (crop_w as usize) * (crop_h as usize) * 3;
+        if crop.len() != expected {
+            return Err(ExtractorError::FrameBufferSize {
+                got: crop.len(),
+                expected,
+                width: crop_w,
+                height: crop_h,
+                format: PixelFormat::Rgb24,
+            });
+        }
+        // D2 fast path: same hash-bucket math as `extract` but skip
+        // the `crop_and_resize` round-trip — the supervisor has
+        // already produced a buffer of the right size.
         let mut vec = vec![0f32; self.dim];
         for (i, &b) in crop.iter().enumerate() {
             vec[i % self.dim] += b as f32;
