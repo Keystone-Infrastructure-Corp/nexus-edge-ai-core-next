@@ -41,7 +41,8 @@ use nexus_pipeline::{LatestFrameCache, StaticAnchorClearRegistry};
 use nexus_rules::{CelEngine, RuleEngine, RuleEvaluator, RulesError};
 use nexus_store::Store;
 use nexus_types::{
-    AlertEvent, CameraId, FrameMetadata, PixelFormat, RuleId, StaticAnchor, StaticAnchorsResponse,
+    AlertEvent, CameraId, FrameMetadata, FrameMetadataLite, PixelFormat, RuleId, StaticAnchor,
+    StaticAnchorsResponse,
 };
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
@@ -2059,6 +2060,15 @@ struct EventsQuery {
     limit: Option<i64>,
 }
 
+/// M_PERF_CROWD F1 — `?attributes=full` opts the SSE subscriber in
+/// to the heavy `FrameMetadata` topic (per-object attributes map).
+/// Any other value (or absent) keeps the default bandwidth-lite
+/// `FrameMetadataLite` topic.
+#[derive(serde::Deserialize)]
+struct StreamMetadataQuery {
+    attributes: Option<String>,
+}
+
 async fn list_events(
     State(s): State<ApiState>,
     Query(q): Query<EventsQuery>,
@@ -2280,25 +2290,56 @@ fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
 
 async fn stream_metadata(
     State(s): State<ApiState>,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let mut sub = s
-        .bus
-        .subscribe::<FrameMetadata>(topic::FRAME_METADATA)
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let stream = async_stream::stream! {
-        while let Some(item) = sub.next().await {
-            match item {
-                Ok(meta) => {
-                    if let Ok(ev) = Event::default().json_data(&meta) {
-                        yield Ok(ev);
+    Query(q): Query<StreamMetadataQuery>,
+) -> Result<Response, ApiError> {
+    // M_PERF_CROWD F1 — default subscribers get the bandwidth-lite
+    // topic (`FrameMetadataLite`, no per-object attributes map);
+    // `?attributes=full` opts in to the heavy `FrameMetadata` topic
+    // for the attributes panel.
+    let full = matches!(q.attributes.as_deref(), Some("full"));
+    if full {
+        let mut sub = s
+            .bus
+            .subscribe::<FrameMetadata>(topic::FRAME_METADATA)
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let stream = async_stream::stream! {
+            while let Some(item) = sub.next().await {
+                match item {
+                    Ok(meta) => {
+                        if let Ok(ev) = Event::default().json_data(&meta) {
+                            yield Ok::<_, Infallible>(ev);
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-    };
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+        };
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
+    } else {
+        let mut sub = s
+            .bus
+            .subscribe::<FrameMetadataLite>(topic::FRAME_METADATA_LITE)
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let stream = async_stream::stream! {
+            while let Some(item) = sub.next().await {
+                match item {
+                    Ok(meta) => {
+                        if let Ok(ev) = Event::default().json_data(&meta) {
+                            yield Ok::<_, Infallible>(ev);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        };
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
+    }
 }
 
 async fn stream_events(

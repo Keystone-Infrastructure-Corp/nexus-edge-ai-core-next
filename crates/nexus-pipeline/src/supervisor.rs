@@ -17,7 +17,10 @@ use nexus_tracker::{
     filter_excluded_zones, filter_zone_min_area, is_object_static, MotionDecision,
     MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
 };
-use nexus_types::{CameraId, Frame, FrameMetadata, PipelineState, PipelineStatus, TrackedObject};
+use nexus_types::{
+    CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState, PipelineStatus, TrackLite,
+    TrackedObject,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, info_span, warn, Instrument};
@@ -641,6 +644,25 @@ async fn run_camera(
                 objects: tracked.clone(),
             };
             let _ = bus.publish(topic::FRAME_METADATA, &meta).await;
+            // M_PERF_CROWD F1 — same per-frame cadence on the
+            // bandwidth-relief lite topic. Drops the per-object
+            // `attributes` map (~400–600 B/object) so the SSE
+            // overlay subscriber's broadcast buffer no longer
+            // dominates `BusError::Lagged` under crowd load. The
+            // attributes panel still subscribes to the full topic
+            // via `?attributes=full`.
+            let meta_lite = FrameMetadataLite {
+                camera_id: meta.camera_id,
+                frame_id: meta.frame_id,
+                captured_at: meta.captured_at,
+                width: meta.width,
+                height: meta.height,
+                trace_id: meta.trace_id.clone(),
+                objects: tracked.iter().map(TrackLite::from).collect(),
+            };
+            let _ = bus
+                .publish(topic::FRAME_METADATA_LITE, &meta_lite)
+                .await;
 
             // Partition: rules and the motion lifecycle only see
             // non-static tracks. A parked car shouldn't keep firing

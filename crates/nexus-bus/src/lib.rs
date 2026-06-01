@@ -23,6 +23,12 @@ use tokio_stream::StreamExt;
 
 pub mod topic {
     pub const FRAME_METADATA: &str = "frame.metadata";
+    /// M_PERF_CROWD F1 — bandwidth-relief companion to
+    /// [`FRAME_METADATA`]. Same per-frame cadence, payload is
+    /// `FrameMetadataLite` (no per-object `attributes` map). Default
+    /// SSE subscribers receive this topic; `?attributes=full` opts
+    /// in to the full topic for the attributes panel.
+    pub const FRAME_METADATA_LITE: &str = "frame.metadata.lite";
     pub const ALERT_EVENT: &str = "alert.event";
     pub const CONFIG_CHANGED: &str = "config.changed";
     pub const PIPELINE_STATUS: &str = "pipeline.status";
