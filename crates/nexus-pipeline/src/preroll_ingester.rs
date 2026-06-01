@@ -523,8 +523,14 @@ async fn run_session(
              ! appsink name=tap emit-signals=true sync=false \
                  max-buffers=200 drop=false"
         ),
-        Some((_, max_fps, rgb_w, rgb_h)) => format!(
-            "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
+        Some((_, max_fps, rgb_w, rgb_h)) => {
+            // Guard against max_fps=0 reaching the caps string —
+            // GStreamer rejects `framerate=0/1` and the pipeline
+            // launch fails. Mirror RtspSource::run_session's
+            // 15-fps fallback (source.rs).
+            let fr = if *max_fps == 0 { 15 } else { *max_fps };
+            format!(
+                "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
              ! {rtp_depay} \
              ! {parse} config-interval=0 \
              ! {base_caps},stream-format=byte-stream,alignment=au \
@@ -537,10 +543,11 @@ async fn run_session(
                 ! videoconvert ! videoscale ! videorate \
                 ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
                 ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4",
-            w = rgb_w,
-            h = rgb_h,
-            fr = max_fps,
-        ),
+                w = rgb_w,
+                h = rgb_h,
+                fr = fr,
+            )
+        }
     };
     let pipeline = gst::parse::launch(&desc)
         .map_err(|e| IngesterError::Pipeline(format!("parse::launch: {e}")))?
@@ -729,49 +736,66 @@ async fn run_session(
     // of the session still finds the pipeline.
     *active_pipeline.lock() = Some(pipeline.clone());
 
-    // Drive the bus on a blocking task so we observe Errors / EOS
-    // and propagate them up to the supervisor for reconnect. We
-    // use a short polling timeout instead of iter_timed(NONE) so
-    // the loop can re-check the shutdown flag between bus pops —
-    // otherwise Drop's pipeline.set_state(NULL) wouldn't cause
-    // iter_timed to return (it only returns on actual messages),
-    // and the spawn_blocking thread would hold a strong ref on
-    // the pipeline + keep the process alive past main exit.
+    // Drive the bus on a dedicated OS thread (NOT tokio's blocking
+    // pool) so we observe Errors / EOS and propagate them up to the
+    // supervisor for reconnect. We use a short polling timeout
+    // instead of iter_timed(NONE) so the loop can re-check the
+    // shutdown flag between bus pops — otherwise Drop's
+    // pipeline.set_state(NULL) wouldn't cause iter_timed to return
+    // (it only returns on actual messages), and the bus thread
+    // would hold a strong ref on the pipeline + keep the process
+    // alive past main exit.
+    //
+    // Why std::thread and not tokio::task::spawn_blocking: this
+    // loop runs for the LIFETIME of the camera. tokio's blocking
+    // pool defaults to 512 threads (cfg.blocking_threads in
+    // RuntimeConfig), but pinning N permanent threads for N
+    // cameras would starve every other spawn_blocking call —
+    // detector replies, sqlx, clip-recorder appsrc pushes — once
+    // the camera count crosses the cap. A dedicated OS thread is
+    // free of that pool and costs the same ~8 KB stack.
     let bus = pipeline
         .bus()
         .ok_or_else(|| IngesterError::Pipeline("pipeline bus missing".into()))?;
     let pipeline_for_bus = pipeline.clone();
     let bus_shutdown = shutdown;
-    let result: Result<(), IngesterError> = tokio::task::spawn_blocking(move || loop {
-        if bus_shutdown.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let timeout = gst::ClockTime::from_mseconds(250);
-        match bus.timed_pop(Some(timeout)) {
-            None => continue,
-            Some(msg) => match msg.view() {
-                gst::MessageView::Eos(..) => {
-                    debug!(camera_id, "preroll ingester pipeline EOS");
-                    return Ok(());
-                }
-                gst::MessageView::Error(e) => {
-                    let err = format!(
-                        "{} (debug: {})",
-                        e.error(),
-                        e.debug().unwrap_or_else(|| "<none>".into())
-                    );
-                    return Err(IngesterError::Pipeline(err));
-                }
-                _ => {}
-            },
-        }
-    })
-    .await
-    .unwrap_or_else(|join_err| {
-        Err(IngesterError::Pipeline(format!(
-            "bus task join: {join_err}"
-        )))
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), IngesterError>>();
+    let thread_name = format!("nexus-gst-bus-cam{camera_id}");
+    let spawn_res = std::thread::Builder::new().name(thread_name).spawn(move || {
+        let out = loop {
+            if bus_shutdown.load(Ordering::Acquire) {
+                break Ok(());
+            }
+            let timeout = gst::ClockTime::from_mseconds(250);
+            match bus.timed_pop(Some(timeout)) {
+                None => continue,
+                Some(msg) => match msg.view() {
+                    gst::MessageView::Eos(..) => {
+                        debug!(camera_id, "preroll ingester pipeline EOS");
+                        break Ok(());
+                    }
+                    gst::MessageView::Error(e) => {
+                        let err = format!(
+                            "{} (debug: {})",
+                            e.error(),
+                            e.debug().unwrap_or_else(|| "<none>".into())
+                        );
+                        break Err(IngesterError::Pipeline(err));
+                    }
+                    _ => {}
+                },
+            }
+        };
+        let _ = done_tx.send(out);
     });
+    if let Err(e) = spawn_res {
+        return Err(IngesterError::Pipeline(format!(
+            "spawn bus thread: {e}"
+        )));
+    }
+    let result: Result<(), IngesterError> = done_rx
+        .await
+        .unwrap_or_else(|_| Err(IngesterError::Pipeline("bus thread dropped".into())));
 
     // Pipeline is going down — deregister BEFORE nulling so Drop
     // doesn't race with us.
