@@ -195,6 +195,30 @@ pub trait ClipRecorder: Send + Sync {
     #[allow(unused_variables)]
     fn remove_camera_ingester(&self, camera_id: CameraId) {}
 
+    /// Hot-resize the RGB tap of an existing camera ingester to
+    /// `new_rgb_w × new_rgb_h`. Used by the supervisor's
+    /// M_PERF_CROWD E2 hysteresis to swap between a high-res and
+    /// low-res `PreRollIngester` under sustained crowd. Implemented
+    /// by the GStreamer recorder via a teardown + rebuild keyed on
+    /// the existing ingester's URL/codec/max-fps/pre-roll; other
+    /// recorders are a no-op.
+    ///
+    /// Returns `Ok(true)` when a rebuild happened (and the
+    /// supervisor MUST re-acquire its [`Self::shared_frame_source`]
+    /// since the old one's broadcast channel is now closed),
+    /// `Ok(false)` when no change was needed (no ingester for this
+    /// camera, dims already match, or this recorder doesn't
+    /// implement the hot-resize).
+    #[allow(unused_variables)]
+    fn resize_camera_rgb_tap(
+        &self,
+        camera_id: CameraId,
+        new_rgb_w: u32,
+        new_rgb_h: u32,
+    ) -> Result<bool, RecorderError> {
+        Ok(false)
+    }
+
     /// Return a [`crate::source::FrameSource`] that consumes
     /// decoded RGB frames from this recorder's per-camera ingester
     /// (sharing the one RTSP session). Default returns `None`; the
