@@ -120,6 +120,7 @@ impl Tracker for ByteTrackTracker {
             &mut track_matched,
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
+            cfg.spatial_bucket_size_px,
         );
 
         // ---- 4. Second pass: low-conf detections recover unmatched tracks. ----
@@ -132,6 +133,7 @@ impl Tracker for ByteTrackTracker {
             &mut track_matched,
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
+            cfg.spatial_bucket_size_px,
         );
 
         // ---- 5. Age unmatched tracks. ----
@@ -251,6 +253,16 @@ fn blend(new: BBox, prior: BBox, alpha: f32) -> BBox {
 /// One association pass over `det_indices`. Mutates the tracks (velocity,
 /// bbox, lifecycle, hit streak) and the `det_used` / `track_matched`
 /// vectors. Greedy best-IoU per track — same as v1.
+///
+/// `spatial_bucket_size_px` (Phase M_PERF_CROWD C1):
+/// - `None` or `Some(0)` → original O(N²) sweep (every track scans every
+///   candidate detection).
+/// - `Some(n)` → builds a `HashMap<(i32, i32), Vec<usize>>` grid keyed
+///   by `floor(det_centre / n)` over `det_indices`, then each track only
+///   scans the 3×3 cell neighbourhood of its own predicted-centre cell.
+///   Safe when `n ≥ max_velocity_per_frame + half_max_bbox_dim` (any
+///   det with positive IoU against the track's bbox is centred within
+///   one cell of the track centre, so it lies in the 3×3 neighbourhood).
 #[allow(clippy::too_many_arguments)]
 fn associate_pass(
     tracks: &mut [TrackState],
@@ -261,23 +273,75 @@ fn associate_pass(
     track_matched: &mut [bool],
     confirm_frames: u32,
     display_smoothing_alpha: f32,
+    spatial_bucket_size_px: Option<u32>,
 ) {
+    // Build the spatial grid once per pass when bucketing is enabled.
+    // Maps cell -> indices into `detections` (already filtered to this
+    // pass's confidence band via `det_indices`).
+    type CellMap = std::collections::HashMap<(i32, i32), Vec<usize>>;
+    let grid: Option<(f32, CellMap)> = match spatial_bucket_size_px {
+        Some(px) if px > 0 => {
+            let cell = px as f32;
+            let mut g: CellMap = std::collections::HashMap::with_capacity(det_indices.len());
+            for &i in det_indices {
+                let b = &detections[i].bbox;
+                let cx = (b.x1 + b.x2) * 0.5;
+                let cy = (b.y1 + b.y2) * 0.5;
+                let key = ((cx / cell).floor() as i32, (cy / cell).floor() as i32);
+                g.entry(key).or_default().push(i);
+            }
+            Some((cell, g))
+        }
+        _ => None,
+    };
+
     for (t_idx, t) in tracks.iter_mut().enumerate() {
         if track_matched[t_idx] {
             continue;
         }
         let mut best: Option<(usize, f32)> = None;
-        for &i in det_indices {
-            if det_used[i] {
-                continue;
+        match &grid {
+            None => {
+                // Original O(N²) sweep — preserves v1 behaviour exactly.
+                for &i in det_indices {
+                    if det_used[i] {
+                        continue;
+                    }
+                    let d = &detections[i];
+                    if d.label != t.label {
+                        continue;
+                    }
+                    let iou = t.bbox.iou(&d.bbox);
+                    if iou > best.map_or(0.0, |(_, b)| b) {
+                        best = Some((i, iou));
+                    }
+                }
             }
-            let d = &detections[i];
-            if d.label != t.label {
-                continue;
-            }
-            let iou = t.bbox.iou(&d.bbox);
-            if iou > best.map_or(0.0, |(_, b)| b) {
-                best = Some((i, iou));
+            Some((cell, g)) => {
+                let tcx = (t.bbox.x1 + t.bbox.x2) * 0.5;
+                let tcy = (t.bbox.y1 + t.bbox.y2) * 0.5;
+                let gx = (tcx / cell).floor() as i32;
+                let gy = (tcy / cell).floor() as i32;
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let Some(cell_dets) = g.get(&(gx + dx, gy + dy)) else {
+                            continue;
+                        };
+                        for &i in cell_dets {
+                            if det_used[i] {
+                                continue;
+                            }
+                            let d = &detections[i];
+                            if d.label != t.label {
+                                continue;
+                            }
+                            let iou = t.bbox.iou(&d.bbox);
+                            if iou > best.map_or(0.0, |(_, b)| b) {
+                                best = Some((i, iou));
+                            }
+                        }
+                    }
+                }
             }
         }
         let Some((i, iou)) = best else { continue };
@@ -475,5 +539,107 @@ mod tests {
             display_x > 0.0 && display_x < 3.0,
             "display bbox x ({display_x}) should be between prior (0.0) and new (3.0)"
         );
+    }
+
+    // Phase M_PERF_CROWD C1: bucketed associate_pass must produce
+    // identical TrackedObject output to the naive O(N²) sweep when
+    // bucket_size_px ≥ max bbox dim + max per-frame motion.
+    fn det_at(label: &str, x: f32, y: f32, w: f32, h: f32, conf: f32) -> Detection {
+        Detection {
+            label: label.into(),
+            confidence: conf,
+            bbox: BBox {
+                x1: x,
+                y1: y,
+                x2: x + w,
+                y2: y + h,
+            },
+            attributes: Default::default(),
+        }
+    }
+
+    fn lcg_next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state
+    }
+
+    fn frames_random_cluster(seed: u64) -> Vec<Vec<Detection>> {
+        // 8 frames, 40 detections per frame, three label classes, motion
+        // ≤ 4 px/frame, bbox up to 30 px. Bucket size 64 px must yield
+        // identical results to naive.
+        let mut s = seed;
+        let labels = ["person", "car", "dog"];
+        (0..8)
+            .map(|_| {
+                (0..40)
+                    .map(|_| {
+                        let lab = labels[(lcg_next(&mut s) % 3) as usize];
+                        let x = (lcg_next(&mut s) % 1200) as f32;
+                        let y = (lcg_next(&mut s) % 680) as f32;
+                        let w = 15.0 + ((lcg_next(&mut s) % 16) as f32);
+                        let h = 15.0 + ((lcg_next(&mut s) % 16) as f32);
+                        let conf = 0.10 + (lcg_next(&mut s) % 90) as f32 / 100.0;
+                        det_at(lab, x, y, w, h, conf)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bucketed_associate_pass_matches_naive_on_random_cluster() {
+        let frames = frames_random_cluster(0xDEAD_BEEF);
+        let mut cfg_naive = cfg_default();
+        cfg_naive.spatial_bucket_size_px = None;
+        let mut cfg_bucketed = cfg_default();
+        cfg_bucketed.spatial_bucket_size_px = Some(64);
+
+        let t_n = ByteTrackTracker::new(cfg_naive);
+        let t_b = ByteTrackTracker::new(cfg_bucketed);
+
+        for (i, frame) in frames.iter().enumerate() {
+            let out_n = t_n.update(frame.clone());
+            let out_b = t_b.update(frame.clone());
+            assert_eq!(
+                out_n.len(),
+                out_b.len(),
+                "frame {i}: naive emitted {} tracks, bucketed emitted {}",
+                out_n.len(),
+                out_b.len()
+            );
+            // Track ids may diverge if the greedy best-IoU pick differs,
+            // but at this bucket size every IoU > 0 candidate is in the
+            // 3×3 neighbourhood, so picks are identical. Compare on
+            // (label, bbox, confidence) — track ids should also match
+            // since both trackers see the same input order.
+            for (a, b) in out_n.iter().zip(out_b.iter()) {
+                assert_eq!(a.track_id, b.track_id, "frame {i}: track_id mismatch");
+                assert_eq!(a.label, b.label, "frame {i}: label mismatch");
+                assert_eq!(
+                    a.bbox.x1, b.bbox.x1,
+                    "frame {i}: bbox.x1 mismatch on track {}",
+                    a.track_id
+                );
+                assert_eq!(a.bbox.y1, b.bbox.y1);
+                assert_eq!(a.bbox.x2, b.bbox.x2);
+                assert_eq!(a.bbox.y2, b.bbox.y2);
+                assert_eq!(a.confidence, b.confidence);
+            }
+        }
+    }
+
+    #[test]
+    fn bucketed_zero_size_falls_back_to_naive() {
+        // Some(0) is treated as None — defensive against config typos.
+        let mut cfg = cfg_default();
+        cfg.spatial_bucket_size_px = Some(0);
+        let t = ByteTrackTracker::new(cfg);
+        let f1 = t.update(vec![det("person", 0.0, 0.9)]);
+        let f2 = t.update(vec![det("person", 1.0, 0.9)]);
+        assert_eq!(f1.len(), 1);
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f1[0].track_id, f2[0].track_id);
     }
 }
