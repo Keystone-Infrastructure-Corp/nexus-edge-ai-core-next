@@ -92,7 +92,7 @@ async fn yoloe_smoke_runs_on_synthetic_frame() {
         .expect("vocab must load from manifest");
     assert!(!vocab.is_empty(), "manifest yoloe26_s.prompts[] is empty");
 
-    let det = YoloeDetector::open(&model, 640, 640, 0.10, 0.50, vocab.clone(), &[])
+    let det = YoloeDetector::open(&model, 640, 640, 0.10, 0.50, None, vocab.clone(), &[])
         .expect("yoloe session must open");
 
     let prompts: Vec<String> = vocab.iter().take(3).cloned().collect();

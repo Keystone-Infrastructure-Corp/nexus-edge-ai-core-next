@@ -24,6 +24,7 @@ pub mod encoder;
 pub mod ensemble;
 #[cfg(feature = "ort")]
 pub mod execution_providers;
+pub mod nms;
 pub mod pool;
 pub mod router;
 pub mod visual_prompts;
@@ -351,6 +352,7 @@ fn build_detector_kind(
             Ok(Arc::new(crate::ensemble::EnsembleDetector::new(
                 members,
                 crate::ensemble::DEFAULT_ENSEMBLE_NMS_IOU,
+                cfg.model.nms_spatial_bucket_size_px,
             )))
         }
         "mock" => Ok(Arc::new(MockDetector::new())),

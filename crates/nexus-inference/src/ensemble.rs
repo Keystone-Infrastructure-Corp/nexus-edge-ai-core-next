@@ -38,7 +38,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::future::join_all;
 use nexus_config::CameraConfigUpdate;
-use nexus_types::{BBox, Detection, Frame};
+use nexus_types::{Detection, Frame};
 use tracing::warn;
 
 use crate::detectors::{Detector, InferenceError};
@@ -52,14 +52,26 @@ pub const DEFAULT_ENSEMBLE_NMS_IOU: f32 = 0.5;
 pub struct EnsembleDetector {
     members: Vec<Arc<dyn Detector>>,
     nms_iou: f32,
+    /// M_PERF_CROWD Phase C3 — optional spatial bucket size (pixels)
+    /// for the merge-time NMS pass. `None` keeps the pre-C3 naive O(N²)
+    /// path bit-identical.
+    nms_spatial_bucket_size_px: Option<u32>,
 }
 
 impl EnsembleDetector {
-    /// Build with explicit members + NMS IoU. Member order is preserved
-    /// only for diagnostics — the merged output is class-aware NMS'd
-    /// and order-invariant.
-    pub fn new(members: Vec<Arc<dyn Detector>>, nms_iou: f32) -> Self {
-        Self { members, nms_iou }
+    /// Build with explicit members + NMS IoU + optional spatial bucket
+    /// size. Member order is preserved only for diagnostics — the
+    /// merged output is class-aware NMS'd and order-invariant.
+    pub fn new(
+        members: Vec<Arc<dyn Detector>>,
+        nms_iou: f32,
+        nms_spatial_bucket_size_px: Option<u32>,
+    ) -> Self {
+        Self {
+            members,
+            nms_iou,
+            nms_spatial_bucket_size_px,
+        }
     }
 
     /// Number of inner detectors. Useful for telemetry and tests.
@@ -105,7 +117,11 @@ impl Detector for EnsembleDetector {
                 }
             }
         }
-        Ok(nms_per_label(merged, self.nms_iou))
+        Ok(crate::nms::nms_per_label(
+            merged,
+            self.nms_iou,
+            self.nms_spatial_bucket_size_px,
+        ))
     }
 
     async fn push_camera_config(&self, update: &CameraConfigUpdate) {
@@ -119,65 +135,11 @@ impl Detector for EnsembleDetector {
     }
 }
 
-/// Class-aware NMS — duplicates of [`crate::yoloe::nms_per_class`] kept
-/// local on purpose. Pulling the yoloe helper out of its module would
-/// drag the `cfg(feature = "ort")` gate up; this ensemble module wants
-/// to compile under the no-features build too (its `EnsembleDetector`
-/// composes MockDetector members on a bare dev box).
-fn nms_per_label(mut dets: Vec<Detection>, iou_threshold: f32) -> Vec<Detection> {
-    if dets.len() <= 1 {
-        return dets;
-    }
-    dets.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut keep = Vec::with_capacity(dets.len());
-    let mut suppressed = vec![false; dets.len()];
-    for i in 0..dets.len() {
-        if suppressed[i] {
-            continue;
-        }
-        keep.push(dets[i].clone());
-        for (j, suppressed_j) in suppressed.iter_mut().enumerate().skip(i + 1) {
-            if *suppressed_j {
-                continue;
-            }
-            if dets[i].label != dets[j].label {
-                continue;
-            }
-            if iou(&dets[i].bbox, &dets[j].bbox) >= iou_threshold {
-                *suppressed_j = true;
-            }
-        }
-    }
-    keep
-}
-
-fn iou(a: &BBox, b: &BBox) -> f32 {
-    let ix1 = a.x1.max(b.x1);
-    let iy1 = a.y1.max(b.y1);
-    let ix2 = a.x2.min(b.x2);
-    let iy2 = a.y2.min(b.y2);
-    let iw = (ix2 - ix1).max(0.0);
-    let ih = (iy2 - iy1).max(0.0);
-    let inter = iw * ih;
-    let area_a = a.width() * a.height();
-    let area_b = b.width() * b.height();
-    let union = area_a + area_b - inter;
-    if union <= 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use nexus_types::PixelFormat;
+    use nexus_types::{BBox, PixelFormat};
 
     /// Test-only detector that emits a fixed list of detections every
     /// call. Lets us script ensemble inputs deterministically without
@@ -242,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_ensemble_returns_empty() {
-        let ens = EnsembleDetector::new(vec![], DEFAULT_ENSEMBLE_NMS_IOU);
+        let ens = EnsembleDetector::new(vec![], DEFAULT_ENSEMBLE_NMS_IOU, None);
         let out = ens.detect(&frame(), &[]).await.expect("ok");
         assert!(out.is_empty());
         assert!(ens.is_empty());
@@ -259,7 +221,11 @@ mod tests {
             out: vec![det("amazon_van", 0.85, 100.0, 100.0, 300.0, 300.0)],
             label: "b",
         };
-        let ens = EnsembleDetector::new(vec![Arc::new(a), Arc::new(b)], DEFAULT_ENSEMBLE_NMS_IOU);
+        let ens = EnsembleDetector::new(
+            vec![Arc::new(a), Arc::new(b)],
+            DEFAULT_ENSEMBLE_NMS_IOU,
+            None,
+        );
         let out = ens.detect(&frame(), &[]).await.expect("ok");
         // Different labels, no overlap suppression — both survive.
         assert_eq!(out.len(), 2, "got {out:?}");
@@ -280,7 +246,11 @@ mod tests {
             out: vec![det("person", 0.62, 105.0, 105.0, 205.0, 205.0)],
             label: "b",
         };
-        let ens = EnsembleDetector::new(vec![Arc::new(a), Arc::new(b)], DEFAULT_ENSEMBLE_NMS_IOU);
+        let ens = EnsembleDetector::new(
+            vec![Arc::new(a), Arc::new(b)],
+            DEFAULT_ENSEMBLE_NMS_IOU,
+            None,
+        );
         let out = ens.detect(&frame(), &[]).await.expect("ok");
         assert_eq!(
             out.len(),
@@ -299,6 +269,7 @@ mod tests {
         let ens = EnsembleDetector::new(
             vec![Arc::new(a), Arc::new(FailingDetector)],
             DEFAULT_ENSEMBLE_NMS_IOU,
+            None,
         );
         let out = ens
             .detect(&frame(), &[])

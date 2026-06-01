@@ -95,7 +95,7 @@ async fn yolo_world_smoke_runs_on_synthetic_frame() {
         "manifest yolo_world_v2_s.prompts[] is empty"
     );
 
-    let det = YoloWorldDetector::open(&model, 640, 640, 0.10, 0.50, vocab.clone(), &[])
+    let det = YoloWorldDetector::open(&model, 640, 640, 0.10, 0.50, None, vocab.clone(), &[])
         .expect("yolo-world session must open");
 
     // Pick the first three prompts as the operator-supplied subset.

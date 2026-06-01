@@ -267,6 +267,7 @@ fn build_yolo_world_detector() -> Arc<dyn Detector> {
         input_h,
         score,
         nms_iou,
+        None,
         vocab,
         &parse_ep_priority_env(),
     ) {
@@ -353,6 +354,7 @@ fn build_yoloe_detector() -> Arc<dyn Detector> {
         input_h,
         score,
         nms_iou,
+        None,
         vocab,
         &parse_ep_priority_env(),
     ) {
@@ -472,6 +474,7 @@ async fn build_yoloe_visual_detector() -> Arc<dyn Detector> {
         input_h,
         score,
         nms_iou,
+        None,
         embedding_dim,
         visual_store,
         &ep_priority,
