@@ -26,6 +26,7 @@ pub mod static_clear;
 pub mod stats;
 pub mod supervisor;
 pub mod tile;
+pub mod tile_executor;
 
 #[cfg(feature = "gstreamer")]
 pub mod gst_clip_recorder;
