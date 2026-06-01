@@ -88,6 +88,12 @@ export interface ModelOverride {
   [k: string]: unknown;
 }
 
+// M_TILE_REINFER (G1) — wire keys for `CameraBehavior::tile_grid`.
+// Mirrors `nexus_config::TileGridConfig` (#[serde(rename_all =
+// "snake_case")]). `g2x2` = 2×2 grid (4 tile slots, default); `g3x3`
+// = 3×3 (9 slots, more zoom per tile).
+export type TileGridConfig = "g2x2" | "g3x3";
+
 export interface CameraConfig {
   /// Server-assigned i64 row id. New cameras created from the UI
   /// MUST start with `0` and call `createCamera` (POST /cameras);
@@ -118,6 +124,19 @@ export interface CameraConfig {
   // default (3600s as of writing). Restart required — the supervisor
   // reads this once at start and the reconciler only respawns on URL change.
   anchor_ttl_secs?: number | null;
+  // M_TILE_REINFER (G1) — crowded-scene tiling cascade. When
+  // `tile_enabled` is true AND stage-1 detection count >= `tile_trigger`,
+  // the supervisor re-runs the same active detector on N cropped
+  // sub-regions chosen by stage-1 density. Stage-2 detections are
+  // mapped back to parent-frame coordinates and merged before the
+  // tracker.update() call. All four fields flatten from the Rust
+  // `CameraBehavior` struct (#[serde(flatten)]); leave undefined to
+  // keep the cascade off. The engine validator rejects
+  // `tile_enabled = true` when the effective model.kind is "ensemble".
+  tile_enabled?: boolean;
+  tile_trigger?: number;
+  tile_max_per_frame?: number;
+  tile_grid?: TileGridConfig;
   zones?: ZoneConfig[];
   // Legacy / extension fields engine may include but UI doesn't yet model.
   [k: string]: unknown;

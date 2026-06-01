@@ -663,6 +663,146 @@ function CameraEditor({
         </SheetSection>
 
         <SheetSection
+          title="Crowded-scene tiling"
+          description="Re-run the detector on N cropped sub-regions when stage-1 finds enough objects. Recovers small/distant targets on crowded frames with no second model. Disabled when the camera's model.kind is ensemble."
+        >
+          {draftKind === "ensemble" ? (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-900 dark:text-amber-200"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                Tiling is incompatible with ensemble routers. Switch the camera
+                off the ensemble model to enable.
+              </span>
+            </div>
+          ) : null}
+          <label className="mt-2 inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={draft.tile_enabled === true}
+              onChange={(e) =>
+                set("tile_enabled", e.target.checked ? true : undefined)
+              }
+              disabled={draftKind === "ensemble"}
+              className="h-4 w-4 rounded border-border disabled:opacity-60"
+            />
+            Enable crowded-scene tiling
+          </label>
+
+          <div className="mt-3 grid gap-3 sm:grid-cols-3">
+            <div className="flex flex-col gap-1 text-sm">
+              <label
+                htmlFor="tile-trigger"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                Stage-1 crowd threshold
+              </label>
+              <input
+                id="tile-trigger"
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                placeholder="e.g. 12"
+                value={
+                  typeof draft.tile_trigger === "number"
+                    ? String(draft.tile_trigger)
+                    : ""
+                }
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  if (raw === "") {
+                    set("tile_trigger", undefined);
+                    return;
+                  }
+                  const n = Number(raw);
+                  if (Number.isFinite(n) && n >= 1) {
+                    set("tile_trigger", Math.floor(n));
+                  }
+                }}
+                disabled={draft.tile_enabled !== true}
+                className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+              />
+              <span className="text-[11px] text-muted-foreground">
+                Fire the cascade when stage-1 produces at least this many
+                detections.
+              </span>
+            </div>
+
+            <div className="flex flex-col gap-1 text-sm">
+              <label
+                htmlFor="tile-max"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                Max tiles per frame
+              </label>
+              <input
+                id="tile-max"
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                placeholder="3"
+                value={
+                  typeof draft.tile_max_per_frame === "number"
+                    ? String(draft.tile_max_per_frame)
+                    : ""
+                }
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  if (raw === "") {
+                    set("tile_max_per_frame", undefined);
+                    return;
+                  }
+                  const n = Number(raw);
+                  if (Number.isFinite(n) && n >= 1) {
+                    set("tile_max_per_frame", Math.floor(n));
+                  }
+                }}
+                disabled={draft.tile_enabled !== true}
+                className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+              />
+              <span className="text-[11px] text-muted-foreground">
+                Cap on per-frame stage-2 inferences. Blank = engine default
+                (3).
+              </span>
+            </div>
+
+            <div className="flex flex-col gap-1 text-sm">
+              <label
+                htmlFor="tile-grid"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                Tile grid
+              </label>
+              <select
+                id="tile-grid"
+                value={draft.tile_grid ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "g2x2" || v === "g3x3") {
+                    set("tile_grid", v);
+                  } else {
+                    set("tile_grid", undefined);
+                  }
+                }}
+                disabled={draft.tile_enabled !== true}
+                className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+              >
+                <option value="">default (2×2)</option>
+                <option value="g2x2">2×2 (four slots)</option>
+                <option value="g3x3">3×3 (nine slots, more zoom)</option>
+              </select>
+              <span className="text-[11px] text-muted-foreground">
+                Square grids preserve 16:9 framing per cell.
+              </span>
+            </div>
+          </div>
+        </SheetSection>
+
+        <SheetSection
           title="Zones"
           description="Draw polygon zones on the live snapshot. Click to add vertices, double-click to close, drag a vertex to move it, right-click a vertex to delete it. Coordinates are stored normalized 0..1 of the source frame."
         >
