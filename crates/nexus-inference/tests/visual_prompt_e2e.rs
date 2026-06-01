@@ -66,6 +66,7 @@ fn cam(id: i64, override_kind: Option<&str>) -> CameraConfig {
         behavior: CameraBehavior {
             parking_lot_mode: false,
             anchor_ttl_secs: None,
+            ..Default::default()
         },
         zones: vec![],
     }

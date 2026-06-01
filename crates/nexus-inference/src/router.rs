@@ -287,6 +287,7 @@ mod tests {
             behavior: nexus_config::CameraBehavior {
                 parking_lot_mode: false,
                 anchor_ttl_secs: None,
+                ..Default::default()
             },
             zones: vec![],
         }
@@ -419,6 +420,7 @@ mod tests {
                 behavior: nexus_config::CameraBehavior {
                     parking_lot_mode: false,
                     anchor_ttl_secs: None,
+                    ..Default::default()
                 },
                 zones: vec![],
             },

@@ -106,6 +106,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         behavior: nexus_config::CameraBehavior {
             parking_lot_mode: false,
             anchor_ttl_secs: None,
+            ..Default::default()
         },
         zones: vec![],
     };

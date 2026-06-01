@@ -57,6 +57,7 @@ fn sample_camera(id: i64, name: &str) -> CameraConfig {
         behavior: nexus_config::CameraBehavior {
             parking_lot_mode: false,
             anchor_ttl_secs: None,
+            ..Default::default()
         },
         zones: vec![],
     }
