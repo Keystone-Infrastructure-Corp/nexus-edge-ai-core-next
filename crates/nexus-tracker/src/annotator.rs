@@ -31,6 +31,8 @@ use serde_json::json;
 
 const FIRST_FRAME_DT_SECONDS: f64 = 1.0 / 30.0;
 
+type CenterGrid = HashMap<(i32, i32), Vec<(f32, f32)>>;
+
 #[derive(Debug, Default, Clone)]
 struct PerTrackState {
     first_seen_at: Option<DateTime<Utc>>,
@@ -77,12 +79,35 @@ impl TrackAnnotator {
 
         // Group-size pre-pass: bucket centers + radii by label so the
         // per-track loop is O(k) instead of O(n²) — same shape as v1.
+        //
+        // Two layouts:
+        //   * naive (`group_spatial_bucket_size_px = None`): per-label
+        //     `Vec<(cx, cy)>`, scanned linearly per track.
+        //   * Phase M_PERF_CROWD C2 (`Some(px)` with `px > 0`): per-label
+        //     `HashMap<(GridX, GridY), Vec<(cx, cy)>>`, keyed by
+        //     `floor(center / px)`. Per-track scan iterates only the
+        //     grid cells whose AABB intersects the disk of `radius`
+        //     around the track centre.
+        let bucket_px = self
+            .cfg
+            .group_spatial_bucket_size_px
+            .filter(|n| *n > 0)
+            .map(|n| n as f32);
         let mut centers_by_label: HashMap<String, Vec<(f32, f32)>> = HashMap::new();
+        let mut bucketed_centers_by_label: HashMap<String, CenterGrid> = HashMap::new();
         for o in objects.iter() {
-            centers_by_label
-                .entry(o.label.clone())
-                .or_default()
-                .push(o.bbox.center());
+            let c = o.bbox.center();
+            if let Some(px) = bucket_px {
+                let key = ((c.0 / px).floor() as i32, (c.1 / px).floor() as i32);
+                bucketed_centers_by_label
+                    .entry(o.label.clone())
+                    .or_default()
+                    .entry(key)
+                    .or_default()
+                    .push(c);
+            } else {
+                centers_by_label.entry(o.label.clone()).or_default().push(c);
+            }
         }
 
         for o in objects.iter_mut() {
@@ -240,7 +265,29 @@ impl TrackAnnotator {
             let radius = self.cfg.group_radius_box_multiplier * half_perim;
             let r2 = (radius * radius) as f64;
             let mut group: u32 = 0;
-            if let Some(centers) = centers_by_label.get(&o.label) {
+            if let Some(px) = bucket_px {
+                if let Some(grid) = bucketed_centers_by_label.get(&o.label) {
+                    // Only the cells whose AABB intersects the disk of
+                    // `radius` around `center` can hold a neighbour.
+                    let min_x = ((center.0 - radius) / px).floor() as i32;
+                    let max_x = ((center.0 + radius) / px).floor() as i32;
+                    let min_y = ((center.1 - radius) / px).floor() as i32;
+                    let max_y = ((center.1 + radius) / px).floor() as i32;
+                    for gx in min_x..=max_x {
+                        for gy in min_y..=max_y {
+                            if let Some(centers) = grid.get(&(gx, gy)) {
+                                for (cx, cy) in centers {
+                                    let ddx = (*cx - center.0) as f64;
+                                    let ddy = (*cy - center.1) as f64;
+                                    if ddx * ddx + ddy * ddy <= r2 {
+                                        group = group.saturating_add(1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(centers) = centers_by_label.get(&o.label) {
                 for (cx, cy) in centers {
                     let ddx = (*cx - center.0) as f64;
                     let ddy = (*cy - center.1) as f64;
@@ -621,5 +668,111 @@ mod tests {
         assert_eq!(compass8(-10.0, 0.0), "w");
         // dx = 0, dy > 0 → image-down → south
         assert_eq!(compass8(0.0, 10.0), "s");
+    }
+
+    // ---- Phase M_PERF_CROWD C2 — spatial-bucketed group.size ----
+
+    fn lcg_next(s: &mut u64) -> u64 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *s
+    }
+
+    fn track_with_bbox(
+        track_id: TrackId,
+        label: &str,
+        cx: f32,
+        cy: f32,
+        w: f32,
+        h: f32,
+    ) -> TrackedObject {
+        TrackedObject {
+            track_id,
+            label: label.into(),
+            confidence: 0.9,
+            bbox: BBox {
+                x1: cx - w * 0.5,
+                y1: cy - h * 0.5,
+                x2: cx + w * 0.5,
+                y2: cy + h * 0.5,
+            },
+            age_frames: 1,
+            age_ms: 0,
+            attributes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn bucketed_group_size_matches_naive_on_random_cluster() {
+        // For a randomly placed cluster of same-label and mixed-label
+        // tracks in a 1920×1080 frame, the bucketed group-size pre-pass
+        // must agree byte-for-byte with the naive O(N²) pass.
+        //
+        // Bucket size 96 px is comfortably > max half-perimeter
+        // (max bbox 60×60 → max radius = 2.5 × 60 = 150 px) — so the
+        // 3×3-of-cell-equivalent walk (here AABB-of-disk) covers every
+        // possible neighbour. (Actually with radius up to 150 px and
+        // bucket 96 px the walk spans ~4×4 cells per track.)
+        let labels = ["person", "vehicle.car", "dog"];
+        let mut seed = 0x00C0_FFEE_F00D_u64;
+        let mut objects_naive: Vec<TrackedObject> = (0..60)
+            .map(|i| {
+                let label = labels[(lcg_next(&mut seed) % 3) as usize];
+                let cx = (lcg_next(&mut seed) % 1920) as f32;
+                let cy = (lcg_next(&mut seed) % 1080) as f32;
+                let w = 20.0 + (lcg_next(&mut seed) % 40) as f32;
+                let h = 20.0 + (lcg_next(&mut seed) % 40) as f32;
+                track_with_bbox(i as TrackId + 1, label, cx, cy, w, h)
+            })
+            .collect();
+        let mut objects_bucketed = objects_naive.clone();
+
+        let mut a_naive = TrackAnnotator::new(AnnotatorConfig::default());
+        a_naive.annotate(&frame_at(0, 1920, 1080), &[], &mut objects_naive);
+
+        let mut a_bucketed = TrackAnnotator::new(AnnotatorConfig {
+            group_spatial_bucket_size_px: Some(96),
+            ..Default::default()
+        });
+        a_bucketed.annotate(&frame_at(0, 1920, 1080), &[], &mut objects_bucketed);
+
+        for (n, b) in objects_naive.iter().zip(objects_bucketed.iter()) {
+            assert_eq!(n.track_id, b.track_id);
+            assert_eq!(
+                n.attributes["group.size"], b.attributes["group.size"],
+                "track {} group.size mismatch",
+                n.track_id
+            );
+        }
+    }
+
+    #[test]
+    fn bucketed_group_size_zero_size_falls_back_to_naive() {
+        // `Some(0)` is treated identically to `None` — naive path.
+        let labels = ["person", "vehicle.car"];
+        let mut seed = 0xDEAD_BEEF_u64;
+        let mut objects_naive: Vec<TrackedObject> = (0..30)
+            .map(|i| {
+                let label = labels[(lcg_next(&mut seed) % 2) as usize];
+                let cx = (lcg_next(&mut seed) % 1280) as f32;
+                let cy = (lcg_next(&mut seed) % 720) as f32;
+                track_with_bbox(i as TrackId + 1, label, cx, cy, 30.0, 30.0)
+            })
+            .collect();
+        let mut objects_zero = objects_naive.clone();
+
+        let mut a_naive = TrackAnnotator::new(AnnotatorConfig::default());
+        a_naive.annotate(&frame_at(0, 1280, 720), &[], &mut objects_naive);
+
+        let mut a_zero = TrackAnnotator::new(AnnotatorConfig {
+            group_spatial_bucket_size_px: Some(0),
+            ..Default::default()
+        });
+        a_zero.annotate(&frame_at(0, 1280, 720), &[], &mut objects_zero);
+
+        for (n, z) in objects_naive.iter().zip(objects_zero.iter()) {
+            assert_eq!(n.attributes["group.size"], z.attributes["group.size"]);
+        }
     }
 }

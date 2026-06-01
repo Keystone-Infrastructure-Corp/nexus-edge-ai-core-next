@@ -1243,6 +1243,16 @@ pub struct AnnotatorConfig {
     /// lost-track recovery. v1 default: 600 (~20 s @ 30 fps).
     #[serde(default = "default_annotator_stale_state_frames")]
     pub stale_state_frames: u32,
+    /// Phase M_PERF_CROWD C2 opt-in: cell size (px) for spatial
+    /// bucketing the group-size pre-pass. `None` (default) → naive
+    /// `Vec<(f32, f32)>` per-label scan (preserves bit-identical
+    /// historical behaviour). `Some(n)` with `n > 0` builds a per-label
+    /// `HashMap<(GridX, GridY), Vec<(f32, f32)>>` and the per-track
+    /// loop iterates only the cells the bbox `radius` overlaps. Bucket
+    /// size must satisfy `n ≥ max plausible radius` for any track at
+    /// runtime; otherwise the cell walk may miss neighbours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_spatial_bucket_size_px: Option<u32>,
 }
 
 impl Default for AnnotatorConfig {
@@ -1258,6 +1268,7 @@ impl Default for AnnotatorConfig {
             direction_ema_alpha: default_annotator_direction_ema_alpha(),
             group_radius_box_multiplier: default_annotator_group_radius_box_multiplier(),
             stale_state_frames: default_annotator_stale_state_frames(),
+            group_spatial_bucket_size_px: None,
         }
     }
 }
