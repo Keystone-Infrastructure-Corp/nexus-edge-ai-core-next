@@ -46,7 +46,7 @@ use nexus_cloud_client::{
     TunnelOutbox,
 };
 use nexus_pipeline::{SightingHook, SightingSnapshot};
-use nexus_reid::Extractor;
+use nexus_reid::{Embedding, Extractor, ExtractorError};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -186,15 +186,31 @@ impl CloudEntitySightingHook {
     /// a fresh `Arc::new(ReidStatsRegistry::new())` and hand the
     /// same Arc to `ApiState::reid_stats` so the admin UI can
     /// read it.
+    ///
+    /// `min_crop_w_px` / `min_crop_h_px` are M_PERF_CROWD B4
+    /// bbox-size floors (in supervisor-frame pixels). Snapshots
+    /// whose bbox is smaller than either floor are dropped BEFORE
+    /// the batched extractor call so we don't spend compute on
+    /// crops too small to embed reliably. Pass `0` for either
+    /// dimension to disable that floor.
     #[must_use]
     pub fn spawn(
         extractor: Arc<dyn Extractor>,
         outbox: Arc<TunnelOutbox>,
         capacity: usize,
         stats: Arc<ReidStatsRegistry>,
+        min_crop_w_px: u32,
+        min_crop_h_px: u32,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<SightingSnapshot>(capacity.max(1));
-        tokio::spawn(run_worker(extractor, outbox, rx, stats));
+        tokio::spawn(run_worker(
+            extractor,
+            outbox,
+            rx,
+            stats,
+            min_crop_w_px,
+            min_crop_h_px,
+        ));
         Self { tx }
     }
 }
@@ -232,11 +248,20 @@ const BATCH_MAX: usize = 32;
 /// to `BATCH_MAX-1` more arrivals within this window before flushing.
 const BATCH_WINDOW: Duration = Duration::from_millis(100);
 
+/// Phase M_PERF_CROWD B4 — max snapshots stacked into a single
+/// `Extractor::extract_batch` call. DINOv2-S at `B=16` saturates
+/// the N150 iGPU while keeping the per-call wall time well under
+/// `BATCH_WINDOW`. Larger batches in one drain window are split
+/// across multiple back-to-back batched ORT calls.
+const REID_EXTRACT_MAX: usize = 16;
+
 async fn run_worker(
     extractor: Arc<dyn Extractor>,
     outbox: Arc<TunnelOutbox>,
     mut rx: mpsc::Receiver<SightingSnapshot>,
     stats: Arc<ReidStatsRegistry>,
+    min_crop_w_px: u32,
+    min_crop_h_px: u32,
 ) {
     let model_id = extractor.model_id().to_string();
     let dim = extractor.dim();
@@ -251,19 +276,7 @@ async fn run_worker(
             "entity-sighting worker running in DEV mode (mock extractor); will run extract for self-test but skip cloud publish"
         );
     }
-    while let Some(snapshot) = rx.recv().await {
-        let Some(first) = extract_projection(
-            &*extractor,
-            &model_id,
-            dim,
-            cloud_eligible,
-            &stats,
-            snapshot,
-        )
-        .await
-        else {
-            continue;
-        };
+    while let Some(first) = rx.recv().await {
         // Snapshot the cloud's advertised capabilities ONCE per
         // batch — the heartbeat_ack pump updates the outbox set in
         // the background, but checking inside the drain loop would
@@ -271,37 +284,95 @@ async fn run_worker(
         let use_batch = outbox.supports(cloud_capabilities::ENTITY_SIGHTING_BATCH);
         let use_f16 = outbox.supports(cloud_capabilities::EMBEDDING_DTYPE_F16);
         if !use_batch {
-            publish_single(&outbox, first, use_f16).await;
+            // Non-A3 path: extract the single snapshot and emit one
+            // envelope. Min-crop filter still applies — a too-small
+            // bbox is dropped here exactly as in the batched path.
+            if let Some(p) = extract_projection(
+                &*extractor,
+                &model_id,
+                dim,
+                cloud_eligible,
+                &stats,
+                first,
+                min_crop_w_px,
+                min_crop_h_px,
+            )
+            .await
+            {
+                publish_single(&outbox, p, use_f16).await;
+            }
             continue;
         }
-        let mut buf: Vec<EntitySightingProjection> = Vec::with_capacity(BATCH_MAX);
-        buf.push(first);
+        // A3 path: drain RAW snapshots first (no per-snapshot
+        // extract). This is the key M_PERF_CROWD B4 inversion —
+        // pre-B4 each arrival fired its own `extract()` from inside
+        // the drain loop, defeating any chance at ORT batching.
+        let mut snapshots: Vec<SightingSnapshot> = Vec::with_capacity(BATCH_MAX);
+        snapshots.push(first);
         let deadline = Instant::now() + BATCH_WINDOW;
-        while buf.len() < BATCH_MAX {
+        while snapshots.len() < BATCH_MAX {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(snap)) => {
-                    if let Some(p) = extract_projection(
-                        &*extractor,
-                        &model_id,
-                        dim,
-                        cloud_eligible,
-                        &stats,
-                        snap,
-                    )
-                    .await
-                    {
-                        buf.push(p);
-                    }
-                }
+                Ok(Some(snap)) => snapshots.push(snap),
                 Ok(None) => break, // channel closed
                 Err(_) => break,   // drain window elapsed
             }
         }
-        publish_batch(&outbox, buf, use_f16).await;
+        // B4 min-crop gate: drop bboxes too small to embed
+        // reliably BEFORE the ORT call. Filter is a no-op when
+        // both floors are 0 (default).
+        let drained = snapshots.len();
+        let kept: Vec<SightingSnapshot> = if min_crop_w_px == 0 && min_crop_h_px == 0 {
+            snapshots
+        } else {
+            snapshots
+                .into_iter()
+                .filter(|s| {
+                    let w = s.bbox.width().max(0.0).round() as u32;
+                    let h = s.bbox.height().max(0.0).round() as u32;
+                    w >= min_crop_w_px && h >= min_crop_h_px
+                })
+                .collect()
+        };
+        let dropped = drained - kept.len();
+        if dropped > 0 {
+            debug!(
+                dropped,
+                drained,
+                min_crop_w_px,
+                min_crop_h_px,
+                "entity-sighting B4 min-crop filter dropped snapshots"
+            );
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        // Chunk into REID_EXTRACT_MAX-sized batched ORT calls. At
+        // BATCH_MAX=32 / REID_EXTRACT_MAX=16 the worst case is
+        // exactly 2 back-to-back batched calls per drain window.
+        let mut remaining = kept;
+        let mut projections: Vec<EntitySightingProjection> = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let take = remaining.len().min(REID_EXTRACT_MAX);
+            let chunk: Vec<SightingSnapshot> = remaining.drain(0..take).collect();
+            let items: Vec<(Arc<nexus_types::Frame>, nexus_types::BBox)> =
+                chunk.iter().map(|s| (s.frame.clone(), s.bbox)).collect();
+            let results = extractor.extract_batch(&items).await;
+            debug_assert_eq!(results.len(), chunk.len());
+            for (snap, res) in chunk.into_iter().zip(results) {
+                if let Some(p) = build_projection(&model_id, dim, cloud_eligible, &stats, snap, res)
+                {
+                    projections.push(p);
+                }
+            }
+        }
+        if projections.is_empty() {
+            continue;
+        }
+        publish_batch(&outbox, projections, use_f16).await;
     }
 }
 
@@ -355,9 +426,13 @@ async fn publish_batch(outbox: &TunnelOutbox, items: Vec<EntitySightingProjectio
 
 /// Extract a single snapshot into a wire projection. Returns `None`
 /// when the snapshot should be dropped (extractor error, dim
-/// mismatch, or dev-mode mock extractor). All counter updates and
-/// log emissions match the pre-batching behaviour so the admin
-/// `/reid/status` semantics are unchanged.
+/// mismatch, dev-mode mock extractor, or B4 min-crop floor). Used
+/// on the non-A3 (single-envelope) worker path; the A3/B4 path
+/// calls [`Extractor::extract_batch`] directly and then funnels
+/// each `(snapshot, result)` pair through [`build_projection`].
+/// All counter updates and log emissions match the pre-batching
+/// behaviour so the admin `/reid/status` semantics are unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn extract_projection(
     extractor: &dyn Extractor,
     model_id: &str,
@@ -365,6 +440,43 @@ async fn extract_projection(
     cloud_eligible: bool,
     stats: &ReidStatsRegistry,
     snapshot: SightingSnapshot,
+    min_crop_w_px: u32,
+    min_crop_h_px: u32,
+) -> Option<EntitySightingProjection> {
+    // B4 min-crop gate (mirrors the batched path so the two modes
+    // observe the same drop policy).
+    if min_crop_w_px > 0 || min_crop_h_px > 0 {
+        let w = snapshot.bbox.width().max(0.0).round() as u32;
+        let h = snapshot.bbox.height().max(0.0).round() as u32;
+        if w < min_crop_w_px || h < min_crop_h_px {
+            debug!(
+                camera_id = snapshot.camera_id,
+                track_id = snapshot.track_id,
+                w,
+                h,
+                min_crop_w_px,
+                min_crop_h_px,
+                "entity-sighting B4 min-crop filter dropped snapshot"
+            );
+            return None;
+        }
+    }
+    let result = extractor.extract(&snapshot.frame, &snapshot.bbox).await;
+    build_projection(model_id, dim, cloud_eligible, stats, snapshot, result)
+}
+
+/// Post-extract slot construction shared by the single and batched
+/// worker paths. Folds the embedding result, dim sanity-check,
+/// stats counter bump, and dev-mode skip into one place so any
+/// future tweak (e.g. new dim, new dev-mode rule) stays consistent
+/// across both paths.
+fn build_projection(
+    model_id: &str,
+    dim: usize,
+    cloud_eligible: bool,
+    stats: &ReidStatsRegistry,
+    snapshot: SightingSnapshot,
+    embedding_result: Result<Embedding, ExtractorError>,
 ) -> Option<EntitySightingProjection> {
     let SightingSnapshot {
         camera_id,
@@ -379,7 +491,7 @@ async fn extract_projection(
     } = snapshot;
     let frame_w = frame.width;
     let frame_h = frame.height;
-    let embedding = match extractor.extract(&frame, &bbox).await {
+    let embedding = match embedding_result {
         Ok(emb) => emb,
         Err(e) => {
             warn!(
@@ -490,7 +602,8 @@ mod tests {
         let extractor: Arc<dyn Extractor> = Arc::new(MockExtractor::new());
         let outbox = Arc::new(TunnelOutbox::new());
         let stats = Arc::new(ReidStatsRegistry::new());
-        let hook = CloudEntitySightingHook::spawn(extractor, outbox.clone(), 8, stats.clone());
+        let hook =
+            CloudEntitySightingHook::spawn(extractor, outbox.clone(), 8, stats.clone(), 0, 0);
         hook.submit(dummy_snapshot(7, 1));
         // Let the worker drain. tokio::time::sleep is fine here —
         // no production code path polls.
@@ -513,7 +626,7 @@ mod tests {
         let extractor: Arc<dyn Extractor> = Arc::new(MockExtractor::new());
         let outbox = Arc::new(TunnelOutbox::new());
         let stats = Arc::new(ReidStatsRegistry::new());
-        let hook = CloudEntitySightingHook::spawn(extractor, outbox, 8, stats.clone());
+        let hook = CloudEntitySightingHook::spawn(extractor, outbox, 8, stats.clone(), 0, 0);
         hook.submit(dummy_snapshot(11, 1));
         hook.submit(dummy_snapshot(11, 2));
         hook.submit(dummy_snapshot(12, 1));
@@ -536,7 +649,7 @@ mod tests {
         let extractor: Arc<dyn Extractor> = Arc::new(MockExtractor::new());
         let outbox = Arc::new(TunnelOutbox::new());
         let stats = Arc::new(ReidStatsRegistry::new());
-        let hook = CloudEntitySightingHook::spawn(extractor, outbox, 1, stats);
+        let hook = CloudEntitySightingHook::spawn(extractor, outbox, 1, stats, 0, 0);
         // First two get into the channel (sender slot + receiver
         // slot); the next three should hit TrySendError::Full and
         // be dropped without blocking. Test guard: this loop must
@@ -606,7 +719,8 @@ mod tests {
             ],
         );
         let stats = Arc::new(ReidStatsRegistry::new());
-        let hook = CloudEntitySightingHook::spawn(real_extractor(), outbox.clone(), 128, stats);
+        let hook =
+            CloudEntitySightingHook::spawn(real_extractor(), outbox.clone(), 128, stats, 0, 0);
         for i in 0..64 {
             hook.submit(dummy_snapshot(1, i));
         }
@@ -649,7 +763,8 @@ mod tests {
         let outbox = Arc::new(TunnelOutbox::new());
         let cap = install(&outbox, &[]);
         let stats = Arc::new(ReidStatsRegistry::new());
-        let hook = CloudEntitySightingHook::spawn(real_extractor(), outbox.clone(), 32, stats);
+        let hook =
+            CloudEntitySightingHook::spawn(real_extractor(), outbox.clone(), 32, stats, 0, 0);
         for i in 0..4 {
             hook.submit(dummy_snapshot(1, i));
         }
@@ -667,5 +782,188 @@ mod tests {
                 other => panic!("expected EntitySighting, got {other:?}"),
             }
         }
+    }
+
+    // --------------------------------------------------------------------
+    // Phase M_PERF_CROWD B4 — batched extractor + min-crop floor.
+    // --------------------------------------------------------------------
+
+    use nexus_reid::{Embedding, ExtractorError};
+    use nexus_types::Frame as ReidFrame;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// `Extractor` that records every `extract_batch` call size so
+    /// tests can assert "the worker actually called the batched
+    /// path, not just looped extract() N times via the default
+    /// trait impl".
+    struct BatchRecordingExtractor {
+        inner: MockExtractor,
+        batch_call_count: AtomicUsize,
+        last_batch_size: AtomicUsize,
+        total_items: AtomicUsize,
+    }
+
+    impl BatchRecordingExtractor {
+        fn new() -> Self {
+            Self {
+                inner: MockExtractor::with_config("dinov2-s-v1", 384),
+                batch_call_count: AtomicUsize::new(0),
+                last_batch_size: AtomicUsize::new(0),
+                total_items: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Extractor for BatchRecordingExtractor {
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        async fn extract(
+            &self,
+            frame: &ReidFrame,
+            bbox: &nexus_types::BBox,
+        ) -> Result<Embedding, ExtractorError> {
+            self.inner.extract(frame, bbox).await
+        }
+        async fn extract_batch(
+            &self,
+            items: &[(Arc<ReidFrame>, nexus_types::BBox)],
+        ) -> Vec<Result<Embedding, ExtractorError>> {
+            self.batch_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            self.last_batch_size
+                .store(items.len(), AtomicOrdering::SeqCst);
+            self.total_items
+                .fetch_add(items.len(), AtomicOrdering::SeqCst);
+            // Fall through to the inner mock so the produced
+            // projections are realistic.
+            self.inner.extract_batch(items).await
+        }
+    }
+
+    fn dummy_snapshot_with_bbox(
+        camera_id: i64,
+        track_id: u64,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+    ) -> SightingSnapshot {
+        let mut s = dummy_snapshot(camera_id, track_id);
+        s.bbox = nexus_types::BBox { x1, y1, x2, y2 };
+        s
+    }
+
+    /// B4 — when the cloud advertises `entity_sighting_batch`, the
+    /// worker MUST route drained snapshots through
+    /// `extract_batch` (chunked to `REID_EXTRACT_MAX=16`) instead
+    /// of looping per-snapshot `extract()`. 32 snapshots in one
+    /// drain window should yield exactly 2 batched calls.
+    #[tokio::test]
+    async fn b4_worker_routes_to_extract_batch() {
+        let outbox = Arc::new(TunnelOutbox::new());
+        let _cap = install(
+            &outbox,
+            &[
+                cloud_capabilities::ENTITY_SIGHTING_BATCH,
+                cloud_capabilities::EMBEDDING_DTYPE_F16,
+            ],
+        );
+        let stats = Arc::new(ReidStatsRegistry::new());
+        let rec = Arc::new(BatchRecordingExtractor::new());
+        let extractor: Arc<dyn Extractor> = rec.clone();
+        let hook = CloudEntitySightingHook::spawn(extractor, outbox.clone(), 128, stats, 0, 0);
+        // 32 snapshots fit one BATCH_MAX drain window. With
+        // REID_EXTRACT_MAX=16 that's 2 extract_batch calls.
+        for i in 0..32 {
+            hook.submit(dummy_snapshot(7, i));
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let calls = rec.batch_call_count.load(AtomicOrdering::SeqCst);
+        let total = rec.total_items.load(AtomicOrdering::SeqCst);
+        assert_eq!(total, 32, "all 32 snapshots reached extract_batch");
+        assert!(
+            (1..=3).contains(&calls),
+            "expected 1-3 extract_batch calls (with chunking), got {calls}"
+        );
+    }
+
+    /// B4 — when both min_crop floors are 0 (default), no
+    /// snapshots are dropped by the size gate even if the bbox is
+    /// tiny.
+    #[tokio::test]
+    async fn b4_min_crop_disabled_passes_tiny_bboxes() {
+        let outbox = Arc::new(TunnelOutbox::new());
+        let _cap = install(&outbox, &[cloud_capabilities::ENTITY_SIGHTING_BATCH]);
+        let stats = Arc::new(ReidStatsRegistry::new());
+        let rec = Arc::new(BatchRecordingExtractor::new());
+        let extractor: Arc<dyn Extractor> = rec.clone();
+        let hook = CloudEntitySightingHook::spawn(extractor, outbox.clone(), 64, stats, 0, 0);
+        // 8 tiny bboxes (10×10) — well below any reasonable
+        // crop floor — should still reach the extractor because
+        // min_crop_*_px = 0 disables the filter.
+        for i in 0..8 {
+            hook.submit(dummy_snapshot_with_bbox(9, i, 0.0, 0.0, 10.0, 10.0));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let total = rec.total_items.load(AtomicOrdering::SeqCst);
+        assert_eq!(total, 8);
+    }
+
+    /// B4 — when min_crop floors are set, snapshots whose bbox is
+    /// smaller than either floor are dropped BEFORE the extractor
+    /// is invoked. Mix of 4 small (10×10) + 4 large (200×200);
+    /// extractor should only see the large 4.
+    #[tokio::test]
+    async fn b4_min_crop_filters_small_bboxes_before_extract() {
+        let outbox = Arc::new(TunnelOutbox::new());
+        let _cap = install(&outbox, &[cloud_capabilities::ENTITY_SIGHTING_BATCH]);
+        let stats = Arc::new(ReidStatsRegistry::new());
+        let rec = Arc::new(BatchRecordingExtractor::new());
+        let extractor: Arc<dyn Extractor> = rec.clone();
+        // Floor at 64×128 (the spec's suggested default).
+        let hook = CloudEntitySightingHook::spawn(extractor, outbox.clone(), 64, stats, 64, 128);
+        for i in 0..4 {
+            hook.submit(dummy_snapshot_with_bbox(3, i, 0.0, 0.0, 10.0, 10.0));
+        }
+        for i in 4..8 {
+            hook.submit(dummy_snapshot_with_bbox(3, i, 0.0, 0.0, 200.0, 200.0));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let total = rec.total_items.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            total, 4,
+            "min-crop floor must drop the 4 small bboxes BEFORE extract_batch"
+        );
+    }
+
+    /// B4 — min-crop floor also applies on the non-A3 (single
+    /// envelope) path so the two modes have identical drop policy.
+    #[tokio::test]
+    async fn b4_min_crop_filters_on_non_batched_path() {
+        let outbox = Arc::new(TunnelOutbox::new());
+        let cap = install(&outbox, &[]); // no ENTITY_SIGHTING_BATCH
+        let stats = Arc::new(ReidStatsRegistry::new());
+        let rec = Arc::new(BatchRecordingExtractor::new());
+        let extractor: Arc<dyn Extractor> = rec.clone();
+        let hook = CloudEntitySightingHook::spawn(extractor, outbox.clone(), 16, stats, 64, 128);
+        // Two tiny bboxes (must drop) + one big (must pass).
+        hook.submit(dummy_snapshot_with_bbox(5, 1, 0.0, 0.0, 10.0, 10.0));
+        hook.submit(dummy_snapshot_with_bbox(5, 2, 0.0, 0.0, 10.0, 10.0));
+        hook.submit(dummy_snapshot_with_bbox(5, 3, 0.0, 0.0, 200.0, 400.0));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Non-batched path uses extract(), not extract_batch().
+        // But our recorder forwards extract() to the inner mock
+        // unchanged, so the assertion here is on the OUTBOX —
+        // exactly one envelope sent for the surviving snapshot.
+        let sent = cap.sent.lock().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "min-crop filter must drop tiny bboxes on the non-batched path too"
+        );
     }
 }

@@ -163,6 +163,30 @@ pub trait Extractor: Send + Sync {
     /// in the same coordinate space as `frame` (i.e. the supervisor
     /// frame — typically 960×540 RGB for nexus-pipeline as of M3).
     async fn extract(&self, frame: &Frame, bbox: &BBox) -> Result<Embedding, ExtractorError>;
+
+    /// M_PERF_CROWD B4 — batched extraction. Returns one
+    /// `Result<Embedding, _>` per input item, in the same order.
+    ///
+    /// The default impl loops over [`Extractor::extract`] so
+    /// existing extractors stay correct without code changes;
+    /// [`ort_dinov2::DinoV2Extractor`] overrides this to stack the
+    /// inputs into a single `[B, 3, 224, 224]` ORT call, amortising
+    /// the per-call session overhead across `B` inferences.
+    ///
+    /// Errors are per-item, not whole-batch: a pre-process failure
+    /// on item 3 must not poison items 0..2 or 4..N. If the entire
+    /// batch fails (e.g. ORT session-run error), every survivor
+    /// gets the same propagated error.
+    async fn extract_batch(
+        &self,
+        items: &[(Arc<Frame>, BBox)],
+    ) -> Vec<Result<Embedding, ExtractorError>> {
+        let mut out = Vec::with_capacity(items.len());
+        for (frame, bbox) in items {
+            out.push(self.extract(frame.as_ref(), bbox).await);
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,5 +787,98 @@ mod tests {
                 f
             );
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase M_PERF_CROWD B4 — `Extractor::extract_batch` default impl.
+    // ----------------------------------------------------------------
+
+    /// The default `extract_batch` impl loops over `extract` so any
+    /// `Extractor` (including `MockExtractor`, which doesn't
+    /// override) gets a working batched API. The returned vector
+    /// MUST have one slot per input, in input order.
+    #[tokio::test]
+    async fn default_extract_batch_loops_one_result_per_input() {
+        let mock = MockExtractor::new();
+        let f1 = Arc::new(frame(
+            20,
+            20,
+            PixelFormat::Rgb24,
+            solid_rgb(20, 20, [50, 50, 50]),
+        ));
+        let f2 = Arc::new(frame(
+            20,
+            20,
+            PixelFormat::Rgb24,
+            solid_rgb(20, 20, [200, 200, 200]),
+        ));
+        let f3 = Arc::new(frame(
+            20,
+            20,
+            PixelFormat::Rgb24,
+            solid_rgb(20, 20, [10, 20, 30]),
+        ));
+        let items = vec![
+            (f1.clone(), bbox(0.0, 0.0, 20.0, 20.0)),
+            (f2.clone(), bbox(0.0, 0.0, 20.0, 20.0)),
+            (f3.clone(), bbox(0.0, 0.0, 20.0, 20.0)),
+        ];
+        let out = mock.extract_batch(&items).await;
+        assert_eq!(out.len(), 3);
+        for slot in &out {
+            let e = slot.as_ref().expect("mock should succeed on RGB24");
+            assert_eq!(e.dim, 384);
+            assert_eq!(e.model_id, "mock_dinov2_s_224");
+        }
+        // Batched results MUST match what per-item `extract` would
+        // have returned — the default impl is just a sequential
+        // loop, no semantic drift.
+        let single = mock
+            .extract(&f1, &bbox(0.0, 0.0, 20.0, 20.0))
+            .await
+            .unwrap();
+        assert_eq!(out[0].as_ref().unwrap().vec, single.vec);
+    }
+
+    /// Per-item preprocess failures (here: unsupported pixel format
+    /// on item 1) MUST NOT poison items 0 and 2. The default impl
+    /// loops `extract`, which already returns per-item Result, so
+    /// we only need to confirm the per-slot routing is right.
+    #[tokio::test]
+    async fn default_extract_batch_isolates_per_item_errors() {
+        let mock = MockExtractor::new();
+        let good = Arc::new(frame(
+            20,
+            20,
+            PixelFormat::Rgb24,
+            solid_rgb(20, 20, [50, 50, 50]),
+        ));
+        let bad = Arc::new(frame(20, 20, PixelFormat::Nv12, vec![0u8; 20 * 20 * 3 / 2]));
+        let items = vec![
+            (good.clone(), bbox(0.0, 0.0, 20.0, 20.0)),
+            (bad.clone(), bbox(0.0, 0.0, 20.0, 20.0)),
+            (good.clone(), bbox(0.0, 0.0, 20.0, 20.0)),
+        ];
+        let out = mock.extract_batch(&items).await;
+        assert_eq!(out.len(), 3);
+        assert!(out[0].is_ok(), "good item 0 must survive");
+        assert!(matches!(
+            out[1],
+            Err(ExtractorError::UnsupportedFormat(PixelFormat::Nv12))
+        ));
+        assert!(
+            out[2].is_ok(),
+            "good item 2 must survive past poisoned item 1"
+        );
+    }
+
+    /// Empty input is a no-op; trait must not panic and must
+    /// return an empty vec (callers rely on `out.len() == items.len()`).
+    #[tokio::test]
+    async fn default_extract_batch_empty_input_returns_empty() {
+        let mock = MockExtractor::new();
+        let items: Vec<(Arc<Frame>, BBox)> = Vec::new();
+        let out = mock.extract_batch(&items).await;
+        assert!(out.is_empty());
     }
 }

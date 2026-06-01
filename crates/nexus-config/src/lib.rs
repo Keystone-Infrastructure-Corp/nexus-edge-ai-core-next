@@ -1886,6 +1886,19 @@ pub struct ReidConfig {
     /// 30 fps; ~1 s at 5 fps).
     #[serde(default = "default_reid_min_track_age_frames")]
     pub min_track_age_frames: u32,
+    /// M_PERF_CROWD B4 — worker-side bbox-width floor (pixels) for
+    /// re-id extraction. Snapshots whose bbox width is below this
+    /// value are dropped before the batched ORT call so we don't
+    /// burn compute on crops too small to embed reliably. `0` (the
+    /// default) disables the filter. Spec recommends 64 for a
+    /// 64×128 floor at the camera's working resolution.
+    #[serde(default = "default_reid_min_crop_w_px")]
+    pub min_crop_w_px: u32,
+    /// M_PERF_CROWD B4 — worker-side bbox-height floor (pixels) for
+    /// re-id extraction. See [`min_crop_w_px`]. `0` (the default)
+    /// disables the filter.
+    #[serde(default = "default_reid_min_crop_h_px")]
+    pub min_crop_h_px: u32,
     /// EP priority list for the ORT session. Ignored when
     /// `model_path` is `None`. Default mirrors `[inference].ep_priority`.
     #[serde(default = "default_ep_priority")]
@@ -1903,6 +1916,8 @@ impl Default for ReidConfig {
             crowded_track_threshold: default_reid_crowded_track_threshold(),
             crowded_emit_interval_s: default_reid_crowded_emit_interval_s(),
             min_track_age_frames: default_reid_min_track_age_frames(),
+            min_crop_w_px: default_reid_min_crop_w_px(),
+            min_crop_h_px: default_reid_min_crop_h_px(),
             ep_priority: default_ep_priority(),
         }
     }
@@ -1925,6 +1940,12 @@ fn default_reid_crowded_emit_interval_s() -> u64 {
 }
 fn default_reid_min_track_age_frames() -> u32 {
     5
+}
+fn default_reid_min_crop_w_px() -> u32 {
+    0
+}
+fn default_reid_min_crop_h_px() -> u32 {
+    0
 }
 
 #[cfg(test)]

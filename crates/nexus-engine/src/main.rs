@@ -709,6 +709,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             cloud_outbox.clone(),
             64,
             reid_stats.clone(),
+            cfg.reid.min_crop_w_px,
+            cfg.reid.min_crop_h_px,
         );
         let scheduler_cfg = nexus_pipeline::supervisor::SightingSchedulerConfig {
             min_track_age_frames: cfg.reid.min_track_age_frames,
@@ -723,6 +725,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             crowded_track_threshold = cfg.reid.crowded_track_threshold,
             crowded_emit_interval_s = cfg.reid.crowded_emit_interval_s,
             min_track_age_frames = cfg.reid.min_track_age_frames,
+            min_crop_w_px = cfg.reid.min_crop_w_px,
+            min_crop_h_px = cfg.reid.min_crop_h_px,
             model_path = ?cfg.reid.model_path,
             "reid enabled — entity-sighting hook installed"
         );
