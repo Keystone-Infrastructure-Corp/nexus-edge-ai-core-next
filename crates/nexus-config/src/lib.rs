@@ -1146,6 +1146,13 @@ pub struct ByteTrackConfig {
     /// `alpha`, prior smoothed box weighs `1 - alpha`. v1 default: 0.6.
     #[serde(default = "default_bytetrack_display_smoothing_alpha")]
     pub display_smoothing_alpha: f32,
+    /// Spatial-bucket cell size (px) for the `associate_pass` neighbour
+    /// search (Phase M_PERF_CROWD C3/C1). `None` or `Some(0)` preserves
+    /// the original O(N²) sweep; `Some(n)` builds a grid over the
+    /// detection centres and walks only the 3×3 neighbourhood per
+    /// track. Safe when `n >= max_velocity_per_frame + half_max_bbox_dim`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial_bucket_size_px: Option<u32>,
 }
 
 impl Default for ByteTrackConfig {
@@ -1158,6 +1165,7 @@ impl Default for ByteTrackConfig {
             confirm_frames: default_bytetrack_confirm_frames(),
             tentative_max_missed_frames: default_bytetrack_tentative_max_missed_frames(),
             display_smoothing_alpha: default_bytetrack_display_smoothing_alpha(),
+            spatial_bucket_size_px: None,
         }
     }
 }
