@@ -60,7 +60,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// Per-request timeout for one SOAP round-trip. Cameras
 /// occasionally take ~2 s to answer `GetStreamUri` on profile
@@ -242,7 +242,16 @@ async fn get_profiles(
 ) -> Result<Vec<ProfileSummary>, String> {
     let body = build_get_profiles_envelope(username, password, ver);
     let text = post_soap(client, url, &ver.action("GetProfiles"), &body).await?;
-    parse_profiles_response(&text)
+    trace!(xaddr = %url, ver = ?ver, body = %text, "onvif media: GetProfiles raw response");
+    let profiles = parse_profiles_response(&text)?;
+    for p in &profiles {
+        debug!(
+            xaddr = %url, ver = ?ver, token = %p.token, name = %p.name,
+            codec = ?p.codec, resolution = ?p.resolution,
+            "onvif media: parsed profile",
+        );
+    }
+    Ok(profiles)
 }
 
 async fn collect_stream_uris(
@@ -391,8 +400,16 @@ fn build_get_profiles_envelope(username: &str, password: &str, ver: MediaVer) ->
     let header = build_ws_security_header(username, password);
     let ns = ver.ns();
     let p = ver.prefix();
+    // Media2 GetProfiles returns only the bare profile (token + name)
+    // unless a <Type> filter is supplied — without it the response is
+    // missing the encoder configuration we need for codec + resolution.
+    // Media1 GetProfiles always includes every configuration.
+    let body = match ver {
+        MediaVer::V1 => format!(r#"<{p}:GetProfiles/>"#),
+        MediaVer::V2 => format!(r#"<{p}:GetProfiles><{p}:Type>All</{p}:Type></{p}:GetProfiles>"#),
+    };
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:{p}="{ns}"><s:Header>{header}</s:Header><s:Body><{p}:GetProfiles/></s:Body></s:Envelope>"#
+        r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:{p}="{ns}"><s:Header>{header}</s:Header><s:Body>{body}</s:Body></s:Envelope>"#
     )
 }
 
@@ -845,6 +862,29 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn media2_get_profiles_envelope_requests_all_configurations() {
+        // Media2 GetProfiles returns only token + name unless a
+        // <Type> filter is supplied. Without it the response omits
+        // the encoder configuration and codec/resolution come back
+        // empty — observed against Hikvision DS-2CD firmware.
+        let env = build_get_profiles_envelope("admin", "secret", MediaVer::V2);
+        assert!(
+            env.contains("<tr2:Type>All</tr2:Type>"),
+            "Media2 envelope must request <Type>All</Type>: {env}",
+        );
+        // Media1 must keep the bare GetProfiles call.
+        let env1 = build_get_profiles_envelope("admin", "secret", MediaVer::V1);
+        assert!(
+            env1.contains("<trt:GetProfiles/>"),
+            "Media1 envelope must use bare GetProfiles: {env1}",
+        );
+        assert!(
+            !env1.contains("<trt:Type>"),
+            "Media1 envelope must not include Type: {env1}",
+        );
     }
 
     #[test]
