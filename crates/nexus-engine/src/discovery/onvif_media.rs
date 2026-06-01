@@ -427,7 +427,8 @@ fn build_get_stream_uri_envelope(
 /// Picked fields:
 /// * `@token` attribute → `ProfileSummary.token`
 /// * `<tt:Name>` text → `ProfileSummary.name`
-/// * first `<tt:VideoEncoderConfiguration>` block's
+/// * first `<tt:VideoEncoderConfiguration>` (Media1) or
+///   `<tr2:VideoEncoder>` (Media2) block's
 ///   `<tt:Encoding>` → `codec`
 /// * that block's `<tt:Resolution>` `Width`/`Height` →
 ///   `resolution`
@@ -491,7 +492,8 @@ fn parse_profiles_response(body: &str) -> Result<Vec<ProfileSummary>, String> {
                             prof.name = text_acc.trim().to_string();
                         }
                         "Encoding"
-                            if parent_is(&stack, "VideoEncoderConfiguration")
+                            if (parent_is(&stack, "VideoEncoderConfiguration")
+                                || parent_is(&stack, "VideoEncoder"))
                                 && !vec_seen_for_profile =>
                         {
                             prof.codec = Some(text_acc.trim().to_string());
@@ -503,14 +505,15 @@ fn parse_profiles_response(body: &str) -> Result<Vec<ProfileSummary>, String> {
                             cur_h = text_acc.trim().parse().ok();
                         }
                         "Resolution"
-                            if parent_is(&stack, "VideoEncoderConfiguration")
+                            if (parent_is(&stack, "VideoEncoderConfiguration")
+                                || parent_is(&stack, "VideoEncoder"))
                                 && !vec_seen_for_profile =>
                         {
                             if let (Some(w), Some(h)) = (cur_w.take(), cur_h.take()) {
                                 prof.resolution = Some(format!("{w}x{h}"));
                             }
                         }
-                        "VideoEncoderConfiguration" => {
+                        "VideoEncoderConfiguration" | "VideoEncoder" => {
                             vec_seen_for_profile = true;
                         }
                         _ => {}
@@ -692,6 +695,59 @@ mod tests {
         assert_eq!(profiles[0].resolution.as_deref(), Some("1920x1080"));
         assert_eq!(profiles[1].token, "Profile_2");
         assert_eq!(profiles[1].resolution.as_deref(), Some("640x480"));
+    }
+
+    #[test]
+    fn parses_hikvision_media2_get_profiles_response() {
+        // Hikvision DS-2CD-series Media2 firmware: the encoder
+        // configuration is wrapped in `<tr2:Configurations>` and
+        // the inner element is `<tr2:VideoEncoder>` (NOT the
+        // Media1 `<tt:VideoEncoderConfiguration>` name). Without
+        // recognising both parent names, the codec + resolution
+        // are silently dropped and the cloud wizard's
+        // pickBestProfile returns `no_video`.
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
+              xmlns:tt="http://www.onvif.org/ver10/schema">
+  <env:Body>
+    <tr2:GetProfilesResponse>
+      <tr2:Profiles token="Profile_1" fixed="true">
+        <tr2:Name>mainStream</tr2:Name>
+        <tr2:Configurations>
+          <tr2:VideoEncoder token="VideoEncoder_1">
+            <tt:Encoding>H264</tt:Encoding>
+            <tt:Resolution>
+              <tt:Width>1920</tt:Width>
+              <tt:Height>1080</tt:Height>
+            </tt:Resolution>
+          </tr2:VideoEncoder>
+        </tr2:Configurations>
+      </tr2:Profiles>
+      <tr2:Profiles token="Profile_2" fixed="true">
+        <tr2:Name>subStream</tr2:Name>
+        <tr2:Configurations>
+          <tr2:VideoEncoder token="VideoEncoder_2">
+            <tt:Encoding>H265</tt:Encoding>
+            <tt:Resolution>
+              <tt:Width>640</tt:Width>
+              <tt:Height>360</tt:Height>
+            </tt:Resolution>
+          </tr2:VideoEncoder>
+        </tr2:Configurations>
+      </tr2:Profiles>
+    </tr2:GetProfilesResponse>
+  </env:Body>
+</env:Envelope>"#;
+        let profiles = parse_profiles_response(body).expect("parses");
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].token, "Profile_1");
+        assert_eq!(profiles[0].name, "mainStream");
+        assert_eq!(profiles[0].codec.as_deref(), Some("H264"));
+        assert_eq!(profiles[0].resolution.as_deref(), Some("1920x1080"));
+        assert_eq!(profiles[1].token, "Profile_2");
+        assert_eq!(profiles[1].codec.as_deref(), Some("H265"));
+        assert_eq!(profiles[1].resolution.as_deref(), Some("640x360"));
     }
 
     #[test]
