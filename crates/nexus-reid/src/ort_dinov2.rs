@@ -272,6 +272,182 @@ impl Extractor for DinoV2Extractor {
         }
         out
     }
+
+    fn expected_crop_dims(&self) -> (u32, u32) {
+        (self.input_w, self.input_h)
+    }
+
+    /// M_PERF_CROWD D2 — fast path for pre-cropped 224×224 RGB
+    /// buffers. Identical to [`extract`] minus the
+    /// [`frame_to_rgb_borrowed_or_owned`] + [`crop_and_resize`]
+    /// preprocess that the supervisor has already done inline.
+    async fn extract_crop(
+        &self,
+        crop: &[u8],
+        crop_w: u32,
+        crop_h: u32,
+    ) -> Result<Embedding, ExtractorError> {
+        if crop_w != self.input_w || crop_h != self.input_h {
+            return Err(ExtractorError::InferenceFailed(format!(
+                "extract_crop dims ({crop_w}x{crop_h}) do not match extractor input ({}x{})",
+                self.input_w, self.input_h
+            )));
+        }
+        let expected = (crop_w as usize) * (crop_h as usize) * 3;
+        if crop.len() != expected {
+            return Err(ExtractorError::FrameBufferSize {
+                got: crop.len(),
+                expected,
+                width: crop_w,
+                height: crop_h,
+                format: nexus_types::PixelFormat::Rgb24,
+            });
+        }
+        let mut nchw_flat = vec![0f32; 3 * (self.input_w as usize) * (self.input_h as usize)];
+        apply_imagenet_normalize(crop, self.input_w, self.input_h, &mut nchw_flat);
+        let nchw = Array4::<f32>::from_shape_vec(
+            (1, 3, self.input_h as usize, self.input_w as usize),
+            nchw_flat,
+        )
+        .map_err(|e| ExtractorError::InferenceFailed(format!("shape into ndarray: {e}")))?;
+
+        let model_id = self.model_id.clone();
+        let expected_dim = self.expected_dim;
+        let session_for_blocking: &Mutex<Session> = &self.session;
+        let result = tokio::task::block_in_place(|| -> Result<Vec<f32>, ExtractorError> {
+            let mut sess = session_for_blocking.lock();
+            run_dinov2(&mut sess, &nchw, expected_dim)
+        })?;
+
+        debug!(model_id = %model_id, dim = result.len(), "dinov2 embedding emitted (D2 fast path)");
+        let mut vec = result;
+        l2_normalise_mut(&mut vec);
+        Ok(Embedding {
+            model_id,
+            dim: vec.len(),
+            vec,
+        })
+    }
+
+    /// M_PERF_CROWD D2 — batched fast path. Skips the per-item
+    /// `crop_and_resize` and stacks the pre-normalised crops into
+    /// a single `(B, 3, H, W)` tensor. Per-item dim / buffer-size
+    /// mismatches do NOT poison the batch: they're reported in the
+    /// matching result slot while the surviving items proceed to
+    /// the single batched ORT call (same semantics as
+    /// [`extract_batch`]).
+    async fn extract_crop_batch(
+        &self,
+        items: &[(Arc<Vec<u8>>, u32, u32)],
+    ) -> Vec<Result<Embedding, ExtractorError>> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let per_item_floats: usize = 3 * (self.input_w as usize) * (self.input_h as usize);
+        let per_item_bytes: usize = (self.input_w as usize) * (self.input_h as usize) * 3;
+        let mut prep: Vec<Result<Vec<f32>, ExtractorError>> = Vec::with_capacity(items.len());
+        for (crop, w, h) in items {
+            let r = (|| -> Result<Vec<f32>, ExtractorError> {
+                if *w != self.input_w || *h != self.input_h {
+                    return Err(ExtractorError::InferenceFailed(format!(
+                        "extract_crop_batch dims ({w}x{h}) do not match extractor input ({}x{})",
+                        self.input_w, self.input_h
+                    )));
+                }
+                if crop.len() != per_item_bytes {
+                    return Err(ExtractorError::FrameBufferSize {
+                        got: crop.len(),
+                        expected: per_item_bytes,
+                        width: *w,
+                        height: *h,
+                        format: nexus_types::PixelFormat::Rgb24,
+                    });
+                }
+                let mut nchw_flat = vec![0f32; per_item_floats];
+                apply_imagenet_normalize(
+                    crop.as_slice(),
+                    self.input_w,
+                    self.input_h,
+                    &mut nchw_flat,
+                );
+                Ok(nchw_flat)
+            })();
+            prep.push(r);
+        }
+
+        let mut survivor_idx: Vec<usize> = Vec::with_capacity(prep.len());
+        let mut survivor_data: Vec<f32> = Vec::with_capacity(prep.len() * per_item_floats);
+        for (i, slot) in prep.iter().enumerate() {
+            if let Ok(v) = slot {
+                survivor_idx.push(i);
+                survivor_data.extend_from_slice(v);
+            }
+        }
+        if survivor_idx.is_empty() {
+            return prep
+                .into_iter()
+                .map(|p| match p {
+                    Err(e) => Err(e),
+                    Ok(_) => unreachable!("survivor_idx empty implies all prep errored"),
+                })
+                .collect();
+        }
+
+        let batch = survivor_idx.len();
+        let nchw = match Array4::<f32>::from_shape_vec(
+            (batch, 3, self.input_h as usize, self.input_w as usize),
+            survivor_data,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                let msg = format!("shape into ndarray (batched, D2): {e}");
+                return splice_batch_error(prep, &survivor_idx, &msg);
+            }
+        };
+        let model_id = self.model_id.clone();
+        let expected_dim = self.expected_dim;
+        let session_for_blocking: &Mutex<Session> = &self.session;
+        let batched_result =
+            tokio::task::block_in_place(|| -> Result<Vec<Vec<f32>>, ExtractorError> {
+                let mut sess = session_for_blocking.lock();
+                run_dinov2_batch(&mut sess, &nchw, expected_dim)
+            });
+        let survivors = match batched_result {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                return splice_batch_error(prep, &survivor_idx, &msg);
+            }
+        };
+
+        debug!(
+            model_id = %model_id,
+            batch = batch,
+            dim = expected_dim,
+            "dinov2 embeddings batched (D2 fast path)"
+        );
+
+        debug_assert_eq!(survivors.len(), batch);
+        let mut survivor_iter = survivors.into_iter();
+        let mut out: Vec<Result<Embedding, ExtractorError>> = Vec::with_capacity(prep.len());
+        for slot in prep.into_iter() {
+            match slot {
+                Err(e) => out.push(Err(e)),
+                Ok(_) => {
+                    let mut vec = survivor_iter
+                        .next()
+                        .expect("survivor_iter must match survivor_idx len");
+                    l2_normalise_mut(&mut vec);
+                    out.push(Ok(Embedding {
+                        model_id: model_id.clone(),
+                        dim: vec.len(),
+                        vec,
+                    }));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Replace each survivor's slot with a freshly-constructed

@@ -46,10 +46,51 @@ use nexus_cloud_client::{
     TunnelOutbox,
 };
 use nexus_pipeline::{SightingHook, SightingSnapshot};
-use nexus_reid::{Embedding, Extractor, ExtractorError};
+use nexus_reid::{
+    crop_and_resize, frame_to_rgb_borrowed_or_owned, Embedding, Extractor, ExtractorError,
+};
+use nexus_types::BBox;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+/// M_PERF_CROWD D2 — internal channel payload for the per-camera
+/// re-ID worker. Replaces the previous `SightingSnapshot` queueing,
+/// which pinned an `Arc<Frame>` (1.5 MB per supervisor frame at
+/// 960×540 RGB) for the lifetime of the queue entry. Now the
+/// supervisor's hook crops + resizes inline at submit time so the
+/// worker queue only holds the small RGB crop (150 KB at 224×224)
+/// plus the original bbox / frame dimensions needed for the wire
+/// envelope. Frame retention drops from `O(queue × 1.5 MB)` to
+/// `O(queue × 150 KB)`.
+#[derive(Clone)]
+struct QueuedSighting {
+    camera_id: i64,
+    track_id: u64,
+    entity_local_id: String,
+    /// Pre-cropped + pre-resized RGB24 buffer at the extractor's
+    /// expected input dims (typically 224×224 for DINOv2-S).
+    /// `Arc` so the engine's batched ORT path can hand the worker
+    /// stable references without copying.
+    crop: Arc<Vec<u8>>,
+    crop_w: u32,
+    crop_h: u32,
+    /// Source supervisor frame dimensions. Carried separately so
+    /// the wire `entity_sighting.frame_w/frame_h` keeps reporting
+    /// the original observation resolution even after the crop
+    /// step has discarded the source frame.
+    frame_w: u32,
+    frame_h: u32,
+    /// Original bbox in supervisor-frame pixels. Carried for the
+    /// wire `entity_sighting.bbox_xywh` field and the B4 min-crop
+    /// floor (which gates on the source bbox size, not the
+    /// fixed-size crop).
+    bbox: BBox,
+    confidence: f32,
+    started_ts: DateTime<Utc>,
+    ts: DateTime<Utc>,
+    is_first: bool,
+}
 
 /// Phase 5.6 · R7 — observability snapshot for a single camera's
 /// re-ID pipeline. One row per `(camera_id)` last touched by the
@@ -169,8 +210,23 @@ fn embedding_prefix_hex8(embedding: &[f32]) -> String {
 
 /// Hook the supervisor calls. Owns a bounded mpsc sender; the
 /// matching receiver lives in [`run_worker`].
+///
+/// M_PERF_CROWD D2 — `submit` now crops + resizes the supervisor
+/// frame inline (synchronously, on the per-camera supervisor task)
+/// so that the queued payload only carries the small RGB crop
+/// (~150 KB at 224×224) and the source frame `Arc` is dropped
+/// immediately. Pre-D2 the worker held `Arc<Frame>` (~1.5 MB at
+/// 960×540 RGB) for the lifetime of every queue entry; under
+/// crowd-burst this pinned multiple frames and starved
+/// `LatestFrameCache` reuse.
 pub struct CloudEntitySightingHook {
-    tx: mpsc::Sender<SightingSnapshot>,
+    tx: mpsc::Sender<QueuedSighting>,
+    /// Cached extractor-preferred crop dims. Read from
+    /// [`Extractor::expected_crop_dims`] at spawn time so the
+    /// per-frame submit path doesn't re-virtual-call the trait on
+    /// every emit.
+    crop_w: u32,
+    crop_h: u32,
 }
 
 impl CloudEntitySightingHook {
@@ -192,7 +248,10 @@ impl CloudEntitySightingHook {
     /// whose bbox is smaller than either floor are dropped BEFORE
     /// the batched extractor call so we don't spend compute on
     /// crops too small to embed reliably. Pass `0` for either
-    /// dimension to disable that floor.
+    /// dimension to disable that floor. The floor applies to the
+    /// source bbox dims (pre-resize), not to the fixed-size crop
+    /// — a 30×60 bbox is dropped even though the resulting crop
+    /// is always 224×224.
     #[must_use]
     pub fn spawn(
         extractor: Arc<dyn Extractor>,
@@ -202,7 +261,8 @@ impl CloudEntitySightingHook {
         min_crop_w_px: u32,
         min_crop_h_px: u32,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<SightingSnapshot>(capacity.max(1));
+        let (crop_w, crop_h) = extractor.expected_crop_dims();
+        let (tx, rx) = mpsc::channel::<QueuedSighting>(capacity.max(1));
         tokio::spawn(run_worker(
             extractor,
             outbox,
@@ -211,27 +271,83 @@ impl CloudEntitySightingHook {
             min_crop_w_px,
             min_crop_h_px,
         ));
-        Self { tx }
+        Self { tx, crop_w, crop_h }
     }
 }
 
 impl SightingHook for CloudEntitySightingHook {
     fn submit(&self, snapshot: SightingSnapshot) {
+        // D2: crop + resize on the supervisor's task BEFORE the
+        // channel hand-off so the queued payload doesn't pin the
+        // 1.5 MB source frame. ~1-3 ms at 960×540 RGB, paid once
+        // per stable-track emit (≤ 1× per `emit_interval` per
+        // track, default 5s). Cheap relative to the prior worker
+        // path cost of carrying the frame Arc through to extract().
+        let camera_id = snapshot.camera_id;
+        let track_id = snapshot.track_id;
+        let rgb = match frame_to_rgb_borrowed_or_owned(&snapshot.frame) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    camera_id,
+                    track_id,
+                    error = %e,
+                    "entity-sighting D2 crop preprocess failed (unsupported pixel format?); dropping"
+                );
+                return;
+            }
+        };
+        let crop = match crop_and_resize(
+            rgb.as_slice(),
+            snapshot.frame.width,
+            snapshot.frame.height,
+            &snapshot.bbox,
+            self.crop_w,
+            self.crop_h,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    camera_id,
+                    track_id,
+                    error = %e,
+                    "entity-sighting D2 crop_and_resize failed (degenerate bbox?); dropping"
+                );
+                return;
+            }
+        };
+        let queued = QueuedSighting {
+            camera_id,
+            track_id,
+            entity_local_id: snapshot.entity_local_id,
+            crop: Arc::new(crop),
+            crop_w: self.crop_w,
+            crop_h: self.crop_h,
+            frame_w: snapshot.frame.width,
+            frame_h: snapshot.frame.height,
+            bbox: snapshot.bbox,
+            confidence: snapshot.confidence,
+            started_ts: snapshot.started_ts,
+            ts: snapshot.ts,
+            is_first: snapshot.is_first,
+        };
+        // `snapshot.frame` Arc is now dropped at end-of-scope so
+        // the worker queue carries no source-frame references.
         // try_send is the right primitive on the hot path — `send`
         // would await on a full queue and stall the supervisor.
-        match self.tx.try_send(snapshot) {
+        match self.tx.try_send(queued) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(snap)) => {
+            Err(mpsc::error::TrySendError::Full(q)) => {
                 warn!(
-                    camera_id = snap.camera_id,
-                    track_id = snap.track_id,
+                    camera_id = q.camera_id,
+                    track_id = q.track_id,
                     "entity-sighting queue full; dropping snapshot"
                 );
             }
-            Err(mpsc::error::TrySendError::Closed(snap)) => {
+            Err(mpsc::error::TrySendError::Closed(q)) => {
                 warn!(
-                    camera_id = snap.camera_id,
-                    track_id = snap.track_id,
+                    camera_id = q.camera_id,
+                    track_id = q.track_id,
                     "entity-sighting worker gone; dropping snapshot"
                 );
             }
@@ -258,7 +374,7 @@ const REID_EXTRACT_MAX: usize = 16;
 async fn run_worker(
     extractor: Arc<dyn Extractor>,
     outbox: Arc<TunnelOutbox>,
-    mut rx: mpsc::Receiver<SightingSnapshot>,
+    mut rx: mpsc::Receiver<QueuedSighting>,
     stats: Arc<ReidStatsRegistry>,
     min_crop_w_px: u32,
     min_crop_h_px: u32,
@@ -307,7 +423,7 @@ async fn run_worker(
         // extract). This is the key M_PERF_CROWD B4 inversion —
         // pre-B4 each arrival fired its own `extract()` from inside
         // the drain loop, defeating any chance at ORT batching.
-        let mut snapshots: Vec<SightingSnapshot> = Vec::with_capacity(BATCH_MAX);
+        let mut snapshots: Vec<QueuedSighting> = Vec::with_capacity(BATCH_MAX);
         snapshots.push(first);
         let deadline = Instant::now() + BATCH_WINDOW;
         while snapshots.len() < BATCH_MAX {
@@ -325,7 +441,7 @@ async fn run_worker(
         // reliably BEFORE the ORT call. Filter is a no-op when
         // both floors are 0 (default).
         let drained = snapshots.len();
-        let kept: Vec<SightingSnapshot> = if min_crop_w_px == 0 && min_crop_h_px == 0 {
+        let kept: Vec<QueuedSighting> = if min_crop_w_px == 0 && min_crop_h_px == 0 {
             snapshots
         } else {
             snapshots
@@ -357,10 +473,15 @@ async fn run_worker(
         let mut projections: Vec<EntitySightingProjection> = Vec::with_capacity(remaining.len());
         while !remaining.is_empty() {
             let take = remaining.len().min(REID_EXTRACT_MAX);
-            let chunk: Vec<SightingSnapshot> = remaining.drain(0..take).collect();
-            let items: Vec<(Arc<nexus_types::Frame>, nexus_types::BBox)> =
-                chunk.iter().map(|s| (s.frame.clone(), s.bbox)).collect();
-            let results = extractor.extract_batch(&items).await;
+            let chunk: Vec<QueuedSighting> = remaining.drain(0..take).collect();
+            // D2: pass pre-cropped buffers down the batched fast
+            // path. Each `Arc<Vec<u8>>` is a 150 KB refcount bump,
+            // not a 1.5 MB frame ref.
+            let items: Vec<(Arc<Vec<u8>>, u32, u32)> = chunk
+                .iter()
+                .map(|s| (s.crop.clone(), s.crop_w, s.crop_h))
+                .collect();
+            let results = extractor.extract_crop_batch(&items).await;
             debug_assert_eq!(results.len(), chunk.len());
             for (snap, res) in chunk.into_iter().zip(results) {
                 if let Some(p) = build_projection(&model_id, dim, cloud_eligible, &stats, snap, res)
@@ -428,7 +549,7 @@ async fn publish_batch(outbox: &TunnelOutbox, items: Vec<EntitySightingProjectio
 /// when the snapshot should be dropped (extractor error, dim
 /// mismatch, dev-mode mock extractor, or B4 min-crop floor). Used
 /// on the non-A3 (single-envelope) worker path; the A3/B4 path
-/// calls [`Extractor::extract_batch`] directly and then funnels
+/// calls [`Extractor::extract_crop_batch`] directly and then funnels
 /// each `(snapshot, result)` pair through [`build_projection`].
 /// All counter updates and log emissions match the pre-batching
 /// behaviour so the admin `/reid/status` semantics are unchanged.
@@ -439,12 +560,15 @@ async fn extract_projection(
     dim: usize,
     cloud_eligible: bool,
     stats: &ReidStatsRegistry,
-    snapshot: SightingSnapshot,
+    snapshot: QueuedSighting,
     min_crop_w_px: u32,
     min_crop_h_px: u32,
 ) -> Option<EntitySightingProjection> {
     // B4 min-crop gate (mirrors the batched path so the two modes
-    // observe the same drop policy).
+    // observe the same drop policy). The floor is checked against
+    // the ORIGINAL bbox in supervisor-frame pixels, not the
+    // fixed-size crop — a 30×60 source bbox must still be dropped
+    // even though the cropped buffer is always 224×224.
     if min_crop_w_px > 0 || min_crop_h_px > 0 {
         let w = snapshot.bbox.width().max(0.0).round() as u32;
         let h = snapshot.bbox.height().max(0.0).round() as u32;
@@ -461,7 +585,9 @@ async fn extract_projection(
             return None;
         }
     }
-    let result = extractor.extract(&snapshot.frame, &snapshot.bbox).await;
+    let result = extractor
+        .extract_crop(snapshot.crop.as_slice(), snapshot.crop_w, snapshot.crop_h)
+        .await;
     build_projection(model_id, dim, cloud_eligible, stats, snapshot, result)
 }
 
@@ -475,22 +601,24 @@ fn build_projection(
     dim: usize,
     cloud_eligible: bool,
     stats: &ReidStatsRegistry,
-    snapshot: SightingSnapshot,
+    snapshot: QueuedSighting,
     embedding_result: Result<Embedding, ExtractorError>,
 ) -> Option<EntitySightingProjection> {
-    let SightingSnapshot {
+    let QueuedSighting {
         camera_id,
         track_id,
         entity_local_id,
-        frame,
+        crop: _,
+        crop_w: _,
+        crop_h: _,
+        frame_w,
+        frame_h,
         bbox,
         confidence,
         started_ts,
         ts,
         is_first,
     } = snapshot;
-    let frame_w = frame.width;
-    let frame_h = frame.height;
     let embedding = match embedding_result {
         Ok(emb) => emb,
         Err(e) => {
@@ -792,10 +920,13 @@ mod tests {
     use nexus_types::Frame as ReidFrame;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    /// `Extractor` that records every `extract_batch` call size so
-    /// tests can assert "the worker actually called the batched
-    /// path, not just looped extract() N times via the default
-    /// trait impl".
+    /// `Extractor` that records every `extract_crop_batch` call size
+    /// so tests can assert "the worker actually called the batched
+    /// fast path, not just looped extract_crop() N times via the
+    /// default trait impl". Post-D2 the worker drives the batched
+    /// path through `extract_crop_batch` (operating on the small
+    /// pre-cropped RGB buffer) rather than `extract_batch` (which
+    /// would re-do `crop_and_resize` on every call).
     struct BatchRecordingExtractor {
         inner: MockExtractor,
         batch_call_count: AtomicUsize,
@@ -829,9 +960,9 @@ mod tests {
         ) -> Result<Embedding, ExtractorError> {
             self.inner.extract(frame, bbox).await
         }
-        async fn extract_batch(
+        async fn extract_crop_batch(
             &self,
-            items: &[(Arc<ReidFrame>, nexus_types::BBox)],
+            items: &[(Arc<Vec<u8>>, u32, u32)],
         ) -> Vec<Result<Embedding, ExtractorError>> {
             self.batch_call_count.fetch_add(1, AtomicOrdering::SeqCst);
             self.last_batch_size
@@ -840,7 +971,7 @@ mod tests {
                 .fetch_add(items.len(), AtomicOrdering::SeqCst);
             // Fall through to the inner mock so the produced
             // projections are realistic.
-            self.inner.extract_batch(items).await
+            self.inner.extract_crop_batch(items).await
         }
     }
 
