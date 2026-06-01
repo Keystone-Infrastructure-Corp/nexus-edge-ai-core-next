@@ -51,6 +51,10 @@ pub struct YoloWorldDetector {
     input_h: u32,
     score_threshold: f32,
     nms_iou_threshold: f32,
+    /// M_PERF_CROWD Phase C3 — optional spatial bucket size (pixels)
+    /// for the shared NMS pass. `None` keeps the pre-C3 naive O(N²)
+    /// path bit-identical.
+    nms_spatial_bucket_size_px: Option<u32>,
     /// Full vocabulary baked into the ONNX, in class-index order.
     vocab: Vec<String>,
     /// Lowercase → class index, for fast lookup of per-camera prompt subsets.
@@ -96,6 +100,7 @@ impl YoloWorldDetector {
             cfg.model.input_height,
             cfg.model.score_threshold,
             default_nms_iou_threshold(),
+            cfg.model.nms_spatial_bucket_size_px,
             vocab,
             &cfg.ep_priority,
         )
@@ -106,12 +111,14 @@ impl YoloWorldDetector {
     /// providers are registered — see
     /// [`crate::execution_providers::selected_for_priority`]. Pass
     /// `&[]` for CPU-only (the default fallback path).
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         model_path: &Path,
         input_w: u32,
         input_h: u32,
         score_threshold: f32,
         nms_iou_threshold: f32,
+        nms_spatial_bucket_size_px: Option<u32>,
         vocab: Vec<String>,
         ep_priority: &[String],
     ) -> Result<Self, InferenceError> {
@@ -137,6 +144,7 @@ impl YoloWorldDetector {
         info!(
             model = %model_path.display(),
             input_w, input_h, score_threshold, nms_iou_threshold,
+            nms_spatial_bucket_size_px,
             vocab_len = vocab.len(),
             ep_requested = ?ep_priority,
             ep_registered = ?ep_names,
@@ -148,6 +156,7 @@ impl YoloWorldDetector {
             input_h,
             score_threshold,
             nms_iou_threshold,
+            nms_spatial_bucket_size_px,
             vocab,
             vocab_index,
             enabled_per_camera: ArcSwap::from_pointee(HashMap::new()),
@@ -195,6 +204,7 @@ impl Detector for YoloWorldDetector {
         let frame_h = frame.height;
         let score_threshold = self.score_threshold;
         let nms_iou = self.nms_iou_threshold;
+        let nms_bucket = self.nms_spatial_bucket_size_px;
         let format = frame.format;
         let camera_id = frame.camera_id;
 
@@ -238,6 +248,7 @@ impl Detector for YoloWorldDetector {
                 input_h,
                 score_threshold,
                 nms_iou,
+                nms_bucket,
                 vocab,
                 &enabled,
             )
@@ -277,6 +288,7 @@ fn run_yolo_world(
     input_h: u32,
     score_threshold: f32,
     nms_iou_threshold: f32,
+    nms_spatial_bucket_size_px: Option<u32>,
     vocab: &[String],
     enabled: &[usize],
 ) -> Result<Vec<Detection>, InferenceError> {
@@ -412,7 +424,10 @@ fn run_yolo_world(
     // Class-aware NMS — YOLO-World exports without the NMS op so we run
     // it here. Per-class to avoid suppressing a "person" with an
     // overlapping "vehicle" detection on the same anchor row.
-    let kept = nms_per_class(candidates, nms_iou_threshold);
+    // M_PERF_CROWD Phase C3 — `crate::nms` owns the implementation;
+    // `nms_spatial_bucket_size_px` opts into the 3×3-neighbourhood
+    // fast path (bit-identical when set high enough).
+    let kept = crate::nms::nms_per_label(candidates, nms_iou_threshold, nms_spatial_bucket_size_px);
     debug!(
         out = kept.len(),
         rows,
@@ -421,59 +436,6 @@ fn run_yolo_world(
         "yolo-world postprocess done"
     );
     Ok(kept)
-}
-
-/// Class-aware non-maximum suppression. Sorts descending by confidence,
-/// then for each detection drops every later detection of the same label
-/// whose IoU exceeds `iou_threshold`. O(n²) but n is small after the
-/// score-threshold filter (typically <100).
-fn nms_per_class(mut dets: Vec<Detection>, iou_threshold: f32) -> Vec<Detection> {
-    if dets.len() <= 1 {
-        return dets;
-    }
-    dets.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut keep = Vec::with_capacity(dets.len());
-    let mut suppressed = vec![false; dets.len()];
-    for i in 0..dets.len() {
-        if suppressed[i] {
-            continue;
-        }
-        keep.push(dets[i].clone());
-        for (j, suppressed_j) in suppressed.iter_mut().enumerate().skip(i + 1) {
-            if *suppressed_j {
-                continue;
-            }
-            if dets[i].label != dets[j].label {
-                continue;
-            }
-            if iou(&dets[i].bbox, &dets[j].bbox) >= iou_threshold {
-                *suppressed_j = true;
-            }
-        }
-    }
-    keep
-}
-
-fn iou(a: &BBox, b: &BBox) -> f32 {
-    let ix1 = a.x1.max(b.x1);
-    let iy1 = a.y1.max(b.y1);
-    let ix2 = a.x2.min(b.x2);
-    let iy2 = a.y2.min(b.y2);
-    let iw = (ix2 - ix1).max(0.0);
-    let ih = (iy2 - iy1).max(0.0);
-    let inter = iw * ih;
-    let area_a = a.width() * a.height();
-    let area_b = b.width() * b.height();
-    let union = area_a + area_b - inter;
-    if union <= 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
 }
 
 /// Bilinear resize RGB → NCHW float32. Same shape as the closed-vocab
@@ -740,7 +702,7 @@ mod tests {
             x2: 30.0,
             y2: 30.0,
         };
-        assert!(iou(&a, &b).abs() < 1e-6);
+        assert!(crate::nms::iou(&a, &b).abs() < 1e-6);
     }
 
     #[test]
@@ -751,7 +713,7 @@ mod tests {
             x2: 10.0,
             y2: 10.0,
         };
-        assert!((iou(&a, &a) - 1.0).abs() < 1e-6);
+        assert!((crate::nms::iou(&a, &a) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -780,7 +742,7 @@ mod tests {
                 attributes: Default::default(),
             },
         ];
-        let out = nms_per_class(dets, 0.5);
+        let out = crate::nms::nms_per_label(dets, 0.5, None);
         assert_eq!(out.len(), 1);
         assert!((out[0].confidence - 0.9).abs() < 1e-6);
     }
@@ -811,7 +773,7 @@ mod tests {
                 attributes: Default::default(),
             },
         ];
-        let out = nms_per_class(dets, 0.5);
+        let out = crate::nms::nms_per_label(dets, 0.5, None);
         assert_eq!(out.len(), 2);
     }
 

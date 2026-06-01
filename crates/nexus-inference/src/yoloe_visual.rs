@@ -67,6 +67,10 @@ pub struct YoloeVisualDetector {
     input_h: u32,
     score_threshold: f32,
     nms_iou_threshold: f32,
+    /// M_PERF_CROWD Phase C3 — optional spatial bucket size (pixels)
+    /// for the shared NMS pass. `None` keeps the pre-C3 naive O(N²)
+    /// path bit-identical.
+    nms_spatial_bucket_size_px: Option<u32>,
     /// Embedding dimension this session expects. Bindings whose
     /// embedding length doesn't match are dropped with a warn-log.
     embedding_dim: usize,
@@ -105,6 +109,7 @@ impl YoloeVisualDetector {
             cfg.model.input_height,
             cfg.model.score_threshold,
             default_visual_nms_iou_threshold(),
+            cfg.model.nms_spatial_bucket_size_px,
             embedding_dim,
             store,
             &cfg.ep_priority,
@@ -123,6 +128,7 @@ impl YoloeVisualDetector {
         input_h: u32,
         score_threshold: f32,
         nms_iou_threshold: f32,
+        nms_spatial_bucket_size_px: Option<u32>,
         embedding_dim: usize,
         store: Arc<dyn VisualPromptStore>,
         ep_priority: &[String],
@@ -146,6 +152,7 @@ impl YoloeVisualDetector {
         info!(
             model = %model_path.display(),
             input_w, input_h, score_threshold, nms_iou_threshold,
+            nms_spatial_bucket_size_px,
             embedding_dim,
             ep_requested = ?ep_priority,
             ep_registered = ?ep_names,
@@ -157,6 +164,7 @@ impl YoloeVisualDetector {
             input_h,
             score_threshold,
             nms_iou_threshold,
+            nms_spatial_bucket_size_px,
             embedding_dim,
             bindings_per_camera: ArcSwap::from_pointee(HashMap::new()),
             store,
@@ -185,6 +193,7 @@ impl Detector for YoloeVisualDetector {
         let frame_h = frame.height;
         let score_threshold = self.score_threshold;
         let nms_iou = self.nms_iou_threshold;
+        let nms_bucket = self.nms_spatial_bucket_size_px;
         let embedding_dim = self.embedding_dim;
 
         // Borrow the source RGB buffer when it's already in the right
@@ -209,6 +218,7 @@ impl Detector for YoloeVisualDetector {
                 input_h,
                 score_threshold,
                 nms_iou,
+                nms_bucket,
                 embedding_dim,
                 &bindings,
             )
@@ -281,6 +291,7 @@ fn run_yoloe_visual(
     input_h: u32,
     score_threshold: f32,
     nms_iou_threshold: f32,
+    nms_spatial_bucket_size_px: Option<u32>,
     embedding_dim: usize,
     bindings: &[VisualPromptBinding],
 ) -> Result<Vec<Detection>, InferenceError> {
@@ -398,7 +409,7 @@ fn run_yoloe_visual(
         });
     }
 
-    let kept = nms_per_class(candidates, nms_iou_threshold);
+    let kept = crate::nms::nms_per_label(candidates, nms_iou_threshold, nms_spatial_bucket_size_px);
     debug!(
         out = kept.len(),
         rows,
@@ -434,59 +445,6 @@ fn build_vpe_tensor(
         }
     }
     Ok(tensor)
-}
-
-/// Class-aware non-maximum suppression. Same algorithm as
-/// [`crate::yoloe::nms_per_class`] (intentionally duplicated — see
-/// module-level note about keeping text/visual code paths fully
-/// independent).
-fn nms_per_class(mut dets: Vec<Detection>, iou_threshold: f32) -> Vec<Detection> {
-    if dets.len() <= 1 {
-        return dets;
-    }
-    dets.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut keep = Vec::with_capacity(dets.len());
-    let mut suppressed = vec![false; dets.len()];
-    for i in 0..dets.len() {
-        if suppressed[i] {
-            continue;
-        }
-        keep.push(dets[i].clone());
-        for (j, suppressed_j) in suppressed.iter_mut().enumerate().skip(i + 1) {
-            if *suppressed_j {
-                continue;
-            }
-            if dets[i].label != dets[j].label {
-                continue;
-            }
-            if iou(&dets[i].bbox, &dets[j].bbox) >= iou_threshold {
-                *suppressed_j = true;
-            }
-        }
-    }
-    keep
-}
-
-fn iou(a: &BBox, b: &BBox) -> f32 {
-    let ix1 = a.x1.max(b.x1);
-    let iy1 = a.y1.max(b.y1);
-    let ix2 = a.x2.min(b.x2);
-    let iy2 = a.y2.min(b.y2);
-    let iw = (ix2 - ix1).max(0.0);
-    let ih = (iy2 - iy1).max(0.0);
-    let inter = iw * ih;
-    let area_a = a.width() * a.height();
-    let area_b = b.width() * b.height();
-    let union = area_a + area_b - inter;
-    if union <= 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
 }
 
 /// Bilinear resize RGB → NCHW float32. Duplicate of

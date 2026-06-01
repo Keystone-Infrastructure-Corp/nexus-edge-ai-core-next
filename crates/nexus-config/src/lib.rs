@@ -984,6 +984,15 @@ pub struct ModelConfig {
     /// [`ZoneConfig::min_bbox_area_px_override`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_bbox_area_px: Option<u32>,
+    /// M_PERF_CROWD Phase C3 — opt-in spatial bucketing for the
+    /// shared class-aware NMS pass in `nexus_inference::nms`. Used by
+    /// `yoloe`, `yoloe_visual`, `yolo_world`, and `ensemble`. Closes
+    /// the O(N²) suppression scan to O(N) by only checking the 3×3
+    /// grid neighbourhood. Output is bit-identical to the naive path
+    /// when `bucket_size_px ≥ max bbox dim in supervisor frame`.
+    /// `None` (default) preserves the pre-C3 naive pass exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nms_spatial_bucket_size_px: Option<u32>,
 }
 
 impl Default for ModelConfig {
@@ -998,6 +1007,7 @@ impl Default for ModelConfig {
             members: Vec::new(),
             top_k: None,
             min_bbox_area_px: None,
+            nms_spatial_bucket_size_px: None,
         }
     }
 }
