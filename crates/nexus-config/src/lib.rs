@@ -241,7 +241,17 @@ impl Default for RuntimeConfig {
 }
 
 fn default_blocking_threads() -> usize {
-    8
+    // 64 leaves enough headroom for camera-scaled spawn_blocking
+    // callers (clip-recorder appsrc pushes, drain tasks, detector
+    // reply recvs, sqlx sqlite workers) on a 32-camera box.
+    //
+    // The historical default of 8 wedged 10-camera deployments
+    // when the GStreamer bus pumps were on this pool (see
+    // preroll_ingester::run_session). Those have since moved to
+    // dedicated std::threads, but the pool still gates many other
+    // short-lived blocking ops — keeping it generous is cheap
+    // (each tokio blocking thread is on-demand, ~8 KB stack).
+    64
 }
 
 fn default_state_dir() -> PathBuf {

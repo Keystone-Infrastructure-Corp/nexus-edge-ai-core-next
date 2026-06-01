@@ -600,33 +600,45 @@ impl RtspSource {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_bus = shutdown.clone();
         let pipeline_for_bus = pipeline.clone();
-        let bus_join = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            use gst::MessageView;
-            let poll = gst::ClockTime::from_mseconds(100);
-            loop {
-                if shutdown_bus.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                let Some(msg) = bus.timed_pop(Some(poll)) else {
-                    continue;
+        // Dedicated OS thread, NOT tokio::task::spawn_blocking: this loop
+        // runs for the lifetime of the RTSP session. Pinning one of
+        // tokio's bounded blocking-pool threads per camera starves every
+        // other spawn_blocking call (detector replies, sqlx, clip-recorder
+        // appsrc pushes) once the camera count crosses the cap. A plain
+        // OS thread is free of the pool and costs ~8 KB stack.
+        let (bus_done_tx, bus_done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let thread_name = format!("nexus-gst-bus-cam{}", self.camera_id);
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                use gst::MessageView;
+                let poll = gst::ClockTime::from_mseconds(100);
+                let out = loop {
+                    if shutdown_bus.load(Ordering::Relaxed) {
+                        break Ok(());
+                    }
+                    let Some(msg) = bus.timed_pop(Some(poll)) else {
+                        continue;
+                    };
+                    match msg.view() {
+                        MessageView::Eos(..) => {
+                            let _ = &pipeline_for_bus;
+                            break Ok(());
+                        }
+                        MessageView::Error(e) => {
+                            let _ = &pipeline_for_bus;
+                            break Err(format!(
+                                "{}: {}",
+                                e.error(),
+                                e.debug().unwrap_or_else(|| "<no debug>".into())
+                            ));
+                        }
+                        _ => {}
+                    }
                 };
-                match msg.view() {
-                    MessageView::Eos(..) => {
-                        let _ = &pipeline_for_bus;
-                        return Ok(());
-                    }
-                    MessageView::Error(e) => {
-                        let _ = &pipeline_for_bus;
-                        return Err(format!(
-                            "{}: {}",
-                            e.error(),
-                            e.debug().unwrap_or_else(|| "<no debug>".into())
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        });
+                let _ = bus_done_tx.send(out);
+            })
+            .map_err(|e| FrameSourceError::Backend(format!("spawn bus thread: {e}")))?;
 
         // `tx.closed()` resolves the moment the supervisor's Receiver is
         // dropped (typically within microseconds of `task.abort()`). Racing
@@ -672,8 +684,8 @@ impl RtspSource {
         tokio::pin!(stall_watchdog);
 
         let bus_result = tokio::select! {
-            r = bus_join => {
-                r.map_err(|e| FrameSourceError::Backend(format!("bus join: {e}")))?
+            r = bus_done_rx => {
+                r.map_err(|e| FrameSourceError::Backend(format!("bus thread dropped: {e}")))?
                     .map_err(FrameSourceError::Backend)
             }
             _ = tx.closed() => {
