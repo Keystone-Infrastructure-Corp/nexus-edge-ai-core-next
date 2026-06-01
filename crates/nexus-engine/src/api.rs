@@ -2114,6 +2114,16 @@ struct CameraFrameStatsView {
     frames_dropped: u64,
     source_width: u32,
     source_height: u32,
+    /// M_TILE_REINFER (G1) — number of frames on which the tile
+    /// cascade fired successfully. Zero on cameras that never
+    /// opted in via `behavior.tile_enabled`.
+    tile_invocations: u64,
+    /// Total stage-2 detections (post per-camera prompts whitelist)
+    /// merged into the tracker input across all `tile_invocations`.
+    tile_detections_added: u64,
+    /// Cumulative wall-clock ms spent inside `run_tile_inference`.
+    /// Divide by `tile_invocations` for mean per-cascade latency.
+    tile_inference_ms_total: u64,
 }
 
 async fn get_camera_stats(
@@ -2134,6 +2144,9 @@ async fn get_camera_stats(
         frames_dropped: snap.frames_dropped,
         source_width: snap.source_width,
         source_height: snap.source_height,
+        tile_invocations: snap.tile_invocations,
+        tile_detections_added: snap.tile_detections_added,
+        tile_inference_ms_total: snap.tile_inference_ms_total,
     }))
 }
 
