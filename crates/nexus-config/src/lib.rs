@@ -1779,6 +1779,41 @@ pub struct CameraBehavior {
     /// disables the policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector_skip_every_n_frames: Option<u32>,
+    /// M_PERF_CROWD Phase E3 — adaptive detector input downscale
+    /// under crowd. Threshold (number of currently-tracked objects,
+    /// EMA-smoothed) at or above which the supervisor begins counting
+    /// toward downscale. Same EMA shape as E1's
+    /// `detector_skip_crowded_threshold` but tracked independently so
+    /// operators can tune each knob without coupling. `None` disables
+    /// the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_downscale_crowded_threshold: Option<u32>,
+    /// M_PERF_CROWD Phase E3 — sustained-crowd hysteresis window.
+    /// Crowd EMA must sit at or above
+    /// `detector_downscale_crowded_threshold` continuously for this
+    /// many seconds before the supervisor swaps to the low-res
+    /// detector. The same window in reverse (EMA below threshold)
+    /// triggers the swap back to the high-res detector. Set together
+    /// with `detector_downscale_to_width` and
+    /// `detector_downscale_to_height` to enable; any being `None`
+    /// disables the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_downscale_sustained_secs: Option<u32>,
+    /// M_PERF_CROWD Phase E3 — target detector input width while
+    /// downscaled. The router pre-builds a second inference layer at
+    /// `(camera's effective kind, detector_downscale_to_width,
+    /// detector_downscale_to_height)` at startup. When the camera's
+    /// hysteresis flips to downscaled, the supervisor picks this
+    /// pre-built layer instead of the camera's normal detector.
+    /// Typical pairing: high-res 960 → low-res 640 on T36, or 1280 →
+    /// 960 on T36-S.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_downscale_to_width: Option<u32>,
+    /// M_PERF_CROWD Phase E3 — companion to
+    /// `detector_downscale_to_width`. See that field's doc for the
+    /// composite semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_downscale_to_height: Option<u32>,
 }
 
 /// One configured camera. Wire shape (TOML + JSON) is flat — every

@@ -748,6 +748,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         let cam_url = cam.ingest.url.to_string();
         let configured_codec = cam.ingest.codec;
         let detector = router.detector_for_camera(&cam);
+        let detector_low_res = router.detector_for_camera_low_res(&cam);
         // Fresh per-camera tracker — see the comment on `cfg.tracker`
         // above for why sharing one Arc across cameras is wrong.
         let tracker: Arc<dyn nexus_tracker::Tracker> = Arc::from(build_tracker(&cfg.tracker));
@@ -777,6 +778,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         let h = spawn_camera(
             cam,
             detector,
+            detector_low_res,
             tracker,
             cfg.tracker.annotator.clone(),
             cfg.tracker.static_object.clone(),
