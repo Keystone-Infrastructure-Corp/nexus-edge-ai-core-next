@@ -236,9 +236,38 @@ if [[ -n "$TARBALL" ]]; then
     fi
 else
     if [[ -r "$SCRIPT_DIR/../VERSION" ]]; then
-        RELEASE_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
-        VERSION="${VERSION:-$(cat "$RELEASE_DIR/VERSION")}"
-        log "installing from extracted release: $RELEASE_DIR (version $VERSION)"
+        src_dir="$( cd "$SCRIPT_DIR/.." && pwd )"
+        VERSION="${VERSION:-$(cat "$src_dir/VERSION")}"
+        canonical="$NEXUS_PREFIX/releases/$VERSION"
+
+        if [[ "$src_dir" == "$canonical" ]]; then
+            # Already in place (re-run from /opt/nexus/releases/<v>/).
+            RELEASE_DIR="$src_dir"
+            log "installing from extracted release: $RELEASE_DIR (version $VERSION)"
+        else
+            # Running from a staging dir (e.g. /tmp/nexus-edge-vX.Y.Z/).
+            # swap_current_symlink unconditionally points
+            # /opt/nexus/current -> releases/<version>, so the release
+            # tree MUST live there or the unit fails with 203/EXEC on
+            # the first restart. Move (or copy across filesystems) it
+            # into place before continuing.
+            if [[ -e "$canonical" ]]; then
+                die "release dir already exists: $canonical — remove it or pass --tarball to skip in-place install"
+            fi
+            install -d -o root -g root -m 0755 "$NEXUS_PREFIX/releases"
+            log "staging $src_dir -> $canonical"
+            if ! mv "$src_dir" "$canonical" 2>/dev/null; then
+                # Cross-filesystem (e.g. /tmp on tmpfs, /opt on disk).
+                # Fall back to copy + remove so the result still owns
+                # the same bytes the operator extracted.
+                cp -a "$src_dir" "$canonical"
+                rm -rf "$src_dir"
+            fi
+            chown -R root:root "$canonical"
+            chmod 0755 "$canonical"
+            RELEASE_DIR="$canonical"
+            log "installing from staged release: $RELEASE_DIR (version $VERSION)"
+        fi
     else
         die "no --tarball given and no VERSION file alongside scripts/ — \
 either run from inside an extracted release or pass --tarball <path>"
