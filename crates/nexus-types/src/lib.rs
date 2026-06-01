@@ -154,6 +154,79 @@ pub struct FrameMetadata {
     pub objects: Vec<TrackedObject>,
 }
 
+/// M_PERF_CROWD F1 — bandwidth-relief lite companion to
+/// [`FrameMetadata`]. Carries only the fields the high-rate live
+/// overlay needs (bbox, label, confidence, lifecycle); drops the
+/// per-object `attributes` map (~400–600 bytes/object) which the
+/// attributes panel still gets from the full topic. Published on
+/// `topic::FRAME_METADATA_LITE` in parallel with the full topic; the
+/// default SSE subscriber receives this, `?attributes=full` opts in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub struct FrameMetadataLite {
+    pub camera_id: CameraId,
+    pub frame_id: FrameId,
+    pub captured_at: DateTime<Utc>,
+    pub width: u32,
+    pub height: u32,
+    pub trace_id: TraceId,
+    pub objects: Vec<TrackLite>,
+}
+
+/// M_PERF_CROWD F1 — minimal per-object payload for the lite
+/// frame-metadata topic. `lifecycle` discriminates first-frame
+/// tracks (so the overlay can draw a born indicator) from
+/// established ones; it is derived from
+/// [`TrackedObject::age_frames`] at construction time so the lite
+/// topic never depends on the full motion-event lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub struct TrackLite {
+    pub track_id: TrackId,
+    pub label: String,
+    pub confidence: f32,
+    pub bbox: BBox,
+    pub lifecycle: TrackLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TrackLifecycle {
+    /// First frame this track has been observed (`age_frames == 0`).
+    New,
+    /// Track has been observed before.
+    Active,
+}
+
+impl From<&TrackedObject> for TrackLite {
+    fn from(o: &TrackedObject) -> Self {
+        Self {
+            track_id: o.track_id,
+            label: o.label.clone(),
+            confidence: o.confidence,
+            bbox: o.bbox,
+            lifecycle: if o.age_frames == 0 {
+                TrackLifecycle::New
+            } else {
+                TrackLifecycle::Active
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Detection + tracking
 // ---------------------------------------------------------------------------
@@ -930,5 +1003,53 @@ mod tests {
         assert_eq!(serde_json::to_string(&h265).unwrap(), "\"h265\"");
 
         assert!(serde_json::from_str::<CodecSelector>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn track_lite_from_tracked_object_drops_attributes_and_derives_lifecycle() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("motion.speed_class".into(), serde_json::json!("running"));
+        attrs.insert("group.size".into(), serde_json::json!(7));
+        let new_obj = TrackedObject {
+            track_id: 42,
+            label: "person".into(),
+            confidence: 0.9,
+            bbox: BBox {
+                x1: 1.0,
+                y1: 2.0,
+                x2: 10.0,
+                y2: 20.0,
+            },
+            age_frames: 0,
+            age_ms: 0,
+            attributes: attrs.clone(),
+        };
+        let lite_new: TrackLite = (&new_obj).into();
+        assert_eq!(lite_new.track_id, 42);
+        assert_eq!(lite_new.label, "person");
+        assert_eq!(lite_new.lifecycle, TrackLifecycle::New);
+        // Attributes map is gone — that's the whole point of the lite topic.
+        let json = serde_json::to_string(&lite_new).unwrap();
+        assert!(!json.contains("attributes"));
+        assert!(!json.contains("group.size"));
+
+        let ongoing = TrackedObject {
+            age_frames: 5,
+            ..new_obj.clone()
+        };
+        let lite_ongoing: TrackLite = (&ongoing).into();
+        assert_eq!(lite_ongoing.lifecycle, TrackLifecycle::Active);
+    }
+
+    #[test]
+    fn track_lifecycle_serde_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&TrackLifecycle::New).unwrap(),
+            "\"new\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TrackLifecycle::Active).unwrap(),
+            "\"active\""
+        );
     }
 }
