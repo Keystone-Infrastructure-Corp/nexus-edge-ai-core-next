@@ -167,6 +167,25 @@ impl Config {
                     cam.ingest.url.scheme()
                 )));
             }
+            // M_TILE_REINFER (G1) — ban tile cascade on ensemble
+            // detectors. Per-member tile budgeting is out of scope
+            // for v1; see docs/edge-core/M_TILE_REINFER.md (cloud).
+            if cam.behavior.tile_enabled == Some(true) {
+                let effective_kind = cam
+                    .detector
+                    .model_override
+                    .as_ref()
+                    .map(|m| m.kind.as_str())
+                    .unwrap_or_else(|| self.inference.model.kind.as_str());
+                if effective_kind == "ensemble" {
+                    return Err(ConfigError::Validation(format!(
+                        "camera {} sets tile_enabled = true but its effective model.kind is 'ensemble' \
+                         — G1 tile re-inference is incompatible with ensemble detectors \
+                         (see docs/edge-core/M_TILE_REINFER.md)",
+                        cam.id
+                    )));
+                }
+            }
         }
         // M7 — sink ids must be unique. The dispatcher keys every
         // `alert_sink_outbox` row by `<kind>:<name>`; duplicates
@@ -1863,6 +1882,55 @@ pub struct CameraBehavior {
     /// Typical pairing: 960 → 640 (T36) or 1280 → 960 (T36-S).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_downscale_to_width: Option<u32>,
+    /// M_TILE_REINFER (G1) — opt-in cascaded re-inference on a small
+    /// set of cropped sub-regions when the stage-1 detection set
+    /// passes [`tile_trigger`]. `None` / `Some(false)` keeps the
+    /// current single-shot pipeline. When `Some(true)`, the
+    /// supervisor calls `nexus_pipeline::tile_executor::run_tile_inference`
+    /// after stage-1 and merges the results before tracker / rules.
+    /// Banned at config-load when the effective model is
+    /// `kind == "ensemble"`: per-member tile budgeting is out of
+    /// scope for v1 and the wedge plan documents the exclusion.
+    /// Disabled at runtime on any tick where E1's detector-skip
+    /// policy fires (no point re-inferring on a skipped frame).
+    /// See `docs/edge-core/M_TILE_REINFER.md` (cloud).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_enabled: Option<bool>,
+    /// M_TILE_REINFER (G1) — crowd EMA threshold at or above which
+    /// the cascade engages. Set together with [`tile_enabled`]; both
+    /// being `Some` is required to activate. `None` disables the
+    /// trigger entirely (defensive — even if `tile_enabled` is
+    /// `Some(true)`, an absent trigger keeps the cascade off so
+    /// half-configured cameras don't quietly burn cycles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_trigger: Option<u32>,
+    /// M_TILE_REINFER (G1) — per-frame cap on stage-2 invocations.
+    /// `None` defaults to `3` at the call site (a 2×2 grid yields
+    /// at most 4 cells; capping at 3 keeps the worst-case latency
+    /// budget within one extra detector cost). Operators raise this
+    /// to allow more thorough coverage on T36-S, or lower it to
+    /// throttle compute on T24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_max_per_frame: Option<u32>,
+    /// M_TILE_REINFER (G1) — grid preset (square-only to preserve
+    /// 16:9 per cell). `None` defaults to `G2x2` at the call site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_grid: Option<TileGridConfig>,
+}
+
+/// M_TILE_REINFER (G1) — wire-shape tile grid preset.
+///
+/// Square grids only so each cell preserves the parent's 16:9
+/// aspect ratio. Mirrored runtime-side as
+/// `nexus_pipeline::tile::TileGridConfig`; the pipeline crate
+/// provides the `From` adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileGridConfig {
+    /// 2 rows × 2 cols = 4 tiles, each at half supervisor resolution.
+    G2x2,
+    /// 3 rows × 3 cols = 9 tiles, each at one-third supervisor resolution.
+    G3x3,
 }
 
 /// One configured camera. Wire shape (TOML + JSON) is flat — every
@@ -2492,5 +2560,129 @@ url = "rtsp://example/cam"
             "expected to round-trip at least 2 TOMLs from {} (found {checked})",
             config_dir.display()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M_TILE_REINFER (G1) Phase B1 — per-camera tile knobs.
+    // -----------------------------------------------------------------------
+
+    /// Default `CameraBehavior` leaves every tile knob unset, so
+    /// pre-G1 configs round-trip unchanged.
+    #[test]
+    fn tile_knobs_default_to_none() {
+        let b = CameraBehavior::default();
+        assert!(b.tile_enabled.is_none());
+        assert!(b.tile_trigger.is_none());
+        assert!(b.tile_max_per_frame.is_none());
+        assert!(b.tile_grid.is_none());
+    }
+
+    /// Wire-shape lock — flat top-level TOML keys, snake-case grid
+    /// variant. The 4 fields land directly under `[[cameras]]` thanks
+    /// to the existing `#[serde(flatten)] behavior` on `CameraConfig`.
+    #[test]
+    fn tile_knobs_round_trip_via_toml() {
+        let src = r#"
+id = 1
+name = "front_door"
+url = "rtsp://example/cam"
+tile_enabled = true
+tile_trigger = 12
+tile_max_per_frame = 4
+tile_grid = "g3x3"
+"#;
+        let cam: CameraConfig = toml::from_str(src).unwrap();
+        assert_eq!(cam.behavior.tile_enabled, Some(true));
+        assert_eq!(cam.behavior.tile_trigger, Some(12));
+        assert_eq!(cam.behavior.tile_max_per_frame, Some(4));
+        assert_eq!(cam.behavior.tile_grid, Some(TileGridConfig::G3x3));
+
+        // Wire JSON must keep the keys flat (no `behavior` envelope).
+        let v = serde_json::to_value(&cam).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("tile_enabled"));
+        assert!(obj.contains_key("tile_grid"));
+        assert!(!obj.contains_key("behavior"));
+    }
+
+    /// `tile_enabled = true` with the global model `kind = "ensemble"`
+    /// must be rejected at load time. The ban is per the wedge plan
+    /// (`docs/edge-core/M_TILE_REINFER.md`): per-member tile budgeting
+    /// is out of scope for v1.
+    #[test]
+    fn tile_enabled_rejected_on_ensemble_global() {
+        let mut cfg = Config::default();
+        cfg.inference.model.kind = "ensemble".into();
+        let cam_src = r#"
+id = 1
+name = "c1"
+url = "rtsp://example/cam"
+tile_enabled = true
+"#;
+        cfg.cameras.push(toml::from_str(cam_src).unwrap());
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("ensemble") && err.to_string().contains("tile_enabled"),
+            "{err}"
+        );
+    }
+
+    /// Same ban, triggered via per-camera `model_override`. The
+    /// effective-kind resolution prefers the override over the global.
+    #[test]
+    fn tile_enabled_rejected_on_ensemble_override() {
+        let mut cfg = Config::default();
+        // Global is fine (default kind), but the camera overrides
+        // to ensemble.
+        let cam_src = r#"
+id = 1
+name = "c1"
+url = "rtsp://example/cam"
+tile_enabled = true
+
+[model_override]
+kind = "ensemble"
+"#;
+        cfg.cameras.push(toml::from_str(cam_src).unwrap());
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("ensemble"), "{err}");
+    }
+
+    /// `tile_enabled = true` is fine when the camera overrides
+    /// AWAY from a global ensemble back to a single detector — the
+    /// override wins.
+    #[test]
+    fn tile_enabled_ok_when_override_escapes_global_ensemble() {
+        let mut cfg = Config::default();
+        cfg.inference.model.kind = "ensemble".into();
+        let cam_src = r#"
+id = 1
+name = "c1"
+url = "rtsp://example/cam"
+tile_enabled = true
+
+[model_override]
+kind = "yolo_world"
+"#;
+        cfg.cameras.push(toml::from_str(cam_src).unwrap());
+        cfg.validate()
+            .expect("override to non-ensemble must validate");
+    }
+
+    /// `tile_enabled = None` or `Some(false)` is always accepted,
+    /// even on ensemble — the ban only fires for true.
+    #[test]
+    fn tile_disabled_is_always_accepted_even_on_ensemble() {
+        let mut cfg = Config::default();
+        cfg.inference.model.kind = "ensemble".into();
+        let cam_src = r#"
+id = 1
+name = "c1"
+url = "rtsp://example/cam"
+tile_enabled = false
+tile_trigger = 12
+"#;
+        cfg.cameras.push(toml::from_str(cam_src).unwrap());
+        cfg.validate().unwrap();
     }
 }

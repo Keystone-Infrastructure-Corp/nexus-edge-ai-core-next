@@ -101,6 +101,15 @@ impl TileGridConfig {
     }
 }
 
+impl From<nexus_config::TileGridConfig> for TileGridConfig {
+    fn from(cfg: nexus_config::TileGridConfig) -> Self {
+        match cfg {
+            nexus_config::TileGridConfig::G2x2 => TileGridConfig::G2x2,
+            nexus_config::TileGridConfig::G3x3 => TileGridConfig::G3x3,
+        }
+    }
+}
+
 /// Partition `(parent_w, parent_h)` into the cells implied by
 /// `grid`, returning them in row-major order. Right/bottom edge
 /// cells absorb any remainder from integer division so the union
