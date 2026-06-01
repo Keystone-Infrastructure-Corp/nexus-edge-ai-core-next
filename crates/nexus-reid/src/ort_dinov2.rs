@@ -21,6 +21,7 @@
 #![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ndarray::Array4;
@@ -144,6 +145,206 @@ impl Extractor for DinoV2Extractor {
             vec,
         })
     }
+
+    /// M_PERF_CROWD B4 — batched extraction. Stacks the input crops
+    /// into one `(B, 3, 224, 224)` tensor and issues a single ORT
+    /// call, amortising the ~3-5ms per-call session overhead across
+    /// `B` inferences. At `B=16` on the N150 iGPU the per-crop cost
+    /// drops from ~8ms to ~3ms.
+    ///
+    /// Per-item preprocessing errors (unsupported pixel format,
+    /// invalid bbox, frame buffer size mismatch) do NOT poison the
+    /// rest of the batch — they're reported in the slot
+    /// corresponding to the failing input and the surviving items
+    /// proceed to the single batched ORT call. A whole-batch ORT
+    /// failure (session-run error) is propagated to every survivor
+    /// slot (preprocess-failed slots keep their original error).
+    async fn extract_batch(
+        &self,
+        items: &[(Arc<Frame>, BBox)],
+    ) -> Vec<Result<Embedding, ExtractorError>> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        // Phase 1 — per-item preprocess. We keep `Vec<f32>` for
+        // successes and the original error for failures so the
+        // result order matches `items` exactly.
+        let per_item_floats: usize = 3 * (self.input_w as usize) * (self.input_h as usize);
+        let mut prep: Vec<Result<Vec<f32>, ExtractorError>> = Vec::with_capacity(items.len());
+        for (frame, bbox) in items {
+            let r = (|| -> Result<Vec<f32>, ExtractorError> {
+                let rgb = frame_to_rgb_borrowed_or_owned(frame)?;
+                let crop = crop_and_resize(
+                    rgb.as_slice(),
+                    frame.width,
+                    frame.height,
+                    bbox,
+                    self.input_w,
+                    self.input_h,
+                )?;
+                let mut nchw_flat = vec![0f32; per_item_floats];
+                apply_imagenet_normalize(&crop, self.input_w, self.input_h, &mut nchw_flat);
+                Ok(nchw_flat)
+            })();
+            prep.push(r);
+        }
+
+        // Phase 2 — gather survivors into a single (B, 3, H, W)
+        // tensor. `survivor_idx[k]` = original item index of the
+        // k-th batched input.
+        let mut survivor_idx: Vec<usize> = Vec::with_capacity(prep.len());
+        let mut survivor_data: Vec<f32> = Vec::with_capacity(prep.len() * per_item_floats);
+        for (i, slot) in prep.iter().enumerate() {
+            if let Ok(v) = slot {
+                survivor_idx.push(i);
+                survivor_data.extend_from_slice(v);
+            }
+        }
+
+        // Short-circuit: no preprocess survivors — just map prep
+        // errors out (no ORT call needed).
+        if survivor_idx.is_empty() {
+            return prep
+                .into_iter()
+                .map(|p| match p {
+                    Err(e) => Err(e),
+                    Ok(_) => unreachable!("survivor_idx empty implies all prep errored"),
+                })
+                .collect();
+        }
+
+        // Phase 3 — single batched ORT call.
+        let batch = survivor_idx.len();
+        let nchw = match Array4::<f32>::from_shape_vec(
+            (batch, 3, self.input_h as usize, self.input_w as usize),
+            survivor_data,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                let msg = format!("shape into ndarray (batched): {e}");
+                return splice_batch_error(prep, &survivor_idx, &msg);
+            }
+        };
+        let model_id = self.model_id.clone();
+        let expected_dim = self.expected_dim;
+        let session_for_blocking: &Mutex<Session> = &self.session;
+        let batched_result =
+            tokio::task::block_in_place(|| -> Result<Vec<Vec<f32>>, ExtractorError> {
+                let mut sess = session_for_blocking.lock();
+                run_dinov2_batch(&mut sess, &nchw, expected_dim)
+            });
+        let survivors = match batched_result {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                return splice_batch_error(prep, &survivor_idx, &msg);
+            }
+        };
+
+        debug!(
+            model_id = %model_id,
+            batch = batch,
+            dim = expected_dim,
+            "dinov2 embeddings batched"
+        );
+
+        // Phase 4 — stitch results back into the original input
+        // order. Survivor slots get L2-normalised embeddings; prep
+        // failure slots keep their original error.
+        debug_assert_eq!(survivors.len(), batch);
+        let mut survivor_iter = survivors.into_iter();
+        let mut out: Vec<Result<Embedding, ExtractorError>> = Vec::with_capacity(prep.len());
+        for slot in prep.into_iter() {
+            match slot {
+                Err(e) => out.push(Err(e)),
+                Ok(_) => {
+                    let mut vec = survivor_iter
+                        .next()
+                        .expect("survivor_iter must match survivor_idx len");
+                    l2_normalise_mut(&mut vec);
+                    out.push(Ok(Embedding {
+                        model_id: model_id.clone(),
+                        dim: vec.len(),
+                        vec,
+                    }));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Replace each survivor's slot with a freshly-constructed
+/// `InferenceFailed(msg)` while leaving preprocess-failure slots
+/// untouched. Used when the batched ORT call (or its shape-build
+/// precondition) fails as a whole.
+fn splice_batch_error(
+    prep: Vec<Result<Vec<f32>, ExtractorError>>,
+    survivor_idx: &[usize],
+    msg: &str,
+) -> Vec<Result<Embedding, ExtractorError>> {
+    let survivor_set: std::collections::HashSet<usize> = survivor_idx.iter().copied().collect();
+    prep.into_iter()
+        .enumerate()
+        .map(|(i, slot)| match slot {
+            Err(e) => Err(e),
+            Ok(_) => {
+                debug_assert!(survivor_set.contains(&i));
+                Err(ExtractorError::InferenceFailed(msg.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// M_PERF_CROWD B4 — batched DINOv2 inference. Accepts a
+/// `(B, 3, 224, 224)` tensor and returns `B` raw (not yet
+/// L2-normalised) embeddings in input order. Caller normalises.
+pub fn run_dinov2_batch(
+    session: &mut Session,
+    nchw: &Array4<f32>,
+    expected_dim: usize,
+) -> Result<Vec<Vec<f32>>, ExtractorError> {
+    let batch = nchw.shape()[0];
+    let input = TensorRef::from_array_view(nchw.view())
+        .map_err(|e| ExtractorError::InferenceFailed(format!("tensor wrap (batched): {e}")))?;
+    let outputs = session
+        .run(ort::inputs![input])
+        .map_err(|e| ExtractorError::InferenceFailed(format!("session run (batched): {e}")))?;
+    let (_name, value) = outputs
+        .iter()
+        .next()
+        .ok_or_else(|| ExtractorError::InferenceFailed("no outputs (batched)".into()))?;
+    let view = value
+        .try_extract_array::<f32>()
+        .map_err(|e| ExtractorError::InferenceFailed(format!("extract array (batched): {e}")))?;
+    let shape: Vec<usize> = view.shape().to_vec();
+    let flat: Vec<f32> = view.iter().copied().collect();
+    // Acceptable batched output shapes mirror the single-call ones:
+    //   [B, 384]                       — bare CLS token (preferred)
+    //   [B, N, 384] where N=patches    — last_hidden_state; CLS is patch 0
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(batch);
+    match shape.as_slice() {
+        [b, d] if *b == batch && *d == expected_dim => {
+            for i in 0..batch {
+                let start = i * expected_dim;
+                out.push(flat[start..start + expected_dim].to_vec());
+            }
+        }
+        [b, patches, d] if *b == batch && *d == expected_dim => {
+            let stride = patches * expected_dim;
+            for i in 0..batch {
+                let start = i * stride;
+                out.push(flat[start..start + expected_dim].to_vec());
+            }
+        }
+        other => {
+            return Err(ExtractorError::UnexpectedDim {
+                got: other.iter().product(),
+                expected: batch * expected_dim,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Single inference step. Public for the integration tests that ship
