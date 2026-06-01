@@ -633,7 +633,10 @@ async fn run_camera(
             let frame_arc = Arc::new(frame.clone());
             cache.put(cfg.id, frame_arc.clone(), tracked_arc.clone());
 
-            // Lightweight metadata onto the bus.
+            // Lightweight metadata onto the bus. `objects` is
+            // `Arc<Vec<TrackedObject>>` (M_PERF_CROWD D1) so we
+            // reuse the same allocation as `LatestFrameCache`
+            // instead of cloning the vec a second time per frame.
             let meta = FrameMetadata {
                 camera_id: cfg.id,
                 frame_id,
@@ -641,7 +644,7 @@ async fn run_camera(
                 width: frame.width,
                 height: frame.height,
                 trace_id: trace_id.clone(),
-                objects: tracked.clone(),
+                objects: Arc::clone(&tracked_arc),
             };
             let _ = bus.publish(topic::FRAME_METADATA, &meta).await;
             // M_PERF_CROWD F1 — same per-frame cadence on the
@@ -658,7 +661,7 @@ async fn run_camera(
                 width: meta.width,
                 height: meta.height,
                 trace_id: meta.trace_id.clone(),
-                objects: tracked.iter().map(TrackLite::from).collect(),
+                objects: Arc::new(tracked.iter().map(TrackLite::from).collect()),
             };
             let _ = bus
                 .publish(topic::FRAME_METADATA_LITE, &meta_lite)

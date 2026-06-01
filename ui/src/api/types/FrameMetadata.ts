@@ -4,4 +4,11 @@ import type { TrackedObject } from "./TrackedObject";
 /**
  * Lightweight frame summary for the bus and the UI. Never carries pixels.
  */
-export type FrameMetadata = { camera_id: bigint, frame_id: bigint, captured_at: string, width: number, height: number, trace_id: string, objects: Array<TrackedObject>, };
+export type FrameMetadata = { camera_id: bigint, frame_id: bigint, captured_at: string, width: number, height: number, trace_id: string, 
+/**
+ * M_PERF_CROWD D1 — `Arc`-wrapped so the supervisor publishes the
+ * same allocation that already lives in `LatestFrameCache`; the
+ * per-subscriber broadcast clone is then a refcount bump. Serde
+ * and `ts-rs` see this exactly as `Vec<TrackedObject>`.
+ */
+objects: Array<TrackedObject>, };

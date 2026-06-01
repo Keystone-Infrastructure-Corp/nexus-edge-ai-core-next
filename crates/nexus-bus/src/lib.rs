@@ -149,12 +149,22 @@ pub enum BusError {
 // Trait
 // ---------------------------------------------------------------------------
 
+// M_PERF_CROWD D1 — broadcast payloads ride as `Arc<Value>` so the
+// per-subscriber clone tokio's broadcast performs is a refcount bump,
+// not a deep clone of the JSON tree. Subscribers that need an owned
+// `Value` (`subscribe_raw`) can `(*arc).clone()`; subscribers using
+// the typed `BusExt::subscribe<T>` path deserialise borrowing from
+// `&Value` so the tree is never cloned at all.
 pub type DynStream =
-    Pin<Box<dyn Stream<Item = Result<serde_json::Value, BusError>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<Arc<serde_json::Value>, BusError>> + Send + 'static>>;
 
 #[async_trait]
 pub trait Bus: Send + Sync {
-    async fn publish_raw(&self, topic: &str, payload: serde_json::Value) -> Result<(), BusError>;
+    async fn publish_raw(
+        &self,
+        topic: &str,
+        payload: Arc<serde_json::Value>,
+    ) -> Result<(), BusError>;
     async fn subscribe_raw(&self, topic: &str) -> Result<DynStream, BusError>;
 }
 
@@ -167,7 +177,7 @@ pub trait BusExt: Bus {
         msg: &T,
     ) -> Result<(), BusError> {
         let v = serde_json::to_value(msg)?;
-        self.publish_raw(topic, v).await
+        self.publish_raw(topic, Arc::new(v)).await
     }
 
     async fn subscribe<T>(
@@ -178,8 +188,7 @@ pub trait BusExt: Bus {
         T: DeserializeOwned + Send + 'static,
     {
         let raw = self.subscribe_raw(topic).await?;
-        let mapped = raw
-            .map(|r| r.and_then(|v| serde_json::from_value::<T>(v).map_err(BusError::Serialize)));
+        let mapped = raw.map(|r| r.and_then(|v| T::deserialize(&*v).map_err(BusError::Serialize)));
         Ok(Box::pin(mapped))
     }
 }
@@ -192,7 +201,7 @@ impl<T: Bus + ?Sized> BusExt for T {}
 
 pub struct BroadcastBus {
     capacity: usize,
-    channels: RwLock<std::collections::HashMap<String, broadcast::Sender<serde_json::Value>>>,
+    channels: RwLock<std::collections::HashMap<String, broadcast::Sender<Arc<serde_json::Value>>>>,
 }
 
 impl BroadcastBus {
@@ -203,7 +212,7 @@ impl BroadcastBus {
         }
     }
 
-    fn sender_for(&self, topic: &str) -> broadcast::Sender<serde_json::Value> {
+    fn sender_for(&self, topic: &str) -> broadcast::Sender<Arc<serde_json::Value>> {
         if let Some(tx) = self.channels.read().get(topic) {
             return tx.clone();
         }
@@ -216,7 +225,11 @@ impl BroadcastBus {
 
 #[async_trait]
 impl Bus for BroadcastBus {
-    async fn publish_raw(&self, topic: &str, payload: serde_json::Value) -> Result<(), BusError> {
+    async fn publish_raw(
+        &self,
+        topic: &str,
+        payload: Arc<serde_json::Value>,
+    ) -> Result<(), BusError> {
         let tx = self.sender_for(topic);
         // Allow no-subscribers; ops bus events shouldn't fail because no one's listening.
         let _ = tx.send(payload);
@@ -245,7 +258,11 @@ pub struct NatsBus {
 #[cfg(feature = "nats")]
 #[async_trait]
 impl Bus for NatsBus {
-    async fn publish_raw(&self, _topic: &str, _payload: serde_json::Value) -> Result<(), BusError> {
+    async fn publish_raw(
+        &self,
+        _topic: &str,
+        _payload: Arc<serde_json::Value>,
+    ) -> Result<(), BusError> {
         Err(BusError::BackendUnavailable(
             "nats backend not yet implemented (M2)",
         ))
@@ -286,5 +303,21 @@ mod tests {
             .unwrap();
         let v = rx.next().await.unwrap().unwrap();
         assert_eq!(v["hello"], "world");
+    }
+
+    /// M_PERF_CROWD D1 — two subscribers on the same topic must see the
+    /// SAME `Arc<Value>` (pointer-equal), proving the broadcast clone is
+    /// a refcount bump and not a deep JSON-tree clone.
+    #[tokio::test]
+    async fn broadcast_payload_shared_between_subscribers() {
+        let bus = BroadcastBus::new(8);
+        let mut a = bus.subscribe_raw("t").await.unwrap();
+        let mut b = bus.subscribe_raw("t").await.unwrap();
+        bus.publish("t", &serde_json::json!({"k": 1}))
+            .await
+            .unwrap();
+        let va = a.next().await.unwrap().unwrap();
+        let vb = b.next().await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&va, &vb));
     }
 }
