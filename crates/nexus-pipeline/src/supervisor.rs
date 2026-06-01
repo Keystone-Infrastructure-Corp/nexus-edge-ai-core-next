@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::cache::LatestFrameCache;
+use crate::crowd_hysteresis::CrowdHysteresis;
 use crate::entity_sighting::{
     EntityLocalPersist, EntityLocalSeed, SightingHook, SightingScheduler,
 };
@@ -83,6 +84,7 @@ pub struct CameraHandle {
 pub fn spawn_camera(
     cfg: CameraConfig,
     detector: Arc<dyn Detector>,
+    detector_low_res: Option<Arc<dyn Detector>>,
     tracker: Arc<dyn Tracker>,
     annotator_cfg: AnnotatorConfig,
     static_object_cfg: StaticObjectConfig,
@@ -106,6 +108,7 @@ pub fn spawn_camera(
     let task = tokio::spawn(run_camera(
         cfg,
         detector,
+        detector_low_res,
         tracker,
         annotator_cfg,
         static_object_cfg,
@@ -132,6 +135,7 @@ pub fn spawn_camera(
 async fn run_camera(
     cfg: CameraConfig,
     detector: Arc<dyn Detector>,
+    detector_low_res: Option<Arc<dyn Detector>>,
     tracker: Arc<dyn Tracker>,
     annotator_cfg: AnnotatorConfig,
     static_object_cfg: StaticObjectConfig,
@@ -190,6 +194,19 @@ async fn run_camera(
             cfg.behavior.detector_skip_crowded_threshold,
             cfg.behavior.detector_skip_every_n_frames,
         );
+        // M_PERF_CROWD Phase E3 — adaptive detector input downscale
+        // under crowd. No-op (always returns `false`) unless both
+        // `behavior.detector_downscale_crowded_threshold` and
+        // `behavior.detector_downscale_sustained_secs` are `Some`
+        // AND the router pre-built a low-res layer (i.e.
+        // `detector_low_res` is `Some`). When all three are present,
+        // the supervisor swaps to `detector_low_res` once the EMA has
+        // held above the threshold for the sustained window.
+        let mut crowd_hysteresis = CrowdHysteresis::new(
+            cfg.behavior.detector_downscale_crowded_threshold,
+            cfg.behavior.detector_downscale_sustained_secs,
+        );
+        let mut detector_downscaled = false;
         let mut decoded: u64 = 0;
         let mut detected: u64 = 0;
         let prompts = cfg.detector.prompts.clone();
@@ -359,6 +376,17 @@ async fn run_camera(
             // detection slice so ByteTrack's predict() advances and
             // existing tracks age normally.
             let skip_detector = skip_policy.should_skip();
+            // M_PERF_CROWD Phase E3 — pick the detector for THIS
+            // frame based on the hysteresis state observed on the
+            // PREVIOUS frame. `detector_low_res` is only ever `Some`
+            // when the camera opted in AND the router pre-built the
+            // low-res layer; if either side is missing the supervisor
+            // stays on the high-res detector regardless of crowd.
+            let active_detector: &Arc<dyn Detector> = match (detector_downscaled, &detector_low_res)
+            {
+                (true, Some(low)) => low,
+                _ => &detector,
+            };
             let detections = if skip_detector {
                 debug!(
                     camera_id = cfg.id,
@@ -366,8 +394,12 @@ async fn run_camera(
                 );
                 Vec::new()
             } else {
-                let span = info_span!("frame.infer", model = %detector.name());
-                match detector.detect(&frame, &prompts).instrument(span).await {
+                let span = info_span!("frame.infer", model = %active_detector.name());
+                match active_detector
+                    .detect(&frame, &prompts)
+                    .instrument(span)
+                    .await
+                {
                     Ok(d) => d,
                     Err(e) => {
                         error!(camera_id = cfg.id, "detect failed: {e}");
@@ -415,6 +447,13 @@ async fn run_camera(
             // the next frame's skip decision reflects current crowd
             // density. No-op when the policy is disabled.
             skip_policy.observe(tracked.len());
+            // M_PERF_CROWD Phase E3 — same tracked-object count drives
+            // the input-downscale hysteresis. The returned bool is the
+            // desired downscale state for the NEXT frame; on the
+            // current frame we already committed to a detector above.
+            // No-op when the policy is disabled.
+            detector_downscaled =
+                crowd_hysteresis.observe(tracked.len(), std::time::Instant::now());
             // M-Admin Phase 2 Step 1 — exclusion-zone enforcement.
             // Drop any tracked object whose bbox centre lies inside
             // a `ZoneKind::Exclusion` polygon for this camera, BEFORE

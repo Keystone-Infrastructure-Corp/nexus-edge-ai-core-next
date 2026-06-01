@@ -154,6 +154,54 @@ impl InferenceRouter {
             }
         }
 
+        // M_PERF_CROWD Phase E3 — pre-build a low-res inference layer
+        // for each camera that opted into adaptive detector input
+        // downscale. The low-res layer reuses the camera's effective
+        // model `kind` (override if set, default otherwise) but swaps
+        // `input_width` / `input_height` for the operator-specified
+        // downscale target. Same dedup as overrides: layers are keyed
+        // by `(kind, input_w, input_h)`, so multiple cameras that
+        // share a (kind, size) downscale target reuse one layer.
+        for cam in cameras {
+            let (Some(dw), Some(dh)) = (
+                cam.behavior.detector_downscale_to_width,
+                cam.behavior.detector_downscale_to_height,
+            ) else {
+                continue;
+            };
+            let base_model = cam
+                .detector
+                .model_override
+                .as_ref()
+                .unwrap_or(&default_cfg.model);
+            let mut low_model = base_model.clone();
+            low_model.input_width = dw;
+            low_model.input_height = dh;
+            let key = LayerKey::from_model(&low_model);
+            if layers.contains_key(&key) {
+                continue;
+            }
+            let derived = derive_inference_cfg(default_cfg, &low_model);
+            match build_with_context(&derived, &ctx) {
+                Ok(layer) => {
+                    info!(
+                        key = %key.display(),
+                        camera_id = cam.id,
+                        "router: built low-res inference layer (E3 downscale)"
+                    );
+                    layers.insert(key, layer);
+                }
+                Err(e) => {
+                    warn!(
+                        key = %key.display(),
+                        camera_id = cam.id,
+                        "router: failed to build low-res layer ({e}); \
+                         camera will stay on its high-res detector even when crowded"
+                    );
+                }
+            }
+        }
+
         Ok(Self {
             default_key,
             layers,
@@ -184,6 +232,35 @@ impl InferenceRouter {
                     .clone()
             }
         }
+    }
+
+    /// M_PERF_CROWD Phase E3 — low-res detector for a camera that
+    /// opted into adaptive downscale. Returns `None` when the camera
+    /// hasn't set both `detector_downscale_to_width` and
+    /// `detector_downscale_to_height`, or when the low-res layer
+    /// failed to build (a startup `warn!` already explained why). The
+    /// supervisor uses this companion to `detector_for_camera` and
+    /// picks between the two based on its per-camera
+    /// `CrowdHysteresis` state.
+    pub fn detector_for_camera_low_res(&self, cam: &CameraConfig) -> Option<Arc<dyn Detector>> {
+        let (Some(dw), Some(dh)) = (
+            cam.behavior.detector_downscale_to_width,
+            cam.behavior.detector_downscale_to_height,
+        ) else {
+            return None;
+        };
+        let base_kind = cam
+            .detector
+            .model_override
+            .as_ref()
+            .map(|m| m.kind.clone())
+            .unwrap_or_else(|| self.default_key.kind.clone());
+        let key = LayerKey {
+            kind: base_kind,
+            input_w: dw,
+            input_h: dh,
+        };
+        self.layers.get(&key).map(|l| l.detector.clone())
     }
 
     /// Default identity's pool, for back-compat with the existing
@@ -329,6 +406,37 @@ mod tests {
         let d2 = router.detector_for_camera(&cams[1]);
         assert_eq!(d1.name(), "mock");
         assert_eq!(d2.name(), "classifier_ensemble");
+    }
+
+    /// M_PERF_CROWD Phase E3 — when a camera opts in to detector
+    /// downscale, the router pre-builds a layer at the requested
+    /// `(kind, low_w, low_h)` and `detector_for_camera_low_res`
+    /// returns it. Cameras without the knobs get `None`.
+    #[test]
+    fn router_low_res_layer_for_camera_with_downscale_knobs() {
+        let cfg = cfg_with_kind("mock");
+        let mut c1 = cam(1, None);
+        // Camera 1 opts in with default kind (mock) at 320x320.
+        c1.behavior.detector_downscale_to_width = Some(320);
+        c1.behavior.detector_downscale_to_height = Some(320);
+        c1.behavior.detector_downscale_crowded_threshold = Some(15);
+        c1.behavior.detector_downscale_sustained_secs = Some(60);
+        let c2 = cam(2, None); // no opt-in
+        let cams = vec![c1, c2];
+        let router = InferenceRouter::build(&cfg, &cams).unwrap();
+        assert!(
+            router.detector_for_camera_low_res(&cams[0]).is_some(),
+            "low-res layer should exist for camera 1"
+        );
+        assert!(
+            router.detector_for_camera_low_res(&cams[1]).is_none(),
+            "no low-res layer for camera without downscale knobs"
+        );
+        // The low-res layer's identity is distinct from the default
+        // layer's identity (different input size).
+        let high = router.detector_for_camera(&cams[0]);
+        let low = router.detector_for_camera_low_res(&cams[0]).unwrap();
+        assert!(!Arc::ptr_eq(&high, &low));
     }
 
     #[test]

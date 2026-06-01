@@ -123,6 +123,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
     let handle = spawn_camera(
         cam,
         detector,
+        None,
         tracker,
         tracker_cfg.annotator.clone(),
         tracker_cfg.static_object.clone(),

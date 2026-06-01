@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod crowd_hysteresis;
 pub mod entity_sighting;
 pub mod gate;
 pub mod post_roll;

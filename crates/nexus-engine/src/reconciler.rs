@@ -342,6 +342,7 @@ async fn start_camera(
     }
 
     let detector = args.router.detector_for_camera(&cam);
+    let detector_low_res = args.router.detector_for_camera_low_res(&cam);
     // Fresh per-camera tracker — see `ReconcilerArgs::tracker_cfg`
     // for why this CANNOT be shared across cameras.
     let tracker: Arc<dyn Tracker> = Arc::from(nexus_tracker::build_tracker(&args.tracker_cfg));
@@ -381,6 +382,7 @@ async fn start_camera(
     let handle = spawn_camera(
         cam,
         detector,
+        detector_low_res,
         tracker,
         args.annotator.clone(),
         args.static_object.clone(),
