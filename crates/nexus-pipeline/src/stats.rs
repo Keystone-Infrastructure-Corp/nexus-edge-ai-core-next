@@ -55,6 +55,18 @@ pub struct CameraFrameStats {
     /// coordinates to the displayed video element.
     pub source_width: u32,
     pub source_height: u32,
+    /// M_TILE_REINFER (G1) — number of frames on which the tile
+    /// cascade fired (stage-1 crowd threshold crossed AND `pick_tiles`
+    /// returned a non-empty set AND `run_tile_inference` succeeded).
+    pub tile_invocations: u64,
+    /// Total stage-2 detections merged into the tracker input across
+    /// all `tile_invocations`. Divide by `tile_invocations` for the
+    /// mean added detections per cascade.
+    pub tile_detections_added: u64,
+    /// Cumulative wall-clock spent inside `run_tile_inference` (sum of
+    /// per-invocation elapsed-ms). Divide by `tile_invocations` for the
+    /// mean per-cascade latency.
+    pub tile_inference_ms_total: u64,
 }
 
 impl CameraFrameStats {
@@ -80,6 +92,9 @@ struct Entry {
     frames_dropped: u64,
     source_width: u32,
     source_height: u32,
+    tile_invocations: u64,
+    tile_detections_added: u64,
+    tile_inference_ms_total: u64,
 }
 
 impl Entry {
@@ -111,6 +126,9 @@ impl Entry {
             frames_dropped: self.frames_dropped,
             source_width: self.source_width,
             source_height: self.source_height,
+            tile_invocations: self.tile_invocations,
+            tile_detections_added: self.tile_detections_added,
+            tile_inference_ms_total: self.tile_inference_ms_total,
         }
     }
 }
@@ -144,6 +162,9 @@ impl FrameStatsRegistry {
             frames_dropped: 0,
             source_width: 0,
             source_height: 0,
+            tile_invocations: 0,
+            tile_detections_added: 0,
+            tile_inference_ms_total: 0,
         });
         // Prune anything older than the window before appending so the
         // VecDeque stays bounded even at high arrival rates.
@@ -171,6 +192,22 @@ impl FrameStatsRegistry {
         let mut guard = self.inner.write();
         if let Some(entry) = guard.get_mut(&camera_id) {
             entry.frames_dropped = entry.frames_dropped.saturating_add(1);
+        }
+    }
+
+    /// M_TILE_REINFER (G1) — record one successful tile cascade. The
+    /// caller passes the number of stage-2 detections merged into the
+    /// tracker input (`added`, post-prompts-whitelist) and the
+    /// wall-clock elapsed across `run_tile_inference` (`infer_ms`). No
+    /// entry is created if the camera has not yet observed a frame —
+    /// the cascade always runs after `observe_frame`, so the entry is
+    /// guaranteed to exist by the time this is called.
+    pub fn observe_tile_invocation(&self, camera_id: CameraId, added: u64, infer_ms: u64) {
+        let mut guard = self.inner.write();
+        if let Some(entry) = guard.get_mut(&camera_id) {
+            entry.tile_invocations = entry.tile_invocations.saturating_add(1);
+            entry.tile_detections_added = entry.tile_detections_added.saturating_add(added);
+            entry.tile_inference_ms_total = entry.tile_inference_ms_total.saturating_add(infer_ms);
         }
     }
 
@@ -288,5 +325,47 @@ mod tests {
         let s = reg.snapshot(1).unwrap();
         let age = s.last_frame_age_ms(Utc::now()).unwrap();
         assert!(age >= 500);
+    }
+
+    #[test]
+    fn tile_counters_default_to_zero() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 960, 540);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.tile_invocations, 0);
+        assert_eq!(s.tile_detections_added, 0);
+        assert_eq!(s.tile_inference_ms_total, 0);
+    }
+
+    #[test]
+    fn observe_tile_invocation_increments_counters() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 960, 540);
+        reg.observe_tile_invocation(1, 7, 12);
+        reg.observe_tile_invocation(1, 3, 8);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.tile_invocations, 2);
+        assert_eq!(s.tile_detections_added, 10);
+        assert_eq!(s.tile_inference_ms_total, 20);
+    }
+
+    #[test]
+    fn observe_tile_invocation_without_entry_is_noop() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_tile_invocation(42, 5, 4);
+        assert!(reg.snapshot(42).is_none());
+    }
+
+    #[test]
+    fn clear_resets_tile_counters() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 960, 540);
+        reg.observe_tile_invocation(1, 4, 6);
+        reg.clear(1);
+        reg.observe_frame(1, Utc::now(), 960, 540);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.tile_invocations, 0);
+        assert_eq!(s.tile_detections_added, 0);
+        assert_eq!(s.tile_inference_ms_total, 0);
     }
 }

@@ -520,6 +520,7 @@ async fn run_camera(
                 } else {
                     let span =
                         info_span!("frame.tile_infer", model = %active_detector.name(), tiles = tiles.len());
+                    let tile_started = std::time::Instant::now();
                     match crate::tile_executor::run_tile_inference(
                         active_detector.as_ref(),
                         &frame,
@@ -530,6 +531,9 @@ async fn run_camera(
                     .await
                     {
                         Ok(stage2) => {
+                            let tile_elapsed_ms =
+                                tile_started.elapsed().as_millis().min(u128::from(u64::MAX))
+                                    as u64;
                             // Apply the same per-camera prompts
                             // whitelist to stage-2 outputs that the
                             // stage-1 block applied above. Idempotent
@@ -545,12 +549,24 @@ async fn run_camera(
                                     .filter(|d| label_matches_any_prompt(&d.label, &prompts))
                                     .collect()
                             };
+                            // M_TILE_REINFER (G1) — Phase B3 telemetry:
+                            // record one tile invocation with the
+                            // post-whitelist stage-2 count and elapsed
+                            // wall-clock ms. `added` is what actually
+                            // reaches the tracker so the UI can show
+                            // "stage-2 detections / cascade".
+                            stats.observe_tile_invocation(
+                                cfg.id,
+                                stage2.len() as u64,
+                                tile_elapsed_ms,
+                            );
                             debug!(
                                 camera_id = cfg.id,
                                 frame_id,
                                 stage1 = detections.len(),
                                 tiles = tiles.len(),
                                 stage2 = stage2.len(),
+                                tile_ms = tile_elapsed_ms,
                                 "tile cascade merged stage-2 detections"
                             );
                             let mut merged = detections;
