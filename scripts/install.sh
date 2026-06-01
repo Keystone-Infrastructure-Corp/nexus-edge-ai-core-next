@@ -245,6 +245,29 @@ either run from inside an extracted release or pass --tarball <path>"
     fi
 fi
 
+# If the extracted release lives outside $NEXUS_PREFIX/releases/<VERSION>/
+# (e.g. operator ran `sudo /tmp/nexus-edge-vX/scripts/install.sh`), stage
+# it into the canonical location before continuing. swap_current_symlink
+# points /opt/nexus/current at releases/<VERSION> unconditionally, so the
+# target must exist under $NEXUS_PREFIX/releases/ or systemd hits 203/EXEC.
+canonical_release_dir="$NEXUS_PREFIX/releases/$VERSION"
+if [[ "$RELEASE_DIR" != "$canonical_release_dir" ]]; then
+    if [[ -d "$canonical_release_dir" ]]; then
+        log "canonical release dir already exists: $canonical_release_dir (re-using)"
+    else
+        install -d -o root -g root -m 0755 "$NEXUS_PREFIX/releases"
+        log "staging $RELEASE_DIR -> $canonical_release_dir"
+        tmpdir="$(mktemp -d -p "$NEXUS_PREFIX/releases" .stage.XXXXXX)"
+        # cp -a preserves permissions/symlinks; trailing /. copies
+        # directory contents (not the dir itself) into tmpdir.
+        cp -a "$RELEASE_DIR/." "$tmpdir/"
+        mv "$tmpdir" "$canonical_release_dir"
+        chown -R root:root "$canonical_release_dir"
+        chmod 0755 "$canonical_release_dir"
+    fi
+    RELEASE_DIR="$canonical_release_dir"
+fi
+
 [[ -d "$RELEASE_DIR/bin" ]]            || die "release $RELEASE_DIR missing bin/"
 [[ -d "$RELEASE_DIR/etc-templates" ]]  || die "release $RELEASE_DIR missing etc-templates/"
 [[ -d "$RELEASE_DIR/share" ]]          || die "release $RELEASE_DIR missing share/"
