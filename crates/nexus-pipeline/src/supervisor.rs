@@ -31,6 +31,7 @@ use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{
     ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError, MAX_CLIP_DURATION_MS,
 };
+use crate::skip_policy::DetectorSkipPolicy;
 use crate::source::{FrameSource, VirtualSource};
 use crate::static_clear::StaticAnchorClearRegistry;
 use crate::stats::FrameStatsRegistry;
@@ -181,6 +182,14 @@ async fn run_camera(
         });
 
         let gate = MotionGate::new();
+        // M_PERF_CROWD Phase E1 — adaptive detector cadence under crowd.
+        // No-op (always-run) unless both
+        // `behavior.detector_skip_crowded_threshold` and
+        // `behavior.detector_skip_every_n_frames` are `Some`.
+        let mut skip_policy = DetectorSkipPolicy::new(
+            cfg.behavior.detector_skip_crowded_threshold,
+            cfg.behavior.detector_skip_every_n_frames,
+        );
         let mut decoded: u64 = 0;
         let mut detected: u64 = 0;
         let prompts = cfg.detector.prompts.clone();
@@ -343,7 +352,20 @@ async fn run_camera(
                 }
             }
 
-            let detections = {
+            // M_PERF_CROWD Phase E1 — decide BEFORE running the
+            // detector whether this frame is one that the skip policy
+            // wants to drop. On a skip frame the detector is bypassed
+            // entirely; the tracker still runs below with an empty
+            // detection slice so ByteTrack's predict() advances and
+            // existing tracks age normally.
+            let skip_detector = skip_policy.should_skip();
+            let detections = if skip_detector {
+                debug!(
+                    camera_id = cfg.id,
+                    frame_id, "detector skipped (crowd skip policy)"
+                );
+                Vec::new()
+            } else {
                 let span = info_span!("frame.infer", model = %detector.name());
                 match detector.detect(&frame, &prompts).instrument(span).await {
                     Ok(d) => d,
@@ -361,7 +383,7 @@ async fn run_camera(
             // mapped class, so this is the only enforcement point
             // that catches it. Empty prompts disables the filter
             // (see `label_matches_any_prompt`).
-            let detections: Vec<_> = if prompts.is_empty() {
+            let detections: Vec<_> = if prompts.is_empty() || skip_detector {
                 detections
             } else {
                 let before = detections.len();
@@ -380,12 +402,19 @@ async fn run_camera(
                 }
                 kept
             };
-            detected += 1;
+            if !skip_detector {
+                detected += 1;
+            }
 
             let mut tracked = {
                 let _g = info_span!("frame.track", tracker = tracker.name()).entered();
                 tracker.update(detections)
             };
+            // M_PERF_CROWD Phase E1 — feed the post-tracker
+            // tracked-object count back into the skip policy's EMA so
+            // the next frame's skip decision reflects current crowd
+            // density. No-op when the policy is disabled.
+            skip_policy.observe(tracked.len());
             // M-Admin Phase 2 Step 1 — exclusion-zone enforcement.
             // Drop any tracked object whose bbox centre lies inside
             // a `ZoneKind::Exclusion` polygon for this camera, BEFORE

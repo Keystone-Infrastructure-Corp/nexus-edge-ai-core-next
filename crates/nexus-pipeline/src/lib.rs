@@ -19,6 +19,7 @@ pub mod gate;
 pub mod post_roll;
 pub mod preroll;
 pub mod recorder;
+pub mod skip_policy;
 pub mod source;
 pub mod static_clear;
 pub mod stats;

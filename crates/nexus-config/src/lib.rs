@@ -1760,6 +1760,25 @@ pub struct CameraBehavior {
     /// — the reconciler only respawns on URL change today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_ttl_secs: Option<u32>,
+    /// M_PERF_CROWD Phase E1 — adaptive detector cadence under crowd.
+    /// Threshold (number of currently-tracked objects, EMA-smoothed)
+    /// at or above which `DetectorSkipPolicy` becomes active. When
+    /// active, the detector runs only every `detector_skip_every_n_frames`
+    /// gate-allowed frame; intervening frames advance the tracker with
+    /// an empty detection slice so ByteTrack's `predict()` still ages
+    /// tracks. Set together with `detector_skip_every_n_frames` to
+    /// enable; either being `None` disables the policy. Defaults `None`
+    /// → no skipping, preserves current behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_skip_crowded_threshold: Option<u32>,
+    /// M_PERF_CROWD Phase E1 — companion to
+    /// `detector_skip_crowded_threshold`. When the policy is active,
+    /// detector runs on `frame_counter % n == 0` and is skipped
+    /// otherwise. Typical value: 2 (halves detector cadence under
+    /// crowd). Values `< 2` are coerced to "always run". `None`
+    /// disables the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_skip_every_n_frames: Option<u32>,
 }
 
 /// One configured camera. Wire shape (TOML + JSON) is flat — every
