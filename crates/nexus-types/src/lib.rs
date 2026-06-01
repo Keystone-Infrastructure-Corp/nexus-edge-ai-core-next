@@ -151,7 +151,11 @@ pub struct FrameMetadata {
     pub width: u32,
     pub height: u32,
     pub trace_id: TraceId,
-    pub objects: Vec<TrackedObject>,
+    /// M_PERF_CROWD D1 — `Arc`-wrapped so the supervisor publishes the
+    /// same allocation that already lives in `LatestFrameCache`; the
+    /// per-subscriber broadcast clone is then a refcount bump. Serde
+    /// and `ts-rs` see this exactly as `Vec<TrackedObject>`.
+    pub objects: Arc<Vec<TrackedObject>>,
 }
 
 /// M_PERF_CROWD F1 — bandwidth-relief lite companion to
@@ -174,7 +178,10 @@ pub struct FrameMetadataLite {
     pub width: u32,
     pub height: u32,
     pub trace_id: TraceId,
-    pub objects: Vec<TrackLite>,
+    /// M_PERF_CROWD D1 — same `Arc` rationale as
+    /// [`FrameMetadata::objects`]. Built per-frame in the supervisor;
+    /// kept behind an `Arc` so the broadcast clone is a refcount bump.
+    pub objects: Arc<Vec<TrackLite>>,
 }
 
 /// M_PERF_CROWD F1 — minimal per-object payload for the lite

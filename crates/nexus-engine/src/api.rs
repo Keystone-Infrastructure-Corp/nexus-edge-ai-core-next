@@ -2094,7 +2094,7 @@ async fn get_latest_frame_meta(
         width: f.width,
         height: f.height,
         trace_id: f.trace_id.clone(),
-        objects: (*entry.objects).clone(),
+        objects: entry.objects.clone(),
     }))
 }
 
