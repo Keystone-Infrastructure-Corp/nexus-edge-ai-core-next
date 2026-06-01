@@ -483,6 +483,99 @@ async fn run_camera(
                 detected += 1;
             }
 
+            // M_TILE_REINFER (G1) — Phase B2 cascade: when this
+            // camera opted in via behavior.tile_enabled = Some(true)
+            // AND the stage-1 detection count crossed
+            // behavior.tile_trigger AND we're not on a skipped
+            // frame (E1 invariant: G1 disabled when E1 skip fires
+            // same tick), re-run the SAME active_detector on a small
+            // set of cropped sub-regions chosen by stage-1 density.
+            // Stage-2 detections are mapped back to parent-frame
+            // coordinates and concatenated with stage-1 before the
+            // single tracker.update() call below.
+            //
+            // On crop or inference error we fall through to
+            // stage-1-only (fail-soft) — the cascade is a compute-
+            // optimality knob, not a correctness one. The merged
+            // detection set is NOT re-deduped here; the tracker's
+            // association layer handles overlapping boxes from
+            // adjacent tiles as it would for any duplicate
+            // detection. See docs/edge-core/M_TILE_REINFER.md.
+            let detections = if !skip_detector
+                && cfg.behavior.tile_enabled == Some(true)
+                && cfg.behavior.tile_trigger.is_some_and(|t| {
+                    let trigger = t as usize;
+                    trigger > 0 && detections.len() >= trigger
+                }) {
+                let grid: crate::tile::TileGridConfig = cfg
+                    .behavior
+                    .tile_grid
+                    .map(Into::into)
+                    .unwrap_or(crate::tile::TileGridConfig::G2x2);
+                let max_tiles = cfg.behavior.tile_max_per_frame.unwrap_or(3);
+                let tiles =
+                    crate::tile::pick_tiles(&detections, frame.width, frame.height, grid, max_tiles);
+                if tiles.is_empty() {
+                    detections
+                } else {
+                    let span =
+                        info_span!("frame.tile_infer", model = %active_detector.name(), tiles = tiles.len());
+                    match crate::tile_executor::run_tile_inference(
+                        active_detector.as_ref(),
+                        &frame,
+                        &tiles,
+                        &prompts,
+                    )
+                    .instrument(span)
+                    .await
+                    {
+                        Ok(stage2) => {
+                            // Apply the same per-camera prompts
+                            // whitelist to stage-2 outputs that the
+                            // stage-1 block applied above. Idempotent
+                            // for open-vocab detectors that already
+                            // honour `prompts`; required for
+                            // closed-vocab YOLO/COCO which emits all
+                            // mapped classes regardless.
+                            let stage2: Vec<_> = if prompts.is_empty() {
+                                stage2
+                            } else {
+                                stage2
+                                    .into_iter()
+                                    .filter(|d| label_matches_any_prompt(&d.label, &prompts))
+                                    .collect()
+                            };
+                            debug!(
+                                camera_id = cfg.id,
+                                frame_id,
+                                stage1 = detections.len(),
+                                tiles = tiles.len(),
+                                stage2 = stage2.len(),
+                                "tile cascade merged stage-2 detections"
+                            );
+                            let mut merged = detections;
+                            merged.extend(stage2);
+                            merged
+                        }
+                        Err(e) => {
+                            // Fail-soft to stage-1 only. The
+                            // alternative — dropping the frame — would
+                            // make the cascade a correctness risk
+                            // rather than a recall booster.
+                            warn!(
+                                camera_id = cfg.id,
+                                frame_id,
+                                tiles = tiles.len(),
+                                "tile cascade failed, falling back to stage-1: {e}"
+                            );
+                            detections
+                        }
+                    }
+                }
+            } else {
+                detections
+            };
+
             let mut tracked = {
                 let _g = info_span!("frame.track", tracker = tracker.name()).entered();
                 tracker.update(detections)
