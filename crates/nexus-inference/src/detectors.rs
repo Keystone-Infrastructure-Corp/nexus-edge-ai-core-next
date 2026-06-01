@@ -39,6 +39,30 @@ pub trait Detector: Send + Sync {
         prompts: &[String],
     ) -> Result<Vec<Detection>, InferenceError>;
 
+    /// Run detection on a pre-cropped frame — i.e. a sub-region of the
+    /// supervisor frame produced by `nexus_pipeline::tile` for the G1
+    /// crowded-scene tile re-inference path
+    /// (`docs/edge-core/M_TILE_REINFER.md` in the cloud repo).
+    ///
+    /// Contract:
+    /// - `crop` is a real `Frame` (same pixel format + camera_id +
+    ///   trace_id as the parent supervisor frame; `width`/`height` are
+    ///   the crop dimensions, NOT the parent dimensions).
+    /// - Returned detection bboxes are in `crop` coordinate space. The
+    ///   caller (the tile executor) maps them back into the parent
+    ///   supervisor-frame coordinate system.
+    /// - The default implementation delegates to `detect()`, which is
+    ///   correct (a crop is a valid `Frame`) but does not save compute.
+    ///   Per-detector overrides may skip full-frame letterboxing or
+    ///   re-use a tile-sized session input to make the call cheaper.
+    async fn detect_crop(
+        &self,
+        crop: &Frame,
+        prompts: &[String],
+    ) -> Result<Vec<Detection>, InferenceError> {
+        self.detect(crop, prompts).await
+    }
+
     /// Hot-update prompts / per-camera params. Default = no-op so detectors
     /// that don't care don't have to implement it.
     async fn push_camera_config(&self, _update: &nexus_config::CameraConfigUpdate) {}
