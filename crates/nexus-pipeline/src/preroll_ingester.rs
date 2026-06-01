@@ -761,37 +761,37 @@ async fn run_session(
     let bus_shutdown = shutdown;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), IngesterError>>();
     let thread_name = format!("nexus-gst-bus-cam{camera_id}");
-    let spawn_res = std::thread::Builder::new().name(thread_name).spawn(move || {
-        let out = loop {
-            if bus_shutdown.load(Ordering::Acquire) {
-                break Ok(());
-            }
-            let timeout = gst::ClockTime::from_mseconds(250);
-            match bus.timed_pop(Some(timeout)) {
-                None => continue,
-                Some(msg) => match msg.view() {
-                    gst::MessageView::Eos(..) => {
-                        debug!(camera_id, "preroll ingester pipeline EOS");
-                        break Ok(());
-                    }
-                    gst::MessageView::Error(e) => {
-                        let err = format!(
-                            "{} (debug: {})",
-                            e.error(),
-                            e.debug().unwrap_or_else(|| "<none>".into())
-                        );
-                        break Err(IngesterError::Pipeline(err));
-                    }
-                    _ => {}
-                },
-            }
-        };
-        let _ = done_tx.send(out);
-    });
+    let spawn_res = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let out = loop {
+                if bus_shutdown.load(Ordering::Acquire) {
+                    break Ok(());
+                }
+                let timeout = gst::ClockTime::from_mseconds(250);
+                match bus.timed_pop(Some(timeout)) {
+                    None => continue,
+                    Some(msg) => match msg.view() {
+                        gst::MessageView::Eos(..) => {
+                            debug!(camera_id, "preroll ingester pipeline EOS");
+                            break Ok(());
+                        }
+                        gst::MessageView::Error(e) => {
+                            let err = format!(
+                                "{} (debug: {})",
+                                e.error(),
+                                e.debug().unwrap_or_else(|| "<none>".into())
+                            );
+                            break Err(IngesterError::Pipeline(err));
+                        }
+                        _ => {}
+                    },
+                }
+            };
+            let _ = done_tx.send(out);
+        });
     if let Err(e) = spawn_res {
-        return Err(IngesterError::Pipeline(format!(
-            "spawn bus thread: {e}"
-        )));
+        return Err(IngesterError::Pipeline(format!("spawn bus thread: {e}")));
     }
     let result: Result<(), IngesterError> = done_rx
         .await
