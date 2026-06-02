@@ -106,6 +106,13 @@ pub fn spawn_camera(
     sighting_cfg: SightingSchedulerConfig,
     sighting_seed: Vec<EntityLocalSeed>,
     sighting_persist: Arc<dyn EntityLocalPersist>,
+    // Effective `model.top_k` for this camera (per-camera `model_override`
+    // wins over the global `inference.model.top_k`). Used by the G1 tile
+    // cascade to re-truncate the merged stage-1 + stage-2 detection vector
+    // so the operator's `top_k` is honoured GLOBALLY across stages rather
+    // than per-stage. `None` disables the post-merge re-cap (matches the
+    // pre-B2.1 behaviour for cameras without a configured cap).
+    effective_top_k: Option<usize>,
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
@@ -130,6 +137,7 @@ pub fn spawn_camera(
         sighting_cfg,
         sighting_seed,
         sighting_persist,
+        effective_top_k,
     ));
     CameraHandle { camera_id, task }
 }
@@ -157,6 +165,7 @@ async fn run_camera(
     sighting_cfg: SightingSchedulerConfig,
     sighting_seed: Vec<EntityLocalSeed>,
     sighting_persist: Arc<dyn EntityLocalPersist>,
+    effective_top_k: Option<usize>,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -571,6 +580,19 @@ async fn run_camera(
                             );
                             let mut merged = detections;
                             merged.extend(stage2);
+                            // M_TILE_REINFER (G1) — Phase B2.1: enforce
+                            // the operator's `top_k` GLOBALLY across the
+                            // merged stage-1 + stage-2 vector. The stage-1
+                            // wrapper and the per-tile wrapper each
+                            // already capped to ≤k, so worst-case input
+                            // here is `k × (1 + max_tiles)` — without
+                            // this call the tracker would see up to that
+                            // many boxes per cascade frame, silently
+                            // exceeding the configured cap. Idempotent
+                            // when `merged.len() ≤ k` (skips the sort).
+                            if let Some(k) = effective_top_k {
+                                nexus_inference::caps::apply_top_k(&mut merged, k);
+                            }
                             merged
                         }
                         Err(e) => {
