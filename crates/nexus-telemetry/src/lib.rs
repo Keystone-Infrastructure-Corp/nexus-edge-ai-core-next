@@ -18,7 +18,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use nexus_cloud_client::trace_layer::TraceLayer;
+use nexus_cloud_client::trace_layer::{TraceLayer, TraceLayerConfig};
 pub use nexus_cloud_client::trace_uploader::TraceUploaderHandle;
 use nexus_config::TelemetryConfig;
 use opentelemetry::trace::TracerProvider as _;
@@ -68,7 +68,25 @@ pub fn init(
 
     // Cloud trace shipping: `tracing_subscriber` implements `Layer` for
     // `Option<L>`, so `None` is a zero-cost no-op.
-    let trace_layer = trace_handle.map(TraceLayer::new);
+    //
+    // Cost guardrail (Phase 6.17 follow-up): the per-frame pipeline
+    // emits one span per stage per frame; at ~10 fps × 8 stages × N
+    // cameras, that's millions of spans/day → ~17 GiB/30d ingest into
+    // Application Insights. Drop the two highest-volume names entirely
+    // (`frame.gate`, `frame.lifecycle` — inner-loop events; per-frame
+    // timing belongs in metrics, not traces) and sample the remaining
+    // `frame.*` spans at 1% by trace_id hash. Non-frame spans
+    // (`camera.pipeline`, audit, RPC, etc.) ship at 100%.
+    let trace_layer = trace_handle.map(|h| {
+        let cfg = TraceLayerConfig {
+            drop_names: ["frame.gate", "frame.lifecycle"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            prefix_sample: vec![("frame.".to_string(), 0.01)],
+        };
+        TraceLayer::with_config(h, cfg)
+    });
 
     let mut guard = TelemetryGuard { provider: None };
 

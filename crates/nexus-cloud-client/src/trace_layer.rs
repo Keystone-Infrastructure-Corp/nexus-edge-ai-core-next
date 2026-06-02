@@ -38,7 +38,7 @@
 //! shipped. Default suggestion: `info,nexus_engine=debug` — INFO-level
 //! and above for everything, debug for nexus-engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use tracing::field::{Field, Visit};
@@ -49,6 +49,74 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 use crate::trace_uploader::{now_unix_ns, Span, SpanKind, SpanStatus, TraceUploaderHandle};
+
+/// Cost guardrail for the cloud trace pipeline.
+///
+/// Without filtering, every per-frame span the engine emits (the
+/// `frame.lifecycle` root plus `frame.gate / infer / track / …` children)
+/// is shipped to `traces-svc` and ingested into Application Insights.
+/// At ~10 fps × 8 stages per frame × multiple cameras that's millions of
+/// `AppDependencies` rows per day; a single dev workspace burned ~17 GiB
+/// in 30 days that way.
+///
+/// Two knobs:
+/// * [`drop_names`](TraceLayerConfig::drop_names) — span names that are
+///   never shipped. The local `fmt` layer still prints them; only the
+///   cloud export drops. Children of a dropped span lose the trace_id
+///   inheritance chain (their nearest ancestor with `SpanData` is now
+///   higher up, or none), so they become roots of their own trace and
+///   are subject to any matching `prefix_sample` rule independently.
+/// * [`prefix_sample`](TraceLayerConfig::prefix_sample) — for any span
+///   whose name starts with `prefix`, ship only `ratio` (0.0..=1.0) of
+///   those spans. The decision is keyed on `hash(trace_id) mod 10_000`,
+///   so all spans in the same trace are kept or dropped together; first
+///   matching prefix wins.
+///
+/// Spans matching neither rule are shipped at 100%.
+#[derive(Debug, Clone, Default)]
+pub struct TraceLayerConfig {
+    pub drop_names: HashSet<String>,
+    pub prefix_sample: Vec<(String, f64)>,
+}
+
+impl TraceLayerConfig {
+    /// Returns `true` if a span with this name should be exported.
+    fn should_ship(&self, name: &str, trace_id: &str) -> bool {
+        if self.drop_names.contains(name) {
+            return false;
+        }
+        for (prefix, ratio) in &self.prefix_sample {
+            if name.starts_with(prefix.as_str()) {
+                if *ratio <= 0.0 {
+                    return false;
+                }
+                if *ratio >= 1.0 {
+                    return true;
+                }
+                // Hash first 8 hex chars of trace_id (32 bits) → mod 10_000.
+                // Keeps all spans sharing a trace_id together (when the
+                // chain is intact) and is deterministic per trace.
+                let bucket = trace_id_bucket(trace_id);
+                let cutoff = (ratio * 10_000.0) as u32;
+                return bucket < cutoff;
+            }
+        }
+        true
+    }
+}
+
+/// Parse the leading 8 hex chars of `trace_id` as a `u32` and reduce
+/// to `[0, 10_000)`. Returns `0` (i.e. keep) on malformed input — the
+/// random_trace_id() generator always yields 32 hex chars, so this only
+/// trips on test fixtures that pass `""`.
+fn trace_id_bucket(trace_id: &str) -> u32 {
+    if trace_id.len() < 8 {
+        return 0;
+    }
+    u32::from_str_radix(&trace_id[..8], 16)
+        .map(|v| v % 10_000)
+        .unwrap_or(0)
+}
 
 /// Per-span state cached in the subscriber's per-span extensions
 /// between `on_new_span` and `on_close`.
@@ -112,13 +180,27 @@ impl<'a> Visit for FieldVisitor<'a> {
 #[derive(Clone)]
 pub struct TraceLayer {
     handle: TraceUploaderHandle,
+    config: std::sync::Arc<TraceLayerConfig>,
 }
 
 impl TraceLayer {
-    /// Wrap an uploader handle into a tracing layer.
+    /// Wrap an uploader handle into a tracing layer with no filtering
+    /// (every span shipped). Equivalent to
+    /// `with_config(handle, TraceLayerConfig::default())`.
     #[must_use]
     pub fn new(handle: TraceUploaderHandle) -> Self {
-        Self { handle }
+        Self::with_config(handle, TraceLayerConfig::default())
+    }
+
+    /// Wrap an uploader handle into a tracing layer that drops /
+    /// samples spans per [`TraceLayerConfig`]. Used by the engine's
+    /// `nexus-telemetry::init` to keep AI ingest costs bounded.
+    #[must_use]
+    pub fn with_config(handle: TraceUploaderHandle, config: TraceLayerConfig) -> Self {
+        Self {
+            handle,
+            config: std::sync::Arc::new(config),
+        }
     }
 }
 
@@ -141,6 +223,16 @@ where
                 parent.map(|p| (p.trace_id.clone(), Some(p.span_id.clone())))
             })
             .unwrap_or_else(|| (random_trace_id(), None));
+
+        // Cost guardrail: drop or sample by name before allocating
+        // SpanData. A dropped span has no SpanData, so on_close won't
+        // push it, and its children's `scope().find_map(...)` above
+        // skips past it — they re-root with a fresh trace_id and are
+        // independently subject to the same rules.
+        let name = span_ref.name();
+        if !self.config.should_ship(name, &trace_id) {
+            return;
+        }
 
         let mut data = SpanData {
             trace_id,
@@ -397,5 +489,98 @@ mod tests {
         let batches = transport.batches.lock().await;
         let span = &batches[0].spans[0];
         assert_eq!(span.status, SpanStatus::Error);
+    }
+
+    #[test]
+    fn drop_names_filter_blocks_listed_spans() {
+        let cfg = TraceLayerConfig {
+            drop_names: ["frame.gate", "frame.lifecycle"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            prefix_sample: vec![],
+        };
+        // Any trace_id; drop_names is name-only.
+        assert!(!cfg.should_ship("frame.gate", "00000000ffffffff"));
+        assert!(!cfg.should_ship("frame.lifecycle", "00000000ffffffff"));
+        assert!(cfg.should_ship("frame.infer", "00000000ffffffff"));
+        assert!(cfg.should_ship("camera.pipeline", "00000000ffffffff"));
+    }
+
+    #[test]
+    fn prefix_sample_keeps_approximately_ratio_fraction() {
+        let cfg = TraceLayerConfig {
+            drop_names: HashSet::new(),
+            prefix_sample: vec![("frame.".to_string(), 0.01)],
+        };
+        // Sweep all 10_000 buckets deterministically — exactly 1% should
+        // be kept (buckets [0, 100)) because should_ship uses the same
+        // mod-10_000 math.
+        let kept = (0u32..10_000)
+            .filter(|i| {
+                let trace_id = format!("{i:08x}{:024x}", 0u128);
+                cfg.should_ship("frame.infer", &trace_id)
+            })
+            .count();
+        assert_eq!(kept, 100, "1% of 10_000 buckets should pass");
+    }
+
+    #[test]
+    fn prefix_sample_ratio_one_keeps_all_and_zero_drops_all() {
+        let keep_all = TraceLayerConfig {
+            drop_names: HashSet::new(),
+            prefix_sample: vec![("frame.".to_string(), 1.0)],
+        };
+        let drop_all = TraceLayerConfig {
+            drop_names: HashSet::new(),
+            prefix_sample: vec![("frame.".to_string(), 0.0)],
+        };
+        for i in 0u32..1000 {
+            let trace_id = format!("{i:08x}{:024x}", 0u128);
+            assert!(keep_all.should_ship("frame.infer", &trace_id));
+            assert!(!drop_all.should_ship("frame.infer", &trace_id));
+        }
+    }
+
+    #[test]
+    fn unmatched_spans_are_always_shipped() {
+        let cfg = TraceLayerConfig {
+            drop_names: HashSet::new(),
+            prefix_sample: vec![("frame.".to_string(), 0.0)], // would drop frame.*
+        };
+        // Not a frame.* — no prefix matches, so ship.
+        assert!(cfg.should_ship("camera.pipeline", "deadbeef0000000000000000"));
+        assert!(cfg.should_ship("audit.event", "0000beef0000000000000000"));
+    }
+
+    #[tokio::test]
+    async fn with_config_drops_listed_span_end_to_end() {
+        let transport = Arc::new(RecordingTransport::default());
+        let cfg = TraceUploaderConfig {
+            endpoint_url: "https://test/".into(),
+            core_id: uuid::Uuid::nil(),
+            batch_size: 1,
+            flush_interval: Duration::from_millis(50),
+            queue_capacity: 16,
+        };
+        let (handle, _join) =
+            TraceUploader::spawn(cfg, transport.clone() as Arc<dyn BatchTransport>);
+        let layer_cfg = TraceLayerConfig {
+            drop_names: ["frame.gate"].into_iter().map(String::from).collect(),
+            prefix_sample: vec![],
+        };
+        let layer = TraceLayer::with_config(handle, layer_cfg);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let _dropped = tracing::info_span!("frame.gate").entered();
+        });
+        // Give the uploader at least one flush window (50 ms) to prove
+        // nothing showed up.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let batches = transport.batches.lock().await;
+        assert!(
+            batches.iter().all(|b| b.spans.is_empty()),
+            "frame.gate must not be exported, got {batches:?}"
+        );
     }
 }
