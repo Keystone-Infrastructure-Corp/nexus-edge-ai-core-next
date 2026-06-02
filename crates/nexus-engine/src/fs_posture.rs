@@ -84,6 +84,7 @@ pub struct PathPosture {
 impl PathPosture {
     /// Convenience constructor for non-Linux callers (and the test
     /// fixture that needs to fabricate a "skip" row).
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn unsupported(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
