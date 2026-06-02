@@ -1,9 +1,16 @@
 # nexus.example.toml — fully annotated reference.
 #
-# Defaults below are sized for the **T24** tier (GMKtec M3 Ultra, Iris Xe
-# 96 EU). For other documented hardware tiers (T10 Beelink Mini S13, T36
-# Arc A380, T36-S Lunar Lake, T64 RTX 4060) copy one of the per-tier
-# files in `config/tiers/` instead. See [docs/HARDWARE_TIERS.md](../docs/HARDWARE_TIERS.md).
+# Defaults below are sized for the **T24** tier (Beelink EQR7 + Hailo-8,
+# 24 cams target). For other documented hardware tiers (T10 Beelink
+# Mini S13, T36 Arc A380, T36-S Lunar Lake, T64 RTX 4060) copy one of
+# the per-tier files in `config/tiers/` instead. See
+# [docs/HARDWARE_TIERS.md](../docs/HARDWARE_TIERS.md).
+#
+# NOTE: this reference file leaves `ep_priority = ["openvino", "cpu"]`
+# below as the historical defaults so the example boots on an Intel
+# dev box. The T24 production config in `config/tiers/t24.toml`
+# overrides this to `["hailo", "cpu"]` — the AMD Radeon 680M iGPU on
+# the EQR7 is NOT OpenVINO-compatible.
 #
 # Every backend-selectable layer exposes a `backend` knob. Everything else
 # under that section configures the chosen backend.

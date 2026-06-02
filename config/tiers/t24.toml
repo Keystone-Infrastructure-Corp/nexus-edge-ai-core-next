@@ -1,9 +1,22 @@
-# T24 — GMKtec M3 Ultra (Intel i7-12700H, Iris Xe 96 EU, 32 GB DDR4)
-# Soak target: 4–6 cameras at 1080p / 15 fps.
+# T24 — Beelink EQR7 (AMD Ryzen 7 7735HS, Radeon 680M, 24 GB LPDDR5)
+#       + Hailo-8 M.2 2280 accelerator (26 TOPS, PCIe Gen3 x4, M-key).
+# Soak target: 24 cameras at 1080p / 15 fps (yolo26n_640).
+#
+# ⚠ ENGINE STATUS (2026-06): the Hailo execution provider is not yet
+# wired in `nexus-inference::execution_providers`. The Radeon 680M iGPU
+# is NOT supported by OpenVINO (Intel-only). On this hardware today
+# the engine silently falls through to the CPU EP and Ryzen 7 7735HS
+# CPU-only soak is ~6–10 cams — far below the 24-cam target. The
+# 24-cam soak unlocks when M_HAILO_EP ships, which adds:
+#   * `"hailo"` arm in selected_for_priority_inner (HailoRT linkage)
+#   * yolo26n_640.hef in models/models-manifest.json alongside the ONNX
+# This file is written in target-steady-state shape so the config does
+# not need to change when M_HAILO_EP lands — only the engine.
 
 [runtime]
-worker_threads = 8
-blocking_threads = 8
+# Ryzen 7 7735HS = 8C / 16T Zen 3+.
+worker_threads = 16
+blocking_threads = 16
 
 [runtime.clips]
 # Real H.264-passthrough mp4 via the shared RTSP session (detector +
@@ -52,20 +65,38 @@ log_level = "info,nexus=debug"
 
 [inference]
 backend = "pool"
-workers = 2                     # Iris Xe 96 EU comfortably runs two parallel sessions
+# Hailo-8 is a single PCIe device. HailoRT's internal stream scheduler
+# multiplexes all 24 camera streams through one session — do NOT spawn
+# multiple ORT workers all binding the same Hailo device, that
+# serialises at the driver. One worker, one session, scheduler does
+# the parallelism.
+workers = 1
 restart_backoff_ms = 2000
 fail_soft = true
-ep_priority = ["openvino", "cpu"]
+# `"hailo"` resolves to the HailoRT EP once M_HAILO_EP lands. Until
+# then it is silently skipped by selected_for_priority_inner and the
+# engine falls through to `"cpu"`. We intentionally do NOT list
+# `"openvino"` here — the AMD Radeon 680M iGPU is not an OpenVINO
+# target (OpenVINO supports Intel iGPU/dGPU only).
+ep_priority = ["hailo", "cpu"]
 
 [inference.model]
 kind = "yolo"
 pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
-preset = "640"                  # T24 = 640 (default per models-manifest.json). Iris Xe iGPU has room for 960 on a single camera if needed — override per-camera in the UI.
+# T24 = 640. The Hailo-8 compiler turns yolo26n_640.onnx into
+# yolo26n_640.hef at model-pack build time (M_HAILO_EP delivers the
+# tool + manifest hooks). 26 TOPS / 24 cams ≈ 1 TOPS/cam at 15 fps,
+# which fits yolo26n_640 with comfortable headroom for DINOv2-S re-id
+# bursts. Operators with low-cam-count + high-detail workloads can
+# override per-camera to 960 or 1280 in the UI; pack ships all three.
+preset = "640"
 input_width = 640
 input_height = 640
 score_threshold = 0.30
 
 [tracker]
+# ByteTrack is CPU-bound; Zen 3+ at 16T has ample headroom for 24
+# concurrent trackers.
 backend = "iou_naive"
 
 [rules]
@@ -73,4 +104,6 @@ backend = "cel"
 
 [bus]
 backend = "broadcast"
-capacity = 1024
+# 24 cams × peak burst headroom. Same shape as T36 (2048) since the
+# cam count is comparable.
+capacity = 2048

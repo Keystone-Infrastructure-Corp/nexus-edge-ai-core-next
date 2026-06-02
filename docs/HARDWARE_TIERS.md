@@ -10,13 +10,24 @@ assume the camera baseline below.
 | Tier        | Box                                              | Accelerator                   | EP order                     | Workers | Preset | Cams (1080p @ 15 fps) | $       | Status |
 | ----------- | ------------------------------------------------ | ----------------------------- | ---------------------------- | ------- | ------ | --------------------- | ------- | ------ |
 | **T10**     | Beelink Mini S13 (N150, 16 GB)                   | UHD 24EU iGPU                 | `openvino, cpu`              | 1       | 320    | 1–2                   | ~$300   | ✅ ordered |
-| **T24**     | GMKtec M3 Ultra (i7-12700H, 32 GB)               | Iris Xe 96 EU                 | `openvino, cpu`              | 2       | 640    | 4–6                   | ~$600   | ✅ ordered |
+| **T24**     | Beelink EQR7 (Ryzen 7 7735HS, 24 GB) + Hailo-8 M.2 | Hailo-8 (26 TOPS, M.2 2280) | `hailo, cpu`                 | 1       | 640    | 24 (target)¹          | ~$1,005 | ✅ ordered |
 | **T36**     | Lenovo P3 Tiny / HP Z2 Mini + Arc A380           | Intel Arc A380 6 GB (dGPU)    | `openvino, cpu`              | 2       | 640    | 8–12                  | ~$1100  | not yet sourced |
 | **T36-S**   | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake) | Arc 140V Xe2 + NPU 4 (47 TOPS)| `openvino, npu, cpu`         | 2       | 640    | 6–8                   | ~$800   | ✅ ordered |
 | **T64**     | Lenovo P3 Tower / HP Z2 G9 + RTX 4060            | NVIDIA RTX 4060 8 GB          | `tensorrt, cuda, cpu`        | 3       | 640    | 12–20                 | ~$1300  | post-beta |
 
-T64 stays opt-in until M5 wires the CUDA/TensorRT EPs — the rest of the
-tiers are first-class M1 targets.
+T64 stays opt-in until M5 wires the CUDA/TensorRT EPs. T24 is similarly
+gated on **`M_HAILO_EP`** — the Hailo execution provider + `.hef`
+model-pack tooling are not yet in the engine, so the EQR7+Hailo-8
+appliance currently falls through to the CPU EP (Ryzen 7 7735HS soak
+~6–10 cams) until that milestone ships. The hardware is the right
+shape for 24 cams; the engine is the blocker. The rest of the tiers
+are first-class M1 targets.
+
+¹ T24 soak is the **design target** for the EQR7 + Hailo-8 SKU after
+`M_HAILO_EP` lands. The legacy GMKtec M3 Ultra (Iris Xe 96 EU) T24
+soak of 4–6 cams is no longer the canonical T24 hardware; existing
+GMKtec deployments continue to work with whatever per-deployment
+`nexus.toml` they currently have.
 
 ## Camera baseline (every tier)
 
@@ -37,7 +48,7 @@ box, copy it to `/etc/nexus/nexus.toml`, edit camera URLs.
 | File                                       | Use it on                                |
 | ------------------------------------------ | ---------------------------------------- |
 | [`config/tiers/t10.toml`](../config/tiers/t10.toml)     | T10 — Beelink Mini S13                  |
-| [`config/tiers/t24.toml`](../config/tiers/t24.toml)     | T24 — GMKtec M3 Ultra                   |
+| [`config/tiers/t24.toml`](../config/tiers/t24.toml)     | T24 — Beelink EQR7 + Hailo-8            |
 | [`config/tiers/t36.toml`](../config/tiers/t36.toml)     | T36 — Arc A380 SFF                      |
 | [`config/tiers/t36s.toml`](../config/tiers/t36s.toml)   | T36-S — GMKtec K13 / EVO-X1 Lunar Lake  |
 | [`config/tiers/t64.toml`](../config/tiers/t64.toml)     | T64 — RTX 4060 desktop                  |
@@ -60,13 +71,19 @@ versions) and adds a `recommended_tier` field. The mapping:
 
 ```
 NVIDIA dGPU present                           → T64
+Hailo-8 M.2 present (PCI vendor 0x1e60)²      → T24
 Intel Arc 140V iGPU OR /dev/accel/* present   → T36-S
 Intel Arc dGPU (A310/A380/A580) present       → T36
-Intel Iris Xe 96 EU iGPU                      → T24
+Intel Iris Xe 96 EU iGPU                      → T24  (legacy GMKtec mapping; still resolves to t24.toml — see note)
 Intel UHD 24EU iGPU (N100/N150 class)         → T10
 Apple Silicon                                 → dev-only (no soak tier)
 fallback                                      → T10
 ```
+
+² Hailo M.2 detection is **not yet implemented** in `nexus-probe`
+(M_HAILO_EP scope). Until then, fresh installs on a Beelink EQR7
+box must select `config/tiers/t24.toml` manually — `nexus-probe`
+will currently fall through to the T10 fallback for AMD CPUs.
 
 The probe is advisory — operator can always override with an explicit
 config — but the recommendation lines up with the boxes actually on the
