@@ -1214,6 +1214,7 @@ yet — that's M2.2 (cold-mirror replication).
 | `vainfo` exits with `iHD_drv_video.so init failed` and no further detail | Stock Ubuntu's `intel-media-va-driver-non-free 24.1.0` against kernel ≥ 6.11. | Add the kobuk-team PPA per §5.1 — its iHD 25.x tracks the current i915 uAPI. |
 | Install fails because `ufw enable` would lock you out | The installer never enables ufw for you. If ufw is already active without an OpenSSH allow rule, the script adds engine port rules but the OpenSSH rule is on you. | Run `sudo ufw allow OpenSSH` BEFORE `sudo ufw enable`. |
 | `apt-get install` fails with "Could not get lock /var/lib/dpkg/lock-frontend" | Another apt frontend (unattended-upgrades, packagekit) is holding the lock. | Wait 60 s and re-run `install.sh` — it's idempotent. |
+| `nexus-doctor` reports `filesystem_posture` WARN with `MISSING=nodev,nosuid` on `/etc/nexus/tls` or `/var/lib/nexus` | The mount covering the secret directories does not have the defence-in-depth hardening flags. Common on Ubuntu Server's stock single-root-mount layout (neither flag on `/`). | Add `nodev,nosuid` to the fstab line covering the secret paths, then `sudo mount -o remount <mountpoint>`. Safe to ignore on single-root-mount appliances where the operator is the only local user — file modes (0750/2750) already keep the secrets private. |
 
 If your symptom isn't here, file an issue (§13).
 
