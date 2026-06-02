@@ -567,4 +567,35 @@ if command -v chronyc >/dev/null 2>&1; then
 else
     warn "  Clock sync: chronyc not on PATH (chrony install failed?)"
 fi
+
+# --- Phase 6.14b — filesystem posture hint (secrets at rest) -----------------
+# Mount-option hardening (`nodev,nosuid`) is defence-in-depth on top
+# of the mode-locked secret directories (`/etc/nexus/tls` is
+# `2750 root:nexus`, `/var/lib/nexus` is `0750 nexus:nexus`). Ubuntu
+# Server's stock single-root-mount layout has neither flag on `/`,
+# and that's not actually broken — surface the gap so an operator
+# who *can* carve a hardened mount knows the contract.
+log ""
+posture_warn=0
+for secret_path in "$NEXUS_CONFIG_DIR/tls" "$NEXUS_STATE_DIR"; do
+    if ! findmnt --noheadings --target "$secret_path" --output OPTIONS >/dev/null 2>&1; then
+        continue
+    fi
+    opts=$(findmnt --noheadings --target "$secret_path" --output OPTIONS 2>/dev/null | head -1)
+    missing=""
+    [[ "$opts" == *nodev* ]]  || missing+=" nodev"
+    [[ "$opts" == *nosuid* ]] || missing+=" nosuid"
+    if [[ -z "$missing" ]]; then
+        log "  Secret-dir posture: $secret_path on a mount with nodev,nosuid ✓"
+    else
+        warn "  Secret-dir posture: $secret_path is on a mount missing:$missing"
+        posture_warn=1
+    fi
+done
+if (( posture_warn )); then
+    warn "  Add nodev,nosuid to the /etc/fstab line covering the secret paths,"
+    warn "  then 'sudo mount -o remount <mountpoint>'. Safe to ignore on"
+    warn "  single-root-mount appliances where the operator is the only local"
+    warn "  user — file modes (0750/2750) already keep the secrets private."
+fi
 log "================================================================"

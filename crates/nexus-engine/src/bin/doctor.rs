@@ -28,6 +28,14 @@ use serde_json::Value;
 #[path = "../time_sync.rs"]
 mod time_sync;
 
+// Phase 6.14b — filesystem posture probe for the directories that
+// hold edge-side secrets at rest (`/etc/nexus/tls` for mTLS keys,
+// `/var/lib/nexus` for the SQLite admin secret + cloud enrollment
+// row). The parser is portable; the runtime probe is Linux-only
+// (`/proc/self/mountinfo`).
+#[path = "../fs_posture.rs"]
+mod fs_posture;
+
 const DEFAULT_BASE_URL: &str = "http://localhost:8089";
 
 #[derive(Debug, Parser)]
@@ -229,11 +237,11 @@ fn tally(outcomes: &[Outcome]) -> (usize, usize, usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// The eight checks (mirrors INSTALL.md §9)
+// The checks (mirrors INSTALL.md §9)
 // ---------------------------------------------------------------------------
 
 fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
-    let mut out = Vec::with_capacity(10);
+    let mut out = Vec::with_capacity(12);
 
     // 9.0 — local clock sync posture (Phase 1.15). Runs first so
     // an operator sees the row even when the engine HTTP listener
@@ -265,11 +273,12 @@ fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
                 "skipped — engine HTTP not reachable".into(),
             ));
         }
-        // NPU runtime check is platform-only (doesn't need the
-        // engine to be up) — still run it so the operator gets
-        // the libze1 hint on a box where the engine is wedged
-        // for unrelated reasons.
+        // NPU runtime + filesystem-posture checks are platform-only
+        // (don't need the engine to be up) — still run them so the
+        // operator gets the libze1 / mount-options hint on a box
+        // where the engine is wedged for unrelated reasons.
         out.push(check_npu_runtime());
+        out.push(check_filesystem_posture());
         return out;
     }
 
@@ -288,6 +297,7 @@ fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
     out.push(check_motion_recent(client, base, &enabled_ids));
     out.push(check_events_recent(client, base));
     out.push(check_npu_runtime());
+    out.push(check_filesystem_posture());
 
     out
 }
@@ -1085,6 +1095,116 @@ fn kobuk_ppa_configured() -> bool {
         }
     }
     false
+}
+
+/// Phase 6.14b — surface the mount-option posture of the two
+/// directories that hold edge-side secrets at rest:
+///
+/// * `/etc/nexus/tls/` — mTLS client cert + key used by
+///   `nexus_cloud_client::tunnel`.
+/// * `/var/lib/nexus/` — SQLite database holding the local-auth
+///   admin secret and cloud enrollment row.
+///
+/// Both directories are mode-locked by the installer
+/// (`/etc/nexus/tls` → `2750 root:nexus`, `/var/lib/nexus` →
+/// `0750 nexus:nexus`).  Mount-option hardening (`nodev`,
+/// `nosuid`) is defence-in-depth: it costs nothing at runtime and
+/// blocks a local attacker who chrooted in from honouring device
+/// nodes or setuid binaries dropped under either path.
+///
+/// Severity is **warn**, never fail — Ubuntu Server's default
+/// single-root-mount layout has neither flag on `/`, and that is
+/// not actually broken (the file modes still keep the secrets
+/// private).  The probe surfaces the gap so an operator who *can*
+/// add the flags via `/etc/fstab` knows the contract.
+///
+/// Skips on non-Linux (`/proc/self/mountinfo` does not exist on
+/// macOS / Windows).
+fn check_filesystem_posture() -> Outcome {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Outcome::skip(
+            "9.10",
+            "filesystem_posture",
+            "skipped — Linux-only check (no /proc/self/mountinfo)".into(),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::path::Path;
+        let paths: [&Path; 2] = [Path::new("/etc/nexus/tls"), Path::new("/var/lib/nexus")];
+        let postures = fs_posture::probe_paths(&paths);
+
+        // Render a one-line `actual` summary that names each
+        // inspected path and the flags that are present.
+        let mut summary_parts = Vec::with_capacity(postures.len());
+        let mut missing_lines = Vec::new();
+        let mut any_missing = false;
+        let mut probe_failed = false;
+        for p in &postures {
+            match &p.mount_point {
+                Some(mp) => {
+                    let flags = if p.is_hardened() {
+                        "nodev,nosuid".to_string()
+                    } else if p.missing_flags().is_empty() {
+                        "ok".to_string()
+                    } else {
+                        format!("MISSING={}", p.missing_flags().join(","))
+                    };
+                    summary_parts.push(format!(
+                        "{} (on {}): {}",
+                        p.path.display(),
+                        mp.display(),
+                        flags,
+                    ));
+                    if !p.is_hardened() {
+                        any_missing = true;
+                        missing_lines.push(format!(
+                            "{} on {} missing {}",
+                            p.path.display(),
+                            mp.display(),
+                            p.missing_flags().join(","),
+                        ));
+                    }
+                }
+                None => {
+                    probe_failed = true;
+                    summary_parts.push(format!(
+                        "{}: no matching mount ({})",
+                        p.path.display(),
+                        p.detail,
+                    ));
+                }
+            }
+        }
+
+        let actual = summary_parts.join(" | ");
+        if probe_failed {
+            return Outcome::warn(
+                "9.10",
+                "filesystem_posture",
+                "every secret path resolves to a mountinfo entry",
+                actual,
+                "could not resolve a mount point for one or more secret paths — verify /var/lib/nexus and /etc/nexus/tls exist (re-run `scripts/install.sh`).",
+            );
+        }
+        if any_missing {
+            Outcome::warn(
+                "9.10",
+                "filesystem_posture",
+                "/etc/nexus/tls and /var/lib/nexus on a mount with nodev,nosuid",
+                actual,
+                "INSTALL.md §9 — add `nodev,nosuid` to the fstab line covering the secret paths and `sudo mount -o remount` (single-root-mount layouts can be ignored on appliances where the operator is the only local user).",
+            )
+        } else {
+            Outcome::pass(
+                "9.10",
+                "filesystem_posture",
+                "/etc/nexus/tls and /var/lib/nexus on a mount with nodev,nosuid",
+                actual,
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
