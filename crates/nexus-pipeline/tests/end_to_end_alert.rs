@@ -142,6 +142,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         nexus_pipeline::supervisor::SightingSchedulerConfig::default(),
         Vec::new(),
         std::sync::Arc::new(nexus_pipeline::NoopEntityLocalPersist),
+        None,
     );
 
     // 4. Wait for the first AlertEvent. 5s budget covers the gate warmup

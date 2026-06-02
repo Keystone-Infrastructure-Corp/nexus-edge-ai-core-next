@@ -764,6 +764,15 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             .map(|m| m.input_width)
             .unwrap_or(cfg.inference.model.input_width);
         let (sup_w, sup_h) = nexus_pipeline::supervisor_frame_for(det_w);
+        // M_TILE_REINFER (G1) Phase B2.1 — effective per-camera `top_k`
+        // for the post-merge cascade re-cap; matches the equivalent
+        // computation in `reconciler::start_camera`.
+        let effective_top_k = cam
+            .detector
+            .model_override
+            .as_ref()
+            .and_then(|m| m.top_k)
+            .or(cfg.inference.model.top_k);
         let seed_for_cam: Vec<nexus_pipeline::EntityLocalSeed> = sighting_seed_all
             .iter()
             .filter(|r| r.camera_id == cam_id)
@@ -797,6 +806,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             sighting_cfg,
             seed_for_cam,
             sighting_persist.clone(),
+            effective_top_k,
         );
         running.lock().insert(
             cam_id,
@@ -1037,6 +1047,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         static_clear: static_clear.clone(),
         pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
         default_detector_width: cfg.inference.model.input_width,
+        default_top_k: cfg.inference.model.top_k,
         sighting_hook: sighting_hook.clone(),
         sighting_cfg,
         sighting_persist: sighting_persist.clone(),

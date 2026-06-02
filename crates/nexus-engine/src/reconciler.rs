@@ -110,6 +110,14 @@ pub struct ReconcilerArgs {
     /// supervisor frame size via
     /// [`nexus_pipeline::supervisor_frame_for`].
     pub default_detector_width: u32,
+    /// Fallback per-frame detection cap when a camera's
+    /// `model_override.top_k` is absent. Sourced from
+    /// `cfg.inference.model.top_k`. Threaded to `spawn_camera` so
+    /// the G1 tile cascade can re-truncate the merged stage-1 +
+    /// stage-2 vector and enforce the cap GLOBALLY across stages
+    /// rather than per-stage (see
+    /// `nexus_inference::caps::apply_top_k`).
+    pub default_top_k: Option<usize>,
     /// Phase 5.6 · slice 4c-ii — engine-built hook that turns
     /// per-stable-track [`nexus_pipeline::SightingSnapshot`]s into
     /// `entity_sighting` wire envelopes. Cloned per `start_camera`
@@ -343,6 +351,16 @@ async fn start_camera(
 
     let detector = args.router.detector_for_camera(&cam);
     let detector_low_res = args.router.detector_for_camera_low_res(&cam);
+    // M_TILE_REINFER (G1) Phase B2.1 — effective per-camera `top_k`.
+    // Per-camera `model_override.top_k` wins over the global
+    // `inference.model.top_k`; both being `None` means no post-merge
+    // re-cap (cascade-disabled cameras don't reach the helper anyway).
+    let effective_top_k = cam
+        .detector
+        .model_override
+        .as_ref()
+        .and_then(|m| m.top_k)
+        .or(args.default_top_k);
     // Fresh per-camera tracker — see `ReconcilerArgs::tracker_cfg`
     // for why this CANNOT be shared across cameras.
     let tracker: Arc<dyn Tracker> = Arc::from(nexus_tracker::build_tracker(&args.tracker_cfg));
@@ -401,6 +419,7 @@ async fn start_camera(
         args.sighting_cfg,
         seed_for_cam,
         args.sighting_persist.clone(),
+        effective_top_k,
     );
     args.handles.lock().insert(
         cam_id,
