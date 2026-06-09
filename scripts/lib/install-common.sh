@@ -593,8 +593,19 @@ _detect_hardware() {
     # Iris Xe, Arc 140V (Lunar Lake), Arc Graphics (Meteor Lake).
     # NB: dGPU Arc cards ALSO match this regex — we filter them out
     # of the iGPU tag below by checking for the discrete device IDs.
+    #
+    # Regex note: `.*` (not `[^[]*`) between `VGA` and `[8086:` because
+    # real lspci -nn output is
+    #   "00:02.0 VGA compatible controller [0300]: Intel Corporation
+    #    Alder Lake-N [UHD Graphics] [8086:46d1]"
+    # i.e. the PCI class id `[0300]` and the marketing name `[UHD
+    # Graphics]` sit between the `VGA` token and the vendor:device id.
+    # A negated-bracket class anchor stops at the first `[` (the class
+    # id) and never reaches `[8086:`, silently misclassifying every
+    # modern Intel iGPU as no-accelerator (the bug v0.1.67 shipped
+    # with that made install_drivers a no-op on T10 boxes).
     local has_intel_vga=0 has_arc_dgpu=0
-    if echo "$pci" | grep -qE 'VGA[^[]*\[8086:'; then
+    if echo "$pci" | grep -qE 'VGA.*\[8086:'; then
         has_intel_vga=1
     fi
     # Intel Arc A-series discrete (DG2 silicon): device IDs 56a0..56af.
@@ -621,8 +632,11 @@ _detect_hardware() {
         echo intel-npu
     fi
 
-    # NVIDIA discrete (vendor 10de).
-    if echo "$pci" | grep -qE '(VGA|3D controller)[^[]*\[10de:'; then
+    # NVIDIA discrete (vendor 10de). Same `.*` reasoning as the Intel
+    # iGPU regex above — the lspci class id `[0300]` sits between the
+    # `VGA`/`3D controller` token and the `[10de:...]` vendor id, so
+    # `[^[]*` would short the match.
+    if echo "$pci" | grep -qE '(VGA|3D controller).*\[10de:'; then
         echo nvidia-gpu
     fi
 }
