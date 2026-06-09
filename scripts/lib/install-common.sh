@@ -91,6 +91,17 @@ ensure_dirs() {
     install -d -o "$NEXUS_SERVICE_USER" -g "$NEXUS_SERVICE_GROUP" -m 0750 "$NEXUS_STATE_DIR"
     install -d -o "$NEXUS_SERVICE_USER" -g "$NEXUS_SERVICE_GROUP" -m 0750 "$NEXUS_STATE_DIR/state"
     install -d -o "$NEXUS_SERVICE_USER" -g "$NEXUS_SERVICE_GROUP" -m 0750 "$NEXUS_STATE_DIR/clips"
+
+    # Self-heal ownership of any pre-existing contents under the state
+    # tree. `install -d` only sets the directory's own owner — files
+    # inside (e.g. an `admin-secret` auto-provisioned by a prior `sudo
+    # nexus-engine` invocation, or migrated from an older layout where
+    # the engine ran as root) keep whatever owner they had. If a single
+    # file is left root-owned the service (running as `nexus`) gets
+    # EACCES on startup and the unit crash-loops with "reading admin
+    # secret … Permission denied". Recursive chown is safe here because
+    # both subtrees are owned entirely by the service user by design.
+    chown -R "$NEXUS_SERVICE_USER:$NEXUS_SERVICE_GROUP" "$NEXUS_STATE_DIR/state" "$NEXUS_STATE_DIR/clips"
 }
 
 # Add the service user to `render` and `video` groups so the engine can
