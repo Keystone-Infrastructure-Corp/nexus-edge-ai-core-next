@@ -135,6 +135,12 @@ ensure_accelerator_groups() {
 #       - GStreamer runtime plugins (clip recorder needs these — without
 #         them every motion event writes a 0-byte mp4 and the UI shows
 #         "no playable data")
+#       - VA-API userspace driver (`va-driver-all` pulls iHD for Gen9+
+#         Intel + i965 fallback + Mesa for AMD; without it both
+#         `gstreamer1.0-vaapi` and the modern `va` plugin register 0
+#         features and the clip recorder's `vaapih264enc` element fails
+#         to construct, silently falling back to software `x264enc`
+#         which pegs a CPU core per camera on 1080p+)
 #       - chrony (clip timestamps + alert correlation get ugly past 1 s
 #         drift; the install banner refuses to declare success if
 #         `timedatectl status` is `unsynchronized`)
@@ -217,6 +223,8 @@ _system_prep_apt() {
         gstreamer1.0-plugins-bad \
         gstreamer1.0-libav \
         gstreamer1.0-vaapi \
+        va-driver-all \
+        vainfo \
         chrony ufw \
         curl jq python3 ca-certificates \
         || warn "apt-get install returned non-zero — continuing, but motion clips may not record"
