@@ -367,6 +367,14 @@ impl RtspSource {
         // 3986 forbids unescaped quotes anyway).
         let url_safe = self.url.replace('"', "");
         let fr = if self.max_fps == 0 { 15 } else { self.max_fps };
+        // `force-sw-decoders` is macOS-only. On macOS, decodebin
+        // autoplugs `vtdec` which produces GL textures and deadlocks
+        // a headless engine (see module docstring). On Linux every
+        // realistic backend (`vah264dec` via libgstva, `vaapih264dec`
+        // via legacy gstreamer-vaapi, or `nvh264dec`) is safe; forcing
+        // software here would pin one CPU core per camera on any 4K+
+        // H.264 stream and keep the iGPU at idle clock.
+        let force_sw = cfg!(target_os = "macos");
         // protocols=tcp forces TCP-only RTP transport. UDP would be
         // marginally lower latency but loses packets silently under
         // any link contention — see preroll_ingester.rs for the same
@@ -374,7 +382,7 @@ impl RtspSource {
         // recover from the same hiccups at the same time.
         let desc = format!(
             "rtspsrc name=src location=\"{url_safe}\" latency=500 protocols=tcp \
-             ! decodebin force-sw-decoders=true \
+             ! decodebin force-sw-decoders={force_sw} \
              ! videoconvert ! videoscale ! videorate \
              ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
              ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4",
