@@ -55,7 +55,14 @@ backend = "pool"
 workers = 1                     # one OpenVINO session is the right size for UHD 24EU
 restart_backoff_ms = 2000
 fail_soft = true
-ep_priority = ["openvino", "cpu"]
+# Explicit "gpu" (not "openvino") because the plain `openvino` entry
+# resolves to OV_DEVICE=AUTO, whose heuristic silently picks the CPU
+# plugin for small models like yolo26n_640 — the engine logged
+# ep_registered=["openvino(AUTO)", "cpu"] but inference still ran on
+# the CPU EP, leaving the iGPU pinned in RC6. `gpu` routes through
+# the OpenVINO EP with with_device_type("GPU") set explicitly, which
+# is the self-documenting T10 default. See execution_providers.rs.
+ep_priority = ["gpu", "cpu"]
 
 [inference.model]
 kind = "yolo"                   # closed-vocab (ships per-size: yolo26n_640.onnx)
