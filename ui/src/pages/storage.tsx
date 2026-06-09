@@ -204,7 +204,7 @@ function HotTierCard({ data }: { data: StorageResponse }) {
                   </span>
                   <span>
                     {c.clip_count} clip{c.clip_count === 1 ? "" : "s"} ·{" "}
-                    {fmtBytes(c.recorded_bytes)}
+                    {fmtBytes(c.bytes)}
                   </span>
                 </div>
               ))}

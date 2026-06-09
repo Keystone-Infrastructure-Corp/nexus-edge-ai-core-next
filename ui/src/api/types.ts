@@ -625,7 +625,8 @@ export interface StorageLocalResponse {
   per_camera: Array<{
     camera_id: number;
     clip_count: number;
-    recorded_bytes: number;
+    bytes: number;
+    oldest_started_at: string;
   }>;
 }
 
