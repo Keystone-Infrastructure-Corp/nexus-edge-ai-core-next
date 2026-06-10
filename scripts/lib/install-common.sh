@@ -1111,11 +1111,152 @@ _drivers_amd_graphics() {
 # at the developer-zone register flow. The engine still installs and
 # runs (CPU EP) — Hailo detection is advisory only until
 # `M_HAILO_EP` lands.
+# Fetch HailoRT .debs into the vendor dir.
+#
+# Two sources are tried in order:
+#   1. URLs supplied non-interactively via env vars
+#      `NEXUS_HAILO_DEB_URL` (runtime) and `NEXUS_HAILO_PCIE_DEB_URL`
+#      (pcie driver). install.sh exports these from the matching
+#      --hailo-deb-url / --hailo-pcie-deb-url flags. Either or both
+#      may be set; the other one falls through to the prompt.
+#   2. Interactive paste prompt — only when stdin is a TTY and
+#      `NEXUS_UNATTENDED` is not set. Operator pastes the two
+#      developer-zone presigned URLs (or hits Enter to skip).
+#
+# Returns 0 if it managed to land at least one new .deb (caller
+# re-globs and decides whether both are now present); returns 1 if
+# there is nothing useful to fetch (no URLs and no TTY, or the
+# operator skipped). Curl failures are warn-and-continue so the
+# install can still fall through to the register-here banner.
+_hailo_fetch_debs() {
+    local hailo_local_dir="$1"
+    local rt_url="${NEXUS_HAILO_DEB_URL:-}"
+    local pcie_url="${NEXUS_HAILO_PCIE_DEB_URL:-}"
+
+    # Prompt only when interactive AND at least one URL is missing.
+    if [[ ( -z "$rt_url" || -z "$pcie_url" ) \
+          && -t 0 \
+          && "${NEXUS_UNATTENDED:-0}" != "1" ]]; then
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "Hailo-8 detected. To enable hardware inference acceleration"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "the installer needs the HailoRT + PCIe driver .debs from"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "your Hailo developer-zone account."
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            ""
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "On your laptop:"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "  1. Log in to https://hailo.ai/developer-zone/software-downloads/"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "  2. Right-click each link below -> Copy link address"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "     - HailoRT (Ubuntu 24.04, .deb)"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "     - HailoRT PCIe driver (.deb)"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "  3. Paste each URL below (or press Enter to skip)."
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            ""
+
+        if [[ -z "$rt_url" ]]; then
+            printf '%s[nexus]%s HailoRT runtime URL: ' \
+                "$(_color '1;36')" "$(_reset)"
+            IFS= read -r rt_url || rt_url=""
+        fi
+        if [[ -z "$pcie_url" ]]; then
+            printf '%s[nexus]%s HailoRT PCIe driver URL: ' \
+                "$(_color '1;36')" "$(_reset)"
+            IFS= read -r pcie_url || pcie_url=""
+        fi
+    fi
+
+    # Trim surrounding whitespace that copy/paste sometimes drops in.
+    rt_url="${rt_url#"${rt_url%%[![:space:]]*}"}"
+    rt_url="${rt_url%"${rt_url##*[![:space:]]}"}"
+    pcie_url="${pcie_url#"${pcie_url%%[![:space:]]*}"}"
+    pcie_url="${pcie_url%"${pcie_url##*[![:space:]]}"}"
+
+    if [[ -z "$rt_url" && -z "$pcie_url" ]]; then
+        return 1
+    fi
+
+    install -d -o root -g root -m 0755 "$hailo_local_dir"
+
+    local fetched=0
+    if [[ -n "$rt_url" ]] \
+        && ! compgen -G "$hailo_local_dir/hailort_*_amd64.deb" >/dev/null 2>&1; then
+        if _hailo_curl_deb "$rt_url" "$hailo_local_dir" "hailort_runtime"; then
+            fetched=1
+        fi
+    fi
+    if [[ -n "$pcie_url" ]] \
+        && ! compgen -G "$hailo_local_dir/hailort-pcie-driver_*.deb" >/dev/null 2>&1; then
+        if _hailo_curl_deb "$pcie_url" "$hailo_local_dir" "hailort_pcie"; then
+            fetched=1
+        fi
+    fi
+
+    (( fetched )) && return 0 || return 1
+}
+
+# Download one .deb from a presigned URL into the vendor dir.
+# Streams to a `.partial` first and atomically renames on success so
+# a Ctrl-C never leaves a truncated .deb that fools the next install.
+# Validates that the result is actually a Debian package (magic bytes
+# `!<arch>`) before renaming — catches the case where the URL has
+# expired and the server returned an HTML error page.
+_hailo_curl_deb() {
+    local url="$1" dest_dir="$2" label="$3"
+    local tmp="$dest_dir/.${label}.partial"
+    log "downloading HailoRT $label .deb from operator-supplied URL"
+    if ! curl -fL --retry 3 --connect-timeout 15 -o "$tmp" "$url"; then
+        warn "curl failed for $label URL (expired presigned URL?); install will fall back to CPU EP"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! head -c 8 "$tmp" | grep -q '^!<arch>'; then
+        warn "$label URL did not return a .deb (got $(file -b "$tmp" 2>/dev/null || echo "unknown content"))"
+        warn "  expired presigned URL? Re-copy from developer-zone and retry."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # Extract the package's own filename from the .deb control field
+    # so the cached file matches what the operator would've staged
+    # manually. Falls back to a generic name keyed off the label.
+    local pkg_filename
+    pkg_filename="$(dpkg-deb -f "$tmp" Package Version 2>/dev/null \
+        | awk 'NR==1{p=$2} NR==2{v=$2} END{if(p&&v) printf "%s_%s_amd64.deb", p, v}')"
+    if [[ -z "$pkg_filename" ]]; then
+        pkg_filename="${label}.deb"
+    fi
+
+    mv "$tmp" "$dest_dir/$pkg_filename"
+    chown root:root "$dest_dir/$pkg_filename"
+    chmod 0644 "$dest_dir/$pkg_filename"
+    log "cached HailoRT $label -> $dest_dir/$pkg_filename"
+    return 0
+}
+
 _drivers_hailo_pcie() {
     local hailo_local_dir="${NEXUS_HAILO_DEB_DIR:-/opt/nexus/vendor/hailo}"
     local rt_deb pcie_deb
     rt_deb=$(compgen -G "$hailo_local_dir/hailort_*_amd64.deb" 2>/dev/null | head -n1 || true)
     pcie_deb=$(compgen -G "$hailo_local_dir/hailort-pcie-driver_*.deb" 2>/dev/null | head -n1 || true)
+
+    # If the operator passed download URLs (via flag/env) or we have
+    # a TTY to prompt on, try to fetch the missing .debs into the
+    # vendor dir before falling through to the register-here banner.
+    # Either flow caches the .debs at $hailo_local_dir so subsequent
+    # installs / rollbacks are no-network re-runs.
+    if [[ -z "$rt_deb" || -z "$pcie_deb" ]]; then
+        if _hailo_fetch_debs "$hailo_local_dir"; then
+            rt_deb=$(compgen -G "$hailo_local_dir/hailort_*_amd64.deb" 2>/dev/null | head -n1 || true)
+            pcie_deb=$(compgen -G "$hailo_local_dir/hailort-pcie-driver_*.deb" 2>/dev/null | head -n1 || true)
+        fi
+    fi
 
     if [[ -z "$rt_deb" || -z "$pcie_deb" ]]; then
         warn ""
@@ -1128,8 +1269,14 @@ _drivers_hailo_pcie() {
         warn "  1. Register at https://hailo.ai/developer-zone/"
         warn "  2. Download hailort_<ver>_amd64.deb +"
         warn "     hailort-pcie-driver_<ver>_all.deb (Ubuntu 22.04 or 24.04)"
-        warn "  3. sudo mkdir -p $hailo_local_dir && sudo cp *.deb $hailo_local_dir/"
-        warn "  4. Re-run install.sh"
+        warn "  3. Either:"
+        warn "       (a) re-run install.sh and paste each download URL"
+        warn "           when prompted (right-click the link on the"
+        warn "           developer-zone download page -> Copy link), OR"
+        warn "       (b) sudo mkdir -p $hailo_local_dir && sudo cp *.deb $hailo_local_dir/"
+        warn "           then re-run install.sh, OR"
+        warn "       (c) re-run install.sh with --hailo-deb-url <url>"
+        warn "           --hailo-pcie-deb-url <url> (unattended)."
         warn ""
         warn "Engine will install and run, but inference will fall back to"
         warn "the CPU EP — the Hailo execution provider lands in M_HAILO_EP."

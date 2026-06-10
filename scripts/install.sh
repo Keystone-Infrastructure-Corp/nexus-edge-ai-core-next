@@ -130,14 +130,23 @@ Host-preparation flags (all ON by default — opt out per-step):
                                     * Intel Arc A-series dGPU
                                     * Intel NPU (Meteor/Arrow/Lunar Lake)
                                     * AMD Radeon iGPU/dGPU (Mesa VA-API)
-                                    * Hailo-8 / 8L M.2 (requires HailoRT
-                                      .debs pre-staged under
-                                      \$NEXUS_HAILO_DEB_DIR; default
-                                      /opt/nexus/vendor/hailo)
+                                    * Hailo-8 / 8L M.2 (HailoRT .debs;
+                                      see --hailo-deb-url below)
                                     * NVIDIA GPU (driver install pending M5)
                                   If the Intel NPU needs an HWE kernel
                                   upgrade, install.sh stages the kernel
                                   and exits asking for a reboot.
+  --hailo-deb-url <url>           HailoRT runtime .deb presigned URL
+                                  (right-click the developer-zone link).
+                                  Skips the interactive paste prompt.
+                                  Env: NEXUS_HAILO_DEB_URL.
+  --hailo-pcie-deb-url <url>      HailoRT PCIe driver .deb presigned URL.
+                                  Env: NEXUS_HAILO_PCIE_DEB_URL.
+                                  When neither flag/env is set and stdin
+                                  is a TTY install.sh prompts; otherwise
+                                  operators stage .debs manually under
+                                  \$NEXUS_HAILO_DEB_DIR (default
+                                  /opt/nexus/vendor/hailo).
 
   -h, --help                      This message.
 
@@ -165,6 +174,8 @@ while [[ $# -gt 0 ]]; do
         --no-firewall)        export NEXUS_PREP_FIREWALL=0; shift ;;
         --enable-auto-updates) export NEXUS_PREP_AUTO_UPDATES=1; shift ;;
         --no-drivers)         export NEXUS_INSTALL_DRIVERS=0; shift ;;
+        --hailo-deb-url)      export NEXUS_HAILO_DEB_URL="$2"; shift 2 ;;
+        --hailo-pcie-deb-url) export NEXUS_HAILO_PCIE_DEB_URL="$2"; shift 2 ;;
         -h|--help)            usage; exit 0 ;;
         *)                    err "unknown option: $1"; usage; exit 2 ;;
     esac

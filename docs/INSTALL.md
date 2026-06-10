@@ -670,39 +670,98 @@ ls -l /dev/dri/render*
 # Expect: crw-rw---- 1 root render ...
 ```
 
-#### 5.5b HailoRT (operator pre-staged debs)
+#### 5.5b HailoRT (operator-supplied debs)
 
 HailoRT is distributed by Hailo Technologies under their developer
-agreement. `install.sh` does **not** pull the `.deb` pair from a
-public URL — operators must register and stage them.
+agreement, so `install.sh` cannot bundle or mirror the `.deb` pair.
+Operators register, accept the EULA, then `install.sh` gets the
+bits onto the box one of three ways.
 
-1. Register at https://hailo.ai/developer-zone/ and accept the
-   HailoRT EULA.
-2. Download from the developer zone (pick the Ubuntu 24.04 build
-   matching the running kernel — DKMS handles the rebuild but the
-   base packages still need to match the distro):
-   - `hailort_<ver>_amd64.deb` (userspace library + `hailortcli`)
-   - `hailort-pcie-driver_<ver>_all.deb` (DKMS source for
-     `hailo_pci.ko`)
-3. Stage them where `install.sh` looks (path is overridable via
-   `NEXUS_HAILO_DEB_DIR`):
+**1. Register and copy the link addresses.**
 
-   ```bash
-   sudo mkdir -p /opt/nexus/vendor/hailo
-   sudo cp hailort_*_amd64.deb hailort-pcie-driver_*.deb \
-       /opt/nexus/vendor/hailo/
-   ```
-4. Re-run the install one-liner from §6.1. `install.sh` detects the
-   debs, installs `dkms` + `linux-headers-$(uname -r)`, then
-   installs the PCIe driver and runtime in that order. The .deb
-   postinst creates the `hailo` system group and udev rule
-   automatically; `install.sh` then adds the `nexus` service user
-   to that group as part of `ensure_accelerator_groups`.
+1. Log in at <https://hailo.ai/developer-zone/software-downloads/>
+   and accept the HailoRT EULA.
+2. On the downloads page, find the two artifacts for
+   **Ubuntu 24.04 / x86_64**:
+   - HailoRT runtime — `hailort_<ver>_amd64.deb`
+   - HailoRT PCIe driver — `hailort-pcie-driver_<ver>_all.deb`
+3. Right-click each link → **Copy link address**. The result is a
+   one-time presigned URL good for ~60 minutes.
 
-If you re-run `install.sh` without staging debs, it emits a loud
-banner pointing to this section and continues with a CPU-only
-engine. Detection is non-blocking by design — the box still
-installs and operates, just without the Hailo userspace.
+**2. Hand the URLs to `install.sh`.** Three flows; pick whichever
+fits the operator's workflow.
+
+*(a) Interactive paste (default — no flags).* Re-run the install
+one-liner from §6.1. When `install.sh` reaches the Hailo branch and
+finds no debs cached, it prompts:
+
+```
+[nexus] Hailo-8 detected. To enable hardware inference acceleration
+[nexus] the installer needs the HailoRT + PCIe driver .debs from
+[nexus] your Hailo developer-zone account.
+[nexus] ...
+[nexus] HailoRT runtime URL: <paste here>
+[nexus] HailoRT PCIe driver URL: <paste here>
+```
+
+Each URL streams into `/opt/nexus/vendor/hailo/` and is then
+installed via `dpkg`. Press **Enter** at a prompt to skip and fall
+through to CPU-only.
+
+*(b) Non-interactive flags.* For unattended re-runs or fleet
+scripts:
+
+```bash
+sudo /opt/nexus/current/scripts/install.sh --tier t24 \
+    --hailo-deb-url      'https://hailo-csms.s3.../hailort_4.20.0_amd64.deb?X-Amz-...' \
+    --hailo-pcie-deb-url 'https://hailo-csms.s3.../hailort-pcie-driver_4.20.0_all.deb?X-Amz-...'
+```
+
+Equivalent env vars: `NEXUS_HAILO_DEB_URL`, `NEXUS_HAILO_PCIE_DEB_URL`.
+
+*(c) Manual stage.* Download the `.debs` to your laptop, `scp` them
+to the box, then re-run `install.sh` with no extra flags:
+
+```bash
+scp hailort_*_amd64.deb hailort-pcie-driver_*.deb \
+    nexus-admin@<box>:/tmp/
+ssh nexus-admin@<box>
+sudo mkdir -p /opt/nexus/vendor/hailo
+sudo install -m 0644 -o root -g root /tmp/hailort*.deb /opt/nexus/vendor/hailo/
+sudo /opt/nexus/current/scripts/install.sh --tier t24
+```
+
+`NEXUS_HAILO_DEB_DIR` overrides the cache directory if you'd
+rather stage somewhere else.
+
+**3. What `install.sh` does next.** Regardless of which flow
+landed the debs, the installer then:
+
+1. Verifies the `.deb` magic bytes (catches expired presigned URLs
+   that returned HTML error pages).
+2. Renames the cached file to the package's canonical
+   `<name>_<version>_amd64.deb` filename via `dpkg-deb -f`, so
+   subsequent runs are a no-op.
+3. `apt install -y dkms linux-headers-$(uname -r)` (matched
+   headers so the DKMS build sees the right kernel).
+4. `dpkg -i hailort-pcie-driver_*.deb` (DKMS builds + loads
+   `hailo_pci.ko`; postinst creates the `hailo` system group +
+   udev rule chowning `/dev/hailo*` to `root:hailo 0660`).
+5. `dpkg -i hailort_*_amd64.deb` (userspace library +
+   `hailortcli`).
+6. `modprobe hailo_pci` so `/dev/hailo0` appears immediately
+   without a reboot.
+7. `ensure_accelerator_groups` adds the `nexus` service user to
+   the freshly-created `hailo` group.
+
+Re-running `install.sh` after a successful Hailo install is a no-op
+(`hailortcli scan` ground-truth probe short-circuits the dpkg path).
+
+If you re-run `install.sh` *without* staging or supplying any of
+the three flows above, it emits a loud banner pointing to this
+section and continues with a CPU-only engine. Detection is
+non-blocking by design — the box still installs and operates, just
+without the Hailo userspace.
 
 #### 5.5c Verification
 
