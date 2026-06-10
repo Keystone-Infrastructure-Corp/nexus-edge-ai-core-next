@@ -452,6 +452,16 @@ if grep -q '^https_bind' "$NEXUS_CONFIG_DIR/nexus.toml" 2>/dev/null; then
     fi
 fi
 
+# --- Re-assert state ownership before service start --------------------------
+#
+# `nexus-engine tls init` (and any other root-invoked subcommand that
+# touches engine startup) auto-provisions `$NEXUS_STATE_DIR/state/admin-secret`
+# as root:root 0600 the first time it runs. The `ensure_dirs` chown in
+# install-common.sh ran earlier — before the secret existed — so without
+# this step the service crash-loops on EACCES reading the secret. Cheap
+# defensive recursive chown; idempotent on every subsequent install.
+chown -R "$NEXUS_SERVICE_USER:$NEXUS_SERVICE_GROUP" "$NEXUS_STATE_DIR/state"
+
 # --- Start the service --------------------------------------------------------
 
 if (( NO_START )); then
