@@ -114,9 +114,17 @@ ensure_dirs() {
 # may run before that on a freshly-flashed box. Same for `hailo` —
 # created only after HailoRT installs (T24-EQR7 boxes only); call this
 # again after `install_drivers` to pick it up.
+#
+# HailoRT 4.23+ chowns /dev/hailo* to `root:video 0660` (not
+# `root:hailo` as older releases did), so `video` covers both the AMD
+# / Intel render path and Hailo on a modern install. We keep the
+# `hailo` group on the optional list for back-compat with operators
+# still on 4.20 — it's only added if the HailoRT postinst created it.
 ensure_accelerator_groups() {
-    local group
-    for group in render video hailo; do
+    local group required
+    for group in render:required video:required hailo:optional; do
+        required="${group#*:}"
+        group="${group%:*}"
         if getent group "$group" >/dev/null 2>&1; then
             if id -nG "$NEXUS_SERVICE_USER" | tr ' ' '\n' | grep -qx "$group"; then
                 log "service user $NEXUS_SERVICE_USER already in $group"
@@ -124,7 +132,7 @@ ensure_accelerator_groups() {
                 usermod -aG "$group" "$NEXUS_SERVICE_USER"
                 log "added $NEXUS_SERVICE_USER to $group group"
             fi
-        else
+        elif [[ "$required" == "required" ]]; then
             log "group '$group' does not exist on host yet (install GPU userspace first); skipping"
         fi
     done
@@ -1301,18 +1309,25 @@ _drivers_hailo_pcie() {
     # against the running kernel. Pull the exact `uname -r` to avoid
     # silently building against a stale linux-headers-generic.
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        dkms "linux-headers-$(uname -r)" || {
+        dkms "linux-headers-$(uname -r)" </dev/null || {
             warn "dkms or linux-headers-$(uname -r) install failed; HailoRT install aborted"
             return 0
         }
 
     # Install pcie driver FIRST so the postinst dkms build sees the
-    # headers we just pulled. Then the runtime userspace.
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pcie_deb"; then
+    # headers we just pulled. Then the runtime userspace. </dev/null
+    # is defense-in-depth on top of DEBIAN_FRONTEND=noninteractive:
+    # HailoRT 4.23's postinst still _displays_ "Do you wish to use
+    # DKMS? [Y/n]" and "activate hailort service? [y/N]" prompts,
+    # but with stdin closed the read returns EOF and both fall
+    # through to their (correct, for us) defaults. Without this an
+    # unattended re-run could block forever if a future HailoRT
+    # release stops honouring DEBIAN_FRONTEND.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pcie_deb" </dev/null; then
         warn "hailort-pcie-driver install failed; engine will fall back to CPU EP"
         return 0
     fi
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$rt_deb"; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$rt_deb" </dev/null; then
         warn "hailort install failed; engine will fall back to CPU EP"
         return 0
     fi
