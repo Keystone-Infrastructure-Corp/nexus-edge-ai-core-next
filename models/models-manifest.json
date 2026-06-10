@@ -1,7 +1,7 @@
 {
   "version": "v2",
-  "pack_version": "v2",
-  "_pack_version_comment": "Bumped only when ONNX bytes change. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX -> bump this field -> commit -> `gh release create models-v2 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build.",
+  "pack_version": "v3",
+  "_pack_version_comment": "Bumped only when ONNX/HEF bytes change. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX (or pull updated HEF) -> bump this field -> commit -> `gh release create models-v3 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build. v3 adds the Hailo-8 `yolo26n.hef` artifact (M_HAILO_EP). The HEF is the public Hailo Model Zoo v2.18.0 compile of Ultralytics yolo26n trained on COCO; no recompile needed. URL: https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8/yolo26n.hef",
   "_comment": "Model pack v2 manifest. See models/MODEL_PACK_V2.md for the schema reference. Paths are resolved relative to this file. sha256 is verified at engine load time when artifact verification is wired up (W-DETECT D5).",
   "_generated_by": "models/tools/generate_model_pack.py (or hand-edited at the repo root for the ship-in-tree models below)",
   "models": [
@@ -39,6 +39,13 @@
           "path": "yolo26n_1280.onnx",
           "preset": "1280",
           "sha256": "7eef96ae3449e16695fc088c7407f5c5c403b80985c275a29a74e2b0c0c14963"
+        },
+        {
+          "backend": "hef",
+          "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for the same Ultralytics yolo26n weights as the .onnx files above. Source: Hailo Model Zoo v2.18.0 (https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8/yolo26n.hef). 640x640 RGB888 in / on-chip NMS out. License chain: Hailo Model Zoo MIT + Ultralytics Apache-2.0 + COCO CC-BY-4.0. Loaded by `nexus-hailo-backend` when `inference.ep_priority` contains `\"hailo\"` AND this file is present in the resolved model pack.",
+          "path": "yolo26n.hef",
+          "preset": "640-hef",
+          "sha256": "af07137a98c9dbfb17d3d63109a4892d0e1d87e7946a1bd4173e208161aa8d30"
         }
       ],
       "presets": [
@@ -62,6 +69,13 @@
           "inputWidth": 1280,
           "inputHeight": 1280,
           "artifact": "yolo26n_1280.onnx"
+        },
+        {
+          "name": "640-hef",
+          "_comment": "M_HAILO_EP — Hailo-8 backed 640 path. Operator-selected by setting `inference.ep_priority = [\"hailo\", \"cpu\"]` in nexus.toml; the router dispatches to HailoYoloDetector when this preset's artifact exists in the model pack. On-chip NMS produces normalized boxes; postproc rescales to frame pixel space and maps COCO class ids to domain labels via the same table the ORT path uses.",
+          "inputWidth": 640,
+          "inputHeight": 640,
+          "artifact": "yolo26n.hef"
         }
       ],
       "default_preset": "640"

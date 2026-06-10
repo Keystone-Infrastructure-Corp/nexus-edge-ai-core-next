@@ -1,0 +1,25 @@
+[package]
+name = "nexus-hailo-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HailoRT 4.x FFI + safe Rust wrappers for Hailo-8 inference (M_HAILO_EP)."
+
+[features]
+default = []
+# When enabled on a Linux target, the crate links against libhailort.so.4.23
+# (vendored at /usr/lib/libhailort.so by the HailoRT .deb installer) and
+# provides a real inference session. When disabled — or when the target is
+# not Linux — every public entry point returns `Error::NotAvailable`, so
+# downstream crates can build cross-platform on dev boxes without HailoRT.
+linked = []
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "nexus-hailo-probe"
+path = "src/bin/nexus-hailo-probe.rs"
