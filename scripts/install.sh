@@ -124,11 +124,20 @@ Host-preparation flags (all ON by default — opt out per-step):
                                   reboots are disabled either way).
   --no-drivers                    Skip accelerator driver auto-install.
                                   By default install.sh lspci-probes the
-                                  box and installs the Intel iGPU / Arc
-                                  dGPU / NPU drivers it finds. If the
-                                  NPU needs an HWE kernel upgrade,
-                                  install.sh stages the kernel and
-                                  exits asking for a reboot.
+                                  box and installs the matching driver
+                                  stack. Recognised hardware:
+                                    * Intel UHD / Iris Xe / Arc iGPU
+                                    * Intel Arc A-series dGPU
+                                    * Intel NPU (Meteor/Arrow/Lunar Lake)
+                                    * AMD Radeon iGPU/dGPU (Mesa VA-API)
+                                    * Hailo-8 / 8L M.2 (requires HailoRT
+                                      .debs pre-staged under
+                                      \$NEXUS_HAILO_DEB_DIR; default
+                                      /opt/nexus/vendor/hailo)
+                                    * NVIDIA GPU (driver install pending M5)
+                                  If the Intel NPU needs an HWE kernel
+                                  upgrade, install.sh stages the kernel
+                                  and exits asking for a reboot.
 
   -h, --help                      This message.
 
