@@ -50,23 +50,25 @@ pub enum OutputLayout {
     ///   uint16 bbox_count
     ///   bbox_count × hailo_detection_t { f32 ymin, xmin, ymax, xmax, score; u16 class_id }
     NmsByScore { max_bboxes_total: u32 },
-    /// Anchor-free YOLOv8/v26 raw heads with on-chip DFL fold. Each scale
-    /// pairs a 4-channel box tensor (per-cell l,t,r,b in cell units) with
-    /// an N-channel class tensor (per-cell sigmoid'd probabilities). All
-    /// tensors are FLOAT32 NHWC. The caller (typically `decode_detections`)
-    /// runs the anchor-free decode + class-agnostic NMS on CPU. This is
-    /// what the public Hailo Model Zoo yolo26n.hef emits (no on-chip NMS).
-    RawYoloV8 {
+    /// Anchor-free yolo26-style raw heads with on-chip DFL fold. Each
+    /// scale pairs a 4-channel box tensor (per-cell l,t,r,b in cell units)
+    /// with an N-channel class tensor (per-cell sigmoid'd probabilities).
+    /// All tensors are FLOAT32 NHWC. The caller (typically
+    /// `decode_detections`) runs the anchor-free decode + class-agnostic
+    /// NMS on CPU. This is what the public Hailo Model Zoo yolo26n.hef
+    /// emits (no on-chip NMS). Naming tracks the model id in the manifest
+    /// (`yolo26n`), not the underlying head architecture family.
+    RawYolo26 {
         num_classes: u32,
-        scales: Vec<RawYoloScale>,
+        scales: Vec<RawYolo26Scale>,
     },
     /// Unsupported by the YOLO detector path — caller must handle raw output.
     Other,
 }
 
-/// One anchor-free YOLOv8 scale (box tensor + class tensor at a given stride).
+/// One anchor-free yolo26 scale (box tensor + class tensor at a given stride).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RawYoloScale {
+pub struct RawYolo26Scale {
     pub stride: u32,
     pub h: u32,
     pub w: u32,
@@ -369,7 +371,7 @@ impl InferSession {
         }
 
         // 9) Output layout dispatch. First output's format.order picks
-        // the family; multi-output HEFs are always RawYoloV8 (no NMS).
+        // the family; multi-output HEFs are always RawYolo26 (no NMS).
         let first_order = {
             let info = get_output_info(outputs[0].0)?;
             info.format.order
@@ -395,13 +397,13 @@ impl InferSession {
             // Multi-output: pair box (c=4) and score (c=num_classes,
             // usually 80) tensors by spatial shape. Each pair becomes
             // one scale; stride = input_w / cell_w.
-            match build_yolov8_scales(&output_infos, input_shape.1) {
+            match build_yolo26_scales(&output_infos, input_shape.1) {
                 Ok((num_classes, scales)) => {
-                    OutputLayout::RawYoloV8 { num_classes, scales }
+                    OutputLayout::RawYolo26 { num_classes, scales }
                 }
                 Err(e) => {
                     warn!(
-                        "Hailo HEF outputs do not match YOLOv8/v26 anchor-free \
+                        "Hailo HEF outputs do not match yolo26-style anchor-free \
                          layout: {e}; falling through to OutputLayout::Other"
                     );
                     OutputLayout::Other
@@ -547,7 +549,7 @@ impl InferSession {
 
 /// Decode the per-output buffers produced by `InferSession::infer_blocking`
 /// into flat detections. For NMS-fused HEFs this is a near-zero-cost
-/// repack of the on-chip output; for raw YOLOv8/v26 HEFs it runs the
+/// repack of the on-chip output; for raw yolo26 HEFs it runs the
 /// anchor-free decode + class-agnostic NMS on CPU.
 ///
 /// `max_detections` caps the output (saves a malloc blow on pathological
@@ -569,8 +571,8 @@ pub fn decode_detections(
             .first()
             .map(|b| decode_nms_by_score(b, max_detections))
             .unwrap_or_default(),
-        OutputLayout::RawYoloV8 { num_classes, scales } => {
-            decode_yolov8_raw(buffers, *num_classes, scales, max_detections)
+        OutputLayout::RawYolo26 { num_classes, scales } => {
+            decode_yolo26_raw(buffers, *num_classes, scales, max_detections)
         }
         OutputLayout::Other => Vec::new(),
     }
@@ -649,7 +651,7 @@ fn decode_nms_by_score(buf: &[u8], max_detections: usize) -> Vec<Detection> {
 }
 
 // ---------------------------------------------------------------------------
-// Raw YOLOv8/v26 anchor-free decoder (multi-output HEFs)
+// Raw yolo26 anchor-free decoder (multi-output HEFs)
 // ---------------------------------------------------------------------------
 
 /// Pair box (c=4) and class (c=num_classes) tensors by spatial shape.
@@ -660,10 +662,10 @@ fn decode_nms_by_score(buf: &[u8], max_detections: usize) -> Vec<Detection> {
 /// 20x20x{4,80} (stride 32). We don't trust the HEF declaration order
 /// — we pair purely by shape, so a regenerated HEF that swaps order
 /// or adds a fourth scale still decodes correctly.
-fn build_yolov8_scales(
+fn build_yolo26_scales(
     output_infos: &[OutputStreamInfo],
     input_w: u32,
-) -> Result<(u32, Vec<RawYoloScale>), String> {
+) -> Result<(u32, Vec<RawYolo26Scale>), String> {
     if output_infos.len() < 2 || output_infos.len() % 2 != 0 {
         return Err(format!(
             "expected an even number of outputs (box + class pairs), got {}",
@@ -676,7 +678,7 @@ fn build_yolov8_scales(
         .find(|i| i.c != 4 && i.c != 0)
         .map(|i| i.c)
         .ok_or_else(|| "no class tensor found (no output with c ≠ 4)".to_string())?;
-    let mut scales: Vec<RawYoloScale> = Vec::new();
+    let mut scales: Vec<RawYolo26Scale> = Vec::new();
     let mut consumed = vec![false; output_infos.len()];
     for (i, info_i) in output_infos.iter().enumerate() {
         if consumed[i] || info_i.c != 4 {
@@ -708,7 +710,7 @@ fn build_yolov8_scales(
                 info_i.h, info_i.w, input_w
             ));
         }
-        scales.push(RawYoloScale {
+        scales.push(RawYolo26Scale {
             stride,
             h: info_i.h,
             w: info_i.w,
@@ -724,17 +726,17 @@ fn build_yolov8_scales(
     Ok((num_classes, scales))
 }
 
-/// Anchor-free YOLOv8/v26 decoder. Inputs are FLOAT32 NHWC tensors.
+/// Anchor-free yolo26 decoder. Inputs are FLOAT32 NHWC tensors.
 /// Box tensor encodes (l, t, r, b) per cell in CELL units (already
 /// DFL-projected by the chip). Class tensor encodes per-class
 /// post-sigmoid probabilities.
 ///
 /// Coords are returned in [0, 1] normalized to the *network input*
 /// space, matching the convention used by NMS-fused HEFs.
-fn decode_yolov8_raw(
+fn decode_yolo26_raw(
     buffers: &[Vec<u8>],
     num_classes: u32,
-    scales: &[RawYoloScale],
+    scales: &[RawYolo26Scale],
     max_detections: usize,
 ) -> Vec<Detection> {
     // Score floor: anything below this is discarded before NMS to keep

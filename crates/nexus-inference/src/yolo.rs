@@ -576,11 +576,12 @@ pub(crate) fn map_coco_to_domain_label(class_id: i32) -> Option<&'static str> {
 /// between mock and real ORT impls without a typed cast at the call site.
 ///
 /// M_HAILO_EP: if `inference.ep_priority` puts `"hailo"` first AND a
-/// `yolo26n.hef` artifact exists in the model pack, we dispatch to the
-/// Hailo-8 backed detector instead of the ORT one. This keeps a single
-/// `kind = "yolo"` config entry working for both x86_64 + Intel/AMD GPU
-/// boxes (ONNX) and Hailo-8 M.2 boxes (HEF) — the operator just changes
-/// `ep_priority` in their tier toml.
+/// size-matched HEF (`yolo26n_<W>_hailo.hef`, pack v4+) or the legacy
+/// `yolo26n.hef` (pack v3) exists in the model pack, we dispatch to
+/// the Hailo-8 backed detector instead of the ORT one. This keeps a
+/// single `kind = "yolo"` config entry working for both x86_64 +
+/// Intel/AMD GPU boxes (ONNX) and Hailo-8 M.2 boxes (HEF) \u2014 the
+/// operator just changes `ep_priority` in their tier toml.
 pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceError> {
     #[cfg(feature = "ep-hailo")]
     {
@@ -602,14 +603,24 @@ pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector
     }
 }
 
-/// Look for a `yolo26n.hef` artifact next to the ONNX pack. Returns
-/// `Some(path)` only when the operator opted in via `ep_priority` AND
-/// the file exists on disk; otherwise falls through to ONNX.
+/// Look for a size-matched yolo26n HEF artifact next to the ONNX pack.
+/// Returns `Some(path)` only when the operator opted in via
+/// `ep_priority` AND a usable HEF exists on disk; otherwise falls
+/// through to ONNX.
 ///
-/// Why both checks: a host that ships the HEF in its model pack but
-/// doesn't have a Hailo chip would otherwise silently get the Hailo
-/// path and fail to open it. Requiring `ep_priority` to mention "hailo"
-/// keeps the dispatcher under operator control.
+/// Resolution order (first existing wins):
+///   1. `yolo26n_<W>_hailo.hef` — pack v4+ convention. Exact size
+///      match against `cfg.model.input_width`, so a camera configured
+///      at 960 dispatches to the 960 HEF and one at 640 to the 640
+///      HEF on the same host.
+///   2. `yolo26n.hef` — legacy pack v3 layout. Single 640-only file.
+///      Kept so old model packs still boot on the new engine.
+///
+/// Why both checks (priority + file): a host that ships the HEF in
+/// its model pack but doesn't have a Hailo chip would otherwise
+/// silently get the Hailo path and fail to open it. Requiring
+/// `ep_priority` to mention "hailo" keeps the dispatcher under
+/// operator control.
 #[cfg(feature = "ep-hailo")]
 fn resolve_hailo_hef(cfg: &InferenceConfig) -> Option<PathBuf> {
     let wants_hailo = cfg
@@ -620,8 +631,13 @@ fn resolve_hailo_hef(cfg: &InferenceConfig) -> Option<PathBuf> {
         return None;
     }
     let pack = cfg.model.pack_path.as_ref()?;
-    let candidate = pack.join("yolo26n.hef");
-    candidate.exists().then_some(candidate)
+    let w = cfg.model.input_width;
+    let size_matched = pack.join(format!("yolo26n_{w}_hailo.hef"));
+    if size_matched.exists() {
+        return Some(size_matched);
+    }
+    let legacy = pack.join("yolo26n.hef");
+    legacy.exists().then_some(legacy)
 }
 
 #[cfg(test)]

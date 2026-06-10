@@ -106,9 +106,9 @@ fn probe_hef(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         OutputLayout::NmsByScore { max_bboxes_total } => {
             println!("output_layout: NMS_BY_SCORE  max_total={max_bboxes_total}")
         }
-        OutputLayout::RawYoloV8 { num_classes, scales } => {
+        OutputLayout::RawYolo26 { num_classes, scales } => {
             println!(
-                "output_layout: RAW_YOLOV8  classes={num_classes}  scales={}",
+                "output_layout: RAW_YOLO26  classes={num_classes}  scales={}",
                 scales.len()
             );
             for s in scales {

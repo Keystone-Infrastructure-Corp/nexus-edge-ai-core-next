@@ -29,15 +29,15 @@ pub enum OutputLayout {
     NmsByScore {
         max_bboxes_total: u32,
     },
-    RawYoloV8 {
+    RawYolo26 {
         num_classes: u32,
-        scales: Vec<RawYoloScale>,
+        scales: Vec<RawYolo26Scale>,
     },
     Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RawYoloScale {
+pub struct RawYolo26Scale {
     pub stride: u32,
     pub h: u32,
     pub w: u32,

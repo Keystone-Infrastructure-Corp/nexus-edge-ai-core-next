@@ -4,15 +4,19 @@
 //! transparently when the resolved model file ends in `.hef`.
 //!
 //! Wire path:
-//!   * `from_config` looks for `<pack_path>/yolo26n.hef`; if present AND
-//!     `ep_priority` contains `"hailo"`, this detector is built. Otherwise
-//!     `build_detector_for_yolo` keeps its existing ORT/ONNX path.
+//!   * `from_config` defers to `yolo.rs::resolve_hailo_hef`, which
+//!     picks the size-matched `yolo26n_<W>_hailo.hef` (pack v4+) or
+//!     falls back to the legacy `yolo26n.hef` (pack v3). When that
+//!     returns `Some` AND `ep_priority` contains `"hailo"`, this
+//!     detector is built. Otherwise `build_detector_for_yolo` keeps
+//!     its existing ORT/ONNX path.
 //!   * `open(hef_path, frame_w, frame_h, threshold)` opens a HailoRT
 //!     `InferSession`. The session owns the vdevice + HEF + vstreams.
 //!   * Per-frame: bilinear resize the RGB24 source to the HEF's input
-//!     dims (640×640 for yolo26n.hef), then `infer_blocking` returns
-//!     normalized NMS_BY_CLASS detections decoded into our `Detection`
-//!     wire type via the COCO→domain label map shared with `yolo.rs`.
+//!     dims (640×640 / 960×960 / 1280×1280), then `infer_blocking`
+//!     returns normalized NMS_BY_CLASS detections decoded into our
+//!     `Detection` wire type via the COCO→domain label map shared
+//!     with `yolo.rs`.
 //!
 //! Concurrency: `InferSession::infer_blocking` takes `&mut self` so
 //! we wrap in a `parking_lot::Mutex` and call from
@@ -42,7 +46,8 @@ use crate::yolo::{bgr_to_rgb, map_coco_to_domain_label};
 pub struct HailoYoloDetector {
     session: Mutex<InferSession>,
     /// Network input geometry — set from the HEF, not the operator
-    /// config. yolo26n.hef ships as 640×640 RGB888.
+    /// config. Reads back as 640×640 / 960×960 / 1280×1280 depending
+    /// on which size HEF the pack staged.
     input_w: u32,
     input_h: u32,
     /// Operator-supplied threshold applied AFTER on-chip NMS — the
@@ -55,7 +60,8 @@ pub struct HailoYoloDetector {
 
 impl HailoYoloDetector {
     /// Build from a resolved [`InferenceConfig`]. Caller must have
-    /// already established that `pack_path / yolo26n.hef` exists —
+    /// already established that the pack-resolved HEF
+    /// (`yolo26n_<W>_hailo.hef` or legacy `yolo26n.hef`) exists —
     /// the dispatcher in `crate::yolo::build_detector_for_yolo` does
     /// that check before calling.
     pub fn from_config(
@@ -83,7 +89,7 @@ impl HailoYoloDetector {
         match &output_layout {
             OutputLayout::NmsByClass { .. }
             | OutputLayout::NmsByScore { .. }
-            | OutputLayout::RawYoloV8 { .. } => {}
+            | OutputLayout::RawYolo26 { .. } => {}
             OutputLayout::Other => {
                 return Err(InferenceError::ModelLoad(format!(
                     "hailo HEF {} has an unsupported output layout for YOLO postproc",
