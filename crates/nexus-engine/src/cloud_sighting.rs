@@ -90,6 +90,12 @@ struct QueuedSighting {
     started_ts: DateTime<Utc>,
     ts: DateTime<Utc>,
     is_first: bool,
+    /// Phase 6.8: detector class label carried from
+    /// [`SightingSnapshot::class_label`] through to the wire
+    /// `EntitySightingPayload.class_label`. Empty string means
+    /// "no class signal" — forwarded as `None` on the wire so the
+    /// cloud-side `class_to_kind` falls back to `'unknown'`.
+    class_label: String,
 }
 
 /// Phase 5.6 · R7 — observability snapshot for a single camera's
@@ -330,6 +336,7 @@ impl SightingHook for CloudEntitySightingHook {
             started_ts: snapshot.started_ts,
             ts: snapshot.ts,
             is_first: snapshot.is_first,
+            class_label: snapshot.class_label,
         };
         // `snapshot.frame` Arc is now dropped at end-of-scope so
         // the worker queue carries no source-frame references.
@@ -618,6 +625,7 @@ fn build_projection(
         started_ts,
         ts,
         is_first,
+        class_label,
     } = snapshot;
     let embedding = match embedding_result {
         Ok(emb) => emb,
@@ -680,6 +688,15 @@ fn build_projection(
         started_ts,
         ts,
         is_first_sighting: is_first,
+        // Phase 6.8: forward the detector class label to the wire.
+        // An empty string from upstream means "no class signal" —
+        // emit `None` so the cloud-side allowlist treats it as
+        // unknown rather than persisting a literal empty string.
+        class_label: if class_label.is_empty() {
+            None
+        } else {
+            Some(class_label)
+        },
     })
 }
 
@@ -716,6 +733,7 @@ mod tests {
             started_ts: now,
             ts: now,
             is_first: true,
+            class_label: "person".to_string(),
         }
     }
 

@@ -304,6 +304,11 @@ pub struct EntitySightingProjection {
     /// `true` for the first envelope emitted for this track,
     /// `false` for every periodic re-send.
     pub is_first_sighting: bool,
+    /// Phase 6.8: optional raw detector class label for this track
+    /// (e.g. `"person"`, `"car"`). `None` means "no class signal";
+    /// the cloud-side `class_to_kind` falls back to `'unknown'`.
+    /// Wire shape: `EntitySightingPayload.class_label` (optional).
+    pub class_label: Option<String>,
 }
 
 /// Pure-function projection. Public so engine tests can construct
@@ -420,6 +425,7 @@ fn build_entity_sighting_payload(
         is_first_sighting: sighting.is_first_sighting,
         started_ts: sighting.started_ts.to_rfc3339(),
         ts: sighting.ts.to_rfc3339(),
+        class_label: sighting.class_label,
     }
 }
 
@@ -556,6 +562,7 @@ mod tests {
             started_ts,
             ts: started_ts,
             is_first_sighting: true,
+            class_label: Some("person".into()),
         })
         .await
         .expect("send");
@@ -571,6 +578,7 @@ mod tests {
                 assert_eq!(p.frame_w, 960);
                 assert_eq!(p.frame_h, 540);
                 assert!((p.confidence - 0.87).abs() < 1e-9);
+                assert_eq!(p.class_label.as_deref(), Some("person"));
                 // round-trip the embedding through base64 and confirm
                 // we got the same float32-little-endian bytes back
                 use base64::Engine as _;
@@ -605,12 +613,14 @@ mod tests {
             started_ts: Utc::now(),
             ts: Utc::now(),
             is_first_sighting: false,
+            class_label: None,
         });
         match env.body {
             EnvelopeBody::EntitySighting(p) => {
                 assert_eq!(p.bbox, vec![0u64, 0, 10, 20]);
                 assert_eq!(p.embedding_dim, 384);
                 assert!(!p.is_first_sighting);
+                assert!(p.class_label.is_none());
             }
             other => panic!("expected EntitySighting, got {other:?}"),
         }

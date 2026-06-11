@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -174,6 +174,45 @@ pub struct CloseSessionPayload {
     pub reason: String,
 }
 
+/// Cloud → Edge. Phase 7.0a. Operator-initiated diagnostic-tarball collection request. The cloud mints a single-use Azure Blob SAS PUT URL scoped to a unique `diag_id` path under the `diagnostics` container, then pushes this envelope down the existing edge-gateway tunnel. The edge tarballs (logs ∪ scrubbed-config ∪ telemetry snapshot ∪ optional sqlite dump), `reqwest::put`s the bytes to `sas_put_url`, then emits `diag_ready` (status=uploaded|failed) with the same `diag_id`. Operator-facing endpoints in the console resolve diag_id → fresh download SAS URL via Blob listBlobs. State-mutating on the edge (creates a tarball, makes outbound network calls), so `actor_token` is REQUIRED and the edge verifies signature + path-binding before any local work. The 30-second actor_token TTL is honoured for receipt-validation only; the tarball+upload work continues past the token expiry (the SAS URL has its own independent expiry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagCollectPayload {
+    /// REQUIRED. JWT proves cloud-side operator provenance. Edge verifies signature, `aud=nexus-edge-rpc`, `path=diag_collect` (logical RPC path), and `exp > now`. State-mutating; same posture as `RpcCallPayload`.
+    pub actor_token: ActorTokenJwt,
+    /// Cloud-minted UUIDv7. Echoed back in the matching `diag_ready` envelope. Also the canonical key the cloud DB uses to track this collection request.
+    pub diag_id: Uuid,
+    /// SAS URL hard expiry. Edge gives up + emits `diag_ready{status=failed, error_code=sas_expired}` if it can't complete the upload by this time. Typical value is `now + 15 min`.
+    pub expires_at: Timestamp,
+    /// Optional. If true, include the live edge sqlite state DB in the tarball (operator opt-in — the DB may contain PII like camera names and clip metadata). Default false. If true but the edge can't snapshot the DB (file lock, disk full), the tarball is uploaded WITHOUT the sqlite file and `diag_ready` carries `error_code=include_sqlite_unavailable` with `status=uploaded` (partial success — operator can still inspect logs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_sqlite: Option<bool>,
+    /// Optional cap on the uncompressed tarball size, defense against runaway disk pressure. Default 52428800 (50 MiB). If the assembled tarball would exceed this, the edge truncates the noisiest input (typically logs) and adds a `_TRUNCATED.txt` marker file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Single-use HTTPS PUT URL. Must include `sp=cw` (Create+Write) and `sr=b` (blob scope) per the cloud SAS-minting contract. Edge MUST NOT log this URL (it carries the SAS token).
+    pub sas_put_url: String,
+}
+
+/// Edge → Cloud. Phase 7.0a. Completion notification for a `diag_collect`. Routed by the cloud orchestrator to the diag-tracking row keyed on `diag_id` (NOT the envelope `in_reply_to` — diag_collect is a fire-and-confirm pattern, not a sync RPC, because tarball assembly + upload can take 30+ seconds well past the actor_token's TTL). Cloud uses (status, error_code) to set the diag row's final state; the SPA polls that row to surface progress + the download button.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagReadyPayload {
+    /// Echoes back the `diag_collect.diag_id`. The cloud orchestrator uses this — not envelope.in_reply_to — to bind to the open diag row.
+    pub diag_id: Uuid,
+    /// Failure mode. Required when status=failed; ALSO present with status=uploaded for partial successes (currently only `include_sqlite_unavailable` — the tarball uploaded but the optional sqlite snapshot couldn't be included). `actor_token_invalid` arrives via this kind rather than as an envelope-level error so the cloud orchestrator can mark the diag row instead of just dropping the envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Operator-facing detail. Optional; safe to display verbatim in the SPA (the edge MUST scrub paths/secrets before populating).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Uncompressed tarball size (informational). Required when status=uploaded; omitted when status=failed (no tarball was assembled or the upload itself failed). Compressed size is unavailable — the edge streams `tar | gzip` straight into reqwest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// `uploaded` = the bytes are in Blob and the operator can download them. `failed` = no usable bytes are in Blob; the operator may retry by calling the collect endpoint again.
+    pub status: String,
+}
+
 /// Cloud → Edge. Push triggered by Stripe webhook or initial enrollment. Edge persists + applies immediately.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +237,9 @@ pub struct EntitySightingPayload {
     pub bbox: Vec<u64>,
     /// Per-core integer id (matches cameras.edge_camera_id).
     pub camera_id: u64,
+    /// Phase 6.8 (additive on v=1). Optional detector class name (raw detector vocabulary, e.g. `person`, `car`, `truck`, `bicycle`). Cloud normalises into `entities.kind` via the gateway-side allowlist: `person` → `person`; `car|truck|motorcycle|bus|bicycle|vehicle` → `vehicle`; anything else (or omitted) → `unknown`. Pre-6.8 edges omit this field and continue to produce `unknown`-kind entities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_label: Option<String>,
     /// Detector confidence for the track at this sighting.
     pub confidence: f64,
     /// Base64 of `float32[embedding_dim]` in little-endian by default. When `embedding_dtype` is `"f16"`, length is `2 * embedding_dim` bytes (IEEE-754 binary16 little-endian) before base64 padding.
@@ -359,6 +401,8 @@ pub enum EnvelopeBody {
     CameraRosterAck(CameraRosterAckPayload),
     EntitySighting(EntitySightingPayload),
     EntitySightingBatch(EntitySightingBatchPayload),
+    DiagCollect(DiagCollectPayload),
+    DiagReady(DiagReadyPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.
