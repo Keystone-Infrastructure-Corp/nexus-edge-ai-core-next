@@ -111,6 +111,13 @@ pub struct SightingSnapshot {
     /// `true` only for the first snapshot a `(camera_id, track_id)`
     /// pair produces in its current lifecycle.
     pub is_first: bool,
+    /// Phase 6.8: raw detector class label for the track
+    /// (e.g. `"person"`, `"car"`). Sourced from
+    /// [`TrackedObject::label`] at emit time and forwarded to the
+    /// wire as `EntitySightingPayload.class_label`. Empty string
+    /// means "no class signal available" — the cloud-side
+    /// `class_to_kind` falls back to `unknown`.
+    pub class_label: String,
 }
 
 /// Engine-side sink for [`SightingSnapshot`]s. Implementations MUST
@@ -345,6 +352,7 @@ impl SightingScheduler {
                     started_ts: plan.started_ts,
                     ts: now,
                     is_first: plan.is_first,
+                    class_label: obj.label.clone(),
                 });
                 emitted += 1;
                 // M_PERF_CROWD B3 — back-date the first-emit stamp
