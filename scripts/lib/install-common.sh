@@ -1614,6 +1614,31 @@ stage_tier_config() {
         -e 's#/usr/share/nexus/ui#/opt/nexus/current/share/ui#g' \
         "$target"
     log "staged tier config: $tier -> $target"
+    _apply_hailo_ep_priority_override "$target"
+}
+
+# Auto-prepend "hailo" to ep_priority when a Hailo-8 M.2 is detected
+# AND the chosen tier template didn't already list it. Runs only from
+# stage_tier_config's first-install path so operator edits are never
+# touched. Rationale: with model pack v4+ every Hailo-8 box benefits
+# from the HEF runtime regardless of which tier the operator picked
+# (`--tier t10` on a Hailo box should still light up the chip).
+_apply_hailo_ep_priority_override() {
+    local target="$1"
+    local tags
+    tags="$(_detect_hardware 2>/dev/null)" || return 0
+    grep -qx 'hailo-m2' <<<"$tags" || return 0
+    # Already present (T24 template) — nothing to do.
+    if grep -qE '^\s*ep_priority\s*=.*"hailo"' "$target"; then
+        log "ep_priority already includes \"hailo\" (no override needed)"
+        return 0
+    fi
+    if ! grep -qE '^\s*ep_priority\s*=\s*\[' "$target"; then
+        warn "ep_priority line not found in $target; skipping Hailo override"
+        return 0
+    fi
+    sed -i -E 's/^(\s*ep_priority\s*=\s*\[)/\1"hailo", /' "$target"
+    log "auto-prepended \"hailo\" to ep_priority in $target (Hailo-8 M.2 detected)"
 }
 
 # --- systemd unit -------------------------------------------------------------
