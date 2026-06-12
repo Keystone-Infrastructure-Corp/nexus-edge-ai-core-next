@@ -1,0 +1,11 @@
+# CODEOWNERS — review gate for branch protection on `main`.
+#
+# Branch protection on `main` requires Code Owner review on every PR.
+# The owner listed here MUST approve before merge (per
+# `require_code_owner_reviews: true` in the protection rule).
+#
+# `andboyer` has a bypass-PR-review allowance, so own-PRs can still
+# merge without a second approver. Every PR opened by anyone else
+# needs a green review from @andboyer.
+
+*       @andboyer
