@@ -64,20 +64,14 @@ impl HailoYoloDetector {
     /// (`yolo26n_<W>_hailo.hef` or legacy `yolo26n.hef`) exists —
     /// the dispatcher in `crate::yolo::build_detector_for_yolo` does
     /// that check before calling.
-    pub fn from_config(
-        cfg: &InferenceConfig,
-        hef_path: &Path,
-    ) -> Result<Self, InferenceError> {
+    pub fn from_config(cfg: &InferenceConfig, hef_path: &Path) -> Result<Self, InferenceError> {
         Self::open(hef_path, cfg.model.score_threshold)
     }
 
     /// Open a session against the given HEF file.
     pub fn open(model_path: &Path, score_threshold: f32) -> Result<Self, InferenceError> {
         let session = InferSession::open(model_path, None, None).map_err(|e| {
-            InferenceError::ModelLoad(format!(
-                "hailo open {}: {e}",
-                model_path.display()
-            ))
+            InferenceError::ModelLoad(format!("hailo open {}: {e}", model_path.display()))
         })?;
         let (h, w, c) = session.input_shape();
         if c != 3 {
@@ -280,9 +274,7 @@ pub fn build_detector_for_hailo_yolo(
     match HailoYoloDetector::from_config(cfg, hef_path) {
         Ok(d) => Ok(Arc::new(d)),
         Err(e) => {
-            warn!(
-                "hailo YOLO detector unavailable, falling back to mock: {e}"
-            );
+            warn!("hailo YOLO detector unavailable, falling back to mock: {e}");
             Ok(Arc::new(crate::detectors::MockDetector::new()))
         }
     }

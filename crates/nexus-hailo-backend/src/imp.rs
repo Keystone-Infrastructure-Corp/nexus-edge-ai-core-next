@@ -271,9 +271,7 @@ impl InferSession {
         for op in &outputs_params {
             let mut handle: hailo_output_vstream = ptr::null_mut();
             check(
-                unsafe {
-                    ffi::hailo_create_output_vstreams(network_group.0, op, 1, &mut handle)
-                },
+                unsafe { ffi::hailo_create_output_vstreams(network_group.0, op, 1, &mut handle) },
                 "hailo_create_output_vstreams",
             )?;
             outputs.push(OwnedOutputVStream(handle));
@@ -332,9 +330,7 @@ impl InferSession {
             let info = get_output_info(out.0)?;
             let mut frame_size: usize = 0;
             check(
-                unsafe {
-                    ffi::hailo_get_output_vstream_frame_size(out.0, &mut frame_size)
-                },
+                unsafe { ffi::hailo_get_output_vstream_frame_size(out.0, &mut frame_size) },
                 "hailo_get_output_vstream_frame_size",
             )?;
             let order = info.format.order;
@@ -358,7 +354,10 @@ impl InferSession {
             };
             let name = c_array_to_string(
                 &info.name,
-                info.name.iter().position(|&c| c == 0).unwrap_or(info.name.len()),
+                info.name
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(info.name.len()),
             );
             output_buffers.push(vec![0u8; frame_size]);
             output_infos.push(OutputStreamInfo {
@@ -376,40 +375,38 @@ impl InferSession {
             let info = get_output_info(outputs[0].0)?;
             info.format.order
         };
-        let output_layout = if num_outputs == 1
-            && first_order == HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS
-        {
-            let info = get_output_info(outputs[0].0)?;
-            let nms = unsafe { info.shape_union.nms_shape };
-            OutputLayout::NmsByClass {
-                num_classes: nms.number_of_classes,
-                max_bboxes_per_class: nms.max_bboxes_per_class,
-            }
-        } else if num_outputs == 1
-            && first_order == HAILO_FORMAT_ORDER_HAILO_NMS_BY_SCORE
-        {
-            let info = get_output_info(outputs[0].0)?;
-            let nms = unsafe { info.shape_union.nms_shape };
-            OutputLayout::NmsByScore {
-                max_bboxes_total: nms.max_bboxes_total,
-            }
-        } else {
-            // Multi-output: pair box (c=4) and score (c=num_classes,
-            // usually 80) tensors by spatial shape. Each pair becomes
-            // one scale; stride = input_w / cell_w.
-            match build_yolo26_scales(&output_infos, input_shape.1) {
-                Ok((num_classes, scales)) => {
-                    OutputLayout::RawYolo26 { num_classes, scales }
+        let output_layout =
+            if num_outputs == 1 && first_order == HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS {
+                let info = get_output_info(outputs[0].0)?;
+                let nms = unsafe { info.shape_union.nms_shape };
+                OutputLayout::NmsByClass {
+                    num_classes: nms.number_of_classes,
+                    max_bboxes_per_class: nms.max_bboxes_per_class,
                 }
-                Err(e) => {
-                    warn!(
-                        "Hailo HEF outputs do not match yolo26-style anchor-free \
+            } else if num_outputs == 1 && first_order == HAILO_FORMAT_ORDER_HAILO_NMS_BY_SCORE {
+                let info = get_output_info(outputs[0].0)?;
+                let nms = unsafe { info.shape_union.nms_shape };
+                OutputLayout::NmsByScore {
+                    max_bboxes_total: nms.max_bboxes_total,
+                }
+            } else {
+                // Multi-output: pair box (c=4) and score (c=num_classes,
+                // usually 80) tensors by spatial shape. Each pair becomes
+                // one scale; stride = input_w / cell_w.
+                match build_yolo26_scales(&output_infos, input_shape.1) {
+                    Ok((num_classes, scales)) => OutputLayout::RawYolo26 {
+                        num_classes,
+                        scales,
+                    },
+                    Err(e) => {
+                        warn!(
+                            "Hailo HEF outputs do not match yolo26-style anchor-free \
                          layout: {e}; falling through to OutputLayout::Other"
-                    );
-                    OutputLayout::Other
+                        );
+                        OutputLayout::Other
+                    }
                 }
-            }
-        };
+            };
 
         info!(
             target: "hailo",
@@ -480,11 +477,7 @@ impl InferSession {
             let buf = &mut self.output_buffers[i];
             check(
                 unsafe {
-                    ffi::hailo_vstream_read_raw_buffer(
-                        out.0,
-                        buf.as_mut_ptr() as *mut _,
-                        buf.len(),
-                    )
+                    ffi::hailo_vstream_read_raw_buffer(out.0, buf.as_mut_ptr() as *mut _, buf.len())
                 },
                 "hailo_vstream_read_raw_buffer",
             )?;
@@ -507,36 +500,29 @@ impl InferSession {
         let mut handles: [hailo_device; 8] = [ptr::null_mut(); 8];
         let mut count: usize = 8;
         check(
-            unsafe {
-                ffi::hailo_get_physical_devices(vdev, handles.as_mut_ptr(), &mut count)
-            },
+            unsafe { ffi::hailo_get_physical_devices(vdev, handles.as_mut_ptr(), &mut count) },
             "hailo_get_physical_devices",
         )?;
 
         let mut out = Vec::with_capacity(count);
         for &dev in &handles[..count] {
             let mut id: hailo_device_identity_t = unsafe { std::mem::zeroed() };
-            if let Err(e) =
-                check(unsafe { ffi::hailo_identify(dev, &mut id) }, "hailo_identify")
-            {
+            if let Err(e) = check(
+                unsafe { ffi::hailo_identify(dev, &mut id) },
+                "hailo_identify",
+            ) {
                 debug!("hailo_identify failed: {e}");
                 continue;
             }
             out.push(DeviceInfo {
                 board_name: c_array_to_string(&id.board_name, id.board_name_length as usize),
-                serial: c_array_to_string(
-                    &id.serial_number,
-                    id.serial_number_length as usize,
-                ),
+                serial: c_array_to_string(&id.serial_number, id.serial_number_length as usize),
                 fw_version: (
                     id.fw_version.major,
                     id.fw_version.minor,
                     id.fw_version.revision,
                 ),
-                device_id: c_array_to_string(
-                    &id.part_number,
-                    id.part_number_length as usize,
-                ),
+                device_id: c_array_to_string(&id.part_number, id.part_number_length as usize),
             });
         }
         Ok(out)
@@ -571,9 +557,10 @@ pub fn decode_detections(
             .first()
             .map(|b| decode_nms_by_score(b, max_detections))
             .unwrap_or_default(),
-        OutputLayout::RawYolo26 { num_classes, scales } => {
-            decode_yolo26_raw(buffers, *num_classes, scales, max_detections)
-        }
+        OutputLayout::RawYolo26 {
+            num_classes,
+            scales,
+        } => decode_yolo26_raw(buffers, *num_classes, scales, max_detections),
         OutputLayout::Other => Vec::new(),
     }
 }
@@ -588,12 +575,7 @@ fn decode_nms_by_class(buf: &[u8], num_classes: usize, max_detections: usize) ->
         if off + 4 > buf.len() {
             break;
         }
-        let count_f = f32::from_le_bytes([
-            buf[off],
-            buf[off + 1],
-            buf[off + 2],
-            buf[off + 3],
-        ]);
+        let count_f = f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
         off += 4;
         let count = count_f.round() as usize;
         for _ in 0..count {
@@ -603,11 +585,15 @@ fn decode_nms_by_class(buf: &[u8], num_classes: usize, max_detections: usize) ->
             if off + 20 > buf.len() {
                 return out;
             }
-            let y_min = f32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
-            let x_min = f32::from_le_bytes([buf[off+4], buf[off+5], buf[off+6], buf[off+7]]);
-            let y_max = f32::from_le_bytes([buf[off+8], buf[off+9], buf[off+10], buf[off+11]]);
-            let x_max = f32::from_le_bytes([buf[off+12], buf[off+13], buf[off+14], buf[off+15]]);
-            let score = f32::from_le_bytes([buf[off+16], buf[off+17], buf[off+18], buf[off+19]]);
+            let y_min = f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            let x_min =
+                f32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
+            let y_max =
+                f32::from_le_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
+            let x_max =
+                f32::from_le_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]]);
+            let score =
+                f32::from_le_bytes([buf[off + 16], buf[off + 17], buf[off + 18], buf[off + 19]]);
             off += 20;
             out.push(Detection {
                 y_min,
@@ -638,14 +624,23 @@ fn decode_nms_by_score(buf: &[u8], max_detections: usize) -> Vec<Detection> {
         if off + 22 > buf.len() {
             break;
         }
-        let y_min = f32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
-        let x_min = f32::from_le_bytes([buf[off+4], buf[off+5], buf[off+6], buf[off+7]]);
-        let y_max = f32::from_le_bytes([buf[off+8], buf[off+9], buf[off+10], buf[off+11]]);
-        let x_max = f32::from_le_bytes([buf[off+12], buf[off+13], buf[off+14], buf[off+15]]);
-        let score = f32::from_le_bytes([buf[off+16], buf[off+17], buf[off+18], buf[off+19]]);
-        let class_id = u16::from_le_bytes([buf[off+20], buf[off+21]]);
+        let y_min = f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        let x_min = f32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
+        let y_max = f32::from_le_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
+        let x_max =
+            f32::from_le_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]]);
+        let score =
+            f32::from_le_bytes([buf[off + 16], buf[off + 17], buf[off + 18], buf[off + 19]]);
+        let class_id = u16::from_le_bytes([buf[off + 20], buf[off + 21]]);
         off += 22;
-        out.push(Detection { y_min, x_min, y_max, x_max, score, class_id });
+        out.push(Detection {
+            y_min,
+            x_min,
+            y_max,
+            x_max,
+            score,
+            class_id,
+        });
     }
     out
 }
@@ -687,7 +682,12 @@ fn build_yolo26_scales(
         // Find the class tensor with matching (h, w).
         let mut pair_idx: Option<usize> = None;
         for (j, info_j) in output_infos.iter().enumerate() {
-            if !consumed[j] && j != i && info_j.c == num_classes && info_j.h == info_i.h && info_j.w == info_i.w {
+            if !consumed[j]
+                && j != i
+                && info_j.c == num_classes
+                && info_j.h == info_i.h
+                && info_j.w == info_i.w
+            {
                 pair_idx = Some(j);
                 break;
             }
@@ -781,7 +781,10 @@ fn decode_yolo26_raw(
                 for c in 0..nc {
                     let o = cls_base + c * 4;
                     let s = f32::from_le_bytes([
-                        cls_buf[o], cls_buf[o + 1], cls_buf[o + 2], cls_buf[o + 3],
+                        cls_buf[o],
+                        cls_buf[o + 1],
+                        cls_buf[o + 2],
+                        cls_buf[o + 3],
                     ]);
                     if s > best_score {
                         best_score = s;
@@ -793,10 +796,30 @@ fn decode_yolo26_raw(
                 }
                 // Decode box: (l, t, r, b) in cell units → normalized xyxy.
                 let box_base = (gy * w + gx) * 4 * 4;
-                let l = f32::from_le_bytes([box_buf[box_base], box_buf[box_base+1], box_buf[box_base+2], box_buf[box_base+3]]);
-                let t = f32::from_le_bytes([box_buf[box_base+4], box_buf[box_base+5], box_buf[box_base+6], box_buf[box_base+7]]);
-                let r = f32::from_le_bytes([box_buf[box_base+8], box_buf[box_base+9], box_buf[box_base+10], box_buf[box_base+11]]);
-                let b = f32::from_le_bytes([box_buf[box_base+12], box_buf[box_base+13], box_buf[box_base+14], box_buf[box_base+15]]);
+                let l = f32::from_le_bytes([
+                    box_buf[box_base],
+                    box_buf[box_base + 1],
+                    box_buf[box_base + 2],
+                    box_buf[box_base + 3],
+                ]);
+                let t = f32::from_le_bytes([
+                    box_buf[box_base + 4],
+                    box_buf[box_base + 5],
+                    box_buf[box_base + 6],
+                    box_buf[box_base + 7],
+                ]);
+                let r = f32::from_le_bytes([
+                    box_buf[box_base + 8],
+                    box_buf[box_base + 9],
+                    box_buf[box_base + 10],
+                    box_buf[box_base + 11],
+                ]);
+                let b = f32::from_le_bytes([
+                    box_buf[box_base + 12],
+                    box_buf[box_base + 13],
+                    box_buf[box_base + 14],
+                    box_buf[box_base + 15],
+                ]);
                 let cx = gx as f32 + 0.5;
                 let cy = gy as f32 + 0.5;
                 let x1 = ((cx - l) * stride * inv_w).clamp(0.0, 1.0);
@@ -832,7 +855,11 @@ fn nms_greedy(
     if dets.is_empty() {
         return dets;
     }
-    dets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    dets.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut keep: Vec<Detection> = Vec::with_capacity(dets.len().min(max_detections));
     'outer: for d in dets {
         if keep.len() >= max_detections {
@@ -859,7 +886,11 @@ fn iou(a: &Detection, b: &Detection) -> f32 {
     let area_a = (a.x_max - a.x_min) * (a.y_max - a.y_min);
     let area_b = (b.x_max - b.x_min) * (b.y_max - b.y_min);
     let union = area_a + area_b - inter;
-    if union <= 0.0 { 0.0 } else { inter / union }
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +962,9 @@ fn make_output_params(
         "hailo_make_output_vstream_params",
     )?;
     if count == 0 {
-        return Err(Error::LayoutMismatch("network has 0 output vstreams".into()));
+        return Err(Error::LayoutMismatch(
+            "network has 0 output vstreams".into(),
+        ));
     }
     buf.truncate(count);
     Ok(buf)
@@ -956,10 +989,6 @@ fn get_output_info(vs: hailo_output_vstream) -> Result<hailo_vstream_info_t, Err
 }
 
 fn c_array_to_string(buf: &[std::os::raw::c_char], len: usize) -> String {
-    let bytes: Vec<u8> = buf
-        .iter()
-        .take(len)
-        .map(|&c| c as u8)
-        .collect();
+    let bytes: Vec<u8> = buf.iter().take(len).map(|&c| c as u8).collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }

@@ -16,7 +16,9 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() -> ExitCode {
     fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(true)
         .init();
 
@@ -106,7 +108,10 @@ fn probe_hef(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         OutputLayout::NmsByScore { max_bboxes_total } => {
             println!("output_layout: NMS_BY_SCORE  max_total={max_bboxes_total}")
         }
-        OutputLayout::RawYolo26 { num_classes, scales } => {
+        OutputLayout::RawYolo26 {
+            num_classes,
+            scales,
+        } => {
             println!(
                 "output_layout: RAW_YOLO26  classes={num_classes}  scales={}",
                 scales.len()
