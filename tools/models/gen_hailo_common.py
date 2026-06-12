@@ -338,8 +338,8 @@ def compile_with_dfc(
         # JPEG-decoded RGB crops resized to the model's input dim, in
         # [0,1] FP32. The model's input dim is auto-discovered from the
         # parsed HAR (DFC exposes this via runner.input_shape).
-        calib_iter = _calibration_loader(calibration_dir, runner)
-        runner.optimize(calib_iter)
+        calib_array = _calibration_loader(calibration_dir, runner)
+        runner.optimize(calib_array)
 
         compiled_hef = runner.compile()
         hef_out.parent.mkdir(parents=True, exist_ok=True)
@@ -387,16 +387,27 @@ def _calibration_loader(calibration_dir: Path, runner):
         pass
 
     images = sorted(calibration_dir.glob("*.jpg")) + sorted(calibration_dir.glob("*.JPEG")) + sorted(calibration_dir.glob("*.png"))
+    # Cap at CALIB_LIMIT to keep DFC's optimize() FP32 array in RAM on
+    # smaller hosts (1024 x 1280 x 1280 x 3 x 4 = 20 GB; 256 is plenty
+    # for INT8 PTQ per Hailo's optimization guide).
+    import os as _os
+    _limit = int(_os.environ.get("CALIB_LIMIT", "256"))
+    if len(images) > _limit:
+        images = images[:_limit]
     if not images:
         raise SystemExit(
             f"[gen_hailo_common] FATAL: no calibration images found under {calibration_dir}"
         )
     print(f"[gen_hailo_common]   calibration: {len(images)} imgs @ {h}x{w}")
-    for img_path in images:
+    # DFC's runner.optimize() expects a single (N, H, W, C) FP32 array
+    # in pre-normalization range, NOT a generator. The .alls
+    # normalization op handles the [0,255] -> per-model scaling.
+    batch = np.empty((len(images), h, w, 3), dtype=np.float32)
+    for i, img_path in enumerate(images):
         with Image.open(img_path).convert("RGB") as im:
             im = im.resize((w, h), Image.Resampling.BILINEAR)
-            arr = np.asarray(im, dtype=np.float32) / 255.0
-            yield arr[None, ...]  # add batch dim \u2192 (1, H, W, 3)
+            batch[i] = np.asarray(im, dtype=np.float32)
+    return batch
 
 
 # --------------------------------------------------------------------------- #

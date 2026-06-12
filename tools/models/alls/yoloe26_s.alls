@@ -1,0 +1,5 @@
+normalization1 = normalization([0.0, 0.0, 0.0], [255.0, 255.0, 255.0])
+model_optimization_config(calibration, batch_size=8, calibset_size=256)
+model_optimization_flavor(optimization_level=1, compression_level=0)
+post_quantization_optimization(adaround, policy=enabled, batch_size=8)
+performance_param(compiler_optimization_level=max)
