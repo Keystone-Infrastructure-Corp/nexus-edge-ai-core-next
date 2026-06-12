@@ -58,8 +58,7 @@
           "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yolo26n_960. NO public Model Zoo build at this size; operator MUST compile from yolo26n_960.onnx via the Hailo Dataflow Compiler. See tools/models/gen_yolo26n_hailo.py --size 960. Calibration: 1024-image sample of COCO val2017 in [0,1] FP32 RGB. Native chip output mirrors the 640 path (raw multi-output, no on-chip NMS).",
           "path": "yolo26n_960_hailo.hef",
           "preset": "960-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "8066d75c746dca4f3003193771eb55e86f504c4c18424e3ba1e8c5c76d9c3539",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo26n_960.onnx",
@@ -160,8 +159,7 @@
           "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yolo_world_v2_s @ 640. NO public Model Zoo build; operator MUST compile via tools/models/gen_yolo_world_hailo.py --size 640. Prompts are baked into the ONNX as fixed text embeddings at export time (see gen_yolo_world.py), so this HEF is image-only at runtime — swapping vocab requires re-exporting the ONNX AND re-compiling the HEF. Calibration: 1024-image COCO val2017 sample.",
           "path": "yolo_world_v2_s_640_hailo.hef",
           "preset": "640-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "197ee57fcc80c4371df9ae68efb6c3d388bbd007bc8bb5c7a09dc9412167b57c",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo_world_v2_s_640.onnx",
@@ -174,8 +172,7 @@
           "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yolo_world_v2_s @ 960. Same prompt-baking + recompile-on-vocab-change constraints as 640.",
           "path": "yolo_world_v2_s_960_hailo.hef",
           "preset": "960-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "678604edee85c378470223ebece378b58a7556b46b907a9cc8d1bb9ba1badf85",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo_world_v2_s_960.onnx",
@@ -285,8 +282,7 @@
           "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yoloe26_s @ 640. NO public Model Zoo build; operator MUST compile via tools/models/gen_yoloe_hailo.py --size 640. Prompts are baked into the ONNX at export time (same pattern as yolo_world); re-exporting the ONNX AND re-compiling the HEF is required to change vocab.",
           "path": "yoloe26_s_640_hailo.hef",
           "preset": "640-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "21526a811818b7827422f21d41cf3db9696d1a3fd5b757c370cfcf9b7cb7a506",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yoloe26_s.onnx",

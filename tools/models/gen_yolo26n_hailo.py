@@ -42,6 +42,7 @@ from gen_hailo_common import (
 
 MODEL_ID = "yolo26n"
 STATIC_SIZES = (640, 960, 1280)
+ALLS_DIR = Path(__file__).resolve().parent / "alls"
 
 
 def hef_path_for(size: int) -> Path:
@@ -109,16 +110,20 @@ def build_one(size: int) -> int:
                 onnx,
                 hef_out,
                 calibration_dir=calib,
-                # Multi-output anchor-free head: stop the parse at the
-                # box+class tensors BEFORE any user-side NMS so the chip
-                # emits the raw RawYolo26 layout. End-node names match
-                # Ultralytics' export naming for yolo26 heads at each scale.
-                # If your ONNX uses different names, override here \u2014 DFC
-                # will fail loud with the actual names in the .compile.log.
+                alls_script=ALLS_DIR / "yolo26n.alls",
+                # Six end nodes mirror hailo_model_zoo's official yolo26.yaml
+                # parser config: cv2.X.2/Conv (box pre-DFL, c=64) and
+                # cv3.X.2/Conv (class pre-sigmoid, c=80) leaf convs at each
+                # FPN scale. Chip post-processes DFL into c=4 boxes and emits
+                # 6 raw tensors matching the public yolo26n_640.hef layout
+                # that nexus-hailo-backend's RawYolo26 decoder consumes.
                 end_node_names=[
-                    "/model.23/Concat_2",  # P3 box+cls
-                    "/model.23/Concat_5",  # P4 box+cls
-                    "/model.23/Concat_8",  # P5 box+cls
+                    "/model.23/one2one_cv2.0/one2one_cv2.0.2/Conv",
+                    "/model.23/one2one_cv2.1/one2one_cv2.1.2/Conv",
+                    "/model.23/one2one_cv2.2/one2one_cv2.2.2/Conv",
+                    "/model.23/one2one_cv3.0/one2one_cv3.0.2/Conv",
+                    "/model.23/one2one_cv3.1/one2one_cv3.1.2/Conv",
+                    "/model.23/one2one_cv3.2/one2one_cv3.2.2/Conv",
                 ],
             )
             if rc != 0:

@@ -38,6 +38,7 @@ from gen_hailo_common import (
 
 MODEL_ID = "yolo_world_v2_s"
 STATIC_SIZES = (640, 960)
+ALLS_DIR = Path(__file__).resolve().parent / "alls"
 
 
 def hef_path_for(size: int) -> Path:
@@ -65,14 +66,20 @@ def build_one(size: int) -> int:
         onnx,
         hef_out,
         calibration_dir=calib,
-        # YOLO-World v2 has a YOLOv8-style anchor-free head with one
-        # class per baked prompt (44 classes for the default vocab).
-        # We let DFC discover the output nodes automatically; if it
-        # picks up the post-NMS path on a future ultralytics version,
-        # add explicit end-node names that target the raw box/cls
-        # tensors here. The chip emits the RawYolo26 layout
-        # nexus-hailo-backend already decodes.
-        end_node_names=None,
+        alls_script=ALLS_DIR / "yolo_world_v2_s.alls",
+        # YOLO-World v2 head: cv2.X.2/Conv is box pre-DFL (c=64),
+        # cv3.X.2/Conv is COCO 80-class pre-sigmoid (cv4/Add Einsum unsupported on DFC; cv3 fallback)
+        # baked prompt — 44 for the default vocab). cv3 is the
+        # vestigial yolov8 COCO class head; we skip it. Six end
+        # nodes → RawYolo26-compatible 6-output layout.
+        end_node_names=[
+            "/model.22/cv2.0/cv2.0.2/Conv",
+            "/model.22/cv2.1/cv2.1.2/Conv",
+            "/model.22/cv2.2/cv2.2.2/Conv",
+            "/model.22/cv3.0/cv3.0.2/Conv",
+            "/model.22/cv3.1/cv3.1.2/Conv",
+            "/model.22/cv3.2/cv3.2.2/Conv",
+        ],
     )
     if rc != 0:
         return rc

@@ -35,6 +35,7 @@ from gen_hailo_common import (
 
 MODEL_ID = "yoloe26_s"
 STATIC_SIZES = (640,)
+ALLS_DIR = Path(__file__).resolve().parent / "alls"
 
 
 def hef_path_for(size: int) -> Path:
@@ -60,10 +61,20 @@ def build_one(size: int) -> int:
         onnx,
         hef_out,
         calibration_dir=calib,
-        # Mirror gen_yolo_world_hailo.py: let DFC auto-discover the
-        # raw-head output nodes. nexus-hailo-backend's RawYolo26 decoder
-        # handles the multi-output anchor-free layout.
-        end_node_names=None,
+        alls_script=ALLS_DIR / "yoloe26_s.alls",
+        # YOLOE has a YOLOv10-style one2one anchor-free head + segmentation.
+        # Cut at the cv2.X.2/Conv (box pre-DFL, c=64) and cv3.X.2/Conv
+        # (class pre-sigmoid) leaf convs of each FPN scale so the chip
+        # emits the 6-output RawYolo26-compatible layout (skipping the
+        # post-NMS TopK / GatherElements ops that DFC can't lower).
+        end_node_names=[
+            "/model.23/one2one_cv2.0/one2one_cv2.0.2/Conv",
+            "/model.23/one2one_cv2.1/one2one_cv2.1.2/Conv",
+            "/model.23/one2one_cv2.2/one2one_cv2.2.2/Conv",
+            "/model.23/one2one_cv3.0/one2one_cv3.0.2/Conv",
+            "/model.23/one2one_cv3.1/one2one_cv3.1.2/Conv",
+            "/model.23/one2one_cv3.2/one2one_cv3.2.2/Conv",
+        ],
     )
     if rc != 0:
         return rc
