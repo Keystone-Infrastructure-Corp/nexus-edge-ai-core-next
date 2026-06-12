@@ -394,6 +394,22 @@ jobs:
                 models/yoloe26_s.onnx \
                 models/dinov2_s_224.onnx \
                 models/models-manifest.json "$R/share/models/"
+          # Hailo-8 HEFs (pack v4+) — tolerated-missing per the pattern
+          # whitelist in the download step. Operators on non-Hailo boxes
+          # never look at these files; on Hailo boxes the engine resolves
+          # `<name>_hailo.hef` next to the matching ONNX in the model pack
+          # (see `build_detector_for_yolo` in crates/nexus-inference). The
+          # shopt+nullglob makes the glob expand to nothing when no HEFs
+          # were uploaded to the pack release (pre-v4 pack tags).
+          shopt -s nullglob
+          hefs=(models/*_hailo.hef)
+          shopt -u nullglob
+          if (( ${#hefs[@]} )); then
+              echo "staging ${#hefs[@]} HEF(s) into share/models/"
+              cp -a "${hefs[@]}" "$R/share/models/"
+          else
+              echo "no HEFs in models/ — ONNX-only pack (pre-v4 or partial pack)"
+          fi
 
           cp config/nexus.example.toml   "$R/etc-templates/nexus.example.toml"
           cp config/tiers/t10.toml       "$R/etc-templates/tiers/"
