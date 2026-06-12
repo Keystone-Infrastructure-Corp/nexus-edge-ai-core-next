@@ -452,6 +452,27 @@ if grep -q '^https_bind' "$NEXUS_CONFIG_DIR/nexus.toml" 2>/dev/null; then
     fi
 fi
 
+# --- Re-assert state ownership before service start --------------------------
+#
+# Belt-and-suspenders for any historical or future root-invoked
+# `nexus-engine` subcommand that touches the state dir (`tls init`,
+# `enroll`, `set-admin-password` if mis-invoked without sudo -u).
+# The serve-path engine auto-provisions `admin-secret` on first boot
+# as the `nexus` user, so a fresh box does NOT need this — but boxes
+# upgraded from versions <= v0.1.69 may have a root-owned
+# `admin-secret` left over from when `auth_bootstrap::apply()` ran
+# in the common early CLI path. Without this chown those boxes
+# crash-loop on EACCES:
+#
+#   Error: reading admin secret from /var/lib/nexus/state/admin-secret
+#   Caused by: Permission denied (os error 13)
+#
+# Idempotent on every re-install; the install-common.sh `ensure_dirs`
+# helper also runs a recursive chown earlier, but only for files that
+# existed at that point.
+chown -R "$NEXUS_SERVICE_USER:$NEXUS_SERVICE_GROUP" \
+    "$NEXUS_STATE_DIR/state" "$NEXUS_STATE_DIR/clips"
+
 # --- Start the service --------------------------------------------------------
 
 if (( NO_START )); then

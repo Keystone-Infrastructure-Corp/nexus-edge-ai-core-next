@@ -241,24 +241,18 @@ fn main() -> Result<()> {
         let _ = fd_limit::raise_fd_soft_limit();
     }
 
-    // Apply M-Admin Phase 0 auth posture rules:
-    // - auto-provision the admin-secret file under
-    //   <state_dir>/admin-secret when mode = local | hybrid and no
-    //   path is pinned in nexus.toml
-    // - leave OIDC-only deployments alone
-    //
-    // Tracing isn't initialised yet, so any messages emitted by
-    // auth_bootstrap reach stderr through the global default
-    // subscriber. That is intentional — the operator-visible
-    // bootstrap line MUST land before anything else can swallow it.
-    let state_dir = auth_bootstrap::state_dir(&cfg);
-    auth_bootstrap::apply(&mut cfg, &state_dir)?;
-
     let runtime = build_runtime(&cfg.runtime)?;
 
     // Route subcommands BEFORE the serve path. Each subcommand owns
     // its own tracing / logging story so we don't bring up the full
-    // pipeline scaffold for a one-shot operation.
+    // pipeline scaffold for a one-shot operation. None of these
+    // subcommands consume `cfg.auth.admin_secret_path`, so the
+    // auth-posture pass is deferred into `run()` (the serve path).
+    // Running it here would auto-provision the secret as whatever
+    // user invoked the subcommand — install.sh invokes `tls init`
+    // as root, which is precisely the bug that left
+    // `/var/lib/nexus/state/admin-secret` root-owned and crashed
+    // the unprivileged service on next boot with EACCES.
     if let Some(cmd) = cli.command.as_ref() {
         return match cmd {
             Cmd::Enroll(args) => runtime.block_on(cloud_enroll::run_enroll(&cfg, args)),
@@ -280,7 +274,26 @@ fn build_runtime(cfg: &nexus_config::RuntimeConfig) -> Result<tokio::runtime::Ru
     Ok(builder.build()?)
 }
 
-async fn run(cfg: Config, cli: Cli) -> Result<()> {
+async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
+    // Apply M-Admin Phase 0 auth posture rules on the serve path
+    // ONLY. Auto-provisions `<state_dir>/admin-secret` (mode 0600)
+    // when `auth.mode in {local, hybrid}` and no path is pinned in
+    // nexus.toml. Skipped for OIDC-only deployments.
+    //
+    // Deliberately runs here (not in the common early path) so the
+    // root-invoked subcommands `tls init` / `enroll` /
+    // `set-admin-password` can never write the secret as root and
+    // strand the unprivileged service on next boot. The systemd
+    // unit starts the engine as the `nexus` user, so this branch
+    // creates the file owned by `nexus` from the start.
+    //
+    // Tracing isn't initialised yet, so any messages emitted by
+    // auth_bootstrap reach stderr through the global default
+    // subscriber. That is intentional — the operator-visible
+    // bootstrap line MUST land before anything else can swallow it.
+    let state_dir = auth_bootstrap::state_dir(&cfg);
+    auth_bootstrap::apply(&mut cfg, &state_dir)?;
+
     // Phase 1.14 — pre-create the trace uploader channel BEFORE
     // telemetry init so the producer half can be wired into the
     // tracing subscriber straight away (every engine span captured by
