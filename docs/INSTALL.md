@@ -50,6 +50,7 @@
     - [5.2 T36 — Intel Arc A380 dGPU](#52-t36--intel-arc-a380-dgpu)
     - [5.3 T36-S — Lunar Lake (Arc 140V iGPU + NPU 4)](#53-t36-s--lunar-lake-arc-140v-igpu--npu-4)
     - [5.4 T64 — NVIDIA RTX 4060](#54-t64--nvidia-rtx-4060)
+    - [5.5 T24 — Beelink EQR7 (AMD Ryzen + Hailo-8 M.2)](#55-t24--beelink-eqr7-amd-ryzen--hailo-8-m2)
   - [6. Install the engine](#6-install-the-engine)
     - [6.1 One-liner from GitHub Releases](#61-one-liner-from-github-releases)
     - [6.2 What the installer does, step by step](#62-what-the-installer-does-step-by-step)
@@ -625,6 +626,167 @@ sudo apt install -y tensorrt
 `install.sh` (§6) adds the `nexus` service user to `render` and
 `video` automatically. Run `nvidia-smi` to confirm the host driver
 is healthy before proceeding.
+
+---
+
+### 5.5 T24 — Beelink EQR7 (AMD Ryzen + Hailo-8 M.2)
+
+> **Status:** Detection-only as of v0.1.70. `install.sh` recognises
+> the AMD Radeon iGPU and Hailo-8 M.2, installs the Mesa VA-API
+> userspace for hardware H.264/HEVC decode, and (when the operator
+> stages the HailoRT `.deb` pair) installs the Hailo PCIe driver +
+> userspace. Inference still runs on the CPU EP until
+> `M_HAILO_EP` ships the Hailo execution provider — the Hailo card
+> is detected and the driver is healthy, the engine just hasn't
+> wired the EP yet. The Ryzen 7 7735HS CPU soak (~6–10 cams) is
+> the de-facto T24 ceiling on this hardware until then.
+
+The EQR7's Radeon 680M (Phoenix gfx1035) is **decode-only** in v1.
+ROCm on Phoenix-class iGPUs is unsupported upstream and only works
+with `HSA_OVERRIDE_GFX_VERSION=10.3.0`; that's tracked as a
+separate experimental spike, not a default install path.
+
+#### 5.5a AMD Mesa VA-API stack (automatic)
+
+`install.sh` installs this automatically when it detects an AMD
+Radeon iGPU/dGPU via `lspci`. No PPA, no third-party repo — the
+in-kernel `amdgpu` module and Ubuntu archive Mesa are sufficient:
+
+```bash
+# What install.sh runs for you (here for reference):
+sudo apt install -y --no-install-recommends \
+    mesa-va-drivers mesa-vulkan-drivers libdrm-amdgpu1 \
+    va-driver-all vainfo
+```
+
+**Verify:**
+
+```bash
+vainfo --display drm --device /dev/dri/renderD128 | head -25
+# Expect: "Driver version: Mesa Gallium driver <ver> for AMD Radeon
+# Graphics (radeonsi, gfx1035_LLVM_x86_64)" and a list of
+# VAProfileH264* / VAProfileHEVCMain profiles.
+ls -l /dev/dri/render*
+# Expect: crw-rw---- 1 root render ...
+```
+
+#### 5.5b HailoRT (operator-supplied debs)
+
+HailoRT is distributed by Hailo Technologies under their developer
+agreement, so `install.sh` cannot bundle or mirror the `.deb` pair.
+Operators register, accept the EULA, then `install.sh` gets the
+bits onto the box one of three ways.
+
+**1. Register and copy the link addresses.**
+
+1. Log in at <https://hailo.ai/developer-zone/software-downloads/>
+   and accept the HailoRT EULA.
+2. On the downloads page, find the two artifacts for
+   **Ubuntu 24.04 / x86_64**:
+   - HailoRT runtime — `hailort_<ver>_amd64.deb`
+   - HailoRT PCIe driver — `hailort-pcie-driver_<ver>_all.deb`
+3. Right-click each link → **Copy link address**. The result is a
+   one-time presigned URL good for ~60 minutes.
+
+**2. Hand the URLs to `install.sh`.** Three flows; pick whichever
+fits the operator's workflow.
+
+*(a) Interactive paste (default — no flags).* Re-run the install
+one-liner from §6.1. When `install.sh` reaches the Hailo branch and
+finds no debs cached, it prompts:
+
+```
+[nexus] Hailo-8 detected. To enable hardware inference acceleration
+[nexus] the installer needs the HailoRT + PCIe driver .debs from
+[nexus] your Hailo developer-zone account.
+[nexus] ...
+[nexus] HailoRT runtime URL: <paste here>
+[nexus] HailoRT PCIe driver URL: <paste here>
+```
+
+Each URL streams into `/opt/nexus/vendor/hailo/` and is then
+installed via `dpkg`. Press **Enter** at a prompt to skip and fall
+through to CPU-only.
+
+*(b) Non-interactive flags.* For unattended re-runs or fleet
+scripts:
+
+```bash
+sudo /opt/nexus/current/scripts/install.sh --tier t24 \
+    --hailo-deb-url      'https://hailo-csms.s3.../hailort_4.20.0_amd64.deb?X-Amz-...' \
+    --hailo-pcie-deb-url 'https://hailo-csms.s3.../hailort-pcie-driver_4.20.0_all.deb?X-Amz-...'
+```
+
+Equivalent env vars: `NEXUS_HAILO_DEB_URL`, `NEXUS_HAILO_PCIE_DEB_URL`.
+
+*(c) Manual stage.* Download the `.debs` to your laptop, `scp` them
+to the box, then re-run `install.sh` with no extra flags:
+
+```bash
+scp hailort_*_amd64.deb hailort-pcie-driver_*.deb \
+    nexus-admin@<box>:/tmp/
+ssh nexus-admin@<box>
+sudo mkdir -p /opt/nexus/vendor/hailo
+sudo install -m 0644 -o root -g root /tmp/hailort*.deb /opt/nexus/vendor/hailo/
+sudo /opt/nexus/current/scripts/install.sh --tier t24
+```
+
+`NEXUS_HAILO_DEB_DIR` overrides the cache directory if you'd
+rather stage somewhere else.
+
+**3. What `install.sh` does next.** Regardless of which flow
+landed the debs, the installer then:
+
+1. Verifies the `.deb` magic bytes (catches expired presigned URLs
+   that returned HTML error pages).
+2. Renames the cached file to the package's canonical
+   `<name>_<version>_amd64.deb` filename via `dpkg-deb -f`, so
+   subsequent runs are a no-op.
+3. `apt install -y dkms linux-headers-$(uname -r)` (matched
+   headers so the DKMS build sees the right kernel).
+4. `dpkg -i hailort-pcie-driver_*.deb` (DKMS builds + loads
+   `hailo_pci.ko`; postinst creates the `hailo` system group +
+   udev rule chowning `/dev/hailo*` to `root:hailo 0660`).
+5. `dpkg -i hailort_*_amd64.deb` (userspace library +
+   `hailortcli`).
+6. `modprobe hailo_pci` so `/dev/hailo0` appears immediately
+   without a reboot.
+7. `ensure_accelerator_groups` adds the `nexus` service user to
+   the freshly-created `hailo` group.
+
+Re-running `install.sh` after a successful Hailo install is a no-op
+(`hailortcli scan` ground-truth probe short-circuits the dpkg path).
+
+If you re-run `install.sh` *without* staging or supplying any of
+the three flows above, it emits a loud banner pointing to this
+section and continues with a CPU-only engine. Detection is
+non-blocking by design — the box still installs and operates, just
+without the Hailo userspace.
+
+#### 5.5c Verification
+
+```bash
+hailortcli scan
+# Expect at least one line:
+#   "Hailo Device 0000:05:00.0 (Hailo-8): ..."
+sudo -u nexus hailortcli scan
+# Same output — proves the service user can open /dev/hailo0.
+ls -l /dev/hailo*
+# Expect: crw-rw---- 1 root hailo ...   (group `hailo`, mode 0660)
+```
+
+If `/dev/hailo0` is missing immediately after install, the DKMS
+build deferred to module load — `sudo modprobe hailo_pci` (or
+`sudo reboot`) and re-run the scan. The `install.sh`
+post-install verification (`verify_accelerators`) does this same
+check and emits a remediation hint if it fails.
+
+> **No Hailo execution provider yet.** Until `M_HAILO_EP` lands the
+> engine logs `ep_priority=["hailo","cpu"]` from `t24.toml` and
+> silently falls through to the CPU EP. The Hailo card is
+> detected, the driver is bound, and `hailortcli` works — the
+> engine just isn't compiled with the Hailo ORT EP plug-in. Track
+> that work under the M_HAILO_EP milestone.
 
 ---
 

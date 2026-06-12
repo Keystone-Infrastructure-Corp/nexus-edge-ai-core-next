@@ -106,13 +106,25 @@ ensure_dirs() {
 
 # Add the service user to `render` and `video` groups so the engine can
 # open `/dev/dri/renderD128` (every iGPU/dGPU tier) and `/dev/accel/accel0`
-# (T36-S NPU). Idempotent: usermod -aG is a no-op if the user is already
-# a member. Groups that don't exist on the host are silently skipped —
-# `render` only exists once the GPU userspace from §5 is installed, but
-# the install script may run before that on a freshly-flashed box.
+# (T36-S NPU). Also adds `hailo` (created by the HailoRT .deb postinst
+# on T24 boxes) so the engine can open `/dev/hailo0`. Idempotent:
+# usermod -aG is a no-op if the user is already a member. Groups that
+# don't exist on the host are silently skipped — `render` only exists
+# once the GPU userspace from §5 is installed, but the install script
+# may run before that on a freshly-flashed box. Same for `hailo` —
+# created only after HailoRT installs (T24-EQR7 boxes only); call this
+# again after `install_drivers` to pick it up.
+#
+# HailoRT 4.23+ chowns /dev/hailo* to `root:video 0660` (not
+# `root:hailo` as older releases did), so `video` covers both the AMD
+# / Intel render path and Hailo on a modern install. We keep the
+# `hailo` group on the optional list for back-compat with operators
+# still on 4.20 — it's only added if the HailoRT postinst created it.
 ensure_accelerator_groups() {
-    local group
-    for group in render video; do
+    local group required
+    for group in render:required video:required hailo:optional; do
+        required="${group#*:}"
+        group="${group%:*}"
         if getent group "$group" >/dev/null 2>&1; then
             if id -nG "$NEXUS_SERVICE_USER" | tr ' ' '\n' | grep -qx "$group"; then
                 log "service user $NEXUS_SERVICE_USER already in $group"
@@ -120,7 +132,7 @@ ensure_accelerator_groups() {
                 usermod -aG "$group" "$NEXUS_SERVICE_USER"
                 log "added $NEXUS_SERVICE_USER to $group group"
             fi
-        else
+        elif [[ "$required" == "required" ]]; then
             log "group '$group' does not exist on host yet (install GPU userspace first); skipping"
         fi
     done
@@ -357,13 +369,15 @@ install_drivers() {
     fi
     log "detected: $(echo "$tags" | tr '\n' ' ')"
 
-    local has_igpu=0 has_arc=0 has_npu=0 has_nvidia=0
+    local has_igpu=0 has_arc=0 has_npu=0 has_nvidia=0 has_amd=0 has_hailo=0
     while IFS= read -r tag; do
         case "$tag" in
             intel-igpu)     has_igpu=1 ;;
             intel-arc-dgpu) has_arc=1 ;;
             intel-npu)      has_npu=1 ;;
             nvidia-gpu)     has_nvidia=1 ;;
+            amd-igpu)       has_amd=1 ;;
+            hailo-m2)       has_hailo=1 ;;
         esac
     done <<<"$tags"
 
@@ -411,6 +425,14 @@ install_drivers() {
         warn "execution providers. Skipping nvidia driver install for now; engine"
         warn "will run on the CPU EP fallback. See docs/INSTALL.md §5.4."
     fi
+
+    if (( has_amd )); then
+        _drivers_amd_graphics
+    fi
+
+    if (( has_hailo )); then
+        _drivers_hailo_pcie
+    fi
 }
 
 # Probe each accelerator class the engine will try to attach to.
@@ -435,12 +457,14 @@ verify_accelerators() {
         return 0
     fi
 
-    local has_igpu=0 has_arc=0 has_npu=0
+    local has_igpu=0 has_arc=0 has_npu=0 has_amd=0 has_hailo=0
     while IFS= read -r tag; do
         case "$tag" in
             intel-igpu)     has_igpu=1 ;;
             intel-arc-dgpu) has_arc=1 ;;
             intel-npu)      has_npu=1 ;;
+            amd-igpu)       has_amd=1 ;;
+            hailo-m2)       has_hailo=1 ;;
         esac
     done <<<"$tags"
 
@@ -451,6 +475,12 @@ verify_accelerators() {
     fi
     if (( has_npu )); then
         _verify_intel_npu_userspace || true
+    fi
+    if (( has_amd )); then
+        _verify_amd_gpu_userspace || true
+    fi
+    if (( has_hailo )); then
+        _verify_hailo_userspace || true
     fi
     log "===================================="
     log ""
@@ -576,8 +606,101 @@ _verify_intel_npu_userspace() {
     return $(( ok ? 0 : 1 ))
 }
 
+# Verify the AMD GPU userspace. Three probes mirroring the Intel
+# path: VA-API enumerates Mesa Gallium, `/dev/dri/renderD128`
+# exists, service user can open it. ROCm intentionally not probed —
+# it's an experimental separate spike (gfx1035 on Phoenix iGPUs is
+# unsupported upstream and only works with HSA_OVERRIDE_GFX_VERSION).
+# T24 inference still runs on the CPU EP until M_HAILO_EP lands.
+_verify_amd_gpu_userspace() {
+    local ok=1
+
+    log "verifying AMD GPU userspace..."
+
+    if [[ -e /dev/dri/renderD128 ]]; then
+        if sudo -u "$NEXUS_SERVICE_USER" \
+                bash -c 'exec 9</dev/dri/renderD128 && exec 9<&-' 2>/dev/null; then
+            log "  [ OK ] service user $NEXUS_SERVICE_USER can open /dev/dri/renderD128"
+        else
+            warn "  [FAIL] service user $NEXUS_SERVICE_USER cannot open /dev/dri/renderD128"
+            warn "         (missing render-group membership or wrong device perms)"
+            warn "         fix: sudo usermod -aG render $NEXUS_SERVICE_USER && sudo systemctl restart nexus-engine"
+            ok=0
+        fi
+    else
+        warn "  [FAIL] /dev/dri/renderD128 missing — amdgpu kernel module not bound"
+        warn "         (check 'lsmod | grep amdgpu' and dmesg for binding errors)"
+        ok=0
+    fi
+
+    if command -v vainfo >/dev/null 2>&1 \
+        && vainfo --display drm --device /dev/dri/renderD128 2>/dev/null \
+             | grep -q 'Mesa Gallium driver'; then
+        log "  [ OK ] VA-API Mesa Gallium driver active (hardware decode available)"
+    else
+        log "  [info] VA-API Mesa Gallium not active (hardware decode unavailable; engine still works on software decode)"
+    fi
+
+    return $(( ok ? 0 : 1 ))
+}
+
+# Verify the Hailo-8 userspace. Probes mirror the Intel NPU path:
+#   1. Driver bound: /dev/hailo0 exists.
+#   2. Userspace works: `hailortcli scan` succeeds AND lists at
+#      least one Hailo Device.
+#   3. Service user can open the device node.
+#
+# Soft-skip path: if HailoRT debs were never staged
+# (_drivers_hailo_pcie ran in warn-and-return mode) then /dev/hailo0
+# won't exist and `hailortcli` won't be on PATH — emit an info-level
+# message pointing back at the install-side warn, and return 0 so the
+# verification banner stays green for an "intentionally CPU EP" install.
+_verify_hailo_userspace() {
+    local ok=1
+
+    log "verifying Hailo-8 userspace..."
+
+    if [[ ! -e /dev/hailo0 ]]; then
+        if ! command -v hailortcli >/dev/null 2>&1; then
+            log "  [info] HailoRT not installed (no .debs staged); engine will use CPU EP"
+            log "         see docs/INSTALL.md §5.5 to enable Hailo"
+            return 0
+        fi
+        warn "  [FAIL] /dev/hailo0 missing"
+        warn "         hailo_pci kernel module not bound. Most common cause is"
+        warn "         DKMS build deferred until reboot. Try: sudo modprobe hailo_pci"
+        warn "         or sudo reboot, then re-run install.sh"
+        return 1
+    fi
+    log "  [ OK ] /dev/hailo0 present"
+
+    if ! command -v hailortcli >/dev/null 2>&1; then
+        warn "  [FAIL] hailortcli not on PATH (hailort .deb missing)"
+        warn "         fix: install hailort_<ver>_amd64.deb from \$NEXUS_HAILO_DEB_DIR"
+        ok=0
+    elif ! hailortcli scan 2>/dev/null | grep -q 'Hailo Device'; then
+        warn "  [FAIL] hailortcli scan does not list any Hailo Device"
+        warn "         (driver bound but userspace can't enumerate — version mismatch?)"
+        ok=0
+    else
+        log "  [ OK ] hailortcli scan enumerates Hailo Device"
+    fi
+
+    if sudo -u "$NEXUS_SERVICE_USER" \
+            bash -c 'exec 9</dev/hailo0 && exec 9<&-' 2>/dev/null; then
+        log "  [ OK ] service user $NEXUS_SERVICE_USER can open /dev/hailo0"
+    else
+        warn "  [FAIL] service user $NEXUS_SERVICE_USER cannot open /dev/hailo0"
+        warn "         (missing hailo-group membership or wrong device perms)"
+        warn "         fix: sudo usermod -aG hailo $NEXUS_SERVICE_USER && sudo systemctl restart nexus-engine"
+        ok=0
+    fi
+
+    return $(( ok ? 0 : 1 ))
+}
+
 # Detect accelerator hardware via lspci. Outputs one tag per line:
-#   intel-igpu | intel-arc-dgpu | intel-npu | nvidia-gpu
+#   intel-igpu | intel-arc-dgpu | intel-npu | nvidia-gpu | amd-igpu | hailo-m2
 # Empty output = nothing recognised (engine still installs CPU-only).
 _detect_hardware() {
     if ! command -v lspci >/dev/null 2>&1; then
@@ -638,6 +761,24 @@ _detect_hardware() {
     # `[^[]*` would short the match.
     if echo "$pci" | grep -qE '(VGA|3D controller).*\[10de:'; then
         echo nvidia-gpu
+    fi
+
+    # AMD iGPU / dGPU (vendor 1002). Covers Radeon 680M / 780M iGPUs
+    # on Ryzen 7000/8000-series APUs (the EQR7 T24 box ships a 680M)
+    # and any AMD dGPU a future tier might bundle. Same `.*` reasoning
+    # as the Intel iGPU regex above — the PCI class id and the
+    # marketing name sit between the device-class token and the
+    # `[1002:...]` vendor id.
+    if echo "$pci" | grep -qE '(VGA|3D controller|Display controller).*\[1002:'; then
+        echo amd-igpu
+    fi
+
+    # Hailo-8 / Hailo-8L M.2 accelerator (vendor 1e60). Known device
+    # IDs: 2864 (Hailo-8), 43a0 (Hailo-8L), 45c4 (next-gen). Vendor
+    # match alone is enough — Hailo only ships AI accelerators under
+    # this vendor id, so a future device id is still ours.
+    if echo "$pci" | grep -qE '\[1e60:'; then
+        echo hailo-m2
     fi
 }
 
@@ -893,6 +1034,318 @@ _drivers_intel_npu() {
     fi
 
     log "NPU driver installed; /dev/accel/accel0 should appear after reboot"
+}
+
+# Install the AMD graphics userspace stack from the Ubuntu archive.
+# In-kernel `amdgpu` is already loaded on every supported tier (Ryzen
+# 7000+ APU on kernel ≥ 6.8), so we only need the userspace bits:
+#
+#   mesa-va-drivers          radeonsi VA-API driver — engine clip
+#                            recorder uses this for hardware H.264
+#                            decode on the EQR7 Radeon 680M.
+#   mesa-vulkan-drivers      RADV — pulls in libdrm + the Mesa shader
+#                            cache; also unblocks any future GStreamer
+#                            element that probes Vulkan.
+#   libdrm-amdgpu1           AMDGPU DRM userspace; required by Mesa
+#                            and by future ROCm experiments.
+#   va-driver-all + vainfo   meta + probe — keep them in sync with
+#                            the Intel install path so post-install
+#                            verification looks identical to
+#                            operators.
+#
+# We deliberately do NOT pull ROCm here. ROCm on Phoenix-class iGPUs
+# (gfx1035, what the 680M reports) is unsupported upstream and
+# requires `HSA_OVERRIDE_GFX_VERSION=10.3.0` plus a several-hundred-MB
+# repo add. That's a separate operator-opt-in spike, not part of
+# the detection-only PR.
+#
+# T24 inference still runs on the CPU EP until `M_HAILO_EP` lands;
+# the AMD path here is decode-only. See docs/INSTALL.md §5.5.
+_AMD_GRAPHICS_PKGS=(
+    mesa-va-drivers
+    mesa-vulkan-drivers
+    libdrm-amdgpu1
+    va-driver-all
+    vainfo
+)
+
+_drivers_amd_graphics() {
+    if _all_dpkg_installed "${_AMD_GRAPHICS_PKGS[@]}" \
+        && command -v vainfo >/dev/null 2>&1 \
+        && vainfo --display drm --device /dev/dri/renderD128 2>/dev/null \
+             | grep -q 'Mesa Gallium driver'; then
+        log "AMD GPU stack already installed (all ${#_AMD_GRAPHICS_PKGS[@]} packages present; vainfo: Mesa Gallium)"
+        return 0
+    fi
+
+    log "installing AMD GPU userspace (Mesa VA-API + AMDGPU DRM)"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            "${_AMD_GRAPHICS_PKGS[@]}"; then
+        warn "AMD graphics package install failed; engine will fall back to software decode"
+        return 0
+    fi
+
+    if vainfo --display drm --device /dev/dri/renderD128 2>/dev/null \
+        | grep -q 'Mesa Gallium driver'; then
+        log "AMD Mesa Gallium VA-API driver active (vainfo confirmed)"
+    else
+        warn "AMD graphics installed but vainfo did not report Mesa Gallium;"
+        warn "amdgpu may not be bound yet — check 'lsmod | grep amdgpu' and dmesg."
+    fi
+}
+
+# Install HailoRT for the Hailo-8 / Hailo-8L M.2 accelerator.
+#
+# HailoRT is distributed by Hailo Technologies under their developer
+# agreement (https://hailo.ai/developer-zone/). We deliberately do
+# NOT download it from a CDN inside install.sh — operators must
+# register, accept the EULA, download the .deb pair, and stage them
+# under `$NEXUS_HAILO_DEB_DIR` (default `/opt/nexus/vendor/hailo`).
+# The installer picks them up from there.
+#
+# Two installable artifacts (versions track Hailo's release cadence):
+#   hailort_<ver>_amd64.deb                    — userspace library
+#                                                 + `hailortcli` probe
+#   hailort-pcie-driver_<ver>_all.deb          — DKMS source for
+#                                                 `hailo_pci.ko`
+#
+# Side-effect of the .deb postinst: creates the `hailo` system group
+# and a udev rule that chowns `/dev/hailo*` to `root:hailo 0660`.
+# `ensure_accelerator_groups` runs after `install_drivers` in
+# install.sh, so the service user gets added to the new group on
+# the same install.
+#
+# When debs are absent we emit a multi-line warn pointing operators
+# at the developer-zone register flow. The engine still installs and
+# runs (CPU EP) — Hailo detection is advisory only until
+# `M_HAILO_EP` lands.
+# Fetch HailoRT .debs into the vendor dir.
+#
+# Two sources are tried in order:
+#   1. URLs supplied non-interactively via env vars
+#      `NEXUS_HAILO_DEB_URL` (runtime) and `NEXUS_HAILO_PCIE_DEB_URL`
+#      (pcie driver). install.sh exports these from the matching
+#      --hailo-deb-url / --hailo-pcie-deb-url flags. Either or both
+#      may be set; the other one falls through to the prompt.
+#   2. Interactive paste prompt — only when stdin is a TTY and
+#      `NEXUS_UNATTENDED` is not set. Operator pastes the two
+#      developer-zone presigned URLs (or hits Enter to skip).
+#
+# Returns 0 if it managed to land at least one new .deb (caller
+# re-globs and decides whether both are now present); returns 1 if
+# there is nothing useful to fetch (no URLs and no TTY, or the
+# operator skipped). Curl failures are warn-and-continue so the
+# install can still fall through to the register-here banner.
+_hailo_fetch_debs() {
+    local hailo_local_dir="$1"
+    local rt_url="${NEXUS_HAILO_DEB_URL:-}"
+    local pcie_url="${NEXUS_HAILO_PCIE_DEB_URL:-}"
+
+    # Prompt only when interactive AND at least one URL is missing.
+    if [[ ( -z "$rt_url" || -z "$pcie_url" ) \
+          && -t 0 \
+          && "${NEXUS_UNATTENDED:-0}" != "1" ]]; then
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "Hailo-8 detected. To enable hardware inference acceleration"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "the installer needs the HailoRT + PCIe driver .debs from"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "your Hailo developer-zone account."
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            ""
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "On your laptop:"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "  1. Log in to https://hailo.ai/developer-zone/software-downloads/"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "  2. Right-click each link below -> Copy link address"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "     - HailoRT (Ubuntu 24.04, .deb)"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "     - HailoRT PCIe driver (.deb)"
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            "  3. Paste each URL below (or press Enter to skip)."
+        printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
+            ""
+
+        if [[ -z "$rt_url" ]]; then
+            printf '%s[nexus]%s HailoRT runtime URL: ' \
+                "$(_color '1;36')" "$(_reset)"
+            IFS= read -r rt_url || rt_url=""
+        fi
+        if [[ -z "$pcie_url" ]]; then
+            printf '%s[nexus]%s HailoRT PCIe driver URL: ' \
+                "$(_color '1;36')" "$(_reset)"
+            IFS= read -r pcie_url || pcie_url=""
+        fi
+    fi
+
+    # Trim surrounding whitespace that copy/paste sometimes drops in.
+    rt_url="${rt_url#"${rt_url%%[![:space:]]*}"}"
+    rt_url="${rt_url%"${rt_url##*[![:space:]]}"}"
+    pcie_url="${pcie_url#"${pcie_url%%[![:space:]]*}"}"
+    pcie_url="${pcie_url%"${pcie_url##*[![:space:]]}"}"
+
+    if [[ -z "$rt_url" && -z "$pcie_url" ]]; then
+        return 1
+    fi
+
+    install -d -o root -g root -m 0755 "$hailo_local_dir"
+
+    local fetched=0
+    if [[ -n "$rt_url" ]] \
+        && ! compgen -G "$hailo_local_dir/hailort_*_amd64.deb" >/dev/null 2>&1; then
+        if _hailo_curl_deb "$rt_url" "$hailo_local_dir" "hailort_runtime"; then
+            fetched=1
+        fi
+    fi
+    if [[ -n "$pcie_url" ]] \
+        && ! compgen -G "$hailo_local_dir/hailort-pcie-driver_*.deb" >/dev/null 2>&1; then
+        if _hailo_curl_deb "$pcie_url" "$hailo_local_dir" "hailort_pcie"; then
+            fetched=1
+        fi
+    fi
+
+    (( fetched )) && return 0 || return 1
+}
+
+# Download one .deb from a presigned URL into the vendor dir.
+# Streams to a `.partial` first and atomically renames on success so
+# a Ctrl-C never leaves a truncated .deb that fools the next install.
+# Validates that the result is actually a Debian package (magic bytes
+# `!<arch>`) before renaming — catches the case where the URL has
+# expired and the server returned an HTML error page.
+_hailo_curl_deb() {
+    local url="$1" dest_dir="$2" label="$3"
+    local tmp="$dest_dir/.${label}.partial"
+    log "downloading HailoRT $label .deb from operator-supplied URL"
+    if ! curl -fL --retry 3 --connect-timeout 15 -o "$tmp" "$url"; then
+        warn "curl failed for $label URL (expired presigned URL?); install will fall back to CPU EP"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! head -c 8 "$tmp" | grep -q '^!<arch>'; then
+        warn "$label URL did not return a .deb (got $(file -b "$tmp" 2>/dev/null || echo "unknown content"))"
+        warn "  expired presigned URL? Re-copy from developer-zone and retry."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # Extract the package's own filename from the .deb control field
+    # so the cached file matches what the operator would've staged
+    # manually. Falls back to a generic name keyed off the label.
+    local pkg_filename
+    pkg_filename="$(dpkg-deb -f "$tmp" Package Version 2>/dev/null \
+        | awk 'NR==1{p=$2} NR==2{v=$2} END{if(p&&v) printf "%s_%s_amd64.deb", p, v}')"
+    if [[ -z "$pkg_filename" ]]; then
+        pkg_filename="${label}.deb"
+    fi
+
+    mv "$tmp" "$dest_dir/$pkg_filename"
+    chown root:root "$dest_dir/$pkg_filename"
+    chmod 0644 "$dest_dir/$pkg_filename"
+    log "cached HailoRT $label -> $dest_dir/$pkg_filename"
+    return 0
+}
+
+_drivers_hailo_pcie() {
+    local hailo_local_dir="${NEXUS_HAILO_DEB_DIR:-/opt/nexus/vendor/hailo}"
+    local rt_deb pcie_deb
+    rt_deb=$(compgen -G "$hailo_local_dir/hailort_*_amd64.deb" 2>/dev/null | head -n1 || true)
+    pcie_deb=$(compgen -G "$hailo_local_dir/hailort-pcie-driver_*.deb" 2>/dev/null | head -n1 || true)
+
+    # If the operator passed download URLs (via flag/env) or we have
+    # a TTY to prompt on, try to fetch the missing .debs into the
+    # vendor dir before falling through to the register-here banner.
+    # Either flow caches the .debs at $hailo_local_dir so subsequent
+    # installs / rollbacks are no-network re-runs.
+    if [[ -z "$rt_deb" || -z "$pcie_deb" ]]; then
+        if _hailo_fetch_debs "$hailo_local_dir"; then
+            rt_deb=$(compgen -G "$hailo_local_dir/hailort_*_amd64.deb" 2>/dev/null | head -n1 || true)
+            pcie_deb=$(compgen -G "$hailo_local_dir/hailort-pcie-driver_*.deb" 2>/dev/null | head -n1 || true)
+        fi
+    fi
+
+    if [[ -z "$rt_deb" || -z "$pcie_deb" ]]; then
+        warn ""
+        warn "================================================================"
+        warn "Hailo-8 hardware detected (PCI vendor 1e60) but no HailoRT .debs"
+        warn "found under $hailo_local_dir/."
+        warn ""
+        warn "HailoRT is a Hailo Technologies product distributed under their"
+        warn "developer agreement. To enable the Hailo userspace + driver:"
+        warn "  1. Register at https://hailo.ai/developer-zone/"
+        warn "  2. Download hailort_<ver>_amd64.deb +"
+        warn "     hailort-pcie-driver_<ver>_all.deb (Ubuntu 22.04 or 24.04)"
+        warn "  3. Either:"
+        warn "       (a) re-run install.sh and paste each download URL"
+        warn "           when prompted (right-click the link on the"
+        warn "           developer-zone download page -> Copy link), OR"
+        warn "       (b) sudo mkdir -p $hailo_local_dir && sudo cp *.deb $hailo_local_dir/"
+        warn "           then re-run install.sh, OR"
+        warn "       (c) re-run install.sh with --hailo-deb-url <url>"
+        warn "           --hailo-pcie-deb-url <url> (unattended)."
+        warn ""
+        warn "Engine will install and run, but inference will fall back to"
+        warn "the CPU EP — the Hailo execution provider lands in M_HAILO_EP."
+        warn "================================================================"
+        warn ""
+        return 0
+    fi
+
+    # Skip if a usable HailoRT is already in place. `hailortcli scan`
+    # is the canonical ground-truth probe; an exit code of 0 with
+    # `Hailo Device` in stdout means the driver is bound AND the
+    # userspace can open it.
+    if command -v hailortcli >/dev/null 2>&1 \
+        && hailortcli scan 2>/dev/null | grep -q 'Hailo Device'; then
+        log "HailoRT already installed and hailortcli scan succeeds (driver + userspace healthy)"
+        return 0
+    fi
+
+    log "installing HailoRT from $hailo_local_dir (pcie driver: $(basename "$pcie_deb"), runtime: $(basename "$rt_deb"))"
+
+    # dkms + matching headers are required to build hailo_pci.ko
+    # against the running kernel. Pull the exact `uname -r` to avoid
+    # silently building against a stale linux-headers-generic.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        dkms "linux-headers-$(uname -r)" </dev/null || {
+            warn "dkms or linux-headers-$(uname -r) install failed; HailoRT install aborted"
+            return 0
+        }
+
+    # Install pcie driver FIRST so the postinst dkms build sees the
+    # headers we just pulled. Then the runtime userspace. </dev/null
+    # is defense-in-depth on top of DEBIAN_FRONTEND=noninteractive:
+    # HailoRT 4.23's postinst still _displays_ "Do you wish to use
+    # DKMS? [Y/n]" and "activate hailort service? [y/N]" prompts,
+    # but with stdin closed the read returns EOF and both fall
+    # through to their (correct, for us) defaults. Without this an
+    # unattended re-run could block forever if a future HailoRT
+    # release stops honouring DEBIAN_FRONTEND.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pcie_deb" </dev/null; then
+        warn "hailort-pcie-driver install failed; engine will fall back to CPU EP"
+        return 0
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$rt_deb" </dev/null; then
+        warn "hailort install failed; engine will fall back to CPU EP"
+        return 0
+    fi
+
+    # Try to bind the module immediately so a fresh install doesn't
+    # need a reboot. DKMS may have already done this via the postinst
+    # — modprobe is idempotent either way.
+    if modprobe hailo_pci 2>/dev/null; then
+        log "hailo_pci module loaded"
+    else
+        warn "modprobe hailo_pci failed; a reboot is required before /dev/hailo0 appears"
+    fi
+
+    if [[ -e /dev/hailo0 ]]; then
+        log "HailoRT installed; /dev/hailo0 present"
+    else
+        warn "HailoRT installed but /dev/hailo0 not yet present — reboot and re-run install.sh to verify"
+    fi
 }
 
 # --- Atomic-swap symlink ------------------------------------------------------

@@ -71,19 +71,23 @@ versions) and adds a `recommended_tier` field. The mapping:
 
 ```
 NVIDIA dGPU present                           → T64
-Hailo-8 M.2 present (PCI vendor 0x1e60)²      → T24
+Hailo-8 M.2 present (PCI vendor 0x1e60)       → T24
 Intel Arc 140V iGPU OR /dev/accel/* present   → T36-S
 Intel Arc dGPU (A310/A380/A580) present       → T36
 Intel Iris Xe 96 EU iGPU                      → T24  (legacy GMKtec mapping; still resolves to t24.toml — see note)
 Intel UHD 24EU iGPU (N100/N150 class)         → T10
+AMD Radeon iGPU/dGPU (no Hailo)               → T10  (CPU-only fallback; no AMD inference EP today)
 Apple Silicon                                 → dev-only (no soak tier)
 fallback                                      → T10
 ```
 
-² Hailo M.2 detection is **not yet implemented** in `nexus-probe`
-(M_HAILO_EP scope). Until then, fresh installs on a Beelink EQR7
-box must select `config/tiers/t24.toml` manually — `nexus-probe`
-will currently fall through to the T10 fallback for AMD CPUs.
+AMD-only boxes intentionally fall through to T10 — there is no
+dedicated AMD inference tier today. The Mesa VA-API path still
+gives hardware decode on the EQR7 Radeon 680M, but inference uses
+the CPU EP. A ROCm spike for gfx1035 (Phoenix iGPU,
+`HSA_OVERRIDE_GFX_VERSION=10.3.0`) is tracked separately; if it
+proves viable it will land as an `ep-rocm` Cargo feature and a new
+tier mapping.
 
 The probe is advisory — operator can always override with an explicit
 config — but the recommendation lines up with the boxes actually on the

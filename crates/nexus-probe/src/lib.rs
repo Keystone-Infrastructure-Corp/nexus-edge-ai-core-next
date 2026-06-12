@@ -66,6 +66,17 @@ pub struct Accelerators {
     pub intel_npu: bool,
     pub nvidia_gpu: bool,
     pub apple_silicon: bool,
+    /// AMD Radeon iGPU (Phoenix-class Ryzen 7000/8000 APUs) or any
+    /// AMD dGPU. Used for hardware H.264/HEVC decode via VA-API
+    /// (Mesa Gallium). Inference EP for AMD is not wired today —
+    /// ROCm on Phoenix gfx1035 is an experimental spike.
+    pub amd_igpu: bool,
+    /// Hailo-8 / Hailo-8L M.2 accelerator (PCI vendor 0x1e60).
+    /// T24 tier signal: a Hailo present recommends `t24.toml`.
+    /// Until `M_HAILO_EP` lands the engine still falls back to the
+    /// CPU EP at runtime — the detection is what unlocks the
+    /// auto-tier mapping ahead of the EP work.
+    pub hailo: bool,
     pub render_nodes: Vec<String>,
     pub accel_nodes: Vec<String>,
 }
@@ -175,6 +186,14 @@ fn probe_accelerators() -> Accelerators {
         intel_npu: !accel_nodes.is_empty() || lspci.contains("npu"),
         nvidia_gpu: lspci.contains("nvidia"),
         apple_silicon: cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        // AMD: vendor string in lspci is "Advanced Micro Devices, Inc.
+        // [AMD/ATI]" — match the bracketed alias because the long form
+        // also appears under non-graphics PCI devices on AMD chipsets.
+        // "radeon" catches the marketing name across iGPU/dGPU SKUs.
+        amd_igpu: lspci.contains("amd/ati") || lspci.contains("radeon"),
+        // Hailo: only ships AI accelerators under the "Hailo
+        // Technologies" PCI vendor string. Substring match is enough.
+        hailo: lspci.contains("hailo"),
         render_nodes,
         accel_nodes,
     }
@@ -208,6 +227,14 @@ fn recommend_tier(cpu: &CpuInfo, acc: &Accelerators) -> (&'static str, &'static 
     if acc.nvidia_gpu {
         return ("T64", "config/tiers/t64.toml");
     }
+    // EQR7 + Hailo-8 SKU. Detected by Hailo presence alone — the box
+    // is "T24" regardless of which AMD/Intel host CPU drives it.
+    // Engine still falls back to CPU EP at runtime until M_HAILO_EP
+    // ships; the recommendation here is what unlocks the auto-tier
+    // selector ahead of EP work.
+    if acc.hailo {
+        return ("T24", "config/tiers/t24.toml");
+    }
     // Lunar Lake = Core Ultra 7 256V (Arc 140V iGPU + NPU 4).
     if acc.intel_arc_140v
         || acc.intel_npu
@@ -235,6 +262,9 @@ fn recommend_tier(cpu: &CpuInfo, acc: &Accelerators) -> (&'static str, &'static 
         return ("dev", "config/single-camera.toml");
     }
     // Fallback: assume the smallest tier so the box doesn't oversubscribe itself.
+    // AMD-only (Radeon iGPU/dGPU without Hailo) lands here intentionally — there's
+    // no dedicated AMD inference tier today (ROCm spike pending). The Mesa VA-API
+    // decode path still works at T10 limits.
     ("T10", "config/tiers/t10.toml")
 }
 
@@ -353,6 +383,55 @@ mod tests {
         };
         let acc = Accelerators::default();
         assert_eq!(recommend_tier(&cpu, &acc), ("T24", "config/tiers/t24.toml"));
+    }
+
+    #[test]
+    fn hailo_present_is_t24() {
+        // EQR7 + Hailo-8 SKU: Hailo flag set on a Ryzen host. T24
+        // should win regardless of the AMD iGPU also being detected.
+        let cpu = CpuInfo {
+            model_name: "AMD Ryzen 7 7735HS with Radeon Graphics".into(),
+            ..Default::default()
+        };
+        let acc = Accelerators {
+            hailo: true,
+            amd_igpu: true,
+            ..Default::default()
+        };
+        assert_eq!(recommend_tier(&cpu, &acc), ("T24", "config/tiers/t24.toml"));
+    }
+
+    #[test]
+    fn amd_only_falls_back_to_t10() {
+        // Bare AMD APU with no Hailo: no dedicated tier today, so
+        // fallback is T10 (CPU-only soak target). Decode path still
+        // works via Mesa VA-API; engine just won't oversubscribe.
+        let cpu = CpuInfo {
+            model_name: "AMD Ryzen 7 7735HS with Radeon Graphics".into(),
+            ..Default::default()
+        };
+        let acc = Accelerators {
+            amd_igpu: true,
+            ..Default::default()
+        };
+        assert_eq!(recommend_tier(&cpu, &acc), ("T10", "config/tiers/t10.toml"));
+    }
+
+    #[test]
+    fn nvidia_wins_over_hailo() {
+        // Defensive: if a future SKU ever pairs an NVIDIA dGPU with
+        // a Hailo M.2 (unlikely but not impossible) we want T64 to
+        // win — that's where the CUDA EP actually attaches.
+        let cpu = CpuInfo {
+            model_name: "AMD Ryzen 9".into(),
+            ..Default::default()
+        };
+        let acc = Accelerators {
+            nvidia_gpu: true,
+            hailo: true,
+            ..Default::default()
+        };
+        assert_eq!(recommend_tier(&cpu, &acc), ("T64", "config/tiers/t64.toml"));
     }
 
     #[test]
