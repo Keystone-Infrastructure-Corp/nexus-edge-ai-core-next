@@ -539,7 +539,7 @@ fn preprocess_nchw(
     Ok(tensor)
 }
 
-fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
+pub(crate) fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; buf.len()];
     for (i, chunk) in buf.chunks_exact(3).enumerate() {
         let off = i * 3;
@@ -554,7 +554,7 @@ fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
 /// nexus-edge-ai-core/src/inference/pipeline_utils.cpp::mapCocoToDomainLabel.
 /// Keep in sync with `models/labels.taxonomy.json` (and the v1 table); if
 /// you change one, change both.
-fn map_coco_to_domain_label(class_id: i32) -> Option<&'static str> {
+pub(crate) fn map_coco_to_domain_label(class_id: i32) -> Option<&'static str> {
     Some(match class_id {
         0 => "person",
         1 => "vehicle.bicycle",
@@ -574,7 +574,26 @@ fn map_coco_to_domain_label(class_id: i32) -> Option<&'static str> {
 
 /// Holds an `Arc<dyn Detector>` so the `build` path can swap freely
 /// between mock and real ORT impls without a typed cast at the call site.
+///
+/// M_HAILO_EP: if `inference.ep_priority` puts `"hailo"` first AND a
+/// size-matched HEF (`yolo26n_<W>_hailo.hef`, pack v4+) or the legacy
+/// `yolo26n.hef` (pack v3) exists in the model pack, we dispatch to
+/// the Hailo-8 backed detector instead of the ORT one. This keeps a
+/// single `kind = "yolo"` config entry working for both x86_64 +
+/// Intel/AMD GPU boxes (ONNX) and Hailo-8 M.2 boxes (HEF) \u2014 the
+/// operator just changes `ep_priority` in their tier toml.
 pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceError> {
+    #[cfg(feature = "ep-hailo")]
+    {
+        if let Some(hef) = resolve_hailo_hef(cfg) {
+            info!(
+                model = %hef.display(),
+                ep_priority = ?cfg.ep_priority,
+                "yolo dispatch: using Hailo-8 backend"
+            );
+            return crate::hailo_yolo::build_detector_for_hailo_yolo(cfg, &hef);
+        }
+    }
     match YoloOrtDetector::from_config(cfg) {
         Ok(d) => Ok(Arc::new(d)),
         Err(e) => {
@@ -582,6 +601,43 @@ pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector
             Ok(Arc::new(crate::detectors::MockDetector::new()))
         }
     }
+}
+
+/// Look for a size-matched yolo26n HEF artifact next to the ONNX pack.
+/// Returns `Some(path)` only when the operator opted in via
+/// `ep_priority` AND a usable HEF exists on disk; otherwise falls
+/// through to ONNX.
+///
+/// Resolution order (first existing wins):
+///   1. `yolo26n_<W>_hailo.hef` — pack v4+ convention. Exact size
+///      match against `cfg.model.input_width`, so a camera configured
+///      at 960 dispatches to the 960 HEF and one at 640 to the 640
+///      HEF on the same host.
+///   2. `yolo26n.hef` — legacy pack v3 layout. Single 640-only file.
+///      Kept so old model packs still boot on the new engine.
+///
+/// Why both checks (priority + file): a host that ships the HEF in
+/// its model pack but doesn't have a Hailo chip would otherwise
+/// silently get the Hailo path and fail to open it. Requiring
+/// `ep_priority` to mention "hailo" keeps the dispatcher under
+/// operator control.
+#[cfg(feature = "ep-hailo")]
+fn resolve_hailo_hef(cfg: &InferenceConfig) -> Option<PathBuf> {
+    let wants_hailo = cfg
+        .ep_priority
+        .iter()
+        .any(|ep| ep.eq_ignore_ascii_case("hailo"));
+    if !wants_hailo {
+        return None;
+    }
+    let pack = cfg.model.pack_path.as_ref()?;
+    let w = cfg.model.input_width;
+    let size_matched = pack.join(format!("yolo26n_{w}_hailo.hef"));
+    if size_matched.exists() {
+        return Some(size_matched);
+    }
+    let legacy = pack.join("yolo26n.hef");
+    legacy.exists().then_some(legacy)
 }
 
 #[cfg(test)]

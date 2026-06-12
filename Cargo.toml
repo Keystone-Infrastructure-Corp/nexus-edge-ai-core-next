@@ -18,6 +18,7 @@ members = [
     "crates/nexus-cloud-protocol",
     "crates/nexus-cloud-client",
     "crates/nexus-reid",
+    "crates/nexus-hailo-backend",
     "xtask",
 ]
 
@@ -252,6 +253,8 @@ nexus-storage-cloud = { path = "crates/nexus-storage-cloud" }
 nexus-sinks = { path = "crates/nexus-sinks" }
 nexus-cloud-protocol = { path = "crates/nexus-cloud-protocol" }
 nexus-cloud-client = { path = "crates/nexus-cloud-client" }
+# M_HAILO_EP — Hailo-8 FFI + safe wrappers. See crate README.
+nexus-hailo-backend = { path = "crates/nexus-hailo-backend" }
 
 # Phase 1.7 — Ed25519 actor_token verifier. RustCrypto-aligned with the
 # existing aes-gcm / hkdf / sha2 family. `pkcs8` feature lets the engine

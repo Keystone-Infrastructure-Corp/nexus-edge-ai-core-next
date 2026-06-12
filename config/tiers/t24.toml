@@ -73,22 +73,27 @@ backend = "pool"
 workers = 1
 restart_backoff_ms = 2000
 fail_soft = true
-# `"hailo"` resolves to the HailoRT EP once M_HAILO_EP lands. Until
-# then it is silently skipped by selected_for_priority_inner and the
-# engine falls through to `"cpu"`. We intentionally do NOT list
-# `"openvino"` here — the AMD Radeon 680M iGPU is not an OpenVINO
-# target (OpenVINO supports Intel iGPU/dGPU only).
+# `"hailo"` dispatches at the detector layer (M_HAILO_EP, v0.1.70):
+# `build_detector_for_yolo` checks if `yolo26n.hef` is present in the
+# model pack AND `"hailo"` appears in this list, and if so swaps in
+# `HailoYoloDetector` backed by `nexus-hailo-backend` (FFI to
+# libhailort.so.4.23). Falls through to `"cpu"` if the chip is
+# offline or the binary was built without `--features ep-hailo`.
+# We intentionally do NOT list `"openvino"` here — the AMD Radeon 680M
+# iGPU is not an OpenVINO target (OpenVINO supports Intel iGPU/dGPU only).
 ep_priority = ["hailo", "cpu"]
 
 [inference.model]
 kind = "yolo"
 pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
-# T24 = 640. The Hailo-8 compiler turns yolo26n_640.onnx into
-# yolo26n_640.hef at model-pack build time (M_HAILO_EP delivers the
-# tool + manifest hooks). 26 TOPS / 24 cams ≈ 1 TOPS/cam at 15 fps,
-# which fits yolo26n_640 with comfortable headroom for DINOv2-S re-id
-# bursts. Operators with low-cam-count + high-detail workloads can
-# override per-camera to 960 or 1280 in the UI; pack ships all three.
+# T24 = 640. The Hailo-8 path uses the public yolo26n.hef from the
+# Hailo Model Zoo (v2.18.0 compile, COCO-trained, on-chip NMS).
+# Same weights as yolo26n_640.onnx, just compiled for the chip.
+# 26 TOPS / 24 cams ≈ 1 TOPS/cam at 15 fps, which fits yolo26n_640
+# with comfortable headroom for DINOv2-S re-id bursts. Operators with
+# low-cam-count + high-detail workloads can override per-camera to
+# 960 or 1280 in the UI (ONNX path, falls back to CPU/iGPU since the
+# HEF ships only at 640); pack ships all four artifacts.
 preset = "640"
 input_width = 640
 input_height = 640

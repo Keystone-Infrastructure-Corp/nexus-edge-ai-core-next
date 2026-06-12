@@ -23,6 +23,11 @@ ep-cuda = ["nexus-inference/ep-cuda", "nexus-reid/ep-cuda"]
 ep-tensorrt = ["nexus-inference/ep-tensorrt", "nexus-reid/ep-tensorrt"]
 ep-coreml = ["nexus-inference/ep-coreml", "nexus-reid/ep-coreml"]
 ep-directml = ["nexus-inference/ep-directml", "nexus-reid/ep-directml"]
+# M_HAILO_EP — Hailo-8 detector path. Forwarded into nexus-inference
+# only (re-id is ONNX-only). Operator opts in by adding "hailo" to
+# `inference.ep_priority` AND dropping `yolo26n.hef` into the model
+# pack; without both, the ORT/ONNX path is used.
+ep-hailo = ["nexus-inference/ep-hailo"]
 # M7 Step 6F2 — dev-only event-injection endpoint at
 # `POST /api/v1/_test/inject_event`. Lets the Playwright e2e suite
 # fire AlertEvents into the outbox without needing a live RTSP

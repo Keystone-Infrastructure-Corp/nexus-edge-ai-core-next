@@ -2282,6 +2282,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-hailo-backend"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nexus-inference"
 version = "0.1.0"
 dependencies = [
@@ -2292,6 +2301,7 @@ dependencies = [
  "futures",
  "ndarray",
  "nexus-config",
+ "nexus-hailo-backend",
  "nexus-store",
  "nexus-types",
  "once_cell",

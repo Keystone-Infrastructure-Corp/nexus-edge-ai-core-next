@@ -168,10 +168,16 @@ restart_backoff_ms = 2000
 fail_soft = true
 # Default order for Intel-based tiers (T10/T24/T36/T36-S). T64 leads with
 # tensorrt; T36-S inserts "npu" between openvino and cpu. coreml is dev-only.
+# `"hailo"` is recognized by `build_detector_for_yolo` (M_HAILO_EP): if it
+# appears in this list AND a `yolo26n.hef` artifact exists in the model
+# pack, the Hailo-8 path is taken via nexus-hailo-backend / libhailort.so.
+# Hailo is not an ORT EP — it's a parallel runtime. Listing it here is
+# safe on non-Hailo boxes (the binary falls through to the next EP).
 ep_priority = ["openvino", "cpu"]
 
 [inference.model]
-# yolo (default, closed-vocab; ships per-size: yolo26n_640.onnx / _960.onnx / _1280.onnx) | open_vocab | classifier_ensemble | mock
+# yolo (default, closed-vocab; ships per-size: yolo26n_640.onnx / _960.onnx / _1280.onnx,
+# plus yolo26n.hef for Hailo-8 boxes) | open_vocab | classifier_ensemble | mock
 kind = "yolo"
 # Pack preset — "320" / "640" / "1280" from models-manifest.json.
 #   T10 → 320 (lowest latency)

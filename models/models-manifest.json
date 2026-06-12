@@ -1,7 +1,7 @@
 {
   "version": "v2",
-  "pack_version": "v2",
-  "_pack_version_comment": "Bumped only when ONNX bytes change. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX -> bump this field -> commit -> `gh release create models-v2 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build.",
+  "pack_version": "v4",
+  "_pack_version_comment": "Bumped only when ONNX/HEF bytes change OR a new artifact filename is introduced. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX (or compile/pull updated HEF) -> bump this field -> commit -> `gh release create models-v4 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build. v4 extends the M_HAILO_EP pack to full Hailo-8 model parity: per-size HEFs for yolo26n (640/960/1280), yolo_world_v2_s (640/960), yoloe26_s (640), and dinov2-s-v1 (224). The yolo26n_640_hailo.hef is identical bytes to the v3 yolo26n.hef (public Hailo Model Zoo v2.18.0 compile); all others require operator DFC compile via tools/models/gen_*_hailo.py and ship with sha256=PENDING_COMPILE + requires_compile=true until the operator regenerates them. See /memories/repo/nexus-models-manifest-pending-compile.md and tools/models/README.md §'Hailo HEF compilation'.",
   "_comment": "Model pack v2 manifest. See models/MODEL_PACK_V2.md for the schema reference. Paths are resolved relative to this file. sha256 is verified at engine load time when artifact verification is wired up (W-DETECT D5).",
   "_generated_by": "models/tools/generate_model_pack.py (or hand-edited at the repo root for the ship-in-tree models below)",
   "models": [
@@ -39,6 +39,47 @@
           "path": "yolo26n_1280.onnx",
           "preset": "1280",
           "sha256": "7eef96ae3449e16695fc088c7407f5c5c403b80985c275a29a74e2b0c0c14963"
+        },
+        {
+          "backend": "hef",
+          "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yolo26n_640. Source: Hailo Model Zoo v2.18.0 (https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8/yolo26n.hef), renamed to the `<id>_<size>_hailo.hef` convention. 640x640 RGB888 in / raw multi-output (no on-chip NMS). License chain: Hailo Model Zoo MIT + Ultralytics Apache-2.0 + COCO CC-BY-4.0. Loaded by `nexus-hailo-backend` when `inference.ep_priority` contains `\"hailo\"` AND this file is present in the resolved model pack.",
+          "path": "yolo26n_640_hailo.hef",
+          "preset": "640-hef",
+          "sha256": "af07137a98c9dbfb17d3d63109a4892d0e1d87e7946a1bd4173e208161aa8d30",
+          "_compile": {
+            "tool": "hailo-model-zoo-download",
+            "source_onnx": "yolo26n_640.onnx",
+            "script": "tools/models/gen_yolo26n_hailo.py --size 640",
+            "calibration": "none (public prebuilt)"
+          }
+        },
+        {
+          "backend": "hef",
+          "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yolo26n_960. NO public Model Zoo build at this size; operator MUST compile from yolo26n_960.onnx via the Hailo Dataflow Compiler. See tools/models/gen_yolo26n_hailo.py --size 960. Calibration: 1024-image sample of COCO val2017 in [0,1] FP32 RGB. Native chip output mirrors the 640 path (raw multi-output, no on-chip NMS).",
+          "path": "yolo26n_960_hailo.hef",
+          "preset": "960-hef",
+          "sha256": "PENDING_COMPILE",
+          "requires_compile": true,
+          "_compile": {
+            "tool": "hailo-dataflow-compiler",
+            "source_onnx": "yolo26n_960.onnx",
+            "script": "tools/models/gen_yolo26n_hailo.py --size 960",
+            "calibration": "coco-val2017-1024"
+          }
+        },
+        {
+          "backend": "hef",
+          "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yolo26n_1280. Same constraints as 960. The 1280 path is the per-camera UI override for plate/face detail; on Hailo-8 the higher resolution roughly doubles chip latency relative to 640 (still bounded by the 26 TOPS budget). Calibration set as for 960.",
+          "path": "yolo26n_1280_hailo.hef",
+          "preset": "1280-hef",
+          "sha256": "PENDING_COMPILE",
+          "requires_compile": true,
+          "_compile": {
+            "tool": "hailo-dataflow-compiler",
+            "source_onnx": "yolo26n_1280.onnx",
+            "script": "tools/models/gen_yolo26n_hailo.py --size 1280",
+            "calibration": "coco-val2017-1024"
+          }
         }
       ],
       "presets": [
@@ -62,6 +103,27 @@
           "inputWidth": 1280,
           "inputHeight": 1280,
           "artifact": "yolo26n_1280.onnx"
+        },
+        {
+          "name": "640-hef",
+          "_comment": "M_HAILO_EP — Hailo-8 backed 640 path. Operator-selected by setting `inference.ep_priority = [\"hailo\", \"cpu\"]` in nexus.toml; the router dispatches to HailoYoloDetector when this preset's artifact exists in the model pack. Raw multi-output postproc on CPU; COCO class ids map to domain labels via the same table the ORT path uses.",
+          "inputWidth": 640,
+          "inputHeight": 640,
+          "artifact": "yolo26n_640_hailo.hef"
+        },
+        {
+          "name": "960-hef",
+          "_comment": "M_HAILO_EP — Hailo-8 backed 960 path. See `requires_compile` on the artifact — ships PENDING_COMPILE until the operator runs `tools/models/gen_yolo26n_hailo.py --size 960` on a host with the Hailo Dataflow Compiler installed.",
+          "inputWidth": 960,
+          "inputHeight": 960,
+          "artifact": "yolo26n_960_hailo.hef"
+        },
+        {
+          "name": "1280-hef",
+          "_comment": "M_HAILO_EP — Hailo-8 backed 1280 path. See `requires_compile` on the artifact.",
+          "inputWidth": 1280,
+          "inputHeight": 1280,
+          "artifact": "yolo26n_1280_hailo.hef"
         }
       ],
       "default_preset": "640"
@@ -92,6 +154,34 @@
           "path": "yolo_world_v2_s_960.onnx",
           "preset": "960",
           "sha256": "a9185c3946231c9d4a337109c6a17c0d0b48404362d3b2ee1641541b30a52cdc"
+        },
+        {
+          "backend": "hef",
+          "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yolo_world_v2_s @ 640. NO public Model Zoo build; operator MUST compile via tools/models/gen_yolo_world_hailo.py --size 640. Prompts are baked into the ONNX as fixed text embeddings at export time (see gen_yolo_world.py), so this HEF is image-only at runtime — swapping vocab requires re-exporting the ONNX AND re-compiling the HEF. Calibration: 1024-image COCO val2017 sample.",
+          "path": "yolo_world_v2_s_640_hailo.hef",
+          "preset": "640-hef",
+          "sha256": "PENDING_COMPILE",
+          "requires_compile": true,
+          "_compile": {
+            "tool": "hailo-dataflow-compiler",
+            "source_onnx": "yolo_world_v2_s_640.onnx",
+            "script": "tools/models/gen_yolo_world_hailo.py --size 640",
+            "calibration": "coco-val2017-1024"
+          }
+        },
+        {
+          "backend": "hef",
+          "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yolo_world_v2_s @ 960. Same prompt-baking + recompile-on-vocab-change constraints as 640.",
+          "path": "yolo_world_v2_s_960_hailo.hef",
+          "preset": "960-hef",
+          "sha256": "PENDING_COMPILE",
+          "requires_compile": true,
+          "_compile": {
+            "tool": "hailo-dataflow-compiler",
+            "source_onnx": "yolo_world_v2_s_960.onnx",
+            "script": "tools/models/gen_yolo_world_hailo.py --size 960",
+            "calibration": "coco-val2017-1024"
+          }
         }
       ],
       "presets": [
@@ -106,6 +196,20 @@
           "inputWidth": 960,
           "inputHeight": 960,
           "artifact": "yolo_world_v2_s_960.onnx"
+        },
+        {
+          "name": "640-hef",
+          "_comment": "M_HAILO_EP — Hailo-8 backed open-vocab path. Prompts are baked into the underlying ONNX, so this is a single-artifact dispatch.",
+          "inputWidth": 640,
+          "inputHeight": 640,
+          "artifact": "yolo_world_v2_s_640_hailo.hef"
+        },
+        {
+          "name": "960-hef",
+          "_comment": "M_HAILO_EP — Hailo-8 backed open-vocab path @ 960. Same single-artifact dispatch.",
+          "inputWidth": 960,
+          "inputHeight": 960,
+          "artifact": "yolo_world_v2_s_960_hailo.hef"
         }
       ],
       "default_preset": "640",
@@ -175,6 +279,20 @@
           "backend": "onnx",
           "path": "yoloe26_s.onnx",
           "sha256": "fc3a3ea43a19b404a9868c7892fdc6b175b53d4f6698fc924cb316ac3b26ffca"
+        },
+        {
+          "backend": "hef",
+          "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for yoloe26_s @ 640. NO public Model Zoo build; operator MUST compile via tools/models/gen_yoloe_hailo.py --size 640. Prompts are baked into the ONNX at export time (same pattern as yolo_world); re-exporting the ONNX AND re-compiling the HEF is required to change vocab.",
+          "path": "yoloe26_s_640_hailo.hef",
+          "preset": "640-hef",
+          "sha256": "PENDING_COMPILE",
+          "requires_compile": true,
+          "_compile": {
+            "tool": "hailo-dataflow-compiler",
+            "source_onnx": "yoloe26_s.onnx",
+            "script": "tools/models/gen_yoloe_hailo.py --size 640",
+            "calibration": "coco-val2017-1024"
+          }
         }
       ],
       "presets": [
@@ -182,6 +300,13 @@
           "name": "640",
           "inputWidth": 640,
           "inputHeight": 640
+        },
+        {
+          "name": "640-hef",
+          "_comment": "M_HAILO_EP — Hailo-8 backed yoloe text-mode path. Prompts are baked into the ONNX, so this is a single-artifact dispatch.",
+          "inputWidth": 640,
+          "inputHeight": 640,
+          "artifact": "yoloe26_s_640_hailo.hef"
         }
       ],
       "default_preset": "640",
@@ -250,6 +375,20 @@
           "path": "dinov2_s_224.onnx",
           "preset": "224",
           "sha256": "1dcd1f60417bf2e9966c9500b27a453fd1ab1463c478f055d40c1d8956d0b0d4"
+        },
+        {
+          "backend": "hef",
+          "_comment": "M_HAILO_EP — Hailo-8 compiled artifact for dinov2_s_224 (ViT-S/14 backbone, 384-dim CLS-token output). NO public Model Zoo build; operator MUST compile via tools/models/gen_dinov2_hailo.py. Hailo-8 ViT support is partial — expect <1% top-1 drift on cosine distances vs. the FP32 ONNX path, which may require re-tuning the cloud linker `COSINE_MAX` from 0.40 if you swap to the HEF in the appearance-embedding pipeline (Phase 5.6). Calibration: 1024-image ImageNet val sample @ 224x224 RGB.",
+          "path": "dinov2_s_224_hailo.hef",
+          "preset": "224-hef",
+          "sha256": "PENDING_COMPILE",
+          "requires_compile": true,
+          "_compile": {
+            "tool": "hailo-dataflow-compiler",
+            "source_onnx": "dinov2_s_224.onnx",
+            "script": "tools/models/gen_dinov2_hailo.py",
+            "calibration": "imagenet-val-1024"
+          }
         }
       ],
       "presets": [
@@ -259,6 +398,13 @@
           "inputWidth": 224,
           "inputHeight": 224,
           "artifact": "dinov2_s_224.onnx"
+        },
+        {
+          "name": "224-hef",
+          "_comment": "M_HAILO_EP — Hailo-8 backed appearance embedding. Same CLS-token output (384 floats per crop); expect minor accuracy drift vs. ONNX baseline. See requires_compile.",
+          "inputWidth": 224,
+          "inputHeight": 224,
+          "artifact": "dinov2_s_224_hailo.hef"
         }
       ],
       "default_preset": "224",

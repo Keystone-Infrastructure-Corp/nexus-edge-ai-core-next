@@ -289,6 +289,15 @@ fn selected_for_priority_inner(
                  --features ep-openvino (Intel GPU routes through OpenVINO); skipping"
             ),
 
+            // M_HAILO_EP — Hailo-8 is not an ORT EP. It's recognized
+            // here so the unknown-EP warn doesn't fire; the actual
+            // dispatch happens in `crate::yolo::build_detector_for_yolo`
+            // when a `.hef` artifact is resolvable from the model pack.
+            "hailo" => tracing::info!(
+                "ep_priority lists 'hailo': dispatch happens at the detector layer; \
+                 ORT EP list unchanged"
+            ),
+
             other => warn!(ep = %other, "unknown EP name in ep_priority; ignoring"),
         }
     }

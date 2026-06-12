@@ -16,6 +16,12 @@ ep-cuda     = ["ort"]
 ep-coreml   = ["ort"]
 ep-tensorrt = ["ort"]
 ep-directml = ["ort"]
+# M_HAILO_EP — Hailo-8 backend. Not an ORT EP (HailoRT is a parallel
+# runtime); enabling this just pulls `nexus-hailo-backend` and asks
+# it to link against the system `libhailort.so` (linux only). The
+# router dispatches to HailoYoloDetector when a `.hef` file is
+# resolved AND `inference.ep_priority` contains "hailo".
+ep-hailo    = ["dep:nexus-hailo-backend", "nexus-hailo-backend/linked"]
 # Wire ORT itself; selected automatically by any ep-* feature above.
 # Listed separately so `--features ort` (no EPs) still compiles the
 # session-builder code path for diagnostics / dry-runs — that build
@@ -52,6 +58,13 @@ rmp-serde = { workspace = true }
 
 ort = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
+
+# M_HAILO_EP — Hailo-8 inference backend (FFI to libhailort.so.4.23).
+# Optional + brought in by the `ep-hailo` feature. On non-linux dev
+# boxes the crate's `linked` feature is off and the public API
+# returns `Error::NotAvailable`, so `--features ep-hailo` still
+# builds cross-platform.
+nexus-hailo-backend = { workspace = true, optional = true }
 
 # nexus-inference-worker: out-of-process detector worker. Spawned by
 # WorkerProcessBackend and driven over stdio with length-prefixed bincode.

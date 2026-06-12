@@ -39,6 +39,12 @@ pub mod yoloe;
 pub mod yoloe_promptfree;
 #[cfg(feature = "ort")]
 pub mod yoloe_visual;
+// M_HAILO_EP — Hailo-8 backed YOLO detector. Cfg-gated to keep
+// non-Hailo builds (notably macOS dev boxes) from pulling
+// nexus-hailo-backend at all. Also gated on `ort` because we share
+// the COCO label table and the BGR→RGB helper with `yolo.rs`.
+#[cfg(all(feature = "ep-hailo", feature = "ort"))]
+pub mod hailo_yolo;
 
 pub use backends::{
     BackendState, DetectorBackend, InProcessBackend, ThreadIsolatedBackend, WorkerProcessBackend,
