@@ -255,6 +255,13 @@ nexus-cloud-protocol = { path = "crates/nexus-cloud-protocol" }
 nexus-cloud-client = { path = "crates/nexus-cloud-client" }
 # M_HAILO_EP — Hailo-8 FFI + safe wrappers. See crate README.
 nexus-hailo-backend = { path = "crates/nexus-hailo-backend" }
+# Runtime `dlopen` + `dlsym` of libhailort.so.4 — keeps the engine binary
+# linkable on CI runners that don't carry the HailoRT .deb (Hailo's
+# developer-zone EULA forbids redistributing it). nexus-hailo-backend
+# binds to its function pointers on the first call to `InferSession::open`
+# and surfaces a clean `Error::NotAvailable` on boxes without HailoRT
+# installed, so `--features ep-hailo` is safe to enable in CI builds.
+libloading = "0.8"
 
 # Phase 1.7 — Ed25519 actor_token verifier. RustCrypto-aligned with the
 # existing aes-gcm / hkdf / sha2 family. `pkcs8` feature lets the engine

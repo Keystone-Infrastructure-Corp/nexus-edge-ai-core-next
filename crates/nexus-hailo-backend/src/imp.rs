@@ -166,6 +166,11 @@ impl InferSession {
         score_threshold: Option<f32>,
         iou_threshold: Option<f32>,
     ) -> Result<Self, Error> {
+        // dlopen libhailort.so.4 on first use. Returns NotAvailable to
+        // the caller (which then falls back to ONNX) if the .deb was
+        // never installed.
+        ffi::ensure_loaded()?;
+
         // Stat first for a clean error if the file is missing — the C
         // API otherwise returns HAILO_OPEN_FILE_FAILURE which loses the path.
         let _ = fs::metadata(hef_path)?;
@@ -489,6 +494,8 @@ impl InferSession {
     /// chip). Currently allocates a transient VDevice for the
     /// enumeration — fine for the probe binary, don't call per-frame.
     pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
+        ffi::ensure_loaded()?;
+
         let mut vdev: hailo_vdevice = ptr::null_mut();
         check(
             unsafe { ffi::hailo_create_vdevice(ptr::null(), &mut vdev) },
