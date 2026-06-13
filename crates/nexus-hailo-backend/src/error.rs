@@ -22,10 +22,7 @@ pub enum Error {
     /// always means an unexpectedly old (< 4.20) or a non-Hailo .so
     /// is masquerading as `libhailort.so.4`.
     #[error("libhailort.so.4 is missing symbol `{symbol}`: {cause}")]
-    SymbolNotFound {
-        symbol: &'static str,
-        cause: String,
-    },
+    SymbolNotFound { symbol: &'static str, cause: String },
 
     /// A HailoRT C call returned a non-zero status. The numeric value
     /// matches the `hailo_status` enum in `/usr/include/hailo/hailort.h`.

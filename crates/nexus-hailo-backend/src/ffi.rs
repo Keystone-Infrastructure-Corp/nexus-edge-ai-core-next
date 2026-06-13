@@ -309,9 +309,10 @@ pub type FnHailoGetPhysicalDevices = unsafe extern "C" fn(
 ) -> i32;
 
 // device identity
-pub type FnHailoIdentify =
-    unsafe extern "C" fn(device: hailo_device, device_identity: *mut hailo_device_identity_t)
-        -> i32;
+pub type FnHailoIdentify = unsafe extern "C" fn(
+    device: hailo_device,
+    device_identity: *mut hailo_device_identity_t,
+) -> i32;
 
 // HEF
 pub type FnHailoCreateHefFile =
@@ -356,14 +357,10 @@ pub type FnHailoCreateOutputVstreams = unsafe extern "C" fn(
     outputs_count: usize,
     output_vstreams: *mut hailo_output_vstream,
 ) -> i32;
-pub type FnHailoReleaseInputVstreams = unsafe extern "C" fn(
-    input_vstreams: *const hailo_input_vstream,
-    inputs_count: usize,
-) -> i32;
-pub type FnHailoReleaseOutputVstreams = unsafe extern "C" fn(
-    output_vstreams: *const hailo_output_vstream,
-    outputs_count: usize,
-) -> i32;
+pub type FnHailoReleaseInputVstreams =
+    unsafe extern "C" fn(input_vstreams: *const hailo_input_vstream, inputs_count: usize) -> i32;
+pub type FnHailoReleaseOutputVstreams =
+    unsafe extern "C" fn(output_vstreams: *const hailo_output_vstream, outputs_count: usize) -> i32;
 
 // vstream info / sizes
 pub type FnHailoGetInputVstreamFrameSize =
@@ -612,10 +609,7 @@ fn lib() -> &'static HailoRt {
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub unsafe fn hailo_create_vdevice(
-    params: *const c_void,
-    vdevice: *mut hailo_vdevice,
-) -> i32 {
+pub unsafe fn hailo_create_vdevice(params: *const c_void, vdevice: *mut hailo_vdevice) -> i32 {
     unsafe { (lib().hailo_create_vdevice)(params, vdevice) }
 }
 #[inline]
@@ -654,7 +648,13 @@ pub unsafe fn hailo_configure_vdevice(
     number_of_network_groups: *mut usize,
 ) -> i32 {
     unsafe {
-        (lib().hailo_configure_vdevice)(vdevice, hef, params, network_groups, number_of_network_groups)
+        (lib().hailo_configure_vdevice)(
+            vdevice,
+            hef,
+            params,
+            network_groups,
+            number_of_network_groups,
+        )
     }
 }
 #[inline]
@@ -701,7 +701,12 @@ pub unsafe fn hailo_create_input_vstreams(
     input_vstreams: *mut hailo_input_vstream,
 ) -> i32 {
     unsafe {
-        (lib().hailo_create_input_vstreams)(network_group, inputs_params, inputs_count, input_vstreams)
+        (lib().hailo_create_input_vstreams)(
+            network_group,
+            inputs_params,
+            inputs_count,
+            input_vstreams,
+        )
     }
 }
 #[inline]
