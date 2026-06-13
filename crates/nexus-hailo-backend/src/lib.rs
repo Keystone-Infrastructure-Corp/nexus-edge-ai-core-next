@@ -9,14 +9,23 @@
 //!
 //! ## Build matrix
 //!
-//! | target          | `linked` feature | behavior                              |
-//! |-----------------|------------------|----------------------------------------|
-//! | linux + x86_64  | on               | real FFI to `libhailort.so.4.23`       |
-//! | anything else   | (any)            | stub returning `Error::NotAvailable`    |
-//! | linux + linked off | n/a           | stub                                   |
+//! | target          | `linked` feature | behavior                                                                          |
+//! |-----------------|------------------|------------------------------------------------------------------------------------|
+//! | linux + x86_64  | on               | real `dlopen("libhailort.so.4")` on first use; `Error::LibraryNotFound` if absent  |
+//! | anything else   | (any)            | stub returning `Error::NotAvailable`                                                |
+//! | linux + linked off | n/a           | stub                                                                                |
 //!
 //! The stub keeps the public API stable so `cargo check --workspace`
 //! passes on macOS dev boxes that have no HailoRT installed.
+//!
+//! Note that the `linked` feature name is historical — bindings are now
+//! resolved at runtime via `libloading` rather than at link time. The
+//! feature still gates whether the real implementation (`imp.rs`) vs
+//! the stub (`stub.rs`) compiles in. Runtime loading was chosen so the
+//! CI release builder (which has no HailoRT .deb available — Hailo's
+//! developer-zone EULA prevents us from caching it) can still ship a
+//! `--features ep-hailo` binary, and so the engine degrades gracefully
+//! on operator boxes where HailoRT was never installed.
 //!
 //! ## Lifetimes
 //!

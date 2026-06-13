@@ -8,17 +8,25 @@ description = "HailoRT 4.x FFI + safe Rust wrappers for Hailo-8 inference (M_HAI
 
 [features]
 default = []
-# When enabled on a Linux target, the crate links against libhailort.so.4.23
-# (vendored at /usr/lib/libhailort.so by the HailoRT .deb installer) and
-# provides a real inference session. When disabled — or when the target is
-# not Linux — every public entry point returns `Error::NotAvailable`, so
-# downstream crates can build cross-platform on dev boxes without HailoRT.
-linked = []
+# When enabled on a Linux target, the crate `dlopen`s `libhailort.so.4`
+# at runtime (via `libloading`) and exposes a real inference session.
+# Build-time linking is intentional NOT used: HailoRT is distributed
+# under the Hailo developer-zone EULA, which prevents us from caching
+# the .deb in CI. Runtime-loading the SONAME lets every release tarball
+# build on a clean Ubuntu runner with zero Hailo artifacts present, and
+# the engine surfaces `Error::NotAvailable` on boxes where the operator
+# never installed HailoRT (instead of failing to start).
+#
+# When the feature is off — or when the target is not Linux — every
+# public entry point returns `Error::NotAvailable`, so downstream
+# crates still build cross-platform on dev boxes without HailoRT.
+linked = ["dep:libloading"]
 
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+libloading = { workspace = true, optional = true }
 
 [[bin]]
 name = "nexus-hailo-probe"

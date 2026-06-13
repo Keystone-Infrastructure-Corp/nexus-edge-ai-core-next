@@ -70,7 +70,8 @@ jobs:
   #   ├── MANIFEST.json.sig               (Ed25519, when signing key set)
   #   ├── bin/
   #   │   ├── nexus-engine                (FEATURES=gstreamer,ort,ep-cpu,
-  #   │   │                                ep-openvino,ep-cuda,ep-tensorrt)
+  #   │   │                                ep-openvino,ep-cuda,ep-tensorrt,
+  #   │   │                                ep-hailo)
   #   │   ├── nexus-probe
   #   │   └── nexus-doctor
   #   ├── lib/onnxruntime/                (libonnxruntime.so + OpenVINO
@@ -96,7 +97,7 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       ORT_VERSION: "1.24.1"
-      FEATURES: "gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt"
+      FEATURES: "gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt,ep-hailo"
     permissions:
       contents: write   # required to `gh release upload`
     steps:
