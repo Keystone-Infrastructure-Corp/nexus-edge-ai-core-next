@@ -2,16 +2,14 @@
 #       + Hailo-8 M.2 2280 accelerator (26 TOPS, PCIe Gen3 x4, M-key).
 # Soak target: 24 cameras at 1080p / 15 fps (yolo26n_640).
 #
-# ⚠ ENGINE STATUS (2026-06): the Hailo execution provider is not yet
-# wired in `nexus-inference::execution_providers`. The Radeon 680M iGPU
-# is NOT supported by OpenVINO (Intel-only). On this hardware today
-# the engine silently falls through to the CPU EP and Ryzen 7 7735HS
-# CPU-only soak is ~6–10 cams — far below the 24-cam target. The
-# 24-cam soak unlocks when M_HAILO_EP ships, which adds:
-#   * `"hailo"` arm in selected_for_priority_inner (HailoRT linkage)
-#   * yolo26n_640.hef in models/models-manifest.json alongside the ONNX
-# This file is written in target-steady-state shape so the config does
-# not need to change when M_HAILO_EP lands — only the engine.
+# As of v0.1.79 the Hailo execution provider is wired through
+# `nexus-hailo-backend` (HailoRT 4.23). With `ep_priority = ["hailo",
+# "cpu"]` below, inference runs on the Hailo-8 via the `.hef`
+# artifact in the model pack. The Radeon 680M iGPU is NOT supported
+# by OpenVINO (Intel-only) and stays decode-only on this SKU. If
+# the operator skips the HailoRT debs at install (§5.5b of INSTALL.md),
+# the engine falls through to the CPU EP and the Ryzen 7 7735HS
+# CPU-only soak is ~6–10 cams — far below the 24-cam target.
 
 [runtime]
 # Ryzen 7 7735HS = 8C / 16T Zen 3+.

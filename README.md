@@ -67,14 +67,15 @@ are flagged ✅. Per-tier reference configs live in
 | Tier        | Box                                       | Accelerator         | Cams (1080p/15fps) | Status |
 | ----------- | ----------------------------------------- | ------------------- | ------------------ | ------ |
 | **T10**     | Beelink Mini S13 (N150)                   | UHD 24EU iGPU       | 1–2               | ✅ ordered |
-| **T24**     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8   | Hailo-8 26 TOPS M.2 | 24 (target)¹      | ✅ ordered |
+| **T24**     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8   | Hailo-8 26 TOPS M.2 | 24 (target)       | ✅ ordered |
 | **T36**     | Lenovo P3 Tiny + Arc A380                 | Intel Arc A380 dGPU | 8–12              | not yet sourced |
 | **T36-S**   | GMKtec K13 / EVO-X1 (Lunar Lake 256V)     | Arc 140V + NPU 4    | 6–8               | ✅ ordered |
 | **T64**     | Lenovo P3 Tower + RTX 4060                | NVIDIA RTX 4060     | 12–20             | post-beta |
 
-¹ T24 soak target unlocks when `M_HAILO_EP` lands (HailoRT execution
-provider + `.hef` model pack). Today the engine falls through to the
-CPU EP on AMD hardware — realistic interim soak ~6–10 cams.
+The T24 Hailo EP shipped in v0.1.79: HailoRT 4.23 + `.hef` model pack
+load through `nexus-hailo-backend`, and the System tab surfaces live
+chip temp, power, utilization%, inferences/sec, firmware, serial, and
+part number. T64 stays opt-in until M5 wires the CUDA/TensorRT EPs.
 
 `nexus-probe` writes `recommended_tier` into the device manifest so a
 clean install picks the right `config/tiers/*.toml` automatically. Full

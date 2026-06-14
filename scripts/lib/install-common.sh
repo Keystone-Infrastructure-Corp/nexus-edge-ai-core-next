@@ -611,7 +611,8 @@ _verify_intel_npu_userspace() {
 # exists, service user can open it. ROCm intentionally not probed —
 # it's an experimental separate spike (gfx1035 on Phoenix iGPUs is
 # unsupported upstream and only works with HSA_OVERRIDE_GFX_VERSION).
-# T24 inference still runs on the CPU EP until M_HAILO_EP lands.
+# T24 inference runs on the Hailo-8 via `nexus-hailo-backend` (the
+# AMD path here is decode-only on this SKU).
 _verify_amd_gpu_userspace() {
     local ok=1
 
@@ -1057,10 +1058,10 @@ _drivers_intel_npu() {
 # (gfx1035, what the 680M reports) is unsupported upstream and
 # requires `HSA_OVERRIDE_GFX_VERSION=10.3.0` plus a several-hundred-MB
 # repo add. That's a separate operator-opt-in spike, not part of
-# the detection-only PR.
+# the default install path.
 #
-# T24 inference still runs on the CPU EP until `M_HAILO_EP` lands;
-# the AMD path here is decode-only. See docs/INSTALL.md §5.5.
+# T24 inference runs on the Hailo-8 via `nexus-hailo-backend`; the
+# AMD path here is decode-only on this SKU. See docs/INSTALL.md §5.5.
 _AMD_GRAPHICS_PKGS=(
     mesa-va-drivers
     mesa-vulkan-drivers
@@ -1117,8 +1118,8 @@ _drivers_amd_graphics() {
 #
 # When debs are absent we emit a multi-line warn pointing operators
 # at the developer-zone register flow. The engine still installs and
-# runs (CPU EP) — Hailo detection is advisory only until
-# `M_HAILO_EP` lands.
+# runs (CPU EP fallback) — staging the HailoRT debs and re-running
+# install.sh enables the Hailo execution provider in `nexus-hailo-backend`.
 # Fetch HailoRT .debs into the vendor dir.
 #
 # Two sources are tried in order:
@@ -1287,7 +1288,8 @@ _drivers_hailo_pcie() {
         warn "           --hailo-pcie-deb-url <url> (unattended)."
         warn ""
         warn "Engine will install and run, but inference will fall back to"
-        warn "the CPU EP — the Hailo execution provider lands in M_HAILO_EP."
+        warn "the CPU EP — stage the HailoRT debs and re-run install.sh to"
+        warn "enable the Hailo execution provider."
         warn "================================================================"
         warn ""
         return 0
