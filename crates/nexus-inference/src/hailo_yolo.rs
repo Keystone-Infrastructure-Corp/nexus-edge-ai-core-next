@@ -20,15 +20,34 @@
 //!
 //! Concurrency: `InferSession::infer_blocking` takes `&mut self` so
 //! we wrap in a `parking_lot::Mutex` and call from
-//! `tokio::task::block_in_place` like the ORT path. One detector per
-//! pool slot keeps lock contention to zero; the Hailo-8 chip itself
-//! is multi-tenant via on-chip scheduling so multiple sessions against
-//! the same device are also fine.
+//! `tokio::task::block_in_place` like the ORT path. **Unlike** the
+//! ORT path, the Hailo-8 chip can host only one vdevice at a time
+//! when HailoRT is in non-scheduled mode (the default in our HEFs).
+//! Every call to `hailo_create_vdevice` claims the single physical
+//! device exclusively; a second call from the same process returns
+//! `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` and leaves the engine with no
+//! working backend.
+//!
+//! The router with `backend = Pool` + `fail_soft = true` builds N
+//! pool detectors + 1 fail-soft fallback, so even the simplest T24
+//! config (workers=1) triggers two `build` calls. To make that work
+//! without a vdevice-leasing protocol with HailoRT, we keep a
+//! process-wide cache of opened detectors keyed by canonical HEF
+//! path: pool slot 0 and the fallback share the same Arc; all
+//! cameras pointing at the same model share the same Arc. The
+//! per-call score_threshold cannot diverge across sharers (the
+//! threshold lives inside the cached detector); if a second caller
+//! requests a different threshold we log a warning and return the
+//! cached detector unchanged. In practice every camera on a host
+//! shares the host's single Hailo HEF, and the per-camera operator
+//! threshold tuning happens at the rule layer downstream of the
+//! detector — so this is the correct sharing boundary.
 
 #![cfg(feature = "ep-hailo")]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use nexus_config::InferenceConfig;
@@ -267,17 +286,62 @@ fn resize_rgb_u8_nhwc(
 }
 
 /// Same `Arc<dyn Detector>`-returning shape as `build_detector_for_yolo`.
+///
+/// Implements the process-wide HEF cache described in the module
+/// doc: every (canonicalized) HEF path resolves to at most one
+/// underlying `HailoYoloDetector`. The cache holds weak refs so the
+/// detector drops (releasing the vdevice) once every router layer
+/// that referenced it goes away — important for the OTA hot-reload
+/// path where a new generation of detectors replaces an old one.
 pub fn build_detector_for_hailo_yolo(
     cfg: &InferenceConfig,
     hef_path: &Path,
 ) -> Result<Arc<dyn Detector>, InferenceError> {
-    match HailoYoloDetector::from_config(cfg, hef_path) {
-        Ok(d) => Ok(Arc::new(d)),
-        Err(e) => {
-            warn!("hailo YOLO detector unavailable, falling back to mock: {e}");
-            Ok(Arc::new(crate::detectors::MockDetector::new()))
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Weak<HailoYoloDetector>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    // Canonicalize so symlinks (e.g. `/opt/nexus/current/...`) and
+    // relative paths land on the same cache key. Falls back to the
+    // raw path if the file is missing — `HailoYoloDetector::open`
+    // will then surface the real error.
+    let key = hef_path
+        .canonicalize()
+        .unwrap_or_else(|_| hef_path.to_path_buf());
+
+    let mut guard = cache.lock();
+    if let Some(existing) = guard.get(&key).and_then(Weak::upgrade) {
+        if (existing.score_threshold - cfg.model.score_threshold).abs() > f32::EPSILON {
+            warn!(
+                target: "hailo",
+                cached = existing.score_threshold,
+                requested = cfg.model.score_threshold,
+                model = %key.display(),
+                "reusing cached HailoYoloDetector despite differing score_threshold — \
+                 Hailo-8 hosts only one vdevice per process; downstream rule layer \
+                 should apply per-camera thresholds",
+            );
+        } else {
+            debug!(
+                target: "hailo",
+                model = %key.display(),
+                "reusing cached HailoYoloDetector",
+            );
         }
+        return Ok(existing as Arc<dyn Detector>);
     }
+
+    let detector: Arc<HailoYoloDetector> = match HailoYoloDetector::from_config(cfg, &key) {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            // Drop the cache lock before returning the mock so a
+            // subsequent successful open can still populate the cache.
+            drop(guard);
+            warn!("hailo YOLO detector unavailable, falling back to mock: {e}");
+            return Ok(Arc::new(crate::detectors::MockDetector::new()));
+        }
+    };
+    guard.insert(key, Arc::downgrade(&detector));
+    Ok(detector as Arc<dyn Detector>)
 }
 
 #[cfg(test)]
