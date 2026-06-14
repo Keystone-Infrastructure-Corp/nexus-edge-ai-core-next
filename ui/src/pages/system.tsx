@@ -359,6 +359,23 @@ export function SystemPage() {
                         {d.board_name}
                       </Badge>
                     </div>
+                    <div>
+                      <div className="flex items-baseline justify-between">
+                        <span className="text-3xl font-semibold tabular-nums">
+                          {m.hailo!.utilization_pct.toFixed(0)}%
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          Inference utilization
+                          {m.hailo!.inferences_per_sec > 0
+                            ? ` · ${m.hailo!.inferences_per_sec.toFixed(1)} infer/s`
+                            : null}
+                        </span>
+                      </div>
+                      <Progress
+                        value={m.hailo!.utilization_pct}
+                        className="mt-2"
+                      />
+                    </div>
                     <div className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
                       <Field
                         label="Temperature"
@@ -379,7 +396,7 @@ export function SystemPage() {
                       />
                       <Field
                         label="Inferences/sec"
-                        value={`${m.hailo!.inferences_per_sec.toFixed(1)}`}
+                        value={m.hailo!.inferences_per_sec.toFixed(1)}
                       />
                       <Field label="Firmware" value={d.fw_version || "—"} />
                       <Field

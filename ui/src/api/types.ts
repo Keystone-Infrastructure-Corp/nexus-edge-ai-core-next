@@ -510,6 +510,13 @@ export interface SystemHailoInfo {
   inferences_per_sec: number;
   /// Lifetime inferences served by the active session.
   frames_total: number;
+  /// Fraction of wall-clock time the inference session spent inside
+  /// `infer_blocking` between the last two `/system/metrics` polls,
+  /// expressed as 0–100. HailoRT 4.x has no per-chip utilization
+  /// counter, so this busy% is the operator-facing utilization
+  /// signal the System tab renders as the prominent "utilization"
+  /// tile. 0.0 on the first poll after open and when `status` is set.
+  utilization_pct: number;
 }
 
 export interface SystemHailoDeviceInfo {

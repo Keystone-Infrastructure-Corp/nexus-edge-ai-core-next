@@ -39,6 +39,14 @@ pub struct HailoInfo {
     pub inferences_per_sec: f32,
     /// Lifetime inference count for the active session.
     pub frames_total: u64,
+    /// Fraction of wall-clock time spent inside `infer_blocking`'s
+    /// write+read FFI pair between consecutive `/system/metrics` polls,
+    /// expressed as 0–100. HailoRT 4.x exposes no per-chip
+    /// utilization counter; this busy% is the operator-facing signal
+    /// the System tab renders as the prominent "utilization" tile so
+    /// the Hailo card matches the NPU and GPU cards. 0.0 on the first
+    /// poll after open and when `status` is set.
+    pub utilization_pct: f32,
 }
 
 /// Per-chip telemetry. Identity fields are always populated when the
@@ -75,5 +83,6 @@ pub(crate) fn snapshot() -> Option<HailoInfo> {
         status: raw.status,
         inferences_per_sec: raw.inferences_per_sec,
         frames_total: raw.frames_total,
+        utilization_pct: raw.utilization_pct,
     })
 }
