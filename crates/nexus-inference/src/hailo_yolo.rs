@@ -370,7 +370,7 @@ pub fn telemetry_snapshot() -> Option<Result<Telemetry, InferenceError>> {
     let guard = session_cache().lock();
     for weak in guard.values() {
         if let Some(det) = weak.upgrade() {
-            let session = det.session.lock();
+            let mut session = det.session.lock();
             return Some(
                 session
                     .telemetry()

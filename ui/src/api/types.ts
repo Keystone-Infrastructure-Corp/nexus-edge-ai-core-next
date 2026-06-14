@@ -504,6 +504,12 @@ export interface SystemHailoInfo {
   /// Operator-facing reason when `devices` is empty (FFI failure).
   /// `null` / absent when devices are populated normally.
   status?: string | null;
+  /// Inferences per second served by the active session, measured as
+  /// a delta between consecutive `/system/metrics` polls. 0.0 on the
+  /// first poll after open and when `status` is set.
+  inferences_per_sec: number;
+  /// Lifetime inferences served by the active session.
+  frames_total: number;
 }
 
 export interface SystemHailoDeviceInfo {

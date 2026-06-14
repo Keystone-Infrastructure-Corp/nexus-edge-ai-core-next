@@ -377,6 +377,10 @@ export function SystemPage() {
                             : "—"
                         }
                       />
+                      <Field
+                        label="Inferences/sec"
+                        value={`${m.hailo!.inferences_per_sec.toFixed(1)}`}
+                      />
                       <Field label="Firmware" value={d.fw_version || "—"} />
                       <Field
                         label="Serial"
@@ -385,6 +389,10 @@ export function SystemPage() {
                       <Field
                         label="Part number"
                         value={d.part_number || "—"}
+                      />
+                      <Field
+                        label="Total inferences"
+                        value={m.hailo!.frames_total.toLocaleString()}
                       />
                     </div>
                   </div>

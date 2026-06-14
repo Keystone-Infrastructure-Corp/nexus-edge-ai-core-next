@@ -23,6 +23,8 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone)]
 pub struct Telemetry {
     pub devices: Vec<DeviceTelemetry>,
+    pub inferences_per_sec: f32,
+    pub frames_total: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +111,7 @@ impl InferSession {
         Err(Error::NotAvailable)
     }
 
-    pub fn telemetry(&self) -> Result<Telemetry, Error> {
+    pub fn telemetry(&mut self) -> Result<Telemetry, Error> {
         Err(Error::NotAvailable)
     }
 }

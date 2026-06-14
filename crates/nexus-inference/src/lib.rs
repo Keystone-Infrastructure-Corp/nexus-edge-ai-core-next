@@ -84,6 +84,13 @@ pub struct HailoTelemetrySnapshot {
     /// FFI call failed — surfaced into the System tab as the operator
     /// hint. `None` when devices populated normally.
     pub status: Option<String>,
+    /// Inferences per second served by the active session, measured
+    /// as a delta between consecutive snapshot polls. 0.0 on the first
+    /// poll after open (no prior sample to delta against) and when
+    /// `status` is set.
+    pub inferences_per_sec: f32,
+    /// Lifetime total inferences served by the active session.
+    pub frames_total: u64,
 }
 
 /// Per-chip telemetry. Identity fields are always populated when the
@@ -122,10 +129,14 @@ pub fn hailo_telemetry_snapshot() -> Option<HailoTelemetrySnapshot> {
                 })
                 .collect(),
             status: None,
+            inferences_per_sec: t.inferences_per_sec,
+            frames_total: t.frames_total,
         }),
         Err(e) => Some(HailoTelemetrySnapshot {
             devices: Vec::new(),
             status: Some(e.to_string()),
+            inferences_per_sec: 0.0,
+            frames_total: 0,
         }),
     }
 }
