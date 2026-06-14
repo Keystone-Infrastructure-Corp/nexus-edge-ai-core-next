@@ -16,6 +16,7 @@ use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::ptr;
+use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
@@ -42,6 +43,15 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone)]
 pub struct Telemetry {
     pub devices: Vec<DeviceTelemetry>,
+    /// Inferences per second observed since the previous `telemetry()`
+    /// call on this session. The first call after `open()` returns 0.0
+    /// (no prior sample to delta against). Session-level because the
+    /// driver does not expose a per-physical-device utilization counter
+    /// in HailoRT 4.x — this is the next-best operator signal.
+    pub inferences_per_sec: f32,
+    /// Total inferences served by this session since `open()`. Useful
+    /// for the UI to render an absolute count alongside the rate.
+    pub frames_total: u64,
 }
 
 /// Per-chip telemetry: stable identity + live temperature + live power.
@@ -134,6 +144,13 @@ pub struct InferSession {
     /// Per-output preallocated read buffers. Reused across `infer_blocking` calls.
     output_buffers: Vec<Vec<u8>>,
     output_layout: OutputLayout,
+
+    /// Total successful `infer_blocking` calls since open.
+    frames_total: u64,
+    /// `(wall_clock_at_last_telemetry, frames_total_at_last_telemetry)`
+    /// — used to compute inferences-per-second as a delta between
+    /// consecutive `telemetry()` calls.
+    prev_telemetry_sample: (Instant, u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +482,8 @@ impl InferSession {
             output_infos,
             output_buffers,
             output_layout,
+            frames_total: 0,
+            prev_telemetry_sample: (Instant::now(), 0),
         })
     }
 
@@ -518,6 +537,7 @@ impl InferSession {
                 "hailo_vstream_read_raw_buffer",
             )?;
         }
+        self.frames_total = self.frames_total.saturating_add(1);
         Ok(&self.output_buffers)
     }
 
@@ -576,7 +596,7 @@ impl InferSession {
     /// `hailo_get_physical_devices` just hands back the device handles
     /// the vdevice was built on, and the per-device telemetry functions
     /// are read-only from the driver's perspective.
-    pub fn telemetry(&self) -> Result<Telemetry, Error> {
+    pub fn telemetry(&mut self) -> Result<Telemetry, Error> {
         // Up to 8 physical devices per vdevice (HailoRT internal max);
         // Hailo-8 M.2 is always exactly 1.
         let mut handles: [hailo_device; 8] = [ptr::null_mut(); 8];
@@ -652,7 +672,24 @@ impl InferSession {
                 power_w,
             });
         }
-        Ok(Telemetry { devices })
+
+        // Inferences/sec over the window since the last telemetry()
+        // call. First call after open returns 0.0 (no prior sample).
+        let now = Instant::now();
+        let (prev_at, prev_frames) = self.prev_telemetry_sample;
+        let dt_secs = now.duration_since(prev_at).as_secs_f32();
+        let inferences_per_sec = if dt_secs > 0.001 && self.frames_total >= prev_frames {
+            (self.frames_total - prev_frames) as f32 / dt_secs
+        } else {
+            0.0
+        };
+        self.prev_telemetry_sample = (now, self.frames_total);
+
+        Ok(Telemetry {
+            devices,
+            inferences_per_sec,
+            frames_total: self.frames_total,
+        })
     }
 }
 

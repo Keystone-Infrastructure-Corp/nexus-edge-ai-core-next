@@ -54,6 +54,21 @@ pub const HAILO_MAX_NETWORK_NAME_SIZE: usize =
 pub const HAILO_DEFAULT_VSTREAM_TIMEOUT_MS: u32 = 10_000;
 pub const HAILO_DEFAULT_VSTREAM_QUEUE_SIZE: u32 = 2;
 
+// hailo_device_identity_t field bounds — these are SMALLER than
+// HAILO_MAX_NAME_SIZE in the real header, and matter for struct
+// layout: using 128 for every field puts `serial_number` /
+// `part_number` / `product_name` at the wrong offsets and the
+// driver writes garbage into adjacent fields. Verified against
+// /usr/include/hailo/hailort.h on HailoRT 4.23.0:
+//   HAILO_MAX_BOARD_NAME_LENGTH      32
+//   HAILO_MAX_SERIAL_NUMBER_LENGTH   16
+//   HAILO_MAX_PART_NUMBER_LENGTH     16
+//   HAILO_MAX_PRODUCT_NAME_LENGTH    42
+pub const HAILO_MAX_BOARD_NAME_LENGTH: usize = 32;
+pub const HAILO_MAX_SERIAL_NUMBER_LENGTH: usize = 16;
+pub const HAILO_MAX_PART_NUMBER_LENGTH: usize = 16;
+pub const HAILO_MAX_PRODUCT_NAME_LENGTH: usize = 42;
+
 // ---------------------------------------------------------------------------
 // hailo_status (enum) — we only name the codes we explicitly check for.
 // ---------------------------------------------------------------------------
@@ -251,16 +266,16 @@ pub struct hailo_device_identity_t {
     pub fw_version: hailo_firmware_version_t,
     pub logger_version: u32,
     pub board_name_length: u8,
-    pub board_name: [c_char; HAILO_MAX_NAME_SIZE],
+    pub board_name: [c_char; HAILO_MAX_BOARD_NAME_LENGTH],
     pub is_release: bool,
     pub extended_context_switch_buffer: bool,
     pub device_architecture: u32,
     pub serial_number_length: u8,
-    pub serial_number: [c_char; HAILO_MAX_NAME_SIZE],
+    pub serial_number: [c_char; HAILO_MAX_SERIAL_NUMBER_LENGTH],
     pub part_number_length: u8,
-    pub part_number: [c_char; HAILO_MAX_NAME_SIZE],
+    pub part_number: [c_char; HAILO_MAX_PART_NUMBER_LENGTH],
     pub product_name_length: u8,
-    pub product_name: [c_char; HAILO_MAX_NAME_SIZE],
+    pub product_name: [c_char; HAILO_MAX_PRODUCT_NAME_LENGTH],
 }
 
 #[repr(C)]

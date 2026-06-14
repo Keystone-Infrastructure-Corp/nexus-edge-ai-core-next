@@ -32,6 +32,13 @@ pub struct HailoInfo {
     /// devices are populated normally.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub status: Option<String>,
+    /// Session-wide inferences/sec, measured as a delta between
+    /// consecutive `/system/metrics` polls (the session keeps the
+    /// last-snapshot watermark internally). 0.0 on the first poll and
+    /// when `status` is set.
+    pub inferences_per_sec: f32,
+    /// Lifetime inference count for the active session.
+    pub frames_total: u64,
 }
 
 /// Per-chip telemetry. Identity fields are always populated when the
@@ -66,5 +73,7 @@ pub(crate) fn snapshot() -> Option<HailoInfo> {
             })
             .collect(),
         status: raw.status,
+        inferences_per_sec: raw.inferences_per_sec,
+        frames_total: raw.frames_total,
     })
 }
