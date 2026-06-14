@@ -96,6 +96,11 @@ DeviceAllow=/dev/accel/accel0 rw
 DeviceAllow=/dev/nvidia0 rw
 DeviceAllow=/dev/nvidiactl rw
 DeviceAllow=/dev/nvidia-uvm rw
+# Hailo-8 M.2 (T24). The hailo_pci driver registers a private char
+# major (511 on Ubuntu 24.04 HWE), so neither char-drm nor /dev/accel/*
+# covers it; without this line DevicePolicy=closed denies the open
+# even though world perms are crw-rw-rw-.
+DeviceAllow=/dev/hailo0 rw
 
 [Install]
 WantedBy=multi-user.target
