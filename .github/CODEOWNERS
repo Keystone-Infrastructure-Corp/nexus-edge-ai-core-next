@@ -1,11 +1,12 @@
-# CODEOWNERS — review gate for branch protection on `main`.
+# CODEOWNERS — review gate for the `main` branch ruleset.
 #
-# Branch protection on `main` requires Code Owner review on every PR.
-# The owner listed here MUST approve before merge (per
-# `require_code_owner_reviews: true` in the protection rule).
+# The ruleset on `main` requires Code Owner review on every PR
+# (`require_code_owner_review: true`). A member of
+# @Keystone-Infrastructure-Corp/nexus-maintainers other than the PR
+# author must approve before merge.
 #
-# `andboyer` has a bypass-PR-review allowance, so own-PRs can still
-# merge without a second approver. Every PR opened by anyone else
-# needs a green review from @andboyer.
+# @andboyer is the sole `bypass_actor` on the ruleset, in `pull_request`
+# mode — used only when no other maintainer is available to review.
+# All other maintainers go through normal code-owner review.
 
-*       @andboyer
+*       @Keystone-Infrastructure-Corp/nexus-maintainers
