@@ -158,6 +158,91 @@ The wedge plan that drives the next three phases of work is
    = "linux")]` gates, `nix` integer width). If your change touches a Linux-gated
    block, expect at least one CI round-trip.
 
+## SSH to operator boxes (sudo, one prompt per turn)
+
+When an agent needs to run *more than one* command on a remote host in the same
+turn (e.g. EQR7 at `192.168.1.183` for install + verify), it MUST set up one
+persistent SSH connection and batch sudo work into one remote script. The
+operator should type the SSH password (or unlock the key) at most **once per
+agent turn**, and the sudo password at most **once per agent turn** — not
+once per remote command.
+
+**THE HARD RULE: EVERY `ssh` AND `scp` INVOCATION MUST CARRY
+`-o "ControlPath=$HOME/.ssh/cm/%r@%h:%p"`.** No exceptions. `scp` without
+`-o ControlPath` opens a fresh TCP+SSH session and prompts for the password
+again, even when a ControlMaster socket is alive. Same for `rsync -e ssh`,
+`git push` over ssh, `ssh-copy-id`, etc. — they all need the option (or an
+`~/.ssh/config` Host stanza, see step 0 below).
+
+0. **(One-time per workstation) make ControlMaster the default for the box.**
+   Adding a stanza to `~/.ssh/config` removes the need to remember `-o
+   ControlPath=…` on every invocation — all `ssh`, `scp`, `rsync -e ssh`,
+   `git@…` calls inherit it automatically. Agents SHOULD assume this is set
+   up; if it isn't, propose it once and ask the operator to add it (the file
+   is sensitive, do not edit it without confirmation):
+   ```
+   # ~/.ssh/config
+   Host eqr7
+       HostName 192.168.1.183
+       User nexus-admin
+       ControlMaster auto
+       ControlPath ~/.ssh/cm/%r@%h:%p
+       ControlPersist 2h
+   ```
+   With this in place, every `ssh eqr7 …` / `scp foo eqr7:bar` rides one
+   socket automatically and the explicit `-o ControlPath` is redundant (but
+   still harmless if used).
+
+1. **Open / reuse one OpenSSH ControlMaster at the start of each turn.**
+   Run this BEFORE any other remote command in the turn; if the master
+   was opened in a prior turn the socket persists for the `ControlPersist`
+   window and this call is a no-op (no password prompt):
+   ```bash
+   mkdir -p "$HOME/.ssh/cm"
+   ssh -o ControlMaster=auto \
+       -o ControlPath="$HOME/.ssh/cm/%r@%h:%p" \
+       -o ControlPersist=2h \
+       nexus-admin@192.168.1.183 true
+   ```
+   Every subsequent `ssh` / `scp` / `rsync -e ssh` MUST pass
+   `-o ControlPath="$HOME/.ssh/cm/%r@%h:%p"` (or use the matching
+   `~/.ssh/config` Host stanza from step 0) so it rides the existing socket.
+
+2. **Batch sudo into ONE remote script** so the sudo password prompt fires
+   exactly once per turn. Stage the script with `scp` + run it with `ssh -tt`
+   so sudo has a real TTY — and BOTH calls carry `-o ControlPath`:
+   ```bash
+   cat >/tmp/do.sh <<'EOF'
+   set -e
+   # …commands that need root…
+   EOF
+   scp -o "ControlPath=$HOME/.ssh/cm/%r@%h:%p" \
+       /tmp/do.sh nexus-admin@192.168.1.183:/tmp/do.sh
+   ssh -tt -o "ControlPath=$HOME/.ssh/cm/%r@%h:%p" \
+       nexus-admin@192.168.1.183 'sudo bash /tmp/do.sh'
+   ```
+   The `ssh <host> 'sudo bash -s' <<EOF` heredoc pattern **does not work** —
+   the heredoc replaces stdin, so `ssh` can't allocate a PTY and sudo bails
+   with "a terminal is required to read the password". Always go via
+   `scp` + `ssh -tt <host> 'sudo bash /tmp/<script>.sh'`.
+3. **Focus the terminal before issuing a sudo-bearing command** so the
+   operator sees the password prompt without hunting for the pane. Call
+   `run_vscode_command` with `workbench.action.terminal.focus`
+   (`skipCheck=true`) immediately before the `ssh -tt … sudo …` invocation.
+   Also: do **not** pipe the `ssh -tt … sudo …` call through `| tail -N`
+   or any pager — `tail` buffers stdin until EOF, so the sudo password
+   prompt is hidden and the operator sees an empty terminal. Run the
+   ssh call unbuffered; if the remote output is long, redirect it to a
+   file on the box (`bash /tmp/do.sh > /tmp/do.log 2>&1`) and `tail` the
+   log from a separate follow-up `ssh` call after sudo finishes.
+4. **Never route passwords / passphrases / API tokens through
+   `vscode_askQuestions`** — those answers flow through the model. Have the
+   operator type secrets directly into the focused terminal.
+5. ControlMaster sockets occasionally go stale (network change, laptop sleep).
+   If `ssh -O check` reports "Control socket connect: No such file or
+   directory" or a command hangs, `rm -f "$HOME/.ssh/cm/<user>@<host>:<port>"`
+   and re-establish per step 1.
+
 ## Out of scope (do not propose without discussion)
 
 - Face-recognition models at the edge in v1 (hard product invariant — see Rule 2).
