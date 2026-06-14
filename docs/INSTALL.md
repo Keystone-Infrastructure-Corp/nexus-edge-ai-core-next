@@ -631,15 +631,16 @@ is healthy before proceeding.
 
 ### 5.5 T24 — Beelink EQR7 (AMD Ryzen + Hailo-8 M.2)
 
-> **Status:** Detection-only as of v0.1.70. `install.sh` recognises
+> **Status:** First-class as of v0.1.79. `install.sh` recognises
 > the AMD Radeon iGPU and Hailo-8 M.2, installs the Mesa VA-API
 > userspace for hardware H.264/HEVC decode, and (when the operator
-> stages the HailoRT `.deb` pair) installs the Hailo PCIe driver +
-> userspace. Inference still runs on the CPU EP until
-> `M_HAILO_EP` ships the Hailo execution provider — the Hailo card
-> is detected and the driver is healthy, the engine just hasn't
-> wired the EP yet. The Ryzen 7 7735HS CPU soak (~6–10 cams) is
-> the de-facto T24 ceiling on this hardware until then.
+> stages the HailoRT `.deb` pair per §5.5b) installs the Hailo
+> PCIe driver + userspace. The engine ships `nexus-hailo-backend`
+> wired through HailoRT 4.23; with `ep_priority = ["hailo","cpu"]`
+> in `t24.toml`, inference runs on the Hailo-8 via the `.hef`
+> models in the model pack. The System tab surfaces live chip
+> temperature, power, utilization%, inferences/sec, firmware,
+> serial, and part number from `nexus-hailo-backend::telemetry()`.
 
 The EQR7's Radeon 680M (Phoenix gfx1035) is **decode-only** in v1.
 ROCm on Phoenix-class iGPUs is unsupported upstream and only works
@@ -781,12 +782,15 @@ build deferred to module load — `sudo modprobe hailo_pci` (or
 post-install verification (`verify_accelerators`) does this same
 check and emits a remediation hint if it fails.
 
-> **No Hailo execution provider yet.** Until `M_HAILO_EP` lands the
-> engine logs `ep_priority=["hailo","cpu"]` from `t24.toml` and
-> silently falls through to the CPU EP. The Hailo card is
-> detected, the driver is bound, and `hailortcli` works — the
-> engine just isn't compiled with the Hailo ORT EP plug-in. Track
-> that work under the M_HAILO_EP milestone.
+> **Hailo EP active.** With `ep_priority = ["hailo","cpu"]` in
+> `t24.toml`, the engine loads the `.hef` model from the model
+> pack and routes inference through `nexus-hailo-backend`
+> (HailoRT 4.23). Confirm in the UI: open the **System** tab and
+> look for the Hailo card showing live chip temperature, power,
+> utilization%, inferences/sec, firmware, serial, and part
+> number. If you see the fields but utilization% stays at 0 with
+> traffic flowing, the engine is on the CPU EP fallback — check
+> `journalctl -u nexus-engine -f` for HailoRT load errors.
 
 ---
 
