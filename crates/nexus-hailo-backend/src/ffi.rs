@@ -272,6 +272,40 @@ pub struct hailo_firmware_version_t {
 }
 
 // ---------------------------------------------------------------------------
+// Telemetry — chip temperature + on-chip power measurement.
+//
+// Both symbols are core HailoRT 4.x API; the 4.23 SONAME exports them
+// (`nm -D libhailort.so.4 | grep -E 'hailo_get_chip_temperature|hailo_power_measurement'`
+// is non-empty). Used by the System tab in the local admin UI.
+// ---------------------------------------------------------------------------
+
+/// `hailo_chip_temperature_info_t` from `hailort.h`.
+///
+/// Hailo-8 carries two on-die temperature sensors; the runtime reports
+/// both readings plus the count of samples that went into them.
+/// `sample_count` is u16 in the header but trails 2 bytes of padding
+/// to align the struct to 4 bytes, which Rust handles automatically
+/// via `#[repr(C)]`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct hailo_chip_temperature_info_t {
+    pub ts0_temperature: f32,
+    pub ts1_temperature: f32,
+    pub sample_count: u16,
+}
+
+/// `hailo_dvm_options_e` — which on-chip dvm (Digital Voltage Monitor)
+/// to read for power measurement. `AUTO` is `INT_MAX` per the header
+/// and means "let HailoRT pick the right one for this chip" (the
+/// overcurrent-protection DVM on Hailo-8, per `hailortcli measure-power`
+/// output). We only ever pass AUTO.
+pub const HAILO_DVM_OPTIONS_AUTO: i32 = i32::MAX;
+
+/// `hailo_power_measurement_types_e` — what to measure. `AUTO` is
+/// `INT_MAX` per the header; on Hailo-8 it resolves to POWER (watts).
+pub const HAILO_POWER_MEASUREMENT_TYPES_AUTO: i32 = i32::MAX;
+
+// ---------------------------------------------------------------------------
 // Runtime-loaded HailoRT bindings.
 //
 // We `dlopen` `libhailort.so.4` on first call to `ensure_loaded()` and
@@ -312,6 +346,18 @@ pub type FnHailoGetPhysicalDevices = unsafe extern "C" fn(
 pub type FnHailoIdentify = unsafe extern "C" fn(
     device: hailo_device,
     device_identity: *mut hailo_device_identity_t,
+) -> i32;
+
+// device telemetry
+pub type FnHailoGetChipTemperature = unsafe extern "C" fn(
+    device: hailo_device,
+    temp_info: *mut hailo_chip_temperature_info_t,
+) -> i32;
+pub type FnHailoPowerMeasurement = unsafe extern "C" fn(
+    device: hailo_device,
+    dvm: i32,
+    measurement_type: i32,
+    measurement: *mut f32,
 ) -> i32;
 
 // HEF
@@ -408,6 +454,8 @@ pub struct HailoRt {
     pub hailo_release_vdevice: FnHailoReleaseVdevice,
     pub hailo_get_physical_devices: FnHailoGetPhysicalDevices,
     pub hailo_identify: FnHailoIdentify,
+    pub hailo_get_chip_temperature: FnHailoGetChipTemperature,
+    pub hailo_power_measurement: FnHailoPowerMeasurement,
     pub hailo_create_hef_file: FnHailoCreateHefFile,
     pub hailo_release_hef: FnHailoReleaseHef,
     pub hailo_configure_vdevice: FnHailoConfigureVdevice,
@@ -472,6 +520,9 @@ unsafe fn load_lib() -> Result<HailoRt, Error> {
     let hailo_get_physical_devices =
         sym!(lib, "hailo_get_physical_devices", FnHailoGetPhysicalDevices);
     let hailo_identify = sym!(lib, "hailo_identify", FnHailoIdentify);
+    let hailo_get_chip_temperature =
+        sym!(lib, "hailo_get_chip_temperature", FnHailoGetChipTemperature);
+    let hailo_power_measurement = sym!(lib, "hailo_power_measurement", FnHailoPowerMeasurement);
     let hailo_create_hef_file = sym!(lib, "hailo_create_hef_file", FnHailoCreateHefFile);
     let hailo_release_hef = sym!(lib, "hailo_release_hef", FnHailoReleaseHef);
     let hailo_configure_vdevice = sym!(lib, "hailo_configure_vdevice", FnHailoConfigureVdevice);
@@ -552,6 +603,8 @@ unsafe fn load_lib() -> Result<HailoRt, Error> {
         hailo_release_vdevice,
         hailo_get_physical_devices,
         hailo_identify,
+        hailo_get_chip_temperature,
+        hailo_power_measurement,
         hailo_create_hef_file,
         hailo_release_hef,
         hailo_configure_vdevice,
@@ -630,6 +683,22 @@ pub unsafe fn hailo_identify(
     device_identity: *mut hailo_device_identity_t,
 ) -> i32 {
     unsafe { (lib().hailo_identify)(device, device_identity) }
+}
+#[inline]
+pub unsafe fn hailo_get_chip_temperature(
+    device: hailo_device,
+    temp_info: *mut hailo_chip_temperature_info_t,
+) -> i32 {
+    unsafe { (lib().hailo_get_chip_temperature)(device, temp_info) }
+}
+#[inline]
+pub unsafe fn hailo_power_measurement(
+    device: hailo_device,
+    dvm: i32,
+    measurement_type: i32,
+    measurement: *mut f32,
+) -> i32 {
+    unsafe { (lib().hailo_power_measurement)(device, dvm, measurement_type, measurement) }
 }
 #[inline]
 pub unsafe fn hailo_create_hef_file(hef: *mut hailo_hef, file_name: *const c_char) -> i32 {

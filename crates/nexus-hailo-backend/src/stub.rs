@@ -20,6 +20,22 @@ pub struct DeviceInfo {
     pub device_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct Telemetry {
+    pub devices: Vec<DeviceTelemetry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceTelemetry {
+    pub board_name: String,
+    pub serial: String,
+    pub fw_version: (u32, u32, u32),
+    pub part_number: String,
+    pub product_name: String,
+    pub temperature_c: Option<f32>,
+    pub power_w: Option<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputLayout {
     NmsByClass {
@@ -90,6 +106,10 @@ impl InferSession {
     }
 
     pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
+        Err(Error::NotAvailable)
+    }
+
+    pub fn telemetry(&self) -> Result<Telemetry, Error> {
         Err(Error::NotAvailable)
     }
 }

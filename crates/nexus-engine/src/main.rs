@@ -36,6 +36,7 @@ mod entity_local_persist;
 #[cfg(unix)]
 mod fd_limit;
 mod gpu;
+mod hailo;
 mod models_catalog;
 mod network;
 mod npu;

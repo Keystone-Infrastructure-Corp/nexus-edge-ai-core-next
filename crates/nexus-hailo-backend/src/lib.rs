@@ -48,11 +48,13 @@ mod stub;
 
 #[cfg(all(target_os = "linux", feature = "linked"))]
 pub use imp::{
-    decode_detections, DeviceInfo, InferSession, OutputLayout, OutputStreamInfo, RawYolo26Scale,
+    decode_detections, DeviceInfo, DeviceTelemetry, InferSession, OutputLayout, OutputStreamInfo,
+    RawYolo26Scale, Telemetry,
 };
 #[cfg(not(all(target_os = "linux", feature = "linked")))]
 pub use stub::{
-    decode_detections, DeviceInfo, InferSession, OutputLayout, OutputStreamInfo, RawYolo26Scale,
+    decode_detections, DeviceInfo, DeviceTelemetry, InferSession, OutputLayout, OutputStreamInfo,
+    RawYolo26Scale, Telemetry,
 };
 
 /// One detection decoded from the on-chip NMS output.

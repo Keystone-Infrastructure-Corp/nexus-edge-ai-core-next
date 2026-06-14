@@ -9,6 +9,7 @@ import {
   MemoryStick,
   Server,
   Terminal,
+  Zap,
 } from "lucide-react";
 
 import { getSystemMetrics } from "@/api/system";
@@ -330,6 +331,74 @@ export function SystemPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* Hailo -------------------------------------------------------- */}
+      {m.hailo ? (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Zap className="h-4 w-4" />
+              Hailo
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {m.hailo.devices.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {m.hailo.status ??
+                  "Hailo session present but reported no devices."}
+              </p>
+            ) : (
+              <div className="space-y-4">
+                {m.hailo.devices.map((d, i) => (
+                  <div key={d.serial || i} className="space-y-3">
+                    <div className="flex flex-wrap items-baseline gap-3">
+                      <span className="text-lg font-semibold">
+                        {d.product_name || d.board_name}
+                      </span>
+                      <Badge variant="outline" className="uppercase">
+                        {d.board_name}
+                      </Badge>
+                    </div>
+                    <div className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
+                      <Field
+                        label="Temperature"
+                        value={
+                          d.temperature_c !== null &&
+                          d.temperature_c !== undefined
+                            ? `${d.temperature_c.toFixed(0)}°C`
+                            : "—"
+                        }
+                      />
+                      <Field
+                        label="Power"
+                        value={
+                          d.power_w !== null && d.power_w !== undefined
+                            ? `${d.power_w.toFixed(2)} W`
+                            : "—"
+                        }
+                      />
+                      <Field label="Firmware" value={d.fw_version || "—"} />
+                      <Field
+                        label="Serial"
+                        value={d.serial || "—"}
+                      />
+                      <Field
+                        label="Part number"
+                        value={d.part_number || "—"}
+                      />
+                    </div>
+                  </div>
+                ))}
+                {m.hailo.status ? (
+                  <p className="text-xs text-muted-foreground">
+                    {m.hailo.status}
+                  </p>
+                ) : null}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      ) : null}
 
       {/* Disks -------------------------------------------------------- */}
       <Card>
