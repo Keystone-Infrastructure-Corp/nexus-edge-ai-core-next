@@ -2086,16 +2086,23 @@ pub struct ReidConfig {
     /// 30 fps; ~1 s at 5 fps).
     #[serde(default = "default_reid_min_track_age_frames")]
     pub min_track_age_frames: u32,
-    /// M_PERF_CROWD B4 — worker-side bbox-width floor (pixels) for
-    /// re-id extraction. Snapshots whose bbox width is below this
+    /// M_PERF_CROWD B4 — worker-side bbox-width floor (pixels in
+    /// supervisor-frame coordinates, pre-crop-resize) for re-id
+    /// extraction. Snapshots whose source bbox width is below this
     /// value are dropped before the batched ORT call so we don't
-    /// burn compute on crops too small to embed reliably. `0` (the
-    /// default) disables the filter. Spec recommends 64 for a
-    /// 64×128 floor at the camera's working resolution.
+    /// burn compute on crops too small to embed reliably AND so
+    /// the cloud-side cross-camera linker isn't poisoned by noisy
+    /// upsampled embeddings (DINOv2-S patch_size=14 needs ≥ ~30 px
+    /// per side before patch features stabilise; on 30×60 crops
+    /// consecutive same-track embeddings drift to cosine distance
+    /// 0.4-0.9 which the cross-camera kNN filter then mis-rejects).
+    /// Default 32 — drops the worst noise crops; bump to 64 for a
+    /// 64×128 floor if false matches dominate the link graph.
+    /// `0` disables the filter.
     #[serde(default = "default_reid_min_crop_w_px")]
     pub min_crop_w_px: u32,
     /// M_PERF_CROWD B4 — worker-side bbox-height floor (pixels) for
-    /// re-id extraction. See [`min_crop_w_px`]. `0` (the default)
+    /// re-id extraction. See [`min_crop_w_px`]. Default 64. `0`
     /// disables the filter.
     #[serde(default = "default_reid_min_crop_h_px")]
     pub min_crop_h_px: u32,
@@ -2142,10 +2149,10 @@ fn default_reid_min_track_age_frames() -> u32 {
     5
 }
 fn default_reid_min_crop_w_px() -> u32 {
-    0
+    32
 }
 fn default_reid_min_crop_h_px() -> u32 {
-    0
+    64
 }
 
 #[cfg(test)]
