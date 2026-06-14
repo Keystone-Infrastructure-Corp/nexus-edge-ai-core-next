@@ -242,6 +242,14 @@ capacity = 1024
 # dim = 384
 # emit_interval_s = 5
 # min_track_age_frames = 5
+# # Supervisor-frame bbox-size floor for the worker. Snapshots
+# # below this are dropped before the ORT call AND before reaching
+# # the cloud — DINOv2-S embeddings on heavily-upsampled tiny
+# # crops are noise and poison the cross-camera linker. Defaults
+# # 32×64; bump to 64×128 if false matches dominate the graph.
+# # `0` disables either floor.
+# min_crop_w_px = 32
+# min_crop_h_px = 64
 # # ep_priority = ["coreml", "cpu"]   # macOS dev
 # # ep_priority = ["openvino", "cpu"] # Intel iGPU/NPU
 # # ep_priority = ["cuda", "cpu"]     # NVIDIA
