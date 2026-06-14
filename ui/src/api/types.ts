@@ -428,6 +428,7 @@ export interface SystemMetrics {
   memory: SystemMemoryInfo;
   gpu: SystemGpuInfo | null;
   npu: SystemNpuInfo | null;
+  hailo: SystemHailoInfo | null;
   disks: SystemDiskInfo[];
   process: SystemProcessInfo;
   captured_at: string;
@@ -493,6 +494,37 @@ export interface SystemNpuInfo {
   /// Operator-facing reason when `utilization_pct` is `null`
   /// (e.g. `"NPU baseline warming up"`).
   utilization_status?: string | null;
+}
+
+export interface SystemHailoInfo {
+  /// Per-chip telemetry, one entry per physical Hailo device backing
+  /// the inference session. On Hailo-8 M.2 this is always exactly one.
+  /// Empty when the FFI call failed (then `status` is populated).
+  devices: SystemHailoDeviceInfo[];
+  /// Operator-facing reason when `devices` is empty (FFI failure).
+  /// `null` / absent when devices are populated normally.
+  status?: string | null;
+}
+
+export interface SystemHailoDeviceInfo {
+  /// Marketing name reported by the chip (e.g. `"Hailo-8"`).
+  board_name: string;
+  /// Per-unit hardware serial (e.g. `"HLLWM2A234601244"`).
+  serial: string;
+  /// Firmware version as `"major.minor.revision"` (e.g. `"4.23.0"`).
+  fw_version: string;
+  /// Manufacturer part number (e.g. `"HM218B1C2FAE"`).
+  part_number: string;
+  /// Marketing product name (e.g.
+  /// `"HAILO-8 AI ACC M.2 M KEY MODULE EXT TEMP"`).
+  product_name: string;
+  /// Hotter of the two on-die temperature sensors, °C. `null` when
+  /// `hailo_get_chip_temperature` failed (sample counter not primed,
+  /// firmware too old, etc.).
+  temperature_c: number | null;
+  /// Instantaneous power draw, watts. `null` on FFI error. Typical
+  /// idle on Hailo-8 M.2 is ~0.9 W; max under full load ~2.5 W.
+  power_w: number | null;
 }
 
 export interface SystemDiskInfo {

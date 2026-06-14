@@ -35,6 +35,37 @@ pub struct DeviceInfo {
     pub device_id: String,
 }
 
+/// Live telemetry snapshot of every physical Hailo chip backing an
+/// `InferSession`. Returned by [`InferSession::telemetry`] for the
+/// System tab in the local admin UI; cheap enough (3 FFI calls per
+/// device, all read-only) to call on a 1–2 s poll cadence.
+#[derive(Debug, Clone)]
+pub struct Telemetry {
+    pub devices: Vec<DeviceTelemetry>,
+}
+
+/// Per-chip telemetry: stable identity + live temperature + live power.
+/// Either of the live readings may be `None` if the underlying FFI call
+/// failed (e.g. a firmware that doesn't support the dvm); identity
+/// fields come from `hailo_identify` and are always populated when the
+/// device handle is valid.
+#[derive(Debug, Clone)]
+pub struct DeviceTelemetry {
+    pub board_name: String,
+    pub serial: String,
+    pub fw_version: (u32, u32, u32),
+    pub part_number: String,
+    pub product_name: String,
+    /// Hotter of the two on-die sensors, in degrees Celsius. `None`
+    /// when `hailo_get_chip_temperature` fails (sample_count == 0
+    /// before the first internal sample is taken, etc.).
+    pub temperature_c: Option<f32>,
+    /// Instantaneous power draw in watts, from
+    /// `hailo_power_measurement(dvm=AUTO, type=AUTO)`. `None` on FFI
+    /// error.
+    pub power_w: Option<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputLayout {
     /// `HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS` (22). Single output buffer:
@@ -533,6 +564,95 @@ impl InferSession {
             });
         }
         Ok(out)
+    }
+
+    /// Read live identity + temperature + power for every physical
+    /// device backing this session. Pulled by `nexus-engine`'s System
+    /// tab handler at the dashboard's 1–2 s poll cadence.
+    ///
+    /// Re-uses the session's existing `hailo_vdevice` — does NOT open
+    /// a second vdevice (a second `hailo_create_vdevice` on the same
+    /// chip returns `HAILO_OUT_OF_PHYSICAL_DEVICES`, see PR #66).
+    /// `hailo_get_physical_devices` just hands back the device handles
+    /// the vdevice was built on, and the per-device telemetry functions
+    /// are read-only from the driver's perspective.
+    pub fn telemetry(&self) -> Result<Telemetry, Error> {
+        // Up to 8 physical devices per vdevice (HailoRT internal max);
+        // Hailo-8 M.2 is always exactly 1.
+        let mut handles: [hailo_device; 8] = [ptr::null_mut(); 8];
+        let mut count: usize = 8;
+        check(
+            unsafe {
+                ffi::hailo_get_physical_devices(self._device.0, handles.as_mut_ptr(), &mut count)
+            },
+            "hailo_get_physical_devices",
+        )?;
+
+        let mut devices = Vec::with_capacity(count);
+        for &dev in &handles[..count] {
+            let mut id: hailo_device_identity_t = unsafe { std::mem::zeroed() };
+            if let Err(e) = check(
+                unsafe { ffi::hailo_identify(dev, &mut id) },
+                "hailo_identify",
+            ) {
+                debug!("hailo_identify failed during telemetry: {e}");
+                continue;
+            }
+
+            let temperature_c = {
+                let mut info: hailo_chip_temperature_info_t = Default::default();
+                match check(
+                    unsafe { ffi::hailo_get_chip_temperature(dev, &mut info) },
+                    "hailo_get_chip_temperature",
+                ) {
+                    Ok(()) => {
+                        // Hottest of the two on-die sensors is the
+                        // operator-relevant number (thermal headroom).
+                        Some(info.ts0_temperature.max(info.ts1_temperature))
+                    }
+                    Err(e) => {
+                        debug!("hailo_get_chip_temperature failed: {e}");
+                        None
+                    }
+                }
+            };
+
+            let power_w = {
+                let mut watts: f32 = 0.0;
+                match check(
+                    unsafe {
+                        ffi::hailo_power_measurement(
+                            dev,
+                            HAILO_DVM_OPTIONS_AUTO,
+                            HAILO_POWER_MEASUREMENT_TYPES_AUTO,
+                            &mut watts,
+                        )
+                    },
+                    "hailo_power_measurement",
+                ) {
+                    Ok(()) => Some(watts),
+                    Err(e) => {
+                        debug!("hailo_power_measurement failed: {e}");
+                        None
+                    }
+                }
+            };
+
+            devices.push(DeviceTelemetry {
+                board_name: c_array_to_string(&id.board_name, id.board_name_length as usize),
+                serial: c_array_to_string(&id.serial_number, id.serial_number_length as usize),
+                fw_version: (
+                    id.fw_version.major,
+                    id.fw_version.minor,
+                    id.fw_version.revision,
+                ),
+                part_number: c_array_to_string(&id.part_number, id.part_number_length as usize),
+                product_name: c_array_to_string(&id.product_name, id.product_name_length as usize),
+                temperature_c,
+                power_w,
+            });
+        }
+        Ok(Telemetry { devices })
     }
 }
 

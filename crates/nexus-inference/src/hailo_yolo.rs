@@ -52,7 +52,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use async_trait::async_trait;
 use nexus_config::InferenceConfig;
 use nexus_hailo_backend::{
-    decode_detections, Detection as HailoDetection, InferSession, OutputLayout,
+    decode_detections, Detection as HailoDetection, InferSession, OutputLayout, Telemetry,
 };
 use nexus_types::{BBox, Detection, Frame, PixelFormat};
 use parking_lot::Mutex;
@@ -60,6 +60,18 @@ use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
 use crate::yolo::{bgr_to_rgb, map_coco_to_domain_label};
+
+/// Process-wide cache of live HailoYoloDetector instances, keyed by
+/// canonicalized HEF path. Holds `Weak` refs so a detector drops as
+/// soon as every router layer that referenced it goes away. Hailo-8
+/// allows at most ONE `hailo_create_vdevice` per process, so in
+/// steady state there is one entry here — `build_detector_for_hailo_yolo`
+/// and `telemetry_snapshot` both consult it.
+static SESSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Weak<HailoYoloDetector>>>> = OnceLock::new();
+
+fn session_cache() -> &'static Mutex<HashMap<PathBuf, Weak<HailoYoloDetector>>> {
+    SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Hailo-8 YOLO detector.
 pub struct HailoYoloDetector {
@@ -297,8 +309,7 @@ pub fn build_detector_for_hailo_yolo(
     cfg: &InferenceConfig,
     hef_path: &Path,
 ) -> Result<Arc<dyn Detector>, InferenceError> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Weak<HailoYoloDetector>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = session_cache();
 
     // Canonicalize so symlinks (e.g. `/opt/nexus/current/...`) and
     // relative paths land on the same cache key. Falls back to the
@@ -342,6 +353,32 @@ pub fn build_detector_for_hailo_yolo(
     };
     guard.insert(key, Arc::downgrade(&detector));
     Ok(detector as Arc<dyn Detector>)
+}
+
+/// Read live telemetry from the first live Hailo detector in
+/// `SESSION_CACHE` — used by the System tab on the local admin UI.
+///
+/// Returns `None` when no detector has been built yet (engine starting
+/// up before the first pipeline is wired) or when the Hailo path is not
+/// the active backend on this host. Returns `Some(Err(...))` when a
+/// detector exists but the underlying FFI calls failed; the caller
+/// surfaces that as a UI-side reason string.
+///
+/// In steady state the cache has exactly one entry (single-vdevice
+/// constraint), so this walks at most one Weak.
+pub fn telemetry_snapshot() -> Option<Result<Telemetry, InferenceError>> {
+    let guard = session_cache().lock();
+    for weak in guard.values() {
+        if let Some(det) = weak.upgrade() {
+            let session = det.session.lock();
+            return Some(
+                session
+                    .telemetry()
+                    .map_err(|e| InferenceError::Failed(format!("hailo telemetry: {e}"))),
+            );
+        }
+    }
+    None
 }
 
 #[cfg(test)]

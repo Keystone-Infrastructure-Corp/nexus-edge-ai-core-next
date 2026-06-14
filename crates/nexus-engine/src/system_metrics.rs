@@ -45,6 +45,11 @@ pub struct SystemMetrics {
     /// without the `intel_vpu` driver, and on non-Intel hosts.
     /// See the sibling `npu` module for the sysfs layout.
     pub npu: Option<crate::npu::NpuInfo>,
+    /// Hailo-8 accelerator telemetry. `None` on builds without the
+    /// `ep-hailo` feature, on hosts without a Hailo card, and during
+    /// engine startup before the first inference pipeline is wired.
+    /// See the sibling `hailo` module.
+    pub hailo: Option<crate::hailo::HailoInfo>,
     pub disks: Vec<DiskInfo>,
     pub process: ProcessInfo,
     /// Wall-clock instant the snapshot was refreshed at, ISO 8601.
@@ -269,6 +274,7 @@ fn render() -> Arc<SystemMetrics> {
         memory,
         gpu: crate::gpu::snapshot(),
         npu: crate::npu::snapshot(),
+        hailo: crate::hailo::snapshot(),
         disks,
         process,
         captured_at: chrono::Utc::now(),

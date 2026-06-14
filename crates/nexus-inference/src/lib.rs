@@ -68,6 +68,73 @@ pub use yolo_world::YoloWorldDetector;
 pub use yoloe::YoloeDetector;
 pub use yoloe_promptfree::YoloePromptFreeDetector;
 
+// ---------------------------------------------------------------------------
+// Hailo telemetry surface — exposed unconditionally so `nexus-engine`'s
+// `system_metrics` handler can compile on every feature-flag combination
+// (macOS dev, Linux without ep-hailo, Linux with ep-hailo). When the
+// real backend is absent, [`hailo_telemetry_snapshot`] returns `None`.
+// ---------------------------------------------------------------------------
+
+/// Live snapshot of every Hailo accelerator backing the active
+/// inference session. Returned by [`hailo_telemetry_snapshot`].
+#[derive(Debug, Clone)]
+pub struct HailoTelemetrySnapshot {
+    pub devices: Vec<HailoDeviceTelemetry>,
+    /// Failure reason when [`devices`] is empty because the underlying
+    /// FFI call failed — surfaced into the System tab as the operator
+    /// hint. `None` when devices populated normally.
+    pub status: Option<String>,
+}
+
+/// Per-chip telemetry. Identity fields are always populated when the
+/// device handle resolves; live readings may be `None` on FFI failure.
+#[derive(Debug, Clone)]
+pub struct HailoDeviceTelemetry {
+    pub board_name: String,
+    pub serial: String,
+    /// Firmware version as "major.minor.revision" (e.g. "4.23.0").
+    pub fw_version: String,
+    pub part_number: String,
+    pub product_name: String,
+    pub temperature_c: Option<f32>,
+    pub power_w: Option<f32>,
+}
+
+/// Read live Hailo telemetry off the active inference session. Returns
+/// `None` when the engine was built without the ep-hailo feature, when
+/// no Hailo detector has been instantiated yet (engine still starting
+/// up), or when the host has no Hailo card.
+#[cfg(all(feature = "ep-hailo", feature = "ort"))]
+pub fn hailo_telemetry_snapshot() -> Option<HailoTelemetrySnapshot> {
+    match hailo_yolo::telemetry_snapshot()? {
+        Ok(t) => Some(HailoTelemetrySnapshot {
+            devices: t
+                .devices
+                .into_iter()
+                .map(|d| HailoDeviceTelemetry {
+                    board_name: d.board_name,
+                    serial: d.serial,
+                    fw_version: format!("{}.{}.{}", d.fw_version.0, d.fw_version.1, d.fw_version.2),
+                    part_number: d.part_number,
+                    product_name: d.product_name,
+                    temperature_c: d.temperature_c,
+                    power_w: d.power_w,
+                })
+                .collect(),
+            status: None,
+        }),
+        Err(e) => Some(HailoTelemetrySnapshot {
+            devices: Vec::new(),
+            status: Some(e.to_string()),
+        }),
+    }
+}
+
+#[cfg(not(all(feature = "ep-hailo", feature = "ort")))]
+pub fn hailo_telemetry_snapshot() -> Option<HailoTelemetrySnapshot> {
+    None
+}
+
 use std::sync::Arc;
 
 use nexus_config::{InferenceBackendKind, InferenceConfig, PoolWorkerKind};
