@@ -16,7 +16,7 @@ use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::ptr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -52,6 +52,15 @@ pub struct Telemetry {
     /// Total inferences served by this session since `open()`. Useful
     /// for the UI to render an absolute count alongside the rate.
     pub frames_total: u64,
+    /// Fraction of wall-clock time the session spent inside
+    /// `infer_blocking` (the write+read FFI pair) between the previous
+    /// and current `telemetry()` calls, expressed as 0–100. The real
+    /// HailoRT 4.x driver exposes no per-chip utilization counter, so
+    /// this busy-time ratio is the next-best operator signal — it is
+    /// what the System tab renders as the big "utilization" tile to
+    /// match the NPU and GPU cards. 0.0 on the first poll after open
+    /// (no prior sample to delta against).
+    pub utilization_pct: f32,
 }
 
 /// Per-chip telemetry: stable identity + live temperature + live power.
@@ -147,10 +156,15 @@ pub struct InferSession {
 
     /// Total successful `infer_blocking` calls since open.
     frames_total: u64,
-    /// `(wall_clock_at_last_telemetry, frames_total_at_last_telemetry)`
-    /// — used to compute inferences-per-second as a delta between
+    /// Cumulative wall-clock time spent inside `infer_blocking` (the
+    /// write+read FFI pair) since open. `telemetry()` deltas this
+    /// against the previous sample to produce a busy% utilization.
+    infer_busy_total: Duration,
+    /// `(wall_clock_at_last_telemetry, frames_total_at_last_telemetry,
+    /// infer_busy_total_at_last_telemetry)` — used to compute
+    /// inferences-per-second and busy% utilization as deltas between
     /// consecutive `telemetry()` calls.
-    prev_telemetry_sample: (Instant, u64),
+    prev_telemetry_sample: (Instant, u64, Duration),
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +497,8 @@ impl InferSession {
             output_buffers,
             output_layout,
             frames_total: 0,
-            prev_telemetry_sample: (Instant::now(), 0),
+            infer_busy_total: Duration::ZERO,
+            prev_telemetry_sample: (Instant::now(), 0, Duration::ZERO),
         })
     }
 
@@ -518,6 +533,7 @@ impl InferSession {
                 self.input_frame_size
             )));
         }
+        let started = Instant::now();
         check(
             unsafe {
                 ffi::hailo_vstream_write_raw_buffer(
@@ -538,6 +554,7 @@ impl InferSession {
             )?;
         }
         self.frames_total = self.frames_total.saturating_add(1);
+        self.infer_busy_total = self.infer_busy_total.saturating_add(started.elapsed());
         Ok(&self.output_buffers)
     }
 
@@ -673,22 +690,34 @@ impl InferSession {
             });
         }
 
-        // Inferences/sec over the window since the last telemetry()
-        // call. First call after open returns 0.0 (no prior sample).
+        // Inferences/sec and busy% utilization over the window since
+        // the last telemetry() call. First call after open returns 0
+        // for both (no prior sample to delta against). Busy% is the
+        // fraction of wall-clock time spent inside `infer_blocking`'s
+        // FFI pair — clamped to 100 to absorb any sub-ms scheduling
+        // jitter between the `Instant::now()` calls.
         let now = Instant::now();
-        let (prev_at, prev_frames) = self.prev_telemetry_sample;
-        let dt_secs = now.duration_since(prev_at).as_secs_f32();
+        let (prev_at, prev_frames, prev_busy) = self.prev_telemetry_sample;
+        let dt = now.duration_since(prev_at);
+        let dt_secs = dt.as_secs_f32();
         let inferences_per_sec = if dt_secs > 0.001 && self.frames_total >= prev_frames {
             (self.frames_total - prev_frames) as f32 / dt_secs
         } else {
             0.0
         };
-        self.prev_telemetry_sample = (now, self.frames_total);
+        let utilization_pct = if dt_secs > 0.001 && self.infer_busy_total >= prev_busy {
+            let busy_delta = (self.infer_busy_total - prev_busy).as_secs_f32();
+            (busy_delta / dt_secs * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        self.prev_telemetry_sample = (now, self.frames_total, self.infer_busy_total);
 
         Ok(Telemetry {
             devices,
             inferences_per_sec,
             frames_total: self.frames_total,
+            utilization_pct,
         })
     }
 }

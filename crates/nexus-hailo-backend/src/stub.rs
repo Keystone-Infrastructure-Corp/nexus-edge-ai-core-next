@@ -25,6 +25,7 @@ pub struct Telemetry {
     pub devices: Vec<DeviceTelemetry>,
     pub inferences_per_sec: f32,
     pub frames_total: u64,
+    pub utilization_pct: f32,
 }
 
 #[derive(Debug, Clone)]

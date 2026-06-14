@@ -91,6 +91,14 @@ pub struct HailoTelemetrySnapshot {
     pub inferences_per_sec: f32,
     /// Lifetime total inferences served by the active session.
     pub frames_total: u64,
+    /// Fraction of wall-clock time the session spent inside
+    /// `infer_blocking` between the previous and current poll,
+    /// expressed as 0–100. HailoRT 4.x exposes no per-chip
+    /// utilization counter, so this busy% is the next-best operator
+    /// signal; the System tab renders it as the prominent
+    /// "utilization" tile (matches the NPU and GPU cards). 0.0 on the
+    /// first poll after open and when `status` is set.
+    pub utilization_pct: f32,
 }
 
 /// Per-chip telemetry. Identity fields are always populated when the
@@ -131,12 +139,14 @@ pub fn hailo_telemetry_snapshot() -> Option<HailoTelemetrySnapshot> {
             status: None,
             inferences_per_sec: t.inferences_per_sec,
             frames_total: t.frames_total,
+            utilization_pct: t.utilization_pct,
         }),
         Err(e) => Some(HailoTelemetrySnapshot {
             devices: Vec::new(),
             status: Some(e.to_string()),
             inferences_per_sec: 0.0,
             frames_total: 0,
+            utilization_pct: 0.0,
         }),
     }
 }
