@@ -167,6 +167,18 @@ operator should type the SSH password (or unlock the key) at most **once per
 agent turn**, and the sudo password at most **once per agent turn** — not
 once per remote command.
 
+**THE ZEROTH RULE — ONE SSH SESSION PER HOST. PERIOD.** Open one interactive
+ssh shell to the box (or reuse the operator's existing pane if they already
+have one open) and ride that single connection for EVERY subsequent remote
+command via `send_to_terminal`. Do NOT spawn a fresh `ssh user@host '<cmd>'`
+one-shot for each command — not for recon, not for verification, not for
+"just a quick check", not ever. Each one-shot opens a new session, fights for
+the operator's terminal, and can kill or race their interactive shell. The
+ControlMaster socket is NOT a license to open parallel `ssh host '…'` calls;
+it just suppresses the password prompt on each one — they are still separate
+sessions. Rule of thumb: if you've typed `ssh user@host '…'` twice in the
+same turn, you're doing it wrong — go back to the existing shell.
+
 **THE HARD RULE: EVERY `ssh` AND `scp` INVOCATION MUST CARRY
 `-o "ControlPath=$HOME/.ssh/cm/%r@%h:%p"`.** No exceptions. `scp` without
 `-o ControlPath` opens a fresh TCP+SSH session and prompts for the password

@@ -1142,10 +1142,22 @@ _hailo_fetch_debs() {
     local rt_url="${NEXUS_HAILO_DEB_URL:-}"
     local pcie_url="${NEXUS_HAILO_PCIE_DEB_URL:-}"
 
-    # Prompt only when interactive AND at least one URL is missing.
-    if [[ ( -z "$rt_url" || -z "$pcie_url" ) \
-          && -t 0 \
-          && "${NEXUS_UNATTENDED:-0}" != "1" ]]; then
+    # Pick the prompt source. Stdin is the obvious one, but the
+    # documented install path is `curl … | sudo bash`, where stdin
+    # is the curl pipe (not a TTY) even when the operator is sitting
+    # at an ssh -tt session. /dev/tty bypasses stdin and talks to the
+    # controlling terminal directly, which is exactly what we want.
+    # NEXUS_UNATTENDED=1 forces no-prompt (CI / scripted installs).
+    local prompt_src=""
+    if [[ "${NEXUS_UNATTENDED:-0}" != "1" ]]; then
+        if [[ -r /dev/tty && -w /dev/tty ]]; then
+            prompt_src="/dev/tty"
+        elif [[ -t 0 ]]; then
+            prompt_src="stdin"
+        fi
+    fi
+
+    if [[ ( -z "$rt_url" || -z "$pcie_url" ) && -n "$prompt_src" ]]; then
         printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
             "Hailo-8 detected. To enable hardware inference acceleration"
         printf '%s[nexus]%s %s\n' "$(_color '1;36')" "$(_reset)" \
@@ -1172,12 +1184,20 @@ _hailo_fetch_debs() {
         if [[ -z "$rt_url" ]]; then
             printf '%s[nexus]%s HailoRT runtime URL: ' \
                 "$(_color '1;36')" "$(_reset)"
-            IFS= read -r rt_url || rt_url=""
+            if [[ "$prompt_src" == "/dev/tty" ]]; then
+                IFS= read -r rt_url </dev/tty || rt_url=""
+            else
+                IFS= read -r rt_url || rt_url=""
+            fi
         fi
         if [[ -z "$pcie_url" ]]; then
             printf '%s[nexus]%s HailoRT PCIe driver URL: ' \
                 "$(_color '1;36')" "$(_reset)"
-            IFS= read -r pcie_url || pcie_url=""
+            if [[ "$prompt_src" == "/dev/tty" ]]; then
+                IFS= read -r pcie_url </dev/tty || pcie_url=""
+            else
+                IFS= read -r pcie_url || pcie_url=""
+            fi
         fi
     fi
 
