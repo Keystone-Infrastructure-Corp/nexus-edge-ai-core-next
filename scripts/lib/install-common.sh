@@ -115,11 +115,14 @@ ensure_dirs() {
 # created only after HailoRT installs (T24-EQR7 boxes only); call this
 # again after `install_drivers` to pick it up.
 #
-# HailoRT 4.23+ chowns /dev/hailo* to `root:video 0660` (not
-# `root:hailo` as older releases did), so `video` covers both the AMD
-# / Intel render path and Hailo on a modern install. We keep the
+# HailoRT 4.23.x ships a udev rule that leaves /dev/hailo* WORLD-rw
+# (MODE="0666", root:root, no group). `install.sh` overrides that with
+# its own 99-nexus-hailo.rules that group-gates the node to `video`
+# 0660 (`_hailo_install_udev_rule`), so `video` membership is what lets
+# the service user open /dev/hailo0 on a modern install. We keep the
 # `hailo` group on the optional list for back-compat with operators
-# still on 4.20 — it's only added if the HailoRT postinst created it.
+# still on HailoRT ≤ 4.20, whose postinst DID create a `hailo` group —
+# it's only added if that group actually exists on the host.
 ensure_accelerator_groups() {
     local group required
     for group in render:required video:required hailo:optional; do
@@ -725,8 +728,8 @@ _verify_hailo_userspace() {
         log "  [ OK ] service user $NEXUS_SERVICE_USER can open /dev/hailo0"
     else
         warn "  [FAIL] service user $NEXUS_SERVICE_USER cannot open /dev/hailo0"
-        warn "         (missing hailo-group membership or wrong device perms)"
-        warn "         fix: sudo usermod -aG hailo $NEXUS_SERVICE_USER && sudo systemctl restart nexus-engine"
+        warn "         (missing video-group membership or wrong device perms)"
+        warn "         fix: sudo usermod -aG video $NEXUS_SERVICE_USER && sudo systemctl restart nexus-engine"
         ok=0
     fi
 
@@ -1143,11 +1146,15 @@ _drivers_amd_graphics() {
 #   hailort-pcie-driver_<ver>_all.deb          — DKMS source for
 #                                                 `hailo_pci.ko`
 #
-# Side-effect of the .deb postinst: creates the `hailo` system group
-# and a udev rule that chowns `/dev/hailo*` to `root:hailo 0660`.
-# `ensure_accelerator_groups` runs after `install_drivers` in
-# install.sh, so the service user gets added to the new group on
-# the same install.
+# Side-effect of the .deb postinst (HailoRT 4.23.x): installs a udev
+# rule that leaves `/dev/hailo*` world-rw (`SUBSYSTEM=="hailo_chardev",
+# MODE="0666"`) — no group, no chown. `install.sh` overrides that with
+# `_hailo_install_udev_rule` (99-nexus-hailo.rules), which re-gates the
+# node to `video` 0660. `ensure_accelerator_groups` runs after
+# `install_drivers` in install.sh and adds the service user to `video`,
+# so the engine can open /dev/hailo0 on the same install.
+# (HailoRT ≤ 4.20 instead created a `hailo` group + `root:hailo 0660`
+# rule; that path is still handled for back-compat.)
 #
 # When debs are absent we emit a multi-line warn pointing operators
 # at the developer-zone register flow. The engine still installs and
@@ -1423,6 +1430,32 @@ _hailo_dkms_compat_patch() {
     return 0
 }
 
+# Harden the Hailo character-device permissions. HailoRT 4.23.x ships
+# a udev rule that sets `/dev/hailo*` world-rw (MODE="0666", no group),
+# which is more permissive than necessary — any local user can talk to
+# the NPU. Older HailoRT (≤ 4.20) created a `hailo` group and chowned
+# the node `root:hailo 0660`; 4.23.x dropped that.
+#
+# We drop our own rule that re-group-gates the node to `video` (a group
+# that always exists and that the `nexus` service user is already a
+# member of via `ensure_accelerator_groups`) at MODE 0660. The filename
+# (99-) sorts after Hailo's own rule, so our GROUP/MODE wins. Idempotent:
+# rewrites the same content every run, then reloads + triggers udev so
+# the live `/dev/hailo0` picks up the new perms without a reboot.
+_hailo_install_udev_rule() {
+    local rule_path="/etc/udev/rules.d/99-nexus-hailo.rules"
+    log "installing Hailo device-permission hardening rule ($rule_path)"
+    cat >"$rule_path" <<'EOF'
+# Managed by nexus install.sh — group-gate the Hailo char device to
+# `video` 0660 instead of HailoRT's default world-rw 0666. See
+# deploy/udev/99-nexus-hailo.rules for the full rationale.
+SUBSYSTEM=="hailo_chardev", GROUP="video", MODE="0660"
+EOF
+    chmod 0644 "$rule_path"
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=hailo_chardev 2>/dev/null || true
+}
+
 _drivers_hailo_pcie() {
     local hailo_local_dir="${NEXUS_HAILO_DEB_DIR:-/opt/nexus/vendor/hailo}"
     local rt_deb pcie_deb
@@ -1548,6 +1581,11 @@ _drivers_hailo_pcie() {
     else
         warn "modprobe hailo_pci failed; a reboot is required before /dev/hailo0 appears"
     fi
+
+    # Replace HailoRT's world-rw (0666) udev rule with a video-group
+    # gated 0660 rule before the device node settles. Done after
+    # modprobe so the trigger re-applies perms to the live node.
+    _hailo_install_udev_rule
 
     if [[ -e /dev/hailo0 ]]; then
         log "HailoRT installed; /dev/hailo0 present"
