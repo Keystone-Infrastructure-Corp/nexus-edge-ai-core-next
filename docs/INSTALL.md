@@ -746,14 +746,22 @@ landed the debs, the installer then:
 3. `apt install -y dkms linux-headers-$(uname -r)` (matched
    headers so the DKMS build sees the right kernel).
 4. `dpkg -i hailort-pcie-driver_*.deb` (DKMS builds + loads
-   `hailo_pci.ko`; postinst creates the `hailo` system group +
-   udev rule chowning `/dev/hailo*` to `root:hailo 0660`).
+   `hailo_pci.ko`; HailoRT 4.23.x's postinst installs a udev rule
+   that leaves `/dev/hailo*` world-rw — `MODE="0666"`, root:root,
+   no group). The installer feeds the postinst's interactive
+   `read` prompt a canned answer so it can't hang or abort under
+   `set -u` (the v0.1.81 fix).
 5. `dpkg -i hailort_*_amd64.deb` (userspace library +
    `hailortcli`).
 6. `modprobe hailo_pci` so `/dev/hailo0` appears immediately
    without a reboot.
-7. `ensure_accelerator_groups` adds the `nexus` service user to
-   the freshly-created `hailo` group.
+7. Installs `/etc/udev/rules.d/99-nexus-hailo.rules` to override
+   HailoRT's world-rw default, re-gating `/dev/hailo*` to
+   `video` group at `0660`, then reloads + triggers udev.
+8. `ensure_accelerator_groups` adds the `nexus` service user to
+   the `video` group (which now gates the Hailo node). HailoRT
+   ≤ 4.20 instead created a dedicated `hailo` group + `root:hailo
+   0660` rule; that path is still handled for back-compat.
 
 Re-running `install.sh` after a successful Hailo install is a no-op
 (`hailortcli scan` ground-truth probe short-circuits the dpkg path).

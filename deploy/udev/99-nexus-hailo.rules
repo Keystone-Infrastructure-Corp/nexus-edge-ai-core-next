@@ -1,0 +1,30 @@
+# udev rule: group-gate the Hailo-8 / Hailo-8L character device.
+#
+# HailoRT 4.23.x ships its own rule (`/etc/udev/rules.d/*hailo*.rules`)
+# that sets the device WORLD-readable/writable:
+#
+#     SUBSYSTEM=="hailo_chardev", MODE="0666"
+#
+# i.e. `/dev/hailo0` lands as `crw-rw-rw- root root`. That works (the
+# engine can open it) but it's needlessly permissive — any local user
+# can talk to the NPU. Older HailoRT releases (≤ 4.20) instead created
+# a `hailo` system group and chowned the node `root:hailo 0660`; 4.23.x
+# dropped that and went world-rw.
+#
+# This rule restores group-gating WITHOUT depending on a `hailo` group
+# that modern HailoRT no longer creates: it re-uses `video`, which
+# always exists and which `install.sh` already adds the `nexus` service
+# user to (`ensure_accelerator_groups`). Filename sorts AFTER Hailo's
+# own rule (99 > 60), so this MODE/GROUP assignment wins.
+#
+# `install.sh` writes this rule automatically on T24 / Hailo boxes
+# (`_hailo_install_udev_rule` in scripts/lib/install-common.sh) and
+# reloads udev. To apply it by hand:
+#
+#     sudo install -m 0644 deploy/udev/99-nexus-hailo.rules \
+#         /etc/udev/rules.d/99-nexus-hailo.rules
+#     sudo udevadm control --reload-rules
+#     sudo udevadm trigger --subsystem-match=hailo_chardev
+#     ls -l /dev/hailo0     # expect: crw-rw---- root video
+#
+SUBSYSTEM=="hailo_chardev", GROUP="video", MODE="0660"
