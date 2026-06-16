@@ -714,8 +714,8 @@ scripts:
 
 ```bash
 sudo /opt/nexus/current/scripts/install.sh --tier t24 \
-    --hailo-deb-url      'https://hailo-csms.s3.../hailort_4.20.0_amd64.deb?X-Amz-...' \
-    --hailo-pcie-deb-url 'https://hailo-csms.s3.../hailort-pcie-driver_4.20.0_all.deb?X-Amz-...'
+    --hailo-deb-url      'https://hailo-csms.s3.../hailort_4.23.0_amd64.deb?X-Amz-...' \
+    --hailo-pcie-deb-url 'https://hailo-csms.s3.../hailort-pcie-driver_4.23.0_all.deb?X-Amz-...'
 ```
 
 Equivalent env vars: `NEXUS_HAILO_DEB_URL`, `NEXUS_HAILO_PCIE_DEB_URL`.

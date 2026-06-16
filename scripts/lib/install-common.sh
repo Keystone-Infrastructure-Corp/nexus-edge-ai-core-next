@@ -651,33 +651,66 @@ _verify_amd_gpu_userspace() {
 #      least one Hailo Device.
 #   3. Service user can open the device node.
 #
-# Soft-skip path: if HailoRT debs were never staged
-# (_drivers_hailo_pcie ran in warn-and-return mode) then /dev/hailo0
-# won't exist and `hailortcli` won't be on PATH — emit an info-level
-# message pointing back at the install-side warn, and return 0 so the
-# verification banner stays green for an "intentionally CPU EP" install.
+# Distinguishes four states explicitly so the operator-facing
+# message matches reality:
+#   - "no .debs staged"        : no apt entry, no .debs in vendor dir
+#   - "staged, install failed" : .debs present but dpkg state != ii
+#   - "installed, no /dev"     : packages ii but module not bound
+#   - "fully working"          : everything green
 _verify_hailo_userspace() {
     local ok=1
-
     log "verifying Hailo-8 userspace..."
 
-    if [[ ! -e /dev/hailo0 ]]; then
-        if ! command -v hailortcli >/dev/null 2>&1; then
-            log "  [info] HailoRT not installed (no .debs staged); engine will use CPU EP"
-            log "         see docs/INSTALL.md §5.5 to enable Hailo"
-            return 0
+    # Package-state probe — the canonical "did the .deb land cleanly?"
+    # answer. dpkg-query exits non-zero if the package isn't even in
+    # the database (treat as 'missing').
+    local rt_state pcie_state
+    rt_state=$(dpkg-query -W -f='${db:Status-Status}' hailort 2>/dev/null || echo missing)
+    pcie_state=$(dpkg-query -W -f='${db:Status-Status}' hailort-pcie-driver 2>/dev/null || echo missing)
+
+    if [[ "$rt_state" == "missing" && "$pcie_state" == "missing" ]]; then
+        local hailo_local_dir="${NEXUS_HAILO_DEB_DIR:-/opt/nexus/vendor/hailo}"
+        if compgen -G "$hailo_local_dir/hailort*.deb" >/dev/null 2>&1; then
+            warn "  [FAIL] HailoRT .debs staged at $hailo_local_dir but no apt entry"
+            warn "         (install.sh did not run the install step — re-run it)"
+            return 1
         fi
-        warn "  [FAIL] /dev/hailo0 missing"
-        warn "         hailo_pci kernel module not bound. Most common cause is"
-        warn "         DKMS build deferred until reboot. Try: sudo modprobe hailo_pci"
-        warn "         or sudo reboot, then re-run install.sh"
+        log "  [info] HailoRT not installed (no .debs staged); engine will use CPU EP"
+        log "         see docs/INSTALL.md §5.5 to enable Hailo"
+        return 0
+    fi
+
+    if [[ "$rt_state" != "installed" || "$pcie_state" != "installed" ]]; then
+        warn "  [FAIL] HailoRT packages in incomplete state:"
+        warn "           hailort=$rt_state  hailort-pcie-driver=$pcie_state"
+        warn "         (postinst failed half-way — common cause is a kernel-API"
+        warn "         rename. Inspect /var/log/hailort.deb.log,"
+        warn "         /var/log/hailort-pcie-driver.deb.log, and"
+        warn "         /var/lib/dkms/hailo_pci/*/build/make.log)"
+        warn "         fix: re-run install.sh — it will retry the postinst"
+        warn "         with the kernel-API compat patch applied."
+        return 1
+    fi
+    log "  [ OK ] hailort + hailort-pcie-driver dpkg state = installed"
+
+    if ! ldconfig -p 2>/dev/null | grep -q '\blibhailort\.so\b'; then
+        warn "  [FAIL] libhailort.so not in ldconfig cache"
+        warn "         fix: sudo ldconfig"
+        ok=0
+    else
+        log "  [ OK ] libhailort.so present in ldconfig cache"
+    fi
+
+    if [[ ! -e /dev/hailo0 ]]; then
+        warn "  [FAIL] /dev/hailo0 missing (packages installed but module not bound)"
+        warn "         fix: sudo modprobe hailo_pci  (or reboot if DKMS just built)"
         return 1
     fi
     log "  [ OK ] /dev/hailo0 present"
 
     if ! command -v hailortcli >/dev/null 2>&1; then
-        warn "  [FAIL] hailortcli not on PATH (hailort .deb missing)"
-        warn "         fix: install hailort_<ver>_amd64.deb from \$NEXUS_HAILO_DEB_DIR"
+        warn "  [FAIL] hailortcli not on PATH despite hailort=installed"
+        warn "         (corrupted package — try: sudo apt-get install --reinstall hailort)"
         ok=0
     elif ! hailortcli scan 2>/dev/null | grep -q 'Hailo Device'; then
         warn "  [FAIL] hailortcli scan does not list any Hailo Device"
@@ -1269,6 +1302,127 @@ _hailo_curl_deb() {
     return 0
 }
 
+# Install one HailoRT .deb, pre-answering its postinst's interactive
+# prompt. Hailo's postinst scripts use `set -eEuo pipefail` together
+# with `read -s -p ... -n 1 -t 10 reply || (( $? > 128 ))`, which has
+# a known unset-var bug: when stdin is closed (`</dev/null`) or the
+# 10s timeout fires with no input, `$reply` is never bound and the
+# next `case $reply in` aborts on `set -u`. The `_drivers_hailo_pcie`
+# call site used `</dev/null` for years and silently hit this bug
+# whenever apt's noninteractive frontend wasn't enough — which is
+# every time on HailoRT 4.23+.
+#
+# Fix: pipe a single-character answer plus newline. `read -n 1`
+# consumes one byte, `$reply` is bound, the `case` dispatches,
+# postinst exits 0.
+#
+# $1 = path to .deb
+# $2 = answer to feed (Y for pcie-driver "use DKMS?", n for runtime
+#      "activate hailort.service?")
+# $3 = human label for log lines
+_hailo_apt_install_with_answer() {
+    local deb="$1" answer="$2" label="$3"
+    if [[ ! -f "$deb" ]]; then
+        warn "$label .deb missing at $deb"
+        return 1
+    fi
+    log "installing $label (answer='$answer' to postinst prompt)"
+    if printf '%s\n' "$answer" \
+        | DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$deb"; then
+        return 0
+    fi
+    # apt-get failed. Most common cause: the postinst's read-timeout
+    # unset-var bug fired before our pipe reached it (apt buffers
+    # stdin oddly under some configurations), or the DKMS build
+    # itself failed. Try a direct dpkg --configure with the same
+    # answer — that bypasses apt's stdin handling.
+    warn "$label apt-get install returned non-zero; retrying via dpkg --configure"
+    local pkg
+    pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null)
+    if [[ -n "$pkg" ]] && printf '%s\n' "$answer" | dpkg --configure "$pkg" 2>&1; then
+        log "$label finished via dpkg --configure"
+        return 0
+    fi
+    warn "$label install failed after retry; package state may be 'iF'"
+    return 1
+}
+
+# Patch known kernel-API renames in the Hailo DKMS source tree, then
+# rebuild the module against the running kernel. Defense-in-depth for
+# operators with older HailoRT cached .debs (4.20–4.22 don't have the
+# `compact.h` shim that 4.23 ships). HailoRT 4.23 already handles
+# `del_timer_sync` → `timer_delete_sync` (kernel 6.15) internally; if
+# Hailo regresses or kernel adds another rename in 6.18+ we pick up
+# the same patch hook here.
+#
+# Returns 0 if a patch was applied (caller should retry dkms build),
+# 1 if no patches were needed.
+_hailo_dkms_compat_patch() {
+    # DKMS source dir from postinst — name varies across HailoRT
+    # versions: 4.18 used hailort-pcie-driver-<ver>, 4.20+ uses
+    # hailo_pci-<ver>, future versions could rename again. Glob both.
+    local src_dirs=()
+    local d
+    for d in /usr/src/hailo_pci-* /usr/src/hailort-pcie-driver* /usr/src/hailo1x_pci-*; do
+        [[ -d "$d" ]] && src_dirs+=("$d")
+    done
+    if (( ${#src_dirs[@]} == 0 )); then
+        return 1
+    fi
+
+    # Map of removed-symbol -> replacement, kernel that did the removal.
+    # Only adds: never remove a mapping (existing edge boxes pinned to
+    # old kernels still need it).
+    local -A renames=(
+        [del_timer_sync]=timer_delete_sync   # removed in 6.15
+        [del_timer]=timer_delete              # removed in 6.15
+    )
+
+    local patched=0 sym repl
+    for sym in "${!renames[@]}"; do
+        repl="${renames[$sym]}"
+        for d in "${src_dirs[@]}"; do
+            # Only patch if the old symbol actually appears (whole word)
+            # AND the new one isn't already there. Avoids re-patching.
+            if grep -rqE "\b${sym}\b" "$d" 2>/dev/null; then
+                log "  patching kernel-API rename: $sym -> $repl in $d"
+                find "$d" -type f \( -name '*.c' -o -name '*.h' \) -print0 \
+                    | xargs -0 sed -i "s/\b${sym}\b/${repl}/g" 2>/dev/null || true
+                patched=1
+            fi
+        done
+    done
+
+    (( patched )) || return 1
+
+    # Rebuild every DKMS module under the patched trees against the
+    # running kernel. dkms add is idempotent (we ignore the "already
+    # exists" failure) but we MUST `dkms remove --all` first so the
+    # cached prior-build artefact doesn't shadow our patched source.
+    local mod ver
+    for d in "${src_dirs[@]}"; do
+        if [[ -f "$d/dkms.conf" ]]; then
+            mod=$(awk -F'"' '/^PACKAGE_NAME=/ {print $2}' "$d/dkms.conf")
+            ver=$(awk -F'"' '/^PACKAGE_VERSION=/ {print $2}' "$d/dkms.conf")
+        else
+            # Fall back to dirname pattern: hailo_pci-4.23.0
+            local base; base=$(basename "$d")
+            mod="${base%-*}"
+            ver="${base##*-}"
+        fi
+        [[ -z "$mod" || -z "$ver" ]] && continue
+        log "  rebuilding $mod/$ver against $(uname -r) with patched source"
+        dkms remove -m "$mod" -v "$ver" --all 2>/dev/null || true
+        dkms add -m "$mod" -v "$ver" 2>/dev/null || true
+        if ! dkms build -m "$mod" -v "$ver" -k "$(uname -r)" 2>&1 | tail -3; then
+            warn "  dkms build of $mod/$ver still failed after patch"
+            return 1
+        fi
+        dkms install -m "$mod" -v "$ver" -k "$(uname -r)" 2>&1 | tail -3 || true
+    done
+    return 0
+}
+
 _drivers_hailo_pcie() {
     local hailo_local_dir="${NEXUS_HAILO_DEB_DIR:-/opt/nexus/vendor/hailo}"
     local rt_deb pcie_deb
@@ -1337,20 +1491,52 @@ _drivers_hailo_pcie() {
         }
 
     # Install pcie driver FIRST so the postinst dkms build sees the
-    # headers we just pulled. Then the runtime userspace. </dev/null
-    # is defense-in-depth on top of DEBIAN_FRONTEND=noninteractive:
-    # HailoRT 4.23's postinst still _displays_ "Do you wish to use
-    # DKMS? [Y/n]" and "activate hailort service? [y/N]" prompts,
-    # but with stdin closed the read returns EOF and both fall
-    # through to their (correct, for us) defaults. Without this an
-    # unattended re-run could block forever if a future HailoRT
-    # release stops honouring DEBIAN_FRONTEND.
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pcie_deb" </dev/null; then
-        warn "hailort-pcie-driver install failed; engine will fall back to CPU EP"
+    # headers we just pulled. Then the runtime userspace. We pipe an
+    # explicit one-character answer instead of using `</dev/null`
+    # because Hailo's postinsts use `set -u` together with a
+    # `read -t 10` that leaves $reply unbound on EOF/timeout — see
+    # _hailo_apt_install_with_answer for the full story.
+    #   pcie postinst : "Do you wish to use DKMS? [Y/n]"  -> Y
+    #   runtime postinst : "activate hailort.service? [y/N]" -> n
+    if ! _hailo_apt_install_with_answer "$pcie_deb" Y "hailort-pcie-driver"; then
+        # Most likely cause now is a kernel-API rename the HailoRT
+        # source predates (e.g. del_timer_sync removed in 6.15+).
+        # Try the compat patch in-place and re-finalise the postinst.
+        if _hailo_dkms_compat_patch; then
+            log "kernel-API patch applied; re-finalising hailort-pcie-driver"
+            if ! printf 'Y\n' | dpkg --configure hailort-pcie-driver 2>&1; then
+                warn "hailort-pcie-driver still failed after patch; engine will fall back to CPU EP"
+                return 0
+            fi
+        else
+            warn "hailort-pcie-driver install failed and no known kernel-API patch matched"
+            warn "  see /var/log/hailort-pcie-driver.deb.log and"
+            warn "  /var/lib/dkms/hailo_pci/*/build/make.log for details"
+            return 0
+        fi
+    fi
+    if ! _hailo_apt_install_with_answer "$rt_deb" n "hailort"; then
+        warn "hailort runtime install failed; engine will fall back to CPU EP"
+        warn "  see /var/log/hailort.deb.log for details"
         return 0
     fi
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$rt_deb" </dev/null; then
-        warn "hailort install failed; engine will fall back to CPU EP"
+
+    # Refresh ldconfig cache. Hailo's runtime postinst symlinks
+    # /usr/lib/libhailort.so but does NOT run ldconfig — and on a
+    # newly-installed package some loaders only see the .so via the
+    # cache. Cheap and idempotent.
+    ldconfig 2>/dev/null || true
+
+    # Confirm both packages landed in 'ii' state. Anything else
+    # (iF / iU / iH) means a postinst aborted half-way and the
+    # engine will hit a partial userspace at runtime.
+    local bad
+    bad=$(dpkg-query -W -f='${db:Status-Status} ${binary:Package}\n' \
+        hailort hailort-pcie-driver 2>/dev/null \
+        | awk '$1 != "installed" {print $2 "(" $1 ")"}' | xargs)
+    if [[ -n "$bad" ]]; then
+        warn "HailoRT packages not fully installed: $bad"
+        warn "  fix: re-run install.sh after resolving the postinst error"
         return 0
     fi
 
