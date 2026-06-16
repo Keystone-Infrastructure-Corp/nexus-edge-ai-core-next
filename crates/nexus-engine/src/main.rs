@@ -380,6 +380,18 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     cfg.inference.model =
         admin_runtime::resolve_persisted_inference_model(&store, &cfg.inference.model).await;
 
+    // Wedge Phase 5.6 follow-up — apply any operator-persisted
+    // re-ID master-switch override BEFORE the `if cfg.reid.enabled`
+    // branch below builds the extractor + sighting hook (the
+    // worker's ORT session is constructed once at boot) and BEFORE
+    // the `reid_config` snapshot is cloned onto `ApiState`. A
+    // persisted `engine_runtime_settings.reid_enabled` row (set via
+    // `PUT /v1/admin/reid/config` from the cloud console or local
+    // UI) wins over `nexus.toml`. See
+    // [`admin_runtime::resolve_persisted_reid_enabled`].
+    cfg.reid.enabled =
+        admin_runtime::resolve_persisted_reid_enabled(&store, cfg.reid.enabled).await;
+
     // First-boot admin: deferred to the UI's first-run-setup
     // form. When `auth.mode` permits local users AND the
     // `users` table is empty, we log a pointer to the UI and

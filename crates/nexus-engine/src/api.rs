@@ -325,6 +325,16 @@ pub fn router(state: ApiState) -> Router {
         // regardless of whether reid is enabled, so the UI can
         // render a clear "feature off" empty state.
         .route("/v1/admin/reid/status", get(get_admin_reid_status))
+        // Wedge Phase 5.6 follow-up — re-ID master-switch writer.
+        // Restart-required (the worker's ORT session is built once
+        // at boot); persists to `engine_runtime_settings.reid_enabled`
+        // and returns `{ restart_required: true }`. The cloud console
+        // reaches this via the generic `/admin/*` passthrough proxy,
+        // so a human-initiated enable carries a verified actor_token.
+        .route(
+            "/v1/admin/reid/config",
+            put(crate::admin_runtime::put_reid_config),
+        )
         // M2.2 closeout: core-next-native OAuth auth-code dance for
         // cloud cold backends. `start` and `status` are gated; the
         // `callback` route is registered outside the gate (the
@@ -4502,6 +4512,15 @@ struct ReidStatusResp {
     emit_interval_s: u64,
     min_track_age_frames: u32,
     cameras: Vec<ReidCameraStatusRow>,
+    /// `Some(desired)` when an operator-persisted `reid_enabled`
+    /// override differs from the live boot-time `enabled` value —
+    /// i.e. re-ID was toggled via `PUT /v1/admin/reid/config` and
+    /// the engine hasn't restarted yet. `None` when the persisted
+    /// value matches the live state (or no override exists).
+    pending_enabled: Option<bool>,
+    /// Convenience mirror of `pending_enabled.is_some()` so the UI
+    /// can render a "pending restart" banner without re-deriving it.
+    restart_required: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -4531,6 +4550,20 @@ async fn get_admin_reid_status(State(s): State<ApiState>) -> Json<ReidStatusResp
             last_embedding_hex8: row.last_embedding_hex8,
         })
         .collect();
+    // Pending-restart marker: a persisted `reid_enabled` row that
+    // differs from the live (boot-time) snapshot means the operator
+    // toggled re-ID via `PUT /v1/admin/reid/config` and an engine
+    // restart is needed to apply it. Mirrors the watermark/inference
+    // `pending` computation in `admin_runtime`.
+    let pending_enabled = s
+        .store
+        .read_runtime_setting(crate::admin_runtime::KEY_REID_ENABLED)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<bool>().ok())
+        .filter(|p| *p != cfg.enabled);
     Json(ReidStatusResp {
         enabled: cfg.enabled,
         model_id: cfg.model_id.clone(),
@@ -4538,6 +4571,8 @@ async fn get_admin_reid_status(State(s): State<ApiState>) -> Json<ReidStatusResp
         emit_interval_s: cfg.emit_interval_s,
         min_track_age_frames: cfg.min_track_age_frames,
         cameras,
+        restart_required: pending_enabled.is_some(),
+        pending_enabled,
     })
 }
 
@@ -5948,6 +5983,95 @@ mod tests {
         req.extensions_mut().insert(ConnectInfo(remote_peer()));
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Wedge Phase 5.6 — `PUT /v1/admin/reid/config` persists the
+    /// requested master-switch flag to `engine_runtime_settings`,
+    /// returns `{ restart_required: true }`, and the status endpoint
+    /// then reports the pending toggle until the engine restarts.
+    /// The boot-time `reid_config` snapshot stays `enabled = false`
+    /// (the harness uses a defaulted `ReidConfig`), so this exercises
+    /// the exact "operator flipped it on, restart pending" state the
+    /// cloud UI renders — plus the boot resolver that folds the
+    /// persisted row over `nexus.toml` in both directions.
+    #[tokio::test]
+    async fn reid_config_put_persists_and_reports_pending() {
+        use axum::body::to_bytes;
+        const ADMIN_SECRET: &[u8] = b"reid-config-put-secret-abc";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        let token = sign_admin_jwt(ADMIN_SECRET);
+
+        // Enable re-ID.
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/reid/config")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({ "enabled": true }).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp["current_enabled"], serde_json::json!(false));
+        assert_eq!(resp["pending_enabled"], serde_json::json!(true));
+        assert_eq!(resp["restart_required"], serde_json::json!(true));
+
+        // Persisted to engine_runtime_settings as the literal "true".
+        let persisted = store
+            .read_runtime_setting(crate::admin_runtime::KEY_REID_ENABLED)
+            .await
+            .unwrap();
+        assert_eq!(persisted, Some(Some("true".to_string())));
+
+        // The boot resolver folds the persisted row over the TOML
+        // value: a defaulted (false) TOML flag now resolves to true.
+        let resolved = crate::admin_runtime::resolve_persisted_reid_enabled(&store, false).await;
+        assert!(resolved);
+
+        // Status endpoint reflects the pending toggle: the live
+        // snapshot is still false (no restart yet) but the override
+        // is surfaced so the UI can show a restart banner.
+        let mut sreq = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/reid/status")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        sreq.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let sres = app.clone().oneshot(sreq).await.unwrap();
+        assert_eq!(sres.status(), StatusCode::OK);
+        let sbytes = to_bytes(sres.into_body(), usize::MAX).await.unwrap();
+        let sresp: serde_json::Value = serde_json::from_slice(&sbytes).unwrap();
+        assert_eq!(sresp["enabled"], serde_json::json!(false));
+        assert_eq!(sresp["pending_enabled"], serde_json::json!(true));
+        assert_eq!(sresp["restart_required"], serde_json::json!(true));
+
+        // Flip back off: persisted "false" now overrides even a
+        // TOML-enabled deployment.
+        let mut req2 = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/reid/config")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({ "enabled": false }).to_string(),
+            ))
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let persisted2 = store
+            .read_runtime_setting(crate::admin_runtime::KEY_REID_ENABLED)
+            .await
+            .unwrap();
+        assert_eq!(persisted2, Some(Some("false".to_string())));
+        // TOML says enabled=true, but the persisted "false" wins.
+        let resolved_off = crate::admin_runtime::resolve_persisted_reid_enabled(&store, true).await;
+        assert!(!resolved_off);
     }
 
     /// The critical at-rest test: PUT a cloud backend with a
