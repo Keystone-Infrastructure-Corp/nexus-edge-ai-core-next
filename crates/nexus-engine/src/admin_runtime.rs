@@ -1905,6 +1905,154 @@ pub async fn get_server_all(
     }))
 }
 
+// ===========================================================
+// Section 10 — Re-ID master switch (Wedge Phase 5.6 follow-up)
+// ===========================================================
+//
+// `PUT /v1/admin/reid/config` flips the cross-camera re-ID
+// worker on or off. The live + pending state is surfaced by the
+// existing `GET /v1/admin/reid/status` handler in `api.rs`
+// (it reads [`KEY_REID_ENABLED`] to compute the pending-restart
+// marker); this section owns the writer plus the boot-time
+// resolver `main.rs` calls before constructing the worker.
+//
+// Enabling re-ID is restart-required: the worker builds its ORT
+// session (DINOv2-S appearance extractor) once at boot and is not
+// rebuilt per-frame. So the PUT persists the requested flag to
+// `engine_runtime_settings.reid_enabled`, audit-logs, and returns
+// `{ restart_required: true }`; the operator then hits
+// `POST /v1/admin/server/restart` to apply it. Boot folds the
+// persisted flag over `nexus.toml`'s `[reid] enabled` via
+// [`resolve_persisted_reid_enabled`].
+//
+// Scope note (WEDGE_PLAN invariant): this toggle flips the master
+// switch ONLY. The model stays the bundled DINOv2-S appearance
+// extractor — `build_reid_extractor` in `main.rs` auto-resolves the
+// release-staged `share/models/dinov2_s_224.onnx` when `model_path`
+// is unset — and never selects a face-recognition model. Per-model
+// and emit-cadence knobs remain `nexus.toml`-only for now.
+
+/// Operator-persisted re-ID master switch. A present row wins over
+/// `nexus.toml`'s `[reid] enabled`. Stored as the literal string
+/// `"true"` / `"false"`. `pub(crate)` so the status handler in
+/// `api.rs` can read it to compute the pending-restart marker.
+pub(crate) const KEY_REID_ENABLED: &str = "reid_enabled";
+
+#[derive(Debug, Deserialize)]
+pub struct PutReidConfigReq {
+    /// Desired master-switch state. `true` turns the cross-camera
+    /// re-ID worker on at next restart; `false` turns it off.
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PutReidConfigOut {
+    /// The live (boot-time) enabled state — what the worker is
+    /// doing right now, before the restart.
+    pub current_enabled: bool,
+    /// The persisted state that takes effect at next restart.
+    pub pending_enabled: bool,
+    pub restart_required: bool,
+}
+
+pub async fn put_reid_config(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    admin: AdminContext,
+    Json(req): Json<PutReidConfigReq>,
+) -> Result<Json<PutReidConfigOut>, ApiError> {
+    let current_enabled = s.reid_config.enabled;
+    let new_enabled = req.enabled;
+
+    let before_str = serde_json::to_string(&serde_json::json!({ "enabled": current_enabled })).ok();
+    let after_str = serde_json::to_string(&serde_json::json!({ "enabled": new_enabled })).ok();
+    let value = if new_enabled { "true" } else { "false" };
+
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store
+            .write_runtime_setting_tx(&mut tx, KEY_REID_ENABLED, Some(value))
+            .await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            Some(&admin.0),
+            &headers,
+            peer.ip(),
+            "reid.config.put",
+            "admin/reid/config",
+            Some("singleton"),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
+        .await?;
+        Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = tx_res {
+        return Err(ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist failed: {e}"),
+        ));
+    }
+
+    tracing::warn!(
+        current_enabled,
+        new_enabled,
+        "admin set re-ID enabled flag; restart required to apply",
+    );
+
+    Ok(Json(PutReidConfigOut {
+        current_enabled,
+        pending_enabled: new_enabled,
+        restart_required: true,
+    }))
+}
+
+/// Resolve the boot-time effective `[reid] enabled` flag: a
+/// persisted row in `engine_runtime_settings.reid_enabled` wins
+/// over `nexus.toml`. Mirrors [`resolve_persisted_watermarks`] —
+/// an unparseable persisted value falls back to the TOML flag with
+/// a `warn!`. Called from `main.rs` BEFORE the re-ID worker is
+/// constructed and BEFORE the `reid_config` snapshot is cloned
+/// onto `ApiState`.
+pub async fn resolve_persisted_reid_enabled(store: &Store, toml_enabled: bool) -> bool {
+    match store.read_runtime_setting(KEY_REID_ENABLED).await {
+        Ok(Some(Some(raw))) => match raw.trim().parse::<bool>() {
+            Ok(persisted) => {
+                if persisted != toml_enabled {
+                    tracing::warn!(
+                        persisted,
+                        toml_enabled,
+                        "applying operator-persisted [reid] enabled from engine_runtime_settings (overrides nexus.toml)",
+                    );
+                }
+                persisted
+            }
+            Err(e) => {
+                tracing::warn!(
+                    raw = %raw,
+                    error = %e,
+                    "engine_runtime_settings.reid_enabled failed to parse as bool; falling back to nexus.toml",
+                );
+                toml_enabled
+            }
+        },
+        Ok(Some(None)) => {
+            tracing::debug!("reid_enabled present but NULL; using nexus.toml");
+            toml_enabled
+        }
+        Ok(None) => toml_enabled,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read reid_enabled from engine_runtime_settings; using nexus.toml");
+            toml_enabled
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1923,6 +2071,26 @@ mod tests {
 
         let reset: UiBindUpdate = serde_json::from_str(r#"{"action":"reset"}"#).unwrap();
         assert!(matches!(reset, UiBindUpdate::Reset));
+    }
+
+    #[test]
+    fn reid_config_req_out_json_shapes() {
+        // Request: a bare `{ "enabled": bool }` — the cloud UI's
+        // typed client posts exactly this.
+        let req: PutReidConfigReq = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(req.enabled);
+
+        // Response: the three fields the UI reads to render the
+        // pending-restart affordance.
+        let out = PutReidConfigOut {
+            current_enabled: false,
+            pending_enabled: true,
+            restart_required: true,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["current_enabled"], serde_json::json!(false));
+        assert_eq!(v["pending_enabled"], serde_json::json!(true));
+        assert_eq!(v["restart_required"], serde_json::json!(true));
     }
 
     #[test]
