@@ -153,6 +153,17 @@ fn warn_openvino_unavailable_once() {
 /// or containerized as a per-tier bundle, so device-node visibility is the
 /// check that depends on the host container configuration.
 ///
+/// Unlike the OpenVINO probe, this one verifies the device nodes are actually
+/// **openable**, not merely present. ORT silently skips an OpenVINO EP that
+/// fails to attach, but the ROCm provider's device probe
+/// (`hipGetDeviceProperties`) throws an *uncaught* C++ exception and aborts
+/// the whole engine process when it cannot open `/dev/kfd` — e.g. the node
+/// exists but the engine user isn't in the `render` group. There is no
+/// silent EP-skip to fall back on, so we must not register the ROCm EP at
+/// all in that case. Probing with a real `open()` (matching what HIP does
+/// internally) means a permission failure degrades to the CPU EP instead of
+/// crashing the engine.
+///
 /// Result is cached for the process lifetime.
 ///
 /// **Override:** set `NEXUS_ROCM_DEVICE=force` to force-true (for testing)
@@ -171,9 +182,20 @@ pub fn rocm_runtime_available() -> bool {
     use std::sync::OnceLock;
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        let kfd = std::path::Path::new("/dev/kfd").exists();
-        let render = std::path::Path::new("/dev/dri/renderD128").exists()
-            || std::path::Path::new("/dev/dri/renderD129").exists();
+        // Probe with an actual open() (read+write, as HIP opens the KFD).
+        // The standard nodes are `crw-rw---- root render`, so a process in
+        // the render group opens them and a non-member gets EACCES — which
+        // is exactly the abort-vs-fallback distinction we need to make
+        // before registering the EP.
+        let openable = |p: &str| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p)
+                .is_ok()
+        };
+        let kfd = openable("/dev/kfd");
+        let render = openable("/dev/dri/renderD128") || openable("/dev/dri/renderD129");
         kfd && render
     })
 }
