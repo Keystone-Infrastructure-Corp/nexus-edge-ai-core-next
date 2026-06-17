@@ -110,7 +110,11 @@ impl YoloOrtDetector {
         let (eps, ep_names) = execution_providers::selected_for_priority(ep_priority);
         let session = Session::builder()
             .map_err(|e| InferenceError::ModelLoad(format!("session builder: {e}")))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
+            // ORT_ENABLE_ALL (99) — valid on every ONNX Runtime ABI.
+            // NOT `Level3`: in ort 2.0-rc that maps to ORT_ENABLE_LAYOUT (3),
+            // a level introduced in ONNX Runtime 1.22 that the ROCm 1.21
+            // runtime rejects with "graph_optimization_level is not valid".
+            .with_optimization_level(GraphOptimizationLevel::All)
             .map_err(|e| InferenceError::ModelLoad(format!("opt level: {e}")))?
             .with_execution_providers(eps)
             .map_err(|e| InferenceError::ModelLoad(format!("EP register: {e}")))?

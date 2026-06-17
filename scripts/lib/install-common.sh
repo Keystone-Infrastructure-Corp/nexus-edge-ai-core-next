@@ -434,6 +434,9 @@ install_drivers() {
         # ROCm compute for inference (if ep_priority includes "rocm").
         # Gracefully skips if amdgpu module is not yet bound.
         _drivers_amd_rocm
+        # Fetch a ROCm-capable ONNX Runtime (1.21.0) and wire the engine
+        # to load it. No-op when /dev/kfd / rocminfo are absent.
+        _install_ort_rocm
     fi
 
     if (( has_hailo )); then
@@ -1150,6 +1153,33 @@ _drivers_amd_graphics() {
 # Installs from the official AMD ROCm PPA (Ubuntu 24.04, 22.04).
 # Adds rocminfo, rocm-smi, hip-runtime-amd, hip-dev, rocm-libs,
 # migraphx, migraphx-dev, libamd-comgr-dev (headers for custom kernels).
+
+# Resolve the rocminfo binary. ROCm installs it under /opt/rocm*/bin,
+# which is NOT on the default PATH (no profile.d entry on a minimal
+# server). Falls back to PATH for distros that do symlink it. Echoes
+# the absolute path on success; empty + return 1 when not found.
+_rocminfo_bin() {
+    local p
+    for p in /opt/rocm/bin/rocminfo /opt/rocm-*/bin/rocminfo; do
+        [[ -x "$p" ]] && { echo "$p"; return 0; }
+    done
+    if command -v rocminfo >/dev/null 2>&1; then
+        command -v rocminfo; return 0
+    fi
+    return 1
+}
+
+# True (0) when a usable ROCm GPU agent is present. Runs rocminfo with
+# HSA_OVERRIDE_GFX_VERSION set (gfx1035 Phoenix iGPUs report no agent
+# without it) and greps for a gfx target. Caller must be able to open
+# /dev/kfd (root during install, or a render-group member at runtime).
+_rocm_gpu_present() {
+    local rocminfo
+    rocminfo="$(_rocminfo_bin)" || return 1
+    HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-10.3.0}" \
+        "$rocminfo" 2>/dev/null | grep -q 'gfx[0-9]'
+}
+
 _drivers_amd_rocm() {
     # Quick check: if /dev/kfd + /dev/dri/renderD128 are missing,
     # the amdgpu module is not bound yet. Defer gracefully.
@@ -1164,61 +1194,96 @@ _drivers_amd_rocm() {
         return 0
     fi
 
-    # Check if rocminfo is already installed + working.
-    if command -v rocminfo >/dev/null 2>&1 \
-        && rocminfo 2>/dev/null | grep -q 'gfx'; then
+    # Check if rocminfo is already installed + working (locate it under
+    # /opt/rocm/bin, not just PATH; set HSA_OVERRIDE for gfx1035).
+    if _rocminfo_bin >/dev/null && _rocm_gpu_present; then
         log "AMD ROCm already installed (rocminfo confirmed)"
         return 0
     fi
 
     log "installing AMD ROCm compute drivers (HIP, MIGraphX, rocminfo)"
 
-    # Add AMD ROCm PPA (Ubuntu 24.04 + 22.04 support).
-    # The PPA signing key is versioned; this uses the current key ID.
-    if ! grep -q "amdgpu.gpuopen.com" /etc/apt/sources.list.d/* 2>/dev/null; then
-        # Key ID from AMD's official docs (rocm.docs.amd.com).
-        local rocm_key="https://repo.radeon.com/rocm/rocm.gpg.key"
-        local rocm_ppa="deb [signed-by=/usr/share/keyrings/rocm-apt-keyring.gpg] https://repo.radeon.com/amdgpu/ubuntu jammy main"
-        
-        if ! curl -sS "$rocm_key" | gpg --dearmor -o /usr/share/keyrings/rocm-apt-keyring.gpg 2>/dev/null; then
+    # ROCm userspace (rocminfo, hip-runtime, rocm-libs) lives in AMD's
+    # `rocm/apt/<ver>` repo — NOT the `amdgpu/` repo (that one only carries
+    # the amdgpu-dkms kernel driver, which we don't need: the in-kernel
+    # amdgpu is already bound, proven by /dev/kfd existing). The repo
+    # codename MUST match the host release (noble=24.04, jammy=22.04); a
+    # mismatched codename silently yields a repo with none of the packages.
+    local rocm_apt_ver="${NEXUS_ROCM_APT_VERSION:-6.4.4}"
+    local ubuntu_codename
+    ubuntu_codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")"
+
+    local rocm_keyring="/usr/share/keyrings/rocm-apt-keyring.gpg"
+    local rocm_repo="deb [arch=amd64 signed-by=${rocm_keyring}] https://repo.radeon.com/rocm/apt/${rocm_apt_ver} ${ubuntu_codename} main"
+
+    # Ensure the signing key exists (older amdgpu-install runs may have
+    # left a stale rocm.list pointing at a different keyring path; we own
+    # our own keyring so apt can always verify our repo line).
+    if [[ ! -s "$rocm_keyring" ]]; then
+        if ! curl -sS https://repo.radeon.com/rocm/rocm.gpg.key \
+                | gpg --dearmor -o "$rocm_keyring" 2>/dev/null; then
             warn "AMD ROCm: could not fetch signing key from repo.radeon.com; skipping ROCm install"
             return 0
         fi
-        
-        printf '%s\n' "$rocm_ppa" | tee /etc/apt/sources.list.d/rocm.list >/dev/null || true
-        apt-get update -qq || true
     fi
 
-    # Install ROCm userspace + HIP dev + MIGraphX + libs.
-    # Intentionally do NOT install rocm-hip-sdk or rocm-language-runtime
-    # (they pull in heavy compilers). We only need the runtime + libs.
+    # Idempotent but self-healing: only (re)write rocm.list when our EXACT
+    # desired line isn't already the sole content. This deliberately
+    # OVERWRITES any stale entry (e.g. an old `rocm/apt/6.1 ubuntu main`
+    # that an earlier amdgpu-install left behind, which would otherwise
+    # shadow the correct repo and make every package "unavailable").
+    if [[ "$(cat /etc/apt/sources.list.d/rocm.list 2>/dev/null)" != "$rocm_repo" ]]; then
+        printf '%s\n' "$rocm_repo" > /etc/apt/sources.list.d/rocm.list
+
+        # Pin the ROCm repo above the Ubuntu archive so apt prefers AMD's
+        # builds of any overlapping packages (per AMD's install guide).
+        cat > /etc/apt/preferences.d/rocm-pin-600 <<'PIN'
+Package: *
+Pin: release o=repo.radeon.com
+Pin-Priority: 600
+PIN
+    fi
+
+    apt-get update -qq || true
+
+    # Install ROCm userspace + HIP runtime + libs. Intentionally do NOT
+    # install rocm-hip-sdk / rocm-language-runtime (heavy compilers) — the
+    # engine only needs the runtime + libs to dlopen the ROCm ORT provider.
     local rocm_pkgs=(
         rocminfo                     # GPU enumeration + gfx version probe
-        rocm-smi                      # monitor GPU utilization + temps
-        hip-runtime-amd               # HIP runtime (required by MIGraphX)
-        hip-dev                       # HIP headers (optional, for custom code)
-        rocm-libs                     # core ROCm libraries
-        migraphx                      # ONNX model inference library
-        migraphx-dev                  # MIGraphX headers (optional)
-        libamd-comgr-dev              # code object generation (optional)
+        rocm-smi-lib                  # GPU utilization + temps (rocm-smi tool)
+        hip-runtime-amd               # HIP runtime (libamdhip64.so)
+        rocm-libs                     # core ROCm libraries (rocBLAS, MIOpen, …)
     )
 
+    # Capture apt output so a failure surfaces the real reason instead of
+    # the silent "package install failed" that hid a broken repo for a
+    # whole debugging session.
+    local apt_log
+    apt_log="$(mktemp -t nexus-rocm-apt.XXXXXX)"
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            "${rocm_pkgs[@]}" 2>/dev/null; then
-        warn "AMD ROCm package install failed; engine will fall back to CPU EP"
+            "${rocm_pkgs[@]}" >"$apt_log" 2>&1; then
+        warn "AMD ROCm package install failed; engine will fall back to CPU EP. apt said:"
+        tail -n 15 "$apt_log" | while IFS= read -r line; do warn "  $line"; done
+        rm -f "$apt_log"
         return 0
     fi
+    rm -f "$apt_log"
 
-    # Verify installation: rocminfo should show at least one gfx* device.
-    if rocminfo 2>/dev/null | grep -q 'gfx'; then
-        log "AMD ROCm installed and GPU detected via rocminfo"
-        # Optional: show the detected GPU for operator feedback.
-        local gfx_name
-        gfx_name=$(rocminfo 2>/dev/null | grep -o 'gfx[0-9]*' | head -1)
-        [[ -n "$gfx_name" ]] && log "  Detected GPU: $gfx_name"
+    # Verify installation: rocminfo (with HSA_OVERRIDE for gfx1035) should
+    # show at least one gfx* device. rocminfo lives under /opt/rocm/bin.
+    if _rocm_gpu_present; then
+        local rocminfo gfx_name
+        rocminfo="$(_rocminfo_bin)"
+        gfx_name=$(HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-10.3.0}" \
+            "$rocminfo" 2>/dev/null | grep -o 'gfx[0-9]*' | head -1)
+        log "AMD ROCm installed and GPU detected via rocminfo${gfx_name:+ ($gfx_name)}"
     else
-        warn "AMD ROCm installed but rocminfo did not detect any GPU;"
-        warn "this may be normal on iGPUs (gfx1035 requires HSA_OVERRIDE at runtime)."
+        warn "AMD ROCm installed but rocminfo did not detect a GPU agent."
+        warn "This is benign at install time if the running user is not in the"
+        warn "'render' group (root sees it; the nexus service user is added to"
+        warn "'render' by ensure_accelerator_groups). gfx1035 iGPUs additionally"
+        warn "require HSA_OVERRIDE_GFX_VERSION=10.3.0, set in the systemd unit."
     fi
 
     # Verify /dev/kfd accessibility for the service user.
@@ -1229,6 +1294,227 @@ _drivers_amd_rocm() {
     else
         warn "/dev/kfd not accessible yet — will be gated by ensure_accelerator_groups"
     fi
+}
+
+# Fetch a ROCm-capable ONNX Runtime and wire the engine to load it.
+#
+# WHY this is a separate download (not bundled in the release tarball):
+#   * The release tarball ships libonnxruntime.so.1.24.1 built with the
+#     OpenVINO provider (Intel CPU/GPU/NPU). That build has NO ROCm EP.
+#   * The newest prebuilt ONNX Runtime with a ROCm execution provider is
+#     1.21.0, published by AMD at repo.radeon.com (~179 MB wheel; PyPI's
+#     onnxruntime-rocm tops out at 1.22.2). Microsoft does not ship a
+#     ROCm build on their mainline.
+#   * The engine binary is compiled against the ort `api-21` feature
+#     (see root Cargo.toml) precisely so ONE binary can dlopen BOTH the
+#     1.24.1 OpenVINO .so (ABI 24 ≥ 21) AND this 1.21.0 ROCm .so
+#     (ABI 21 == 21). GetApi(21) is satisfied by both runtimes.
+#
+# Layout: the ROCm runtime lands in a release-independent vendor dir
+# (`/opt/nexus/vendor/onnxruntime-rocm`, mirroring the hailo vendor dir)
+# so it survives `current` symlink flips on upgrade. A systemd drop-in
+# (`10-ort-rocm.conf`) repoints ORT_DYLIB_PATH + LD_LIBRARY_PATH at it,
+# so on an AMD box the engine loads the ROCm runtime instead of the
+# bundled OpenVINO one. The ROCm runtime also carries a CPU EP, so the
+# ["rocm","cpu"] fallback chain still works through the same .so.
+#
+# Idempotent: a version marker file short-circuits re-download. Curl /
+# extract failures are warn-and-continue — the engine still installs and
+# runs on the bundled OpenVINO/CPU runtime (just without GPU on AMD).
+_install_ort_rocm() {
+    # Only meaningful when ROCm compute is actually present. _drivers_amd_rocm
+    # runs first; if /dev/kfd is absent (no GPU) or the ROCm runtime never
+    # installed (no libamdhip64.so under /opt/rocm*/lib), there is nothing
+    # for the ROCm ONNX Runtime provider to bind to. NOTE: do NOT gate on
+    # `command -v rocminfo` here — ROCm installs rocminfo to /opt/rocm/bin,
+    # which is not on PATH, so that check spuriously skipped the whole step.
+    if [[ ! -c /dev/kfd ]]; then
+        return 0
+    fi
+    if ! compgen -G "/opt/rocm*/lib/libamdhip64.so*" >/dev/null; then
+        warn "ROCm runtime (libamdhip64.so) not found under /opt/rocm*/lib;"
+        warn "skipping ROCm ONNX Runtime fetch (engine uses OpenVINO/CPU runtime)."
+        return 0
+    fi
+
+    local ort_ver="1.21.0"
+    local rocm_rel="6.4.4"          # repo.radeon.com directory carrying the 1.21.0 wheels
+    local vendor_dir="${NEXUS_ORT_ROCM_DIR:-/opt/nexus/vendor/onnxruntime-rocm}"
+    local marker="$vendor_dir/.nexus-ort-rocm-version"
+
+    # Idempotent short-circuit: already installed at the target version.
+    if [[ -f "$marker" ]] && grep -qx "$ort_ver" "$marker" 2>/dev/null \
+        && [[ -e "$vendor_dir/libonnxruntime.so" ]]; then
+        log "ROCm ONNX Runtime $ort_ver already installed ($vendor_dir)"
+        # Re-resolve provider deps in case a prior install predated the
+        # dep-linking step or ROCm libs were upgraded under it.
+        _ort_rocm_link_missing_deps "$vendor_dir"
+        _ort_rocm_write_dropin "$vendor_dir"
+        return 0
+    fi
+
+    log "installing ROCm ONNX Runtime $ort_ver (provider for AMD Radeon inference)"
+
+    local base="https://repo.radeon.com/rocm/manylinux/rocm-rel-${rocm_rel}"
+    local mlx="manylinux_2_27_x86_64.manylinux_2_28_x86_64"
+    # The wheel is just a zip; the bundled libonnxruntime.so is identical
+    # across cp tags (the C API .so is not Python-version-specific). Try
+    # cp312 (Ubuntu 24.04 default) first, then cp310 (22.04), then cp39.
+    local cp_tags=(cp312 cp310 cp39)
+
+    local tmpdir
+    tmpdir="$(mktemp -d -t nexus-ort-rocm.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+
+    local whl="" tag
+    for tag in "${cp_tags[@]}"; do
+        local fn="onnxruntime_rocm-${ort_ver}-${tag}-${tag}-${mlx}.whl"
+        log "  fetching $fn (~179 MB)…"
+        if curl -fsSL "${base}/${fn}" -o "$tmpdir/ort.whl"; then
+            whl="$tmpdir/ort.whl"
+            break
+        fi
+        warn "  $fn not available; trying next cp tag"
+    done
+
+    if [[ -z "$whl" ]]; then
+        warn "ROCm ONNX Runtime download failed (all cp tags); engine will use"
+        warn "the bundled OpenVINO/CPU runtime — AMD GPU inference disabled."
+        return 0
+    fi
+
+    # Wheels are zip archives. The runtime + provider .so files live under
+    # onnxruntime/capi/. Need unzip (apt: unzip) — install if missing.
+    if ! command -v unzip >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip >/dev/null 2>&1 || {
+            warn "unzip unavailable and install failed; cannot unpack ROCm ORT wheel"
+            return 0
+        }
+    fi
+
+    if ! unzip -q -o "$whl" 'onnxruntime/capi/*' -d "$tmpdir/extract"; then
+        warn "ROCm ORT wheel extract failed; AMD GPU inference disabled"
+        return 0
+    fi
+
+    local capi="$tmpdir/extract/onnxruntime/capi"
+    if [[ ! -e "$capi/libonnxruntime.so" ]] \
+        && ! compgen -G "$capi/libonnxruntime.so*" >/dev/null; then
+        warn "ROCm ORT wheel layout unexpected (no libonnxruntime.so under capi/)"
+        return 0
+    fi
+
+    # Stage into the vendor dir. Ship the versioned runtime + the
+    # provider .so siblings ONNX Runtime dlopens at session-create time
+    # (onnxruntime_providers_shared.so, onnxruntime_providers_rocm.so).
+    install -d -m 0755 "$vendor_dir"
+    cp -a "$capi"/libonnxruntime*.so* "$vendor_dir"/ 2>/dev/null || true
+    cp -a "$capi"/libonnxruntime_providers_*.so* "$vendor_dir"/ 2>/dev/null || true
+
+    # The ort crate dlopens the unversioned soname `libonnxruntime.so`.
+    # The wheel ships it as libonnxruntime.so.<ver>; create the symlink.
+    if [[ ! -e "$vendor_dir/libonnxruntime.so" ]]; then
+        local versioned
+        versioned="$(cd "$vendor_dir" && ls libonnxruntime.so.* 2>/dev/null | head -1)"
+        if [[ -n "$versioned" ]]; then
+            ln -sf "$versioned" "$vendor_dir/libonnxruntime.so"
+        fi
+    fi
+
+    if [[ ! -e "$vendor_dir/libonnxruntime.so" ]]; then
+        warn "ROCm ORT staged but libonnxruntime.so symlink missing; AMD GPU disabled"
+        return 0
+    fi
+
+    # auditwheel mangles a handful of the provider's ROCm dependencies to
+    # hash-suffixed sonames (e.g. librocm_smi64-a53a9aba.so.7.7.60404) but
+    # does NOT bundle the .so itself into the capi/ dir — it expects the
+    # matching system lib from the rocm-smi-lib / rocm-libs packages we
+    # already install in `_drivers_amd_rocm`. ORT's provider loader matches
+    # DT_NEEDED by exact filename string, so the version-suffixed system lib
+    # under /opt/rocm/lib won't satisfy the hashed name. Bridge every still-
+    # missing ROCm dependency to its system twin by symlinking the exact
+    # name the provider asks for. Without this the provider .so fails to
+    # dlopen, ORT silently drops the ROCm EP, and inference runs on CPU.
+    _ort_rocm_link_missing_deps "$vendor_dir"
+
+    printf '%s\n' "$ort_ver" > "$marker"
+    log "ROCm ONNX Runtime $ort_ver staged at $vendor_dir"
+
+    _ort_rocm_write_dropin "$vendor_dir"
+}
+
+# Resolve the ROCm provider's unsatisfied DT_NEEDED entries (auditwheel
+# hash-named ROCm libs) to the matching system libraries under
+# /opt/rocm/lib, by creating a symlink with the EXACT name the loader
+# asks for. Idempotent. Only touches names that resolve to a real system
+# lib whose un-hashed stem + version suffix match — never fabricates a lib.
+_ort_rocm_link_missing_deps() {
+    local vendor_dir="$1"
+    local provider="$vendor_dir/libonnxruntime_providers_rocm.so"
+    local rocm_lib="${NEXUS_ROCM_LIB_DIR:-/opt/rocm/lib}"
+    [[ -e "$provider" ]] || return 0
+    [[ -d "$rocm_lib" ]] || return 0
+
+    local missing stem sys
+    # `ldd` prints "<soname> => not found" for every unresolved dep when
+    # the vendor + rocm dirs are on the search path.
+    while read -r missing; do
+        [[ -n "$missing" ]] || continue
+        # Already satisfied (e.g. a prior install run)? skip.
+        [[ -e "$vendor_dir/$missing" ]] && continue
+        # Strip auditwheel's "-<8 hex>" hash that sits between the lib
+        # stem and the ".so" suffix: librocm_smi64-a53a9aba.so.7.7.60404
+        # -> librocm_smi64.so.7.7.60404
+        stem="$(printf '%s' "$missing" | sed -E 's/-[0-9a-f]{6,}\.so/.so/')"
+        if [[ -e "$rocm_lib/$stem" ]]; then
+            ln -sfn "$rocm_lib/$stem" "$vendor_dir/$missing"
+            log "ROCm ORT: linked provider dep $missing -> $rocm_lib/$stem"
+        else
+            warn "ROCm ORT: provider needs $missing but no system match at $rocm_lib/$stem"
+        fi
+    done < <(LD_LIBRARY_PATH="$vendor_dir:$rocm_lib" ldd "$provider" 2>/dev/null \
+        | awk '/not found/ {print $1}')
+}
+
+# Write the systemd drop-in that repoints the engine's ORT loader at the
+# ROCm runtime. Kept separate so the idempotent path can refresh it even
+# when the .so is already present. The drop-in lives alongside the unit
+# at /etc/systemd/system/nexus-engine.service.d/ and only OVERRIDES the
+# two ORT env vars — everything else in the base unit (HSA_OVERRIDE,
+# DeviceAllow, SupplementaryGroups) still applies.
+_ort_rocm_write_dropin() {
+    local vendor_dir="$1"
+    local dropin_dir="/etc/systemd/system/nexus-engine.service.d"
+    local dropin="$dropin_dir/10-ort-rocm.conf"
+
+    # /opt/rocm/lib carries libamdhip64.so + the rocBLAS/MIOpen libs the
+    # ROCm provider links against; the vendor dir carries libonnxruntime.so
+    # and its provider siblings. Both must be on LD_LIBRARY_PATH.
+    local rocm_lib="/opt/rocm/lib"
+    [[ -d "$rocm_lib" ]] || rocm_lib="$(ls -d /opt/rocm*/lib 2>/dev/null | head -1)"
+    [[ -n "$rocm_lib" ]] || rocm_lib="/opt/rocm/lib"
+
+    install -d -m 0755 "$dropin_dir"
+    cat > "$dropin" <<EOF
+# Auto-generated by nexus install.sh (_install_ort_rocm). Repoints the
+# ONNX Runtime loader at the ROCm-capable runtime fetched from AMD's
+# repo.radeon.com (onnxruntime_rocm). The engine binary is built against
+# ort api-21 so this 1.21.0 runtime loads cleanly. Overrides only the two
+# ORT env vars from the base unit; HSA_OVERRIDE_GFX_VERSION etc. still apply.
+#
+# Remove this file (and 'systemctl daemon-reload && systemctl restart
+# nexus-engine') to fall back to the bundled OpenVINO/CPU runtime.
+[Service]
+Environment=ORT_DYLIB_PATH=${vendor_dir}/libonnxruntime.so
+Environment=LD_LIBRARY_PATH=${vendor_dir}:${rocm_lib}
+EOF
+
+    log "wrote systemd drop-in $dropin (ORT_DYLIB_PATH -> ROCm runtime)"
+    # daemon-reload so the override takes effect on next restart. install.sh
+    # restarts the engine after install_drivers, so no explicit restart here.
+    systemctl daemon-reload 2>/dev/null || true
 }
 
 # Install HailoRT for the Hailo-8 / Hailo-8L M.2 accelerator.
