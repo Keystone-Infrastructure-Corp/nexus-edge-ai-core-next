@@ -80,7 +80,8 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  --tier {t10|t24|t36|t36s|t64}   Pick the tier config template (required on
+  --tier {t10|t24|t24-amd|t36|t36s|t64}
+                                  Pick the tier config template (required on
                                   first install; ignored on upgrades unless
                                   --force-tier is also passed). Omit to let
                                   nexus-probe pick on first install.
@@ -366,7 +367,7 @@ verify_accelerators
 # --- Stage tier config (first install only, or --force-tier) ------------------
 
 if [[ -n "$TIER" ]]; then
-    case "$TIER" in t10|t24|t36|t36s|t64) ;; *) die "unknown --tier: $TIER" ;; esac
+    case "$TIER" in t10|t24|t24-amd|t36|t36s|t64) ;; *) die "unknown --tier: $TIER" ;; esac
 
     if (( FORCE_TIER )); then
         if [[ -e "$NEXUS_CONFIG_DIR/nexus.toml" ]]; then
