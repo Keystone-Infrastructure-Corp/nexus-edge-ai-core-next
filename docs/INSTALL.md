@@ -96,6 +96,7 @@ you choose here. Full background:
 | ----------- | --------------------------------------------------- | -------------------------- | ----------------------- | ------------------------- | ------------------------------------------------- | ------------- |
 | **T10**     | Beelink Mini S13 (N150, 16 GB)                      | UHD 24EU iGPU              | `openvino, cpu`         | 1–2                       | [config/tiers/t10.toml](../config/tiers/t10.toml)     | shipping      |
 | **T24**     | GMKtec M3 Ultra (i7-12700H, 32 GB)                  | Iris Xe 96 EU              | `openvino, cpu`         | 4–6                       | [config/tiers/t24.toml](../config/tiers/t24.toml)     | shipping      |
+| **T24-AMD** | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)                | Radeon 680M (gfx1035) ROCm | `rocm, cpu`             | 4–6                       | [config/tiers/t24-amd.toml](../config/tiers/t24-amd.toml) | shipping — forces GPU inference even on a Hailo-equipped box; see §5.5d |
 | **T36**     | Lenovo P3 Tiny / HP Z2 Mini + Arc A380              | Intel Arc A380 6 GB dGPU   | `openvino, cpu`         | 8–12                      | [config/tiers/t36.toml](../config/tiers/t36.toml)     | shipping      |
 | **T36-S**   | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)    | Arc 140V Xe2 + NPU 4       | `openvino, npu, cpu`    | 6–8                       | [config/tiers/t36s.toml](../config/tiers/t36s.toml)   | shipping      |
 | **T64**     | Lenovo P3 Tower / HP Z2 G9 + RTX 4060               | NVIDIA RTX 4060 8 GB       | `tensorrt, cuda, cpu`   | 12–20                     | [config/tiers/t64.toml](../config/tiers/t64.toml)     | post-beta — CUDA/TensorRT EPs land in M5; until then T64 falls through to CPU and is **not** a meaningful deployment |
@@ -642,10 +643,15 @@ is healthy before proceeding.
 > temperature, power, utilization%, inferences/sec, firmware,
 > serial, and part number from `nexus-hailo-backend::telemetry()`.
 
-The EQR7's Radeon 680M (Phoenix gfx1035) is **decode-only** in v1.
-ROCm on Phoenix-class iGPUs is unsupported upstream and only works
-with `HSA_OVERRIDE_GFX_VERSION=10.3.0`; that's tracked as a
-separate experimental spike, not a default install path.
+The EQR7's Radeon 680M (Phoenix gfx1035) drives **both** hardware
+video decode (Mesa VA-API, §5.5a) **and** ONNX-Runtime inference
+through the AMD **ROCm execution provider** as of v0.1.84. ROCm on
+Phoenix-class iGPUs is unsupported upstream and requires
+`HSA_OVERRIDE_GFX_VERSION=10.3.0` (set automatically in the systemd
+unit); discrete RDNA/CDNA cards work without the override. To run a
+box on the GPU instead of the Hailo-8, install with the **`t24-amd`**
+tier — see §5.5d. If you'd rather keep inference on the Hailo-8,
+use the default `t24` tier and leave the Radeon for decode only.
 
 #### 5.5a AMD Mesa VA-API stack (automatic)
 
@@ -800,6 +806,47 @@ check and emits a remediation hint if it fails.
 > traffic flowing, the engine is on the CPU EP fallback — check
 > `journalctl -u nexus-engine -f` for HailoRT load errors.
 
+#### 5.5d AMD ROCm inference (force GPU instead of Hailo)
+
+To run inference on the Radeon iGPU/dGPU via the ROCm execution
+provider — even on a box that also has a Hailo-8 — install with the
+**`t24-amd`** tier, which ships `ep_priority = ["rocm", "cpu"]`:
+
+```bash
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
+  | sudo bash -s -- --tier t24-amd
+```
+
+What the installer does for the ROCm path (all automatic when an AMD
+GPU is detected via `lspci`):
+
+1. Installs the AMD ROCm userspace (`rocminfo`, `rocm-smi-lib`,
+   `hip-runtime-amd`, `rocm-libs`) from `repo.radeon.com`.
+2. Fetches a ROCm-capable ONNX Runtime (1.21.0) into
+   `/opt/nexus/vendor/onnxruntime-rocm/` and writes a systemd drop-in
+   that points `ORT_DYLIB_PATH` / `LD_LIBRARY_PATH` at it.
+3. Resolves the provider `.so`'s auditwheel-hashed `librocm_smi64`
+   dependency to its `/opt/rocm/lib` twin via symlink.
+4. The base systemd unit already sets `HSA_OVERRIDE_GFX_VERSION=10.3.0`
+   (needed for Phoenix iGPUs) and grants the `nexus` user the
+   `render`/`video` groups + `/dev/kfd` access.
+
+Because the `t24-amd` template lists `rocm` first, the installer's
+Hailo auto-override is **suppressed** — the Hailo-8 is left alone and
+inference is pinned to the GPU. **Verify:**
+
+```bash
+journalctl -u nexus-engine | grep -iE 'ep_registered|rocm'
+# Expect: ep_requested=["rocm","cpu"] ep_registered=["rocm","cpu"]
+HSA_OVERRIDE_GFX_VERSION=10.3.0 rocm-smi --showuse
+# Expect GPU use% to spike while cameras stream.
+```
+
+> **Fail-soft to CPU.** If the GPU can't be reached (e.g. `/dev/kfd`
+> not accessible to the service user), the engine logs a warning and
+> falls back to the CPU EP — `ep_registered=["cpu"]` — rather than
+> crashing. It never silently runs the mock detector.
+
 ---
 
 ## 6. Install the engine
@@ -903,7 +950,7 @@ Each release directory contains:
 
 ```text
 bin/
-├── nexus-engine             # FEATURES=gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt
+├── nexus-engine             # FEATURES=gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt,ep-hailo,ep-rocm
 ├── nexus-probe
 └── nexus-doctor
 lib/onnxruntime/             # libonnxruntime.so + OpenVINO EP + intel CPU/GPU/NPU plugins
