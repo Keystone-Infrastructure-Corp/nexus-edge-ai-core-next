@@ -591,7 +591,16 @@ pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector
                 ep_priority = ?cfg.ep_priority,
                 "yolo dispatch: using Hailo-8 backend"
             );
-            return crate::hailo_yolo::build_detector_for_hailo_yolo(cfg, &hef);
+            // If Hailo open fails, fall through to ORT/CPU chain instead of
+            // using mock. This allows `ep_priority = ["hailo", "rocm", "cpu"]`
+            // to degrade gracefully: try Hailo, then ROCm, then CPU.
+            match crate::hailo_yolo::build_detector_for_hailo_yolo(cfg, &hef) {
+                Ok(detector) => return Ok(detector),
+                Err(e) => {
+                    warn!("hailo backend failed: {e}, falling through to ORT chain");
+                    // Continue to ORT path below
+                }
+            }
         }
     }
     match YoloOrtDetector::from_config(cfg) {

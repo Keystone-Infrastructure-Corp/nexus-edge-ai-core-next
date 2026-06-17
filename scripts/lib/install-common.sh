@@ -431,6 +431,9 @@ install_drivers() {
 
     if (( has_amd )); then
         _drivers_amd_graphics
+        # ROCm compute for inference (if ep_priority includes "rocm").
+        # Gracefully skips if amdgpu module is not yet bound.
+        _drivers_amd_rocm
     fi
 
     if (( has_hailo )); then
@@ -1128,6 +1131,103 @@ _drivers_amd_graphics() {
     else
         warn "AMD graphics installed but vainfo did not report Mesa Gallium;"
         warn "amdgpu may not be bound yet — check 'lsmod | grep amdgpu' and dmesg."
+    fi
+}
+
+# Install AMD ROCm compute drivers for Radeon iGPU/dGPU (ONNX Runtime EP).
+#
+# Enables the ROCm execution provider in nexus-inference when the operator
+# sets `ep_priority = ["rocm", "cpu"]` in the tier config. Works with
+# discrete RDNA/CDNA GPUs out-of-box. Phoenix iGPUs (Radeon 680M/780M,
+# gfx1035) receive UNOFFICIAL upstream support via the
+# `HSA_OVERRIDE_GFX_VERSION=10.3.0` workaround (set by systemd service unit).
+#
+# Operator must already have the amdgpu kernel module bound (i.e.
+# `_drivers_amd_graphics` has run first) so that /dev/dri/renderD12x
+# and /dev/kfd exist. If either is missing, we emit a warn and return
+# gracefully — the engine will fall back to CPU EP.
+#
+# Installs from the official AMD ROCm PPA (Ubuntu 24.04, 22.04).
+# Adds rocminfo, rocm-smi, hip-runtime-amd, hip-dev, rocm-libs,
+# migraphx, migraphx-dev, libamd-comgr-dev (headers for custom kernels).
+_drivers_amd_rocm() {
+    # Quick check: if /dev/kfd + /dev/dri/renderD128 are missing,
+    # the amdgpu module is not bound yet. Defer gracefully.
+    if [[ ! -c /dev/kfd ]]; then
+        warn "AMD ROCm: /dev/kfd not present — amdgpu kernel module not bound"
+        warn "         (reboot or 'modprobe amdgpu' and re-run install.sh)"
+        return 0
+    fi
+    if [[ ! -e /dev/dri/renderD128 ]]; then
+        warn "AMD ROCm: /dev/dri/renderD128 not present — amdgpu not yet bound to GPU"
+        warn "         (reboot or 'modprobe amdgpu' and re-run install.sh)"
+        return 0
+    fi
+
+    # Check if rocminfo is already installed + working.
+    if command -v rocminfo >/dev/null 2>&1 \
+        && rocminfo 2>/dev/null | grep -q 'gfx'; then
+        log "AMD ROCm already installed (rocminfo confirmed)"
+        return 0
+    fi
+
+    log "installing AMD ROCm compute drivers (HIP, MIGraphX, rocminfo)"
+
+    # Add AMD ROCm PPA (Ubuntu 24.04 + 22.04 support).
+    # The PPA signing key is versioned; this uses the current key ID.
+    if ! grep -q "amdgpu.gpuopen.com" /etc/apt/sources.list.d/* 2>/dev/null; then
+        # Key ID from AMD's official docs (rocm.docs.amd.com).
+        local rocm_key="https://repo.radeon.com/rocm/rocm.gpg.key"
+        local rocm_ppa="deb [signed-by=/usr/share/keyrings/rocm-apt-keyring.gpg] https://repo.radeon.com/amdgpu/ubuntu jammy main"
+        
+        if ! curl -sS "$rocm_key" | gpg --dearmor -o /usr/share/keyrings/rocm-apt-keyring.gpg 2>/dev/null; then
+            warn "AMD ROCm: could not fetch signing key from repo.radeon.com; skipping ROCm install"
+            return 0
+        fi
+        
+        printf '%s\n' "$rocm_ppa" | tee /etc/apt/sources.list.d/rocm.list >/dev/null || true
+        apt-get update -qq || true
+    fi
+
+    # Install ROCm userspace + HIP dev + MIGraphX + libs.
+    # Intentionally do NOT install rocm-hip-sdk or rocm-language-runtime
+    # (they pull in heavy compilers). We only need the runtime + libs.
+    local rocm_pkgs=(
+        rocminfo                     # GPU enumeration + gfx version probe
+        rocm-smi                      # monitor GPU utilization + temps
+        hip-runtime-amd               # HIP runtime (required by MIGraphX)
+        hip-dev                       # HIP headers (optional, for custom code)
+        rocm-libs                     # core ROCm libraries
+        migraphx                      # ONNX model inference library
+        migraphx-dev                  # MIGraphX headers (optional)
+        libamd-comgr-dev              # code object generation (optional)
+    )
+
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            "${rocm_pkgs[@]}" 2>/dev/null; then
+        warn "AMD ROCm package install failed; engine will fall back to CPU EP"
+        return 0
+    fi
+
+    # Verify installation: rocminfo should show at least one gfx* device.
+    if rocminfo 2>/dev/null | grep -q 'gfx'; then
+        log "AMD ROCm installed and GPU detected via rocminfo"
+        # Optional: show the detected GPU for operator feedback.
+        local gfx_name
+        gfx_name=$(rocminfo 2>/dev/null | grep -o 'gfx[0-9]*' | head -1)
+        [[ -n "$gfx_name" ]] && log "  Detected GPU: $gfx_name"
+    else
+        warn "AMD ROCm installed but rocminfo did not detect any GPU;"
+        warn "this may be normal on iGPUs (gfx1035 requires HSA_OVERRIDE at runtime)."
+    fi
+
+    # Verify /dev/kfd accessibility for the service user.
+    # The nexus user will be added to the 'render' group by
+    # ensure_accelerator_groups (called after install_drivers).
+    if [[ -r /dev/kfd && -w /dev/kfd ]]; then
+        log "/dev/kfd is accessible (ROCm compute ready)"
+    else
+        warn "/dev/kfd not accessible yet — will be gated by ensure_accelerator_groups"
     fi
 }
 

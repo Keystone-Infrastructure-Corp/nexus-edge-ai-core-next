@@ -16,6 +16,7 @@ ep-cuda     = ["ort"]
 ep-coreml   = ["ort"]
 ep-tensorrt = ["ort"]
 ep-directml = ["ort"]
+ep-rocm     = ["ort"]
 # M_HAILO_EP — Hailo-8 backend. Not an ORT EP (HailoRT is a parallel
 # runtime); enabling this just pulls `nexus-hailo-backend` and asks
 # it to link against the system `libhailort.so` (linux only). The
