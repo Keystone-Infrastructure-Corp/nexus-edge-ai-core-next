@@ -2265,6 +2265,14 @@ _apply_hailo_ep_priority_override() {
         log "ep_priority already includes \"hailo\" (no override needed)"
         return 0
     fi
+    # Operator deliberately chose a ROCm-primary tier (e.g. --tier
+    # t24-amd, ep_priority = ["rocm", "cpu"]). Honor that choice and do
+    # NOT inject "hailo" — a box with both a Hailo-8 and a Radeon iGPU
+    # can be pinned to GPU inference on purpose. The explicit tier wins.
+    if grep -qE '^\s*ep_priority\s*=.*"rocm"' "$target"; then
+        log "ep_priority lists \"rocm\" (ROCm-primary tier); not injecting \"hailo\""
+        return 0
+    fi
     if ! grep -qE '^\s*ep_priority\s*=\s*\[' "$target"; then
         warn "ep_priority line not found in $target; skipping Hailo override"
         return 0

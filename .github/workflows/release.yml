@@ -84,7 +84,7 @@ jobs:
   #   │                                    release at workflow runtime)
   #   ├── etc-templates/
   #   │   ├── nexus.example.toml
-  #   │   ├── tiers/{t10,t24,t36,t36s,t64}.toml
+  #   │   ├── tiers/{t10,t24,t24-amd,t36,t36s,t64}.toml
   #   │   └── systemd/nexus-engine.service
   #   └── scripts/
   #       ├── install.sh                  (in-tarball installer)
@@ -415,6 +415,7 @@ jobs:
           cp config/nexus.example.toml   "$R/etc-templates/nexus.example.toml"
           cp config/tiers/t10.toml       "$R/etc-templates/tiers/"
           cp config/tiers/t24.toml       "$R/etc-templates/tiers/"
+          cp config/tiers/t24-amd.toml   "$R/etc-templates/tiers/"
           cp config/tiers/t36.toml       "$R/etc-templates/tiers/"
           cp config/tiers/t36s.toml      "$R/etc-templates/tiers/"
           cp config/tiers/t64.toml       "$R/etc-templates/tiers/"
