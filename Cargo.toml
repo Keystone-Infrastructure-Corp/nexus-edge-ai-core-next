@@ -112,16 +112,27 @@ cel-interpreter = "0.10"
 # Inference + image
 # ort 2.0.0-rc.12 supports the ONNX Runtime 1.17–1.24 ABI via the
 # `api-NN` feature flags (rc.12 release notes, Mar 2026). We pin to
-# `api-24` so the bundled libonnxruntime.so.1.24.x ABI is the one the
-# crate compiles against; the runtime is loaded dynamically via
-# `load-dynamic` (ORT_DYLIB_PATH). The matched runtime version is
-# tracked in `.github/workflows/{ci,release}.yml::ORT_VERSION` and in
-# `docs/INSTALL.md §7.4`.
+# `api-21` — the LOWEST common denominator across every runtime we
+# dynamically load:
+#   * OpenVINO/CPU path bundles libonnxruntime.so.1.24.x (ABI 24).
+#   * AMD ROCm path loads onnxruntime_rocm 1.21.0 — the newest prebuilt
+#     ROCm ONNX Runtime AMD ships (repo.radeon.com manylinux, ABI 21);
+#     PyPI's onnxruntime-rocm tops out at 1.22.2.
+# The ONNX Runtime C API is backward-compatible: a binary compiled
+# against `api-21` calls `GetApi(21)`, which BOTH a 1.24.x runtime
+# (24 ≥ 21) and a 1.21.0 runtime (21 == 21) satisfy. Compiling against
+# `api-24` instead would make `GetApi(24)` return NULL on the 1.21 ROCm
+# runtime → hard dlopen-time failure. The engine only uses base
+# Session/Value/Run APIs that have existed since well before 1.21, so
+# nothing is lost by the floor. The runtime is loaded dynamically via
+# `load-dynamic` (ORT_DYLIB_PATH). Matched runtime versions are tracked
+# in `.github/workflows/{ci,release}.yml::ORT_VERSION` (OpenVINO 1.24.1)
+# and in the installer's `_install_ort_rocm` (ROCm 1.21.0) + docs/INSTALL.md §7.4.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = [
     "std",
     "load-dynamic",
     "ndarray",
-    "api-24",
+    "api-21",
 ] }
 ndarray = "0.17"
 image = { version = "0.25", default-features = false, features = [

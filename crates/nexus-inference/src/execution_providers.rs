@@ -137,6 +137,88 @@ fn warn_openvino_unavailable_once() {
     });
 }
 
+/// Returns true iff this container can drive an AMD Radeon GPU through the ROCm EP.
+///
+/// We detect via kernel-level device nodes:
+///   * `/dev/kfd` — AMD KFD compute driver (present on all RDNA/CDNA GPUs and some iGPUs)
+///   * `/dev/dri/renderD12{8,9}` — amdgpu DRM render node
+///
+/// For Phoenix-class iGPUs (Radeon 680M/780M, gfx1035/gfx1103), ROCm is
+/// officially unsupported upstream and requires `HSA_OVERRIDE_GFX_VERSION=10.3.0`
+/// environment variable at runtime. For discrete RDNA/CDNA GPUs (gfx1030+),
+/// ROCm is fully supported.
+///
+/// The userspace runtime libs (rocm-hip-runtime, rocm-opencl-runtime, librocm_*.so,
+/// and a ROCm-enabled libonnxruntime.so) are installed via apt/package manager
+/// or containerized as a per-tier bundle, so device-node visibility is the
+/// check that depends on the host container configuration.
+///
+/// Unlike the OpenVINO probe, this one verifies the device nodes are actually
+/// **openable**, not merely present. ORT silently skips an OpenVINO EP that
+/// fails to attach, but the ROCm provider's device probe
+/// (`hipGetDeviceProperties`) throws an *uncaught* C++ exception and aborts
+/// the whole engine process when it cannot open `/dev/kfd` — e.g. the node
+/// exists but the engine user isn't in the `render` group. There is no
+/// silent EP-skip to fall back on, so we must not register the ROCm EP at
+/// all in that case. Probing with a real `open()` (matching what HIP does
+/// internally) means a permission failure degrades to the CPU EP instead of
+/// crashing the engine.
+///
+/// Result is cached for the process lifetime.
+///
+/// **Override:** set `NEXUS_ROCM_DEVICE=force` to force-true (for testing)
+/// or `NEXUS_ROCM_DEVICE=skip` to force-false (to verify CPU fallback on a
+/// box that does have an AMD GPU). Unset / any other value goes through
+/// autodetection.
+#[cfg(feature = "ep-rocm")]
+pub fn rocm_runtime_available() -> bool {
+    if let Ok(v) = std::env::var("NEXUS_ROCM_DEVICE") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "force" | "present" | "1" | "true" => return true,
+            "skip" | "absent" | "0" | "false" => return false,
+            _ => {}
+        }
+    }
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        // Probe with an actual open() (read+write, as HIP opens the KFD).
+        // The standard nodes are `crw-rw---- root render`, so a process in
+        // the render group opens them and a non-member gets EACCES — which
+        // is exactly the abort-vs-fallback distinction we need to make
+        // before registering the EP.
+        let openable = |p: &str| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p)
+                .is_ok()
+        };
+        let kfd = openable("/dev/kfd");
+        let render = openable("/dev/dri/renderD128") || openable("/dev/dri/renderD129");
+        kfd && render
+    })
+}
+
+/// Emit a single deduplicated WARN when ROCm was requested but no AMD GPU
+/// device nodes are reachable.
+#[cfg(feature = "ep-rocm")]
+fn warn_rocm_unavailable_once() {
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "ep_priority requested 'rocm' but no AMD GPU device nodes \
+             (/dev/kfd and /dev/dri/renderD12x) are reachable; ROCm entries \
+             are being skipped and inference will run on CPU. For hardware \
+             acceleration, ensure /dev/kfd and /dev/dri are accessible to \
+             the engine process (via group membership or device permissions). \
+             Override autodetection by setting NEXUS_ROCM_DEVICE=force in \
+             the environment."
+        );
+    });
+}
+
 /// Build the list of EPs to register with the ORT session, in the
 /// priority order requested by `ep_priority`. Always appends CPU as
 /// the final fallback if it wasn't already in the list.
@@ -287,6 +369,27 @@ fn selected_for_priority_inner(
             "gpu" => warn!(
                 "ep_priority requested 'gpu' but the binary was built without \
                  --features ep-openvino (Intel GPU routes through OpenVINO); skipping"
+            ),
+
+            // AMD Radeon GPU via ROCm EP. Works on discrete RDNA/CDNA GPUs.
+            // For Phoenix iGPUs (Radeon 680M/780M), requires
+            // `HSA_OVERRIDE_GFX_VERSION=10.3.0` environment variable at runtime
+            // (unofficial upstream support, fragile on older kernels).
+            #[cfg(feature = "ep-rocm")]
+            "rocm" => {
+                let rocm_available = rocm_runtime_available();
+                if rocm_available {
+                    use ort::execution_providers::ROCmExecutionProvider;
+                    dispatchers.push(ROCmExecutionProvider::default().build());
+                    names.push("rocm".into());
+                } else {
+                    warn_rocm_unavailable_once();
+                }
+            }
+            #[cfg(not(feature = "ep-rocm"))]
+            "rocm" => warn!(
+                "ep_priority requested 'rocm' but the binary was built without \
+                 --features ep-rocm; skipping"
             ),
 
             // M_HAILO_EP — Hailo-8 is not an ORT EP. It's recognized

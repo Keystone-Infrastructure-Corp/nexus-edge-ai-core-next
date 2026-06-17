@@ -344,11 +344,11 @@ pub fn build_detector_for_hailo_yolo(
     let detector: Arc<HailoYoloDetector> = match HailoYoloDetector::from_config(cfg, &key) {
         Ok(d) => Arc::new(d),
         Err(e) => {
-            // Drop the cache lock before returning the mock so a
+            // Drop the cache lock before returning the error so a
             // subsequent successful open can still populate the cache.
             drop(guard);
-            warn!("hailo YOLO detector unavailable, falling back to mock: {e}");
-            return Ok(Arc::new(crate::detectors::MockDetector::new()));
+            warn!("hailo YOLO detector unavailable: {e} (will try ORT/CPU chain)");
+            return Err(e);
         }
     };
     guard.insert(key, Arc::downgrade(&detector));

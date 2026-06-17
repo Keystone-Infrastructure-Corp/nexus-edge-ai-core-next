@@ -110,7 +110,11 @@ impl YoloOrtDetector {
         let (eps, ep_names) = execution_providers::selected_for_priority(ep_priority);
         let session = Session::builder()
             .map_err(|e| InferenceError::ModelLoad(format!("session builder: {e}")))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
+            // ORT_ENABLE_ALL (99) — valid on every ONNX Runtime ABI.
+            // NOT `Level3`: in ort 2.0-rc that maps to ORT_ENABLE_LAYOUT (3),
+            // a level introduced in ONNX Runtime 1.22 that the ROCm 1.21
+            // runtime rejects with "graph_optimization_level is not valid".
+            .with_optimization_level(GraphOptimizationLevel::All)
             .map_err(|e| InferenceError::ModelLoad(format!("opt level: {e}")))?
             .with_execution_providers(eps)
             .map_err(|e| InferenceError::ModelLoad(format!("EP register: {e}")))?
@@ -591,7 +595,16 @@ pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector
                 ep_priority = ?cfg.ep_priority,
                 "yolo dispatch: using Hailo-8 backend"
             );
-            return crate::hailo_yolo::build_detector_for_hailo_yolo(cfg, &hef);
+            // If Hailo open fails, fall through to ORT/CPU chain instead of
+            // using mock. This allows `ep_priority = ["hailo", "rocm", "cpu"]`
+            // to degrade gracefully: try Hailo, then ROCm, then CPU.
+            match crate::hailo_yolo::build_detector_for_hailo_yolo(cfg, &hef) {
+                Ok(detector) => return Ok(detector),
+                Err(e) => {
+                    warn!("hailo backend failed: {e}, falling through to ORT chain");
+                    // Continue to ORT path below
+                }
+            }
         }
     }
     match YoloOrtDetector::from_config(cfg) {

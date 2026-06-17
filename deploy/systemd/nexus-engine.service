@@ -25,6 +25,7 @@ Wants=network-online.target
 Type=simple
 User=nexus
 Group=nexus
+SupplementaryGroups=video render
 WorkingDirectory=/var/lib/nexus
 
 # ORT shared libs ship inside the release at lib/onnxruntime/. The ort
@@ -34,6 +35,12 @@ WorkingDirectory=/var/lib/nexus
 Environment=ORT_DYLIB_PATH=/opt/nexus/current/lib/onnxruntime/libonnxruntime.so
 Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime
 Environment=RUST_LOG=info,nexus=info
+
+# AMD ROCm / Radeon GPU configuration. HSA_OVERRIDE_GFX_VERSION is required
+# for Phoenix iGPUs (Radeon 680M/780M, gfx1035) due to unofficial upstream
+# support. Discrete RDNA/CDNA GPUs ignore this setting. Only takes effect
+# when ep_priority in nexus.toml includes "rocm" AND /dev/kfd is accessible.
+Environment=HSA_OVERRIDE_GFX_VERSION=10.3.0
 
 # T64 (CUDA + TensorRT) operators uncomment the CUDA path. The installed
 # binary is built with --features ep-cuda,ep-tensorrt — the EP is only
@@ -101,6 +108,12 @@ DeviceAllow=/dev/nvidia-uvm rw
 # covers it; without this line DevicePolicy=closed denies the open
 # even though world perms are crw-rw-rw-.
 DeviceAllow=/dev/hailo0 rw
+# AMD ROCm compute (Radeon iGPU/dGPU). /dev/kfd is the KFD (Kernel
+# Fusion Driver) character device used by HIP + ROCm libraries for
+# GPU compute. Gated to the 'render' group by default (mode 0660).
+# The install.sh script adds the `nexus` user to 'render', so the
+# engine can open it.
+DeviceAllow=/dev/kfd rw
 
 [Install]
 WantedBy=multi-user.target
