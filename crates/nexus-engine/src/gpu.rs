@@ -1026,16 +1026,30 @@ mod intel {
 // CAP_PERFMON / sudo is required and there is no PMU baseline to warm
 // up — every snapshot reports a live value. This covers the AMD APU
 // tiers (e.g. Beelink EQR7 / Ryzen Radeon 680M, gfx1035) running the
-// ROCm execution provider. NOTE: `gpu_busy_percent` is an instantaneous
-// sample; on a bursty inference load polled every 2 s it can legitimately
-// read 0 between bursts — that is the GPU's own reading, not a bug.
+// ROCm execution provider. NOTE: `gpu_busy_percent` on these APUs is a
+// coarse 0/100 instantaneous gauge that spikes to 100 for ~1 ms per
+// inference burst and reads 0 otherwise, so a single read almost always
+// catches an idle gap. A background sampler thread polls it at 50 ms and
+// publishes a rolling multi-second mean (the GPU-busy duty cycle), which
+// `snapshot()` returns as `utilization_pct` — a stable value that tracks
+// real load instead of flickering between 0 and 100.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 mod amd {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use super::{read_sysfs_string, GpuInfo};
+
+    /// Background sampler cadence. `gpu_busy_percent` on AMD APUs is a
+    /// coarse 0/100 instantaneous gauge, so we poll it far faster than
+    /// the UI metrics interval and report a rolling time-average.
+    const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+    /// Rolling window length (`SAMPLE_INTERVAL * WINDOW` ≈ 4 s @ 50 ms).
+    const SAMPLE_WINDOW: usize = 80;
 
     /// Cached probe of the first AMD render node we find. All
     /// dynamic values are re-read per snapshot from the cached
@@ -1047,6 +1061,42 @@ mod amd {
         vram_used_path: Option<PathBuf>,
         // First `hwmon*/temp1_input` under the device (millidegrees C).
         temp_path: Option<PathBuf>,
+        // Rolling, time-averaged GPU-busy duty cycle in centi-percent
+        // (0..=10000), updated by a background sampler thread. `Some`
+        // only when the sampler thread was spawned successfully; reads
+        // are lock-free so `snapshot()` never blocks. When `None` we
+        // fall back to a single direct read of `busy_path`.
+        busy_avg_centi: Option<Arc<AtomicU32>>,
+    }
+
+    /// Continuously sample `gpu_busy_percent` and publish a rolling
+    /// mean (the GPU-busy duty cycle) into `out`, in centi-percent.
+    ///
+    /// The raw counter is a binary 0/100 gauge that spikes for ~1 ms
+    /// per inference burst and reads 0 otherwise, so a single read is
+    /// almost always 0. Averaging over a multi-second window yields a
+    /// stable, representative utilization that tracks real load and is
+    /// non-zero whenever the GPU is doing periodic work.
+    fn sample_busy_loop(path: PathBuf, out: Arc<AtomicU32>) {
+        let mut ring = [0u32; SAMPLE_WINDOW];
+        let mut idx = 0usize;
+        let mut filled = 0usize;
+        loop {
+            let v = read_sysfs_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(100);
+            ring[idx] = v;
+            idx = (idx + 1) % SAMPLE_WINDOW;
+            if filled < SAMPLE_WINDOW {
+                filled += 1;
+            }
+            // Mean of 0..=100 samples → centi-percent (two decimals).
+            let sum: u32 = ring[..filled].iter().sum();
+            out.store(sum * 100 / filled as u32, Ordering::Relaxed);
+            std::thread::sleep(SAMPLE_INTERVAL);
+        }
     }
 
     pub(super) fn try_init() -> Option<AmdSysfs> {
@@ -1074,11 +1124,28 @@ mod amd {
             let vram_used_path = exists("mem_info_vram_used");
             let temp_path = find_hwmon_temp(&base);
 
+            // Spawn a background sampler so `utilization_pct` reports a
+            // time-averaged duty cycle instead of a single instantaneous
+            // read (which almost always catches an idle gap → 0%). If
+            // the thread can't be spawned we leave this `None` and
+            // `snapshot()` falls back to a direct read.
+            let busy_avg_centi = busy_path.as_ref().and_then(|p| {
+                let cell = Arc::new(AtomicU32::new(0));
+                let writer = Arc::clone(&cell);
+                let path = p.clone();
+                std::thread::Builder::new()
+                    .name("amd-gpu-busy-sampler".to_string())
+                    .spawn(move || sample_busy_loop(path, writer))
+                    .ok()
+                    .map(|_| cell)
+            });
+
             tracing::info!(
                 name = %name,
                 busy = busy_path.is_some(),
                 vram = vram_total_path.is_some(),
                 temp = temp_path.is_some(),
+                averaged = busy_avg_centi.is_some(),
                 "GPU backend: AMD amdgpu (sysfs)",
             );
             return Some(AmdSysfs {
@@ -1087,6 +1154,7 @@ mod amd {
                 vram_total_path,
                 vram_used_path,
                 temp_path,
+                busy_avg_centi,
             });
         }
         None
@@ -1113,12 +1181,18 @@ mod amd {
                 read_sysfs_string(p).ok()?.trim().parse::<u64>().ok()
             };
 
-            let utilization_pct = self
-                .busy_path
-                .as_ref()
-                .and_then(|p| read_sysfs_string(p).ok())
-                .and_then(|s| s.trim().parse::<f32>().ok())
-                .map(|v| v.clamp(0.0, 100.0));
+            let utilization_pct = match &self.busy_avg_centi {
+                // Time-averaged duty cycle published by the sampler
+                // thread (centi-percent → percent).
+                Some(cell) => Some(cell.load(Ordering::Relaxed) as f32 / 100.0),
+                // Sampler unavailable: fall back to a single read.
+                None => self
+                    .busy_path
+                    .as_ref()
+                    .and_then(|p| read_sysfs_string(p).ok())
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .map(|v| v.clamp(0.0, 100.0)),
+            };
 
             // amdgpu reports temp in millidegrees C.
             let temp_c = self
