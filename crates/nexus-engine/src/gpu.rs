@@ -62,6 +62,8 @@ enum GpuBackend {
     #[cfg(target_os = "linux")]
     Nvidia(nvidia::NvidiaState),
     #[cfg(target_os = "linux")]
+    Amd(amd::AmdSysfs),
+    #[cfg(target_os = "linux")]
     IntelSysfs(intel::IntelSysfs),
     #[cfg(target_os = "macos")]
     Apple(apple::AppleStaticInfo),
@@ -73,6 +75,14 @@ impl GpuBackend {
         {
             if let Some(state) = nvidia::try_init() {
                 return GpuBackend::Nvidia(state);
+            }
+            // AMD before Intel: a board may carry an AMD APU/dGPU
+            // (vendor 0x1002) and an Intel iGPU is mutually
+            // exclusive on the AMD platforms we ship, but probing
+            // AMD first keeps the discrete-Radeon path ahead of
+            // any vestigial Intel display node.
+            if let Some(state) = amd::try_init() {
+                return GpuBackend::Amd(state);
             }
             if let Some(state) = intel::try_init() {
                 return GpuBackend::IntelSysfs(state);
@@ -97,6 +107,8 @@ impl GpuBackend {
             GpuBackend::None => None,
             #[cfg(target_os = "linux")]
             GpuBackend::Nvidia(state) => state.snapshot(),
+            #[cfg(target_os = "linux")]
+            GpuBackend::Amd(state) => Some(state.snapshot()),
             #[cfg(target_os = "linux")]
             GpuBackend::IntelSysfs(state) => Some(state.snapshot()),
             #[cfg(target_os = "macos")]
@@ -991,6 +1003,192 @@ mod intel {
         fn returns_none_when_no_recognised_prefix_present() {
             let f = write_sysfs("umask=0xff,inv=1\n");
             assert_eq!(read_event_config(f.path()), None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux AMD (amdgpu) backend.
+//
+// Unlike the Intel iGPU — whose utilization needs CAP_PERFMON via the
+// i915/xe PMU — `amdgpu` publishes everything we need as plain,
+// world-readable sysfs files under `/sys/class/drm/card*/device/`:
+//
+//   * `vendor`               — must be `0x1002` (AMD/ATI)
+//   * `device`               — PCI device ID → friendly name
+//   * `gpu_busy_percent`     — integer 0..100 GPU activity (the same
+//                              counter `rocm-smi --showuse` reads)
+//   * `mem_info_vram_total`  — VRAM (or APU carve-out) total bytes
+//   * `mem_info_vram_used`   — VRAM bytes currently allocated
+//   * `hwmon/hwmon*/temp1_input` — edge temperature in millidegrees C
+//
+// All of these are readable by the unprivileged `nexus` user, so no
+// CAP_PERFMON / sudo is required and there is no PMU baseline to warm
+// up — every snapshot reports a live value. This covers the AMD APU
+// tiers (e.g. Beelink EQR7 / Ryzen Radeon 680M, gfx1035) running the
+// ROCm execution provider. NOTE: `gpu_busy_percent` is an instantaneous
+// sample; on a bursty inference load polled every 2 s it can legitimately
+// read 0 between bursts — that is the GPU's own reading, not a bug.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod amd {
+    use std::path::PathBuf;
+
+    use super::{read_sysfs_string, GpuInfo};
+
+    /// Cached probe of the first AMD render node we find. All
+    /// dynamic values are re-read per snapshot from the cached
+    /// paths (sysfs reads are a few microseconds each).
+    pub(super) struct AmdSysfs {
+        name: String,
+        busy_path: Option<PathBuf>,
+        vram_total_path: Option<PathBuf>,
+        vram_used_path: Option<PathBuf>,
+        // First `hwmon*/temp1_input` under the device (millidegrees C).
+        temp_path: Option<PathBuf>,
+    }
+
+    pub(super) fn try_init() -> Option<AmdSysfs> {
+        // Walk /sys/class/drm/card{0..9} (typically only card0/card1).
+        for n in 0..10u32 {
+            let base = PathBuf::from(format!("/sys/class/drm/card{n}/device"));
+            if !base.exists() {
+                continue;
+            }
+            let vendor = read_sysfs_string(&base.join("vendor")).unwrap_or_default();
+            if vendor.trim() != "0x1002" {
+                continue;
+            }
+            let device_id = read_sysfs_string(&base.join("device"))
+                .ok()
+                .unwrap_or_default();
+            let name = amd_pci_name(device_id.trim());
+
+            let exists = |rel: &str| -> Option<PathBuf> {
+                let p = base.join(rel);
+                p.exists().then_some(p)
+            };
+            let busy_path = exists("gpu_busy_percent");
+            let vram_total_path = exists("mem_info_vram_total");
+            let vram_used_path = exists("mem_info_vram_used");
+            let temp_path = find_hwmon_temp(&base);
+
+            tracing::info!(
+                name = %name,
+                busy = busy_path.is_some(),
+                vram = vram_total_path.is_some(),
+                temp = temp_path.is_some(),
+                "GPU backend: AMD amdgpu (sysfs)",
+            );
+            return Some(AmdSysfs {
+                name,
+                busy_path,
+                vram_total_path,
+                vram_used_path,
+                temp_path,
+            });
+        }
+        None
+    }
+
+    /// Locate the first `temp1_input` under the device's hwmon
+    /// directory (`/sys/class/drm/cardN/device/hwmon/hwmonM/`).
+    fn find_hwmon_temp(base: &std::path::Path) -> Option<PathBuf> {
+        let hwmon_dir = base.join("hwmon");
+        let entries = std::fs::read_dir(&hwmon_dir).ok()?;
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("temp1_input");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    impl AmdSysfs {
+        pub(super) fn snapshot(&self) -> GpuInfo {
+            let read_u64 = |p: &Option<PathBuf>| -> Option<u64> {
+                let p = p.as_ref()?;
+                read_sysfs_string(p).ok()?.trim().parse::<u64>().ok()
+            };
+
+            let utilization_pct = self
+                .busy_path
+                .as_ref()
+                .and_then(|p| read_sysfs_string(p).ok())
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .map(|v| v.clamp(0.0, 100.0));
+
+            // amdgpu reports temp in millidegrees C.
+            let temp_c = self
+                .temp_path
+                .as_ref()
+                .and_then(|p| read_sysfs_string(p).ok())
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .map(|milli| milli / 1000.0);
+
+            // `gpu_busy_percent` is always present on amdgpu, so a
+            // `None` here means the file genuinely couldn't be read
+            // (permissions / unbound device) rather than the
+            // CAP_PERFMON limitation the Intel path hits.
+            let utilization_status = if utilization_pct.is_none() {
+                Some(
+                    "amdgpu gpu_busy_percent not readable \u{2014} the \
+                     device may be unbound or the kernel too old"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+
+            GpuInfo {
+                kind: "amd".to_string(),
+                name: self.name.clone(),
+                mem_total_bytes: read_u64(&self.vram_total_path),
+                mem_used_bytes: read_u64(&self.vram_used_path),
+                utilization_pct,
+                temp_c,
+                utilization_status,
+            }
+        }
+    }
+
+    /// Map a handful of common AMD APU / Radeon PCI device IDs to
+    /// friendly names. Anything unknown falls back to "AMD Radeon
+    /// Graphics" + the raw ID for support tickets.
+    fn amd_pci_name(device_id: &str) -> String {
+        match device_id.to_ascii_lowercase().as_str() {
+            // Rembrandt / Ryzen 6000 (RDNA2) — Radeon 660M/680M.
+            // Beelink EQR7 (Ryzen 7 6800H) lands here (gfx1035).
+            "0x1681" => "AMD Radeon 680M (Rembrandt)".to_string(),
+            // Phoenix / Ryzen 7040 (RDNA3) — Radeon 740M/760M/780M.
+            "0x15bf" => "AMD Radeon 780M (Phoenix)".to_string(),
+            "0x15c8" => "AMD Radeon 740M (Phoenix2)".to_string(),
+            // Raphael desktop iGPU (RDNA2, 2 CU).
+            "0x164e" => "AMD Radeon Graphics (Raphael)".to_string(),
+            // Cezanne / Ryzen 5000 (Vega).
+            "0x1638" => "AMD Radeon Graphics (Cezanne)".to_string(),
+            // Strix Point (RDNA3.5) — Radeon 880M/890M.
+            "0x150e" => "AMD Radeon 890M (Strix)".to_string(),
+            other => format!("AMD Radeon Graphics ({other})"),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::amd_pci_name;
+
+        #[test]
+        fn maps_known_apu_and_falls_back() {
+            assert_eq!(amd_pci_name("0x1681"), "AMD Radeon 680M (Rembrandt)");
+            // Case-insensitive on the hex digits.
+            assert_eq!(amd_pci_name("0x1681"), amd_pci_name("0X1681"));
+            // Unknown ID is preserved verbatim for support.
+            assert_eq!(
+                amd_pci_name("0xabcd"),
+                "AMD Radeon Graphics (0xabcd)".to_string(),
+            );
         }
     }
 }
