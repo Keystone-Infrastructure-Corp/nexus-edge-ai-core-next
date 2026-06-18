@@ -2526,8 +2526,7 @@ url = "rtsp://example/cam"
         }
         let mut checked = 0usize;
         for path in &toml_paths {
-            let cfg =
-                Config::load(path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+            let cfg = Config::load(path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
             // Validate via the same path the engine uses on boot.
             cfg.validate()
                 .unwrap_or_else(|e| panic!("validate {}: {e}", path.display()));
