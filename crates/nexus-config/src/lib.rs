@@ -2505,17 +2505,28 @@ url = "rtsp://example/cam"
             .and_then(|p| p.parent())
             .expect("repo root above crates/nexus-config");
         let config_dir = repo_root.join("config");
-        let entries = std::fs::read_dir(&config_dir)
-            .unwrap_or_else(|e| panic!("read_dir {}: {e}", config_dir.display()));
-        let mut checked = 0usize;
-        for entry in entries {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
-                continue;
+        // Scan the top-level `config/` samples AND the per-tier
+        // templates under `config/tiers/`. The tier files are what
+        // install.sh stages to /etc/nexus/nexus.toml, so a schema typo
+        // there crash-loops the engine on a clean install — and CI
+        // never builds/runs the installer, so this is the only gate
+        // that catches it (regression: t24-amd.toml shipped a
+        // fabricated `[tracker] clock` field that `deny_unknown_fields`
+        // rejects, but no test parsed config/tiers/ until now).
+        let mut toml_paths: Vec<std::path::PathBuf> = Vec::new();
+        for dir in [config_dir.clone(), config_dir.join("tiers")] {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                    toml_paths.push(path);
+                }
             }
-            let cfg =
-                Config::load(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+        }
+        let mut checked = 0usize;
+        for path in &toml_paths {
+            let cfg = Config::load(path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
             // Validate via the same path the engine uses on boot.
             cfg.validate()
                 .unwrap_or_else(|e| panic!("validate {}: {e}", path.display()));
@@ -2563,8 +2574,9 @@ url = "rtsp://example/cam"
             checked += 1;
         }
         assert!(
-            checked >= 2,
-            "expected to round-trip at least 2 TOMLs from {} (found {checked})",
+            checked >= 6,
+            "expected to round-trip at least 6 TOMLs (the per-tier templates) \
+             from {} and its tiers/ subdir (found {checked})",
             config_dir.display()
         );
     }
