@@ -239,6 +239,7 @@ export function SystemPage() {
           ) : (
             <p className="text-sm text-muted-foreground">
               No GPU detected. NVIDIA cards require the proprietary driver;
+              AMD Radeon (incl. Ryzen APUs) require the amdgpu kernel module;
               Intel iGPUs require the i915 kernel module; macOS reports
               integrated graphics via system_profiler.
             </p>
