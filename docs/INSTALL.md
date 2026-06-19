@@ -842,6 +842,18 @@ HSA_OVERRIDE_GFX_VERSION=10.3.0 rocm-smi --showuse
 # Expect GPU use% to spike while cameras stream.
 ```
 
+> **System tab GPU card.** Open the **System** tab in the UI to see a
+> live AMD Radeon card with VRAM used/total, edge temperature, and
+> utilization%. The card is populated lazily on the first authenticated
+> metrics request, so give it a few seconds after loading the page.
+> Utilization is a **time-averaged GPU-busy duty cycle** (a background
+> sampler polls the amdgpu `gpu_busy_percent` counter and reports a
+> rolling multi-second mean, the same semantics as `nvidia-smi`).
+> Because the motion gate drops most frames before inference, the GPU
+> is genuinely idle most of the time, so utilization typically reads a
+> few percent and climbs with sustained motion — it is not pinned to a
+> single instantaneous 0/100 reading.
+
 > **Fail-soft to CPU.** If the GPU can't be reached (e.g. `/dev/kfd`
 > not accessible to the service user), the engine logs a warning and
 > falls back to the CPU EP — `ep_registered=["cpu"]` — rather than
