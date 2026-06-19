@@ -26,6 +26,12 @@ ep-directml = ["nexus-inference/ep-directml", "nexus-reid/ep-directml"]
 # M_AMD_ROCM — AMD Radeon GPU via ROCm EP. Works on discrete RDNA/CDNA
 # and Phoenix iGPUs (with HSA_OVERRIDE_GFX_VERSION=10.3.0 at runtime).
 ep-rocm = ["nexus-inference/ep-rocm"]
+# ep-vulkan — Vulkan-accelerated inference (ORT WebGPU EP on its
+# Dawn->Vulkan backend). Default accelerator for AMD GPUs ROCm does not
+# officially support. Forwarded into nexus-inference only (re-id reuses
+# the compiled selector arm), mirroring ep-rocm. Operator opts in by
+# putting "vulkan" (alias "webgpu") in `inference.ep_priority`.
+ep-vulkan = ["nexus-inference/ep-vulkan"]
 # M_HAILO_EP — Hailo-8 detector path. Forwarded into nexus-inference
 # only (re-id is ONNX-only). Operator opts in by adding "hailo" to
 # `inference.ep_priority` AND dropping `yolo26n.hef` into the model

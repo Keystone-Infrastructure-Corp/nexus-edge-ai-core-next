@@ -17,6 +17,15 @@ ep-coreml   = ["ort"]
 ep-tensorrt = ["ort"]
 ep-directml = ["ort"]
 ep-rocm     = ["ort"]
+# ep-vulkan — Vulkan-accelerated inference via ORT's WebGPU EP on its
+# Dawn->Vulkan backend (ONNX Runtime has NO native Vulkan EP; WebGPU IS
+# the Vulkan path on Linux). Default accelerator for AMD GPUs that ROCm
+# does not officially support (Phoenix iGPUs etc). Maps to `ort` only —
+# NOT `ort/webgpu`: because we load ORT dynamically (`load-dynamic`),
+# the WebGPU register path compiles without statically linking the
+# provider; availability is a runtime concern of the dlopened .so (an
+# ORT built from source with `--use_webgpu`), exactly like `ep-rocm`.
+ep-vulkan   = ["ort"]
 # M_HAILO_EP — Hailo-8 backend. Not an ORT EP (HailoRT is a parallel
 # runtime); enabling this just pulls `nexus-hailo-backend` and asks
 # it to link against the system `libhailort.so` (linux only). The

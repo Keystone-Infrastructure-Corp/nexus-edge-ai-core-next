@@ -2273,6 +2273,14 @@ _apply_hailo_ep_priority_override() {
         log "ep_priority lists \"rocm\" (ROCm-primary tier); not injecting \"hailo\""
         return 0
     fi
+    # Symmetric to the ROCm guard: the operator chose a Vulkan-primary tier
+    # (e.g. --tier amd, ep_priority = ["vulkan", "cpu"]). A box with both a
+    # Hailo-8 and an AMD iGPU can be pinned to Vulkan inference on purpose —
+    # the explicit tier wins, so do NOT inject "hailo".
+    if grep -qE '^\s*ep_priority\s*=.*"vulkan"' "$target"; then
+        log "ep_priority lists \"vulkan\" (Vulkan-primary tier); not injecting \"hailo\""
+        return 0
+    fi
     if ! grep -qE '^\s*ep_priority\s*=\s*\[' "$target"; then
         warn "ep_priority line not found in $target; skipping Hailo override"
         return 0
