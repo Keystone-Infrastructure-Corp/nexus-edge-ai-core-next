@@ -431,12 +431,24 @@ install_drivers() {
 
     if (( has_amd )); then
         _drivers_amd_graphics
-        # ROCm compute for inference (if ep_priority includes "rocm").
-        # Gracefully skips if amdgpu module is not yet bound.
-        _drivers_amd_rocm
-        # Fetch a ROCm-capable ONNX Runtime (1.21.0) and wire the engine
-        # to load it. No-op when /dev/kfd / rocminfo are absent.
-        _install_ort_rocm
+        if [[ "${TIER:-}" == "amd" ]]; then
+            # `amd` tier = Vulkan-first for AMD GPUs ROCm does not officially
+            # support (Phoenix/Rembrandt iGPUs, gfx1035/gfx1103). Install the
+            # Vulkan diagnostic userspace and a WebGPU-capable ONNX Runtime;
+            # skip ROCm entirely (no HSA_OVERRIDE force-fit on this tier).
+            _drivers_amd_vulkan
+            # Fetch a WebGPU-capable ONNX Runtime (1.27.0, Dawn->Vulkan) and
+            # wire the engine to load it. No-op (CPU fallback) if no Vulkan
+            # ICD / render node is present.
+            _install_ort_webgpu
+        else
+            # ROCm compute for inference (if ep_priority includes "rocm").
+            # Gracefully skips if amdgpu module is not yet bound.
+            _drivers_amd_rocm
+            # Fetch a ROCm-capable ONNX Runtime (1.21.0) and wire the engine
+            # to load it. No-op when /dev/kfd / rocminfo are absent.
+            _install_ort_rocm
+        fi
     fi
 
     if (( has_hailo )); then
@@ -1514,6 +1526,219 @@ EOF
     log "wrote systemd drop-in $dropin (ORT_DYLIB_PATH -> ROCm runtime)"
     # daemon-reload so the override takes effect on next restart. install.sh
     # restarts the engine after install_drivers, so no explicit restart here.
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# AMD Vulkan (WebGPU EP) — runtime install for the `amd` tier.
+#
+# The `amd` tier targets AMD GPUs that ROCm does NOT officially support
+# (Phoenix/Rembrandt iGPUs such as the Radeon 680M/780M, gfx1035/gfx1103).
+# Instead of force-fitting them onto ROCm with HSA_OVERRIDE_GFX_VERSION,
+# inference runs through ONNX Runtime's WebGPU execution provider on its
+# Dawn->Vulkan backend (ONNX Runtime has no native Vulkan EP; WebGPU IS
+# the Vulkan path on Linux). CPU is the terminal fallback.
+#
+# Validated end-to-end on a Radeon 680M (Rembrandt gfx1035): the engine
+# registers ep="vulkan(webgpu)" and runs yolo26n_640 with the GPU at
+# ~100% busy under sustained load (i.e. the RADV hardware device, not the
+# llvmpipe software fallback).
+# ---------------------------------------------------------------------------
+
+# Install the Vulkan diagnostic userspace for the amd tier. The RADV ICD
+# itself (mesa-vulkan-drivers) + libvulkan1 are already pulled in by
+# `_drivers_amd_graphics`; this adds `vulkan-tools` so post-install
+# verification (and the operator) can run `vulkaninfo --summary`.
+# Idempotent + non-fatal.
+_drivers_amd_vulkan() {
+    if _all_dpkg_installed mesa-vulkan-drivers libvulkan1 vulkan-tools; then
+        log "AMD Vulkan userspace already installed (RADV ICD + vulkan-tools present)"
+    else
+        log "installing AMD Vulkan userspace (RADV ICD + vulkan-tools)"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                mesa-vulkan-drivers libvulkan1 vulkan-tools; then
+            warn "Vulkan userspace install failed; WebGPU EP will fall back to CPU."
+            return 0
+        fi
+    fi
+
+    # Sanity probe (non-fatal) — vulkaninfo enumerates the RADV device.
+    if command -v vulkaninfo >/dev/null 2>&1 \
+        && vulkaninfo --summary 2>/dev/null | grep -qiE 'RADV|AMD RADEON'; then
+        log "Vulkan: RADV device enumerated (vulkaninfo confirmed)"
+    else
+        warn "Vulkan userspace installed but vulkaninfo did not enumerate a RADV"
+        warn "device — amdgpu may not be bound yet; a reboot may be required."
+    fi
+}
+
+# Fetch a WebGPU-capable ONNX Runtime and wire the engine to load it.
+#
+# WHY a separate download (not bundled in the release tarball):
+#   * The release tarball ships libonnxruntime.so.1.24.x built with the
+#     OpenVINO provider — it has NO WebGPU/Vulkan backend.
+#   * The `onnxruntime-webgpu` PyPI wheel (1.27.0) ships a libonnxruntime.so
+#     with Dawn STATICALLY linked in on its Vulkan backend. Stock PyPI
+#     `onnxruntime` does NOT (its provider list is Azure+CPU only).
+#   * The engine binary is built against ort `api-21`, so it dlopens the
+#     1.27 runtime cleanly (GetApi(21) is satisfied by any ABI >= 21).
+#
+# Layout mirrors _install_ort_rocm: lands in a release-independent vendor
+# dir (/opt/nexus/vendor/onnxruntime-webgpu) so it survives `current`
+# symlink flips; a systemd drop-in (10-ort-webgpu.conf) repoints
+# ORT_DYLIB_PATH + LD_LIBRARY_PATH at it. The WebGPU runtime also carries a
+# CPU EP, so the ["vulkan","cpu"] fallback chain works through the same .so.
+#
+# Idempotent (version marker). Every failure is warn-and-continue — the
+# engine still installs and runs on the bundled OpenVINO/CPU runtime (the
+# amd tier's ep_priority falls through "vulkan" -> "cpu").
+_install_ort_webgpu() {
+    # WebGPU/Vulkan needs a DRM render node + a Vulkan ICD to attach to. If
+    # neither is present there is nothing for Dawn to bind, so skip the
+    # download and let the engine run CPU-only.
+    if ! compgen -G "/dev/dri/renderD*" >/dev/null; then
+        warn "no DRM render node (/dev/dri/renderD*); skipping WebGPU ONNX Runtime"
+        warn "fetch (engine uses the bundled OpenVINO/CPU runtime)."
+        return 0
+    fi
+    if ! compgen -G "/usr/share/vulkan/icd.d/*.json" >/dev/null \
+        && ! compgen -G "/etc/vulkan/icd.d/*.json" >/dev/null; then
+        warn "no Vulkan ICD found under /usr/share/vulkan/icd.d; skipping WebGPU"
+        warn "ONNX Runtime fetch (engine uses the bundled OpenVINO/CPU runtime)."
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 unavailable; cannot resolve onnxruntime-webgpu wheel URL — skipping."
+        return 0
+    fi
+
+    local ort_ver="1.27.0"
+    local vendor_dir="${NEXUS_ORT_WEBGPU_DIR:-/opt/nexus/vendor/onnxruntime-webgpu}"
+    local marker="$vendor_dir/.nexus-ort-webgpu-version"
+
+    # Idempotent short-circuit: already installed at the target version.
+    if [[ -f "$marker" ]] && grep -qx "$ort_ver" "$marker" 2>/dev/null \
+        && [[ -e "$vendor_dir/libonnxruntime.so" ]]; then
+        log "WebGPU ONNX Runtime $ort_ver already installed ($vendor_dir)"
+        _ort_webgpu_write_dropin "$vendor_dir"
+        return 0
+    fi
+
+    log "installing WebGPU ONNX Runtime $ort_ver (Vulkan inference for AMD GPUs)"
+
+    # Resolve a manylinux x86_64 wheel URL from the PyPI JSON API. The C
+    # API .so is identical across cp tags (it is not Python-version
+    # specific), so any manylinux x86_64 wheel works — take the first.
+    local url
+    url="$(curl -fsSL "https://pypi.org/pypi/onnxruntime-webgpu/${ort_ver}/json" 2>/dev/null \
+        | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for u in d.get("urls", []):
+    fn = u.get("filename", "")
+    if fn.endswith(".whl") and "manylinux" in fn and "x86_64" in fn:
+        print(u["url"])
+        break
+' 2>/dev/null)"
+
+    if [[ -z "$url" ]]; then
+        warn "could not resolve an onnxruntime-webgpu manylinux x86_64 wheel URL;"
+        warn "engine will use the bundled OpenVINO/CPU runtime (Vulkan disabled)."
+        return 0
+    fi
+
+    local tmpdir
+    tmpdir="$(mktemp -d -t nexus-ort-webgpu.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+
+    log "  fetching $(basename "$url") (~24 MB)…"
+    if ! curl -fsSL "$url" -o "$tmpdir/ort.whl"; then
+        warn "WebGPU ONNX Runtime download failed; Vulkan inference disabled."
+        return 0
+    fi
+
+    # Wheels are zip archives; the runtime + provider .so files live under
+    # onnxruntime/capi/. Need unzip — install if missing.
+    if ! command -v unzip >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip >/dev/null 2>&1 || {
+            warn "unzip unavailable and install failed; cannot unpack WebGPU ORT wheel"
+            return 0
+        }
+    fi
+
+    if ! unzip -q -o "$tmpdir/ort.whl" 'onnxruntime/capi/*' -d "$tmpdir/extract"; then
+        warn "WebGPU ORT wheel extract failed; Vulkan inference disabled"
+        return 0
+    fi
+
+    local capi="$tmpdir/extract/onnxruntime/capi"
+    if [[ ! -e "$capi/libonnxruntime.so" ]] \
+        && ! compgen -G "$capi/libonnxruntime.so*" >/dev/null; then
+        warn "WebGPU ORT wheel layout unexpected (no libonnxruntime.so under capi/)"
+        return 0
+    fi
+
+    # Stage into the vendor dir. Ship the versioned runtime + the provider
+    # .so siblings ONNX Runtime dlopens at session-create time
+    # (onnxruntime_providers_shared.so). Dawn is statically linked into
+    # libonnxruntime.so itself, so there is no separate webgpu provider .so.
+    install -d -m 0755 "$vendor_dir"
+    cp -a "$capi"/libonnxruntime*.so* "$vendor_dir"/ 2>/dev/null || true
+    cp -a "$capi"/libonnxruntime_providers_*.so* "$vendor_dir"/ 2>/dev/null || true
+
+    # The ort crate dlopens the unversioned soname `libonnxruntime.so`. The
+    # wheel ships it as libonnxruntime.so.<ver>; create the symlink.
+    if [[ ! -e "$vendor_dir/libonnxruntime.so" ]]; then
+        local versioned
+        versioned="$(cd "$vendor_dir" && ls libonnxruntime.so.* 2>/dev/null | head -1)"
+        [[ -n "$versioned" ]] && ln -sf "$versioned" "$vendor_dir/libonnxruntime.so"
+    fi
+
+    if [[ ! -e "$vendor_dir/libonnxruntime.so" ]]; then
+        warn "WebGPU ORT staged but libonnxruntime.so symlink missing; Vulkan disabled"
+        return 0
+    fi
+
+    printf '%s\n' "$ort_ver" > "$marker"
+    log "WebGPU ONNX Runtime $ort_ver staged at $vendor_dir"
+
+    _ort_webgpu_write_dropin "$vendor_dir"
+}
+
+# Write the systemd drop-in that repoints the engine's ORT loader at the
+# WebGPU (Dawn->Vulkan) runtime. Mirrors _ort_rocm_write_dropin. The WebGPU
+# .so links Dawn statically and dlopens libvulkan.so.1 from the default
+# loader path (/usr/lib/x86_64-linux-gnu), so only the vendor dir needs to
+# be on LD_LIBRARY_PATH (it AUGMENTS, not replaces, ld.so's default search).
+_ort_webgpu_write_dropin() {
+    local vendor_dir="$1"
+    local dropin_dir="/etc/systemd/system/nexus-engine.service.d"
+    local dropin="$dropin_dir/10-ort-webgpu.conf"
+
+    install -d -m 0755 "$dropin_dir"
+    # A box cannot run both the ROCm and the WebGPU runtime; if a stale
+    # ROCm drop-in is present (e.g. a tier change) remove it so the two
+    # ORT_DYLIB_PATH overrides do not stack.
+    rm -f "$dropin_dir/10-ort-rocm.conf"
+    cat > "$dropin" <<EOF
+# Auto-generated by nexus install.sh (_install_ort_webgpu). Repoints the
+# ONNX Runtime loader at the WebGPU-capable runtime (onnxruntime-webgpu,
+# Dawn->Vulkan backend) for AMD GPUs ROCm does not support. The engine
+# binary is built against ort api-21 so this 1.27 runtime loads cleanly.
+# Overrides only the two ORT env vars from the base unit.
+#
+# Remove this file (and 'systemctl daemon-reload && systemctl restart
+# nexus-engine') to fall back to the bundled OpenVINO/CPU runtime.
+[Service]
+Environment=ORT_DYLIB_PATH=${vendor_dir}/libonnxruntime.so
+Environment=LD_LIBRARY_PATH=${vendor_dir}
+EOF
+
+    log "wrote systemd drop-in $dropin (ORT_DYLIB_PATH -> WebGPU/Vulkan runtime)"
     systemctl daemon-reload 2>/dev/null || true
 }
 
