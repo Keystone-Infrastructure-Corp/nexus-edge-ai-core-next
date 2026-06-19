@@ -11,7 +11,7 @@ assume the camera baseline below.
 | ----------- | ------------------------------------------------ | ----------------------------- | ---------------------------- | ------- | ------ | --------------------- | ------- | ------ |
 | **T10**     | Beelink Mini S13 (N150, 16 GB)                   | UHD 24EU iGPU                 | `openvino, cpu`              | 1       | 320    | 1–2                   | ~$300   | ✅ ordered |
 | **T24**     | Beelink EQR7 (Ryzen 7 7735HS, 24 GB) + Hailo-8 M.2 | Hailo-8 (26 TOPS, M.2 2280) | `hailo, cpu`                 | 1       | 640    | 24 (target)           | ~$1,005 | ✅ ordered |
-| **T24-AMD** | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)             | Radeon 680M (gfx1035) ROCm    | `rocm, cpu`                  | 1       | 640    | 4–6                   | ~$650   | ✅ shipping — opt-in via `--tier t24-amd` |
+| **AMD**     | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)             | Radeon 680M/780M iGPU (Vulkan)| `vulkan, cpu`                | 1       | 640    | 4–6                   | ~$650   | ✅ shipping — opt-in via `--tier amd` |
 | **T36**     | Lenovo P3 Tiny / HP Z2 Mini + Arc A380           | Intel Arc A380 6 GB (dGPU)    | `openvino, cpu`              | 2       | 640    | 8–12                  | ~$1100  | not yet sourced |
 | **T36-S**   | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake) | Arc 140V Xe2 + NPU 4 (47 TOPS)| `openvino, npu, cpu`         | 2       | 640    | 6–8                   | ~$800   | ✅ ordered |
 | **T64**     | Lenovo P3 Tower / HP Z2 G9 + RTX 4060            | NVIDIA RTX 4060 8 GB          | `tensorrt, cuda, cpu`        | 3       | 640    | 12–20                 | ~$1300  | post-beta |
@@ -25,19 +25,20 @@ M3 Ultra (Iris Xe 96 EU) T24 soak of 4–6 cams is no longer the
 canonical T24 hardware; existing GMKtec deployments continue to work
 with whatever per-deployment `nexus.toml` they currently have.
 
-**T24-AMD** is the AMD-GPU sibling of T24, shipping as of v0.1.84.
-The EQR7's Radeon 680M (Phoenix gfx1035) runs ONNX-Runtime inference
-through the AMD **ROCm execution provider** (`ep-rocm` Cargo feature,
-bundled ROCm ONNX Runtime 1.21), pinned by `t24-amd.toml`'s
-`ep_priority = ["rocm", "cpu"]`. It is **opt-in only** (`--tier
-t24-amd`) — the probe never auto-selects it (see mapping below),
-because forcing inference onto the iGPU is a deliberate choice and
-the same EQR7 chassis defaults to the Hailo-8 when one is fitted.
-Phoenix-class iGPUs need `HSA_OVERRIDE_GFX_VERSION=10.3.0` (set in the
-systemd unit); discrete RDNA/CDNA cards work without it. The System
-tab surfaces the Radeon's live VRAM, edge temperature, and a
-time-averaged GPU-busy utilization%. Setup details:
-[INSTALL.md §5.5d](INSTALL.md#55d-amd-rocm-inference-force-gpu-instead-of-hailo).
+**AMD** is the AMD-GPU sibling of T24. The EQR7's Radeon 680M
+(Phoenix gfx1035) runs ONNX-Runtime inference through the
+**Vulkan(WebGPU) execution provider** (`ep-vulkan` Cargo feature, ORT
+WebGPU on its Dawn→Vulkan backend, bundled ONNX Runtime 1.27), pinned
+by `amd.toml`'s `ep_priority = ["vulkan", "cpu"]`. It is **opt-in
+only** (`--tier amd`) — the probe never auto-selects it (see mapping
+below), because forcing inference onto the iGPU is a deliberate choice
+and the same EQR7 chassis defaults to the Hailo-8 when one is fitted.
+No `HSA_OVERRIDE_GFX_VERSION` force-fit: ROCm is reserved for the
+discrete RDNA/CDNA GPUs it officially supports (classified from the
+PCI device ID at install time). The System tab surfaces the Radeon's
+live VRAM, edge temperature, and a time-averaged GPU-busy
+utilization%. Setup details:
+[INSTALL.md §5.5d](INSTALL.md#55d-amd-gpu-inference-vulkan-default-rocm-for-supported-discrete-gpus).
 
 ## Camera baseline (every tier)
 
@@ -59,7 +60,7 @@ box, copy it to `/etc/nexus/nexus.toml`, edit camera URLs.
 | ------------------------------------------ | ---------------------------------------- |
 | [`config/tiers/t10.toml`](../config/tiers/t10.toml)     | T10 — Beelink Mini S13                  |
 | [`config/tiers/t24.toml`](../config/tiers/t24.toml)     | T24 — Beelink EQR7 + Hailo-8            |
-| [`config/tiers/t24-amd.toml`](../config/tiers/t24-amd.toml) | T24-AMD — Beelink EQR7, Radeon 680M (ROCm) |
+| [`config/tiers/amd.toml`](../config/tiers/amd.toml) | AMD — Beelink EQR7, Radeon 680M (Vulkan) |
 | [`config/tiers/t36.toml`](../config/tiers/t36.toml)     | T36 — Arc A380 SFF                      |
 | [`config/tiers/t36s.toml`](../config/tiers/t36s.toml)   | T36-S — GMKtec K13 / EVO-X1 Lunar Lake  |
 | [`config/tiers/t64.toml`](../config/tiers/t64.toml)     | T64 — RTX 4060 desktop                  |
@@ -87,20 +88,23 @@ Intel Arc 140V iGPU OR /dev/accel/* present   → T36-S
 Intel Arc dGPU (A310/A380/A580) present       → T36
 Intel Iris Xe 96 EU iGPU                      → T24  (legacy GMKtec mapping; still resolves to t24.toml — see note)
 Intel UHD 24EU iGPU (N100/N150 class)         → T10
-AMD Radeon iGPU/dGPU (no Hailo)               → T10  (CPU-only auto-default; opt into GPU inference with --tier t24-amd)
+AMD Radeon iGPU/dGPU (no Hailo)               → T10  (CPU-only auto-default; opt into GPU inference with --tier amd)
 Apple Silicon                                 → dev-only (no soak tier)
 fallback                                      → T10
 ```
 
 AMD-only boxes auto-default to T10 (CPU EP) — the probe does **not**
-select T24-AMD on its own, because routing inference onto the Radeon
-iGPU is a deliberate operator choice. The ROCm inference path is
-fully shipped (the `ep-rocm` Cargo feature + bundled ROCm ONNX
-Runtime 1.21, validated on the EQR7 Radeon 680M / Phoenix gfx1035
-with `HSA_OVERRIDE_GFX_VERSION=10.3.0`); to use it, install with
-`--tier t24-amd`, which pins `ep_priority = ["rocm", "cpu"]`. Either
-way the Mesa VA-API path gives hardware H.264/HEVC decode on the
-Radeon. See [INSTALL.md §5.5d](INSTALL.md#55d-amd-rocm-inference-force-gpu-instead-of-hailo).
+select the AMD tier on its own, because routing inference onto the
+Radeon iGPU is a deliberate operator choice. The Vulkan inference
+path is fully shipped (the `ep-vulkan` Cargo feature + bundled ONNX
+Runtime 1.27 WebGPU/Dawn→Vulkan, validated on the EQR7 Radeon 680M /
+Phoenix gfx1035 at ~100% GPU-busy); to use it, install with `--tier
+amd`, which pins `ep_priority = ["vulkan", "cpu"]`. ROCm is reserved
+for the discrete RDNA/CDNA GPUs it officially supports (classified
+from the PCI device ID at install time) — never force-fit onto an
+unsupported iGPU. Either way the Mesa VA-API path gives hardware
+H.264/HEVC decode on the Radeon. See
+[INSTALL.md §5.5d](INSTALL.md#55d-amd-gpu-inference-vulkan-default-rocm-for-supported-discrete-gpus).
 
 The probe is advisory — operator can always override with an explicit
 config — but the recommendation lines up with the boxes actually on the

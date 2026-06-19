@@ -143,10 +143,12 @@ fn warn_openvino_unavailable_once() {
 ///   * `/dev/kfd` — AMD KFD compute driver (present on all RDNA/CDNA GPUs and some iGPUs)
 ///   * `/dev/dri/renderD12{8,9}` — amdgpu DRM render node
 ///
-/// For Phoenix-class iGPUs (Radeon 680M/780M, gfx1035/gfx1103), ROCm is
-/// officially unsupported upstream and requires `HSA_OVERRIDE_GFX_VERSION=10.3.0`
-/// environment variable at runtime. For discrete RDNA/CDNA GPUs (gfx1030+),
-/// ROCm is fully supported.
+/// ROCm is registered only for AMD GPUs it officially supports — discrete
+/// RDNA/CDNA parts (gfx1030+). The installer classifies the GPU from its PCI
+/// device ID and routes unsupported parts (Phoenix/Rembrandt iGPUs,
+/// gfx1035/gfx1103) to the Vulkan(WebGPU) EP instead. `HSA_OVERRIDE_GFX_VERSION`
+/// is not set by default; it remains only as an unsupported manual escape
+/// hatch for operators who insist on force-fitting ROCm onto such an iGPU.
 ///
 /// The userspace runtime libs (rocm-hip-runtime, rocm-opencl-runtime, librocm_*.so,
 /// and a ROCm-enabled libonnxruntime.so) are installed via apt/package manager
@@ -455,10 +457,11 @@ fn selected_for_priority_inner(
                  --features ep-openvino (Intel GPU routes through OpenVINO); skipping"
             ),
 
-            // AMD Radeon GPU via ROCm EP. Works on discrete RDNA/CDNA GPUs.
-            // For Phoenix iGPUs (Radeon 680M/780M), requires
-            // `HSA_OVERRIDE_GFX_VERSION=10.3.0` environment variable at runtime
-            // (unofficial upstream support, fragile on older kernels).
+            // AMD Radeon GPU via ROCm EP — officially-supported discrete
+            // RDNA/CDNA GPUs only. Unsupported parts (Phoenix iGPUs etc.) are
+            // routed to the Vulkan(WebGPU) arm by the installer, not here.
+            // HSA_OVERRIDE_GFX_VERSION is an unsupported manual escape hatch,
+            // never set by default.
             #[cfg(feature = "ep-rocm")]
             "rocm" => {
                 let rocm_available = rocm_runtime_available();

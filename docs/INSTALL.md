@@ -96,7 +96,7 @@ you choose here. Full background:
 | ----------- | --------------------------------------------------- | -------------------------- | ----------------------- | ------------------------- | ------------------------------------------------- | ------------- |
 | **T10**     | Beelink Mini S13 (N150, 16 GB)                      | UHD 24EU iGPU              | `openvino, cpu`         | 1–2                       | [config/tiers/t10.toml](../config/tiers/t10.toml)     | shipping      |
 | **T24**     | GMKtec M3 Ultra (i7-12700H, 32 GB)                  | Iris Xe 96 EU              | `openvino, cpu`         | 4–6                       | [config/tiers/t24.toml](../config/tiers/t24.toml)     | shipping      |
-| **T24-AMD** | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)                | Radeon 680M (gfx1035) ROCm | `rocm, cpu`             | 4–6                       | [config/tiers/t24-amd.toml](../config/tiers/t24-amd.toml) | shipping — forces GPU inference even on a Hailo-equipped box; see §5.5d |
+| **AMD**     | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)                | Radeon 680M/780M iGPU (Vulkan) | `vulkan, cpu`           | 4–6                       | [config/tiers/amd.toml](../config/tiers/amd.toml) | shipping — Vulkan(WebGPU) EP for AMD GPUs ROCm does not support; see §5.5d |
 | **T36**     | Lenovo P3 Tiny / HP Z2 Mini + Arc A380              | Intel Arc A380 6 GB dGPU   | `openvino, cpu`         | 8–12                      | [config/tiers/t36.toml](../config/tiers/t36.toml)     | shipping      |
 | **T36-S**   | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)    | Arc 140V Xe2 + NPU 4       | `openvino, npu, cpu`    | 6–8                       | [config/tiers/t36s.toml](../config/tiers/t36s.toml)   | shipping      |
 | **T64**     | Lenovo P3 Tower / HP Z2 G9 + RTX 4060               | NVIDIA RTX 4060 8 GB       | `tensorrt, cuda, cpu`   | 12–20                     | [config/tiers/t64.toml](../config/tiers/t64.toml)     | post-beta — CUDA/TensorRT EPs land in M5; until then T64 falls through to CPU and is **not** a meaningful deployment |
@@ -644,14 +644,15 @@ is healthy before proceeding.
 > serial, and part number from `nexus-hailo-backend::telemetry()`.
 
 The EQR7's Radeon 680M (Phoenix gfx1035) drives **both** hardware
-video decode (Mesa VA-API, §5.5a) **and** ONNX-Runtime inference
-through the AMD **ROCm execution provider** as of v0.1.84. ROCm on
-Phoenix-class iGPUs is unsupported upstream and requires
-`HSA_OVERRIDE_GFX_VERSION=10.3.0` (set automatically in the systemd
-unit); discrete RDNA/CDNA cards work without the override. To run a
-box on the GPU instead of the Hailo-8, install with the **`t24-amd`**
-tier — see §5.5d. If you'd rather keep inference on the Hailo-8,
-use the default `t24` tier and leave the Radeon for decode only.
+video decode (Mesa VA-API, §5.5a) **and** ONNX-Runtime inference. For
+AMD GPUs ROCm does not officially support — Phoenix/Rembrandt iGPUs
+like the 680M/780M — inference runs through ONNX Runtime's
+**Vulkan(WebGPU) execution provider** (Dawn→Vulkan backend), selected
+by the **`amd`** tier (`ep_priority = ["vulkan", "cpu"]`); see §5.5d.
+ROCm is reserved for the discrete RDNA/CDNA cards it officially
+supports, which the installer classifies from the PCI device ID — no
+`HSA_OVERRIDE_GFX_VERSION` force-fit. To keep inference on the Hailo-8
+instead, use the default `t24` tier and leave the Radeon for decode.
 
 #### 5.5a AMD Mesa VA-API stack (automatic)
 
@@ -806,41 +807,56 @@ check and emits a remediation hint if it fails.
 > traffic flowing, the engine is on the CPU EP fallback — check
 > `journalctl -u nexus-engine -f` for HailoRT load errors.
 
-#### 5.5d AMD ROCm inference (force GPU instead of Hailo)
+#### 5.5d AMD GPU inference (Vulkan default; ROCm for supported discrete GPUs)
 
-To run inference on the Radeon iGPU/dGPU via the ROCm execution
-provider — even on a box that also has a Hailo-8 — install with the
-**`t24-amd`** tier, which ships `ep_priority = ["rocm", "cpu"]`:
+To run inference on the Radeon iGPU/dGPU — even on a box that also has a
+Hailo-8 — install with the **`amd`** tier, which ships
+`ep_priority = ["vulkan", "cpu"]`:
 
 ```bash
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
-  | sudo bash -s -- --tier t24-amd
+  | sudo bash -s -- --tier amd
 ```
 
-What the installer does for the ROCm path (all automatic when an AMD
-GPU is detected via `lspci`):
+What the installer does for the `amd` (Vulkan) path (all automatic when
+an AMD GPU is detected via `lspci`):
 
-1. Installs the AMD ROCm userspace (`rocminfo`, `rocm-smi-lib`,
-   `hip-runtime-amd`, `rocm-libs`) from `repo.radeon.com`.
-2. Fetches a ROCm-capable ONNX Runtime (1.21.0) into
-   `/opt/nexus/vendor/onnxruntime-rocm/` and writes a systemd drop-in
-   that points `ORT_DYLIB_PATH` / `LD_LIBRARY_PATH` at it.
-3. Resolves the provider `.so`'s auditwheel-hashed `librocm_smi64`
-   dependency to its `/opt/rocm/lib` twin via symlink.
-4. The base systemd unit already sets `HSA_OVERRIDE_GFX_VERSION=10.3.0`
-   (needed for Phoenix iGPUs) and grants the `nexus` user the
-   `render`/`video` groups + `/dev/kfd` access.
+1. Installs the Vulkan userspace (RADV ICD via `mesa-vulkan-drivers`,
+   `libvulkan1`, `vulkan-tools`).
+2. Fetches a WebGPU-capable ONNX Runtime (1.27.0, Dawn→Vulkan) into
+   `/opt/nexus/vendor/onnxruntime-webgpu/` and writes a systemd drop-in
+   (`10-ort-webgpu.conf`) that points `ORT_DYLIB_PATH` / `LD_LIBRARY_PATH`
+   at it.
+3. Grants the `nexus` user the `render`/`video` groups + render-node
+   access. No ROCm stack, no `HSA_OVERRIDE_GFX_VERSION`.
 
-Because the `t24-amd` template lists `rocm` first, the installer's
-Hailo auto-override is **suppressed** — the Hailo-8 is left alone and
-inference is pinned to the GPU. **Verify:**
+Because the `amd` template lists `vulkan` first, the installer's Hailo
+auto-override is **suppressed** — the Hailo-8 is left alone and inference
+is pinned to the GPU. **Verify:**
 
 ```bash
-journalctl -u nexus-engine | grep -iE 'ep_registered|rocm'
-# Expect: ep_requested=["rocm","cpu"] ep_registered=["rocm","cpu"]
-HSA_OVERRIDE_GFX_VERSION=10.3.0 rocm-smi --showuse
-# Expect GPU use% to spike while cameras stream.
+journalctl -u nexus-engine | grep -iE 'ep_registered|vulkan'
+# Expect: ep_requested=["vulkan","cpu"] ep_registered=["vulkan(webgpu)","cpu"]
+vulkaninfo --summary | grep -iE 'deviceName|driverName'
+# Expect the RADV device (e.g. "AMD Radeon Graphics (RADV ...)"),
+# not "llvmpipe" — llvmpipe means no hardware Vulkan device was found.
 ```
+
+**Officially-supported discrete AMD GPUs (RDNA/CDNA, gfx1030+)** instead
+take the **ROCm** path automatically when auto-detected: the installer
+classifies the GPU from its PCI device ID, installs the ROCm userspace +
+a ROCm-capable ONNX Runtime (1.21.0), and registers
+`ep_registered=["rocm","cpu"]`. ROCm is never force-fit onto an
+unsupported iGPU.
+
+> **Unsupported manual escape hatch.** An operator who insists on running
+> ROCm on an iGPU ROCm does not support can uncomment
+> `# Environment=HSA_OVERRIDE_GFX_VERSION=10.3.0` in
+> `/etc/systemd/system/nexus-engine.service` (10.3.0 maps a gfx1035
+> Phoenix part onto the gfx1030 ISA) and switch `ep_priority` to
+> `["rocm", "cpu"]`. This is fragile on older kernels and
+> **unsupported** — the Vulkan path is the supported default for these
+> GPUs.
 
 > **System tab GPU card.** Open the **System** tab in the UI to see a
 > live AMD Radeon card with VRAM used/total, edge temperature, and
