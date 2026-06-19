@@ -36,11 +36,21 @@ Environment=ORT_DYLIB_PATH=/opt/nexus/current/lib/onnxruntime/libonnxruntime.so
 Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime
 Environment=RUST_LOG=info,nexus=info
 
-# AMD ROCm / Radeon GPU configuration. HSA_OVERRIDE_GFX_VERSION is required
-# for Phoenix iGPUs (Radeon 680M/780M, gfx1035) due to unofficial upstream
-# support. Discrete RDNA/CDNA GPUs ignore this setting. Only takes effect
-# when ep_priority in nexus.toml includes "rocm" AND /dev/kfd is accessible.
-Environment=HSA_OVERRIDE_GFX_VERSION=10.3.0
+# AMD ROCm / Radeon GPU configuration.
+#
+# ROCm is enabled only for AMD GPUs it OFFICIALLY supports — discrete
+# RDNA/CDNA parts (gfx1030+) — which the installer classifies at install
+# time from the PCI device ID. AMD GPUs ROCm does NOT support (Phoenix /
+# Rembrandt iGPUs such as the Radeon 680M/780M, gfx1035/gfx1103) run
+# inference through the Vulkan(WebGPU) EP instead; the installer writes a
+# 10-ort-webgpu.conf drop-in for them and never force-fits ROCm.
+#
+# HSA_OVERRIDE_GFX_VERSION is therefore NOT set by default. It exists only
+# as an UNSUPPORTED manual escape hatch: an operator who insists on running
+# ROCm on an unsupported iGPU may uncomment the line below (10.3.0 maps a
+# gfx1035 Phoenix part onto the gfx1030 ISA). This is fragile on older
+# kernels and unsupported upstream — prefer the Vulkan path.
+# Environment=HSA_OVERRIDE_GFX_VERSION=10.3.0
 
 # T64 (CUDA + TensorRT) operators uncomment the CUDA path. The installed
 # binary is built with --features ep-cuda,ep-tensorrt — the EP is only

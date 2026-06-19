@@ -143,10 +143,12 @@ fn warn_openvino_unavailable_once() {
 ///   * `/dev/kfd` — AMD KFD compute driver (present on all RDNA/CDNA GPUs and some iGPUs)
 ///   * `/dev/dri/renderD12{8,9}` — amdgpu DRM render node
 ///
-/// For Phoenix-class iGPUs (Radeon 680M/780M, gfx1035/gfx1103), ROCm is
-/// officially unsupported upstream and requires `HSA_OVERRIDE_GFX_VERSION=10.3.0`
-/// environment variable at runtime. For discrete RDNA/CDNA GPUs (gfx1030+),
-/// ROCm is fully supported.
+/// ROCm is registered only for AMD GPUs it officially supports — discrete
+/// RDNA/CDNA parts (gfx1030+). The installer classifies the GPU from its PCI
+/// device ID and routes unsupported parts (Phoenix/Rembrandt iGPUs,
+/// gfx1035/gfx1103) to the Vulkan(WebGPU) EP instead. `HSA_OVERRIDE_GFX_VERSION`
+/// is not set by default; it remains only as an unsupported manual escape
+/// hatch for operators who insist on force-fitting ROCm onto such an iGPU.
 ///
 /// The userspace runtime libs (rocm-hip-runtime, rocm-opencl-runtime, librocm_*.so,
 /// and a ROCm-enabled libonnxruntime.so) are installed via apt/package manager
@@ -215,6 +217,90 @@ fn warn_rocm_unavailable_once() {
              the engine process (via group membership or device permissions). \
              Override autodetection by setting NEXUS_ROCM_DEVICE=force in \
              the environment."
+        );
+    });
+}
+
+/// Returns true iff this host can plausibly drive a GPU through the WebGPU
+/// EP on its Vulkan (Dawn) backend.
+///
+/// ONNX Runtime has **no native Vulkan execution provider**; on Linux the
+/// WebGPU EP *is* the Vulkan path (Dawn → Vulkan). This is the default
+/// accelerator for AMD GPUs that ROCm does NOT officially support — Phoenix
+/// iGPUs like the Radeon 680M/780M (gfx1035/gfx1103) and other unsupported
+/// gfx targets. Officially-supported discrete RDNA/CDNA GPUs go through ROCm
+/// instead (see [`rocm_runtime_available`]).
+///
+/// We detect via two host signals:
+///   * a DRM render node (`/dev/dri/renderD12{8,9}`) — the minimum for a
+///     GPU-backed Vulkan device;
+///   * a Vulkan ICD manifest in a standard search dir
+///     (`/usr/share/vulkan/icd.d` or `/etc/vulkan/icd.d`) — without an
+///     installed ICD (e.g. mesa RADV from `mesa-vulkan-drivers`) Dawn finds
+///     no Vulkan driver and inference falls through to CPU.
+///
+/// Unlike the ROCm probe this does NOT need a permission-checking `open()`:
+/// the WebGPU EP's `register()` returns a `Result` and ORT silently skips an
+/// EP that fails to attach, so a permission/device failure degrades to the
+/// next EP rather than aborting the process (the ROCm provider, by contrast,
+/// throws an uncaught C++ exception). The probe exists mainly to suppress the
+/// ORT C++ "failed to create WebGPU device" log spam on CPU-only hosts and to
+/// emit a single actionable WARN.
+///
+/// Result is cached for the process lifetime.
+///
+/// **Override:** set `NEXUS_VULKAN_DEVICE=force` to force-true (testing, or to
+/// override a missed ICD path) or `NEXUS_VULKAN_DEVICE=skip` to force-false
+/// (verify CPU fallback / fast field kill switch). Unset / any other value
+/// goes through autodetection.
+#[cfg(feature = "ep-vulkan")]
+#[allow(clippy::doc_lazy_continuation)]
+pub fn vulkan_runtime_available() -> bool {
+    if let Ok(v) = std::env::var("NEXUS_VULKAN_DEVICE") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "force" | "present" | "1" | "true" => return true,
+            "skip" | "absent" | "0" | "false" => return false,
+            _ => {}
+        }
+    }
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let render = std::path::Path::new("/dev/dri/renderD128").exists()
+            || std::path::Path::new("/dev/dri/renderD129").exists();
+        // A Vulkan ICD manifest (*.json) must be installed for Dawn to find a
+        // driver. Standard loader search dirs on Debian/Ubuntu.
+        let icd_present = |dir: &str| {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries.filter_map(Result::ok).any(|e| {
+                        e.path()
+                            .extension()
+                            .is_some_and(|x| x.eq_ignore_ascii_case("json"))
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let icd = icd_present("/usr/share/vulkan/icd.d") || icd_present("/etc/vulkan/icd.d");
+        render && icd
+    })
+}
+
+/// Emit a single deduplicated WARN when Vulkan/WebGPU was requested but no
+/// Vulkan-capable device + ICD is reachable.
+#[cfg(feature = "ep-vulkan")]
+fn warn_vulkan_unavailable_once() {
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "ep_priority requested 'vulkan'/'webgpu' but no Vulkan-capable \
+             GPU is reachable (need a DRM render node /dev/dri/renderD12x AND \
+             a Vulkan ICD in /usr/share/vulkan/icd.d); Vulkan entries are \
+             being skipped and inference will run on CPU. Install a Vulkan \
+             driver (e.g. mesa-vulkan-drivers for AMD RADV) and ensure the \
+             engine user can reach the render node. Override autodetection by \
+             setting NEXUS_VULKAN_DEVICE=force in the environment."
         );
     });
 }
@@ -371,10 +457,11 @@ fn selected_for_priority_inner(
                  --features ep-openvino (Intel GPU routes through OpenVINO); skipping"
             ),
 
-            // AMD Radeon GPU via ROCm EP. Works on discrete RDNA/CDNA GPUs.
-            // For Phoenix iGPUs (Radeon 680M/780M), requires
-            // `HSA_OVERRIDE_GFX_VERSION=10.3.0` environment variable at runtime
-            // (unofficial upstream support, fragile on older kernels).
+            // AMD Radeon GPU via ROCm EP — officially-supported discrete
+            // RDNA/CDNA GPUs only. Unsupported parts (Phoenix iGPUs etc.) are
+            // routed to the Vulkan(WebGPU) arm by the installer, not here.
+            // HSA_OVERRIDE_GFX_VERSION is an unsupported manual escape hatch,
+            // never set by default.
             #[cfg(feature = "ep-rocm")]
             "rocm" => {
                 let rocm_available = rocm_runtime_available();
@@ -390,6 +477,35 @@ fn selected_for_priority_inner(
             "rocm" => warn!(
                 "ep_priority requested 'rocm' but the binary was built without \
                  --features ep-rocm; skipping"
+            ),
+
+            // Vulkan-accelerated inference via the WebGPU EP on its Dawn→Vulkan
+            // backend. ONNX Runtime has no native Vulkan EP; WebGPU IS the
+            // Vulkan path on Linux. This is the default accelerator for AMD
+            // GPUs that ROCm does not officially support (Phoenix iGPUs etc).
+            // The operator token is `vulkan` (canonical); `webgpu` is accepted
+            // as an alias for the same arm. WebGPU is flagged experimental
+            // upstream, but a failed attach degrades to the next EP (no SIGABRT
+            // like ROCm), so the CPU terminal fallback is a total safety net.
+            #[cfg(feature = "ep-vulkan")]
+            "vulkan" | "webgpu" => {
+                if vulkan_runtime_available() {
+                    use ort::execution_providers::webgpu::DawnBackendType;
+                    use ort::execution_providers::WebGPU;
+                    dispatchers.push(
+                        WebGPU::default()
+                            .with_dawn_backend_type(DawnBackendType::Vulkan)
+                            .build(),
+                    );
+                    names.push("vulkan(webgpu)".into());
+                } else {
+                    warn_vulkan_unavailable_once();
+                }
+            }
+            #[cfg(not(feature = "ep-vulkan"))]
+            "vulkan" | "webgpu" => warn!(
+                "ep_priority requested 'vulkan'/'webgpu' but the binary was built \
+                 without --features ep-vulkan; skipping"
             ),
 
             // M_HAILO_EP — Hailo-8 is not an ORT EP. It's recognized
@@ -578,5 +694,106 @@ mod tests {
             None => std::env::remove_var("NEXUS_OPENVINO_DEVICE"),
         }
         assert!(!v, "skip override must return false");
+    }
+
+    // ── Vulkan (WebGPU-over-Vulkan) EP selection ──────────────────────────
+    // The `vulkan` arm calls `vulkan_runtime_available()` directly (like the
+    // `rocm` arm). Its `NEXUS_VULKAN_DEVICE=force|skip` override short-circuits
+    // the probe BEFORE the cached autodetect, so the selector path is fully
+    // deterministic on any host. These env-mutating tests serialize on a
+    // module-local mutex so cargo's parallel runner can't interleave them.
+    #[cfg(feature = "ep-vulkan")]
+    static VULKAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(feature = "ep-vulkan")]
+    fn with_vulkan_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _guard = VULKAN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("NEXUS_VULKAN_DEVICE").ok();
+        match value {
+            Some(v) => std::env::set_var("NEXUS_VULKAN_DEVICE", v),
+            None => std::env::remove_var("NEXUS_VULKAN_DEVICE"),
+        }
+        f();
+        match prev {
+            Some(p) => std::env::set_var("NEXUS_VULKAN_DEVICE", p),
+            None => std::env::remove_var("NEXUS_VULKAN_DEVICE"),
+        }
+    }
+
+    #[cfg(feature = "ep-vulkan")]
+    #[test]
+    fn vulkan_selected_when_forced() {
+        with_vulkan_env(Some("force"), || {
+            let (eps, names) = selected_for_priority(&["vulkan".into()]);
+            assert_eq!(eps.len(), 2);
+            assert_eq!(names, vec!["vulkan(webgpu)", "cpu(fallback)"]);
+        });
+    }
+
+    /// `webgpu` is an accepted alias for `vulkan` and resolves to the same arm.
+    #[cfg(feature = "ep-vulkan")]
+    #[test]
+    fn webgpu_alias_resolves_to_vulkan() {
+        with_vulkan_env(Some("force"), || {
+            let (_, names) = selected_for_priority(&["webgpu".into()]);
+            assert_eq!(names, vec!["vulkan(webgpu)", "cpu(fallback)"]);
+        });
+    }
+
+    /// Priority order is preserved: vulkan first, then an explicit cpu (no
+    /// duplicate fallback append).
+    #[cfg(feature = "ep-vulkan")]
+    #[test]
+    fn vulkan_then_cpu_preserves_order() {
+        with_vulkan_env(Some("force"), || {
+            let (_, names) = selected_for_priority(&["vulkan".into(), "cpu".into()]);
+            assert_eq!(names, vec!["vulkan(webgpu)", "cpu"]);
+        });
+    }
+
+    /// With the device forced absent, vulkan is skipped (warn-once) and CPU is
+    /// appended — the kill-switch / no-Vulkan-driver path.
+    #[cfg(feature = "ep-vulkan")]
+    #[test]
+    fn vulkan_dropped_when_device_absent() {
+        with_vulkan_env(Some("skip"), || {
+            let (eps, names) = selected_for_priority(&["vulkan".into(), "cpu".into()]);
+            assert_eq!(eps.len(), 1);
+            assert_eq!(names, vec!["cpu"]);
+        });
+    }
+
+    #[cfg(feature = "ep-vulkan")]
+    #[test]
+    fn vulkan_env_override_force_returns_true() {
+        with_vulkan_env(Some("force"), || {
+            assert!(
+                vulkan_runtime_available(),
+                "force override must return true"
+            );
+        });
+    }
+
+    #[cfg(feature = "ep-vulkan")]
+    #[test]
+    fn vulkan_env_override_skip_returns_false() {
+        with_vulkan_env(Some("skip"), || {
+            assert!(
+                !vulkan_runtime_available(),
+                "skip override must return false"
+            );
+        });
+    }
+
+    /// When the binary is built WITHOUT `ep-vulkan`, both the canonical token
+    /// and its alias are dropped (warn-logged) and CPU is appended.
+    #[cfg(not(feature = "ep-vulkan"))]
+    #[test]
+    fn vulkan_dropped_when_feature_off() {
+        let (eps, names) = selected_for_priority(&["vulkan".into()]);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(names, vec!["cpu(fallback)"]);
+        let (_, alias_names) = selected_for_priority(&["webgpu".into()]);
+        assert_eq!(alias_names, vec!["cpu(fallback)"]);
     }
 }

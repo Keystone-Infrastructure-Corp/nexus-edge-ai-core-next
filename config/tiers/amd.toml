@@ -1,22 +1,26 @@
-# T24-AMD — Beelink EQR7 (AMD Ryzen 7 7735HS, Radeon 680M, 24 GB LPDDR5)
-#            configured for ROCm-first inference (Hailo-8 optional).
+# AMD — generic AMD GPU appliance, Vulkan-first inference.
 #
-# As of v0.1.84 this tier prioritizes the AMD Radeon 680M iGPU via
-# the ROCm execution provider (ONNX Runtime backend), with CPU fallback.
-# The Hailo-8 M.2 accelerator is NOT used on this config (see t24.toml
-# for the Hailo-primary setup). The Radeon 680M (gfx1035, Rembrandt
-# gen) receives UNOFFICIAL upstream ROCm support — requires
-# `HSA_OVERRIDE_GFX_VERSION=10.3.0` at runtime (set automatically by
-# the systemd service unit).
+# This is the default tier for AMD-GPU boxes whose GPU is NOT officially
+# supported by ROCm — Phoenix/Rembrandt iGPUs such as the Radeon 680M/780M
+# (gfx1035/gfx1103) and other unsupported gfx targets. Inference runs through
+# ONNX Runtime's WebGPU execution provider on its Dawn→Vulkan backend (ONNX
+# Runtime has no native Vulkan EP; WebGPU IS the Vulkan path on Linux), with
+# CPU as the terminal fallback.
 #
-# Soak target: 12–18 cameras at 1080p / 15 fps (yolo26n_640) on ROCm.
-# ROCm dispatch is GPU-bound; actual throughput depends on model
-# batch-scheduling within ORT and GPU memory residency.
+# Officially-ROCm-supported AMD discrete GPUs (RDNA2 gfx1030, RDNA3
+# gfx1100/1101/1102, CDNA gfx908/gfx90a/gfx942) do NOT use this tier — the
+# installer routes them to a ROCm-primary configuration based on a static
+# gfx/PCI allowlist. No `HSA_OVERRIDE_GFX_VERSION` workaround is used or
+# required on this tier: unsupported gfx targets go to Vulkan instead of
+# being force-fit onto an unsupported ROCm path.
+#
+# Soak target: 12–18 cameras at 1080p / 15 fps (yolo26n_640) on Vulkan.
+# WebGPU/Vulkan dispatch is GPU-bound; actual throughput depends on the
+# Vulkan driver (mesa RADV) and GPU memory residency.
 
 [runtime]
-# Ryzen 7 7735HS = 8C / 16T Zen 3+. Single worker for sequential GPU
-# dispatch (ORT serializes at the compute path if multiple workers
-# try to use the same GPU without explicit scheduling).
+# Typical AMD APU = 8C / 16T. Single inference worker (see [inference]);
+# the runtime thread pool still has ample headroom for tracking + I/O.
 worker_threads = 8
 blocking_threads = 4
 
@@ -73,26 +77,26 @@ backend = "pool"
 workers = 1
 restart_backoff_ms = 2000
 fail_soft = true
-# ROCm execution provider for AMD Radeon 680M iGPU (gfx1035, Rembrandt).
-# Unofficial upstream support via `HSA_OVERRIDE_GFX_VERSION=10.3.0`.
-# Falls through to CPU if the Radeon is offline or not accessible via
-# /dev/kfd + /dev/dri/renderD128. Set by systemd service unit.
-ep_priority = ["rocm", "cpu"]
+# WebGPU(Vulkan) execution provider for AMD GPUs not supported by ROCm
+# (Phoenix iGPUs etc). Falls through to CPU if no Vulkan driver/ICD is
+# present or the render node is unreachable (no engine crash — WebGPU
+# attach failure degrades gracefully). `webgpu` is an accepted alias.
+ep_priority = ["vulkan", "cpu"]
 
 [inference.model]
 kind = "yolo"
 pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
-# T24 / ROCm = 640. Uses yolo26n_640.onnx (static shape, ONNX Runtime
+# AMD / Vulkan = 640. Uses yolo26n_640.onnx (static shape, ONNX Runtime
 # path). Same weights as the Hailo-8 HEF (COCO-trained, yolo26n-nano).
-# ROCm GEMM + cutlass convolutions; throughput depends on GPU residency
-# and batch-scheduling within ORT (no on-chip NMS like Hailo).
+# WebGPU compute shaders on the Vulkan backend; throughput depends on
+# GPU residency and the Vulkan driver (no on-chip NMS like Hailo).
 preset = "640"
 input_width = 640
 input_height = 640
 score_threshold = 0.30
 
 [tracker]
-# ByteTrack is CPU-bound; Zen 3+ at 16T has ample headroom for 24
+# ByteTrack is CPU-bound; a modern APU at 16T has ample headroom for 24
 # concurrent trackers (same tracker config as the Hailo-primary t24).
 backend = "iou_naive"
 

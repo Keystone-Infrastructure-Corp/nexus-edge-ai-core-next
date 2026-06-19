@@ -68,7 +68,7 @@ are flagged ✅. Per-tier reference configs live in
 | ----------- | ----------------------------------------- | ------------------- | ------------------ | ------ |
 | **T10**     | Beelink Mini S13 (N150)                   | UHD 24EU iGPU       | 1–2               | ✅ ordered |
 | **T24**     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8   | Hailo-8 26 TOPS M.2 | 24 (target)       | ✅ ordered |
-| **T24-AMD** | Beelink EQR7 (Ryzen 7 7735HS)             | Radeon 680M (ROCm)  | 4–6               | ✅ shipping |
+| **AMD**     | Beelink EQR7 (Ryzen 7 7735HS)             | Radeon 680M (Vulkan)| 4–6               | ✅ shipping |
 | **T36**     | Lenovo P3 Tiny + Arc A380                 | Intel Arc A380 dGPU | 8–12              | not yet sourced |
 | **T36-S**   | GMKtec K13 / EVO-X1 (Lunar Lake 256V)     | Arc 140V + NPU 4    | 6–8               | ✅ ordered |
 | **T64**     | Lenovo P3 Tower + RTX 4060                | NVIDIA RTX 4060     | 12–20             | post-beta |
@@ -76,11 +76,14 @@ are flagged ✅. Per-tier reference configs live in
 The T24 Hailo EP shipped in v0.1.79: HailoRT 4.23 + `.hef` model pack
 load through `nexus-hailo-backend`, and the System tab surfaces live
 chip temp, power, utilization%, inferences/sec, firmware, serial, and
-part number. The T24-AMD tier shipped in v0.1.84: the Radeon 680M
-(Phoenix gfx1035) runs inference through the AMD ROCm execution
-provider (`ep-rocm` + bundled ROCm ONNX Runtime 1.21), opt-in via
-`--tier t24-amd`; the System tab shows the Radeon's VRAM, temperature,
-and utilization%. T64 stays opt-in until M5 wires the CUDA/TensorRT EPs.
+part number. The AMD tier ships the Radeon 680M (Phoenix gfx1035)
+running inference through the Vulkan(WebGPU) execution provider
+(`ep-vulkan` + bundled ONNX Runtime 1.27 on its Dawn→Vulkan backend),
+opt-in via `--tier amd`; the System tab shows the Radeon's VRAM,
+temperature, and utilization%. ROCm is reserved for the discrete
+RDNA/CDNA GPUs it officially supports (classified from the PCI device
+ID at install time) — never force-fit onto an unsupported iGPU. T64
+stays opt-in until M5 wires the CUDA/TensorRT EPs.
 
 `nexus-probe` writes `recommended_tier` into the device manifest so a
 clean install picks the right `config/tiers/*.toml` automatically. Full

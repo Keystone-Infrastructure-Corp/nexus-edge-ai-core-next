@@ -431,12 +431,34 @@ install_drivers() {
 
     if (( has_amd )); then
         _drivers_amd_graphics
-        # ROCm compute for inference (if ep_priority includes "rocm").
-        # Gracefully skips if amdgpu module is not yet bound.
-        _drivers_amd_rocm
-        # Fetch a ROCm-capable ONNX Runtime (1.21.0) and wire the engine
-        # to load it. No-op when /dev/kfd / rocminfo are absent.
-        _install_ort_rocm
+        # AMD GPU execution-provider selection:
+        #   * explicit `--tier amd`         -> Vulkan(WebGPU), operator's choice
+        #   * officially ROCm-supported GPU -> ROCm EP (discrete RDNA/CDNA)
+        #   * everything else (iGPUs etc.)  -> Vulkan(WebGPU), no ROCm force-fit
+        # `_amd_gpu_rocm_supported` classifies ROCm-free from the PCI device
+        # ID, so we never install the multi-hundred-MB ROCm stack on a GPU it
+        # cannot drive, and never depend on the HSA_OVERRIDE_GFX_VERSION
+        # force-fit (now an unsupported manual escape hatch only).
+        if [[ "${TIER:-}" == "amd" ]] || ! _amd_gpu_rocm_supported; then
+            if [[ "${TIER:-}" == "amd" ]]; then
+                log "AMD: '--tier amd' selected; using Vulkan(WebGPU) EP"
+            else
+                log "AMD: GPU not on the ROCm-supported allowlist; using Vulkan(WebGPU) EP"
+            fi
+            # Install the Vulkan diagnostic userspace and a WebGPU-capable
+            # ONNX Runtime (1.27.0, Dawn->Vulkan). No-op (CPU fallback) if no
+            # Vulkan ICD / render node is present.
+            _drivers_amd_vulkan
+            _install_ort_webgpu
+        else
+            log "AMD: GPU on the ROCm-supported allowlist; using ROCm EP"
+            # ROCm compute for inference (officially-supported discrete GPU).
+            # Gracefully skips if amdgpu module is not yet bound.
+            _drivers_amd_rocm
+            # Fetch a ROCm-capable ONNX Runtime (1.21.0) and wire the engine
+            # to load it. No-op when /dev/kfd / rocminfo are absent.
+            _install_ort_rocm
+        fi
     fi
 
     if (( has_hailo )); then
@@ -617,11 +639,12 @@ _verify_intel_npu_userspace() {
 
 # Verify the AMD GPU userspace. Three probes mirroring the Intel
 # path: VA-API enumerates Mesa Gallium, `/dev/dri/renderD128`
-# exists, service user can open it. ROCm intentionally not probed —
-# it's an experimental separate spike (gfx1035 on Phoenix iGPUs is
-# unsupported upstream and only works with HSA_OVERRIDE_GFX_VERSION).
-# T24 inference runs on the Hailo-8 via `nexus-hailo-backend` (the
-# AMD path here is decode-only on this SKU).
+# exists, service user can open it. ROCm intentionally not probed
+# here — it's classified + verified in `_drivers_amd_rocm` for the
+# discrete GPUs it officially supports, and unsupported iGPUs run
+# inference on the Vulkan(WebGPU) EP, not ROCm. On a Hailo box the
+# AMD path here is decode-only (inference runs on the Hailo-8 via
+# `nexus-hailo-backend`).
 _verify_amd_gpu_userspace() {
     local ok=1
 
@@ -1097,13 +1120,14 @@ _drivers_intel_npu() {
 #                            operators.
 #
 # We deliberately do NOT pull ROCm here. ROCm on Phoenix-class iGPUs
-# (gfx1035, what the 680M reports) is unsupported upstream and
-# requires `HSA_OVERRIDE_GFX_VERSION=10.3.0` plus a several-hundred-MB
-# repo add. That's a separate operator-opt-in spike, not part of
-# the default install path.
+# (gfx1035, what the 680M reports) is unsupported upstream — those parts
+# run inference through the Vulkan(WebGPU) EP instead (see
+# `_drivers_amd_vulkan` / `_install_ort_webgpu`). The ROCm path is only
+# taken for officially-supported discrete RDNA/CDNA GPUs, classified by
+# `_amd_gpu_rocm_supported` from the PCI device ID.
 #
-# T24 inference runs on the Hailo-8 via `nexus-hailo-backend`; the
-# AMD path here is decode-only on this SKU. See docs/INSTALL.md §5.5.
+# On a Hailo-equipped box the AMD path here is decode-only; inference runs
+# on the Hailo-8 via `nexus-hailo-backend`. See docs/INSTALL.md §5.5.
 _AMD_GRAPHICS_PKGS=(
     mesa-va-drivers
     mesa-vulkan-drivers
@@ -1139,11 +1163,12 @@ _drivers_amd_graphics() {
 
 # Install AMD ROCm compute drivers for Radeon iGPU/dGPU (ONNX Runtime EP).
 #
-# Enables the ROCm execution provider in nexus-inference when the operator
-# sets `ep_priority = ["rocm", "cpu"]` in the tier config. Works with
-# discrete RDNA/CDNA GPUs out-of-box. Phoenix iGPUs (Radeon 680M/780M,
-# gfx1035) receive UNOFFICIAL upstream support via the
-# `HSA_OVERRIDE_GFX_VERSION=10.3.0` workaround (set by systemd service unit).
+# Enables the ROCm execution provider in nexus-inference for AMD GPUs ROCm
+# officially supports — discrete RDNA/CDNA parts (gfx1030+). The install
+# driver branch only calls this after `_amd_gpu_rocm_supported` has
+# classified the GPU from its PCI device ID; unsupported parts (Phoenix /
+# Rembrandt iGPUs, gfx1035/gfx1103) take the Vulkan(WebGPU) path instead
+# and never reach here. No HSA_OVERRIDE_GFX_VERSION force-fit is applied.
 #
 # Operator must already have the amdgpu kernel module bound (i.e.
 # `_drivers_amd_graphics` has run first) so that /dev/dri/renderD12x
@@ -1169,15 +1194,69 @@ _rocminfo_bin() {
     return 1
 }
 
-# True (0) when a usable ROCm GPU agent is present. Runs rocminfo with
-# HSA_OVERRIDE_GFX_VERSION set (gfx1035 Phoenix iGPUs report no agent
-# without it) and greps for a gfx target. Caller must be able to open
-# /dev/kfd (root during install, or a render-group member at runtime).
+# Static allowlist of AMD PCI device IDs (the 0xXXXX device portion of
+# `1002:XXXX`) that ROCm OFFICIALLY supports: discrete RDNA2 (gfx1030),
+# RDNA3 (gfx1100/1101/1102), and CDNA (gfx908/gfx90a/gfx942). Used by
+# `_amd_gpu_rocm_supported` as the ROCm-free primary classifier — read the
+# PCI ID from sysfs and match. This is deliberately DEFAULT-DENY: anything
+# NOT on the list (Phoenix/Rembrandt iGPUs gfx1035/gfx1103, lower SKUs we
+# have not vetted, brand-new parts) routes to the Vulkan(WebGPU) EP, never
+# ROCm. Routing an unlisted-but-actually-supported part to Vulkan is a perf
+# miss; routing an UNsupported part to ROCm risks the uncaught-C++ SIGABRT
+# the engine's rocm_runtime_available() guard exists to avoid.
+_ROCM_SUPPORTED_PCI_IDS=(
+    738c 738e                 # CDNA  — MI100 (gfx908)
+    7408 740c 740f 7410       # CDNA2 — MI200 / MI210 / MI250 (gfx90a)
+    74a0 74a1 74a5 74a9 74b5 74b9 74bd  # CDNA3 — MI300 (gfx942)
+    73a1 73a2 73a3 73a5 73ab 73af 73bf  # RDNA2 — Navi 21, RX 6800/6900 (gfx1030)
+    744c 745e                 # RDNA3 — Navi 31, RX 7900 (gfx1100)
+    747e                      # RDNA3 — Navi 32, RX 7700/7800 (gfx1101)
+    7480 7483                 # RDNA3 — Navi 33, RX 7600 (gfx1102)
+)
+
+# True (0) only when an AMD GPU on the ROCm-supported allowlist is present.
+# ROCm-free: reads PCI vendor/device IDs from /sys/class/drm/card*/device
+# (no rocminfo, no HSA_OVERRIDE), so the driver branch can decide ROCm vs
+# Vulkan BEFORE installing the heavy ROCm stack. If ROCm happens to be
+# pre-installed, a rocminfo gfx probe is consulted as a secondary signal —
+# WITHOUT HSA_OVERRIDE, so an unsupported iGPU that only enumerates a gfx
+# agent under the override is NOT misclassified as supported.
+_amd_gpu_rocm_supported() {
+    local dev vendor id known
+    for dev in /sys/class/drm/card*/device; do
+        [[ -r "$dev/vendor" && -r "$dev/device" ]] || continue
+        vendor="$(cat "$dev/vendor" 2>/dev/null)"
+        [[ "$vendor" == "0x1002" ]] || continue        # AMD/ATI only
+        id="$(cat "$dev/device" 2>/dev/null)"
+        id="${id#0x}"; id="${id,,}"                     # 0x744C -> 744c
+        for known in "${_ROCM_SUPPORTED_PCI_IDS[@]}"; do
+            [[ "$id" == "$known" ]] && return 0
+        done
+    done
+
+    # Secondary signal: only if ROCm is ALREADY installed. No HSA_OVERRIDE —
+    # we want the GPU's real, un-forced gfx target.
+    local rocminfo gfx
+    if rocminfo="$(_rocminfo_bin)"; then
+        gfx="$("$rocminfo" 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | head -1)"
+        case "$gfx" in
+            gfx908|gfx90a|gfx942|gfx1030|gfx1100|gfx1101|gfx1102) return 0 ;;
+        esac
+    fi
+    return 1
+}
+
+# True (0) when a usable ROCm GPU agent is present. Runs rocminfo and greps
+# for a gfx target. Does NOT inject HSA_OVERRIDE_GFX_VERSION — this path is
+# only reached for officially-supported discrete GPUs that enumerate a gfx
+# agent without any override. If the operator has manually set the override
+# (the unsupported escape hatch), it is honoured from the environment.
+# Caller must be able to open /dev/kfd (root during install, or a
+# render-group member at runtime).
 _rocm_gpu_present() {
     local rocminfo
     rocminfo="$(_rocminfo_bin)" || return 1
-    HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-10.3.0}" \
-        "$rocminfo" 2>/dev/null | grep -q 'gfx[0-9]'
+    "$rocminfo" 2>/dev/null | grep -q 'gfx[0-9]'
 }
 
 _drivers_amd_rocm() {
@@ -1195,7 +1274,7 @@ _drivers_amd_rocm() {
     fi
 
     # Check if rocminfo is already installed + working (locate it under
-    # /opt/rocm/bin, not just PATH; set HSA_OVERRIDE for gfx1035).
+    # /opt/rocm/bin, not just PATH).
     if _rocminfo_bin >/dev/null && _rocm_gpu_present; then
         log "AMD ROCm already installed (rocminfo confirmed)"
         return 0
@@ -1270,20 +1349,19 @@ PIN
     fi
     rm -f "$apt_log"
 
-    # Verify installation: rocminfo (with HSA_OVERRIDE for gfx1035) should
-    # show at least one gfx* device. rocminfo lives under /opt/rocm/bin.
+    # Verify installation: rocminfo should show at least one gfx* device.
+    # rocminfo lives under /opt/rocm/bin. No HSA_OVERRIDE force-fit — this
+    # branch only runs for officially-supported discrete GPUs.
     if _rocm_gpu_present; then
         local rocminfo gfx_name
         rocminfo="$(_rocminfo_bin)"
-        gfx_name=$(HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-10.3.0}" \
-            "$rocminfo" 2>/dev/null | grep -o 'gfx[0-9]*' | head -1)
+        gfx_name=$("$rocminfo" 2>/dev/null | grep -o 'gfx[0-9]*' | head -1)
         log "AMD ROCm installed and GPU detected via rocminfo${gfx_name:+ ($gfx_name)}"
     else
         warn "AMD ROCm installed but rocminfo did not detect a GPU agent."
         warn "This is benign at install time if the running user is not in the"
         warn "'render' group (root sees it; the nexus service user is added to"
-        warn "'render' by ensure_accelerator_groups). gfx1035 iGPUs additionally"
-        warn "require HSA_OVERRIDE_GFX_VERSION=10.3.0, set in the systemd unit."
+        warn "'render' by ensure_accelerator_groups)."
     fi
 
     # Verify /dev/kfd accessibility for the service user.
@@ -1482,8 +1560,8 @@ _ort_rocm_link_missing_deps() {
 # ROCm runtime. Kept separate so the idempotent path can refresh it even
 # when the .so is already present. The drop-in lives alongside the unit
 # at /etc/systemd/system/nexus-engine.service.d/ and only OVERRIDES the
-# two ORT env vars — everything else in the base unit (HSA_OVERRIDE,
-# DeviceAllow, SupplementaryGroups) still applies.
+# two ORT env vars — everything else in the base unit (DeviceAllow,
+# SupplementaryGroups) still applies.
 _ort_rocm_write_dropin() {
     local vendor_dir="$1"
     local dropin_dir="/etc/systemd/system/nexus-engine.service.d"
@@ -1502,7 +1580,7 @@ _ort_rocm_write_dropin() {
 # ONNX Runtime loader at the ROCm-capable runtime fetched from AMD's
 # repo.radeon.com (onnxruntime_rocm). The engine binary is built against
 # ort api-21 so this 1.21.0 runtime loads cleanly. Overrides only the two
-# ORT env vars from the base unit; HSA_OVERRIDE_GFX_VERSION etc. still apply.
+# ORT env vars from the base unit.
 #
 # Remove this file (and 'systemctl daemon-reload && systemctl restart
 # nexus-engine') to fall back to the bundled OpenVINO/CPU runtime.
@@ -1514,6 +1592,219 @@ EOF
     log "wrote systemd drop-in $dropin (ORT_DYLIB_PATH -> ROCm runtime)"
     # daemon-reload so the override takes effect on next restart. install.sh
     # restarts the engine after install_drivers, so no explicit restart here.
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# AMD Vulkan (WebGPU EP) — runtime install for the `amd` tier.
+#
+# The `amd` tier targets AMD GPUs that ROCm does NOT officially support
+# (Phoenix/Rembrandt iGPUs such as the Radeon 680M/780M, gfx1035/gfx1103).
+# Instead of force-fitting them onto ROCm with HSA_OVERRIDE_GFX_VERSION,
+# inference runs through ONNX Runtime's WebGPU execution provider on its
+# Dawn->Vulkan backend (ONNX Runtime has no native Vulkan EP; WebGPU IS
+# the Vulkan path on Linux). CPU is the terminal fallback.
+#
+# Validated end-to-end on a Radeon 680M (Rembrandt gfx1035): the engine
+# registers ep="vulkan(webgpu)" and runs yolo26n_640 with the GPU at
+# ~100% busy under sustained load (i.e. the RADV hardware device, not the
+# llvmpipe software fallback).
+# ---------------------------------------------------------------------------
+
+# Install the Vulkan diagnostic userspace for the amd tier. The RADV ICD
+# itself (mesa-vulkan-drivers) + libvulkan1 are already pulled in by
+# `_drivers_amd_graphics`; this adds `vulkan-tools` so post-install
+# verification (and the operator) can run `vulkaninfo --summary`.
+# Idempotent + non-fatal.
+_drivers_amd_vulkan() {
+    if _all_dpkg_installed mesa-vulkan-drivers libvulkan1 vulkan-tools; then
+        log "AMD Vulkan userspace already installed (RADV ICD + vulkan-tools present)"
+    else
+        log "installing AMD Vulkan userspace (RADV ICD + vulkan-tools)"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                mesa-vulkan-drivers libvulkan1 vulkan-tools; then
+            warn "Vulkan userspace install failed; WebGPU EP will fall back to CPU."
+            return 0
+        fi
+    fi
+
+    # Sanity probe (non-fatal) — vulkaninfo enumerates the RADV device.
+    if command -v vulkaninfo >/dev/null 2>&1 \
+        && vulkaninfo --summary 2>/dev/null | grep -qiE 'RADV|AMD RADEON'; then
+        log "Vulkan: RADV device enumerated (vulkaninfo confirmed)"
+    else
+        warn "Vulkan userspace installed but vulkaninfo did not enumerate a RADV"
+        warn "device — amdgpu may not be bound yet; a reboot may be required."
+    fi
+}
+
+# Fetch a WebGPU-capable ONNX Runtime and wire the engine to load it.
+#
+# WHY a separate download (not bundled in the release tarball):
+#   * The release tarball ships libonnxruntime.so.1.24.x built with the
+#     OpenVINO provider — it has NO WebGPU/Vulkan backend.
+#   * The `onnxruntime-webgpu` PyPI wheel (1.27.0) ships a libonnxruntime.so
+#     with Dawn STATICALLY linked in on its Vulkan backend. Stock PyPI
+#     `onnxruntime` does NOT (its provider list is Azure+CPU only).
+#   * The engine binary is built against ort `api-21`, so it dlopens the
+#     1.27 runtime cleanly (GetApi(21) is satisfied by any ABI >= 21).
+#
+# Layout mirrors _install_ort_rocm: lands in a release-independent vendor
+# dir (/opt/nexus/vendor/onnxruntime-webgpu) so it survives `current`
+# symlink flips; a systemd drop-in (10-ort-webgpu.conf) repoints
+# ORT_DYLIB_PATH + LD_LIBRARY_PATH at it. The WebGPU runtime also carries a
+# CPU EP, so the ["vulkan","cpu"] fallback chain works through the same .so.
+#
+# Idempotent (version marker). Every failure is warn-and-continue — the
+# engine still installs and runs on the bundled OpenVINO/CPU runtime (the
+# amd tier's ep_priority falls through "vulkan" -> "cpu").
+_install_ort_webgpu() {
+    # WebGPU/Vulkan needs a DRM render node + a Vulkan ICD to attach to. If
+    # neither is present there is nothing for Dawn to bind, so skip the
+    # download and let the engine run CPU-only.
+    if ! compgen -G "/dev/dri/renderD*" >/dev/null; then
+        warn "no DRM render node (/dev/dri/renderD*); skipping WebGPU ONNX Runtime"
+        warn "fetch (engine uses the bundled OpenVINO/CPU runtime)."
+        return 0
+    fi
+    if ! compgen -G "/usr/share/vulkan/icd.d/*.json" >/dev/null \
+        && ! compgen -G "/etc/vulkan/icd.d/*.json" >/dev/null; then
+        warn "no Vulkan ICD found under /usr/share/vulkan/icd.d; skipping WebGPU"
+        warn "ONNX Runtime fetch (engine uses the bundled OpenVINO/CPU runtime)."
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 unavailable; cannot resolve onnxruntime-webgpu wheel URL — skipping."
+        return 0
+    fi
+
+    local ort_ver="1.27.0"
+    local vendor_dir="${NEXUS_ORT_WEBGPU_DIR:-/opt/nexus/vendor/onnxruntime-webgpu}"
+    local marker="$vendor_dir/.nexus-ort-webgpu-version"
+
+    # Idempotent short-circuit: already installed at the target version.
+    if [[ -f "$marker" ]] && grep -qx "$ort_ver" "$marker" 2>/dev/null \
+        && [[ -e "$vendor_dir/libonnxruntime.so" ]]; then
+        log "WebGPU ONNX Runtime $ort_ver already installed ($vendor_dir)"
+        _ort_webgpu_write_dropin "$vendor_dir"
+        return 0
+    fi
+
+    log "installing WebGPU ONNX Runtime $ort_ver (Vulkan inference for AMD GPUs)"
+
+    # Resolve a manylinux x86_64 wheel URL from the PyPI JSON API. The C
+    # API .so is identical across cp tags (it is not Python-version
+    # specific), so any manylinux x86_64 wheel works — take the first.
+    local url
+    url="$(curl -fsSL "https://pypi.org/pypi/onnxruntime-webgpu/${ort_ver}/json" 2>/dev/null \
+        | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for u in d.get("urls", []):
+    fn = u.get("filename", "")
+    if fn.endswith(".whl") and "manylinux" in fn and "x86_64" in fn:
+        print(u["url"])
+        break
+' 2>/dev/null)"
+
+    if [[ -z "$url" ]]; then
+        warn "could not resolve an onnxruntime-webgpu manylinux x86_64 wheel URL;"
+        warn "engine will use the bundled OpenVINO/CPU runtime (Vulkan disabled)."
+        return 0
+    fi
+
+    local tmpdir
+    tmpdir="$(mktemp -d -t nexus-ort-webgpu.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+
+    log "  fetching $(basename "$url") (~24 MB)…"
+    if ! curl -fsSL "$url" -o "$tmpdir/ort.whl"; then
+        warn "WebGPU ONNX Runtime download failed; Vulkan inference disabled."
+        return 0
+    fi
+
+    # Wheels are zip archives; the runtime + provider .so files live under
+    # onnxruntime/capi/. Need unzip — install if missing.
+    if ! command -v unzip >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip >/dev/null 2>&1 || {
+            warn "unzip unavailable and install failed; cannot unpack WebGPU ORT wheel"
+            return 0
+        }
+    fi
+
+    if ! unzip -q -o "$tmpdir/ort.whl" 'onnxruntime/capi/*' -d "$tmpdir/extract"; then
+        warn "WebGPU ORT wheel extract failed; Vulkan inference disabled"
+        return 0
+    fi
+
+    local capi="$tmpdir/extract/onnxruntime/capi"
+    if [[ ! -e "$capi/libonnxruntime.so" ]] \
+        && ! compgen -G "$capi/libonnxruntime.so*" >/dev/null; then
+        warn "WebGPU ORT wheel layout unexpected (no libonnxruntime.so under capi/)"
+        return 0
+    fi
+
+    # Stage into the vendor dir. Ship the versioned runtime + the provider
+    # .so siblings ONNX Runtime dlopens at session-create time
+    # (onnxruntime_providers_shared.so). Dawn is statically linked into
+    # libonnxruntime.so itself, so there is no separate webgpu provider .so.
+    install -d -m 0755 "$vendor_dir"
+    cp -a "$capi"/libonnxruntime*.so* "$vendor_dir"/ 2>/dev/null || true
+    cp -a "$capi"/libonnxruntime_providers_*.so* "$vendor_dir"/ 2>/dev/null || true
+
+    # The ort crate dlopens the unversioned soname `libonnxruntime.so`. The
+    # wheel ships it as libonnxruntime.so.<ver>; create the symlink.
+    if [[ ! -e "$vendor_dir/libonnxruntime.so" ]]; then
+        local versioned
+        versioned="$(cd "$vendor_dir" && ls libonnxruntime.so.* 2>/dev/null | head -1)"
+        [[ -n "$versioned" ]] && ln -sf "$versioned" "$vendor_dir/libonnxruntime.so"
+    fi
+
+    if [[ ! -e "$vendor_dir/libonnxruntime.so" ]]; then
+        warn "WebGPU ORT staged but libonnxruntime.so symlink missing; Vulkan disabled"
+        return 0
+    fi
+
+    printf '%s\n' "$ort_ver" > "$marker"
+    log "WebGPU ONNX Runtime $ort_ver staged at $vendor_dir"
+
+    _ort_webgpu_write_dropin "$vendor_dir"
+}
+
+# Write the systemd drop-in that repoints the engine's ORT loader at the
+# WebGPU (Dawn->Vulkan) runtime. Mirrors _ort_rocm_write_dropin. The WebGPU
+# .so links Dawn statically and dlopens libvulkan.so.1 from the default
+# loader path (/usr/lib/x86_64-linux-gnu), so only the vendor dir needs to
+# be on LD_LIBRARY_PATH (it AUGMENTS, not replaces, ld.so's default search).
+_ort_webgpu_write_dropin() {
+    local vendor_dir="$1"
+    local dropin_dir="/etc/systemd/system/nexus-engine.service.d"
+    local dropin="$dropin_dir/10-ort-webgpu.conf"
+
+    install -d -m 0755 "$dropin_dir"
+    # A box cannot run both the ROCm and the WebGPU runtime; if a stale
+    # ROCm drop-in is present (e.g. a tier change) remove it so the two
+    # ORT_DYLIB_PATH overrides do not stack.
+    rm -f "$dropin_dir/10-ort-rocm.conf"
+    cat > "$dropin" <<EOF
+# Auto-generated by nexus install.sh (_install_ort_webgpu). Repoints the
+# ONNX Runtime loader at the WebGPU-capable runtime (onnxruntime-webgpu,
+# Dawn->Vulkan backend) for AMD GPUs ROCm does not support. The engine
+# binary is built against ort api-21 so this 1.27 runtime loads cleanly.
+# Overrides only the two ORT env vars from the base unit.
+#
+# Remove this file (and 'systemctl daemon-reload && systemctl restart
+# nexus-engine') to fall back to the bundled OpenVINO/CPU runtime.
+[Service]
+Environment=ORT_DYLIB_PATH=${vendor_dir}/libonnxruntime.so
+Environment=LD_LIBRARY_PATH=${vendor_dir}
+EOF
+
+    log "wrote systemd drop-in $dropin (ORT_DYLIB_PATH -> WebGPU/Vulkan runtime)"
     systemctl daemon-reload 2>/dev/null || true
 }
 
@@ -2265,12 +2556,20 @@ _apply_hailo_ep_priority_override() {
         log "ep_priority already includes \"hailo\" (no override needed)"
         return 0
     fi
-    # Operator deliberately chose a ROCm-primary tier (e.g. --tier
-    # t24-amd, ep_priority = ["rocm", "cpu"]). Honor that choice and do
-    # NOT inject "hailo" — a box with both a Hailo-8 and a Radeon iGPU
-    # can be pinned to GPU inference on purpose. The explicit tier wins.
+    # The chosen config pins a ROCm-primary tier (ep_priority = ["rocm",
+    # "cpu"]). Honor that choice and do NOT inject "hailo" — a box with both
+    # a Hailo-8 and an officially-supported AMD GPU can be pinned to ROCm
+    # inference on purpose. The explicit config wins.
     if grep -qE '^\s*ep_priority\s*=.*"rocm"' "$target"; then
         log "ep_priority lists \"rocm\" (ROCm-primary tier); not injecting \"hailo\""
+        return 0
+    fi
+    # Symmetric to the ROCm guard: the operator chose a Vulkan-primary tier
+    # (e.g. --tier amd, ep_priority = ["vulkan", "cpu"]). A box with both a
+    # Hailo-8 and an AMD iGPU can be pinned to Vulkan inference on purpose —
+    # the explicit tier wins, so do NOT inject "hailo".
+    if grep -qE '^\s*ep_priority\s*=.*"vulkan"' "$target"; then
+        log "ep_priority lists \"vulkan\" (Vulkan-primary tier); not injecting \"hailo\""
         return 0
     fi
     if ! grep -qE '^\s*ep_priority\s*=\s*\[' "$target"; then
