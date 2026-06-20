@@ -173,6 +173,12 @@ pub struct ApiState {
     /// (so the UI doesn't appear to forget a freshly-added sink
     /// just because no alerts have fired yet).
     pub sink_registry: Arc<nexus_sinks::SinkRegistry>,
+    /// File-defined sinks (`nexus.toml` `[[sinks]]`), snapshot at
+    /// boot. The `GET /v1/admin/sinks` handler merges these with the
+    /// runtime `alert_sinks` db rows so the console can show which
+    /// sinks are pinned in config (read-only) vs cloud-managed
+    /// (editable). Cheap to clone — an `Arc<Vec<…>>`.
+    pub file_sinks: Arc<Vec<nexus_config::SinkConfig>>,
     /// M6 Phase 2 Step 2.7 — failed-login lockout policy.
     /// Snapshot of `runtime.auth.lockout` at engine boot;
     /// consumed by `auth::login::post_login` via the
@@ -319,6 +325,23 @@ pub fn router(state: ApiState) -> Router {
         // over a 1h + 24h window, plus the registry list so
         // configured-but-quiet sinks still get a card.
         .route("/v1/admin/sinks/health", get(get_admin_sinks_health))
+        // M7 cloud-managed sinks — runtime CRUD over the
+        // alert-delivery sink set. `GET /v1/admin/sinks` lists the
+        // effective set (file ∪ db, secrets redacted, source +
+        // active annotated). Per-item writes live under
+        // `…/sinks/config/{kind}/{name}` (two path segments instead
+        // of a colon-joined id) so the param routes never sit as a
+        // sibling of the `sinks/health` literal — matchit treats a
+        // same-depth literal-vs-param overlap as a 405 (see the
+        // discovery routes' `sessions/` prefix note above). PUT
+        // upserts + DELETE removes a db sink, each emitting
+        // `sink.config.changed`; the `sinks_reload` task in main.rs
+        // rebuilds the live `SinkRegistry` without a restart.
+        .route("/v1/admin/sinks", get(get_admin_sinks))
+        .route(
+            "/v1/admin/sinks/config/{kind}/{name}",
+            put(put_admin_sink).delete(delete_admin_sink),
+        )
         // Phase 5.6 · R7 — per-camera re-ID emit telemetry +
         // [reid] config snapshot. Drives the `/admin/reid`
         // local diagnostic page. Returns shape-stable JSON
@@ -4483,6 +4506,234 @@ async fn get_admin_sinks_health(
 }
 
 // ===========================================================================
+// M7 cloud-managed sinks — runtime CRUD.
+//
+// The runtime sink set is the UNION of `nexus.toml` `[[sinks]]`
+// (file sinks, frozen at boot) and the `alert_sinks` db rows
+// (cloud / admin-UI managed). These handlers expose the db half as
+// a REST collection so the cloud console can add / edit / remove a
+// sink without a config edit + restart — mirroring the camera +
+// delivery-settings precedent.
+//
+// Secret discipline: every secret (SureView `api_key`, webhook
+// `hmac_secret`) is replaced with `SinkConfig::REDACTED_SECRET`
+// before it leaves the box (GET responses AND audit rows). A PUT
+// that echoes the sentinel back means "keep the stored secret"; the
+// edge re-fills it from the db. The cloud NEVER persists the secret
+// — it forwards the operator's input verbatim to the edge, which
+// stores it locally (same trust boundary as camera RTSP creds).
+// ===========================================================================
+
+/// One sink in the `GET /v1/admin/sinks` response.
+#[derive(serde::Serialize)]
+struct AdminSinkView {
+    /// `"<kind>:<name>"` — the dispatcher's SinkId.
+    sink_id: String,
+    kind: String,
+    name: String,
+    /// `"file"` = pinned in `nexus.toml` (read-only from the
+    /// console); `"cloud"` = a runtime `alert_sinks` row
+    /// (editable / deletable).
+    source: &'static str,
+    /// True ⇔ this sink id is present in the live `SinkRegistry`.
+    active: bool,
+    /// Full `SinkConfig` with every secret replaced by
+    /// [`nexus_config::SinkConfig::REDACTED_SECRET`].
+    config: nexus_config::SinkConfig,
+}
+
+#[derive(serde::Serialize)]
+struct AdminSinksResp {
+    sinks: Vec<AdminSinkView>,
+}
+
+async fn get_admin_sinks(State(s): State<ApiState>) -> Result<Json<AdminSinksResp>, ApiError> {
+    // Effective set = file sinks overlaid with db sinks (db wins on
+    // `<kind>:<name>`). Preserve file order; append db-only sinks.
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, (&'static str, nexus_config::SinkConfig)> =
+        std::collections::HashMap::new();
+    for cfg in s.file_sinks.iter() {
+        let id = format!("{}:{}", cfg.kind(), cfg.name());
+        if by_id.insert(id.clone(), ("file", cfg.clone())).is_none() {
+            order.push(id);
+        }
+    }
+    for row in s.store.alert_sinks_list().await? {
+        let cfg: nexus_config::SinkConfig =
+            serde_json::from_str(&row.config_json).map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("corrupt persisted sink '{}': {e}", row.sink_id),
+                )
+            })?;
+        if by_id.insert(row.sink_id.clone(), ("cloud", cfg)).is_none() {
+            order.push(row.sink_id);
+        }
+    }
+    let active: std::collections::BTreeSet<String> = s
+        .sink_registry
+        .ids()
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect();
+    let sinks = order
+        .into_iter()
+        .map(|id| {
+            let (source, mut config) = by_id.remove(&id).expect("id present in order map");
+            config.redact_secrets();
+            AdminSinkView {
+                kind: config.kind().to_string(),
+                name: config.name().to_string(),
+                active: active.contains(&id),
+                source,
+                sink_id: id,
+                config,
+            }
+        })
+        .collect();
+    Ok(Json(AdminSinksResp { sinks }))
+}
+
+/// Serialise a `SinkConfig` with secrets redacted, for audit rows.
+fn redacted_sink_json(cfg: &nexus_config::SinkConfig) -> Option<String> {
+    let mut c = cfg.clone();
+    c.redact_secrets();
+    serde_json::to_string(&c).ok()
+}
+
+async fn put_admin_sink(
+    State(s): State<ApiState>,
+    Path((kind, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    admin: crate::auth::require_role::AdminContext,
+    Json(mut cfg): Json<nexus_config::SinkConfig>,
+) -> Result<Json<AdminSinkView>, ApiError> {
+    // The path id must agree with the body so a console bug can't
+    // upsert a sink under the wrong key.
+    if cfg.kind() != kind || cfg.name() != name {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "path sink id '{kind}:{name}' does not match body '{}:{}'",
+                cfg.kind(),
+                cfg.name()
+            ),
+        ));
+    }
+    let sink_id = format!("{kind}:{name}");
+
+    // Restore any secret the console echoed back as the redaction
+    // sentinel from the currently-stored row.
+    let existing = s.store.alert_sink_get(&sink_id).await?;
+    let existing_cfg = existing
+        .as_ref()
+        .and_then(|r| serde_json::from_str::<nexus_config::SinkConfig>(&r.config_json).ok());
+    if let Some(old) = &existing_cfg {
+        cfg.restore_redacted_secrets_from(old);
+    }
+    if cfg.has_redacted_secret() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "secret required: a new sink must carry its secret (the redaction \
+             sentinel has nothing to restore from)"
+                .into(),
+        ));
+    }
+    cfg.validate()
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let config_json = serde_json::to_string(&cfg)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    s.store
+        .alert_sink_upsert(&sink_id, &kind, &name, &config_json)
+        .await?;
+
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&admin.0),
+        &headers,
+        peer.ip(),
+        "sink.config.put",
+        "admin/sinks",
+        Some(sink_id.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        existing_cfg
+            .as_ref()
+            .and_then(redacted_sink_json)
+            .as_deref(),
+        redacted_sink_json(&cfg).as_deref(),
+    )
+    .await;
+    // Sentinel — the reload task re-reads the db. `_ =`d so a
+    // saturated bus doesn't fail the write.
+    let _ = s
+        .bus
+        .publish(topic::SINK_CONFIG_CHANGED, &serde_json::json!({}))
+        .await;
+
+    let active = s
+        .sink_registry
+        .ids()
+        .iter()
+        .any(|id| id.to_string() == sink_id);
+    cfg.redact_secrets();
+    Ok(Json(AdminSinkView {
+        kind: cfg.kind().to_string(),
+        name: cfg.name().to_string(),
+        source: "cloud",
+        active,
+        sink_id,
+        config: cfg,
+    }))
+}
+
+async fn delete_admin_sink(
+    State(s): State<ApiState>,
+    Path((kind, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    admin: crate::auth::require_role::AdminContext,
+) -> Result<StatusCode, ApiError> {
+    let sink_id = format!("{kind}:{name}");
+    let existing = s.store.alert_sink_get(&sink_id).await?;
+    let before = existing
+        .as_ref()
+        .and_then(|r| serde_json::from_str::<nexus_config::SinkConfig>(&r.config_json).ok())
+        .as_ref()
+        .and_then(redacted_sink_json);
+    let removed = s.store.alert_sink_delete(&sink_id).await?;
+    if !removed {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no cloud-managed sink '{sink_id}' (a sink defined in nexus.toml \
+                 cannot be removed from the console)"
+            ),
+        ));
+    }
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&admin.0),
+        &headers,
+        peer.ip(),
+        "sink.config.delete",
+        "admin/sinks",
+        Some(sink_id.as_str()),
+        nexus_store::audit::AuditOutcome::Success,
+        before.as_deref(),
+        None,
+    )
+    .await;
+    let _ = s
+        .bus
+        .publish(topic::SINK_CONFIG_CHANGED, &serde_json::json!({}))
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ===========================================================================
 // Phase 5.6 · R7 — re-identification local diagnostic.
 //
 // `GET /v1/admin/reid/status` is the local-only operator-facing
@@ -5851,6 +6102,8 @@ mod tests {
             // delivery-policy tests below populate it when they
             // exercise the sinks-health endpoint.
             sink_registry: Arc::new(nexus_sinks::SinkRegistry::new()),
+            // M7 cloud-managed sinks — no file sinks in tests.
+            file_sinks: Arc::new(Vec::new()),
             // M6 — default LockoutConfig is fine for every test
             // here; tests that exercise the lockout boundary
             // override via a per-test mutation of `state` before

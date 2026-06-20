@@ -300,4 +300,57 @@ score_threshold = 0.10
 # [sinks.headers]                             # optional; verbatim HTTP headers
 # # "Authorization" = "Bearer xyz"
 # # "X-Tenant"      = "acme"
+#
+# The SureView sink requires the engine to be built with the `sureview`
+# feature (the workspace `nexus-engine` Cargo.toml enables it on `nexus-sinks`).
+# It triggers a SureView Ops alarm point ("HTTP Alarms") with one JSON POST per
+# alert. `api_key` is the account key from SureView's Alarm Setup → HTTP Alarms
+# tab (a SECRET — keep it out of version control); the sink base64-encodes it in
+# the Authorization header. `system_identifier` is the alarm point's System
+# Identifier; map individual cameras to their own alarm points with the optional
+# `[sinks.system_identifiers]` table (keyed by camera id). SureView pulls video
+# from the camera you configure as a device in SureView — no media is uploaded.
+#
+# [[sinks]]
+# kind = "sureview"
+# name = "central-station"
+# region = "us"                               # "us" or "eu"; default "us"
+# api_key = "your-sureview-account-key"       # SECRET — from HTTP Alarms tab
+# system_identifier = "9z5138b9ak"            # default alarm point
+# # location = "27.947380,-82.460741"         # optional "Lat,Long"
+# # timeout_secs = 15                         # optional; default 15s
+#
+# [sinks.system_identifiers]                  # optional; per-camera alarm points
+# # "1" = "front-door-point"
+# # "2" = "loading-bay-point"
+#
+# The SureView *email* sink (`kind = "sureview_email"`) requires the engine to
+# be built with the `sureview-email` feature (enabled by default on the
+# workspace `nexus-engine`). It triggers a SureView Ops alarm point over SMTP
+# instead of HTTP — there is NO api_key, because the destination address itself
+# identifies the alarm point. The operator-facing message rides the email
+# Subject; an optional decimal "Lat,Long" in `location` is placed in the body so
+# SureView auto-plots the alarm on its map; the clip (MP4) / snapshot (JPG) can
+# ride as attachments. `region` selects the relay (us-smtp / eu-smtp); SureView
+# requires no auth, but optional `username`/`password` cover a fronting relay.
+#
+# [[sinks]]
+# kind = "sureview_email"
+# name = "central-station-email"
+# region = "us"                               # "us" or "eu"; picks the smtp relay
+# alarm_email = "8nrawg1sxc@us.sureviewops.com"  # default alarm-point address (To)
+# # from_address = "nexus-edge@localhost"     # optional; SureView ignores From
+# # location = "51.650646,-3.914983"          # optional "Lat,Long" → map plot
+# # attach_snapshot = true                    # optional; attach the JPG snapshot
+# # attach_clip = false                       # optional; attach the MP4 clip
+# # smtp_host = "us-smtp.sureviewops.com"     # optional; overrides region
+# # smtp_port = 587                           # optional; default 587 (or 25)
+# # starttls = true                           # optional; default true
+# # username = "device"                       # optional; only for a relay that auths
+# # password = "placeholder"                  # optional SECRET; paired with username
+# # timeout_secs = 15                         # optional; default 15s
+#
+# [sinks.alarm_emails]                        # optional; per-camera alarm points
+# # "1" = "frontdoor1xyz@us.sureviewops.com"
+# # "2" = "loadingbay2abc@us.sureviewops.com"
 # ---------------------------------------------------------------------------
