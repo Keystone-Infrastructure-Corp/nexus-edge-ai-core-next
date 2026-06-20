@@ -1525,6 +1525,22 @@ pub struct RuleConfig {
     pub debounce: RuleDebounce,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// M7 per-rule sink routing. The `"<kind>:<name>"` ids of the
+    /// alert-delivery sinks this rule's matches are enqueued to.
+    /// Empty (the default) routes to **every** configured sink, so
+    /// existing rules keep delivering everywhere. A non-empty list
+    /// restricts delivery to the named sinks (filtered at dispatch
+    /// time to those that actually exist, so a stale id never
+    /// produces an undeliverable outbox row). This is distinct from
+    /// the per-rule delivery *policy* (`rules.delivery_policy_json`,
+    /// which gates whether/when delivery happens): routing decides
+    /// *which* sinks, the policy decides *if* and *when*.
+    ///
+    /// Lives inside `rules.config_json` (no schema migration). Old
+    /// payloads without the field deserialize to an empty list via
+    /// `#[serde(default)]`, preserving the route-to-all behaviour.
+    #[serde(default)]
+    pub sinks: Vec<String>,
 }
 
 fn default_min_track_age_ms() -> u64 {

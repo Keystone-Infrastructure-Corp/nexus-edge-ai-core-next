@@ -58,8 +58,12 @@ pub(crate) async fn post_inject_event(
     Json(ev): Json<AlertEvent>,
 ) -> Result<(StatusCode, Json<InjectEventResp>), ApiError> {
     // Snapshot the live registry → string-ids in the format the
-    // store expects. Matches the production fire path in the rule
-    // engine, which also resolves sinks from this same registry.
+    // store expects. The injected event is not tied to a loaded rule,
+    // so it routes to ALL configured sinks (no per-rule `sinks`
+    // filtering). The production fire path in the per-camera
+    // supervisor resolves the same registry via `EngineSinkRouter`
+    // and additionally narrows to the firing rule's `sinks`
+    // allow-list — see `nexus-engine/src/sink_router.rs`.
     let sink_ids: Vec<String> = s
         .sink_registry
         .ids()

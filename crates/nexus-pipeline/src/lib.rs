@@ -20,6 +20,7 @@ pub mod gate;
 pub mod post_roll;
 pub mod preroll;
 pub mod recorder;
+pub mod sink_router;
 pub mod skip_policy;
 pub mod source;
 pub mod static_clear;
@@ -47,6 +48,7 @@ pub use preroll::{NalRingBuffer, NalSample};
 pub use recorder::{
     ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError, StubClipRecorder,
 };
+pub use sink_router::{NoopSinkRouter, SinkRouter};
 pub use source::{supervisor_frame_for, RTSP_SOURCE_FRAME_HEIGHT, RTSP_SOURCE_FRAME_WIDTH};
 pub use source::{FailingSource, FrameSource, FrameSourceError, VirtualSource};
 pub use static_clear::StaticAnchorClearRegistry;

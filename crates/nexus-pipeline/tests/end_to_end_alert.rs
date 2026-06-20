@@ -29,6 +29,18 @@ use nexus_store::{EventStore, Store};
 use nexus_types::AlertEvent;
 use url::Url;
 
+/// Test [`nexus_pipeline::SinkRouter`] that routes every alert to one
+/// fixed sink id. Stands in for the engine's `EngineSinkRouter` so the
+/// test can assert the supervisor's M7 enqueue path actually writes an
+/// `alert_sink_outbox` row (the production fire path).
+struct FixedSinkRouter(&'static str);
+
+impl nexus_pipeline::SinkRouter for FixedSinkRouter {
+    fn sinks_for(&self, _rule_id: &str) -> Vec<String> {
+        vec![self.0.to_string()]
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cel_rule_emits_alert_for_virtual_person() {
     // 1. In-memory bus + subscriber. Subscribe BEFORE spawning the camera
@@ -65,6 +77,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
             cooldown_ms: 0,
         },
         enabled: true,
+        sinks: Vec::new(),
     };
     let rules_cfg = RulesConfig {
         backend: RulesBackendKind::Cel,
@@ -143,6 +156,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         Vec::new(),
         std::sync::Arc::new(nexus_pipeline::NoopEntityLocalPersist),
         None,
+        std::sync::Arc::new(FixedSinkRouter("webhook:test")),
     );
 
     // 4. Wait for the first AlertEvent. 5s budget covers the gate warmup
@@ -171,6 +185,22 @@ async fn cel_rule_emits_alert_for_virtual_person() {
     assert!(
         stored.iter().any(|e| e.event_id == event.event_id),
         "store must contain the same event"
+    );
+
+    // 5a. M7 per-rule sink routing — the supervisor records + enqueues
+    //     atomically BEFORE publishing to the bus, so by the time the
+    //     event arrived above the `alert_sink_outbox` row is already
+    //     committed. Exactly one row, carrying the sink the router
+    //     selected, must exist for this event.
+    let outbox = store
+        .outbox_for_event(&event.event_id.to_string())
+        .await
+        .expect("outbox_for_event ok");
+    let outbox_sinks: Vec<String> = outbox.into_iter().map(|r| r.sink_id).collect();
+    assert_eq!(
+        outbox_sinks,
+        vec!["webhook:test".to_string()],
+        "supervisor must enqueue exactly the routed sink"
     );
 
     // 5b. The supervisor opens a motion clip on the same frame the
