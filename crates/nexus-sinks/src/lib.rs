@@ -43,6 +43,8 @@ pub mod dispatcher;
 pub mod policy;
 #[cfg(feature = "sureview")]
 pub mod sureview;
+#[cfg(feature = "sureview-email")]
+pub mod sureview_email;
 #[cfg(feature = "webhook")]
 pub mod webhook;
 pub use backoff::{backoff_for, backoff_for_with};
@@ -278,7 +280,10 @@ pub fn build_sinks_from_config(
     // The `mut` is only consumed by feature-gated branches that
     // push into the vec; suppress the unused-mut warning under
     // every feature combination that has no enabled sink kinds.
-    #[cfg_attr(not(any(feature = "webhook", feature = "sureview")), allow(unused_mut))]
+    #[cfg_attr(
+        not(any(feature = "webhook", feature = "sureview", feature = "sureview-email")),
+        allow(unused_mut)
+    )]
     let mut out: Vec<Arc<dyn AlertSink>> = Vec::with_capacity(sinks.len());
     for cfg in sinks {
         match cfg {
@@ -301,6 +306,17 @@ pub fn build_sinks_from_config(
             nexus_config::SinkConfig::SureView(s) => {
                 return Err(SinkError::Permanent(format!(
                     "sureview sink '{}' configured but binary was built without --features sureview",
+                    s.name
+                )));
+            }
+            #[cfg(feature = "sureview-email")]
+            nexus_config::SinkConfig::SureViewEmail(s) => {
+                out.push(Arc::new(sureview_email::SureViewEmailSink::new(s)?));
+            }
+            #[cfg(not(feature = "sureview-email"))]
+            nexus_config::SinkConfig::SureViewEmail(s) => {
+                return Err(SinkError::Permanent(format!(
+                    "sureview_email sink '{}' configured but binary was built without --features sureview-email",
                     s.name
                 )));
             }

@@ -93,8 +93,14 @@ nexus-storage = { workspace = true }
 # The `webhook` feature pulls reqwest + hmac + sha2 + hex for the
 # JSON-POST sink — engines that ship without HTTP egress (rare in
 # practice) can drop it. The `sureview` feature adds the SureView
-# Ops/Response central-monitoring sink (REST event + multipart media).
-nexus-sinks = { workspace = true, features = ["webhook", "sureview"] }
+# Ops/Response central-monitoring sink (HTTP Alarms JSON POST); the
+# `sureview-email` feature adds the SureView SMTP / Email Alarms sink
+# (lettre over rustls), independent of the HTTP one.
+nexus-sinks = { workspace = true, features = [
+    "webhook",
+    "sureview",
+    "sureview-email",
+] }
 # Cloud cold backends (Google Drive, OneDrive). Brings reqwest +
 # OAuth + per-provider HTTP. The crate is always-on in nexus-engine
 # even though LAN-only deployments never instantiate a cloud

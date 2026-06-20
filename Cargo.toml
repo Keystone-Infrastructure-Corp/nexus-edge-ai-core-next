@@ -214,6 +214,22 @@ reqwest = { version = "0.12", default-features = false, features = [
 # Hex encoding for sha256 round-trip in cloud `exists()` checks.
 hex = "0.4"
 
+# SMTP client for the SureView "SMTP / Email Alarms" sink
+# (`nexus-sinks`, behind the optional `sureview-email` feature). The
+# de-facto standard Rust mailer; MIT-licensed (allowlist-clean) and it
+# reuses the rustls stack we already pull for reqwest + the cloud
+# tunnel, so the incremental binary cost is the message builder + SMTP
+# state machine only. `default-features = false` strips the sync/
+# native-tls transports we don't use; we keep the async tokio +
+# rustls path and the message builder.
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls-tls",
+    "hostname",
+] }
+
 # M-Admin Phase 1B — camera discovery. `ipnet` parses CIDR strings
 # and enumerates host iterators for the bounded-concurrency LAN
 # sweep; `dashmap` backs the lock-free `Arc<DashMap<Uuid, Session>>`

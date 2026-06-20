@@ -1617,6 +1617,20 @@ pub enum SinkConfig {
     /// SinkId the dispatcher + outbox use.
     #[serde(rename = "sureview")]
     SureView(SureViewSinkConfig),
+    /// SureView Ops central-monitoring sink over **SMTP / Email
+    /// Alarms**. Sends one email per alert to the alarm point's
+    /// unique receiver address; the operator-facing message rides the
+    /// `Subject`, optional GPS map-plot coordinates ride the body, and
+    /// the clip / snapshot can ride as attachments. No account API key
+    /// is required — the destination address identifies the alarm
+    /// point (per the SureView *SMTP Alarms* reference).
+    ///
+    /// The serde discriminator is pinned to `"sureview_email"` (the
+    /// snake_case default already matches, but it is spelled
+    /// explicitly to keep the wire tag stable alongside the
+    /// `<kind>:<name>` SinkId).
+    #[serde(rename = "sureview_email")]
+    SureViewEmail(SureViewEmailSinkConfig),
 }
 
 impl SinkConfig {
@@ -1625,6 +1639,7 @@ impl SinkConfig {
         match self {
             SinkConfig::Webhook(_) => "webhook",
             SinkConfig::SureView(_) => "sureview",
+            SinkConfig::SureViewEmail(_) => "sureview_email",
         }
     }
 
@@ -1634,6 +1649,7 @@ impl SinkConfig {
         match self {
             SinkConfig::Webhook(cfg) => &cfg.name,
             SinkConfig::SureView(cfg) => &cfg.name,
+            SinkConfig::SureViewEmail(cfg) => &cfg.name,
         }
     }
 
@@ -1644,6 +1660,7 @@ impl SinkConfig {
         match self {
             SinkConfig::Webhook(cfg) => cfg.validate(),
             SinkConfig::SureView(cfg) => cfg.validate(),
+            SinkConfig::SureViewEmail(cfg) => cfg.validate(),
         }
     }
 
@@ -1669,6 +1686,11 @@ impl SinkConfig {
             SinkConfig::SureView(s) => {
                 s.api_key = Self::REDACTED_SECRET.to_string();
             }
+            SinkConfig::SureViewEmail(s) => {
+                if s.password.is_some() {
+                    s.password = Some(Self::REDACTED_SECRET.to_string());
+                }
+            }
         }
     }
 
@@ -1691,6 +1713,11 @@ impl SinkConfig {
             {
                 new.api_key = old.api_key.clone();
             }
+            (SinkConfig::SureViewEmail(new), SinkConfig::SureViewEmail(old))
+                if new.password.as_deref() == Some(Self::REDACTED_SECRET) =>
+            {
+                new.password = old.password.clone();
+            }
             _ => {}
         }
     }
@@ -1704,6 +1731,7 @@ impl SinkConfig {
         match self {
             SinkConfig::Webhook(w) => w.hmac_secret.as_deref() == Some(Self::REDACTED_SECRET),
             SinkConfig::SureView(s) => s.api_key == Self::REDACTED_SECRET,
+            SinkConfig::SureViewEmail(s) => s.password.as_deref() == Some(Self::REDACTED_SECRET),
         }
     }
 }
@@ -1855,6 +1883,16 @@ impl SureViewRegion {
             SureViewRegion::Eu => "https://eu.sureviewops.com/receiver",
         }
     }
+
+    /// The documented regional SMTP relay host for *SMTP / Email
+    /// Alarms*. AMER routes through `us-smtp`; EMEA / APAC through
+    /// `eu-smtp`.
+    pub fn smtp_host(self) -> &'static str {
+        match self {
+            SureViewRegion::Us => "us-smtp.sureviewops.com",
+            SureViewRegion::Eu => "eu-smtp.sureviewops.com",
+        }
+    }
 }
 
 impl SureViewSinkConfig {
@@ -1922,6 +1960,184 @@ impl SureViewSinkConfig {
 
 fn default_sureview_timeout_secs() -> u64 {
     15
+}
+
+/// SureView Ops "SMTP / Email Alarms" sink configuration. Triggers a
+/// SureView alarm point by sending one email per alert to the alarm
+/// point's unique receiver address, per the SureView Ops *SMTP Alarms*
+/// reference
+/// (<https://help.sureviewops.com/hc/en-us/articles/13211794487837-Smtp-alarms-Email-Alarms>).
+///
+/// Unlike the HTTP Alarms sink there is **no account API key** — the
+/// destination email address itself identifies the alarm point.
+/// SureView reads the email as follows:
+///   * `To` — the alarm point's unique address (e.g.
+///     `8nrawg1sxc@us.sureviewops.com`). Per-camera overrides live in
+///     [`Self::alarm_emails`].
+///   * `From` — any syntactically valid address (SureView ignores it).
+///   * `Subject` — the operator-facing alarm message.
+///   * body — optional; a decimal `"latitude,longitude"` pair auto-
+///     plots the alarm on the SureView map ([`Self::location`]).
+///   * attachments — optional clip (MP4) / snapshot (JPG).
+///
+/// SureView's relay requires no authentication, but some networks
+/// front it with an authenticating relay, so optional
+/// [`Self::username`] / [`Self::password`] (a redacted secret) are
+/// supported. Retry / backoff is the dispatcher's job; the sink sends
+/// at most one message per `deliver()` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SureViewEmailSinkConfig {
+    /// Operator-chosen identifier (the `<name>` of the SinkId).
+    /// Must be unique across the `[[sinks]]` list. Stable across
+    /// config reloads — outbox rows reference it by string.
+    pub name: String,
+    /// SureView Ops SaaS hosting region. Selects the documented SMTP
+    /// relay host unless `smtp_host` overrides it. Defaults to `us`.
+    #[serde(default)]
+    pub region: SureViewRegion,
+    /// Explicit SMTP relay host override. Set this only for on-prem
+    /// SureView installs or integration testing; production SaaS
+    /// deployments should set `region` instead.
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    /// SMTP submission port. Defaults to 587 (SureView also accepts
+    /// 25).
+    #[serde(default = "default_sureview_smtp_port")]
+    pub smtp_port: u16,
+    /// Negotiate STARTTLS on the connection. Defaults to `true`
+    /// (SureView supports but does not require TLS); set `false` only
+    /// for a plaintext test relay.
+    #[serde(default = "default_true")]
+    pub starttls: bool,
+    /// Envelope / header `From` address. SureView ignores it, but SMTP
+    /// requires a syntactically valid sender. Defaults to
+    /// `nexus-edge@localhost`.
+    #[serde(default = "default_sureview_from")]
+    pub from_address: String,
+    /// Default SureView alarm-point receiver address (the `To`). Used
+    /// for any camera without an `alarm_emails` override.
+    pub alarm_email: String,
+    /// Optional per-camera override of `alarm_email`, keyed by the
+    /// nexus camera id (as a string). Lets each camera trigger its own
+    /// SureView alarm point.
+    #[serde(default)]
+    pub alarm_emails: std::collections::HashMap<String, String>,
+    /// Optional static `"Latitude,Longitude"` placed in the email body
+    /// so SureView auto-plots the alarm on its map.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Attach the alert's annotated snapshot (JPG) when one is present
+    /// on the event. Best-effort: a missing / unreadable file is
+    /// logged and the alarm is still sent. Defaults to `false`.
+    #[serde(default)]
+    pub attach_snapshot: bool,
+    /// Attach the alert's motion clip (MP4) when one is present on the
+    /// event. Best-effort and size-capped; a missing / oversized file
+    /// is logged and the alarm is still sent. Defaults to `false`.
+    #[serde(default)]
+    pub attach_clip: bool,
+    /// Optional SMTP AUTH username for a fronting authenticating relay.
+    /// Leave unset for SureView's unauthenticated relay.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional SMTP AUTH password (paired with `username`). Secret —
+    /// sourced from `nexus.toml` on the box, never committed; redacted
+    /// on the admin GET surface.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Per-attempt SMTP timeout in seconds. Defaults to 15. The
+    /// dispatcher's retry backoff wraps it.
+    #[serde(default = "default_sureview_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_sureview_smtp_port() -> u16 {
+    587
+}
+
+fn default_sureview_from() -> String {
+    "nexus-edge@localhost".to_string()
+}
+
+impl SureViewEmailSinkConfig {
+    /// The SMTP relay host this sink connects to — the explicit
+    /// `smtp_host` override when set, else the region's documented
+    /// relay host.
+    pub fn resolved_smtp_host(&self) -> &str {
+        match &self.smtp_host {
+            Some(h) => h.as_str(),
+            None => self.region.smtp_host(),
+        }
+    }
+
+    /// Resolve the SureView alarm-point address for a given camera —
+    /// the per-camera override if present, else the default.
+    pub fn alarm_email_for(&self, camera_id: CameraId) -> &str {
+        self.alarm_emails
+            .get(&camera_id.to_string())
+            .map(String::as_str)
+            .unwrap_or(&self.alarm_email)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.name.is_empty() {
+            return Err(ConfigError::Validation(
+                "sureview_email sink name must be non-empty".into(),
+            ));
+        }
+        if self.name.contains(':') {
+            return Err(ConfigError::Validation(format!(
+                "sureview_email sink name '{}' must not contain ':' (reserved as SinkId separator)",
+                self.name
+            )));
+        }
+        if !self.from_address.contains('@') {
+            return Err(ConfigError::Validation(format!(
+                "sureview_email sink '{}' from_address '{}' is not a valid email",
+                self.name, self.from_address
+            )));
+        }
+        if !self.alarm_email.contains('@') {
+            return Err(ConfigError::Validation(format!(
+                "sureview_email sink '{}' alarm_email '{}' is not a valid email",
+                self.name, self.alarm_email
+            )));
+        }
+        for (cam, addr) in &self.alarm_emails {
+            if !addr.contains('@') {
+                return Err(ConfigError::Validation(format!(
+                    "sureview_email sink '{}' alarm_emails['{cam}'] '{addr}' is not a valid email",
+                    self.name
+                )));
+            }
+        }
+        if self.resolved_smtp_host().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "sureview_email sink '{}' smtp_host must be non-empty",
+                self.name
+            )));
+        }
+        if self.smtp_port == 0 {
+            return Err(ConfigError::Validation(format!(
+                "sureview_email sink '{}' smtp_port must be > 0",
+                self.name
+            )));
+        }
+        if self.username.is_some() != self.password.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "sureview_email sink '{}' username and password must be set together",
+                self.name
+            )));
+        }
+        if self.timeout_secs == 0 {
+            return Err(ConfigError::Validation(format!(
+                "sureview_email sink '{}' timeout_secs must be > 0",
+                self.name
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
