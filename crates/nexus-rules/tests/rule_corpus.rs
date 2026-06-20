@@ -192,6 +192,7 @@ fn corpus_to_rule_configs() -> Vec<RuleConfig> {
                 cooldown_ms: 0,
             },
             enabled: true,
+            sinks: Vec::new(),
         })
         .collect()
 }
@@ -728,6 +729,7 @@ fn every_corpus_rule_compiles() {
                 cooldown_ms: 0,
             },
             enabled: true,
+            sinks: Vec::new(),
         };
         if let Err(e) = engine.compile(&cfg) {
             failures.push(format!("{}: {}", spec.id, e));
@@ -777,6 +779,7 @@ fn golden_fixtures_match_expected_verdicts() {
                 cooldown_ms: 0,
             },
             enabled: true,
+            sinks: Vec::new(),
         };
         let compiled = engine
             .compile(&cfg)

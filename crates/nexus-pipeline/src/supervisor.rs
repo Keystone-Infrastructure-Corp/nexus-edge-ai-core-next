@@ -12,7 +12,7 @@ use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
 use nexus_inference::{label_matches_any_prompt, Detector};
 use nexus_rules::RuleEvaluator;
-use nexus_store::{EventStore, MotionEventKind, NewMotionEvent, Store};
+use nexus_store::{MotionEventKind, NewMotionEvent, Store};
 use nexus_tracker::{
     filter_excluded_zones, filter_zone_min_area, is_object_static, MotionDecision,
     MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
@@ -35,6 +35,7 @@ use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{
     ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError, MAX_CLIP_DURATION_MS,
 };
+use crate::sink_router::SinkRouter;
 use crate::skip_policy::DetectorSkipPolicy;
 use crate::source::{FrameSource, VirtualSource};
 use crate::static_clear::StaticAnchorClearRegistry;
@@ -113,6 +114,12 @@ pub fn spawn_camera(
     // than per-stage. `None` disables the post-merge re-cap (matches the
     // pre-B2.1 behaviour for cameras without a configured cap).
     effective_top_k: Option<usize>,
+    // M7 per-rule sink routing. Resolves, per firing rule, which
+    // alert-delivery sinks each recorded alert is enqueued into the
+    // `alert_sink_outbox` for. A `NoopSinkRouter` routes to nothing,
+    // degrading the enqueue path to a plain event-record (pre-M7
+    // behaviour) for harnesses that don't wire the dispatcher.
+    sink_router: Arc<dyn SinkRouter>,
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
@@ -138,6 +145,7 @@ pub fn spawn_camera(
         sighting_seed,
         sighting_persist,
         effective_top_k,
+        sink_router,
     ));
     CameraHandle { camera_id, task }
 }
@@ -166,6 +174,7 @@ async fn run_camera(
     sighting_seed: Vec<EntityLocalSeed>,
     sighting_persist: Arc<dyn EntityLocalPersist>,
     effective_top_k: Option<usize>,
+    sink_router: Arc<dyn SinkRouter>,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -848,8 +857,17 @@ async fn run_camera(
             let mut events_to_link: Vec<String> = Vec::new();
             for ev in events {
                 let event_id = ev.event_id.to_string();
-                if let Err(e) = store.record_event(&ev).await {
-                    warn!(event = %ev.event_id, "store.record_event failed: {e}");
+                // M7 per-rule sink routing — resolve which configured
+                // sinks this rule delivers to, then record the event
+                // and enqueue an `alert_sink_outbox` row per sink in a
+                // single transaction. An empty resolution records the
+                // event with no outbox rows (identical to the pre-M7
+                // `record_event`), so a `NoopSinkRouter` or a config
+                // with no sinks keeps today's behaviour.
+                let sinks = sink_router.sinks_for(&ev.rule_id);
+                let sink_refs: Vec<&str> = sinks.iter().map(String::as_str).collect();
+                if let Err(e) = store.record_event_and_enqueue(&ev, &sink_refs).await {
+                    warn!(event = %ev.event_id, "store.record_event_and_enqueue failed: {e}");
                 } else {
                     events_to_link.push(event_id);
                 }

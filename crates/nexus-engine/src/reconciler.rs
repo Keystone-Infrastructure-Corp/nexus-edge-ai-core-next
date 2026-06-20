@@ -134,6 +134,11 @@ pub struct ReconcilerArgs {
     /// Hydration window (seconds) used when `start_camera` loads a
     /// per-camera seed from the store. Matches the boot-time value.
     pub sighting_hydration_window_secs: u64,
+    /// M7 per-rule sink routing — shared resolver of which configured
+    /// sinks each recorded alert is enqueued to. Cloned into every
+    /// `start_camera` call so a hot-added camera routes alerts with
+    /// the same per-rule `sinks` semantics as the boot-time ones.
+    pub sink_router: Arc<dyn nexus_pipeline::SinkRouter>,
     pub handles: HandleMap,
 }
 
@@ -420,6 +425,7 @@ async fn start_camera(
         seed_for_cam,
         args.sighting_persist.clone(),
         effective_top_k,
+        args.sink_router.clone(),
     );
     args.handles.lock().insert(
         cam_id,

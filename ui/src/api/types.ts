@@ -164,6 +164,12 @@ export interface RuleConfig {
   consecutive_frames?: number;
   cooldown_ms?: number;
   enabled?: boolean;
+  /// M7 per-rule sink routing. The `"<kind>:<name>"` ids of the
+  /// alert-delivery sinks this rule's alerts are enqueued to. Empty
+  /// or omitted routes to every configured sink (the default). The
+  /// rules editor preserves this field on round-trip even without a
+  /// dedicated control, so cloud/API-set routing survives a UI edit.
+  sinks?: string[];
   [k: string]: unknown;
 }
 

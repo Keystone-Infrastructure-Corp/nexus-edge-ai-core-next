@@ -227,6 +227,22 @@ impl RuleEvaluator {
         self.engine.kind()
     }
 
+    /// M7 per-rule sink routing — return the configured `sinks`
+    /// allow-list for `rule_id` from the live (hot-reloaded) rule
+    /// set. `Some(vec![])` means the rule exists and routes to every
+    /// configured sink (the default); `Some(non-empty)` restricts to
+    /// the named sink ids; `None` means no rule with that id is
+    /// currently loaded. Reads the same `ArcSwap` snapshot as
+    /// [`Self::evaluate`], so a concurrent [`Self::reload`] is
+    /// observed atomically.
+    pub fn sinks_for(&self, rule_id: &str) -> Option<Vec<String>> {
+        let rules = self.rules.load();
+        rules
+            .iter()
+            .find(|r| r.config.id == rule_id)
+            .map(|r| r.config.sinks.clone())
+    }
+
     /// Evaluate every rule against every tracked object on a frame.
     /// Returns the events that should be persisted + published.
     ///
@@ -493,6 +509,7 @@ mod tests {
                 cooldown_ms: 0,
             },
             enabled: true,
+            sinks: Vec::new(),
         };
         let eng = CelEngine::new();
         let compiled = eng.compile(&cfg).unwrap();
@@ -539,6 +556,7 @@ mod tests {
                 cooldown_ms: 0,
             },
             enabled: true,
+            sinks: Vec::new(),
         }
     }
 

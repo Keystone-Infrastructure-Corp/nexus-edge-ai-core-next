@@ -1546,6 +1546,7 @@ async fn validate_rule(Json(req): Json<ValidateRuleReq>) -> Json<ValidateRuleRes
             cooldown_ms: 0,
         },
         enabled: true,
+        sinks: Vec::new(),
     };
     match compile_cel_safely(&stub) {
         Ok(()) => Json(ValidateRuleResp {
@@ -6806,6 +6807,7 @@ mod tests {
                     cooldown_ms: 0,
                 },
                 enabled: true,
+                sinks: Vec::new(),
             })
             .await
             .unwrap();
@@ -6848,6 +6850,7 @@ mod tests {
                     cooldown_ms: 0,
                 },
                 enabled: true,
+                sinks: Vec::new(),
             })
             .await
             .unwrap();
@@ -6912,6 +6915,7 @@ mod tests {
                     cooldown_ms: 0,
                 },
                 enabled: true,
+                sinks: Vec::new(),
             })
             .await
             .unwrap();

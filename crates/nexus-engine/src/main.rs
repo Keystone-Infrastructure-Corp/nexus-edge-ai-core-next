@@ -45,6 +45,7 @@ mod reconciler;
 mod retention;
 mod roster;
 mod setup;
+mod sink_router;
 mod sinks_reload;
 mod storage_safety;
 mod system_metrics;
@@ -766,6 +767,21 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         )
     };
 
+    // M7 per-rule sink routing — the registry is the single live
+    // source of "which sinks are configured". It is populated further
+    // below (after the boot-time camera spawn) via `replace`, and the
+    // cloud/admin `sinks_reload` task rebuilds it at runtime. The
+    // router holds the same `Arc`, so per-camera supervisors resolve
+    // routing against the current set without re-plumbing. Building it
+    // here (rather than at the dispatcher site) lets the boot-time
+    // spawn loop pass it in; routing is a no-op until `replace` runs,
+    // which is harmless because the cameras have not yet produced any
+    // frames at that point.
+    let sink_registry = std::sync::Arc::new(nexus_sinks::SinkRegistry::new());
+    let sink_router: std::sync::Arc<dyn nexus_pipeline::SinkRouter> = std::sync::Arc::new(
+        sink_router::EngineSinkRouter::new(evaluator.clone(), sink_registry.clone()),
+    );
+
     for cam in cameras {
         if !cam.ingest.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
@@ -834,6 +850,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             seed_for_cam,
             sighting_persist.clone(),
             effective_top_k,
+            sink_router.clone(),
         );
         running.lock().insert(
             cam_id,
@@ -1017,7 +1034,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // With no `[[sinks]]` in the config the registry is empty
     // and the dispatcher spins quietly because
     // `record_event_and_enqueue` enqueues nothing.
-    let sink_registry = std::sync::Arc::new(nexus_sinks::SinkRegistry::new());
+    //
+    // The `Arc<SinkRegistry>` itself was created earlier (before the
+    // boot-time camera spawn) so the per-camera supervisors' M7 sink
+    // router could be wired in; here we populate it with the effective
+    // sink set.
     // File sinks (`nexus.toml` `[[sinks]]`) are frozen at boot; the
     // cloud console / admin UI manage additional sinks at runtime in
     // the `alert_sinks` db table. The live registry is the UNION of
@@ -1102,6 +1123,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         sighting_cfg,
         sighting_persist: sighting_persist.clone(),
         sighting_hydration_window_secs: hydration_window_secs,
+        sink_router: sink_router.clone(),
         handles: running.clone(),
     });
 
