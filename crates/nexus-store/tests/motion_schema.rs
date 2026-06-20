@@ -651,6 +651,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0018_entity_local_state".to_string(),
             "0019_auth_refresh_idle".to_string(),
             "0020_cloud_enrollment_server_cert".to_string(),
+            "0021_alert_sinks".to_string(),
         ]
     );
 }

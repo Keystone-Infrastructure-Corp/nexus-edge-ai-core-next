@@ -14,6 +14,7 @@ pub mod entity;
 pub mod motion;
 pub mod outbox;
 pub mod sessions;
+pub mod sinks;
 pub mod users;
 pub mod visual_prompts;
 pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
@@ -133,6 +134,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0020_cloud_enrollment_server_cert",
         include_str!("../migrations/0020_cloud_enrollment_server_cert.sql"),
+    ),
+    (
+        "0021_alert_sinks",
+        include_str!("../migrations/0021_alert_sinks.sql"),
     ),
 ];
 

@@ -45,6 +45,7 @@ mod reconciler;
 mod retention;
 mod roster;
 mod setup;
+mod sinks_reload;
 mod storage_safety;
 mod system_metrics;
 // M7 Step 6F2 — only compiled when the `test-injection` feature
@@ -1017,8 +1018,21 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // and the dispatcher spins quietly because
     // `record_event_and_enqueue` enqueues nothing.
     let sink_registry = std::sync::Arc::new(nexus_sinks::SinkRegistry::new());
-    let configured_sinks = nexus_sinks::build_sinks_from_config(&cfg.sinks)
-        .context("M7: build alert-delivery sinks from cfg.sinks")?;
+    // File sinks (`nexus.toml` `[[sinks]]`) are frozen at boot; the
+    // cloud console / admin UI manage additional sinks at runtime in
+    // the `alert_sinks` db table. The live registry is the UNION of
+    // the two (db wins on `<kind>:<name>`). The `sinks_reload` task
+    // below rebuilds it on each `sink.config.changed` bus signal.
+    let file_sinks = std::sync::Arc::new(cfg.sinks.clone());
+    let db_sink_json: Vec<String> = store
+        .alert_sinks_list()
+        .await
+        .context("M7: load cloud-managed sinks from store")?
+        .into_iter()
+        .map(|r| r.config_json)
+        .collect();
+    let configured_sinks = nexus_sinks::build_effective_sinks(&file_sinks, &db_sink_json)
+        .context("M7: build alert-delivery sinks from cfg.sinks + db")?;
     let n_sinks = sink_registry.replace(configured_sinks);
     if n_sinks > 0 {
         info!(n_sinks, "M7: alert-delivery sinks registered");
@@ -1032,6 +1046,16 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cascading_policy.clone();
     let (delivery_reload_handle, delivery_reload_shutdown_tx) =
         delivery_reload::spawn(bus.clone(), store.clone(), cascading_policy.clone());
+    // M7 cloud-managed sinks — rebuild the registry on each
+    // `sink.config.changed` signal (admin PUT/DELETE under
+    // `/v1/admin/sinks/config/*`). file_sinks is the boot snapshot
+    // of `nexus.toml` `[[sinks]]`; db sinks override on collision.
+    let (sinks_reload_handle, sinks_reload_shutdown_tx) = sinks_reload::spawn(
+        bus.clone(),
+        store.clone(),
+        sink_registry.clone(),
+        file_sinks.clone(),
+    );
     let (dispatcher_shutdown_tx, dispatcher_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let dispatcher_handle = {
         let store = store.clone();
@@ -1223,6 +1247,10 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // `/api/v1/admin/sinks/health` can list configured sinks
         // even if they've never produced an outbox row.
         sink_registry: sink_registry.clone(),
+        // M7 cloud-managed sinks — boot snapshot of `nexus.toml`
+        // `[[sinks]]` so `GET /v1/admin/sinks` can mark which sinks
+        // are file-pinned (read-only) vs cloud-managed (editable).
+        file_sinks: file_sinks.clone(),
         // M2.2 closeout — in-memory pending-session cache for the
         // OAuth auth-code dance. Empty at boot; lives only as long
         // as the process. Operators who restart mid-consent just
@@ -1714,6 +1742,8 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), dispatcher_handle).await;
     let _ = delivery_reload_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), delivery_reload_handle).await;
+    let _ = sinks_reload_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), sinks_reload_handle).await;
     let _ = cloud_tunnel_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cloud_tunnel_handle).await;
     reconciler_handle.abort();

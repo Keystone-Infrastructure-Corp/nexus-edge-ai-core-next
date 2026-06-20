@@ -1610,6 +1610,12 @@ pub enum SinkConfig {
     /// SureView Ops central-monitoring sink. Triggers a SureView
     /// alarm point via a single JSON POST to the `/receiver`
     /// endpoint ("HTTP Alarms"); video stays on the SureView device.
+    ///
+    /// The serde discriminator is pinned to `"sureview"` (NOT the
+    /// snake_case default `"sure_view"`) so the JSON / TOML `kind`
+    /// tag matches [`SinkConfig::kind`] and the `<kind>:<name>`
+    /// SinkId the dispatcher + outbox use.
+    #[serde(rename = "sureview")]
     SureView(SureViewSinkConfig),
 }
 
@@ -1638,6 +1644,66 @@ impl SinkConfig {
         match self {
             SinkConfig::Webhook(cfg) => cfg.validate(),
             SinkConfig::SureView(cfg) => cfg.validate(),
+        }
+    }
+
+    /// Sentinel the admin GET surface substitutes for any secret
+    /// field so a configured secret never leaves the box. A PUT
+    /// that echoes this value back means "keep the stored secret
+    /// unchanged" — see [`SinkConfig::restore_redacted_secrets_from`].
+    pub const REDACTED_SECRET: &'static str = "__nexus_secret_redacted__";
+
+    /// Replace every secret field with [`Self::REDACTED_SECRET`] in
+    /// place. Called before a sink config is serialised into an
+    /// admin GET response so the live secret never leaves the edge.
+    /// Covers SureView `api_key` and webhook `hmac_secret`. Custom
+    /// webhook `headers` are NOT redacted — operators must not place
+    /// secrets there when configuring from the cloud.
+    pub fn redact_secrets(&mut self) {
+        match self {
+            SinkConfig::Webhook(w) => {
+                if w.hmac_secret.is_some() {
+                    w.hmac_secret = Some(Self::REDACTED_SECRET.to_string());
+                }
+            }
+            SinkConfig::SureView(s) => {
+                s.api_key = Self::REDACTED_SECRET.to_string();
+            }
+        }
+    }
+
+    /// For an incoming PUT body, restore any secret left as the
+    /// redaction sentinel from the previously-stored config. Lets
+    /// the cloud console round-trip a sink edit without ever
+    /// handling the live secret: it echoes [`Self::REDACTED_SECRET`]
+    /// for an unchanged field and the edge re-fills it from the db.
+    /// `existing` is the prior stored config for the same `sink_id`;
+    /// a kind mismatch is a no-op (the caller validates kind).
+    pub fn restore_redacted_secrets_from(&mut self, existing: &SinkConfig) {
+        match (self, existing) {
+            (SinkConfig::Webhook(new), SinkConfig::Webhook(old))
+                if new.hmac_secret.as_deref() == Some(Self::REDACTED_SECRET) =>
+            {
+                new.hmac_secret = old.hmac_secret.clone();
+            }
+            (SinkConfig::SureView(new), SinkConfig::SureView(old))
+                if new.api_key == Self::REDACTED_SECRET =>
+            {
+                new.api_key = old.api_key.clone();
+            }
+            _ => {}
+        }
+    }
+
+    /// `true` iff any secret field still holds the redaction
+    /// sentinel. After [`Self::restore_redacted_secrets_from`] this
+    /// signals a brand-new sink whose secret the operator never
+    /// supplied (the sentinel had nothing to restore from) — the
+    /// admin handler rejects such a PUT with a 400.
+    pub fn has_redacted_secret(&self) -> bool {
+        match self {
+            SinkConfig::Webhook(w) => w.hmac_secret.as_deref() == Some(Self::REDACTED_SECRET),
+            SinkConfig::SureView(s) => s.api_key == Self::REDACTED_SECRET,
         }
     }
 }
@@ -2320,6 +2386,53 @@ mod tests {
             ..Default::default()
         };
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn sureview_secret_redact_round_trip() {
+        let json = r#"{"kind":"sureview","name":"front","api_key":"LIVE-KEY","system_identifier":"site-1"}"#;
+        let stored: SinkConfig = serde_json::from_str(json).unwrap();
+
+        // Redaction replaces the live key with the sentinel.
+        let mut redacted = stored.clone();
+        redacted.redact_secrets();
+        assert!(redacted.has_redacted_secret());
+        if let SinkConfig::SureView(s) = &redacted {
+            assert_eq!(s.api_key, SinkConfig::REDACTED_SECRET);
+        } else {
+            panic!("expected sureview");
+        }
+
+        // An incoming PUT that echoes the sentinel back gets the
+        // live key restored from the stored config.
+        let mut incoming = redacted.clone();
+        incoming.restore_redacted_secrets_from(&stored);
+        assert!(!incoming.has_redacted_secret());
+        if let SinkConfig::SureView(s) = &incoming {
+            assert_eq!(s.api_key, "LIVE-KEY");
+        } else {
+            panic!("expected sureview");
+        }
+    }
+
+    #[test]
+    fn restore_is_a_noop_when_secret_changed() {
+        let stored: SinkConfig = serde_json::from_str(
+            r#"{"kind":"sureview","name":"front","api_key":"OLD","system_identifier":"s"}"#,
+        )
+        .unwrap();
+        // Operator typed a brand-new key — NOT the sentinel — so
+        // restore must leave it untouched.
+        let mut incoming: SinkConfig = serde_json::from_str(
+            r#"{"kind":"sureview","name":"front","api_key":"NEW","system_identifier":"s"}"#,
+        )
+        .unwrap();
+        incoming.restore_redacted_secrets_from(&stored);
+        if let SinkConfig::SureView(s) = &incoming {
+            assert_eq!(s.api_key, "NEW");
+        } else {
+            panic!("expected sureview");
+        }
     }
 
     #[test]

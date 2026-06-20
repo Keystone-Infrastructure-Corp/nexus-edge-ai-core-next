@@ -309,6 +309,55 @@ pub fn build_sinks_from_config(
     Ok(out)
 }
 
+/// Merge file-defined sinks (`nexus.toml` `[[sinks]]`) with the
+/// db-persisted sink configs the cloud console / admin UI manage at
+/// runtime. db sinks WIN on `<kind>:<name>` collision; file order is
+/// preserved and db-only sinks are appended in input order. Returns
+/// a flat config list ready for [`build_sinks_from_config`].
+///
+/// `db_sink_json` is the raw `config_json` blob from each
+/// `alert_sinks` row (see `nexus-store::alert_sinks_list`); a blob
+/// that fails to deserialise is a `Permanent` error so a corrupt row
+/// surfaces at boot / reload rather than silently dropping a sink.
+pub fn merge_sink_configs(
+    file_sinks: &[nexus_config::SinkConfig],
+    db_sink_json: &[String],
+) -> Result<Vec<nexus_config::SinkConfig>, SinkError> {
+    let mut out: Vec<nexus_config::SinkConfig> = Vec::with_capacity(file_sinks.len());
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for cfg in file_sinks {
+        let id = format!("{}:{}", cfg.kind(), cfg.name());
+        index.insert(id, out.len());
+        out.push(cfg.clone());
+    }
+    for json in db_sink_json {
+        let cfg: nexus_config::SinkConfig = serde_json::from_str(json).map_err(|e| {
+            SinkError::Permanent(format!("persisted sink config is not valid JSON: {e}"))
+        })?;
+        let id = format!("{}:{}", cfg.kind(), cfg.name());
+        match index.get(&id) {
+            Some(&i) => out[i] = cfg,
+            None => {
+                index.insert(id, out.len());
+                out.push(cfg);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build the live sink set from the UNION of file sinks + db sinks.
+/// Convenience wrapper over [`merge_sink_configs`] +
+/// [`build_sinks_from_config`] used by the engine at boot and on
+/// each `sink.config.changed` bus signal.
+pub fn build_effective_sinks(
+    file_sinks: &[nexus_config::SinkConfig],
+    db_sink_json: &[String],
+) -> Result<Vec<Arc<dyn AlertSink>>, SinkError> {
+    let merged = merge_sink_configs(file_sinks, db_sink_json)?;
+    build_sinks_from_config(&merged)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -356,6 +405,36 @@ mod tests {
         let parsed = SinkId::parse("sureview:siteX").unwrap();
         assert_eq!(parsed.kind(), "sureview");
         assert_eq!(parsed.name(), "siteX");
+    }
+
+    #[test]
+    fn merge_db_wins_and_appends_db_only() {
+        // One file sink; db re-points it and adds a second.
+        let file: Vec<nexus_config::SinkConfig> = vec![serde_json::from_str(
+            r#"{"kind":"webhook","name":"a","url":"https://file.example/a"}"#,
+        )
+        .unwrap()];
+        let db = vec![
+            r#"{"kind":"webhook","name":"a","url":"https://db.example/a"}"#.to_string(),
+            r#"{"kind":"webhook","name":"b","url":"https://db.example/b"}"#.to_string(),
+        ];
+        let merged = merge_sink_configs(&file, &db).unwrap();
+        assert_eq!(merged.len(), 2);
+        // File order preserved: "a" first (db override), then db-only "b".
+        assert_eq!(merged[0].name(), "a");
+        assert_eq!(merged[1].name(), "b");
+        if let nexus_config::SinkConfig::Webhook(w) = &merged[0] {
+            assert_eq!(w.url.as_str(), "https://db.example/a");
+        } else {
+            panic!("expected webhook");
+        }
+    }
+
+    #[test]
+    fn merge_rejects_corrupt_db_json() {
+        let file: Vec<nexus_config::SinkConfig> = vec![];
+        let db = vec!["not json".to_string()];
+        assert!(merge_sink_configs(&file, &db).is_err());
     }
 
     #[test]

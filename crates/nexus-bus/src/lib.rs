@@ -125,6 +125,15 @@ pub mod topic {
     /// `PUT /api/v1/rules/:id/delivery`. The clear-override case
     /// uses the same topic.
     pub const RULE_DELIVERY_POLICY_CHANGED: &str = "rule.delivery_policy.changed";
+
+    /// The `alert_sinks` table mutated (a sink was added, edited,
+    /// or removed via `PUT|DELETE /api/v1/admin/sinks/:id`). Payload
+    /// is an empty sentinel — the reload task rebuilds the live
+    /// `SinkRegistry` from the UNION of file sinks + the db sinks
+    /// it re-reads via `nexus-store::alert_sinks_list`. A Lagged
+    /// subscriber that drops an intermediate signal still converges
+    /// on the next signal.
+    pub const SINK_CONFIG_CHANGED: &str = "sink.config.changed";
 }
 
 // ---------------------------------------------------------------------------
