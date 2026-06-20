@@ -1607,6 +1607,10 @@ pub enum SinkConfig {
     /// Generic HTTP webhook with optional HMAC-SHA256 signature.
     /// v1 parity port of `webhook_retry_queue.cpp`.
     Webhook(WebhookSinkConfig),
+    /// SureView Ops central-monitoring sink. Triggers a SureView
+    /// alarm point via a single JSON POST to the `/receiver`
+    /// endpoint ("HTTP Alarms"); video stays on the SureView device.
+    SureView(SureViewSinkConfig),
 }
 
 impl SinkConfig {
@@ -1614,6 +1618,7 @@ impl SinkConfig {
     pub fn kind(&self) -> &'static str {
         match self {
             SinkConfig::Webhook(_) => "webhook",
+            SinkConfig::SureView(_) => "sureview",
         }
     }
 
@@ -1622,6 +1627,7 @@ impl SinkConfig {
     pub fn name(&self) -> &str {
         match self {
             SinkConfig::Webhook(cfg) => &cfg.name,
+            SinkConfig::SureView(cfg) => &cfg.name,
         }
     }
 
@@ -1631,6 +1637,7 @@ impl SinkConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self {
             SinkConfig::Webhook(cfg) => cfg.validate(),
+            SinkConfig::SureView(cfg) => cfg.validate(),
         }
     }
 }
@@ -1702,6 +1709,153 @@ impl WebhookSinkConfig {
 
 fn default_webhook_timeout_secs() -> u64 {
     10
+}
+
+/// SureView Ops "HTTP Alarms" sink configuration. Triggers a SureView
+/// alarm point with a single JSON POST to the regional `/receiver`
+/// endpoint, per the SureView Ops *HTTP Alarms* reference
+/// (<https://help.sureviewops.com/hc/en-us/articles/13213264758557-Http-Alarms>).
+///
+/// SureView Ops is an alarm receiver: the POST only *triggers* an
+/// alarm point identified by its **System Identifier** (configured in
+/// SureView's *Alarm Setup → HTTP Alarms* tab). Video is NOT carried
+/// in the payload — the operator pulls live/recorded video from the
+/// camera the customer has set up as a SureView device — so this sink
+/// has no media-upload step.
+///
+/// The account API Key is a per-customer secret — it lives in
+/// `nexus.toml` on the edge box, never in this repo — and is sent
+/// base64-encoded in the `Authorization` header (per the docs).
+/// Retry/backoff is the dispatcher's job; the sink does one HTTP POST
+/// per `deliver()` call and classifies the outcome as `Transient`
+/// (5xx, 408, 429, network) or `Permanent` (other 4xx, e.g. a bad
+/// API key).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SureViewSinkConfig {
+    /// Operator-chosen identifier (the `<name>` of the SinkId).
+    /// Must be unique across the `[[sinks]]` list. Stable across
+    /// config reloads — outbox rows reference it by string.
+    pub name: String,
+    /// SureView Ops SaaS hosting region. Resolves to the documented
+    /// receiver endpoint unless `endpoint` overrides it. Defaults to
+    /// `us`.
+    #[serde(default)]
+    pub region: SureViewRegion,
+    /// Explicit receiver endpoint override. Set this only for on-prem
+    /// SureView installs or integration testing; production SaaS
+    /// deployments should set `region` instead.
+    #[serde(default)]
+    pub endpoint: Option<Url>,
+    /// Per-customer account API Key from SureView's *Alarm Setup →
+    /// HTTP Alarms* tab. Secret — sourced from `nexus.toml` on the
+    /// box, never committed. Sent base64-encoded in `Authorization`.
+    pub api_key: String,
+    /// Default SureView alarm-point **System Identifier** to trigger.
+    /// Used for any camera without a `system_identifiers` override.
+    pub system_identifier: String,
+    /// Optional per-camera override of `system_identifier`, keyed by
+    /// the nexus camera id (as a string). Lets each camera trigger
+    /// its own SureView alarm point / zone.
+    #[serde(default)]
+    pub system_identifiers: std::collections::HashMap<String, String>,
+    /// Optional static `"Latitude,Longitude"` reported as the SureView
+    /// `location` field on every alarm from this sink.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Per-attempt HTTP timeout in seconds. Defaults to 15. The
+    /// dispatcher's retry backoff (500ms → 60s, 8 attempts) wraps it.
+    #[serde(default = "default_sureview_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+/// SureView Ops SaaS hosting region — selects the documented
+/// `/receiver` endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SureViewRegion {
+    /// `https://us.sureviewops.com/receiver`
+    #[default]
+    Us,
+    /// `https://eu.sureviewops.com/receiver`
+    Eu,
+}
+
+impl SureViewRegion {
+    /// The documented regional receiver URL.
+    pub fn receiver_url(self) -> &'static str {
+        match self {
+            SureViewRegion::Us => "https://us.sureviewops.com/receiver",
+            SureViewRegion::Eu => "https://eu.sureviewops.com/receiver",
+        }
+    }
+}
+
+impl SureViewSinkConfig {
+    /// The receiver URL this sink POSTs to — the explicit `endpoint`
+    /// override when set, else the region's documented receiver URL.
+    pub fn resolved_endpoint(&self) -> Result<Url, ConfigError> {
+        match &self.endpoint {
+            Some(u) => Ok(u.clone()),
+            None => Url::parse(self.region.receiver_url())
+                .map_err(|e| ConfigError::Validation(format!("sureview region url: {e}"))),
+        }
+    }
+
+    /// Resolve the SureView System Identifier for a given camera —
+    /// the per-camera override if present, else the default.
+    pub fn system_identifier_for(&self, camera_id: CameraId) -> &str {
+        self.system_identifiers
+            .get(&camera_id.to_string())
+            .map(String::as_str)
+            .unwrap_or(&self.system_identifier)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.name.is_empty() {
+            return Err(ConfigError::Validation(
+                "sureview sink name must be non-empty".into(),
+            ));
+        }
+        if self.name.contains(':') {
+            return Err(ConfigError::Validation(format!(
+                "sureview sink name '{}' must not contain ':' (reserved as SinkId separator)",
+                self.name
+            )));
+        }
+        if let Some(endpoint) = &self.endpoint {
+            if endpoint.scheme() != "http" && endpoint.scheme() != "https" {
+                return Err(ConfigError::Validation(format!(
+                    "sureview sink '{}' endpoint scheme '{}' is not http(s)",
+                    self.name,
+                    endpoint.scheme()
+                )));
+            }
+        }
+        if self.api_key.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "sureview sink '{}' api_key must be non-empty",
+                self.name
+            )));
+        }
+        if self.system_identifier.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "sureview sink '{}' system_identifier must be non-empty",
+                self.name
+            )));
+        }
+        if self.timeout_secs == 0 {
+            return Err(ConfigError::Validation(format!(
+                "sureview sink '{}' timeout_secs must be > 0",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn default_sureview_timeout_secs() -> u64 {
+    15
 }
 
 // ---------------------------------------------------------------------------

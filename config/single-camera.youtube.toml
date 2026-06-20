@@ -300,4 +300,27 @@ score_threshold = 0.10
 # [sinks.headers]                             # optional; verbatim HTTP headers
 # # "Authorization" = "Bearer xyz"
 # # "X-Tenant"      = "acme"
+#
+# The SureView sink requires the engine to be built with the `sureview`
+# feature (the workspace `nexus-engine` Cargo.toml enables it on `nexus-sinks`).
+# It triggers a SureView Ops alarm point ("HTTP Alarms") with one JSON POST per
+# alert. `api_key` is the account key from SureView's Alarm Setup → HTTP Alarms
+# tab (a SECRET — keep it out of version control); the sink base64-encodes it in
+# the Authorization header. `system_identifier` is the alarm point's System
+# Identifier; map individual cameras to their own alarm points with the optional
+# `[sinks.system_identifiers]` table (keyed by camera id). SureView pulls video
+# from the camera you configure as a device in SureView — no media is uploaded.
+#
+# [[sinks]]
+# kind = "sureview"
+# name = "central-station"
+# region = "us"                               # "us" or "eu"; default "us"
+# api_key = "your-sureview-account-key"       # SECRET — from HTTP Alarms tab
+# system_identifier = "9z5138b9ak"            # default alarm point
+# # location = "27.947380,-82.460741"         # optional "Lat,Long"
+# # timeout_secs = 15                         # optional; default 15s
+#
+# [sinks.system_identifiers]                  # optional; per-camera alarm points
+# # "1" = "front-door-point"
+# # "2" = "loading-bay-point"
 # ---------------------------------------------------------------------------

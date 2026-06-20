@@ -56,11 +56,19 @@ hex = { workspace = true, optional = true }
 # pulls it transitively, so the only cost here is making it visible
 # to nexus-sinks's own code.
 url = { workspace = true, optional = true }
+# SureView's HTTP Alarms receiver wants the account API Key sent
+# base64-encoded in the Authorization header.
+base64 = { workspace = true, optional = true }
 
 [features]
 default = []
 # Builds the `WebhookSink` impl (HTTP POST + HMAC-SHA256 signature).
 webhook = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:hex", "dep:url"]
+# Builds the `SureViewSink` impl (SureView Ops "HTTP Alarms"):
+# a single JSON POST per alert to the regional `/receiver` endpoint,
+# with the account API Key base64-encoded in the Authorization
+# header. Reuses reqwest (rustls) like the webhook sink.
+sureview = ["dep:reqwest", "dep:url", "dep:base64"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

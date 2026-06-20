@@ -2405,6 +2405,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64",
  "chrono",
  "chrono-tz",
  "hex",
