@@ -11,6 +11,7 @@
 pub mod audit;
 pub mod cloud;
 pub mod entity;
+pub mod fleet;
 pub mod motion;
 pub mod outbox;
 pub mod sessions;
@@ -19,6 +20,7 @@ pub mod users;
 pub mod visual_prompts;
 pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
 pub use entity::{EntityLocalRecord, EntityLocalUpsert};
+pub use fleet::FleetManagedMarker;
 pub use motion::{
     ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
     MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket, NewClip, NewMotionEvent,
@@ -138,6 +140,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0021_alert_sinks",
         include_str!("../migrations/0021_alert_sinks.sql"),
+    ),
+    (
+        "0022_fleet_managed_markers",
+        include_str!("../migrations/0022_fleet_managed_markers.sql"),
     ),
 ];
 

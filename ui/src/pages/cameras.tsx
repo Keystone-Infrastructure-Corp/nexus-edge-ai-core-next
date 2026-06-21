@@ -63,6 +63,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Sheet, SheetSection } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import { FleetManagedBadge } from "@/components/fleet-managed-badge";
 import {
   defaultSizeForKind,
   describeSize,
@@ -201,7 +202,9 @@ export function CamerasPage() {
             Configure RTSP sources, detector overrides, prompts, and zones.
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <FleetManagedBadge category="text_prompts" />
+          <FleetManagedBadge category="detector_config" />
           <Button variant="outline" onClick={() => setDiscoveryOpen(true)}>
             <Radar className="mr-2 h-4 w-4" />
             Discover

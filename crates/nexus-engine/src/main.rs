@@ -36,6 +36,7 @@ mod entity_local_persist;
 #[cfg(unix)]
 mod fd_limit;
 mod fleet_apply;
+mod fleet_hash;
 mod gpu;
 mod hailo;
 mod models_catalog;
@@ -48,6 +49,7 @@ mod roster;
 mod setup;
 mod sink_router;
 mod sinks_reload;
+mod state_hashes;
 mod storage_safety;
 mod system_metrics;
 // M7 Step 6F2 — only compiled when the `test-injection` feature
@@ -1164,8 +1166,14 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // locally — even ones that have never produced an alert.
     let roster_handle = roster::spawn(store.clone(), bus.clone(), cloud_outbox.clone());
 
-    // Phase 1.8 — cloud tunnel supervisor. If the local store has a
-    // `cloud_enrollment` row (populated by `nexus-engine enroll`),
+    // Phase 7.5.5 — fleet-state-hash publisher. Subscribes to
+    // `topic::CONFIG_CHANGED` + `topic::DELIVERY_SETTINGS_CHANGED` and
+    // pushes a `core_state_hashes` envelope (one canonical SHA-256 per
+    // fleet-settings category) so the cloud can render configuration
+    // drift without round-tripping the full config. Emits once on boot,
+    // after a short debounce on edits, and on a retry tick while the
+    // tunnel is down.
+    let state_hashes_handle = state_hashes::spawn(store.clone(), bus.clone(), cloud_outbox.clone());
     // this spawns a long-running task that maintains the WSS+mTLS
     // tunnel to `edge-gateway`, sending heartbeats every 30s. When
     // no enrollment is present, the task parks on
@@ -1771,6 +1779,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cloud_tunnel_handle).await;
     reconciler_handle.abort();
     roster_handle.abort();
+    state_hashes_handle.abort();
     // Abort every per-camera supervisor. `drain()` empties the map
     // under one lock acquisition; the reconciler is already aborted
     // above so nothing will re-populate it.

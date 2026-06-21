@@ -53,6 +53,7 @@ import {
   cloneGrid,
   makeEmptyGrid,
 } from "@/components/schedule-grid";
+import { FleetManagedBadge } from "@/components/fleet-managed-badge";
 import { formatAgo } from "@/lib/format";
 
 const EMPTY_RULE: RuleConfig = {
@@ -132,10 +133,13 @@ export function RulesPage() {
             CEL expressions that match motion events and emit alerts.
           </p>
         </div>
-        <Button onClick={openNew}>
-          <Plus className="mr-2 h-4 w-4" />
-          New rule
-        </Button>
+        <div className="flex items-center gap-3">
+          <FleetManagedBadge category="rules" />
+          <Button onClick={openNew}>
+            <Plus className="mr-2 h-4 w-4" />
+            New rule
+          </Button>
+        </div>
       </header>
 
       <Card>

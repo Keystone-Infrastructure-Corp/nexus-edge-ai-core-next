@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActorTokenClaims {
+    /// Phase 7.5 (additive). Present only when the human triggering the mutation belongs to a different org than the targeted core (a CMS operator acting on a monitored org via the fleet-settings hierarchy). Carries the acting org's UUID; org_id keeps the target (monitored) org's UUID. The token is still signed with the single global Ed25519 key, so engine verification is unchanged — it treats this as an opaque audit-only string. See WIRE_PROTOCOL.md §11.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_org_id: Option<Uuid>,
     pub aud: String,
     pub core_id: Uuid,
     /// MUST be iat + 30 s.
@@ -172,6 +175,29 @@ pub struct ClipReplicatedPayload {
 #[serde(deny_unknown_fields)]
 pub struct CloseSessionPayload {
     pub reason: String,
+}
+
+/// Edge → Cloud. Phase 7.5.5 (additive on v=1). Periodic + change-triggered digest of the edge's current canonical configuration state, one SHA-256 per fleet-settings category (rules, text_prompts, visual_prompts, detector_config, delivery_settings). Each hash is the lower-hex SHA-256 of the canonical JSON (recursively sorted object keys, arrays in document order, no insignificant whitespace) the edge derives from its local config for that category — byte-identical canonicalisation to the cloud's `fleet/effective` projection, so the cloud compares reported vs projected to surface configuration drift without round-tripping the full config. The edge emits this on startup and (debounced) whenever local config mutates (config.changed / delivery.settings.changed bus signals). A category hash is omitted when that category has no state on the edge. The cloud upserts these into `core_runtime_hashes` keyed on core_id; the edge-gateway resolves org_id from the cores FK. Additive: pre-7.5.5 cloud peers ignore this kind, pre-7.5.5 edges never emit it. No ack — fire-and-forget; the cloud reconciler is the recovery path when the tunnel is down.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreStateHashesPayload {
+    /// Edge wall-clock when the hashes were computed. Diagnostics only — the cloud stores this as core_runtime_hashes.computed_at; reported_at is set server-side on receipt.
+    pub computed_at: Timestamp,
+    /// Lower-hex SHA-256 of the canonical JSON of the delivery settings singleton. Omitted when delivery settings are unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_settings_sha256: Option<String>,
+    /// Lower-hex SHA-256 of the canonical JSON of the per-camera detector model overrides. Omitted when no camera overrides the detector model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_config_sha256: Option<String>,
+    /// Lower-hex SHA-256 of the canonical JSON of the edge's full rule set. Omitted when the edge has no rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_sha256: Option<String>,
+    /// Lower-hex SHA-256 of the canonical JSON of the per-camera detector text prompts. Omitted when no camera has text prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_prompts_sha256: Option<String>,
+    /// Lower-hex SHA-256 of the canonical JSON of the per-camera attached visual prompts. Omitted when no visual prompts are attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_prompts_sha256: Option<String>,
 }
 
 /// Cloud → Edge. Phase 7.0a. Operator-initiated diagnostic-tarball collection request. The cloud mints a single-use Azure Blob SAS PUT URL scoped to a unique `diag_id` path under the `diagnostics` container, then pushes this envelope down the existing edge-gateway tunnel. The edge tarballs (logs ∪ scrubbed-config ∪ telemetry snapshot ∪ optional sqlite dump), `reqwest::put`s the bytes to `sas_put_url`, then emits `diag_ready` (status=uploaded|failed) with the same `diag_id`. Operator-facing endpoints in the console resolve diag_id → fresh download SAS URL via Blob listBlobs. State-mutating on the edge (creates a tarball, makes outbound network calls), so `actor_token` is REQUIRED and the edge verifies signature + path-binding before any local work. The 30-second actor_token TTL is honoured for receipt-validation only; the tarball+upload work continues past the token expiry (the SAS URL has its own independent expiry).
@@ -403,6 +429,7 @@ pub enum EnvelopeBody {
     EntitySightingBatch(EntitySightingBatchPayload),
     DiagCollect(DiagCollectPayload),
     DiagReady(DiagReadyPayload),
+    CoreStateHashes(CoreStateHashesPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.

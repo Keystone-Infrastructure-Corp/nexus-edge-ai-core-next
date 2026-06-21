@@ -314,6 +314,25 @@ impl Store {
         .map_err(|e| VisualPromptError::Store(StoreError::Sqlx(e)))?;
         rows.into_iter().map(decode_visual_prompt_row).collect()
     }
+
+    /// Lightweight list of the visual-prompt ids attached to a camera,
+    /// without decoding embeddings. Phase 7.5.5 replace-reconcile uses
+    /// this to diff the attached set against the fleet-listed set so it
+    /// can detach prompts the fleet no longer manages.
+    pub async fn list_camera_visual_prompt_ids(
+        &self,
+        camera_id: CameraId,
+    ) -> Result<Vec<VisualPromptId>, VisualPromptError> {
+        let rows = sqlx::query(
+            "SELECT visual_prompt_id FROM camera_visual_prompts
+             WHERE camera_id = ?",
+        )
+        .bind(camera_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| VisualPromptError::Store(StoreError::Sqlx(e)))?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
