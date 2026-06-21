@@ -1,0 +1,329 @@
+//! Phase 7.5 · Step 7.5.4 — edge fleet-settings apply endpoint.
+//!
+//! Route (gated by the admin-auth middleware in
+//! [`crate::api::router`] alongside the other `/v1/admin/*` writes):
+//!
+//! * `POST /api/v1/admin/fleet/{category}`
+//!
+//! The cloud api-gateway's fleet-apply pipeline (Phase 7.5.3) fans a
+//! resolved configuration out to every enrolled core as an `rpc_call`
+//! envelope with path `/admin/fleet/{db_key}`; the `engine_rpc`
+//! dispatcher prepends `/api/v1`, producing
+//! `/api/v1/admin/fleet/{db_key}`. The body the cloud sends is:
+//!
+//! ```json
+//! { "effective": <category-specific payload>,
+//!   "scope": { "type": "org|site|core|camera", "id": "<uuid>" } }
+//! ```
+//!
+//! where `effective` is the cloud-resolved (org → site → core folded)
+//! value for the category. The `db_key` segment is one of `rules`,
+//! `text_prompts`, `visual_prompts`, `detector_config`,
+//! `delivery_settings`.
+//!
+//! # Apply semantics (v1)
+//!
+//! * **Overlay, never replace.** Each category upserts the items in
+//!   `effective`; it never deletes unlisted local rules / cameras /
+//!   prompts. The edge has no `managed_by_fleet` marker column, so a
+//!   full reconcile would clobber operator-local configuration. The
+//!   apply is idempotent: applying the same payload twice is a no-op.
+//! * **Per-camera categories apply core-wide.** `text_prompts`,
+//!   `visual_prompts`, and `detector_config` are applied to **every**
+//!   local camera on this core, regardless of the `scope.type`. The
+//!   edge stores cameras under local integer ids only — there is no
+//!   cloud-camera-UUID mapping — so `scope.id` cannot select a single
+//!   camera. The cloud already dispatches at core granularity
+//!   (Phase 7.5.3); `scope` is recorded for audit / tracing only.
+//! * **`visual_prompts` is attach-only in v1.** The reconcile only
+//!   attaches prompts that already exist locally (matched by `name`).
+//!   Downloading the reference image over a Blob SAS URL and encoding
+//!   the embedding (which needs the `ort` feature + an ONNX encoder)
+//!   is deferred to a follow-up step; an unknown prompt name yields a
+//!   `400` so the cloud records that target as failed.
+
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::Json;
+use nexus_bus::{topic, BusExt};
+use nexus_config::{ModelConfig, RuleConfig};
+use nexus_store::audit::AuditOutcome;
+use nexus_types::{RuleId, VisualPromptId};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::api::{ApiError, ApiState};
+use crate::auth::require_role::SessionContext;
+
+/// Inbound body for `POST /v1/admin/fleet/{category}`.
+#[derive(Debug, Deserialize)]
+pub struct FleetApplyReq {
+    /// Cloud-resolved value for the category. Shape depends on the
+    /// `{category}` path segment — see the per-category helpers.
+    pub effective: Value,
+    /// Original apply scope. Recorded for audit / tracing only; it
+    /// does not influence targeting on the edge (see module docs).
+    #[serde(default)]
+    pub scope: Option<FleetScope>,
+}
+
+/// The `scope` half of [`FleetApplyReq`].
+#[derive(Debug, Deserialize)]
+pub struct FleetScope {
+    #[serde(rename = "type")]
+    pub scope_type: String,
+    pub id: String,
+}
+
+/// Response body — echoes the applied category and the number of
+/// targets (rules upserted, cameras touched, or prompts attached).
+#[derive(Debug, Serialize)]
+pub struct FleetApplyResponse {
+    pub category: String,
+    pub targets: usize,
+}
+
+/// A single `visual_prompts` entry. Only `name` is consumed on the
+/// edge; the cloud carries additional fields (`sha256`, `image_url`)
+/// that the deferred encode path will use.
+#[derive(Debug, Deserialize)]
+struct FleetVisualPromptEntry {
+    name: String,
+}
+
+/// `POST /v1/admin/fleet/{category}` — apply a cloud-resolved fleet
+/// setting to this core. See module docs for semantics.
+pub async fn post_admin_fleet_apply(
+    State(s): State<ApiState>,
+    Path(category): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<SessionContext>,
+    Json(req): Json<FleetApplyReq>,
+) -> Result<Json<FleetApplyResponse>, ApiError> {
+    let result = apply_category(&s, &category, &req.effective).await;
+    let outcome = if result.is_ok() {
+        AuditOutcome::Success
+    } else {
+        AuditOutcome::Failure
+    };
+    let after_str = serde_json::to_string(&req.effective).ok();
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        session.as_ref(),
+        &headers,
+        peer.ip(),
+        "fleet.apply",
+        "fleet",
+        Some(category.as_str()),
+        outcome,
+        None,
+        after_str.as_deref(),
+    )
+    .await;
+    let targets = result?;
+    match &req.scope {
+        Some(scope) => tracing::info!(
+            category = %category,
+            scope_type = %scope.scope_type,
+            scope_id = %scope.id,
+            targets,
+            "fleet apply ok"
+        ),
+        None => tracing::info!(category = %category, targets, "fleet apply ok"),
+    }
+    Ok(Json(FleetApplyResponse { category, targets }))
+}
+
+/// Dispatch on the `db_key` category segment.
+async fn apply_category(
+    s: &ApiState,
+    category: &str,
+    effective: &Value,
+) -> Result<usize, ApiError> {
+    match category {
+        "rules" => apply_rules(s, effective).await,
+        "text_prompts" => apply_text_prompts(s, effective).await,
+        "visual_prompts" => apply_visual_prompts(s, effective).await,
+        "detector_config" => apply_detector_config(s, effective).await,
+        "delivery_settings" => apply_delivery_settings(s, effective).await,
+        other => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("unknown fleet category: {other:?}"),
+        )),
+    }
+}
+
+/// `rules` — `effective` is a JSON array of full [`RuleConfig`]
+/// objects. Every rule's CEL `when` clause is compiled up-front so a
+/// bad payload fails atomically (nothing is persisted). Rules are
+/// upserted by id; the live evaluator is hot-reloaded afterwards.
+async fn apply_rules(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+    let rules: Vec<RuleConfig> = serde_json::from_value(effective.clone())
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rules payload: {e}")))?;
+    for rule in &rules {
+        if rule.id.trim().is_empty() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("rule {:?} has an empty id", rule.name),
+            ));
+        }
+        if let Err(msg) = crate::api::compile_cel_safely(rule) {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("invalid CEL in rule {:?}: {msg}", rule.id),
+            ));
+        }
+    }
+    let mut tx = s.store.begin_tx().await?;
+    for rule in &rules {
+        s.store.upsert_rule_tx(&mut tx, rule).await?;
+    }
+    nexus_store::Store::commit_tx(tx).await?;
+    let reload_id: RuleId = "fleet-apply".to_string();
+    crate::api::reload_rules_into_evaluator(s, "fleet-apply", &reload_id).await;
+    Ok(rules.len())
+}
+
+/// `text_prompts` — `effective` is a JSON array of strings. The list
+/// is written to every local camera's `detector.prompts`.
+async fn apply_text_prompts(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+    let prompts: Vec<String> = serde_json::from_value(effective.clone()).map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("text_prompts payload: {e}"),
+        )
+    })?;
+    let mut cameras = s.store.list_cameras().await?;
+    let mut tx = s.store.begin_tx().await?;
+    for cam in &mut cameras {
+        cam.detector.prompts = prompts.clone();
+        s.store.upsert_camera_tx(&mut tx, cam).await?;
+    }
+    nexus_store::Store::commit_tx(tx).await?;
+    let _ = s
+        .bus
+        .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
+        .await;
+    Ok(cameras.len())
+}
+
+/// `detector_config` — `effective` is a [`ModelConfig`] object,
+/// applied as every local camera's `detector.model_override`.
+async fn apply_detector_config(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+    let model: ModelConfig = serde_json::from_value(effective.clone()).map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("detector_config payload: {e}"),
+        )
+    })?;
+    let mut cameras = s.store.list_cameras().await?;
+    let mut tx = s.store.begin_tx().await?;
+    for cam in &mut cameras {
+        cam.detector.model_override = Some(model.clone());
+        s.store.upsert_camera_tx(&mut tx, cam).await?;
+    }
+    nexus_store::Store::commit_tx(tx).await?;
+    let _ = s
+        .bus
+        .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
+        .await;
+    Ok(cameras.len())
+}
+
+/// `delivery_settings` — `effective` is a `{enabled, schedule?,
+/// timezone?}` object (the same shape `PUT /v1/admin/delivery`
+/// accepts). The singleton row is upserted.
+async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+    #[derive(Deserialize)]
+    struct DeliveryPayload {
+        enabled: bool,
+        #[serde(default)]
+        schedule: Option<nexus_types::DeliverySchedule>,
+        #[serde(default)]
+        timezone: Option<String>,
+    }
+    let payload: DeliveryPayload = serde_json::from_value(effective.clone()).map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("delivery_settings payload: {e}"),
+        )
+    })?;
+    let timezone = payload
+        .timezone
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "UTC".to_string());
+    if timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown IANA timezone: {timezone:?}"),
+        ));
+    }
+    let settings = nexus_types::DeliverySettings {
+        enabled: payload.enabled,
+        schedule: payload.schedule,
+        timezone,
+        updated_at: chrono::Utc::now(),
+    };
+    let mut tx = s.store.begin_tx().await?;
+    s.store.delivery_settings_put_tx(&mut tx, &settings).await?;
+    nexus_store::Store::commit_tx(tx).await?;
+    let _ = s
+        .bus
+        .publish(topic::DELIVERY_SETTINGS_CHANGED, &serde_json::json!({}))
+        .await;
+    Ok(1)
+}
+
+/// `visual_prompts` — attach-only reconcile. `effective` is a JSON
+/// array of `{name, …}` entries. Each name must already exist
+/// locally (uploaded + encoded via `POST /v1/admin/visual-prompts`);
+/// the prompt is attached to every local camera. An unknown name is
+/// a `400` so the cloud records the target as failed. Attaching is
+/// idempotent (the join table has `INSERT OR IGNORE` semantics), so a
+/// repeated apply is a no-op.
+async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+    let entries: Vec<FleetVisualPromptEntry> =
+        serde_json::from_value(effective.clone()).map_err(|e| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("visual_prompts payload: {e}"),
+            )
+        })?;
+    let mut ids: Vec<VisualPromptId> = Vec::with_capacity(entries.len());
+    let mut unknown: Vec<String> = Vec::new();
+    for entry in &entries {
+        match s.store.get_visual_prompt_by_name(&entry.name).await {
+            Ok(Some(summary)) => ids.push(summary.id),
+            Ok(None) => unknown.push(entry.name.clone()),
+            Err(e) => return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown visual prompt(s) not present on this core: {unknown:?}"),
+        ));
+    }
+    let cameras = s.store.list_cameras().await?;
+    let mut attachments = 0_usize;
+    for cam in &cameras {
+        for vp_id in &ids {
+            s.store
+                .attach_camera_visual_prompt(cam.id, *vp_id)
+                .await
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            attachments += 1;
+        }
+    }
+    if attachments > 0 {
+        let _ = s
+            .bus
+            .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
+            .await;
+    }
+    Ok(attachments)
+}

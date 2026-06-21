@@ -488,6 +488,16 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
         )
+        // Phase 7.5 · Step 7.5.4 — cloud fleet-settings apply. The
+        // cloud api-gateway fans a resolved category value out to
+        // every core as an `rpc_call` with path
+        // `/admin/fleet/{db_key}`; the dispatcher prepends `/api/v1`,
+        // landing here. Overlay semantics, core-wide targeting — see
+        // `crate::fleet_apply` for the full contract.
+        .route(
+            "/v1/admin/fleet/{category}",
+            axum::routing::post(crate::fleet_apply::post_admin_fleet_apply),
+        )
         // ----- M-Admin Phase 0 — runtime knobs that today require
         // an engine restart to take effect.
         //
@@ -1476,7 +1486,7 @@ async fn delete_rule(
 ///     never had a chance to catch (e.g. it was written by an
 ///     older build that didn't validate). Log the offending
 ///     rule id so the operator can find and fix it.
-async fn reload_rules_into_evaluator(s: &ApiState, op: &str, rule_id: &RuleId) {
+pub(crate) async fn reload_rules_into_evaluator(s: &ApiState, op: &str, rule_id: &RuleId) {
     match s.store.list_rules().await {
         Ok(rules) => {
             if let Err(e) = s.evaluator.reload(&rules) {
@@ -1610,7 +1620,7 @@ async fn get_rules_schema(State(s): State<ApiState>) -> Json<RulesSchemaResp> {
 /// malformed-but-balanced inputs (e.g. trailing operators); we want
 /// those to land as a clean validation error, not a 500/hung
 /// connection. Returns the parser's error message on `Err`.
-fn compile_cel_safely(rule: &RuleConfig) -> Result<(), String> {
+pub(crate) fn compile_cel_safely(rule: &RuleConfig) -> Result<(), String> {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     match catch_unwind(AssertUnwindSafe(|| CelEngine::new().compile(rule))) {
         Ok(Ok(_)) => Ok(()),
@@ -7390,5 +7400,226 @@ mod tests {
         let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.as_array().expect("array").len(), 0);
+    }
+
+    // ===============================================================
+    // Phase 7.5 · Step 7.5.4 — fleet-settings apply endpoint
+    // ===============================================================
+
+    /// Minimal camera row for the fleet-apply tests.
+    fn fleet_test_camera(id: nexus_types::CameraId, name: &str) -> nexus_config::CameraConfig {
+        nexus_config::CameraConfig {
+            id,
+            name: name.into(),
+            ingest: nexus_config::CameraIngest {
+                url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                enabled: true,
+                max_fps: 0,
+                codec: None,
+            },
+            detector: nexus_config::CameraDetector {
+                prompts: vec![],
+                visual_prompts: vec![],
+                model_override: None,
+            },
+            behavior: nexus_config::CameraBehavior {
+                parking_lot_mode: false,
+                anchor_ttl_secs: None,
+                ..Default::default()
+            },
+            zones: vec![],
+        }
+    }
+
+    /// POST a category payload to the fleet-apply route with an admin
+    /// bearer from a loopback peer (matching the cloud-tunnel
+    /// passthrough). The payload is wrapped in the `{effective,
+    /// scope}` envelope the cloud api-gateway sends.
+    async fn fleet_apply(
+        app: &axum::Router,
+        secret: &[u8],
+        category: &str,
+        effective: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        let token = sign_admin_jwt(secret);
+        let body = serde_json::json!({
+            "effective": effective,
+            "scope": { "type": "core", "id": "00000000-0000-0000-0000-000000000000" },
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/admin/fleet/{category}"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    /// `rules` overlay upserts by id and is idempotent: applying the
+    /// same payload twice leaves exactly one rule row.
+    #[tokio::test]
+    async fn fleet_apply_rules_is_idempotent() {
+        const SECRET: &[u8] = b"fleet-rules-idempotent-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let body = serde_json::json!([{
+            "id": "fleet-1",
+            "name": "Fleet person rule",
+            "when": "object.label == 'person'",
+            "severity": "low",
+            "enabled": true,
+        }]);
+
+        let res = fleet_apply(&app, SECRET, "rules", body.clone()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["targets"], serde_json::json!(1));
+        assert_eq!(store.list_rules().await.unwrap().len(), 1);
+
+        // Second identical apply — still exactly one rule.
+        let res = fleet_apply(&app, SECRET, "rules", body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let rules = store.list_rules().await.unwrap();
+        assert_eq!(rules.len(), 1, "overlay apply must be idempotent");
+        assert_eq!(rules[0].id, "fleet-1");
+        assert_eq!(rules[0].predicate.when, "object.label == 'person'");
+    }
+
+    /// `rules` with an invalid CEL `when` is rejected atomically with
+    /// a 400 and nothing is persisted.
+    #[tokio::test]
+    async fn fleet_apply_rules_rejects_bad_cel() {
+        const SECRET: &[u8] = b"fleet-rules-bad-cel-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let body = serde_json::json!([{
+            "id": "fleet-bad",
+            "name": "broken",
+            "when": "(object.label",
+            "severity": "low",
+        }]);
+        let res = fleet_apply(&app, SECRET, "rules", body).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(store.list_rules().await.unwrap().len(), 0);
+    }
+
+    /// `text_prompts` is applied to every local camera regardless of
+    /// scope, and is idempotent.
+    #[tokio::test]
+    async fn fleet_apply_text_prompts_targets_all_cameras() {
+        const SECRET: &[u8] = b"fleet-text-prompts-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        store
+            .upsert_camera(&fleet_test_camera(1, "front"))
+            .await
+            .unwrap();
+        store
+            .upsert_camera(&fleet_test_camera(2, "back"))
+            .await
+            .unwrap();
+
+        let body = serde_json::json!(["person", "car"]);
+        let res = fleet_apply(&app, SECRET, "text_prompts", body.clone()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["targets"], serde_json::json!(2));
+
+        for cam in store.list_cameras().await.unwrap() {
+            assert_eq!(cam.detector.prompts, vec!["person", "car"]);
+        }
+
+        // Idempotent re-apply leaves the same prompts.
+        let res = fleet_apply(&app, SECRET, "text_prompts", body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        for cam in store.list_cameras().await.unwrap() {
+            assert_eq!(cam.detector.prompts, vec!["person", "car"]);
+        }
+    }
+
+    /// `detector_config` overlays a `ModelConfig` onto every camera's
+    /// `model_override`.
+    #[tokio::test]
+    async fn fleet_apply_detector_config_sets_model_override() {
+        const SECRET: &[u8] = b"fleet-detector-config-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        store
+            .upsert_camera(&fleet_test_camera(1, "front"))
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({ "kind": "yolo", "preset": "640" });
+        let res = fleet_apply(&app, SECRET, "detector_config", body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let cam = &store.list_cameras().await.unwrap()[0];
+        let model = cam
+            .detector
+            .model_override
+            .as_ref()
+            .expect("model_override set");
+        assert_eq!(model.kind, "yolo");
+        assert_eq!(model.preset, "640");
+    }
+
+    /// `delivery_settings` upserts the singleton row.
+    #[tokio::test]
+    async fn fleet_apply_delivery_settings_round_trips() {
+        const SECRET: &[u8] = b"fleet-delivery-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let body = serde_json::json!({ "enabled": true, "timezone": "America/Los_Angeles" });
+        let res = fleet_apply(&app, SECRET, "delivery_settings", body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let settings = store.delivery_settings_get().await.unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.timezone, "America/Los_Angeles");
+    }
+
+    /// `delivery_settings` with a bogus IANA timezone is a 400.
+    #[tokio::test]
+    async fn fleet_apply_delivery_settings_rejects_bad_tz() {
+        const SECRET: &[u8] = b"fleet-delivery-bad-tz-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let body = serde_json::json!({ "enabled": true, "timezone": "Mars/Olympus_Mons" });
+        let res = fleet_apply(&app, SECRET, "delivery_settings", body).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `visual_prompts` referencing a name not present on this core is
+    /// a 400 (attach-only v1 — encode is deferred).
+    #[tokio::test]
+    async fn fleet_apply_visual_prompts_unknown_name_is_400() {
+        const SECRET: &[u8] = b"fleet-vp-unknown-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let body = serde_json::json!([{ "name": "not-uploaded-yet" }]);
+        let res = fleet_apply(&app, SECRET, "visual_prompts", body).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An unknown category segment is a 404.
+    #[tokio::test]
+    async fn fleet_apply_unknown_category_is_404() {
+        const SECRET: &[u8] = b"fleet-unknown-category-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let res = fleet_apply(&app, SECRET, "bogus", serde_json::json!([])).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The fleet-apply route sits behind the admin gate: no bearer
+    /// from a remote peer is a 401.
+    #[tokio::test]
+    async fn fleet_apply_requires_admin_bearer() {
+        const SECRET: &[u8] = b"fleet-gate-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/fleet/rules")
+            .header("content-type", "application/json")
+            .body(Body::from("[]"))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(remote_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

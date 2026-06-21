@@ -35,6 +35,7 @@ mod engine_rpc;
 mod entity_local_persist;
 #[cfg(unix)]
 mod fd_limit;
+mod fleet_apply;
 mod gpu;
 mod hailo;
 mod models_catalog;
