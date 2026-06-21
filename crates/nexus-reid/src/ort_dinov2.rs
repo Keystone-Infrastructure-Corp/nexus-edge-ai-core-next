@@ -150,17 +150,19 @@ impl Extractor for DinoV2Extractor {
         })
     }
 
-    /// M_PERF_CROWD B4 — batched extraction. Stacks the input crops
-    /// into one `(B, 3, 224, 224)` tensor and issues a single ORT
-    /// call, amortising the ~3-5ms per-call session overhead across
-    /// `B` inferences. At `B=16` on the N150 iGPU the per-crop cost
-    /// drops from ~8ms to ~3ms.
+    /// M_PERF_CROWD B4 — multi-crop extraction. Coalesces the input
+    /// crops into one `(B, 3, 224, 224)` tensor and embeds them under
+    /// a single session-lock acquisition. The shipped DINOv2-S ONNX
+    /// pins its batch axis to a static `1`, so [`run_dinov2_batch`]
+    /// decomposes that tensor into `B` sequential single-image ORT
+    /// runs internally rather than one `B > 1` call (which the model
+    /// rejects with `Got invalid dimensions for input: pixel_values`).
     ///
     /// Per-item preprocessing errors (unsupported pixel format,
     /// invalid bbox, frame buffer size mismatch) do NOT poison the
     /// rest of the batch — they're reported in the slot
     /// corresponding to the failing input and the surviving items
-    /// proceed to the single batched ORT call. A whole-batch ORT
+    /// proceed to the batched ORT call. A whole-batch ORT
     /// failure (session-run error) is propagated to every survivor
     /// slot (preprocess-failed slots keep their original error).
     async fn extract_batch(
@@ -217,7 +219,8 @@ impl Extractor for DinoV2Extractor {
                 .collect();
         }
 
-        // Phase 3 — single batched ORT call.
+        // Phase 3 — batched ORT call (decomposed to per-image runs
+        // inside run_dinov2_batch; see its docs).
         let batch = survivor_idx.len();
         let nchw = match Array4::<f32>::from_shape_vec(
             (batch, 3, self.input_h as usize, self.input_w as usize),
@@ -338,7 +341,7 @@ impl Extractor for DinoV2Extractor {
     /// a single `(B, 3, H, W)` tensor. Per-item dim / buffer-size
     /// mismatches do NOT poison the batch: they're reported in the
     /// matching result slot while the surviving items proceed to
-    /// the single batched ORT call (same semantics as
+    /// the batched ORT call (same semantics as
     /// [`extract_batch`]).
     async fn extract_crop_batch(
         &self,
@@ -476,53 +479,35 @@ fn splice_batch_error(
         .collect()
 }
 
-/// M_PERF_CROWD B4 — batched DINOv2 inference. Accepts a
+/// M_PERF_CROWD B4 — multi-crop DINOv2 inference. Accepts a
 /// `(B, 3, 224, 224)` tensor and returns `B` raw (not yet
 /// L2-normalised) embeddings in input order. Caller normalises.
+///
+/// The shipped DINOv2-S ONNX pins its batch axis to a static `1`
+/// (`tools/models/gen_dinov2.py` exports with `dynamic_axes=None`) so
+/// the Intel NPU / OpenVINO blob cache stays valid and the Hailo
+/// `.hef` — which can only compile a fixed batch — remains loadable.
+/// Issuing a single `(B, 3, 224, 224)` run against that model fails
+/// with `Got invalid dimensions for input: pixel_values` for any
+/// `B > 1`. We therefore decompose the batch into `B` sequential
+/// single-image runs under the one session lock the caller already
+/// holds. This keeps the extractor correct on every execution
+/// provider (NPU, OpenVINO GPU, CUDA, TensorRT, ROCm, Vulkan, CPU)
+/// without a per-EP-revalidated dynamic-axis model re-export; at the
+/// re-id emit cadence the per-call overhead is negligible.
 pub fn run_dinov2_batch(
     session: &mut Session,
     nchw: &Array4<f32>,
     expected_dim: usize,
 ) -> Result<Vec<Vec<f32>>, ExtractorError> {
     let batch = nchw.shape()[0];
-    let input = TensorRef::from_array_view(nchw.view())
-        .map_err(|e| ExtractorError::InferenceFailed(format!("tensor wrap (batched): {e}")))?;
-    let outputs = session
-        .run(ort::inputs![input])
-        .map_err(|e| ExtractorError::InferenceFailed(format!("session run (batched): {e}")))?;
-    let (_name, value) = outputs
-        .iter()
-        .next()
-        .ok_or_else(|| ExtractorError::InferenceFailed("no outputs (batched)".into()))?;
-    let view = value
-        .try_extract_array::<f32>()
-        .map_err(|e| ExtractorError::InferenceFailed(format!("extract array (batched): {e}")))?;
-    let shape: Vec<usize> = view.shape().to_vec();
-    let flat: Vec<f32> = view.iter().copied().collect();
-    // Acceptable batched output shapes mirror the single-call ones:
-    //   [B, 384]                       — bare CLS token (preferred)
-    //   [B, N, 384] where N=patches    — last_hidden_state; CLS is patch 0
     let mut out: Vec<Vec<f32>> = Vec::with_capacity(batch);
-    match shape.as_slice() {
-        [b, d] if *b == batch && *d == expected_dim => {
-            for i in 0..batch {
-                let start = i * expected_dim;
-                out.push(flat[start..start + expected_dim].to_vec());
-            }
-        }
-        [b, patches, d] if *b == batch && *d == expected_dim => {
-            let stride = patches * expected_dim;
-            for i in 0..batch {
-                let start = i * stride;
-                out.push(flat[start..start + expected_dim].to_vec());
-            }
-        }
-        other => {
-            return Err(ExtractorError::UnexpectedDim {
-                got: other.iter().product(),
-                expected: batch * expected_dim,
-            });
-        }
+    for i in 0..batch {
+        // Contiguous outermost-axis slice → a standard-layout
+        // `(1, 3, 224, 224)` owned array that satisfies the model's
+        // static batch=1 input contract.
+        let single = nchw.slice(ndarray::s![i..i + 1, .., .., ..]).to_owned();
+        out.push(run_dinov2(session, &single, expected_dim)?);
     }
     Ok(out)
 }
