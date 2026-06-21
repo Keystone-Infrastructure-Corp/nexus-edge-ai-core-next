@@ -193,7 +193,7 @@ score_threshold = 0.30
 # Tracker
 # -----------------------------------------------------------------
 [tracker]
-backend = "iou_naive" # iou_naive | bytetrack
+backend = "bytetrack" # iou_naive | bytetrack
 track_ttl_ms = 2000
 iou_threshold = 0.30
 
@@ -246,10 +246,10 @@ capacity = 1024
 # # below this are dropped before the ORT call AND before reaching
 # # the cloud — DINOv2-S embeddings on heavily-upsampled tiny
 # # crops are noise and poison the cross-camera linker. Defaults
-# # 32×64; bump to 64×128 if false matches dominate the graph.
-# # `0` disables either floor.
-# min_crop_w_px = 32
-# min_crop_h_px = 64
+# # 40×96; bump higher (e.g. 64×128) if false matches dominate the
+# # graph. `0` disables either floor.
+# min_crop_w_px = 40
+# min_crop_h_px = 96
 # # ep_priority = ["coreml", "cpu"]   # macOS dev
 # # ep_priority = ["openvino", "cpu"] # Intel iGPU/NPU
 # # ep_priority = ["cuda", "cpu"]     # NVIDIA

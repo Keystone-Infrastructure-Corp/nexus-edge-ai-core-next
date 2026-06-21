@@ -1138,8 +1138,8 @@ impl Default for TrackerConfig {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackerBackendKind {
-    #[default]
     IouNaive,
+    #[default]
     Bytetrack,
 }
 
@@ -2554,14 +2554,16 @@ pub struct ReidConfig {
     ///   — stricter filtering reduces noisy small-crop embeddings.
     ///
     /// DINOv2-S patch_size=14 reaches stability around 30-40px per
-    /// side; below 20px drift becomes significant. Default 20 is
-    /// permissive — captures medium-range full-body crops while
-    /// filtering extreme distance/framing. `0` disables the filter.
+    /// side; below 20px drift becomes significant. Default 40
+    /// (paired with a 96px height floor) keeps only crops large
+    /// enough to embed cleanly — daytime-crowd validation showed
+    /// sub-40px crops were the dominant source of cross-camera
+    /// embedding drift. `0` disables the filter.
     #[serde(default = "default_reid_min_crop_w_px")]
     pub min_crop_w_px: u32,
     /// M_PERF_CROWD B4 — worker-side bbox-height floor (pixels) for
     /// re-id extraction. See [`min_crop_w_px`] for tuning guidance.
-    /// Default 40. `0` disables the filter.
+    /// Default 96. `0` disables the filter.
     #[serde(default = "default_reid_min_crop_h_px")]
     pub min_crop_h_px: u32,
     /// EP priority list for the ORT session. Ignored when
@@ -2607,10 +2609,10 @@ fn default_reid_min_track_age_frames() -> u32 {
     5
 }
 fn default_reid_min_crop_w_px() -> u32 {
-    20
+    40
 }
 fn default_reid_min_crop_h_px() -> u32 {
-    40
+    96
 }
 
 #[cfg(test)]
