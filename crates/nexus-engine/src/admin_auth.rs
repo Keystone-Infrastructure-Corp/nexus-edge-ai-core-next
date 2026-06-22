@@ -365,12 +365,14 @@ const INTERNAL_PASSTHROUGH_TTL_SECS: u64 = 60;
 /// in-process — same secret, same alg, same gate.
 ///
 /// **Threat surface.** This minting helper is private to the
-/// engine binary: the only caller is [`forward_admin_request`]
-/// inside the same process. There is no HTTP endpoint that mints
-/// bearers (the "no JWT issuance" rule in the module preamble
-/// still holds for external callers). A compromise of the engine
-/// process already grants the attacker read access to the secret
-/// file on disk, so there is no new privilege escalation surface.
+/// engine binary: the only callers are [`forward_admin_request`]
+/// and the Phase 7.0a diagnostics collector
+/// ([`crate::diag_collect`]), both inside the same process. There
+/// is no HTTP endpoint that mints bearers (the "no JWT issuance"
+/// rule in the module preamble still holds for external callers).
+/// A compromise of the engine process already grants the attacker
+/// read access to the secret file on disk, so there is no new
+/// privilege escalation surface.
 pub fn mint_internal_passthrough_bearer(
     secret: &str,
 ) -> Result<String, jsonwebtoken::errors::Error> {

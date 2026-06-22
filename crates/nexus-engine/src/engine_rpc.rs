@@ -197,6 +197,26 @@ impl Handler for EngineRpcHandler {
 }
 
 impl EngineRpcHandler {
+    /// Spawn the Phase 7.0a diagnostics collector for a verified
+    /// `diag_collect`. Returns immediately — tarball assembly + SAS
+    /// upload run on a detached task that emits exactly one terminal
+    /// `diag_ready` envelope through `outbox` when done. The caller
+    /// (the cloud-tunnel dispatch pump) has already verified the
+    /// `actor_token` and gated on a privileged role.
+    pub fn spawn_diag_collect(
+        &self,
+        payload: nexus_cloud_protocol::v1::DiagCollectPayload,
+        outbox: Arc<nexus_cloud_client::TunnelOutbox>,
+    ) {
+        let http = self.http_client.clone();
+        let loopback_admin_base = Arc::clone(&self.loopback_admin_base);
+        let admin_secret = self.admin_secret.clone();
+        tokio::spawn(async move {
+            crate::diag_collect::run(http, loopback_admin_base, admin_secret, payload, outbox)
+                .await;
+        });
+    }
+
     async fn handle_expedite(
         &self,
         path: &str,
@@ -759,7 +779,7 @@ fn is_expedite_path(path: &str) -> bool {
     parse_expedite_clip_id(path).is_some()
 }
 
-fn is_priviledged_role(role: &str) -> bool {
+pub(crate) fn is_priviledged_role(role: &str) -> bool {
     matches!(role, "owner" | "admin" | "operator")
 }
 

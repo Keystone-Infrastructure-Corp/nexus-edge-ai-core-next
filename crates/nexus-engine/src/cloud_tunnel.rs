@@ -28,8 +28,8 @@ use nexus_cloud_client::trace_uploader::{
     DEFAULT_QUEUE_CAPACITY,
 };
 use nexus_cloud_client::{
-    RpcDispatcher, RpcResponseCache, SystemMethodPolicy, TrustedKey, TunnelClient, TunnelHandle,
-    VerifierBuilder,
+    EnvelopeContext, RpcDispatcher, RpcResponseCache, SystemMethodPolicy, TrustedKey, TunnelClient,
+    TunnelHandle, VerifierBuilder,
 };
 use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload};
 use nexus_storage::Registry;
@@ -513,7 +513,7 @@ async fn run(
                     inbound,
                     dispatcher.as_deref(),
                     &core_id,
-                    cloud_outbox.as_ref(),
+                    &cloud_outbox,
                 );
                 tokio::select! {
                     biased;
@@ -575,7 +575,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     inbound: Option<mpsc::Receiver<Envelope>>,
     dispatcher: Option<&RpcDispatcher<EngineRpcHandler>>,
     core_id: &str,
-    outbox: &nexus_cloud_client::TunnelOutbox,
+    outbox: &Arc<nexus_cloud_client::TunnelOutbox>,
 ) {
     let Some(mut rx) = inbound else {
         debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
@@ -620,6 +620,49 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         "rpc dispatch send failed; tunnel writer down",
                     );
                     return;
+                }
+            }
+            EnvelopeBody::DiagCollect(payload) => {
+                // Phase 7.0a — verified out-of-band here (NOT through the
+                // RpcCall dispatch path, which is reply-bound) because the
+                // collector outlives the request: tarball assembly + upload
+                // routinely exceed the actor_token TTL, so we spawn a
+                // detached task and confirm later via a `diag_ready`.
+                let Some(disp) = dispatcher else {
+                    // Heartbeat-only mode: no signing key, so we cannot
+                    // authenticate the actor_token. Drop — the cloud sees
+                    // the run stay non-terminal and the operator re-collects.
+                    warn!(
+                        core_id = %core_id,
+                        "diag_collect received but inbound dispatch is disabled (missing enrollment signing key); dropping",
+                    );
+                    continue;
+                };
+                match disp.verifier().verify(
+                    &payload.actor_token,
+                    EnvelopeContext {
+                        method: "POST",
+                        path: "diag_collect",
+                    },
+                ) {
+                    Ok(actor) if crate::engine_rpc::is_priviledged_role(&actor.role) => {
+                        disp.handler()
+                            .spawn_diag_collect(payload.clone(), Arc::clone(outbox));
+                    }
+                    Ok(actor) => {
+                        warn!(
+                            core_id = %core_id,
+                            role = %actor.role,
+                            "diag_collect actor lacks a privileged role; dropping",
+                        );
+                    }
+                    Err(reason) => {
+                        warn!(
+                            core_id = %core_id,
+                            reason = %reason,
+                            "diag_collect actor_token verification failed; dropping",
+                        );
+                    }
                 }
             }
             other => {

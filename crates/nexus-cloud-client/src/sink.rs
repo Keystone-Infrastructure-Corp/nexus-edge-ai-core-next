@@ -11,8 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nexus_cloud_protocol::v1::{
-    AlertPayload, ClipReplicatedPayload, EntitySightingBatchPayload, EntitySightingPayload,
-    Envelope, EnvelopeBody, EnvelopeMeta,
+    AlertPayload, ClipReplicatedPayload, DiagReadyPayload, EntitySightingBatchPayload,
+    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta,
 };
 use uuid::Uuid;
 
@@ -238,6 +238,46 @@ pub fn build_clip_replicated_envelope(clip: ClipReplicatedProjection) -> Envelop
             trace: None,
         },
         body: EnvelopeBody::ClipReplicated(payload),
+    }
+}
+
+/// Build the terminal `diag_ready` envelope for a Phase 7.0a
+/// `diag_collect`. Fire-and-confirm: the cloud binds this to the open
+/// diag row on `diag_id` (NOT `in_reply_to`), because tarball assembly +
+/// upload routinely outlive the originating `actor_token` TTL.
+///
+/// `status` is `"uploaded"` or `"failed"`. On `uploaded`, `size_bytes`
+/// carries the on-wire (gzip) artifact size and `error_code` is `None`
+/// unless the run was a partial success (e.g.
+/// `include_sqlite_unavailable`). On `failed`, `size_bytes` is `None` and
+/// `error_code` names the stable failure mode.
+///
+/// Public so engine tests can construct reference envelopes without
+/// instantiating a collector.
+#[must_use]
+pub fn build_diag_ready_envelope(
+    diag_id: String,
+    status: String,
+    size_bytes: Option<u64>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+) -> Envelope {
+    Envelope {
+        meta: EnvelopeMeta {
+            v: 1,
+            id: Uuid::now_v7().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+        },
+        body: EnvelopeBody::DiagReady(DiagReadyPayload {
+            diag_id,
+            error_code,
+            error_message,
+            size_bytes,
+            status,
+        }),
     }
 }
 
@@ -623,6 +663,49 @@ mod tests {
                 assert!(p.class_label.is_none());
             }
             other => panic!("expected EntitySighting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_diag_ready_uploaded_envelope_shape() {
+        let env = build_diag_ready_envelope(
+            "0191c111-2222-7333-8444-555566667777".to_string(),
+            "uploaded".to_string(),
+            Some(4096),
+            None,
+            None,
+        );
+        assert_eq!(env.meta.v, 1);
+        assert!(env.meta.in_reply_to.is_none());
+        match env.body {
+            EnvelopeBody::DiagReady(p) => {
+                assert_eq!(p.diag_id, "0191c111-2222-7333-8444-555566667777");
+                assert_eq!(p.status, "uploaded");
+                assert_eq!(p.size_bytes, Some(4096));
+                assert!(p.error_code.is_none());
+                assert!(p.error_message.is_none());
+            }
+            other => panic!("expected DiagReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_diag_ready_failed_envelope_shape() {
+        let env = build_diag_ready_envelope(
+            "0191c111-2222-7333-8444-555566667777".to_string(),
+            "failed".to_string(),
+            None,
+            Some("sas_expired".to_string()),
+            Some("the upload URL expired".to_string()),
+        );
+        match env.body {
+            EnvelopeBody::DiagReady(p) => {
+                assert_eq!(p.status, "failed");
+                assert!(p.size_bytes.is_none());
+                assert_eq!(p.error_code.as_deref(), Some("sas_expired"));
+                assert_eq!(p.error_message.as_deref(), Some("the upload URL expired"));
+            }
+            other => panic!("expected DiagReady, got {other:?}"),
         }
     }
 }

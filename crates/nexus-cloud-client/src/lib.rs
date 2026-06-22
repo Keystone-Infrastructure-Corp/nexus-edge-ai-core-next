@@ -55,8 +55,8 @@ pub use jti_cache::JtiReplayCache;
 pub use outbox::{caps as cloud_capabilities, TunnelOutbox};
 pub use response_cache::RpcResponseCache;
 pub use sink::{
-    build_alert_envelope, build_clip_replicated_envelope, AlertProjection,
-    ClipReplicatedProjection, CloudConsoleSink,
+    build_alert_envelope, build_clip_replicated_envelope, build_diag_ready_envelope,
+    AlertProjection, ClipReplicatedProjection, CloudConsoleSink,
 };
 pub use trace_uploader::{
     now_unix_ns, BatchTransport, ReqwestMtlsTransport, Span, SpanKind, SpanStatus, TraceBatch,

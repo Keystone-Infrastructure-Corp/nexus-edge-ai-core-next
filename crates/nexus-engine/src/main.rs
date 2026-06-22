@@ -30,6 +30,7 @@ mod cloud_tunnel;
 mod cold_read_cache;
 mod cold_replicator;
 mod delivery_reload;
+mod diag_collect;
 mod discovery;
 mod engine_rpc;
 mod entity_local_persist;

@@ -195,6 +195,15 @@ impl<H: Handler> RpcDispatcher<H> {
         &self.verifier
     }
 
+    /// Reference to the wrapped handler. Exposed so the engine can route
+    /// non-`rpc_call` cloud→edge envelopes (e.g. Phase 7.0a
+    /// `diag_collect`) to handler methods after verifying the
+    /// `actor_token` out-of-band via [`Self::verifier`].
+    #[must_use]
+    pub const fn handler(&self) -> &H {
+        &self.handler
+    }
+
     /// Top-level entry point. The engine calls this for every inbound
     /// state-mutating `rpc_call`.
     ///
