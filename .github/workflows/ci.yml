@@ -219,3 +219,6 @@ jobs:
           cargo check --locked -p nexus-pipeline  --features gstreamer
           cargo check --locked -p nexus-inference --features ort,ep-cpu
           cargo check --locked -p nexus-engine    --features gstreamer
+          # ep-cpu implies `ort`, so this is the only job that compiles the
+          # cfg(feature = "ort") DINOv2 extractor (nexus-reid/src/ort_dinov2.rs).
+          cargo check --locked -p nexus-reid      --features ep-cpu
