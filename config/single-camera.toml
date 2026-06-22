@@ -40,7 +40,7 @@ input_width = 640
 input_height = 480
 
 [tracker]
-backend = "iou_naive"
+backend = "bytetrack"
 
 [rules]
 backend = "cel"

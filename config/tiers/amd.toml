@@ -98,7 +98,7 @@ score_threshold = 0.30
 [tracker]
 # ByteTrack is CPU-bound; a modern APU at 16T has ample headroom for 24
 # concurrent trackers (same tracker config as the Hailo-primary t24).
-backend = "iou_naive"
+backend = "bytetrack"
 
 [rules]
 backend = "cel"

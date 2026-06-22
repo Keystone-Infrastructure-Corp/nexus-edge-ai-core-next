@@ -66,7 +66,7 @@ input_height = 960
 score_threshold = 0.30
 
 [tracker]
-backend = "iou_naive"
+backend = "bytetrack"
 
 [rules]
 backend = "cel"
