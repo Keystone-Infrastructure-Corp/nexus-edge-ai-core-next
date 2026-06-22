@@ -5,6 +5,7 @@ import { api, getAccessToken } from "@/api/client";
 import type {
   CreateUserRequest,
   CreateUserResponse,
+  FleetManagedResponse,
   ListAuditQuery,
   ListAuditResponse,
   ListUsersResponse,
@@ -53,6 +54,14 @@ export function listAudit(q: ListAuditQuery = {}) {
   return api.get<ListAuditResponse>("/admin/audit", {
     query: q as Record<string, string | number | boolean | undefined>,
   });
+}
+
+// --- Fleet-managed markers (Phase 7.5.5) ----------------------------------
+
+// List which fleet-settings categories are currently cloud-managed on
+// this core, so pages can badge themselves "Fleet-managed".
+export function listFleetManaged() {
+  return api.get<FleetManagedResponse>("/admin/fleet/managed");
 }
 
 // --- Server bind (M-Admin Phase 0, restart-based) -------------------------

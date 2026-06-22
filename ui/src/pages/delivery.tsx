@@ -25,6 +25,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import { FleetManagedBadge } from "@/components/fleet-managed-badge";
 import {
   ScheduleGrid,
   makeEmptyGrid,
@@ -62,11 +63,14 @@ export function DeliveryPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold">Delivery</h1>
-        <p className="text-sm text-muted-foreground">
-          Outbox dispatch settings, weekly schedule, and per-sink health.
-        </p>
+      <header className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold">Delivery</h1>
+          <p className="text-sm text-muted-foreground">
+            Outbox dispatch settings, weekly schedule, and per-sink health.
+          </p>
+        </div>
+        <FleetManagedBadge category="delivery_settings" />
       </header>
 
       <CascadeAlert />

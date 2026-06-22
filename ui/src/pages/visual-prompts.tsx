@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Sheet, SheetSection } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import { FleetManagedBadge } from "@/components/fleet-managed-badge";
 
 export function VisualPromptsPage() {
   const qc = useQueryClient();
@@ -43,10 +44,13 @@ export function VisualPromptsPage() {
             from the Cameras page.
           </p>
         </div>
-        <Button onClick={() => setUploadOpen(true)}>
-          <Plus className="mr-2 h-4 w-4" />
-          Upload
-        </Button>
+        <div className="flex items-center gap-3">
+          <FleetManagedBadge category="visual_prompts" />
+          <Button onClick={() => setUploadOpen(true)}>
+            <Plus className="mr-2 h-4 w-4" />
+            Upload
+          </Button>
+        </div>
       </header>
 
       {promptsQuery.isLoading ? (

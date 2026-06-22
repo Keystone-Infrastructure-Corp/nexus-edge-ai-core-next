@@ -492,11 +492,18 @@ pub fn router(state: ApiState) -> Router {
         // cloud api-gateway fans a resolved category value out to
         // every core as an `rpc_call` with path
         // `/admin/fleet/{db_key}`; the dispatcher prepends `/api/v1`,
-        // landing here. Overlay semantics, core-wide targeting — see
+        // landing here. REPLACE semantics, core-wide targeting — see
         // `crate::fleet_apply` for the full contract.
         .route(
             "/v1/admin/fleet/{category}",
             axum::routing::post(crate::fleet_apply::post_admin_fleet_apply),
+        )
+        // Phase 7.5 · Step 7.5.5 — list which categories are currently
+        // fleet-managed, so the local admin UI can badge them as
+        // "Fleet-managed". Read-only.
+        .route(
+            "/v1/admin/fleet/managed",
+            axum::routing::get(crate::fleet_apply::get_admin_fleet_managed),
         )
         // ----- M-Admin Phase 0 — runtime knobs that today require
         // an engine restart to take effect.
@@ -7621,5 +7628,155 @@ mod tests {
         req.extensions_mut().insert(ConnectInfo(remote_peer()));
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// REPLACE semantics: a fleet apply that drops a rule from the
+    /// payload deletes that rule locally (it is not merely additive).
+    #[tokio::test]
+    async fn fleet_apply_rules_replace_deletes_unlisted() {
+        const SECRET: &[u8] = b"fleet-rules-replace-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+
+        // Apply two rules.
+        let two = serde_json::json!([
+            { "id": "a", "name": "A", "when": "object.label == 'person'", "severity": "low", "enabled": true },
+            { "id": "b", "name": "B", "when": "object.label == 'car'", "severity": "low", "enabled": true },
+        ]);
+        let res = fleet_apply(&app, SECRET, "rules", two).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(store.list_rules().await.unwrap().len(), 2);
+
+        // Re-apply with only one — the other must be deleted.
+        let one = serde_json::json!([
+            { "id": "a", "name": "A", "when": "object.label == 'person'", "severity": "low", "enabled": true },
+        ]);
+        let res = fleet_apply(&app, SECRET, "rules", one).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let rules = store.list_rules().await.unwrap();
+        assert_eq!(rules.len(), 1, "replace must delete unlisted rules");
+        assert_eq!(rules[0].id, "a");
+    }
+
+    /// Every successful apply records a per-category fleet-managed
+    /// marker (the local UI's "Fleet-managed" badge source) carrying
+    /// the canonical hash of the applied payload and the apply scope.
+    #[tokio::test]
+    async fn fleet_apply_records_managed_marker() {
+        const SECRET: &[u8] = b"fleet-marker-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let payload = serde_json::json!([
+            { "id": "a", "name": "A", "when": "object.label == 'person'", "severity": "low", "enabled": true },
+        ]);
+        let res = fleet_apply(&app, SECRET, "rules", payload.clone()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let markers = store.list_fleet_managed_markers().await.unwrap();
+        let marker = markers
+            .iter()
+            .find(|m| m.category == "rules")
+            .expect("rules marker recorded");
+        assert_eq!(marker.scope_type.as_deref(), Some("core"));
+        assert_eq!(
+            marker.scope_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
+        assert_eq!(
+            marker.effective_sha256.as_deref(),
+            Some(crate::fleet_hash::sha256_canonical(&payload).as_str()),
+            "marker carries the canonical hash of the applied payload"
+        );
+    }
+
+    /// `GET /v1/admin/fleet/managed` lists the recorded markers.
+    #[tokio::test]
+    async fn fleet_managed_list_endpoint() {
+        const SECRET: &[u8] = b"fleet-managed-list-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+
+        // Nothing managed yet → empty list.
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/fleet/managed")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["managed"].as_array().expect("array").len(), 0);
+
+        // After an apply the category shows up.
+        let payload = serde_json::json!({ "enabled": true, "timezone": "UTC" });
+        let res = fleet_apply(&app, SECRET, "delivery_settings", payload).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/fleet/managed")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let managed = v["managed"].as_array().expect("array");
+        assert!(managed.iter().any(|m| m["category"] == "delivery_settings"));
+    }
+
+    /// REPLACE semantics for `visual_prompts`: a prompt currently
+    /// attached but absent from the fleet payload is detached.
+    #[tokio::test]
+    async fn fleet_apply_visual_prompts_replace_detaches_unlisted() {
+        const SECRET: &[u8] = b"fleet-vp-replace-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        store
+            .upsert_camera(&fleet_test_camera(1, "front"))
+            .await
+            .unwrap();
+
+        // Two local prompts, both attached to the camera.
+        let embedding = [0.1f32, 0.2, 0.3];
+        let vp_a = store
+            .create_visual_prompt(&nexus_store::NewVisualPrompt {
+                name: "alpha",
+                description: None,
+                image_path: "/tmp/a.jpg",
+                image_sha256: "a",
+                embedding: &embedding,
+                encoder_model_id: "test",
+            })
+            .await
+            .unwrap();
+        let vp_b = store
+            .create_visual_prompt(&nexus_store::NewVisualPrompt {
+                name: "beta",
+                description: None,
+                image_path: "/tmp/b.jpg",
+                image_sha256: "b",
+                embedding: &embedding,
+                encoder_model_id: "test",
+            })
+            .await
+            .unwrap();
+        store.attach_camera_visual_prompt(1, vp_a).await.unwrap();
+        store.attach_camera_visual_prompt(1, vp_b).await.unwrap();
+        assert_eq!(
+            store.list_camera_visual_prompt_ids(1).await.unwrap().len(),
+            2
+        );
+
+        // Apply a fleet payload listing only "alpha".
+        let body = serde_json::json!([{ "name": "alpha" }]);
+        let res = fleet_apply(&app, SECRET, "visual_prompts", body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let attached = store.list_camera_visual_prompt_ids(1).await.unwrap();
+        assert_eq!(attached, vec![vp_a], "beta must be detached by replace");
     }
 }

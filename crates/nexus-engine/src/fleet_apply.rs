@@ -23,11 +23,18 @@
 //!
 //! # Apply semantics (v1)
 //!
-//! * **Overlay, never replace.** Each category upserts the items in
-//!   `effective`; it never deletes unlisted local rules / cameras /
-//!   prompts. The edge has no `managed_by_fleet` marker column, so a
-//!   full reconcile would clobber operator-local configuration. The
-//!   apply is idempotent: applying the same payload twice is a no-op.
+//! * **Replace, not overlay.** Phase 7.5.5 — a fleet apply *overwrites*
+//!   the local state for the category: the edge reconciles its
+//!   configuration to exactly the `effective` payload, deleting local
+//!   items the fleet no longer lists (`rules` not in the set are
+//!   removed; `visual_prompts` not in the set are detached). Fleet
+//!   management wins over operator-local edits. The apply is idempotent:
+//!   applying the same payload twice is a no-op.
+//! * **Per-category fleet-managed marker.** Every successful apply
+//!   upserts a [`nexus_store::FleetManagedMarker`] row recording that the
+//!   category is fleet-managed, the apply scope, and the canonical
+//!   SHA-256 of the effective payload. The local admin UI reads these to
+//!   badge a category as "Fleet-managed".
 //! * **Per-camera categories apply core-wide.** `text_prompts`,
 //!   `visual_prompts`, and `detector_config` are applied to **every**
 //!   local camera on this core, regardless of the `scope.type`. The
@@ -35,12 +42,13 @@
 //!   cloud-camera-UUID mapping — so `scope.id` cannot select a single
 //!   camera. The cloud already dispatches at core granularity
 //!   (Phase 7.5.3); `scope` is recorded for audit / tracing only.
-//! * **`visual_prompts` is attach-only in v1.** The reconcile only
-//!   attaches prompts that already exist locally (matched by `name`).
-//!   Downloading the reference image over a Blob SAS URL and encoding
-//!   the embedding (which needs the `ort` feature + an ONNX encoder)
-//!   is deferred to a follow-up step; an unknown prompt name yields a
-//!   `400` so the cloud records that target as failed.
+//! * **`visual_prompts` is attach/detach by known name in v1.** The
+//!   reconcile attaches prompts that already exist locally (matched by
+//!   `name`) and detaches any currently-attached prompt the fleet no
+//!   longer lists. Downloading the reference image over a Blob SAS URL
+//!   and encoding the embedding (which needs the `ort` feature + an ONNX
+//!   encoder) is deferred to a follow-up step; an unknown prompt name
+//!   yields a `400` so the cloud records that target as failed.
 
 use std::net::SocketAddr;
 
@@ -124,6 +132,21 @@ pub async fn post_admin_fleet_apply(
     )
     .await;
     let targets = result?;
+    // Record that the category is now fleet-managed (badge source for
+    // the local admin UI) along with the canonical hash of what we
+    // applied and the original apply scope.
+    let effective_sha = crate::fleet_hash::sha256_canonical(&req.effective);
+    let (scope_type, scope_id) = match &req.scope {
+        Some(scope) => (Some(scope.scope_type.as_str()), Some(scope.id.as_str())),
+        None => (None, None),
+    };
+    if let Err(e) = s
+        .store
+        .fleet_marker_upsert(&category, scope_type, scope_id, Some(&effective_sha))
+        .await
+    {
+        tracing::warn!(category = %category, error = %e, "fleet-managed marker upsert failed");
+    }
     match &req.scope {
         Some(scope) => tracing::info!(
             category = %category,
@@ -135,6 +158,23 @@ pub async fn post_admin_fleet_apply(
         None => tracing::info!(category = %category, targets, "fleet apply ok"),
     }
     Ok(Json(FleetApplyResponse { category, targets }))
+}
+
+/// Response body for `GET /v1/admin/fleet/managed`.
+#[derive(Debug, Serialize)]
+pub struct FleetManagedResponse {
+    pub managed: Vec<nexus_store::FleetManagedMarker>,
+}
+
+/// `GET /v1/admin/fleet/managed` — list the fleet-settings categories
+/// currently under cloud fleet management on this core, so the local
+/// admin UI can badge them as "Fleet-managed". Read-only; admin-gated.
+pub async fn get_admin_fleet_managed(
+    State(s): State<ApiState>,
+    _admin: crate::auth::require_role::AdminContext,
+) -> Result<Json<FleetManagedResponse>, ApiError> {
+    let managed = s.store.list_fleet_managed_markers().await?;
+    Ok(Json(FleetManagedResponse { managed }))
 }
 
 /// Dispatch on the `db_key` category segment.
@@ -158,8 +198,10 @@ async fn apply_category(
 
 /// `rules` — `effective` is a JSON array of full [`RuleConfig`]
 /// objects. Every rule's CEL `when` clause is compiled up-front so a
-/// bad payload fails atomically (nothing is persisted). Rules are
-/// upserted by id; the live evaluator is hot-reloaded afterwards.
+/// bad payload fails atomically (nothing is persisted). REPLACE
+/// semantics: rules in the payload are upserted by id and any local
+/// rule whose id is not in the payload is deleted, all within one
+/// transaction. The live evaluator is hot-reloaded afterwards.
 async fn apply_rules(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
     let rules: Vec<RuleConfig> = serde_json::from_value(effective.clone())
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rules payload: {e}")))?;
@@ -177,7 +219,14 @@ async fn apply_rules(s: &ApiState, effective: &Value) -> Result<usize, ApiError>
             ));
         }
     }
+    let keep: std::collections::HashSet<&str> = rules.iter().map(|r| r.id.as_str()).collect();
+    let existing = s.store.list_rules().await?;
     let mut tx = s.store.begin_tx().await?;
+    for rule in &existing {
+        if !keep.contains(rule.id.as_str()) {
+            s.store.delete_rule_tx(&mut tx, &rule.id).await?;
+        }
+    }
     for rule in &rules {
         s.store.upsert_rule_tx(&mut tx, rule).await?;
     }
@@ -278,13 +327,13 @@ async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usiz
     Ok(1)
 }
 
-/// `visual_prompts` — attach-only reconcile. `effective` is a JSON
+/// `visual_prompts` — attach/detach reconcile. `effective` is a JSON
 /// array of `{name, …}` entries. Each name must already exist
 /// locally (uploaded + encoded via `POST /v1/admin/visual-prompts`);
-/// the prompt is attached to every local camera. An unknown name is
-/// a `400` so the cloud records the target as failed. Attaching is
-/// idempotent (the join table has `INSERT OR IGNORE` semantics), so a
-/// repeated apply is a no-op.
+/// an unknown name is a `400` so the cloud records the target as
+/// failed. REPLACE semantics: on every local camera the listed
+/// prompts are attached and any currently-attached prompt the fleet
+/// no longer lists is detached. A repeated identical apply is a no-op.
 async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
     let entries: Vec<FleetVisualPromptEntry> =
         serde_json::from_value(effective.clone()).map_err(|e| {
@@ -308,22 +357,43 @@ async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, 
             format!("unknown visual prompt(s) not present on this core: {unknown:?}"),
         ));
     }
+    let keep: std::collections::HashSet<VisualPromptId> = ids.iter().copied().collect();
     let cameras = s.store.list_cameras().await?;
-    let mut attachments = 0_usize;
+    let mut changed = false;
     for cam in &cameras {
+        let current = s
+            .store
+            .list_camera_visual_prompt_ids(cam.id)
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let current_set: std::collections::HashSet<VisualPromptId> =
+            current.iter().copied().collect();
+        // Detach prompts the fleet no longer lists.
+        for vp_id in &current {
+            if !keep.contains(vp_id) {
+                s.store
+                    .detach_camera_visual_prompt(cam.id, *vp_id)
+                    .await
+                    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                changed = true;
+            }
+        }
+        // Attach the listed prompts (idempotent).
         for vp_id in &ids {
-            s.store
-                .attach_camera_visual_prompt(cam.id, *vp_id)
-                .await
-                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            attachments += 1;
+            if !current_set.contains(vp_id) {
+                s.store
+                    .attach_camera_visual_prompt(cam.id, *vp_id)
+                    .await
+                    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                changed = true;
+            }
         }
     }
-    if attachments > 0 {
+    if changed {
         let _ = s
             .bus
             .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
             .await;
     }
-    Ok(attachments)
+    Ok(ids.len())
 }

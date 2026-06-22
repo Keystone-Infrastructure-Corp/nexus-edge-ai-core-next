@@ -246,6 +246,31 @@ export interface CameraVisualPromptAttachment {
 }
 
 // ---------------------------------------------------------------------------
+// Fleet-managed markers (Phase 7.5.5). When the cloud applies a
+// fleet-settings category to this core, the edge records a marker so the
+// local UI can badge the category as "Fleet-managed".
+// ---------------------------------------------------------------------------
+
+export type FleetCategory =
+  | "rules"
+  | "text_prompts"
+  | "visual_prompts"
+  | "detector_config"
+  | "delivery_settings";
+
+export interface FleetManagedMarker {
+  category: FleetCategory;
+  scope_type?: string | null;
+  scope_id?: string | null;
+  effective_sha256?: string | null;
+  applied_at: string;
+}
+
+export interface FleetManagedResponse {
+  managed: FleetManagedMarker[];
+}
+
+// ---------------------------------------------------------------------------
 // Discovery.
 // ---------------------------------------------------------------------------
 
