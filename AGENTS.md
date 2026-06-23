@@ -158,6 +158,45 @@ The wedge plan that drives the next three phases of work is
    = "linux")]` gates, `nix` integer width). If your change touches a Linux-gated
    block, expect at least one CI round-trip.
 
+## Terminal output discipline (cost control)
+
+Terminal output is the single largest driver of token spend in this workspace —
+multi-hundred-kilobyte command dumps (full build logs, `journalctl` tails, remote
+edge-box diagnostics) pasted into the chat transcript routinely dominate the context
+budget. Keep command output small and deliberate:
+
+1. **Never stream a full, unbounded command into chat.** Builds, test runs,
+   `journalctl`, `cargo`, `npm`, package installs, and remote diagnostics MUST be
+   capped. Redirect the firehose to a file and surface only the tail:
+
+   ```bash
+   <noisy-cmd> > /tmp/nexus-cmd.log 2>&1; rc=$?; tail -n 40 /tmp/nexus-cmd.log; exit $rc
+   ```
+
+   or use the helper [scripts/run-capped.sh](scripts/run-capped.sh):
+
+   ```bash
+   scripts/run-capped.sh cargo test --workspace
+   ```
+
+2. **Filter at the source.** Prefer `grep -E`, `rg`, `awk`, `tail -n`, `head -n`,
+   `-q`/`--quiet`, `wc -l`, and `gh ... --json ... --jq` over dumping everything and
+   reading it back in chat. Ask for the few lines you need, not the thousands you
+   don't.
+
+3. **Never use follow / watch modes inside an agent turn.** No `tail -f`,
+   `journalctl -f`, `gh ... --watch` without a `| tail`, `cargo watch`, or a
+   foreground dev server — they pin the terminal and stream unbounded output. Poll
+   once and stop, or background the process.
+
+4. **For remote (SSH) edge-box work, cap on the box, not in chat.** Redirect remote
+   output to a log on the remote host (`bash /tmp/do.sh > /tmp/do.log 2>&1`) and
+   `tail` it in a separate follow-up call — never let a remote command's full stdout
+   cross the tunnel into the transcript. (Complements the SSH rules below.)
+
+5. **One chat per task.** Start a fresh chat when you switch to an unrelated task so
+   a long transcript doesn't ride along as dead context into the next piece of work.
+
 ## SSH to operator boxes (sudo, one prompt per turn)
 
 When an agent needs to run *more than one* command on a remote host in the same
