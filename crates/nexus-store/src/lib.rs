@@ -10,6 +10,7 @@
 
 pub mod audit;
 pub mod cloud;
+pub mod diag_snapshot;
 pub mod entity;
 pub mod fleet;
 pub mod motion;
@@ -151,6 +152,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
 pub enum StoreError {
     #[error("sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("serde_json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("not found: {0}")]
@@ -627,6 +630,20 @@ impl Store {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Phase 7.0a — produce a **secret-scrubbed** copy of the live
+    /// SQLite state DB as a self-contained `.sqlite` byte buffer for the
+    /// diagnostics bundle (operator `include_sqlite` opt-in).
+    ///
+    /// The returned bytes carry NO mTLS client key, camera credential,
+    /// alert-sink secret, storage-backend token, local-user password
+    /// hash, or refresh token — every secret-bearing table is dropped
+    /// and every secret column is redacted by an allowlist that is
+    /// fail-closed against future migrations. See
+    /// [`crate::diag_snapshot`] for the exact policy.
+    pub async fn export_scrubbed_snapshot(&self) -> Result<Vec<u8>, StoreError> {
+        crate::diag_snapshot::export_scrubbed_snapshot(&self.pool).await
     }
 }
 
