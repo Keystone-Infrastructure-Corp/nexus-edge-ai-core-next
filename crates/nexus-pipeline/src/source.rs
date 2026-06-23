@@ -374,6 +374,17 @@ impl RtspSource {
         // via legacy gstreamer-vaapi, or `nvh264dec`) is safe; forcing
         // software here would pin one CPU core per camera on any 4K+
         // H.264 stream and keep the iGPU at idle clock.
+        //
+        // This standalone source keeps `decodebin` (rank-based
+        // autoplug already prefers `vah264dec` on a VA-capable Linux
+        // box, so it is hardware-accelerated without an explicit
+        // chain). The explicit-decoder selection driven by
+        // `[runtime.decode] mode` (see `crate::decode`) applies to the
+        // pre-roll RGB tap in `preroll_ingester.rs`, which builds its
+        // pipeline by hand and so has no decodebin to autoplug. In
+        // production the detector consumes that shared tap
+        // (`SharedRtspSource`); this `RtspSource` is the fallback used
+        // only when no shared tap exists.
         let force_sw = cfg!(target_os = "macos");
         // protocols=tcp forces TCP-only RTP transport. UDP would be
         // marginally lower latency but loses packets silently under

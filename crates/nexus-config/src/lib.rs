@@ -234,6 +234,12 @@ pub struct RuntimeConfig {
     /// M2.1 motion-clip recording + safety-floor configuration.
     #[serde(default)]
     pub clips: ClipsConfig,
+    /// Hardware-decode strategy for the RTSP ingest path. Defaults to
+    /// `Auto` (probe for a VA-capable GPU, fall back to software), so
+    /// configs that predate this knob auto-enable hardware decode on a
+    /// capable box with zero migration.
+    #[serde(default)]
+    pub decode: RuntimeDecodeConfig,
     /// M6 auth-side runtime knobs (lockout FSM thresholds, audit
     /// retention). All have safe defaults so existing configs that
     /// predate M6 boot unchanged.
@@ -253,10 +259,51 @@ impl Default for RuntimeConfig {
             state_dir: default_state_dir(),
             visual_prompts_dir: default_visual_prompts_dir(),
             clips: ClipsConfig::default(),
+            decode: RuntimeDecodeConfig::default(),
             auth: RuntimeAuthConfig::default(),
             audit: RuntimeAuditConfig::default(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hardware decode
+// ---------------------------------------------------------------------------
+
+/// Decoder-selection strategy for the RTSP ingest path (the RGB tap that
+/// feeds the detector). Serialised as `[runtime.decode] mode = "..."`
+/// and optionally overridden per camera via [`CameraIngest::decode`].
+///
+/// The actual element selection (which `vah26Xdec` / `avdec_h26X` /
+/// `msdkh26Xdec` chain to launch, with fail-open fallback) lives in
+/// `nexus_pipeline::decode`. This enum is only the operator-facing knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecodeMode {
+    /// Probe for the best available hardware backend (libva `va`) and
+    /// fall back to software when no VA decoder is registered. Default.
+    #[default]
+    Auto,
+    /// Force the libva `va` backend (`vah26Xdec` + `vapostproc`). Falls
+    /// back to software with a warning if those elements are missing.
+    Va,
+    /// Force the Intel Media-SDK backend (`msdkh26Xdec` + `msdkvpp`).
+    /// Falls back to VA, then software.
+    Msdk,
+    /// Force the software backend (`avdec_h26X`). Always available.
+    Software,
+}
+
+/// `[runtime.decode]` section. Currently a single `mode` knob; kept as a
+/// struct so future decode tuning (e.g. an explicit libva driver name or
+/// a VRAM budget) is an additive field rather than a breaking reshape.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeDecodeConfig {
+    /// Global decode strategy. Per-camera [`CameraIngest::decode`]
+    /// overrides this when set.
+    #[serde(default)]
+    pub mode: DecodeMode,
 }
 
 fn default_blocking_threads() -> usize {
@@ -2884,6 +2931,63 @@ retention_days = 90
         assert_eq!(rc.auth.lockout.window_secs, 300);
         assert_eq!(rc.auth.lockout.lockout_secs, 60);
         assert_eq!(rc.audit.retention_days, 90);
+    }
+
+    // -----------------------------------------------------------------
+    // [runtime.decode] hardware-decode knob
+    // -----------------------------------------------------------------
+
+    /// Upgrade-reach guarantee (Wedge P3.1): a config that predates
+    /// the `[runtime.decode]` knob (no `[decode]` table at all)
+    /// deserialises with `DecodeMode::Auto`, so an old core that
+    /// upgrades onto a VA-capable box auto-enables hardware decode
+    /// with zero config migration.
+    #[test]
+    fn runtime_decode_defaults_to_auto() {
+        let from_default: RuntimeConfig = Default::default();
+        assert_eq!(from_default.decode.mode, DecodeMode::Auto);
+        let from_empty: RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(from_empty.decode.mode, DecodeMode::Auto);
+        // A legacy config that sets an unrelated [runtime] knob but
+        // carries no [decode] table still defaults to Auto.
+        let legacy: RuntimeConfig = toml::from_str("state_dir = \"/var/lib/nexus/state\"").unwrap();
+        assert_eq!(legacy.decode.mode, DecodeMode::Auto);
+    }
+
+    /// `[decode] mode = "..."` round-trips for every variant, and the
+    /// serialised token matches the documented lowercase spelling
+    /// (the engine and installer both rely on these exact tokens).
+    #[test]
+    fn runtime_decode_mode_round_trips_via_toml() {
+        for (token, mode) in [
+            ("auto", DecodeMode::Auto),
+            ("va", DecodeMode::Va),
+            ("msdk", DecodeMode::Msdk),
+            ("software", DecodeMode::Software),
+        ] {
+            let src = format!("[decode]\nmode = \"{token}\"\n");
+            let rc: RuntimeConfig = toml::from_str(&src).unwrap();
+            assert_eq!(rc.decode.mode, mode, "parse {token}");
+            let out = toml::to_string(&RuntimeDecodeConfig { mode }).unwrap();
+            assert!(
+                out.contains(&format!("mode = \"{token}\"")),
+                "serialise {token}: {out}"
+            );
+        }
+    }
+
+    /// `[runtime.decode]` rejects unknown keys (deny_unknown_fields)
+    /// so a typo'd knob fails loudly at boot instead of being
+    /// silently ignored.
+    #[test]
+    fn runtime_decode_rejects_unknown_key() {
+        let src = "[decode]\nmode = \"auto\"\nbogus = true\n";
+        let err = toml::from_str::<RuntimeConfig>(src).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus") || msg.contains("unknown"),
+            "expected unknown-field error, got: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------
