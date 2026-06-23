@@ -57,6 +57,15 @@ low_watermark_pct = 15
 panic_watermark_pct = 5
 # How often the watermark sampler runs.
 watermark_sample_interval_secs = 30
+# Hard ceiling on a single clip's on-disk size, in bytes. A healthy
+# 30-60 s 1080p clip is a few MB; this only trips on a camera emitting
+# a corrupt H.264 stream whose byte-rate explodes (seen in the field:
+# 640x360 clips ballooning to ~2 GiB). The recorder stats the in-flight
+# file periodically and rotates when it crosses this size, and the cold
+# replicator derives a pre-emptive upload-quarantine ceiling (2x) from
+# it so a runaway clip never head-of-line-blocks the upload queue.
+# Default 256 MiB.
+max_clip_bytes = 268435456
 
 [server]
 api_bind = "0.0.0.0:8089"

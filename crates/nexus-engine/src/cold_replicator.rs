@@ -91,6 +91,54 @@ pub struct ColdReplicatorConfig {
     ///
     /// Phase 2 · Step 2.8.
     pub outbox: Option<Arc<TunnelOutbox>>,
+    /// Hard ceiling (bytes) above which a clip is pre-emptively
+    /// quarantined out of the cold-upload queue instead of being
+    /// uploaded. Derived at the spawn site as
+    /// `runtime.clips.max_clip_bytes * 2` — the 2x headroom absorbs
+    /// the recorder's stat-every-N-frames rotation overshoot. A clip
+    /// this large can only be a corrupt byte-explosion; attempting it
+    /// would burn the whole batch on a PUT that can't finish inside
+    /// any sane timeout, head-of-line-blocking every healthy clip
+    /// behind it. See [`Store::quarantine_clip`].
+    pub max_cold_upload_bytes: u64,
+}
+
+/// Maximum consecutive cold-upload failures before a clip is
+/// permanently quarantined out of the pending queue. After this many
+/// attempts the replicator stops retrying so one pathological clip
+/// (e.g. a backend that 4xx's a specific blob) can't burn the batch
+/// budget forever; an operator can re-clear `cold_quarantined` by
+/// hand once the root cause is fixed.
+const MAX_COLD_ATTEMPTS: i64 = 8;
+
+/// Backoff schedule indexed by attempt number. The Nth consecutive
+/// failure delays the next attempt by `COLD_BACKOFF[min(N, len) - 1]`,
+/// capping at 6 h so a transiently-unreachable backend is still
+/// retried a few times a day without hammering it every tick.
+const COLD_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(60),          // attempt 1 → +1m
+    Duration::from_secs(5 * 60),      // attempt 2 → +5m
+    Duration::from_secs(30 * 60),     // attempt 3 → +30m
+    Duration::from_secs(2 * 60 * 60), // attempt 4 → +2h
+    Duration::from_secs(6 * 60 * 60), // attempt 5+ → +6h
+];
+
+/// Compute the `(next_attempt_at, quarantined)` pair for a clip that
+/// just failed its `new_attempts`-th consecutive cold-upload attempt.
+/// At or past [`MAX_COLD_ATTEMPTS`] the clip is quarantined (no
+/// further attempts, so `next_attempt_at` is `None`); otherwise it is
+/// delayed by the matching [`COLD_BACKOFF`] step.
+fn cold_backoff_schedule(
+    new_attempts: i64,
+    now: chrono::DateTime<Utc>,
+) -> (Option<chrono::DateTime<Utc>>, bool) {
+    if new_attempts >= MAX_COLD_ATTEMPTS {
+        return (None, true);
+    }
+    let idx = (new_attempts.max(1) as usize - 1).min(COLD_BACKOFF.len() - 1);
+    let delay = chrono::Duration::from_std(COLD_BACKOFF[idx])
+        .unwrap_or_else(|_| chrono::Duration::seconds(60));
+    (Some(now + delay), false)
 }
 
 /// Subscriber payload for `topic::CLIP_CLOSED`. We only deserialise
@@ -364,7 +412,41 @@ async fn tick(
 
     let mut uploaded = 0usize;
     let mut failed = 0usize;
+    let mut quarantined = 0usize;
     for clip in pending {
+        // Pre-emptive size guard. A clip whose on-disk bytes exceed
+        // the cold-upload ceiling (2x the recorder's `max_clip_bytes`
+        // cap) can only be a corrupt byte-explosion — it can never
+        // finish a PUT inside any sane timeout on a typical edge
+        // uplink, and left in the queue it head-of-line-blocks every
+        // healthy clip behind it. Quarantine it on first sight and
+        // move on. This is the self-healing path for the field
+        // incident where a corrupt camera H.264 stream ballooned
+        // single 640x360 clips to ~2 GiB.
+        if clip.size_bytes > 0 && clip.size_bytes as u64 > cfg.max_cold_upload_bytes {
+            warn!(
+                clip_id = clip.id,
+                size_bytes = clip.size_bytes,
+                ceiling = cfg.max_cold_upload_bytes,
+                "cold replicator: clip exceeds cold-upload size ceiling; quarantining (will not retry)"
+            );
+            if let Err(e) = store
+                .quarantine_clip(
+                    clip.id,
+                    Utc::now(),
+                    &format!(
+                        "size {} bytes exceeds cold-upload ceiling {} bytes",
+                        clip.size_bytes, cfg.max_cold_upload_bytes
+                    ),
+                )
+                .await
+            {
+                warn!(clip_id = clip.id, error = %e, "cold replicator: quarantine_clip failed");
+            } else {
+                quarantined += 1;
+            }
+            continue;
+        }
         // Phase 2 · Step 2.9 — stamp `attached_history: true` iff
         // (a) the operator opted into history replay AND (b) the
         // clip predates the enrollment timestamp. The combination
@@ -391,10 +473,40 @@ async fn tick(
             Ok(()) => uploaded += 1,
             Err(e) => {
                 failed += 1;
+                // Schedule an exponential backoff (or quarantine past
+                // the attempt ceiling) so a clip that keeps failing
+                // stops monopolising the batch on every tick. The
+                // increment is authoritative in SQL; we derive the
+                // schedule from the snapshot count + 1, which matches
+                // because there is exactly one replicator task.
+                let now = Utc::now();
+                let new_attempts = clip.cold_attempts + 1;
+                let (next_attempt_at, quarantine) = cold_backoff_schedule(new_attempts, now);
+                if let Err(se) = store
+                    .record_cold_upload_failure(
+                        clip.id,
+                        now,
+                        &e.to_string(),
+                        next_attempt_at,
+                        quarantine,
+                    )
+                    .await
+                {
+                    warn!(
+                        clip_id = clip.id,
+                        error = %se,
+                        "cold replicator: record_cold_upload_failure failed"
+                    );
+                }
+                if quarantine {
+                    quarantined += 1;
+                }
                 warn!(
                     clip_id = clip.id,
+                    attempts = new_attempts,
+                    quarantined = quarantine,
                     error = %e,
-                    "cold replicator: upload failed; will retry on next tick"
+                    "cold replicator: upload failed; backing off"
                 );
             }
         }
@@ -403,6 +515,7 @@ async fn tick(
         backend = %backend_handle,
         uploaded,
         failed,
+        quarantined,
         "cold replicator: batch complete"
     );
 }
@@ -612,6 +725,7 @@ mod tests {
         health: Mutex<HealthStatus>,
         puts: AtomicU32,
         existing: Mutex<std::collections::HashSet<String>>,
+        fail: Mutex<bool>,
     }
     impl MockBackend {
         fn new(handle: &str, health: HealthStatus) -> Arc<Self> {
@@ -620,10 +734,16 @@ mod tests {
                 health: Mutex::new(health),
                 puts: AtomicU32::new(0),
                 existing: Mutex::new(Default::default()),
+                fail: Mutex::new(false),
             })
         }
         fn put_count(&self) -> u32 {
             self.puts.load(Ordering::SeqCst)
+        }
+        /// Inject a transient `put` failure so the replicator's
+        /// per-clip backoff path can be exercised.
+        fn set_fail(&self, v: bool) {
+            *self.fail.lock() = v;
         }
     }
     #[async_trait]
@@ -641,6 +761,9 @@ mod tests {
             _expected_sha256: &str,
         ) -> Result<PutReceipt, BackendError> {
             self.puts.fetch_add(1, Ordering::SeqCst);
+            if *self.fail.lock() {
+                return Err(BackendError::Other("injected put failure".into()));
+            }
             self.existing.lock().insert(path.to_string());
             Ok(PutReceipt {
                 cold_path: path.to_string(),
@@ -780,6 +903,7 @@ mod tests {
             clips_dir: clips_dir.clone(),
             kick: None,
             outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -812,6 +936,155 @@ mod tests {
         assert_eq!(backend.put_count(), 1, "exactly one put expected");
     }
 
+    /// A clip whose `size_bytes` exceeds `max_cold_upload_bytes` is
+    /// quarantined on the next tick WITHOUT any upload attempt. This
+    /// is the head-of-line-blocking fix: one corrupt byte-exploding
+    /// clip can never wedge the backfill queue behind it.
+    #[tokio::test]
+    async fn replicator_quarantines_oversized_clip_without_put() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        // The seeded clip is 10 bytes; a 5-byte ceiling makes it
+        // oversized → pre-emptive quarantine.
+        let cfg = ColdReplicatorConfig {
+            clips_dir: clips_dir.clone(),
+            kick: None,
+            outbox: None,
+            max_cold_upload_bytes: 5,
+        };
+        let store_clone = store.clone();
+        let bus_clone = bus.clone();
+        let task = tokio::spawn(async move {
+            run_cold_replicator(cfg, store_clone, bus_clone, registry, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        // Poll until the clip leaves the pending set (quarantined).
+        let mut quarantined = false;
+        for _ in 0..80 {
+            let row = store.clips_pending_cold_upload(8).await.unwrap();
+            if !row.iter().any(|c| c.id == clip_id) {
+                quarantined = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        assert!(
+            quarantined,
+            "oversized clip should have been quarantined within 2s"
+        );
+        assert_eq!(
+            backend.put_count(),
+            0,
+            "oversized clip must never trigger an upload"
+        );
+        let row = store.get_clip(clip_id).await.unwrap().unwrap();
+        assert!(row.cold_quarantined, "row must be flagged quarantined");
+        assert_eq!(
+            row.cold_attempts, 0,
+            "a pre-emptive size skip consumes no attempt"
+        );
+    }
+
+    /// When `put` fails, the replicator records the failure and
+    /// schedules an exponential backoff (first delay = 60 s), so the
+    /// clip is gated out of the pending set for the backoff window
+    /// instead of being retried on every tick. One attempt is made,
+    /// the clip is NOT quarantined (1 < ceiling), and `put_count`
+    /// stays at 1 across the remaining ticks in the test window.
+    #[tokio::test]
+    async fn replicator_backs_off_failing_clip() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        backend.set_fail(true);
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let cfg = ColdReplicatorConfig {
+            clips_dir: clips_dir.clone(),
+            kick: None,
+            outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
+        };
+        let store_clone = store.clone();
+        let bus_clone = bus.clone();
+        let task = tokio::spawn(async move {
+            run_cold_replicator(cfg, store_clone, bus_clone, registry, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        // Poll until the failure is recorded (cold_attempts == 1).
+        let mut backed_off = false;
+        for _ in 0..80 {
+            let row = store.get_clip(clip_id).await.unwrap().unwrap();
+            if row.cold_attempts >= 1 {
+                backed_off = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Let a couple more ticks pass; the backoff must keep the
+        // clip out of the working set (no further put attempts).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        assert!(backed_off, "replicator should record a failure within 2s");
+        let row = store.get_clip(clip_id).await.unwrap().unwrap();
+        assert_eq!(row.cold_attempts, 1, "exactly one attempt before backoff");
+        assert!(!row.cold_quarantined, "one failure is below the ceiling");
+        assert!(
+            row.cold_next_attempt_at.is_some_and(|t| t > Utc::now()),
+            "a future retry must be scheduled"
+        );
+        assert_eq!(
+            backend.put_count(),
+            1,
+            "the backoff window must suppress further put attempts"
+        );
+    }
+
+    /// `cold_backoff_schedule` returns a future retry time below the
+    /// attempt ceiling and signals quarantine once the ceiling is
+    /// reached.
+    #[test]
+    fn cold_backoff_schedule_quarantines_past_ceiling() {
+        let now = Utc::now();
+        // Below the ceiling: always a future retry, never quarantine.
+        for attempts in 1..MAX_COLD_ATTEMPTS {
+            let (next, quarantine) = cold_backoff_schedule(attempts, now);
+            assert!(!quarantine, "attempt {attempts} must not quarantine");
+            assert!(
+                next.is_some_and(|t| t > now),
+                "attempt {attempts} must schedule a future retry"
+            );
+        }
+        // At/over the ceiling: quarantine, no further retry.
+        for attempts in [MAX_COLD_ATTEMPTS, MAX_COLD_ATTEMPTS + 1] {
+            let (next, quarantine) = cold_backoff_schedule(attempts, now);
+            assert!(quarantine, "attempt {attempts} must quarantine");
+            assert!(next.is_none(), "quarantined clip has no scheduled retry");
+        }
+    }
+
     /// When the cold replica is disabled (handle is NULL), the
     /// replicator MUST NOT call `put` even though there are
     /// pending clips. This is the "exactly one cold backend at a
@@ -831,6 +1104,7 @@ mod tests {
             clips_dir: clips_dir.clone(),
             kick: None,
             outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -888,6 +1162,7 @@ mod tests {
             clips_dir: clips_dir.clone(),
             kick: None,
             outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -956,6 +1231,7 @@ mod tests {
             clips_dir: clips_dir.clone(),
             kick: None,
             outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -1035,6 +1311,7 @@ mod tests {
             clips_dir: clips_dir.clone(),
             kick: None,
             outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -1101,6 +1378,7 @@ mod tests {
             clips_dir: clips_dir.clone(),
             kick: None,
             outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();

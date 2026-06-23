@@ -961,6 +961,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             clips_dir: clips_dir.clone(),
             kick: Some(cold_kick.clone()),
             outbox: Some(cloud_outbox.clone()),
+            // 2x the recorder's per-clip size cap. Headroom for the
+            // recorder's stat-every-N-frames rotation overshoot; any
+            // clip larger than this can only be a corrupt
+            // byte-explosion and is quarantined rather than uploaded.
+            max_cold_upload_bytes: cfg.runtime.clips.max_clip_bytes.saturating_mul(2),
         };
         tokio::spawn(async move {
             cold_replicator::run_cold_replicator(cfg, store, bus, registry, async {
