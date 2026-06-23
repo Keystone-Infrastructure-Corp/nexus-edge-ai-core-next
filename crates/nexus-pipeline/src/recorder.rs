@@ -135,6 +135,24 @@ pub trait ClipRecorder: Send + Sync {
     /// `duration_ms` / `size_bytes` on the row.
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError>;
 
+    /// Best-effort current on-disk size, in bytes, of the in-flight
+    /// clip file for `handle`. The supervisor polls this every
+    /// `SIZE_STAT_INTERVAL_FRAMES` to enforce a byte cap on the open
+    /// clip: a corrupt camera stream can balloon a single short clip
+    /// to multiple GiB long before the `MAX_CLIP_DURATION_MS` cap
+    /// fires, and such a clip then wedges the cold replicator (it
+    /// cannot finish a multi-GiB upload inside the SAS window).
+    ///
+    /// Returns `None` when the recorder can't cheaply stat the file
+    /// (unknown handle, file not yet created, or a backend that
+    /// doesn't write a single growing file). The default impl returns
+    /// `None`, so size-based rotation is simply inert for recorders
+    /// that don't override it.
+    #[allow(unused_variables)]
+    async fn inflight_size_bytes(&self, handle: ClipHandle) -> Option<u64> {
+        None
+    }
+
     /// Set or clear the panic flag. The watermark sampler calls
     /// `set_panic(true)` when free space is below
     /// `panic_watermark_pct` and `set_panic(false)` once eviction has
@@ -731,6 +749,14 @@ impl ClipRecorder for StubClipRecorder {
         })
     }
 
+    async fn inflight_size_bytes(&self, handle: ClipHandle) -> Option<u64> {
+        let path = {
+            let open = self.open.lock().await;
+            open.get(&handle.clip_id).map(|s| s.path.clone())?
+        };
+        fs::metadata(&path).await.ok().map(|m| m.len())
+    }
+
     fn set_panic(&self, panic: bool) {
         let mut guard = self.panic.write();
         if *guard != panic {
@@ -861,6 +887,61 @@ mod tests {
             clips_dir.join(closed_hot).exists(),
             "renamed clip file should exist on disk"
         );
+    }
+
+    #[tokio::test]
+    async fn stub_recorder_reports_inflight_size() {
+        let (store, _dir, clips_dir) = fresh_store_and_dir().await;
+        let rec = StubClipRecorder::new(store.clone(), &clips_dir);
+
+        let started = Utc::now();
+        let handle = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at: started,
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .unwrap();
+
+        // Freshly opened: touch-only 0-byte file.
+        assert_eq!(
+            rec.inflight_size_bytes(handle).await,
+            Some(0),
+            "freshly opened clip should report 0 bytes"
+        );
+
+        // Grow the on-disk in-flight file and confirm the recorder
+        // observes the new size (this is what the supervisor's
+        // byte-cap rotation guard polls).
+        let row = store.get_clip(handle.clip_id).await.unwrap().unwrap();
+        let hot_path = row.hot_path.as_deref().expect("in-flight clip is hot");
+        let path_on_disk = clips_dir.join(hot_path);
+        std::fs::write(&path_on_disk, vec![0u8; 4096]).unwrap();
+        assert_eq!(
+            rec.inflight_size_bytes(handle).await,
+            Some(4096),
+            "recorder should report the grown in-flight file size"
+        );
+
+        // After close the handle is no longer open -> None.
+        let ended = started + chrono::Duration::seconds(7);
+        rec.close(handle, ClipFinal { ended_at: ended })
+            .await
+            .unwrap();
+        assert_eq!(
+            rec.inflight_size_bytes(handle).await,
+            None,
+            "closed clip handle should report no in-flight size"
+        );
+
+        // Unknown handle -> None.
+        let unknown = ClipHandle {
+            clip_id: 9_999_999,
+            camera_id: 1,
+        };
+        assert_eq!(rec.inflight_size_bytes(unknown).await, None);
     }
 
     #[tokio::test]

@@ -41,6 +41,17 @@ use crate::source::{FrameSource, VirtualSource};
 use crate::static_clear::StaticAnchorClearRegistry;
 use crate::stats::FrameStatsRegistry;
 
+/// How often (in analysis frames) the supervisor stats the in-flight
+/// clip file to enforce the `max_clip_bytes` byte cap. Statting every
+/// frame would add a syscall to the per-frame fast path for no
+/// benefit — a runaway stream takes many frames to balloon — so we
+/// sample. The cost of sampling is that the on-disk file can overrun
+/// the cap by up to one interval's worth of growth before rotation
+/// fires; the cold-upload quarantine ceiling
+/// (`max_cold_upload_bytes = max_clip_bytes * 2`) absorbs that
+/// overshoot.
+const SIZE_STAT_INTERVAL_FRAMES: u32 = 60;
+
 /// Tunables for the per-camera [`SightingScheduler`]. Constructed
 /// at the engine boot site so all per-camera supervisors share the
 /// same cadence + minimum-stability thresholds. Passed by value into
@@ -312,6 +323,16 @@ async fn run_camera(
         // is still active on this frame) the next Born will open a
         // fresh one. Reset to None on every close.
         let mut clip_opened_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        // Byte cap on the in-flight clip. A corrupt camera H.264
+        // stream can balloon a single short clip to multiple GiB
+        // long before the 5-min duration cap fires, and such a clip
+        // wedges the cold replicator (it can't finish a multi-GiB
+        // upload inside the SAS window). We stat the partial file
+        // every `SIZE_STAT_INTERVAL_FRAMES` while a clip is open and
+        // rotate on the same path as the duration cap once it crosses
+        // `max_clip_bytes`. `0` disables the guard.
+        let max_clip_bytes = clips_cfg.max_clip_bytes;
+        let mut frames_since_size_stat: u32 = 0;
         let mut post_roll = PostRoll::new(clips_cfg.post_roll_secs);
 
         info!(camera_id = cfg.id, "pipeline running");
@@ -394,14 +415,44 @@ async fn run_camera(
             let mut force_reopen_after_rotation = false;
             if let (Some(handle), Some(opened_at)) = (current_clip, clip_opened_at) {
                 let age_ms = (frame.captured_at - opened_at).num_milliseconds();
-                if age_ms >= MAX_CLIP_DURATION_MS {
-                    debug!(
-                        camera_id = cfg.id,
-                        clip_id = handle.clip_id,
-                        age_ms,
-                        max_ms = MAX_CLIP_DURATION_MS,
-                        "rotating clip: max duration reached"
-                    );
+                let duration_exceeded = age_ms >= MAX_CLIP_DURATION_MS;
+
+                // Byte-cap guard. Sampled every SIZE_STAT_INTERVAL_FRAMES
+                // to keep the per-frame fast path syscall-free. Rotates
+                // on the same close+reopen path as the duration cap so a
+                // corrupt byte-exploding stream can't produce a single
+                // multi-GiB clip that wedges the cold replicator.
+                let mut size_exceeded = false;
+                if max_clip_bytes > 0 {
+                    frames_since_size_stat += 1;
+                    if frames_since_size_stat >= SIZE_STAT_INTERVAL_FRAMES {
+                        frames_since_size_stat = 0;
+                        if let Some(size_bytes) = recorder.inflight_size_bytes(handle).await {
+                            if size_bytes >= max_clip_bytes {
+                                size_exceeded = true;
+                                warn!(
+                                    camera_id = cfg.id,
+                                    clip_id = handle.clip_id,
+                                    size_bytes,
+                                    max_bytes = max_clip_bytes,
+                                    "rotating clip: max size reached \
+                                     (likely corrupt byte-exploding stream)"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if duration_exceeded || size_exceeded {
+                    if duration_exceeded {
+                        debug!(
+                            camera_id = cfg.id,
+                            clip_id = handle.clip_id,
+                            age_ms,
+                            max_ms = MAX_CLIP_DURATION_MS,
+                            "rotating clip: max duration reached"
+                        );
+                    }
                     if let Err(e) = recorder
                         .close(
                             handle,
@@ -413,11 +464,12 @@ async fn run_camera(
                     {
                         warn!(
                             camera_id = cfg.id,
-                            "recorder.close (max-duration rotation) failed: {e}"
+                            "recorder.close (rotation) failed: {e}"
                         );
                     }
                     current_clip = None;
                     clip_opened_at = None;
+                    frames_since_size_stat = 0;
                     // Reset post-roll so the rotation isn't observed
                     // as a motion-end window.
                     post_roll.reset();
