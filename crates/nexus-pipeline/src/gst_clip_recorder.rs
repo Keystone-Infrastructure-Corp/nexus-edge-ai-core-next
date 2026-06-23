@@ -799,6 +799,14 @@ impl ClipRecorder for GstClipRecorder {
         })
     }
 
+    async fn inflight_size_bytes(&self, handle: ClipHandle) -> Option<u64> {
+        let path = {
+            let open = self.open.lock().await;
+            open.get(&handle.clip_id).map(|s| s.path.clone())?
+        };
+        tokio::fs::metadata(&path).await.ok().map(|m| m.len())
+    }
+
     fn set_panic(&self, panic: bool) {
         let mut guard = self.panic.lock();
         if *guard != panic {
