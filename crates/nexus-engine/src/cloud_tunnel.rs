@@ -293,10 +293,19 @@ async fn install_cloud_blob_backend(
         }
     };
     // Direct-to-Azure client. SAS URL carries its own auth; no
-    // cert material needed here. 5 min total timeout is generous
-    // for a single PUT of a typical 30-60 s clip MP4 (a few MB).
+    // cert material needed here. We deliberately do NOT pin a tight
+    // whole-request timeout: a single Put Blob of a large (but
+    // in-bounds) clip over a slow edge uplink can legitimately run
+    // for many minutes, and a fixed 5-min ceiling used to abort
+    // every such PUT and wedge the cold queue. The per-PUT deadline
+    // is now set size-proportionally at the call site
+    // (`AzureBlobBackend::put` → `put_timeout_for`); the
+    // client-level `timeout` here is only a coarse 2 h backstop so a
+    // truly hung socket can't leak a task forever, while
+    // `connect_timeout` still fails fast when the box is offline.
     let azure_http = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5 * 60))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(2 * 60 * 60))
         .build()
     {
         Ok(c) => c,

@@ -72,6 +72,7 @@
 //!   under a feature gate later.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -265,6 +266,40 @@ impl std::fmt::Debug for AzureBlobBackend {
     }
 }
 
+/// Per-request deadline for a single blob PUT, sized to the payload.
+///
+/// A fixed whole-request timeout is wrong for blob uploads: it is
+/// simultaneously too tight for a large clip on a slow edge uplink
+/// (the transfer is aborted mid-flight and re-queued forever) and
+/// needlessly loose for a tiny clip on a stuck socket. This returns
+/// `clamp(BASE + len / MIN_THROUGHPUT_BPS, MIN, MAX)` so the
+/// deadline scales with the bytes on the wire.
+///
+/// The floor throughput is deliberately pessimistic (~64 KiB/s, well
+/// under the ~130-400 KB/s seen in the field) so the deadline is
+/// generous on a congested link and only fires on a genuinely stuck
+/// transfer. With the cold replicator's pre-emptive size quarantine
+/// (clips over ~512 MiB never reach here), the clamp `MAX` bounds the
+/// worst in-bounds case. Reused as the per-block deadline by the
+/// Phase 4 chunked Put Block path.
+pub(crate) fn put_timeout_for(len: usize) -> Duration {
+    /// Fixed setup/handshake overhead added on top of the
+    /// throughput-derived transfer time.
+    const BASE: Duration = Duration::from_secs(30);
+    /// Lower clamp — even a 0-byte body waits at least this long.
+    const MIN: Duration = Duration::from_secs(60);
+    /// Upper clamp — a 512 MiB clip at the floor throughput needs
+    /// ~136 min in theory but ~67 min at the real ~130 KB/s floor;
+    /// 90 min covers the realistic worst case with headroom and
+    /// stays under the client-level 2 h backstop.
+    const MAX: Duration = Duration::from_secs(90 * 60);
+    /// Pessimistic effective floor throughput, bytes/sec.
+    const MIN_THROUGHPUT_BPS: u64 = 64 * 1024;
+
+    let transfer_secs = (len as u64) / MIN_THROUGHPUT_BPS;
+    (BASE + Duration::from_secs(transfer_secs)).clamp(MIN, MAX)
+}
+
 /// Extract the `edge_clip_id` (basename, no extension) from a
 /// trait-level `path` like `cam1/1700000000_15000.mp4`.
 ///
@@ -403,6 +438,13 @@ impl ColdBackend for AzureBlobBackend {
             // through the PutOptions instead.
             .header("x-ms-blob-content-type", "video/mp4")
             .header("content-length", bytes.len().to_string())
+            // Size-proportional deadline for THIS PUT (Phase 2 fix).
+            // A fixed client-level timeout used to abort every PUT of
+            // a large clip over a slow uplink and wedge the cold
+            // queue forever. `put_timeout_for` gives the transfer
+            // headroom proportional to its byte count while still
+            // failing a stalled socket in bounded time.
+            .timeout(put_timeout_for(bytes.len()))
             .body(bytes.to_vec())
             .send()
             .await
@@ -741,6 +783,31 @@ mod tests {
         let b = build_backend(Arc::new(MockIssuer::new()));
         assert_eq!(b.handle(), "azure-test");
         assert_eq!(b.kind(), "azure");
+    }
+
+    #[test]
+    fn put_timeout_scales_with_payload_size() {
+        // Tiny payloads clamp to the 60 s floor.
+        assert_eq!(put_timeout_for(0), Duration::from_secs(60));
+        assert_eq!(put_timeout_for(1024), Duration::from_secs(60));
+
+        // Mid-size: BASE (30 s) + len / 64 KiB/s. 16 MiB → 256 s
+        // transfer + 30 = 286 s, inside the clamp window.
+        let sixteen_mib = 16 * 1024 * 1024;
+        assert_eq!(
+            put_timeout_for(sixteen_mib),
+            Duration::from_secs(30 + (sixteen_mib as u64) / (64 * 1024)),
+        );
+
+        // Monotonic non-decreasing in size.
+        assert!(put_timeout_for(64 * 1024 * 1024) >= put_timeout_for(sixteen_mib));
+
+        // A payload past the cold-upload ceiling clamps to the
+        // 90-minute upper bound rather than growing unbounded.
+        assert_eq!(
+            put_timeout_for(4 * 1024 * 1024 * 1024),
+            Duration::from_secs(90 * 60),
+        );
     }
 
     #[tokio::test]
