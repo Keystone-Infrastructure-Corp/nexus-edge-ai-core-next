@@ -760,6 +760,15 @@ pub struct ExportQuery {
     /// 100; capped at 10 000.
     #[serde(default)]
     pub motion_limit: Option<i64>,
+    /// Operator opt-in: include a secret-scrubbed copy of the
+    /// live SQLite state DB (`state/nexus-state.sqlite`) in the
+    /// tarball. Default false. The snapshot drops every
+    /// secret-bearing table and redacts every secret column
+    /// (see `nexus_store::diag_snapshot`); if it can't be built
+    /// the export still streams without it and the
+    /// `X-Nexus-Diag-Sqlite` response header reports `failed`.
+    #[serde(default)]
+    pub include_sqlite: Option<bool>,
 }
 
 pub async fn get_diagnostics_export(
@@ -777,13 +786,15 @@ pub async fn get_diagnostics_export(
         .motion_limit
         .unwrap_or(DEFAULT_MOTION_LIMIT)
         .clamp(0, 10_000);
+    let include_sqlite = q.include_sqlite.unwrap_or(false);
 
     // Gather everything that needs the tokio runtime BEFORE
     // we hand off to spawn_blocking. The tar writer itself
     // runs sync; pre-computing the bytes here keeps the
     // blocking task pure-CPU and avoids smuggling a Handle
     // across the thread boundary.
-    let snapshot = build_snapshot(&s, audit_limit, motion_limit).await;
+    let snapshot = build_snapshot(&s, audit_limit, motion_limit, include_sqlite).await;
+    let sqlite_status = snapshot.sqlite_status;
 
     audit_admin_action(
         &s.store,
@@ -802,6 +813,8 @@ pub async fn get_diagnostics_export(
                 "audit_count": snapshot.audit_count,
                 "motion_count": snapshot.motion_count,
                 "redacted": true,
+                "include_sqlite": include_sqlite,
+                "sqlite_included": sqlite_status == SqliteSnapshotStatus::Included,
             })
             .to_string(),
         ),
@@ -849,6 +862,11 @@ pub async fn get_diagnostics_export(
             format!("attachment; filename=\"{filename}\""),
         )
         .header("X-Content-Type-Options", "nosniff")
+        // Tells the cloud-side collector (`diag_collect.rs`) whether the
+        // optional sqlite snapshot made it into the stream, so it can set
+        // `diag_ready.error_code = include_sqlite_unavailable` on a
+        // partial success without re-parsing the tarball.
+        .header("X-Nexus-Diag-Sqlite", sqlite_status.header_value())
         .body(body)
         .map_err(|e| {
             ApiError(
@@ -866,12 +884,46 @@ struct DiagnosticsSnapshot {
     motion_events_json: String,
     storage_backends_json: String,
     build_info_json: String,
+    /// Secret-scrubbed copy of the live SQLite state DB. `Some` only
+    /// when `include_sqlite` was requested AND the snapshot succeeded.
+    sqlite_bytes: Option<Vec<u8>>,
+    /// Whether the sqlite snapshot was omitted, included, or attempted
+    /// and failed — surfaced to the collector via a response header.
+    sqlite_status: SqliteSnapshotStatus,
     audit_count: usize,
     motion_count: usize,
     generated_at: chrono::DateTime<chrono::Utc>,
 }
 
-async fn build_snapshot(s: &ApiState, audit_limit: i64, motion_limit: i64) -> DiagnosticsSnapshot {
+/// Disposition of the optional sqlite snapshot for one export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteSnapshotStatus {
+    /// Not requested (`include_sqlite=false`).
+    Omitted,
+    /// Requested and bundled.
+    Included,
+    /// Requested but the scrubbed snapshot could not be built; the
+    /// tarball streams without it (partial success).
+    Failed,
+}
+
+impl SqliteSnapshotStatus {
+    /// Stable `X-Nexus-Diag-Sqlite` header value.
+    fn header_value(self) -> &'static str {
+        match self {
+            Self::Omitted => "omitted",
+            Self::Included => "included",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+async fn build_snapshot(
+    s: &ApiState,
+    audit_limit: i64,
+    motion_limit: i64,
+    include_sqlite: bool,
+) -> DiagnosticsSnapshot {
     let now = Utc::now();
 
     let redacted_config_toml = build_redacted_config_toml(s).await;
@@ -952,6 +1004,24 @@ async fn build_snapshot(s: &ApiState, audit_limit: i64, motion_limit: i64) -> Di
     }))
     .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
 
+    // Optional secret-scrubbed sqlite snapshot. On any failure we log
+    // and downgrade to a partial success (Failed) rather than aborting
+    // the whole export — the logs/metrics are still worth shipping.
+    let (sqlite_bytes, sqlite_status) = if include_sqlite {
+        match s.store.export_scrubbed_snapshot().await {
+            Ok(bytes) => (Some(bytes), SqliteSnapshotStatus::Included),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "diagnostics sqlite snapshot failed; streaming bundle without it"
+                );
+                (None, SqliteSnapshotStatus::Failed)
+            }
+        }
+    } else {
+        (None, SqliteSnapshotStatus::Omitted)
+    };
+
     DiagnosticsSnapshot {
         redacted_config_toml,
         system_metrics_json,
@@ -959,6 +1029,8 @@ async fn build_snapshot(s: &ApiState, audit_limit: i64, motion_limit: i64) -> Di
         motion_events_json,
         storage_backends_json,
         build_info_json,
+        sqlite_bytes,
+        sqlite_status,
         audit_count,
         motion_count,
         generated_at: now,
@@ -1025,6 +1097,9 @@ fn write_tar_entries<W: Write>(
         mtime,
     )?;
     write_entry(tar, "build-info.json", &snap.build_info_json, mtime)?;
+    if let Some(bytes) = &snap.sqlite_bytes {
+        write_entry_bytes(tar, "state/nexus-state.sqlite", bytes, mtime)?;
+    }
     Ok(())
 }
 
@@ -1034,7 +1109,15 @@ fn write_entry<W: Write>(
     body: &str,
     mtime: u64,
 ) -> std::io::Result<()> {
-    let bytes = body.as_bytes();
+    write_entry_bytes(tar, name, body.as_bytes(), mtime)
+}
+
+fn write_entry_bytes<W: Write>(
+    tar: &mut tar::Builder<W>,
+    name: &str,
+    bytes: &[u8],
+    mtime: u64,
+) -> std::io::Result<()> {
     let mut header = tar::Header::new_gnu();
     header.set_path(name)?;
     header.set_size(bytes.len() as u64);

@@ -125,24 +125,27 @@ pub async fn run(
         admin_secret.as_deref().map(String::as_str),
         &payload,
         max_bytes,
+        include_sqlite,
     )
     .await;
 
     let envelope = match outcome {
-        Ok(size_bytes) => {
-            // Partial success: the loopback export endpoint does not
-            // (yet) bundle the SQLite state DB, so an opt-in
-            // `include_sqlite` request uploads the tarball WITHOUT it
-            // and reports the locked `include_sqlite_unavailable` code.
-            let error_code = include_sqlite.then(|| "include_sqlite_unavailable".to_string());
+        Ok((size_bytes, sqlite_included)) => {
+            // Partial success: the operator asked for the sqlite state DB
+            // but the edge could not produce the scrubbed snapshot (e.g.
+            // disk full, file lock). The tarball still uploaded WITHOUT
+            // it, so report the locked `include_sqlite_unavailable` code
+            // alongside `status=uploaded`.
+            let error_code = (include_sqlite && !sqlite_included)
+                .then(|| "include_sqlite_unavailable".to_string());
             if error_code.is_some() {
                 info!(
                     diag_id = %diag_id,
                     size_bytes,
-                    "diag tarball uploaded (sqlite requested but unavailable in this build)"
+                    "diag tarball uploaded (sqlite requested but the edge could not snapshot it)"
                 );
             } else {
-                info!(diag_id = %diag_id, size_bytes, "diag tarball uploaded");
+                info!(diag_id = %diag_id, size_bytes, include_sqlite, "diag tarball uploaded");
             }
             build_diag_ready_envelope(
                 diag_id.clone(),
@@ -176,35 +179,53 @@ pub async fn run(
 }
 
 /// Assemble the tarball from the loopback export, then upload it to the
-/// SAS URL. Returns the uploaded (compressed, on-wire) byte count on
-/// success.
+/// SAS URL. Returns the uploaded (compressed, on-wire) byte count and
+/// whether the optional sqlite snapshot was actually included.
 async fn collect_and_upload(
     http: &reqwest::Client,
     loopback_admin_base: &Arc<ArcSwap<String>>,
     admin_secret: Option<&str>,
     payload: &DiagCollectPayload,
     max_bytes: u64,
-) -> Result<u64, DiagError> {
-    let tarball = assemble_tarball(http, loopback_admin_base, admin_secret, max_bytes).await?;
+    include_sqlite: bool,
+) -> Result<(u64, bool), DiagError> {
+    let (tarball, sqlite_included) = assemble_tarball(
+        http,
+        loopback_admin_base,
+        admin_secret,
+        max_bytes,
+        include_sqlite,
+    )
+    .await?;
     let size = tarball.len() as u64;
     upload_to_sas(http, &payload.sas_put_url, tarball).await?;
-    Ok(size)
+    Ok((size, sqlite_included))
 }
 
 /// GET the engine's own loopback diagnostics export, streaming the gzip
-/// body into memory and aborting if it would exceed `max_bytes`.
+/// body into memory and aborting if it would exceed `max_bytes`. Returns
+/// the body plus whether the edge included the optional sqlite snapshot
+/// (read off the `X-Nexus-Diag-Sqlite` response header).
 async fn assemble_tarball(
     http: &reqwest::Client,
     loopback_admin_base: &Arc<ArcSwap<String>>,
     admin_secret: Option<&str>,
     max_bytes: u64,
-) -> Result<Vec<u8>, DiagError> {
+    include_sqlite: bool,
+) -> Result<(Vec<u8>, bool), DiagError> {
     let base = loopback_admin_base.load();
     // Local admin API serves under `/api/v1` (api.rs `.nest("/api", _)`).
-    let url = format!(
-        "{}/api/v1/admin/diagnostics/export",
-        base.trim_end_matches('/')
-    );
+    let url = if include_sqlite {
+        format!(
+            "{}/api/v1/admin/diagnostics/export?include_sqlite=true",
+            base.trim_end_matches('/')
+        )
+    } else {
+        format!(
+            "{}/api/v1/admin/diagnostics/export",
+            base.trim_end_matches('/')
+        )
+    };
 
     let mut req = http.get(&url);
     if let Some(secret) = admin_secret {
@@ -228,6 +249,17 @@ async fn assemble_tarball(
         )));
     }
 
+    // Whether the edge actually bundled the scrubbed sqlite snapshot.
+    // Absent header (older engine) or any non-`included` value counts as
+    // not-included so an `include_sqlite` request degrades to a partial
+    // success rather than silently claiming the DB is present.
+    let sqlite_included = resp
+        .headers()
+        .get("x-nexus-diag-sqlite")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("included"))
+        .unwrap_or(false);
+
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| {
         DiagError::TarballFailed(format!("reading loopback export body failed: {e}"))
@@ -244,7 +276,7 @@ async fn assemble_tarball(
         ));
     }
 
-    Ok(buf)
+    Ok((buf, sqlite_included))
 }
 
 /// PUT `bytes` to the SAS URL as a single `BlockBlob`. Retries up to
