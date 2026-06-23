@@ -653,6 +653,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0020_cloud_enrollment_server_cert".to_string(),
             "0021_alert_sinks".to_string(),
             "0022_fleet_managed_markers".to_string(),
+            "0023_motion_clips_cold_backoff".to_string(),
         ]
     );
 }
