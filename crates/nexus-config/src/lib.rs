@@ -453,6 +453,18 @@ pub struct ClipsConfig {
     /// only takes effect on the next `open()` call.
     #[serde(default)]
     pub preferred_usb_label: Option<String>,
+    /// Hard ceiling on a single clip's on-disk size in bytes. A
+    /// healthy camera never approaches this — a 30-60 s 1080p clip is
+    /// a few MB. The cap exists to bound the damage when a camera
+    /// emits a corrupt H.264 stream whose byte-rate explodes (seen in
+    /// the field: 640x360 clips ballooning to ~2 GiB at 160-740 Mbps).
+    /// The recorder stats the in-flight file periodically and rotates
+    /// when it crosses this size (Phase 3b enforcement); the cold
+    /// replicator derives its own pre-emptive quarantine ceiling from
+    /// this value so a runaway clip never head-of-line-blocks the
+    /// upload queue. Default 256 MiB.
+    #[serde(default = "default_max_clip_bytes")]
+    pub max_clip_bytes: u64,
 }
 
 impl Default for ClipsConfig {
@@ -468,6 +480,7 @@ impl Default for ClipsConfig {
             post_roll_secs: default_post_roll_secs(),
             pre_roll_secs: default_pre_roll_secs(),
             preferred_usb_label: None,
+            max_clip_bytes: default_max_clip_bytes(),
         }
     }
 }
@@ -502,6 +515,12 @@ fn default_post_roll_secs() -> u32 {
 
 fn default_pre_roll_secs() -> u32 {
     5
+}
+
+fn default_max_clip_bytes() -> u64 {
+    // 256 MiB. A healthy 30-60 s clip is a few MB; this only ever
+    // trips on corrupt byte-exploding streams.
+    256 * 1024 * 1024
 }
 
 // ---------------------------------------------------------------------------

@@ -161,6 +161,26 @@ pub struct ClipRow {
     pub frame_width: u32,
     /// Companion to [`Self::frame_width`].
     pub frame_height: u32,
+    /// Cold-replicator backoff bookkeeping (migration 0023). Count of
+    /// consecutive failed cold-upload attempts; drives the
+    /// exponential backoff schedule and the quarantine threshold.
+    pub cold_attempts: i64,
+    /// Wall-clock of the most recent cold-upload attempt (RFC3339 in
+    /// the DB), or `None` if never attempted.
+    pub cold_last_attempt_at: Option<DateTime<Utc>>,
+    /// Earliest time the clip is eligible for another cold-upload
+    /// attempt. `None` means "eligible now" (no backoff pending);
+    /// a future value gates the clip out of the pending working set
+    /// until it elapses.
+    pub cold_next_attempt_at: Option<DateTime<Utc>>,
+    /// When true the clip is permanently excluded from the cold-upload
+    /// queue — it either exceeded `MAX_COLD_ATTEMPTS` or was
+    /// pre-emptively skipped because its on-disk size exceeded the
+    /// cold-upload ceiling (corrupt byte-explosion guard).
+    pub cold_quarantined: bool,
+    /// Last cold-upload error string (for the admin UI / diagnostics),
+    /// or `None` if never failed.
+    pub cold_last_error: Option<String>,
 }
 
 /// Args for [`Store::mark_cold_replicated`]. All three fields are
@@ -847,7 +867,15 @@ impl Store {
     /// clause an O(log n) scan over just the pending subset; the
     /// `ORDER BY` is satisfied by an in-memory sort over that small
     /// result set (at `LIMIT 32` per tick, trivially fast).
+    ///
+    /// Migration 0023 added the backoff/quarantine gate: a clip that
+    /// keeps failing is delayed by `cold_next_attempt_at` (skipped
+    /// until that time elapses) and a clip that exceeds the attempt
+    /// ceiling or the size ceiling is `cold_quarantined` (skipped
+    /// forever). Both keep one pathological clip from head-of-line-
+    /// blocking the rest of the queue.
     pub async fn clips_pending_cold_upload(&self, limit: i64) -> Result<Vec<ClipRow>, StoreError> {
+        let now = Utc::now().to_rfc3339();
         let rows = sqlx::query(&format!(
             "{CLIP_SELECT_COLUMNS_BASE}
               WHERE cold_handle IS NULL
@@ -855,9 +883,12 @@ impl Store {
                 AND sha256 IS NOT NULL
                 AND hot_handle IS NOT NULL
                 AND hot_path IS NOT NULL
+                AND cold_quarantined = 0
+                AND (cold_next_attempt_at IS NULL OR cold_next_attempt_at <= ?)
               ORDER BY priority DESC, ended_at ASC
               LIMIT ?"
         ))
+        .bind(now)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -883,6 +914,7 @@ impl Store {
                 AND sha256 IS NOT NULL
                 AND hot_handle IS NOT NULL
                 AND hot_path IS NOT NULL
+                AND cold_quarantined = 0
               ORDER BY priority DESC, ended_at ASC",
         )
         .fetch_all(&self.pool)
@@ -932,6 +964,7 @@ impl Store {
                       AND sha256 IS NOT NULL
                       AND hot_handle IS NOT NULL
                       AND hot_path IS NOT NULL
+                      AND cold_quarantined = 0
                 )                                                 AS pending_count,
                 COUNT(*) FILTER (WHERE cold_handle IS NOT NULL)   AS replicated_count,
                 COUNT(*) FILTER (
@@ -975,6 +1008,79 @@ impl Store {
         .bind(&mark.cold_handle)
         .bind(&mark.cold_path)
         .bind(mark.cold_uploaded_at.to_rfc3339())
+        .bind(clip_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
+        }
+        Ok(())
+    }
+
+    /// Record a failed cold-upload attempt for backoff scheduling
+    /// (migration 0023). Increments `cold_attempts` in SQL — which is
+    /// authoritative even if the caller's `ClipRow` snapshot was
+    /// slightly stale — and stamps the error, the attempt time, the
+    /// caller-computed next-eligible time, and the quarantine flag.
+    ///
+    /// The cold replicator owns the backoff *policy* (the schedule
+    /// and the attempt ceiling) and passes the derived
+    /// `next_attempt_at` / `quarantined` values; the store just
+    /// persists them atomically so a single UPDATE never leaves the
+    /// row half-written.
+    pub async fn record_cold_upload_failure(
+        &self,
+        clip_id: ClipId,
+        now: DateTime<Utc>,
+        error: &str,
+        next_attempt_at: Option<DateTime<Utc>>,
+        quarantined: bool,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE motion_clips
+                SET cold_attempts = cold_attempts + 1,
+                    cold_last_attempt_at = ?,
+                    cold_last_error = ?,
+                    cold_next_attempt_at = ?,
+                    cold_quarantined = ?
+              WHERE id = ?",
+        )
+        .bind(now.to_rfc3339())
+        .bind(error)
+        .bind(next_attempt_at.map(|t| t.to_rfc3339()))
+        .bind(quarantined as i64)
+        .bind(clip_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
+        }
+        Ok(())
+    }
+
+    /// Pre-emptively quarantine a clip from cold upload WITHOUT an
+    /// attempt (migration 0023). Used by the replicator's size guard
+    /// when a clip's on-disk bytes exceed the cold-upload ceiling, so
+    /// a runaway (corrupt) clip is dropped from the pending queue on
+    /// first sight instead of burning the attempt budget on doomed
+    /// multi-hour PUTs that head-of-line-block every healthy clip
+    /// behind it. Leaves `cold_attempts` untouched (it was never
+    /// attempted) but stamps the reason for the admin UI.
+    pub async fn quarantine_clip(
+        &self,
+        clip_id: ClipId,
+        now: DateTime<Utc>,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE motion_clips
+                SET cold_quarantined = 1,
+                    cold_last_attempt_at = ?,
+                    cold_last_error = ?
+              WHERE id = ?",
+        )
+        .bind(now.to_rfc3339())
+        .bind(reason)
         .bind(clip_id)
         .execute(&self.pool)
         .await?;
@@ -1380,21 +1486,25 @@ impl Store {
 // Row decoders
 // ---------------------------------------------------------------------------
 
-/// The 17 ClipRow columns in stable bind-index order. Centralised so
+/// The 22 ClipRow columns in stable bind-index order. Centralised so
 /// the row decoder below can index by position instead of carrying a
 /// fragile column-name lookup. Every helper that returns
 /// `Result<ClipRow, _>` must SELECT these in this exact order.
 const CLIP_SELECT_COLUMNS_BASE: &str = "SELECT id, camera_id, started_at, ended_at, duration_ms,
             size_bytes, codec, container,
             hot_handle, hot_path, cold_handle, cold_path, cold_uploaded_at, sha256,
-            priority, frame_width, frame_height
+            priority, frame_width, frame_height,
+            cold_attempts, cold_last_attempt_at, cold_next_attempt_at,
+            cold_quarantined, cold_last_error
        FROM motion_clips";
 
 const CLIP_SELECT_COLUMNS_WHERE_ID: &str =
     "SELECT id, camera_id, started_at, ended_at, duration_ms,
             size_bytes, codec, container,
             hot_handle, hot_path, cold_handle, cold_path, cold_uploaded_at, sha256,
-            priority, frame_width, frame_height
+            priority, frame_width, frame_height,
+            cold_attempts, cold_last_attempt_at, cold_next_attempt_at,
+            cold_quarantined, cold_last_error
        FROM motion_clips WHERE id = ?";
 
 fn clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ClipRow, StoreError> {
@@ -1405,6 +1515,14 @@ fn clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ClipRow, StoreError
         .transpose()?;
     let cold_uploaded_at = row
         .try_get::<Option<String>, _>(12)?
+        .map(|s| parse_ts(&s))
+        .transpose()?;
+    let cold_last_attempt_at = row
+        .try_get::<Option<String>, _>(18)?
+        .map(|s| parse_ts(&s))
+        .transpose()?;
+    let cold_next_attempt_at = row
+        .try_get::<Option<String>, _>(19)?
         .map(|s| parse_ts(&s))
         .transpose()?;
     Ok(ClipRow {
@@ -1425,6 +1543,11 @@ fn clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ClipRow, StoreError
         priority: row.get::<i64, _>(14),
         frame_width: row.get::<i64, _>(15) as u32,
         frame_height: row.get::<i64, _>(16) as u32,
+        cold_attempts: row.get::<i64, _>(17),
+        cold_last_attempt_at,
+        cold_next_attempt_at,
+        cold_quarantined: row.get::<i64, _>(20) != 0,
+        cold_last_error: row.try_get::<Option<String>, _>(21)?,
     })
 }
 

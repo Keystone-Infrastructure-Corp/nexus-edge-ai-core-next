@@ -146,6 +146,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0022_fleet_managed_markers",
         include_str!("../migrations/0022_fleet_managed_markers.sql"),
     ),
+    (
+        "0023_motion_clips_cold_backoff",
+        include_str!("../migrations/0023_motion_clips_cold_backoff.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]
