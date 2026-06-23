@@ -7464,6 +7464,30 @@ mod tests {
         app.clone().oneshot(req).await.unwrap()
     }
 
+    /// Spin a throwaway HTTP server on an ephemeral loopback port that
+    /// serves `bytes` at `GET /img` with the given content-type.
+    /// Returns the bound address and the server task handle (kept
+    /// alive by the caller via a binding). Stands in for a real Blob
+    /// SAS endpoint in the fleet visual-prompt create-by-image tests.
+    async fn serve_image_once(
+        bytes: Vec<u8>,
+        content_type: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/img",
+            axum::routing::get(move || {
+                let bytes = bytes.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, content_type)], bytes) }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, handle)
+    }
+
     /// `rules` overlay upserts by id and is idempotent: applying the
     /// same payload twice leaves exactly one rule row.
     #[tokio::test]
@@ -7593,8 +7617,9 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// `visual_prompts` referencing a name not present on this core is
-    /// a 400 (attach-only v1 — encode is deferred).
+    /// `visual_prompts` referencing a name not present on this core
+    /// AND carrying no `image_url` is a 400 (legacy attach-by-name
+    /// miss — there's nothing to download or create from).
     #[tokio::test]
     async fn fleet_apply_visual_prompts_unknown_name_is_400() {
         const SECRET: &[u8] = b"fleet-vp-unknown-secret";
@@ -7602,6 +7627,74 @@ mod tests {
         let body = serde_json::json!([{ "name": "not-uploaded-yet" }]);
         let res = fleet_apply(&app, SECRET, "visual_prompts", body).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `visual_prompts` create-by-image rejects a body whose bytes
+    /// don't hash to the advertised `sha256` — the content-address
+    /// integrity check fires before the encoder is ever touched, so
+    /// this is a 400 even on a no-`ort` build.
+    #[tokio::test]
+    async fn fleet_apply_visual_prompts_image_sha_mismatch_is_400() {
+        const SECRET: &[u8] = b"fleet-vp-sha-mismatch-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let (addr, _server) = serve_image_once(b"tampered-bytes".to_vec(), "image/png").await;
+        let body = serde_json::json!([{
+            "name": "blue-pallet",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "ext": "png",
+            "image_url": format!("http://{addr}/img"),
+        }]);
+        let res = fleet_apply(&app, SECRET, "visual_prompts", body).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        // Verify gate runs before create — nothing persisted.
+        assert!(store.list_visual_prompts().await.unwrap().is_empty());
+    }
+
+    /// `visual_prompts` create-by-image whose bytes DO hash to
+    /// `sha256` clears the integrity gate and reaches the encoder. The
+    /// unit harness builds `ApiState` with `encoder_model_path =
+    /// None`, so the create path surfaces a 503
+    /// (`encoder_not_configured`) rather than silently succeeding —
+    /// proving the download → verify → create wiring runs end-to-end.
+    #[tokio::test]
+    async fn fleet_apply_visual_prompts_image_verified_reaches_encoder() {
+        const SECRET: &[u8] = b"fleet-vp-verified-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let image = b"reference-image-bytes".to_vec();
+        let sha = crate::fleet_apply::sha256_hex(&image);
+        let (addr, _server) = serve_image_once(image, "image/png").await;
+        let body = serde_json::json!([{
+            "name": "blue-pallet",
+            "sha256": sha,
+            "ext": "png",
+            "image_url": format!("http://{addr}/img"),
+        }]);
+        let res = fleet_apply(&app, SECRET, "visual_prompts", body).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(store.list_visual_prompts().await.unwrap().is_empty());
+    }
+
+    /// `visual_prompts` create-by-image with an `image_url` whose host
+    /// refuses the connection surfaces a 502 (bad gateway), keeping
+    /// the cloud's per-target failure accounting honest.
+    #[tokio::test]
+    async fn fleet_apply_visual_prompts_image_fetch_failure_is_502() {
+        const SECRET: &[u8] = b"fleet-vp-fetch-fail-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        // Bind + immediately drop a listener to get a port nothing is
+        // listening on, so the GET is refused rather than hanging.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let body = serde_json::json!([{
+            "name": "blue-pallet",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "ext": "png",
+            "image_url": format!("http://{dead_addr}/img"),
+        }]);
+        let res = fleet_apply(&app, SECRET, "visual_prompts", body).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        assert!(store.list_visual_prompts().await.unwrap().is_empty());
     }
 
     /// An unknown category segment is a 404.

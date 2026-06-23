@@ -150,6 +150,104 @@ struct UploadFields {
     image_content_type: Option<String>,
 }
 
+/// Shared create path for visual prompts: decode → hash → persist the
+/// original pixels to disk → encode the embedding → insert the row.
+///
+/// Used by the multipart upload handler ([`post_visual_prompt`]) and
+/// the fleet-config create-by-image path
+/// ([`crate::fleet_apply::apply_visual_prompts`]) so both flows agree
+/// on filename derivation, the encoder gate, and the on-disk layout.
+///
+/// Returns the new prompt's id. The caller owns any audit logging and
+/// re-reading the persisted row if it needs the full projection.
+/// `503` when no encoder pack is configured, `400` on undecodable
+/// bytes.
+pub(crate) async fn create_visual_prompt_from_image(
+    s: &ApiState,
+    name: &str,
+    description: Option<&str>,
+    image_bytes: &[u8],
+    content_type: Option<&str>,
+) -> Result<VisualPromptId, ApiError> {
+    let extension = guess_extension(content_type, image_bytes);
+
+    let admin = &s.visual_prompts;
+    // Encoder ONNX path is required for the create path; the
+    // listing / detach paths still work without an encoder.
+    let encoder_model_path = match admin.encoder_model_path.as_ref() {
+        Some(p) => p.clone(),
+        None => {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "encoder_not_configured: set inference.model.pack_path".to_string(),
+            ))
+        }
+    };
+
+    // Decode the image first — both to fail-fast on garbage bytes
+    // AND to get the (width, height, RGB bytes) the encoder needs.
+    let (rgb_bytes, src_w, src_h) = match decode_to_rgb(image_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("image decode: {e}"),
+            ))
+        }
+    };
+
+    // SHA256 of the original bytes — keys the on-disk filename so
+    // re-supplying the same crop reuses the same file (and the
+    // store's UNIQUE constraint surfaces "name taken" only when the
+    // caller actually picked a different name with the same image).
+    let mut hasher = Sha256::new();
+    hasher.update(image_bytes);
+    let sha = hex_digest(&hasher.finalize());
+
+    // Write to disk before computing the embedding — the file is
+    // the source of truth for the original pixels (used on encoder
+    // upgrades to re-embed without asking the operator to re-supply).
+    tokio::fs::create_dir_all(&admin.visual_prompts_dir)
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "create_dir_all({}): {e}",
+                    admin.visual_prompts_dir.display()
+                ),
+            )
+        })?;
+    let image_filename = format!("{sha}.{extension}");
+    let on_disk_path = admin.visual_prompts_dir.join(&image_filename);
+    tokio::fs::write(&on_disk_path, image_bytes)
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write {}: {e}", on_disk_path.display()),
+            )
+        })?;
+
+    // Compute the embedding. Encoder lazy-init on first call.
+    let embedding = encode_image(admin, &encoder_model_path, rgb_bytes, src_w, src_h).await?;
+
+    // Persist. The store layer validates `embedding.len() ==
+    // embedding_dim` and rejects an empty embedding.
+    let new = NewVisualPrompt {
+        name,
+        description,
+        image_path: image_filename.as_str(),
+        image_sha256: sha.as_str(),
+        embedding: embedding.as_slice(),
+        encoder_model_id: admin.encoder_model_id.as_str(),
+    };
+    s.store
+        .create_visual_prompt(&new)
+        .await
+        .map_err(visual_prompt_error_to_api)
+}
+
 pub async fn post_visual_prompt(
     State(s): State<ApiState>,
     headers: HeaderMap,
@@ -217,83 +315,14 @@ pub async fn post_visual_prompt(
             ))
         }
     };
-    let extension = guess_extension(fields.image_content_type.as_deref(), &image_bytes);
-
-    let admin = &s.visual_prompts;
-    // Encoder ONNX path is required for the upload path; the
-    // listing / detach paths still work without an encoder.
-    let encoder_model_path = match admin.encoder_model_path.as_ref() {
-        Some(p) => p.clone(),
-        None => {
-            return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "encoder_not_configured: set inference.model.pack_path".to_string(),
-            ))
-        }
-    };
-
-    // Decode the image first — both to fail-fast on garbage uploads
-    // AND to get the (width, height, RGB bytes) the encoder needs.
-    let (rgb_bytes, src_w, src_h) = match decode_to_rgb(&image_bytes) {
-        Ok(t) => t,
-        Err(e) => {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                format!("image decode: {e}"),
-            ))
-        }
-    };
-
-    // SHA256 of the original bytes — keys the on-disk filename so
-    // re-uploading the same crop replaces the same file (and the
-    // store's UNIQUE constraint surfaces "name taken" only when the
-    // operator actually picked a different name with the same image).
-    let mut hasher = Sha256::new();
-    hasher.update(&image_bytes);
-    let sha = hex_digest(&hasher.finalize());
-
-    // Write to disk before computing the embedding — the file is
-    // the source of truth for the original pixels (used on encoder
-    // upgrades to re-embed without asking the operator to re-upload).
-    tokio::fs::create_dir_all(&admin.visual_prompts_dir)
-        .await
-        .map_err(|e| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "create_dir_all({}): {e}",
-                    admin.visual_prompts_dir.display()
-                ),
-            )
-        })?;
-    let image_filename = format!("{sha}.{extension}");
-    let on_disk_path = admin.visual_prompts_dir.join(&image_filename);
-    tokio::fs::write(&on_disk_path, &image_bytes)
-        .await
-        .map_err(|e| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("write {}: {e}", on_disk_path.display()),
-            )
-        })?;
-
-    // Compute the embedding. Encoder lazy-init on first POST.
-    let embedding = encode_image(admin, &encoder_model_path, rgb_bytes, src_w, src_h).await?;
-
-    // Persist. The store layer validates `embedding.len() ==
-    // embedding_dim` and rejects an empty embedding.
-    let new = NewVisualPrompt {
-        name: name.as_str(),
-        description: fields.description.as_deref(),
-        image_path: image_filename.as_str(),
-        image_sha256: sha.as_str(),
-        embedding: embedding.as_slice(),
-        encoder_model_id: admin.encoder_model_id.as_str(),
-    };
-    let id = match s.store.create_visual_prompt(&new).await {
-        Ok(id) => id,
-        Err(e) => return Err(visual_prompt_error_to_api(e)),
-    };
+    let id = create_visual_prompt_from_image(
+        &s,
+        &name,
+        fields.description.as_deref(),
+        &image_bytes,
+        fields.image_content_type.as_deref(),
+    )
+    .await?;
     let stored = s
         .store
         .get_visual_prompt(id)
