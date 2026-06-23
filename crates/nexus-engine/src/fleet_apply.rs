@@ -42,13 +42,19 @@
 //!   cloud-camera-UUID mapping — so `scope.id` cannot select a single
 //!   camera. The cloud already dispatches at core granularity
 //!   (Phase 7.5.3); `scope` is recorded for audit / tracing only.
-//! * **`visual_prompts` is attach/detach by known name in v1.** The
-//!   reconcile attaches prompts that already exist locally (matched by
-//!   `name`) and detaches any currently-attached prompt the fleet no
-//!   longer lists. Downloading the reference image over a Blob SAS URL
-//!   and encoding the embedding (which needs the `ort` feature + an ONNX
-//!   encoder) is deferred to a follow-up step; an unknown prompt name
-//!   yields a `400` so the cloud records that target as failed.
+//! * **`visual_prompts` attaches by name, and creates from a pushed
+//!   reference image.** The reconcile attaches prompts that already
+//!   exist locally (matched by `name`) and detaches any
+//!   currently-attached prompt the fleet no longer lists. When a name
+//!   is *not* present locally but the entry carries an `image_url`
+//!   (a signed read SAS minted by the cloud, Phase 7.5.9), the edge
+//!   downloads the reference image over HTTPS with `reqwest`, verifies
+//!   its SHA-256 against the entry's `sha256` (content-address
+//!   integrity), encodes the embedding (needs the `ort` feature + an
+//!   ONNX encoder) and creates the prompt locally before attaching it.
+//!   An unknown name *without* an `image_url` still yields a `400` so
+//!   the cloud records that target as failed. Media never crosses the
+//!   gateway — only the signed SAS URL does (AGENTS.md §7).
 
 use std::net::SocketAddr;
 
@@ -61,6 +67,7 @@ use nexus_store::audit::AuditOutcome;
 use nexus_types::{RuleId, VisualPromptId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::api::{ApiError, ApiState};
 use crate::auth::require_role::SessionContext;
@@ -93,12 +100,26 @@ pub struct FleetApplyResponse {
     pub targets: usize,
 }
 
-/// A single `visual_prompts` entry. Only `name` is consumed on the
-/// edge; the cloud carries additional fields (`sha256`, `image_url`)
-/// that the deferred encode path will use.
+/// A single `visual_prompts` entry. `name` is always consumed; the
+/// remaining fields drive the create-by-image path (Phase 7.5.9):
+/// when `name` is unknown locally, the edge fetches `image_url`,
+/// verifies the bytes hash to `sha256`, and encodes a new prompt.
+/// Unknown serde fields (e.g. the cloud's `ext`) are ignored.
 #[derive(Debug, Deserialize)]
 struct FleetVisualPromptEntry {
     name: String,
+    /// Lowercase hex SHA-256 of the reference image's original bytes.
+    /// Present when the cloud has an uploaded image for this prompt.
+    #[serde(default)]
+    sha256: Option<String>,
+    /// Signed read SAS URL for the reference image. Present alongside
+    /// `sha256` when the cloud has an uploaded image.
+    #[serde(default)]
+    image_url: Option<String>,
+    /// Optional operator-supplied description carried through to the
+    /// created prompt.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// `POST /v1/admin/fleet/{category}` — apply a cloud-resolved fleet
@@ -327,13 +348,17 @@ async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usiz
     Ok(1)
 }
 
-/// `visual_prompts` — attach/detach reconcile. `effective` is a JSON
-/// array of `{name, …}` entries. Each name must already exist
-/// locally (uploaded + encoded via `POST /v1/admin/visual-prompts`);
-/// an unknown name is a `400` so the cloud records the target as
-/// failed. REPLACE semantics: on every local camera the listed
-/// prompts are attached and any currently-attached prompt the fleet
-/// no longer lists is detached. A repeated identical apply is a no-op.
+/// `visual_prompts` — attach/detach reconcile with create-by-image.
+/// `effective` is a JSON array of `{name, sha256?, image_url?, …}`
+/// entries. A name that already exists locally is attached. A name
+/// that is *not* present locally but carries an `image_url` is
+/// downloaded (the bytes verified against `sha256`), encoded, and
+/// created before attaching; an unknown name *without* an `image_url`
+/// is a `400` so the cloud records the target as failed. REPLACE
+/// semantics: on every local camera the resolved prompts are attached
+/// and any currently-attached prompt the fleet no longer lists is
+/// detached. A repeated identical apply is a no-op (the create path
+/// is skipped because the name now resolves locally).
 async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
     let entries: Vec<FleetVisualPromptEntry> =
         serde_json::from_value(effective.clone()).map_err(|e| {
@@ -347,6 +372,12 @@ async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, 
     for entry in &entries {
         match s.store.get_visual_prompt_by_name(&entry.name).await {
             Ok(Some(summary)) => ids.push(summary.id),
+            // Unknown locally. If the fleet payload carries a reference
+            // image, download + verify + encode + create it; otherwise
+            // it's a legacy attach-by-name miss → 400.
+            Ok(None) if entry.image_url.is_some() => {
+                ids.push(fetch_and_create_visual_prompt(s, entry).await?);
+            }
             Ok(None) => unknown.push(entry.name.clone()),
             Err(e) => return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         }
@@ -396,4 +427,119 @@ async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, 
             .await;
     }
     Ok(ids.len())
+}
+
+/// Upper bound on a fleet-pushed reference image. Mirrors the cloud
+/// api-gateway's upload cap so a tampered or oversized SAS target
+/// can't make the edge buffer an unbounded body.
+const FLEET_VP_MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Lowercase hex SHA-256 of `bytes`. Local helper so the verify path
+/// doesn't depend on the admin module's private `hex_digest`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// Download a fleet-pushed reference image, verify it hashes to the
+/// advertised `sha256`, then encode + create the visual prompt
+/// locally. Returns the new prompt's id.
+///
+/// The SHA-256 check is a security boundary, not a nicety: the blob
+/// lives at a content-addressed path the cloud minted, so a body that
+/// doesn't hash to `sha256` means corruption or tampering and is
+/// rejected *before* the bytes ever reach the image decoder.
+async fn fetch_and_create_visual_prompt(
+    s: &ApiState,
+    entry: &FleetVisualPromptEntry,
+) -> Result<VisualPromptId, ApiError> {
+    let url = entry.image_url.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "visual prompt {:?}: image_url required to create by image",
+                entry.name
+            ),
+        )
+    })?;
+    let expected_sha = entry.sha256.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("visual prompt {:?}: image_url without sha256", entry.name),
+        )
+    })?;
+
+    let resp = reqwest::Client::new().get(url).send().await.map_err(|e| {
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            format!("visual prompt {:?} image fetch: {e}", entry.name),
+        )
+    })?;
+    if !resp.status().is_success() {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "visual prompt {:?} image fetch: HTTP {}",
+                entry.name,
+                resp.status()
+            ),
+        ));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > FLEET_VP_MAX_IMAGE_BYTES {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "visual prompt {:?} image too large: {len} bytes > {FLEET_VP_MAX_IMAGE_BYTES} max",
+                    entry.name
+                ),
+            ));
+        }
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let bytes = resp.bytes().await.map_err(|e| {
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            format!("visual prompt {:?} image body: {e}", entry.name),
+        )
+    })?;
+    if bytes.len() as u64 > FLEET_VP_MAX_IMAGE_BYTES {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "visual prompt {:?} image too large: {} bytes > {FLEET_VP_MAX_IMAGE_BYTES} max",
+                entry.name,
+                bytes.len()
+            ),
+        ));
+    }
+
+    let actual_sha = sha256_hex(&bytes);
+    if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "visual prompt {:?} image sha256 mismatch: expected {expected_sha}, got {actual_sha}",
+                entry.name
+            ),
+        ));
+    }
+
+    crate::visual_prompts_admin::create_visual_prompt_from_image(
+        s,
+        &entry.name,
+        entry.description.as_deref(),
+        &bytes,
+        content_type.as_deref(),
+    )
+    .await
 }
