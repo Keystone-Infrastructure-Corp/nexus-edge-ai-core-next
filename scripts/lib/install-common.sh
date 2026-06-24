@@ -517,6 +517,37 @@ verify_accelerators() {
     log ""
 }
 
+# Verify GStreamer can actually instantiate the VA hardware decode
+# elements the pipeline selects (`vah264dec` / `vah265dec`, provided
+# by gstreamer1.0-plugins-bad). This is distinct from the `vainfo`
+# probe: vainfo proves the libva *driver* enumerates the GPU, while
+# this proves the GStreamer *plugin* sees that driver and the
+# `[runtime.decode] mode = "va"` / "auto" chain in preroll_ingester.rs
+# will negotiate at launch instead of silently falling back to the
+# software `avdec_*` decoder. Bonus probe — hardware decode is
+# optional and the engine fails open to software, so this logs
+# success/info without affecting the caller's return code.
+_verify_va_gst_decoder() {
+    if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
+        log "  [info] gst-inspect-1.0 not on PATH (gstreamer1.0-tools missing); skipping VA decoder probe"
+        return 0
+    fi
+    local missing=()
+    local dec
+    for dec in vah264dec vah265dec; do
+        if ! gst-inspect-1.0 "$dec" >/dev/null 2>&1; then
+            missing+=("$dec")
+        fi
+    done
+    if (( ${#missing[@]} == 0 )); then
+        log "  [ OK ] GStreamer VA decoders loadable (vah264dec, vah265dec) -- hardware decode chain available"
+    else
+        log "  [info] GStreamer VA decoders unavailable (${missing[*]}); pipeline will fall back to software decode"
+        log "         (gstreamer1.0-plugins-bad missing, or libva driver not visible to GStreamer)"
+    fi
+    return 0
+}
+
 # Verify the iGPU / Arc dGPU userspace the engine will load:
 #   1. intel-opencl-icd (NEO compute runtime) enumerates the device
 #      \u2014 this is the ground-truth probe the engine's OpenVINO GPU
@@ -589,6 +620,7 @@ _verify_intel_gpu_userspace() {
     else
         log "  [info] VA-API iHD not active (hardware decode unavailable; engine still works on software decode)"
     fi
+    _verify_va_gst_decoder
 
     return $(( ok ? 0 : 1 ))
 }
@@ -673,6 +705,7 @@ _verify_amd_gpu_userspace() {
     else
         log "  [info] VA-API Mesa Gallium not active (hardware decode unavailable; engine still works on software decode)"
     fi
+    _verify_va_gst_decoder
 
     return $(( ok ? 0 : 1 ))
 }

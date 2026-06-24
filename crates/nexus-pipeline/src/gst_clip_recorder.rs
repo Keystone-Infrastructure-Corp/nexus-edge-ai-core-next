@@ -165,6 +165,12 @@ pub struct GstClipRecorder {
     /// [`crate::recorder::PreferredUsbLabel`] for the rationale.
     usb_resolver: Option<Arc<dyn crate::recorder::UsbResolver>>,
     preferred_usb_label: crate::recorder::PreferredUsbLabel,
+    /// Hardware-decode strategy applied to every per-camera RGB tap
+    /// this recorder builds (`add_camera_ingester` /
+    /// `resize_camera_rgb_tap`). Defaults to [`DecodeMode::Auto`];
+    /// the engine overrides it from `[runtime.decode] mode` via
+    /// [`Self::with_decode_mode`].
+    decode_mode: crate::decode::DecodeMode,
 }
 
 struct OpenState {
@@ -217,6 +223,7 @@ impl GstClipRecorder {
             bus: None,
             usb_resolver: None,
             preferred_usb_label: crate::recorder::PreferredUsbLabel::default(),
+            decode_mode: crate::decode::DecodeMode::default(),
         })
     }
 
@@ -244,6 +251,15 @@ impl GstClipRecorder {
     ) -> Self {
         self.usb_resolver = Some(resolver);
         self.preferred_usb_label = preferred_label.into();
+        self
+    }
+
+    /// Set the hardware-decode strategy for every per-camera RGB tap
+    /// this recorder builds. Builder pattern so existing callsites
+    /// that don't pass a mode keep the [`DecodeMode::Auto`] default.
+    /// The engine wires this from `[runtime.decode] mode`.
+    pub fn with_decode_mode(mut self, mode: crate::decode::DecodeMode) -> Self {
+        self.decode_mode = mode;
         self
     }
 
@@ -860,6 +876,7 @@ impl ClipRecorder for GstClipRecorder {
             url.to_string(),
             pre_roll_secs,
             codec,
+            self.decode_mode,
             max_fps,
             rgb_w,
             rgb_h,
@@ -970,6 +987,7 @@ impl ClipRecorder for GstClipRecorder {
             url.clone(),
             pre_roll_secs,
             codec,
+            self.decode_mode,
             max_fps,
             new_rgb_w,
             new_rgb_h,

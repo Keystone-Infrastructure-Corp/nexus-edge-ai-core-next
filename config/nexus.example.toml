@@ -28,6 +28,24 @@ blocking_threads = 8
 # the same disk (uploads are small but admin-only writes).
 # visual_prompts_dir = "/var/lib/nexus/visual_prompts"
 
+[runtime.decode]
+# Selects the RTSP decode + post-process backend for the analysis
+# (detector) frame tap. Hardware decode offloads H.264/H.265 from
+# the CPU onto the GPU video block, which is the difference between
+# a CPU-bound and a comfortable box on multi-camera installs.
+#   "auto"     — (default) use VA-API hardware decode
+#                (vah264dec/vah265dec ! vapostproc) when the GPU +
+#                GStreamer VA plugin are present, otherwise fall back
+#                to software (avdec_h264/avdec_h265). Always safe.
+#   "va"       — force VA-API; still fails open to software if the
+#                VA plugin/driver is missing (logged as a warning).
+#   "msdk"     — force Intel Media SDK (msdkh264dec ! msdkvpp); falls
+#                back to VA then software. Only for boxes where MSDK
+#                outperforms the libva path.
+#   "software" — force CPU decode. Use to rule out a flaky GPU driver.
+# Omit this whole section to get "auto" (zero-migration upgrade).
+mode = "auto"
+
 [runtime.clips]
 # Which recorder backend writes the mp4 files.
 #   "gstreamer" — real H.264-passthrough fragmented mp4 via the shared

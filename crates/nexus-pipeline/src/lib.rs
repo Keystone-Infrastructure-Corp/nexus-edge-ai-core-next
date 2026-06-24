@@ -15,6 +15,7 @@
 
 pub mod cache;
 pub mod crowd_hysteresis;
+pub mod decode;
 pub mod entity_sighting;
 pub mod gate;
 pub mod post_roll;
@@ -39,6 +40,7 @@ pub mod preroll_ingester;
 pub mod thumbnail;
 
 pub use cache::{LatestEntry, LatestFrameCache};
+pub use decode::{select_decode_chain, DecodeBackend, DecodeChain, DecodeMode, FactoryProbe};
 pub use entity_sighting::{
     EntityLocalPersist, EntityLocalSeed, EntityLocalUpdate, NoopEntityLocalPersist,
     NoopSightingHook, SightingHook, SightingScheduler, SightingSnapshot,
@@ -57,6 +59,9 @@ pub use supervisor::{spawn_camera, CameraHandle};
 
 #[cfg(feature = "gstreamer")]
 pub use gst_clip_recorder::GstClipRecorder;
+
+#[cfg(feature = "gstreamer")]
+pub use decode::GstFactoryProbe;
 
 #[cfg(feature = "gstreamer")]
 pub use preroll_ingester::PreRollIngester;

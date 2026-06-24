@@ -78,6 +78,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::decode::{select_decode_chain, DecodeMode, GstFactoryProbe};
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
 
@@ -147,12 +148,13 @@ pub struct PreRollIngester {
     camera_id: CameraId,
     url: String,
     /// Wire codec carried by the upstream RTSP feed. Selects
-    /// `rtph264depay`/`h264parse`/`avdec_h264` vs the H.265
-    /// equivalents in the generated pipeline string. The vendor
-    /// `_plus` variants (Hikvision H.264+/H.265+, Dahua Smart
-    /// Codec) collapse to their base via [`CodecKind::base`] —
-    /// GStreamer's stock parsers handle the SVC bitstream as
-    /// plain H.264/H.265.
+    /// `rtph264depay`/`h264parse` vs the H.265 equivalents in the
+    /// generated pipeline string; the decoder element for the RGB
+    /// tap branch is chosen separately by [`select_decode_chain`]
+    /// (VA hwaccel vs software). The vendor `_plus` variants
+    /// (Hikvision H.264+/H.265+, Dahua Smart Codec) collapse to
+    /// their base via [`CodecKind::base`] — GStreamer's stock
+    /// parsers handle the SVC bitstream as plain H.264/H.265.
     codec: CodecKind,
     /// Pre-roll window the ring buffer was sized for. Stored on the
     /// struct so the recorder can read it back when it needs to
@@ -200,15 +202,24 @@ impl PreRollIngester {
         pre_roll_secs: u32,
         codec: CodecKind,
     ) -> Result<Arc<Self>, IngesterError> {
-        Self::build(camera_id, url, pre_roll_secs, codec, None)
+        Self::build(
+            camera_id,
+            url,
+            pre_roll_secs,
+            codec,
+            DecodeMode::default(),
+            None,
+        )
     }
 
     /// Variant of [`Self::new`] that also exposes a decoded RGB
     /// frame stream off the same RTSP session, sized to
     /// `rgb_w × rgb_h` at `max_fps` (0 ⇒ 15). Pipeline grows a
     /// `tee` after `h264parse` plus a second branch
-    /// `queue → avdec_h264 → videoconvert → videoscale → videorate
-    /// → appsink RGB`; the detector consumes frames via
+    /// `queue → <decode chain> → appsink RGB`, where the decode
+    /// chain is [`select_decode_chain`]'s pick (VA hwaccel when a
+    /// capable GPU is present, software `avdec_*` otherwise); the
+    /// detector consumes frames via
     /// [`Self::subscribe_frames`] without opening a second
     /// connection to the camera. Use this constructor whenever the
     /// recorder is `gstreamer` so single-session cameras (e.g.
@@ -225,6 +236,7 @@ impl PreRollIngester {
         url: impl Into<String>,
         pre_roll_secs: u32,
         codec: CodecKind,
+        decode_mode: DecodeMode,
         max_fps: u32,
         rgb_w: u32,
         rgb_h: u32,
@@ -234,6 +246,7 @@ impl PreRollIngester {
             url,
             pre_roll_secs,
             codec,
+            decode_mode,
             Some((max_fps, rgb_w, rgb_h)),
         )
     }
@@ -243,6 +256,7 @@ impl PreRollIngester {
         url: impl Into<String>,
         pre_roll_secs: u32,
         codec: CodecKind,
+        decode_mode: DecodeMode,
         rgb_params: Option<(u32, u32, u32)>,
     ) -> Result<Arc<Self>, IngesterError> {
         gst_init::ensure().map_err(|e| IngesterError::GstInit(e.to_string()))?;
@@ -276,6 +290,7 @@ impl PreRollIngester {
                 camera_id,
                 task_url,
                 codec,
+                decode_mode,
                 task_ring,
                 task_tx,
                 task_frame_tap,
@@ -416,6 +431,7 @@ async fn run_supervisor(
     camera_id: CameraId,
     url: String,
     codec: CodecKind,
+    decode_mode: DecodeMode,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
     frame_tap: Option<(broadcast::Sender<Frame>, u32, u32, u32)>,
@@ -438,6 +454,7 @@ async fn run_supervisor(
             camera_id,
             &url,
             codec,
+            decode_mode,
             ring.clone(),
             live_tx.clone(),
             frame_tap.clone(),
@@ -471,6 +488,7 @@ async fn run_session(
     camera_id: CameraId,
     url: &str,
     codec: CodecKind,
+    decode_mode: DecodeMode,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
     frame_tap: Option<(broadcast::Sender<Frame>, u32, u32, u32)>,
@@ -478,14 +496,15 @@ async fn run_session(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), IngesterError> {
     let url_safe = url.replace('"', "");
-    // Codec-specific element names: rtp{depay}, {parse}, video/x-{base},
-    // and the {decoder} used by the optional RGB tap branch. The base
-    // collapse (`_plus` -> base) is intentional \u2014 Hikvision H.264+ /
-    // Dahua Smart Codec are SVC-tagged but the bitstream still parses
-    // through the stock H.264/H.265 elements.
-    let (rtp_depay, parse, base_caps, decoder) = match codec.base() {
-        "h265" => ("rtph265depay", "h265parse", "video/x-h265", "avdec_h265"),
-        _ => ("rtph264depay", "h264parse", "video/x-h264", "avdec_h264"),
+    // Codec-specific element names: rtp{depay}, {parse}, video/x-{base}.
+    // The decode chain for the optional RGB tap branch is chosen
+    // separately by `select_decode_chain` (VA hwaccel vs software).
+    // The base collapse (`_plus` -> base) is intentional — Hikvision
+    // H.264+ / Dahua Smart Codec are SVC-tagged but the bitstream
+    // still parses through the stock H.264/H.265 elements.
+    let (rtp_depay, parse, base_caps) = match codec.base() {
+        "h265" => ("rtph265depay", "h265parse", "video/x-h265"),
+        _ => ("rtph264depay", "h264parse", "video/x-h264"),
     };
     // protocols=tcp (NOT tcp+udp) so rtspsrc never falls back to UDP.
     // UDP packet loss on a contended link (WiFi / busy switch / bursty
@@ -529,6 +548,29 @@ async fn run_session(
             // launch fails. Mirror RtspSource::run_session's
             // 15-fps fallback (source.rs).
             let fr = if *max_fps == 0 { 15 } else { *max_fps };
+            // Pick the decode + post-process chain: VA hwaccel
+            // (`vah26Xdec ! vapostproc`) when a capable GPU is
+            // present, software `avdec_*` otherwise. Fail-open — a
+            // missing VA plugin downgrades to software rather than
+            // failing the launch (caller's runtime fail-open is the
+            // last net). The chain already ends with
+            // `videoconvert ! videoscale ! videorate` so the RGB
+            // caps below always negotiate regardless of vapostproc's
+            // native output format.
+            let chain = select_decode_chain(codec.base(), decode_mode, &GstFactoryProbe);
+            if chain.downgraded_from(decode_mode) {
+                warn!(
+                    camera_id,
+                    requested = ?decode_mode,
+                    "decode: requested hardware backend unavailable, falling back to software"
+                );
+            }
+            info!(
+                camera_id,
+                decode_backend = %chain.label,
+                hwaccel = chain.hwaccel,
+                "preroll RGB tap decode backend selected"
+            );
             format!(
                 "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
              ! {rtp_depay} \
@@ -539,10 +581,10 @@ async fn run_session(
                 ! appsink name=tap emit-signals=true sync=false \
                     max-buffers=200 drop=false \
              t. ! queue leaky=downstream max-size-buffers=8 max-size-bytes=0 max-size-time=0 \
-                ! {decoder} \
-                ! videoconvert ! videoscale ! videorate \
+                ! {decode_chain} \
                 ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
                 ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4",
+                decode_chain = chain.elements,
                 w = rgb_w,
                 h = rgb_h,
                 fr = fr,

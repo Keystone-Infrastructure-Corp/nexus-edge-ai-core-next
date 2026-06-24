@@ -646,6 +646,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         &cameras,
         cfg.inference.model.input_width,
         cfg.runtime.clips.pre_roll_secs,
+        cfg.runtime.decode.mode,
         bus.clone(),
         usb_resolver.clone(),
         preferred_usb_label.clone(),
@@ -1939,6 +1940,7 @@ async fn build_recorder(
     cameras: &[CameraConfig],
     default_detector_width: u32,
     pre_roll_secs: u32,
+    decode_mode: nexus_config::DecodeMode,
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
@@ -1956,6 +1958,7 @@ async fn build_recorder(
                 cameras,
                 default_detector_width,
                 pre_roll_secs,
+                decode_mode,
                 bus,
                 usb_resolver,
                 preferred_usb_label,
@@ -1973,6 +1976,7 @@ async fn build_gst_recorder(
     cameras: &[CameraConfig],
     default_detector_width: u32,
     pre_roll_secs: u32,
+    decode_mode: nexus_config::DecodeMode,
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
@@ -2042,6 +2046,7 @@ async fn build_gst_recorder(
             cam.ingest.url.to_string(),
             pre_roll_secs,
             codec,
+            decode_mode,
             cam.ingest.max_fps,
             rgb_w,
             rgb_h,
@@ -2069,7 +2074,8 @@ async fn build_gst_recorder(
     let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, ingesters)
         .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?
         .with_bus(bus)
-        .with_usb(usb_resolver, preferred_usb_label);
+        .with_usb(usb_resolver, preferred_usb_label)
+        .with_decode_mode(decode_mode);
     Ok(Arc::new(rec))
 }
 
@@ -2081,6 +2087,7 @@ async fn build_gst_recorder(
     _cameras: &[CameraConfig],
     _default_detector_width: u32,
     _pre_roll_secs: u32,
+    _decode_mode: nexus_config::DecodeMode,
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
