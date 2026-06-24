@@ -20,16 +20,16 @@ recognises. The `--force-profile <name>` install flag pins inference to
 one of these explicitly (it still scales the CPU/RAM-derived knobs to the
 actual box); without it, `nexus-probe` auto-selects by detected hardware.
 
-| Profile (`--force-profile`) | Representative box                                 | Inference accelerator          | EP order (`ep_priority`)     | Decode block            | Preset | Cams (1080p @ 15 fps) |
-| --------------------------- | -------------------------------------------------- | ------------------------------ | ---------------------------- | ----------------------- | ------ | --------------------- |
-| `intel-igpu`                | Beelink Mini S13 (N150) · GMKtec M3 (Iris Xe)      | Intel iGPU (OpenVINO)          | `gpu, cpu`                   | Intel iGPU MFX (VA)     | 640    | 1–6                   |
-| `intel-igpu`                | Lenovo P3 Tiny / HP Z2 Mini + Arc A380             | Intel Arc dGPU (OpenVINO)      | `gpu, cpu`                   | Arc MFX (VA)            | 960    | 8–12                  |
-| `intel-npu`                 | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)   | Intel NPU 4 (OpenVINO NPU)     | `npu, cpu`                   | Arc 140V Xe2 (VA)       | 640    | 6–8                   |
-| `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8 M.2        | Hailo-8 (26 TOPS)              | `hailo, cpu`                 | host AMD Radeon (VA)    | 640    | up to ~24             |
-| `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS), Radeon 680M/780M    | AMD iGPU (ORT Vulkan/WebGPU)   | `vulkan, cpu`                | AMD VCN (radeonsi VA)   | 640    | 4–6                   |
-| `amd-rocm`                  | discrete RDNA/CDNA GPU on the ROCm allowlist       | AMD dGPU (ORT ROCm)            | `rocm, cpu`                  | AMD VCN (radeonsi VA)   | 960    | hardware-dependent    |
-| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + RTX 4060              | NVIDIA (CUDA/TensorRT — M5)    | `cpu` **today**              | NVDEC (M5)              | 640    | CPU-only until M5     |
-| `cpu`                       | any host with no usable accelerator                | CPU                            | `cpu`                        | software                | 640    | 1–2                   |
+| Profile (`--force-profile`) | Representative box                                 | Inference accelerator          | EP order (`ep_priority`)     | Decode block            | Preset |
+| --------------------------- | -------------------------------------------------- | ------------------------------ | ---------------------------- | ----------------------- | ------ |
+| `intel-igpu`                | Beelink Mini S13 (N150) · GMKtec M3 (Iris Xe)      | Intel iGPU (OpenVINO)          | `gpu, cpu`                   | Intel iGPU MFX (VA)     | 640    |
+| `intel-igpu`                | Lenovo P3 Tiny / HP Z2 Mini + Arc A380             | Intel Arc dGPU (OpenVINO)      | `gpu, cpu`                   | Arc MFX (VA)            | 960    |
+| `intel-npu`                 | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)   | Intel NPU 4 (OpenVINO NPU)     | `npu, cpu`                   | Arc 140V Xe2 (VA)       | 640    |
+| `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8 M.2        | Hailo-8 (26 TOPS)              | `hailo, cpu`                 | host AMD Radeon (VA)    | 640    |
+| `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS), Radeon 680M/780M    | AMD iGPU (ORT Vulkan/WebGPU)   | `vulkan, cpu`                | AMD VCN (radeonsi VA)   | 640    |
+| `amd-rocm`                  | discrete RDNA/CDNA GPU on the ROCm allowlist       | AMD dGPU (ORT ROCm)            | `rocm, cpu`                  | AMD VCN (radeonsi VA)   | 960    |
+| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + RTX 4060              | NVIDIA (CUDA/TensorRT — M5)    | `cpu` **today**              | NVDEC (M5)              | 640    |
+| `cpu`                       | any host with no usable accelerator                | CPU                            | `cpu`                        | software                | 640    |
 
 Notes on the matrix:
 
@@ -45,9 +45,10 @@ Notes on the matrix:
 - **AMD ROCm vs Vulkan** is decided from the PCI device ID against a
   default-deny allowlist (CDNA MI100/200/300, RDNA2 RX6000, RDNA3 RX7000).
   Phoenix/Rembrandt iGPUs (gfx1035/1103) are **not** on the allowlist and
-  resolve to `amd-vulkan`, never ROCm. The same allowlist is enforced in
-  both `nexus-probe` and the bash installer until the single-detector
-  cutover unifies them.
+  resolve to `amd-vulkan`, never ROCm. The allowlist lives solely in
+  `nexus-probe`; the bash installer queries it via `nexus-probe
+  accel-tags` (the duplicate bash array was removed in the
+  single-detector cutover).
 
 ## Camera baseline (every profile)
 
@@ -56,9 +57,15 @@ Notes on the matrix:
 - One `nexus-engine` process per host. Internal fan-out via
   `[inference].workers`; **do not** stack engines on one box.
 
-If your cameras don't fit this profile (4K, sub-stream only, sub-1 fps,
-JPEG snapshot mode) document it in the per-camera config and don't
-multiply the soak ceiling by anything optimistic.
+**Camera capacity is not a fixed per-profile number** and the matrix
+above deliberately omits one. Sustained stream count depends on
+resolution, codec, frame rate, motion duty-cycle, model preset, and how
+many streams are concurrently active — size it empirically per box
+rather than reading a count off a table. As a real-world anchor, an
+`intel-npu` Lunar Lake box comfortably sustains ~21 cameras at this
+baseline. If your cameras don't fit this profile (4K, sub-stream only,
+sub-1 fps, JPEG snapshot mode), document it in the per-camera config and
+validate with a short pilot.
 
 ## What the generator decides
 

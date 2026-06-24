@@ -65,14 +65,20 @@ host's silicon and **generates** `/etc/nexus/nexus.toml` sized for it
 (`emit-config`) — there are no per-tier templates to pick from. Boxes already
 on the desk are flagged ✅.
 
-| Profile (`--force-profile`) | Box                                       | Accelerator         | Cams (1080p/15fps) | Status |
-| --------------------------- | ----------------------------------------- | ------------------- | ------------------ | ------ |
-| `intel-igpu`                | Beelink Mini S13 (N150)                   | UHD 24EU iGPU       | 1–2               | ✅ ordered |
-| `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8   | Hailo-8 26 TOPS M.2 | 24 (target)       | ✅ ordered |
-| `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS)             | Radeon 680M (Vulkan)| 4–6               | ✅ shipping |
-| `intel-igpu`                | Lenovo P3 Tiny + Arc A380                 | Intel Arc A380 dGPU | 8–12              | not yet sourced |
-| `intel-npu`                 | GMKtec K13 / EVO-X1 (Lunar Lake 256V)     | Arc 140V + NPU 4    | 6–8               | ✅ ordered |
-| `nvidia`                    | Lenovo P3 Tower + RTX 4060                | NVIDIA RTX 4060     | CPU-only (M5)     | post-beta |
+| Profile (`--force-profile`) | Box                                       | Accelerator         | Status |
+| --------------------------- | ----------------------------------------- | ------------------- | ------ |
+| `intel-igpu`                | Beelink Mini S13 (N150)                   | UHD 24EU iGPU       | ✅ ordered |
+| `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8   | Hailo-8 26 TOPS M.2 | ✅ ordered |
+| `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS)             | Radeon 680M (Vulkan)| ✅ shipping |
+| `intel-igpu`                | Lenovo P3 Tiny + Arc A380                 | Intel Arc A380 dGPU | not yet sourced |
+| `intel-npu`                 | GMKtec K13 / EVO-X1 (Lunar Lake 256V)     | Arc 140V + NPU 4    | ✅ ordered |
+| `nvidia`                    | Lenovo P3 Tower + RTX 4060                | NVIDIA RTX 4060     | post-beta |
+
+Sustained camera count is **sized empirically per box** — it depends on
+resolution, codec, frame rate, motion duty-cycle, and model preset, so
+it isn't a fixed number you can read off a table. As a real-world
+anchor, an `intel-npu` Lunar Lake box comfortably runs ~21 cameras at
+1080p/15fps.
 
 The Hailo EP shipped in v0.1.79: HailoRT 4.23 + `.hef` model pack
 load through `nexus-hailo-backend`, and the System tab surfaces live
