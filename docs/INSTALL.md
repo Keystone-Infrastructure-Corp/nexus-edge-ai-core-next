@@ -2,24 +2,24 @@
 
 > **Status: beta.** Cores M0–M4 + M-Install Checkpoints 1–3 + M-Admin
 > Phases 0–6 are complete; the engine + admin UI are usable
-> end-to-end on the reference hardware tiers. **Docker is no longer
+> end-to-end on the reference hardware profiles. **Docker is no longer
 > a supported install path** as of v0.1.10 — every install is a
 > bare-metal release tarball driven by [scripts/install.sh](../scripts/install.sh).
 > The bootstrap one-liner runs the host prep (apt prereqs, swap,
 > firewall, render-group plumbing) automatically; only BIOS settings
-> (§2), the Ubuntu install (§3), and the tier-specific GPU/NPU
+> (§2), the Ubuntu install (§3), and the hardware-specific GPU/NPU
 > drivers (§5) still require operator hands. Follow the verification
 > gate in §7 before declaring an install "done", and start with §8.0
 > for the admin UI quickstart.
 >
 > **Audience:** an operator bringing up the engine on a fresh
-> tier-target box. If you're contributing to the codebase, follow
+> target box. If you're contributing to the codebase, follow
 > [DEV_NOTES.md](DEV_NOTES.md) instead — it covers the macOS dev
 > toolchain and the per-change `cargo` loop.
 >
 > **Last reviewed:** 2026-05-24 (Docker install path removed —
 > bare-metal tarball + install.sh is the only supported path on
-> every tier). The kernel, driver, ORT, and CUDA versions cited
+> every box). The kernel, driver, ORT, and CUDA versions cited
 > here drift over time. Re-validate against the Appendix B / C
 > transcripts on a fresh Multipass VM at every minor release before
 > relying on the published commands.
@@ -30,33 +30,33 @@
 
 - [Installation guide — `nexus-edge-ai-core-next`](#installation-guide--nexus-edge-ai-core-next)
   - [Table of contents](#table-of-contents)
-  - [1. Decide the hardware tier](#1-decide-the-hardware-tier)
+  - [1. Decide the hardware profile](#1-decide-the-hardware-profile)
   - [2. BIOS + firmware pre-install](#2-bios--firmware-pre-install)
-    - [Universal (every tier)](#universal-every-tier)
-    - [T10 / T24 (Intel mini PCs — Beelink, GMKtec)](#t10--t24-intel-mini-pcs--beelink-gmktec)
-    - [T36 (Intel Arc A380 dGPU)](#t36-intel-arc-a380-dgpu)
-    - [T36-S (Lunar Lake — GMKtec K13 / EVO-X1)](#t36-s-lunar-lake--gmktec-k13--evo-x1)
-    - [T64 (NVIDIA RTX 4060)](#t64-nvidia-rtx-4060)
+    - [Universal (every box)](#universal-every-box)
+    - [Intel mini PCs (Beelink, GMKtec)](#intel-mini-pcs-beelink-gmktec)
+    - [Intel Arc A380 dGPU](#intel-arc-a380-dgpu)
+    - [Lunar Lake (GMKtec K13 / EVO-X1)](#lunar-lake-gmktec-k13--evo-x1)
+    - [NVIDIA RTX 4060](#nvidia-rtx-4060)
   - [3. Install Ubuntu 24.04 LTS Server](#3-install-ubuntu-2404-lts-server)
     - [3.1 Download + verify the ISO](#31-download--verify-the-iso)
     - [3.2 Write the ISO to USB](#32-write-the-iso-to-usb)
     - [3.3 Boot from USB](#33-boot-from-usb)
     - [3.4 Installer choices](#34-installer-choices)
     - [3.5 First boot housekeeping](#35-first-boot-housekeeping)
-    - [3.6 HWE kernel — T36-S only](#36-hwe-kernel--t36-s-only)
+    - [3.6 HWE kernel — Lunar Lake only](#36-hwe-kernel--lunar-lake-only)
   - [4. What `install.sh` does for you](#4-what-installsh-does-for-you)
-  - [5. Tier-specific accelerator drivers](#5-tier-specific-accelerator-drivers)
-    - [5.1 T10 / T24 — Intel UHD / Iris Xe iGPU](#51-t10--t24--intel-uhd--iris-xe-igpu)
-    - [5.2 T36 — Intel Arc A380 dGPU](#52-t36--intel-arc-a380-dgpu)
-    - [5.3 T36-S — Lunar Lake (Arc 140V iGPU + NPU 4)](#53-t36-s--lunar-lake-arc-140v-igpu--npu-4)
-    - [5.4 T64 — NVIDIA RTX 4060](#54-t64--nvidia-rtx-4060)
-    - [5.5 T24 — Beelink EQR7 (AMD Ryzen + Hailo-8 M.2)](#55-t24--beelink-eqr7-amd-ryzen--hailo-8-m2)
+  - [5. Accelerator drivers (by hardware)](#5-accelerator-drivers-by-hardware)
+    - [5.1 Intel UHD / Iris Xe iGPU](#51-intel-uhd--iris-xe-igpu)
+    - [5.2 Intel Arc A380 dGPU](#52-intel-arc-a380-dgpu)
+    - [5.3 Lunar Lake — Arc 140V iGPU + NPU 4](#53-lunar-lake--arc-140v-igpu--npu-4)
+    - [5.4 NVIDIA RTX 4060](#54-nvidia-rtx-4060)
+    - [5.5 Beelink EQR7 — AMD Ryzen + Hailo-8 M.2](#55-beelink-eqr7--amd-ryzen--hailo-8-m2)
   - [6. Install the engine](#6-install-the-engine)
     - [6.1 One-liner from GitHub Releases](#61-one-liner-from-github-releases)
     - [6.2 What the installer does, step by step](#62-what-the-installer-does-step-by-step)
     - [6.3 On-disk layout](#63-on-disk-layout)
     - [6.4 Configure cameras + first boot](#64-configure-cameras--first-boot)
-      - [Confirm the tier the engine actually picked](#confirm-the-tier-the-engine-actually-picked)
+      - [Confirm the hardware the engine actually detected](#confirm-the-hardware-the-engine-actually-detected)
     - [6.5 OS-level network manager (optional)](#65-os-level-network-manager-optional)
     - [6.6 Authentication](#66-authentication)
     - [6.7 Upgrades + rollback](#67-upgrades--rollback)
@@ -76,8 +76,8 @@
     - [8.2 Backups](#82-backups)
     - [8.3 Forward-looking](#83-forward-looking)
   - [9. Troubleshooting](#9-troubleshooting)
-  - [10. Appendix A — End-to-end T24 transcript](#10-appendix-a--end-to-end-t24-transcript)
-  - [11. Appendix B — End-to-end T36-S transcript](#11-appendix-b--end-to-end-t36-s-transcript)
+  - [10. Appendix A — End-to-end Intel iGPU transcript](#10-appendix-a--end-to-end-intel-igpu-transcript)
+  - [11. Appendix B — End-to-end Lunar Lake (NPU) transcript](#11-appendix-b--end-to-end-lunar-lake-npu-transcript)
   - [12. Appendix C — Build from source (developer-only)](#12-appendix-c--build-from-source-developer-only)
     - [12.1 Regenerate ONNX models with custom prompts](#121-regenerate-onnx-models-with-custom-prompts)
   - [13. Appendix D — Where to file bugs](#13-appendix-d--where-to-file-bugs)
@@ -89,7 +89,7 @@
 
 The engine is **capability-based**: at install time `nexus-probe` detects
 your silicon and **generates** `/etc/nexus/nexus.toml` sized for it — you
-do **not** copy a per-tier template. Find the row that matches your box
+do **not** copy a hand-tuned config template. Find the row that matches your box
 below to know what the installer will pick (and what `--force-profile`
 value to pass if you ever need to pin it). Full background:
 [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md).
@@ -131,13 +131,13 @@ that would otherwise default to CPU).
 Knock these out *before* booting the Ubuntu installer. Each item is a
 common foot-gun on the boxes we ship.
 
-### Universal (every tier)
+### Universal (every box)
 
 - **Update BIOS to the latest stable release** before doing anything
   else. Lunar Lake firmware in particular shipped without NPU
   exposed in early revisions.
 - **VT-x / VT-d / IOMMU** — enabled. Required for device passthrough
-  to accelerators on every tier.
+  to accelerators on every box.
 - **Secure Boot** — disabled if you'll be installing the NVIDIA
   proprietary driver (§5.4) or the Intel NPU driver trio (§5.3).
   Otherwise leave it on.
@@ -146,7 +146,7 @@ common foot-gun on the boxes we ship.
 - **RAM XMP / EXPO** — enable the rated profile; the engine doesn't
   benefit from memory clock tuning beyond rated.
 
-### T10 / T24 (Intel mini PCs — Beelink, GMKtec)
+### Intel mini PCs (Beelink, GMKtec)
 
 - **iGPU shared memory** — allocate **≥ 512 MB**. Beelink and GMKtec
   firmwares default to 64 MB on some SKUs, which starves the
@@ -154,21 +154,21 @@ common foot-gun on the boxes we ship.
   for "DVMT pre-allocated" / "Frame buffer size" / "iGPU memory" in
   the Advanced → Chipset menu.
 
-### T36 (Intel Arc A380 dGPU)
+### Intel Arc A380 dGPU
 
 - **Above 4G Decoding** — ON.
 - **Resizable BAR** — ON. The Intel `i915` driver requires it for the
   A380.
 - **PCIe slot speed** — Auto / Gen 4 (the A380 is x8 Gen 4).
 
-### T36-S (Lunar Lake — GMKtec K13 / EVO-X1)
+### Lunar Lake (GMKtec K13 / EVO-X1)
 
 - **AI Acceleration / NPU** — ENABLED. On some K13 firmwares this is
   hidden under Advanced → AI Settings → "Intel AI Boost". If you
   don't see the option, the BIOS is too old; update first.
 - **HWE kernel required** — see §3.6.
 
-### T64 (NVIDIA RTX 4060)
+### NVIDIA RTX 4060
 
 - **Above 4G Decoding** — ON.
 - **Resizable BAR** — ON.
@@ -257,7 +257,7 @@ Walk the installer; the only screens that matter:
     `/var/lib/nexus` on the same filesystem as `/`. `install.sh`
     adds an 8 GB swap **file** at `/swapfile` for you in §6.
 - **Profile setup:**
-  - Server name: your asset tag (e.g. `nx-t24-001`).
+  - Server name: your asset tag (e.g. `nx-cam-001`).
   - Pick a user name: `nexus-admin`.
   - Strong password.
 - **SSH:** install OpenSSH server. Import SSH keys from GitHub /
@@ -272,7 +272,7 @@ sudo apt full-upgrade -y
 sudo reboot
 ```
 
-### 3.6 HWE kernel — T36-S only
+### 3.6 HWE kernel — Lunar Lake only
 
 Lunar Lake's NPU driver requires kernel ≥ 6.10. Default 24.04
 ships with 6.8; install the HWE kernel:
@@ -283,7 +283,7 @@ sudo reboot
 uname -r            # expect 6.10.x or newer
 ```
 
-T10 / T24 / T36 / T64: skip this — the GA kernel is what we test
+Every other box: skip this — the GA kernel is what we test
 against.
 
 ---
@@ -316,7 +316,7 @@ Concretely the installer:
 | **Install Intel iGPU + Arc dGPU stack** (kobuk-team PPA + iHD 25.x + Level Zero + media + compute — see §5.1 / §5.2) | apt + PPA                                          | on      | `--no-drivers`                     |
 | **Install Intel NPU driver v1.32.1** (Lunar Lake + Meteor Lake; requires kernel ≥ 6.10 — see §5.3) | `wget` + `apt install ./intel-*.deb`              | on†    | `--no-drivers`                     |
 | **Auto-install `linux-generic-hwe-24.04`** when NPU hardware is detected on a < 6.10 kernel, then exit asking for a reboot | apt                                          | on      | `--no-drivers`                     |
-| Stage `/etc/nexus/nexus.toml` from tier template (first install only) | `install -m 0644`                                  | on      | n/a (preserved on upgrades)         |
+| Generate `/etc/nexus/nexus.toml` via `nexus-probe emit-config` (first install only) | `install -m 0644`                                  | on      | n/a (preserved on upgrades)         |
 | Install `/etc/systemd/system/nexus-engine.service` | from `etc-templates/systemd/`                       | on      | n/a                                |
 | Atomically flip `/opt/nexus/current` → new release | `ln -sfn`                                          | on      | n/a                                |
 | `systemctl enable --now nexus-engine`      | systemd                                                 | on      | `--no-start`                       |
@@ -332,7 +332,7 @@ What the installer **does NOT** do (the bits that still need you):
 
 1. **BIOS settings** (§2) — physical access; never automated.
 2. **Ubuntu install** (§3) — must complete before §4.
-3. **NVIDIA driver install** (§5.4) — T64 is post-beta; the engine
+3. **NVIDIA driver install** (§5.4) — the NVIDIA box is post-beta; the engine
    doesn't ship a CUDA or TensorRT execution provider yet (M5). The
    installer detects the card, warns, and leaves the host driver
    alone so you can manage it however you prefer.
@@ -348,19 +348,19 @@ in [Appendix C](#12-appendix-c--build-from-source-developer-only).
 
 ---
 
-## 5. Tier-specific accelerator drivers
+## 5. Accelerator drivers (by hardware)
 
 > **§5 is automated by default.** The one-liner in §6.1 detects your
 > accelerator hardware via `lspci` and installs the matching driver
 > stack as part of the same run. The recipes below are kept for
 > reference (hardened-image operators who passed `--no-drivers`,
 > troubleshooting, or operators who want to understand what's
-> happening). Read your tier's subsection, then continue at §6.
+> happening). Read your box's subsection, then continue at §6.
 >
 > **Exception:** NVIDIA (§5.4) is detect-only — the installer warns
 > and skips because the engine has no GPU EP yet.
 
-### 5.1 T10 / T24 — Intel UHD / Iris Xe iGPU
+### 5.1 Intel UHD / Iris Xe iGPU
 
 > **Use the Intel-graphics PPA (`ppa:kobuk-team/intel-graphics`), not
 > the Ubuntu archive and not the old `repositories.intel.com/gpu`
@@ -389,7 +389,7 @@ sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
 sudo apt update
 
 # Compute stack. (intel-gsc = GPU firmware update tool, useful on
-# T10 N100 boxes whose shipping firmware lags behind kernel.)
+# Some Intel N100 boxes whose shipping firmware lags behind kernel.)
 sudo apt install -y \
     libze-intel-gpu1 libze1 \
     intel-metrics-discovery intel-opencl-icd intel-gsc \
@@ -463,7 +463,7 @@ so i915 binds even when running headless. The `i965_drv_video.so`
 failure beneath the iHD one is expected and harmless — `i965` only
 covers Gen8 and older; iHD is the right driver for Alder Lake-N.
 
-### 5.2 T36 — Intel Arc A380 dGPU
+### 5.2 Intel Arc A380 dGPU
 
 > Same PPA as §5.1 — see that section for the background on why the
 > old `repositories.intel.com/gpu` recipe no longer works.
@@ -504,7 +504,7 @@ clinfo | grep -A2 'Platform Name'
 sudo intel_gpu_top -L          # lists the engines on the card
 ```
 
-### 5.3 T36-S — Lunar Lake (Arc 140V iGPU + NPU 4)
+### 5.3 Lunar Lake — Arc 140V iGPU + NPU 4
 
 ```bash
 # Step 1 — confirm HWE kernel is active (§3.6).
@@ -589,12 +589,12 @@ nexus-engine` to pick it up.
 > `intel-npu` profile in [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md)
 > for the full reasoning.
 
-### 5.4 T64 — NVIDIA RTX 4060
+### 5.4 NVIDIA RTX 4060
 
-> **Status:** T64 is post-beta. The CUDA + TensorRT EPs land in M5.
+> **Status:** the NVIDIA box is post-beta. The CUDA + TensorRT EPs land in M5.
 > Until then the engine compiles fine and exposes `cuda` /
 > `tensorrt` in `ep_priority`, but the actual session opens against
-> the CPU EP. T64 is **not** a meaningful production deployment yet.
+> the CPU EP. It is **not** a meaningful production deployment yet.
 > Set the box up to be ready for M5; verify with `nvidia-smi` only.
 
 ```bash
@@ -640,7 +640,7 @@ is healthy before proceeding.
 
 ---
 
-### 5.5 T24 — Beelink EQR7 (AMD Ryzen + Hailo-8 M.2)
+### 5.5 Beelink EQR7 — AMD Ryzen + Hailo-8 M.2
 
 > **Status:** First-class as of v0.1.79. `install.sh` recognises
 > the AMD Radeon iGPU and Hailo-8 M.2, installs the Mesa VA-API
@@ -648,7 +648,8 @@ is healthy before proceeding.
 > stages the HailoRT `.deb` pair per §5.5b) installs the Hailo
 > PCIe driver + userspace. The engine ships `nexus-hailo-backend`
 > wired through HailoRT 4.23; with `ep_priority = ["hailo","cpu"]`
-> in `t24.toml`, inference runs on the Hailo-8 via the `.hef`
+> in the generated `/etc/nexus/nexus.toml` (the `hailo` profile),
+> inference runs on the Hailo-8 via the `.hef`
 > models in the model pack. The System tab surfaces live chip
 > temperature, power, utilization%, inferences/sec, firmware,
 > serial, and part number from `nexus-hailo-backend::telemetry()`.
@@ -658,11 +659,11 @@ video decode (Mesa VA-API, §5.5a) **and** ONNX-Runtime inference. For
 AMD GPUs ROCm does not officially support — Phoenix/Rembrandt iGPUs
 like the 680M/780M — inference runs through ONNX Runtime's
 **Vulkan(WebGPU) execution provider** (Dawn→Vulkan backend), selected
-by the **`amd`** tier (`ep_priority = ["vulkan", "cpu"]`); see §5.5d.
+by the **`amd-vulkan`** profile (`ep_priority = ["vulkan", "cpu"]`); see §5.5d.
 ROCm is reserved for the discrete RDNA/CDNA cards it officially
 supports, which the installer classifies from the PCI device ID — no
 `HSA_OVERRIDE_GFX_VERSION` force-fit. To keep inference on the Hailo-8
-instead, use the default `t24` tier and leave the Radeon for decode.
+instead, use the default `hailo` profile and leave the Radeon for decode.
 
 #### 5.5a AMD Mesa VA-API stack (automatic)
 
@@ -808,7 +809,7 @@ post-install verification (`verify_accelerators`) does this same
 check and emits a remediation hint if it fails.
 
 > **Hailo EP active.** With `ep_priority = ["hailo","cpu"]` in
-> `t24.toml`, the engine loads the `.hef` model from the model
+> the generated `/etc/nexus/nexus.toml` (the `hailo` profile), the engine loads the `.hef` model from the model
 > pack and routes inference through `nexus-hailo-backend`
 > (HailoRT 4.23). Confirm in the UI: open the **System** tab and
 > look for the Hailo card showing live chip temperature, power,
@@ -1251,7 +1252,7 @@ curl -fsS http://localhost/api/v1/health         # UI alias on :80
 ```
 
 If the second command fails:
-- `[server].ui_bind` is unset — the tier templates set it; confirm
+- `[server].ui_bind` is unset — `nexus-probe emit-config` sets it; confirm
   in `/etc/nexus/nexus.toml`.
 - Port 80 is taken by another process — `sudo ss -ltnp | grep ':80 '`.
 - The unit is missing `AmbientCapabilities=CAP_NET_BIND_SERVICE`
@@ -1301,9 +1302,9 @@ file /tmp/cam1.jpg
 
 ```bash
 curl -fsS http://localhost:8089/api/v1/backends | jq
-# Expect: every slot in `state: "ready"` with the EP your tier expects:
-#   T10/T24/T36/T36-S → "openvino" (or "npu" on T36-S if NPU stack present)
-#   T64               → "cpu" today; "tensorrt" / "cuda" once M5 lands
+# Expect: every slot in `state: "ready"` with the EP your hardware expects:
+#   Intel iGPU / NPU boxes → "openvino" (or "npu" on Lunar Lake if NPU stack present)
+#   NVIDIA box             → "cpu" today; "tensorrt" / "cuda" once M5 lands
 #   anything          → "cpu" as last-resort fallback
 ```
 
@@ -1463,8 +1464,8 @@ yet — that's M2.2 (cold-mirror replication).
 | UI loads but `/` returns 404 | `ui_root` mismatch — engine pointing at a path that doesn't exist. | `ls /opt/nexus/current/share/ui/index.html` should exist; `[server].ui_root` in `/etc/nexus/nexus.toml` should be `/opt/nexus/current/share/ui`. |
 | Camera stuck on `connecting` for > 2 min | RTSP transport mismatch (camera serves UDP, engine asks TCP), bad credentials, blocked port. | Test with `gst-launch-1.0 -v rtspsrc location=<url> ! fakesink` from the host. If the password contains `!`, run `set +H` first and single-quote the URL. |
 | `vainfo` succeeds for your login but engine logs say "no VAAPI device" | `nexus` user not in `render` group. | `sudo usermod -aG render nexus && sudo systemctl restart nexus-engine`. Re-running `install.sh` does this automatically. |
-| `/dev/accel/accel0` missing on T36-S | Kernel < 6.10, NPU disabled in BIOS, or driver trio not installed. | `uname -r` ≥ 6.10 (§3.6); §2 BIOS; §5.3 driver install. |
-| `nvidia-smi` works on the host but engine reports CPU EP only | T64 is post-beta; M5 hasn't landed. | Expected. The engine falls through to CPU until M5. |
+| `/dev/accel/accel0` missing on Lunar Lake | Kernel < 6.10, NPU disabled in BIOS, or driver trio not installed. | `uname -r` ≥ 6.10 (§3.6); §2 BIOS; §5.3 driver install. |
+| `nvidia-smi` works on the host but engine reports CPU EP only | the NVIDIA box is post-beta; M5 hasn't landed. | Expected. The engine falls through to CPU until M5. |
 | `/api/v1/backends` shows all slots `state: "ready"` but every camera returns generic / mock-looking detection labels | `ep_priority` lists both `openvino` and `npu`. ORT's `RegisterExecutionProviderLibrary` is one-shot per session — the duplicate trips a "Provider OpenVINOExecutionProvider has already been registered" error and the yolo loader silently falls back to the mock detector. | Set `ep_priority = ["npu", "cpu"]` (`intel-npu`) or `ep_priority = ["gpu", "cpu"]` (`intel-igpu`) — never both. A generated config already does this; see [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md). |
 | Camera reaches `streaming` once then stays at 0 fps after every subsequent reconnect, but VLC against the same URL works fine | IP-camera firmware (e.g. InSight CS-series) enforces one RTSP session per stream path. | Power-cycle the camera, confirm no other VMS / external probe is hitting the same `url`, and verify the engine is on `recorder = "gstreamer"` (§6.4). |
 | Recorder writes 0-byte mp4 files | `recorder = "stub"` (the runtime default when `[runtime.clips]` is missing). | Add `[runtime.clips] recorder = "gstreamer"` to `/etc/nexus/nexus.toml` and restart. |
@@ -1482,7 +1483,7 @@ If your symptom isn't here, file an issue (§13).
 
 ---
 
-## 10. Appendix A — End-to-end T24 transcript
+## 10. Appendix A — End-to-end Intel iGPU transcript
 
 Copy-pasteable shell session that takes a fresh GMKtec M3 Ultra
 from post-Ubuntu-install to "first alert visible in the UI". Use
@@ -1548,7 +1549,7 @@ sudo -u nexus sqlite3 /var/lib/nexus/nexus.db "SELECT count(*) FROM events;"
 
 ---
 
-## 11. Appendix B — End-to-end T36-S transcript
+## 11. Appendix B — End-to-end Lunar Lake (NPU) transcript
 
 Copy-pasteable shell session that takes a fresh **GMKtec K13 AI**
 (or EVO-X1, Intel Core Ultra 7 256V "Lunar Lake", Arc 140V iGPU
@@ -1630,7 +1631,7 @@ sleep 15
 sudo -u nexus sqlite3 /var/lib/nexus/nexus.db "SELECT count(*) FROM events;"
 ```
 
-**T36-S-specific gotchas to watch for:**
+**Lunar Lake-specific gotchas to watch for:**
 
 1. `intel-level-zero-gpu : Depends: libigc1 ... but it is not
    installable` — you copy-pasted a pre-2025-Q3 recipe that
@@ -1692,10 +1693,10 @@ sudo mv "/opt/onnxruntime-linux-x64-${ORT_VER}" /opt/onnxruntime
 echo '/opt/onnxruntime/lib' | sudo tee /etc/ld.so.conf.d/onnxruntime.conf
 sudo ldconfig
 
-# Build. Per-tier feature flags:
-#   T10 / T24 / T36     →  gstreamer,ort,ep-cpu,ep-openvino
-#   T36-S               →  gstreamer,ort,ep-cpu,ep-openvino   # NPU via OpenVINO
-#   T64 (post-beta)     →  gstreamer,ort,ep-cpu,ep-cuda,ep-tensorrt
+# Build. Feature flags by accelerator:
+#   Intel iGPU             →  gstreamer,ort,ep-cpu,ep-openvino
+#   Intel NPU (Lunar Lake) →  gstreamer,ort,ep-cpu,ep-openvino   # NPU via OpenVINO
+#   NVIDIA (post-beta)     →  gstreamer,ort,ep-cpu,ep-cuda,ep-tensorrt
 # `gstreamer` is mandatory — without it, RTSP support is `#[cfg]`'d out.
 FEATURES="gstreamer,ort,ep-cpu,ep-openvino"
 git clone https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next.git
@@ -1739,8 +1740,8 @@ curl -sL --fail \
     https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-worldv2.pt
 # Generate ALL static-size variants in one ultralytics session
 # (matches what release.yml ships). Writes:
-#   models/yolo_world_v2_s_640.onnx   (T10/T24 default)
-#   models/yolo_world_v2_s_960.onnx   (T36/T36-S default)
+#   models/yolo_world_v2_s_640.onnx   (iGPU default)
+#   models/yolo_world_v2_s_960.onnx   (Arc / Lunar Lake default)
 python tools/models/gen_yolo_world.py \
     --base-model models/.cache/yolov8s-worldv2.pt \
     --all-static
@@ -1772,7 +1773,7 @@ loader can map detections back to labels.
 Open issues at
 <https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/issues>. Include:
 
-1. **Tier + box** — e.g. "T36-S, GMKtec K13 AI, BIOS V1.07".
+1. **Box** — e.g. "GMKtec K13 AI (Lunar Lake), BIOS V1.07".
 2. **OS + kernel** — `cat /etc/os-release; uname -r`.
 3. **Engine version** — `sudo /opt/nexus/current/bin/nexus-engine --version`
    (or `cat /opt/nexus/current/VERSION`).
