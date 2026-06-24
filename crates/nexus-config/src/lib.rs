@@ -2954,6 +2954,40 @@ retention_days = 90
         assert_eq!(legacy.decode.mode, DecodeMode::Auto);
     }
 
+    /// Upgrade-reach guarantee at the TOP-LEVEL `Config` boundary (Wedge
+    /// P3.1): a complete operator `nexus.toml` that predates the decode
+    /// knob — i.e. has `[runtime]`, `[server]`, `[inference]` … but no
+    /// `[runtime.decode]` section — still yields `DecodeMode::Auto`. This
+    /// is the exact shape a preserved pre-upgrade config has, and Auto is
+    /// what lets the upgraded engine auto-probe for VA decode without any
+    /// config migration. If this regresses (e.g. the default flips to
+    /// `Software`), every upgraded box silently loses hardware decode.
+    #[test]
+    fn full_config_without_decode_section_defaults_to_auto() {
+        // A trimmed-but-realistic legacy config: several sections present,
+        // deliberately NO [runtime.decode].
+        let legacy = r#"
+[runtime]
+worker_threads = 16
+blocking_threads = 16
+
+[server]
+api_bind = "0.0.0.0:8089"
+
+[inference]
+backend = "pool"
+ep_priority = ["hailo", "cpu"]
+
+[bus]
+capacity = 2048
+"#;
+        let cfg: Config = toml::from_str(legacy).expect("legacy config must parse");
+        assert_eq!(cfg.runtime.decode.mode, DecodeMode::Auto);
+        // Sanity: the sections that ARE present still parsed.
+        assert_eq!(cfg.runtime.worker_threads, 16);
+        assert_eq!(cfg.inference.ep_priority, vec!["hailo", "cpu"]);
+    }
+
     /// `[decode] mode = "..."` round-trips for every variant, and the
     /// serialised token matches the documented lowercase spelling
     /// (the engine and installer both rely on these exact tokens).
