@@ -69,6 +69,9 @@ pub struct MemoryInfo {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Accelerators {
     pub intel_igpu: bool,
+    /// A discrete Intel Arc A-series (DG2) GPU is present. Folded into the
+    /// Intel-GPU profile decision alongside `intel_igpu`; the field name is
+    /// retained for `device-manifest.json` wire stability.
     pub intel_arc_140v: bool,
     pub intel_npu: bool,
     pub nvidia_gpu: bool,
@@ -132,6 +135,55 @@ pub fn build_manifest() -> Manifest {
     }
 }
 
+/// Install-time accelerator tags for a host, in the vocabulary the
+/// installer's driver-selection logic consumes (`intel-igpu`,
+/// `intel-arc-dgpu`, `intel-npu`, `nvidia-gpu`, `amd-igpu`, `hailo-m2`)
+/// plus the ROCm-vs-Vulkan verdict. Emitted by `nexus-probe accel-tags`
+/// so the installer no longer duplicates the `lspci` scan or the ROCm
+/// device-ID allowlist — detection lives only here.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct AccelTags {
+    /// One entry per detected accelerator class. Stable vocabulary shared
+    /// with `scripts/lib/install-common.sh`.
+    pub tags: Vec<String>,
+    /// True when a discrete AMD GPU on the ROCm allowlist is present;
+    /// drives the installer's ROCm-vs-Vulkan driver/EP choice.
+    pub amd_rocm_capable: bool,
+}
+
+/// Probe the host and produce its [`AccelTags`]. Shares the single
+/// `lspci -nn` detector ([`detect_accel_from_lspci`]) with
+/// [`build_manifest`], so the installer's driver selection and the
+/// generated `nexus.toml` always agree about the box's hardware.
+pub fn accel_tags() -> AccelTags {
+    let lspci = shell_out("lspci", &["-nn"]).unwrap_or_default();
+    let det = detect_accel_from_lspci(&lspci);
+    let accel_nodes = list_dir_starts_with("/dev/accel", "");
+    let mut tags = Vec::new();
+    if det.intel_igpu {
+        tags.push("intel-igpu".to_string());
+    }
+    if det.intel_arc_dgpu {
+        tags.push("intel-arc-dgpu".to_string());
+    }
+    if det.intel_npu || !accel_nodes.is_empty() {
+        tags.push("intel-npu".to_string());
+    }
+    if det.nvidia_gpu {
+        tags.push("nvidia-gpu".to_string());
+    }
+    if det.amd_igpu {
+        tags.push("amd-igpu".to_string());
+    }
+    if det.hailo {
+        tags.push("hailo-m2".to_string());
+    }
+    AccelTags {
+        tags,
+        amd_rocm_capable: detect_amd_rocm_capable(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Probe helpers
 // ---------------------------------------------------------------------------
@@ -179,41 +231,118 @@ fn probe_memory() -> MemoryInfo {
 }
 
 fn probe_accelerators() -> Accelerators {
-    let lspci = shell_out("lspci", &[]).unwrap_or_default().to_lowercase();
+    let lspci = shell_out("lspci", &["-nn"]).unwrap_or_default();
+    let det = detect_accel_from_lspci(&lspci);
     let render_nodes = list_dir_starts_with("/dev/dri", "renderD");
     let accel_nodes = list_dir_starts_with("/dev/accel", "");
     Accelerators {
-        intel_igpu: lspci.contains("intel") && lspci.contains("graphics"),
-        intel_arc_140v: lspci.contains("arc")
-            || lspci.contains("battlemage")
-            || lspci.contains("lunar lake"),
-        intel_npu: !accel_nodes.is_empty() || lspci.contains("npu"),
-        nvidia_gpu: lspci.contains("nvidia"),
+        intel_igpu: det.intel_igpu,
+        intel_arc_140v: det.intel_arc_dgpu,
+        // A /dev/accel node is a runtime signal an NPU exists even when
+        // lspci can't name it; keep it as an additional positive.
+        intel_npu: det.intel_npu || !accel_nodes.is_empty(),
+        nvidia_gpu: det.nvidia_gpu,
         apple_silicon: cfg!(all(target_os = "macos", target_arch = "aarch64")),
-        // AMD: vendor string in lspci is "Advanced Micro Devices, Inc.
-        // [AMD/ATI]" — match the bracketed alias because the long form
-        // also appears under non-graphics PCI devices on AMD chipsets.
-        // "radeon" catches the marketing name across iGPU/dGPU SKUs.
-        amd_igpu: lspci.contains("amd/ati") || lspci.contains("radeon"),
-        // Hailo: only ships AI accelerators under the "Hailo
-        // Technologies" PCI vendor string. Substring match is enough.
-        hailo: lspci.contains("hailo"),
+        amd_igpu: det.amd_igpu,
+        hailo: det.hailo,
         // ROCm-vs-Vulkan: read PCI device IDs from sysfs and match the
-        // ported allowlist (default-deny). Linux-only; false elsewhere.
+        // allowlist (default-deny). Linux-only; false elsewhere.
         amd_rocm_capable: detect_amd_rocm_capable(),
         render_nodes,
         accel_nodes,
     }
 }
 
+/// Accelerator presence derived from a single pass over `lspci -nn`. The
+/// one detector shared by [`build_manifest`] (→ `device-manifest.json` /
+/// `emit-config`) and [`accel_tags`] (→ the installer's driver
+/// selection), so the generated `nexus.toml` and the drivers actually
+/// installed can never disagree about what hardware is present.
+#[derive(Debug, Default, Clone, Copy)]
+struct AccelDetection {
+    intel_igpu: bool,
+    intel_arc_dgpu: bool,
+    intel_npu: bool,
+    nvidia_gpu: bool,
+    amd_igpu: bool,
+    hailo: bool,
+}
+
+/// Parse `lspci -nn` output into [`AccelDetection`]. Device-ID-precise,
+/// matching the vocabulary the installer historically detected in bash
+/// (`scripts/lib/install-common.sh`), so moving detection here does not
+/// regress driver selection. Each rule is applied per line (as `grep`
+/// would), then OR-ed across the device list.
+fn detect_accel_from_lspci(lspci_nn: &str) -> AccelDetection {
+    let mut d = AccelDetection::default();
+    for line in lspci_nn.lines() {
+        let lower = line.to_ascii_lowercase();
+        // Intel iGPU/dGPU: display-class VGA with vendor 8086 (covers
+        // UHD, Iris Xe, Arc 140V, and discrete Arc — the latter is also
+        // tagged below).
+        if line.contains("VGA") && line.contains("[8086:") {
+            d.intel_igpu = true;
+        }
+        // Intel Arc A-series discrete (DG2 silicon): device IDs 56a0..56af.
+        if line_has_arc_dgpu(line) {
+            d.intel_arc_dgpu = true;
+        }
+        // Intel NPU: Meteor Lake (7d1d), Arrow Lake (643e), Lunar Lake
+        // (7e4e), or the "Processing accelerators" PCI class for a future
+        // SKU the device-ID list misses.
+        if line.contains("[8086:7d1d]")
+            || line.contains("[8086:643e]")
+            || line.contains("[8086:7e4e]")
+            || (lower.contains("processing accelerator") && lower.contains("[8086:"))
+        {
+            d.intel_npu = true;
+        }
+        // NVIDIA discrete (vendor 10de).
+        if (line.contains("VGA") || line.contains("3D controller")) && line.contains("[10de:") {
+            d.nvidia_gpu = true;
+        }
+        // AMD iGPU/dGPU (vendor 1002): Radeon 680M/780M iGPUs and any dGPU.
+        if (line.contains("VGA")
+            || line.contains("3D controller")
+            || line.contains("Display controller"))
+            && line.contains("[1002:")
+        {
+            d.amd_igpu = true;
+        }
+        // Hailo-8 / Hailo-8L M.2 accelerator (vendor 1e60).
+        if line.contains("[1e60:") {
+            d.hailo = true;
+        }
+    }
+    d
+}
+
+/// True when `line` carries an Intel Arc A-series discrete device ID
+/// (`[8086:56XY]` with `X` in `a..=f`), i.e. the bash
+/// `\[8086:56[a-f][0-9a-f]\]` match. Implemented without a regex
+/// dependency.
+fn line_has_arc_dgpu(line: &str) -> bool {
+    for (idx, _) in line.match_indices("[8086:56") {
+        let rest = &line[idx + "[8086:56".len()..];
+        let mut chars = rest.chars();
+        if let (Some(a), Some(b), Some(']')) = (chars.next(), chars.next(), chars.next()) {
+            if matches!(a, 'a'..='f' | 'A'..='F') && b.is_ascii_hexdigit() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Static allowlist of AMD PCI device IDs (the `XXXX` in `1002:XXXX`) that
 /// ROCm OFFICIALLY supports: discrete RDNA2 (gfx1030), RDNA3
-/// (gfx1100/1101/1102), and CDNA (gfx908/gfx90a/gfx942). Ported verbatim
-/// from `scripts/lib/install-common.sh::_ROCM_SUPPORTED_PCI_IDS`. Keep the
-/// two lists in sync — this is the single source of truth the bash
-/// installer is being migrated onto. Deliberately DEFAULT-DENY: anything
-/// NOT listed (Phoenix / Rembrandt iGPUs gfx1035 / gfx1103, unvetted or
-/// brand-new parts) routes to the Vulkan(WebGPU) EP, never ROCm.
+/// (gfx1100/1101/1102), and CDNA (gfx908/gfx90a/gfx942). This is the
+/// single source of truth for the ROCm-vs-Vulkan decision; the bash
+/// installer queries it via `nexus-probe accel-tags` (the duplicate
+/// `_ROCM_SUPPORTED_PCI_IDS` array was removed). Deliberately
+/// DEFAULT-DENY: anything NOT listed (Phoenix / Rembrandt iGPUs gfx1035
+/// / gfx1103, unvetted or brand-new parts) routes to the Vulkan(WebGPU)
+/// EP, never ROCm.
 const ROCM_SUPPORTED_PCI_IDS: &[&str] = &[
     // CDNA — MI100 (gfx908)
     "738c", "738e", //
@@ -614,5 +743,67 @@ mod tests {
         let acc: Accelerators = serde_json::from_str(json).expect("legacy accelerators parse");
         assert!(acc.amd_igpu);
         assert!(!acc.amd_rocm_capable);
+    }
+
+    #[test]
+    fn lspci_detects_intel_igpu_only() {
+        let s = "00:02.0 VGA compatible controller [0300]: Intel Corporation \
+                 Alder Lake-N [UHD Graphics] [8086:46d1]";
+        let d = detect_accel_from_lspci(s);
+        assert!(d.intel_igpu);
+        assert!(!d.intel_arc_dgpu);
+        assert!(!d.intel_npu && !d.nvidia_gpu && !d.amd_igpu && !d.hailo);
+    }
+
+    #[test]
+    fn lspci_detects_arc_dgpu_alongside_igpu() {
+        let s = "00:02.0 VGA compatible controller [0300]: Intel Corporation \
+                 Raptor Lake-S UHD Graphics [8086:a780]\n\
+                 03:00.0 VGA compatible controller [0300]: Intel Corporation \
+                 DG2 [Arc A380] [8086:56a5]";
+        let d = detect_accel_from_lspci(s);
+        assert!(d.intel_igpu);
+        assert!(d.intel_arc_dgpu);
+    }
+
+    #[test]
+    fn lspci_arc_dgpu_rejects_non_arc_8086_ids() {
+        // a780 (RPL iGPU) is not in the 56xx Arc range.
+        assert!(!detect_accel_from_lspci("VGA ... [8086:a780]").intel_arc_dgpu);
+        // 5690: third char '9' is not in a..f, so not an Arc dGPU.
+        assert!(!detect_accel_from_lspci("VGA ... [8086:5690]").intel_arc_dgpu);
+    }
+
+    #[test]
+    fn lspci_detects_intel_npu_by_device_id_and_class() {
+        let by_id = "00:0b.0 Processing accelerators [1200]: Intel Corporation \
+                     Meteor Lake NPU [8086:7d1d]";
+        assert!(detect_accel_from_lspci(by_id).intel_npu);
+        // Class-based fallback for an unlisted future device id.
+        let by_class = "00:0b.0 Processing accelerators [1200]: Intel Corporation \
+                        Future NPU [8086:1234]";
+        assert!(detect_accel_from_lspci(by_class).intel_npu);
+    }
+
+    #[test]
+    fn lspci_detects_nvidia_amd_hailo() {
+        let nv = "01:00.0 VGA compatible controller [0300]: NVIDIA Corporation \
+                  GA106 [GeForce RTX 3060] [10de:2503]";
+        assert!(detect_accel_from_lspci(nv).nvidia_gpu);
+        let amd = "06:00.0 VGA compatible controller [0300]: Advanced Micro Devices, \
+                   Inc. [AMD/ATI] Rembrandt [Radeon 680M] [1002:1681]";
+        assert!(detect_accel_from_lspci(amd).amd_igpu);
+        let hailo = "01:00.0 Co-processor [0b40]: Hailo Technologies Ltd. \
+                     Hailo-8 AI Processor [1e60:2864]";
+        assert!(detect_accel_from_lspci(hailo).hailo);
+    }
+
+    #[test]
+    fn lspci_ignores_non_gpu_amd_chipset_devices() {
+        // AMD CPU-vendor (1022) SMBus/PCI bridges must not trip amd_igpu;
+        // the GPU vendor is 1002 and the rule needs a display device class.
+        let s = "00:14.0 SMBus [0c05]: Advanced Micro Devices, Inc. [AMD/ATI] \
+                 FCH SMBus Controller [1022:790b]";
+        assert!(!detect_accel_from_lspci(s).amd_igpu);
     }
 }

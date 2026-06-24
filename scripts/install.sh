@@ -345,6 +345,12 @@ fi
 [[ -d "$RELEASE_DIR/etc-templates" ]]  || die "release $RELEASE_DIR missing etc-templates/"
 [[ -d "$RELEASE_DIR/share" ]]          || die "release $RELEASE_DIR missing share/"
 
+# Single staged nexus-probe binary, shared by install_drivers /
+# verify_accelerators (hardware detection via `accel-tags`) and
+# emit_config (config generation) so detection lives in exactly one place.
+NEXUS_PROBE_BIN="$RELEASE_DIR/bin/nexus-probe"
+export NEXUS_PROBE_BIN
+
 # --- Verify every file in the release ----------------------------------------
 
 verify_manifest_files "$RELEASE_DIR"

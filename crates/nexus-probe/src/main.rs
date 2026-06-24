@@ -10,6 +10,11 @@
 //!   and write a complete, guaranteed-parseable `nexus.toml`. This replaces
 //!   the old "copy a `config/tiers/<tier>.toml` template and `sed`-rewrite
 //!   the paths" install step.
+//! * **`accel-tags`** — print the host's accelerator tags (the same
+//!   vocabulary the installer's driver selection consumes) plus the
+//!   ROCm-vs-Vulkan verdict. The installer shells out to this instead of
+//!   re-implementing the `lspci` scan and the ROCm device-ID allowlist in
+//!   bash, so hardware detection lives in exactly one place.
 //!
 //! All real logic lives in [`nexus_probe`] (the library); this binary is a
 //! thin wrapper.
@@ -58,6 +63,19 @@ enum Command {
         #[arg(long, value_name = "PROFILE")]
         force_profile: Option<String>,
     },
+
+    /// Print the host's accelerator tags (the installer's driver-selection
+    /// vocabulary): `intel-igpu`, `intel-arc-dgpu`, `intel-npu`,
+    /// `nvidia-gpu`, `amd-igpu`, `hailo-m2`. The default output is one tag
+    /// per line, plus `amd-rocm-capable` when a ROCm-allowlisted AMD GPU is
+    /// present, so the bash installer can consume it without `jq`. `--json`
+    /// emits `{"tags":[...],"amd_rocm_capable":<bool>}` for programmatic
+    /// consumers.
+    AccelTags {
+        /// Emit JSON instead of newline-delimited tags.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -67,6 +85,7 @@ fn main() -> Result<()> {
         Some(Command::EmitConfig { out, force_profile }) => {
             emit_config(&out, force_profile.as_deref())
         }
+        Some(Command::AccelTags { json }) => emit_accel_tags(json),
     }
 }
 
@@ -92,6 +111,24 @@ fn emit_config(out: &str, force_profile: Option<&str>) -> Result<()> {
     let profile = HardwareProfile::from_manifest_forced(&manifest, forced);
     let toml = nexus_probe::render_toml(&profile).context("rendering nexus.toml")?;
     write_out(out, &toml)
+}
+
+/// Print the host's accelerator tags for the installer. Default output is
+/// one tag per line (plus `amd-rocm-capable` when present) so bash can
+/// consume it without `jq`; `--json` emits the structured form.
+fn emit_accel_tags(json: bool) -> Result<()> {
+    let tags = nexus_probe::accel_tags();
+    if json {
+        println!("{}", serde_json::to_string(&tags)?);
+    } else {
+        for tag in &tags.tags {
+            println!("{tag}");
+        }
+        if tags.amd_rocm_capable {
+            println!("amd-rocm-capable");
+        }
+    }
+    Ok(())
 }
 
 /// Write `contents` to `out` (`-` = stdout), creating parent dirs as needed.

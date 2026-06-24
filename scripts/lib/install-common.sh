@@ -435,13 +435,13 @@ install_drivers() {
         #   * `--force-profile amd-vulkan`  -> Vulkan(WebGPU), operator's choice
         #   * officially ROCm-supported GPU -> ROCm EP (discrete RDNA/CDNA)
         #   * everything else (iGPUs etc.)  -> Vulkan(WebGPU), no ROCm force-fit
-        # `_amd_gpu_rocm_supported` classifies ROCm-free from the PCI device
-        # ID, so we never install the multi-hundred-MB ROCm stack on a GPU it
-        # cannot drive, and never depend on the HSA_OVERRIDE_GFX_VERSION
-        # force-fit (now an unsupported manual escape hatch only). This bash
-        # allowlist is kept in lock-step with the Rust port in nexus-probe
-        # (`amd_rocm_supported`) that drives the generated ep_priority — the
-        # two MUST agree until the single-detector cutover unifies them.
+        # `_amd_gpu_rocm_supported` classifies ROCm-free, so we never install
+        # the multi-hundred-MB ROCm stack on a GPU it cannot drive, and never
+        # depend on the HSA_OVERRIDE_GFX_VERSION force-fit (now an unsupported
+        # manual escape hatch only). The classification is the Rust nexus-probe
+        # allowlist, queried via `nexus-probe accel-tags`, so the
+        # ROCm-vs-Vulkan decision and the generated ep_priority come from one
+        # source of truth.
         if [[ "${FORCE_PROFILE:-}" == "amd-vulkan" ]] || ! _amd_gpu_rocm_supported; then
             if [[ "${FORCE_PROFILE:-}" == "amd-vulkan" ]]; then
                 log "AMD: '--force-profile amd-vulkan' selected; using Vulkan(WebGPU) EP"
@@ -801,87 +801,45 @@ _verify_hailo_userspace() {
     return $(( ok ? 0 : 1 ))
 }
 
-# Detect accelerator hardware via lspci. Outputs one tag per line:
+# Resolve the staged nexus-probe binary. install.sh exports
+# NEXUS_PROBE_BIN from the verified release dir; fall back to PATH for
+# dev / standalone runs. Prints the path on success, returns 1 if none.
+_nexus_probe_bin() {
+    if [[ -n "${NEXUS_PROBE_BIN:-}" && -x "${NEXUS_PROBE_BIN}" ]]; then
+        printf '%s' "${NEXUS_PROBE_BIN}"
+        return 0
+    fi
+    local p
+    if p="$(command -v nexus-probe 2>/dev/null)"; then
+        printf '%s' "$p"
+        return 0
+    fi
+    return 1
+}
+
+# Detect accelerator hardware via `nexus-probe accel-tags` (the single
+# detector, shared with emit-config so drivers and the generated config
+# can never disagree). Outputs one tag per line:
 #   intel-igpu | intel-arc-dgpu | intel-npu | nvidia-gpu | amd-igpu | hailo-m2
 # Empty output = nothing recognised (engine still installs CPU-only).
+# The probe runs `lspci -nn`, so make sure pciutils is present first.
 _detect_hardware() {
+    local probe
+    probe="$(_nexus_probe_bin)" || {
+        warn "nexus-probe not available; cannot detect accelerator hardware"
+        return 1
+    }
     if ! command -v lspci >/dev/null 2>&1; then
         log "lspci missing; installing pciutils for hardware detection"
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pciutils \
             >/dev/null 2>&1 || return 1
     fi
-
-    local pci
-    pci="$(lspci -nn 2>/dev/null)" || return 1
-
-    # Intel iGPU (display-class VGA with vendor 8086). Covers UHD,
-    # Iris Xe, Arc 140V (Lunar Lake), Arc Graphics (Meteor Lake).
-    # NB: dGPU Arc cards ALSO match this regex — we filter them out
-    # of the iGPU tag below by checking for the discrete device IDs.
-    #
-    # Regex note: `.*` (not `[^[]*`) between `VGA` and `[8086:` because
-    # real lspci -nn output is
-    #   "00:02.0 VGA compatible controller [0300]: Intel Corporation
-    #    Alder Lake-N [UHD Graphics] [8086:46d1]"
-    # i.e. the PCI class id `[0300]` and the marketing name `[UHD
-    # Graphics]` sit between the `VGA` token and the vendor:device id.
-    # A negated-bracket class anchor stops at the first `[` (the class
-    # id) and never reaches `[8086:`, silently misclassifying every
-    # modern Intel iGPU as no-accelerator (the bug v0.1.67 shipped
-    # with that made install_drivers a no-op on T10 boxes).
-    local has_intel_vga=0 has_arc_dgpu=0
-    if echo "$pci" | grep -qE 'VGA.*\[8086:'; then
-        has_intel_vga=1
-    fi
-    # Intel Arc A-series discrete (DG2 silicon): device IDs 56a0..56af.
-    if echo "$pci" | grep -qE '\[8086:56[a-f][0-9a-f]\]'; then
-        has_arc_dgpu=1
-    fi
-    if (( has_intel_vga && ! has_arc_dgpu )); then
-        echo intel-igpu
-    elif (( has_intel_vga && has_arc_dgpu )); then
-        # Box has both (e.g. Lenovo P3 Tower with iGPU + A380).
-        echo intel-igpu
-    fi
-    if (( has_arc_dgpu )); then
-        echo intel-arc-dgpu
-    fi
-
-    # Intel NPU (Versatile Processing Unit / Neural Processing Unit).
-    # Device IDs: 7d1d (Meteor Lake VPU), 643e (Arrow Lake NPU),
-    # 7e4e (Lunar Lake NPU). Also matches the "Processing
-    # accelerators" PCI class (1200) when the device-id list above
-    # misses a future SKU.
-    if echo "$pci" | grep -qE '\[8086:(7d1d|643e|7e4e)\]' \
-        || echo "$pci" | grep -qiE 'processing accelerator.*\[8086:'; then
-        echo intel-npu
-    fi
-
-    # NVIDIA discrete (vendor 10de). Same `.*` reasoning as the Intel
-    # iGPU regex above — the lspci class id `[0300]` sits between the
-    # `VGA`/`3D controller` token and the `[10de:...]` vendor id, so
-    # `[^[]*` would short the match.
-    if echo "$pci" | grep -qE '(VGA|3D controller).*\[10de:'; then
-        echo nvidia-gpu
-    fi
-
-    # AMD iGPU / dGPU (vendor 1002). Covers Radeon 680M / 780M iGPUs
-    # on Ryzen 7000/8000-series APUs (the EQR7 T24 box ships a 680M)
-    # and any AMD dGPU a future tier might bundle. Same `.*` reasoning
-    # as the Intel iGPU regex above — the PCI class id and the
-    # marketing name sit between the device-class token and the
-    # `[1002:...]` vendor id.
-    if echo "$pci" | grep -qE '(VGA|3D controller|Display controller).*\[1002:'; then
-        echo amd-igpu
-    fi
-
-    # Hailo-8 / Hailo-8L M.2 accelerator (vendor 1e60). Known device
-    # IDs: 2864 (Hailo-8), 43a0 (Hailo-8L), 45c4 (next-gen). Vendor
-    # match alone is enough — Hailo only ships AI accelerators under
-    # this vendor id, so a future device id is still ours.
-    if echo "$pci" | grep -qE '\[1e60:'; then
-        echo hailo-m2
-    fi
+    # accel-tags emits the six hardware tags plus `amd-rocm-capable` (the
+    # ROCm-vs-Vulkan verdict). _detect_hardware's contract is the hardware
+    # tags only, so drop the rocm line here; the AMD driver branch reads
+    # the verdict via _amd_gpu_rocm_supported. `|| true` keeps a CPU-only
+    # box (no tags -> grep exit 1) from looking like a detection failure.
+    "$probe" accel-tags 2>/dev/null | grep -Ev '^amd-rocm-capable$' || true
 }
 
 # Compare uname -r to a required major.minor pair. Returns 0 if
@@ -1232,54 +1190,35 @@ _rocminfo_bin() {
 
 # Static allowlist of AMD PCI device IDs (the 0xXXXX device portion of
 # `1002:XXXX`) that ROCm OFFICIALLY supports: discrete RDNA2 (gfx1030),
-# RDNA3 (gfx1100/1101/1102), and CDNA (gfx908/gfx90a/gfx942). Used by
-# `_amd_gpu_rocm_supported` as the ROCm-free primary classifier — read the
-# PCI ID from sysfs and match. This is deliberately DEFAULT-DENY: anything
-# NOT on the list (Phoenix/Rembrandt iGPUs gfx1035/gfx1103, lower SKUs we
-# have not vetted, brand-new parts) routes to the Vulkan(WebGPU) EP, never
-# ROCm. Routing an unlisted-but-actually-supported part to Vulkan is a perf
+# RDNA3 (gfx1100/1101/1102), and CDNA (gfx908/gfx90a/gfx942). The
+# allowlist itself now lives ONLY in the Rust nexus-probe crate
+# (`ROCM_SUPPORTED_PCI_IDS`); `_amd_gpu_rocm_supported` queries it via
+# `nexus-probe accel-tags` so the ROCm-vs-Vulkan decision has a single
+# source of truth. Deliberately DEFAULT-DENY there: anything NOT on the
+# list (Phoenix/Rembrandt iGPUs gfx1035/gfx1103, lower SKUs we have not
+# vetted, brand-new parts) routes to the Vulkan(WebGPU) EP, never ROCm.
+# Routing an unlisted-but-actually-supported part to Vulkan is a perf
 # miss; routing an UNsupported part to ROCm risks the uncaught-C++ SIGABRT
 # the engine's rocm_runtime_available() guard exists to avoid.
-_ROCM_SUPPORTED_PCI_IDS=(
-    738c 738e                 # CDNA  — MI100 (gfx908)
-    7408 740c 740f 7410       # CDNA2 — MI200 / MI210 / MI250 (gfx90a)
-    74a0 74a1 74a5 74a9 74b5 74b9 74bd  # CDNA3 — MI300 (gfx942)
-    73a1 73a2 73a3 73a5 73ab 73af 73bf  # RDNA2 — Navi 21, RX 6800/6900 (gfx1030)
-    744c 745e                 # RDNA3 — Navi 31, RX 7900 (gfx1100)
-    747e                      # RDNA3 — Navi 32, RX 7700/7800 (gfx1101)
-    7480 7483                 # RDNA3 — Navi 33, RX 7600 (gfx1102)
-)
 
-# True (0) only when an AMD GPU on the ROCm-supported allowlist is present.
-# ROCm-free: reads PCI vendor/device IDs from /sys/class/drm/card*/device
-# (no rocminfo, no HSA_OVERRIDE), so the driver branch can decide ROCm vs
-# Vulkan BEFORE installing the heavy ROCm stack. If ROCm happens to be
-# pre-installed, a rocminfo gfx probe is consulted as a secondary signal —
-# WITHOUT HSA_OVERRIDE, so an unsupported iGPU that only enumerates a gfx
-# agent under the override is NOT misclassified as supported.
+# True (0) when a discrete AMD GPU on the ROCm allowlist is present.
+# Delegates to `nexus-probe accel-tags` — the device-ID allowlist now
+# lives only in the Rust nexus-probe crate (the duplicate bash
+# _ROCM_SUPPORTED_PCI_IDS array was removed), so the driver branch and
+# the generated ep_priority decide ROCm-vs-Vulkan from one source.
+# DEFAULT-DENY: a missing probe or no `amd-rocm-capable` tag returns 1,
+# so the branch routes to Vulkan(WebGPU) rather than force-fitting the
+# heavy ROCm stack onto a part it cannot drive.
+#
+# NOTE: the old bash helper also consulted a secondary `rocminfo` gfx
+# probe when ROCm happened to be pre-installed. The Rust port omits that
+# (the sysfs PCI-ID allowlist is authoritative); on a fresh install
+# rocminfo isn't present yet, so that secondary probe was a no-op in the
+# common case anyway.
 _amd_gpu_rocm_supported() {
-    local dev vendor id known
-    for dev in /sys/class/drm/card*/device; do
-        [[ -r "$dev/vendor" && -r "$dev/device" ]] || continue
-        vendor="$(cat "$dev/vendor" 2>/dev/null)"
-        [[ "$vendor" == "0x1002" ]] || continue        # AMD/ATI only
-        id="$(cat "$dev/device" 2>/dev/null)"
-        id="${id#0x}"; id="${id,,}"                     # 0x744C -> 744c
-        for known in "${_ROCM_SUPPORTED_PCI_IDS[@]}"; do
-            [[ "$id" == "$known" ]] && return 0
-        done
-    done
-
-    # Secondary signal: only if ROCm is ALREADY installed. No HSA_OVERRIDE —
-    # we want the GPU's real, un-forced gfx target.
-    local rocminfo gfx
-    if rocminfo="$(_rocminfo_bin)"; then
-        gfx="$("$rocminfo" 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | head -1)"
-        case "$gfx" in
-            gfx908|gfx90a|gfx942|gfx1030|gfx1100|gfx1101|gfx1102) return 0 ;;
-        esac
-    fi
-    return 1
+    local probe
+    probe="$(_nexus_probe_bin)" || return 1
+    "$probe" accel-tags 2>/dev/null | grep -qx 'amd-rocm-capable'
 }
 
 # True (0) when a usable ROCm GPU agent is present. Runs rocminfo and greps
