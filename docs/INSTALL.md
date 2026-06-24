@@ -94,22 +94,29 @@ below to know what the installer will pick (and what `--force-profile`
 value to pass if you ever need to pin it). Full background:
 [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md).
 
-| Profile (`--force-profile`) | Reference box                                       | Accelerator                | EP order                | Cameras (1080p / 15 fps) | Status        |
-| --------------------------- | --------------------------------------------------- | -------------------------- | ----------------------- | ------------------------- | ------------- |
-| `intel-igpu`                | Beelink Mini S13 (N150, 16 GB)                      | UHD 24EU iGPU              | `gpu, cpu`              | 1–2                       | shipping      |
-| `intel-igpu`                | GMKtec M3 Ultra (i7-12700H, 32 GB)                  | Iris Xe 96 EU              | `gpu, cpu`              | 4–6                       | shipping      |
-| `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)                | Radeon 680M/780M iGPU (Vulkan) | `vulkan, cpu`       | 4–6                       | shipping — Vulkan(WebGPU) EP for AMD GPUs ROCm does not support; see §5.5d |
-| `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8 M.2         | Hailo-8 (26 TOPS)         | `hailo, cpu`            | up to ~24                 | shipping      |
-| `intel-igpu`                | Lenovo P3 Tiny / HP Z2 Mini + Arc A380              | Intel Arc A380 6 GB dGPU   | `gpu, cpu`              | 8–12                      | shipping      |
-| `intel-npu`                 | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)    | Arc 140V Xe2 + NPU 4       | `npu, cpu`              | 6–8                       | shipping      |
-| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + RTX 4060               | NVIDIA RTX 4060 8 GB       | `cpu` (M5 → tensorrt)   | CPU-only until M5         | post-beta — CUDA/TensorRT EPs land in M5; until then it falls through to CPU and is **not** a meaningful deployment |
+| Profile (`--force-profile`) | Reference box                                       | Accelerator                | EP order                | Status        |
+| --------------------------- | --------------------------------------------------- | -------------------------- | ----------------------- | ------------- |
+| `intel-igpu`                | Beelink Mini S13 (N150, 16 GB)                      | UHD 24EU iGPU              | `gpu, cpu`              | shipping      |
+| `intel-igpu`                | GMKtec M3 Ultra (i7-12700H, 32 GB)                  | Iris Xe 96 EU              | `gpu, cpu`              | shipping      |
+| `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)                | Radeon 680M/780M iGPU (Vulkan) | `vulkan, cpu`       | shipping — Vulkan(WebGPU) EP for AMD GPUs ROCm does not support; see §5.5d |
+| `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8 M.2         | Hailo-8 (26 TOPS)         | `hailo, cpu`            | shipping      |
+| `intel-igpu`                | Lenovo P3 Tiny / HP Z2 Mini + Arc A380              | Intel Arc A380 6 GB dGPU   | `gpu, cpu`              | shipping      |
+| `intel-npu`                 | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)    | Arc 140V Xe2 + NPU 4       | `npu, cpu`              | shipping      |
+| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + RTX 4060               | NVIDIA RTX 4060 8 GB       | `cpu` (M5 → tensorrt)   | post-beta — CUDA/TensorRT EPs land in M5; until then it falls through to CPU and is **not** a meaningful deployment |
 
 **Camera baseline (every profile):** 1080p H.264 over RTSP (or H.265 with
 hardware decode), 15 fps capture, motion-gated to the detector. One
-`nexus-engine` process per host. If your cameras don't fit this
-profile (4K, JPEG snapshots, sub-1 fps), don't multiply the soak
-ceiling by anything optimistic — open an issue (§13) so we can size
-the box together.
+`nexus-engine` process per host.
+
+**Camera capacity is not a fixed per-profile number** and this guide
+deliberately doesn't publish one. Sustained stream count depends on
+resolution, codec, frame rate, motion duty-cycle, model preset, and how
+many streams run concurrently — so size it empirically per box rather
+than reading a count off a table. As a real-world anchor, an `intel-npu`
+Lunar Lake box comfortably sustains ~21 cameras at this baseline. If
+your cameras don't fit the baseline (4K, JPEG snapshots, sub-1 fps),
+document it per-camera and validate with a short pilot — open an issue
+(§13) if you want help sizing.
 
 **Box not in this list?** Just run `install.sh` without `--force-profile`
 and the installer runs `nexus-probe emit-config` to detect your hardware
