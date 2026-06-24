@@ -108,9 +108,6 @@ nexus-sinks = { workspace = true, features = [
 # CI matrix without saving bytes on disk (reqwest+rustls is
 # already in the dep graph via the cold-replicator's HTTP path).
 nexus-storage-cloud = { workspace = true }
-# Probe library for `--tier auto` (M-Install Checkpoint 1) and the
-# `nexus-doctor` binary. Pure-Rust; pulls in serde + chrono only.
-nexus-probe = { workspace = true }
 # Phase 1.7 — edge-side cloud client. Provides the
 # `RpcDispatcher`/`Verifier`/`AuditSink` trait surface that the
 # engine wires up at boot (see `cloud_audit.rs` for the local

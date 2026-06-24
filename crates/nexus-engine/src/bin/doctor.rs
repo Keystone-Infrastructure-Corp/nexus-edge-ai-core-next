@@ -8,7 +8,7 @@
 //! Designed to keep the per-bake iteration loop on a fresh box short:
 //!
 //! ```bash
-//! cargo run --bin nexus-engine -- --tier auto &
+//! cargo run --bin nexus-engine -- --config config/single-camera.toml &
 //! sleep 5
 //! nexus-doctor                      # all-green -> exit 0
 //! ```

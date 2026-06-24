@@ -85,34 +85,37 @@
 
 ---
 
-## 1. Decide the hardware tier
+## 1. Decide the hardware profile
 
-The engine ships with five reference hardware tiers. Pick the row that
-matches your box; everything else in this guide branches on the tier
-you choose here. Full background:
-[HARDWARE_TIERS.md](HARDWARE_TIERS.md).
+The engine is **capability-based**: at install time `nexus-probe` detects
+your silicon and **generates** `/etc/nexus/nexus.toml` sized for it — you
+do **not** copy a per-tier template. Find the row that matches your box
+below to know what the installer will pick (and what `--force-profile`
+value to pass if you ever need to pin it). Full background:
+[HARDWARE_MATRIX.md](HARDWARE_MATRIX.md).
 
-| Tier        | Reference box                                       | Accelerator                | EP order                | Cameras (1080p / 15 fps) | Tier config                                       | Status        |
-| ----------- | --------------------------------------------------- | -------------------------- | ----------------------- | ------------------------- | ------------------------------------------------- | ------------- |
-| **T10**     | Beelink Mini S13 (N150, 16 GB)                      | UHD 24EU iGPU              | `openvino, cpu`         | 1–2                       | [config/tiers/t10.toml](../config/tiers/t10.toml)     | shipping      |
-| **T24**     | GMKtec M3 Ultra (i7-12700H, 32 GB)                  | Iris Xe 96 EU              | `openvino, cpu`         | 4–6                       | [config/tiers/t24.toml](../config/tiers/t24.toml)     | shipping      |
-| **AMD**     | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)                | Radeon 680M/780M iGPU (Vulkan) | `vulkan, cpu`           | 4–6                       | [config/tiers/amd.toml](../config/tiers/amd.toml) | shipping — Vulkan(WebGPU) EP for AMD GPUs ROCm does not support; see §5.5d |
-| **T36**     | Lenovo P3 Tiny / HP Z2 Mini + Arc A380              | Intel Arc A380 6 GB dGPU   | `openvino, cpu`         | 8–12                      | [config/tiers/t36.toml](../config/tiers/t36.toml)     | shipping      |
-| **T36-S**   | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)    | Arc 140V Xe2 + NPU 4       | `openvino, npu, cpu`    | 6–8                       | [config/tiers/t36s.toml](../config/tiers/t36s.toml)   | shipping      |
-| **T64**     | Lenovo P3 Tower / HP Z2 G9 + RTX 4060               | NVIDIA RTX 4060 8 GB       | `tensorrt, cuda, cpu`   | 12–20                     | [config/tiers/t64.toml](../config/tiers/t64.toml)     | post-beta — CUDA/TensorRT EPs land in M5; until then T64 falls through to CPU and is **not** a meaningful deployment |
+| Profile (`--force-profile`) | Reference box                                       | Accelerator                | EP order                | Cameras (1080p / 15 fps) | Status        |
+| --------------------------- | --------------------------------------------------- | -------------------------- | ----------------------- | ------------------------- | ------------- |
+| `intel-igpu`                | Beelink Mini S13 (N150, 16 GB)                      | UHD 24EU iGPU              | `gpu, cpu`              | 1–2                       | shipping      |
+| `intel-igpu`                | GMKtec M3 Ultra (i7-12700H, 32 GB)                  | Iris Xe 96 EU              | `gpu, cpu`              | 4–6                       | shipping      |
+| `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS, 32 GB)                | Radeon 680M/780M iGPU (Vulkan) | `vulkan, cpu`       | 4–6                       | shipping — Vulkan(WebGPU) EP for AMD GPUs ROCm does not support; see §5.5d |
+| `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8 M.2         | Hailo-8 (26 TOPS)         | `hailo, cpu`            | up to ~24                 | shipping      |
+| `intel-igpu`                | Lenovo P3 Tiny / HP Z2 Mini + Arc A380              | Intel Arc A380 6 GB dGPU   | `gpu, cpu`              | 8–12                      | shipping      |
+| `intel-npu`                 | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)    | Arc 140V Xe2 + NPU 4       | `npu, cpu`              | 6–8                       | shipping      |
+| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + RTX 4060               | NVIDIA RTX 4060 8 GB       | `cpu` (M5 → tensorrt)   | CPU-only until M5         | post-beta — CUDA/TensorRT EPs land in M5; until then it falls through to CPU and is **not** a meaningful deployment |
 
-**Camera baseline (every tier):** 1080p H.264 over RTSP (or H.265 with
+**Camera baseline (every profile):** 1080p H.264 over RTSP (or H.265 with
 hardware decode), 15 fps capture, motion-gated to the detector. One
 `nexus-engine` process per host. If your cameras don't fit this
-profile (4K, JPEG snapshots, sub-1 fps), don't multiply the tier soak
+profile (4K, JPEG snapshots, sub-1 fps), don't multiply the soak
 ceiling by anything optimistic — open an issue (§13) so we can size
 the box together.
 
-**Box not in this list?** Skip `--tier` on `install.sh` and the
-installer will run `nexus-probe` to pick the closest documented tier
-for you. The mapping is advisory — you can override it later by
-re-running with `--tier <name> --force-tier` — but it's the right
-starting point.
+**Box not in this list?** Just run `install.sh` without `--force-profile`
+and the installer runs `nexus-probe emit-config` to detect your hardware
+and generate the best config for it. Pass `--force-profile <name>` only
+to override the auto-selection (e.g. to pin AMD Vulkan inference on a box
+that would otherwise default to CPU).
 
 ---
 
@@ -560,7 +563,7 @@ sudo dmesg | grep -i 'intel_vpu\|intel_vpu0'
 # authoritative "driver is up" signal — the engine only needs that.
 ```
 
-The tier config [config/tiers/t36s.toml](../config/tiers/t36s.toml)
+The generated config for a Lunar Lake (`intel-npu`) box
 lists `npu` first in `ep_priority`, then `cpu`. If the NPU stack
 is missing the engine **falls through to CPU automatically** — that's
 the whole point of the EP priority list — so you can bring the box
@@ -575,8 +578,8 @@ nexus-engine` to pick it up.
 > to the mock detector — `/api/v1/backends` still reports
 > `state: "ready"` so the failure is invisible from the UI. The
 > single `npu` entry already dispatches through the OpenVINO EP with
-> `device_type=NPU`, which covers both accelerators. See the inline
-> comments in [config/tiers/t36s.toml](../config/tiers/t36s.toml#L43)
+> `device_type=NPU`, which covers both accelerators. See the
+> `intel-npu` profile in [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md)
 > for the full reasoning.
 
 ### 5.4 T64 — NVIDIA RTX 4060
@@ -720,7 +723,7 @@ through to CPU-only.
 scripts:
 
 ```bash
-sudo /opt/nexus/current/scripts/install.sh --tier t24 \
+sudo /opt/nexus/current/scripts/install.sh --force-profile hailo \
     --hailo-deb-url      'https://hailo-csms.s3.../hailort_4.23.0_amd64.deb?X-Amz-...' \
     --hailo-pcie-deb-url 'https://hailo-csms.s3.../hailort-pcie-driver_4.23.0_all.deb?X-Amz-...'
 ```
@@ -736,7 +739,7 @@ scp hailort_*_amd64.deb hailort-pcie-driver_*.deb \
 ssh nexus-admin@<box>
 sudo mkdir -p /opt/nexus/vendor/hailo
 sudo install -m 0644 -o root -g root /tmp/hailort*.deb /opt/nexus/vendor/hailo/
-sudo /opt/nexus/current/scripts/install.sh --tier t24
+sudo /opt/nexus/current/scripts/install.sh --force-profile hailo
 ```
 
 `NEXUS_HAILO_DEB_DIR` overrides the cache directory if you'd
@@ -810,15 +813,15 @@ check and emits a remediation hint if it fails.
 #### 5.5d AMD GPU inference (Vulkan default; ROCm for supported discrete GPUs)
 
 To run inference on the Radeon iGPU/dGPU — even on a box that also has a
-Hailo-8 — install with the **`amd`** tier, which ships
-`ep_priority = ["vulkan", "cpu"]`:
+Hailo-8 — install with **`--force-profile amd-vulkan`**, which generates a
+config with `ep_priority = ["vulkan", "cpu"]`:
 
 ```bash
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
-  | sudo bash -s -- --tier amd
+  | sudo bash -s -- --force-profile amd-vulkan
 ```
 
-What the installer does for the `amd` (Vulkan) path (all automatic when
+What the installer does for the `amd-vulkan` path (all automatic when
 an AMD GPU is detected via `lspci`):
 
 1. Installs the Vulkan userspace (RADV ICD via `mesa-vulkan-drivers`,
@@ -882,28 +885,30 @@ unsupported iGPU.
 ### 6.1 One-liner from GitHub Releases
 
 Same command does first install **and** every subsequent upgrade —
-it's idempotent. On first install the script runs `nexus-probe`
-from the staged release and auto-selects the matching tier from §1,
-so the minimum invocation is zero flags:
+it's idempotent. On first install the script runs `nexus-probe
+emit-config` from the staged release and **generates** the matching
+config from §1's detected hardware, so the minimum invocation is zero
+flags:
 
 ```bash
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash
 ```
 
-Pass `--tier <name>` only to override the probe — e.g. forcing
-`t10` on a box that probes as `t24` for low-power soak testing, or
-on hardware the probe doesn't recognise. `--tier` is consulted only
-on first install, so re-running with the wrong tier on an existing
-box won't clobber a tuned `/etc/nexus/nexus.toml` (use
-`--force-tier` to opt in).
+Pass `--force-profile <name>` only to override the auto-selection —
+e.g. forcing `amd-vulkan` on a box that would otherwise default to CPU,
+or pinning a profile the probe doesn't auto-select. Re-running the
+installer **regenerates** `/etc/nexus/nexus.toml` from detected hardware
+by default (backing the old file up to `nexus.toml.bak.<ts>` first); pass
+`--keep-config` to preserve a hand-tuned file untouched.
 
 Useful flag combinations:
 
 | Flags                                      | When                                                                                  |
 | ------------------------------------------ | ------------------------------------------------------------------------------------- |
-| (no flags)                                 | Fresh install — let `nexus-probe` auto-select the tier. **This is the default path.** |
-| `--tier t24`                               | Fresh install on hardware the probe doesn't recognise, or forcing a non-default tier. |
+| (no flags)                                 | Fresh install or upgrade — let `nexus-probe` generate the config. **This is the default path.** |
+| `--force-profile amd-vulkan`               | Pin a specific inference profile (e.g. AMD Vulkan, which the probe never auto-selects). |
+| `--keep-config`                            | Upgrade without regenerating — preserve a hand-tuned `/etc/nexus/nexus.toml`.          |
 | `--enable-auto-updates`                    | Plus any of the above — opts into apt's `unattended-upgrades` for security patches (auto-reboot stays OFF). |
 | `--skip-system-prep`                       | Upgrade on a hardened base image where the operator manages apt prereqs themselves.   |
 | `--no-firewall`                            | Cluster-edge box already behind a perimeter firewall; don't add ufw rules.            |
@@ -911,10 +916,9 @@ Useful flag combinations:
 | `--no-deps`                                | Apt prereqs already baked into the golden image.                                      |
 | `--rollback`                               | Flip `/opt/nexus/current` back to the previous good release.                          |
 | `--version vX.Y.Z`                         | Pin a specific version (instead of `latest`).                                         |
-| `--force-tier --tier t36`                  | Re-templatize `/etc/nexus/nexus.toml` from a different tier (backs up to `.bak`).     |
 | `--no-start`                               | Install everything but don't enable / start the systemd unit (useful for image bake). |
 
-Expected runtime on a T24-class box: ~90 s end-to-end on a clean
+Expected runtime on a Hailo-class box: ~90 s end-to-end on a clean
 network (most of which is the 250 MB tarball download). All flags
 above are also available as environment variables (`NEXUS_PREP_DEPS=0`,
 `NEXUS_PREP_SWAP=0`, etc.) for use in image-bake pipelines.
@@ -940,11 +944,14 @@ The bootstrap script:
    - Creates the `nexus` system user + `/etc/nexus` + `/var/lib/nexus`.
    - Adds the `nexus` user to `render` + `video` groups (if those
      groups exist — they appear once you complete §5).
-   - On first install with no `--tier`, runs `bin/nexus-probe` to
-     auto-detect the tier from CPU + accelerator features.
-   - Stages `/etc/nexus/nexus.toml` from the tier template **only if
-     the file doesn't already exist** (operator edits survive
-     upgrades forever).
+   - On first install (or any re-run without `--keep-config`), runs
+     `bin/nexus-probe emit-config` to detect CPU + accelerators and
+     **generate** a complete `/etc/nexus/nexus.toml` (correct
+     `ep_priority`, decode mode, worker/thread sizing, model preset).
+   - Regenerates the config by default, backing up any existing file
+     to `nexus.toml.bak.<ts>` first; `--keep-config` skips regeneration
+     and preserves a hand-tuned file. Cameras, admin password, and TLS
+     certs live outside `nexus.toml`, so a regenerate never touches them.
    - Installs `/etc/systemd/system/nexus-engine.service`.
    - Atomically flips `/opt/nexus/current → releases/<version>` and
      records the previous version into `/etc/nexus/install-state.json`.
@@ -988,8 +995,7 @@ share/
 ├── ui/                      # SPA bundle
 └── models/                  # default 4-file model pack (~100 MB)
 etc-templates/
-├── nexus.example.toml
-├── tiers/{t10,t24,t36,t36s,t64}.toml
+├── nexus.example.toml       # reference only — live config is GENERATED
 └── systemd/nexus-engine.service
 scripts/
 ├── install.sh               # idempotent; same script first install + upgrade
@@ -1076,7 +1082,7 @@ curl -fsS -X PUT -H 'Content-Type: application/json' \
     }'
 ```
 
-#### Confirm the tier the engine actually picked
+#### Confirm the hardware the engine actually detected
 
 ```bash
 sudo -u nexus /opt/nexus/current/bin/nexus-probe \
@@ -1084,11 +1090,11 @@ sudo -u nexus /opt/nexus/current/bin/nexus-probe \
 jq '.recommended_tier, .accelerators' /var/lib/nexus/device-manifest.json
 ```
 
-The `recommended_tier` field should match what's in
-`/etc/nexus/nexus.toml`. If they disagree, the probe is right by
-default — switch to its recommendation unless you have a deliberate
-reason not to (e.g. you have both an Arc A380 and an RTX 4060 in the
-same Lenovo P3 Tower and want `t64` over `t36`).
+The `recommended_tier` label (advisory metadata for the cloud) and the
+detected `accelerators` should line up with the `ep_priority` in
+`/etc/nexus/nexus.toml`. If they disagree, regenerate the config by
+re-running the installer (it picks the right profile from the same
+detected hardware) — or pin one explicitly with `--force-profile`.
 
 ### 6.5 OS-level network manager (optional)
 
@@ -1152,7 +1158,7 @@ local-admin path, and the offline escape hatch.
 | `"oidc"`      | **Expert mode.** Rare on-prem deployment pointed at a site-local IdP.            | OIDC auth-code + PKCE; bearer tokens validated against the issuer's JWKS at every request. Not the customer-facing default — ships unconfigured. |
 | `"hybrid"`    | **Expert mode.** OIDC + a single local `breakglass` admin for IdP outages.       | Same as `oidc` plus the local-users login path. |
 
-Tier configs in [config/tiers/](../config/tiers/) ship with
+A generated `/etc/nexus/nexus.toml` (`nexus-probe emit-config`) ships with
 `mode = "local"`. Override with an explicit `[auth]` block in
 `/etc/nexus/nexus.toml`:
 
@@ -1452,7 +1458,7 @@ yet — that's M2.2 (cold-mirror replication).
 | `vainfo` succeeds for your login but engine logs say "no VAAPI device" | `nexus` user not in `render` group. | `sudo usermod -aG render nexus && sudo systemctl restart nexus-engine`. Re-running `install.sh` does this automatically. |
 | `/dev/accel/accel0` missing on T36-S | Kernel < 6.10, NPU disabled in BIOS, or driver trio not installed. | `uname -r` ≥ 6.10 (§3.6); §2 BIOS; §5.3 driver install. |
 | `nvidia-smi` works on the host but engine reports CPU EP only | T64 is post-beta; M5 hasn't landed. | Expected. The engine falls through to CPU until M5. |
-| `/api/v1/backends` shows all slots `state: "ready"` but every camera returns generic / mock-looking detection labels | `ep_priority` lists both `openvino` and `npu`. ORT's `RegisterExecutionProviderLibrary` is one-shot per session — the duplicate trips a "Provider OpenVINOExecutionProvider has already been registered" error and the yolo loader silently falls back to the mock detector. | Set `ep_priority = ["npu", "cpu"]` (T36-S) or `ep_priority = ["openvino", "cpu"]` (T10/T24/T36) — never both. See [config/tiers/t36s.toml](../config/tiers/t36s.toml#L43). |
+| `/api/v1/backends` shows all slots `state: "ready"` but every camera returns generic / mock-looking detection labels | `ep_priority` lists both `openvino` and `npu`. ORT's `RegisterExecutionProviderLibrary` is one-shot per session — the duplicate trips a "Provider OpenVINOExecutionProvider has already been registered" error and the yolo loader silently falls back to the mock detector. | Set `ep_priority = ["npu", "cpu"]` (`intel-npu`) or `ep_priority = ["gpu", "cpu"]` (`intel-igpu`) — never both. A generated config already does this; see [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md). |
 | Camera reaches `streaming` once then stays at 0 fps after every subsequent reconnect, but VLC against the same URL works fine | IP-camera firmware (e.g. InSight CS-series) enforces one RTSP session per stream path. | Power-cycle the camera, confirm no other VMS / external probe is hitting the same `url`, and verify the engine is on `recorder = "gstreamer"` (§6.4). |
 | Recorder writes 0-byte mp4 files | `recorder = "stub"` (the runtime default when `[runtime.clips]` is missing). | Add `[runtime.clips] recorder = "gstreamer"` to `/etc/nexus/nexus.toml` and restart. |
 | Recorder writes ~864-byte mp4 files (`recorder_kind = "gstreamer"`) | mp4mux silently dropping buffers without PTS — should not happen on `main`. | Capture logs with `GST_DEBUG=qtmux:5,h264parse:4` and file an issue (§13). |
@@ -1494,9 +1500,9 @@ sudo reboot
 #   - creates the `nexus` system user + dirs
 #   - adds `nexus` to render + video groups
 #   - downloads + verifies the release tarball
-#   - stages tier config, installs systemd unit, starts engine
+#   - generates config (emit-config), installs systemd unit, starts engine
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
-  | sudo bash -s -- --tier t24
+  | sudo bash
 
 # (Optional) verify the iGPU stack came up cleanly.
 vainfo --display drm --device /dev/dri/renderD128 | head -5
@@ -1555,7 +1561,7 @@ sudo reboot
 # linux-generic-hwe-24.04, and exits with a REBOOT REQUIRED banner.
 # Re-running the same one-liner after reboot does the rest.
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
-  | sudo bash -s -- --tier t36s
+  | sudo bash -s -- --force-profile intel-npu
 
 sudo reboot
 # (reconnect)
@@ -1568,9 +1574,9 @@ uname -r                       # expect 6.10.x or newer
 #   - installs the Intel iGPU stack (kobuk-team PPA)
 #   - downloads + installs the NPU driver v1.32.1 (4 .deb files)
 #   - creates the `nexus` user, dirs, group memberships
-#   - stages tier config, installs systemd unit, starts engine
+#   - generates config (emit-config), installs systemd unit, starts engine
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
-  | sudo bash -s -- --tier t36s
+  | sudo bash -s -- --force-profile intel-npu
 
 # (Optional) verify both accelerators came up.
 vainfo --display drm --device /dev/dri/renderD128 | head -25
@@ -1631,7 +1637,8 @@ sudo -u nexus sqlite3 /var/lib/nexus/nexus.db "SELECT count(*) FROM events;"
    list.
 3. `nexus-engine` boots but the OpenVINO NPU device isn't picked
    up — the engine **falls through to the iGPU automatically** per
-   the EP priority list in [config/tiers/t36s.toml](../config/tiers/t36s.toml).
+   the generated `ep_priority` list (`intel-npu` profile, see
+   [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md)).
    Restart the engine after installing the NPU stack to pick it up
    (`sudo systemctl restart nexus-engine`).
 
@@ -1776,8 +1783,8 @@ camera names before posting.
 
 ## See also
 
-- [README.md](../README.md) — project overview, tier table, status banner.
-- [docs/HARDWARE_TIERS.md](HARDWARE_TIERS.md) — full tier rationale + Lunar Lake driver caveat.
+- [README.md](../README.md) — project overview, hardware support table, status banner.
+- [docs/HARDWARE_MATRIX.md](HARDWARE_MATRIX.md) — capability matrix (profile × accelerator × ep_priority) + Lunar Lake driver caveat.
 - [docs/ARCHITECTURE.md](../../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md) — trait + pool pattern, frame-lifecycle spans, side-channels.
 - [docs/ROADMAP.md](../../nexus-cloud-console/docs/product/ROADMAP.md) — milestones M0 → M9.
 - [docs/M2_STORAGE.md](../../nexus-cloud-console/docs/edge-core/M2_STORAGE.md) — M2.1 storage safety floor (shipped) + M2.2 cold-mirror (in progress).

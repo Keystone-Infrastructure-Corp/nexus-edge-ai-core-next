@@ -18,8 +18,8 @@ one contract: the wire protocol vendored under
 
 This repo keeps only **install + dev** docs:
 
-- [docs/INSTALL.md](docs/INSTALL.md) — bring-up on each hardware tier
-- [docs/HARDWARE_TIERS.md](docs/HARDWARE_TIERS.md) — tier selection matrix
+- [docs/INSTALL.md](docs/INSTALL.md) — bring-up on each hardware profile
+- [docs/HARDWARE_MATRIX.md](docs/HARDWARE_MATRIX.md) — vendor/capability matrix
 - [docs/DEV_NOTES.md](docs/DEV_NOTES.md) — developer workflow, ORT setup, model gen
 
 All architecture, pipeline design, milestone plans (M2/M3/M6/M7/M_ADMIN/M_OTA), the

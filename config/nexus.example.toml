@@ -1,16 +1,19 @@
 # nexus.example.toml — fully annotated reference.
 #
-# Defaults below are sized for the **T24** tier (Beelink EQR7 + Hailo-8,
-# 24 cams target). For other documented hardware tiers (T10 Beelink
-# Mini S13, T36 Arc A380, T36-S Lunar Lake, T64 RTX 4060) copy one of
-# the per-tier files in `config/tiers/` instead. See
-# [docs/HARDWARE_TIERS.md](../docs/HARDWARE_TIERS.md).
+# This is a human-readable REFERENCE only. On a real box the live
+# /etc/nexus/nexus.toml is GENERATED from the detected hardware by
+# `nexus-probe emit-config` (run automatically by scripts/install.sh) —
+# the right ep_priority, decode mode, worker/thread sizing, and model
+# preset are chosen per box. The capability matrix (Intel iGPU / NPU /
+# AMD Vulkan / ROCm / Hailo / NVIDIA / CPU) is documented in
+# [docs/HARDWARE_MATRIX.md](../docs/HARDWARE_MATRIX.md).
 #
 # NOTE: this reference file leaves `ep_priority = ["openvino", "cpu"]`
-# below as the historical defaults so the example boots on an Intel
-# dev box. The T24 production config in `config/tiers/t24.toml`
-# overrides this to `["hailo", "cpu"]` — the AMD Radeon 680M iGPU on
-# the EQR7 is NOT OpenVINO-compatible.
+# below as a neutral default so the example boots on an Intel dev box.
+# A generated Hailo config pins `["hailo", "cpu"]`; an AMD Vulkan box
+# pins `["vulkan", "cpu"]` (the AMD Radeon 680M iGPU is NOT
+# OpenVINO-compatible). To pin a profile by hand use
+# `install.sh --force-profile <name>`.
 #
 # Every backend-selectable layer exposes a `backend` knob. Everything else
 # under that section configures the chosen backend.
@@ -186,15 +189,16 @@ mode = "local" # local | oidc | hybrid
 
 # -----------------------------------------------------------------
 # Inference — the trait + pool + scale-factor pattern lives here.
-# Per-tier defaults live in config/tiers/. The values below are T24.
+# A generated config sizes `workers`/`ep_priority` per detected box; the
+# values below are neutral reference defaults.
 # -----------------------------------------------------------------
 [inference]
 backend = "pool"          # in_process | pool
 workers = 2
 restart_backoff_ms = 2000
 fail_soft = true
-# Default order for Intel-based tiers (T10/T24/T36/T36-S). T64 leads with
-# tensorrt; T36-S inserts "npu" between openvino and cpu. coreml is dev-only.
+# Default order for Intel-based boxes (iGPU/dGPU). An NVIDIA box leads with
+# tensorrt; an Intel NPU box inserts "npu" between openvino and cpu. coreml is dev-only.
 # `"hailo"` is recognized by `build_detector_for_yolo` (M_HAILO_EP): if it
 # appears in this list AND a `yolo26n.hef` artifact exists in the model
 # pack, the Hailo-8 path is taken via nexus-hailo-backend / libhailort.so.

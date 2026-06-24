@@ -1116,14 +1116,15 @@ fn default_restart_backoff_ms() -> u64 {
 fn default_true() -> bool {
     true
 }
-/// Default EP order matches the documented hardware pyramid:
-///   T10/T24/T36/T36-S → openvino   (Intel iGPU/dGPU/NPU)
-///   T64               → tensorrt → cuda
-///   anything else     → cpu
-/// Per-tier configs in `config/tiers/` override this with the right
-/// short list for the box (e.g. T36-S adds "npu" between openvino and cpu;
-/// T64 leads with "tensorrt"). `coreml` is dev-only and excluded from
-/// production defaults — opt in explicitly in your config if you need it.
+/// Default EP order matches the documented hardware matrix:
+///   Intel iGPU/dGPU/NPU → openvino
+///   NVIDIA              → tensorrt → cuda (M5)
+///   anything else       → cpu
+/// A generated `/etc/nexus/nexus.toml` (`nexus-probe emit-config`) pins the
+/// right short list for the detected box (e.g. an NPU box adds "npu" between
+/// openvino and cpu; an NVIDIA box leads with "tensorrt"). `coreml` is
+/// dev-only and excluded from production defaults — opt in explicitly in your
+/// config if you need it.
 fn default_ep_priority() -> Vec<String> {
     vec![
         "openvino".into(),
@@ -3169,23 +3170,21 @@ url = "rtsp://example/cam"
             .and_then(|p| p.parent())
             .expect("repo root above crates/nexus-config");
         let config_dir = repo_root.join("config");
-        // Scan the top-level `config/` samples AND the per-tier
-        // templates under `config/tiers/`. The tier files are what
-        // install.sh stages to /etc/nexus/nexus.toml, so a schema typo
-        // there crash-loops the engine on a clean install — and CI
-        // never builds/runs the installer, so this is the only gate
-        // that catches it (regression: t24-amd.toml shipped a
-        // fabricated `[tracker] clock` field that `deny_unknown_fields`
-        // rejects, but no test parsed config/tiers/ until now).
+        // Scan the shipped top-level `config/` samples. The per-tier
+        // templates that used to live under `config/tiers/` were retired
+        // with the capability-based generator (M_HWCONFIG): the live
+        // /etc/nexus/nexus.toml is now produced by `nexus-probe
+        // emit-config`, whose output is type-checked + `deny_unknown_fields`
+        // safe by construction (built from a real `Config`), and the
+        // generated shape is covered by the nexus-probe golden_config
+        // fixtures. This test still guards the hand-written sample configs.
         let mut toml_paths: Vec<std::path::PathBuf> = Vec::new();
-        for dir in [config_dir.clone(), config_dir.join("tiers")] {
-            let entries = std::fs::read_dir(&dir)
-                .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
-            for entry in entries {
-                let path = entry.unwrap().path();
-                if path.extension().and_then(|s| s.to_str()) == Some("toml") {
-                    toml_paths.push(path);
-                }
+        let entries = std::fs::read_dir(&config_dir)
+            .unwrap_or_else(|e| panic!("read_dir {}: {e}", config_dir.display()));
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                toml_paths.push(path);
             }
         }
         let mut checked = 0usize;
@@ -3238,9 +3237,10 @@ url = "rtsp://example/cam"
             checked += 1;
         }
         assert!(
-            checked >= 6,
-            "expected to round-trip at least 6 TOMLs (the per-tier templates) \
-             from {} and its tiers/ subdir (found {checked})",
+            checked >= 3,
+            "expected to round-trip at least 3 shipped top-level sample TOMLs \
+             (nexus.example.toml, single-camera.toml, single-camera.youtube.toml) \
+             from {} (found {checked})",
             config_dir.display()
         );
     }

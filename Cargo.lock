@@ -2283,7 +2283,6 @@ dependencies = [
  "nexus-config",
  "nexus-inference",
  "nexus-pipeline",
- "nexus-probe",
  "nexus-reid",
  "nexus-rules",
  "nexus-sinks",
