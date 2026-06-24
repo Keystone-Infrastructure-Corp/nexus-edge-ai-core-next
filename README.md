@@ -22,7 +22,7 @@
 > [`../nexus-cloud-console/docs/product/`](../nexus-cloud-console/docs/product/). This
 > repo retains only install + dev docs ([`docs/INSTALL.md`](docs/INSTALL.md),
 > [`docs/DEV_NOTES.md`](docs/DEV_NOTES.md),
-> [`docs/HARDWARE_TIERS.md`](docs/HARDWARE_TIERS.md)). The repo boundary + license
+> [`docs/HARDWARE_MATRIX.md`](docs/HARDWARE_MATRIX.md)). The repo boundary + license
 > asymmetry (engine AGPL-3.0-or-later, cloud Proprietary) is documented in
 > [`AGENTS.md`](AGENTS.md) and
 > [`../nexus-cloud-console/docs/REPO_BOUNDARY.md`](../nexus-cloud-console/docs/REPO_BOUNDARY.md).
@@ -58,36 +58,38 @@ See [`../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md`](../nexus-cloud-con
 for the data flow and the explicit list of side-channels (`LatestFrameCache` etc.) that
 live alongside the main bus.
 
-## Hardware tiers
+## Hardware support
 
-Sized against the same five-tier pyramid as v1. Boxes already on the desk
-are flagged ✅. Per-tier reference configs live in
-[`config/tiers/`](config/tiers/). Pick the file that matches the box.
+The engine is **capability-based**: at install time `nexus-probe` detects the
+host's silicon and **generates** `/etc/nexus/nexus.toml` sized for it
+(`emit-config`) — there are no per-tier templates to pick from. Boxes already
+on the desk are flagged ✅.
 
-| Tier        | Box                                       | Accelerator         | Cams (1080p/15fps) | Status |
-| ----------- | ----------------------------------------- | ------------------- | ------------------ | ------ |
-| **T10**     | Beelink Mini S13 (N150)                   | UHD 24EU iGPU       | 1–2               | ✅ ordered |
-| **T24**     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8   | Hailo-8 26 TOPS M.2 | 24 (target)       | ✅ ordered |
-| **AMD**     | Beelink EQR7 (Ryzen 7 7735HS)             | Radeon 680M (Vulkan)| 4–6               | ✅ shipping |
-| **T36**     | Lenovo P3 Tiny + Arc A380                 | Intel Arc A380 dGPU | 8–12              | not yet sourced |
-| **T36-S**   | GMKtec K13 / EVO-X1 (Lunar Lake 256V)     | Arc 140V + NPU 4    | 6–8               | ✅ ordered |
-| **T64**     | Lenovo P3 Tower + RTX 4060                | NVIDIA RTX 4060     | 12–20             | post-beta |
+| Profile (`--force-profile`) | Box                                       | Accelerator         | Cams (1080p/15fps) | Status |
+| --------------------------- | ----------------------------------------- | ------------------- | ------------------ | ------ |
+| `intel-igpu`                | Beelink Mini S13 (N150)                   | UHD 24EU iGPU       | 1–2               | ✅ ordered |
+| `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8   | Hailo-8 26 TOPS M.2 | 24 (target)       | ✅ ordered |
+| `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS)             | Radeon 680M (Vulkan)| 4–6               | ✅ shipping |
+| `intel-igpu`                | Lenovo P3 Tiny + Arc A380                 | Intel Arc A380 dGPU | 8–12              | not yet sourced |
+| `intel-npu`                 | GMKtec K13 / EVO-X1 (Lunar Lake 256V)     | Arc 140V + NPU 4    | 6–8               | ✅ ordered |
+| `nvidia`                    | Lenovo P3 Tower + RTX 4060                | NVIDIA RTX 4060     | CPU-only (M5)     | post-beta |
 
-The T24 Hailo EP shipped in v0.1.79: HailoRT 4.23 + `.hef` model pack
+The Hailo EP shipped in v0.1.79: HailoRT 4.23 + `.hef` model pack
 load through `nexus-hailo-backend`, and the System tab surfaces live
 chip temp, power, utilization%, inferences/sec, firmware, serial, and
-part number. The AMD tier ships the Radeon 680M (Phoenix gfx1035)
+part number. The AMD profile ships the Radeon 680M (Phoenix gfx1035)
 running inference through the Vulkan(WebGPU) execution provider
 (`ep-vulkan` + bundled ONNX Runtime 1.27 on its Dawn→Vulkan backend),
-opt-in via `--tier amd`; the System tab shows the Radeon's VRAM,
-temperature, and utilization%. ROCm is reserved for the discrete
-RDNA/CDNA GPUs it officially supports (classified from the PCI device
-ID at install time) — never force-fit onto an unsupported iGPU. T64
-stays opt-in until M5 wires the CUDA/TensorRT EPs.
+opt-in via `--force-profile amd-vulkan`; the System tab shows the
+Radeon's VRAM, temperature, and utilization%. ROCm is reserved for the
+discrete RDNA/CDNA GPUs it officially supports (classified from the PCI
+device ID at install time) — never force-fit onto an unsupported iGPU.
+NVIDIA emits a CPU `ep_priority` until M5 wires the CUDA/TensorRT EPs.
 
-`nexus-probe` writes `recommended_tier` into the device manifest so a
-clean install picks the right `config/tiers/*.toml` automatically. Full
-table + Lunar Lake driver caveats: [`docs/HARDWARE_TIERS.md`](docs/HARDWARE_TIERS.md).
+`nexus-probe emit-config` generates the right `ep_priority`, decode mode,
+worker/thread sizing, and model preset for the detected box automatically
+on a clean install. Full matrix + Lunar Lake driver caveats:
+[`docs/HARDWARE_MATRIX.md`](docs/HARDWARE_MATRIX.md).
 
 ## Workspace layout
 
@@ -133,8 +135,8 @@ docker compose -f deploy/docker-compose.yml up
 
 ```bash
 ./target/release/nexus-probe --out data/device-manifest.json
-# Probe writes recommended_tier; pick the matching config/tiers/*.toml.
-./target/release/nexus-engine --config config/tiers/t24.toml
+# Or generate a full config from detected hardware: nexus-probe emit-config --out -
+./target/release/nexus-engine --config config/single-camera.toml
 # Engine listens on :8089 — the SPA at / hosts Viewer (live), Timeline (clips),
 # Events (alerts) plus an admin console (Cameras CRUD + ONVIF/CIDR discovery,
 # Rules CRUD + visual CEL builder, polygon Zones, Storage backends, Backends

@@ -83,8 +83,9 @@ jobs:
   #   │                                    from models-${PACK_VERSION}
   #   │                                    release at workflow runtime)
   #   ├── etc-templates/
-  #   │   ├── nexus.example.toml
-  #   │   ├── tiers/{t10,t24,amd,t36,t36s,t64}.toml
+  #   │   ├── nexus.example.toml             (reference only — the live
+  #   │   │                                  /etc/nexus/nexus.toml is GENERATED
+  #   │   │                                  by `nexus-probe emit-config`)
   #   │   └── systemd/nexus-engine.service
   #   └── scripts/
   #       ├── install.sh                  (in-tarball installer)
@@ -373,7 +374,7 @@ jobs:
           set -euo pipefail
           R="stage"
           mkdir -p "$R/bin" "$R/share/ui" "$R/share/models" \
-                   "$R/etc-templates/tiers" "$R/etc-templates/systemd" \
+                   "$R/etc-templates/systemd" \
                    "$R/scripts/lib"
 
           install -m 0755 target/release/nexus-engine "$R/bin/"
@@ -412,13 +413,11 @@ jobs:
               echo "no HEFs in models/ — ONNX-only pack (pre-v4 or partial pack)"
           fi
 
+          # The live config is GENERATED on-box by `nexus-probe emit-config`
+          # (see scripts/install.sh emit_config); nexus.example.toml ships as a
+          # human-readable reference only. The old per-tier templates were
+          # retired with the capability-based generator (M_HWCONFIG).
           cp config/nexus.example.toml   "$R/etc-templates/nexus.example.toml"
-          cp config/tiers/t10.toml       "$R/etc-templates/tiers/"
-          cp config/tiers/t24.toml       "$R/etc-templates/tiers/"
-          cp config/tiers/amd.toml       "$R/etc-templates/tiers/"
-          cp config/tiers/t36.toml       "$R/etc-templates/tiers/"
-          cp config/tiers/t36s.toml      "$R/etc-templates/tiers/"
-          cp config/tiers/t64.toml       "$R/etc-templates/tiers/"
 
           cp deploy/systemd/nexus-engine.service \
              "$R/etc-templates/systemd/nexus-engine.service"

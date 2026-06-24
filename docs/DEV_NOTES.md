@@ -260,4 +260,4 @@ verbatim (no vocab-index lookup), so CEL rules read e.g.
 - [`ARCHITECTURE.md`](../../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md) — trait + pool + fail-soft pattern,
   L7 cache, frame-lifecycle spans, sampling.
 - [`ROADMAP.md`](../../nexus-cloud-console/docs/product/ROADMAP.md) — milestones M0 → M8.
-- [`HARDWARE_TIERS.md`](HARDWARE_TIERS.md) — T10 / T24 / T36-S / T64 specs.
+- [`HARDWARE_MATRIX.md`](HARDWARE_MATRIX.md) — vendor/capability matrix (Intel iGPU / NPU / AMD Vulkan / ROCm / Hailo / NVIDIA / CPU).
