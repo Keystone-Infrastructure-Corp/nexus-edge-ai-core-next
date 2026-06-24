@@ -18,6 +18,10 @@ use std::process::Command;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+pub mod profile;
+
+pub use profile::{DecodeCapability, ForcedProfile, HardwareProfile, InferenceDevice};
+
 // ---------------------------------------------------------------------------
 // Wire types — exposed so external callers (engine + tests) can consume them.
 // ---------------------------------------------------------------------------
@@ -77,6 +81,16 @@ pub struct Accelerators {
     /// CPU EP at runtime — the detection is what unlocks the
     /// auto-tier mapping ahead of the EP work.
     pub hailo: bool,
+    /// True only when an AMD GPU whose PCI device ID is on the
+    /// ROCm-supported allowlist (discrete CDNA / RDNA2 / RDNA3) is
+    /// present. Default-deny: Phoenix / Rembrandt iGPUs (gfx1035 /
+    /// gfx1103) and any unvetted part stay `false` and route to the
+    /// Vulkan EP. Ported from `scripts/lib/install-common.sh`
+    /// (`_ROCM_SUPPORTED_PCI_IDS`) so the ROCm-vs-Vulkan EP decision
+    /// lives in exactly one place. `#[serde(default)]` keeps older
+    /// `device-manifest.json` (which lacks this key) deserializable.
+    #[serde(default)]
+    pub amd_rocm_capable: bool,
     pub render_nodes: Vec<String>,
     pub accel_nodes: Vec<String>,
 }
@@ -194,9 +208,81 @@ fn probe_accelerators() -> Accelerators {
         // Hailo: only ships AI accelerators under the "Hailo
         // Technologies" PCI vendor string. Substring match is enough.
         hailo: lspci.contains("hailo"),
+        // ROCm-vs-Vulkan: read PCI device IDs from sysfs and match the
+        // ported allowlist (default-deny). Linux-only; false elsewhere.
+        amd_rocm_capable: detect_amd_rocm_capable(),
         render_nodes,
         accel_nodes,
     }
+}
+
+/// Static allowlist of AMD PCI device IDs (the `XXXX` in `1002:XXXX`) that
+/// ROCm OFFICIALLY supports: discrete RDNA2 (gfx1030), RDNA3
+/// (gfx1100/1101/1102), and CDNA (gfx908/gfx90a/gfx942). Ported verbatim
+/// from `scripts/lib/install-common.sh::_ROCM_SUPPORTED_PCI_IDS`. Keep the
+/// two lists in sync — this is the single source of truth the bash
+/// installer is being migrated onto. Deliberately DEFAULT-DENY: anything
+/// NOT listed (Phoenix / Rembrandt iGPUs gfx1035 / gfx1103, unvetted or
+/// brand-new parts) routes to the Vulkan(WebGPU) EP, never ROCm.
+const ROCM_SUPPORTED_PCI_IDS: &[&str] = &[
+    // CDNA — MI100 (gfx908)
+    "738c", "738e", //
+    // CDNA2 — MI200 / MI210 / MI250 (gfx90a)
+    "7408", "740c", "740f", "7410", //
+    // CDNA3 — MI300 (gfx942)
+    "74a0", "74a1", "74a5", "74a9", "74b5", "74b9", "74bd", //
+    // RDNA2 — Navi 21, RX 6800/6900 (gfx1030)
+    "73a1", "73a2", "73a3", "73a5", "73ab", "73af", "73bf", //
+    // RDNA3 — Navi 31 RX 7900 (gfx1100), Navi 32 RX 7700/7800 (gfx1101),
+    // Navi 33 RX 7600 (gfx1102)
+    "744c", "745e", "747e", "7480", "7483",
+];
+
+/// Pure allowlist check: true when `device_id` — the `device` portion of
+/// `1002:device` (with or without a `0x` prefix, any case) — is a
+/// ROCm-supported part. The pure half of the ROCm-vs-Vulkan classifier so
+/// it can be unit-tested without sysfs.
+fn amd_rocm_supported(device_id: &str) -> bool {
+    let id = device_id
+        .trim()
+        .trim_start_matches("0x")
+        .to_ascii_lowercase();
+    ROCM_SUPPORTED_PCI_IDS.contains(&id.as_str())
+}
+
+/// Best-effort sysfs scan for an AMD GPU whose PCI device ID is on the
+/// ROCm allowlist. Mirrors the PRIMARY classifier in the bash
+/// `_amd_gpu_rocm_supported`: iterate `/sys/class/drm/card*/device`, keep
+/// AMD vendor `0x1002` nodes, match the `device` ID against the allowlist.
+/// Linux-only — on macOS (and any host without sysfs) `read_dir` fails and
+/// this returns `false`, failing safe to the Vulkan EP. The bash helper's
+/// SECONDARY `rocminfo` gfx probe stays installer-side (it only matters
+/// when ROCm is already installed); the sysfs allowlist is authoritative
+/// for the manifest.
+fn detect_amd_rocm_capable() -> bool {
+    let Ok(rd) = fs::read_dir("/sys/class/drm") else {
+        return false;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        if !name.starts_with("card") {
+            continue;
+        }
+        let dev = ent.path().join("device");
+        let Ok(vendor) = fs::read_to_string(dev.join("vendor")) else {
+            continue;
+        };
+        if vendor.trim() != "0x1002" {
+            continue; // AMD/ATI only
+        }
+        let Ok(device) = fs::read_to_string(dev.join("device")) else {
+            continue;
+        };
+        if amd_rocm_supported(device.trim()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn probe_runtimes() -> Runtimes {
@@ -497,5 +583,52 @@ mod tests {
         ] {
             assert!(v.get(key).is_some(), "missing top-level key {key}");
         }
+    }
+
+    #[test]
+    fn rocm_allowlist_accepts_supported_discrete_parts() {
+        // One representative per family that the bash allowlist covers.
+        for id in ["738c", "7410", "74a0", "73a5", "744c", "7483"] {
+            assert!(amd_rocm_supported(id), "{id} should be ROCm-supported");
+        }
+    }
+
+    #[test]
+    fn rocm_allowlist_normalizes_prefix_and_case() {
+        // sysfs reports e.g. "0x744C\n"; the matcher must strip 0x, trim,
+        // and lowercase before comparing.
+        assert!(amd_rocm_supported("0x744C"));
+        assert!(amd_rocm_supported("  744C  "));
+    }
+
+    #[test]
+    fn rocm_allowlist_default_denies_igpus_and_unknowns() {
+        // Phoenix 780M (0x15bf, gfx1103) and Rembrandt 680M (0x1681,
+        // gfx1035) are iGPUs that must route to Vulkan, never ROCm.
+        // An arbitrary unvetted ID is denied too.
+        for id in ["15bf", "1681", "1900", "ffff"] {
+            assert!(!amd_rocm_supported(id), "{id} must NOT be ROCm-supported");
+        }
+    }
+
+    #[test]
+    fn accelerators_amd_rocm_capable_deserializes_from_legacy_manifest() {
+        // Wire-compat: an older device-manifest.json that predates the
+        // amd_rocm_capable key must still deserialize (serde default
+        // -> false), never error.
+        let json = r#"{
+            "intel_igpu": false,
+            "intel_arc_140v": false,
+            "intel_npu": false,
+            "nvidia_gpu": false,
+            "apple_silicon": false,
+            "amd_igpu": true,
+            "hailo": false,
+            "render_nodes": [],
+            "accel_nodes": []
+        }"#;
+        let acc: Accelerators = serde_json::from_str(json).expect("legacy accelerators parse");
+        assert!(acc.amd_igpu);
+        assert!(!acc.amd_rocm_capable);
     }
 }
