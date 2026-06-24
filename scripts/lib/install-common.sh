@@ -432,16 +432,19 @@ install_drivers() {
     if (( has_amd )); then
         _drivers_amd_graphics
         # AMD GPU execution-provider selection:
-        #   * explicit `--tier amd`         -> Vulkan(WebGPU), operator's choice
+        #   * `--force-profile amd-vulkan`  -> Vulkan(WebGPU), operator's choice
         #   * officially ROCm-supported GPU -> ROCm EP (discrete RDNA/CDNA)
         #   * everything else (iGPUs etc.)  -> Vulkan(WebGPU), no ROCm force-fit
         # `_amd_gpu_rocm_supported` classifies ROCm-free from the PCI device
         # ID, so we never install the multi-hundred-MB ROCm stack on a GPU it
         # cannot drive, and never depend on the HSA_OVERRIDE_GFX_VERSION
-        # force-fit (now an unsupported manual escape hatch only).
-        if [[ "${TIER:-}" == "amd" ]] || ! _amd_gpu_rocm_supported; then
-            if [[ "${TIER:-}" == "amd" ]]; then
-                log "AMD: '--tier amd' selected; using Vulkan(WebGPU) EP"
+        # force-fit (now an unsupported manual escape hatch only). This bash
+        # allowlist is kept in lock-step with the Rust port in nexus-probe
+        # (`amd_rocm_supported`) that drives the generated ep_priority — the
+        # two MUST agree until the single-detector cutover unifies them.
+        if [[ "${FORCE_PROFILE:-}" == "amd-vulkan" ]] || ! _amd_gpu_rocm_supported; then
+            if [[ "${FORCE_PROFILE:-}" == "amd-vulkan" ]]; then
+                log "AMD: '--force-profile amd-vulkan' selected; using Vulkan(WebGPU) EP"
             else
                 log "AMD: GPU not on the ROCm-supported allowlist; using Vulkan(WebGPU) EP"
             fi
@@ -2446,45 +2449,67 @@ verify_signature() {
     log "MANIFEST.json signature OK (Ed25519, $(wc -c < "$sig") bytes)"
 }
 
-# --- nexus-probe auto-tier ----------------------------------------------------
+# --- Config generation (nexus-probe emit-config) ------------------------------
 
-# Run the staged `nexus-probe` binary, parse its JSON manifest, and
-# echo the `recommended_tier` (e.g. "t24"). Returns empty string on
-# any failure (missing binary, non-zero exit, malformed JSON, tier
-# not in the known set) so the caller can fall back to demanding an
-# explicit `--tier`.
-auto_detect_tier() {
+# Generate /etc/nexus/nexus.toml from the DETECTED hardware via
+# `nexus-probe emit-config`, replacing the old per-tier template copy
+# (`stage_tier_config`) and the `recommended_tier` lookup. nexus-probe
+# builds a real, fully-defaulted `nexus_config::Config` from the box's
+# capabilities (inference EP order, decode mode, worker/blocking
+# threads, inference workers, model preset, bus capacity) and writes
+# the bare-metal pack_path/ui_root directly — so the old sed
+# path-rewrites and the Hailo ep_priority override are gone, decided in
+# exactly one place (the generator).
+#
+# Runs on BOTH first install and every re-run. By DEFAULT it
+# regenerates the config so an upgraded box picks up the
+# capability-derived settings for its current hardware; any existing
+# file is backed up to nexus.toml.bak.<ts> first. `--keep-config`
+# (KEEP_CONFIG=1) opts out and preserves a hand-tuned file untouched.
+#
+# Arg 2 is the optional `--force-profile` value (intel-igpu | intel-npu
+# | amd-vulkan | amd-rocm | hailo | nvidia | cpu); empty = auto-detect.
+#
+# ORDER CONTRACT: install_drivers() MUST have run before this so the VA
+# GStreamer stack is present when emit-config probes for hardware decode.
+emit_config() {
     local release_dir="$1"
+    local force_profile="${2:-}"
+    local target="$NEXUS_CONFIG_DIR/nexus.toml"
     local probe="$release_dir/bin/nexus-probe"
 
-    if [[ ! -x "$probe" ]]; then
-        return 0
-    fi
-    require_cmd python3
+    [[ -x "$probe" ]] || die "nexus-probe not found or not executable: $probe"
 
-    local json
-    if ! json="$("$probe" --out - 2>/dev/null)"; then
+    if [[ -e "$target" ]] && (( ${KEEP_CONFIG:-0} )); then
+        log "--keep-config: preserving existing config: $target (skipping regenerate)"
         return 0
     fi
-    local tier
-    # Prefer `recommended_tier_config` (e.g. "config/tiers/t24.toml")
-    # over `recommended_tier` because the latter is upper-case with
-    # punctuation ("T10", "T36-S") while the file stem is the exact
-    # lower-case CLI tier we want ("t10", "t36s"). Falls through
-    # silently for the "dev" / "config/single-camera.toml" case
-    # which has no production tier mapping.
-    tier="$(printf '%s' "$json" | python3 -c '
-import json, os, sys
-try:
-    m = json.load(sys.stdin)
-    cfg = m.get("recommended_tier_config", "")
-    stem = os.path.splitext(os.path.basename(cfg))[0]
-    if stem in ("t10","t24","t36","t36s","t64"):
-        print(stem)
-except Exception:
-    pass
-' 2>/dev/null || true)"
-    printf '%s' "$tier"
+
+    install -d -o root -g root -m 0755 "$NEXUS_CONFIG_DIR"
+
+    # Unconditionally back up before any overwrite so the operator can
+    # always roll back to the previous config.
+    if [[ -e "$target" ]]; then
+        local backup
+        backup="$target.bak.$(date +%Y%m%dT%H%M%S)"
+        log "backing up existing config to $backup before regenerate"
+        cp -a "$target" "$backup"
+    fi
+
+    local args=(emit-config --out "$target")
+    if [[ -n "$force_profile" ]]; then
+        args+=(--force-profile "$force_profile")
+    fi
+
+    log "generating $target from detected hardware (nexus-probe emit-config)"
+    if ! "$probe" "${args[@]}"; then
+        die "nexus-probe emit-config failed; refusing to start with an incomplete config"
+    fi
+    # nexus-probe writes the file as the invoking user (root); normalize
+    # owner/mode to the old `install -m 0644` contract.
+    chown root:root "$target"
+    chmod 0644 "$target"
+    log "generated config: $target"
 }
 
 # --- install-state.json -------------------------------------------------------
@@ -2539,78 +2564,6 @@ os.chmod(state_file, 0o644)
 PY
 
     log "wrote $state_file"
-}
-
-# --- Tier config staging ------------------------------------------------------
-
-# Copy etc-templates/tiers/<tier>.toml -> /etc/nexus/nexus.toml on
-# FIRST install only.  Rewrites pack_path + ui_root to point at the
-# atomic-swap symlink so upgrades that change either don't require
-# editing nexus.toml.  Preserves operator edits on every subsequent
-# install (the file lives in /etc, which is the contract).
-stage_tier_config() {
-    local tier="$1"
-    local release_dir="$2"
-    local target="$NEXUS_CONFIG_DIR/nexus.toml"
-    local src="$release_dir/etc-templates/tiers/${tier}.toml"
-
-    [[ -r "$src" ]] || die "tier template not found: $src"
-
-    if [[ -e "$target" ]]; then
-        log "preserving existing config: $target (tier template skipped)"
-        return 0
-    fi
-
-    install -o root -g root -m 0644 "$src" "$target"
-    # Tier templates use the Docker paths /usr/share/nexus/{models,ui}
-    # because the same templates are bind-mounted into the container.
-    # On bare-metal the equivalent lives under the atomic-swap root.
-    sed -i \
-        -e 's#/usr/share/nexus/models#/opt/nexus/current/share/models#g' \
-        -e 's#/usr/share/nexus/ui#/opt/nexus/current/share/ui#g' \
-        "$target"
-    log "staged tier config: $tier -> $target"
-    _apply_hailo_ep_priority_override "$target"
-}
-
-# Auto-prepend "hailo" to ep_priority when a Hailo-8 M.2 is detected
-# AND the chosen tier template didn't already list it. Runs only from
-# stage_tier_config's first-install path so operator edits are never
-# touched. Rationale: with model pack v4+ every Hailo-8 box benefits
-# from the HEF runtime regardless of which tier the operator picked
-# (`--tier t10` on a Hailo box should still light up the chip).
-_apply_hailo_ep_priority_override() {
-    local target="$1"
-    local tags
-    tags="$(_detect_hardware 2>/dev/null)" || return 0
-    grep -qx 'hailo-m2' <<<"$tags" || return 0
-    # Already present (T24 template) — nothing to do.
-    if grep -qE '^\s*ep_priority\s*=.*"hailo"' "$target"; then
-        log "ep_priority already includes \"hailo\" (no override needed)"
-        return 0
-    fi
-    # The chosen config pins a ROCm-primary tier (ep_priority = ["rocm",
-    # "cpu"]). Honor that choice and do NOT inject "hailo" — a box with both
-    # a Hailo-8 and an officially-supported AMD GPU can be pinned to ROCm
-    # inference on purpose. The explicit config wins.
-    if grep -qE '^\s*ep_priority\s*=.*"rocm"' "$target"; then
-        log "ep_priority lists \"rocm\" (ROCm-primary tier); not injecting \"hailo\""
-        return 0
-    fi
-    # Symmetric to the ROCm guard: the operator chose a Vulkan-primary tier
-    # (e.g. --tier amd, ep_priority = ["vulkan", "cpu"]). A box with both a
-    # Hailo-8 and an AMD iGPU can be pinned to Vulkan inference on purpose —
-    # the explicit tier wins, so do NOT inject "hailo".
-    if grep -qE '^\s*ep_priority\s*=.*"vulkan"' "$target"; then
-        log "ep_priority lists \"vulkan\" (Vulkan-primary tier); not injecting \"hailo\""
-        return 0
-    fi
-    if ! grep -qE '^\s*ep_priority\s*=\s*\[' "$target"; then
-        warn "ep_priority line not found in $target; skipping Hailo override"
-        return 0
-    fi
-    sed -i -E 's/^(\s*ep_priority\s*=\s*\[)/\1"hailo", /' "$target"
-    log "auto-prepended \"hailo\" to ep_priority in $target (Hailo-8 M.2 detected)"
 }
 
 # --- systemd unit -------------------------------------------------------------

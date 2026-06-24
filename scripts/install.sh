@@ -7,13 +7,12 @@
 #      driven by scripts/bootstrap.sh):
 #
 #         cd /opt/nexus/releases/v0.2.0
-#         sudo ./scripts/install.sh --tier t24
+#         sudo ./scripts/install.sh
 #
 #   2. From a clone of this repo, against a release tarball you
 #      downloaded yourself:
 #
 #         sudo scripts/install.sh \
-#             --tier t24 \
 #             --tarball ~/Downloads/nexus-edge-v0.2.0-linux-x86_64.tar.gz
 #
 # Either way the script:
@@ -24,16 +23,21 @@
 #   * verifies every file's sha256 against MANIFEST.json,
 #   * creates the `nexus` system user + /etc/nexus + /var/lib/nexus
 #     on first run,
-#   * stages /etc/nexus/nexus.toml from the chosen tier template (only
-#     on first run; preserves operator edits forever after),
+#   * GENERATES /etc/nexus/nexus.toml from the detected hardware via
+#     `nexus-probe emit-config` (capability-based: inference EP order,
+#     decode mode, threads, workers, preset, bus capacity). Regenerates
+#     by default on every re-run, backing up the previous file to
+#     nexus.toml.bak.<ts> first; pass --keep-config to preserve a
+#     hand-tuned file,
 #   * installs the systemd unit,
 #   * atomically flips /opt/nexus/current to the new release,
 #   * (re)starts nexus-engine.service and waits for /api/v1/health.
 #
-# Idempotent: re-running with the same --tier on the same version
-# is a no-op except for `systemctl restart`.  Re-running with a
-# different --tier rewrites /etc/nexus/nexus.toml ONLY if you also
-# pass --force-tier (because the operator may have hand-tuned).
+# Idempotent: the generated config is deterministic from the box's
+# hardware, so re-running on unchanged hardware reproduces the same
+# nexus.toml (the timestamped header comment aside). Pass
+# --force-profile <name> to pin the inference profile, or --keep-config
+# to skip regeneration entirely.
 #
 # This file lives inside the tarball at scripts/install.sh and is
 # also tracked in the repo at scripts/install.sh — the two are
@@ -50,10 +54,10 @@ SCRIPT_DIR="$( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd )"
 
 # --- Arg parsing --------------------------------------------------------------
 
-TIER=""
+FORCE_PROFILE=""
 TARBALL=""
 VERSION=""
-FORCE_TIER=0
+KEEP_CONFIG=0
 NO_START=0
 ROLLBACK=0
 SKIP_SYSTEM_PREP=0
@@ -80,20 +84,25 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  --tier {t10|t24|amd|t36|t36s|t64}
-                                  Pick the tier config template (required on
-                                  first install; ignored on upgrades unless
-                                  --force-tier is also passed). Omit to let
-                                  nexus-probe pick on first install.
+  --force-profile {intel-igpu|intel-npu|amd-vulkan|amd-rocm|hailo|nvidia|cpu}
+                                  Pin the inference profile instead of
+                                  auto-detecting. Scales CPU/RAM-derived
+                                  knobs to the box but forces the inference
+                                  EP order + decode for the named profile.
+                                  Omit to let nexus-probe pick from detected
+                                  hardware (the normal case).
+  --keep-config                   Skip config (re)generation and preserve an
+                                  existing /etc/nexus/nexus.toml untouched.
+                                  Use on a box whose nexus.toml you have
+                                  hand-tuned. By default install.sh
+                                  REGENERATES the config from detected
+                                  hardware on every run (backing up the old
+                                  file to nexus.toml.bak.<ts> first).
   --tarball <path>                Install from a .tar.gz on disk (defaults
                                   to assuming we're already inside an
                                   extracted release).
   --version <vX.Y.Z>              Override the version string (defaults to
                                   the VERSION file inside the release).
-  --force-tier                    Overwrite /etc/nexus/nexus.toml with the
-                                  chosen tier template, even if a config
-                                  already exists.  Backs up the old file
-                                  to nexus.toml.bak first.
   --no-start                      Install everything but don't enable or
                                   start the systemd unit.
   --unattended                    Deprecated no-op. The installer is now
@@ -161,10 +170,10 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tier)               TIER="$2"; shift 2 ;;
+        --force-profile)      FORCE_PROFILE="$2"; shift 2 ;;
+        --keep-config)        KEEP_CONFIG=1; shift ;;
         --tarball)            TARBALL="$2"; shift 2 ;;
         --version)            VERSION="$2"; shift 2 ;;
-        --force-tier)         FORCE_TIER=1; shift ;;
         --no-start)           NO_START=1; shift ;;
         --unattended)         UNATTENDED=1; shift ;;
         --admin-password-file) ADMIN_PASSWORD_FILE="$2"; shift 2 ;;
@@ -181,6 +190,20 @@ while [[ $# -gt 0 ]]; do
         *)                    err "unknown option: $1"; usage; exit 2 ;;
     esac
 done
+
+# install_drivers() (AMD EP gating) and emit_config() in
+# install-common.sh both read these — export so the sourced helpers
+# see them regardless of subshell boundaries.
+export FORCE_PROFILE KEEP_CONFIG
+
+# Validate --force-profile early with a friendly error rather than
+# letting nexus-probe reject it after the long driver install.
+if [[ -n "$FORCE_PROFILE" ]]; then
+    case "$FORCE_PROFILE" in
+        intel-igpu|intel-npu|amd-vulkan|amd-rocm|hailo|nvidia|cpu) ;;
+        *) die "unknown --force-profile: $FORCE_PROFILE (expected one of: intel-igpu, intel-npu, amd-vulkan, amd-rocm, hailo, nvidia, cpu)" ;;
+    esac
+fi
 
 # --- Pre-flight ---------------------------------------------------------------
 
@@ -364,38 +387,15 @@ ensure_accelerator_groups
 # and report success. Non-fatal: produces a loud banner with a fix.
 verify_accelerators
 
-# --- Stage tier config (first install only, or --force-tier) ------------------
-
-if [[ -n "$TIER" ]]; then
-    case "$TIER" in t10|t24|amd|t36|t36s|t64) ;; *) die "unknown --tier: $TIER" ;; esac
-
-    if (( FORCE_TIER )); then
-        if [[ -e "$NEXUS_CONFIG_DIR/nexus.toml" ]]; then
-            backup="$NEXUS_CONFIG_DIR/nexus.toml.bak.$(date +%Y%m%dT%H%M%S)"
-            log "--force-tier: backing up existing config to $backup"
-            cp -a "$NEXUS_CONFIG_DIR/nexus.toml" "$backup"
-            rm -f "$NEXUS_CONFIG_DIR/nexus.toml"
-        fi
-    fi
-    stage_tier_config "$TIER" "$RELEASE_DIR"
-elif [[ ! -e "$NEXUS_CONFIG_DIR/nexus.toml" ]]; then
-    # First install + no explicit --tier: ask nexus-probe what this
-    # box looks like and use its `recommended_tier`. Falls back to
-    # the original "please pass --tier" error if probe doesn't
-    # produce a usable answer (no GPU on a recent CPU might still
-    # land on the right tier; an ancient box without AVX2 might
-    # not).
-    auto_tier="$(auto_detect_tier "$RELEASE_DIR")"
-    if [[ -n "$auto_tier" ]]; then
-        log "nexus-probe recommends --tier $auto_tier; using it (override with --tier on re-run)"
-        TIER="$auto_tier"
-        stage_tier_config "$TIER" "$RELEASE_DIR"
-    else
-        die "no /etc/nexus/nexus.toml, no --tier given, and nexus-probe could not auto-detect — pass --tier t{10,24,36,36s,64}"
-    fi
-else
-    log "preserving existing config: $NEXUS_CONFIG_DIR/nexus.toml"
-fi
+# --- Generate config from detected hardware -----------------------------------
+# Replaces the old tier-template copy. nexus-probe builds a complete,
+# capability-derived nexus.toml (ep_priority, decode mode, threads,
+# workers, preset, bus capacity) from the box's hardware and writes the
+# bare-metal pack_path/ui_root directly. Regenerates by default (with a
+# timestamped backup of any existing file); --keep-config opts out.
+# install_drivers ran above, so the VA GStreamer stack is present before
+# emit-config probes for hardware decode.
+emit_config "$RELEASE_DIR" "$FORCE_PROFILE"
 
 # --- systemd unit -------------------------------------------------------------
 
@@ -455,14 +455,14 @@ fi
 
 # --- TLS bootstrap (M-HTTPS Phase 1) -----------------------------------------
 #
-# If the loaded tier config declares an `https_bind` listener, mint
+# If the generated config declares an `https_bind` listener, mint
 # a self-signed leaf at the configured cert/key paths when none is
 # already present. Idempotent: subsequent installs preserve any
 # existing PEM (operator-installed or cloud-issued). Failure is
 # loud but non-fatal — the engine starts in plain-HTTP mode if
 # the cert is missing, so a bug here can't brick the appliance.
 if grep -q '^https_bind' "$NEXUS_CONFIG_DIR/nexus.toml" 2>/dev/null; then
-    log "tier config has [server].https_bind set; ensuring TLS material is present"
+    log "config has [server].https_bind set; ensuring TLS material is present"
     # Run as root: /etc/nexus/tls/ is root:nexus 2750 so the
     # service user can read the PEMs (key is 0640) but not
     # write into the directory. The cert PEM (0644) and key

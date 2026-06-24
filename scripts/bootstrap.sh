@@ -7,20 +7,21 @@
 # Operator-facing surface:
 #
 #     curl -fsSL https://raw.githubusercontent.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/main/scripts/bootstrap.sh \
-#         | sudo bash -s -- --tier t24 --version v0.2.0
+#         | sudo bash -s -- --version v0.2.0
 #
 # Or, against a release that's already cut:
 #
 #     curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/bootstrap.sh \
-#         | sudo bash -s -- --tier t24
+#         | sudo bash -s --
 #
 # (The release workflow uploads this file as `bootstrap.sh` alongside
 # the tarball so the second URL works without specifying --version.)
 #
 # bootstrap.sh stays tiny and parameter-driven on purpose so that the
-# verifier and tier-staging logic live in install.sh + install-common.sh
-# inside the tarball — i.e. shipped with the release and pinned by
-# manifest sha256 — instead of in this network-fetched script.
+# verifier and config-generation logic live in install.sh +
+# install-common.sh inside the tarball — i.e. shipped with the release
+# and pinned by manifest sha256 — instead of in this network-fetched
+# script.
 
 set -euo pipefail
 
@@ -29,7 +30,8 @@ ARCH="$(uname -m)"
 KERNEL="$(uname -s)"
 NEXUS_PREFIX="${NEXUS_PREFIX:-/opt/nexus}"
 
-TIER=""
+FORCE_PROFILE=""
+KEEP_CONFIG=0
 VERSION=""
 EXTRA_ARGS=()
 
@@ -38,22 +40,28 @@ usage() {
 Usage: bootstrap.sh [options] [-- <install.sh args>]
 
 Options:
-  --version <vX.Y.Z>  Release tag to install (default: latest).
-  --tier <name>       Hardware tier; forwarded to install.sh.
-  --help              This message.
+  --version <vX.Y.Z>       Release tag to install (default: latest).
+  --force-profile <name>   Pin the inference profile (intel-igpu|intel-npu|
+                           amd-vulkan|amd-rocm|hailo|nvidia|cpu); forwarded
+                           to install.sh. Omit to auto-detect.
+  --keep-config            Preserve an existing /etc/nexus/nexus.toml
+                           instead of regenerating it; forwarded to
+                           install.sh.
+  --help                   This message.
 
 Anything after --  is forwarded to install.sh verbatim, e.g.:
-  bootstrap.sh --version v0.2.0 --tier t24 -- --no-start
+  bootstrap.sh --version v0.2.0 -- --no-start
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version)  VERSION="$2"; shift 2 ;;
-        --tier)     TIER="$2"; shift 2 ;;
-        --help|-h)  usage; exit 0 ;;
-        --)         shift; EXTRA_ARGS=("$@"); break ;;
-        *)          echo "bootstrap.sh: unknown arg: $1" >&2; usage; exit 2 ;;
+        --version)        VERSION="$2"; shift 2 ;;
+        --force-profile)  FORCE_PROFILE="$2"; shift 2 ;;
+        --keep-config)    KEEP_CONFIG=1; shift ;;
+        --help|-h)        usage; exit 0 ;;
+        --)               shift; EXTRA_ARGS=("$@"); break ;;
+        *)                echo "bootstrap.sh: unknown arg: $1" >&2; usage; exit 2 ;;
     esac
 done
 
@@ -96,7 +104,8 @@ curl -fL --retry 3 -o "$workdir/$TARBALL_NAME.sha256" "$SHA_URL"
 # location, runs MANIFEST.json verification, stages config, installs
 # the systemd unit, flips current, and starts the service.
 install_args=(--tarball "$workdir/$TARBALL_NAME" --version "$VERSION")
-[[ -n "$TIER" ]] && install_args+=(--tier "$TIER")
+[[ -n "$FORCE_PROFILE" ]] && install_args+=(--force-profile "$FORCE_PROFILE")
+(( KEEP_CONFIG )) && install_args+=(--keep-config)
 install_args+=("${EXTRA_ARGS[@]}")
 
 # We don't have install.sh on disk yet (the tarball does), but it's
