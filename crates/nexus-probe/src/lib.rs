@@ -18,8 +18,10 @@ use std::process::Command;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+pub mod generate;
 pub mod profile;
 
+pub use generate::{generate_config, render_toml};
 pub use profile::{DecodeCapability, ForcedProfile, HardwareProfile, InferenceDevice};
 
 // ---------------------------------------------------------------------------

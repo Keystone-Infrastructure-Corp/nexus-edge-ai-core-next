@@ -19,3 +19,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+# Capability-based config generation: build a real `nexus_config::Config`
+# from the detected `HardwareProfile` and serialize it to nexus.toml. This
+# is the single source of truth for `/etc/nexus/nexus.toml` (the installer
+# calls `nexus-probe emit-config`), so the output is guaranteed-parseable
+# and `deny_unknown_fields`-clean by construction.
+nexus-config = { workspace = true }
+toml = { workspace = true }

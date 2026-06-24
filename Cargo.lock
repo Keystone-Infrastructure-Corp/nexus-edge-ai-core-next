@@ -2403,8 +2403,10 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "nexus-config",
  "serde",
  "serde_json",
+ "toml 0.8.23",
 ]
 
 [[package]]
