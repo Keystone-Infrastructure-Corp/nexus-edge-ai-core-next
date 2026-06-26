@@ -87,6 +87,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setSession(null);
   }, []);
 
+  // Idle / server-forced logout: clear the session AND hard-redirect so
+  // the router's `_app` beforeLoad gate re-runs and lands the user on
+  // /login. Clearing React state alone is NOT enough — the gate reads
+  // localStorage at route-resolve time and won't re-run just because a
+  // context value changed, so the current page (e.g. the live view)
+  // would stay mounted. Mirrors the Sign-out button in <TopBar>.
+  const endSessionAndRedirect = useCallback(() => {
+    clearSession();
+    window.location.assign("/");
+  }, [clearSession]);
+
   // Wire the imperative HTTP client every time the session shape changes.
   // It captures the setters so the 401-refresh loop can rotate tokens
   // without going through React state mutation in the hot path.
@@ -95,24 +106,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       accessToken: session?.access_token ?? null,
       refreshToken: session?.refresh_token ?? null,
       onRotate: (t) => setSessionFromTokens(t),
-      onClear: () => clearSession(),
+      // onClear fires only when the client gives up on a refresh
+      // (idle timeout, refresh-token expiry, or a hard refresh
+      // failure) — i.e. the session is terminally gone. Redirect so
+      // the user lands on /login instead of staring at a stale page.
+      onClear: () => endSessionAndRedirect(),
     });
-  }, [session, setSessionFromTokens, clearSession]);
+  }, [session, setSessionFromTokens, endSessionAndRedirect]);
 
   // v0.1.36 — 20-minute client-side idle nudge. Server is the
   // authoritative gate; this just clears local state slightly
   // before the next refresh would have been refused so the UX
   // is a clean redirect to /login instead of a failed request.
-  useIdleLogout(session !== null, clearSession);
+  useIdleLogout(session !== null, endSessionAndRedirect);
 
   // Also listen for the global idle_expired event the api client
   // dispatches when the refresh endpoint returned the 401 first
   // (e.g. the user came back after a long lunch with a stale tab).
   useEffect(() => {
-    const handler = () => clearSession();
+    const handler = () => endSessionAndRedirect();
     window.addEventListener("nexus:idle-expired", handler);
     return () => window.removeEventListener("nexus:idle-expired", handler);
-  }, [clearSession]);
+  }, [endSessionAndRedirect]);
 
   const value = useMemo(
     () => ({ session, setSessionFromTokens, clearSession }),
