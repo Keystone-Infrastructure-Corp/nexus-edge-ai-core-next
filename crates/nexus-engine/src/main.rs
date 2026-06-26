@@ -40,6 +40,7 @@ mod fleet_apply;
 mod fleet_hash;
 mod gpu;
 mod hailo;
+mod model_catalog_publish;
 mod models_catalog;
 mod network;
 mod npu;
@@ -1199,6 +1200,15 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // yolo_world). See `models_catalog.rs` for details.
     let model_prompts = std::sync::Arc::new(models_catalog::build_catalog(&cfg.inference, &router));
 
+    // Wedge follow-up — publish the engine's resolved detector vocabulary
+    // to the cloud on every tunnel-up. The console renders prompt
+    // suggestions from this live data instead of a hand-maintained mirror
+    // of the engine's label map. The catalog is a boot-time snapshot, so
+    // the task simply re-pushes it on each (re)connect. See
+    // `model_catalog_publish.rs`.
+    let model_catalog_handle =
+        model_catalog_publish::spawn(model_prompts.clone(), cloud_outbox.clone());
+
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),
@@ -1734,6 +1744,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     reconciler_handle.abort();
     roster_handle.abort();
     state_hashes_handle.abort();
+    model_catalog_handle.abort();
     // Abort every per-camera supervisor. `drain()` empties the map
     // under one lock acquisition; the reconciler is already aborted
     // above so nothing will re-populate it.
