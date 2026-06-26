@@ -25,7 +25,14 @@
 //! `/22`), and the audit-log contract.
 
 pub mod onvif;
+pub mod onvif_device;
+pub mod onvif_deviceio;
+pub mod onvif_encoder;
+pub mod onvif_imaging;
 pub mod onvif_media;
+pub mod onvif_ptz;
+pub mod onvif_snapshot;
+pub mod onvif_soap;
 pub mod rtsp_probe;
 pub mod scan;
 
