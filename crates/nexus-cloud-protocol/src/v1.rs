@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -200,6 +200,23 @@ pub struct CoreStateHashesPayload {
     pub visual_prompts_sha256: Option<String>,
 }
 
+/// One detector kind the engine knows how to build, with the prompt vocabulary it actually resolves at boot. The console renders prompt suggestions from these entries instead of a hand-maintained mirror, so closed-vocab kinds advertise the exact label set the detector emits and open-vocab kinds advertise the baked prompt vocabulary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectorVocabEntry {
+    /// Canonical detector kind name (e.g. "yolo", "yolo_world", "yoloe", "yoloe_promptfree", "yoloe_visual", "classifier_ensemble", "mock"). Matches CameraRosterEntry.model_kind values.
+    pub kind: String,
+    /// True iff the engine's router already built a layer for this kind at boot. The console may surface a restart-engine-to-activate hint for unloaded kinds chosen as a camera override.
+    pub loaded: bool,
+    /// Optional human-readable note describing the detector, shown beneath the suggestion strip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// True for open-vocab detectors (yolo_world / yoloe) that accept arbitrary user prompt strings but only emit labels from the baked vocabulary; false for closed-vocab detectors that emit a fixed label set. The console renders a free-text+suggestion box when true and a fixed chip strip when false.
+    pub open_vocab: bool,
+    /// Every label/prompt this detector kind is known to emit (closed-vocab) or accept (open-vocab baked vocabulary). Empty for detectors whose vocabulary is unknown (e.g. mock / visual-prompt).
+    pub prompts: Vec<String>,
+}
+
 /// Cloud → Edge. Phase 7.0a. Operator-initiated diagnostic-tarball collection request. The cloud mints a single-use Azure Blob SAS PUT URL scoped to a unique `diag_id` path under the `diagnostics` container, then pushes this envelope down the existing edge-gateway tunnel. The edge tarballs (logs ∪ scrubbed-config ∪ telemetry snapshot ∪ optional sqlite dump), `reqwest::put`s the bytes to `sas_put_url`, then emits `diag_ready` (status=uploaded|failed) with the same `diag_id`. Operator-facing endpoints in the console resolve diag_id → fresh download SAS URL via Blob listBlobs. State-mutating on the edge (creates a tarball, makes outbound network calls), so `actor_token` is REQUIRED and the edge verifies signature + path-binding before any local work. The 30-second actor_token TTL is honoured for receipt-validation only; the tarball+upload work continues past the token expiry (the SAS URL has its own independent expiry).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -331,6 +348,18 @@ pub struct HeartbeatPayload {
     pub version: String,
 }
 
+/// Edge → Cloud. Additive on v=1. The detector-prompt vocabulary the engine actually resolved at boot — one DetectorVocabEntry per detector kind the engine knows how to build. Sent on tunnel-up and whenever the loaded model pack changes (rare — effectively per OTA / restart). The console renders prompt suggestions from this live data instead of a hand-maintained mirror of the engine's label map. Fire-and-forget — no ack in the v1 wire schema; the cloud upserts these into core_model_catalog keyed on core_id (org_id resolved from the cores FK), and the next report on reconnect is the recovery path. Pre-feature cloud peers ignore this kind; pre-feature edges never emit it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalogPayload {
+    /// Edge wall-clock when the catalog was built (engine boot). Diagnostics only — the cloud stores this as core_model_catalog.computed_at; reported_at is set server-side on receipt.
+    pub computed_at: Timestamp,
+    /// inference.model.kind from the loaded config — the kind every camera that does NOT set a per-camera override runs against.
+    pub default_kind: String,
+    /// One entry per detector kind the engine knows how to build, regardless of whether the router currently has a layer for it (loaded distinguishes).
+    pub kinds: Vec<DetectorVocabEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseStatus {
@@ -430,6 +459,7 @@ pub enum EnvelopeBody {
     DiagCollect(DiagCollectPayload),
     DiagReady(DiagReadyPayload),
     CoreStateHashes(CoreStateHashesPayload),
+    ModelCatalog(ModelCatalogPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.
