@@ -18,9 +18,7 @@
 //!
 //! The public `async` operations are the camera-control surface
 //! consumed by the operator admin-passthrough routes added in
-//! Phase 7.6.3; until those routes land they have no in-crate
-//! caller, hence the module-level `dead_code` allowance.
-#![allow(dead_code)]
+//! Phase 7.6.3 (`crate::device_control`).
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;

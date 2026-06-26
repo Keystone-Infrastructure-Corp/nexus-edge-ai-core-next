@@ -488,6 +488,83 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
         )
+        // Phase 7.6 · Step 7.6.3 — ONVIF device control. These drive
+        // the per-camera SOAP client (`crate::discovery::onvif_*`)
+        // against the camera's edge-resident endpoint + credentials.
+        // RBAC carve-out (operator = PTZ jog/recall; admin = the
+        // rest) and edge-side auditing live in the handlers — see
+        // `crate::device_control`. Param is `{camera_id}` to match
+        // the existing `…/visual-prompts` sub-resource routes above
+        // (every continuation under `cameras/{…}/` shares one param
+        // name so matchit doesn't see a conflict).
+        .route(
+            "/v1/admin/cameras/{camera_id}/ptz",
+            axum::routing::post(crate::device_control::ptz_command),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/ptz/presets",
+            get(crate::device_control::ptz_presets),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/ptz/nodes",
+            get(crate::device_control::ptz_nodes),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/ptz/status",
+            get(crate::device_control::ptz_status),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/ptz/config-options",
+            get(crate::device_control::ptz_config_options),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/imaging",
+            get(crate::device_control::imaging_get).put(crate::device_control::imaging_put),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/imaging/focus",
+            axum::routing::post(crate::device_control::imaging_focus),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/device",
+            get(crate::device_control::device_get).post(crate::device_control::device_command),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/device/log",
+            get(crate::device_control::device_log),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/deviceio/relays",
+            get(crate::device_control::relays_get).put(crate::device_control::relays_put),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/deviceio/inputs",
+            get(crate::device_control::digital_inputs_get),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/deviceio/audio-sources",
+            get(crate::device_control::audio_sources_get),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/deviceio/osds",
+            get(crate::device_control::osds_get),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/deviceio/osd",
+            axum::routing::post(crate::device_control::osd_command),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/encoder",
+            get(crate::device_control::encoder_get).put(crate::device_control::encoder_put),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/snapshot",
+            get(crate::device_control::snapshot_get),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/onvif/raw",
+            axum::routing::post(crate::device_control::onvif_raw),
+        )
         // Phase 7.5 · Step 7.5.4 — cloud fleet-settings apply. The
         // cloud api-gateway fans a resolved category value out to
         // every core as an `rpc_call` with path
@@ -6256,6 +6333,323 @@ mod tests {
         req.extensions_mut().insert(ConnectInfo(remote_peer()));
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ===============================================================
+    // Phase 7.6 · Step 7.6.3 — ONVIF device-control admin routes
+    // ===============================================================
+
+    /// Sign an HS256 admin bearer that *also* carries a `role`
+    /// claim, so the [`crate::auth::require_role::SessionContext`]
+    /// extractor resolves a real non-admin role. The admin-auth
+    /// middleware itself only validates `exp` + signature (it
+    /// ignores `role`), so the token passes the gate and the
+    /// fine-grained RBAC carve-out is exercised inside the handler.
+    fn sign_role_jwt(secret: &[u8], role: &str) -> String {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let claims = serde_json::json!({ "exp": exp, "sub": "role-test", "role": role });
+        jwt_encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap()
+    }
+
+    /// A camera endpoint that is guaranteed-dead on the loopback
+    /// (TCP discard port 9 is closed on the CI hosts), so any SOAP
+    /// round-trip fails fast with connection-refused → `502`. Lets
+    /// the RBAC + audit tests assert "passed the gate, then the
+    /// device call failed" without standing up a fake ONVIF server.
+    const DEAD_ONVIF: &str = "http://127.0.0.1:9/onvif/device_service";
+
+    /// Insert a camera row, optionally with an ONVIF endpoint.
+    async fn seed_onvif_camera(store: &Store, id: i64, onvif_endpoint: Option<&str>) {
+        let cam = nexus_config::CameraConfig {
+            id,
+            name: format!("cam-{id}"),
+            ingest: nexus_config::CameraIngest {
+                url: "rtsp://127.0.0.1/stream".parse().unwrap(),
+                enabled: true,
+                max_fps: 0,
+                codec: None,
+            },
+            detector: nexus_config::CameraDetector::default(),
+            behavior: nexus_config::CameraBehavior::default(),
+            onvif: nexus_config::CameraOnvif {
+                endpoint: onvif_endpoint.map(|s| s.to_string()),
+                username: Some("admin".into()),
+                password: Some("secret".into()),
+            },
+            zones: vec![],
+        };
+        store.upsert_camera(&cam).await.unwrap();
+    }
+
+    /// An operator may not touch the imaging surface — that's
+    /// admin-only. RBAC rejects *before* any camera load or network
+    /// call, so this returns `403` instantly with no ONVIF endpoint
+    /// even configured.
+    #[tokio::test]
+    async fn device_control_operator_rejected_from_imaging() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"devctl-op-imaging-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_role_jwt(SECRET, "operator");
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/cameras/1/imaging")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({ "video_source_token": "vsc0", "settings": {} }).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+    }
+
+    /// An admin clears RBAC on the imaging surface; with a dead
+    /// ONVIF endpoint the SOAP write then fails, surfacing as `502`
+    /// (definitively *not* `403`).
+    #[tokio::test]
+    async fn device_control_admin_allowed_on_imaging() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"devctl-admin-imaging-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_onvif_camera(&store, 7, Some(DEAD_ONVIF)).await;
+        let token = sign_admin_jwt(SECRET); // legacy admin (no role) → Admin
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/cameras/7/imaging")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({ "video_source_token": "vsc0", "settings": {} }).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+    }
+
+    /// An operator *can* jog PTZ — the carve-out's whole point. The
+    /// command passes RBAC and reaches the (dead) device, so the
+    /// result is `502`, never `403`.
+    #[tokio::test]
+    async fn device_control_operator_can_jog_ptz() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"devctl-op-ptz-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_onvif_camera(&store, 3, Some(DEAD_ONVIF)).await;
+        let token = sign_role_jwt(SECRET, "operator");
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras/3/ptz")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "action": "move",
+                    "profile_token": "Profile_1",
+                    "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_ne!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+    }
+
+    /// A camera with no ONVIF endpoint configured is a `400` (the
+    /// operator hasn't filled in the device-control fields), not a
+    /// `502` or a panic. RBAC (admin satisfies the operator-level
+    /// `ptz/nodes` read) clears first, then the lookup fails.
+    #[tokio::test]
+    async fn device_control_missing_endpoint_returns_400() {
+        const SECRET: &[u8] = b"devctl-noendpoint-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_onvif_camera(&store, 5, None).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/cameras/5/ptz/nodes")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Every *mutating* device-control action lands an edge-side
+    /// `audit_log` row. A failed PTZ jog records the attempt with
+    /// outcome `Failure` so the operator still sees who poked the
+    /// camera even when the SOAP call didn't land.
+    #[tokio::test]
+    async fn device_control_ptz_move_audits() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"devctl-audit-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_onvif_camera(&store, 9, Some(DEAD_ONVIF)).await;
+        let token = sign_role_jwt(SECRET, "operator");
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras/9/ptz")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "action": "move",
+                    "profile_token": "Profile_1",
+                    "velocity": { "pan": -0.3, "tilt": 0.2, "zoom": 0.0 }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+
+        // `audit_admin_action` awaits the insert inline, so the row
+        // is durable by the time the response returns.
+        let rows = store
+            .list_audit_for_resource("camera", "9", 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.action == "camera.onvif.ptz.move")
+            .expect("expected a camera.onvif.ptz.move audit row");
+        assert!(matches!(
+            row.outcome,
+            nexus_store::audit::AuditOutcome::Failure
+        ));
+    }
+
+    /// Every registered route+method pair resolves to a handler —
+    /// no `405 Method Not Allowed` (wrong method on a real path) and
+    /// no `404` (path never registered). Runs in dev-mode (no admin
+    /// secret) from loopback so the gate + RBAC pass synthetically;
+    /// the seeded camera has no ONVIF endpoint so each handler
+    /// short-circuits at the `400` lookup with zero network I/O.
+    #[tokio::test]
+    async fn device_control_routes_do_not_405() {
+        let (app, store, _dir) = build_test_router(None).await;
+        seed_onvif_camera(&store, 1, None).await;
+        let cases: Vec<(Method, &str, Option<serde_json::Value>)> = vec![
+            (
+                Method::POST,
+                "/api/v1/admin/cameras/1/ptz",
+                Some(serde_json::json!({ "action": "stop", "profile_token": "p" })),
+            ),
+            (
+                Method::GET,
+                "/api/v1/admin/cameras/1/ptz/presets?profile_token=p",
+                None,
+            ),
+            (Method::GET, "/api/v1/admin/cameras/1/ptz/nodes", None),
+            (
+                Method::GET,
+                "/api/v1/admin/cameras/1/ptz/status?profile_token=p",
+                None,
+            ),
+            (
+                Method::GET,
+                "/api/v1/admin/cameras/1/ptz/config-options?config_token=c",
+                None,
+            ),
+            (
+                Method::GET,
+                "/api/v1/admin/cameras/1/imaging?video_source_token=v",
+                None,
+            ),
+            (
+                Method::PUT,
+                "/api/v1/admin/cameras/1/imaging",
+                Some(serde_json::json!({ "video_source_token": "v", "settings": {} })),
+            ),
+            (
+                Method::POST,
+                "/api/v1/admin/cameras/1/imaging/focus",
+                Some(serde_json::json!({ "action": "stop", "video_source_token": "v" })),
+            ),
+            (Method::GET, "/api/v1/admin/cameras/1/device", None),
+            (
+                Method::POST,
+                "/api/v1/admin/cameras/1/device",
+                Some(serde_json::json!({ "action": "reboot" })),
+            ),
+            (Method::GET, "/api/v1/admin/cameras/1/device/log", None),
+            (Method::GET, "/api/v1/admin/cameras/1/deviceio/relays", None),
+            (
+                Method::PUT,
+                "/api/v1/admin/cameras/1/deviceio/relays",
+                Some(serde_json::json!({ "relay_token": "r", "active": true })),
+            ),
+            (Method::GET, "/api/v1/admin/cameras/1/deviceio/inputs", None),
+            (
+                Method::GET,
+                "/api/v1/admin/cameras/1/deviceio/audio-sources",
+                None,
+            ),
+            (Method::GET, "/api/v1/admin/cameras/1/deviceio/osds", None),
+            (
+                Method::POST,
+                "/api/v1/admin/cameras/1/deviceio/osd",
+                Some(serde_json::json!({ "action": "delete", "osd_token": "o" })),
+            ),
+            (Method::GET, "/api/v1/admin/cameras/1/encoder", None),
+            (
+                Method::PUT,
+                "/api/v1/admin/cameras/1/encoder",
+                Some(serde_json::json!({ "config": { "token": "c" } })),
+            ),
+            (
+                Method::GET,
+                "/api/v1/admin/cameras/1/snapshot?profile_token=p",
+                None,
+            ),
+            (
+                Method::POST,
+                "/api/v1/admin/cameras/1/onvif/raw",
+                Some(serde_json::json!({ "service": "ptz", "operation": "GetNodes", "body": "" })),
+            ),
+        ];
+        for (method, uri, body) in cases {
+            let label = format!("{method} {uri}");
+            let mut builder = Request::builder().method(method).uri(uri);
+            let mut req = match body {
+                Some(b) => {
+                    builder = builder.header("content-type", "application/json");
+                    builder.body(Body::from(b.to_string())).unwrap()
+                }
+                None => builder.body(Body::empty()).unwrap(),
+            };
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_ne!(
+                res.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{label} returned 405 — route/method not wired"
+            );
+            assert_ne!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "{label} returned 404 — route not registered"
+            );
+        }
     }
 
     /// Wedge Phase 5.6 — `PUT /v1/admin/reid/config` persists the

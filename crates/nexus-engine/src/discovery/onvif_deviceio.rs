@@ -17,9 +17,7 @@
 //! Request builders and response parsers are pure so they unit
 //! test against recorded fixtures. The public operations are
 //! consumed by the operator admin-passthrough routes added in
-//! Phase 7.6.3; until those land they have no in-crate caller,
-//! hence the module-level `dead_code` allowance.
-#![allow(dead_code)]
+//! Phase 7.6.3 (`crate::device_control`).
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
