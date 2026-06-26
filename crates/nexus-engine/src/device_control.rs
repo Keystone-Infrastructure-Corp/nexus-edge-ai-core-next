@@ -198,6 +198,26 @@ pub struct VideoSourceQuery {
     video_source_token: String,
 }
 
+/// Query params for the snapshot route.
+///
+/// * `profile_token` — required ONVIF media profile token.
+/// * `upload_sas` — when present, the edge PUTs the JPEG to this
+///   cloud-minted single-blob Write SAS (the bytes leave the box
+///   straight to Blob storage, never through the gateway — Hard
+///   Rule 7) and returns a small JSON receipt instead of the image.
+///   This is the path the cloud admin-proxy drives by default.
+/// * `encoding` — `base64` returns the JPEG as a base64 string
+///   inside JSON (the cloud's fallback when no Blob storage is
+///   configured, since binary cannot ride the rpc_call tunnel).
+///   Any other value (or absent) returns raw `image/jpeg` bytes for
+///   direct loopback use.
+#[derive(Deserialize)]
+pub struct SnapshotQuery {
+    profile_token: String,
+    upload_sas: Option<String>,
+    encoding: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct ConfigTokenQuery {
     config_token: String,
@@ -1266,13 +1286,22 @@ pub async fn encoder_put(
 // ---------------------------------------------------------------------------
 
 /// `GET /v1/admin/cameras/{id}/snapshot` — pull a full-resolution
-/// still as `image/jpeg`. The image fetch leaves the box straight
-/// to the camera (not the gateway); only the bytes return here.
+/// still. Three response shapes, selected by query params (see
+/// [`SnapshotQuery`]):
+///
+/// * `?upload_sas=<url>` → PUT the JPEG straight to Blob and return
+///   a JSON receipt `{ uploaded, content_type, bytes }`.
+/// * `?encoding=base64` → JSON `{ image_base64, content_type, bytes }`.
+/// * neither → raw `image/jpeg` bytes (loopback / local use).
+///
+/// The image fetch always leaves the box straight to the camera (not
+/// the gateway); with `upload_sas` the bytes go on to Blob storage
+/// without ever crossing the cloud tunnel (Hard Rule 7).
 pub async fn snapshot_get(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
     ctx: SessionContext,
-    Query(q): Query<ProfileQuery>,
+    Query(q): Query<SnapshotQuery>,
 ) -> Result<Response, ApiError> {
     rbac(&ctx, Role::Admin)?;
     let t = onvif_target(&s, id).await?;
@@ -1280,6 +1309,41 @@ pub async fn snapshot_get(
         onvif_snapshot::fetch_snapshot(&t.endpoint, &t.username, &t.password, &q.profile_token)
             .await
             .map_err(gateway_err)?;
+
+    // SAS-preferred: PUT the still straight to Blob storage and
+    // return a tiny JSON receipt. The image never crosses the tunnel.
+    if let Some(sas) = q.upload_sas.as_deref().filter(|v| !v.trim().is_empty()) {
+        let n = onvif_snapshot::put_snapshot_to_sas(sas, &bytes)
+            .await
+            .map_err(gateway_err)?;
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "uploaded": true,
+                "content_type": "image/jpeg",
+                "bytes": n,
+            })),
+        )
+            .into_response());
+    }
+
+    // Base64-in-JSON fallback: lets the non-binary rpc_call tunnel
+    // carry the image when no Blob SAS is available (dev / no storage).
+    if q.encoding.as_deref() == Some("base64") {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "content_type": "image/jpeg",
+                "bytes": bytes.len(),
+                "image_base64": B64.encode(&bytes),
+            })),
+        )
+            .into_response());
+    }
+
+    // Default: raw bytes for direct loopback use.
     Ok((
         StatusCode::OK,
         [

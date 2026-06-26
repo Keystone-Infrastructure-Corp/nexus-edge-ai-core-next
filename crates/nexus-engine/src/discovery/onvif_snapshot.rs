@@ -77,6 +77,34 @@ pub async fn fetch_snapshot(
     Ok(bytes.to_vec())
 }
 
+/// PUT JPEG bytes to a cloud-minted single-blob **Write** SAS URL
+/// (an Azure Block Blob). The image leaves the box straight to Blob
+/// storage and never crosses the cloud gateway tunnel — Hard Rule 7
+/// (SAS URLs for media). The cloud admin-proxy mints the SAS and the
+/// matching short-TTL Read SAS it hands back to the browser.
+///
+/// Returns the number of bytes uploaded on success. The Azure block-
+/// blob PUT requires the `x-ms-blob-type: BlockBlob` header; without
+/// it the service returns `400`.
+pub async fn put_snapshot_to_sas(sas_url: &str, jpeg: &[u8]) -> Result<usize, String> {
+    let client = build_client()?;
+    let resp = client
+        .put(sas_url)
+        .header("x-ms-blob-type", "BlockBlob")
+        .header("content-type", "image/jpeg")
+        .body(jpeg.to_vec())
+        .send()
+        .await
+        .map_err(|e| format!("snapshot SAS PUT failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let preview: String = body.chars().take(256).collect();
+        return Err(format!("snapshot SAS PUT http error {status}: {preview}"));
+    }
+    Ok(jpeg.len())
+}
+
 fn get_snapshot_uri_body(profile_token: &str) -> String {
     format!(
         "<trt:GetSnapshotUri><trt:ProfileToken>{}</trt:ProfileToken></trt:GetSnapshotUri>",
@@ -132,5 +160,83 @@ mod tests {
             first_text(&body, "Uri").as_deref(),
             Some("http://192.168.1.64/onvif-http/snapshot?Profile_1")
         );
+    }
+
+    #[tokio::test]
+    async fn put_snapshot_to_sas_uploads_block_blob() {
+        use std::sync::{Arc, Mutex};
+
+        use axum::body::Bytes;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::put;
+        use axum::Router;
+
+        #[derive(Default)]
+        struct Captured {
+            blob_type: Option<String>,
+            content_type: Option<String>,
+            body: Vec<u8>,
+        }
+        let cap = Arc::new(Mutex::new(Captured::default()));
+        let cap_handler = Arc::clone(&cap);
+
+        let app = Router::new().route(
+            "/snap",
+            put(move |headers: HeaderMap, body: Bytes| {
+                let cap = Arc::clone(&cap_handler);
+                async move {
+                    let mut c = cap.lock().expect("cap lock");
+                    c.blob_type = headers
+                        .get("x-ms-blob-type")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    c.content_type = headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    c.body = body.to_vec();
+                    StatusCode::CREATED
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+
+        let url = format!("http://{addr}/snap");
+        let n = put_snapshot_to_sas(&url, b"jpeg-bytes")
+            .await
+            .expect("upload ok");
+        assert_eq!(n, 10);
+
+        let c = cap.lock().expect("cap lock");
+        assert_eq!(c.blob_type.as_deref(), Some("BlockBlob"));
+        assert_eq!(c.content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(c.body, b"jpeg-bytes");
+    }
+
+    #[tokio::test]
+    async fn put_snapshot_to_sas_surfaces_http_error() {
+        use axum::http::StatusCode;
+        use axum::routing::put;
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/snap",
+            put(|| async { (StatusCode::FORBIDDEN, "AuthenticationFailed") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+
+        let url = format!("http://{addr}/snap");
+        let err = put_snapshot_to_sas(&url, b"x")
+            .await
+            .expect_err("must fail");
+        assert!(err.contains("403"), "{err}");
     }
 }
