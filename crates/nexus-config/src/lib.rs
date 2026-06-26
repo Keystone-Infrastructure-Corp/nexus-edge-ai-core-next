@@ -2256,6 +2256,45 @@ pub struct CameraIngest {
     pub codec: Option<CodecKind>,
 }
 
+/// ONVIF device-control endpoint + credentials for a camera.
+///
+/// Powers Phase 7.6 device control (PTZ / imaging / device / etc.):
+/// the cloud console issues live ONVIF commands *through the edge
+/// tunnel*, but the credentials themselves are **edge-resident only**
+/// — AGENTS.md Rule 6 / REPO_BOUNDARY R5b. They ride the existing
+/// `cameras.config_json` blob (no SQLite schema change, no migration)
+/// and MUST NEVER be serialized into the `camera_roster` envelope that
+/// crosses the tunnel (the roster builder hand-picks metadata fields,
+/// so this stays trivially redacted; a unit test asserts it).
+///
+/// Stored plaintext inside `config_json`, matching the existing
+/// convention for RTSP credentials embedded in [`CameraIngest::url`].
+///
+/// `endpoint` is the verbatim WS-Discovery `XAddrs` device-service URL
+/// (e.g. `http://192.168.1.64/onvif/device_service`); when a camera is
+/// added from discovery it is populated from
+/// [`crate`]'s discovered-device `onvif_xaddrs` so an ONVIF camera
+/// needs no re-entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CameraOnvif {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl CameraOnvif {
+    /// True when nothing is configured, so the blob serializes away
+    /// cleanly via `skip_serializing_if` — keeps the `config_json`
+    /// shape byte-identical for the (overwhelming) non-ONVIF majority.
+    pub fn is_empty(&self) -> bool {
+        self.endpoint.is_none() && self.username.is_none() && self.password.is_none()
+    }
+}
+
 /// Detector-side knobs — open-vocab prompts and model overrides.
 /// Anything that changes WHAT the inference layer is asked to
 /// look for, vs. CameraIngest which controls how frames get there.
@@ -2483,6 +2522,12 @@ pub struct CameraConfig {
     pub detector: CameraDetector,
     #[serde(flatten)]
     pub behavior: CameraBehavior,
+    /// ONVIF device-control endpoint + credentials (Phase 7.6).
+    /// Edge-resident only — never crosses the tunnel. Defaults to
+    /// empty and is skipped on serialize when empty, so existing
+    /// non-ONVIF cameras keep an unchanged `config_json` shape.
+    #[serde(default, skip_serializing_if = "CameraOnvif::is_empty")]
+    pub onvif: CameraOnvif,
     /// Polygon zones used by motion gate / dwell rules.
     #[serde(default)]
     pub zones: Vec<ZoneConfig>,
@@ -3106,6 +3151,52 @@ url = "rtsp://example/cam"
 "#;
         let cam: CameraConfig = toml::from_str(src).unwrap();
         assert!(cam.detector.visual_prompts.is_empty());
+    }
+
+    /// Phase 7.6.1 — ONVIF endpoint + credentials round-trip through the
+    /// `cameras.config_json` blob (which is just `serde_json` of
+    /// `CameraConfig`), and a camera that omits them serializes WITHOUT
+    /// an `onvif` key so existing blobs stay byte-identical (no SQLite
+    /// migration). Credentials are edge-resident only; the roster
+    /// redaction is asserted separately in `nexus-engine`.
+    #[test]
+    fn camera_onvif_round_trips_and_is_omitted_when_empty() {
+        // Absent → empty, and serializes away (config_json unchanged).
+        let bare: CameraConfig = toml::from_str(
+            r#"
+id = 1
+name = "front_door"
+url = "rtsp://example/cam"
+"#,
+        )
+        .unwrap();
+        assert!(bare.onvif.is_empty());
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("onvif"),
+            "empty onvif must be skipped so config_json is unchanged"
+        );
+
+        // Present → parses, and JSON round-trips losslessly.
+        let cam: CameraConfig = toml::from_str(
+            r#"
+id = 2
+name = "ptz_cam"
+url = "rtsp://example/ptz"
+onvif = { endpoint = "http://192.168.1.64/onvif/device_service", username = "admin", password = "s3cret" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cam.onvif.endpoint.as_deref(),
+            Some("http://192.168.1.64/onvif/device_service")
+        );
+        assert_eq!(cam.onvif.username.as_deref(), Some("admin"));
+        assert_eq!(cam.onvif.password.as_deref(), Some("s3cret"));
+
+        let json = serde_json::to_string(&cam).unwrap();
+        let back: CameraConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.onvif, cam.onvif);
     }
 
     /// `CameraConfigUpdate` (fan-pushed to every detector slot on

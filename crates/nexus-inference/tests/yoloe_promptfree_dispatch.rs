@@ -51,6 +51,7 @@ fn cam(id: i64, override_kind: Option<&str>, top_k: Option<usize>) -> CameraConf
             anchor_ttl_secs: None,
             ..Default::default()
         },
+        onvif: Default::default(),
         zones: vec![],
     }
 }

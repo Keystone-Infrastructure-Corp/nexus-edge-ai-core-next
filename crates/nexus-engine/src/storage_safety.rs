@@ -780,6 +780,7 @@ mod tests {
                     anchor_ttl_secs: None,
                     ..Default::default()
                 },
+                onvif: Default::default(),
                 zones: vec![],
             })
             .await
@@ -957,6 +958,7 @@ mod tests {
                         anchor_ttl_secs: None,
                         ..Default::default()
                     },
+                    onvif: Default::default(),
                     zones: vec![],
                 })
                 .await
@@ -1353,6 +1355,7 @@ mod tests {
                     anchor_ttl_secs: None,
                     ..Default::default()
                 },
+                onvif: Default::default(),
                 zones: vec![],
             })
             .await
