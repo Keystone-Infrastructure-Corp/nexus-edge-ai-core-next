@@ -61,6 +61,7 @@ fn sample_camera(id: i64, name: &str) -> CameraConfig {
             ..Default::default()
         },
         onvif: Default::default(),
+        talk_down: Default::default(),
         zones: vec![],
     }
 }

@@ -576,6 +576,7 @@ mod tests {
                     ..Default::default()
                 },
                 onvif: Default::default(),
+                talk_down: Default::default(),
                 zones: vec![],
             })
             .await

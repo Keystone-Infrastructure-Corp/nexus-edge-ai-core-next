@@ -2295,6 +2295,41 @@ impl CameraOnvif {
     }
 }
 
+/// ONVIF talk-down (two-way audio / speaker) capability for a camera,
+/// discovered via `GetAudioOutputs` and the RTSP backchannel SDP
+/// (Phase 7.6.7). Edge-resident only — like [`CameraOnvif`] it never
+/// crosses the tunnel into the `camera_roster` envelope, and it
+/// serializes away when empty so non-speaker cameras keep an unchanged
+/// `config_json`.
+///
+/// Carries no credential: the RTSP backchannel reuses the ingest URL's
+/// userinfo, and the ONVIF probe reuses [`CameraOnvif`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CameraTalkDown {
+    /// True when the camera advertises an audio output (speaker) the
+    /// operator can talk down through.
+    #[serde(default)]
+    pub speaker_present: bool,
+    /// Backchannel audio codec the camera expects (e.g. `PCMU`,
+    /// `PCMA`, `G726`, `AAC`) as reported by the backchannel SDP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backchannel_codec: Option<String>,
+    /// RTSP backchannel control URL the talk-down session streams audio
+    /// to (the `a=control:` of the `sendonly` audio media line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backchannel_url: Option<String>,
+}
+
+impl CameraTalkDown {
+    /// True when nothing is configured, so the block serializes away
+    /// via `skip_serializing_if` and the `config_json` stays
+    /// byte-identical for the non-speaker majority.
+    pub fn is_empty(&self) -> bool {
+        !self.speaker_present && self.backchannel_codec.is_none() && self.backchannel_url.is_none()
+    }
+}
+
 /// Detector-side knobs — open-vocab prompts and model overrides.
 /// Anything that changes WHAT the inference layer is asked to
 /// look for, vs. CameraIngest which controls how frames get there.
@@ -2528,6 +2563,10 @@ pub struct CameraConfig {
     /// non-ONVIF cameras keep an unchanged `config_json` shape.
     #[serde(default, skip_serializing_if = "CameraOnvif::is_empty")]
     pub onvif: CameraOnvif,
+    /// ONVIF talk-down (speaker) capability (Phase 7.6.7). Edge-resident
+    /// only — never crosses the tunnel. Skipped on serialize when empty.
+    #[serde(default, skip_serializing_if = "CameraTalkDown::is_empty")]
+    pub talk_down: CameraTalkDown,
     /// Polygon zones used by motion gate / dwell rules.
     #[serde(default)]
     pub zones: Vec<ZoneConfig>,
@@ -3197,6 +3236,50 @@ onvif = { endpoint = "http://192.168.1.64/onvif/device_service", username = "adm
         let json = serde_json::to_string(&cam).unwrap();
         let back: CameraConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.onvif, cam.onvif);
+    }
+
+    /// Phase 7.6.7 — the `talk_down` (speaker) block round-trips through
+    /// JSON and serializes away when empty so non-speaker cameras keep
+    /// an unchanged `config_json` (no SQLite migration). Edge-resident
+    /// only; the roster redaction is asserted in `nexus-engine`.
+    #[test]
+    fn camera_talk_down_round_trips_and_is_omitted_when_empty() {
+        // Absent → empty, serializes away.
+        let bare: CameraConfig = toml::from_str(
+            r#"
+id = 1
+name = "fixed_cam"
+url = "rtsp://example/cam"
+"#,
+        )
+        .unwrap();
+        assert!(bare.talk_down.is_empty());
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("talk_down"),
+            "empty talk_down must be skipped so config_json is unchanged"
+        );
+
+        // Present → parses, and JSON round-trips losslessly.
+        let cam: CameraConfig = toml::from_str(
+            r#"
+id = 2
+name = "speaker_cam"
+url = "rtsp://example/spk"
+talk_down = { speaker_present = true, backchannel_codec = "PCMU", backchannel_url = "rtsp://example/spk/backchannel" }
+"#,
+        )
+        .unwrap();
+        assert!(cam.talk_down.speaker_present);
+        assert_eq!(cam.talk_down.backchannel_codec.as_deref(), Some("PCMU"));
+        assert_eq!(
+            cam.talk_down.backchannel_url.as_deref(),
+            Some("rtsp://example/spk/backchannel")
+        );
+
+        let json = serde_json::to_string(&cam).unwrap();
+        let back: CameraConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.talk_down, cam.talk_down);
     }
 
     /// `CameraConfigUpdate` (fan-pushed to every detector slot on

@@ -1667,6 +1667,7 @@ mod tests {
                 detector: nexus_config::CameraDetector::default(),
                 behavior: nexus_config::CameraBehavior::default(),
                 onvif: Default::default(),
+                talk_down: Default::default(),
                 zones: vec![],
             })
             .await

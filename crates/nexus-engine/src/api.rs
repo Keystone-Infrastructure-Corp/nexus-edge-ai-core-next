@@ -5653,6 +5653,7 @@ mod tests {
                     ..Default::default()
                 },
                 onvif: Default::default(),
+                talk_down: Default::default(),
                 zones: vec![],
             })
             .await
@@ -5918,6 +5919,7 @@ mod tests {
                     ..Default::default()
                 },
                 onvif: Default::default(),
+                talk_down: Default::default(),
                 zones: vec![],
             })
             .await
@@ -6385,6 +6387,7 @@ mod tests {
                 username: Some("admin".into()),
                 password: Some("secret".into()),
             },
+            talk_down: Default::default(),
             zones: vec![],
         };
         store.upsert_camera(&cam).await.unwrap();
@@ -7414,6 +7417,7 @@ mod tests {
                     ..Default::default()
                 },
                 onvif: Default::default(),
+                talk_down: Default::default(),
                 zones: vec![],
             })
             .await
@@ -7832,6 +7836,7 @@ mod tests {
                 ..Default::default()
             },
             onvif: Default::default(),
+            talk_down: Default::default(),
             zones: vec![],
         }
     }
