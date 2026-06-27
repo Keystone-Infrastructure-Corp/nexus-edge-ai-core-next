@@ -568,6 +568,10 @@ pub fn router(state: ApiState) -> Router {
             get(crate::device_control::snapshot_get),
         )
         .route(
+            "/v1/admin/cameras/{camera_id}/firmware:upgrade",
+            axum::routing::post(crate::device_control::firmware_upgrade),
+        )
+        .route(
             "/v1/admin/cameras/{camera_id}/speakers",
             get(crate::device_control::speakers_get),
         )
@@ -6683,6 +6687,95 @@ mod tests {
         }
     }
 
+    /// Phase 7.6.8 — the firmware upgrade is owner-only at the cloud;
+    /// the edge enforces its top tier (`Admin`). An operator bearer is
+    /// rejected with `403` *before* any camera load or network call,
+    /// so no ONVIF endpoint even needs to be configured.
+    #[tokio::test]
+    async fn firmware_upgrade_rejects_operator() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"firmware-operator-gate-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_role_jwt(SECRET, "operator");
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras/1/firmware:upgrade")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "sas_get_url": "http://127.0.0.1:9/fw",
+                    "sha256": "00",
+                    "expected_make": "Acme",
+                    "expected_model": "X"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+    }
+
+    /// Phase 7.6.8 — a failed firmware download lands an audit row,
+    /// but the cloud-minted Read SAS (a bearer credential) MUST NOT
+    /// appear in it. The blob is pulled from a closed port → the
+    /// download errors with the URL stripped, so neither the audit
+    /// detail nor any other column echoes the SAS signature.
+    #[tokio::test]
+    async fn firmware_upgrade_does_not_leak_sas_credential() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"firmware-noleak-secret";
+        const SAS_SIG: &str = "SUPERSECRET-sas-signature-9f3";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_onvif_camera(&store, 12, Some(DEAD_ONVIF)).await;
+        let token = sign_admin_jwt(SECRET);
+        // Port 9 is closed → the download fails at connect, the path
+        // where reqwest would otherwise embed the URL in its error.
+        let sas = format!("http://127.0.0.1:9/firmware.bin?sv=2024-08-04&sig={SAS_SIG}");
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras/12/firmware:upgrade")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "sas_get_url": sas,
+                    "sha256": "00",
+                    "expected_make": "Acme",
+                    "expected_model": "X"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+
+        let rows = store
+            .list_audit_for_resource("camera", "12", 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.action == "camera.onvif.firmware.upgrade")
+            .expect("expected a camera.onvif.firmware.upgrade audit row");
+        assert!(matches!(
+            row.outcome,
+            nexus_store::audit::AuditOutcome::Failure
+        ));
+        for row in &rows {
+            let before = row.before_json.as_deref().unwrap_or("");
+            let after = row.after_json.as_deref().unwrap_or("");
+            assert!(
+                !before.contains(SAS_SIG) && !after.contains(SAS_SIG),
+                "SAS credential leaked into audit row: before={before:?} after={after:?}"
+            );
+        }
+    }
+
     /// Every registered route+method pair resolves to a handler —
     /// no `405 Method Not Allowed` (wrong method on a real path) and
     /// no `404` (path never registered). Runs in dev-mode (no admin
@@ -6770,6 +6863,16 @@ mod tests {
                 Method::POST,
                 "/api/v1/admin/cameras/1/onvif/raw",
                 Some(serde_json::json!({ "service": "ptz", "operation": "GetNodes", "body": "" })),
+            ),
+            (
+                Method::POST,
+                "/api/v1/admin/cameras/1/firmware:upgrade",
+                Some(serde_json::json!({
+                    "sas_get_url": "http://127.0.0.1:9/fw",
+                    "sha256": "00",
+                    "expected_make": "Acme",
+                    "expected_model": "X"
+                })),
             ),
         ];
         for (method, uri, body) in cases {

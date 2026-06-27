@@ -28,6 +28,7 @@ pub mod onvif;
 pub mod onvif_device;
 pub mod onvif_deviceio;
 pub mod onvif_encoder;
+pub mod onvif_firmware;
 pub mod onvif_imaging;
 pub mod onvif_media;
 pub mod onvif_ptz;
