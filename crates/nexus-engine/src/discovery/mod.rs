@@ -31,6 +31,7 @@ pub mod onvif_encoder;
 pub mod onvif_firmware;
 pub mod onvif_imaging;
 pub mod onvif_media;
+pub mod onvif_network;
 pub mod onvif_ptz;
 pub mod onvif_snapshot;
 pub mod onvif_soap;

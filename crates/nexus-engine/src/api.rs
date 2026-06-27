@@ -572,6 +572,18 @@ pub fn router(state: ApiState) -> Router {
             axum::routing::post(crate::device_control::firmware_upgrade),
         )
         .route(
+            "/v1/admin/cameras/{camera_id}/network",
+            get(crate::device_control::network_get),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/network/safe",
+            axum::routing::put(crate::device_control::network_safe_put),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/network/interface",
+            axum::routing::put(crate::device_control::network_interface_put),
+        )
+        .route(
             "/v1/admin/cameras/{camera_id}/speakers",
             get(crate::device_control::speakers_get),
         )
@@ -6776,6 +6788,143 @@ mod tests {
         }
     }
 
+    /// Phase 7.6.9 — the dangerous network write is owner-only at the
+    /// cloud; the edge enforces its top tier (`Admin`). An operator
+    /// bearer is rejected with `403` before any camera load or network
+    /// call, so no ONVIF endpoint even needs to be configured.
+    #[tokio::test]
+    async fn network_interface_put_rejects_operator() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"network-operator-gate-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_role_jwt(SECRET, "operator");
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/cameras/1/network/interface")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "interface": { "token": "eth0", "dhcp": false, "address": "10.9.9.9", "prefix_length": 24 },
+                    "new_endpoint_host": "10.9.9.9"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+    }
+
+    /// Phase 7.6.9 — a dangerous IP change applies to the camera,
+    /// rewrites the stored `ingest.url` + `onvif_endpoint` to the new
+    /// address in lockstep, then re-probes. When the camera does not
+    /// answer at its new address the handler **fails loud** (`502` +
+    /// a `Failure` audit row) rather than reporting a false success —
+    /// there is no transactional ONVIF revert. The lockstep rewrite
+    /// still lands (the edge must keep pointing at wherever the camera
+    /// now is). A stub ONVIF endpoint answers `SetNetworkInterfaces`
+    /// with `200` + `RebootNeeded` but `500`s the `GetSystemDateAndTime`
+    /// re-probe so the camera looks unreachable at its new address.
+    #[tokio::test]
+    async fn network_dangerous_write_rewrites_endpoint_and_fails_loud_when_unreachable() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        async fn onvif_stub(body: String) -> axum::response::Response {
+            if body.contains("GetSystemDateAndTime") {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "down").into_response();
+            }
+            if body.contains("SetNetworkInterfaces") {
+                let soap = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl"><s:Body><tds:SetNetworkInterfacesResponse><tds:RebootNeeded>false</tds:RebootNeeded></tds:SetNetworkInterfacesResponse></s:Body></s:Envelope>"#;
+                return (StatusCode::OK, soap).into_response();
+            }
+            (StatusCode::OK, "<ok/>").into_response()
+        }
+
+        let stub = axum::Router::new().fallback(onvif_stub);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, stub.into_make_service()).await;
+        });
+
+        const SECRET: &[u8] = b"network-failloud-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        // Camera ingest starts at a DIFFERENT host (so the rewrite to
+        // the new host is observable); the ONVIF endpoint is the stub.
+        let cam = nexus_config::CameraConfig {
+            id: 21,
+            name: "cam-21".into(),
+            ingest: nexus_config::CameraIngest {
+                url: "rtsp://192.168.50.50:554/stream".parse().unwrap(),
+                enabled: true,
+                max_fps: 0,
+                codec: None,
+            },
+            detector: nexus_config::CameraDetector::default(),
+            behavior: nexus_config::CameraBehavior::default(),
+            onvif: nexus_config::CameraOnvif {
+                endpoint: Some(format!("http://{addr}/onvif/device_service")),
+                username: Some("admin".into()),
+                password: Some("secret".into()),
+            },
+            talk_down: Default::default(),
+            zones: vec![],
+        };
+        store.upsert_camera(&cam).await.unwrap();
+
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/cameras/21/network/interface")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "interface": { "token": "eth0", "dhcp": false, "address": "192.168.50.77", "prefix_length": 24 },
+                    "new_endpoint_host": "127.0.0.1"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+
+        // Lockstep rewrite landed: ingest host moved to the new address.
+        let after = store
+            .list_cameras()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == 21)
+            .unwrap();
+        assert_eq!(after.ingest.url.host_str(), Some("127.0.0.1"));
+        assert!(after
+            .onvif
+            .endpoint
+            .as_deref()
+            .unwrap()
+            .contains("127.0.0.1"));
+
+        // The loud failure is recorded as a Failure audit row.
+        let rows = store
+            .list_audit_for_resource("camera", "21", 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.action == "camera.onvif.network.interface")
+            .expect("expected a camera.onvif.network.interface audit row");
+        assert!(matches!(
+            row.outcome,
+            nexus_store::audit::AuditOutcome::Failure
+        ));
+    }
+
     /// Every registered route+method pair resolves to a handler —
     /// no `405 Method Not Allowed` (wrong method on a real path) and
     /// no `404` (path never registered). Runs in dev-mode (no admin
@@ -6872,6 +7021,20 @@ mod tests {
                     "sha256": "00",
                     "expected_make": "Acme",
                     "expected_model": "X"
+                })),
+            ),
+            (Method::GET, "/api/v1/admin/cameras/1/network", None),
+            (
+                Method::PUT,
+                "/api/v1/admin/cameras/1/network/safe",
+                Some(serde_json::json!({ "action": "set_hostname", "name": "cam-front" })),
+            ),
+            (
+                Method::PUT,
+                "/api/v1/admin/cameras/1/network/interface",
+                Some(serde_json::json!({
+                    "interface": { "token": "eth0", "dhcp": true },
+                    "new_endpoint_host": "10.0.0.5"
                 })),
             ),
         ];
