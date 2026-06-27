@@ -916,6 +916,7 @@ fn parse_sdp(body: &str) -> Vec<SdpStream> {
                 codec_kind: None,
                 resolution: None,
                 control: None,
+                direction: None,
             });
         } else if let Some(track) = current.as_mut() {
             if let Some(rest) = line.strip_prefix("a=rtpmap:") {
@@ -942,6 +943,13 @@ fn parse_sdp(body: &str) -> Vec<SdpStream> {
                 }
             } else if let Some(rest) = line.strip_prefix("a=control:") {
                 track.control = Some(rest.to_string());
+            } else if matches!(
+                line,
+                "a=sendonly" | "a=recvonly" | "a=sendrecv" | "a=inactive"
+            ) {
+                // Media direction — identifies a talk-down backchannel
+                // (`sendonly` audio) so 7.6.7 can capture its control URL.
+                track.direction = Some(line.trim_start_matches("a=").to_string());
             }
         }
     }
@@ -1076,6 +1084,34 @@ mod tests {
         assert_eq!(tracks[1].codec, "MPEG4-GENERIC");
         // MPEG4-GENERIC is audio — we don't enumerate it.
         assert_eq!(tracks[1].codec_kind, None);
+    }
+
+    #[test]
+    fn parse_sdp_captures_backchannel_audio_direction() {
+        // ONVIF talk-down backchannel: the camera advertises a
+        // `sendonly` audio track (it *receives* the operator's audio).
+        // Phase 7.6.7 needs both the direction and the control URL to
+        // drive a talk-down session, so parse_sdp must surface them.
+        let body = "v=0\r\n\
+            m=video 0 RTP/AVP 96\r\n\
+            a=rtpmap:96 H264/90000\r\n\
+            a=control:trackID=0\r\n\
+            a=sendrecv\r\n\
+            m=audio 0 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=control:trackID=2\r\n\
+            a=sendonly\r\n";
+        let tracks = parse_sdp(body);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].direction.as_deref(), Some("sendrecv"));
+        let audio = &tracks[1];
+        assert_eq!(audio.codec, "PCMU");
+        assert_eq!(audio.control.as_deref(), Some("trackID=2"));
+        assert_eq!(
+            audio.direction.as_deref(),
+            Some("sendonly"),
+            "backchannel audio must surface its sendonly direction",
+        );
     }
 
     #[test]

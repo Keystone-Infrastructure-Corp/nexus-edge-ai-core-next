@@ -478,6 +478,133 @@ fn parse_stream_uri_response(body: &str) -> Option<String> {
     }
 }
 
+/// One ONVIF audio output (a speaker / talk-down sink) as reported by
+/// `GetAudioOutputs` on the Media service. Surfaced to the operator
+/// console via the `/speakers` admin route (Phase 7.6.7) so the
+/// Phase 10.5 talk-down session knows a sink exists. Carries no
+/// credential — it's a capability descriptor only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioOutput {
+    /// Opaque ONVIF audio-output token.
+    pub token: String,
+    /// Operator-facing name, when the camera supplies one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Query the camera's audio outputs (speakers) via the Media1
+/// `GetAudioOutputs` operation — same WS-Security + quick-xml pattern
+/// as [`query_streams`], no new dependency.
+///
+/// A non-empty result means the camera can sink talk-down audio. An
+/// empty `Vec` (not an error) is returned both when the camera reports
+/// no audio outputs (most fixed cameras) and when it answers
+/// `GetAudioOutputs` with `ActionNotSupported` / `OperationProhibited`
+/// (older Media1 firmware) — either way there is no speaker. A real
+/// transport / SOAP fault surfaces as `Err`.
+pub async fn query_audio_outputs(
+    xaddr: &str,
+    username: &str,
+    password: &str,
+) -> Result<Vec<AudioOutput>, String> {
+    let url = xaddr
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "empty xaddr".to_string())?;
+    let client = build_client()?;
+    let body = build_get_audio_outputs_envelope(username, password);
+    match post_soap(&client, url, &MediaVer::V1.action("GetAudioOutputs"), &body).await {
+        Ok(text) => {
+            trace!(xaddr = %url, body = %text, "onvif media: GetAudioOutputs raw response");
+            parse_audio_outputs_response(&text)
+        }
+        Err(e) if e.contains("ActionNotSupported") || e.contains("OperationProhibited") => {
+            debug!(xaddr = %url, "onvif media: GetAudioOutputs unsupported → no speaker");
+            Ok(Vec::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn build_get_audio_outputs_envelope(username: &str, password: &str) -> String {
+    let header = ws_security_header(username, password);
+    let ns = MediaVer::V1.ns();
+    let p = MediaVer::V1.prefix();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:{p}="{ns}"><s:Header>{header}</s:Header><s:Body><{p}:GetAudioOutputs/></s:Body></s:Envelope>"#
+    )
+}
+
+/// Walk a `GetAudioOutputsResponse`: one `<trt:AudioOutputs>` per
+/// audio output, carrying a `token` attribute and an optional
+/// `<tt:Name>` child. Vendors disagree on prefixes; match local-name
+/// only. An empty list is a valid (common) result.
+fn parse_audio_outputs_response(body: &str) -> Result<Vec<AudioOutput>, String> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut out: Vec<AudioOutput> = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut current: Option<AudioOutput> = None;
+    let mut text_acc = String::new();
+
+    loop {
+        let evt = match reader.read_event_into(&mut buf) {
+            Ok(e) => e,
+            Err(e) => return Err(format!("xml parse error: {e}")),
+        };
+        match evt {
+            Event::Start(e) => {
+                let name = local_name(&e.name());
+                if name == "AudioOutputs" {
+                    let mut tok = String::new();
+                    for attr in e.attributes().flatten() {
+                        if local_name(&attr.key) == "token" {
+                            tok = attr.unescape_value().unwrap_or_default().to_string();
+                        }
+                    }
+                    current = Some(AudioOutput {
+                        token: tok,
+                        name: None,
+                    });
+                }
+                stack.push(name);
+                text_acc.clear();
+            }
+            Event::Text(t) => {
+                if let Ok(s) = t.unescape() {
+                    text_acc.push_str(&s);
+                }
+            }
+            Event::End(e) => {
+                let name = local_name(&e.name());
+                if let Some(ao) = current.as_mut() {
+                    if name == "Name" && parent_is(&stack, "AudioOutputs") {
+                        let n = text_acc.trim();
+                        if !n.is_empty() {
+                            ao.name = Some(n.to_string());
+                        }
+                    }
+                }
+                if name == "AudioOutputs" {
+                    if let Some(ao) = current.take() {
+                        if !ao.token.is_empty() {
+                            out.push(ao);
+                        }
+                    }
+                }
+                stack.pop();
+                text_acc.clear();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +788,53 @@ mod tests {
         assert_eq!(codec_kind_from_onvif("JPEG"), None);
         assert_eq!(codec_kind_from_onvif("MPEG4"), None);
         assert_eq!(codec_kind_from_onvif(""), None);
+    }
+
+    #[test]
+    fn parses_get_audio_outputs_response_with_speaker() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+              xmlns:tt="http://www.onvif.org/ver10/schema">
+  <env:Body>
+    <trt:GetAudioOutputsResponse>
+      <trt:AudioOutputs token="AudioOutputToken_1">
+        <tt:Name>Speaker</tt:Name>
+      </trt:AudioOutputs>
+    </trt:GetAudioOutputsResponse>
+  </env:Body>
+</env:Envelope>"#;
+        let outs = parse_audio_outputs_response(body).expect("parses");
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].token, "AudioOutputToken_1");
+        assert_eq!(outs[0].name.as_deref(), Some("Speaker"));
+    }
+
+    #[test]
+    fn parses_empty_get_audio_outputs_response() {
+        // A fixed camera with no speaker returns an empty response —
+        // a valid result, not an error.
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:trt="http://www.onvif.org/ver10/media/wsdl">
+  <env:Body><trt:GetAudioOutputsResponse/></env:Body>
+</env:Envelope>"#;
+        let outs = parse_audio_outputs_response(body).expect("parses");
+        assert!(outs.is_empty());
+    }
+
+    #[test]
+    fn get_audio_outputs_envelope_is_well_formed() {
+        let env = build_get_audio_outputs_envelope("admin", "p@ss<>&\"'");
+        let mut r = Reader::from_str(&env);
+        let mut buf = Vec::new();
+        loop {
+            match r.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("invalid xml: {e}\n{env}"),
+                _ => {}
+            }
+        }
+        assert!(env.contains("<trt:GetAudioOutputs/>"), "{env}");
     }
 }

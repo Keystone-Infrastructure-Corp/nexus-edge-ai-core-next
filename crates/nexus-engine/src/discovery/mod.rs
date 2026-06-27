@@ -279,6 +279,15 @@ pub struct SdpStream {
     pub resolution: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<String>,
+    /// SDP media direction (`sendonly` / `recvonly` / `sendrecv` /
+    /// `inactive`, from the matching `a=` attribute). For an
+    /// `m=audio` track this distinguishes a talk-down backchannel
+    /// sink (`sendonly` from the camera's point of view) from a
+    /// normal audio source, so the Phase 7.6.7 `talk_down` capture
+    /// can pick the right `a=control:` URL. `None` when the SDP omits
+    /// a direction attribute (RFC 4566 defaults to `sendrecv`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 /// Per-path summary returned in [`ProbeRtspResult::streams`].

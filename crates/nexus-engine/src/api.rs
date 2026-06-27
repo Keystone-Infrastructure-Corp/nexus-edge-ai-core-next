@@ -562,6 +562,10 @@ pub fn router(state: ApiState) -> Router {
             get(crate::device_control::snapshot_get),
         )
         .route(
+            "/v1/admin/cameras/{camera_id}/speakers",
+            get(crate::device_control::speakers_get),
+        )
+        .route(
             "/v1/admin/cameras/{camera_id}/onvif/raw",
             axum::routing::post(crate::device_control::onvif_raw),
         )
@@ -6441,6 +6445,36 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
         let _ = to_bytes(res.into_body(), usize::MAX).await;
+    }
+
+    /// `/speakers` is operator-readable (talk-down is an operator
+    /// action, like PTZ) and returns the stored talk-down capability.
+    /// With no ONVIF endpoint the live `GetAudioOutputs` probe is
+    /// skipped, so the response comes back instantly with
+    /// `audio_outputs: null` and the default (empty) `talk_down` block.
+    #[tokio::test]
+    async fn device_control_speakers_returns_capability() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"devctl-speakers-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_onvif_camera(&store, 8, None).await;
+        let token = sign_role_jwt(SECRET, "operator");
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/cameras/8/speakers")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("talk_down").is_some(), "response has talk_down: {v}");
+        assert!(
+            v["audio_outputs"].is_null(),
+            "no endpoint → null audio_outputs: {v}"
+        );
     }
 
     /// An operator *can* jog PTZ — the carve-out's whole point. The
