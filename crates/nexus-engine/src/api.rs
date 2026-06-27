@@ -280,6 +280,12 @@ pub struct ApiState {
     /// live per-camera emit counters. Restart-required: this
     /// value never changes for the lifetime of the process.
     pub reid_config: Arc<nexus_config::ReidConfig>,
+    /// Phase 7.6.6 — whether the generic LAN device proxy
+    /// (`POST /v1/admin/proxy`) is enabled. Sourced from
+    /// `[lan_proxy] enabled` at boot; defaults `false` (the feature
+    /// is opt-in per REPO_BOUNDARY R5c §5). When `false`,
+    /// `crate::lan_proxy::proxy_request` rejects every call.
+    pub lan_proxy_enabled: bool,
     /// Phase 5.6 · R7 — shared with the `CloudEntitySightingHook`
     /// worker (writer) and the `/v1/admin/reid/status` endpoint
     /// (reader). Always present even when `reid.enabled = false`
@@ -568,6 +574,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/v1/admin/cameras/{camera_id}/onvif/raw",
             axum::routing::post(crate::device_control::onvif_raw),
+        )
+        .route(
+            "/v1/admin/proxy",
+            axum::routing::post(crate::lan_proxy::proxy_request),
         )
         // Phase 7.5 · Step 7.5.4 — cloud fleet-settings apply. The
         // cloud api-gateway fans a resolved category value out to
@@ -6271,6 +6281,10 @@ mod tests {
             // and exercises the same code paths as a real
             // operator who left `[reid]` defaulted.
             reid_config: Arc::new(nexus_config::ReidConfig::default()),
+            // Phase 7.6.6 — enabled in the test router so the LAN-proxy
+            // route tests exercise the real handler; the default-off
+            // behaviour is pinned by the nexus-config default test.
+            lan_proxy_enabled: true,
             reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
         };
         let app = super::router(state);
@@ -6573,6 +6587,100 @@ mod tests {
             row.outcome,
             nexus_store::audit::AuditOutcome::Failure
         ));
+    }
+
+    /// Phase 7.6.6 — a syntactically-valid LAN target that the edge has
+    /// never discovered (no configured camera, no recent scan) is
+    /// rejected with `403` by the SSRF/allowlist guard, and the refusal
+    /// lands an audit row with outcome `Denied`. The proxy never opens a
+    /// socket to the target.
+    #[tokio::test]
+    async fn lan_proxy_rejects_non_allowlisted_target() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"lan-proxy-allowlist-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/proxy")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "target": "http://192.168.77.77/cgi-bin/snapshot",
+                    "method": "GET"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+
+        let rows = store
+            .list_audit_for_resource("lan_device", "192.168.77.77:80", 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.action == "lan_proxy.request")
+            .expect("expected a lan_proxy.request audit row");
+        assert!(matches!(
+            row.outcome,
+            nexus_store::audit::AuditOutcome::Denied
+        ));
+    }
+
+    /// Phase 7.6.6 / REPO_BOUNDARY R5c §1 — a device credential the
+    /// operator supplies for the LAN target (in the proxied headers or
+    /// body) MUST NOT land in any audit row. The audit detail records
+    /// the method only. Assert the secret appears in neither the
+    /// `before_json` nor the `after_json` of any `lan_device` row.
+    #[tokio::test]
+    async fn lan_proxy_does_not_log_target_credentials() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"lan-proxy-noleak-secret";
+        const DEVICE_CRED: &str = "SUPERSECRET-device-cred-1337";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/proxy")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "target": "http://192.168.66.66/api/login",
+                    "method": "POST",
+                    "headers": { "authorization": format!("Basic {DEVICE_CRED}") },
+                    "body": format!("password={DEVICE_CRED}")
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        // Non-allowlisted → denied before any socket opens.
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let _ = to_bytes(res.into_body(), usize::MAX).await;
+
+        let rows = store
+            .list_audit_for_resource("lan_device", "192.168.66.66:80", 10)
+            .await
+            .unwrap();
+        assert!(
+            !rows.is_empty(),
+            "expected at least one lan_device audit row"
+        );
+        for row in &rows {
+            let before = row.before_json.as_deref().unwrap_or("");
+            let after = row.after_json.as_deref().unwrap_or("");
+            assert!(
+                !before.contains(DEVICE_CRED) && !after.contains(DEVICE_CRED),
+                "device credential leaked into audit row: before={before:?} after={after:?}"
+            );
+        }
     }
 
     /// Every registered route+method pair resolves to a handler —

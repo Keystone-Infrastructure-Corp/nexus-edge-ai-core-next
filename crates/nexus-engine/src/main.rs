@@ -41,6 +41,7 @@ mod fleet_apply;
 mod fleet_hash;
 mod gpu;
 mod hailo;
+mod lan_proxy;
 mod model_catalog_publish;
 mod models_catalog;
 mod network;
@@ -1343,6 +1344,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // shared per-camera stats registry the worker bumps on
         // every successful extract. Drive `/v1/admin/reid/status`.
         reid_config: Arc::new(cfg.reid.clone()),
+        lan_proxy_enabled: cfg.lan_proxy.enabled,
         reid_stats: reid_stats.clone(),
     };
 

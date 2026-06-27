@@ -114,6 +114,10 @@ pub struct Config {
     /// `nexus_pipeline::SightingScheduler` for the per-track FSM.
     #[serde(default)]
     pub reid: ReidConfig,
+    /// Phase 7.6.6 — generic LAN device proxy (REPO_BOUNDARY R5c).
+    /// Ships OFF; opt-in per deployment.
+    #[serde(default)]
+    pub lan_proxy: LanProxyConfig,
 }
 
 impl Config {
@@ -2625,6 +2629,27 @@ pub struct CameraConfigUpdate {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7.6.6 — generic LAN device proxy (REPO_BOUNDARY R5c)
+// ---------------------------------------------------------------------------
+
+/// `[lan_proxy]` block. **Disabled by default.** When `enabled = true`,
+/// the audited, SSRF-bounded `POST /api/v1/admin/proxy` admin route
+/// lets the operator console reach a non-ONVIF device on the edge's own
+/// LAN (camera web UIs, NVRs). The whole feature is an explicit,
+/// narrowly-scoped exception to the credential-boundary rule, so it is
+/// opt-in per deployment (R5c §5: ships off). Every other R5c
+/// constraint (SSRF guard, discovery allowlist, per-call audit, no
+/// credential persistence) is enforced unconditionally in
+/// `crate::lan_proxy` whenever this is on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LanProxyConfig {
+    /// Master switch. Defaults `false`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Phase 5.6 — cross-camera re-identification
 // ---------------------------------------------------------------------------
 
@@ -2777,6 +2802,20 @@ mod tests {
             ..Default::default()
         };
         cfg.validate().unwrap();
+    }
+
+    /// Phase 7.6.6 / REPO_BOUNDARY R5c §5 — the generic LAN device proxy
+    /// is opt-in: with `[lan_proxy]` absent (or defaulted) the feature is
+    /// off. This pins the default so the edge never proxies LAN traffic
+    /// unless an operator explicitly enables it.
+    #[test]
+    fn lan_proxy_is_off_by_default() {
+        assert!(!LanProxyConfig::default().enabled);
+        let cfg = Config {
+            cameras: vec![],
+            ..Default::default()
+        };
+        assert!(!cfg.lan_proxy.enabled);
     }
 
     #[test]

@@ -435,6 +435,26 @@ impl DiscoverySessions {
         Some(snap)
     }
 
+    /// Snapshot every IP currently surfaced by an in-flight or recent
+    /// discovery session. Backs the Phase 7.6.6 LAN-proxy allowlist
+    /// (REPO_BOUNDARY R5c §4): the proxy may only reach a device the
+    /// edge has actually discovered. Unparseable `ip` strings are
+    /// skipped. Sessions TTL-evict after a few minutes, so this is the
+    /// *fresh-scan* half of the allowlist; configured-camera IPs supply
+    /// the persistent half.
+    pub fn discovered_ips(&self) -> std::collections::HashSet<std::net::IpAddr> {
+        let mut out = std::collections::HashSet::new();
+        for entry in self.inner.iter() {
+            let guard = entry.value().lock();
+            for d in &guard.found {
+                if let Ok(ip) = d.ip.parse::<std::net::IpAddr>() {
+                    out.insert(ip);
+                }
+            }
+        }
+        out
+    }
+
     /// Mark a Running session as cancelled. Returns:
     /// * `Some(true)`  — the session existed AND was Running;
     ///   state transitioned to `Done` with `cancelled = true`.
