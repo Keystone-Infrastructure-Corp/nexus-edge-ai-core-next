@@ -54,6 +54,8 @@ fn sample_camera(id: i64, name: &str) -> CameraConfig {
             anchor_ttl_secs: None,
             ..Default::default()
         },
+        onvif: Default::default(),
+        talk_down: Default::default(),
         zones: vec![],
     }
 }

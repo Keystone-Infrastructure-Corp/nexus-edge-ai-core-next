@@ -260,4 +260,86 @@ mod tests {
             "expected a recent millis seed, got {r}"
         );
     }
+
+    /// Phase 7.6.1 — ONVIF endpoint + credentials live edge-resident in
+    /// the camera's `config_json` blob and MUST NEVER cross the tunnel
+    /// (AGENTS.md Rule 6 / REPO_BOUNDARY R5b). The roster builder
+    /// hand-picks metadata fields, so the credentials stay redacted —
+    /// this asserts it end-to-end through `build_envelope`.
+    #[tokio::test]
+    async fn camera_roster_redacts_onvif_credentials() {
+        use nexus_config::{
+            CameraBehavior, CameraConfig, CameraDetector, CameraIngest, CameraOnvif,
+            CameraTalkDown, StoreConfig,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nexus.db");
+        let store = Store::open(&StoreConfig {
+            url: format!("sqlite://{}?mode=rwc", db_path.display()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+
+        let secret_user = "onvif-admin";
+        let secret_pass = "sup3r-secret-onvif-pw";
+        let secret_backchannel = "rtsp://127.0.0.1/talk-backchannel-secret";
+        store
+            .upsert_camera(&CameraConfig {
+                id: 1,
+                name: "ptz-cam".into(),
+                ingest: CameraIngest {
+                    url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    enabled: true,
+                    max_fps: 0,
+                    codec: None,
+                },
+                detector: CameraDetector {
+                    prompts: vec![],
+                    visual_prompts: vec![],
+                    model_override: None,
+                },
+                behavior: CameraBehavior::default(),
+                onvif: CameraOnvif {
+                    endpoint: Some("http://192.168.1.64/onvif/device_service".into()),
+                    username: Some(secret_user.into()),
+                    password: Some(secret_pass.into()),
+                },
+                talk_down: CameraTalkDown {
+                    speaker_present: true,
+                    backchannel_codec: Some("PCMU".into()),
+                    backchannel_url: Some(secret_backchannel.into()),
+                },
+                zones: vec![],
+            })
+            .await
+            .unwrap();
+
+        let env = build_envelope(&store, 42).await.expect("build envelope");
+        let json = serde_json::to_string(&env).expect("serialize envelope");
+
+        // The camera URL is rtsp://, so "onvif" can only appear in the
+        // serialized envelope if the credential blob leaked.
+        assert!(
+            !json.contains("onvif"),
+            "camera_roster envelope must not mention onvif: {json}"
+        );
+        assert!(
+            !json.contains(secret_user),
+            "camera_roster envelope leaked the ONVIF username"
+        );
+        assert!(
+            !json.contains(secret_pass),
+            "camera_roster envelope leaked the ONVIF password"
+        );
+        assert!(
+            !json.contains("talk_down") && !json.contains("backchannel"),
+            "camera_roster envelope must not mention talk_down: {json}"
+        );
+        assert!(
+            !json.contains(secret_backchannel),
+            "camera_roster envelope leaked the talk-down backchannel URL"
+        );
+    }
 }

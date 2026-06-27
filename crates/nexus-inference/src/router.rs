@@ -366,6 +366,8 @@ mod tests {
                 anchor_ttl_secs: None,
                 ..Default::default()
             },
+            onvif: Default::default(),
+            talk_down: Default::default(),
             zones: vec![],
         }
     }
@@ -530,6 +532,8 @@ mod tests {
                     anchor_ttl_secs: None,
                     ..Default::default()
                 },
+                onvif: Default::default(),
+                talk_down: Default::default(),
                 zones: vec![],
             },
             cam2.clone(),

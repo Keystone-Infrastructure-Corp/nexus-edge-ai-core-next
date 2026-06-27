@@ -114,6 +114,10 @@ pub struct Config {
     /// `nexus_pipeline::SightingScheduler` for the per-track FSM.
     #[serde(default)]
     pub reid: ReidConfig,
+    /// Phase 7.6.6 — generic LAN device proxy (REPO_BOUNDARY R5c).
+    /// Ships OFF; opt-in per deployment.
+    #[serde(default)]
+    pub lan_proxy: LanProxyConfig,
 }
 
 impl Config {
@@ -2256,6 +2260,80 @@ pub struct CameraIngest {
     pub codec: Option<CodecKind>,
 }
 
+/// ONVIF device-control endpoint + credentials for a camera.
+///
+/// Powers Phase 7.6 device control (PTZ / imaging / device / etc.):
+/// the cloud console issues live ONVIF commands *through the edge
+/// tunnel*, but the credentials themselves are **edge-resident only**
+/// — AGENTS.md Rule 6 / REPO_BOUNDARY R5b. They ride the existing
+/// `cameras.config_json` blob (no SQLite schema change, no migration)
+/// and MUST NEVER be serialized into the `camera_roster` envelope that
+/// crosses the tunnel (the roster builder hand-picks metadata fields,
+/// so this stays trivially redacted; a unit test asserts it).
+///
+/// Stored plaintext inside `config_json`, matching the existing
+/// convention for RTSP credentials embedded in [`CameraIngest::url`].
+///
+/// `endpoint` is the verbatim WS-Discovery `XAddrs` device-service URL
+/// (e.g. `http://192.168.1.64/onvif/device_service`); when a camera is
+/// added from discovery it is populated from
+/// [`crate`]'s discovered-device `onvif_xaddrs` so an ONVIF camera
+/// needs no re-entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CameraOnvif {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl CameraOnvif {
+    /// True when nothing is configured, so the blob serializes away
+    /// cleanly via `skip_serializing_if` — keeps the `config_json`
+    /// shape byte-identical for the (overwhelming) non-ONVIF majority.
+    pub fn is_empty(&self) -> bool {
+        self.endpoint.is_none() && self.username.is_none() && self.password.is_none()
+    }
+}
+
+/// ONVIF talk-down (two-way audio / speaker) capability for a camera,
+/// discovered via `GetAudioOutputs` and the RTSP backchannel SDP
+/// (Phase 7.6.7). Edge-resident only — like [`CameraOnvif`] it never
+/// crosses the tunnel into the `camera_roster` envelope, and it
+/// serializes away when empty so non-speaker cameras keep an unchanged
+/// `config_json`.
+///
+/// Carries no credential: the RTSP backchannel reuses the ingest URL's
+/// userinfo, and the ONVIF probe reuses [`CameraOnvif`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CameraTalkDown {
+    /// True when the camera advertises an audio output (speaker) the
+    /// operator can talk down through.
+    #[serde(default)]
+    pub speaker_present: bool,
+    /// Backchannel audio codec the camera expects (e.g. `PCMU`,
+    /// `PCMA`, `G726`, `AAC`) as reported by the backchannel SDP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backchannel_codec: Option<String>,
+    /// RTSP backchannel control URL the talk-down session streams audio
+    /// to (the `a=control:` of the `sendonly` audio media line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backchannel_url: Option<String>,
+}
+
+impl CameraTalkDown {
+    /// True when nothing is configured, so the block serializes away
+    /// via `skip_serializing_if` and the `config_json` stays
+    /// byte-identical for the non-speaker majority.
+    pub fn is_empty(&self) -> bool {
+        !self.speaker_present && self.backchannel_codec.is_none() && self.backchannel_url.is_none()
+    }
+}
+
 /// Detector-side knobs — open-vocab prompts and model overrides.
 /// Anything that changes WHAT the inference layer is asked to
 /// look for, vs. CameraIngest which controls how frames get there.
@@ -2483,6 +2561,16 @@ pub struct CameraConfig {
     pub detector: CameraDetector,
     #[serde(flatten)]
     pub behavior: CameraBehavior,
+    /// ONVIF device-control endpoint + credentials (Phase 7.6).
+    /// Edge-resident only — never crosses the tunnel. Defaults to
+    /// empty and is skipped on serialize when empty, so existing
+    /// non-ONVIF cameras keep an unchanged `config_json` shape.
+    #[serde(default, skip_serializing_if = "CameraOnvif::is_empty")]
+    pub onvif: CameraOnvif,
+    /// ONVIF talk-down (speaker) capability (Phase 7.6.7). Edge-resident
+    /// only — never crosses the tunnel. Skipped on serialize when empty.
+    #[serde(default, skip_serializing_if = "CameraTalkDown::is_empty")]
+    pub talk_down: CameraTalkDown,
     /// Polygon zones used by motion gate / dwell rules.
     #[serde(default)]
     pub zones: Vec<ZoneConfig>,
@@ -2538,6 +2626,27 @@ pub struct CameraConfigUpdate {
     pub visual_prompts: Vec<VisualPromptRef>,
     pub model: ModelConfig,
     pub generation: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7.6.6 — generic LAN device proxy (REPO_BOUNDARY R5c)
+// ---------------------------------------------------------------------------
+
+/// `[lan_proxy]` block. **Disabled by default.** When `enabled = true`,
+/// the audited, SSRF-bounded `POST /api/v1/admin/proxy` admin route
+/// lets the operator console reach a non-ONVIF device on the edge's own
+/// LAN (camera web UIs, NVRs). The whole feature is an explicit,
+/// narrowly-scoped exception to the credential-boundary rule, so it is
+/// opt-in per deployment (R5c §5: ships off). Every other R5c
+/// constraint (SSRF guard, discovery allowlist, per-call audit, no
+/// credential persistence) is enforced unconditionally in
+/// `crate::lan_proxy` whenever this is on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LanProxyConfig {
+    /// Master switch. Defaults `false`.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2693,6 +2802,20 @@ mod tests {
             ..Default::default()
         };
         cfg.validate().unwrap();
+    }
+
+    /// Phase 7.6.6 / REPO_BOUNDARY R5c §5 — the generic LAN device proxy
+    /// is opt-in: with `[lan_proxy]` absent (or defaulted) the feature is
+    /// off. This pins the default so the edge never proxies LAN traffic
+    /// unless an operator explicitly enables it.
+    #[test]
+    fn lan_proxy_is_off_by_default() {
+        assert!(!LanProxyConfig::default().enabled);
+        let cfg = Config {
+            cameras: vec![],
+            ..Default::default()
+        };
+        assert!(!cfg.lan_proxy.enabled);
     }
 
     #[test]
@@ -3106,6 +3229,96 @@ url = "rtsp://example/cam"
 "#;
         let cam: CameraConfig = toml::from_str(src).unwrap();
         assert!(cam.detector.visual_prompts.is_empty());
+    }
+
+    /// Phase 7.6.1 — ONVIF endpoint + credentials round-trip through the
+    /// `cameras.config_json` blob (which is just `serde_json` of
+    /// `CameraConfig`), and a camera that omits them serializes WITHOUT
+    /// an `onvif` key so existing blobs stay byte-identical (no SQLite
+    /// migration). Credentials are edge-resident only; the roster
+    /// redaction is asserted separately in `nexus-engine`.
+    #[test]
+    fn camera_onvif_round_trips_and_is_omitted_when_empty() {
+        // Absent → empty, and serializes away (config_json unchanged).
+        let bare: CameraConfig = toml::from_str(
+            r#"
+id = 1
+name = "front_door"
+url = "rtsp://example/cam"
+"#,
+        )
+        .unwrap();
+        assert!(bare.onvif.is_empty());
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("onvif"),
+            "empty onvif must be skipped so config_json is unchanged"
+        );
+
+        // Present → parses, and JSON round-trips losslessly.
+        let cam: CameraConfig = toml::from_str(
+            r#"
+id = 2
+name = "ptz_cam"
+url = "rtsp://example/ptz"
+onvif = { endpoint = "http://192.168.1.64/onvif/device_service", username = "admin", password = "s3cret" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cam.onvif.endpoint.as_deref(),
+            Some("http://192.168.1.64/onvif/device_service")
+        );
+        assert_eq!(cam.onvif.username.as_deref(), Some("admin"));
+        assert_eq!(cam.onvif.password.as_deref(), Some("s3cret"));
+
+        let json = serde_json::to_string(&cam).unwrap();
+        let back: CameraConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.onvif, cam.onvif);
+    }
+
+    /// Phase 7.6.7 — the `talk_down` (speaker) block round-trips through
+    /// JSON and serializes away when empty so non-speaker cameras keep
+    /// an unchanged `config_json` (no SQLite migration). Edge-resident
+    /// only; the roster redaction is asserted in `nexus-engine`.
+    #[test]
+    fn camera_talk_down_round_trips_and_is_omitted_when_empty() {
+        // Absent → empty, serializes away.
+        let bare: CameraConfig = toml::from_str(
+            r#"
+id = 1
+name = "fixed_cam"
+url = "rtsp://example/cam"
+"#,
+        )
+        .unwrap();
+        assert!(bare.talk_down.is_empty());
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("talk_down"),
+            "empty talk_down must be skipped so config_json is unchanged"
+        );
+
+        // Present → parses, and JSON round-trips losslessly.
+        let cam: CameraConfig = toml::from_str(
+            r#"
+id = 2
+name = "speaker_cam"
+url = "rtsp://example/spk"
+talk_down = { speaker_present = true, backchannel_codec = "PCMU", backchannel_url = "rtsp://example/spk/backchannel" }
+"#,
+        )
+        .unwrap();
+        assert!(cam.talk_down.speaker_present);
+        assert_eq!(cam.talk_down.backchannel_codec.as_deref(), Some("PCMU"));
+        assert_eq!(
+            cam.talk_down.backchannel_url.as_deref(),
+            Some("rtsp://example/spk/backchannel")
+        );
+
+        let json = serde_json::to_string(&cam).unwrap();
+        let back: CameraConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.talk_down, cam.talk_down);
     }
 
     /// `CameraConfigUpdate` (fan-pushed to every detector slot on

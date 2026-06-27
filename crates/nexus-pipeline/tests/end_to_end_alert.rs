@@ -121,6 +121,8 @@ async fn cel_rule_emits_alert_for_virtual_person() {
             anchor_ttl_secs: None,
             ..Default::default()
         },
+        onvif: Default::default(),
+        talk_down: Default::default(),
         zones: vec![],
     };
     // Recorder + clips_dir under the same tempdir so artefacts are

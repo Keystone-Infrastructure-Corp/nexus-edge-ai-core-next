@@ -25,7 +25,16 @@
 //! `/22`), and the audit-log contract.
 
 pub mod onvif;
+pub mod onvif_device;
+pub mod onvif_deviceio;
+pub mod onvif_encoder;
+pub mod onvif_firmware;
+pub mod onvif_imaging;
 pub mod onvif_media;
+pub mod onvif_network;
+pub mod onvif_ptz;
+pub mod onvif_snapshot;
+pub mod onvif_soap;
 pub mod rtsp_probe;
 pub mod scan;
 
@@ -272,6 +281,15 @@ pub struct SdpStream {
     pub resolution: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<String>,
+    /// SDP media direction (`sendonly` / `recvonly` / `sendrecv` /
+    /// `inactive`, from the matching `a=` attribute). For an
+    /// `m=audio` track this distinguishes a talk-down backchannel
+    /// sink (`sendonly` from the camera's point of view) from a
+    /// normal audio source, so the Phase 7.6.7 `talk_down` capture
+    /// can pick the right `a=control:` URL. `None` when the SDP omits
+    /// a direction attribute (RFC 4566 defaults to `sendrecv`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 /// Per-path summary returned in [`ProbeRtspResult::streams`].
@@ -417,6 +435,26 @@ impl DiscoverySessions {
         let entry = self.inner.get(id)?;
         let snap = entry.value().lock().snapshot(*id);
         Some(snap)
+    }
+
+    /// Snapshot every IP currently surfaced by an in-flight or recent
+    /// discovery session. Backs the Phase 7.6.6 LAN-proxy allowlist
+    /// (REPO_BOUNDARY R5c §4): the proxy may only reach a device the
+    /// edge has actually discovered. Unparseable `ip` strings are
+    /// skipped. Sessions TTL-evict after a few minutes, so this is the
+    /// *fresh-scan* half of the allowlist; configured-camera IPs supply
+    /// the persistent half.
+    pub fn discovered_ips(&self) -> std::collections::HashSet<std::net::IpAddr> {
+        let mut out = std::collections::HashSet::new();
+        for entry in self.inner.iter() {
+            let guard = entry.value().lock();
+            for d in &guard.found {
+                if let Ok(ip) = d.ip.parse::<std::net::IpAddr>() {
+                    out.insert(ip);
+                }
+            }
+        }
+        out
     }
 
     /// Mark a Running session as cancelled. Returns:
