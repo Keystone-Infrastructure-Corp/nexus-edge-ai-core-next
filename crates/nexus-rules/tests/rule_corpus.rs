@@ -30,6 +30,12 @@
 //! | `motion.dwell_seconds`    | annotator                           | `loitering`                               |
 //! | `motion.zone_state`       | annotator                           | `zone_breach_entering`, `zone_occupied`   |
 //! | `group.size`              | annotator                           | `crowd_forming`                           |
+//! | `motion.near_static_vehicle_id`      | annotator (8.1)          | `near_static_equipment`                   |
+//! | `motion.near_static_vehicle_seconds` | annotator (8.1)          | `loitering_near_vehicle`, `suspected_vehicle_break_in` |
+//! | `motion.tool_in_proximity_label`     | annotator (8.1)          | `suspected_vehicle_break_in`              |
+//! | `motion.tool_in_proximity_confidence`| annotator (8.1)          | `tool_brandished`                         |
+//! | `motion.removed_anchor_ids`          | annotator (8.1)          | `anchor_removed_any`, `equipment_removed_from_zone` |
+//! | `motion.carrying_anchor_label`       | annotator (8.1)          | `equipment_removed_from_zone`             |
 //! | `camera.id`               | engine context                      | `specific_camera`                         |
 //! | `now.hour`                | engine context                      | `after_hours` (compile-only, time-flaky)  |
 //! | `now.day_of_week`         | engine context                      | `weekend_activity` (compile-only)         |
@@ -168,6 +174,50 @@ const RULE_CORPUS: &[RuleSpec] = &[
         id: "weekend_activity",
         name: "Any track on Sat/Sun",
         when: "now.day_of_week >= 6",
+        severity: "low",
+    },
+    // --- Phase 8.1 wedge rules: candidates the cloud VLM verifies -------
+    RuleSpec {
+        id: "suspected_vehicle_break_in",
+        name: "Person with a tool lingering at a parked vehicle",
+        when: "object.label == 'person' && \
+               object.attributes['motion.near_static_vehicle_seconds'] >= 15 && \
+               object.attributes['motion.tool_in_proximity_label'] != ''",
+        severity: "critical",
+    },
+    RuleSpec {
+        id: "equipment_removed_from_zone",
+        name: "Person carrying away a tracked anchor",
+        when: "object.label == 'person' && \
+               size(object.attributes['motion.removed_anchor_ids']) > 0 && \
+               object.attributes['motion.carrying_anchor_label'] != ''",
+        severity: "high",
+    },
+    RuleSpec {
+        id: "loitering_near_vehicle",
+        name: "Person loitering at a parked vehicle >= 30s",
+        when: "object.label == 'person' && \
+               object.attributes['motion.near_static_vehicle_seconds'] >= 30",
+        severity: "high",
+    },
+    RuleSpec {
+        id: "tool_brandished",
+        name: "Tool detected near a person with high confidence",
+        when: "object.label == 'person' && \
+               object.attributes['motion.tool_in_proximity_confidence'] >= 0.6",
+        severity: "medium",
+    },
+    RuleSpec {
+        id: "anchor_removed_any",
+        name: "A tracked static anchor disappeared this frame",
+        when: "size(object.attributes['motion.removed_anchor_ids']) > 0",
+        severity: "medium",
+    },
+    RuleSpec {
+        id: "near_static_equipment",
+        name: "Person standing next to a static equipment anchor",
+        when: "object.label == 'person' && \
+               object.attributes['motion.near_static_vehicle_id'] != ''",
         severity: "low",
     },
 ];
@@ -699,6 +749,143 @@ fn fixtures() -> Vec<Fixture> {
             camera_id: 1,
             expected: false,
             object: || ObjectBuilder::new("dog").build(),
+        },
+        // --- Phase 8.1 wedge rules -----------------------------------------
+        Fixture {
+            name: "suspected_vehicle_break_in: person 20s at vehicle with tool matches",
+            rule_id: "suspected_vehicle_break_in",
+            camera_id: 1,
+            expected: true,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.near_static_vehicle_seconds", json!(20))
+                    .attr("motion.tool_in_proximity_label", json!("pry_bar"))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "suspected_vehicle_break_in: person at vehicle without tool rejected",
+            rule_id: "suspected_vehicle_break_in",
+            camera_id: 1,
+            expected: false,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.near_static_vehicle_seconds", json!(20))
+                    .attr("motion.tool_in_proximity_label", json!(""))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "equipment_removed_from_zone: carrying labelled anchor matches",
+            rule_id: "equipment_removed_from_zone",
+            camera_id: 1,
+            expected: true,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.removed_anchor_ids", json!(["ladder@320x240"]))
+                    .attr("motion.carrying_anchor_label", json!("ladder"))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "equipment_removed_from_zone: no removal rejected",
+            rule_id: "equipment_removed_from_zone",
+            camera_id: 1,
+            expected: false,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.removed_anchor_ids", json!([] as [&str; 0]))
+                    .attr("motion.carrying_anchor_label", json!(""))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "loitering_near_vehicle: 30s near vehicle matches (boundary)",
+            rule_id: "loitering_near_vehicle",
+            camera_id: 1,
+            expected: true,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.near_static_vehicle_seconds", json!(30))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "loitering_near_vehicle: 29s rejected (boundary)",
+            rule_id: "loitering_near_vehicle",
+            camera_id: 1,
+            expected: false,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.near_static_vehicle_seconds", json!(29))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "tool_brandished: high-conf tool nearby matches",
+            rule_id: "tool_brandished",
+            camera_id: 1,
+            expected: true,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.tool_in_proximity_confidence", json!(0.75))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "tool_brandished: low-conf tool rejected",
+            rule_id: "tool_brandished",
+            camera_id: 1,
+            expected: false,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.tool_in_proximity_confidence", json!(0.4))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "anchor_removed_any: removal present matches",
+            rule_id: "anchor_removed_any",
+            camera_id: 1,
+            expected: true,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.removed_anchor_ids", json!(["wheelbarrow@10x20"]))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "anchor_removed_any: no removal rejected",
+            rule_id: "anchor_removed_any",
+            camera_id: 1,
+            expected: false,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.removed_anchor_ids", json!([] as [&str; 0]))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "near_static_equipment: near anchor matches",
+            rule_id: "near_static_equipment",
+            camera_id: 1,
+            expected: true,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.near_static_vehicle_id", json!("ladder@320x240"))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "near_static_equipment: empty id rejected",
+            rule_id: "near_static_equipment",
+            camera_id: 1,
+            expected: false,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.near_static_vehicle_id", json!(""))
+                    .build()
+            },
         },
     ]
 }

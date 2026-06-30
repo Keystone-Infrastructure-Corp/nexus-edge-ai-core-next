@@ -222,6 +222,36 @@ export const ATTRIBUTE_KEYS: Record<AttributeKeyCatalog, readonly AttributeKey[]
       doc: "List of inclusion/dwell zone ids the object is currently inside (post-transition).",
     },
     {
+      name: "motion.near_static_vehicle_id",
+      type: "string",
+      doc: "Id of the nearest static anchor within proximity, or absent. Form 'label@cxXcy'.",
+    },
+    {
+      name: "motion.near_static_vehicle_seconds",
+      type: "number",
+      doc: "Seconds this track has dwelt continuously near the same static anchor.",
+    },
+    {
+      name: "motion.tool_in_proximity_label",
+      type: "string",
+      doc: "Lowercased label of the closest tool detection within reach, or '' when none.",
+    },
+    {
+      name: "motion.tool_in_proximity_confidence",
+      type: "number",
+      doc: "Detector confidence of the nearby tool, when one is in proximity.",
+    },
+    {
+      name: "motion.removed_anchor_ids",
+      type: "list",
+      doc: "Ids of static anchors present last frame but absent now (possible pickup).",
+    },
+    {
+      name: "motion.carrying_anchor_label",
+      type: "string",
+      doc: "Label of the first removed anchor — pairs with removed_anchor_ids for pickup rules.",
+    },
+    {
       name: "group.size",
       type: "number",
       doc: "Count of OTHER same-label tracks within the proximity radius.",

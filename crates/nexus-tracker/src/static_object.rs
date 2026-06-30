@@ -112,6 +112,10 @@ pub struct StaticObjectFilter {
     persistence_path: Option<PathBuf>,
     state_by_track: HashMap<TrackId, PerTrackState>,
     anchors: Vec<StaticAnchor>,
+    /// Phase 8.1 — extra (non-vehicle) lowercased label classes that are
+    /// also eligible for static-anchor promotion (equipment: `ladder`,
+    /// `wheelbarrow`, etc.). Empty preserves vehicle-only behaviour.
+    extra_anchor_classes: Vec<String>,
 }
 
 impl StaticObjectFilter {
@@ -123,6 +127,17 @@ impl StaticObjectFilter {
         camera_id: CameraId,
         persistence_path: Option<PathBuf>,
     ) -> Self {
+        Self::with_anchor_classes(cfg, camera_id, persistence_path, Vec::new())
+    }
+
+    /// Like [`Self::new`] but also promotes the supplied lowercased
+    /// label classes (Phase 8.1 `static_anchor_classes`) to anchors.
+    pub fn with_anchor_classes(
+        cfg: StaticObjectConfig,
+        camera_id: CameraId,
+        persistence_path: Option<PathBuf>,
+        extra_anchor_classes: Vec<String>,
+    ) -> Self {
         let anchors = match &persistence_path {
             Some(path) if cfg.persistence_enabled => Self::load_registry(camera_id, path),
             _ => Vec::new(),
@@ -133,6 +148,10 @@ impl StaticObjectFilter {
             persistence_path,
             state_by_track: HashMap::new(),
             anchors,
+            extra_anchor_classes: extra_anchor_classes
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
         }
     }
 
@@ -210,7 +229,12 @@ impl StaticObjectFilter {
         let mut suppress_verdict: Vec<bool> = Vec::with_capacity(objects.len());
 
         for o in objects.iter() {
-            if !is_vehicle_label(&o.label) {
+            if !is_vehicle_label(&o.label)
+                && !self
+                    .extra_anchor_classes
+                    .iter()
+                    .any(|c| c == &o.label.to_lowercase())
+            {
                 suppress_verdict.push(false);
                 continue;
             }

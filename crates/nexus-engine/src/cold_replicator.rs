@@ -33,6 +33,7 @@ use nexus_bus::{topic, Bus, BusExt};
 use nexus_cloud_client::{ClipReplicatedProjection, TunnelError, TunnelOutbox};
 use nexus_storage::{BackendError, HealthStatus, Registry};
 use nexus_store::{ClipColdMark, ClipRow, Store};
+use nexus_types::AlertEvent;
 use serde::Deserialize;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -54,6 +55,15 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// progress. The 32 number is per-tick; with the default 5 min
 /// backstop that's >9 k clips/day even with zero bus events.
 pub const BATCH_SIZE: i64 = 32;
+
+/// Phase 8.3 — clip priority at or above which the cold replicator
+/// treats a clip as "urgent" and bypasses the bandwidth throttle so
+/// the cloud behaviour-verifier gets its evidence clip with minimal
+/// latency. Priority 1 is the human "Expedite" lane (Phase 2.1c);
+/// priority 2 is auto-bumped when a candidate (verification) alert
+/// fires on the clip's camera. `bump_clip_priority` is idempotent so
+/// an Expedite + candidate alert on the same clip just lands at 2.
+pub const URGENT_CLIP_PRIORITY: i64 = 2;
 
 /// Configuration for the replicator task. All fields are owned so
 /// the spawn site can `clone()` and move into the spawn future.
@@ -192,6 +202,18 @@ pub async fn run_cold_replicator(
         }
     };
 
+    // Phase 8.3 — also watch alerts so a candidate (verification)
+    // alert auto-bumps that camera's most-recent pending clip into
+    // the urgent cold-upload lane. The verifier needs the evidence
+    // clip fast; the urgent lane bypasses the bandwidth throttle.
+    let mut alerts = match bus.subscribe::<AlertEvent>(topic::ALERT_EVENT).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "cold replicator: subscribe to ALERT_EVENT failed; urgent lane disabled");
+            Box::pin(futures::stream::pending())
+        }
+    };
+
     // Track the last unreachable warning so we don't spam the log
     // every 5 min when the LAN share is permanently down. The bus
     // event is emitted exactly once per "transition into
@@ -264,6 +286,39 @@ pub async fn run_cold_replicator(
             _ = &mut kick_fut => {
                 debug!("cold replicator: boot kick");
                 tick(&cfg, &store, &bus, &registry, &throttle, &mut last_health_was_ok).await;
+            }
+            ev = alerts.next() => {
+                match ev {
+                    None => {
+                        warn!("cold replicator: ALERT_EVENT stream ended; urgent lane off");
+                        alerts = Box::pin(futures::stream::pending());
+                    }
+                    Some(Err(e)) => {
+                        warn!(error = %e, "cold replicator: ALERT_EVENT stream error");
+                    }
+                    Some(Ok(alert)) => {
+                        // Auto-expedite the camera's most-recent pending
+                        // clip into the urgent lane; kick so it ships now.
+                        match store
+                            .bump_latest_pending_clip_for_camera(
+                                alert.camera_id,
+                                URGENT_CLIP_PRIORITY,
+                            )
+                            .await
+                        {
+                            Ok(Some(clip_id)) => {
+                                debug!(
+                                    clip_id,
+                                    camera_id = alert.camera_id,
+                                    "cold replicator: candidate alert bumped clip to urgent lane"
+                                );
+                                kick.notify_one();
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(error = %e, "cold replicator: urgent bump failed"),
+                        }
+                    }
+                }
             }
         }
     }
@@ -594,8 +649,19 @@ async fn upload_one(
         })?;
 
     // Throttle BEFORE the put so the bandwidth budget actually
-    // governs the bytes-on-the-wire moment.
-    throttle.acquire(bytes.len() as u64).await;
+    // governs the bytes-on-the-wire moment. Phase 8.3: urgent clips
+    // (a candidate verification alert fired on this camera) bypass
+    // the bucket entirely so the verifier's evidence isn't delayed
+    // behind a slow backfill on a metered uplink.
+    if clip.priority < URGENT_CLIP_PRIORITY {
+        throttle.acquire(bytes.len() as u64).await;
+    } else {
+        debug!(
+            clip_id = clip.id,
+            priority = clip.priority,
+            "cold replicator: urgent clip bypasses bandwidth throttle"
+        );
+    }
 
     let receipt = backend
         .put(&cold_path, &bytes, sha256)

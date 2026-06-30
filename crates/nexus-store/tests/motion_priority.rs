@@ -149,6 +149,51 @@ async fn bump_clip_priority_is_idempotent_and_no_op_on_missing() {
 }
 
 #[tokio::test]
+async fn bump_latest_pending_clip_for_camera_picks_newest_and_is_idempotent() {
+    // Phase 8.3 urgent lane: a candidate alert bumps the camera's
+    // newest pending clip to priority 2; a second alert is a no-op.
+    let (store, _dir) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    let t0 = Utc::now() - Duration::minutes(30);
+    let t1 = t0 + Duration::minutes(10);
+    let id_old = insert_pending_clip(&store, 1, t0).await;
+    let id_new = insert_pending_clip(&store, 1, t1).await;
+
+    // Bumps the newest clip on the camera.
+    let bumped = store
+        .bump_latest_pending_clip_for_camera(1, 2)
+        .await
+        .unwrap();
+    assert_eq!(bumped, Some(id_new));
+
+    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    assert_eq!(pending[0].id, id_new);
+    assert_eq!(pending[0].priority, 2);
+    assert_eq!(pending[1].id, id_old);
+
+    // Second alert: already at 2 → no-op (None).
+    assert_eq!(
+        store
+            .bump_latest_pending_clip_for_camera(1, 2)
+            .await
+            .unwrap(),
+        None
+    );
+    // No eligible clip on an unknown camera → None.
+    assert_eq!(
+        store
+            .bump_latest_pending_clip_for_camera(2, 2)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn pending_position_reflects_priority_ordering() {
     let (store, _dir) = fresh_store().await;
     store

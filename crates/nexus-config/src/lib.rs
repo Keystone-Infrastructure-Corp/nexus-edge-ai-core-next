@@ -1353,6 +1353,30 @@ pub struct AnnotatorConfig {
     /// runtime; otherwise the cell walk may miss neighbours.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_spatial_bucket_size_px: Option<u32>,
+    /// Phase 8.1 — non-vehicle object classes (lowercased detector
+    /// labels) the static-object filter should also promote to
+    /// persistent anchors, so equipment like `ladder`, `wheelbarrow`,
+    /// `scissor lift` joins `vehicle` in the registry. Empty (default)
+    /// preserves vehicle-only static-anchor behaviour. Drives the
+    /// `motion.removed_anchor_ids` / `motion.carrying_anchor_label`
+    /// attributes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_anchor_classes: Vec<String>,
+    /// Phase 8.1 — detector labels (lowercased) treated as "tools" for
+    /// the `motion.tool_in_proximity_*` attributes (e.g. `crowbar`,
+    /// `hammer`, `bolt cutter`). Empty (default) disables tool
+    /// proximity stamping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_proximity_labels: Vec<String>,
+    /// Phase 8.1 — proximity search radius (multiple of the moving
+    /// track's bbox half-perimeter) for `motion.near_static_vehicle_*`.
+    /// Default 1.5.
+    #[serde(default = "default_annotator_proximity_radius_box_multiplier")]
+    pub proximity_radius_box_multiplier: f32,
+    /// Phase 8.1 — proximity radius (multiple of the person's bbox
+    /// half-perimeter) for `motion.tool_in_proximity_*`. Default 1.0.
+    #[serde(default = "default_annotator_tool_proximity_radius_box_multiplier")]
+    pub tool_proximity_radius_box_multiplier: f32,
 }
 
 impl Default for AnnotatorConfig {
@@ -1369,6 +1393,11 @@ impl Default for AnnotatorConfig {
             group_radius_box_multiplier: default_annotator_group_radius_box_multiplier(),
             stale_state_frames: default_annotator_stale_state_frames(),
             group_spatial_bucket_size_px: None,
+            static_anchor_classes: Vec::new(),
+            tool_proximity_labels: Vec::new(),
+            proximity_radius_box_multiplier: default_annotator_proximity_radius_box_multiplier(),
+            tool_proximity_radius_box_multiplier:
+                default_annotator_tool_proximity_radius_box_multiplier(),
         }
     }
 }
@@ -1402,6 +1431,12 @@ fn default_annotator_group_radius_box_multiplier() -> f32 {
 }
 fn default_annotator_stale_state_frames() -> u32 {
     600
+}
+fn default_annotator_proximity_radius_box_multiplier() -> f32 {
+    1.5
+}
+fn default_annotator_tool_proximity_radius_box_multiplier() -> f32 {
+    1.0
 }
 
 // ---------------------------------------------------------------------------

@@ -228,6 +228,14 @@ backend = "bytetrack" # iou_naive | bytetrack
 track_ttl_ms = 2000
 iou_threshold = 0.30
 
+# Phase 8.1 annotator tuning. Defaults preserve vehicle-only anchors and
+# disable tool proximity. Set these to drive the wedge break-in rules:
+# [tracker.annotator]
+# static_anchor_classes = ["ladder", "wheelbarrow", "scissor lift"]
+# tool_proximity_labels = ["crowbar", "hammer", "bolt cutter"]
+# proximity_radius_box_multiplier = 1.5
+# tool_proximity_radius_box_multiplier = 1.0
+
 # -----------------------------------------------------------------
 # Rules — CEL.
 # -----------------------------------------------------------------
@@ -243,6 +251,29 @@ min_track_age_ms = 500
 consecutive_frames = 2
 cooldown_ms = 30000
 enabled = true
+
+# --- Phase 8 wedge starter rules: candidates the cloud VLM verifies ---
+# These match the new annotator attributes (motion.near_static_vehicle_*,
+# motion.tool_in_proximity_*, motion.removed_anchor_ids). They only fire
+# usefully when [tracker.annotator] has static_anchor_classes and
+# tool_proximity_labels set, and the camera runs parking_lot_mode = true.
+# [[rules.inline]]
+# id = "suspected_vehicle_break_in"
+# name = "Person with a tool lingering at a parked vehicle"
+# when = "object.label == 'person' && object.attributes['motion.near_static_vehicle_seconds'] >= 15 && object.attributes['motion.tool_in_proximity_label'] != ''"
+# severity = "critical"
+# min_track_age_ms = 1000
+# consecutive_frames = 3
+# cooldown_ms = 60000
+# enabled = true
+#
+# [[rules.inline]]
+# id = "equipment_removed_from_zone"
+# name = "Person carrying away a tracked anchor"
+# when = "object.label == 'person' && size(object.attributes['motion.removed_anchor_ids']) > 0 && object.attributes['motion.carrying_anchor_label'] != ''"
+# severity = "high"
+# cooldown_ms = 60000
+# enabled = true
 
 # -----------------------------------------------------------------
 # Bus

@@ -176,6 +176,11 @@ mod tests {
                 snapshot_blob_url: None,
                 clip_blob_url: None,
                 attached_history: None,
+                verification_state: None,
+                verdict_description: None,
+                verdict_evidence: None,
+                verdict_confidence: None,
+                evidence_clip_ref: None,
             }),
         }
     }
