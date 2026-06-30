@@ -195,6 +195,29 @@ export function SystemPage() {
                   <Progress value={m.gpu.utilization_pct} className="mt-2" />
                 </div>
               ) : null}
+              {m.gpu.engines && m.gpu.engines.length > 0 ? (
+                <div className="space-y-2 rounded-lg border border-border/50 bg-muted/20 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Per-engine utilization
+                    </span>
+                    <span className="text-[11px] text-muted-foreground">
+                      video decode / enhance carry the camera load
+                    </span>
+                  </div>
+                  {m.gpu.engines.map((e) => (
+                    <div key={e.class} className="space-y-1">
+                      <div className="flex items-baseline justify-between text-sm">
+                        <span>{engineLabel(e.class)}</span>
+                        <span className="tabular-nums text-muted-foreground">
+                          {e.utilization_pct.toFixed(0)}%
+                        </span>
+                      </div>
+                      <Progress value={e.utilization_pct} />
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               <div className="grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
                 <Field
                   label="VRAM used"
@@ -524,4 +547,20 @@ function Field({ label, value }: { label: string; value: string }) {
       <span className="font-mono">{value}</span>
     </div>
   );
+}
+
+// Friendly labels for the Intel GPU engine classes the engine
+// reports per-engine utilization for. Falls back to the raw class
+// string so a future engine class still renders something readable.
+const ENGINE_LABELS: Record<string, string> = {
+  render: "Render / 3D",
+  "video-decode": "Video decode",
+  "video-enhance": "Video enhance",
+  copy: "Copy / blitter",
+  compute: "Compute",
+  other: "Other",
+};
+
+function engineLabel(cls: string): string {
+  return ENGINE_LABELS[cls] ?? cls;
 }

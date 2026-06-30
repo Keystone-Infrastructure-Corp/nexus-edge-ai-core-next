@@ -96,6 +96,31 @@ pub struct MemoryInfo {
     pub swap_used_bytes: u64,
 }
 
+/// One Intel GPU engine class with its own utilization reading.
+///
+/// Intel iGPUs split work across distinct hardware engines —
+/// render/3D, video-decode, video-enhance, copy/blitter, compute —
+/// each clocked independently. On a headless video appliance the
+/// render engine sits near 0% while the video-decode and
+/// video-enhance engines carry the real load, so the single
+/// `GpuInfo::utilization_pct` aggregate can look misleadingly idle.
+/// This per-class breakdown surfaces where the work actually is.
+///
+/// Populated for the Intel sysfs/PMU backend only (both the i915
+/// driver on Alder Lake / Raptor Lake and the xe driver on Lunar
+/// Lake / Battlemage); empty on NVIDIA, AMD, and Apple.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuEngineUtil {
+    /// Stable engine class: `"render"`, `"video-decode"`,
+    /// `"video-enhance"`, `"copy"`, or `"compute"`. Instances of
+    /// the same class (e.g. two video-decode engines) are averaged
+    /// into one entry.
+    pub class: String,
+    /// 0–100 utilization for this engine class over the sampling
+    /// window.
+    pub utilization_pct: f32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuInfo {
     pub kind: String,
@@ -104,6 +129,14 @@ pub struct GpuInfo {
     pub mem_used_bytes: Option<u64>,
     pub utilization_pct: Option<f32>,
     pub temp_c: Option<f32>,
+    /// Per-engine-class utilization breakdown for Intel iGPUs.
+    /// Empty on every other backend (and while the Intel PMU
+    /// baseline is warming up). The aggregate `utilization_pct`
+    /// above is unchanged when this is populated, so consumers
+    /// that only read the headline number — including the existing
+    /// Alder Lake path — keep working untouched.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub engines: Vec<GpuEngineUtil>,
     /// Operator-facing explanation when `utilization_pct` is `None`.
     /// `Some("...")` describes which PMU init / sampling step
     /// failed; `None` means utilization is being reported normally.

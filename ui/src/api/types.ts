@@ -491,6 +491,15 @@ export interface SystemMemoryInfo {
   swap_used_bytes: number;
 }
 
+export interface GpuEngineUtil {
+  /// Engine class: `"render"`, `"video-decode"`, `"video-enhance"`,
+  /// `"copy"`, or `"compute"`. Instances of the same class are
+  /// averaged into one entry.
+  class: string;
+  /// 0–100 utilization for this engine class.
+  utilization_pct: number;
+}
+
 export interface SystemGpuInfo {
   kind: string;
   name: string;
@@ -498,6 +507,13 @@ export interface SystemGpuInfo {
   mem_used_bytes: number | null;
   utilization_pct: number | null;
   temp_c: number | null;
+  /// Per-engine-class utilization for Intel iGPUs (i915 on Alder
+  /// Lake / Raptor Lake, xe on Lunar Lake / Battlemage). One entry
+  /// per engine class, each with its own 0–100 reading. Absent or
+  /// empty on NVIDIA, AMD, Apple, and while the Intel PMU baseline
+  /// is warming up. The `utilization_pct` above stays the overall
+  /// aggregate, so existing readouts are unchanged.
+  engines?: GpuEngineUtil[];
   /// Operator-facing reason when `utilization_pct` is `null`.
   /// Populated by the engine when PMU init or sampling failed
   /// (e.g. "missing CAP_PERFMON", "i915 PMU not exposed");
