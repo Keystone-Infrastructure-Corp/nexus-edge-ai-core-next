@@ -951,6 +951,48 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Phase 8.3 — expedite the most relevant clip for a camera when a
+    /// candidate (verification) alert fires, so the cloud behaviour-
+    /// verifier gets its evidence with minimal latency. Picks the
+    /// newest clip on `camera_id` that is still pending cold upload
+    /// (closed, hashed, not yet replicated, not quarantined) and bumps
+    /// it to `new_priority` via the same idempotent rule as
+    /// [`Self::bump_clip_priority`]. Returns the bumped clip id when a
+    /// row was promoted, or `None` when no eligible clip exists or it
+    /// already had >= `new_priority`. The selection mirrors
+    /// `clips_pending_cold_upload` so it lines up with what the
+    /// replicator drains next.
+    pub async fn bump_latest_pending_clip_for_camera(
+        &self,
+        camera_id: CameraId,
+        new_priority: i64,
+    ) -> Result<Option<ClipId>, StoreError> {
+        let Some(row) = sqlx::query(
+            "SELECT id FROM motion_clips
+              WHERE camera_id = ?
+                AND cold_handle IS NULL
+                AND ended_at IS NOT NULL
+                AND sha256 IS NOT NULL
+                AND hot_handle IS NOT NULL
+                AND hot_path IS NOT NULL
+                AND cold_quarantined = 0
+              ORDER BY ended_at DESC
+              LIMIT 1",
+        )
+        .bind(camera_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let clip_id = row.get::<i64, _>(0);
+        if self.bump_clip_priority(clip_id, new_priority).await? {
+            Ok(Some(clip_id))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Aggregate cold-mirror counters for the storage admin UI. See
     /// [`ColdReplicaStats`] for field semantics. Single SUM/COUNT
     /// pass with conditional-aggregate filters so it stays O(n) over

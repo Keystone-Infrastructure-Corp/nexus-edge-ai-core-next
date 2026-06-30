@@ -62,12 +62,27 @@ pub struct AlertPayload {
     pub edge_event_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_rule_id: Option<String>,
+    /// Phase 8.2. Edge-populated pointer to the urgent-upload evidence clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_clip_ref: Option<EvidenceClipRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_label: Option<String>,
     pub severity: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_blob_url: Option<String>,
     pub ts: Timestamp,
+    /// Phase 8.2. Verifier confidence 0..1. Cloud-written; edge always omits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_confidence: Option<f64>,
+    /// Phase 8.2. Human-readable VLM verdict headline. Cloud-written; edge always omits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_description: Option<String>,
+    /// Phase 8.2. Structured-evidence map from the verifier. Cloud-written; edge always omits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_evidence: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Phase 8.2 (additive). Edge fires `candidate`; cloud verifier overwrites. Omitted by N-1 edges → treated as `verified`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_state: Option<VerificationState>,
 }
 
 /// Cloud → Edge. Reply to a camera_roster. `permanent_failure` tells the edge to stop retrying this revision (e.g. malformed metadata). `accepted_revision` is echoed back so the edge can drop the outbox entry and advance its high-water-mark.
@@ -308,6 +323,18 @@ pub struct EntitySightingPayload {
     pub ts: Timestamp,
 }
 
+/// Phase 8.2 — pointer to the urgent-upload clip the cloud verifier samples keyframes from. Edge populates this when an alert fires; sas_url is dereferenceable by the time the alert reaches the verifier (8.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceClipRef {
+    /// Clip-relative end of the evidence window, ms.
+    pub frame_end_ms: u64,
+    /// Clip-relative start of the evidence window, ms.
+    pub frame_start_ms: u64,
+    /// Signed Blob SAS URL for the evidence clip MP4.
+    pub sas_url: String,
+}
+
 /// Cloud → Edge. Reply to a heartbeat. May hint at cert rotation after day 75. Phase M_PERF_CROWD A: optionally carries `cloud_capabilities` so the edge can gate batched / FP16 sighting envelopes on cloud-side support.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -421,6 +448,17 @@ pub struct TraceContext {
 pub type UnixSeconds = u64;
 
 pub type Uuid = String;
+
+/// Phase 8.2 — lifecycle of a behavior-verified alert. Edge fires `candidate`; cloud verifier advances it. A N-1 edge that omits the field is treated as `verified` (legacy rule-engine alerts predate the verifier).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationState {
+    Candidate,
+    Pending,
+    Verified,
+    Dismissed,
+    Review,
+}
 
 /// Envelope metadata — every field of [`Envelope`] except the
 /// `kind`/`payload` discriminator, which is encoded by [`EnvelopeBody`].

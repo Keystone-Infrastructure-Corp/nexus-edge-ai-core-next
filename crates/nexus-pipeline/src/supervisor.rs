@@ -263,6 +263,9 @@ async fn run_camera(
         let mut detected: u64 = 0;
         let prompts = cfg.detector.prompts.clone();
         let zones = cfg.zones.clone();
+        // Phase 8.1: equipment classes the static filter should also
+        // promote to anchors (captured before the annotator config moves).
+        let anchor_classes = annotator_cfg.static_anchor_classes.clone();
         let mut annotator = TrackAnnotator::new(annotator_cfg);
         // Static-object filter is only built when the camera opted in.
         // We always pass the persistence path (under state_dir) so a
@@ -280,10 +283,11 @@ async fn run_camera(
             let path = state_dir
                 .join("static_objects")
                 .join(format!("cam-{}.json", cfg.id));
-            Some(StaticObjectFilter::new(
+            Some(StaticObjectFilter::with_anchor_classes(
                 effective_static_cfg,
                 cfg.id,
                 Some(path),
+                anchor_classes,
             ))
         } else {
             None
@@ -807,7 +811,14 @@ async fn run_camera(
             }
             {
                 let _g = info_span!("frame.annotate", annotator = annotator.name()).entered();
-                annotator.annotate(&frame, &zones, &mut tracked);
+                // Phase 8.1: hand the annotator the prior-frame static
+                // anchor set (empty when parking_lot_mode is off) so it
+                // can stamp `motion.near_static_vehicle_*`.
+                let anchors = static_filter
+                    .as_ref()
+                    .map(|f| f.anchors())
+                    .unwrap_or(&[]);
+                annotator.annotate(&frame, &zones, anchors, &mut tracked);
             }
             if let Some(sf) = static_filter.as_mut() {
                 let _g = info_span!("frame.static_filter", filter = sf.name()).entered();

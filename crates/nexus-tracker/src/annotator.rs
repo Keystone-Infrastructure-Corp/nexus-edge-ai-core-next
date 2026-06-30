@@ -29,6 +29,8 @@ use nexus_config::{AnnotatorConfig, ZoneConfig, ZoneKind};
 use nexus_types::{Frame, TrackId, TrackedObject};
 use serde_json::json;
 
+use crate::static_object::StaticAnchor;
+
 const FIRST_FRAME_DT_SECONDS: f64 = 1.0 / 30.0;
 
 type CenterGrid = HashMap<(i32, i32), Vec<(f32, f32)>>;
@@ -48,12 +50,21 @@ struct PerTrackState {
     parked_frames_accum: u32,
     /// Per-zone "was inside last frame" flag for the entering/exiting FSM.
     inside_by_zone: HashMap<String, bool>,
+    /// Phase 8.1 — id of the static anchor this track is currently
+    /// within proximity of (None when clear). Drives near_static_vehicle_id.
+    near_anchor_id: Option<String>,
+    /// Phase 8.1 — first wall-clock at which the track entered the
+    /// current anchor's proximity. Drives near_static_vehicle_seconds.
+    near_anchor_since: Option<DateTime<Utc>>,
 }
 
 pub struct TrackAnnotator {
     cfg: AnnotatorConfig,
     state_by_track: HashMap<TrackId, PerTrackState>,
     frame_tick: u64,
+    /// Phase 8.1 — anchor ids seen on the previous frame, so removal
+    /// (anchor present last frame, absent now) can be reported.
+    prev_anchor_ids: Vec<String>,
 }
 
 impl TrackAnnotator {
@@ -62,12 +73,24 @@ impl TrackAnnotator {
             cfg,
             state_by_track: HashMap::new(),
             frame_tick: 0,
+            prev_anchor_ids: Vec::new(),
         }
     }
 
     /// Stamp attributes onto every track in `objects`. Mutates internal
     /// per-track state so subsequent calls have access to deltas.
-    pub fn annotate(&mut self, frame: &Frame, zones: &[ZoneConfig], objects: &mut [TrackedObject]) {
+    ///
+    /// `anchors` is the static-object registry's current anchor set
+    /// (from the previous frame's classify pass) used for the Phase 8.1
+    /// `motion.near_static_vehicle_*` / `motion.removed_anchor_ids`
+    /// proximity attributes. Pass an empty slice to disable.
+    pub fn annotate(
+        &mut self,
+        frame: &Frame,
+        zones: &[ZoneConfig],
+        anchors: &[StaticAnchor],
+        objects: &mut [TrackedObject],
+    ) {
         self.frame_tick = self.frame_tick.saturating_add(1);
         if objects.is_empty() {
             self.gc_stale();
@@ -110,11 +133,30 @@ impl TrackAnnotator {
             }
         }
 
+        // Phase 8.1 tool pre-pass: (center, label, confidence) of every
+        // detection whose lowercased label is in `tool_proximity_labels`.
+        // Scanned per moving track to stamp `motion.tool_in_proximity_*`.
+        let tools: Vec<((f32, f32), String, f32)> = if self.cfg.tool_proximity_labels.is_empty() {
+            Vec::new()
+        } else {
+            objects
+                .iter()
+                .filter(|o| {
+                    self.cfg
+                        .tool_proximity_labels
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(&o.label))
+                })
+                .map(|o| (o.bbox.center(), o.label.to_lowercase(), o.confidence))
+                .collect()
+        };
+        // Phase 8.1 anchor ids present this frame (label@cx×cy, integer px).
+        let anchor_ids: Vec<String> = anchors.iter().map(anchor_id).collect();
+
         for o in objects.iter_mut() {
             let state = self.state_by_track.entry(o.track_id).or_default();
             let now = frame.captured_at;
             let center = o.bbox.center();
-
             // ---- dt seconds since last observation ----
             let dt_seconds = match state.last_seen_at {
                 Some(prev) => {
@@ -298,7 +340,99 @@ impl TrackAnnotator {
             }
             let group = group.saturating_sub(1); // remove self
             o.attributes.insert("group.size".into(), json!(group));
+
+            // ---- Phase 8.1 proximity attributes ----
+            // near_static_vehicle: nearest static anchor within
+            // proximity_radius_box_multiplier × half-perimeter. Stamp the
+            // anchor id and an accumulating dwell-near duration. Only
+            // meaningful for non-anchor labels (people, tools), so skip
+            // anchor classes themselves.
+            let half_perim = 0.5 * (o.bbox.width() + o.bbox.height());
+            let near_radius = self.cfg.proximity_radius_box_multiplier * half_perim;
+            let near_r2 = (near_radius * near_radius) as f64;
+            let mut nearest: Option<&str> = None;
+            let mut nearest_d2 = f64::MAX;
+            for (i, a) in anchors.iter().enumerate() {
+                let dx = (a.center_x - center.0) as f64;
+                let dy = (a.center_y - center.1) as f64;
+                let d2 = dx * dx + dy * dy;
+                if d2 <= near_r2 && d2 < nearest_d2 {
+                    nearest_d2 = d2;
+                    nearest = Some(anchor_ids[i].as_str());
+                }
+            }
+            match nearest {
+                Some(id) => {
+                    if state.near_anchor_id.as_deref() != Some(id) {
+                        state.near_anchor_id = Some(id.to_string());
+                        state.near_anchor_since = Some(now);
+                    }
+                    let secs = state
+                        .near_anchor_since
+                        .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                        .unwrap_or(0);
+                    o.attributes
+                        .insert("motion.near_static_vehicle_id".into(), json!(id));
+                    o.attributes
+                        .insert("motion.near_static_vehicle_seconds".into(), json!(secs));
+                }
+                None => {
+                    state.near_anchor_id = None;
+                    state.near_anchor_since = None;
+                }
+            }
+
+            // tool_in_proximity: closest tool detection within
+            // tool_proximity_radius_box_multiplier × half-perimeter.
+            if !tools.is_empty() {
+                let tool_radius = self.cfg.tool_proximity_radius_box_multiplier * half_perim;
+                let tool_r2 = (tool_radius * tool_radius) as f64;
+                let mut best: Option<(&str, f32)> = None;
+                let mut best_d2 = f64::MAX;
+                for (tc, tl, tconf) in &tools {
+                    let dx = (tc.0 - center.0) as f64;
+                    let dy = (tc.1 - center.1) as f64;
+                    let d2 = dx * dx + dy * dy;
+                    // skip the tool's own bbox (distance ~0 to itself)
+                    if d2 <= tool_r2 && d2 < best_d2 && o.label.to_lowercase() != *tl {
+                        best_d2 = d2;
+                        best = Some((tl.as_str(), *tconf));
+                    }
+                }
+                if let Some((label, conf)) = best {
+                    o.attributes
+                        .insert("motion.tool_in_proximity_label".into(), json!(label));
+                    o.attributes
+                        .insert("motion.tool_in_proximity_confidence".into(), json!(conf));
+                }
+            }
         }
+
+        // ---- Phase 8.1 anchor-removal (frame-global) ----
+        // Anchors present last frame but absent now → removed. Stamp the
+        // removed ids on every track + a carried-label on the nearest
+        // person so a CEL rule can fire `equipment_removed_from_zone`.
+        let removed: Vec<String> = self
+            .prev_anchor_ids
+            .iter()
+            .filter(|id| !anchor_ids.contains(id))
+            .cloned()
+            .collect();
+        if !removed.is_empty() {
+            let carried_label: Option<String> = removed
+                .first()
+                .and_then(|id| id.split('@').next())
+                .map(str::to_string);
+            for o in objects.iter_mut() {
+                o.attributes
+                    .insert("motion.removed_anchor_ids".into(), json!(removed));
+                if let Some(label) = &carried_label {
+                    o.attributes
+                        .insert("motion.carrying_anchor_label".into(), json!(label));
+                }
+            }
+        }
+        self.prev_anchor_ids = anchor_ids;
 
         self.gc_stale();
     }
@@ -323,6 +457,18 @@ fn is_vehicle_label(label: &str) -> bool {
     // Mirrors v1: `label.startsWith("vehicle")`. Domain labels use the
     // `vehicle.*` taxonomy after `mapCocoToDomainLabel`.
     label.starts_with("vehicle")
+}
+
+/// Phase 8.1 — stable id for a static anchor: `label@cx×cy` with px
+/// rounded to the nearest integer. Same anchor across frames yields the
+/// same id; a removed/re-added anchor changes id only if it moves > ~0.5px.
+fn anchor_id(a: &StaticAnchor) -> String {
+    format!(
+        "{}@{}x{}",
+        a.label.to_lowercase(),
+        a.center_x.round() as i64,
+        a.center_y.round() as i64
+    )
 }
 
 /// Image-y is down; "n" should mean "up the screen", so flip dy. Returns
@@ -424,11 +570,11 @@ mod tests {
     fn stationary_object_classifies_stationary() {
         let mut a = TrackAnnotator::new(AnnotatorConfig::default());
         let mut o1 = vec![obj(1, "person", 100.0, 100.0)];
-        a.annotate(&frame_at(0, 1920, 1080), &[], &mut o1);
+        a.annotate(&frame_at(0, 1920, 1080), &[], &[], &mut o1);
         assert_eq!(o1[0].attributes["motion.speed_class"], "stationary");
         // Second frame, same position → still stationary.
         let mut o2 = vec![obj(1, "person", 100.0, 100.0)];
-        a.annotate(&frame_at(1, 1920, 1080), &[], &mut o2);
+        a.annotate(&frame_at(1, 1920, 1080), &[], &[], &mut o2);
         assert_eq!(o2[0].attributes["motion.speed_class"], "stationary");
         assert_eq!(o2[0].attributes["motion.direction"], "none");
     }
@@ -437,13 +583,13 @@ mod tests {
     fn fast_horizontal_motion_classifies_running() {
         let mut a = TrackAnnotator::new(AnnotatorConfig::default());
         let mut o1 = vec![obj(1, "person", 100.0, 500.0)];
-        a.annotate(&frame_at_ms(0, 1920, 1080), &[], &mut o1);
+        a.annotate(&frame_at_ms(0, 1920, 1080), &[], &[], &mut o1);
         // After ~250 px in 1 s → 250 px/s → walking (>30) but not
         // running yet because the EMA is still ramping. Push two more
         // identical-velocity frames to let the EMA settle past 120.
         for i in 1..=4 {
             let mut o = vec![obj(1, "person", 100.0 + 250.0 * i as f32, 500.0)];
-            a.annotate(&frame_at_ms(i as i64 * 1000, 1920, 1080), &[], &mut o);
+            a.annotate(&frame_at_ms(i as i64 * 1000, 1920, 1080), &[], &[], &mut o);
             if i == 4 {
                 assert_eq!(o[0].attributes["motion.speed_class"], "running");
                 assert_eq!(o[0].attributes["motion.direction"], "e");
@@ -458,10 +604,10 @@ mod tests {
         // the vehicle_speed threshold (250 px/s) — should be running
         // (vehicle uses the running bucket as the next-down rung).
         let mut o1 = vec![obj(1, "vehicle.car", 100.0, 500.0)];
-        a.annotate(&frame_at_ms(0, 1920, 1080), &[], &mut o1);
+        a.annotate(&frame_at_ms(0, 1920, 1080), &[], &[], &mut o1);
         for i in 1..=4 {
             let mut o = vec![obj(1, "vehicle.car", 100.0 + 250.0 * i as f32, 500.0)];
-            a.annotate(&frame_at_ms(i as i64 * 1000, 1920, 1080), &[], &mut o);
+            a.annotate(&frame_at_ms(i as i64 * 1000, 1920, 1080), &[], &[], &mut o);
             if i == 4 {
                 // EMA has settled at ~250 px/sec → running, NOT vehicle_speed.
                 assert_eq!(o[0].attributes["motion.speed_class"], "running");
@@ -470,7 +616,7 @@ mod tests {
         // Now bump to ~500 px/s — should clear the vehicle_speed bar.
         for i in 5..=10 {
             let mut o = vec![obj(1, "vehicle.car", 100.0 + 500.0 * i as f32, 500.0)];
-            a.annotate(&frame_at_ms(i as i64 * 1000, 1920, 1080), &[], &mut o);
+            a.annotate(&frame_at_ms(i as i64 * 1000, 1920, 1080), &[], &[], &mut o);
             if i == 10 {
                 assert_eq!(o[0].attributes["motion.speed_class"], "vehicle_speed");
             }
@@ -486,7 +632,7 @@ mod tests {
         let mut a = TrackAnnotator::new(cfg);
         for i in 0..5 {
             let mut o = vec![obj(1, "vehicle.car", 100.0, 100.0)];
-            a.annotate(&frame_at_ms(i * 1000, 1920, 1080), &[], &mut o);
+            a.annotate(&frame_at_ms(i * 1000, 1920, 1080), &[], &[], &mut o);
             // i=0,1 → accum 1,2 (still "no"); i=2 → accum 3 (>=3 → "yes").
             let expected = if i >= 2 { "yes" } else { "no" };
             assert_eq!(
@@ -500,10 +646,10 @@ mod tests {
     fn dwell_seconds_counts_from_first_observation() {
         let mut a = TrackAnnotator::new(AnnotatorConfig::default());
         let mut o = vec![obj(1, "person", 100.0, 100.0)];
-        a.annotate(&frame_at(0, 1920, 1080), &[], &mut o);
+        a.annotate(&frame_at(0, 1920, 1080), &[], &[], &mut o);
         assert_eq!(o[0].attributes["motion.dwell_seconds"], 0);
         let mut o2 = vec![obj(1, "person", 100.0, 100.0)];
-        a.annotate(&frame_at(7, 1920, 1080), &[], &mut o2);
+        a.annotate(&frame_at(7, 1920, 1080), &[], &[], &mut o2);
         assert_eq!(o2[0].attributes["motion.dwell_seconds"], 7);
     }
 
@@ -522,22 +668,22 @@ mod tests {
 
         // Frame 1: outside (center at 90% across).
         let mut o = vec![obj(1, "person", 1700.0, 100.0)];
-        a.annotate(&frame_at(0, 1920, 1080), &zones, &mut o);
+        a.annotate(&frame_at(0, 1920, 1080), &zones, &[], &mut o);
         assert_eq!(o[0].attributes["motion.zone_state"], "outside");
 
         // Frame 2: cross into the zone → entering.
         let mut o = vec![obj(1, "person", 200.0, 200.0)];
-        a.annotate(&frame_at(1, 1920, 1080), &zones, &mut o);
+        a.annotate(&frame_at(1, 1920, 1080), &zones, &[], &mut o);
         assert_eq!(o[0].attributes["motion.zone_state"], "entering");
 
         // Frame 3: still inside → inside.
         let mut o = vec![obj(1, "person", 300.0, 300.0)];
-        a.annotate(&frame_at(2, 1920, 1080), &zones, &mut o);
+        a.annotate(&frame_at(2, 1920, 1080), &zones, &[], &mut o);
         assert_eq!(o[0].attributes["motion.zone_state"], "inside");
 
         // Frame 4: leave → exiting.
         let mut o = vec![obj(1, "person", 1700.0, 100.0)];
-        a.annotate(&frame_at(3, 1920, 1080), &zones, &mut o);
+        a.annotate(&frame_at(3, 1920, 1080), &zones, &[], &mut o);
         assert_eq!(o[0].attributes["motion.zone_state"], "exiting");
     }
 
@@ -552,7 +698,7 @@ mod tests {
             min_bbox_area_px_override: None,
         };
         let mut o = vec![obj(1, "person", 100.0, 100.0)];
-        a.annotate(&frame_at(0, 1920, 1080), &[zone], &mut o);
+        a.annotate(&frame_at(0, 1920, 1080), &[zone], &[], &mut o);
         // Despite being inside the exclusion polygon, zone_state stays
         // outside — exclusion zones are a gate concern, not an annotator one.
         assert_eq!(o[0].attributes["motion.zone_state"], "outside");
@@ -590,14 +736,14 @@ mod tests {
 
         // Center at (0.15, 0.15) — inside `parking` only.
         let mut o = vec![obj(1, "person", 1920.0 * 0.15, 1080.0 * 0.15)];
-        a.annotate(&frame_at(0, 1920, 1080), &zones, &mut o);
+        a.annotate(&frame_at(0, 1920, 1080), &zones, &[], &mut o);
         let ids = o[0].attributes["motion.zone_ids"].as_array().unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "parking");
 
         // Center at (0.4, 0.4) — inside BOTH parking and loading_dock.
         let mut o = vec![obj(1, "person", 1920.0 * 0.4, 1080.0 * 0.4)];
-        a.annotate(&frame_at(1, 1920, 1080), &zones, &mut o);
+        a.annotate(&frame_at(1, 1920, 1080), &zones, &[], &mut o);
         let ids = o[0].attributes["motion.zone_ids"].as_array().unwrap();
         let id_strs: Vec<&str> = ids.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(id_strs.contains(&"parking"));
@@ -606,7 +752,7 @@ mod tests {
 
         // Center at (0.9, 0.9) — outside both inclusion zones.
         let mut o = vec![obj(1, "person", 1920.0 * 0.9, 1080.0 * 0.9)];
-        a.annotate(&frame_at(2, 1920, 1080), &zones, &mut o);
+        a.annotate(&frame_at(2, 1920, 1080), &zones, &[], &mut o);
         let ids = o[0].attributes["motion.zone_ids"].as_array().unwrap();
         assert!(ids.is_empty());
     }
@@ -621,7 +767,7 @@ mod tests {
             obj(4, "dog", 105.0, 100.0),      // different label, ignored
             obj(5, "person", 1000.0, 1000.0), // far away, ignored
         ];
-        a.annotate(&frame_at(0, 1920, 1080), &[], &mut o);
+        a.annotate(&frame_at(0, 1920, 1080), &[], &[], &mut o);
         assert_eq!(o[0].attributes["group.size"], 2);
         assert_eq!(o[1].attributes["group.size"], 2);
         assert_eq!(o[2].attributes["group.size"], 2);
@@ -636,14 +782,14 @@ mod tests {
         };
         let mut a = TrackAnnotator::new(cfg);
         let mut o = vec![obj(1, "person", 100.0, 100.0)];
-        a.annotate(&frame_at(0, 1920, 1080), &[], &mut o);
+        a.annotate(&frame_at(0, 1920, 1080), &[], &[], &mut o);
         assert_eq!(a.state_by_track.len(), 1);
 
         // Three more frames with NO objects — track 1 is now stale and
         // should be evicted by the 4th frame (3 ticks > 2 stale_state_frames).
-        a.annotate(&frame_at(1, 1920, 1080), &[], &mut []);
-        a.annotate(&frame_at(2, 1920, 1080), &[], &mut []);
-        a.annotate(&frame_at(3, 1920, 1080), &[], &mut []);
+        a.annotate(&frame_at(1, 1920, 1080), &[], &[], &mut []);
+        a.annotate(&frame_at(2, 1920, 1080), &[], &[], &mut []);
+        a.annotate(&frame_at(3, 1920, 1080), &[], &[], &mut []);
         assert_eq!(
             a.state_by_track.len(),
             0,
@@ -729,13 +875,13 @@ mod tests {
         let mut objects_bucketed = objects_naive.clone();
 
         let mut a_naive = TrackAnnotator::new(AnnotatorConfig::default());
-        a_naive.annotate(&frame_at(0, 1920, 1080), &[], &mut objects_naive);
+        a_naive.annotate(&frame_at(0, 1920, 1080), &[], &[], &mut objects_naive);
 
         let mut a_bucketed = TrackAnnotator::new(AnnotatorConfig {
             group_spatial_bucket_size_px: Some(96),
             ..Default::default()
         });
-        a_bucketed.annotate(&frame_at(0, 1920, 1080), &[], &mut objects_bucketed);
+        a_bucketed.annotate(&frame_at(0, 1920, 1080), &[], &[], &mut objects_bucketed);
 
         for (n, b) in objects_naive.iter().zip(objects_bucketed.iter()) {
             assert_eq!(n.track_id, b.track_id);
@@ -763,13 +909,13 @@ mod tests {
         let mut objects_zero = objects_naive.clone();
 
         let mut a_naive = TrackAnnotator::new(AnnotatorConfig::default());
-        a_naive.annotate(&frame_at(0, 1280, 720), &[], &mut objects_naive);
+        a_naive.annotate(&frame_at(0, 1280, 720), &[], &[], &mut objects_naive);
 
         let mut a_zero = TrackAnnotator::new(AnnotatorConfig {
             group_spatial_bucket_size_px: Some(0),
             ..Default::default()
         });
-        a_zero.annotate(&frame_at(0, 1280, 720), &[], &mut objects_zero);
+        a_zero.annotate(&frame_at(0, 1280, 720), &[], &[], &mut objects_zero);
 
         for (n, z) in objects_naive.iter().zip(objects_zero.iter()) {
             assert_eq!(n.attributes["group.size"], z.attributes["group.size"]);

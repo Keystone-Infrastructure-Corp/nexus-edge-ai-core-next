@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nexus_cloud_protocol::v1::{
     AlertPayload, ClipReplicatedPayload, DiagReadyPayload, EntitySightingBatchPayload,
-    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta,
+    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta, VerificationState,
 };
 use uuid::Uuid;
 
@@ -144,6 +144,14 @@ pub fn build_alert_envelope(alert: AlertProjection) -> Envelope {
         snapshot_blob_url: alert.snapshot_blob_url,
         clip_blob_url: alert.clip_blob_url,
         attached_history: alert.attached_history,
+        // Phase 8.2: the edge always fires `candidate`; the cloud verifier
+        // advances the state and writes the verdict_* fields. evidence_clip_ref
+        // is populated by the urgent-upload lane (Phase 8.3).
+        verification_state: Some(VerificationState::Candidate),
+        verdict_description: None,
+        verdict_evidence: None,
+        verdict_confidence: None,
+        evidence_clip_ref: None,
     };
     Envelope {
         meta: EnvelopeMeta {
