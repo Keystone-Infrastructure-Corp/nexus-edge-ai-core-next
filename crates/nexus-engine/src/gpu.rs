@@ -185,6 +185,7 @@ mod nvidia {
                 mem_used_bytes: mem.map(|m| m.used),
                 utilization_pct: util,
                 temp_c: temp,
+                engines: Vec::new(),
                 utilization_status,
             })
         }
@@ -224,6 +225,7 @@ mod intel {
     use std::time::Instant;
 
     use super::{read_sysfs_string, GpuInfo};
+    use crate::system_metrics::GpuEngineUtil;
 
     /// Cached probe of the first Intel render node we find.
     pub(super) struct IntelSysfs {
@@ -260,12 +262,86 @@ mod intel {
         Xe(XePmu),
     }
 
+    /// Result of sampling either Intel GPU PMU: the overall
+    /// aggregate utilization (unchanged from the historical
+    /// single-number behaviour) plus a per-engine-class breakdown.
+    #[derive(Default)]
+    struct PmuSample {
+        /// Overall 0–100 utilization, or `None` while the baseline
+        /// warms up. Computed exactly as before the per-engine
+        /// breakdown was added, so the headline number — and the
+        /// Alder Lake path that depends on it — is untouched.
+        overall: Option<f32>,
+        /// `(class, pct)` per engine class, instances averaged.
+        /// Empty whenever `overall` is `None`.
+        engines: Vec<(&'static str, f32)>,
+    }
+
     impl IntelPmuBackend {
-        fn snapshot(&mut self) -> Option<f32> {
+        fn snapshot(&mut self) -> PmuSample {
             match self {
                 IntelPmuBackend::I915(p) => p.snapshot(),
                 IntelPmuBackend::Xe(p) => p.snapshot(),
             }
+        }
+    }
+
+    /// Accumulate per-engine `(class, numerator, denominator)`
+    /// readings into one entry per class (instances summed) and
+    /// emit them in a stable display order. `numerator/denominator`
+    /// is the class busy fraction: `busy_ns / elapsed_ns` for i915,
+    /// `active_ticks / total_ticks` for xe.
+    fn group_engine_classes(
+        per_engine: impl IntoIterator<Item = (&'static str, f64, f64)>,
+    ) -> Vec<(&'static str, f32)> {
+        const ORDER: [&str; 6] = [
+            "render",
+            "video-decode",
+            "video-enhance",
+            "copy",
+            "compute",
+            "other",
+        ];
+        // At most six classes, so a linear find-or-insert is fine.
+        let mut acc: Vec<(&'static str, f64, f64)> = Vec::new();
+        for (class, num, den) in per_engine {
+            if let Some(slot) = acc.iter_mut().find(|(c, _, _)| *c == class) {
+                slot.1 += num;
+                slot.2 += den;
+            } else {
+                acc.push((class, num, den));
+            }
+        }
+        let mut out: Vec<(&'static str, f32)> = Vec::new();
+        for class in ORDER {
+            if let Some((_, num, den)) = acc.iter().find(|(c, _, _)| *c == class) {
+                if *den > 0.0 {
+                    out.push((class, ((num / den) * 100.0).clamp(0.0, 100.0) as f32));
+                }
+            }
+        }
+        out
+    }
+
+    /// Map an i915 `<engine>-busy` event basename (e.g. `vcs0-busy`,
+    /// `vecs0-busy`) to a stable engine class. i915 abbreviates
+    /// engines `rcs`/`bcs`/`vcs`/`vecs`/`ccs` with a trailing
+    /// instance index.
+    fn i915_engine_class(event_basename: &str) -> &'static str {
+        let stem = event_basename
+            .strip_suffix("-busy")
+            .unwrap_or(event_basename);
+        let prefix: String = stem
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        match prefix.as_str() {
+            "rcs" => "render",
+            "bcs" => "copy",
+            "vcs" => "video-decode",
+            "vecs" => "video-enhance",
+            "ccs" => "compute",
+            _ => "other",
         }
     }
 
@@ -351,21 +427,36 @@ mod intel {
                     }
                 }
             }
-            let (utilization_pct, utilization_status) = match &self.pmu {
-                None => (None, self.pmu_init_error.clone()),
+            let (utilization_pct, engines, utilization_status) = match &self.pmu {
+                None => (None, Vec::new(), self.pmu_init_error.clone()),
                 Some(m) => match m.lock() {
-                    Err(_) => (None, Some("PMU mutex poisoned".to_string())),
-                    Ok(mut guard) => match guard.snapshot() {
-                        Some(pct) => (Some(pct), None),
-                        None => (
-                            None,
-                            Some(
-                                "GPU PMU baseline warming up \u{2014} \
-                                 a reading will appear after the next snapshot"
-                                    .to_string(),
+                    Err(_) => (None, Vec::new(), Some("PMU mutex poisoned".to_string())),
+                    Ok(mut guard) => {
+                        let sample = guard.snapshot();
+                        match sample.overall {
+                            Some(pct) => (
+                                Some(pct),
+                                sample
+                                    .engines
+                                    .into_iter()
+                                    .map(|(class, util)| GpuEngineUtil {
+                                        class: class.to_string(),
+                                        utilization_pct: util,
+                                    })
+                                    .collect(),
+                                None,
                             ),
-                        ),
-                    },
+                            None => (
+                                None,
+                                Vec::new(),
+                                Some(
+                                    "GPU PMU baseline warming up \u{2014} \
+                                     a reading will appear after the next snapshot"
+                                        .to_string(),
+                                ),
+                            ),
+                        }
+                    }
                 },
             };
             GpuInfo {
@@ -375,6 +466,7 @@ mod intel {
                 mem_used_bytes: None,
                 utilization_pct,
                 temp_c: None,
+                engines,
                 utilization_status,
             }
         }
@@ -389,6 +481,10 @@ mod intel {
         // engine busy nanoseconds since fd creation; deltas give
         // us per-second utilization.
         engine_fds: Vec<OwnedFd>,
+        // Engine class for each fd, in lockstep with `engine_fds`
+        // (e.g. `vcs0-busy` → `"video-decode"`). Used to group the
+        // per-engine deltas into the operator-facing breakdown.
+        engine_classes: Vec<&'static str>,
         // (Sample wall time, busy-ns per engine from the
         // previous read). `None` until the first snapshot warms
         // the baseline.
@@ -447,6 +543,7 @@ mod intel {
 
             let total_events = event_files.len();
             let mut engine_fds = Vec::with_capacity(total_events);
+            let mut engine_classes: Vec<&'static str> = Vec::with_capacity(total_events);
             let mut skipped: Vec<(String, i32)> = Vec::new();
             for path in &event_files {
                 let Some(config) = read_event_config(path) else {
@@ -454,7 +551,10 @@ mod intel {
                     continue;
                 };
                 match open_i915_event(type_id, config) {
-                    Ok(fd) => engine_fds.push(fd),
+                    Ok(fd) => {
+                        engine_fds.push(fd);
+                        engine_classes.push(i915_engine_class(&short_name(path)));
+                    }
                     Err(e) => {
                         if e == nix_eaccess() || e == libc::EPERM {
                             // First EACCES/EPERM is decisive — the
@@ -497,11 +597,12 @@ mod intel {
             );
             Ok(IntelPmu {
                 engine_fds,
+                engine_classes,
                 last_sample: None,
             })
         }
 
-        fn snapshot(&mut self) -> Option<f32> {
+        fn snapshot(&mut self) -> PmuSample {
             let now = Instant::now();
             let mut values = Vec::with_capacity(self.engine_fds.len());
             for fd in &self.engine_fds {
@@ -512,19 +613,18 @@ mod intel {
                 // isn't possible on a non-blocking sample read.
                 let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 if n != buf.len() as isize {
-                    return None;
+                    return PmuSample::default();
                 }
                 values.push(u64::from_ne_bytes(buf));
             }
-            let result = match &self.last_sample {
-                Some((prev_t, prev_v)) if prev_v.len() == values.len() => {
+            let mut sample = PmuSample::default();
+            if let Some((prev_t, prev_v)) = &self.last_sample {
+                if prev_v.len() == values.len() {
                     let elapsed_ns = now.duration_since(*prev_t).as_nanos() as u64;
                     // <100 ms apart is too noisy (and the 1 s
                     // cache TTL above us should normally space
                     // them ~1 s).
-                    if elapsed_ns < 100_000_000 {
-                        None
-                    } else {
+                    if elapsed_ns >= 100_000_000 {
                         let busy_ns: u64 = values
                             .iter()
                             .zip(prev_v.iter())
@@ -532,13 +632,23 @@ mod intel {
                             .sum();
                         let n_engines = values.len() as u64;
                         let pct = (busy_ns as f64 / (n_engines as f64 * elapsed_ns as f64)) * 100.0;
-                        Some((pct.clamp(0.0, 100.0)) as f32)
+                        sample.overall = Some(pct.clamp(0.0, 100.0) as f32);
+                        // Per-engine: each engine's own busy-ns over
+                        // the same elapsed window; instances of a
+                        // class are averaged by group_engine_classes.
+                        sample.engines = group_engine_classes(
+                            self.engine_classes
+                                .iter()
+                                .zip(values.iter().zip(prev_v.iter()))
+                                .map(|(class, (c, p))| {
+                                    (*class, c.saturating_sub(*p) as f64, elapsed_ns as f64)
+                                }),
+                        );
                     }
                 }
-                _ => None,
-            };
+            }
             self.last_sample = Some((now, values));
-            result
+            sample
         }
     }
 
@@ -571,6 +681,11 @@ mod intel {
         active_fd: OwnedFd,
         total_fd: OwnedFd,
         label: String,
+        // Engine class (`"render"`, `"video-decode"`, …) — the
+        // second element of the `class_labels` table. Used to
+        // group per-engine readings into the operator-facing
+        // breakdown.
+        class: &'static str,
     }
 
     pub(super) struct XePmu {
@@ -738,6 +853,7 @@ mod intel {
                         active_fd,
                         total_fd,
                         label: format!("{label_class}{instance}"),
+                        class: label_class,
                     });
                 }
             }
@@ -761,7 +877,7 @@ mod intel {
             })
         }
 
-        fn snapshot(&mut self) -> Option<f32> {
+        fn snapshot(&mut self) -> PmuSample {
             let now = Instant::now();
             let mut values = Vec::with_capacity(self.engines.len());
             for eng in &self.engines {
@@ -773,34 +889,45 @@ mod intel {
                 let na = unsafe { libc::read(eng.active_fd.as_raw_fd(), a.as_mut_ptr().cast(), 8) };
                 let nt = unsafe { libc::read(eng.total_fd.as_raw_fd(), t.as_mut_ptr().cast(), 8) };
                 if na != 8 || nt != 8 {
-                    return None;
+                    return PmuSample::default();
                 }
                 values.push((u64::from_ne_bytes(a), u64::from_ne_bytes(t)));
             }
-            let result = match &self.last_sample {
-                Some((prev_t, prev_v)) if prev_v.len() == values.len() => {
+            let mut sample = PmuSample::default();
+            if let Some((prev_t, prev_v)) = &self.last_sample {
+                if prev_v.len() == values.len() {
                     let elapsed_ns = now.duration_since(*prev_t).as_nanos() as u64;
-                    if elapsed_ns < 100_000_000 {
-                        None
-                    } else {
+                    if elapsed_ns >= 100_000_000 {
                         let mut active_delta: u64 = 0;
                         let mut total_delta: u64 = 0;
                         for ((a, t), (pa, pt)) in values.iter().zip(prev_v.iter()) {
                             active_delta = active_delta.saturating_add(a.saturating_sub(*pa));
                             total_delta = total_delta.saturating_add(t.saturating_sub(*pt));
                         }
-                        if total_delta == 0 {
-                            None
-                        } else {
+                        if total_delta != 0 {
                             let pct = (active_delta as f64 / total_delta as f64) * 100.0;
-                            Some(pct.clamp(0.0, 100.0) as f32)
+                            sample.overall = Some(pct.clamp(0.0, 100.0) as f32);
+                            // Per-engine: each engine's own active /
+                            // total ticks; instances of a class are
+                            // averaged by group_engine_classes.
+                            sample.engines = group_engine_classes(
+                                self.engines
+                                    .iter()
+                                    .zip(values.iter().zip(prev_v.iter()))
+                                    .map(|(eng, ((a, t), (pa, pt)))| {
+                                        (
+                                            eng.class,
+                                            a.saturating_sub(*pa) as f64,
+                                            t.saturating_sub(*pt) as f64,
+                                        )
+                                    }),
+                            );
                         }
                     }
                 }
-                _ => None,
-            };
+            }
             self.last_sample = Some((now, values));
-            result
+            sample
         }
     }
 
@@ -1223,6 +1350,7 @@ mod amd {
                 mem_used_bytes: read_u64(&self.vram_used_path),
                 utilization_pct,
                 temp_c,
+                engines: Vec::new(),
                 utilization_status,
             }
         }
@@ -1329,6 +1457,7 @@ mod apple {
                 mem_used_bytes: None,
                 utilization_pct: None,
                 temp_c: None,
+                engines: Vec::new(),
                 utilization_status: Some(
                     "live utilization requires Apple's private IOReport \
                      framework (not implemented in this build); device \

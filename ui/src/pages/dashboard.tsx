@@ -16,6 +16,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   AlertTriangle,
+  BrainCircuit,
   Camera,
   Cpu,
   Gauge,
@@ -110,6 +111,26 @@ export function DashboardPage() {
   const gpuBuf = useRollingBuffer(
     metricsQuery.data?.gpu?.utilization_pct ?? null,
   );
+  // NPU utilization (Intel AI Boost via the intel_vpu sysfs path).
+  // `null` on hosts without an NPU or while its first-sample
+  // baseline warms up, which keeps the sparkline empty rather than
+  // pinned at zero.
+  const npuBuf = useRollingBuffer(
+    metricsQuery.data?.npu?.utilization_pct ?? null,
+  );
+  // Busiest GPU engine class from the Intel i915/xe per-engine
+  // breakdown. On a headless video appliance the headline GPU
+  // aggregate can read near-zero while video-decode / video-enhance
+  // are busy, so surface the hottest engine next to the aggregate.
+  // `null` on backends without a per-engine breakdown (NVIDIA /
+  // AMD / Apple).
+  const busiestGpuEngine = useMemo(() => {
+    const engines = metricsQuery.data?.gpu?.engines ?? [];
+    if (engines.length === 0) return null;
+    return engines.reduce((a, b) =>
+      b.utilization_pct > a.utilization_pct ? b : a,
+    );
+  }, [metricsQuery.data]);
 
   const eventsLastHour = useMemo(() => {
     const cutoff = Date.now() - 60 * 60 * 1000;
@@ -139,6 +160,20 @@ export function DashboardPage() {
 
   const cameras = camerasQuery.data ?? [];
   const healthOk = healthQuery.data?.status === "ok";
+
+  // System sparkline cards: CPU + Memory + Inference are always
+  // shown; GPU and NPU are added when the host reports them. Pick a
+  // column count that fits the present cards without leaving a gap.
+  const sparkCount =
+    3 +
+    (metricsQuery.data?.gpu ? 1 : 0) +
+    (metricsQuery.data?.npu ? 1 : 0);
+  const sparkColumns =
+    sparkCount >= 5
+      ? "sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5"
+      : sparkCount === 4
+        ? "sm:grid-cols-2 lg:grid-cols-4"
+        : "lg:grid-cols-3";
 
   return (
     <div className="flex flex-col gap-6">
@@ -271,12 +306,7 @@ export function DashboardPage() {
       </div>
 
       {/* System sparklines ---------------------------------------- */}
-      <div
-        className={cn(
-          "grid grid-cols-1 gap-6",
-          metricsQuery.data?.gpu ? "lg:grid-cols-4" : "lg:grid-cols-3",
-        )}
-      >
+      <div className={cn("grid grid-cols-1 gap-6", sparkColumns)}>
         <SystemSparkCard
           icon={<Cpu className="h-4 w-4" />}
           title="CPU"
@@ -313,7 +343,26 @@ export function DashboardPage() {
                 ? `${metricsQuery.data.gpu.utilization_pct.toFixed(0)}%`
                 : "—"
             }
-            secondary={metricsQuery.data.gpu.name}
+            secondary={
+              busiestGpuEngine
+                ? `${engineShort(busiestGpuEngine.class)} ${busiestGpuEngine.utilization_pct.toFixed(0)}%`
+                : metricsQuery.data.gpu.name
+            }
+          />
+        )}
+        {metricsQuery.data?.npu && (
+          <SystemSparkCard
+            icon={<BrainCircuit className="h-4 w-4" />}
+            title="NPU"
+            values={npuBuf}
+            max={100}
+            primary={
+              metricsQuery.data.npu.utilization_pct !== null &&
+              metricsQuery.data.npu.utilization_pct !== undefined
+                ? `${metricsQuery.data.npu.utilization_pct.toFixed(0)}%`
+                : "\u2014"
+            }
+            secondary={metricsQuery.data.npu.name}
           />
         )}
         <Card>
@@ -509,6 +558,26 @@ function SystemSparkCard({
       </CardContent>
     </Card>
   );
+}
+
+// Compact GPU engine-class label for the sparkline secondary line
+// (the System page uses the long form). Falls back to the raw class
+// for any class the engine adds later.
+function engineShort(cls: string): string {
+  switch (cls) {
+    case "video-decode":
+      return "decode";
+    case "video-enhance":
+      return "enhance";
+    case "render":
+      return "render";
+    case "copy":
+      return "copy";
+    case "compute":
+      return "compute";
+    default:
+      return cls;
+  }
 }
 
 // ---------------------------------------------------------------------------
