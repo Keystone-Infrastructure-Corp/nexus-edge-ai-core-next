@@ -219,6 +219,7 @@ mod nvidia {
 
 #[cfg(target_os = "linux")]
 mod intel {
+    use std::collections::HashSet;
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -260,6 +261,13 @@ mod intel {
     pub(super) enum IntelPmuBackend {
         I915(IntelPmu),
         Xe(XePmu),
+        /// Unprivileged per-engine utilisation read from the engine's
+        /// own DRM client fdinfo (`/proc/self/fdinfo/*`). Preferred
+        /// over the xe perf PMU on the `xe` driver: it surfaces every
+        /// engine class (including the video-decode / video-enhance
+        /// engines the xe PMU omits on Lunar Lake) and needs no
+        /// CAP_PERFMON.
+        Fdinfo(XeFdinfo),
     }
 
     /// Result of sampling either Intel GPU PMU: the overall
@@ -282,6 +290,7 @@ mod intel {
             match self {
                 IntelPmuBackend::I915(p) => p.snapshot(),
                 IntelPmuBackend::Xe(p) => p.snapshot(),
+                IntelPmuBackend::Fdinfo(p) => p.snapshot(),
             }
         }
     }
@@ -331,7 +340,16 @@ mod intel {
         let stem = event_basename
             .strip_suffix("-busy")
             .unwrap_or(event_basename);
-        let prefix: String = stem
+        drm_engine_class(stem)
+    }
+
+    /// Map a DRM engine keystring (`rcs`, `vcs0`, `vecs`, `bcs`,
+    /// `ccs`, …) to a stable display class. Shared by the i915
+    /// `<engine>-busy` PMU event names and the xe
+    /// `drm-(total-)cycles-<engine>` fdinfo keys, which use the same
+    /// abbreviations (optionally with a trailing instance index).
+    fn drm_engine_class(keystr: &str) -> &'static str {
+        let prefix: String = keystr
             .chars()
             .take_while(|c| c.is_ascii_alphabetic())
             .collect();
@@ -385,16 +403,31 @@ mod intel {
             // Battlemage / anything booted with the xe driver.
             let (pmu, pmu_init_error) = match IntelPmu::try_open() {
                 Ok(p) => (Some(Mutex::new(IntelPmuBackend::I915(p))), None),
-                Err(i915_reason) => match XePmu::try_open(pci_bdf.as_deref()) {
-                    Ok(p) => (Some(Mutex::new(IntelPmuBackend::Xe(p))), None),
-                    Err(xe_reason) => {
-                        let combined = format!("i915 PMU: {i915_reason}; xe PMU: {xe_reason}");
-                        tracing::warn!(
-                            reason = %combined,
-                            "neither i915 nor xe PMU could be opened; GPU utilization will be unavailable",
-                        );
-                        (None, Some(combined))
-                    }
+                // Not the legacy i915 driver. On the newer `xe` driver
+                // (Lunar Lake / Battlemage) prefer the unprivileged
+                // drm-fdinfo reader: it surfaces every engine class —
+                // including the video-decode / video-enhance engines
+                // that carry a camera decode workload and that the xe
+                // perf PMU's engine-tick events omit on Lunar Lake —
+                // and it needs no CAP_PERFMON. Fall back to the xe perf
+                // PMU only if fdinfo can't be opened.
+                Err(i915_reason) => match XeFdinfo::try_open(pci_bdf.as_deref()) {
+                    Ok(p) => (Some(Mutex::new(IntelPmuBackend::Fdinfo(p))), None),
+                    Err(fdinfo_reason) => match XePmu::try_open(pci_bdf.as_deref()) {
+                        Ok(p) => (Some(Mutex::new(IntelPmuBackend::Xe(p))), None),
+                        Err(xe_reason) => {
+                            let combined = format!(
+                                "i915 PMU: {i915_reason}; xe fdinfo: {fdinfo_reason}; \
+                                 xe PMU: {xe_reason}"
+                            );
+                            tracing::warn!(
+                                reason = %combined,
+                                "no Intel GPU utilization source could be opened; \
+                                 GPU utilization will be unavailable",
+                            );
+                            (None, Some(combined))
+                        }
+                    },
                 },
             };
 
@@ -931,6 +964,214 @@ mod intel {
         }
     }
 
+    // -----------------------------------------------------------------
+    // xe drm-fdinfo backend (PREFERRED for the `xe` driver).
+    //
+    // Reads the engine's OWN DRM clients from `/proc/self/fdinfo/*`
+    // (the in-process GStreamer VA decode + VA postproc contexts) and
+    // sums the standard DRM usage-stats cycle counters per engine
+    // class:
+    //
+    //   drm-cycles-<eng>        busy cycles for this client on <eng>
+    //   drm-total-cycles-<eng>  free-running <eng> cycle timeline
+    //
+    //   util(class) = Δ(Σ_clients drm-cycles) / Δ(drm-total-cycles) ·100
+    //
+    // Why this instead of the xe perf PMU: on Lunar Lake the xe PMU's
+    // `engine-active-ticks` / `engine-total-ticks` events do not
+    // surface the video-decode / video-enhance engines (precisely the
+    // busy ones under a camera decode workload), and opening them
+    // needs CAP_PERFMON. drm-fdinfo is per-engine, exposes the video
+    // engines, and the unprivileged `nexus` process can read its own
+    // fds with no extra capability — so the metrics populate out of
+    // the box.
+    // -----------------------------------------------------------------
+
+    /// One fdinfo sweep: per-class `(class, busy_cycles_summed,
+    /// total_cycles_repr)` plus the wall time it was taken so the next
+    /// sweep can delta against it. `total_cycles_repr` is the max
+    /// across clients — every client samples the same shared engine
+    /// timeline, just at slightly different instants.
+    struct XeFdinfoSample {
+        at: Instant,
+        per_class: Vec<(&'static str, u64, u64)>,
+    }
+
+    /// One parsed DRM client from a `/proc/<pid>/fdinfo/<fd>` file:
+    /// its `drm-client-id` plus `(class, busy_cycles, total_cycles)`
+    /// merged per engine class (multiple instances of one class within
+    /// a single client — e.g. `vcs0` + `vcs1` — sum their busy cycles
+    /// and share the engine timeline).
+    struct FdinfoClient {
+        id: u64,
+        engines: Vec<(&'static str, u64, u64)>,
+    }
+
+    /// Parse one fdinfo file body. Returns `None` for any fd that is
+    /// not a DRM client (no `drm-client-id` key) so the caller can
+    /// skip sockets/pipes/regular files cheaply. Pure (no I/O) so the
+    /// `vcs`/`vecs` class disambiguation and the busy/total merge are
+    /// unit-testable without a live `/proc`.
+    fn parse_fdinfo_client(content: &str) -> Option<FdinfoClient> {
+        // Cheap pre-filter: only DRM client fds carry this key.
+        if !content.contains("drm-client-id") {
+            return None;
+        }
+        let mut id: Option<u64> = None;
+        let mut engines: Vec<(&'static str, u64, u64)> = Vec::new();
+        // Find-or-insert the `(class, busy, total)` slot for a class.
+        fn slot<'a>(
+            acc: &'a mut Vec<(&'static str, u64, u64)>,
+            class: &'static str,
+        ) -> &'a mut (&'static str, u64, u64) {
+            if let Some(i) = acc.iter().position(|(c, _, _)| *c == class) {
+                &mut acc[i]
+            } else {
+                acc.push((class, 0, 0));
+                acc.last_mut().expect("just pushed")
+            }
+        }
+        for line in content.lines() {
+            let Some((key, val)) = line.split_once(':') else {
+                continue;
+            };
+            let (key, val) = (key.trim(), val.trim());
+            if key == "drm-client-id" {
+                id = val.parse().ok();
+            } else if let Some(eng) = key.strip_prefix("drm-total-cycles-") {
+                // Must be tested before the `drm-cycles-` prefix below;
+                // it is a longer prefix on the same lines' siblings.
+                if let Ok(v) = val.parse::<u64>() {
+                    let s = slot(&mut engines, drm_engine_class(eng));
+                    s.2 = s.2.max(v);
+                }
+            } else if let Some(eng) = key.strip_prefix("drm-cycles-") {
+                if let Ok(v) = val.parse::<u64>() {
+                    slot(&mut engines, drm_engine_class(eng)).1 += v;
+                }
+            }
+        }
+        Some(FdinfoClient { id: id?, engines })
+    }
+
+    pub(super) struct XeFdinfo {
+        fdinfo_dir: PathBuf,
+        last: Option<XeFdinfoSample>,
+    }
+
+    impl XeFdinfo {
+        fn try_open(pci_bdf: Option<&str>) -> Result<Self, String> {
+            // Only take this path for a real `xe`-driver GPU. The xe
+            // driver always registers a per-device PMU node at
+            // /sys/bus/event_source/devices/xe_<bdf> even though we
+            // sample utilisation from fdinfo, so its presence is a
+            // reliable "this iGPU runs on xe" signal that costs no
+            // capability to check.
+            let devices_root = Path::new("/sys/bus/event_source/devices");
+            let wanted = pci_bdf.map(|bdf| format!("xe_{}", bdf.replace(':', "_")));
+            let saw_xe = std::fs::read_dir(devices_root).is_ok_and(|rd| {
+                rd.flatten().any(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    match wanted.as_deref() {
+                        Some(w) => name == w,
+                        None => name.starts_with("xe_"),
+                    }
+                })
+            });
+            if !saw_xe {
+                return Err("no xe_<bdf> device under /sys/bus/event_source/devices \
+                     (iGPU is not bound to the xe driver)"
+                    .to_string());
+            }
+            let fdinfo_dir = PathBuf::from("/proc/self/fdinfo");
+            if !fdinfo_dir.is_dir() {
+                return Err("/proc/self/fdinfo is not a readable directory".to_string());
+            }
+            tracing::info!(
+                fdinfo = %fdinfo_dir.display(),
+                "xe drm-fdinfo opened; sampling per-engine GPU utilization on each /system/metrics call",
+            );
+            Ok(XeFdinfo {
+                fdinfo_dir,
+                last: None,
+            })
+        }
+
+        /// Sweep `/proc/self/fdinfo`, dedupe DRM clients by
+        /// `drm-client-id`, and accumulate the per-engine-class cycle
+        /// counters: busy cycles summed across distinct clients, total
+        /// (engine timeline) cycles taken as the per-class max.
+        fn read_per_class(&self) -> Vec<(&'static str, u64, u64)> {
+            let mut seen: HashSet<u64> = HashSet::new();
+            let mut acc: Vec<(&'static str, u64, u64)> = Vec::new();
+            let Ok(rd) = std::fs::read_dir(&self.fdinfo_dir) else {
+                return acc;
+            };
+            for ent in rd.flatten() {
+                let Ok(content) = std::fs::read_to_string(ent.path()) else {
+                    // procfs fdinfo for sockets/pipes/etc. — or a fd
+                    // that closed mid-sweep. Skip; never fail the whole
+                    // snapshot for one unreadable entry.
+                    continue;
+                };
+                let Some(client) = parse_fdinfo_client(&content) else {
+                    continue;
+                };
+                // Several fds can alias one DRM client (dup'd handles);
+                // the cycle counters are identical, so count each
+                // client exactly once.
+                if !seen.insert(client.id) {
+                    continue;
+                }
+                for (class, busy, total) in client.engines {
+                    if let Some(s) = acc.iter_mut().find(|(c, _, _)| *c == class) {
+                        s.1 += busy;
+                        s.2 = s.2.max(total);
+                    } else {
+                        acc.push((class, busy, total));
+                    }
+                }
+            }
+            acc
+        }
+
+        fn snapshot(&mut self) -> PmuSample {
+            let now = Instant::now();
+            let per_class = self.read_per_class();
+            let mut sample = PmuSample::default();
+            if let Some(prev) = &self.last {
+                // <100 ms apart is too noisy; the 1 s cache TTL above
+                // us normally spaces snapshots ~1 s.
+                if now.duration_since(prev.at).as_millis() >= 100 {
+                    let mut deltas: Vec<(&'static str, f64, f64)> =
+                        Vec::with_capacity(per_class.len());
+                    for &(class, busy_now, total_now) in &per_class {
+                        let (busy_prev, total_prev) = prev
+                            .per_class
+                            .iter()
+                            .find(|&&(c, _, _)| c == class)
+                            .map(|&(_, b, t)| (b, t))
+                            .unwrap_or((0, 0));
+                        deltas.push((
+                            class,
+                            busy_now.saturating_sub(busy_prev) as f64,
+                            total_now.saturating_sub(total_prev) as f64,
+                        ));
+                    }
+                    let engines = group_engine_classes(deltas);
+                    // Headline = busiest engine so the "GPU %" honestly
+                    // reflects that the GPU is working (render alone is
+                    // a misleading 0 under a pure decode workload).
+                    let overall = engines.iter().map(|(_, p)| *p).fold(0.0_f32, f32::max);
+                    sample.overall = Some(overall);
+                    sample.engines = engines;
+                }
+            }
+            self.last = Some(XeFdinfoSample { at: now, per_class });
+            sample
+        }
+    }
+
     /// Variant of `open_i915_event` that takes an explicit CPU
     /// argument. The xe PMU's `cpumask` may be non-zero on
     /// multi-socket systems, so the caller resolves it from
@@ -1092,6 +1333,7 @@ mod intel {
     #[cfg(test)]
     mod tests {
         use super::read_event_config;
+        use super::{drm_engine_class, group_engine_classes, parse_fdinfo_client};
         use std::io::Write;
 
         fn write_sysfs(content: &str) -> tempfile::NamedTempFile {
@@ -1130,6 +1372,84 @@ mod intel {
         fn returns_none_when_no_recognised_prefix_present() {
             let f = write_sysfs("umask=0xff,inv=1\n");
             assert_eq!(read_event_config(f.path()), None);
+        }
+
+        #[test]
+        fn drm_engine_keys_map_to_stable_classes() {
+            // The xe driver emits bare engine abbreviations (no
+            // instance suffix) in fdinfo; i915 appends an index. Both
+            // must resolve to the same class — and `vcs` (decode) must
+            // not be confused with `vecs` (enhance), the exact bug that
+            // hid the busy video engines.
+            assert_eq!(drm_engine_class("rcs"), "render");
+            assert_eq!(drm_engine_class("bcs"), "copy");
+            assert_eq!(drm_engine_class("vcs"), "video-decode");
+            assert_eq!(drm_engine_class("vcs0"), "video-decode");
+            assert_eq!(drm_engine_class("vecs"), "video-enhance");
+            assert_eq!(drm_engine_class("vecs0"), "video-enhance");
+            assert_eq!(drm_engine_class("ccs"), "compute");
+            assert_eq!(drm_engine_class("xyz"), "other");
+        }
+
+        #[test]
+        fn parse_fdinfo_skips_non_drm_fds() {
+            // A pipe/socket fdinfo has no `drm-client-id`.
+            assert!(parse_fdinfo_client("pos:\t0\nflags:\t0100002\n").is_none());
+        }
+
+        #[test]
+        fn parse_fdinfo_reads_xe_engine_cycles() {
+            // Verbatim shape captured from the production Lunar Lake
+            // box (`/proc/<engine-pid>/fdinfo/<fd>`, xe driver).
+            let body = "\
+pos:\t0
+drm-driver:\txe
+drm-client-id:\t339
+drm-pdev:\t0000:00:02.0
+drm-cycles-rcs:\t0
+drm-total-cycles-rcs:\t8077280786690
+drm-cycles-vcs:\t1202534501
+drm-total-cycles-vcs:\t8077280786690
+drm-cycles-vecs:\t1098801757
+drm-total-cycles-vecs:\t8077280786690
+drm-cycles-bcs:\t0
+drm-total-cycles-bcs:\t8077280786690
+drm-cycles-ccs:\t0
+drm-total-cycles-ccs:\t8077280786690
+";
+            let client = parse_fdinfo_client(body).expect("is a drm client");
+            assert_eq!(client.id, 339);
+            let get = |class: &str| {
+                client
+                    .engines
+                    .iter()
+                    .find(|(c, _, _)| *c == class)
+                    .map(|&(_, b, t)| (b, t))
+            };
+            assert_eq!(get("video-decode"), Some((1202534501, 8077280786690)));
+            assert_eq!(get("video-enhance"), Some((1098801757, 8077280786690)));
+            assert_eq!(get("render"), Some((0, 8077280786690)));
+            assert_eq!(get("copy"), Some((0, 8077280786690)));
+            assert_eq!(get("compute"), Some((0, 8077280786690)));
+        }
+
+        #[test]
+        fn group_engine_classes_computes_busy_fraction_in_display_order() {
+            // Two decode deltas accumulate; render is idle. Output is
+            // in canonical display order and skips zero-denominator
+            // classes.
+            let out = group_engine_classes([
+                ("render", 0.0, 1000.0),
+                ("video-decode", 177.0, 1000.0),
+                ("video-enhance", 176.0, 1000.0),
+                ("copy", 0.0, 0.0), // den == 0 → dropped
+            ]);
+            let classes: Vec<&str> = out.iter().map(|(c, _)| *c).collect();
+            assert_eq!(classes, vec!["render", "video-decode", "video-enhance"]);
+            let pct = |class: &str| out.iter().find(|(c, _)| *c == class).map(|(_, p)| *p);
+            assert!((pct("render").unwrap() - 0.0).abs() < 0.01);
+            assert!((pct("video-decode").unwrap() - 17.7).abs() < 0.01);
+            assert!((pct("video-enhance").unwrap() - 17.6).abs() < 0.01);
         }
     }
 }
