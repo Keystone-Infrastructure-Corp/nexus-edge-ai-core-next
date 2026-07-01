@@ -46,6 +46,7 @@ import {
 } from "@/api/system";
 import type {
   CameraConfig,
+  CameraOnvif,
   CodecKind,
   DiscoveredDevice,
   DiscoverySessionView,
@@ -161,6 +162,20 @@ export function CamerasPage() {
       // autodetect" — if the probe also failed during discovery
       // we leave it unset rather than guessing H.264.
       codec: device.codec ?? null,
+      // Persist the camera's ONVIF device-service URL + the same
+      // credentials so the PTZ / imaging / device-control surface
+      // works without re-entry (the engine resolves `cam.onvif`
+      // per call; an unset endpoint makes every device-control
+      // action 400 with "camera has no ONVIF endpoint configured").
+      // Only ONVIF-discovered devices advertise an XAddrs URL;
+      // CIDR-scanned ones leave `onvif` unset.
+      onvif: device.onvif_xaddrs
+        ? {
+            endpoint: device.onvif_xaddrs,
+            username: username || undefined,
+            password: password || undefined,
+          }
+        : undefined,
     });
     setDiscoveryOpen(false);
     setEditorOpen(true);
@@ -349,6 +364,24 @@ function CameraRow({
 // Camera editor sheet.
 // ---------------------------------------------------------------------------
 
+/**
+ * Derive the conventional ONVIF device-service URL from an RTSP URL's host —
+ * `rtsp://…@192.168.1.64:554/s1` → `http://192.168.1.64/onvif/device_service`.
+ * ONVIF almost always rides port 80 (not RTSP's 554) and `/onvif/device_service`
+ * is the ONVIF-mandated default path most cameras honour. Returns `""` when the
+ * URL has no parseable host, so the field simply stays blank. Only a starting
+ * point — the operator edits it for vendors on a non-standard host/port/path.
+ */
+function deriveOnvifEndpoint(rtspUrl: string | null | undefined): string {
+  if (!rtspUrl) return "";
+  try {
+    const host = new URL(rtspUrl).hostname;
+    return host ? `http://${host}/onvif/device_service` : "";
+  } catch {
+    return "";
+  }
+}
+
 function CameraEditor({
   camera,
   existing,
@@ -362,6 +395,11 @@ function CameraEditor({
 }) {
   const [draft, setDraft] = useState<CameraConfig>(camera);
   const [error, setError] = useState<string | null>(null);
+  // Tracks whether the operator has hand-edited the ONVIF endpoint. While
+  // false, the endpoint auto-tracks the RTSP URL host (see the URL input's
+  // onChange). Seeded true when the camera already carries an endpoint — an
+  // existing save or a discovery-supplied XAddrs — so we never clobber it.
+  const onvifEndpointTouched = useRef(Boolean(camera.onvif?.endpoint));
 
   // Engine-wide defaults for tracker.static_object — used to label
   // the per-camera anchor-TTL override input with the fallback the
@@ -430,6 +468,22 @@ function CameraEditor({
     v: CameraConfig[K],
   ) => {
     setDraft((d) => ({ ...d, [k]: v }));
+  };
+
+  // Nested updater for the ONVIF sub-object. Collapses the whole
+  // `onvif` blob back to undefined once every field is blank so the
+  // engine keeps `CameraOnvif::is_empty()` true (skips it on
+  // serialize) and the stored config_json shape stays unchanged for
+  // the non-ONVIF majority.
+  const setOnvif = (k: keyof CameraOnvif, v: string) => {
+    setDraft((d) => {
+      const next: CameraOnvif = {
+        ...(d.onvif ?? {}),
+        [k]: v.trim() === "" ? undefined : v,
+      };
+      const empty = !next.endpoint && !next.username && !next.password;
+      return { ...d, onvif: empty ? undefined : next };
+    });
   };
 
   const onSubmit = (e: React.FormEvent) => {
@@ -522,7 +576,15 @@ function CameraEditor({
             <Input
               id="cam-url"
               value={draft.url}
-              onChange={(e) => set("url", e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                set("url", v);
+                // Keep the ONVIF endpoint tracking the URL host until the
+                // operator edits it by hand (see `onvifEndpointTouched`).
+                if (!onvifEndpointTouched.current) {
+                  setOnvif("endpoint", deriveOnvifEndpoint(v));
+                }
+              }}
               placeholder="rtsp://user:pass@host:554/stream"
               className="font-mono"
             />
@@ -582,6 +644,55 @@ function CameraEditor({
               specific codec only if autodetect fails (camera requires Digest
               auth or speaks a non-H.26x codec).
             </p>
+          </div>
+        </SheetSection>
+
+        <SheetSection
+          title="Device control (ONVIF)"
+          description="Endpoint + credentials for PTZ, imaging, and other ONVIF device-control actions. Auto-filled from ONVIF discovery, or derived from the RTSP URL host (port 80) as you type — edit it for cameras that expose the ONVIF service on a non-standard host, port, or path. Without an endpoint, every device-control action fails with “camera has no ONVIF endpoint configured”."
+        >
+          <div className="space-y-2">
+            <Label htmlFor="cam-onvif-endpoint">Device-service URL</Label>
+            <Input
+              id="cam-onvif-endpoint"
+              value={draft.onvif?.endpoint ?? ""}
+              onChange={(e) => {
+                // Any manual edit stops the auto-derive-from-URL tracking.
+                onvifEndpointTouched.current = true;
+                setOnvif("endpoint", e.target.value);
+              }}
+              placeholder="http://192.168.1.64/onvif/device_service"
+              className="font-mono"
+            />
+            <p className="text-xs text-muted-foreground">
+              The verbatim ONVIF{" "}
+              <code className="font-mono">XAddrs</code> device-service URL the
+              camera advertises. The host usually matches the RTSP URL, but the
+              port is typically 80 (ONVIF/web), not 554.
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-2">
+              <Label htmlFor="cam-onvif-user">Username</Label>
+              <Input
+                id="cam-onvif-user"
+                value={draft.onvif?.username ?? ""}
+                onChange={(e) => setOnvif("username", e.target.value)}
+                autoComplete="off"
+                placeholder="admin"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="cam-onvif-pass">Password</Label>
+              <Input
+                id="cam-onvif-pass"
+                type="password"
+                value={draft.onvif?.password ?? ""}
+                onChange={(e) => setOnvif("password", e.target.value)}
+                autoComplete="new-password"
+                placeholder="••••••••"
+              />
+            </div>
           </div>
         </SheetSection>
 

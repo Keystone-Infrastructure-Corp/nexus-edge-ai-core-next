@@ -94,6 +94,21 @@ export interface ModelOverride {
 // = 3×3 (9 slots, more zoom per tile).
 export type TileGridConfig = "g2x2" | "g3x3";
 
+/// ONVIF device-control endpoint + credentials (Phase 7.6). Mirrors
+/// `nexus_config::CameraOnvif`. Edge-resident only — never crosses the
+/// tunnel (AGENTS.md Rule 6 / REPO_BOUNDARY R5b). `endpoint` is the
+/// verbatim WS-Discovery `XAddrs` device-service URL (e.g.
+/// `http://192.168.1.64/onvif/device_service`); it is auto-populated
+/// when a camera is added from ONVIF discovery and otherwise entered by
+/// the operator. Every PTZ / imaging / device-control call requires
+/// `endpoint` to be set — without it the engine returns
+/// `400 "camera has no ONVIF endpoint configured"`.
+export interface CameraOnvif {
+  endpoint?: string | null;
+  username?: string | null;
+  password?: string | null;
+}
+
 export interface CameraConfig {
   /// Server-assigned i64 row id. New cameras created from the UI
   /// MUST start with `0` and call `createCamera` (POST /cameras);
@@ -138,6 +153,11 @@ export interface CameraConfig {
   tile_max_per_frame?: number;
   tile_grid?: TileGridConfig;
   zones?: ZoneConfig[];
+  /// ONVIF device-control endpoint + credentials. Required for the
+  /// PTZ / imaging / device-control surface; auto-populated when the
+  /// camera is added from ONVIF discovery, or set via the editor's
+  /// "Device control (ONVIF)" section for cameras added by RTSP URL.
+  onvif?: CameraOnvif | null;
   // Legacy / extension fields engine may include but UI doesn't yet model.
   [k: string]: unknown;
 }
