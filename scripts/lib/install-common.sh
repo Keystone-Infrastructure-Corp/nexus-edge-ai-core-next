@@ -2520,6 +2520,34 @@ install_systemd_unit() {
     systemctl daemon-reload
 }
 
+# --- OTA sudoers allowlist ----------------------------------------------------
+
+# Phase 9 (M_OTA). Install the narrow sudoers rule that lets the
+# unprivileged `nexus` service user run the three pinned OTA commands
+# (tar extract, symlink flip, self restart) as root NOPASSWD. Validated
+# with `visudo -cf` before it lands so a malformed file can never wedge
+# sudo for the whole box.
+install_update_sudoers() {
+    local release_dir="$1"
+    local src="$release_dir/etc-templates/sudoers.d/nexus-update"
+    local target="/etc/sudoers.d/nexus-update"
+
+    [[ -r "$src" ]] || die "OTA sudoers template not found: $src"
+
+    # Stage to a temp file, validate, then atomically move into place so
+    # a partial write can never break sudo parsing of /etc/sudoers.d.
+    local tmp
+    tmp="$(mktemp)"
+    install -o root -g root -m 0440 "$src" "$tmp"
+    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "OTA sudoers file failed visudo validation: $src"
+    fi
+    install -o root -g root -m 0440 "$tmp" "$target"
+    rm -f "$tmp"
+    log "installed OTA sudoers allowlist: $target"
+}
+
 # --- Health check -------------------------------------------------------------
 
 # Poll the API until /api/v1/health returns 200 or the timeout elapses.

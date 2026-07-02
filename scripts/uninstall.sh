@@ -104,6 +104,13 @@ if [[ -e "$unit" ]]; then
     systemctl daemon-reload
 fi
 
+# --- Remove the OTA sudoers allowlist (Phase 9 M_OTA) -------------------------
+
+if [[ -e /etc/sudoers.d/nexus-update ]]; then
+    log "removing /etc/sudoers.d/nexus-update"
+    rm -f /etc/sudoers.d/nexus-update
+fi
+
 # --- Remove binaries under $NEXUS_PREFIX --------------------------------------
 
 if (( KEEP_RELEASES )); then

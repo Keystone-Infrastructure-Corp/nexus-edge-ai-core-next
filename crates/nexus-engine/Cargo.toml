@@ -183,6 +183,9 @@ reqwest = { workspace = true, features = ["blocking"] }
 image = { workspace = true }
 async-stream = "0.3"
 sha2 = "0.10"
+# Phase 9 (M_OTA) — lower-hex SHA-256 of the OTA artifact for the
+# `artifact_sha256` re-verification in `cloud_update.rs`.
+hex = { workspace = true }
 # Phase 1.8 — `nexus-engine enroll` derives a stable opaque
 # hardware fingerprint that includes the local hostname. Also
 # used by the M-HTTPS Phase 1 self-signed-cert generator to
@@ -290,6 +293,9 @@ libc = "0.2"# Linux-only: `network::apply` stages netplan YAML into a tempfile
 [dev-dependencies]
 tempfile = { workspace = true }
 base64 = { workspace = true }
+# Phase 9 (M_OTA) — Ed25519 test-key generation for the
+# `cloud_update` manifest-signature round-trip tests.
+rand = { workspace = true }
 # Used by audit_retention tests to backdate `audit_log.created_at`
 # (Store has no public API for inserting at a specified historical
 # timestamp — by design; sweeper tests are the only consumer).

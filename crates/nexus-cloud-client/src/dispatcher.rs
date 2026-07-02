@@ -204,6 +204,17 @@ impl<H: Handler> RpcDispatcher<H> {
         &self.handler
     }
 
+    /// Reference to the configured [`SystemMethodPolicy`]. Exposed so the
+    /// engine can run the same `system:`-sub method-whitelist gate for
+    /// non-`rpc_call` cloud→edge envelopes it verifies out-of-band via
+    /// [`Self::verifier`] (Phase 9 OTA `update_assignment` /
+    /// `update_cancel` / `update_rollback`), matching the gate
+    /// [`Self::dispatch`] applies to inbound `rpc_call`s.
+    #[must_use]
+    pub const fn policy(&self) -> &SystemMethodPolicy {
+        &self.policy
+    }
+
     /// Top-level entry point. The engine calls this for every inbound
     /// state-mutating `rpc_call`.
     ///

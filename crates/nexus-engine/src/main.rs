@@ -27,6 +27,7 @@ mod cloud_audit;
 mod cloud_enroll;
 mod cloud_sighting;
 mod cloud_tunnel;
+mod cloud_update;
 mod cold_read_cache;
 mod cold_replicator;
 mod delivery_reload;
@@ -1187,6 +1188,14 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cloud_passthrough_admin_secret,
     );
 
+    // Phase 9 (M_OTA) — boot-time finalize of any update that was
+    // mid-flight across the restart. If the previous boot flipped the
+    // `/opt/nexus/current` symlink and restarted into this version, mark
+    // the assignment SUCCESS and emit a terminal `update_progress`;
+    // otherwise count the crash and auto-rollback once the threshold is
+    // crossed. Runs after the outbox exists so progress can be sent.
+    cloud_update::finalize_pending_update(store.clone(), cloud_outbox.clone()).await;
+
     let cache_jobs = cold_read_cache::CacheJobs::new(
         store.clone(),
         registry.clone(),
@@ -1754,6 +1763,20 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     for (_, entry) in running.lock().drain() {
         entry.task.abort();
     }
+
+    // Phase 9 (M_OTA) graceful drain — now that the reconciler and
+    // every supervisor are stopped (no new clip opens can race), send
+    // EOS through each in-flight `mp4mux` so clips finish with a valid
+    // `moov` atom instead of stranding as header-only `.partial.mp4`
+    // stubs across an OTA restart. Bounded well under the unit's
+    // `TimeoutStopSec=30s` so a wedged muxer can't block the restart.
+    match tokio::time::timeout(std::time::Duration::from_secs(20), recorder.shutdown()).await {
+        Ok(()) => {}
+        Err(_) => tracing::warn!(
+            "recorder shutdown drain exceeded 20s; proceeding to exit (some clips may be truncated)"
+        ),
+    }
+
     Ok(())
 }
 
@@ -2066,7 +2089,32 @@ async fn build_gst_recorder(
 }
 
 async fn wait_for_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    // Phase 9 (M_OTA): systemd sends SIGTERM on stop/restart (the OTA
+    // apply path runs `systemctl restart nexus-engine`). Without an
+    // explicit SIGTERM handler the default disposition kills the
+    // process instantly — no orderly shutdown, in-flight clips
+    // stranded. Race SIGINT (ctrl-c, dev) against SIGTERM (systemd)
+    // so either triggers the graceful drain sweep in `main()`.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// v0.1.36 — background sliding-window idle-bump drain.

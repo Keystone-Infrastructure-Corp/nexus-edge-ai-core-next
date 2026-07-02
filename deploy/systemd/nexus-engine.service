@@ -60,11 +60,11 @@ Environment=RUST_LOG=info,nexus=info
 
 ExecStart=/opt/nexus/current/bin/nexus-engine --config /etc/nexus/nexus.toml
 
-# Graceful drain (M-OTA Step 1, planned). Engine traps SIGTERM,
-# EOSes every open mp4mux so clips finish writing instead of stranding
-# at a header-only 864-byte stub on restart. Until the handler ships,
-# systemd's default 90s still lets the engine exit cleanly on a
-# clip-idle camera; recording cameras may lose the in-flight clip.
+# Graceful drain (M-OTA Step 1). Engine traps SIGTERM, EOSes every
+# open mp4mux so clips finish writing instead of stranding at a
+# header-only 864-byte stub on restart, then drains the cloud outbox
+# before exiting 0. TimeoutStopSec caps the drain; on expiry systemd
+# escalates to SIGKILL.
 TimeoutStopSec=30s
 KillSignal=SIGTERM
 
@@ -92,10 +92,24 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_PERFMON
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_PERFMON
 
 # Hardening — keep the engine boxed in.
-NoNewPrivileges=true
-ProtectSystem=strict
+#
+# NoNewPrivileges is deliberately NOT set: the Phase 9 (M_OTA) update
+# path shells out to `sudo` for the three pinned commands in
+# /etc/sudoers.d/nexus-update (tar extract, symlink flip, self
+# restart). NoNewPrivileges=true sets PR_SET_NO_NEW_PRIVS on the
+# engine, which makes the setuid `sudo` binary unable to escalate —
+# the OTA apply would fail closed. The sudoers allowlist is the
+# privilege boundary instead: a compromised engine can run ONLY those
+# three exact command lines as root, nothing else.
+NoNewPrivileges=false
+# ProtectSystem=full (not strict): /usr, /boot, /etc stay read-only,
+# but /opt is writable so the OTA can extract into
+# /opt/nexus/releases/<version>/ and flip /opt/nexus/current. The
+# bytes written there were already signature- + sha256-verified
+# in-process before the privileged tar runs.
+ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/var/lib/nexus /tmp
+ReadWritePaths=/var/lib/nexus /opt/nexus /tmp
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
