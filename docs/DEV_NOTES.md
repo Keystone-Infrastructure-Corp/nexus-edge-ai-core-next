@@ -255,6 +255,38 @@ Detections emitted by visual mode carry the operator-supplied label
 verbatim (no vocab-index lookup), so CEL rules read e.g.
 `object.label == "amazon_van"`.
 
+## OTA update handler (Phase 9)
+
+The cloud-orchestrated updater is **in-process** — it lives in
+[`crates/nexus-engine/src/cloud_update.rs`](../crates/nexus-engine/src/cloud_update.rs),
+not a separate binary. It reacts to `update_assignment` /
+`update_rollback` frames off the cloud tunnel. Flow: Ed25519-verify
+the release manifest → download + SHA-256 → sudoers-gated
+extract/flip/restart → post-restart health check. Each step is
+reported as an `update_progress` phase (`verifying_signature`,
+`fetching_artifact`, `draining`, `restarting`, `verifying_health`,
+`success`, `failed:<code>`). `UpdateState` is persisted in the
+engine settings store (key `update.state`) so a restart can resume
+and finalise.
+
+Dev/test notes:
+
+- The extract/flip/restart path is `cfg(target_os = "linux")`; on
+  macOS the handler compiles but fails closed with
+  `unsupported_platform`, so unit tests exercise the verify/download
+  logic only.
+- The pinned signing key `NEXUS_RELEASE_SIGNING_PUBKEY_V1` is empty
+  in un-provisioned builds → every assignment fails
+  `signature_invalid`. To exercise the full path locally, override
+  with a test key via `NEXUS_RELEASE_SIGNING_PUBKEY_PEM`.
+- Crash-loop auto-rollback fires after the **3rd** consecutive
+  post-restart version mismatch (`crash_count >= 3`), self-issuing a
+  local `handle_rollback` to `previous_good` with `actor_token: None`
+  (never crosses the tunnel, so no token to verify).
+- The privileged commands must stay byte-for-byte in sync with
+  [`deploy/sudoers.d/nexus-update`](../deploy/sudoers.d/nexus-update);
+  any drift breaks the extract/flip/restart step at runtime.
+
 ## See also
 
 - [`ARCHITECTURE.md`](../../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md) — trait + pool + fail-soft pattern,

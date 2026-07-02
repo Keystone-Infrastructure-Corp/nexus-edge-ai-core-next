@@ -1223,6 +1223,58 @@ This re-points `/opt/nexus/current` at the previous release dir
 (no download needed) and restarts the engine. If you've upgraded
 twice since the version you want, run `--rollback` twice.
 
+#### Cloud-orchestrated OTA (Phase 9)
+
+Everything above is the **manual** path. When the box is enrolled
+with a cloud tenant that has the update orchestrator enabled, the
+engine can also apply updates **in-process**, with no operator
+action, from an `update_assignment` pushed over the cloud tunnel.
+The handler lives inside `nexus-engine`
+([crates/nexus-engine/src/cloud_update.rs](../crates/nexus-engine/src/cloud_update.rs)) —
+there is **no sidecar updater, no Docker, no extra daemon**. It runs
+these steps and reports each as an `update_progress` phase back to
+the cloud:
+
+1. **`verifying_signature`** — the release manifest is Ed25519-verified
+   against the pinned `NEXUS_RELEASE_SIGNING_PUBKEY_V1` build key.
+   If that key is empty (the default in an un-provisioned build) the
+   handler **fails closed** with `signature_invalid` and applies
+   nothing. There is no unsigned path in production.
+2. **`fetching_artifact`** — the tarball is downloaded and its
+   SHA-256 is checked against the manifest digest (`digest_mismatch`
+   on any deviation).
+3. **`draining` → `restarting`** — the release is extracted into
+   `/opt/nexus/releases/<version>/`, `/opt/nexus/current` is flipped,
+   and `nexus-engine` is restarted. These three privileged actions
+   are the **only** things the `nexus` user may do as root, gated by
+   [/etc/sudoers.d/nexus-update](../deploy/sudoers.d/nexus-update),
+   which whitelists exactly those commands and nothing else. The
+   restart sends `SIGTERM`; the systemd unit's `TimeoutStopSec=30s`
+   gives in-flight clip recordings time to finalise (EOS + mux)
+   before exit — no truncated MP4s.
+4. **`verifying_health` → `success`** — after the restart the new
+   binary confirms the running version matches the target and emits
+   `success`.
+
+**Automatic rollback.** If the box fails to come back on the new
+version, the engine's crash-loop guard counts the failed boots and,
+on the **third** failure, self-issues a rollback to the last
+known-good release still on disk (`previous_good`) — no cloud
+round-trip required. The cloud can also request a rollback
+explicitly via `update_rollback`; both paths reuse the same
+locally-cached, already-verified previous release (no re-download).
+
+**Prerequisites / notes:**
+
+- Cloud OTA is **dormant** on a stock install until the tenant's
+  update orchestrator is enabled *and* the build carries a signing
+  pubkey — until then only the manual §6.7 path applies.
+- The Linux extract/flip/restart path is `cfg(target_os = "linux")`;
+  on any other platform the handler fails closed with
+  `unsupported_platform`.
+- Keep the box's clock in sync (systemd-timesyncd is enabled by the
+  installer) — assignment `actor_token`s are time-bounded.
+
 ### 6.8 Uninstall
 
 ```bash
@@ -1657,8 +1709,8 @@ sudo -u nexus sqlite3 /var/lib/nexus/nexus.db "SELECT count(*) FROM events;"
 For contributors who need to compile the engine themselves
 (patched branches, untagged commits, custom feature sets). For
 shipping releases, use §6 — it lands the same on-disk layout
-without a Rust + Node toolchain on the box, and is what the future
-OTA updater operates against.
+without a Rust + Node toolchain on the box, and is what the
+cloud-orchestrated OTA handler (§6.7) operates against.
 
 The toolchain pin lives in [rust-toolchain.toml](../rust-toolchain.toml)
 (`channel = "stable"`).
