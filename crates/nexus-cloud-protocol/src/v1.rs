@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -447,6 +447,77 @@ pub struct TraceContext {
 
 pub type UnixSeconds = u64;
 
+/// Cloud → Edge. Phase 7 (additive on v=1). The update-orchestrator-svc assigns a signed release to a core when its deterministic cohort bucket is reached for the active rollout (or immediately on operator Force). The engine's in-process update handler re-verifies the cloud's Ed25519 manifest `signature` against the public key embedded in the engine binary (NEXUS_RELEASE_SIGNING_PUBKEY_V1) BEFORE downloading the tarball, then re-verifies `artifact_sha256` over the downloaded bytes. Dispatch is fire-and-forget — progress flows back asynchronously via `update_progress`, never as a sync RPC reply. Routine cohort assignments rely on the manifest signature as the trust boundary; operator `force` and orchestrator-issued downgrades additionally carry a system/human actor_token at the envelope level (see WIRE_PROTOCOL §11.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAssignmentPayload {
+    /// Optional. Present ONLY when `force` or `allow_downgrade` is set (operator force / orchestrator-issued downgrade); routine cohort assignments omit it and rely on the manifest signature as the trust boundary. When present the edge verifies signature, `aud=nexus-edge-rpc`, `path=update_assignment` (logical RPC path), `core_id`, and `exp > now`, and enforces the system-sub method whitelist for `system:<svc>` subjects (WIRE_PROTOCOL §11.4). Additive on v=1 — pre-feature edges ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_token: Option<ActorTokenJwt>,
+    /// Optional. Permit installing a `target_version` older than the running version. Set true only by orchestrator-issued rollbacks/downgrades; refused otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_downgrade: Option<bool>,
+    /// Lower-hex SHA-256 of the tarball bytes. The edge re-computes this over the downloaded artifact and aborts with `digest_mismatch` on any difference. Also bound into the signed manifest.
+    pub artifact_sha256: String,
+    /// HTTPS URL of the signed release tarball (GitHub Releases in v1; the trust model is host-agnostic so a Blob/SAS mirror is a future additive change). The edge downloads with reqwest only — bytes never transit the gateway.
+    pub artifact_url: String,
+    /// Cloud-minted UUID for this assignment. Echoed back in every `update_progress` envelope so the orchestrator can bind progress to the open update_history row.
+    pub assignment_id: Uuid,
+    /// Release channel this assignment is drawn from. The edge persists it as its assigned channel and reports it back in heartbeat.release.channel.
+    pub channel: String,
+    /// Optional. The edge holds the update until this wall-clock time (operator maintenance window). Omitted = apply now. Ignored when `force` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferral_until: Option<Timestamp>,
+    /// Optional. Operator/orchestrator override that bypasses the maintenance window and any soak deferral. Force assignments are accompanied by an envelope-level actor_token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
+    /// Optional. URL of the full signed manifest JSON when it is not inlined. Omitted in v1 — the signature covers the canonical fields carried in this payload directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_url: Option<String>,
+    /// Base64-encoded Ed25519 signature over the canonical release manifest (version ∪ channel ∪ artifact_url ∪ artifact_sha256 ∪ min/max wire_v ∪ min_engine_version_to_apply). The engine re-verifies against NEXUS_RELEASE_SIGNING_PUBKEY_V1 before any download; failure → `update_progress.error = "failed:signature_invalid"`.
+    pub signature: String,
+    /// Engine semver to install, e.g. "0.6.0". The edge no-ops the assignment if it is already running this version (idempotent re-delivery).
+    pub target_version: String,
+}
+
+/// Cloud → Edge. Phase 7 (additive on v=1). Idempotent abort of an in-progress assignment. The edge cancels if it has not yet passed the `restarting` phase; once the symlink flip + restart is committed the cancel is ignored (the new version will simply heartbeat and the orchestrator reconciles). No-op if no assignment is active.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateCancelPayload {
+    /// REQUIRED for the edge to honour the cancel. Operator-initiated cancels carry a human actor_token forwarded by the api-gateway. The edge verifies signature, `aud=nexus-edge-rpc`, `path=update_cancel` (logical RPC path), `core_id`, and `exp > now`, and enforces the system-sub method whitelist for `system:<svc>` subjects (WIRE_PROTOCOL §11.4). Kept out of `required` so the field is additive on v=1; the edge drops a cancel that arrives without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_token: Option<ActorTokenJwt>,
+    /// The `update_assignment.assignment_id` to abort. Ignored if it does not match the edge's currently-active assignment.
+    pub assignment_id: Uuid,
+}
+
+/// Edge → Cloud. Phase 7 (additive on v=1). Emitted by the engine's in-process update handler at each phase transition. Fire-and-forget — routed by the cloud on `assignment_id` (NOT envelope.in_reply_to; an update outlives any actor_token TTL and spans an engine restart). The orchestrator uses (phase, error) to advance the per-core update_history row and feed the rollout state machine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateProgressPayload {
+    /// Echoes the `update_assignment.assignment_id`. Binds this progress event to the open update_history row.
+    pub assignment_id: Uuid,
+    /// Required when phase=failed. Format `failed:<code>` where code ∈ signature_invalid | digest_mismatch | recording_in_progress | artifact_unavailable | health_check_failed | rollback_also_failed. Surfaced verbatim in the console update history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Optional coarse progress percentage, primarily meaningful during `fetching_artifact`. Omitted for instantaneous phases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pct: Option<u64>,
+    /// Current update phase. `restarting` is the last event the OLD binary emits; `verifying_health`/`success` are emitted by the NEW binary after it comes up (recovered from the persisted last_phase). `failed` is terminal for this attempt.
+    pub phase: String,
+}
+
+/// Cloud → Edge. Phase 7 (additive on v=1). Forces re-install of the edge's locally-cached `previous_good` release. The previous-good directory is already on disk under /opt/nexus/releases/<version>/ and was Ed25519-verified when it was first installed, so a rollback carries NO artifact_url, NO sha256, and NO signature — the edge just flips the `current` symlink back to previous_good and restarts. Bypasses maintenance windows and implies allow_downgrade. Issued by the orchestrator on auto-halt or by an operator via the console; both paths carry an envelope-level system/human actor_token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRollbackPayload {
+    /// REQUIRED for the edge to honour the rollback. Auto-halt rollbacks carry a `system:update-orchestrator` actor_token minted by entitlement-svc; operator rollbacks carry a human token forwarded by the api-gateway. The edge verifies signature, `aud=nexus-edge-rpc`, `path=update_rollback` (logical RPC path), `core_id`, and `exp > now`, and enforces the system-sub method whitelist for `system:<svc>` subjects (WIRE_PROTOCOL §11.4). Kept out of `required` so the field is additive on v=1; the edge drops a rollback that arrives without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_token: Option<ActorTokenJwt>,
+    /// Operator-facing rollback reason (e.g. "auto-halt: alert volume collapsed", "operator rollback"). Recorded by the edge and surfaced in update_history.
+    pub reason: String,
+}
+
 pub type Uuid = String;
 
 /// Phase 8.2 — lifecycle of a behavior-verified alert. Edge fires `candidate`; cloud verifier advances it. A N-1 edge that omits the field is treated as `verified` (legacy rule-engine alerts predate the verifier).
@@ -498,6 +569,10 @@ pub enum EnvelopeBody {
     DiagReady(DiagReadyPayload),
     CoreStateHashes(CoreStateHashesPayload),
     ModelCatalog(ModelCatalogPayload),
+    UpdateAssignment(UpdateAssignmentPayload),
+    UpdateCancel(UpdateCancelPayload),
+    UpdateRollback(UpdateRollbackPayload),
+    UpdateProgress(UpdateProgressPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.

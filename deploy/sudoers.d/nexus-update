@@ -1,0 +1,36 @@
+# nexus-update sudoers entry — installed to /etc/sudoers.d/nexus-update
+#
+# Phase 9 (M_OTA). Grants the unprivileged `nexus` service user the
+# narrow set of privileged commands an OTA apply needs, and ONLY
+# those three exact commands, NOPASSWD (the engine runs unattended).
+#
+# Every command, argument, and path here MUST match byte-for-byte the
+# `std::process::Command` invocations in
+# `crates/nexus-engine/src/cloud_update.rs` (`install_release` +
+# `flip_and_restart`). sudo matches the command line against these
+# rules; any drift (a renamed path, an extra flag) makes the apply
+# fail closed with a sudo password prompt that never gets answered.
+#
+# Scope rationale:
+#   - `tar -xzf <staged> -C <releases>`: extract the verified tarball
+#     (signature + sha256 already checked in-process by the engine
+#     BEFORE this runs) into /opt/nexus/releases/<version>/.
+#   - `ln -sfn /opt/nexus/releases/* /opt/nexus/current`: atomic flip
+#     of the live symlink. The `*` wildcard covers the per-version
+#     release dir; sudo's wildcard does NOT cross `/`, so this cannot
+#     be coerced into linking an arbitrary tree outside releases/.
+#   - `systemctl restart nexus-engine`: restart into the new version.
+#     Pinned to the single unit; a compromised engine cannot pivot to
+#     `systemctl` against any other unit, `apt`, etc.
+#
+# The bytes of the artifact never transit this boundary — the engine
+# downloads + verifies them as the `nexus` user; sudo only touches
+# already-staged, already-verified files.
+#
+# Install:
+#   sudo install -m 0440 -o root -g root deploy/sudoers.d/nexus-update \
+#       /etc/sudoers.d/nexus-update
+#   sudo visudo -cf /etc/sudoers.d/nexus-update   # validate
+nexus ALL=(root) NOPASSWD: /usr/bin/tar -xzf /opt/nexus/staging/update.tar.gz -C /opt/nexus/releases
+nexus ALL=(root) NOPASSWD: /usr/bin/ln -sfn /opt/nexus/releases/* /opt/nexus/current
+nexus ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-engine

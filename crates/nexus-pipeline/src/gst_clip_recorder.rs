@@ -823,6 +823,47 @@ impl ClipRecorder for GstClipRecorder {
         tokio::fs::metadata(&path).await.ok().map(|m| m.len())
     }
 
+    async fn shutdown(&self) {
+        // Snapshot the (clip_id, camera_id) of every in-flight clip
+        // under one lock, then release it so `close()` can re-lock
+        // and `remove()` each one. Cloning the keys avoids holding
+        // the lock across the per-clip EOS drain (which awaits the
+        // bus for up to `EOS_DRAIN_TIMEOUT`).
+        let handles: Vec<ClipHandle> = {
+            let open = self.open.lock().await;
+            open.iter()
+                .map(|(clip_id, st)| ClipHandle {
+                    clip_id: *clip_id,
+                    camera_id: st.camera_id,
+                })
+                .collect()
+        };
+        if handles.is_empty() {
+            return;
+        }
+        info!(
+            count = handles.len(),
+            "gst recorder: draining in-flight clips on shutdown (EOS + moov flush)"
+        );
+        let ended_at = Utc::now();
+        for handle in handles {
+            // Reuse the full `close()` finalise path (EOS → moov
+            // flush → rename → row stamp). A concurrent supervisor
+            // close of the same clip is safe: whichever calls
+            // `open.remove()` first wins, the loser gets
+            // `UnknownClip` which we swallow.
+            match self.close(handle, ClipFinal { ended_at }).await {
+                Ok(_) | Err(RecorderError::UnknownClip(_)) => {}
+                Err(e) => warn!(
+                    clip_id = handle.clip_id,
+                    camera_id = handle.camera_id,
+                    error = %e,
+                    "gst recorder: failed to finalise clip during shutdown drain"
+                ),
+            }
+        }
+    }
+
     fn set_panic(&self, panic: bool) {
         let mut guard = self.panic.lock();
         if *guard != panic {

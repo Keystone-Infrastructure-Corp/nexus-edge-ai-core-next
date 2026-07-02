@@ -407,6 +407,10 @@ emit_config "$RELEASE_DIR" "$FORCE_PROFILE"
 
 install_systemd_unit "$RELEASE_DIR"
 
+# --- OTA sudoers allowlist ----------------------------------------------------
+
+install_update_sudoers "$RELEASE_DIR"
+
 # --- Atomic swap --------------------------------------------------------------
 
 previous="$(swap_current_symlink "$VERSION")"

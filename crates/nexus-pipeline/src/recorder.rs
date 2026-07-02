@@ -257,6 +257,21 @@ pub trait ClipRecorder: Send + Sync {
     ) -> Option<Box<dyn crate::source::FrameSource + Send>> {
         None
     }
+
+    /// Gracefully finalise every in-flight clip before process exit.
+    ///
+    /// Called from the engine's SIGTERM path (Phase 9 M_OTA graceful
+    /// drain) so an OTA restart doesn't strand open recordings as
+    /// header-only `.partial.mp4` stubs with no `moov` atom. The
+    /// GStreamer backend overrides this to send EOS through every
+    /// open `mp4mux`, wait for the muxer to flush the `moov`, and
+    /// stamp the `motion_clips` rows — the same path as a normal
+    /// [`Self::close`], just applied to all clips at once with
+    /// `ended_at = now`.
+    ///
+    /// Default impl is a no-op so the stub recorder (which writes
+    /// nothing muxable) doesn't have to opt in.
+    async fn shutdown(&self) {}
 }
 
 // ---------------------------------------------------------------------------

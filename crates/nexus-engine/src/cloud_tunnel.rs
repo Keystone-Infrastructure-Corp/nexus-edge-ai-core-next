@@ -29,7 +29,7 @@ use nexus_cloud_client::trace_uploader::{
 };
 use nexus_cloud_client::{
     EnvelopeContext, RpcDispatcher, RpcResponseCache, SystemMethodPolicy, TrustedKey, TunnelClient,
-    TunnelHandle, VerifierBuilder,
+    TunnelHandle, VerifiedActor, VerifierBuilder,
 };
 use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload};
 use nexus_storage::Registry;
@@ -233,10 +233,20 @@ fn build_rpc_dispatcher(
         return None;
     };
 
-    // System-sub policy: the only `system:` lane we admit today is
-    // the existing `entitlement_update`. The Phase 2 Expedite path
-    // is on the human-actor lane (owner/admin/operator).
-    let policy = SystemMethodPolicy::default();
+    // System-sub policy: `entitlement_update` (existing) plus the Phase 9
+    // OTA control verbs the orchestrator issues as
+    // `system:update-orchestrator` — auto-halt rollback fan-out and
+    // orchestrator-issued forced downgrades (WIRE_PROTOCOL §11.4). The
+    // logical path each token binds to (`update_assignment` /
+    // `update_cancel` / `update_rollback`) doubles as the whitelist key,
+    // consulted out-of-band in `pump_rpc_dispatch` (the OTA handlers are
+    // fire-and-forget and outlive the token TTL, so they never travel the
+    // reply-bound `RpcCall` dispatch path). Human-actor forced assignments
+    // and cancels ride the owner/admin/operator lane and skip this gate.
+    let mut policy = SystemMethodPolicy::default();
+    policy.permit("update_assignment");
+    policy.permit("update_cancel");
+    policy.permit("update_rollback");
     let handler = EngineRpcHandler {
         store: store.clone(),
         replicator_kick: replicator_kick.clone(),
@@ -523,6 +533,7 @@ async fn run(
                     dispatcher.as_deref(),
                     &core_id,
                     &cloud_outbox,
+                    &store,
                 );
                 tokio::select! {
                     biased;
@@ -564,6 +575,46 @@ async fn run(
     }
 }
 
+/// Verify the `actor_token` on a Phase 9 OTA control envelope out-of-band.
+///
+/// The OTA update handlers are fire-and-forget and outlive the token TTL, so
+/// they never travel the reply-bound [`RpcDispatcher::dispatch`] path. This
+/// mirrors the `diag_collect` gate: verify the signature + claims against a
+/// LOGICAL RPC path (there is no HTTP path on an update payload — the cloud
+/// binds `path=update_assignment` / `update_cancel` / `update_rollback`),
+/// then require EITHER a privileged human role (owner/admin/operator) OR a
+/// `system:`-sub token whose logical path is on the dispatcher's
+/// system-method whitelist — the same authorisation the dispatcher applies
+/// to an inbound `rpc_call`.
+fn verify_update_actor(
+    disp: &RpcDispatcher<EngineRpcHandler>,
+    token: Option<&str>,
+    logical_path: &str,
+) -> Result<VerifiedActor, String> {
+    let token = token.ok_or_else(|| "actor_token missing".to_string())?;
+    let actor = disp
+        .verifier()
+        .verify(
+            token,
+            EnvelopeContext {
+                method: "POST",
+                path: logical_path,
+            },
+        )
+        .map_err(|reason| format!("actor_token invalid: {reason}"))?;
+    if actor.sub.starts_with("system:") {
+        if !disp.policy().allows(logical_path) {
+            return Err(format!(
+                "system sub `{}` not permitted for `{logical_path}`",
+                actor.sub
+            ));
+        }
+    } else if !crate::engine_rpc::is_priviledged_role(&actor.role) {
+        return Err(format!("actor role `{}` lacks privilege", actor.role));
+    }
+    Ok(actor)
+}
+
 /// Drain inbound envelopes off the tunnel reader's channel. For
 /// every `rpc_call`, build the response envelope (with the
 /// `EngineRpcHandler`-derived status code) and send it back through
@@ -585,6 +636,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     dispatcher: Option<&RpcDispatcher<EngineRpcHandler>>,
     core_id: &str,
     outbox: &Arc<nexus_cloud_client::TunnelOutbox>,
+    store: &Arc<Store>,
 ) {
     let Some(mut rx) = inbound else {
         debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
@@ -684,6 +736,143 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                     );
                     continue;
                 }
+                // Phase 9 (M_OTA) — OTA update envelopes. Dispatch is
+                // fire-and-forget: the handlers persist state + emit
+                // `update_progress` asynchronously, never a sync reply.
+                // Every state-mutating verb re-verifies its `actor_token`
+                // out-of-band here (REPO_BOUNDARY R4c) — the same posture
+                // as `diag_collect` — because the apply outlives the token
+                // TTL and never travels the reply-bound RpcCall path.
+                match other {
+                    EnvelopeBody::UpdateAssignment(p) => {
+                        // Routine cohort assignments trust the Ed25519
+                        // manifest signature (re-verified inside the
+                        // handler) and carry no actor_token. Operator
+                        // `force` and orchestrator-issued downgrades DO
+                        // carry one and MUST verify before we apply.
+                        let forced = p.force.unwrap_or(false) || p.allow_downgrade.unwrap_or(false);
+                        if forced {
+                            let Some(disp) = dispatcher else {
+                                warn!(
+                                    core_id = %core_id,
+                                    "forced update_assignment received but inbound dispatch is disabled (missing enrollment signing key); dropping",
+                                );
+                                continue;
+                            };
+                            match verify_update_actor(
+                                disp,
+                                p.actor_token.as_deref(),
+                                "update_assignment",
+                            ) {
+                                Ok(actor) => {
+                                    info!(
+                                        core_id = %core_id,
+                                        sub = %actor.sub,
+                                        assignment_id = %p.assignment_id,
+                                        "forced update_assignment actor_token verified",
+                                    );
+                                }
+                                Err(reason) => {
+                                    warn!(
+                                        core_id = %core_id,
+                                        reason = %reason,
+                                        "forced update_assignment actor_token rejected; dropping",
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        crate::cloud_update::handle_assignment(
+                            Arc::clone(store),
+                            Arc::clone(outbox),
+                            p.clone(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    EnvelopeBody::UpdateRollback(p) => {
+                        // Rollback ALWAYS carries a verified actor_token
+                        // (system:update-orchestrator on auto-halt, or a
+                        // human operator token) — there is no manifest to
+                        // anchor trust, so the token is the only gate.
+                        let Some(disp) = dispatcher else {
+                            warn!(
+                                core_id = %core_id,
+                                "update_rollback received but inbound dispatch is disabled (missing enrollment signing key); dropping",
+                            );
+                            continue;
+                        };
+                        match verify_update_actor(disp, p.actor_token.as_deref(), "update_rollback")
+                        {
+                            Ok(actor) => {
+                                info!(
+                                    core_id = %core_id,
+                                    sub = %actor.sub,
+                                    reason = %p.reason,
+                                    "update_rollback actor_token verified",
+                                );
+                                crate::cloud_update::handle_rollback(
+                                    Arc::clone(store),
+                                    Arc::clone(outbox),
+                                    p.clone(),
+                                )
+                                .await;
+                            }
+                            Err(reason) => {
+                                warn!(
+                                    core_id = %core_id,
+                                    reason = %reason,
+                                    "update_rollback actor_token rejected; dropping",
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    EnvelopeBody::UpdateCancel(p) => {
+                        // Cancel is honoured only before the restart is
+                        // committed; once the symlink flip + restart
+                        // fires the new version simply heartbeats and the
+                        // orchestrator reconciles. The apply task runs
+                        // detached, so a best-effort log is the contract
+                        // here — mid-flight cancellation of an in-process
+                        // download is a post-v1 refinement. We still
+                        // verify the actor_token so a spoofed cancel
+                        // cannot even reach that best-effort path.
+                        let Some(disp) = dispatcher else {
+                            warn!(
+                                core_id = %core_id,
+                                "update_cancel received but inbound dispatch is disabled (missing enrollment signing key); dropping",
+                            );
+                            continue;
+                        };
+                        match verify_update_actor(disp, p.actor_token.as_deref(), "update_cancel") {
+                            Ok(actor) => {
+                                debug!(
+                                    core_id = %core_id,
+                                    sub = %actor.sub,
+                                    assignment_id = %p.assignment_id,
+                                    "update_cancel verified (best-effort; ignored once restart committed)",
+                                );
+                            }
+                            Err(reason) => {
+                                warn!(
+                                    core_id = %core_id,
+                                    reason = %reason,
+                                    "update_cancel actor_token rejected; dropping",
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    EnvelopeBody::UpdateProgress(_) => {
+                        warn!(
+                            core_id = %core_id,
+                            "refused inbound update_progress (edge→cloud only)",
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
                 debug!(
                     core_id = %core_id,
                     kind = ?std::mem::discriminant(other),
@@ -710,6 +899,11 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
         // within ~30 s with no engine restart. A failure here is
         // logged but never blocks the heartbeat itself.
         let name = crate::admin_runtime::read_display_name(&store).await;
+        // Phase 9 (M_OTA) — report the OTA status block so the
+        // orchestrator can drive its rollout state machine + reconcile
+        // committed versions. `recording_active` is best-effort false
+        // here; the SIGTERM drain is the real recording-safety guarantee.
+        let release = Some(crate::cloud_update::release_status_for_heartbeat(&store, false).await);
         let env = Envelope {
             meta: EnvelopeMeta {
                 id: uuid::Uuid::now_v7().to_string(),
@@ -724,7 +918,7 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
                 name,
                 online_cameras: 0,
                 queued_alerts: 0,
-                release: None,
+                release,
                 tier: "dev".to_string(),
                 uptime_s: start.elapsed().as_secs(),
                 // See `build.rs` — release-tag at CI build-time, falls

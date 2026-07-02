@@ -375,6 +375,7 @@ jobs:
           R="stage"
           mkdir -p "$R/bin" "$R/share/ui" "$R/share/models" \
                    "$R/etc-templates/systemd" \
+                   "$R/etc-templates/sudoers.d" \
                    "$R/scripts/lib"
 
           install -m 0755 target/release/nexus-engine "$R/bin/"
@@ -421,6 +422,12 @@ jobs:
 
           cp deploy/systemd/nexus-engine.service \
              "$R/etc-templates/systemd/nexus-engine.service"
+
+          # Phase 9 (M_OTA) — the OTA apply path shells out to `sudo`
+          # for the three pinned commands whitelisted here. Installed by
+          # scripts/install.sh to /etc/sudoers.d/nexus-update (0440 root).
+          cp deploy/sudoers.d/nexus-update \
+             "$R/etc-templates/sudoers.d/nexus-update"
 
           cp scripts/install.sh   "$R/scripts/"
           cp scripts/uninstall.sh "$R/scripts/"
@@ -564,3 +571,127 @@ jobs:
           # engine releases small and avoids per-cut 180 MB uploads.
           # The model files are still embedded in the tarball at
           # share/models/ for self-contained `install.sh` runs.
+
+  # -------------------------------------------------------------------------
+  # publish-release-manifest — Phase 9 (OTA) cloud registration.
+  #
+  # After the signed tarball is attached to the GitHub Release, register it
+  # with the cloud update-orchestrator so it becomes assignable to a channel
+  # cohort. The orchestrator signs a canonical Ed25519 manifest over
+  # {channel, version, artifact_url, artifact_sha256, min_wire_v, max_wire_v,
+  # min_engine_version_to_apply} — the edge verifies that signature (against
+  # the compiled-in NEXUS_RELEASE_SIGNING_PUBKEY_V1) plus the sha256 pin
+  # before applying. This job only *reports* the artifact URL + digest; it
+  # never uploads the tarball to the cloud (artifacts stay on GitHub
+  # Releases — see docs decision "Artifact hosting: GitHub Releases ONLY").
+  #
+  # Auth: GitHub OIDC. The runner mints a short-lived id-token and presents
+  # it as a Bearer to the cloud releases ingress (the api-gateway, which
+  # validates the OIDC `sub` against its release-publisher allow-list and
+  # forwards to the orchestrator's internal POST /v1/releases with an
+  # X-Release-Publisher header). No long-lived secret is stored in the repo.
+  #
+  # Inert until configured: the job is skipped unless the repo/environment
+  # variable NEXUS_CLOUD_RELEASES_URL is set, so cutting a release before
+  # the cloud control plane is provisioned is a harmless no-op.
+  # -------------------------------------------------------------------------
+  publish-release-manifest:
+    name: register release with cloud orchestrator
+    needs: tarball
+    runs-on: ubuntu-22.04
+    # Only run when the cloud endpoint is configured. Skipping here keeps
+    # tarball-only releases (pre-cloud, or airgapped forks) green.
+    if: ${{ vars.NEXUS_CLOUD_RELEASES_URL != '' }}
+    permissions:
+      # id-token: mint the GitHub OIDC token presented to the cloud.
+      # contents: read the .sha256 sidecar asset back off the release.
+      id-token: write
+      contents: read
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      RELEASES_URL: ${{ vars.NEXUS_CLOUD_RELEASES_URL }}
+      # OIDC audience the cloud releases ingress expects. Override via the
+      # NEXUS_CLOUD_RELEASES_AUD variable if the api-gateway is configured
+      # with a different `aud`.
+      RELEASES_AUD: ${{ vars.NEXUS_CLOUD_RELEASES_AUD || 'api://nexus-cloud/releases' }}
+      # Channel override. Default: prereleases land on `beta`, full releases
+      # on `stable`. `dev` is published out-of-band (never from a GH release).
+      CHANNEL_OVERRIDE: ${{ vars.NEXUS_CLOUD_RELEASE_CHANNEL }}
+      IS_PRERELEASE: ${{ github.event.release.prerelease }}
+    steps:
+      - name: post release manifest to cloud
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          name="nexus-edge-${TAG}-linux-x86_64"
+
+          # version: strip a single leading 'v' so the cloud stores plain
+          # semver (v0.6.0 -> 0.6.0). Everything after is passed verbatim.
+          version="${TAG#v}"
+
+          # channel: explicit override wins; otherwise map prerelease->beta,
+          # full release->stable. workflow_dispatch re-publishes have no
+          # release object, so IS_PRERELEASE is '' -> treated as stable.
+          if [[ -n "${CHANNEL_OVERRIDE:-}" ]]; then
+            channel="$CHANNEL_OVERRIDE"
+          elif [[ "${IS_PRERELEASE:-}" == "true" ]]; then
+            channel="beta"
+          else
+            channel="stable"
+          fi
+
+          # artifact_url: the public GitHub Release asset download URL for
+          # the linux-x86_64 tarball (attached by the `tarball` job).
+          artifact_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}/${name}.tar.gz"
+
+          # artifact_sha256: pull the .sha256 sidecar back off the release
+          # and take the digest field (sha256sum format: "<hex>  <name>").
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "${name}.tar.gz.sha256" \
+            --dir /tmp \
+            --clobber
+          artifact_sha256="$(awk '{print $1; exit}' "/tmp/${name}.tar.gz.sha256")"
+          if [[ ! "$artifact_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::could not parse a 64-hex sha256 from ${name}.tar.gz.sha256"
+            exit 1
+          fi
+
+          # Mint a GitHub OIDC token scoped to the cloud releases audience.
+          oidc="$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${RELEASES_AUD}" \
+            | jq -r '.value')"
+          if [[ -z "$oidc" || "$oidc" == "null" ]]; then
+            echo "::error::failed to mint GitHub OIDC token"
+            exit 1
+          fi
+
+          body="$(jq -nc \
+            --arg channel "$channel" \
+            --arg version "$version" \
+            --arg url "$artifact_url" \
+            --arg sha "$artifact_sha256" \
+            '{channel: $channel, version: $version, artifact_url: $url, artifact_sha256: $sha, min_wire_v: 1, max_wire_v: 1}')"
+
+          echo "Registering ${channel}/${version} -> ${artifact_url}"
+
+          # POST and capture status + body separately so a non-2xx fails the
+          # job with a readable message (and never dumps the OIDC token).
+          http_code="$(curl -sS -o /tmp/cloud-resp.json -w '%{http_code}' \
+            -X POST "$RELEASES_URL" \
+            -H "Authorization: Bearer ${oidc}" \
+            -H 'Content-Type: application/json' \
+            --data "$body")"
+
+          if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+            echo "cloud accepted release manifest (HTTP ${http_code})"
+            jq -r '"  id=\(.id // "?") signing_key_id=\(.signing_key_id // "?")"' \
+              /tmp/cloud-resp.json 2>/dev/null || true
+          else
+            echo "::error::cloud rejected release manifest (HTTP ${http_code})"
+            head -c 2000 /tmp/cloud-resp.json || true
+            exit 1
+          fi
