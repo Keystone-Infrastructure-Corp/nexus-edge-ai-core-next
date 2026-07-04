@@ -532,6 +532,10 @@ pub fn router(state: ApiState) -> Router {
             axum::routing::post(crate::device_control::imaging_focus),
         )
         .route(
+            "/v1/admin/cameras/{camera_id}/media/profiles",
+            get(crate::device_control::media_profiles_get),
+        )
+        .route(
             "/v1/admin/cameras/{camera_id}/device",
             get(crate::device_control::device_get).post(crate::device_control::device_command),
         )
