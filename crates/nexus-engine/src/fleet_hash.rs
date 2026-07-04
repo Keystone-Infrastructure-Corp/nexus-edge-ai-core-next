@@ -104,7 +104,15 @@ fn hash_detector_config(cameras: &[nexus_config::CameraConfig]) -> Option<String
     let mut shared: Option<String> = None;
     for cam in cameras {
         let model = cam.detector.model_override.as_ref()?;
-        let canon = canonical_json(&serde_json::to_value(model).ok()?);
+        // Serialize via string (not `to_value`) so `serde_json`'s float
+        // formatter emits the shortest round-tripping decimal for the
+        // `f32` `score_threshold` (`0.3`, not the `0.30000001192092896`
+        // that an `f32`->`f64` `to_value` widening produces) and
+        // `skip_serializing_if` drops the null / empty optionals. This
+        // MUST match the cloud's `normalize_detector_config` projection
+        // (api-gateway `handlers/fleet.rs`).
+        let json = serde_json::to_string(model).ok()?;
+        let canon = canonical_json(&serde_json::from_str::<Value>(&json).ok()?);
         match &shared {
             None => shared = Some(canon),
             Some(prev) if *prev == canon => {}
@@ -371,6 +379,38 @@ mod tests {
             camera(2, &[], Some(model("1280"))),
         ];
         assert!(hash_detector_config(&divergent).is_none());
+    }
+
+    /// FROZEN cross-repo vector. The default detector override
+    /// (`{kind:"yolo", preset:"640"}`, every other field defaulted)
+    /// canonicalizes to the shape the cloud's `normalize_detector_config`
+    /// produces and hashes to this exact SHA. It MUST stay byte-identical
+    /// to the cloud's `project_runtime_sha(Category::DetectorConfig, …)`
+    /// frozen vector in api-gateway `handlers/fleet.rs`
+    /// (`detector_config_projection_normalizes_to_edge_form`). If either
+    /// side's detector canonicalization drifts — e.g. the `f32`
+    /// `score_threshold` starts widening again, or `pack_path` stops being
+    /// skipped — one of the two frozen hashes breaks and surfaces it.
+    #[test]
+    fn detector_config_default_frozen_vector() {
+        // The `ModelConfig` round-trip drops `pack_path` / `members` /
+        // caps and emits the `f32` `score_threshold` as its shortest
+        // decimal (`0.3`).
+        let json = serde_json::to_string(&model("640")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            canonical_json(&value),
+            r#"{"input_height":640,"input_width":640,"kind":"yolo","preset":"640","score_threshold":0.3}"#
+        );
+
+        let uniform = [
+            camera(1, &[], Some(model("640"))),
+            camera(2, &[], Some(model("640"))),
+        ];
+        assert_eq!(
+            hash_detector_config(&uniform),
+            Some("fe93ff4c4f303ec691e924306f4f9c1bbc6334171d346ed497e8ee3b4e8b567a".to_owned()),
+        );
     }
 
     /// On a fresh store: no rules, no cameras → both `None`; delivery
