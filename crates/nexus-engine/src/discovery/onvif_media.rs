@@ -167,6 +167,72 @@ pub async fn query_streams(
     }
 }
 
+/// One ONVIF media profile reduced to the opaque tokens the
+/// device-control UI needs: the profile token itself (PTZ +
+/// snapshot/preview), the underlying video-source token (imaging
+/// `GetImagingSettings`), and the video-source *configuration*
+/// token (OSD create). Serialised straight to the operator console
+/// via the `/media/profiles` admin route so the UI stops guessing
+/// `Profile_1` / `VideoSource_1` / `VideoSourceConfig_1`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaProfile {
+    /// Opaque ONVIF media profile token (e.g. `"Profile_1"`).
+    pub token: String,
+    /// Operator-facing profile name; defaults to the token when
+    /// the camera leaves `<Name>` blank.
+    pub name: String,
+    /// `<tt:SourceToken>` of the profile's video-source
+    /// configuration — the `VideoSourceToken` imaging operations
+    /// require. `None` when the camera omits the video-source
+    /// configuration from `GetProfiles`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_source_token: Option<String>,
+    /// `@token` of the profile's video-source configuration — the
+    /// `ConfigurationToken` OSD create requires. `None` when the
+    /// camera omits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_source_config_token: Option<String>,
+}
+
+/// Resolve the camera's media profiles down to their opaque tokens
+/// via `GetProfiles` (Media2 first, Media1 fallback — same version
+/// dance as [`query_streams`], minus the per-profile
+/// `GetStreamUri`). Drives the operator console's device-control
+/// tabs so the profile / video-source / video-source-config tokens
+/// come from the device instead of hard-coded guesses.
+pub async fn query_profiles(
+    xaddr: &str,
+    username: &str,
+    password: &str,
+) -> Result<Vec<MediaProfile>, String> {
+    let url = xaddr
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "empty xaddr".to_string())?;
+    let client = build_client()?;
+    let summaries = match get_profiles(&client, url, username, password, MediaVer::V2).await {
+        Ok(p) if !p.is_empty() => p,
+        Ok(_) => get_profiles(&client, url, username, password, MediaVer::V1).await?,
+        Err(err) if err.contains("ActionNotSupported") || err.contains("OperationProhibited") => {
+            get_profiles(&client, url, username, password, MediaVer::V1).await?
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(summaries
+        .into_iter()
+        .map(|p| MediaProfile {
+            name: if p.name.is_empty() {
+                p.token.clone()
+            } else {
+                p.name.clone()
+            },
+            token: p.token,
+            video_source_token: p.video_source_token,
+            video_source_config_token: p.video_source_config_token,
+        })
+        .collect())
+}
+
 /// ONVIF Media service generation. Picked once per probe and
 /// threaded through the helpers so we don't accidentally mix
 /// Media1's StreamSetup body with Media2's bare `Protocol`
@@ -211,6 +277,12 @@ struct ProfileSummary {
     name: String,
     codec: Option<String>,
     resolution: Option<String>,
+    /// `<tt:SourceToken>` of the profile's video-source
+    /// configuration (the imaging `VideoSourceToken`).
+    video_source_token: Option<String>,
+    /// `@token` of the profile's video-source configuration (the
+    /// OSD `ConfigurationToken`).
+    video_source_config_token: Option<String>,
 }
 
 async fn get_profiles(
@@ -377,8 +449,29 @@ fn parse_profiles_response(body: &str) -> Result<Vec<ProfileSummary>, String> {
                         name: String::new(),
                         codec: None,
                         resolution: None,
+                        video_source_token: None,
+                        video_source_config_token: None,
                     });
                     vec_seen_for_profile = false;
+                }
+                // The video-source configuration carries its own
+                // `@token` (the OSD `ConfigurationToken`). Media1
+                // names it `<tt:VideoSourceConfiguration>`; Media2
+                // `<tr2:VideoSource>` under `<tr2:Configurations>`.
+                // First one wins — a profile references exactly one.
+                if name == "VideoSourceConfiguration" || name == "VideoSource" {
+                    if let Some(prof) = current.as_mut() {
+                        if prof.video_source_config_token.is_none() {
+                            for attr in e.attributes().flatten() {
+                                if local_name(&attr.key) == "token" {
+                                    let v = attr.unescape_value().unwrap_or_default().to_string();
+                                    if !v.is_empty() {
+                                        prof.video_source_config_token = Some(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 stack.push(name);
                 text_acc.clear();
@@ -394,6 +487,16 @@ fn parse_profiles_response(body: &str) -> Result<Vec<ProfileSummary>, String> {
                     match name.as_str() {
                         "Name" if parent_is(&stack, "Profiles") => {
                             prof.name = text_acc.trim().to_string();
+                        }
+                        "SourceToken"
+                            if (parent_is(&stack, "VideoSourceConfiguration")
+                                || parent_is(&stack, "VideoSource"))
+                                && prof.video_source_token.is_none() =>
+                        {
+                            let v = text_acc.trim();
+                            if !v.is_empty() {
+                                prof.video_source_token = Some(v.to_string());
+                            }
                         }
                         "Encoding"
                             if (parent_is(&stack, "VideoEncoderConfiguration")
@@ -622,6 +725,12 @@ mod tests {
     <trt:GetProfilesResponse>
       <trt:Profiles token="Profile_1" fixed="true">
         <tt:Name>mainStream</tt:Name>
+        <tt:VideoSourceConfiguration token="VideoSourceConfig_1">
+          <tt:Name>VideoSourceConfig</tt:Name>
+          <tt:UseCount>2</tt:UseCount>
+          <tt:SourceToken>VideoSource_1</tt:SourceToken>
+          <tt:Bounds x="0" y="0" width="1920" height="1080"/>
+        </tt:VideoSourceConfiguration>
         <tt:VideoEncoderConfiguration token="VideoEncoder_1">
           <tt:Encoding>H264</tt:Encoding>
           <tt:Resolution>
@@ -649,6 +758,14 @@ mod tests {
         assert_eq!(profiles[0].name, "mainStream");
         assert_eq!(profiles[0].codec.as_deref(), Some("H264"));
         assert_eq!(profiles[0].resolution.as_deref(), Some("1920x1080"));
+        assert_eq!(
+            profiles[0].video_source_token.as_deref(),
+            Some("VideoSource_1")
+        );
+        assert_eq!(
+            profiles[0].video_source_config_token.as_deref(),
+            Some("VideoSourceConfig_1")
+        );
         assert_eq!(profiles[1].token, "Profile_2");
         assert_eq!(profiles[1].resolution.as_deref(), Some("640x480"));
     }
@@ -671,6 +788,12 @@ mod tests {
       <tr2:Profiles token="Profile_1" fixed="true">
         <tr2:Name>mainStream</tr2:Name>
         <tr2:Configurations>
+          <tr2:VideoSource token="VideoSourceConfig_1">
+            <tt:Name>VideoSourceConfig</tt:Name>
+            <tt:UseCount>2</tt:UseCount>
+            <tt:SourceToken>VideoSource_1</tt:SourceToken>
+            <tt:Bounds x="0" y="0" width="1920" height="1080"/>
+          </tr2:VideoSource>
           <tr2:VideoEncoder token="VideoEncoder_1">
             <tt:Encoding>H264</tt:Encoding>
             <tt:Resolution>
@@ -701,6 +824,14 @@ mod tests {
         assert_eq!(profiles[0].name, "mainStream");
         assert_eq!(profiles[0].codec.as_deref(), Some("H264"));
         assert_eq!(profiles[0].resolution.as_deref(), Some("1920x1080"));
+        assert_eq!(
+            profiles[0].video_source_token.as_deref(),
+            Some("VideoSource_1")
+        );
+        assert_eq!(
+            profiles[0].video_source_config_token.as_deref(),
+            Some("VideoSourceConfig_1")
+        );
         assert_eq!(profiles[1].token, "Profile_2");
         assert_eq!(profiles[1].codec.as_deref(), Some("H265"));
         assert_eq!(profiles[1].resolution.as_deref(), Some("640x360"));
