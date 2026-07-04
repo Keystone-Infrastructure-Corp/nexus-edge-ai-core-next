@@ -1037,7 +1037,12 @@ pub struct ModelConfig {
     /// Optional model-pack directory containing `models-manifest.json`.
     /// When set, the engine resolves `preset` against the manifest and
     /// ignores `input_width` / `input_height`.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` keeps `None` out of the serialized form so the
+    /// fleet-config hash (`nexus-engine` `fleet_hash`) matches the cloud's
+    /// `normalize_detector_config` projection, which drops an absent
+    /// `pack_path` rather than emitting `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_path: Option<PathBuf>,
     /// Pack preset name — "320" / "640" / "1280" for the shipped yolo26n
     /// dynamic model. T10 picks 320, T24/T36/T36-S/T64 pick 640.
