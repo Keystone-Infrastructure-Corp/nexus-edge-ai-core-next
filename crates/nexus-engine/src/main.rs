@@ -1115,6 +1115,49 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         });
     }
 
+    // Host-metrics sampler + retention sweeper. Samples the cached
+    // `system_metrics::render()` snapshot every 5 seconds into the
+    // `metrics_samples` table so the cloud console can draw a rolling
+    // "last 24 hours" trend view for this core while it is online, and
+    // prunes on a 60-second tick (two-tier retention: full 5s
+    // resolution for the most recent hour, coarsened to 5-minute
+    // boundaries beyond that, dropped past 24h — see
+    // `nexus_store::metrics`). Fail-open: a store hiccup logs and the
+    // loop continues; the sampler never blocks the pipeline.
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            const SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+            // Prune every 12th sample (~60s).
+            const PRUNE_EVERY: u32 = 12;
+            let mut tick = tokio::time::interval(SAMPLE_PERIOD);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut n: u32 = 0;
+            loop {
+                tick.tick().await;
+                let snap = crate::system_metrics::snapshot();
+                let captured_ms = snap.captured_at.timestamp_millis();
+                match serde_json::to_string(&*snap) {
+                    Ok(json) => {
+                        if let Err(e) = store.insert_metrics_sample(captured_ms, &json).await {
+                            warn!(error = %e, "metrics sampler: insert failed");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "metrics sampler: serialize failed"),
+                }
+                n = n.wrapping_add(1);
+                if n % PRUNE_EVERY == 0 {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    match store.prune_metrics_samples(now_ms).await {
+                        Ok(0) => {}
+                        Ok(pruned) => debug!(pruned, "metrics sampler pruned stale samples"),
+                        Err(e) => warn!(error = %e, "metrics sampler: prune failed"),
+                    }
+                }
+            }
+        });
+    }
+
     // Phase A — camera-roster publisher. Subscribes to
     // `topic::CONFIG_CHANGED` and pushes a `camera_roster` envelope
     // to the cloud edge-gateway whenever cameras change (plus an

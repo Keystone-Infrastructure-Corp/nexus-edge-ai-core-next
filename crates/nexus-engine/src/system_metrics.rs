@@ -17,12 +17,13 @@
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nexus_types::Role;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::auth::require_role::{SessionContext, SessionRejection};
@@ -345,6 +346,57 @@ pub async fn get_system_metrics(session: SessionContext) -> Result<Response, Res
     // payload is tiny (~few KB).
     let body: SystemMetrics = (*snapshot).clone();
     Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// History handler.
+// ---------------------------------------------------------------------------
+
+/// Query params for [`get_metrics_history`].
+#[derive(Debug, Deserialize)]
+pub struct MetricsHistoryQuery {
+    /// How far back from now to include, in seconds. Defaults to 24h;
+    /// clamped to `[1, 86_400]`.
+    window_secs: Option<i64>,
+    /// Downsample bucket width in seconds. Defaults to 300 (5 min);
+    /// clamped to `>= 5`. Pass `5` for full resolution — note only the
+    /// most recent hour is retained at that cadence (see
+    /// [`nexus_store::metrics`]).
+    bucket_secs: Option<i64>,
+    /// Optional delta cursor (Unix epoch ms). Return only samples at or
+    /// after this instant (floored to the 5-second grid). The console's
+    /// live tail passes this so a refresh fetches just the new points.
+    since_ms: Option<i64>,
+}
+
+/// `GET /api/v1/admin/system/metrics-history` — rolling window of host
+/// metrics samples for the cloud console's "last 24 hours" trend view.
+///
+/// Admin-gated: the cloud console reaches it through the generic
+/// `/admin/*` passthrough proxy, which is itself viewer+ RBAC'd on the
+/// cloud side. Each array element is the verbatim `SystemMetrics` JSON
+/// captured at that instant, oldest → newest. Read-only host telemetry
+/// with no secrets, so — like the live snapshot — it carries no
+/// actor_token requirement.
+pub async fn get_metrics_history(
+    State(s): State<crate::api::ApiState>,
+    Query(q): Query<MetricsHistoryQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, crate::api::ApiError> {
+    let window_secs = q.window_secs.unwrap_or(86_400).clamp(1, 86_400);
+    let bucket_secs = q.bucket_secs.unwrap_or(300).max(5);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let payloads = s
+        .store
+        .list_metrics_samples(now_ms, window_secs, bucket_secs, q.since_ms)
+        .await?;
+    // Parse each stored blob back into JSON so the client receives an
+    // array of objects, not an array of strings. A row that somehow
+    // fails to parse is skipped rather than failing the whole request.
+    let out: Vec<serde_json::Value> = payloads
+        .iter()
+        .filter_map(|p| serde_json::from_str(p).ok())
+        .collect();
+    Ok(Json(out))
 }
 
 #[cfg(test)]

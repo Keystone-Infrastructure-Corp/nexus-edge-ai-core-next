@@ -13,6 +13,7 @@ pub mod cloud;
 pub mod diag_snapshot;
 pub mod entity;
 pub mod fleet;
+pub mod metrics;
 pub mod motion;
 pub mod outbox;
 pub mod sessions;
@@ -149,6 +150,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0023_motion_clips_cold_backoff",
         include_str!("../migrations/0023_motion_clips_cold_backoff.sql"),
+    ),
+    (
+        "0024_metrics_samples",
+        include_str!("../migrations/0024_metrics_samples.sql"),
     ),
 ];
 
