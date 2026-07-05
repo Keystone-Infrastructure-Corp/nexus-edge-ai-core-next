@@ -354,6 +354,15 @@ pub fn router(state: ApiState) -> Router {
         // regardless of whether reid is enabled, so the UI can
         // render a clear "feature off" empty state.
         .route("/v1/admin/reid/status", get(get_admin_reid_status))
+        // M-Dashboard follow-up — rolling 24h host-metrics history for
+        // the cloud console's per-core trend view. Admin-gated (reached
+        // via the cloud `/admin/*` passthrough proxy, viewer+ RBAC'd
+        // cloud-side). Read-only host telemetry; see
+        // [`crate::system_metrics::get_metrics_history`].
+        .route(
+            "/v1/admin/system/metrics-history",
+            get(crate::system_metrics::get_metrics_history),
+        )
         // Wedge Phase 5.6 follow-up — re-ID master-switch writer.
         // Restart-required (the worker's ORT session is built once
         // at boot); persists to `engine_runtime_settings.reid_enabled`
