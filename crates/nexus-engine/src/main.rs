@@ -1146,7 +1146,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
                     Err(e) => warn!(error = %e, "metrics sampler: serialize failed"),
                 }
                 n = n.wrapping_add(1);
-                if n % PRUNE_EVERY == 0 {
+                if n.is_multiple_of(PRUNE_EVERY) {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     match store.prune_metrics_samples(now_ms).await {
                         Ok(0) => {}
