@@ -46,14 +46,17 @@ use uuid::Uuid;
 
 /// Hardcoded Ed25519 release-signing public key (SPKI PEM).
 ///
-/// Bootstrap: provision the dedicated release-signing key in Key Vault,
-/// export the public half (`-----BEGIN PUBLIC KEY-----` … PKCS#8/SPKI),
-/// and paste it here. Until that const is populated every assignment
-/// fails closed with `signature_invalid`. A dev/CI override is read from
-/// the `NEXUS_RELEASE_SIGNING_PUBKEY_PEM` environment variable — that
-/// env path is ONLY for synthetic-edge tests and never set in a real
-/// deployment.
-const NEXUS_RELEASE_SIGNING_PUBKEY_V1: &str = "";
+/// This is the public half of the `release-ed25519-v1` signing key whose
+/// private half lives in Key Vault (`release-signing-key-pem-<env>`) and
+/// is file-mounted into the cloud `update-orchestrator-svc`. The edge
+/// re-verifies every `update_assignment` manifest signature against this
+/// key BEFORE downloading; a mismatch fails closed with
+/// `signature_invalid`. A dev/CI override is read from the
+/// `NEXUS_RELEASE_SIGNING_PUBKEY_PEM` environment variable — that env
+/// path is ONLY for synthetic-edge tests and never set in a real
+/// deployment. Rotate via the docs/cloud-console signing-key runbook
+/// (bump `signing_key_id` + ship a new edge release with the new key).
+const NEXUS_RELEASE_SIGNING_PUBKEY_V1: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAN+D4ubLSbOUPt1muO03GRn4nD5OHpsUthVxR2W449OY=\n-----END PUBLIC KEY-----\n";
 
 /// `engine_runtime_settings` key holding the JSON-serialised
 /// [`UpdateState`] single-row snapshot.
