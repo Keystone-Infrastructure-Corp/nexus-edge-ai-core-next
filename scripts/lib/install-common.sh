@@ -80,6 +80,15 @@ ensure_user() {
 ensure_dirs() {
     install -d -o root                  -g root                  -m 0755 "$NEXUS_PREFIX"
     install -d -o root                  -g root                  -m 0755 "$NEXUS_PREFIX/releases"
+    # Phase 9 (M_OTA) — staging dir the OTA self-updater writes the
+    # downloaded release tarball into before the privileged `sudo tar`
+    # extract (STAGED_TARBALL=/opt/nexus/staging/update.tar.gz, pinned in
+    # crates/nexus-engine/src/cloud_update.rs and the nexus-update sudoers
+    # rule). Owned by the service user — unlike releases/ (root:root) — so
+    # the engine, which runs as `nexus`, can write the tarball here itself;
+    # /opt/nexus is root:root 0755, so without this the first OTA fails to
+    # create the subdir and the apply aborts with `artifact_unavailable`.
+    install -d -o "$NEXUS_SERVICE_USER" -g "$NEXUS_SERVICE_GROUP" -m 0750 "$NEXUS_PREFIX/staging"
     install -d -o root                  -g root                  -m 0755 "$NEXUS_CONFIG_DIR"
     # M-HTTPS Phase 1 — staging dir for the in-process TLS
     # listener's cert+key. Mode 2750 (setgid) so any cert

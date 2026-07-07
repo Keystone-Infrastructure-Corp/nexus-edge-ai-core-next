@@ -485,26 +485,64 @@ pub async fn finalize_pending_update(store: Arc<Store>, outbox: Arc<TunnelOutbox
 // ---------------------------------------------------------------------
 
 /// Extract the tarball, flip the `current` symlink, and restart.
+///
+/// The release tarball carries a single top-level directory named after
+/// the **bare** version (e.g. `0.1.7/`) — the same `<version>` the cloud
+/// dispatches (`== NEXUS_BUILD_VERSION`; see the `package tarball` step in
+/// `.github/workflows/release.yml`). Extracting into `RELEASES_DIR` (no
+/// `--strip-components`) therefore lands the tree at
+/// `RELEASES_DIR/<version>/`, exactly where `flip_and_restart` points
+/// `current`.
 #[cfg(target_os = "linux")]
 async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str> {
     use std::io::Write as _;
     // Stage the tarball at the pinned path (matches the sudoers tar rule).
     if let Some(parent) = std::path::Path::new(STAGED_TARBALL).parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(error = %e, dir = %parent.display(), "update: staging dir create failed");
+        }
     }
-    let mut f = std::fs::File::create(STAGED_TARBALL).map_err(|_| "artifact_unavailable")?;
-    f.write_all(bytes).map_err(|_| "artifact_unavailable")?;
+    let mut f = std::fs::File::create(STAGED_TARBALL).map_err(|e| {
+        warn!(error = %e, path = STAGED_TARBALL, "update: staged tarball create failed");
+        "artifact_unavailable"
+    })?;
+    f.write_all(bytes).map_err(|e| {
+        warn!(error = %e, path = STAGED_TARBALL, "update: staged tarball write failed");
+        "artifact_unavailable"
+    })?;
     drop(f);
 
-    // sudo tar -xzf <staged> -C /opt/nexus/releases  (tarball carries a
-    // top-level <version>/ directory).
+    // sudo tar -xzf <staged> -C /opt/nexus/releases. The tarball's top-level
+    // dir is the bare <version>, so this lands the tree at
+    // /opt/nexus/releases/<version>/.
     let extract = std::process::Command::new("sudo")
         .args(["/usr/bin/tar", "-xzf", STAGED_TARBALL, "-C", RELEASES_DIR])
         .status();
     match extract {
         Ok(s) if s.success() => {}
-        _ => return Err("artifact_unavailable"),
+        Ok(s) => {
+            warn!(code = ?s.code(), "update: `sudo tar` extract exited non-zero");
+            return Err("artifact_unavailable");
+        }
+        Err(e) => {
+            warn!(error = %e, "update: failed to spawn `sudo tar` extract");
+            return Err("artifact_unavailable");
+        }
     }
+
+    // Sanity-check that the expected release dir materialised BEFORE flipping
+    // the live symlink. A mismatch here (e.g. a tarball whose top-level dir
+    // is not the bare <version>) would otherwise leave `current` dangling and
+    // the unit failing status=203/EXEC after the restart — a silent brick.
+    let release_path = format!("{RELEASES_DIR}/{version}");
+    if !std::path::Path::new(&release_path).is_dir() {
+        warn!(
+            expected = %release_path,
+            "update: extracted release dir missing after tar (tarball top-level dir != bare version?)"
+        );
+        return Err("artifact_unavailable");
+    }
+
     flip_and_restart(version).await
 }
 
@@ -517,14 +555,28 @@ async fn flip_and_restart(version: &str) -> Result<(), &'static str> {
         .status();
     match link {
         Ok(s) if s.success() => {}
-        _ => return Err("rollback_also_failed"),
+        Ok(s) => {
+            warn!(code = ?s.code(), target = %release_path, "update: `sudo ln` symlink flip exited non-zero");
+            return Err("rollback_also_failed");
+        }
+        Err(e) => {
+            warn!(error = %e, "update: failed to spawn `sudo ln` symlink flip");
+            return Err("rollback_also_failed");
+        }
     }
     let restart = std::process::Command::new("sudo")
         .args(["/usr/bin/systemctl", "restart", "nexus-engine"])
         .status();
     match restart {
         Ok(s) if s.success() => Ok(()),
-        _ => Err("rollback_also_failed"),
+        Ok(s) => {
+            warn!(code = ?s.code(), "update: `sudo systemctl restart` exited non-zero");
+            Err("rollback_also_failed")
+        }
+        Err(e) => {
+            warn!(error = %e, "update: failed to spawn `sudo systemctl restart`");
+            Err("rollback_also_failed")
+        }
     }
 }
 

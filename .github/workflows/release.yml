@@ -520,18 +520,30 @@ jobs:
         run: |
           set -euo pipefail
           name="nexus-edge-${TAG}-linux-x86_64"
-          # Rename stage/ -> <name>/ so the tarball has a sensible
-          # top-level directory; tar's --transform would also work
-          # but a mv is harder to misread.
-          mv stage "$name"
-          tar -czf "${name}.tar.gz" "$name"
+          # The published asset keeps the descriptive `name` above, but the
+          # tarball's INTERNAL top-level directory MUST be the BARE version
+          # (a single leading 'v' stripped, e.g. v0.1.7 -> 0.1.7). The OTA
+          # self-updater (nexus-engine `cloud_update::install_release`)
+          # extracts with `sudo tar -xzf … -C /opt/nexus/releases` (no
+          # --strip-components) and then flips
+          # `/opt/nexus/current -> releases/<version>` using the bare version
+          # the cloud dispatches — which equals `NEXUS_BUILD_VERSION`
+          # (build.rs strips the leading 'v'). If the top-level dir is
+          # anything else (e.g. `nexus-edge-<tag>-linux-x86_64/`), the symlink
+          # lands on a non-existent path and systemd fails the unit with
+          # status=203/EXEC on the post-update restart. `install.sh` is
+          # unaffected: it extracts with --strip-components=1 and derives the
+          # release dir from the VERSION file, so the top-level name is moot.
+          topdir="${TAG#v}"
+          mv stage "$topdir"
+          tar -czf "${name}.tar.gz" "$topdir"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
           ls -lh "${name}.tar.gz" "${name}.tar.gz.sha256"
           # Hoist the in-tarball MANIFEST.json.sig (if signing ran)
           # out to a sibling asset so operators can grab it without
           # extracting the tarball first — same shape as .sha256.
-          if [[ -f "${name}/MANIFEST.json.sig" ]]; then
-            cp "${name}/MANIFEST.json.sig" "${name}.tar.gz.manifest.sig"
+          if [[ -f "${topdir}/MANIFEST.json.sig" ]]; then
+            cp "${topdir}/MANIFEST.json.sig" "${name}.tar.gz.manifest.sig"
             echo "have_sig=1" >> "$GITHUB_OUTPUT"
           else
             echo "have_sig=0" >> "$GITHUB_OUTPUT"
