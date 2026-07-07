@@ -602,6 +602,13 @@ jobs:
     # Only run when the cloud endpoint is configured. Skipping here keeps
     # tarball-only releases (pre-cloud, or airgapped forks) green.
     if: ${{ vars.NEXUS_CLOUD_RELEASES_URL != '' }}
+    # Bind the job to a GitHub Environment so the OIDC token's `sub` is the
+    # STABLE `repo:<owner>/<repo>:environment:cloud-release-publish` instead
+    # of the per-tag `...:ref:refs/tags/<tag>`. The cloud orchestrator's
+    # RELEASE_PUBLISHER_SUBJECTS allow-list pins this exact subject, so it
+    # must not vary per release. The environment carries no secrets and no
+    # required reviewers — it exists purely to fix the OIDC subject.
+    environment: cloud-release-publish
     permissions:
       # id-token: mint the GitHub OIDC token presented to the cloud.
       # contents: read the .sha256 sidecar asset back off the release.
