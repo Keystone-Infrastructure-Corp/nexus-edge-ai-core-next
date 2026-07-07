@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, webrtc_offer, webrtc_answer, webrtc_ice_candidate. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -357,6 +357,9 @@ pub struct HeartbeatAckPayloadCertRotate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatPayload {
+    /// Phase 10 (additive on v=1). Edge-advertised live-view capabilities. Defined tags: `live_view` (the always-on LBR snapshot pump is available) and `webrtc` (the gstreamer-webrtc HD sub-pipeline is compiled in). The cloud greys the HD control / hides the live wall for cores that do not advertise the matching tag (an N-1 edge, or a build without the gstreamer-webrtc feature). Unknown tags ignored; missing field is treated identically to an empty array (pre-Phase-10 edge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<Vec<String>>,
     /// Phase 1.15: edge wall-clock for skew tracking (gateway writes EMA to cores.last_skew_ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_ts_unix_ms: Option<u64>,
@@ -373,6 +376,57 @@ pub struct HeartbeatPayload {
     pub uptime_s: u64,
     /// Engine semver, e.g. "0.5.0".
     pub version: String,
+}
+
+/// Phase 10 (additive on v=1). One ICE server for a WebRTC session, shaped like the browser RTCIceServer dict. STUN entries carry only `urls`; TURN entries additionally carry ephemeral HMAC `username` / `credential` (30-min TTL) minted by the api-gateway from the coturn static-auth-secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IceServer {
+    /// TURN only. base64(HMAC-SHA1(static_auth_secret, username)); 30-min TTL. Never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    /// STUN/TURN URLs, e.g. "stun:turn.nexusedge.ai:3478", "turn:turn.nexusedge.ai:3478?transport=udp", "turns:turn.nexusedge.ai:5349".
+    pub urls: Vec<String>,
+    /// TURN only. Ephemeral username `<expiry_unix>:<rand>` (coturn long-term-credential REST convention).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+/// Edge → Cloud. Phase 10 (additive on v=1). One adaptive-fps JPEG snapshot for a subscribed camera. Fire-and-forget: the cloud LiveHub fans it out to every subscribed browser, and it is the FIRST payload dropped under backpressure (a dropped frame is invisible — the next snapshot supersedes it). The frame is the CLEAN supervisor frame (no detection overlays), resized to the subscriber's tile size, JPEG q70–75. Emitted at ~0.5–1 fps when the scene is static (keepalive) and bursts up to the fps_tier ceiling on motion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LbrFramePayload {
+    /// Per-core integer id (matches cameras.edge_camera_id). Disambiguates cameras multiplexed on the one live WS.
+    pub camera_id: u64,
+    /// Base64-encoded JPEG of the clean, tile-sized supervisor frame. Bounded so one lbr_frame stays within the 256 KiB envelope cap; in practice a 640×360 q70 JPEG is ~15–50 KiB. The edge keeps encodes well under the cap.
+    pub jpeg_b64: String,
+    /// Edge capture wall-clock, unix ms. Diagnostics / staleness only — never used for security or ordering (frames are idempotent snapshots).
+    pub ts: u64,
+}
+
+/// Cloud → Edge. Phase 10 (additive on v=1). Requests the edge start (or keep running) the always-on Low-Bit-Rate JPEG snapshot pump for one camera. The cloud LiveHub ref-counts browser subscribers and sends exactly one lbr_subscribe when the first viewer engages a (core, camera); it re-sends when the max tile size or highest fps_tier across viewers changes. Idempotent — a subscribe for an already-pumping camera just updates the encode target. LBR rides the gateway WSS path and never touches WebRTC / coturn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LbrSubscribePayload {
+    /// Per-core integer id (matches cameras.edge_camera_id).
+    pub camera_id: u64,
+    /// Optional. Adaptive-fps ceiling tier: `grid` (~4 fps, a normal wall cell) or `focus` (~8 fps, the hovered/selected cell warmed for a smoother preview). Omitted = grid. The edge takes the highest tier across all viewers of the camera.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_tier: Option<String>,
+    /// Optional. On-screen tile height in CSS pixels. Omitted = native height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_h: Option<u64>,
+    /// Optional. On-screen tile width in CSS pixels the client is painting into; the edge encodes to actual need and never upscales past the native supervisor frame. Omitted = native width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_w: Option<u64>,
+}
+
+/// Cloud → Edge. Phase 10 (additive on v=1). The LiveHub's last browser subscriber for a (core, camera) disengaged (removed the cell, switched preset, closed the tab, or the WS dropped). The edge stops that camera's LBR pump within ~1 s. Idempotent / no-op when the camera is not pumping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LbrUnsubscribePayload {
+    /// Per-core integer id (matches cameras.edge_camera_id).
+    pub camera_id: u64,
 }
 
 /// Edge → Cloud. Additive on v=1. The detector-prompt vocabulary the engine actually resolved at boot — one DetectorVocabEntry per detector kind the engine knows how to build. Sent on tunnel-up and whenever the loaded model pack changes (rare — effectively per OTA / restart). The console renders prompt suggestions from this live data instead of a hand-maintained mirror of the engine's label map. Fire-and-forget — no ack in the v1 wire schema; the cloud upserts these into core_model_catalog keyed on core_id (org_id resolved from the cores FK), and the next report on reconnect is the recovery path. Pre-feature cloud peers ignore this kind; pre-feature edges never emit it.
@@ -531,6 +585,55 @@ pub enum VerificationState {
     Review,
 }
 
+/// Edge → Cloud. Phase 10 (additive on v=1). The edge's SDP answer to a webrtc_offer. Routed by session_id (NOT envelope.in_reply_to — media + trickled ICE outlive a single request). `codec` tells the client what the edge actually negotiated so it can label the video and drive the fallback ladder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebrtcAnswerPayload {
+    /// Optional. The video codec the edge actually sent: `h264` / `h265` for passthrough, `h264` for the transcode fallback. Lets the client show the right label and know whether HEVC passthrough succeeded. Omitted by older edges → the client infers from the answer SDP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// The edge's SDP answer (unified-plan).
+    pub sdp: String,
+    /// Echoes the webrtc_offer.session_id.
+    pub session_id: Uuid,
+}
+
+/// Both directions. Phase 10 (additive on v=1). One trickled ICE candidate for an in-progress WebRTC session — sent cloud→edge (the browser's candidates relayed by api-gateway) and edge→cloud (the edge webrtcbin's candidates). Routed by session_id. An empty-string `candidate` signals end-of-candidates for that m-line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebrtcIceCandidatePayload {
+    /// The SDP candidate line ("candidate:..."). Empty string = end-of-candidates for this m-line.
+    pub candidate: String,
+    /// Optional. Media stream identification tag the candidate belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdp_mid: Option<String>,
+    /// Zero-based index of the m-line the candidate belongs to.
+    pub sdp_mline_index: u64,
+    /// Echoes the webrtc_offer.session_id.
+    pub session_id: Uuid,
+}
+
+/// Cloud → Edge. Phase 10 (additive on v=1). Opens an HD WebRTC session for the single expanded (solo / 1×1) camera — the ONLY path to HD. The api-gateway mints session_id + ephemeral ice_servers (STUN + short-TTL HMAC TURN) and forwards the browser's SDP offer. The edge builds a passthrough webrtcbin sub-pipeline (re-payload the camera's native codec, force an IDR on join) and replies webrtc_answer. Server-enforced solo-only: the gateway rejects an offer whose session is not the single expanded camera. LBR (the grid default) never opens a WebRTC session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebrtcOfferPayload {
+    /// Per-core integer id (matches cameras.edge_camera_id) of the solo camera to stream.
+    pub camera_id: u64,
+    /// STUN + ephemeral HMAC TURN servers for the edge webrtcbin. Omitted / empty = STUN-only (host + srflx candidates, no relay). LBR never uses these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice_servers: Option<Vec<IceServer>>,
+    /// Optional. `passthrough` (default, zero-transcode re-payload of the native codec) or `transcode` (compatibility fallback: the edge re-encodes to H.264 Constrained Baseline when the viewer cannot decode the camera's native codec, e.g. HEVC cam + Chrome). Omitted = passthrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The browser's SDP offer (unified-plan). Advertises the codecs the viewer can decode (H.264 everywhere; HEVC on Safari + HEVC-capable Chromium) so the edge answers with native passthrough when possible.
+    pub sdp: String,
+    /// Cloud-minted session id; echoed in webrtc_answer + every webrtc_ice_candidate so both sides bind trickled candidates to the session. Torn down on PC close or 5-min no-RTP.
+    pub session_id: Uuid,
+    /// Optional. Which camera stream to passthrough: `sub` (substream, ~0.5–2 Mbps, default) or `main` (full-quality, ~2–12 Mbps; explicit operator toggle). Omitted = sub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+}
+
 /// Envelope metadata — every field of [`Envelope`] except the
 /// `kind`/`payload` discriminator, which is encoded by [`EnvelopeBody`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -573,6 +676,12 @@ pub enum EnvelopeBody {
     UpdateCancel(UpdateCancelPayload),
     UpdateRollback(UpdateRollbackPayload),
     UpdateProgress(UpdateProgressPayload),
+    LbrSubscribe(LbrSubscribePayload),
+    LbrFrame(LbrFramePayload),
+    LbrUnsubscribe(LbrUnsubscribePayload),
+    WebrtcOffer(WebrtcOfferPayload),
+    WebrtcAnswer(WebrtcAnswerPayload),
+    WebrtcIceCandidate(WebrtcIceCandidatePayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.

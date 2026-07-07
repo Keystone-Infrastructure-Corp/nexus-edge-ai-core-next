@@ -916,6 +916,12 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
             body: EnvelopeBody::Heartbeat(HeartbeatPayload {
                 edge_ts_unix_ms: Some(now_unix_ms()),
                 name,
+                // Phase 10 (Phase A): live-view capability tags are
+                // advertised here — `live_view` once the LBR pump lands
+                // (Phase B) and `webrtc` once the gstreamer-webrtc HD
+                // sub-pipeline lands (Phase E). Neither is built yet, so
+                // advertise nothing. Additive on wire `v=1`.
+                caps: None,
                 online_cameras: 0,
                 queued_alerts: 0,
                 release,

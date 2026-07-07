@@ -217,6 +217,7 @@ async fn dispatch_envelope_rejects_non_rpc_call() {
         body: EnvelopeBody::Heartbeat(HeartbeatPayload {
             edge_ts_unix_ms: None,
             name: None,
+            caps: None,
             online_cameras: 0,
             queued_alerts: 0,
             release: None,
