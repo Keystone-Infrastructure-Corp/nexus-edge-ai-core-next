@@ -2267,10 +2267,17 @@ swap_current_symlink() {
     # it over the existing one.
     ln -sfn "releases/$target_version" "$link"
 
+    # NOTE: these log lines MUST go to stderr. This function returns the
+    # previous version via stdout (`printf '%s' "$previous"` below) and
+    # is called as `previous="$(swap_current_symlink ...)"`. `log()`
+    # writes to stdout, so an un-redirected log call here leaks into the
+    # captured value and corrupts `previous_good_version` in
+    # install-state.json (breaking --rollback and OTA crash-loop
+    # auto-rollback).
     if [[ -n "$previous" && "$previous" != "$target_version" ]]; then
-        log "swapped current: $previous -> $target_version"
+        log "swapped current: $previous -> $target_version" >&2
     else
-        log "current -> $target_version"
+        log "current -> $target_version" >&2
     fi
     printf '%s' "$previous"
 }
