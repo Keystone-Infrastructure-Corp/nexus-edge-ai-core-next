@@ -100,6 +100,7 @@ pub fn spawn_tunnel(
     replicator_kick: Arc<Notify>,
     enrollment_changed: Arc<Notify>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
+    live_view: Arc<crate::live_view::LiveViewManager>,
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
     admin_secret: Option<Arc<String>>,
@@ -169,7 +170,7 @@ pub fn spawn_tunnel(
             &admin_http_client,
             admin_secret.as_ref(),
         );
-        run(enrollment, dispatcher, cloud_outbox, store, rx).await;
+        run(enrollment, dispatcher, cloud_outbox, live_view, store, rx).await;
     });
     (tx, handle)
 }
@@ -493,6 +494,7 @@ async fn run(
     enrollment: CloudEnrollment,
     dispatcher: Option<Arc<RpcDispatcher<EngineRpcHandler>>>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
+    live_view: Arc<crate::live_view::LiveViewManager>,
     store: Arc<Store>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -534,6 +536,7 @@ async fn run(
                     &core_id,
                     &cloud_outbox,
                     &store,
+                    &live_view,
                 );
                 tokio::select! {
                     biased;
@@ -552,6 +555,7 @@ async fn run(
                     }
                 }
                 cloud_outbox.set_handle(None);
+                live_view.clear_all();
             }
             Err(e) => {
                 warn!(
@@ -637,6 +641,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     core_id: &str,
     outbox: &Arc<nexus_cloud_client::TunnelOutbox>,
     store: &Arc<Store>,
+    live_view: &Arc<crate::live_view::LiveViewManager>,
 ) {
     let Some(mut rx) = inbound else {
         debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
@@ -725,6 +730,17 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         );
                     }
                 }
+            }
+            // Phase 10 Live View — LBR pump lifecycle. The cloud LiveHub
+            // ref-counts browser subscribers and sends exactly one subscribe
+            // per (core, camera) (re-sent on tile/tier change) and one
+            // unsubscribe when the last viewer leaves; the manager keeps a
+            // single encode task per camera (encode-once fan-out).
+            EnvelopeBody::LbrSubscribe(payload) => {
+                live_view.on_subscribe(payload);
+            }
+            EnvelopeBody::LbrUnsubscribe(payload) => {
+                live_view.on_unsubscribe(payload);
             }
             other => {
                 if let EnvelopeBody::HeartbeatAck(ack) = other {
@@ -916,12 +932,12 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
             body: EnvelopeBody::Heartbeat(HeartbeatPayload {
                 edge_ts_unix_ms: Some(now_unix_ms()),
                 name,
-                // Phase 10 (Phase A): live-view capability tags are
-                // advertised here — `live_view` once the LBR pump lands
-                // (Phase B) and `webrtc` once the gstreamer-webrtc HD
-                // sub-pipeline lands (Phase E). Neither is built yet, so
-                // advertise nothing. Additive on wire `v=1`.
-                caps: None,
+                // Phase 10 — advertise the edge's live-view capabilities so
+                // the cloud enables the wall / greys HD per core. `live_view`
+                // (the LBR snapshot pump, Phase B) is available now; `webrtc`
+                // (the gstreamer-webrtc HD sub-pipeline, Phase E) is added
+                // once that feature is compiled in. Additive on wire `v=1`.
+                caps: Some(vec!["live_view".to_string()]),
                 online_cameras: 0,
                 queued_alerts: 0,
                 release,

@@ -43,6 +43,7 @@ mod fleet_hash;
 mod gpu;
 mod hailo;
 mod lan_proxy;
+mod live_view;
 mod model_catalog_publish;
 mod models_catalog;
 mod network;
@@ -1220,12 +1221,17 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             .admin_secret()
             .map(|s| std::sync::Arc::new(s.to_string()))
     };
+    // Phase 10 Live View — the LBR pump manager. Constructed once here so it
+    // persists across tunnel reconnects; the supervisor drives it from the
+    // inbound lbr_subscribe / lbr_unsubscribe envelopes.
+    let live_view_manager = live_view::LiveViewManager::new(cache.clone(), cloud_outbox.clone());
     let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(
         store.clone(),
         registry.clone(),
         cold_kick.clone(),
         cloud_enrollment_changed.clone(),
         cloud_outbox.clone(),
+        live_view_manager,
         Some(trace_rx),
         loopback_admin_base.clone(),
         cloud_passthrough_admin_secret,

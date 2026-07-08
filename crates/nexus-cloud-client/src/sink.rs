@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nexus_cloud_protocol::v1::{
     AlertPayload, ClipReplicatedPayload, DiagReadyPayload, EntitySightingBatchPayload,
-    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta, VerificationState,
+    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta, LbrFramePayload,
+    VerificationState,
 };
 use uuid::Uuid;
 
@@ -246,6 +247,38 @@ pub fn build_clip_replicated_envelope(clip: ClipReplicatedProjection) -> Envelop
             trace: None,
         },
         body: EnvelopeBody::ClipReplicated(payload),
+    }
+}
+
+/// Build an `lbr_frame` envelope for the Phase 10 Live View LBR pump.
+///
+/// Fire-and-forget: the cloud `LiveHub` fans this out to every subscribed
+/// browser, and it is the FIRST payload dropped under backpressure (a
+/// dropped frame is invisible — the next snapshot supersedes it). The
+/// `jpeg_b64` is the CLEAN, tile-sized supervisor frame (no detection
+/// overlays) at q70–75; `camera_id` is the per-core integer id
+/// (`cameras.edge_camera_id`); `ts_unix_ms` is the edge capture wall-clock
+/// in unix ms (diagnostics / staleness only — frames are idempotent
+/// snapshots, never ordered or security-relevant).
+///
+/// Public so engine tests + the `LbrSnapshotPump` can build reference
+/// envelopes without instantiating a sink.
+#[must_use]
+pub fn build_lbr_frame_envelope(camera_id: u64, ts_unix_ms: u64, jpeg_b64: String) -> Envelope {
+    Envelope {
+        meta: EnvelopeMeta {
+            v: 1,
+            id: Uuid::now_v7().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+        },
+        body: EnvelopeBody::LbrFrame(LbrFramePayload {
+            camera_id,
+            jpeg_b64,
+            ts: ts_unix_ms,
+        }),
     }
 }
 
