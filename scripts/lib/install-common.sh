@@ -243,17 +243,29 @@ _system_prep_apt() {
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
     fi
 
+    # Media/runtime deps come from the release's share/apt-requirements.txt
+    # — the SINGLE SOURCE OF TRUTH also consumed by the OTA wrapper
+    # (/usr/local/sbin/nexus-apply-deps), so a new dependency is declared in
+    # exactly ONE place. Fall back to a built-in list if the file is absent
+    # (e.g. a bare repo checkout without a staged release tree).
+    local media_pkgs=()
+    local req="${RELEASE_DIR:-}/share/apt-requirements.txt"
+    if [[ -r "$req" ]]; then
+        mapfile -t media_pkgs < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$req" | grep -v '^$' || true)
+    fi
+    if (( ${#media_pkgs[@]} == 0 )); then
+        warn "apt-requirements.txt not found at $req — using built-in media dep list"
+        media_pkgs=(
+            gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+            gstreamer1.0-nice gstreamer1.0-libav gstreamer1.0-vaapi
+            va-driver-all vainfo
+        )
+    fi
+
     # Two install groups to keep the noise grep-able in the install log.
-    log "installing GStreamer runtime + script prereqs"
+    log "installing GStreamer runtime + script prereqs (${#media_pkgs[@]} media pkgs)"
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        gstreamer1.0-tools \
-        gstreamer1.0-plugins-good \
-        gstreamer1.0-plugins-bad \
-        gstreamer1.0-nice \
-        gstreamer1.0-libav \
-        gstreamer1.0-vaapi \
-        va-driver-all \
-        vainfo \
+        "${media_pkgs[@]}" \
         chrony ufw \
         curl jq python3 ca-certificates \
         || warn "apt-get install returned non-zero — continuing, but motion clips may not record"
@@ -2567,6 +2579,33 @@ install_update_sudoers() {
     install -o root -g root -m 0440 "$tmp" "$target"
     rm -f "$tmp"
     log "installed OTA sudoers allowlist: $target"
+}
+
+# --- OTA runtime-dependency installer wrapper ---------------------------------
+
+# Phase 10. Install the pinned, root-owned runtime-dependency wrapper to
+# /usr/local/sbin/nexus-apply-deps (root:root 0755) — OUTSIDE the OTA-writable
+# /opt/nexus tree so the unprivileged `nexus` user cannot tamper with it. The
+# OTA apply path (crates/nexus-engine/src/cloud_update.rs) invokes it via the
+# single nexus-update sudoers rule, AFTER extracting a new release, to install
+# that release's declared apt deps (share/apt-requirements.txt) through the
+# wrapper's own package allowlist — so an OTA never needs an operator to
+# hand-install a package on the box. Idempotent: a re-run refreshes the
+# wrapper in place. This is the only place the wrapper (the thing with root
+# power) is updated — NEVER on an OTA — so its allowlist can only change via a
+# deliberate install.sh re-run.
+install_apply_deps_wrapper() {
+    local release_dir="$1"
+    local src="$release_dir/scripts/nexus-apply-deps"
+    local target="/usr/local/sbin/nexus-apply-deps"
+
+    if [[ ! -r "$src" ]]; then
+        warn "OTA runtime-dep wrapper not in release ($src); OTA dep auto-install disabled"
+        return 0
+    fi
+    install -d -o root -g root -m 0755 /usr/local/sbin
+    install -o root -g root -m 0755 "$src" "$target"
+    log "installed OTA runtime-dep wrapper: $target"
 }
 
 # --- Health check -------------------------------------------------------------

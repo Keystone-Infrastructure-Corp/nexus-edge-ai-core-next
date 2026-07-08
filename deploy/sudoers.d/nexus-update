@@ -1,8 +1,9 @@
 # nexus-update sudoers entry — installed to /etc/sudoers.d/nexus-update
 #
-# Phase 9 (M_OTA). Grants the unprivileged `nexus` service user the
-# narrow set of privileged commands an OTA apply needs, and ONLY
-# those three exact commands, NOPASSWD (the engine runs unattended).
+# Phase 9 (M_OTA) + Phase 10 (runtime-dep auto-install). Grants the
+# unprivileged `nexus` service user the narrow set of privileged
+# commands an OTA apply needs, and ONLY those four exact commands,
+# NOPASSWD (the engine runs unattended).
 #
 # Every command, argument, and path here MUST match byte-for-byte the
 # `std::process::Command` invocations in
@@ -22,6 +23,14 @@
 #   - `systemctl restart nexus-engine`: restart into the new version.
 #     Pinned to the single unit; a compromised engine cannot pivot to
 #     `systemctl` against any other unit, `apt`, etc.
+#   - `nexus-apply-deps /opt/nexus/releases/*`: install the new release's
+#     DECLARED apt runtime deps (share/apt-requirements.txt) so an OTA
+#     never needs an operator to hand-install a package. This is a FIXED
+#     root-owned wrapper at /usr/local/sbin/nexus-apply-deps (installed by
+#     scripts/install.sh, OUTSIDE the nexus-writable /opt/nexus tree) that
+#     enforces its OWN package allowlist (gstreamer1.0-* + an explicit
+#     media set) — so this rule does NOT grant general `apt`. The `*`
+#     wildcard does not cross `/`, so it cannot escape releases/.
 #
 # The bytes of the artifact never transit this boundary — the engine
 # downloads + verifies them as the `nexus` user; sudo only touches
@@ -34,3 +43,4 @@
 nexus ALL=(root) NOPASSWD: /usr/bin/tar -xzf /opt/nexus/staging/update.tar.gz -C /opt/nexus/releases
 nexus ALL=(root) NOPASSWD: /usr/bin/ln -sfn /opt/nexus/releases/* /opt/nexus/current
 nexus ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-engine
+nexus ALL=(root) NOPASSWD: /usr/local/sbin/nexus-apply-deps /opt/nexus/releases/*

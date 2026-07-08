@@ -411,6 +411,13 @@ install_systemd_unit "$RELEASE_DIR"
 
 install_update_sudoers "$RELEASE_DIR"
 
+# --- OTA runtime-dependency wrapper -------------------------------------------
+# Root-owned installer (/usr/local/sbin/nexus-apply-deps) that the OTA apply
+# path runs to install a new release's declared apt deps (share/apt-
+# requirements.txt) without an operator ever touching the box.
+
+install_apply_deps_wrapper "$RELEASE_DIR"
+
 # --- Atomic swap --------------------------------------------------------------
 
 previous="$(swap_current_symlink "$VERSION")"

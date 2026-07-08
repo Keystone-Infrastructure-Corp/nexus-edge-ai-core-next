@@ -107,10 +107,13 @@ The wedge plan that drives the next three phases of work is
    The engine runs as the unprivileged `nexus` system user under `nexus-engine.service`
    (systemd). There is no Docker on the edge, no sidecar updater, no shared socket. The
    small amount of privileged work an OTA needs (extract into
-   `/opt/nexus/releases/<version>/`, flip `/opt/nexus/current`, run
-   `systemctl restart nexus-engine`) is gated through a single
-   `/etc/sudoers.d/nexus-update` entry in [deploy/sudoers.d/](deploy/sudoers.d/) that
-   whitelists only those exact commands. See
+   `/opt/nexus/releases/<version>/`, install that release's declared apt runtime
+   deps via the pinned root-owned `/usr/local/sbin/nexus-apply-deps` wrapper, flip
+   `/opt/nexus/current`, run `systemctl restart nexus-engine`) is gated through a
+   single `/etc/sudoers.d/nexus-update` entry in [deploy/sudoers.d/](deploy/sudoers.d/)
+   that whitelists only those exact commands. The dep wrapper lives outside the
+   OTA-writable tree and enforces its own package allowlist, so it never grants
+   general `apt`. See
    [REPO_BOUNDARY R8](../nexus-cloud-console/docs/REPO_BOUNDARY.md#r8-edge-runs-as-a-single-nexus-engine-process-privileged-work-is-sudoers-gated).
 
 ## Conventions

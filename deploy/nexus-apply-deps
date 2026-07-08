@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# nexus-apply-deps — pinned, root-owned runtime-dependency installer for OTA.
+#
+# Installed by scripts/install.sh to /usr/local/sbin/nexus-apply-deps
+# (root:root 0755) — deliberately OUTSIDE the OTA-writable /opt/nexus tree so
+# the unprivileged `nexus` service user cannot tamper with it. It is the ONLY
+# command beyond `tar` / `ln` / `systemctl restart` that the nexus-update
+# sudoers rule lets `nexus` run as root, and it is invoked by the OTA apply
+# path (crates/nexus-engine/src/cloud_update.rs) as:
+#
+#   sudo /usr/local/sbin/nexus-apply-deps /opt/nexus/releases/<version>
+#
+# It reads the release's declared apt packages from
+#   <release_dir>/share/apt-requirements.txt
+# and installs ONLY those that satisfy the hard allowlist below
+# (`gstreamer1.0-*` plus an explicit media set). A tampered requirements file
+# can therefore never coerce this into `apt-get install <arbitrary>` — the
+# allowlist is the load-bearing security control and it lives here, root-side,
+# NOT in the (nexus-writable) release tree.
+#
+# Best-effort + fail-open: a missing file, a non-Debian host, or a transient
+# apt/network failure logs and exits 0 so a core update is NEVER blocked on an
+# optional plugin (matches the engine's local-first philosophy — only optional
+# features such as HD live view's libnice degrade). The sole non-zero exit is
+# a usage error (bad/missing release dir).
+set -euo pipefail
+
+log()  { printf 'nexus-apply-deps: %s\n' "$*"; }
+warn() { printf 'nexus-apply-deps: WARN: %s\n' "$*" >&2; }
+
+release_dir="${1:-}"
+if [[ -z "$release_dir" || ! -d "$release_dir" ]]; then
+    warn "usage: nexus-apply-deps <release_dir> (got '${1:-}')"
+    exit 2
+fi
+
+req="$release_dir/share/apt-requirements.txt"
+if [[ ! -r "$req" ]]; then
+    log "no apt-requirements.txt in release ($req) — nothing to do"
+    exit 0
+fi
+
+# Hard allowlist. A package is installable iff this returns 0. `gstreamer1.0-*`
+# covers any current or future GStreamer plugin (the common case) without an
+# allowlist edit; the explicit set covers the non-gstreamer media runtime deps.
+# `-dev` / `-dbg` / `dkms` and anything not matching are refused — kernel and
+# driver packages (reboots, huge attack surface) stay in install.sh's
+# operator-gated --drivers path, never the unattended OTA wrapper.
+is_allowed() {
+    local p="$1"
+    # Charset guard: valid apt package names only. Blocks shell metachars,
+    # spaces, path separators, and injection attempts outright.
+    [[ "$p" =~ ^[a-z0-9][a-z0-9.+-]*$ ]] || return 1
+    case "$p" in
+        *-dev | *-dbg | *dkms*)                     return 1 ;;
+        gstreamer1.0-*)                             return 0 ;;
+        va-driver-all | vainfo | libnice10 | \
+        mesa-va-drivers | intel-media-va-driver-non-free) return 0 ;;
+        *)                                          return 1 ;;
+    esac
+}
+
+# Parse: strip comments, trim whitespace, drop blanks.
+mapfile -t declared < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$req" | grep -v '^$' || true)
+
+allowed=()
+for p in "${declared[@]}"; do
+    if is_allowed "$p"; then
+        allowed+=("$p")
+    else
+        warn "refusing non-allowlisted package from requirements: '$p' (skipped)"
+    fi
+done
+
+if (( ${#allowed[@]} == 0 )); then
+    log "no allowlisted packages to install"
+    exit 0
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+    warn "no apt-get on PATH (non-Debian host?) — cannot install: ${allowed[*]}"
+    exit 0
+fi
+
+log "ensuring ${#allowed[@]} runtime package(s): ${allowed[*]}"
+export DEBIAN_FRONTEND=noninteractive
+
+# Refresh the package cache only if it is stale (>24h) to avoid a network hit
+# on every apply. apt-get install is idempotent — already-present packages are
+# a fast no-op, so re-running this on every update is cheap.
+cache=/var/cache/apt/pkgcache.bin
+stale=1
+if [[ -r "$cache" ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    (( age < 86400 )) && stale=0
+fi
+if (( stale )); then
+    apt-get update -qq || warn "apt-get update failed — continuing with existing cache"
+fi
+
+if apt-get install -y -qq --no-install-recommends "${allowed[@]}"; then
+    log "runtime dependencies satisfied"
+else
+    warn "apt-get install returned non-zero — update proceeds; optional features may be degraded"
+fi
+exit 0
