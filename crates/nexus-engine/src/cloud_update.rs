@@ -543,6 +543,34 @@ async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str
         return Err("artifact_unavailable");
     }
 
+    // Install any runtime system dependencies this release declares
+    // (`share/apt-requirements.txt`) via the pinned, root-owned wrapper at
+    // `/usr/local/sbin/nexus-apply-deps` (installed by `scripts/install.sh`,
+    // whitelisted in `deploy/sudoers.d/nexus-update`). This is what lets an
+    // OTA pull in a NEW system package (e.g. `gstreamer1.0-nice` for HD live
+    // view) without an operator hand-touching the box. Best-effort and
+    // NON-FATAL: a missing or failed dep install must never block the version
+    // flip — the engine fail-opens locally and only optional features degrade.
+    // The wrapper enforces its own package allowlist, so a tampered manifest
+    // cannot coerce it into installing arbitrary packages.
+    match std::process::Command::new("sudo")
+        .args(["/usr/local/sbin/nexus-apply-deps", &release_path])
+        .status()
+    {
+        Ok(s) if s.success() => {
+            info!(release = %release_path, "update: runtime dependencies applied");
+        }
+        Ok(s) => {
+            warn!(
+                code = ?s.code(),
+                "update: nexus-apply-deps exited non-zero; proceeding with flip (optional features may degrade)"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "update: failed to spawn nexus-apply-deps; proceeding with flip");
+        }
+    }
+
     flip_and_restart(version).await
 }
 

@@ -1,0 +1,40 @@
+# apt-requirements.txt — runtime system packages the Nexus engine needs
+# beyond the self-contained release tarball (the GStreamer / media / ICE
+# stack that evolves as the engine gains features).
+#
+# SINGLE SOURCE OF TRUTH. Consumed by two paths so a dependency is declared
+# in exactly ONE place:
+#
+#   1. scripts/lib/install-common.sh  (`_system_prep_apt`) — fresh install
+#      or an install.sh re-run installs everything listed here.
+#   2. /usr/local/sbin/nexus-apply-deps — the pinned, root-owned wrapper the
+#      OTA apply path (crates/nexus-engine/src/cloud_update.rs) runs after
+#      extracting a new release, so an over-the-air update installs any NEW
+#      dependency this file declares WITHOUT an operator touching the box.
+#
+# Format: one package per line; `#` comments and blank lines are ignored.
+# Every name MUST satisfy the allowlist baked into `nexus-apply-deps`
+# (`gstreamer1.0-*` plus an explicit media set); anything else is refused at
+# OTA apply time. Do NOT add kernel / `-dev` / driver / dkms packages here —
+# those need reboots and belong in install.sh's operator-gated `--drivers`
+# path, not the unattended OTA wrapper.
+
+# GStreamer runtime plugins. The clip recorder (mp4 mux + hardware/software
+# H.264/H.265 encode) and the Phase 10 live-view pipeline are built on these;
+# without them motion events write 0-byte clips and live view cannot encode.
+gstreamer1.0-tools
+gstreamer1.0-plugins-good
+gstreamer1.0-plugins-bad
+gstreamer1.0-libav
+gstreamer1.0-vaapi
+
+# libnice — the ICE agent (nicesrc / nicesink) that webrtcbin loads for the
+# Phase 10 HD (WebRTC) solo live view. Missing it => an HD view negotiates
+# no candidates and never connects; the LBR live wall is unaffected.
+gstreamer1.0-nice
+
+# VA-API userspace drivers — hardware video decode/encode for the clip
+# recorder (iHD for Gen9+ Intel, Mesa for AMD). Without them the recorder
+# falls back to software x264enc and pegs a CPU core per camera at 1080p+.
+va-driver-all
+vainfo

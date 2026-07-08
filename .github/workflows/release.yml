@@ -69,9 +69,9 @@ jobs:
   #   ├── MANIFEST.json                   (every file + sha256)
   #   ├── MANIFEST.json.sig               (Ed25519, when signing key set)
   #   ├── bin/
-  #   │   ├── nexus-engine                (FEATURES=gstreamer,ort,ep-cpu,
-  #   │   │                                ep-openvino,ep-cuda,ep-tensorrt,
-  #   │   │                                ep-hailo,ep-rocm,ep-vulkan)
+  #   │   ├── nexus-engine                (FEATURES=gstreamer,gstreamer-webrtc,
+  #   │   │                                ort,ep-cpu,ep-openvino,ep-cuda,
+  #   │   │                                ep-tensorrt,ep-hailo,ep-rocm,ep-vulkan)
   #   │   ├── nexus-probe
   #   │   └── nexus-doctor
   #   ├── lib/onnxruntime/                (libonnxruntime.so + OpenVINO
@@ -79,9 +79,12 @@ jobs:
   #   │                                    extracted from the wheel)
   #   ├── share/
   #   │   ├── ui/                         (ui/dist/)
-  #   │   └── models/                     (default model pack, pulled
-  #   │                                    from models-${PACK_VERSION}
-  #   │                                    release at workflow runtime)
+  #   │   ├── models/                     (default model pack, pulled
+  #   │   │                                from models-${PACK_VERSION}
+  #   │   │                                release at workflow runtime)
+  #   │   └── apt-requirements.txt        (runtime apt deps; consumed by
+  #   │                                    install.sh + the OTA
+  #   │                                    nexus-apply-deps wrapper)
   #   ├── etc-templates/
   #   │   ├── nexus.example.toml             (reference only — the live
   #   │   │                                  /etc/nexus/nexus.toml is GENERATED
@@ -90,6 +93,8 @@ jobs:
   #   └── scripts/
   #       ├── install.sh                  (in-tarball installer)
   #       ├── uninstall.sh
+  #       ├── nexus-apply-deps            (pinned OTA runtime-dep installer;
+  #       │                                copied to /usr/local/sbin on install)
   #       └── lib/install-common.sh
   # -------------------------------------------------------------------------
   tarball:
@@ -438,7 +443,16 @@ jobs:
           cp scripts/uninstall.sh "$R/scripts/"
           cp scripts/lib/install-common.sh "$R/scripts/lib/"
           cp scripts/lib/release-pubkey.pem "$R/scripts/lib/"
-          chmod +x "$R/scripts/install.sh" "$R/scripts/uninstall.sh"
+
+          # Phase 10 — runtime-dependency auto-install on OTA. The declared
+          # apt deps (share/apt-requirements.txt) plus the pinned root-owned
+          # installer (scripts/nexus-apply-deps) that the OTA apply path runs
+          # via sudo; scripts/install.sh copies the wrapper to
+          # /usr/local/sbin/nexus-apply-deps (root:root 0755).
+          cp deploy/apt-requirements.txt "$R/share/apt-requirements.txt"
+          cp deploy/nexus-apply-deps     "$R/scripts/nexus-apply-deps"
+          chmod +x "$R/scripts/install.sh" "$R/scripts/uninstall.sh" \
+                   "$R/scripts/nexus-apply-deps"
 
           echo "$TAG" > "$R/VERSION"
 
