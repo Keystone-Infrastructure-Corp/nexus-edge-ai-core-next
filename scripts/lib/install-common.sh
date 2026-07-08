@@ -158,7 +158,11 @@ ensure_accelerator_groups() {
 #   * apt-installs runtime prerequisites that are NOT inside the tarball:
 #       - GStreamer runtime plugins (clip recorder needs these — without
 #         them every motion event writes a 0-byte mp4 and the UI shows
-#         "no playable data")
+#         "no playable data"). `gstreamer1.0-plugins-bad` also provides
+#         `webrtcbin` and `gstreamer1.0-nice` (libnice) provides the ICE
+#         agent (nicesrc/nicesink) for the Phase 10 live-view HD (WebRTC)
+#         solo path; without libnice an HD view negotiates no candidates
+#         and never connects (the LBR live wall still works without it)
 #       - VA-API userspace driver (`va-driver-all` pulls iHD for Gen9+
 #         Intel + i965 fallback + Mesa for AMD; without it both
 #         `gstreamer1.0-vaapi` and the modern `va` plugin register 0
@@ -245,6 +249,7 @@ _system_prep_apt() {
         gstreamer1.0-tools \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
+        gstreamer1.0-nice \
         gstreamer1.0-libav \
         gstreamer1.0-vaapi \
         va-driver-all \

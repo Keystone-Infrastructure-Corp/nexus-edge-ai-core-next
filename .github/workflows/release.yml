@@ -98,7 +98,11 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       ORT_VERSION: "1.24.1"
-      FEATURES: "gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt,ep-hailo,ep-rocm,ep-vulkan"
+      # `gstreamer-webrtc` (implies base `gstreamer`) builds the Phase 10 HD
+      # live-view sub-pipeline (webrtcbin). Requires libgstreamer-plugins-bad1.0-dev
+      # at build time (added to the apt step below) and gstreamer1.0-nice +
+      # gstreamer1.0-plugins-bad on the box at runtime (install-common.sh).
+      FEATURES: "gstreamer,gstreamer-webrtc,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt,ep-hailo,ep-rocm,ep-vulkan"
     permissions:
       contents: write   # required to `gh release upload`
     steps:
@@ -256,6 +260,7 @@ jobs:
             pkg-config build-essential cmake \
             libunwind-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-libav gstreamer1.0-tools \
             libssl-dev jq
