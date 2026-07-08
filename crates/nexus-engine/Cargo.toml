@@ -12,6 +12,11 @@ default-run = "nexus-engine"
 [features]
 default = []
 gstreamer = ["nexus-pipeline/gstreamer"]
+# Phase 10 / Phase E — WebRTC HD sub-pipeline. Forwards into
+# nexus-pipeline (which turns on its own `gstreamer` base feature) and
+# lets the heartbeat advertise the `webrtc` capability. Same
+# system-libs constraint as `gstreamer`.
+gstreamer-webrtc = ["gstreamer", "nexus-pipeline/gstreamer-webrtc"]
 # M-Install Checkpoint 2 — feature proxies that forward into
 # nexus-inference. The release pipeline (and the kitchen-sink Docker
 # image) selects `ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt`; lighter

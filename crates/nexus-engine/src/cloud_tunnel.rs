@@ -937,7 +937,16 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
                 // (the LBR snapshot pump, Phase B) is available now; `webrtc`
                 // (the gstreamer-webrtc HD sub-pipeline, Phase E) is added
                 // once that feature is compiled in. Additive on wire `v=1`.
-                caps: Some(vec!["live_view".to_string()]),
+                caps: Some({
+                    let caps = vec!["live_view".to_string()];
+                    #[cfg(feature = "gstreamer-webrtc")]
+                    let caps = {
+                        let mut caps = caps;
+                        caps.push("webrtc".to_string());
+                        caps
+                    };
+                    caps
+                }),
                 online_cameras: 0,
                 queued_alerts: 0,
                 release,

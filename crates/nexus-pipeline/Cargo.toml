@@ -8,6 +8,12 @@ rust-version.workspace = true
 [features]
 default = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+# Phase 10 / Phase E — optional WebRTC HD sub-pipeline (webrtcbin). Implies
+# the base `gstreamer` feature; adds the -webrtc / -sdp bindings. Builds
+# only on hosts with gst-plugins-bad + -base dev headers (Linux CI
+# `system-libs` job, or a local GStreamer install), never on the default
+# macOS build.
+gstreamer-webrtc = ["gstreamer", "dep:gstreamer-webrtc", "dep:gstreamer-sdp"]
 
 [dependencies]
 nexus-types = { workspace = true }
@@ -38,6 +44,8 @@ rand = { workspace = true }
 gstreamer = { workspace = true, optional = true }
 gstreamer-app = { workspace = true, optional = true }
 gstreamer-video = { workspace = true, optional = true }
+gstreamer-webrtc = { workspace = true, optional = true }
+gstreamer-sdp = { workspace = true, optional = true }
 # M2.2: streaming hash for cold-replication. Same dep version as
 # `nexus-storage` to keep the workspace lock single-versioned.
 sha2 = "0.10"
