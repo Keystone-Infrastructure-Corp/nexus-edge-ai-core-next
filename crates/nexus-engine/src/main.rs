@@ -58,6 +58,7 @@ mod sinks_reload;
 mod state_hashes;
 mod storage_safety;
 mod system_metrics;
+mod webrtc_bridge;
 // M7 Step 6F2 — only compiled when the `test-injection` feature
 // is on (off in any production build). Wires the dev-only
 // `POST /api/v1/_test/inject_event` handler.
@@ -591,7 +592,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let preferred_usb_label =
         nexus_pipeline::recorder::PreferredUsbLabel::new(initial_label.clone());
 
-    let recorder: Arc<dyn nexus_pipeline::ClipRecorder> = build_recorder(
+    let (recorder, webrtc_bridge) = build_recorder(
         &cfg.runtime.clips.recorder,
         store.clone(),
         &clips_dir,
@@ -1232,6 +1233,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cloud_enrollment_changed.clone(),
         cloud_outbox.clone(),
         live_view_manager,
+        webrtc_bridge,
         Some(trace_rx),
         loopback_admin_base.clone(),
         cloud_passthrough_admin_secret,
@@ -1977,12 +1979,18 @@ async fn build_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
-) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
+) -> Result<(
+    Arc<dyn nexus_pipeline::ClipRecorder>,
+    Arc<crate::webrtc_bridge::WebRtcBridge>,
+)> {
     match kind {
-        RecorderKind::Stub => Ok(Arc::new(
-            nexus_pipeline::StubClipRecorder::new(store, clips_dir)
-                .with_bus(bus)
-                .with_usb(usb_resolver, preferred_usb_label),
+        RecorderKind::Stub => Ok((
+            Arc::new(
+                nexus_pipeline::StubClipRecorder::new(store, clips_dir)
+                    .with_bus(bus)
+                    .with_usb(usb_resolver, preferred_usb_label),
+            ),
+            crate::webrtc_bridge::WebRtcBridge::disabled(),
         )),
         RecorderKind::Gstreamer => {
             build_gst_recorder(
@@ -2013,7 +2021,10 @@ async fn build_gst_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
-) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
+) -> Result<(
+    Arc<dyn nexus_pipeline::ClipRecorder>,
+    Arc<crate::webrtc_bridge::WebRtcBridge>,
+)> {
     // Build one always-on PreRollIngester per enabled camera. The
     // ingester holds the only RTSP connection for that camera; the
     // recorder consumes from its broadcast channel + ring snapshot,
@@ -2104,12 +2115,20 @@ async fn build_gst_recorder(
             }
         }
     }
+    // Phase F — snapshot the camera→ingester registry for the WebRTC bridge
+    // before the map is moved into the recorder (values are Arcs, so this
+    // clones only refcounts). Camera rebuilds at new dims aren't hot-reflected
+    // in v1 — a fresh HD expand picks up the current ingester.
+    #[cfg(feature = "gstreamer-webrtc")]
+    let webrtc = crate::webrtc_bridge::WebRtcBridge::new(std::sync::Arc::new(ingesters.clone()));
+    #[cfg(not(feature = "gstreamer-webrtc"))]
+    let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
     let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, ingesters)
         .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?
         .with_bus(bus)
         .with_usb(usb_resolver, preferred_usb_label)
         .with_decode_mode(decode_mode);
-    Ok(Arc::new(rec))
+    Ok((Arc::new(rec), webrtc))
 }
 
 #[cfg(not(feature = "gstreamer"))]
@@ -2124,16 +2143,22 @@ async fn build_gst_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
-) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
+) -> Result<(
+    Arc<dyn nexus_pipeline::ClipRecorder>,
+    Arc<crate::webrtc_bridge::WebRtcBridge>,
+)> {
     tracing::error!(
         "config selected RecorderKind::Gstreamer but this build was compiled without \
          --features gstreamer; falling back to StubClipRecorder. Rebuild nexus-engine with \
          the gstreamer feature to record real video."
     );
-    Ok(Arc::new(
-        nexus_pipeline::StubClipRecorder::new(store, clips_dir)
-            .with_bus(bus)
-            .with_usb(usb_resolver, preferred_usb_label),
+    Ok((
+        Arc::new(
+            nexus_pipeline::StubClipRecorder::new(store, clips_dir)
+                .with_bus(bus)
+                .with_usb(usb_resolver, preferred_usb_label),
+        ),
+        crate::webrtc_bridge::WebRtcBridge::disabled(),
     ))
 }
 

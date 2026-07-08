@@ -50,7 +50,6 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 use crate::preroll::NalSample;
 
@@ -127,7 +126,7 @@ pub enum WebRtcEvent {
 ///
 /// Dropping the session tears the pipeline down and stops the NAL feed.
 pub struct WebRtcSession {
-    session_id: Uuid,
+    session_id: String,
     camera_id: CameraId,
     codec: CodecKind,
     pipeline: gst::Pipeline,
@@ -147,7 +146,7 @@ impl WebRtcSession {
     /// [`crate::preroll_ingester::PreRollIngester`] broadcast; `codec` is
     /// that ingester's `codec()`.
     pub fn new(
-        session_id: Uuid,
+        session_id: String,
         camera_id: CameraId,
         codec: CodecKind,
         mode: WebRtcMode,
@@ -223,7 +222,7 @@ impl WebRtcSession {
         });
         // We're the answerer, so we never create an offer on renegotiation;
         // log for diagnostics only.
-        let sess = session_id;
+        let sess = session_id.clone();
         webrtc.connect("on-negotiation-needed", false, move |_vals| {
             debug!(session = %sess, "webrtcbin on-negotiation-needed (answerer; ignored)");
             None
@@ -314,8 +313,8 @@ impl WebRtcSession {
     }
 
     /// The session's stable id (for logging / manager bookkeeping).
-    pub fn session_id(&self) -> Uuid {
-        self.session_id
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// The camera this session streams.
@@ -503,7 +502,7 @@ mod tests {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<WebRtcEvent>();
 
         let session = WebRtcSession::new(
-            Uuid::now_v7(),
+            "test-session-1".to_string(),
             1,
             CodecKind::H264,
             WebRtcMode::Passthrough,

@@ -101,6 +101,7 @@ pub fn spawn_tunnel(
     enrollment_changed: Arc<Notify>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
     live_view: Arc<crate::live_view::LiveViewManager>,
+    webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
     admin_secret: Option<Arc<String>>,
@@ -170,7 +171,16 @@ pub fn spawn_tunnel(
             &admin_http_client,
             admin_secret.as_ref(),
         );
-        run(enrollment, dispatcher, cloud_outbox, live_view, store, rx).await;
+        run(
+            enrollment,
+            dispatcher,
+            cloud_outbox,
+            live_view,
+            webrtc,
+            store,
+            rx,
+        )
+        .await;
     });
     (tx, handle)
 }
@@ -495,6 +505,7 @@ async fn run(
     dispatcher: Option<Arc<RpcDispatcher<EngineRpcHandler>>>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
     live_view: Arc<crate::live_view::LiveViewManager>,
+    webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -537,6 +548,7 @@ async fn run(
                     &cloud_outbox,
                     &store,
                     &live_view,
+                    &webrtc,
                 );
                 tokio::select! {
                     biased;
@@ -556,6 +568,7 @@ async fn run(
                 }
                 cloud_outbox.set_handle(None);
                 live_view.clear_all();
+                webrtc.clear_all();
             }
             Err(e) => {
                 warn!(
@@ -634,6 +647,7 @@ fn verify_update_actor(
 ///     non-RpcCall envelope that does have a consumer).
 ///   * the outbound `handle.send` errors (tunnel writer died) —
 ///     supervisor reconnects.
+#[allow(clippy::too_many_arguments)]
 async fn pump_rpc_dispatch<H: TunnelHandle>(
     handle: &H,
     inbound: Option<mpsc::Receiver<Envelope>>,
@@ -642,6 +656,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     outbox: &Arc<nexus_cloud_client::TunnelOutbox>,
     store: &Arc<Store>,
     live_view: &Arc<crate::live_view::LiveViewManager>,
+    webrtc: &Arc<crate::webrtc_bridge::WebRtcBridge>,
 ) {
     let Some(mut rx) = inbound else {
         debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
@@ -741,6 +756,19 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             }
             EnvelopeBody::LbrUnsubscribe(payload) => {
                 live_view.on_unsubscribe(payload);
+            }
+            // Phase 10 (Phase F) — HD WebRTC signalling. The cloud sends a
+            // webrtc_offer for the single expanded camera; the bridge builds
+            // a passthrough webrtcbin session and pumps the answer + local
+            // ICE back out. webrtc_ice_candidate feeds the browser's trickle.
+            // No-op (logged) when the engine lacks the gstreamer-webrtc
+            // feature — the heartbeat never advertised `webrtc` then, so this
+            // is defence in depth.
+            EnvelopeBody::WebrtcOffer(payload) => {
+                webrtc.on_offer(payload, outbox);
+            }
+            EnvelopeBody::WebrtcIceCandidate(payload) => {
+                webrtc.on_ice_candidate(payload);
             }
             other => {
                 if let EnvelopeBody::HeartbeatAck(ack) = other {
