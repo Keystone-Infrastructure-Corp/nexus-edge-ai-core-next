@@ -39,6 +39,9 @@ pub mod preroll_ingester;
 #[cfg(feature = "gstreamer")]
 pub mod thumbnail;
 
+#[cfg(feature = "gstreamer-webrtc")]
+pub mod webrtc;
+
 pub use cache::{LatestEntry, LatestFrameCache};
 pub use decode::{select_decode_chain, DecodeBackend, DecodeChain, DecodeMode, FactoryProbe};
 pub use entity_sighting::{
@@ -71,3 +74,6 @@ pub use source::RtspSource;
 
 #[cfg(feature = "gstreamer")]
 pub use source::SharedRtspSource;
+
+#[cfg(feature = "gstreamer-webrtc")]
+pub use webrtc::{IceServerCfg, WebRtcError, WebRtcEvent, WebRtcMode, WebRtcSession};

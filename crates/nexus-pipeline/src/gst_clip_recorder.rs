@@ -1586,7 +1586,7 @@ mod tests {
         // Different PTS — previous gets flushed, new one buffered.
         // Both have slices so the header-only-merge path doesn't fire.
         let second = sample(Some(66), &slice_au(10), false);
-        let flushed = coalesce_same_pts(&mut pending, second)
+        let flushed = coalesce_same_pts(&mut pending, second, CodecKind::H264)
             .expect("must flush previous slice on PTS change");
         assert_eq!(flushed.pts, Some(Duration::from_millis(33)));
         let still_pending = pending.as_ref().unwrap();
@@ -1898,9 +1898,10 @@ mod tests {
     /// regression and needs a deliberate decision.
     #[test]
     fn pipeline_string_is_codec_passthrough() {
-        let desc = GstClipRecorder::pipeline_desc(Path::new(
-            "/var/lib/nexus/clips/1/2026-05-13/1234567890.partial.mp4",
-        ));
+        let desc = GstClipRecorder::pipeline_desc(
+            Path::new("/var/lib/nexus/clips/1/2026-05-13/1234567890.partial.mp4"),
+            CodecKind::H264,
+        );
         assert!(desc.contains("appsrc"), "missing appsrc: {desc}");
         assert!(desc.contains("h264parse"), "missing h264parse: {desc}");
         assert!(desc.contains("mp4mux"), "missing mp4mux: {desc}");

@@ -163,9 +163,13 @@ jobs:
   #   * libgstreamer1.0-dev, libgstreamer-plugins-base1.0-dev: gstreamer
   #     core + base .pc files & headers. These transitively pull every
   #     library gstreamer-rs links to (gstreamer-1.0, gstreamer-base-1.0,
-  #     glib-2.0, gobject-2.0).
+  #     gstreamer-sdp-1.0, glib-2.0, gobject-2.0).
+  #   * libgstreamer-plugins-bad1.0-dev: gstreamer-webrtc-1.0 .pc + headers
+  #     for the `gstreamer-webrtc` feature (Phase 10 HD sub-pipeline). DEV
+  #     headers only — enough for `cargo check`, no runtime webrtcbin.
   # NOT installed (would be runtime-only / not exercised by `cargo check`):
-  #   * gstreamer1.0-plugins-good / -bad / -libav  (runtime plugins).
+  #   * gstreamer1.0-plugins-good / -bad / -libav + libnice (runtime plugins
+  #     the webrtcbin element needs at execution time, not compile time).
   #   * libssl-dev (workspace uses rustls everywhere; Cargo.lock has no
   #     openssl / openssl-sys / native-tls — re-verify if that changes).
   #   * libunwind-dev (was needed only on ubuntu-22.04; 24.04 resolves
@@ -189,9 +193,9 @@ jobs:
       - name: install gstreamer dev headers (cached)
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
-          # Keyed by package list; bumping a package version invalidates.
-          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-          version: 1
+          # Keyed by package list; bumping `version` invalidates the cache.
+          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+          version: 2
 
       - name: cache onnxruntime tarball
         id: ort-cache
@@ -217,8 +221,10 @@ jobs:
       - name: cargo check (gstreamer + ort)
         run: |
           cargo check --locked -p nexus-pipeline  --features gstreamer
+          cargo check --locked -p nexus-pipeline  --features gstreamer-webrtc
           cargo check --locked -p nexus-inference --features ort,ep-cpu
           cargo check --locked -p nexus-engine    --features gstreamer
+          cargo check --locked -p nexus-engine    --features gstreamer-webrtc
           # ep-cpu implies `ort`, so this is the only job that compiles the
           # cfg(feature = "ort") DINOv2 extractor (nexus-reid/src/ort_dinov2.rs).
           cargo check --locked -p nexus-reid      --features ep-cpu
