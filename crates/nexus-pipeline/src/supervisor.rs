@@ -5,7 +5,7 @@
 //! that opens child spans for `decode/gate/infer/track/rules`. That's how
 //! the `trace_id` field on [`nexus_types::Frame`] is actually backed.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nexus_bus::{topic, Bus, BusExt};
@@ -18,8 +18,8 @@ use nexus_tracker::{
     MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
 };
 use nexus_types::{
-    CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState, PipelineStatus, TrackLite,
-    TrackedObject,
+    CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState, PipelineStatus, PixelFormat,
+    TrackLite, TrackedObject,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -51,6 +51,63 @@ use crate::stats::FrameStatsRegistry;
 /// (`max_cold_upload_bytes = max_clip_bytes * 2`) absorbs that
 /// overshoot.
 const SIZE_STAT_INTERVAL_FRAMES: u32 = 60;
+
+/// JPEG quality for alert snapshot thumbnails written at rule-fire.
+/// Matches the live-view low-bitrate encoder — high enough for a
+/// recognisable console thumbnail, small enough to keep the blob cheap.
+const SNAPSHOT_JPEG_QUALITY: u8 = 72;
+
+/// Encode an alert's supervisor frame to JPEG and persist it at
+/// `<snapshots_dir>/<event_id>.jpg`.
+///
+/// The path is deterministic in `event_id`, so the cloud-console alert
+/// sink can locate the file for SAS upload without the path travelling
+/// through the durable outbox. Best-effort: any encode/write failure is
+/// logged and yields `None` so a missing thumbnail never blocks the
+/// alert itself. Encoding runs on the blocking pool because JPEG of a
+/// 720p frame is a few milliseconds of CPU we keep off the async loop.
+async fn write_alert_snapshot(
+    snapshots_dir: &Path,
+    event_id: &str,
+    frame: &Arc<Frame>,
+) -> Option<String> {
+    // The supervisor frame is guaranteed RGB24 (see source.rs); guard
+    // anyway so a future format change fails closed rather than writing
+    // a corrupt JPEG.
+    if frame.format != PixelFormat::Rgb24 {
+        return None;
+    }
+    let dir = snapshots_dir.to_path_buf();
+    let frame = Arc::clone(frame);
+    let id = event_id.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        use image::ImageEncoder as _;
+        let path = dir.join(format!("{id}.jpg"));
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, SNAPSHOT_JPEG_QUALITY)
+            .write_image(
+                &frame.data[..],
+                frame.width,
+                frame.height,
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|e| format!("jpeg encode: {e}"))?;
+        std::fs::write(&path, &out).map_err(|e| format!("write {}: {e}", path.display()))?;
+        Ok::<PathBuf, String>(path)
+    })
+    .await;
+    match join {
+        Ok(Ok(path)) => Some(path.to_string_lossy().into_owned()),
+        Ok(Err(e)) => {
+            warn!(event = %event_id, "alert snapshot encode/write failed: {e}");
+            None
+        }
+        Err(e) => {
+            warn!(event = %event_id, "alert snapshot task join failed: {e}");
+            None
+        }
+    }
+}
 
 /// Tunables for the per-camera [`SightingScheduler`]. Constructed
 /// at the engine boot site so all per-camera supervisors share the
@@ -321,6 +378,18 @@ async fn run_camera(
         )
         .with_first_emit_jitter();
         let mut current_clip: Option<ClipHandle> = None;
+        // Alert snapshot output dir — created once per camera task so the
+        // per-alert write path (below) never races a mkdir. Failure to
+        // create it is non-fatal: snapshots are best-effort and the
+        // per-alert write simply logs + skips.
+        let snapshots_dir = state_dir.join("snapshots");
+        if let Err(e) = tokio::fs::create_dir_all(&snapshots_dir).await {
+            warn!(
+                camera_id = cfg.id,
+                dir = %snapshots_dir.display(),
+                "failed to create alert snapshot dir (snapshots disabled for this camera): {e}"
+            );
+        }
         // Wall-clock anchor for the currently-open clip. Used to
         // enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
         // open clip exceeds 5min we force-close it and (if motion
@@ -918,8 +987,20 @@ async fn run_camera(
             // to the clip that gets opened on this frame, not the
             // previous one.
             let mut events_to_link: Vec<String> = Vec::new();
-            for ev in events {
+            for mut ev in events {
                 let event_id = ev.event_id.to_string();
+                // Alert snapshot — persist a JPEG of the frame that fired
+                // this rule at a deterministic
+                // `<state_dir>/snapshots/<event_id>.jpg` path BEFORE the
+                // outbox row is written, so the cloud-console sink (if
+                // enrolled) always finds the file when it processes the
+                // row. Best-effort: a missing thumbnail never blocks the
+                // alert. Also stamped onto `artifacts.snapshot` for bus
+                // subscribers / the local admin API.
+                if let Some(path) = write_alert_snapshot(&snapshots_dir, &event_id, &frame_arc).await
+                {
+                    ev.artifacts.snapshot = Some(path);
+                }
                 // M7 per-rule sink routing — resolve which configured
                 // sinks this rule delivers to, then record the event
                 // and enqueue an `alert_sink_outbox` row per sink in a

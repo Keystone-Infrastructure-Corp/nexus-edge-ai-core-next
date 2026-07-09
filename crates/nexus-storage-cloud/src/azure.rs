@@ -173,11 +173,41 @@ impl GatewaySasIssuer {
     }
 
     async fn request(&self, edge_clip_id: &str, kind: &str) -> Result<IssuedSas, BackendError> {
+        self.request_blob(edge_clip_id, kind, None).await
+    }
+
+    /// Issue a **write** SAS for the alert snapshot identified by
+    /// `event_id`. The gateway routes `blob = "snapshot"` to the
+    /// `snapshots` container with a `.jpg` blob path (vs. the default
+    /// clip container `.mp4`). Kept as an inherent method (not on the
+    /// [`SasIssuer`] trait) so the clip-oriented trait and its mocks stay
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Propagates gateway HTTP / auth failures as [`BackendError`].
+    pub async fn issue_snapshot_put(&self, event_id: &str) -> Result<IssuedSas, BackendError> {
+        self.request_blob(event_id, "put", Some("snapshot")).await
+    }
+
+    async fn request_blob(
+        &self,
+        edge_id: &str,
+        kind: &str,
+        blob: Option<&str>,
+    ) -> Result<IssuedSas, BackendError> {
         let endpoint = format!("{}/v1/edge/blob-sas", self.gateway_url);
-        let body = serde_json::json!({
-            "edge_clip_id": edge_clip_id,
+        let mut body = serde_json::json!({
+            "edge_clip_id": edge_id,
             "kind": kind,
         });
+        // Default (absent) = clip (`.mp4`); `"snapshot"` selects the
+        // snapshots container (`.jpg`). Older gateways ignore the field
+        // and keep serving clips, so this stays additive on the private
+        // edge↔gateway REST contract.
+        if let Some(blob) = blob {
+            body["blob"] = serde_json::Value::String(blob.to_owned());
+        }
 
         let resp = self
             .http

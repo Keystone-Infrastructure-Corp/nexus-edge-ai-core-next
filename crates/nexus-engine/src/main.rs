@@ -23,6 +23,7 @@ mod api;
 mod audit_retention;
 mod auth;
 mod auth_bootstrap;
+mod cloud_alert_sink;
 mod cloud_audit;
 mod cloud_enroll;
 mod cloud_sighting;
@@ -634,6 +635,32 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // replicator + the sighting hook both read it.
     let cloud_outbox = std::sync::Arc::new(nexus_cloud_client::TunnelOutbox::new());
 
+    // Cloud entitlement cache — populated from inbound `entitlement_update`
+    // envelopes by the cloud-tunnel supervisor, read by the M7
+    // `CloudAwarePolicy` to suppress the always-on `cloud:console` audit
+    // sink when the org is suspended for non-payment (§12.4). Constructed
+    // here so both the dispatcher policy and `spawn_tunnel` share one
+    // `Arc`. Fail-open: an empty / unpopulated cache reports "not
+    // suspended", so a fresh core keeps delivering to the cloud audit sink.
+    let entitlement_cache =
+        std::sync::Arc::new(nexus_cloud_client::entitlements::EntitlementCache::new());
+
+    // alert_ack correlation — shared registry mapping a sent alert
+    // envelope's meta.id to the `deliver()` awaiting its cloud `alert_ack`.
+    // Shared by the cloud alert sink (registers a waiter before sending) and
+    // the cloud-tunnel dispatch (fires the waiter on the matching ack).
+    let pending_acks = std::sync::Arc::new(cloud_alert_sink::PendingAckRegistry::new());
+
+    // Alert-snapshot uploader slot + directory. The supervisor writes a
+    // JPEG of the rule-fire frame to `<state_dir>/snapshots/<event_id>.jpg`;
+    // the cloud alert sink reads it back and PUTs it via a gateway SAS on
+    // delivery so the console can render an alert thumbnail. The slot is
+    // filled once the cloud tunnel enrolls (mTLS SAS path); until then the
+    // sink delivers alerts without a thumbnail. Both the sink and
+    // `spawn_tunnel` share one `Arc`.
+    let snapshot_uploader_slot = cloud_alert_sink::new_uploader_slot();
+    let snapshots_dir = cfg.runtime.state_dir.join("snapshots");
+
     // Phase 5.6 · slice 4c-ii — build the per-engine entity-sighting
     // hook + scheduler config. Always built, even when the cloud is
     // unreachable: the hook drops snapshots silently when the outbox
@@ -1021,13 +1048,34 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     if n_sinks > 0 {
         info!(n_sinks, "M7: alert-delivery sinks registered");
     }
+    // Register the always-on cloud-console audit sink as a RESERVED sink so
+    // it survives every `sink.config.changed` rebuild (which only swaps the
+    // file + db config set). It rides the same durable `alert_sink_outbox`
+    // + dispatcher as external sinks; the `CloudAwarePolicy` below makes it
+    // bypass the operator delivery schedule while still honouring
+    // entitlement suspension.
+    sink_registry.insert_reserved(std::sync::Arc::new(
+        cloud_alert_sink::CloudConsoleAlertSink::new(
+            cloud_outbox.clone(),
+            pending_acks.clone(),
+            snapshots_dir.clone(),
+            snapshot_uploader_slot.clone(),
+        ),
+    ));
     let cascading_policy = std::sync::Arc::new(
         nexus_sinks::policy::CascadingPolicy::hydrate(&store)
             .await
             .context("M7: hydrate delivery policy from store")?,
     );
+    // Wrap the operator delivery policy so `cloud:*` rows are always-on
+    // (the complete audit trail) except under entitlement suspension;
+    // external sinks still get the full CascadingPolicy (schedule /
+    // global-disable / per-rule).
     let delivery_policy: std::sync::Arc<dyn nexus_sinks::dispatcher::DeliveryPolicy> =
-        cascading_policy.clone();
+        std::sync::Arc::new(cloud_alert_sink::CloudAwarePolicy::new(
+            cascading_policy.clone(),
+            entitlement_cache.clone(),
+        ));
     let (delivery_reload_handle, delivery_reload_shutdown_tx) =
         delivery_reload::spawn(bus.clone(), store.clone(), cascading_policy.clone());
     // M7 cloud-managed sinks — rebuild the registry on each
@@ -1232,6 +1280,9 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cold_kick.clone(),
         cloud_enrollment_changed.clone(),
         cloud_outbox.clone(),
+        entitlement_cache.clone(),
+        pending_acks.clone(),
+        snapshot_uploader_slot.clone(),
         live_view_manager,
         webrtc_bridge,
         Some(trace_rx),

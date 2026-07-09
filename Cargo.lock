@@ -2426,6 +2426,7 @@ dependencies = [
  "gstreamer-sdp",
  "gstreamer-video",
  "gstreamer-webrtc",
+ "image",
  "nexus-bus",
  "nexus-config",
  "nexus-inference",

@@ -1684,6 +1684,7 @@ async fn validate_rule(Json(req): Json<ValidateRuleReq>) -> Json<ValidateRuleRes
         },
         enabled: true,
         sinks: Vec::new(),
+        verify: false,
     };
     match compile_cel_safely(&stub) {
         Ok(()) => Json(ValidateRuleResp {
@@ -7645,6 +7646,7 @@ mod tests {
                 },
                 enabled: true,
                 sinks: Vec::new(),
+                verify: false,
             })
             .await
             .unwrap();
@@ -7688,6 +7690,7 @@ mod tests {
                 },
                 enabled: true,
                 sinks: Vec::new(),
+                verify: false,
             })
             .await
             .unwrap();
@@ -7753,6 +7756,7 @@ mod tests {
                 },
                 enabled: true,
                 sinks: Vec::new(),
+                verify: false,
             })
             .await
             .unwrap();
@@ -7856,6 +7860,8 @@ mod tests {
             trace_id: "trace-test".into(),
             artifacts: nexus_types::Artifacts::default(),
             context: serde_json::Map::new(),
+            frame_w: 0,
+            frame_h: 0,
         };
         store
             .record_event_and_enqueue(&ev, &["webhook:foo"])

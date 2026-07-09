@@ -50,6 +50,8 @@ fn alert_on_camera(camera_id: i64) -> AlertEvent {
         trace_id: Uuid::now_v7().to_string(),
         artifacts: Artifacts::default(),
         context: Default::default(),
+        frame_w: 0,
+        frame_h: 0,
     }
 }
 

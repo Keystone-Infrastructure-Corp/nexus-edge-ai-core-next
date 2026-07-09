@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nexus_cloud_protocol::v1::{
     AlertPayload, ClipReplicatedPayload, DiagReadyPayload, EntitySightingBatchPayload,
-    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta, LbrFramePayload,
+    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta, LbrFramePayload, TraceContext,
     VerificationState,
 };
 use uuid::Uuid;
@@ -48,6 +48,17 @@ pub struct AlertProjection {
     pub clip_blob_url: Option<String>,
     /// Phase 21.2 — set when the clip was pre-attached on edge.
     pub attached_history: Option<bool>,
+    /// Cloud verification lifecycle state (Phase 8.2). `None` lets the
+    /// cloud default it to `verified`; the engine's cloud-console alert
+    /// sink sets `Some(Verified)` for plain rule-engine alerts and
+    /// reserves `Some(Candidate)` for composite / verify-tagged rules
+    /// the cloud VLM should adjudicate.
+    pub verification_state: Option<VerificationState>,
+    /// W3C 32-hex-lowercase trace id, stamped into the envelope
+    /// `meta.trace` so the cloud can wire the alert to its end-to-end
+    /// App Insights trace ("View end-to-end trace"). `None` → no trace
+    /// context on the envelope.
+    pub trace_id: Option<String>,
 }
 
 /// Sink shell. Wraps any [`TunnelHandle`] impl so the engine can
@@ -73,7 +84,7 @@ impl CloudConsoleSink {
     /// always surfaces [`TunnelError::NotImplemented`] from the default
     /// [`TunnelClient`](crate::tunnel::TunnelClient).
     pub async fn publish_alert(&self, alert: AlertProjection) -> Result<(), TunnelError> {
-        let envelope = build_alert_envelope(alert);
+        let (envelope, _id) = build_alert_envelope(alert);
         self.tunnel.send(envelope).await
     }
 
@@ -131,8 +142,13 @@ impl CloudConsoleSink {
 
 /// Pure-function projection. Public so engine tests can construct
 /// reference envelopes without instantiating a sink.
+///
+/// Returns the built [`Envelope`] and its `meta.id` — the caller (the
+/// cloud alert sink) registers a pending-ack waiter keyed by that id
+/// BEFORE sending, so the inbound `alert_ack` (whose `in_reply_to`
+/// echoes this id) can be correlated back to the delivery.
 #[must_use]
-pub fn build_alert_envelope(alert: AlertProjection) -> Envelope {
+pub fn build_alert_envelope(alert: AlertProjection) -> (Envelope, String) {
     let payload = AlertPayload {
         edge_event_id: alert.edge_event_id,
         ts: alert.ts.to_rfc3339(),
@@ -145,26 +161,47 @@ pub fn build_alert_envelope(alert: AlertProjection) -> Envelope {
         snapshot_blob_url: alert.snapshot_blob_url,
         clip_blob_url: alert.clip_blob_url,
         attached_history: alert.attached_history,
-        // Phase 8.2: the edge always fires `candidate`; the cloud verifier
-        // advances the state and writes the verdict_* fields. evidence_clip_ref
-        // is populated by the urgent-upload lane (Phase 8.3).
-        verification_state: Some(VerificationState::Candidate),
+        // Phase 8.2: verification lifecycle is caller-chosen via the
+        // projection — plain rule alerts fire `verified` (shown in the
+        // console immediately), composite / verify-tagged rules fire
+        // `candidate` for the cloud VLM to adjudicate. `None` lets the
+        // cloud default to `verified`. verdict_* + evidence_clip_ref are
+        // cloud-written.
+        verification_state: alert.verification_state,
         verdict_description: None,
         verdict_evidence: None,
         verdict_confidence: None,
         evidence_clip_ref: None,
     };
-    Envelope {
+    // Stamp the edge's W3C trace id into meta.trace so the cloud can wire
+    // the alert to its end-to-end App Insights trace. The alert is a root
+    // event on the edge (no parent span), so we mint a fresh 16-hex
+    // parent_span_id.
+    let trace = alert.trace_id.filter(|t| !t.is_empty()).map(|trace_id| {
+        let parent_span_id: String = Uuid::now_v7()
+            .simple()
+            .to_string()
+            .chars()
+            .take(16)
+            .collect();
+        TraceContext {
+            trace_id,
+            parent_span_id,
+        }
+    });
+    let id = Uuid::now_v7().to_string();
+    let envelope = Envelope {
         meta: EnvelopeMeta {
             v: 1,
-            id: Uuid::now_v7().to_string(),
+            id: id.clone(),
             ts: Utc::now().to_rfc3339(),
             in_reply_to: None,
             seq: None,
-            trace: None,
+            trace,
         },
         body: EnvelopeBody::Alert(payload),
-    }
+    };
+    (envelope, id)
 }
 
 #[async_trait]
@@ -572,15 +609,22 @@ mod tests {
             snapshot_blob_url: None,
             clip_blob_url: None,
             attached_history: None,
+            verification_state: Some(VerificationState::Verified),
+            trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
         })
         .await
         .expect("send");
         let captured = tunnel.last.lock().clone().expect("captured envelope");
         assert_eq!(captured.meta.v, 1);
+        assert_eq!(
+            captured.meta.trace.as_ref().map(|t| t.trace_id.as_str()),
+            Some("0af7651916cd43dd8448eb211c80319c")
+        );
         match captured.body {
             EnvelopeBody::Alert(p) => {
                 assert_eq!(p.edge_event_id, "evt-1");
                 assert_eq!(p.camera_id, 7);
+                assert_eq!(p.verification_state, Some(VerificationState::Verified));
             }
             other => panic!("expected Alert, got {other:?}"),
         }

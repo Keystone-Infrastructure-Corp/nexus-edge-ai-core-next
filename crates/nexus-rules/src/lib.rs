@@ -390,7 +390,7 @@ impl RuleEvaluator {
                 // serde_json map serialised verbatim into the
                 // events table's `payload_json` column, so this
                 // costs no schema change.
-                let mut context = serde_json::Map::with_capacity(2);
+                let mut context = serde_json::Map::with_capacity(3);
                 context.insert(
                     "confidence".into(),
                     serde_json::Number::from_f64(o.confidence as f64)
@@ -398,6 +398,12 @@ impl RuleEvaluator {
                         .unwrap_or(JsonValue::Null),
                 );
                 context.insert("rule_name".into(), JsonValue::String(cfg.name.clone()));
+                // Phase 8 — mark alerts from a verify-opt-in rule so the
+                // cloud sink projects `verification_state = candidate` for
+                // the cloud VLM to adjudicate (default rules fire `verified`).
+                if cfg.verify {
+                    context.insert("verify".into(), JsonValue::Bool(true));
+                }
                 out.push(AlertEvent {
                     event_id: Uuid::now_v7(),
                     camera_id,
@@ -409,6 +415,8 @@ impl RuleEvaluator {
                     frame_id,
                     captured_at: Utc::now(),
                     trace_id: trace_id.clone(),
+                    frame_w: frame_width,
+                    frame_h: frame_height,
                     artifacts: Artifacts::default(),
                     context,
                 });
@@ -510,6 +518,7 @@ mod tests {
             },
             enabled: true,
             sinks: Vec::new(),
+            verify: false,
         };
         let eng = CelEngine::new();
         let compiled = eng.compile(&cfg).unwrap();
@@ -557,6 +566,7 @@ mod tests {
             },
             enabled: true,
             sinks: Vec::new(),
+            verify: false,
         }
     }
 

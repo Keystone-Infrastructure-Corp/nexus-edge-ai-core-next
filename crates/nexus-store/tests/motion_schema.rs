@@ -229,6 +229,8 @@ async fn cascade_delete_drops_motion_events_and_alert_events() {
         trace_id: "trace-1".into(),
         artifacts: Artifacts::default(),
         context: serde_json::Map::new(),
+        frame_w: 0,
+        frame_h: 0,
     };
     store.record_event(&alert).await.unwrap();
     store
@@ -251,6 +253,8 @@ async fn cascade_delete_drops_motion_events_and_alert_events() {
         trace_id: "trace-2".into(),
         artifacts: Artifacts::default(),
         context: serde_json::Map::new(),
+        frame_w: 0,
+        frame_h: 0,
     };
     store.record_event(&unlinked).await.unwrap();
 

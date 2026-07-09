@@ -21,6 +21,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::VerifyingKey;
 use nexus_cloud_client::trace_uploader::{
@@ -100,6 +101,9 @@ pub fn spawn_tunnel(
     replicator_kick: Arc<Notify>,
     enrollment_changed: Arc<Notify>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
+    entitlement_cache: Arc<nexus_cloud_client::entitlements::EntitlementCache>,
+    pending_acks: Arc<crate::cloud_alert_sink::PendingAckRegistry>,
+    snapshot_uploader_slot: crate::cloud_alert_sink::SnapshotUploaderSlot,
     live_view: Arc<crate::live_view::LiveViewManager>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     trace_rx: Option<mpsc::Receiver<Span>>,
@@ -159,7 +163,14 @@ pub fn spawn_tunnel(
             gateway_url = %enrollment.gateway_url,
             "starting cloud tunnel supervisor",
         );
-        install_cloud_blob_backend(&enrollment, &store, &registry, &replicator_kick).await;
+        install_cloud_blob_backend(
+            &enrollment,
+            &store,
+            &registry,
+            &replicator_kick,
+            &snapshot_uploader_slot,
+        )
+        .await;
         if let Some(trace_rx) = trace_rx {
             spawn_trace_uploader(&enrollment, trace_rx);
         }
@@ -175,6 +186,8 @@ pub fn spawn_tunnel(
             enrollment,
             dispatcher,
             cloud_outbox,
+            entitlement_cache,
+            pending_acks,
             live_view,
             webrtc,
             store,
@@ -278,6 +291,29 @@ fn build_rpc_dispatcher(
     Some(Arc::new(dispatcher))
 }
 
+/// [`SnapshotUploader`](crate::cloud_alert_sink::SnapshotUploader) backed by
+/// the gateway SAS issuer: mints a snapshot **write** SAS then PUTs the JPEG
+/// straight to blob storage (never through the tunnel — Hard Rule 7).
+/// Installed into the shared slot post-enrollment by
+/// [`install_cloud_blob_backend`].
+#[derive(Debug)]
+struct GatewaySnapshotUploader {
+    issuer: GatewaySasIssuer,
+}
+
+#[async_trait]
+impl crate::cloud_alert_sink::SnapshotUploader for GatewaySnapshotUploader {
+    async fn upload(&self, event_id: &str, jpeg: Vec<u8>) -> Result<String, String> {
+        let sas = self
+            .issuer
+            .issue_snapshot_put(event_id)
+            .await
+            .map_err(|e| format!("snapshot SAS issuance: {e}"))?;
+        crate::discovery::onvif_snapshot::put_snapshot_to_sas(&sas.url, &jpeg).await?;
+        Ok(sas.blob_url_unsigned)
+    }
+}
+
 /// Build the cloud `AzureBlobBackend` from the enrollment artefact
 /// (mTLS cert chain for the SAS-issuance hop, plain HTTPS for direct
 /// Azure Blob PUT/GET) and install it into the registry under the
@@ -295,6 +331,7 @@ async fn install_cloud_blob_backend(
     store: &Arc<Store>,
     registry: &Registry,
     replicator_kick: &Arc<Notify>,
+    snapshot_uploader_slot: &crate::cloud_alert_sink::SnapshotUploaderSlot,
 ) {
     // Reuse the trace-uploader's mTLS recipe verbatim for the SAS
     // issuance hop; the gateway authenticates the edge by client
@@ -340,6 +377,15 @@ async fn install_cloud_blob_backend(
     };
     let gateway_url = derive_https_base(&enrollment.gateway_url);
     let issuer = Arc::new(GatewaySasIssuer::new(mtls_http, gateway_url.clone()));
+    // Install the alert-snapshot uploader now that we have an
+    // mTLS-authenticated SAS path. The cloud alert sink reads this slot
+    // per delivery to PUT the rule-fire thumbnail before sending the alert.
+    snapshot_uploader_slot
+        .write()
+        .replace(Arc::new(GatewaySnapshotUploader {
+            issuer: (*issuer).clone(),
+        })
+            as Arc<dyn crate::cloud_alert_sink::SnapshotUploader>);
     let backend: Arc<dyn nexus_storage::ColdBackend> =
         Arc::new(AzureBlobBackend::new("cloud", issuer, azure_http));
 
@@ -500,10 +546,13 @@ fn spawn_trace_uploader(enrollment: &CloudEnrollment, rx: mpsc::Receiver<Span>) 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     enrollment: CloudEnrollment,
     dispatcher: Option<Arc<RpcDispatcher<EngineRpcHandler>>>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
+    entitlement_cache: Arc<nexus_cloud_client::entitlements::EntitlementCache>,
+    pending_acks: Arc<crate::cloud_alert_sink::PendingAckRegistry>,
     live_view: Arc<crate::live_view::LiveViewManager>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
@@ -546,6 +595,8 @@ async fn run(
                     dispatcher.as_deref(),
                     &core_id,
                     &cloud_outbox,
+                    &entitlement_cache,
+                    &pending_acks,
                     &store,
                     &live_view,
                     &webrtc,
@@ -654,6 +705,8 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     dispatcher: Option<&RpcDispatcher<EngineRpcHandler>>,
     core_id: &str,
     outbox: &Arc<nexus_cloud_client::TunnelOutbox>,
+    entitlement_cache: &Arc<nexus_cloud_client::entitlements::EntitlementCache>,
+    pending_acks: &Arc<crate::cloud_alert_sink::PendingAckRegistry>,
     store: &Arc<Store>,
     live_view: &Arc<crate::live_view::LiveViewManager>,
     webrtc: &Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -701,6 +754,47 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         "rpc dispatch send failed; tunnel writer down",
                     );
                     return;
+                }
+            }
+            EnvelopeBody::EntitlementUpdate(payload) => {
+                // Phase 3 / cloud ARCHITECTURE §12.4 — cache the latest
+                // entitlement JWT so the M7 `CloudAwarePolicy` can suppress
+                // the always-on `cloud:console` audit sink when the org is
+                // suspended for non-payment. Claims are re-decoded
+                // (unverified) on each read; we just store the compact JWS.
+                let previous = entitlement_cache.store(payload.jwt.clone());
+                if previous.as_deref() != Some(payload.jwt.as_str()) {
+                    debug!(
+                        core_id = %core_id,
+                        suspended = entitlement_cache.is_suspended(),
+                        "entitlement_update cached",
+                    );
+                }
+            }
+            EnvelopeBody::AlertAck(ack) => {
+                // Cloud confirmation for an alert we forwarded. Correlate it
+                // back to the waiting `deliver()` via `in_reply_to` (the sent
+                // envelope's meta.id) and fire the outcome so the M7 outbox
+                // row transitions correctly: stored → sent, permanent_failure
+                // → dead. (No ack → deliver() times out → transient retry.)
+                let outcome = match ack.status.as_str() {
+                    "stored" | "received" => crate::cloud_alert_sink::AckOutcome::Stored,
+                    "permanent_failure" => {
+                        crate::cloud_alert_sink::AckOutcome::PermanentFailure(ack.reason.clone())
+                    }
+                    other => {
+                        debug!(core_id = %core_id, status = %other, "alert_ack: unknown status, treating as stored");
+                        crate::cloud_alert_sink::AckOutcome::Stored
+                    }
+                };
+                match &env.meta.in_reply_to {
+                    Some(reply_id) => {
+                        let fired = pending_acks.fire(reply_id, outcome);
+                        debug!(core_id = %core_id, in_reply_to = %reply_id, status = %ack.status, fired, "alert_ack correlated");
+                    }
+                    None => {
+                        warn!(core_id = %core_id, status = %ack.status, "alert_ack missing in_reply_to; cannot correlate");
+                    }
                 }
             }
             EnvelopeBody::DiagCollect(payload) => {

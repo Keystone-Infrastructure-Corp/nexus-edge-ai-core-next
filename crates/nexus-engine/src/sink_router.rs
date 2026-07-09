@@ -50,7 +50,7 @@ impl SinkRouter for EngineSinkRouter {
             .into_iter()
             .map(|id| id.to_string())
             .collect();
-        match self.evaluator.sinks_for(rule_id) {
+        let mut result: Vec<String> = match self.evaluator.sinks_for(rule_id) {
             // Rule has an explicit allow-list — intersect with the
             // configured set (preserving the rule's order) so an id
             // that doesn't exist right now is silently dropped rather
@@ -64,7 +64,19 @@ impl SinkRouter for EngineSinkRouter {
             // Empty allow-list, or rule not currently loaded — route
             // to every configured sink (the default).
             _ => configured,
+        };
+        // Always union the reserved (subsystem-owned) sinks. The
+        // always-on `cloud:console` audit sink must receive EVERY alert
+        // regardless of a rule's external-sink allow-list, so it is not
+        // subject to the intersect above. Deduped in case a rule
+        // explicitly names it.
+        for reserved in self.registry.reserved_ids() {
+            let id = reserved.to_string();
+            if !result.contains(&id) {
+                result.push(id);
+            }
         }
+        result
     }
 }
 
@@ -92,6 +104,7 @@ mod tests {
             },
             enabled: true,
             sinks,
+            verify: false,
         }
     }
 

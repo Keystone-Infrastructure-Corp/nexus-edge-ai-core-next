@@ -87,6 +87,11 @@ pub enum SuppressionReason {
     /// Rule schedule (which fully *replaces* the global schedule)
     /// is in a `false` slot.
     OffScheduleRule,
+    /// The org's cloud entitlement is suspended (non-payment /
+    /// lifecycle `suspended`). Set by the engine's `CloudAwarePolicy`
+    /// for the always-on `cloud:console` audit sink ONLY — external
+    /// sinks are unaffected. See cloud `ARCHITECTURE.md` §12.4.
+    EntitlementSuspended,
 }
 
 impl SuppressionReason {
@@ -96,6 +101,7 @@ impl SuppressionReason {
             SuppressionReason::RuleDisabled => "rule_disabled",
             SuppressionReason::OffScheduleGlobal => "off_schedule_global",
             SuppressionReason::OffScheduleRule => "off_schedule_rule",
+            SuppressionReason::EntitlementSuspended => "entitlement_suspended",
         }
     }
 }
@@ -109,6 +115,7 @@ impl TryFrom<&str> for SuppressionReason {
             "rule_disabled" => Ok(SuppressionReason::RuleDisabled),
             "off_schedule_global" => Ok(SuppressionReason::OffScheduleGlobal),
             "off_schedule_rule" => Ok(SuppressionReason::OffScheduleRule),
+            "entitlement_suspended" => Ok(SuppressionReason::EntitlementSuspended),
             other => Err(format!("unknown SuppressionReason: {other:?}")),
         }
     }
