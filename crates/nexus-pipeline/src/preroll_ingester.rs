@@ -78,7 +78,10 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::decode::{select_decode_chain, DecodeMode, GstFactoryProbe};
+use crate::decode::{
+    rgb_frame_looks_degenerate, select_decode_chain, DecodeMode, GstFactoryProbe,
+    DECODE_VALIDATION_FRAMES,
+};
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
 
@@ -231,6 +234,7 @@ impl PreRollIngester {
     /// [`crate::source::supervisor_frame_for`]; pass
     /// `(RTSP_SOURCE_FRAME_WIDTH, RTSP_SOURCE_FRAME_HEIGHT)` to
     /// reproduce the pre-per-camera (960×540) behaviour.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_rgb(
         camera_id: CameraId,
         url: impl Into<String>,
@@ -285,6 +289,10 @@ impl PreRollIngester {
             .map(|t| (t.tx.clone(), t.max_fps, t.width, t.height));
         let task_pipeline = active_pipeline.clone();
         let task_shutdown = shutdown.clone();
+        // Runtime decode-health latch: flipped by the RGB tap's first-frames
+        // guard when a hardware decoder renders only degenerate frames on this
+        // GPU, so the supervisor rebuilds the session on the software chain.
+        let task_force_software = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(async move {
             run_supervisor(
                 camera_id,
@@ -296,6 +304,7 @@ impl PreRollIngester {
                 task_frame_tap,
                 task_pipeline,
                 task_shutdown,
+                task_force_software,
             )
             .await;
         });
@@ -427,6 +436,7 @@ impl PreRollIngester {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     camera_id: CameraId,
     url: String,
@@ -437,6 +447,7 @@ async fn run_supervisor(
     frame_tap: Option<(broadcast::Sender<Frame>, u32, u32, u32)>,
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
+    force_software: Arc<AtomicBool>,
 ) {
     info!(
         camera_id,
@@ -450,16 +461,25 @@ async fn run_supervisor(
         if shutdown.load(Ordering::Acquire) {
             return;
         }
+        // A latched decode downgrade (set by the RGB tap's health guard when a
+        // hardware decoder rendered only degenerate frames) forces the
+        // software chain regardless of the operator-configured mode.
+        let effective_mode = if force_software.load(Ordering::Acquire) {
+            DecodeMode::Software
+        } else {
+            decode_mode
+        };
         match run_session(
             camera_id,
             &url,
             codec,
-            decode_mode,
+            effective_mode,
             ring.clone(),
             live_tx.clone(),
             frame_tap.clone(),
             active_pipeline.clone(),
             shutdown.clone(),
+            force_software.clone(),
         )
         .await
         {
@@ -484,6 +504,7 @@ async fn run_supervisor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     camera_id: CameraId,
     url: &str,
@@ -494,6 +515,7 @@ async fn run_session(
     frame_tap: Option<(broadcast::Sender<Frame>, u32, u32, u32)>,
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
+    force_software: Arc<AtomicBool>,
 ) -> Result<(), IngesterError> {
     let url_safe = url.replace('"', "");
     // Codec-specific element names: rtp{depay}, {parse}, video/x-{base}.
@@ -506,6 +528,16 @@ async fn run_session(
         "h265" => ("rtph265depay", "h265parse", "video/x-h265"),
         _ => ("rtph264depay", "h264parse", "video/x-h264"),
     };
+    // Whether the RGB-tap decode chain runs on the GPU. Drives the
+    // first-frames health guard on the `rgb` appsink below: a hardware
+    // decoder that renders only degenerate (e.g. all-green) frames on this
+    // GPU/driver latches `force_software` so the supervisor rebuilds on the
+    // software chain. Cheap pure recompute that mirrors the chain the `desc`
+    // match arm builds, rather than threading the value out of the match.
+    let rgb_hwaccel = frame_tap
+        .as_ref()
+        .map(|_| select_decode_chain(codec.base(), decode_mode, &GstFactoryProbe).hwaccel)
+        .unwrap_or(false);
     // protocols=tcp (NOT tcp+udp) so rtspsrc never falls back to UDP.
     // UDP packet loss on a contended link (WiFi / busy switch / bursty
     // CPU on the receiver) shows up as 2\u20134 s gaps in the recorded clip
@@ -673,6 +705,11 @@ async fn run_session(
         let counter_cb = counter.clone();
         let logged_first = Arc::new(AtomicBool::new(false));
         let logged_first_cb = logged_first.clone();
+        // Per-session decode-health guard state (see `force_software`).
+        let flat_streak_cb = Arc::new(parking_lot::Mutex::new(0u32));
+        let validation_done_cb = Arc::new(AtomicBool::new(false));
+        let force_software_cb = force_software.clone();
+        let guard_hwaccel = rgb_hwaccel;
         rgb_sink.set_callbacks(
             AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -731,6 +768,40 @@ async fn run_session(
                         for y in 0..height {
                             let start = y * stride;
                             data.extend_from_slice(&plane[start..start + row_bytes]);
+                        }
+                    }
+
+                    // Runtime decode-health guard. A decoder is chosen on
+                    // element *presence*, not on whether it renders correctly
+                    // on this GPU/driver (some, e.g. radeonsi `vapostproc`,
+                    // emit only all-green frames). If the first
+                    // `DECODE_VALIDATION_FRAMES` frames off a hardware chain
+                    // are all near-constant colour, latch the software
+                    // fallback and end the session so the supervisor rebuilds
+                    // on `avdec_*`. One real (varied) frame disarms the check
+                    // for the rest of the session.
+                    if guard_hwaccel && !validation_done_cb.load(Ordering::Relaxed) {
+                        if rgb_frame_looks_degenerate(&data) {
+                            let hit = {
+                                let mut streak = flat_streak_cb.lock();
+                                *streak += 1;
+                                *streak >= DECODE_VALIDATION_FRAMES
+                            };
+                            if hit {
+                                validation_done_cb.store(true, Ordering::Relaxed);
+                                force_software_cb.store(true, Ordering::Release);
+                                error!(
+                                    camera_id,
+                                    frames = DECODE_VALIDATION_FRAMES,
+                                    "hardware decoder rendered only degenerate \
+                                     (near-constant colour) frames on this GPU; \
+                                     falling back to software decode and \
+                                     rebuilding the camera session"
+                                );
+                                return Err(gst::FlowError::Error);
+                            }
+                        } else {
+                            validation_done_cb.store(true, Ordering::Relaxed);
                         }
                     }
 
