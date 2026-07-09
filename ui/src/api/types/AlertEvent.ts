@@ -3,4 +3,14 @@ import type { Artifacts } from "./Artifacts";
 import type { BBox } from "./BBox";
 import type { Severity } from "./Severity";
 
-export type AlertEvent = { event_id: string, camera_id: bigint, rule_id: string, track_id: bigint | null, label: string, severity: Severity, bbox: BBox | null, frame_id: bigint, captured_at: string, trace_id: string, artifacts: Artifacts, context: Record<string, unknown>, };
+export type AlertEvent = { event_id: string, camera_id: bigint, rule_id: string, track_id: bigint | null, label: string, severity: Severity, bbox: BBox | null, frame_id: bigint, captured_at: string, trace_id: string, 
+/**
+ * Analysis (supervisor) frame width in pixels at detection time. Lets
+ * cloud consumers normalise the pixel `bbox` to 0..1. `#[serde(default)]`
+ * so events persisted before this field existed deserialise to 0.
+ */
+frame_w: number, 
+/**
+ * Analysis (supervisor) frame height in pixels at detection time.
+ */
+frame_h: number, artifacts: Artifacts, context: Record<string, unknown>, };
