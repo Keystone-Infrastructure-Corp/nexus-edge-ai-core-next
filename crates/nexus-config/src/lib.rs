@@ -1652,6 +1652,16 @@ pub struct RuleConfig {
     /// `#[serde(default)]`, preserving the route-to-all behaviour.
     #[serde(default)]
     pub sinks: Vec<String>,
+    /// Phase 8 — when `true`, alerts from this rule are sent to the cloud
+    /// with `verification_state = candidate` so the cloud VLM
+    /// behavior-verifier adjudicates them (advancing to `verified` /
+    /// `dismissed` / `review`), instead of the default `verified` that
+    /// shows in the console immediately. Only meaningful when the org is
+    /// on a tier with cloud verification; otherwise the alert simply stays
+    /// `candidate`. Lives inside `rules.config_json` (no schema
+    /// migration); old payloads without the field deserialize to `false`.
+    #[serde(default)]
+    pub verify: bool,
 }
 
 fn default_min_track_age_ms() -> u64 {

@@ -220,6 +220,13 @@ type SinkMap = HashMap<SinkId, Arc<dyn AlertSink>>;
 #[derive(Default)]
 pub struct SinkRegistry {
     inner: RwLock<SinkMap>,
+    /// Subsystem-owned sinks that survive [`SinkRegistry::replace`].
+    /// Used for the engine's always-on `cloud:console` audit sink,
+    /// which is not an operator-managed `[[sinks]]` / `alert_sinks`
+    /// entry and must not be wiped when a config edit rebuilds the
+    /// config-managed set (mirrors the storage `Registry::insert_reserved`
+    /// precedent from Phase 2.1b).
+    reserved: RwLock<SinkMap>,
 }
 
 impl SinkRegistry {
@@ -227,9 +234,11 @@ impl SinkRegistry {
         Self::default()
     }
 
-    /// Replace the entire active set in one atomic swap.
+    /// Replace the entire *config-managed* active set in one atomic
+    /// swap. Reserved sinks (see [`SinkRegistry::insert_reserved`]) are
+    /// untouched.
     ///
-    /// Returns the number of sinks now registered.
+    /// Returns the number of config sinks now registered.
     pub fn replace(&self, sinks: Vec<Arc<dyn AlertSink>>) -> usize {
         let map: SinkMap = sinks.into_iter().map(|s| (s.id().clone(), s)).collect();
         let n = map.len();
@@ -237,24 +246,51 @@ impl SinkRegistry {
         n
     }
 
-    /// Look up by ID. Returns `None` if no sink is registered
-    /// under that identifier — the dispatcher must treat this as a
-    /// `Permanent` failure (most likely a stale `alert_sink_outbox`
-    /// row that survived a sink deletion).
+    /// Register a subsystem-owned sink that survives every
+    /// [`SinkRegistry::replace`]. Idempotent by id. Reserved sinks are
+    /// resolvable via [`SinkRegistry::get`] and enumerated by
+    /// [`SinkRegistry::reserved_ids`], but are NOT part of the
+    /// config-managed set reported by [`SinkRegistry::ids`] /
+    /// [`SinkRegistry::len`] — so the admin `GET /v1/admin/sinks`
+    /// listing (built from file + db configs) never surfaces them.
+    pub fn insert_reserved(&self, sink: Arc<dyn AlertSink>) {
+        self.reserved.write().insert(sink.id().clone(), sink);
+    }
+
+    /// Look up by ID. Reserved sinks take precedence over config sinks
+    /// on the (in practice impossible) id collision. Returns `None` if
+    /// no sink is registered under that identifier — the dispatcher must
+    /// treat this as a `Permanent` failure (most likely a stale
+    /// `alert_sink_outbox` row that survived a sink deletion).
     pub fn get(&self, id: &SinkId) -> Option<Arc<dyn AlertSink>> {
+        if let Some(sink) = self.reserved.read().get(id).cloned() {
+            return Some(sink);
+        }
         self.inner.read().get(id).cloned()
     }
 
-    /// All currently registered IDs. Cheap snapshot; ordering is
-    /// unspecified.
+    /// All currently registered *config-managed* IDs. Cheap snapshot;
+    /// ordering is unspecified. Excludes reserved sinks (see
+    /// [`SinkRegistry::reserved_ids`]).
     pub fn ids(&self) -> Vec<SinkId> {
         self.inner.read().keys().cloned().collect()
     }
 
+    /// Snapshot of the reserved (subsystem-owned) sink IDs. The engine's
+    /// M7 sink router unions these into every rule's delivery set so the
+    /// always-on cloud audit sink receives regardless of a rule's
+    /// external-sink allow-list.
+    pub fn reserved_ids(&self) -> Vec<SinkId> {
+        self.reserved.read().keys().cloned().collect()
+    }
+
+    /// Count of config-managed sinks (excludes reserved).
     pub fn len(&self) -> usize {
         self.inner.read().len()
     }
 
+    /// `true` when no config-managed sinks are registered (ignores
+    /// reserved).
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
     }
@@ -502,5 +538,36 @@ mod tests {
         assert!(t.is_transient());
         let p = SinkError::Permanent("401".into());
         assert!(!p.is_transient());
+    }
+
+    #[test]
+    fn reserved_sink_survives_replace_and_is_excluded_from_config_ids() {
+        let reg = SinkRegistry::new();
+        let cloud: Arc<dyn AlertSink> = Arc::new(CountingSink::new("cloud", "console"));
+        reg.insert_reserved(cloud);
+        let cloud_id = SinkId::new("cloud", "console").unwrap();
+
+        // A config rebuild (replace) must NOT wipe the reserved sink,
+        // and neither must a second config edit.
+        reg.replace(vec![Arc::new(CountingSink::new("test", "a"))]);
+        reg.replace(vec![Arc::new(CountingSink::new("test", "b"))]);
+
+        // Resolvable via get() so the dispatcher can deliver to it.
+        assert!(reg.get(&cloud_id).is_some());
+        // Enumerated by reserved_ids() (the router unions these) ...
+        assert!(reg.reserved_ids().contains(&cloud_id));
+        // ... but NOT part of the config-managed set (ids()/len()), so the
+        // admin `GET /v1/admin/sinks` listing never surfaces it.
+        assert!(!reg.ids().contains(&cloud_id));
+        assert_eq!(reg.len(), 1); // only the config "test:b"
+        assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn insert_reserved_is_idempotent_by_id() {
+        let reg = SinkRegistry::new();
+        reg.insert_reserved(Arc::new(CountingSink::new("cloud", "console")));
+        reg.insert_reserved(Arc::new(CountingSink::new("cloud", "console")));
+        assert_eq!(reg.reserved_ids().len(), 1);
     }
 }

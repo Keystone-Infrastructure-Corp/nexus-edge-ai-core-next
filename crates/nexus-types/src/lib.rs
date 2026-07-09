@@ -429,6 +429,14 @@ pub struct AlertEvent {
     pub frame_id: FrameId,
     pub captured_at: DateTime<Utc>,
     pub trace_id: TraceId,
+    /// Analysis (supervisor) frame width in pixels at detection time. Lets
+    /// cloud consumers normalise the pixel `bbox` to 0..1. `#[serde(default)]`
+    /// so events persisted before this field existed deserialise to 0.
+    #[serde(default)]
+    pub frame_w: u32,
+    /// Analysis (supervisor) frame height in pixels at detection time.
+    #[serde(default)]
+    pub frame_h: u32,
     #[serde(default)]
     pub artifacts: Artifacts,
     #[serde(default)]

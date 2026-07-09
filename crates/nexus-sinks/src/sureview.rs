@@ -249,6 +249,8 @@ mod tests {
             trace_id: nexus_types::TraceId::default(),
             artifacts: Default::default(),
             context: serde_json::Map::new(),
+            frame_w: 0,
+            frame_h: 0,
         }
     }
 

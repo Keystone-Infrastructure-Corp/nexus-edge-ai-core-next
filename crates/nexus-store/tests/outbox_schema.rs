@@ -79,6 +79,8 @@ fn sample_alert(camera_id: i64, rule: &str) -> AlertEvent {
         trace_id: "trace-out".into(),
         artifacts: Artifacts::default(),
         context: serde_json::Map::new(),
+        frame_w: 0,
+        frame_h: 0,
     }
 }
 

@@ -78,6 +78,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         },
         enabled: true,
         sinks: Vec::new(),
+        verify: false,
     };
     let rules_cfg = RulesConfig {
         backend: RulesBackendKind::Cel,
