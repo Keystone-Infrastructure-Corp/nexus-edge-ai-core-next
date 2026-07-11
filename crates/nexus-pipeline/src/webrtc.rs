@@ -255,6 +255,11 @@ impl WebRtcSession {
         let webrtc_for_local = self.webrtc.clone();
         let events_ok = self.events.clone();
         let codec_label = self.codec.base();
+        // The RTP payload type the browser assigned to our codec lives in the
+        // negotiated answer; the payloader must stamp that exact number on the
+        // wire (see the `pay` reconfiguration below).
+        let encoding_name = if codec_label == "h265" { "H265" } else { "H264" };
+        let pay = self.pipeline.by_name("pay");
 
         // Second stage: once the answer exists, adopt it locally + emit it.
         let answer_promise = gst::Promise::with_change_func(move |reply| {
@@ -268,6 +273,19 @@ impl WebRtcSession {
                 ));
                 return;
             };
+            // Re-stamp the payloader with the negotiated payload type BEFORE
+            // adopting the answer. The browser is the offerer, so it picks the
+            // payload numbers (e.g. pt 96 → VP8, H264 at 102/104/…). Our
+            // payloader defaults to pt=96; if we leave it there, every RTP
+            // packet is tagged 96, the browser maps 96 → VP8, cannot decode the
+            // H264 bytes, and drops them all (ICE connects, 0 fps, blank HD).
+            // Adopting the answer's pt makes the wire match what the browser
+            // expects to decode.
+            if let (Some(pay), Some(pt)) =
+                (pay.as_ref(), negotiated_video_pt(&answer.sdp(), encoding_name))
+            {
+                pay.set_property("pt", pt);
+            }
             webrtc_for_local
                 .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
             match answer.sdp().as_text() {
@@ -421,6 +439,38 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     )
 }
 
+/// Scan a negotiated SDP for the video payload type the peer assigned to
+/// `encoding_name` (`"H264"` / `"H265"`). Returns the first matching
+/// `a=rtpmap:<pt> <ENC>/<clock>` payload number. Pure.
+fn negotiated_video_pt(sdp: &gst_sdp::SDPMessage, encoding_name: &str) -> Option<u32> {
+    for media in sdp.medias() {
+        if media.media() != Some("video") {
+            continue;
+        }
+        for attr in media.attributes() {
+            if attr.key() != "rtpmap" {
+                continue;
+            }
+            // Value looks like "102 H264/90000".
+            let Some(val) = attr.value() else { continue };
+            let mut parts = val.split_whitespace();
+            let (Some(pt), Some(enc)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let matches = enc
+                .split('/')
+                .next()
+                .is_some_and(|e| e.eq_ignore_ascii_case(encoding_name));
+            if matches {
+                if let Ok(pt) = pt.parse::<u32>() {
+                    return Some(pt);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Normalise a wire `stun:` URL into the `stun://host:port` form
 /// webrtcbin's `stun-server` property expects. Returns `None` for
 /// non-STUN URLs. Pure.
@@ -473,6 +523,19 @@ mod tests {
         assert!(d.contains("h265parse"), "{d}");
         assert!(d.contains("rtph265pay"), "{d}");
         assert!(d.contains("encoding-name=H265"), "{d}");
+    }
+
+    #[test]
+    fn negotiated_pt_picks_matching_encoding() {
+        let sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96 102 104\r\n\
+                   a=rtpmap:96 VP8/90000\r\n\
+                   a=rtpmap:102 H264/90000\r\n\
+                   a=rtpmap:104 H265/90000\r\n";
+        let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
+        assert_eq!(negotiated_video_pt(&msg, "H264"), Some(102));
+        assert_eq!(negotiated_video_pt(&msg, "H265"), Some(104));
+        assert_eq!(negotiated_video_pt(&msg, "VP9"), None);
     }
 
     #[test]
