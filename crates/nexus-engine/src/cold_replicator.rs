@@ -404,27 +404,16 @@ async fn tick(
         }
     }
 
-    // 3. Pull a batch of pending clips and process oldest-first.
-    let pending = match store.clips_pending_cold_upload(BATCH_SIZE).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!(error = %e, "cold replicator: clips_pending_cold_upload failed");
-            return;
-        }
-    };
-    if pending.is_empty() {
-        debug!("cold replicator: no pending clips this tick");
-        return;
-    }
-
-    // Phase 2 · Step 2.9 — enrollment-aware filter. If the box has
-    // been enrolled, gate which clips are eligible for cloud cold
-    // replication by the enrollment timestamp; clips that predate
-    // the enrollment window stay local-only unless the operator
-    // explicitly opted into history replay via
-    // `nexus-engine enroll --keep-history`.
+    // 3. Determine the enrollment eligibility floor BEFORE selecting
+    // the batch so pre-enrollment clips are excluded at selection
+    // time rather than filtered out after the LIMIT. Phase 2 · Step
+    // 2.9 — if the box has been enrolled, gate which clips are
+    // eligible for cloud cold replication by the enrollment
+    // timestamp; clips that predate the enrollment window stay
+    // local-only unless the operator explicitly opted into history
+    // replay via `nexus-engine enroll --keep-history`.
     //
-    // * No enrollment row → LAN/USB-only deployment, no filter
+    // * No enrollment row → LAN/USB-only deployment, no floor
     //   (today's behaviour).
     // * Enrollment row, `attach_replay_after = NULL` → floor is
     //   `enrolled_at`; pre-enrollment clips skipped silently.
@@ -433,6 +422,13 @@ async fn tick(
     //   enrolled_at) are uploaded AND stamped
     //   `attached_history: true` on the wire so the cloud renders
     //   an "imported" badge and suppresses notify-svc fan-out.
+    //
+    // Pushing the floor into the SQL predicate (rather than filtering
+    // the fetched batch in memory) is essential: the pending query is
+    // oldest-first with a LIMIT, so a large pre-enrollment backlog
+    // used to fill every batch and head-of-line-block all eligible
+    // post-enrollment clips — a freshly-enrolled core replicated
+    // nothing until the (skipped-not-drained) backlog was cleared.
     let enrollment = match store.get_cloud_enrollment().await {
         Ok(e) => e,
         Err(e) => {
@@ -447,12 +443,19 @@ async fn tick(
         }
         None => (None, None),
     };
-    let pending: Vec<ClipRow> = match floor {
-        Some(f) => pending.into_iter().filter(|c| c.started_at >= f).collect(),
-        None => pending,
+
+    // 4. Pull a batch of eligible pending clips and process
+    // oldest-first. The floor predicate is applied in SQL so the
+    // LIMIT window only ever contains upload-eligible clips.
+    let pending = match store.clips_pending_cold_upload(BATCH_SIZE, floor).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "cold replicator: clips_pending_cold_upload failed");
+            return;
+        }
     };
     if pending.is_empty() {
-        debug!("cold replicator: all pending clips predate enrollment floor; skipping batch");
+        debug!("cold replicator: no eligible pending clips this tick");
         return;
     }
 
@@ -987,7 +990,7 @@ mod tests {
         // mock-backend put + DB write.
         let mut got_cold = false;
         for _ in 0..80 {
-            let row = store.clips_pending_cold_upload(8).await.unwrap();
+            let row = store.clips_pending_cold_upload(8, None).await.unwrap();
             if !row.iter().any(|c| c.id == clip_id) {
                 got_cold = true;
                 break;
@@ -1039,7 +1042,7 @@ mod tests {
         // Poll until the clip leaves the pending set (quarantined).
         let mut quarantined = false;
         for _ in 0..80 {
-            let row = store.clips_pending_cold_upload(8).await.unwrap();
+            let row = store.clips_pending_cold_upload(8, None).await.unwrap();
             if !row.iter().any(|c| c.id == clip_id) {
                 quarantined = true;
                 break;
@@ -1191,7 +1194,7 @@ mod tests {
 
         assert_eq!(backend.put_count(), 0, "no put when cold disabled");
         // Row still pending.
-        let pending = store.clips_pending_cold_upload(8).await.unwrap();
+        let pending = store.clips_pending_cold_upload(8, None).await.unwrap();
         assert!(
             pending.iter().any(|c| c.id == clip_id),
             "pending clip stays pending when cold is disabled"
@@ -1313,7 +1316,7 @@ mod tests {
         // Wait for cold-stamp.
         let mut got_cold = false;
         for _ in 0..80 {
-            let row = store.clips_pending_cold_upload(8).await.unwrap();
+            let row = store.clips_pending_cold_upload(8, None).await.unwrap();
             if !row.iter().any(|c| c.id == clip_id) {
                 got_cold = true;
                 break;
@@ -1397,7 +1400,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
 
         // Clip is STILL pending (no cold pointer).
-        let pending = store.clips_pending_cold_upload(8).await.unwrap();
+        let pending = store.clips_pending_cold_upload(8, None).await.unwrap();
         assert!(
             pending.iter().any(|c| c.id == clip_id),
             "pre-enrollment clip should stay local-only without --keep-history"
@@ -1459,7 +1462,7 @@ mod tests {
 
         let mut got_cold = false;
         for _ in 0..80 {
-            let row = store.clips_pending_cold_upload(8).await.unwrap();
+            let row = store.clips_pending_cold_upload(8, None).await.unwrap();
             if !row.iter().any(|c| c.id == clip_id) {
                 got_cold = true;
                 break;
