@@ -102,7 +102,7 @@ async fn backoff_gate_excludes_then_readmits_pending_clip() {
     let id = insert_pending_clip(&store, 1, Utc::now() - Duration::minutes(5)).await;
 
     // Eligible by default, no attempts yet.
-    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
     assert!(pending.iter().any(|c| c.id == id));
     let row = pending.iter().find(|c| c.id == id).unwrap();
     assert_eq!(row.cold_attempts, 0);
@@ -114,7 +114,7 @@ async fn backoff_gate_excludes_then_readmits_pending_clip() {
         .record_cold_upload_failure(id, now, "boom", Some(now + Duration::hours(1)), false)
         .await
         .unwrap();
-    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
     assert!(
         !pending.iter().any(|c| c.id == id),
         "backoff-gated clip must be excluded from the pending set"
@@ -134,7 +134,7 @@ async fn backoff_gate_excludes_then_readmits_pending_clip() {
         .record_cold_upload_failure(id, now2, "boom2", Some(now2 - Duration::hours(1)), false)
         .await
         .unwrap();
-    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
     assert!(
         pending.iter().any(|c| c.id == id),
         "clip must be eligible again once its backoff window has elapsed"
@@ -165,7 +165,7 @@ async fn quarantine_removes_clip_from_pending_and_stats() {
         .await
         .unwrap();
 
-    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
     assert!(
         pending.is_empty(),
         "quarantined clip must be excluded from the pending set"
@@ -198,7 +198,7 @@ async fn record_failure_with_quarantine_flag_excludes_clip() {
         .await
         .unwrap();
 
-    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
     assert!(pending.is_empty(), "quarantined clip must be excluded");
 
     let row = store.get_clip(id).await.unwrap().unwrap();
@@ -208,4 +208,54 @@ async fn record_failure_with_quarantine_flag_excludes_clip() {
         row.cold_next_attempt_at.is_none(),
         "a quarantined clip has no scheduled next attempt"
     );
+}
+
+#[tokio::test]
+async fn enrollment_floor_excludes_pre_enrollment_clips_at_selection_time() {
+    // Phase 2 · Step 2.9 regression: a large pre-enrollment backlog
+    // must NOT head-of-line-block eligible post-enrollment clips. The
+    // floor is applied in SQL (before the LIMIT), so the oldest-first
+    // batch window is filled only with upload-eligible clips — never
+    // consumed entirely by skipped-but-not-drained old clips.
+    let (store, _dir) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    let enrolled_at = Utc::now() - Duration::minutes(30);
+
+    // 5 pre-enrollment clips (older than the floor) …
+    let mut pre_ids = Vec::new();
+    for i in 0..5 {
+        let started = enrolled_at - Duration::minutes(20 - i);
+        pre_ids.push(insert_pending_clip(&store, 1, started).await);
+    }
+    // … and 2 post-enrollment clips (newer than the floor).
+    let post_a = insert_pending_clip(&store, 1, enrolled_at + Duration::minutes(1)).await;
+    let post_b = insert_pending_clip(&store, 1, enrolled_at + Duration::minutes(2)).await;
+
+    // With NO floor every clip is eligible (LAN/USB-only behaviour).
+    let all = store.clips_pending_cold_upload(10, None).await.unwrap();
+    assert_eq!(all.len(), 7, "no floor → all pending clips eligible");
+
+    // With the enrollment floor, only the post-enrollment clips are
+    // selected — even with a LIMIT smaller than the pre-enrollment
+    // backlog, the pre-enrollment clips can never crowd them out.
+    let eligible = store
+        .clips_pending_cold_upload(3, Some(enrolled_at))
+        .await
+        .unwrap();
+    let eligible_ids: Vec<i64> = eligible.iter().map(|c| c.id).collect();
+    assert_eq!(
+        eligible_ids,
+        vec![post_a, post_b],
+        "floor must select only post-enrollment clips, oldest-first"
+    );
+    for id in &pre_ids {
+        assert!(
+            !eligible_ids.contains(id),
+            "pre-enrollment clip {id} must be excluded at selection time"
+        );
+    }
 }

@@ -111,7 +111,7 @@ async fn pending_orders_by_priority_then_ended_at() {
     let id_new = insert_pending_clip(&store, 1, t1).await;
 
     // Default priority = 0 → oldest-first.
-    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
     assert_eq!(pending.len(), 2);
     assert_eq!(pending[0].id, id_old);
     assert_eq!(pending[1].id, id_new);
@@ -122,7 +122,7 @@ async fn pending_orders_by_priority_then_ended_at() {
     assert!(bumped, "first bump must report a change");
 
     // Now the newer clip leads despite older ended_at on the other.
-    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
     assert_eq!(pending[0].id, id_new);
     assert_eq!(pending[0].priority, 1);
     assert_eq!(pending[1].id, id_old);
@@ -170,7 +170,7 @@ async fn bump_latest_pending_clip_for_camera_picks_newest_and_is_idempotent() {
         .unwrap();
     assert_eq!(bumped, Some(id_new));
 
-    let pending = store.clips_pending_cold_upload(10).await.unwrap();
+    let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
     assert_eq!(pending[0].id, id_new);
     assert_eq!(pending[0].priority, 2);
     assert_eq!(pending[1].id, id_old);

@@ -874,8 +874,27 @@ impl Store {
     /// ceiling or the size ceiling is `cold_quarantined` (skipped
     /// forever). Both keep one pathological clip from head-of-line-
     /// blocking the rest of the queue.
-    pub async fn clips_pending_cold_upload(&self, limit: i64) -> Result<Vec<ClipRow>, StoreError> {
+    ///
+    /// `floor` is the Phase 2 · Step 2.9 enrollment eligibility floor
+    /// (`attach_replay_after` ?? `enrolled_at`): when `Some`, clips
+    /// whose `started_at` predates it are excluded here at *selection*
+    /// time, not filtered out after the `LIMIT`. Filtering post-`LIMIT`
+    /// let a large pre-enrollment backlog permanently occupy the
+    /// oldest-first batch window and head-of-line-block every eligible
+    /// post-enrollment clip — so a freshly-enrolled core replicated
+    /// nothing. Pushing the predicate into SQL keeps pre-enrollment
+    /// clips local-only (intended) while letting eligible clips flow.
+    /// `None` (LAN/USB-only, pre-enrollment) applies no floor.
+    pub async fn clips_pending_cold_upload(
+        &self,
+        limit: i64,
+        floor: Option<chrono::DateTime<Utc>>,
+    ) -> Result<Vec<ClipRow>, StoreError> {
         let now = Utc::now().to_rfc3339();
+        // A NULL bind disables the floor predicate; otherwise compare
+        // against the RFC3339 rendering that matches how `started_at`
+        // is stored, so string ordering equals chronological ordering.
+        let floor_str = floor.map(|f| f.to_rfc3339());
         let rows = sqlx::query(&format!(
             "{CLIP_SELECT_COLUMNS_BASE}
               WHERE cold_handle IS NULL
@@ -885,10 +904,13 @@ impl Store {
                 AND hot_path IS NOT NULL
                 AND cold_quarantined = 0
                 AND (cold_next_attempt_at IS NULL OR cold_next_attempt_at <= ?)
+                AND (? IS NULL OR started_at >= ?)
               ORDER BY priority DESC, ended_at ASC
               LIMIT ?"
         ))
         .bind(now)
+        .bind(&floor_str)
+        .bind(&floor_str)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
