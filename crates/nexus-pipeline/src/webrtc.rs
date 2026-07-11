@@ -403,12 +403,20 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     // `config-interval=-1` on parse + pay repeats SPS/PPS with every IDR so
     // a mid-stream browser join can start decoding; `mtu=1200` keeps RTP
     // packets inside a conservative WebRTC MTU.
+    //
+    // Do NOT pin a `payload` on the RTP caps: the browser's offer assigns the
+    // payload types (e.g. pt 96 → VP8, H264 at 102/104/…). If we hardcode
+    // `payload=96`, webrtcbin looks for our H264/H265 at pt 96 — which the
+    // browser mapped to VP8 — and reports "did not find compatible transceiver
+    // for offer caps", so the answer carries no decodable video (blank HD).
+    // Leaving the payload unset lets webrtcbin adopt the browser's H264/H265
+    // payload type during answer negotiation.
     format!(
         "appsrc name=src is-live=true do-timestamp=true format=time \
              block=true max-bytes=8388608 stream-type=stream \
            ! {base}parse config-interval=-1 \
            ! rtp{base}pay name=pay pt=96 config-interval=-1 mtu=1200 \
-           ! application/x-rtp,media=video,encoding-name={encoding},payload=96,clock-rate=90000 \
+           ! application/x-rtp,media=video,encoding-name={encoding},clock-rate=90000 \
            ! webrtcbin name=webrtc latency=0 bundle-policy=max-bundle"
     )
 }
