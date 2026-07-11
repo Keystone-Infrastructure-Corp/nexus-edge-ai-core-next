@@ -258,7 +258,11 @@ impl WebRtcSession {
         // The RTP payload type the browser assigned to our codec lives in the
         // negotiated answer; the payloader must stamp that exact number on the
         // wire (see the `pay` reconfiguration below).
-        let encoding_name = if codec_label == "h265" { "H265" } else { "H264" };
+        let encoding_name = if codec_label == "h265" {
+            "H265"
+        } else {
+            "H264"
+        };
         let pay = self.pipeline.by_name("pay");
 
         // Second stage: once the answer exists, adopt it locally + emit it.
@@ -281,9 +285,10 @@ impl WebRtcSession {
             // H264 bytes, and drops them all (ICE connects, 0 fps, blank HD).
             // Adopting the answer's pt makes the wire match what the browser
             // expects to decode.
-            if let (Some(pay), Some(pt)) =
-                (pay.as_ref(), negotiated_video_pt(&answer.sdp(), encoding_name))
-            {
+            if let (Some(pay), Some(pt)) = (
+                pay.as_ref(),
+                negotiated_video_pt(&answer.sdp(), encoding_name),
+            ) {
                 pay.set_property("pt", pt);
             }
             webrtc_for_local
