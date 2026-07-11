@@ -287,7 +287,7 @@ impl WebRtcSession {
             // expects to decode.
             if let (Some(pay), Some(pt)) = (
                 pay.as_ref(),
-                negotiated_video_pt(&answer.sdp(), encoding_name),
+                negotiated_video_pt(answer.sdp(), encoding_name),
             ) {
                 pay.set_property("pt", pt);
             }
@@ -447,7 +447,7 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
 /// Scan a negotiated SDP for the video payload type the peer assigned to
 /// `encoding_name` (`"H264"` / `"H265"`). Returns the first matching
 /// `a=rtpmap:<pt> <ENC>/<clock>` payload number. Pure.
-fn negotiated_video_pt(sdp: &gst_sdp::SDPMessage, encoding_name: &str) -> Option<u32> {
+fn negotiated_video_pt(sdp: &gst_sdp::SDPMessageRef, encoding_name: &str) -> Option<u32> {
     for media in sdp.medias() {
         if media.media() != Some("video") {
             continue;
