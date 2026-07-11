@@ -297,12 +297,21 @@ impl WebRtcSession {
                 .emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
         });
 
-        self.webrtc
-            .emit_by_name::<()>("set-remote-description", &[&offer, &remote_promise]);
-
+        // Bring the pipeline up BEFORE applying the offer. `webrtcbin` only
+        // opens its internal peer-connection once it has reached at least the
+        // READY state; emitting `set-remote-description` / `create-answer`
+        // while the bin is still in NULL makes webrtcbin abort both async
+        // tasks with "Peerconnection is closed, aborting execution", so the
+        // create-answer promise resolves empty ("no answer in reply") and the
+        // browser hangs on "Negotiating HD". Starting the pipeline first keeps
+        // the SDP exchange on an open peer-connection.
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
+
+        self.webrtc
+            .emit_by_name::<()>("set-remote-description", &[&offer, &remote_promise]);
+
         Ok(())
     }
 
