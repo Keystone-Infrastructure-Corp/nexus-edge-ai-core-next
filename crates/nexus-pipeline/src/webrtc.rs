@@ -277,15 +277,42 @@ impl WebRtcSession {
         let webrtc_for_local = self.webrtc.clone();
         let events_ok = self.events.clone();
         let codec_label = self.codec.base();
-        // The RTP payload type the browser assigned to our codec lives in the
-        // negotiated answer; the payloader must stamp that exact number on the
-        // wire (see the `pay` reconfiguration below).
         let encoding_name = if codec_label == "h265" {
             "H265"
         } else {
             "H264"
         };
-        let pay = self.pipeline.by_name("pay");
+
+        // Configure the send transceiver from the browser's OFFER *before*
+        // create-answer. The browser is the offerer, so it assigns the payload
+        // numbers (e.g. pt 96 → VP8, H264 at 102/104/109/…). Our payloader
+        // defaults to pt=96, which the browser maps to VP8; if we leave it,
+        // webrtcbin cannot reconcile "send H264" against "pt96=VP8", drops our
+        // send stream, and answers `a=inactive` with VP8/96 — no decodable
+        // video, and DTLS never completes (ICE connects, dtlsState stuck at
+        // connecting, blank HD). Selecting the offer's H264 pt, pinning it on
+        // the payloader, forcing the transceiver to sendonly, and setting
+        // codec-preferences to that exact H264 pt makes webrtcbin answer
+        // `a=sendonly` with H264 on a pt the browser can decode.
+        if let Some(pt) = negotiated_video_pt(offer.sdp(), encoding_name) {
+            if let Some(pay) = self.pipeline.by_name("pay") {
+                pay.set_property("pt", pt);
+            }
+            let transceiver = self
+                .webrtc
+                .emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>("get-transceiver", &[&0i32]);
+            transceiver.set_property(
+                "direction",
+                gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
+            );
+            let pref = gst::Caps::builder("application/x-rtp")
+                .field("media", "video")
+                .field("encoding-name", encoding_name)
+                .field("clock-rate", 90000i32)
+                .field("payload", pt as i32)
+                .build();
+            transceiver.set_property("codec-preferences", &pref);
+        }
 
         // Second stage: once the answer exists, adopt it locally + emit it.
         let answer_promise = gst::Promise::with_change_func(move |reply| {
@@ -299,20 +326,6 @@ impl WebRtcSession {
                 ));
                 return;
             };
-            // Re-stamp the payloader with the negotiated payload type BEFORE
-            // adopting the answer. The browser is the offerer, so it picks the
-            // payload numbers (e.g. pt 96 → VP8, H264 at 102/104/…). Our
-            // payloader defaults to pt=96; if we leave it there, every RTP
-            // packet is tagged 96, the browser maps 96 → VP8, cannot decode the
-            // H264 bytes, and drops them all (ICE connects, 0 fps, blank HD).
-            // Adopting the answer's pt makes the wire match what the browser
-            // expects to decode.
-            if let (Some(pay), Some(pt)) = (
-                pay.as_ref(),
-                negotiated_video_pt(answer.sdp(), encoding_name),
-            ) {
-                pay.set_property("pt", pt);
-            }
             webrtc_for_local
                 .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
             match answer.sdp().as_text() {
