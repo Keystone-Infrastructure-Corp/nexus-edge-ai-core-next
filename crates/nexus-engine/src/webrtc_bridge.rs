@@ -48,6 +48,9 @@ struct Inner {
 
 #[cfg(feature = "gstreamer-webrtc")]
 struct ActiveSession {
+    /// The camera this session streams — used to evict a stale session when
+    /// the operator re-opens HD for the same camera under a fresh session id.
+    camera_id: CameraId,
     /// Dropping this tears the webrtcbin pipeline down.
     _session: nexus_pipeline::WebRtcSession,
     /// The task draining `WebRtcEvent`s → outbox envelopes.
@@ -133,9 +136,23 @@ impl WebRtcBridge {
         };
 
         let mut inner = self.inner.lock();
-        // Idempotent re-offer: tear any prior session for this id first.
-        if let Some(prev) = inner.sessions.remove(&payload.session_id) {
-            prev.pump.abort();
+        // Evict any prior session for this id (idempotent re-offer) OR for this
+        // camera. HD is solo — one session per camera — but the browser mints a
+        // fresh session id every time it re-expands, so a close-then-reopen
+        // arrives under a NEW id. Without evicting by camera, the stale session
+        // (pipeline + feed) would leak until the tunnel drops. Collect first to
+        // avoid holding a borrow across the retain.
+        let stale: Vec<String> = inner
+            .sessions
+            .iter()
+            .filter(|(id, active)| id.as_str() == payload.session_id || active.camera_id == cam_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Some(prev) = inner.sessions.remove(&id) {
+                prev.pump.abort();
+                // `prev._session` drops here → prior pipeline to NULL.
+            }
         }
         let Some(ingester) = inner.ingesters.get(&cam_id).cloned() else {
             warn!(
@@ -200,6 +217,7 @@ impl WebRtcBridge {
         inner.sessions.insert(
             payload.session_id.clone(),
             ActiveSession {
+                camera_id: cam_id,
                 _session: session,
                 pump,
             },
