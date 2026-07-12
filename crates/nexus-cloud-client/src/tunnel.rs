@@ -27,10 +27,11 @@
 //!   in this crate; testing uses a locally-trusted CA instead.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt as _, StreamExt as _};
-use nexus_cloud_protocol::v1::Envelope;
+use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody};
 use tokio::sync::mpsc;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -50,6 +51,68 @@ pub trait TunnelHandle: Send + Sync {
     /// has been queued for the WSS writer task; not when the cloud has
     /// acknowledged it.
     async fn send(&self, envelope: Envelope) -> Result<(), TunnelError>;
+}
+
+/// Uplink priority tier for an outbound envelope. See
+/// [`docs/edge-core/M_PERF_CROWD.md` Phase H][ph] — a single WSS writer
+/// drains three separate channels in strict priority order so a
+/// `entity_sighting` flood can never delay heartbeats (which would
+/// surface as bogus `cores.last_skew_ms`) or `rpc_response` frames
+/// (which would surface as "core offline / can't get settings").
+///
+/// [ph]: https://github.com/Keystone-Infrastructure-Corp/nexus-cloud-console/blob/main/docs/edge-core/M_PERF_CROWD.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    /// Heartbeats, rpc responses, update progress, webrtc signaling,
+    /// session/roster control. Never dropped; jumps the bulk queue.
+    Control,
+    /// Security events (`alert`) and clip replication receipts. Never
+    /// dropped (the edge outbox reconciles on disconnect), but ranked
+    /// below control so an alert storm cannot delay heartbeats.
+    Alert,
+    /// Best-effort telemetry: appearance sightings + live-view frames.
+    /// Dropped on a full channel rather than blocking the writer.
+    Bulk,
+}
+
+/// Classify an envelope into its uplink [`Tier`]. Only the known
+/// high-volume kinds are `Bulk`; alerts + clip receipts are `Alert`;
+/// **everything else defaults to `Control`** so a new low-volume kind
+/// is never accidentally droppable.
+pub(crate) fn tier_of(body: &EnvelopeBody) -> Tier {
+    match body {
+        EnvelopeBody::EntitySighting(_)
+        | EnvelopeBody::EntitySightingBatch(_)
+        | EnvelopeBody::LbrFrame(_) => Tier::Bulk,
+        EnvelopeBody::Alert(_) | EnvelopeBody::ClipReplicated(_) => Tier::Alert,
+        _ => Tier::Control,
+    }
+}
+
+/// Milliseconds since the Unix epoch from the system clock. Used to
+/// re-stamp a heartbeat's `edge_ts_unix_ms` at flush time (see
+/// [`stamp_at_flush`]).
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Re-stamp an envelope's edge-side timestamps immediately before it is
+/// written to the socket. For heartbeats this overwrites
+/// `edge_ts_unix_ms` (and `meta.ts`) with the true flush instant so the
+/// gateway's clock-skew EMA measures transport latency, not the time
+/// the envelope spent queued behind bulk frames. Non-heartbeat kinds
+/// are left untouched.
+fn stamp_at_flush(env: &mut Envelope) {
+    if let EnvelopeBody::Heartbeat(ref mut hb) = env.body {
+        let now = now_unix_ms();
+        hb.edge_ts_unix_ms = Some(now);
+        env.meta.ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now as i64)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+    }
 }
 
 /// Errors the tunnel client can surface.
@@ -98,6 +161,15 @@ pub struct TunnelClient {
 /// reader logs and drops any frame that can't be queued so the WSS
 /// pump never stalls on slow handlers.
 pub struct Connection {
+    /// Tier 1 (control): heartbeats, rpc responses, signaling. Never
+    /// dropped; drained before alerts and bulk. Cap 64.
+    ctl_tx: mpsc::Sender<Envelope>,
+    /// Tier 2 (alerts): security events + clip receipts. Never dropped;
+    /// drained after control, before bulk. Cap 64.
+    alert_tx: mpsc::Sender<Envelope>,
+    /// Tier 3 (bulk): appearance sightings + live-view frames. Dropped
+    /// on a full channel (`try_send`) so best-effort telemetry can
+    /// never head-of-line-block the control/alert tiers. Cap 32.
     out_tx: mpsc::Sender<Envelope>,
     in_rx: Option<mpsc::Receiver<Envelope>>,
     _close_tx: tokio::sync::oneshot::Sender<()>,
@@ -152,6 +224,12 @@ impl TunnelClient {
         info!(url = %self.gateway_url, "cloud tunnel connected");
 
         let (mut writer, mut reader) = ws_stream.split();
+        // Phase H — uplink priority channels. Three bounded queues drained
+        // by one writer in strict priority order (control → alert → bulk)
+        // so an `entity_sighting` flood cannot delay heartbeats or rpc
+        // responses. See docs/edge-core/M_PERF_CROWD.md.
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<Envelope>(64);
+        let (alert_tx, mut alert_rx) = mpsc::channel::<Envelope>(64);
         let (out_tx, mut out_rx) = mpsc::channel::<Envelope>(32);
         let (in_tx, in_rx) = mpsc::channel::<Envelope>(32);
         let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
@@ -165,18 +243,39 @@ impl TunnelClient {
                         let _ = writer.send(Message::Close(None)).await;
                         break;
                     }
-                    maybe = out_rx.recv() => {
+                    // Tier 1: control. Highest write priority. Heartbeats are
+                    // re-stamped with the true flush instant here so the
+                    // gateway's skew EMA measures transport latency, not queue
+                    // dwell time.
+                    maybe = ctl_rx.recv() => {
+                        let Some(mut env) = maybe else { break };
+                        stamp_at_flush(&mut env);
+                        match serde_json::to_string(&env) {
+                            Ok(text) => {
+                                if let Err(e) = writer.send(Message::Text(text)).await {
+                                    warn!(error = %e, "tunnel control write failed; closing");
+                                    break;
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "tunnel control envelope serialise failed; dropping"),
+                        }
+                    }
+                    // Tier 2: alerts. Drained after control, before bulk.
+                    maybe = alert_rx.recv() => {
                         let Some(env) = maybe else { break };
                         match serde_json::to_string(&env) {
                             Ok(text) => {
                                 if let Err(e) = writer.send(Message::Text(text)).await {
-                                    warn!(error = %e, "tunnel write failed; closing");
+                                    warn!(error = %e, "tunnel alert write failed; closing");
                                     break;
                                 }
                             }
-                            Err(e) => warn!(error = %e, "tunnel envelope serialise failed; dropping"),
+                            Err(e) => warn!(error = %e, "tunnel alert envelope serialise failed; dropping"),
                         }
                     }
+                    // Inbound frames (acks, pings, rpc calls) rank above bulk
+                    // so the cloud's control traffic is never starved by an
+                    // outbound sighting flood.
                     incoming = reader.next() => {
                         match incoming {
                             Some(Ok(Message::Text(text))) => {
@@ -220,12 +319,30 @@ impl TunnelClient {
                             }
                         }
                     }
+                    // Tier 3: bulk. Lowest write priority; only serviced when
+                    // no control frame, alert frame, or inbound frame is
+                    // ready. A large sighting batch here blocks the writer for
+                    // at most one frame's flush, never the whole backlog.
+                    maybe = out_rx.recv() => {
+                        let Some(env) = maybe else { break };
+                        match serde_json::to_string(&env) {
+                            Ok(text) => {
+                                if let Err(e) = writer.send(Message::Text(text)).await {
+                                    warn!(error = %e, "tunnel bulk write failed; closing");
+                                    break;
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "tunnel bulk envelope serialise failed; dropping"),
+                        }
+                    }
                 }
             }
             debug!("tunnel pump exiting");
         });
 
         Ok(Connection {
+            ctl_tx,
+            alert_tx,
             out_tx,
             in_rx: Some(in_rx),
             _close_tx: close_tx,
@@ -248,10 +365,30 @@ impl Connection {
 #[async_trait]
 impl TunnelHandle for Connection {
     async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
-        self.out_tx
-            .send(envelope)
-            .await
-            .map_err(|_| TunnelError::SendChannelClosed)
+        // Route by tier. Control and alert frames are never dropped: they
+        // await queue capacity (each queue is 64 deep). Bulk frames are
+        // best-effort — a full bulk queue drops the frame rather than
+        // blocking the caller (and, transitively, the writer).
+        match tier_of(&envelope.body) {
+            Tier::Control => self
+                .ctl_tx
+                .send(envelope)
+                .await
+                .map_err(|_| TunnelError::SendChannelClosed),
+            Tier::Alert => self
+                .alert_tx
+                .send(envelope)
+                .await
+                .map_err(|_| TunnelError::SendChannelClosed),
+            Tier::Bulk => match self.out_tx.try_send(envelope) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!("tunnel bulk queue full; dropping best-effort envelope");
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(TunnelError::SendChannelClosed),
+            },
+        }
     }
 }
 
