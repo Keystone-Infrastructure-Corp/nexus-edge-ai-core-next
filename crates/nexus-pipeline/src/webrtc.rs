@@ -283,35 +283,22 @@ impl WebRtcSession {
             "H264"
         };
 
-        // Configure the send transceiver from the browser's OFFER *before*
-        // create-answer. The browser is the offerer, so it assigns the payload
-        // numbers (e.g. pt 96 → VP8, H264 at 102/104/109/…). Our payloader
-        // defaults to pt=96, which the browser maps to VP8; if we leave it,
-        // webrtcbin cannot reconcile "send H264" against "pt96=VP8", drops our
-        // send stream, and answers `a=inactive` with VP8/96 — no decodable
-        // video, and DTLS never completes (ICE connects, dtlsState stuck at
-        // connecting, blank HD). Selecting the offer's H264 pt, pinning it on
-        // the payloader, forcing the transceiver to sendonly, and setting
-        // codec-preferences to that exact H264 pt makes webrtcbin answer
-        // `a=sendonly` with H264 on a pt the browser can decode.
-        if let Some(pt) = negotiated_video_pt(offer.sdp(), encoding_name) {
+        // Pick the H264/H265 payload type the browser assigned in its OFFER.
+        // The browser is the offerer, so it owns the payload numbers (e.g.
+        // pt 96 → VP8, H264 at 103/109/119/…). Our payloader defaults to
+        // pt=96, which the browser maps to VP8; if we leave it, webrtcbin
+        // cannot reconcile "send H264" against "pt96=VP8", drops our send
+        // stream, and answers `a=inactive` with VP8/96 — no decodable video,
+        // DTLS never completes (ICE connects, dtlsState stuck at connecting,
+        // blank HD). Pin the payloader to the offer's H264 pt now; the
+        // transceiver direction + codec-preferences are configured *after*
+        // set-remote-description (below), because transceiver 0 does not exist
+        // until the offer has been applied and the pipeline is running.
+        let video_pt = negotiated_video_pt(offer.sdp(), encoding_name);
+        if let Some(pt) = video_pt {
             if let Some(pay) = self.pipeline.by_name("pay") {
                 pay.set_property("pt", pt);
             }
-            let transceiver = self
-                .webrtc
-                .emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>("get-transceiver", &[&0i32]);
-            transceiver.set_property(
-                "direction",
-                gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
-            );
-            let pref = gst::Caps::builder("application/x-rtp")
-                .field("media", "video")
-                .field("encoding-name", encoding_name)
-                .field("clock-rate", 90000i32)
-                .field("payload", pt as i32)
-                .build();
-            transceiver.set_property("codec-preferences", &pref);
         }
 
         // Second stage: once the answer exists, adopt it locally + emit it.
@@ -341,7 +328,14 @@ impl WebRtcSession {
             }
         });
 
-        // First stage: set the remote (offer); on success create the answer.
+        // First stage: set the remote (offer); on success configure the send
+        // transceiver, then create the answer. The transceiver MUST be
+        // configured here — after set-remote-description has created and
+        // reconciled transceiver 0 against the offer's m-line — and before
+        // create-answer reads its direction + codec-preferences. Forcing the
+        // transceiver to sendonly and pinning codec-preferences to the offer's
+        // H264 pt makes webrtcbin answer `a=sendonly` with H264 on a pt the
+        // browser can decode, instead of the `a=inactive` / VP8-96 fallback.
         let webrtc_for_answer = self.webrtc.clone();
         let events_err = self.events.clone();
         let remote_promise = gst::Promise::with_change_func(move |reply| {
@@ -350,6 +344,21 @@ impl WebRtcSession {
                     "set-remote-description: {e:?}"
                 )));
                 return;
+            }
+            if let Some(pt) = video_pt {
+                let transceiver = webrtc_for_answer
+                    .emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>("get-transceiver", &[&0i32]);
+                transceiver.set_property(
+                    "direction",
+                    gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
+                );
+                let pref = gst::Caps::builder("application/x-rtp")
+                    .field("media", "video")
+                    .field("encoding-name", encoding_name)
+                    .field("clock-rate", 90000i32)
+                    .field("payload", pt as i32)
+                    .build();
+                transceiver.set_property("codec-preferences", &pref);
             }
             webrtc_for_answer
                 .emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
