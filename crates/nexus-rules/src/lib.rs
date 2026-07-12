@@ -199,7 +199,13 @@ struct TrackState {
 pub struct RuleEvaluator {
     engine: Arc<dyn RuleEngine>,
     rules: ArcSwap<Vec<Arc<CompiledRule>>>,
-    /// (rule_id, camera_id, track_id) -> per-track state.
+    /// (rule_id, camera_id, _) -> per-(rule, camera) debounce +
+    /// cooldown state. The third tuple element is a fixed `0`: the
+    /// debounce ladder (`consecutive_frames`) and the `cooldown_ms`
+    /// suppression window are scoped per rule-per-camera, NOT per
+    /// track — keying on `track_id` let the tracker's ID churn
+    /// (a new id for the same real object after an occlusion /
+    /// re-entry) bypass the cooldown and flood alerts.
     track_state: Mutex<HashMap<(String, CameraId, u64), TrackState>>,
 }
 
@@ -363,7 +369,11 @@ impl RuleEvaluator {
                     }
                 };
 
-                let key = (cfg.id.clone(), camera_id, o.track_id);
+                // Cooldown + debounce are scoped per (rule, camera),
+                // not per track: the fixed `0` collapses every track on
+                // this camera onto one debounce entry so tracker ID
+                // churn can't bypass `cooldown_ms`.
+                let key = (cfg.id.clone(), camera_id, 0u64);
                 let entry = state.entry(key.clone()).or_default();
 
                 if !matched {
