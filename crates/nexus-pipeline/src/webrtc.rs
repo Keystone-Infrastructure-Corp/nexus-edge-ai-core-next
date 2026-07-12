@@ -46,10 +46,10 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 
 use nexus_types::{CameraId, CodecKind};
-use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -136,11 +136,6 @@ pub struct WebRtcSession {
     /// Kept alive for the session's lifetime; the feed task holds a clone.
     _appsrc: AppSrc,
     events: mpsc::UnboundedSender<WebRtcEvent>,
-    /// Released by [`WebRtcSession::accept_offer`] once the pipeline reaches
-    /// `Playing`. The feed task waits on it before pushing any buffer: pushing
-    /// into the appsrc while the pipeline is still `Ready` would be dropped or
-    /// stall, and the RTP timeline never starts (connects, but blank video).
-    play_gate: Arc<Notify>,
     feed: JoinHandle<()>,
 }
 
@@ -240,17 +235,14 @@ impl WebRtcSession {
             None
         });
 
-        // Pump compressed NALs into appsrc, splicing in at the next IDR. The
-        // feed waits on `play_gate` until `accept_offer` sets the pipeline
-        // Playing, so buffers are only pushed against a running clock.
-        let play_gate = Arc::new(Notify::new());
-        let feed = tokio::spawn(feed_loop(
-            appsrc.clone(),
-            seed,
-            nal_rx,
-            play_gate.clone(),
-            camera_id,
-        ));
+        // Pump compressed NALs into appsrc immediately. `do-timestamp=false`
+        // means each buffer carries an explicit PTS, so pushing before the
+        // pipeline is Playing is valid: `block=true` appsrc pre-queues the
+        // seed GOP and blocks once full. When `accept_offer` sets Playing the
+        // queued buffers flush through h264parse→rtppay→webrtcbin, negotiating
+        // the send-pad caps BEFORE create-answer runs — without this pre-queue
+        // webrtcbin has no send media at answer time and replies `a=inactive`.
+        let feed = tokio::spawn(feed_loop(appsrc.clone(), seed, nal_rx, camera_id));
 
         Ok(Self {
             session_id,
@@ -260,7 +252,6 @@ impl WebRtcSession {
             webrtc,
             _appsrc: appsrc,
             events,
-            play_gate,
             feed,
         })
     }
@@ -376,9 +367,23 @@ impl WebRtcSession {
             .set_state(gst::State::Playing)
             .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
 
-        // The pipeline now has a running clock, so let the feed task push the
-        // seed GOP + live NALs; the feed assigns each buffer an explicit PTS.
-        self.play_gate.notify_one();
+        // Wait for the payloader to negotiate its RTP output caps before we
+        // create the answer. `rtph264pay`/`rtph265pay` only produce
+        // `application/x-rtp` caps once real H264/H265 has flowed through
+        // h264parse — which happens when the pre-queued seed GOP flushes now
+        // that the pipeline is Playing. If we ran set-remote-description /
+        // create-answer before that, webrtcbin's send pad would have no
+        // negotiated caps, so it answers `a=inactive` with the offer's first
+        // codec (VP8/96) and no video is decodable. Bounded poll so a stalled
+        // camera can never hang negotiation.
+        if let Some(pay) = self.pipeline.by_name("pay") {
+            if let Some(src_pad) = pay.static_pad("src") {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while src_pad.current_caps().is_none() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
 
         self.webrtc
             .emit_by_name::<()>("set-remote-description", &[&offer, &remote_promise]);
@@ -427,13 +432,8 @@ async fn feed_loop(
     appsrc: AppSrc,
     seed: Vec<NalSample>,
     mut rx: broadcast::Receiver<NalSample>,
-    play_gate: Arc<Notify>,
     camera_id: CameraId,
 ) {
-    // Wait until the pipeline is Playing before pushing anything: buffers
-    // pushed while the pipeline is still Ready are dropped and the RTP
-    // timeline never starts (connects, but blank video).
-    play_gate.notified().await;
     let mut started = false;
     // Highest source PTS already delivered via the seed; live samples at or
     // below it are duplicates from the subscribe→snapshot overlap and skipped.
