@@ -268,38 +268,15 @@ impl WebRtcSession {
         let webrtc_for_local = self.webrtc.clone();
         let events_ok = self.events.clone();
         let codec_label = self.codec.base();
+        // The RTP payload type the browser assigned to our codec lives in the
+        // negotiated answer; the payloader must stamp that exact number on the
+        // wire (see the `pay` reconfiguration below).
         let encoding_name = if codec_label == "h265" {
             "H265"
         } else {
             "H264"
         };
-
-        // Pick the H264/H265 codec line the browser assigned in its OFFER.
-        // The browser is the offerer, so it owns the payload numbers AND the
-        // profile-level-id it is willing to receive. Our camera streams H264
-        // *Main* profile, but Chrome only offers baseline / constrained-
-        // baseline H264 payload types (e.g. pt 103 baseline, pt 109
-        // constrained-baseline). webrtcbin's answer codec matcher compares
-        // profile-level-id, so a Main-profile send caps never matches a
-        // baseline offer line — webrtcbin logs "did not find compatible
-        // transceiver for offer caps", mints a fresh recvonly transceiver, and
-        // answers `a=inactive` with the offer's first codec (VP8/96). No video.
-        //
-        // Fix: build the send transceiver's codec-preferences from the OFFER's
-        // own H264 media line — copy its payload type, packetization-mode, and
-        // profile-level-id verbatim — so the SDP-level comparison agrees. The
-        // RTP bitstream we actually send is still Main profile, but browsers
-        // decode a Main stream fine on a baseline-negotiated m-line (Main is a
-        // decode-superset of baseline). We pin the payloader `pt` up front;
-        // the direction + codec-preferences are applied *after*
-        // set-remote-description (transceiver 0 does not exist until then).
-        let video_pref = offer_video_codec_prefs(offer.sdp(), encoding_name);
-        let video_pt = video_pref.as_ref().map(|(pt, _)| *pt);
-        if let Some(pt) = video_pt {
-            if let Some(pay) = self.pipeline.by_name("pay") {
-                pay.set_property("pt", pt);
-            }
-        }
+        let pay = self.pipeline.by_name("pay");
 
         // Second stage: once the answer exists, adopt it locally + emit it.
         let answer_promise = gst::Promise::with_change_func(move |reply| {
@@ -313,6 +290,30 @@ impl WebRtcSession {
                 ));
                 return;
             };
+            // Re-stamp the payloader with the negotiated payload type BEFORE
+            // adopting the answer. The browser is the offerer, so it picks the
+            // payload numbers (e.g. pt 96 → VP8, H264 at 102/104/…). Our
+            // payloader defaults to pt=96; if we leave it there, every RTP
+            // packet is tagged 96, the browser maps 96 → VP8, cannot decode the
+            // H264 bytes, and drops them all (ICE connects, 0 fps, blank HD).
+            // Adopting the answer's pt makes the wire match what the browser
+            // expects to decode.
+            //
+            // We deliberately do NOT set explicit codec-preferences or force
+            // the transceiver direction: letting webrtcbin negotiate leniently
+            // (match on encoding-name, echo the send pad's profile-level-id
+            // into an `a=sendonly` answer) is what lets a Main-profile camera
+            // stream to a browser that only offers baseline/constrained-
+            // baseline H264 — browsers decode Main on a baseline-negotiated
+            // m-line fine. Pinning codec-preferences to the offer's baseline
+            // profile made webrtcbin strict and rejected our Main send pad,
+            // answering `a=inactive` (blank).
+            if let (Some(pay), Some(pt)) = (
+                pay.as_ref(),
+                negotiated_video_pt(answer.sdp(), encoding_name),
+            ) {
+                pay.set_property("pt", pt);
+            }
             webrtc_for_local
                 .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
             match answer.sdp().as_text() {
@@ -328,14 +329,7 @@ impl WebRtcSession {
             }
         });
 
-        // First stage: set the remote (offer); on success configure the send
-        // transceiver, then create the answer. The transceiver MUST be
-        // configured here — after set-remote-description has created and
-        // reconciled transceiver 0 against the offer's m-line — and before
-        // create-answer reads its direction + codec-preferences. Forcing the
-        // transceiver to sendonly and pinning codec-preferences to the offer's
-        // H264 pt makes webrtcbin answer `a=sendonly` with H264 on a pt the
-        // browser can decode, instead of the `a=inactive` / VP8-96 fallback.
+        // First stage: set the remote (offer); on success create the answer.
         let webrtc_for_answer = self.webrtc.clone();
         let events_err = self.events.clone();
         let remote_promise = gst::Promise::with_change_func(move |reply| {
@@ -344,27 +338,6 @@ impl WebRtcSession {
                     "set-remote-description: {e:?}"
                 )));
                 return;
-            }
-            if let Some((pt, ref extra)) = video_pref {
-                let transceiver = webrtc_for_answer
-                    .emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>("get-transceiver", &[&0i32]);
-                transceiver.set_property(
-                    "direction",
-                    gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly,
-                );
-                // Mirror the offer's H264/H265 line exactly (payload +
-                // packetization-mode + profile-level-id) so webrtcbin's
-                // profile-aware codec comparison matches and answers sendonly
-                // instead of falling back to inactive.
-                let mut builder = gst::Caps::builder("application/x-rtp")
-                    .field("media", "video")
-                    .field("encoding-name", encoding_name)
-                    .field("clock-rate", 90000i32)
-                    .field("payload", pt as i32);
-                for (k, v) in extra {
-                    builder = builder.field(k.as_str(), v.as_str());
-                }
-                transceiver.set_property("codec-preferences", &builder.build());
             }
             webrtc_for_answer
                 .emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
@@ -593,85 +566,36 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     )
 }
 
-/// Scan a browser OFFER for the video codec line matching `encoding_name`
-/// (`"H264"` / `"H265"`) and return its payload type plus the profile /
-/// packetization attributes webrtcbin needs to match it during answer
-/// creation. Prefers a `packetization-mode=1` line (single-NAL + FU-A, what
-/// our `rtph264pay` produces) over `packetization-mode=0`.
-///
-/// The returned `extra` vector carries the offer's `packetization-mode` and
-/// `profile-level-id` (H264) so the send transceiver's codec-preferences can
-/// mirror the offer exactly — otherwise webrtcbin rejects our Main-profile
-/// send caps against the offer's baseline line and answers `a=inactive`.
-/// Pure so it can be unit-tested without a GStreamer runtime.
-#[allow(clippy::type_complexity)]
-fn offer_video_codec_prefs(
-    sdp: &gst_sdp::SDPMessageRef,
-    encoding_name: &str,
-) -> Option<(u32, Vec<(String, String)>)> {
-    // Collect candidate H264/H265 payload types with their fmtp params.
-    let mut candidates: Vec<(u32, Vec<(String, String)>)> = Vec::new();
+/// Scan a negotiated SDP for the video payload type the peer assigned to
+/// `encoding_name` (`"H264"` / `"H265"`). Returns the first matching
+/// `a=rtpmap:<pt> <ENC>/<clock>` payload number. Pure.
+fn negotiated_video_pt(sdp: &gst_sdp::SDPMessageRef, encoding_name: &str) -> Option<u32> {
     for media in sdp.medias() {
         if media.media() != Some("video") {
             continue;
         }
-        // pt → fmtp params, filled from a=fmtp lines below.
         for attr in media.attributes() {
             if attr.key() != "rtpmap" {
                 continue;
             }
-            // Value looks like "103 H264/90000".
+            // Value looks like "102 H264/90000".
             let Some(val) = attr.value() else { continue };
             let mut parts = val.split_whitespace();
-            let (Some(pt_str), Some(enc)) = (parts.next(), parts.next()) else {
+            let (Some(pt), Some(enc)) = (parts.next(), parts.next()) else {
                 continue;
             };
-            let enc_matches = enc
+            let matches = enc
                 .split('/')
                 .next()
                 .is_some_and(|e| e.eq_ignore_ascii_case(encoding_name));
-            if !enc_matches {
-                continue;
-            }
-            let Ok(pt) = pt_str.parse::<u32>() else {
-                continue;
-            };
-            // Find the matching `a=fmtp:<pt> key=val;key=val` line.
-            let mut extra: Vec<(String, String)> = Vec::new();
-            for fmtp in media.attributes() {
-                if fmtp.key() != "fmtp" {
-                    continue;
-                }
-                let Some(fval) = fmtp.value() else { continue };
-                let mut fparts = fval.splitn(2, char::is_whitespace);
-                let Some(fpt) = fparts.next() else { continue };
-                if fpt != pt_str {
-                    continue;
-                }
-                if let Some(params) = fparts.next() {
-                    for kv in params.split(';') {
-                        if let Some((k, v)) = kv.trim().split_once('=') {
-                            let key = match k.trim() {
-                                "packetization-mode" => "packetization-mode",
-                                "profile-level-id" => "profile-level-id",
-                                _ => continue,
-                            };
-                            extra.push((key.to_string(), v.trim().to_string()));
-                        }
-                    }
+            if matches {
+                if let Ok(pt) = pt.parse::<u32>() {
+                    return Some(pt);
                 }
             }
-            candidates.push((pt, extra));
         }
     }
-    // Prefer packetization-mode=1 (matches rtph264pay's aggregation output).
-    candidates.sort_by_key(|(_, extra)| {
-        let pm1 = extra
-            .iter()
-            .any(|(k, v)| k == "packetization-mode" && v == "1");
-        u8::from(!pm1) // false(0) sorts before true(1) → pm=1 first
-    });
-    candidates.into_iter().next()
+    None
 }
 
 /// Normalise a wire `stun:` URL into the `stun://host:port` form
@@ -736,43 +660,9 @@ mod tests {
                    a=rtpmap:102 H264/90000\r\n\
                    a=rtpmap:104 H265/90000\r\n";
         let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
-        assert_eq!(
-            offer_video_codec_prefs(&msg, "H264").map(|(pt, _)| pt),
-            Some(102)
-        );
-        assert_eq!(
-            offer_video_codec_prefs(&msg, "H265").map(|(pt, _)| pt),
-            Some(104)
-        );
-        assert!(offer_video_codec_prefs(&msg, "VP9").is_none());
-    }
-
-    #[test]
-    fn offer_prefs_prefer_pm1_and_carry_profile() {
-        // Two H264 lines: pt107 packetization-mode=0, pt109 pm=1. The pm=1
-        // line must win and its profile-level-id must be carried through.
-        let sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
-                   m=video 9 UDP/TLS/RTP/SAVPF 96 107 109\r\n\
-                   a=rtpmap:96 VP8/90000\r\n\
-                   a=rtpmap:107 H264/90000\r\n\
-                   a=fmtp:107 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f\r\n\
-                   a=rtpmap:109 H264/90000\r\n\
-                   a=fmtp:109 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n";
-        let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
-        let (pt, extra) = offer_video_codec_prefs(&msg, "H264").unwrap();
-        assert_eq!(pt, 109, "pm=1 line should win");
-        assert!(
-            extra
-                .iter()
-                .any(|(k, v)| k == "packetization-mode" && v == "1"),
-            "{extra:?}"
-        );
-        assert!(
-            extra
-                .iter()
-                .any(|(k, v)| k == "profile-level-id" && v == "42001f"),
-            "{extra:?}"
-        );
+        assert_eq!(negotiated_video_pt(&msg, "H264"), Some(102));
+        assert_eq!(negotiated_video_pt(&msg, "H265"), Some(104));
+        assert_eq!(negotiated_video_pt(&msg, "VP9"), None);
     }
 
     #[test]
