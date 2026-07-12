@@ -136,10 +136,9 @@ pub struct WebRtcSession {
     _appsrc: AppSrc,
     events: mpsc::UnboundedSender<WebRtcEvent>,
     /// Released by [`WebRtcSession::accept_offer`] once the pipeline reaches
-    /// `Playing`. The feed task waits on it before pushing any buffer so the
-    /// `do-timestamp=true` appsrc stamps every buffer against a running clock;
-    /// buffers pushed while the pipeline is still `Ready` would carry invalid
-    /// timestamps and corrupt the RTP timeline (connects, but blank video).
+    /// `Playing`. The feed task waits on it before pushing any buffer: pushing
+    /// into the appsrc while the pipeline is still `Ready` would be dropped or
+    /// stall, and the RTP timeline never starts (connects, but blank video).
     play_gate: Arc<Notify>,
     feed: JoinHandle<()>,
 }
@@ -355,7 +354,7 @@ impl WebRtcSession {
             .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
 
         // The pipeline now has a running clock, so let the feed task push the
-        // seed GOP + live NALs with valid `do-timestamp` timestamps.
+        // seed GOP + live NALs; the feed assigns each buffer an explicit PTS.
         self.play_gate.notify_one();
 
         self.webrtc
@@ -408,23 +407,60 @@ async fn feed_loop(
     play_gate: Arc<Notify>,
     camera_id: CameraId,
 ) {
-    // Wait until the pipeline is Playing before pushing anything: the
-    // do-timestamp=true appsrc must stamp buffers against a running clock, or
-    // the RTP timeline is corrupt and the browser renders nothing.
+    // Wait until the pipeline is Playing before pushing anything: buffers
+    // pushed while the pipeline is still Ready are dropped and the RTP
+    // timeline never starts (connects, but blank video).
     play_gate.notified().await;
     let mut started = false;
-    // Highest PTS already delivered via the seed; live samples at or below it
-    // are duplicates from the subscribe→snapshot overlap window and skipped.
-    let mut seed_watermark: Option<std::time::Duration> = None;
+    // Highest source PTS already delivered via the seed; live samples at or
+    // below it are duplicates from the subscribe→snapshot overlap and skipped.
+    let mut seed_watermark: Option<Duration> = None;
+
+    // Explicit output PTS rebasing. `do-timestamp` is OFF, so every buffer
+    // carries a PTS we derive from the source cadence. The seed GOP and the
+    // live tail share one RTSP source clock, so rebasing both onto a single
+    // monotonic timeline splices them seamlessly — unlike do-timestamp, which
+    // stamped the instantly-flushed seed burst with near-identical wall-clock
+    // times and left the browser nothing decodable (connected, but blank).
+    const DEFAULT_DELTA: Duration = Duration::from_micros(33_366); // ~29.97 fps
+    const MIN_DELTA: Duration = Duration::from_millis(1);
+    const MAX_DELTA: Duration = Duration::from_millis(500);
+    let mut out_pts = Duration::ZERO;
+    let mut prev_src: Option<Duration> = None;
+    let mut any_pushed = false;
+
+    // Advance the monotonic output PTS for the next sample and return it.
+    let next_pts = |sample: &NalSample,
+                    out_pts: &mut Duration,
+                    prev_src: &mut Option<Duration>,
+                    any_pushed: &mut bool|
+     -> Duration {
+        let delta = if !*any_pushed {
+            Duration::ZERO
+        } else {
+            match (*prev_src, sample.pts) {
+                (Some(p), Some(s)) => s.saturating_sub(p).clamp(MIN_DELTA, MAX_DELTA),
+                _ => DEFAULT_DELTA,
+            }
+        };
+        *out_pts += delta;
+        if let Some(s) = sample.pts {
+            *prev_src = Some(s);
+        }
+        *any_pushed = true;
+        *out_pts
+    };
+
     if !seed.is_empty() {
         for sample in &seed {
-            if let Err(e) = push_nal(&appsrc, sample) {
+            let pts = next_pts(sample, &mut out_pts, &mut prev_src, &mut any_pushed);
+            if let Err(e) = push_nal(&appsrc, sample, pts) {
                 warn!(camera_id, error = %e, "webrtc feed: seed push failed; ending");
                 let _ = appsrc.end_of_stream();
                 return;
             }
-            if let Some(pts) = sample.pts {
-                seed_watermark = Some(seed_watermark.map_or(pts, |w| w.max(pts)));
+            if let Some(src) = sample.pts {
+                seed_watermark = Some(seed_watermark.map_or(src, |w| w.max(src)));
             }
         }
         started = true;
@@ -450,7 +486,8 @@ async fn feed_loop(
                     started = true;
                     debug!(camera_id, "webrtc feed: spliced in at keyframe");
                 }
-                if let Err(e) = push_nal(&appsrc, &sample) {
+                let pts = next_pts(&sample, &mut out_pts, &mut prev_src, &mut any_pushed);
+                if let Err(e) = push_nal(&appsrc, &sample, pts) {
                     warn!(camera_id, error = %e, "webrtc feed: push failed; ending");
                     break;
                 }
@@ -472,15 +509,16 @@ async fn feed_loop(
 }
 
 /// Copy one NAL sample into a `gst::Buffer` and push it into `appsrc`.
-/// `appsrc` is configured `do-timestamp=true`, so we don't set PTS; we
-/// only flag delta (non-key) frames for the downstream payloader.
-fn push_nal(appsrc: &AppSrc, sample: &NalSample) -> Result<(), String> {
+/// `appsrc` is configured `do-timestamp=false`, so we assign the explicit
+/// monotonic `pts` and flag delta (non-key) frames for the payloader.
+fn push_nal(appsrc: &AppSrc, sample: &NalSample, pts: Duration) -> Result<(), String> {
     let mut buf = gst::Buffer::with_size(sample.data.len()).map_err(|e| format!("alloc: {e}"))?;
     {
         let bm = buf.get_mut().ok_or("buffer not unique")?;
         let mut map = bm.map_writable().map_err(|e| format!("map: {e}"))?;
         map.copy_from_slice(&sample.data);
         drop(map);
+        bm.set_pts(gst::ClockTime::from_nseconds(pts.as_nanos() as u64));
         if !sample.is_keyframe {
             bm.set_flags(gst::BufferFlags::DELTA_UNIT);
         }
@@ -508,7 +546,7 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     // Leaving the payload unset lets webrtcbin adopt the browser's H264/H265
     // payload type during answer negotiation.
     format!(
-        "appsrc name=src is-live=true do-timestamp=true format=time \
+        "appsrc name=src is-live=true do-timestamp=false format=time \
              block=true max-bytes=8388608 stream-type=stream \
            ! {base}parse config-interval=-1 \
            ! rtp{base}pay name=pay pt=96 config-interval=-1 mtu=1200 \
