@@ -144,7 +144,11 @@ impl WebRtcSession {
     ///
     /// `nal_rx` is a fresh subscription to the camera's
     /// [`crate::preroll_ingester::PreRollIngester`] broadcast; `codec` is
-    /// that ingester's `codec()`.
+    /// that ingester's `codec()`. `seed` is that ingester's `latest_gop()`
+    /// captured immediately after subscribing — the newest buffered GOP,
+    /// pushed ahead of the live stream so the browser can start decoding
+    /// without waiting for the camera's next natural IDR.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: String,
         camera_id: CameraId,
@@ -152,6 +156,7 @@ impl WebRtcSession {
         mode: WebRtcMode,
         ice_servers: &[IceServerCfg],
         nal_rx: broadcast::Receiver<NalSample>,
+        seed: Vec<NalSample>,
         events: mpsc::UnboundedSender<WebRtcEvent>,
     ) -> Result<Self, WebRtcError> {
         if mode == WebRtcMode::Transcode {
@@ -229,7 +234,7 @@ impl WebRtcSession {
         });
 
         // Pump compressed NALs into appsrc, splicing in at the next IDR.
-        let feed = tokio::spawn(feed_loop(appsrc.clone(), nal_rx, camera_id));
+        let feed = tokio::spawn(feed_loop(appsrc.clone(), seed, nal_rx, camera_id));
 
         Ok(Self {
             session_id,
@@ -364,15 +369,54 @@ impl Drop for WebRtcSession {
 
 /// Pump compressed NAL samples from the ingester broadcast into `appsrc`.
 ///
-/// Splices in at the next keyframe (drops delta frames until an IDR) so a
-/// mid-GOP subscribe never feeds the browser a broken reference frame. A
-/// broadcast lag re-arms the splice (we may have dropped the frames between
-/// the last IDR and now).
-async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camera_id: CameraId) {
+/// `seed` is the newest buffered GOP captured right after subscribing. When
+/// present it is flushed first so the browser starts decoding immediately;
+/// without it the feed would stall until the camera emits its next natural
+/// IDR (many seconds on a long-GOP camera — the "Negotiating HD…" hang).
+///
+/// After the seed, live samples splice in: with no seed we drop delta frames
+/// until the next keyframe (a mid-GOP subscribe must never feed the browser a
+/// broken reference frame); with a seed we instead drop the live samples that
+/// overlap the seed (same PTS or older) so nothing is delivered twice. A
+/// broadcast lag re-arms the keyframe splice (we may have dropped frames
+/// between the last IDR and now).
+async fn feed_loop(
+    appsrc: AppSrc,
+    seed: Vec<NalSample>,
+    mut rx: broadcast::Receiver<NalSample>,
+    camera_id: CameraId,
+) {
     let mut started = false;
+    // Highest PTS already delivered via the seed; live samples at or below it
+    // are duplicates from the subscribe→snapshot overlap window and skipped.
+    let mut seed_watermark: Option<std::time::Duration> = None;
+    if !seed.is_empty() {
+        for sample in &seed {
+            if let Err(e) = push_nal(&appsrc, sample) {
+                warn!(camera_id, error = %e, "webrtc feed: seed push failed; ending");
+                let _ = appsrc.end_of_stream();
+                return;
+            }
+            if let Some(pts) = sample.pts {
+                seed_watermark = Some(seed_watermark.map_or(pts, |w| w.max(pts)));
+            }
+        }
+        started = true;
+        debug!(
+            camera_id,
+            samples = seed.len(),
+            "webrtc feed: seeded from latest ring GOP"
+        );
+    }
     loop {
         match rx.recv().await {
             Ok(sample) => {
+                // Drop live samples already delivered by the seed.
+                if let (Some(w), Some(pts)) = (seed_watermark, sample.pts) {
+                    if pts <= w {
+                        continue;
+                    }
+                }
                 if !started {
                     if !sample.is_keyframe {
                         continue;
@@ -391,6 +435,9 @@ async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camer
                     dropped, "webrtc feed: broadcast lagged; re-arming splice"
                 );
                 started = false;
+                // The seed watermark is stale after a lag; post-lag live PTS
+                // are strictly newer, so stop filtering against it.
+                seed_watermark = None;
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
@@ -593,6 +640,7 @@ mod tests {
             WebRtcMode::Passthrough,
             &[],
             nal_rx,
+            Vec::new(),
             ev_tx,
         )
         .expect("build session");
