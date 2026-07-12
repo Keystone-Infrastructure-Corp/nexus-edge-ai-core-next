@@ -46,8 +46,9 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 
 use nexus_types::{CameraId, CodecKind};
+use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -134,6 +135,12 @@ pub struct WebRtcSession {
     /// Kept alive for the session's lifetime; the feed task holds a clone.
     _appsrc: AppSrc,
     events: mpsc::UnboundedSender<WebRtcEvent>,
+    /// Released by [`WebRtcSession::accept_offer`] once the pipeline reaches
+    /// `Playing`. The feed task waits on it before pushing any buffer so the
+    /// `do-timestamp=true` appsrc stamps every buffer against a running clock;
+    /// buffers pushed while the pipeline is still `Ready` would carry invalid
+    /// timestamps and corrupt the RTP timeline (connects, but blank video).
+    play_gate: Arc<Notify>,
     feed: JoinHandle<()>,
 }
 
@@ -233,8 +240,17 @@ impl WebRtcSession {
             None
         });
 
-        // Pump compressed NALs into appsrc, splicing in at the next IDR.
-        let feed = tokio::spawn(feed_loop(appsrc.clone(), seed, nal_rx, camera_id));
+        // Pump compressed NALs into appsrc, splicing in at the next IDR. The
+        // feed waits on `play_gate` until `accept_offer` sets the pipeline
+        // Playing, so buffers are only pushed against a running clock.
+        let play_gate = Arc::new(Notify::new());
+        let feed = tokio::spawn(feed_loop(
+            appsrc.clone(),
+            seed,
+            nal_rx,
+            play_gate.clone(),
+            camera_id,
+        ));
 
         Ok(Self {
             session_id,
@@ -244,6 +260,7 @@ impl WebRtcSession {
             webrtc,
             _appsrc: appsrc,
             events,
+            play_gate,
             feed,
         })
     }
@@ -337,6 +354,10 @@ impl WebRtcSession {
             .set_state(gst::State::Playing)
             .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
 
+        // The pipeline now has a running clock, so let the feed task push the
+        // seed GOP + live NALs with valid `do-timestamp` timestamps.
+        self.play_gate.notify_one();
+
         self.webrtc
             .emit_by_name::<()>("set-remote-description", &[&offer, &remote_promise]);
 
@@ -384,8 +405,13 @@ async fn feed_loop(
     appsrc: AppSrc,
     seed: Vec<NalSample>,
     mut rx: broadcast::Receiver<NalSample>,
+    play_gate: Arc<Notify>,
     camera_id: CameraId,
 ) {
+    // Wait until the pipeline is Playing before pushing anything: the
+    // do-timestamp=true appsrc must stamp buffers against a running clock, or
+    // the RTP timeline is corrupt and the browser renders nothing.
+    play_gate.notified().await;
     let mut started = false;
     // Highest PTS already delivered via the seed; live samples at or below it
     // are duplicates from the subscribe→snapshot overlap window and skipped.
