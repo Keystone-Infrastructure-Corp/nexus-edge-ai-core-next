@@ -46,8 +46,6 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 
 use nexus_types::{CameraId, CodecKind};
-use std::time::Duration;
-use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -146,11 +144,7 @@ impl WebRtcSession {
     ///
     /// `nal_rx` is a fresh subscription to the camera's
     /// [`crate::preroll_ingester::PreRollIngester`] broadcast; `codec` is
-    /// that ingester's `codec()`. `seed` is that ingester's `latest_gop()`
-    /// captured immediately after subscribing — the newest buffered GOP,
-    /// pushed ahead of the live stream so the browser can start decoding
-    /// without waiting for the camera's next natural IDR.
-    #[allow(clippy::too_many_arguments)]
+    /// that ingester's `codec()`.
     pub fn new(
         session_id: String,
         camera_id: CameraId,
@@ -158,7 +152,6 @@ impl WebRtcSession {
         mode: WebRtcMode,
         ice_servers: &[IceServerCfg],
         nal_rx: broadcast::Receiver<NalSample>,
-        seed: Vec<NalSample>,
         events: mpsc::UnboundedSender<WebRtcEvent>,
     ) -> Result<Self, WebRtcError> {
         if mode == WebRtcMode::Transcode {
@@ -235,14 +228,8 @@ impl WebRtcSession {
             None
         });
 
-        // Pump compressed NALs into appsrc immediately. `do-timestamp=false`
-        // means each buffer carries an explicit PTS, so pushing before the
-        // pipeline is Playing is valid: `block=true` appsrc pre-queues the
-        // seed GOP and blocks once full. When `accept_offer` sets Playing the
-        // queued buffers flush through h264parse→rtppay→webrtcbin, negotiating
-        // the send-pad caps BEFORE create-answer runs — without this pre-queue
-        // webrtcbin has no send media at answer time and replies `a=inactive`.
-        let feed = tokio::spawn(feed_loop(appsrc.clone(), seed, nal_rx, camera_id));
+        // Pump compressed NALs into appsrc, splicing in at the next IDR.
+        let feed = tokio::spawn(feed_loop(appsrc.clone(), nal_rx, camera_id));
 
         Ok(Self {
             session_id,
@@ -298,19 +285,9 @@ impl WebRtcSession {
             // H264 bytes, and drops them all (ICE connects, 0 fps, blank HD).
             // Adopting the answer's pt makes the wire match what the browser
             // expects to decode.
-            //
-            // We deliberately do NOT set explicit codec-preferences or force
-            // the transceiver direction: letting webrtcbin negotiate leniently
-            // (match on encoding-name, echo the send pad's profile-level-id
-            // into an `a=sendonly` answer) is what lets a Main-profile camera
-            // stream to a browser that only offers baseline/constrained-
-            // baseline H264 — browsers decode Main on a baseline-negotiated
-            // m-line fine. Pinning codec-preferences to the offer's baseline
-            // profile made webrtcbin strict and rejected our Main send pad,
-            // answering `a=inactive` (blank).
             if let (Some(pay), Some(pt)) = (
                 pay.as_ref(),
-                negotiated_video_pt(answer.sdp(), encoding_name),
+                negotiated_video_pt(&answer.sdp(), encoding_name),
             ) {
                 pay.set_property("pt", pt);
             }
@@ -355,24 +332,6 @@ impl WebRtcSession {
             .set_state(gst::State::Playing)
             .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
 
-        // Wait for the payloader to negotiate its RTP output caps before we
-        // create the answer. `rtph264pay`/`rtph265pay` only produce
-        // `application/x-rtp` caps once real H264/H265 has flowed through
-        // h264parse — which happens when the pre-queued seed GOP flushes now
-        // that the pipeline is Playing. If we ran set-remote-description /
-        // create-answer before that, webrtcbin's send pad would have no
-        // negotiated caps, so it answers `a=inactive` with the offer's first
-        // codec (VP8/96) and no video is decodable. Bounded poll so a stalled
-        // camera can never hang negotiation.
-        if let Some(pay) = self.pipeline.by_name("pay") {
-            if let Some(src_pad) = pay.static_pad("src") {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while src_pad.current_caps().is_none() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
-
         self.webrtc
             .emit_by_name::<()>("set-remote-description", &[&offer, &remote_promise]);
 
@@ -405,91 +364,15 @@ impl Drop for WebRtcSession {
 
 /// Pump compressed NAL samples from the ingester broadcast into `appsrc`.
 ///
-/// `seed` is the newest buffered GOP captured right after subscribing. When
-/// present it is flushed first so the browser starts decoding immediately;
-/// without it the feed would stall until the camera emits its next natural
-/// IDR (many seconds on a long-GOP camera — the "Negotiating HD…" hang).
-///
-/// After the seed, live samples splice in: with no seed we drop delta frames
-/// until the next keyframe (a mid-GOP subscribe must never feed the browser a
-/// broken reference frame); with a seed we instead drop the live samples that
-/// overlap the seed (same PTS or older) so nothing is delivered twice. A
-/// broadcast lag re-arms the keyframe splice (we may have dropped frames
-/// between the last IDR and now).
-async fn feed_loop(
-    appsrc: AppSrc,
-    seed: Vec<NalSample>,
-    mut rx: broadcast::Receiver<NalSample>,
-    camera_id: CameraId,
-) {
+/// Splices in at the next keyframe (drops delta frames until an IDR) so a
+/// mid-GOP subscribe never feeds the browser a broken reference frame. A
+/// broadcast lag re-arms the splice (we may have dropped the frames between
+/// the last IDR and now).
+async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camera_id: CameraId) {
     let mut started = false;
-    // Highest source PTS already delivered via the seed; live samples at or
-    // below it are duplicates from the subscribe→snapshot overlap and skipped.
-    let mut seed_watermark: Option<Duration> = None;
-
-    // Explicit output PTS rebasing. `do-timestamp` is OFF, so every buffer
-    // carries a PTS we derive from the source cadence. The seed GOP and the
-    // live tail share one RTSP source clock, so rebasing both onto a single
-    // monotonic timeline splices them seamlessly — unlike do-timestamp, which
-    // stamped the instantly-flushed seed burst with near-identical wall-clock
-    // times and left the browser nothing decodable (connected, but blank).
-    const DEFAULT_DELTA: Duration = Duration::from_micros(33_366); // ~29.97 fps
-    const MIN_DELTA: Duration = Duration::from_millis(1);
-    const MAX_DELTA: Duration = Duration::from_millis(500);
-    let mut out_pts = Duration::ZERO;
-    let mut prev_src: Option<Duration> = None;
-    let mut any_pushed = false;
-
-    // Advance the monotonic output PTS for the next sample and return it.
-    let next_pts = |sample: &NalSample,
-                    out_pts: &mut Duration,
-                    prev_src: &mut Option<Duration>,
-                    any_pushed: &mut bool|
-     -> Duration {
-        let delta = if !*any_pushed {
-            Duration::ZERO
-        } else {
-            match (*prev_src, sample.pts) {
-                (Some(p), Some(s)) => s.saturating_sub(p).clamp(MIN_DELTA, MAX_DELTA),
-                _ => DEFAULT_DELTA,
-            }
-        };
-        *out_pts += delta;
-        if let Some(s) = sample.pts {
-            *prev_src = Some(s);
-        }
-        *any_pushed = true;
-        *out_pts
-    };
-
-    if !seed.is_empty() {
-        for sample in &seed {
-            let pts = next_pts(sample, &mut out_pts, &mut prev_src, &mut any_pushed);
-            if let Err(e) = push_nal(&appsrc, sample, pts) {
-                warn!(camera_id, error = %e, "webrtc feed: seed push failed; ending");
-                let _ = appsrc.end_of_stream();
-                return;
-            }
-            if let Some(src) = sample.pts {
-                seed_watermark = Some(seed_watermark.map_or(src, |w| w.max(src)));
-            }
-        }
-        started = true;
-        debug!(
-            camera_id,
-            samples = seed.len(),
-            "webrtc feed: seeded from latest ring GOP"
-        );
-    }
     loop {
         match rx.recv().await {
             Ok(sample) => {
-                // Drop live samples already delivered by the seed.
-                if let (Some(w), Some(pts)) = (seed_watermark, sample.pts) {
-                    if pts <= w {
-                        continue;
-                    }
-                }
                 if !started {
                     if !sample.is_keyframe {
                         continue;
@@ -497,8 +380,7 @@ async fn feed_loop(
                     started = true;
                     debug!(camera_id, "webrtc feed: spliced in at keyframe");
                 }
-                let pts = next_pts(&sample, &mut out_pts, &mut prev_src, &mut any_pushed);
-                if let Err(e) = push_nal(&appsrc, &sample, pts) {
+                if let Err(e) = push_nal(&appsrc, &sample) {
                     warn!(camera_id, error = %e, "webrtc feed: push failed; ending");
                     break;
                 }
@@ -509,9 +391,6 @@ async fn feed_loop(
                     dropped, "webrtc feed: broadcast lagged; re-arming splice"
                 );
                 started = false;
-                // The seed watermark is stale after a lag; post-lag live PTS
-                // are strictly newer, so stop filtering against it.
-                seed_watermark = None;
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
@@ -520,16 +399,15 @@ async fn feed_loop(
 }
 
 /// Copy one NAL sample into a `gst::Buffer` and push it into `appsrc`.
-/// `appsrc` is configured `do-timestamp=false`, so we assign the explicit
-/// monotonic `pts` and flag delta (non-key) frames for the payloader.
-fn push_nal(appsrc: &AppSrc, sample: &NalSample, pts: Duration) -> Result<(), String> {
+/// `appsrc` is configured `do-timestamp=true`, so we don't set PTS; we
+/// only flag delta (non-key) frames for the downstream payloader.
+fn push_nal(appsrc: &AppSrc, sample: &NalSample) -> Result<(), String> {
     let mut buf = gst::Buffer::with_size(sample.data.len()).map_err(|e| format!("alloc: {e}"))?;
     {
         let bm = buf.get_mut().ok_or("buffer not unique")?;
         let mut map = bm.map_writable().map_err(|e| format!("map: {e}"))?;
         map.copy_from_slice(&sample.data);
         drop(map);
-        bm.set_pts(gst::ClockTime::from_nseconds(pts.as_nanos() as u64));
         if !sample.is_keyframe {
             bm.set_flags(gst::BufferFlags::DELTA_UNIT);
         }
@@ -557,7 +435,7 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     // Leaving the payload unset lets webrtcbin adopt the browser's H264/H265
     // payload type during answer negotiation.
     format!(
-        "appsrc name=src is-live=true do-timestamp=false format=time \
+        "appsrc name=src is-live=true do-timestamp=true format=time \
              block=true max-bytes=8388608 stream-type=stream \
            ! {base}parse config-interval=-1 \
            ! rtp{base}pay name=pay pt=96 config-interval=-1 mtu=1200 \
@@ -569,7 +447,7 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
 /// Scan a negotiated SDP for the video payload type the peer assigned to
 /// `encoding_name` (`"H264"` / `"H265"`). Returns the first matching
 /// `a=rtpmap:<pt> <ENC>/<clock>` payload number. Pure.
-fn negotiated_video_pt(sdp: &gst_sdp::SDPMessageRef, encoding_name: &str) -> Option<u32> {
+fn negotiated_video_pt(sdp: &gst_sdp::SDPMessage, encoding_name: &str) -> Option<u32> {
     for media in sdp.medias() {
         if media.media() != Some("video") {
             continue;
@@ -715,7 +593,6 @@ mod tests {
             WebRtcMode::Passthrough,
             &[],
             nal_rx,
-            Vec::new(),
             ev_tx,
         )
         .expect("build session");

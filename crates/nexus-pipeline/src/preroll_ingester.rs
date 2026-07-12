@@ -405,14 +405,6 @@ impl PreRollIngester {
         self.ring.lock().snapshot()
     }
 
-    /// Copy the most recent buffered GOP (keyframe onward). Empty if no
-    /// keyframe has been buffered yet. Seeds the WebRTC feed so a fresh
-    /// subscriber starts decoding immediately rather than waiting for the
-    /// camera's next natural IDR.
-    pub fn latest_gop(&self) -> Vec<NalSample> {
-        self.ring.lock().latest_gop()
-    }
-
     /// True iff the ring buffer has at least one keyframe and one
     /// sample. Used by the recorder + tests to wait for the
     /// camera to become healthy enough to record.

@@ -196,20 +196,6 @@ impl NalRingBuffer {
         }
         out
     }
-
-    /// Snapshot only the most recent buffered GOP (its keyframe plus
-    /// whatever delta-frames have arrived since). Empty if no keyframe
-    /// has arrived yet. Used by the WebRTC feed to seed a fresh
-    /// subscriber with an immediately-decodable keyframe instead of
-    /// stalling until the camera emits its next natural IDR (which, on a
-    /// long-GOP camera, can be many seconds away and shows as a browser
-    /// stuck on "Negotiating HD…").
-    pub fn latest_gop(&self) -> Vec<NalSample> {
-        self.gops
-            .back()
-            .map(|g| g.samples.clone())
-            .unwrap_or_default()
-    }
 }
 
 #[cfg(test)]

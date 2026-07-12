@@ -48,8 +48,9 @@ struct Inner {
 
 #[cfg(feature = "gstreamer-webrtc")]
 struct ActiveSession {
-    /// The camera this session streams — used to evict a stale session when
-    /// the operator re-opens HD for the same camera under a fresh session id.
+    /// The camera this session streams — used to evict a stale prior session
+    /// for the same camera when the browser reopens HD (the browser drops the
+    /// old session client-side without closing it, so we must reclaim it here).
     camera_id: CameraId,
     /// Dropping this tears the webrtcbin pipeline down.
     _session: nexus_pipeline::WebRtcSession,
@@ -136,12 +137,9 @@ impl WebRtcBridge {
         };
 
         let mut inner = self.inner.lock();
-        // Evict any prior session for this id (idempotent re-offer) OR for this
-        // camera. HD is solo — one session per camera — but the browser mints a
-        // fresh session id every time it re-expands, so a close-then-reopen
-        // arrives under a NEW id. Without evicting by camera, the stale session
-        // (pipeline + feed) would leak until the tunnel drops. Collect first to
-        // avoid holding a borrow across the retain.
+        // Idempotent re-offer: tear any prior session for this id first, and
+        // evict any stale session still bound to the same camera (browser
+        // reopen leaves the old session dangling on our side otherwise).
         let stale: Vec<String> = inner
             .sessions
             .iter()
@@ -151,7 +149,6 @@ impl WebRtcBridge {
         for id in stale {
             if let Some(prev) = inner.sessions.remove(&id) {
                 prev.pump.abort();
-                // `prev._session` drops here → prior pipeline to NULL.
             }
         }
         let Some(ingester) = inner.ingesters.get(&cam_id).cloned() else {
@@ -164,10 +161,6 @@ impl WebRtcBridge {
         };
         let codec = ingester.codec();
         let nal_rx = ingester.subscribe();
-        // Capture the newest buffered GOP *after* subscribing so the feed can
-        // start decoding immediately; the subscribe→snapshot overlap is
-        // de-duplicated by PTS inside the feed loop.
-        let seed = ingester.latest_gop();
 
         let ice_servers: Vec<IceServerCfg> = payload
             .ice_servers
@@ -196,7 +189,6 @@ impl WebRtcBridge {
             mode,
             &ice_servers,
             nal_rx,
-            seed,
             ev_tx,
         ) {
             Ok(s) => s,
