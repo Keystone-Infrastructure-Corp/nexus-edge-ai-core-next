@@ -147,6 +147,10 @@ impl WebRtcBridge {
         };
         let codec = ingester.codec();
         let nal_rx = ingester.subscribe();
+        // Capture the newest buffered GOP *after* subscribing so the feed can
+        // start decoding immediately; the subscribe→snapshot overlap is
+        // de-duplicated by PTS inside the feed loop.
+        let seed = ingester.latest_gop();
 
         let ice_servers: Vec<IceServerCfg> = payload
             .ice_servers
@@ -175,6 +179,7 @@ impl WebRtcBridge {
             mode,
             &ice_servers,
             nal_rx,
+            seed,
             ev_tx,
         ) {
             Ok(s) => s,
