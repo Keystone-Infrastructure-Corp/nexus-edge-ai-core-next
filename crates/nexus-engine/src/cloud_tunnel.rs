@@ -1037,6 +1037,10 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
         // within ~30 s with no engine restart. A failure here is
         // logged but never blocks the heartbeat itself.
         let name = crate::admin_runtime::read_display_name(&store).await;
+        // Dual-transport live view — read the per-core configured HD transport
+        // each tick so a cloud fleet flip is reflected in the advertised caps
+        // within one heartbeat, no restart.
+        let hd_transport = crate::admin_runtime::read_hd_transport(&store).await;
         // Phase 9 (M_OTA) — report the OTA status block so the
         // orchestrator can drive its rollout state machine + reconcile
         // committed versions. `recording_active` is best-effort false
@@ -1054,19 +1058,21 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
             body: EnvelopeBody::Heartbeat(HeartbeatPayload {
                 edge_ts_unix_ms: Some(now_unix_ms()),
                 name,
-                // Phase 10 — advertise the edge's live-view capabilities so
-                // the cloud enables the wall / greys HD per core. `live_view`
-                // (the LBR snapshot pump, Phase B) is available now; `webrtc`
-                // (the gstreamer-webrtc HD sub-pipeline, Phase E) is added
-                // once that feature is compiled in. Additive on wire `v=1`.
+                // Dual-transport live view — advertise the always-on LBR pump
+                // (`live_view`) plus the per-core configured HD transport
+                // (`hd_sfu` / `hd_moq`) so the cloud routes an expanding
+                // operator to the matching client adapter. `talkdown_webrtc`
+                // is advertised whenever the WebRTC/Opus talk-down
+                // sub-pipeline is compiled in. No back-compat: the old single
+                // `webrtc` tag is gone. Additive on wire `v=1`.
                 caps: Some({
-                    let caps = vec!["live_view".to_string()];
+                    // `mut` is only exercised when the talk-down sub-pipeline
+                    // is compiled in; suppress the unused-mut lint otherwise.
+                    #[cfg_attr(not(feature = "gstreamer-webrtc"), allow(unused_mut))]
+                    let mut caps =
+                        vec!["live_view".to_string(), hd_transport.cap_tag().to_string()];
                     #[cfg(feature = "gstreamer-webrtc")]
-                    let caps = {
-                        let mut caps = caps;
-                        caps.push("webrtc".to_string());
-                        caps
-                    };
+                    caps.push("talkdown_webrtc".to_string());
                     caps
                 }),
                 online_cameras: 0,

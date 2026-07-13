@@ -60,6 +60,7 @@ use flate2::Compression;
 use nexus_config::{AuthConfig, AuthMode, OidcConfig};
 use nexus_store::audit::{AuditFilter, AuditOutcome};
 use nexus_store::Store;
+use nexus_types::HdTransport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -86,6 +87,12 @@ const KEY_PANIC_WATERMARK_PCT: &str = "panic_watermark_pct";
 /// absent row = no name set (cloud renders the fingerprint
 /// fallback).
 pub(crate) const KEY_DISPLAY_NAME: &str = "display_name";
+
+/// Persisted HD live-view transport (`sfu` | `moq`), written by the fleet
+/// apply path via `PUT /api/v1/admin/live-view/transport` and read live by
+/// the heartbeat (advertises the matching `hd_*` cap) and the publisher
+/// selector. Absent row = the [`HdTransport`] default (SFU).
+pub(crate) const KEY_HD_TRANSPORT: &str = "hd_transport";
 
 #[derive(Debug, Deserialize)]
 pub struct PutServerBindReq {
@@ -1890,6 +1897,15 @@ pub(crate) async fn read_display_name(store: &Store) -> Option<String> {
         .ok()
         .flatten()
         .flatten()
+}
+
+/// Read the persisted HD live-view transport, defaulting to the [`HdTransport`]
+/// default (SFU) when the row is absent, SQL NULL, or unparseable.
+pub(crate) async fn read_hd_transport(store: &Store) -> HdTransport {
+    match store.read_runtime_setting(KEY_HD_TRANSPORT).await {
+        Ok(Some(Some(v))) => v.parse().unwrap_or_default(),
+        _ => HdTransport::default(),
+    }
 }
 
 pub async fn put_server_identity(
