@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, webrtc_offer, webrtc_answer, webrtc_ice_candidate. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, webrtc_offer, webrtc_answer, webrtc_ice_candidate, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -429,6 +429,74 @@ pub struct LbrUnsubscribePayload {
     pub camera_id: u64,
 }
 
+/// Cloud → Edge. Phase 2 (additive on v=1). The SFU's SDP answer to the edge's live_hd_offer, relayed by the api-gateway. The edge sets it as the remote description to complete the publish handshake. Routed by session_id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveHdAnswerPayload {
+    /// The SFU's SDP answer (unified-plan).
+    pub sdp: String,
+    /// Echoes the live_hd_start.session_id.
+    pub session_id: Uuid,
+}
+
+/// Edge → Cloud. Phase 2 (additive on v=1). The edge's SDP offer to publish its local HD track. The api-gateway relays it to the Cloudflare SFU (tracks/new, location=local) and returns the SFU's answer as live_hd_answer. ICE is bundled in the SDP (the edge waits for gathering-complete before sending). Routed by session_id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveHdOfferPayload {
+    /// The edge's SDP offer (unified-plan, send-only), ICE candidates bundled.
+    pub sdp: String,
+    /// Echoes the live_hd_start.session_id.
+    pub session_id: Uuid,
+}
+
+/// Edge → Cloud. Phase 2 (additive on v=1). The edge confirms it is publishing the HD stream and reports the transport-specific handle browsers subscribe to. For `sfu`, `track_name` is the SFU track name (the api-gateway pairs it with the publisher session to create per-browser subscriber sessions). For `moq`, `broadcast`/`track` identify the relay broadcast. `codec` is what the edge actually sent. Routed by session_id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveHdPublishingPayload {
+    /// MoQ-only. The relay broadcast id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadcast: Option<String>,
+    /// Optional. The video codec the edge actually published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// Echoes the live_hd_start.session_id.
+    pub session_id: Uuid,
+    /// MoQ-only. The relay track name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<String>,
+    /// SFU-only. The SFU track name browsers subscribe to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_name: Option<String>,
+    /// The transport this stream is published on.
+    pub transport: String,
+}
+
+/// Cloud → Edge. Phase 2 dual-transport (additive on v=1). Tells the edge to begin publishing the solo (expanded) camera's HD stream on the selected transport. For `sfu` the edge builds a send-only webrtcbin, gathers ICE, and replies live_hd_offer (the api-gateway relays it to the Cloudflare SFU publisher session it already created and returns live_hd_answer). For `moq` (gated until preview) the edge publishes to the relay. The edge never talks to the SFU directly — the api-gateway holds CALLS_APP_SECRET and proxies. Routed by session_id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveHdStartPayload {
+    /// Per-core integer id (cameras.edge_camera_id) of the solo camera to publish.
+    pub camera_id: u64,
+    /// Optional. `passthrough` (default) or `transcode` to H.264 when the subscriber can't decode the native codec. Omitted = passthrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Cloud-minted HD session id; echoed on every live_hd_* for this session.
+    pub session_id: Uuid,
+    /// Optional. Which camera stream to publish: `sub` (default) or `main`. Omitted = sub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+    /// HD transport for this session (matches the core's hd_transport setting).
+    pub transport: String,
+}
+
+/// Cloud → Edge. Phase 2 (additive on v=1). Tears down the edge's HD publish for this session (last browser viewer left, or the transport was switched). The edge stops the publisher webrtcbin / MoQ publisher and releases the camera stream. Idempotent. Routed by session_id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveHdStopPayload {
+    /// Echoes the live_hd_start.session_id.
+    pub session_id: Uuid,
+}
+
 /// Edge → Cloud. Additive on v=1. The detector-prompt vocabulary the engine actually resolved at boot — one DetectorVocabEntry per detector kind the engine knows how to build. Sent on tunnel-up and whenever the loaded model pack changes (rare — effectively per OTA / restart). The console renders prompt suggestions from this live data instead of a hand-maintained mirror of the engine's label map. Fire-and-forget — no ack in the v1 wire schema; the cloud upserts these into core_model_catalog keyed on core_id (org_id resolved from the cores FK), and the next report on reconnect is the recovery path. Pre-feature cloud peers ignore this kind; pre-feature edges never emit it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -682,6 +750,11 @@ pub enum EnvelopeBody {
     WebrtcOffer(WebrtcOfferPayload),
     WebrtcAnswer(WebrtcAnswerPayload),
     WebrtcIceCandidate(WebrtcIceCandidatePayload),
+    LiveHdStart(LiveHdStartPayload),
+    LiveHdOffer(LiveHdOfferPayload),
+    LiveHdAnswer(LiveHdAnswerPayload),
+    LiveHdPublishing(LiveHdPublishingPayload),
+    LiveHdStop(LiveHdStopPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.
