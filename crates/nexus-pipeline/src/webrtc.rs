@@ -99,25 +99,40 @@ pub struct IceServerCfg {
     pub credential: Option<String>,
 }
 
-/// An outbound signalling artefact produced by the edge answerer. The
-/// caller (the Phase F tunnel manager) forwards these to the cloud as
-/// `webrtc_answer` / `webrtc_ice_candidate` envelopes.
+/// An outbound signalling artefact produced by the edge. The caller (the
+/// signalling bridge) forwards these to the cloud: the answerer role emits
+/// `webrtc_answer` / `webrtc_ice_candidate`; the publisher role emits
+/// `live_hd_offer` / `live_hd_publishing`.
 #[derive(Debug, Clone)]
 pub enum WebRtcEvent {
-    /// The local SDP answer is ready.
+    /// The local SDP answer is ready (answerer / P2P role).
     Answer {
         /// The answer SDP text.
         sdp: String,
         /// Negotiated video codec label (`"h264"` / `"h265"`).
         codec: &'static str,
     },
-    /// A local ICE candidate was gathered.
+    /// The local SDP **offer** is ready (publisher / offerer role), with the
+    /// gathered ICE candidates already baked into the SDP. The caller
+    /// forwards it to the SFU as `live_hd_offer`.
+    Offer {
+        /// The offer SDP text (ICE candidates baked in).
+        sdp: String,
+        /// Negotiated video codec label (`"h264"` / `"h265"`).
+        codec: &'static str,
+    },
+    /// A local ICE candidate was gathered (answerer / P2P role only —
+    /// the publisher bakes candidates into the offer instead of trickling).
     IceCandidate {
         /// The media-line index the candidate belongs to.
         sdp_mline_index: u32,
         /// The candidate attribute value (`candidate:…`).
         candidate: String,
     },
+    /// The peer connection reached `connected` (publisher role) — the edge
+    /// is now streaming media to the SFU. The caller forwards this as
+    /// `live_hd_publishing`.
+    Connected,
     /// The session failed while negotiating; the caller should tear down.
     Failed(String),
 }
@@ -146,6 +161,75 @@ impl WebRtcSession {
     /// [`crate::preroll_ingester::PreRollIngester`] broadcast; `codec` is
     /// that ingester's `codec()`.
     pub fn new(
+        session_id: String,
+        camera_id: CameraId,
+        codec: CodecKind,
+        mode: WebRtcMode,
+        ice_servers: &[IceServerCfg],
+        nal_rx: broadcast::Receiver<NalSample>,
+        events: mpsc::UnboundedSender<WebRtcEvent>,
+    ) -> Result<Self, WebRtcError> {
+        let sess = Self::build_common(
+            session_id,
+            camera_id,
+            codec,
+            mode,
+            ice_servers,
+            nal_rx,
+            events,
+        )?;
+        sess.wire_answerer_ice();
+        // We're the answerer, so we never create an offer on renegotiation;
+        // log for diagnostics only.
+        let sid = sess.session_id.clone();
+        sess.webrtc
+            .connect("on-negotiation-needed", false, move |_vals| {
+                debug!(session = %sid, "webrtcbin on-negotiation-needed (answerer; ignored)");
+                None
+            });
+        Ok(sess)
+    }
+
+    /// Build a **publisher** (offerer) session that streams the camera
+    /// send-only to an SFU.
+    ///
+    /// Unlike [`WebRtcSession::new`], the edge creates the SDP offer, waits
+    /// for ICE gathering to complete (the SFU's `tracks/new` is a single
+    /// request — no trickle), and emits [`WebRtcEvent::Offer`] with the
+    /// candidates baked into the SDP. The SFU's answer arrives via
+    /// [`WebRtcSession::set_answer`], and once the peer connection is up the
+    /// session emits [`WebRtcEvent::Connected`].
+    pub fn new_publisher(
+        session_id: String,
+        camera_id: CameraId,
+        codec: CodecKind,
+        mode: WebRtcMode,
+        ice_servers: &[IceServerCfg],
+        nal_rx: broadcast::Receiver<NalSample>,
+        events: mpsc::UnboundedSender<WebRtcEvent>,
+    ) -> Result<Self, WebRtcError> {
+        let sess = Self::build_common(
+            session_id,
+            camera_id,
+            codec,
+            mode,
+            ice_servers,
+            nal_rx,
+            events,
+        )?;
+        sess.wire_offerer();
+        // Bring the pipeline up so `webrtcbin` opens its peer-connection,
+        // fires `on-negotiation-needed`, and begins gathering ICE.
+        sess.pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
+        Ok(sess)
+    }
+
+    /// Shared pipeline construction for both roles. Builds the passthrough
+    /// pipeline, applies ICE servers, and starts the NAL feed. The caller
+    /// wires the role-specific signalling afterwards.
+    fn build_common(
         session_id: String,
         camera_id: CameraId,
         codec: CodecKind,
@@ -206,28 +290,6 @@ impl WebRtcSession {
             }
         }
 
-        // Local ICE candidates → events (relayed to the browser via cloud).
-        let ice_tx = events.clone();
-        webrtc.connect("on-ice-candidate", false, move |vals| {
-            let mline = vals.get(1).and_then(|v| v.get::<u32>().ok()).unwrap_or(0);
-            let candidate = vals
-                .get(2)
-                .and_then(|v| v.get::<String>().ok())
-                .unwrap_or_default();
-            let _ = ice_tx.send(WebRtcEvent::IceCandidate {
-                sdp_mline_index: mline,
-                candidate,
-            });
-            None
-        });
-        // We're the answerer, so we never create an offer on renegotiation;
-        // log for diagnostics only.
-        let sess = session_id.clone();
-        webrtc.connect("on-negotiation-needed", false, move |_vals| {
-            debug!(session = %sess, "webrtcbin on-negotiation-needed (answerer; ignored)");
-            None
-        });
-
         // Pump compressed NALs into appsrc, splicing in at the next IDR.
         let feed = tokio::spawn(feed_loop(appsrc.clone(), nal_rx, camera_id));
 
@@ -241,6 +303,98 @@ impl WebRtcSession {
             events,
             feed,
         })
+    }
+
+    /// Wire the answerer's ICE trickle: forward each gathered local ICE
+    /// candidate as [`WebRtcEvent::IceCandidate`] (the browser peers directly).
+    fn wire_answerer_ice(&self) {
+        let ice_tx = self.events.clone();
+        self.webrtc.connect("on-ice-candidate", false, move |vals| {
+            let mline = vals.get(1).and_then(|v| v.get::<u32>().ok()).unwrap_or(0);
+            let candidate = vals
+                .get(2)
+                .and_then(|v| v.get::<String>().ok())
+                .unwrap_or_default();
+            let _ = ice_tx.send(WebRtcEvent::IceCandidate {
+                sdp_mline_index: mline,
+                candidate,
+            });
+            None
+        });
+    }
+
+    /// Wire the publisher/offerer negotiation: on `on-negotiation-needed`
+    /// create an offer, adopt it locally, and — once ICE gathering completes
+    /// — emit [`WebRtcEvent::Offer`] with the candidates baked into the SDP.
+    /// Also emit [`WebRtcEvent::Connected`] when the peer connection is up.
+    fn wire_offerer(&self) {
+        let codec_label = self.codec.base();
+
+        // create-offer → set-local → emit once gathered.
+        let webrtc_neg = self.webrtc.clone();
+        let events_neg = self.events.clone();
+        let session_neg = self.session_id.clone();
+        let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.webrtc
+            .connect("on-negotiation-needed", false, move |_vals| {
+                let webrtc = webrtc_neg.clone();
+                let events = events_neg.clone();
+                let session = session_neg.clone();
+                let emitted = std::sync::Arc::clone(&emitted);
+                let webrtc_for_local = webrtc.clone();
+                let offer_promise = gst::Promise::with_change_func(move |reply| {
+                    let offer = reply.ok().flatten().and_then(|s| {
+                        s.get::<gst_webrtc::WebRTCSessionDescription>("offer").ok()
+                    });
+                    let Some(offer) = offer else {
+                        let _ = events.send(WebRtcEvent::Failed(
+                            "create-offer: no offer in reply".to_string(),
+                        ));
+                        return;
+                    };
+                    webrtc_for_local.emit_by_name::<()>(
+                        "set-local-description",
+                        &[&offer, &None::<gst::Promise>],
+                    );
+                    emit_offer_when_gathered(
+                        &webrtc_for_local,
+                        &events,
+                        &session,
+                        codec_label,
+                        &emitted,
+                    );
+                });
+                webrtc.emit_by_name::<()>(
+                    "create-offer",
+                    &[&None::<gst::Structure>, &offer_promise],
+                );
+                None
+            });
+
+        // connection established → Connected (publishing).
+        let events_conn = self.events.clone();
+        let session_conn = self.session_id.clone();
+        let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.webrtc
+            .connect("notify::connection-state", false, move |vals| {
+                let wb = vals.first().and_then(|v| v.get::<gst::Element>().ok())?;
+                let state =
+                    wb.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+                match state {
+                    gst_webrtc::WebRTCPeerConnectionState::Connected
+                        if !signalled.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+                    {
+                        debug!(session = %session_conn, "webrtc publisher connected");
+                        let _ = events_conn.send(WebRtcEvent::Connected);
+                    }
+                    gst_webrtc::WebRTCPeerConnectionState::Failed => {
+                        let _ = events_conn
+                            .send(WebRtcEvent::Failed("peer connection failed".to_string()));
+                    }
+                    _ => {}
+                }
+                None
+            });
     }
 
     /// Apply the browser's SDP offer, create + adopt the local answer, and
@@ -344,6 +498,28 @@ impl WebRtcSession {
             .emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
     }
 
+    /// Apply the SFU's SDP **answer** (publisher role). Media starts flowing
+    /// to the SFU once the DTLS/ICE connection is up (which fires
+    /// [`WebRtcEvent::Connected`]). The pipeline is already `Playing` from
+    /// [`WebRtcSession::new_publisher`], so no state change is needed here.
+    pub fn set_answer(&self, sdp_answer: &str) -> Result<(), WebRtcError> {
+        let msg = gst_sdp::SDPMessage::parse_buffer(sdp_answer.as_bytes())
+            .map_err(|e| WebRtcError::Sdp(format!("parse answer: {e}")))?;
+        let answer =
+            gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, msg);
+        let events_err = self.events.clone();
+        let remote_promise = gst::Promise::with_change_func(move |reply| {
+            if let Err(e) = reply {
+                let _ = events_err.send(WebRtcEvent::Failed(format!(
+                    "set-remote-description(answer): {e:?}"
+                )));
+            }
+        });
+        self.webrtc
+            .emit_by_name::<()>("set-remote-description", &[&answer, &remote_promise]);
+        Ok(())
+    }
+
     /// The session's stable id (for logging / manager bookkeeping).
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -416,6 +592,66 @@ fn push_nal(appsrc: &AppSrc, sample: &NalSample) -> Result<(), String> {
         .push_buffer(buf)
         .map(|_| ())
         .map_err(|e| format!("push_buffer: {e:?}"))
+}
+
+/// Emit the local offer (with ICE candidates baked in) once `webrtcbin` has
+/// finished gathering, guarding against a double emit. If gathering is
+/// already complete, emit immediately; otherwise subscribe to
+/// `notify::ice-gathering-state` and emit on the first `Complete`.
+fn emit_offer_when_gathered(
+    webrtc: &gst::Element,
+    events: &mpsc::UnboundedSender<WebRtcEvent>,
+    session: &str,
+    codec: &'static str,
+    emitted: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let state = webrtc.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+    if state == gst_webrtc::WebRTCICEGatheringState::Complete {
+        emit_local_offer(webrtc, events, session, codec, emitted);
+        return;
+    }
+    let events = events.clone();
+    let session = session.to_string();
+    let emitted = std::sync::Arc::clone(emitted);
+    webrtc.connect("notify::ice-gathering-state", false, move |vals| {
+        let wb = vals.first().and_then(|v| v.get::<gst::Element>().ok())?;
+        let st = wb.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+        if st == gst_webrtc::WebRTCICEGatheringState::Complete {
+            emit_local_offer(&wb, &events, &session, codec, &emitted);
+        }
+        None
+    });
+}
+
+/// Read `webrtcbin`'s `local-description` (now including gathered candidates)
+/// and emit it as [`WebRtcEvent::Offer`], at most once.
+fn emit_local_offer(
+    webrtc: &gst::Element,
+    events: &mpsc::UnboundedSender<WebRtcEvent>,
+    session: &str,
+    codec: &'static str,
+    emitted: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(local) =
+        webrtc.property::<Option<gst_webrtc::WebRTCSessionDescription>>("local-description")
+    else {
+        let _ = events.send(WebRtcEvent::Failed(
+            "local-description is empty at ICE-complete".to_string(),
+        ));
+        return;
+    };
+    match local.sdp().as_text() {
+        Ok(sdp) => {
+            debug!(session = %session, "webrtc publisher offer ready (ICE gathered)");
+            let _ = events.send(WebRtcEvent::Offer { sdp, codec });
+        }
+        Err(e) => {
+            let _ = events.send(WebRtcEvent::Failed(format!("offer as_text: {e}")));
+        }
+    }
 }
 
 /// Build the passthrough launch description for a camera codec. Pure so it
