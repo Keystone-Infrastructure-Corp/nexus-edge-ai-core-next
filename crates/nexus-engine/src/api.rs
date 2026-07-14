@@ -373,6 +373,17 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/reid/config",
             put(crate::admin_runtime::put_reid_config),
         )
+        // Dual-transport live view — HD transport selector (`sfu` | `moq`).
+        // GET returns the persisted value; PUT persists it to
+        // `engine_runtime_settings.hd_transport` and it takes effect within
+        // one heartbeat (the pump re-reads it) — no restart. The cloud
+        // fleet-apply path reaches PUT via the generic `/admin/*` passthrough
+        // proxy, so a human-initiated flip carries a verified actor_token.
+        .route(
+            "/v1/admin/live-view/transport",
+            get(crate::admin_runtime::get_live_view_transport)
+                .put(crate::admin_runtime::put_live_view_transport),
+        )
         // M2.2 closeout: core-next-native OAuth auth-code dance for
         // cloud cold backends. `start` and `status` are gated; the
         // `callback` route is registered outside the gate (the

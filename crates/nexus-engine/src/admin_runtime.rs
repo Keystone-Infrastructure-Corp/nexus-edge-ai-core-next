@@ -60,6 +60,7 @@ use flate2::Compression;
 use nexus_config::{AuthConfig, AuthMode, OidcConfig};
 use nexus_store::audit::{AuditFilter, AuditOutcome};
 use nexus_store::Store;
+use nexus_types::HdTransport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -86,6 +87,12 @@ const KEY_PANIC_WATERMARK_PCT: &str = "panic_watermark_pct";
 /// absent row = no name set (cloud renders the fingerprint
 /// fallback).
 pub(crate) const KEY_DISPLAY_NAME: &str = "display_name";
+
+/// Persisted HD live-view transport (`sfu` | `moq`), written by the fleet
+/// apply path via `PUT /api/v1/admin/live-view/transport` and read live by
+/// the heartbeat (advertises the matching `hd_*` cap) and the publisher
+/// selector. Absent row = the [`HdTransport`] default (SFU).
+pub(crate) const KEY_HD_TRANSPORT: &str = "hd_transport";
 
 #[derive(Debug, Deserialize)]
 pub struct PutServerBindReq {
@@ -1890,6 +1897,85 @@ pub(crate) async fn read_display_name(store: &Store) -> Option<String> {
         .ok()
         .flatten()
         .flatten()
+}
+
+/// Read the persisted HD live-view transport, defaulting to the [`HdTransport`]
+/// default (SFU) when the row is absent, SQL NULL, or unparseable.
+pub(crate) async fn read_hd_transport(store: &Store) -> HdTransport {
+    match store.read_runtime_setting(KEY_HD_TRANSPORT).await {
+        Ok(Some(Some(v))) => v.parse().unwrap_or_default(),
+        _ => HdTransport::default(),
+    }
+}
+
+/// Response body for the HD live-view transport selector.
+#[derive(Debug, Serialize)]
+pub struct LiveViewTransportOut {
+    pub transport: HdTransport,
+}
+
+/// Request body for `PUT /v1/admin/live-view/transport`.
+#[derive(Debug, Deserialize)]
+pub struct PutLiveViewTransportReq {
+    pub transport: HdTransport,
+}
+
+/// `GET /v1/admin/live-view/transport` — the persisted HD live-view transport.
+pub async fn get_live_view_transport(State(s): State<ApiState>) -> Json<LiveViewTransportOut> {
+    Json(LiveViewTransportOut {
+        transport: read_hd_transport(&s.store).await,
+    })
+}
+
+/// `PUT /v1/admin/live-view/transport` — set the HD live-view transport
+/// (`sfu` | `moq`). Written by an operator locally or by the cloud fleet
+/// apply path (as an `/admin/*` rpc_call). Persisted to
+/// `engine_runtime_settings.hd_transport`; the heartbeat pump re-reads it each
+/// tick so the advertised `hd_*` cap flips within one heartbeat, no restart.
+pub async fn put_live_view_transport(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    admin: AdminContext,
+    Json(req): Json<PutLiveViewTransportReq>,
+) -> Result<Json<LiveViewTransportOut>, ApiError> {
+    let before = read_hd_transport(&s.store).await;
+    let before_str = serde_json::to_string(&serde_json::json!({ "transport": before })).ok();
+    let after_str = serde_json::to_string(&serde_json::json!({ "transport": req.transport })).ok();
+
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store
+            .write_runtime_setting_tx(&mut tx, KEY_HD_TRANSPORT, Some(&req.transport.to_string()))
+            .await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            Some(&admin.0),
+            &headers,
+            peer.ip(),
+            "live_view.transport.put",
+            "admin/live-view/transport",
+            Some("singleton"),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    tx_res.map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist hd_transport failed: {e}"),
+        )
+    })?;
+
+    Ok(Json(LiveViewTransportOut {
+        transport: req.transport,
+    }))
 }
 
 pub async fn put_server_identity(
