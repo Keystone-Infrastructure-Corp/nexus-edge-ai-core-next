@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, webrtc_offer, webrtc_answer, webrtc_ice_candidate, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -656,55 +656,6 @@ pub enum VerificationState {
     Review,
 }
 
-/// Edge → Cloud. Phase 10 (additive on v=1). The edge's SDP answer to a webrtc_offer. Routed by session_id (NOT envelope.in_reply_to — media + trickled ICE outlive a single request). `codec` tells the client what the edge actually negotiated so it can label the video and drive the fallback ladder.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebrtcAnswerPayload {
-    /// Optional. The video codec the edge actually sent: `h264` / `h265` for passthrough, `h264` for the transcode fallback. Lets the client show the right label and know whether HEVC passthrough succeeded. Omitted by older edges → the client infers from the answer SDP.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codec: Option<String>,
-    /// The edge's SDP answer (unified-plan).
-    pub sdp: String,
-    /// Echoes the webrtc_offer.session_id.
-    pub session_id: Uuid,
-}
-
-/// Both directions. Phase 10 (additive on v=1). One trickled ICE candidate for an in-progress WebRTC session — sent cloud→edge (the browser's candidates relayed by api-gateway) and edge→cloud (the edge webrtcbin's candidates). Routed by session_id. An empty-string `candidate` signals end-of-candidates for that m-line.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebrtcIceCandidatePayload {
-    /// The SDP candidate line ("candidate:..."). Empty string = end-of-candidates for this m-line.
-    pub candidate: String,
-    /// Optional. Media stream identification tag the candidate belongs to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sdp_mid: Option<String>,
-    /// Zero-based index of the m-line the candidate belongs to.
-    pub sdp_mline_index: u64,
-    /// Echoes the webrtc_offer.session_id.
-    pub session_id: Uuid,
-}
-
-/// Cloud → Edge. Phase 10 (additive on v=1). Opens an HD WebRTC session for the single expanded (solo / 1×1) camera — the ONLY path to HD. The api-gateway mints session_id + ephemeral ice_servers (STUN + short-TTL HMAC TURN) and forwards the browser's SDP offer. The edge builds a passthrough webrtcbin sub-pipeline (re-payload the camera's native codec, force an IDR on join) and replies webrtc_answer. Server-enforced solo-only: the gateway rejects an offer whose session is not the single expanded camera. LBR (the grid default) never opens a WebRTC session.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebrtcOfferPayload {
-    /// Per-core integer id (matches cameras.edge_camera_id) of the solo camera to stream.
-    pub camera_id: u64,
-    /// STUN + ephemeral HMAC TURN servers for the edge webrtcbin. Omitted / empty = STUN-only (host + srflx candidates, no relay). LBR never uses these.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ice_servers: Option<Vec<IceServer>>,
-    /// Optional. `passthrough` (default, zero-transcode re-payload of the native codec) or `transcode` (compatibility fallback: the edge re-encodes to H.264 Constrained Baseline when the viewer cannot decode the camera's native codec, e.g. HEVC cam + Chrome). Omitted = passthrough.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-    /// The browser's SDP offer (unified-plan). Advertises the codecs the viewer can decode (H.264 everywhere; HEVC on Safari + HEVC-capable Chromium) so the edge answers with native passthrough when possible.
-    pub sdp: String,
-    /// Cloud-minted session id; echoed in webrtc_answer + every webrtc_ice_candidate so both sides bind trickled candidates to the session. Torn down on PC close or 5-min no-RTP.
-    pub session_id: Uuid,
-    /// Optional. Which camera stream to passthrough: `sub` (substream, ~0.5–2 Mbps, default) or `main` (full-quality, ~2–12 Mbps; explicit operator toggle). Omitted = sub.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream: Option<String>,
-}
-
 /// Envelope metadata — every field of [`Envelope`] except the
 /// `kind`/`payload` discriminator, which is encoded by [`EnvelopeBody`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -750,9 +701,6 @@ pub enum EnvelopeBody {
     LbrSubscribe(LbrSubscribePayload),
     LbrFrame(LbrFramePayload),
     LbrUnsubscribe(LbrUnsubscribePayload),
-    WebrtcOffer(WebrtcOfferPayload),
-    WebrtcAnswer(WebrtcAnswerPayload),
-    WebrtcIceCandidate(WebrtcIceCandidatePayload),
     LiveHdStart(LiveHdStartPayload),
     LiveHdOffer(LiveHdOfferPayload),
     LiveHdAnswer(LiveHdAnswerPayload),

@@ -99,19 +99,11 @@ pub struct IceServerCfg {
     pub credential: Option<String>,
 }
 
-/// An outbound signalling artefact produced by the edge. The caller (the
-/// signalling bridge) forwards these to the cloud: the answerer role emits
-/// `webrtc_answer` / `webrtc_ice_candidate`; the publisher role emits
-/// `live_hd_offer` / `live_hd_publishing`.
+/// An outbound signalling artefact produced by the edge publisher. The caller
+/// (the signalling bridge) forwards these to the cloud: `Offer` →
+/// `live_hd_offer`, `Connected` → `live_hd_publishing`.
 #[derive(Debug, Clone)]
 pub enum WebRtcEvent {
-    /// The local SDP answer is ready (answerer / P2P role).
-    Answer {
-        /// The answer SDP text.
-        sdp: String,
-        /// Negotiated video codec label (`"h264"` / `"h265"`).
-        codec: &'static str,
-    },
     /// The local SDP **offer** is ready (publisher / offerer role), with the
     /// gathered ICE candidates already baked into the SDP. The caller
     /// forwards it to the SFU as `live_hd_offer`.
@@ -120,14 +112,6 @@ pub enum WebRtcEvent {
         sdp: String,
         /// Negotiated video codec label (`"h264"` / `"h265"`).
         codec: &'static str,
-    },
-    /// A local ICE candidate was gathered (answerer / P2P role only —
-    /// the publisher bakes candidates into the offer instead of trickling).
-    IceCandidate {
-        /// The media-line index the candidate belongs to.
-        sdp_mline_index: u32,
-        /// The candidate attribute value (`candidate:…`).
-        candidate: String,
     },
     /// The peer connection reached `connected` (publisher role) — the edge
     /// is now streaming media to the SFU. The caller forwards this as
@@ -153,43 +137,6 @@ pub struct WebRtcSession {
 }
 
 impl WebRtcSession {
-    /// Build the passthrough sub-pipeline for one camera and start pumping
-    /// its compressed NAL stream into the pipeline. Negotiation does not
-    /// begin until [`WebRtcSession::accept_offer`] is called.
-    ///
-    /// `nal_rx` is a fresh subscription to the camera's
-    /// [`crate::preroll_ingester::PreRollIngester`] broadcast; `codec` is
-    /// that ingester's `codec()`.
-    pub fn new(
-        session_id: String,
-        camera_id: CameraId,
-        codec: CodecKind,
-        mode: WebRtcMode,
-        ice_servers: &[IceServerCfg],
-        nal_rx: broadcast::Receiver<NalSample>,
-        events: mpsc::UnboundedSender<WebRtcEvent>,
-    ) -> Result<Self, WebRtcError> {
-        let sess = Self::build_common(
-            session_id,
-            camera_id,
-            codec,
-            mode,
-            ice_servers,
-            nal_rx,
-            events,
-        )?;
-        sess.wire_answerer_ice();
-        // We're the answerer, so we never create an offer on renegotiation;
-        // log for diagnostics only.
-        let sid = sess.session_id.clone();
-        sess.webrtc
-            .connect("on-negotiation-needed", false, move |_vals| {
-                debug!(session = %sid, "webrtcbin on-negotiation-needed (answerer; ignored)");
-                None
-            });
-        Ok(sess)
-    }
-
     /// Build a **publisher** (offerer) session that streams the camera
     /// send-only to an SFU.
     ///
@@ -305,24 +252,6 @@ impl WebRtcSession {
         })
     }
 
-    /// Wire the answerer's ICE trickle: forward each gathered local ICE
-    /// candidate as [`WebRtcEvent::IceCandidate`] (the browser peers directly).
-    fn wire_answerer_ice(&self) {
-        let ice_tx = self.events.clone();
-        self.webrtc.connect("on-ice-candidate", false, move |vals| {
-            let mline = vals.get(1).and_then(|v| v.get::<u32>().ok()).unwrap_or(0);
-            let candidate = vals
-                .get(2)
-                .and_then(|v| v.get::<String>().ok())
-                .unwrap_or_default();
-            let _ = ice_tx.send(WebRtcEvent::IceCandidate {
-                sdp_mline_index: mline,
-                candidate,
-            });
-            None
-        });
-    }
-
     /// Wire the publisher/offerer negotiation: on `on-negotiation-needed`
     /// create an offer, adopt it locally, and — once ICE gathering completes
     /// — emit [`WebRtcEvent::Offer`] with the candidates baked into the SDP.
@@ -395,107 +324,6 @@ impl WebRtcSession {
                 }
                 None
             });
-    }
-
-    /// Apply the browser's SDP offer, create + adopt the local answer, and
-    /// emit [`WebRtcEvent::Answer`]. Also transitions the pipeline to
-    /// `Playing` so media starts flowing.
-    pub fn accept_offer(&self, sdp_offer: &str) -> Result<(), WebRtcError> {
-        let msg = gst_sdp::SDPMessage::parse_buffer(sdp_offer.as_bytes())
-            .map_err(|e| WebRtcError::Sdp(format!("parse offer: {e}")))?;
-        let offer =
-            gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Offer, msg);
-
-        let webrtc_for_local = self.webrtc.clone();
-        let events_ok = self.events.clone();
-        let codec_label = self.codec.base();
-        // The RTP payload type the browser assigned to our codec lives in the
-        // negotiated answer; the payloader must stamp that exact number on the
-        // wire (see the `pay` reconfiguration below).
-        let encoding_name = if codec_label == "h265" {
-            "H265"
-        } else {
-            "H264"
-        };
-        let pay = self.pipeline.by_name("pay");
-
-        // Second stage: once the answer exists, adopt it locally + emit it.
-        let answer_promise = gst::Promise::with_change_func(move |reply| {
-            let answer = reply
-                .ok()
-                .flatten()
-                .and_then(|s| s.get::<gst_webrtc::WebRTCSessionDescription>("answer").ok());
-            let Some(answer) = answer else {
-                let _ = events_ok.send(WebRtcEvent::Failed(
-                    "create-answer: no answer in reply".to_string(),
-                ));
-                return;
-            };
-            // Re-stamp the payloader with the negotiated payload type BEFORE
-            // adopting the answer. The browser is the offerer, so it picks the
-            // payload numbers (e.g. pt 96 → VP8, H264 at 102/104/…). Our
-            // payloader defaults to pt=96; if we leave it there, every RTP
-            // packet is tagged 96, the browser maps 96 → VP8, cannot decode the
-            // H264 bytes, and drops them all (ICE connects, 0 fps, blank HD).
-            // Adopting the answer's pt makes the wire match what the browser
-            // expects to decode.
-            if let (Some(pay), Some(pt)) = (
-                pay.as_ref(),
-                negotiated_video_pt(answer.sdp(), encoding_name),
-            ) {
-                pay.set_property("pt", pt);
-            }
-            webrtc_for_local
-                .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
-            match answer.sdp().as_text() {
-                Ok(sdp) => {
-                    let _ = events_ok.send(WebRtcEvent::Answer {
-                        sdp,
-                        codec: codec_label,
-                    });
-                }
-                Err(e) => {
-                    let _ = events_ok.send(WebRtcEvent::Failed(format!("answer as_text: {e}")));
-                }
-            }
-        });
-
-        // First stage: set the remote (offer); on success create the answer.
-        let webrtc_for_answer = self.webrtc.clone();
-        let events_err = self.events.clone();
-        let remote_promise = gst::Promise::with_change_func(move |reply| {
-            if let Err(e) = reply {
-                let _ = events_err.send(WebRtcEvent::Failed(format!(
-                    "set-remote-description: {e:?}"
-                )));
-                return;
-            }
-            webrtc_for_answer
-                .emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
-        });
-
-        // Bring the pipeline up BEFORE applying the offer. `webrtcbin` only
-        // opens its internal peer-connection once it has reached at least the
-        // READY state; emitting `set-remote-description` / `create-answer`
-        // while the bin is still in NULL makes webrtcbin abort both async
-        // tasks with "Peerconnection is closed, aborting execution", so the
-        // create-answer promise resolves empty ("no answer in reply") and the
-        // browser hangs on "Negotiating HD". Starting the pipeline first keeps
-        // the SDP exchange on an open peer-connection.
-        self.pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
-
-        self.webrtc
-            .emit_by_name::<()>("set-remote-description", &[&offer, &remote_promise]);
-
-        Ok(())
-    }
-
-    /// Add a remote ICE candidate received from the browser (via cloud).
-    pub fn add_ice_candidate(&self, sdp_mline_index: u32, candidate: &str) {
-        self.webrtc
-            .emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
     }
 
     /// Apply the SFU's SDP **answer** (publisher role). Media starts flowing
@@ -680,38 +508,6 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     )
 }
 
-/// Scan a negotiated SDP for the video payload type the peer assigned to
-/// `encoding_name` (`"H264"` / `"H265"`). Returns the first matching
-/// `a=rtpmap:<pt> <ENC>/<clock>` payload number. Pure.
-fn negotiated_video_pt(sdp: &gst_sdp::SDPMessageRef, encoding_name: &str) -> Option<u32> {
-    for media in sdp.medias() {
-        if media.media() != Some("video") {
-            continue;
-        }
-        for attr in media.attributes() {
-            if attr.key() != "rtpmap" {
-                continue;
-            }
-            // Value looks like "102 H264/90000".
-            let Some(val) = attr.value() else { continue };
-            let mut parts = val.split_whitespace();
-            let (Some(pt), Some(enc)) = (parts.next(), parts.next()) else {
-                continue;
-            };
-            let matches = enc
-                .split('/')
-                .next()
-                .is_some_and(|e| e.eq_ignore_ascii_case(encoding_name));
-            if matches {
-                if let Ok(pt) = pt.parse::<u32>() {
-                    return Some(pt);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Normalise a wire `stun:` URL into the `stun://host:port` form
 /// webrtcbin's `stun-server` property expects. Returns `None` for
 /// non-STUN URLs. Pure.
@@ -767,19 +563,6 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_pt_picks_matching_encoding() {
-        let sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
-                   m=video 9 UDP/TLS/RTP/SAVPF 96 102 104\r\n\
-                   a=rtpmap:96 VP8/90000\r\n\
-                   a=rtpmap:102 H264/90000\r\n\
-                   a=rtpmap:104 H265/90000\r\n";
-        let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
-        assert_eq!(negotiated_video_pt(&msg, "H264"), Some(102));
-        assert_eq!(negotiated_video_pt(&msg, "H265"), Some(104));
-        assert_eq!(negotiated_video_pt(&msg, "VP9"), None);
-    }
-
-    #[test]
     fn stun_url_normalisation() {
         assert_eq!(
             stun_url_for("stun:host:3478").as_deref(),
@@ -810,69 +593,4 @@ mod tests {
         // Non-TURN scheme.
         assert_eq!(turn_url_for("stun:host:3478", Some("u"), Some("p")), None);
     }
-
-    /// End-to-end answerer flow against a real `webrtcbin`. Requires the
-    /// GStreamer runtime + gst-plugins-bad `webrtc` element + libnice, so
-    /// it's `#[ignore]`d in the default run and executed manually with
-    /// `cargo test -p nexus-pipeline --features gstreamer-webrtc -- --ignored`
-    /// on a host that has GStreamer installed.
-    #[tokio::test]
-    #[ignore = "needs a live GStreamer webrtcbin runtime"]
-    async fn answer_from_canned_offer() {
-        let (_nal_tx, nal_rx) = broadcast::channel::<NalSample>(8);
-        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<WebRtcEvent>();
-
-        let session = WebRtcSession::new(
-            "test-session-1".to_string(),
-            1,
-            CodecKind::H264,
-            WebRtcMode::Passthrough,
-            &[],
-            nal_rx,
-            ev_tx,
-        )
-        .expect("build session");
-
-        session
-            .accept_offer(CANNED_H264_OFFER)
-            .expect("accept offer");
-
-        let evt = tokio::time::timeout(std::time::Duration::from_secs(5), ev_rx.recv())
-            .await
-            .expect("answer within 5s")
-            .expect("event channel open");
-        match evt {
-            WebRtcEvent::Answer { sdp, codec } => {
-                assert_eq!(codec, "h264");
-                assert!(sdp.contains("m=video"), "answer sdp: {sdp}");
-            }
-            other => panic!("expected an Answer, got {other:?}"),
-        }
-    }
-
-    /// A minimal browser-style recvonly H.264 offer (dummy but well-formed
-    /// fingerprint; DTLS never runs during answer creation).
-    const CANNED_H264_OFFER: &str = "v=0\r\n\
-o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
-s=-\r\n\
-t=0 0\r\n\
-a=group:BUNDLE 0\r\n\
-a=msid-semantic: WMS\r\n\
-m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
-c=IN IP4 0.0.0.0\r\n\
-a=rtcp:9 IN IP4 0.0.0.0\r\n\
-a=ice-ufrag:sTmA\r\n\
-a=ice-pwd:1TS7iGCGqZLtVQjSVGodpAsr\r\n\
-a=ice-options:trickle\r\n\
-a=fingerprint:sha-256 \
-AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:\
-AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
-a=setup:actpass\r\n\
-a=mid:0\r\n\
-a=recvonly\r\n\
-a=rtcp-mux\r\n\
-a=rtpmap:96 H264/90000\r\n\
-a=rtcp-fb:96 nack\r\n\
-a=rtcp-fb:96 nack pli\r\n\
-a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n";
 }

@@ -851,19 +851,6 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             EnvelopeBody::LbrUnsubscribe(payload) => {
                 live_view.on_unsubscribe(payload);
             }
-            // Phase 10 (Phase F) — HD WebRTC signalling. The cloud sends a
-            // webrtc_offer for the single expanded camera; the bridge builds
-            // a passthrough webrtcbin session and pumps the answer + local
-            // ICE back out. webrtc_ice_candidate feeds the browser's trickle.
-            // No-op (logged) when the engine lacks the gstreamer-webrtc
-            // feature — the heartbeat never advertised `webrtc` then, so this
-            // is defence in depth.
-            EnvelopeBody::WebrtcOffer(payload) => {
-                webrtc.on_offer(payload, outbox);
-            }
-            EnvelopeBody::WebrtcIceCandidate(payload) => {
-                webrtc.on_ice_candidate(payload);
-            }
             // Phase 2 dual-transport — SFU HD publish signalling. The cloud
             // sends live_hd_start for the single expanded camera; the bridge
             // builds a send-only publisher webrtcbin, gathers ICE, and emits
