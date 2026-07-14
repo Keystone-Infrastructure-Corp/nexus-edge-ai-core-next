@@ -477,6 +477,9 @@ pub struct LiveHdPublishingPayload {
 pub struct LiveHdStartPayload {
     /// Per-core integer id (cameras.edge_camera_id) of the solo camera to publish.
     pub camera_id: u64,
+    /// SFU-only. STUN + ephemeral Cloudflare TURN servers the edge publisher webrtcbin uses to gather srflx/relay candidates so its offer reaches the SFU through NAT. Omitted / empty = host candidates only. Ignored for `moq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice_servers: Option<Vec<IceServer>>,
     /// Optional. `passthrough` (default) or `transcode` to H.264 when the subscriber can't decode the native codec. Omitted = passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
