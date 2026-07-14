@@ -272,9 +272,10 @@ impl WebRtcSession {
                 let emitted = std::sync::Arc::clone(&emitted);
                 let webrtc_for_local = webrtc.clone();
                 let offer_promise = gst::Promise::with_change_func(move |reply| {
-                    let offer = reply.ok().flatten().and_then(|s| {
-                        s.get::<gst_webrtc::WebRTCSessionDescription>("offer").ok()
-                    });
+                    let offer = reply
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.get::<gst_webrtc::WebRTCSessionDescription>("offer").ok());
                     let Some(offer) = offer else {
                         let _ = events.send(WebRtcEvent::Failed(
                             "create-offer: no offer in reply".to_string(),
@@ -293,10 +294,8 @@ impl WebRtcSession {
                         &emitted,
                     );
                 });
-                webrtc.emit_by_name::<()>(
-                    "create-offer",
-                    &[&None::<gst::Structure>, &offer_promise],
-                );
+                webrtc
+                    .emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &offer_promise]);
                 None
             });
 
