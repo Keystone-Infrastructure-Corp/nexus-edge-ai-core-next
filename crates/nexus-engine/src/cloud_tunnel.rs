@@ -864,6 +864,22 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             EnvelopeBody::WebrtcIceCandidate(payload) => {
                 webrtc.on_ice_candidate(payload);
             }
+            // Phase 2 dual-transport — SFU HD publish signalling. The cloud
+            // sends live_hd_start for the single expanded camera; the bridge
+            // builds a send-only publisher webrtcbin, gathers ICE, and emits
+            // live_hd_offer. live_hd_answer carries the SFU's answer;
+            // live_hd_stop tears the publisher down. No-op (logged) without
+            // the gstreamer-webrtc feature — the heartbeat never advertised
+            // `hd_sfu` then, so this is defence in depth.
+            EnvelopeBody::LiveHdStart(payload) => {
+                webrtc.on_live_hd_start(payload, outbox);
+            }
+            EnvelopeBody::LiveHdAnswer(payload) => {
+                webrtc.on_live_hd_answer(payload);
+            }
+            EnvelopeBody::LiveHdStop(payload) => {
+                webrtc.on_live_hd_stop(payload);
+            }
             other => {
                 if let EnvelopeBody::HeartbeatAck(ack) = other {
                     outbox.update_caps(ack.cloud_capabilities.as_deref());
