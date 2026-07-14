@@ -64,7 +64,7 @@ use axum::Json;
 use nexus_bus::{topic, BusExt};
 use nexus_config::{ModelConfig, RuleConfig};
 use nexus_store::audit::AuditOutcome;
-use nexus_types::{RuleId, VisualPromptId};
+use nexus_types::{HdTransport, RuleId, VisualPromptId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -210,11 +210,45 @@ async fn apply_category(
         "visual_prompts" => apply_visual_prompts(s, effective).await,
         "detector_config" => apply_detector_config(s, effective).await,
         "delivery_settings" => apply_delivery_settings(s, effective).await,
+        "live_view" => apply_live_view(s, effective).await,
         other => Err(ApiError(
             StatusCode::NOT_FOUND,
             format!("unknown fleet category: {other:?}"),
         )),
     }
+}
+
+/// `live_view` — `effective` is a JSON object `{ "hd_transport": "sfu"|"moq" }`.
+/// REPLACE semantics: persists the core's HD live-view transport into
+/// `engine_runtime_settings.hd_transport`. The heartbeat pump re-reads it each
+/// tick, so the advertised `hd_*` cap flips within one heartbeat — no restart.
+/// The paired local operator surface is `PUT /v1/admin/live-view/transport`;
+/// both write the same setting.
+async fn apply_live_view(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+    let transport: HdTransport = effective
+        .get("hd_transport")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "live_view payload requires hd_transport = \"sfu\" | \"moq\"".to_string(),
+            )
+        })?
+        .parse()
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("live_view payload: {e}")))?;
+    s.store
+        .write_runtime_setting(
+            crate::admin_runtime::KEY_HD_TRANSPORT,
+            Some(&transport.to_string()),
+        )
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist hd_transport: {e}"),
+            )
+        })?;
+    Ok(1)
 }
 
 /// `rules` — `effective` is a JSON array of full [`RuleConfig`]
