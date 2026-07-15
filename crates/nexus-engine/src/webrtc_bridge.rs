@@ -188,12 +188,6 @@ impl WebRtcBridge {
         };
         let codec = ingester.codec();
         let nal_rx = ingester.subscribe();
-        // Snapshot the ring AFTER subscribing so the seed can't miss a live
-        // sample: the webrtc feed prepends this (the current GOP, starting at a
-        // keyframe) so the browser decodes immediately instead of waiting up to
-        // a full camera GOP for the next IDR. Overlap with the live channel is
-        // de-duped by PTS in the feed.
-        let seed = ingester.snapshot();
 
         let ice_servers: Vec<IceServerCfg> = payload
             .ice_servers
@@ -222,7 +216,6 @@ impl WebRtcBridge {
             mode,
             &ice_servers,
             nal_rx,
-            seed,
             ev_tx,
         ) {
             Ok(s) => s,
