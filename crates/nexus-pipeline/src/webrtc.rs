@@ -552,8 +552,13 @@ fn emit_local_offer(
 fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     let base = codec.base(); // "h264" | "h265"
     let encoding = if base == "h265" { "H265" } else { "H264" };
-    // `config-interval=-1` on parse + pay repeats SPS/PPS with every IDR so
-    // a mid-stream browser join can start decoding; `mtu=1200` keeps RTP
+    // `config-interval=0` (trust the source) on BOTH parse and pay: this
+    // InSight camera already emits SPS/PPS in every keyframe access unit, so
+    // `config-interval=-1` made h264parse re-insert them — doubling the
+    // parameter sets, which intermittently corrupts the keyframe (the browser
+    // receives it but never decodes it, so `keyFramesDecoded` stalls and HD
+    // freezes/blacks out). The camera supplies SPS/PPS at every IDR, so the
+    // browser still gets them without re-insertion. `mtu=1200` keeps RTP
     // packets inside a conservative WebRTC MTU.
     //
     // `do-timestamp=false`: the feed stamps each buffer with an explicit,
@@ -571,8 +576,8 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     format!(
         "appsrc name=src is-live=true do-timestamp=false format=time \
              block=true max-bytes=8388608 stream-type=stream \
-           ! {base}parse config-interval=-1 \
-           ! rtp{base}pay name=pay pt=96 config-interval=-1 mtu=1200 \
+           ! {base}parse config-interval=0 \
+           ! rtp{base}pay name=pay pt=96 config-interval=0 mtu=1200 \
            ! application/x-rtp,media=video,encoding-name={encoding},clock-rate=90000 \
            ! webrtcbin name=webrtc latency=0 bundle-policy=max-bundle"
     )
