@@ -51,6 +51,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use std::time::Duration;
+
 use crate::preroll::NalSample;
 
 /// Errors from building or driving a [`WebRtcSession`].
@@ -365,14 +367,71 @@ impl Drop for WebRtcSession {
     }
 }
 
+/// Nominal frame spacing (~30 fps) used to keep the appsrc timeline strictly
+/// advancing when a sample lacks a usable PTS or repeats one.
+const FEED_FALLBACK_STEP: Duration = Duration::from_millis(33);
+
+/// Builds a clean, 0-based, **strictly-monotonic** presentation timeline from
+/// the camera's own per-AU timestamps so `rtph264pay` emits exactly one
+/// distinct RTP timestamp per access unit.
+///
+/// Why this exists: the pipeline used to run `appsrc do-timestamp=true`, which
+/// stamps each buffer with the pipeline running-time *at push*. Under the
+/// `block=true` back-pressure from `webrtcbin`, the feed pushes access units in
+/// bursts, so consecutive AUs got near-identical timestamps. `rtph264pay` then
+/// emitted colliding RTP timestamps and the browser's H.264 depacketiser could
+/// not tell one frame from the next — it only ever completed the occasional
+/// keyframe, so HD rendered frozen/black (confirmed via `chrome://webrtc-internals`:
+/// tens of MB received, `framesReceived` stuck at a handful, all keyframes).
+///
+/// The pre-roll ingester already hands us a monotonic `NalSample.pts` per AU
+/// (synthesised for cameras that drop it), so we stamp buffers with that
+/// instead — every frame gets a distinct, correctly-spaced RTP timestamp
+/// regardless of push cadence.
+struct FeedClock {
+    base: Option<Duration>,
+    last: Option<Duration>,
+}
+
+impl FeedClock {
+    fn new() -> Self {
+        Self {
+            base: None,
+            last: None,
+        }
+    }
+
+    /// Resolve the session-relative, strictly-advancing PTS for a sample.
+    /// Rebases the first seen timestamp to zero; a missing, duplicate, or
+    /// backward source timestamp is nudged forward by one nominal frame so two
+    /// AUs never share an RTP timestamp (the exact failure this guards against).
+    fn resolve(&mut self, sample: &NalSample) -> Duration {
+        let rel = match sample.pts.or(sample.dts) {
+            Some(raw) => {
+                let base = *self.base.get_or_insert(raw);
+                raw.saturating_sub(base)
+            }
+            None => self.last.map_or(Duration::ZERO, |l| l + FEED_FALLBACK_STEP),
+        };
+        let rel = match self.last {
+            Some(last) if rel <= last => last + FEED_FALLBACK_STEP,
+            _ => rel,
+        };
+        self.last = Some(rel);
+        rel
+    }
+}
+
 /// Pump compressed NAL samples from the ingester broadcast into `appsrc`.
 ///
 /// Splices in at the next keyframe (drops delta frames until an IDR) so a
 /// mid-GOP subscribe never feeds the browser a broken reference frame. A
 /// broadcast lag re-arms the splice (we may have dropped the frames between
-/// the last IDR and now).
+/// the last IDR and now). The [`FeedClock`] persists across re-arms so the
+/// outbound RTP timeline stays monotonic even across a dropped-frame gap.
 async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camera_id: CameraId) {
     let mut started = false;
+    let mut clock = FeedClock::new();
     loop {
         match rx.recv().await {
             Ok(sample) => {
@@ -383,7 +442,7 @@ async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camer
                     started = true;
                     debug!(camera_id, "webrtc feed: spliced in at keyframe");
                 }
-                if let Err(e) = push_nal(&appsrc, &sample) {
+                if let Err(e) = push_nal(&appsrc, &sample, &mut clock) {
                     warn!(camera_id, error = %e, "webrtc feed: push failed; ending");
                     break;
                 }
@@ -401,16 +460,23 @@ async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camer
     let _ = appsrc.end_of_stream();
 }
 
-/// Copy one NAL sample into a `gst::Buffer` and push it into `appsrc`.
-/// `appsrc` is configured `do-timestamp=true`, so we don't set PTS; we
-/// only flag delta (non-key) frames for the downstream payloader.
-fn push_nal(appsrc: &AppSrc, sample: &NalSample) -> Result<(), String> {
+/// Copy one NAL sample into a `gst::Buffer`, stamp it with the [`FeedClock`]'s
+/// monotonic PTS/DTS, and push it into `appsrc`. `appsrc` runs
+/// `do-timestamp=false` so these explicit timestamps drive `rtph264pay`'s RTP
+/// clock — see [`FeedClock`] for why auto-timestamping breaks frame assembly.
+fn push_nal(appsrc: &AppSrc, sample: &NalSample, clock: &mut FeedClock) -> Result<(), String> {
+    let ts = gst::ClockTime::from_nseconds(clock.resolve(sample).as_nanos() as u64);
     let mut buf = gst::Buffer::with_size(sample.data.len()).map_err(|e| format!("alloc: {e}"))?;
     {
         let bm = buf.get_mut().ok_or("buffer not unique")?;
         let mut map = bm.map_writable().map_err(|e| format!("map: {e}"))?;
         map.copy_from_slice(&sample.data);
         drop(map);
+        // Baseline/main-profile IP-camera live streams carry no B-frames, so
+        // DTS == PTS; setting both keeps `rtph264pay` from inferring a bogus
+        // reorder delay.
+        bm.set_pts(ts);
+        bm.set_dts(ts);
         if !sample.is_keyframe {
             bm.set_flags(gst::BufferFlags::DELTA_UNIT);
         }
@@ -490,6 +556,11 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     // a mid-stream browser join can start decoding; `mtu=1200` keeps RTP
     // packets inside a conservative WebRTC MTU.
     //
+    // `do-timestamp=false`: the feed stamps each buffer with an explicit,
+    // monotonic PTS/DTS off the camera's own per-AU timeline (see `FeedClock`).
+    // Auto-timestamping collided RTP timestamps under back-pressure and left the
+    // browser unable to assemble delta frames (frozen/black HD).
+    //
     // Do NOT pin a `payload` on the RTP caps: the browser's offer assigns the
     // payload types (e.g. pt 96 → VP8, H264 at 102/104/…). If we hardcode
     // `payload=96`, webrtcbin looks for our H264/H265 at pt 96 — which the
@@ -498,7 +569,7 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     // Leaving the payload unset lets webrtcbin adopt the browser's H264/H265
     // payload type during answer negotiation.
     format!(
-        "appsrc name=src is-live=true do-timestamp=true format=time \
+        "appsrc name=src is-live=true do-timestamp=false format=time \
              block=true max-bytes=8388608 stream-type=stream \
            ! {base}parse config-interval=-1 \
            ! rtp{base}pay name=pay pt=96 config-interval=-1 mtu=1200 \
@@ -550,6 +621,9 @@ mod tests {
         assert!(d.contains("rtph264pay"), "{d}");
         assert!(d.contains("encoding-name=H264"), "{d}");
         assert!(d.contains("webrtcbin name=webrtc"), "{d}");
+        // We stamp PTS/DTS ourselves; auto-timestamping is what broke delta
+        // frame assembly in the browser.
+        assert!(d.contains("do-timestamp=false"), "{d}");
     }
 
     #[test]
@@ -559,6 +633,34 @@ mod tests {
         assert!(d.contains("h265parse"), "{d}");
         assert!(d.contains("rtph265pay"), "{d}");
         assert!(d.contains("encoding-name=H265"), "{d}");
+    }
+
+    #[test]
+    fn feed_clock_strictly_advances() {
+        let kf = |pts_ms: u64, key: bool| NalSample {
+            pts: Some(Duration::from_millis(pts_ms)),
+            dts: None,
+            is_keyframe: key,
+            data: vec![0u8],
+        };
+        let mut clock = FeedClock::new();
+        // First AU rebases to zero regardless of the camera's absolute clock.
+        assert_eq!(clock.resolve(&kf(1000, true)), Duration::ZERO);
+        // Normal ~40 ms spacing is preserved.
+        assert_eq!(clock.resolve(&kf(1040, false)), Duration::from_millis(40));
+        // A duplicate source timestamp is nudged forward, never repeated —
+        // colliding RTP timestamps are exactly what froze HD.
+        assert_eq!(clock.resolve(&kf(1040, false)), Duration::from_millis(73));
+        // A missing PTS still advances.
+        let no_pts = NalSample {
+            pts: None,
+            dts: None,
+            is_keyframe: false,
+            data: vec![0u8],
+        };
+        assert_eq!(clock.resolve(&no_pts), Duration::from_millis(106));
+        // A backward jump is clamped forward, keeping the timeline monotonic.
+        assert_eq!(clock.resolve(&kf(500, true)), Duration::from_millis(139));
     }
 
     #[test]
