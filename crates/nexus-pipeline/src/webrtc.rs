@@ -39,8 +39,6 @@
 //! `system-libs` job or a local GStreamer install), never on the default
 //! macOS build.
 
-use std::time::Duration;
-
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppStreamType};
@@ -53,7 +51,6 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::gst_clip_recorder::contains_slice_nal;
 use crate::preroll::NalSample;
 
 /// Errors from building or driving a [`WebRtcSession`].
@@ -134,11 +131,9 @@ pub struct WebRtcSession {
     pipeline: gst::Pipeline,
     webrtc: gst::Element,
     /// Kept alive for the session's lifetime; the feed task holds a clone.
-    appsrc: AppSrc,
+    _appsrc: AppSrc,
     events: mpsc::UnboundedSender<WebRtcEvent>,
-    /// Spawned by `new_publisher` once the pipeline is PLAYING, so the
-    /// ring-seed prepend lands in an appsrc that already accepts buffers.
-    feed: Option<JoinHandle<()>>,
+    feed: JoinHandle<()>,
 }
 
 impl WebRtcSession {
@@ -151,7 +146,6 @@ impl WebRtcSession {
     /// candidates baked into the SDP. The SFU's answer arrives via
     /// [`WebRtcSession::set_answer`], and once the peer connection is up the
     /// session emits [`WebRtcEvent::Connected`].
-    #[allow(clippy::too_many_arguments)]
     pub fn new_publisher(
         session_id: String,
         camera_id: CameraId,
@@ -159,26 +153,23 @@ impl WebRtcSession {
         mode: WebRtcMode,
         ice_servers: &[IceServerCfg],
         nal_rx: broadcast::Receiver<NalSample>,
-        seed: Vec<NalSample>,
         events: mpsc::UnboundedSender<WebRtcEvent>,
     ) -> Result<Self, WebRtcError> {
-        let mut sess = Self::build_common(session_id, camera_id, codec, mode, ice_servers, events)?;
+        let sess = Self::build_common(
+            session_id,
+            camera_id,
+            codec,
+            mode,
+            ice_servers,
+            nal_rx,
+            events,
+        )?;
         sess.wire_offerer();
         // Bring the pipeline up so `webrtcbin` opens its peer-connection,
         // fires `on-negotiation-needed`, and begins gathering ICE.
         sess.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
-        // Spawn the NAL feed only AFTER the pipeline is live: the ring-seed
-        // prepend is pushed immediately (unlike the live path, which blocks on
-        // `recv`), so the appsrc must already be accepting buffers.
-        sess.feed = Some(tokio::spawn(feed_loop(
-            sess.appsrc.clone(),
-            nal_rx,
-            seed,
-            codec,
-            camera_id,
-        )));
         Ok(sess)
     }
 
@@ -191,6 +182,7 @@ impl WebRtcSession {
         codec: CodecKind,
         mode: WebRtcMode,
         ice_servers: &[IceServerCfg],
+        nal_rx: broadcast::Receiver<NalSample>,
         events: mpsc::UnboundedSender<WebRtcEvent>,
     ) -> Result<Self, WebRtcError> {
         if mode == WebRtcMode::Transcode {
@@ -245,17 +237,18 @@ impl WebRtcSession {
             }
         }
 
-        // The NAL feed (with its ring-seed prepend) is spawned by the caller
-        // once the pipeline is PLAYING — see `new_publisher`.
+        // Pump compressed NALs into appsrc, splicing in at the next IDR.
+        let feed = tokio::spawn(feed_loop(appsrc.clone(), nal_rx, camera_id));
+
         Ok(Self {
             session_id,
             camera_id,
             codec,
             pipeline,
             webrtc,
-            appsrc,
+            _appsrc: appsrc,
             events,
-            feed: None,
+            feed,
         })
     }
 
@@ -367,86 +360,19 @@ impl WebRtcSession {
 
 impl Drop for WebRtcSession {
     fn drop(&mut self) {
-        if let Some(feed) = &self.feed {
-            feed.abort();
-        }
+        self.feed.abort();
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
 
-/// Pump compressed NAL samples into `appsrc`, seeding from a ring snapshot.
+/// Pump compressed NAL samples from the ingester broadcast into `appsrc`.
 ///
-/// `seed` is the ingester's ring snapshot taken at subscribe time — the
-/// current GOP, which by the ring invariant starts at a keyframe. Pushing it
-/// first hands `h264parse` its SPS/PPS and the browser's decoder an intra
-/// frame *immediately*, instead of waiting up to a full camera GOP (2–15 s)
-/// for the next natural IDR. That SPS/PPS is what unblocks `webrtcbin`'s
-/// offer (the payloader's caps must resolve before `on-negotiation-needed`
-/// fires), so the seed collapses the dominant first-frame cost. Live samples
-/// already covered by the seed are de-duped by PTS.
-///
-/// Without a usable seed (pre-roll disabled, or a snapshot that doesn't start
-/// on a keyframe) this falls back to the original behaviour: splice in at the
-/// next live keyframe, dropping delta frames until an IDR so a mid-GOP
-/// subscribe never feeds the browser a broken reference frame. A broadcast
-/// lag re-arms the splice.
-async fn feed_loop(
-    appsrc: AppSrc,
-    mut rx: broadcast::Receiver<NalSample>,
-    seed: Vec<NalSample>,
-    codec: CodecKind,
-    camera_id: CameraId,
-) {
+/// Splices in at the next keyframe (drops delta frames until an IDR) so a
+/// mid-GOP subscribe never feeds the browser a broken reference frame. A
+/// broadcast lag re-arms the splice (we may have dropped the frames between
+/// the last IDR and now).
+async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camera_id: CameraId) {
     let mut started = false;
-    let mut last_seeded_pts: Option<Duration> = None;
-
-    // Trim trailing header-only samples (AUD/SEI with no slice NAL) off the
-    // seed: the matching slice for that access unit may still be in flight on
-    // the live channel with the SAME pts, and the de-dup below
-    // (`pts <= last_seeded_pts`) would drop it — orphaning the header and
-    // smearing the picture until the next IDR. Trimming lets the complete AU
-    // arrive intact on the live path.
-    let seed_end = seed
-        .iter()
-        .rposition(|s| contains_slice_nal(&s.data, codec));
-    if let Some(end) = seed_end {
-        if seed.first().is_some_and(|s| s.is_keyframe) {
-            let mut to_push = seed;
-            to_push.truncate(end + 1);
-            let seeded_pts = to_push.iter().filter_map(|s| s.pts).next_back();
-            let n = to_push.len();
-            // `block=true` appsrc can stall on downstream backpressure; push
-            // the (up to one whole GOP) seed off the tokio worker.
-            let appsrc_seed = appsrc.clone();
-            match tokio::task::spawn_blocking(move || {
-                for sample in &to_push {
-                    push_nal(&appsrc_seed, sample)?;
-                }
-                Ok::<(), String>(())
-            })
-            .await
-            {
-                Ok(Ok(())) => {
-                    started = true;
-                    last_seeded_pts = seeded_pts;
-                    debug!(
-                        camera_id,
-                        seeded = n,
-                        "webrtc feed: seeded from ring keyframe"
-                    );
-                }
-                Ok(Err(e)) => {
-                    // Fall back to the live splice rather than aborting — a
-                    // failed seed must not leave the session with no media.
-                    debug!(camera_id, error = %e, "webrtc feed: seed push failed; live splice");
-                }
-                Err(e) => {
-                    debug!(camera_id, error = %e, "webrtc feed: seed task join failed; live splice");
-                }
-            }
-        }
-    }
-
     loop {
         match rx.recv().await {
             Ok(sample) => {
@@ -456,12 +382,6 @@ async fn feed_loop(
                     }
                     started = true;
                     debug!(camera_id, "webrtc feed: spliced in at keyframe");
-                } else if let (Some(spts), Some(lpts)) = (sample.pts, last_seeded_pts) {
-                    // De-dup the seed↔live overlap: a ring sample can also
-                    // arrive on the broadcast a moment later.
-                    if spts <= lpts {
-                        continue;
-                    }
                 }
                 if let Err(e) = push_nal(&appsrc, &sample) {
                     warn!(camera_id, error = %e, "webrtc feed: push failed; ending");
@@ -474,7 +394,6 @@ async fn feed_loop(
                     dropped, "webrtc feed: broadcast lagged; re-arming splice"
                 );
                 started = false;
-                last_seeded_pts = None;
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }

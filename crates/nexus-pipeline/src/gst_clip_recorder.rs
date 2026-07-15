@@ -1186,7 +1186,7 @@ fn coalesce_same_pts(
 /// without a slice is by definition NOT a complete access unit and
 /// must not be muxed on its own — see [`coalesce_same_pts`] for the
 /// rationale.
-pub(crate) fn contains_slice_nal(data: &[u8], codec: CodecKind) -> bool {
+fn contains_slice_nal(data: &[u8], codec: CodecKind) -> bool {
     let is_h265 = codec.base() == "h265";
     let mut i = 0;
     while i + 3 < data.len() {
