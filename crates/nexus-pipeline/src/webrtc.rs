@@ -187,18 +187,40 @@ impl WebRtcSession {
         nal_rx: broadcast::Receiver<NalSample>,
         events: mpsc::UnboundedSender<WebRtcEvent>,
     ) -> Result<Self, WebRtcError> {
-        if mode == WebRtcMode::Transcode {
-            return Err(WebRtcError::Unsupported(
-                "transcode fallback is not implemented in Phase E (passthrough only)".to_string(),
-            ));
-        }
         gst::init().map_err(|e| WebRtcError::Init(e.to_string()))?;
 
-        let desc = passthrough_pipeline_desc(codec);
-        let pipeline = gst::parse::launch(&desc)
-            .map_err(|e| WebRtcError::Build(format!("parse::launch: {e}")))?
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| WebRtcError::Build("downcast Pipeline".to_string()))?;
+        // Choose the media pipeline. Prefer a short-GOP hardware **transcode**
+        // (HW-decode the camera codec → re-encode H.264 with a ~2s keyframe
+        // interval, CBR, no B-frames): a long-GOP camera stream stalls for a
+        // full GOP after any packet loss on the UDP WebRTC path, whereas a
+        // short GOP recovers within ~1-2s. Falls back to raw passthrough on
+        // boxes without a HW encoder + matching decoder (e.g. macOS dev), or if
+        // the transcode pipeline fails to build. `mode` is advisory; the choice
+        // is driven by hardware availability.
+        let _ = mode;
+        let transcode = hw_h264_encoder().zip(hw_decoder(codec));
+        let (mut desc, mut transcoding) = match transcode {
+            Some((enc, dec)) => (transcode_pipeline_desc(codec, enc, dec), true),
+            None => (passthrough_pipeline_desc(codec), false),
+        };
+        let pipeline = match gst::parse::launch(&desc) {
+            Ok(p) => p,
+            Err(e) if transcoding => {
+                warn!(
+                    camera_id,
+                    error = %e,
+                    "webrtc transcode pipeline failed to build; falling back to passthrough"
+                );
+                transcoding = false;
+                desc = passthrough_pipeline_desc(codec);
+                gst::parse::launch(&desc)
+                    .map_err(|e| WebRtcError::Build(format!("parse::launch: {e}")))?
+            }
+            Err(e) => return Err(WebRtcError::Build(format!("parse::launch: {e}"))),
+        }
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| WebRtcError::Build("downcast Pipeline".to_string()))?;
+        debug!(camera_id, transcoding, "webrtc HD pipeline built");
 
         let appsrc = pipeline
             .by_name("src")
@@ -547,6 +569,58 @@ fn emit_local_offer(
     }
 }
 
+/// Name of an available hardware H.264 **encoder** for the transcode path, or
+/// `None` on boxes without one (e.g. macOS dev), where the caller falls back
+/// to passthrough. Pure aside from the plugin registry lookup.
+fn hw_h264_encoder() -> Option<&'static str> {
+    ["vah264enc", "vaapih264enc"]
+        .into_iter()
+        .find(|name| gst::ElementFactory::find(name).is_some())
+}
+
+/// Name of an available hardware **decoder** for the camera codec, matching
+/// [`hw_h264_encoder`] so the transcode chain stays fully on the GPU.
+fn hw_decoder(codec: CodecKind) -> Option<&'static str> {
+    let candidates: &[&str] = if codec.base() == "h265" {
+        &["vah265dec", "vaapih265dec"]
+    } else {
+        &["vah264dec", "vaapih264dec"]
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|name| gst::ElementFactory::find(name).is_some())
+}
+
+/// Build a **transcode** launch description: HW-decode the camera codec and
+/// re-encode to H.264 with a short GOP for smooth WebRTC over a lossy network.
+///
+/// Camera streams often use a multi-second GOP (this InSight uses ~15s). Over
+/// WebRTC (UDP) a single lost packet corrupts every delta frame until the next
+/// keyframe, so a long GOP means multi-second freezes on ~1% loss. Re-encoding
+/// with `key-int-max=48` (~2s @ 24fps), CBR, and no B-frames caps the recovery
+/// window at ~2s while leaving the camera untouched. The output is always
+/// H.264 (`encoding-name=H264`), which also covers the HEVC-camera →
+/// non-HEVC-browser case. `config-interval=1` repeats SPS/PPS once a second in
+/// the RTP stream for extra resilience. Pure — unit-testable without a runtime.
+fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> String {
+    let base = codec.base(); // "h264" | "h265"
+    format!(
+        "appsrc name=src is-live=true do-timestamp=false format=time \
+             block=true max-bytes=8388608 stream-type=stream \
+           ! {base}parse \
+           ! {decoder} \
+           ! vapostproc \
+           ! video/x-raw(memory:VAMemory) \
+           ! {encoder} name=enc key-int-max=48 b-frames=0 rate-control=cbr \
+             bitrate=2500 target-usage=6 \
+           ! h264parse config-interval=1 \
+           ! rtph264pay name=pay pt=96 config-interval=1 mtu=1200 \
+           ! application/x-rtp,media=video,encoding-name=H264,clock-rate=90000 \
+           ! webrtcbin name=webrtc latency=0 bundle-policy=max-bundle"
+    )
+}
+
 /// Build the passthrough launch description for a camera codec. Pure so it
 /// can be unit-tested without a GStreamer runtime.
 fn passthrough_pipeline_desc(codec: CodecKind) -> String {
@@ -666,6 +740,29 @@ mod tests {
         assert_eq!(clock.resolve(&no_pts), Duration::from_millis(106));
         // A backward jump is clamped forward, keeping the timeline monotonic.
         assert_eq!(clock.resolve(&kf(500, true)), Duration::from_millis(139));
+    }
+
+    #[test]
+    fn transcode_desc_h264() {
+        let d = transcode_pipeline_desc(CodecKind::H264, "vah264enc", "vah264dec");
+        assert!(d.contains("h264parse"), "{d}");
+        assert!(d.contains("vah264dec"), "{d}");
+        assert!(d.contains("vah264enc name=enc"), "{d}");
+        assert!(d.contains("key-int-max=48"), "{d}");
+        assert!(d.contains("rate-control=cbr"), "{d}");
+        assert!(d.contains("b-frames=0"), "{d}");
+        assert!(d.contains("encoding-name=H264"), "{d}");
+        assert!(d.contains("webrtcbin name=webrtc"), "{d}");
+    }
+
+    #[test]
+    fn transcode_desc_h265_outputs_h264() {
+        // An H.265 camera is decoded then re-encoded to H.264 for the browser.
+        let d = transcode_pipeline_desc(CodecKind::H265Plus, "vah264enc", "vah265dec");
+        assert!(d.contains("h265parse"), "{d}");
+        assert!(d.contains("vah265dec"), "{d}");
+        assert!(d.contains("vah264enc name=enc"), "{d}");
+        assert!(d.contains("encoding-name=H264"), "{d}");
     }
 
     #[test]
