@@ -602,7 +602,10 @@ fn hw_decoder(codec: CodecKind) -> Option<&'static str> {
 /// window at ~2s while leaving the camera untouched. The output is always
 /// H.264 (`encoding-name=H264`), which also covers the HEVC-camera →
 /// non-HEVC-browser case. `config-interval=1` repeats SPS/PPS once a second in
-/// the RTP stream for extra resilience. Pure — unit-testable without a runtime.
+/// the RTP stream for extra resilience. `videorate` normalises the camera's
+/// irregular frame delivery to a constant 24fps: the browser plays frames out
+/// on the RTP timestamps, so jittery source timing shows as visible jitter
+/// even at a healthy average fps. Pure — unit-testable without a runtime.
 fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> String {
     let base = codec.base(); // "h264" | "h265"
     format!(
@@ -611,7 +614,8 @@ fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> St
            ! {base}parse \
            ! {decoder} \
            ! vapostproc \
-           ! video/x-raw(memory:VAMemory) \
+           ! videorate \
+           ! video/x-raw(memory:VAMemory),framerate=24/1 \
            ! {encoder} name=enc key-int-max=48 b-frames=0 rate-control=cbr \
              bitrate=2500 target-usage=6 \
            ! h264parse config-interval=1 \
@@ -751,6 +755,8 @@ mod tests {
         assert!(d.contains("key-int-max=48"), "{d}");
         assert!(d.contains("rate-control=cbr"), "{d}");
         assert!(d.contains("b-frames=0"), "{d}");
+        assert!(d.contains("videorate"), "{d}");
+        assert!(d.contains("framerate=24/1"), "{d}");
         assert!(d.contains("encoding-name=H264"), "{d}");
         assert!(d.contains("webrtcbin name=webrtc"), "{d}");
     }
