@@ -815,25 +815,6 @@ impl BitrateController {
     }
 }
 
-/// Read the rtpbin session's `twcc-stats` (Phase b probe). Non-empty
-/// `packets`/`bitrate-recv` here means the receiver (Cloudflare SFU) is
-/// returning transport-wide-cc feedback — the signal `rtpgccbwe` depends on.
-/// Returns `None` before session 0 exists or if the property is unavailable.
-fn read_twcc_stats(webrtc: &gst::Element) -> Option<gst::Structure> {
-    // webrtcbin IS a GstBin; reach its internal rtpbin by name. (Its ChildProxy
-    // impl enumerates transceivers, so `Bin::by_name` is clearer than
-    // `child_by_name`, though both resolve the element.)
-    let rtpbin = webrtc.dynamic_cast_ref::<gst::Bin>()?.by_name("rtpbin")?;
-    let session = rtpbin.emit_by_name::<Option<gst::Element>>("get-session", &[&0u32])?;
-    // `twcc-stats` holds a NULL GValue until TWCC feedback arrives (and stays
-    // NULL if the remote never sends any). Read it as `Option` so a null value
-    // yields `None`. `property::<Structure>` on a NULL value PANICS with
-    // "Unexpected None" — an abort that took the whole engine offline on every
-    // HD open in rc11/rc12; `find_property` only proves the pspec exists, not
-    // that its value is non-null, so it is NOT a sufficient guard.
-    session.property::<Option<gst::Structure>>("twcc-stats")
-}
-
 /// Wire `rtpgccbwe` as webrtcbin's aux-sender for the transcode path. The
 /// element paces the outbound RTP and produces a delay-based bandwidth
 /// estimate; on each `estimated-bitrate` change we retarget the `vah264enc`
@@ -887,13 +868,6 @@ fn spawn_congestion_control(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match read_twcc_stats(&webrtc) {
-                Some(tw) => debug!(camera_id, twcc = %tw.to_string(), "webrtc twcc-stats (probe)"),
-                None => debug!(
-                    camera_id,
-                    "webrtc twcc-stats (probe): unavailable (rtpbin/session/prop lookup)"
-                ),
-            }
             let enc = enc.clone();
             let controller = std::sync::Arc::clone(&controller);
             let promise = gst::Promise::with_change_func(move |reply| {
