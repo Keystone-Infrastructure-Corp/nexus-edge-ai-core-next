@@ -726,10 +726,19 @@ fn capped_transcode_dims(src_w: i32, src_h: i32) -> Option<(i32, i32)> {
         f64::from(MAX_TRANSCODE_HEIGHT) / f64::from(src_h),
     );
     let even = |v: f64| ((v.round() as i32) & !1).max(2);
-    Some((
-        even(f64::from(src_w) * scale),
-        even(f64::from(src_h) * scale),
-    ))
+    let mut w = even(f64::from(src_w) * scale);
+    let mut h = even(f64::from(src_h) * scale);
+    // Snap to the exact cap when within ~2% so a near-16:9 source (e.g. a 4MP
+    // 2688x1520 sensor at 1.768:1) lands on a clean 1920x1080 instead of
+    // 1910x1080. Genuinely different ratios (e.g. 4:3) stay far from the box
+    // edge and keep their true aspect (letterboxed by the browser).
+    if w >= MAX_TRANSCODE_WIDTH * 98 / 100 {
+        w = MAX_TRANSCODE_WIDTH;
+    }
+    if h >= MAX_TRANSCODE_HEIGHT * 98 / 100 {
+        h = MAX_TRANSCODE_HEIGHT;
+    }
+    Some((w, h))
 }
 
 /// A VAMemory raw-video caps fixing the output `framerate` and, when `dims` is
@@ -1114,10 +1123,13 @@ mod tests {
 
     #[test]
     fn capped_transcode_dims_scales_down_4mp_only() {
-        // 4MP source (cam1) is scaled to fit within 1920x1080, aspect kept.
-        assert_eq!(capped_transcode_dims(2688, 1520), Some((1910, 1080)));
-        // 4K is scaled to exactly 1080p.
+        // 4MP source (cam1, 2688x1520 = 1.768:1) is scaled to fit 1080p and
+        // snapped to a clean 1920x1080 (within ~2% of true 16:9).
+        assert_eq!(capped_transcode_dims(2688, 1520), Some((1920, 1080)));
+        // 4K (exactly 16:9) is scaled to exactly 1080p.
         assert_eq!(capped_transcode_dims(3840, 2160), Some((1920, 1080)));
+        // A genuine 4:3 source keeps its aspect (letterboxed), not snapped.
+        assert_eq!(capped_transcode_dims(2048, 1536), Some((1440, 1080)));
         // 720p (cam2) and 1080p already fit — never upscaled.
         assert_eq!(capped_transcode_dims(1280, 720), None);
         assert_eq!(capped_transcode_dims(1920, 1080), None);
