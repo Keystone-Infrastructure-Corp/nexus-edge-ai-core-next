@@ -222,6 +222,52 @@ impl WebRtcSession {
         .map_err(|_| WebRtcError::Build("downcast Pipeline".to_string()))?;
         debug!(camera_id, transcoding, "webrtc HD pipeline built");
 
+        // Per-camera transcode framerate. `videorate` normalises to a constant
+        // rate so the browser plays out smoothly on even RTP timestamps, but
+        // cameras run at different rates — so rather than hardcode one value,
+        // start the `ratecaps` filter at DEFAULT_TRANSCODE_FPS and adopt the
+        // camera's own declared framerate once the decoder negotiates it. A
+        // framerate-only caps change does not realloc VA surfaces, so it is
+        // safe even if `videorate` has already begun. Cameras that declare no
+        // rate (`framerate=0/1`) keep the default. Passthrough builds have no
+        // `ratecaps` element and skip this entirely.
+        if transcoding {
+            if let Some(ratecaps) = pipeline.by_name("ratecaps") {
+                ratecaps.set_property("caps", va_framerate_caps(DEFAULT_TRANSCODE_FPS));
+                if let Some(dec_src) = pipeline.by_name("dec").and_then(|d| d.static_pad("src")) {
+                    let ratecaps = ratecaps.clone();
+                    let _ = dec_src.add_probe(
+                        gst::PadProbeType::EVENT_DOWNSTREAM,
+                        move |_pad, info| {
+                            let Some(gst::PadProbeData::Event(ev)) = &info.data else {
+                                return gst::PadProbeReturn::Ok;
+                            };
+                            let gst::EventView::Caps(caps_ev) = ev.view() else {
+                                return gst::PadProbeReturn::Ok;
+                            };
+                            let declared = caps_ev
+                                .caps()
+                                .structure(0)
+                                .and_then(|s| s.get::<gst::Fraction>("framerate").ok())
+                                .filter(|fr| fr.numer() > 0 && fr.denom() > 0)
+                                .map(|fr| (fr.numer() / fr.denom()).clamp(1, MAX_TRANSCODE_FPS));
+                            if let Some(fps) = declared {
+                                if fps != DEFAULT_TRANSCODE_FPS {
+                                    ratecaps.set_property("caps", va_framerate_caps(fps));
+                                    debug!(
+                                        camera_id,
+                                        fps, "webrtc transcode adopted camera framerate"
+                                    );
+                                }
+                                return gst::PadProbeReturn::Remove;
+                            }
+                            gst::PadProbeReturn::Ok
+                        },
+                    );
+                }
+            }
+        }
+
         let appsrc = pipeline
             .by_name("src")
             .ok_or_else(|| WebRtcError::Build("appsrc 'src' missing".to_string()))?
@@ -569,6 +615,23 @@ fn emit_local_offer(
     }
 }
 
+/// Default constant framerate for the HD transcode, used up front and kept for
+/// cameras that do not declare a source rate (e.g. an RTSP stream negotiating
+/// `framerate=0/1`). Both current reference cameras deliver ~24fps.
+const DEFAULT_TRANSCODE_FPS: i32 = 24;
+/// Upper bound on the transcode output framerate. A security live view does not
+/// need more, and it caps re-encode load for high-rate (e.g. 60fps) cameras.
+const MAX_TRANSCODE_FPS: i32 = 30;
+
+/// A VAMemory raw-video caps fixing only the output `framerate`, used to drive
+/// `videorate`'s constant-rate conversion via the `ratecaps` capsfilter.
+fn va_framerate_caps(fps: i32) -> gst::Caps {
+    gst::Caps::builder("video/x-raw")
+        .features(["memory:VAMemory"])
+        .field("framerate", gst::Fraction::new(fps, 1))
+        .build()
+}
+
 /// Name of an available hardware H.264 **encoder** for the transcode path, or
 /// `None` on boxes without one (e.g. macOS dev), where the caller falls back
 /// to passthrough. Pure aside from the plugin registry lookup.
@@ -603,19 +666,24 @@ fn hw_decoder(codec: CodecKind) -> Option<&'static str> {
 /// H.264 (`encoding-name=H264`), which also covers the HEVC-camera →
 /// non-HEVC-browser case. `config-interval=1` repeats SPS/PPS once a second in
 /// the RTP stream for extra resilience. `videorate` normalises the camera's
-/// irregular frame delivery to a constant 24fps: the browser plays frames out
-/// on the RTP timestamps, so jittery source timing shows as visible jitter
-/// even at a healthy average fps. Pure — unit-testable without a runtime.
+/// irregular frame delivery to a **constant** rate so the browser plays frames
+/// out smoothly on even RTP timestamps. Cameras run at different rates (this
+/// InSight declares 25fps; another declares none), so the target rate is not
+/// baked in here: the named `ratecaps` capsfilter is left unconstrained and
+/// [`WebRtcSession::build_common`] sets it — to [`DEFAULT_TRANSCODE_FPS`] up
+/// front, then to the camera's own declared framerate once the decoder
+/// negotiates it (see the `dec` src-pad probe). Pure — unit-testable without a
+/// runtime.
 fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> String {
     let base = codec.base(); // "h264" | "h265"
     format!(
         "appsrc name=src is-live=true do-timestamp=false format=time \
              block=true max-bytes=8388608 stream-type=stream \
            ! {base}parse \
-           ! {decoder} \
+           ! {decoder} name=dec \
            ! vapostproc \
            ! videorate \
-           ! video/x-raw(memory:VAMemory),framerate=24/1 \
+           ! capsfilter name=ratecaps \
            ! {encoder} name=enc key-int-max=48 b-frames=0 rate-control=cbr \
              bitrate=2500 target-usage=6 \
            ! h264parse config-interval=1 \
@@ -756,7 +824,8 @@ mod tests {
         assert!(d.contains("rate-control=cbr"), "{d}");
         assert!(d.contains("b-frames=0"), "{d}");
         assert!(d.contains("videorate"), "{d}");
-        assert!(d.contains("framerate=24/1"), "{d}");
+        assert!(d.contains("capsfilter name=ratecaps"), "{d}");
+        assert!(d.contains("name=dec"), "{d}");
         assert!(d.contains("encoding-name=H264"), "{d}");
         assert!(d.contains("webrtcbin name=webrtc"), "{d}");
     }
