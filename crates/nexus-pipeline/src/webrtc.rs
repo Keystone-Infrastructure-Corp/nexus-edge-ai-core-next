@@ -676,6 +676,15 @@ fn hw_decoder(codec: CodecKind) -> Option<&'static str> {
 /// runtime.
 fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> String {
     let base = codec.base(); // "h264" | "h265"
+
+    // Uplink-constrained bitrate. The reference edge uploads only ~5.3 Mbps to
+    // Cloudflare (measured), shared with the LBR wall + detection; an un-paced
+    // 2.5 Mbps WebRTC stream's keyframe bursts overflowed that thin uplink and
+    // dropped ~50% of packets -> periodic multi-second freezes on BOTH cameras
+    // (independent of resolution). 1000 kbps keeps the average and keyframe
+    // bursts comfortably inside the uplink. The proper long-term fix is
+    // send-side congestion control (rtpgccbwe) for adaptive pacing.
+    let bitrate_kbps = 1000;
     format!(
         "appsrc name=src is-live=true do-timestamp=false format=time \
              block=true max-bytes=8388608 stream-type=stream \
@@ -685,7 +694,7 @@ fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> St
            ! videorate \
            ! capsfilter name=ratecaps \
            ! {encoder} name=enc key-int-max=48 b-frames=0 rate-control=cbr \
-             bitrate=2500 target-usage=6 \
+             bitrate={bitrate_kbps} target-usage=6 \
            ! h264parse config-interval=1 \
            ! rtph264pay name=pay pt=96 config-interval=1 mtu=1200 \
            ! application/x-rtp,media=video,encoding-name=H264,clock-rate=90000 \
