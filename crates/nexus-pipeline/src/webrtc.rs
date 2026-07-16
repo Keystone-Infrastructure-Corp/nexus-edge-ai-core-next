@@ -51,7 +51,7 @@ use nexus_types::{CameraId, CodecKind};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use std::time::Duration;
 
@@ -335,13 +335,32 @@ impl WebRtcSession {
         // Pump compressed NALs into appsrc, splicing in at the next IDR.
         let feed = tokio::spawn(feed_loop(appsrc.clone(), nal_rx, camera_id));
 
-        // Adaptive bitrate for the transcode path: track the browser's RTCP
-        // loss feedback and step the encoder bitrate to fit the uplink.
-        // Passthrough builds have no `enc` element and skip this.
+        // Congestion control for the transcode path. Prefer `rtpgccbwe`
+        // (Google Congestion Control + pacing) when the bundled plugin is
+        // present: it spreads keyframe bursts under the uplink and drives the
+        // encoder off a delay-based estimate, so a higher sustained bitrate no
+        // longer triggers the loss spikes that plague pure loss-based AIMD.
+        // Fall back to the AIMD loop when the plugin is absent/unloadable.
+        // Passthrough builds have no `enc` element and skip both.
         let cc = if transcoding {
-            pipeline
-                .by_name("enc")
-                .map(|enc| spawn_congestion_control(webrtc.clone(), enc, camera_id))
+            match pipeline.by_name("enc") {
+                Some(enc) if gst::ElementFactory::find("rtpgccbwe").is_some() => {
+                    wire_gcc_congestion_control(&webrtc, &enc, camera_id);
+                    info!(
+                        camera_id,
+                        "webrtc congestion control: rtpgccbwe (paced GCC)"
+                    );
+                    None
+                }
+                Some(enc) => {
+                    info!(
+                        camera_id,
+                        "webrtc congestion control: AIMD (rtpgccbwe plugin unavailable)"
+                    );
+                    Some(spawn_congestion_control(webrtc.clone(), enc, camera_id))
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -696,6 +715,14 @@ const CC_DECREASE_FACTOR: f64 = 0.8;
 const CC_LOSS_HIGH: f64 = 0.10;
 const CC_LOSS_LOW: f64 = 0.02;
 
+/// Bounds for `rtpgccbwe`, in BITS per second (its properties are bits/s, not
+/// kbps). The ceiling is higher than the AIMD path's because rtpgccbwe paces
+/// the outbound RTP, so a higher *sustained* encoder bitrate no longer bursts
+/// past the uplink the way un-paced keyframes did.
+const GCC_MIN_BPS: u32 = 400_000;
+const GCC_START_BPS: u32 = 1_200_000;
+const GCC_MAX_BPS: u32 = 3_000_000;
+
 /// Manual AIMD bitrate controller for the WebRTC transcode. `rtpgccbwe` (the
 /// stock GStreamer Google-Congestion-Control estimator) is not installed on the
 /// edge, so this is a lightweight stand-in: it reacts to the RTCP
@@ -742,6 +769,39 @@ fn read_twcc_stats(webrtc: &gst::Element) -> Option<gst::Structure> {
     // HD open in rc11/rc12; `find_property` only proves the pspec exists, not
     // that its value is non-null, so it is NOT a sufficient guard.
     session.property::<Option<gst::Structure>>("twcc-stats")
+}
+
+/// Wire `rtpgccbwe` as webrtcbin's aux-sender for the transcode path. The
+/// element paces the outbound RTP and produces a delay-based bandwidth
+/// estimate; on each `estimated-bitrate` change we retarget the `vah264enc`
+/// `bitrate` (kbps = bits/1000). This is the proactive replacement for the
+/// reactive [`spawn_congestion_control`] AIMD loop and is only wired when the
+/// bundled `libgstrsrtp.so` plugin registered `rtpgccbwe`.
+fn wire_gcc_congestion_control(webrtc: &gst::Element, enc: &gst::Element, camera_id: CameraId) {
+    let enc_weak = enc.downgrade();
+    // `request-aux-sender` fires during negotiation with (webrtcbin, session_id);
+    // it must return the element to splice into the send path (the pacer). We
+    // ignore the session id (single sendonly video) and return `None` (no aux
+    // sender) only if the element unexpectedly fails to build.
+    webrtc.connect("request-aux-sender", false, move |_values| {
+        let cc = gst::ElementFactory::make("rtpgccbwe").build().ok()?;
+        cc.set_property("min-bitrate", GCC_MIN_BPS);
+        cc.set_property("estimated-bitrate", GCC_START_BPS);
+        cc.set_property("max-bitrate", GCC_MAX_BPS);
+        let enc_weak = enc_weak.clone();
+        cc.connect_notify(Some("estimated-bitrate"), move |bwe, _pspec| {
+            let bits: u32 = bwe.property("estimated-bitrate");
+            let kbps = (bits / 1000).max(GCC_MIN_BPS / 1000);
+            if let Some(enc) = enc_weak.upgrade() {
+                let current: u32 = enc.property("bitrate");
+                if current != kbps {
+                    enc.set_property("bitrate", kbps);
+                    debug!(camera_id, kbps, "rtpgccbwe adjusted encoder bitrate");
+                }
+            }
+        });
+        Some(cc.to_value())
+    });
 }
 
 /// Spawn the adaptive-bitrate control loop for a transcode session. Every ~2s

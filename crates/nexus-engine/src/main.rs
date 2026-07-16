@@ -180,6 +180,11 @@ impl Cli {
 }
 
 fn main() -> Result<()> {
+    // Make bundled GStreamer plugins (libgstrsrtp.so → rtpgccbwe, used for
+    // WebRTC congestion control) discoverable before any pipeline calls
+    // gst::init().
+    register_bundled_gst_plugins();
+
     let cli = Cli::parse();
     let config_path = cli.resolved_config_path();
     let (mut cfg, compat) = Config::load_with_compat(&config_path)
@@ -223,6 +228,36 @@ fn main() -> Result<()> {
     }
 
     runtime.block_on(run(cfg, cli))
+}
+
+/// Prepend the release tree's bundled GStreamer plugin directory to
+/// `GST_PLUGIN_PATH` so plugins shipped alongside the binary (e.g.
+/// `libgstrsrtp.so`, which provides `rtpgccbwe`) are registered by
+/// `gst::init()`. Layout: the binary is `<root>/bin/nexus-engine` and plugins
+/// live in `<root>/lib/gstreamer-1.0/`. No-op in dev checkouts (dir absent) and
+/// harmless if already set — existing entries are preserved.
+fn register_bundled_gst_plugins() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe
+        .parent()
+        .and_then(|bin| bin.parent())
+        .map(|root| root.join("lib/gstreamer-1.0"))
+    else {
+        return;
+    };
+    if !dir.is_dir() {
+        return;
+    }
+    let dir = dir.to_string_lossy().into_owned();
+    let combined = match std::env::var_os("GST_PLUGIN_PATH") {
+        Some(existing) if !existing.is_empty() => {
+            format!("{dir}:{}", existing.to_string_lossy())
+        }
+        _ => dir,
+    };
+    std::env::set_var("GST_PLUGIN_PATH", combined);
 }
 
 fn build_runtime(cfg: &nexus_config::RuntimeConfig) -> Result<tokio::runtime::Runtime> {
