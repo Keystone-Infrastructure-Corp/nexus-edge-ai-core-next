@@ -779,12 +779,14 @@ const CC_LOSS_HIGH: f64 = 0.10;
 const CC_LOSS_LOW: f64 = 0.02;
 
 /// Bounds for `rtpgccbwe`, in BITS per second (its properties are bits/s, not
-/// kbps). The ceiling is higher than the AIMD path's because rtpgccbwe paces
-/// the outbound RTP, so a higher *sustained* encoder bitrate no longer bursts
-/// past the uplink the way un-paced keyframes did.
+/// kbps). The ceiling is deliberately high (8 Mbps, the gst-plugins-rs default)
+/// so `rtpgccbwe`'s own delay-based estimate — not an artificial cap — is the
+/// limit: on a typical uplink it climbs until the path pushes back (~4-5 Mbps
+/// for 1080p) instead of stopping short. Pacing keeps those higher sustained
+/// bitrates from bursting past the uplink the way un-paced keyframes did.
 const GCC_MIN_BPS: u32 = 400_000;
 const GCC_START_BPS: u32 = 1_200_000;
-const GCC_MAX_BPS: u32 = 3_000_000;
+const GCC_MAX_BPS: u32 = 8_000_000;
 
 /// Manual AIMD bitrate controller for the WebRTC transcode. `rtpgccbwe` (the
 /// stock GStreamer Google-Congestion-Control estimator) is not installed on the
