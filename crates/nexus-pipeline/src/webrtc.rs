@@ -42,6 +42,8 @@
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppStreamType};
+use gstreamer_rtp as gst_rtp;
+use gstreamer_rtp::prelude::RTPHeaderExtensionExt;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 
@@ -278,6 +280,27 @@ impl WebRtcSession {
         let webrtc = pipeline
             .by_name("webrtc")
             .ok_or_else(|| WebRtcError::Build("webrtcbin 'webrtc' missing".to_string()))?;
+
+        // (Phase b probe) Add the transport-wide-cc RTP header extension to the
+        // payloader so the offer advertises TWCC. Combined with the twcc-stats
+        // logging in the congestion-control loop, this tells us whether the
+        // Cloudflare SFU returns TWCC feedback — the signal `rtpgccbwe` needs.
+        if let Some(pay) = pipeline.by_name("pay") {
+            match gst_rtp::RTPHeaderExtension::create_from_uri(RTP_TWCC_URI) {
+                Some(ext) => {
+                    ext.set_id(1);
+                    pay.emit_by_name::<()>("add-extension", &[&ext]);
+                    debug!(
+                        camera_id,
+                        "webrtc: added transport-wide-cc extension (id=1)"
+                    );
+                }
+                None => warn!(
+                    camera_id,
+                    "webrtc: could not create TWCC extension (rtpmanager missing?)"
+                ),
+            }
+        }
 
         // Tell appsrc the exact byte-stream codec so h264parse/rtppay
         // negotiate without a probe.
@@ -649,6 +672,14 @@ fn va_framerate_caps(fps: i32) -> gst::Caps {
         .build()
 }
 
+/// URI of the transport-wide-cc RTP header extension (RMCAT draft). Added to
+/// the payloader so `webrtcbin` negotiates TWCC in the SDP. `rtpgccbwe` (the
+/// future GCC estimator) needs the receiver — Cloudflare's SFU — to return
+/// TWCC feedback; adding this + logging `twcc-stats` confirms whether it does,
+/// before we invest in cross-building the native `gst-plugins-rs` estimator.
+const RTP_TWCC_URI: &str =
+    "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+
 /// Bounds and step sizes for the manual AIMD (additive-increase,
 /// multiplicative-decrease) bitrate controller. The reference edge's uplink to
 /// Cloudflare is ~5.3 Mbps shared with the LBR wall + detection, so the ceiling
@@ -694,6 +725,24 @@ impl BitrateController {
     }
 }
 
+/// Read the rtpbin session's `twcc-stats` (Phase b probe). Non-empty
+/// `packets`/`bitrate-recv` here means the receiver (Cloudflare SFU) is
+/// returning transport-wide-cc feedback — the signal `rtpgccbwe` depends on.
+/// Returns `None` before session 0 exists or if the property is unavailable.
+fn read_twcc_stats(webrtc: &gst::Element) -> Option<gst::Structure> {
+    let rtpbin = webrtc
+        .dynamic_cast_ref::<gst::ChildProxy>()?
+        .child_by_name("rtpbin")?
+        .downcast::<gst::Element>()
+        .ok()?;
+    let session = rtpbin.emit_by_name::<Option<gst::Element>>("get-session", &[&0u32])?;
+    if session.find_property("twcc-stats").is_some() {
+        Some(session.property::<gst::Structure>("twcc-stats"))
+    } else {
+        None
+    }
+}
+
 /// Spawn the adaptive-bitrate control loop for a transcode session. Every ~2s
 /// it asks `webrtcbin` for stats, reads the worst `fraction-lost` across the
 /// remote-inbound reports (the browser's RTCP feedback), feeds it to a
@@ -714,6 +763,9 @@ fn spawn_congestion_control(
         ticker.tick().await;
         loop {
             ticker.tick().await;
+            if let Some(tw) = read_twcc_stats(&webrtc) {
+                debug!(camera_id, twcc = %tw.to_string(), "webrtc twcc-stats (probe)");
+            }
             let enc = enc.clone();
             let controller = std::sync::Arc::clone(&controller);
             let promise = gst::Promise::with_change_func(move |reply| {
