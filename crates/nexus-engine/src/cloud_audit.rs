@@ -105,6 +105,9 @@ impl AuditSink for StoreAuditSink {
 /// Serialise the envelope context + actor's `org_id` into a compact
 /// JSON blob suitable for `audit_log.before_json`. The blob is keyed
 /// by short field names because every byte ends up in SQLite.
+// Dead until `StoreAuditSink` is wired into boot (Phase 1.11); the sink's
+// struct + inherent impl carry the same suppression.
+#[allow(dead_code)]
 fn build_before_json(method: &str, envelope: EnvelopeContext<'_>, actor: &VerifiedActor) -> String {
     // Hand-rolled to avoid a serde_json::to_string round-trip for a
     // shape with zero possibility of nested escaping (every value is
@@ -120,6 +123,9 @@ fn build_before_json(method: &str, envelope: EnvelopeContext<'_>, actor: &Verifi
 
 /// Minimal JSON-string escaper for the subset of characters that can
 /// appear in a method name, HTTP method, path, or UUID.
+// Dead in non-test builds until `StoreAuditSink` is wired (Phase 1.11); the
+// unit tests below exercise it directly.
+#[allow(dead_code)]
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
