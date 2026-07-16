@@ -131,6 +131,12 @@ jobs:
              && [ -f gpr/target/release/libgstrsrtp.so ]; then
             cp gpr/target/release/libgstrsrtp.so out/
             echo "built libgstrsrtp.so ($(du -h out/libgstrsrtp.so | cut -f1))"
+            # Strip debug symbols: the unstripped cdylib is ~63M, ~5-8M stripped.
+            # Pure size win — `--strip-unneeded` keeps the exported dynamic
+            # symbols (incl. the gst plugin descriptor) the loader needs, so the
+            # gst-inspect check below still validates the stripped artifact.
+            strip --strip-unneeded out/libgstrsrtp.so || echo "::warning::strip failed; shipping unstripped .so"
+            echo "stripped libgstrsrtp.so ($(du -h out/libgstrsrtp.so | cut -f1))"
             # The built plugin MUST expose rtpgccbwe or it is useless to us.
             if GST_PLUGIN_PATH="$PWD/out" gst-inspect-1.0 rtpgccbwe >/dev/null 2>&1; then
               echo "rtpgccbwe registered OK"
