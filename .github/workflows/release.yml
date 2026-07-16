@@ -97,9 +97,62 @@ jobs:
   #       │                                copied to /usr/local/sbin on install)
   #       └── lib/install-common.sh
   # -------------------------------------------------------------------------
+  # ----------------------------------------------------------------
+  # Cross-build the gst-plugins-rs `rtp` plugin (libgstrsrtp.so) which
+  # carries `rtpgccbwe` — Google Congestion Control + pacing for the HD
+  # WebRTC transcode. Not apt-installable on Ubuntu, so we build it from
+  # the 0.13 branch (gstreamer 1.24 series, matching the target boxes)
+  # on a 24.04 runner and bundle the .so into the tarball under
+  # lib/gstreamer-1.0/. Best-effort: on any failure the job still exits
+  # 0, no artifact is produced, and the release ships without the plugin
+  # (the engine falls back to the loss-based AIMD controller).
+  # ----------------------------------------------------------------
+  rtp-plugin:
+    name: build rtpgccbwe plugin (gst-plugins-rs)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install GStreamer 1.24 dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config build-essential git \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev gstreamer1.0-tools
+
+      - name: build libgstrsrtp.so (best-effort)
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          if git clone --depth 1 --branch 0.13 \
+               https://github.com/GStreamer/gst-plugins-rs.git gpr \
+             && ( cd gpr && cargo build --release -p gst-plugin-rtp ) \
+             && [ -f gpr/target/release/libgstrsrtp.so ]; then
+            cp gpr/target/release/libgstrsrtp.so out/
+            echo "built libgstrsrtp.so ($(du -h out/libgstrsrtp.so | cut -f1))"
+            # The built plugin MUST expose rtpgccbwe or it is useless to us.
+            if GST_PLUGIN_PATH="$PWD/out" gst-inspect-1.0 rtpgccbwe >/dev/null 2>&1; then
+              echo "rtpgccbwe registered OK"
+            else
+              echo "::warning::built plugin does not expose rtpgccbwe; dropping it"
+              rm -f out/libgstrsrtp.so
+            fi
+          else
+            echo "::warning::gst-plugin-rtp build failed; release ships without rtpgccbwe (AIMD fallback)"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtpgccbwe-plugin
+          path: out/
+          if-no-files-found: warn
+          retention-days: 1
+
   tarball:
     name: build + attach bare-metal tarball
     runs-on: ubuntu-22.04
+    needs: rtp-plugin
     env:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       ORT_VERSION: "1.24.1"
@@ -379,6 +432,16 @@ jobs:
           done
           [ $missing -eq 0 ] || exit 1
 
+      # Pull the libgstrsrtp.so built by the rtp-plugin job. continue-on-error
+      # so a missing/empty artifact (build failed upstream) doesn't block the
+      # release — the assemble step below tolerates the file being absent.
+      - name: download rtpgccbwe plugin
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: rtpgccbwe-plugin
+          path: rtp-plugin
+
       - name: assemble release tree
         run: |
           set -euo pipefail
@@ -391,6 +454,19 @@ jobs:
           install -m 0755 target/release/nexus-engine "$R/bin/"
           install -m 0755 target/release/nexus-probe  "$R/bin/"
           install -m 0755 target/release/nexus-doctor "$R/bin/"
+
+          # Bundled gst-plugins-rs rtpgccbwe (paced congestion control),
+          # built by the rtp-plugin job against gst 1.24. Optional — the
+          # engine registers it via GST_PLUGIN_PATH (see
+          # register_bundled_gst_plugins in nexus-engine main.rs) and falls
+          # back to the AIMD controller if absent/unloadable on the box.
+          if [ -f rtp-plugin/libgstrsrtp.so ]; then
+            mkdir -p "$R/lib/gstreamer-1.0"
+            install -m 0755 rtp-plugin/libgstrsrtp.so "$R/lib/gstreamer-1.0/"
+            echo "bundled rtpgccbwe plugin (libgstrsrtp.so)"
+          else
+            echo "no rtpgccbwe plugin artifact — shipping without (AIMD fallback)"
+          fi
 
           cp -a ui/dist/. "$R/share/ui/"
           # dinov2_s_224.onnx is the Phase 5.6 appearance-embedding
