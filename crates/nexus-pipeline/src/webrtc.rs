@@ -730,17 +730,14 @@ impl BitrateController {
 /// returning transport-wide-cc feedback — the signal `rtpgccbwe` depends on.
 /// Returns `None` before session 0 exists or if the property is unavailable.
 fn read_twcc_stats(webrtc: &gst::Element) -> Option<gst::Structure> {
-    let rtpbin = webrtc
-        .dynamic_cast_ref::<gst::ChildProxy>()?
-        .child_by_name("rtpbin")?
-        .downcast::<gst::Element>()
-        .ok()?;
+    // NB: webrtcbin's ChildProxy exposes its *transceivers* by name, not the
+    // internal elements — so `child_by_name("rtpbin")` returns None. webrtcbin
+    // IS a GstBin, so reach the internal rtpbin via `Bin::by_name` instead.
+    let rtpbin = webrtc.dynamic_cast_ref::<gst::Bin>()?.by_name("rtpbin")?;
     let session = rtpbin.emit_by_name::<Option<gst::Element>>("get-session", &[&0u32])?;
-    if session.find_property("twcc-stats").is_some() {
-        Some(session.property::<gst::Structure>("twcc-stats"))
-    } else {
-        None
-    }
+    session
+        .find_property("twcc-stats")
+        .map(|_| session.property::<gst::Structure>("twcc-stats"))
 }
 
 /// Spawn the adaptive-bitrate control loop for a transcode session. Every ~2s
@@ -763,8 +760,12 @@ fn spawn_congestion_control(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Some(tw) = read_twcc_stats(&webrtc) {
-                debug!(camera_id, twcc = %tw.to_string(), "webrtc twcc-stats (probe)");
+            match read_twcc_stats(&webrtc) {
+                Some(tw) => debug!(camera_id, twcc = %tw.to_string(), "webrtc twcc-stats (probe)"),
+                None => debug!(
+                    camera_id,
+                    "webrtc twcc-stats (probe): unavailable (rtpbin/session/prop lookup)"
+                ),
             }
             let enc = enc.clone();
             let controller = std::sync::Arc::clone(&controller);
