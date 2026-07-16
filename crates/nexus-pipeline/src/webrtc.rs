@@ -730,14 +730,18 @@ impl BitrateController {
 /// returning transport-wide-cc feedback — the signal `rtpgccbwe` depends on.
 /// Returns `None` before session 0 exists or if the property is unavailable.
 fn read_twcc_stats(webrtc: &gst::Element) -> Option<gst::Structure> {
-    // NB: webrtcbin's ChildProxy exposes its *transceivers* by name, not the
-    // internal elements — so `child_by_name("rtpbin")` returns None. webrtcbin
-    // IS a GstBin, so reach the internal rtpbin via `Bin::by_name` instead.
+    // webrtcbin IS a GstBin; reach its internal rtpbin by name. (Its ChildProxy
+    // impl enumerates transceivers, so `Bin::by_name` is clearer than
+    // `child_by_name`, though both resolve the element.)
     let rtpbin = webrtc.dynamic_cast_ref::<gst::Bin>()?.by_name("rtpbin")?;
     let session = rtpbin.emit_by_name::<Option<gst::Element>>("get-session", &[&0u32])?;
-    session
-        .find_property("twcc-stats")
-        .map(|_| session.property::<gst::Structure>("twcc-stats"))
+    // `twcc-stats` holds a NULL GValue until TWCC feedback arrives (and stays
+    // NULL if the remote never sends any). Read it as `Option` so a null value
+    // yields `None`. `property::<Structure>` on a NULL value PANICS with
+    // "Unexpected None" — an abort that took the whole engine offline on every
+    // HD open in rc11/rc12; `find_property` only proves the pspec exists, not
+    // that its value is non-null, so it is NOT a sufficient guard.
+    session.property::<Option<gst::Structure>>("twcc-stats")
 }
 
 /// Spawn the adaptive-bitrate control loop for a transcode session. Every ~2s
