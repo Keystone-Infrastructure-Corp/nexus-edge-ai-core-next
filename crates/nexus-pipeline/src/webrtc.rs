@@ -136,6 +136,8 @@ pub struct WebRtcSession {
     _appsrc: AppSrc,
     events: mpsc::UnboundedSender<WebRtcEvent>,
     feed: JoinHandle<()>,
+    /// Adaptive-bitrate control loop (transcode sessions only); aborted on drop.
+    cc: Option<JoinHandle<()>>,
 }
 
 impl WebRtcSession {
@@ -310,6 +312,17 @@ impl WebRtcSession {
         // Pump compressed NALs into appsrc, splicing in at the next IDR.
         let feed = tokio::spawn(feed_loop(appsrc.clone(), nal_rx, camera_id));
 
+        // Adaptive bitrate for the transcode path: track the browser's RTCP
+        // loss feedback and step the encoder bitrate to fit the uplink.
+        // Passthrough builds have no `enc` element and skip this.
+        let cc = if transcoding {
+            pipeline
+                .by_name("enc")
+                .map(|enc| spawn_congestion_control(webrtc.clone(), enc, camera_id))
+        } else {
+            None
+        };
+
         Ok(Self {
             session_id,
             camera_id,
@@ -319,6 +332,7 @@ impl WebRtcSession {
             _appsrc: appsrc,
             events,
             feed,
+            cc,
         })
     }
 
@@ -431,6 +445,9 @@ impl WebRtcSession {
 impl Drop for WebRtcSession {
     fn drop(&mut self) {
         self.feed.abort();
+        if let Some(cc) = &self.cc {
+            cc.abort();
+        }
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
@@ -630,6 +647,107 @@ fn va_framerate_caps(fps: i32) -> gst::Caps {
         .features(["memory:VAMemory"])
         .field("framerate", gst::Fraction::new(fps, 1))
         .build()
+}
+
+/// Bounds and step sizes for the manual AIMD (additive-increase,
+/// multiplicative-decrease) bitrate controller. The reference edge's uplink to
+/// Cloudflare is ~5.3 Mbps shared with the LBR wall + detection, so the ceiling
+/// stays modest; the floor keeps HD watchable.
+const CC_MIN_KBPS: u32 = 400;
+const CC_MAX_KBPS: u32 = 1800;
+const CC_START_KBPS: u32 = 1000;
+/// Additive increase (kbps) per control tick when the path is clean.
+const CC_INCREASE_KBPS: u32 = 100;
+/// Multiplicative decrease factor applied when loss is high.
+const CC_DECREASE_FACTOR: f64 = 0.8;
+/// RTCP `fraction-lost` (0..1) above which we back off, and below which we
+/// probe the bitrate upward. Between the two we hold (dead-band).
+const CC_LOSS_HIGH: f64 = 0.10;
+const CC_LOSS_LOW: f64 = 0.02;
+
+/// Manual AIMD bitrate controller for the WebRTC transcode. `rtpgccbwe` (the
+/// stock GStreamer Google-Congestion-Control estimator) is not installed on the
+/// edge, so this is a lightweight stand-in: it reacts to the RTCP
+/// `fraction-lost` the browser reports back and nudges the encoder bitrate to
+/// track the available uplink — slow up, fast down. Pure + unit-testable.
+struct BitrateController {
+    kbps: u32,
+}
+
+impl BitrateController {
+    fn new() -> Self {
+        Self {
+            kbps: CC_START_KBPS,
+        }
+    }
+
+    /// Fold one loss observation (`fraction_lost` in 0..1) into the target
+    /// bitrate and return the new value (kbps), clamped to [MIN, MAX].
+    fn update(&mut self, fraction_lost: f64) -> u32 {
+        if fraction_lost > CC_LOSS_HIGH {
+            let reduced = (self.kbps as f64 * CC_DECREASE_FACTOR) as u32;
+            self.kbps = reduced.max(CC_MIN_KBPS);
+        } else if fraction_lost < CC_LOSS_LOW {
+            self.kbps = (self.kbps + CC_INCREASE_KBPS).min(CC_MAX_KBPS);
+        }
+        self.kbps
+    }
+}
+
+/// Spawn the adaptive-bitrate control loop for a transcode session. Every ~2s
+/// it asks `webrtcbin` for stats, reads the worst `fraction-lost` across the
+/// remote-inbound reports (the browser's RTCP feedback), feeds it to a
+/// [`BitrateController`], and applies the new target to the `vah264enc`
+/// `bitrate` property (kbps). If no loss report is available yet (early in the
+/// session, before RTCP flows) it holds the current bitrate — it never raises
+/// blindly. Aborted on session drop.
+fn spawn_congestion_control(
+    webrtc: gst::Element,
+    enc: gst::Element,
+    camera_id: CameraId,
+) -> JoinHandle<()> {
+    const CC_POLL: Duration = Duration::from_secs(2);
+    tokio::spawn(async move {
+        let controller = std::sync::Arc::new(parking_lot::Mutex::new(BitrateController::new()));
+        let mut ticker = tokio::time::interval(CC_POLL);
+        // The first tick fires immediately; consume it so RTCP has time to flow.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let enc = enc.clone();
+            let controller = std::sync::Arc::clone(&controller);
+            let promise = gst::Promise::with_change_func(move |reply| {
+                let Ok(Some(stats)) = reply else {
+                    return;
+                };
+                // The browser's RTCP receiver report surfaces as one or more
+                // `remote-inbound-rtp` sub-structures, each carrying
+                // `fraction-lost` (0..1). Take the worst across streams.
+                let mut worst: Option<f64> = None;
+                for (_field, value) in stats.iter() {
+                    if let Ok(sub) = value.get::<gst::Structure>() {
+                        if let Ok(fl) = sub.get::<f64>("fraction-lost") {
+                            worst = Some(worst.map_or(fl, |w| w.max(fl)));
+                        }
+                    }
+                }
+                let Some(loss) = worst else {
+                    // No feedback yet — hold; never raise the bitrate blindly.
+                    return;
+                };
+                let new_kbps = controller.lock().update(loss);
+                let current: u32 = enc.property("bitrate");
+                if new_kbps != current {
+                    enc.set_property("bitrate", new_kbps);
+                    debug!(
+                        camera_id,
+                        loss, new_kbps, "webrtc congestion control adjusted bitrate"
+                    );
+                }
+            });
+            webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        }
+    })
 }
 
 /// Name of an available hardware H.264 **encoder** for the transcode path, or
@@ -847,6 +965,40 @@ mod tests {
         assert!(d.contains("vah265dec"), "{d}");
         assert!(d.contains("vah264enc name=enc"), "{d}");
         assert!(d.contains("encoding-name=H264"), "{d}");
+    }
+
+    #[test]
+    fn bitrate_controller_backs_off_on_loss() {
+        let mut c = BitrateController::new();
+        assert_eq!(c.kbps, CC_START_KBPS);
+        // Loss above the high threshold -> multiplicative decrease.
+        let after = c.update(0.20);
+        assert_eq!(after, (CC_START_KBPS as f64 * CC_DECREASE_FACTOR) as u32);
+        // Sustained loss drives it to the floor, never below.
+        for _ in 0..20 {
+            c.update(0.30);
+        }
+        assert_eq!(c.kbps, CC_MIN_KBPS);
+    }
+
+    #[test]
+    fn bitrate_controller_probes_up_when_clean() {
+        let mut c = BitrateController::new();
+        // Loss below the low threshold -> additive increase.
+        assert_eq!(c.update(0.0), CC_START_KBPS + CC_INCREASE_KBPS);
+        // A clean path drives it to the ceiling, never above.
+        for _ in 0..50 {
+            c.update(0.0);
+        }
+        assert_eq!(c.kbps, CC_MAX_KBPS);
+    }
+
+    #[test]
+    fn bitrate_controller_holds_in_deadband() {
+        let mut c = BitrateController::new();
+        // Loss between LOW and HIGH -> hold steady.
+        assert_eq!(c.update(0.05), CC_START_KBPS);
+        assert_eq!(c.kbps, CC_START_KBPS);
     }
 
     #[test]
