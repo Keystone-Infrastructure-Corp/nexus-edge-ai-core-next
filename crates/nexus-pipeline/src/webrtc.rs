@@ -237,7 +237,7 @@ impl WebRtcSession {
         // `ratecaps` element and skip this entirely.
         if transcoding {
             if let Some(ratecaps) = pipeline.by_name("ratecaps") {
-                ratecaps.set_property("caps", va_framerate_caps(DEFAULT_TRANSCODE_FPS));
+                ratecaps.set_property("caps", va_transcode_caps(DEFAULT_TRANSCODE_FPS, None));
                 if let Some(dec_src) = pipeline.by_name("dec").and_then(|d| d.static_pad("src")) {
                     let ratecaps = ratecaps.clone();
                     let _ = dec_src.add_probe(
@@ -249,23 +249,44 @@ impl WebRtcSession {
                             let gst::EventView::Caps(caps_ev) = ev.view() else {
                                 return gst::PadProbeReturn::Ok;
                             };
-                            let declared = caps_ev
-                                .caps()
-                                .structure(0)
-                                .and_then(|s| s.get::<gst::Fraction>("framerate").ok())
+                            // Act on the first raw-video caps event (always
+                            // carries width/height). Adopt the camera's declared
+                            // framerate (default if it declares none), and cap
+                            // the output resolution to <=1080p so a 4MP source
+                            // is scaled down: a full-native re-encode makes
+                            // oversized keyframes that starve a shared uplink.
+                            let Some(s) = caps_ev.caps().structure(0) else {
+                                return gst::PadProbeReturn::Ok;
+                            };
+                            let (Ok(src_w), Ok(src_h)) =
+                                (s.get::<i32>("width"), s.get::<i32>("height"))
+                            else {
+                                return gst::PadProbeReturn::Ok;
+                            };
+                            let fps = s
+                                .get::<gst::Fraction>("framerate")
+                                .ok()
                                 .filter(|fr| fr.numer() > 0 && fr.denom() > 0)
-                                .map(|fr| (fr.numer() / fr.denom()).clamp(1, MAX_TRANSCODE_FPS));
-                            if let Some(fps) = declared {
-                                if fps != DEFAULT_TRANSCODE_FPS {
-                                    ratecaps.set_property("caps", va_framerate_caps(fps));
-                                    debug!(
-                                        camera_id,
-                                        fps, "webrtc transcode adopted camera framerate"
-                                    );
-                                }
-                                return gst::PadProbeReturn::Remove;
+                                .map(|fr| (fr.numer() / fr.denom()).clamp(1, MAX_TRANSCODE_FPS))
+                                .unwrap_or(DEFAULT_TRANSCODE_FPS);
+                            let dims = capped_transcode_dims(src_w, src_h);
+                            ratecaps.set_property("caps", va_transcode_caps(fps, dims));
+                            match dims {
+                                Some((w, h)) => debug!(
+                                    camera_id,
+                                    src_w,
+                                    src_h,
+                                    out_w = w,
+                                    out_h = h,
+                                    fps,
+                                    "webrtc transcode capped resolution"
+                                ),
+                                None => debug!(
+                                    camera_id,
+                                    src_w, src_h, fps, "webrtc transcode framerate"
+                                ),
                             }
-                            gst::PadProbeReturn::Ok
+                            gst::PadProbeReturn::Remove
                         },
                     );
                 }
@@ -681,14 +702,47 @@ const DEFAULT_TRANSCODE_FPS: i32 = 24;
 /// Upper bound on the transcode output framerate. A security live view does not
 /// need more, and it caps re-encode load for high-rate (e.g. 60fps) cameras.
 const MAX_TRANSCODE_FPS: i32 = 30;
+/// Upper bound on the transcode output resolution (1080p). A security HD live
+/// view does not need more, and re-encoding a camera's full native resolution
+/// (e.g. 4MP, 2688x1520) yields oversized keyframes that starve a shared
+/// uplink. Larger sources are scaled down aspect-preserving; smaller ones pass
+/// through unchanged (never upscaled).
+const MAX_TRANSCODE_WIDTH: i32 = 1920;
+const MAX_TRANSCODE_HEIGHT: i32 = 1080;
 
-/// A VAMemory raw-video caps fixing only the output `framerate`, used to drive
-/// `videorate`'s constant-rate conversion via the `ratecaps` capsfilter.
-fn va_framerate_caps(fps: i32) -> gst::Caps {
-    gst::Caps::builder("video/x-raw")
+/// Scale `(src_w, src_h)` down to fit within
+/// [`MAX_TRANSCODE_WIDTH`] x [`MAX_TRANSCODE_HEIGHT`], preserving aspect ratio
+/// and rounding to even dimensions (H.264 requires even). Returns `None` when
+/// the source already fits (no scaling, and never an upscale).
+fn capped_transcode_dims(src_w: i32, src_h: i32) -> Option<(i32, i32)> {
+    if src_w <= 0 || src_h <= 0 {
+        return None;
+    }
+    if src_w <= MAX_TRANSCODE_WIDTH && src_h <= MAX_TRANSCODE_HEIGHT {
+        return None;
+    }
+    let scale = f64::min(
+        f64::from(MAX_TRANSCODE_WIDTH) / f64::from(src_w),
+        f64::from(MAX_TRANSCODE_HEIGHT) / f64::from(src_h),
+    );
+    let even = |v: f64| ((v.round() as i32) & !1).max(2);
+    Some((
+        even(f64::from(src_w) * scale),
+        even(f64::from(src_h) * scale),
+    ))
+}
+
+/// A VAMemory raw-video caps fixing the output `framerate` and, when `dims` is
+/// `Some`, the output `width`/`height` — used to drive `videorate` +
+/// `vapostproc` via the `ratecaps` capsfilter.
+fn va_transcode_caps(fps: i32, dims: Option<(i32, i32)>) -> gst::Caps {
+    let mut builder = gst::Caps::builder("video/x-raw")
         .features(["memory:VAMemory"])
-        .field("framerate", gst::Fraction::new(fps, 1))
-        .build()
+        .field("framerate", gst::Fraction::new(fps, 1));
+    if let Some((w, h)) = dims {
+        builder = builder.field("width", w).field("height", h);
+    }
+    builder.build()
 }
 
 /// URI of the transport-wide-cc RTP header extension (RMCAT draft). Added to
@@ -1056,6 +1110,23 @@ mod tests {
         assert_eq!(clock.resolve(&no_pts), Duration::from_millis(106));
         // A backward jump is clamped forward, keeping the timeline monotonic.
         assert_eq!(clock.resolve(&kf(500, true)), Duration::from_millis(139));
+    }
+
+    #[test]
+    fn capped_transcode_dims_scales_down_4mp_only() {
+        // 4MP source (cam1) is scaled to fit within 1920x1080, aspect kept.
+        assert_eq!(capped_transcode_dims(2688, 1520), Some((1910, 1080)));
+        // 4K is scaled to exactly 1080p.
+        assert_eq!(capped_transcode_dims(3840, 2160), Some((1920, 1080)));
+        // 720p (cam2) and 1080p already fit — never upscaled.
+        assert_eq!(capped_transcode_dims(1280, 720), None);
+        assert_eq!(capped_transcode_dims(1920, 1080), None);
+        // Degenerate inputs are left alone.
+        assert_eq!(capped_transcode_dims(0, 0), None);
+        // Output dimensions are always even (H.264 requirement).
+        let (w, h) = capped_transcode_dims(2688, 1520).unwrap();
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
     }
 
     #[test]
