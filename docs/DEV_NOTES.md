@@ -140,9 +140,9 @@ curl -sL --fail \
   -o models/.cache/yolov8s-worldv2.pt \
   https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-worldv2.pt
 
-# Generate per-tier static-size variants
-# (`models/yolo_world_v2_s_640.onnx` ~50 MB for T10/T24,
-#  `models/yolo_world_v2_s_960.onnx` ~50 MB for T36/T36-S) with the
+# Generate the static-size variants
+# (`models/yolo_world_v2_s_640.onnx` ~50 MB, the 640 default,
+#  `models/yolo_world_v2_s_960.onnx` ~50 MB, the 960 default) with the
 # default vocabulary baked in. `--all-static` is the release path; it
 # runs both sizes in one ultralytics session to avoid the import +
 # checkpoint-load overhead twice. The script also upserts the entry

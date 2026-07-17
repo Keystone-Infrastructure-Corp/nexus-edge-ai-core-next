@@ -17,7 +17,7 @@
 # user to (`ensure_accelerator_groups`). Filename sorts AFTER Hailo's
 # own rule (99 > 60), so this MODE/GROUP assignment wins.
 #
-# `install.sh` writes this rule automatically on T24 / Hailo boxes
+# `install.sh` writes this rule automatically on Hailo boxes
 # (`_hailo_install_udev_rule` in scripts/lib/install-common.sh) and
 # reloads udev. To apply it by hand:
 #

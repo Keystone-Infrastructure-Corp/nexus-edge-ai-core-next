@@ -3,7 +3,7 @@
 Generate the closed-vocab YOLOv26-nano ONNX detectors that power M1's
 `YoloOrtDetector`. As of v0.1.19 the engine ships three STATIC-shape
 exports — `yolo26n_640.onnx`, `yolo26n_960.onnx`, `yolo26n_1280.onnx` —
-one per supported input size (matched to per-tier defaults and the
+one per supported input size (matched to per-profile defaults and the
 per-camera size override). Static shapes are mandatory for the Intel
 NPU plugin (which silently falls back to CPU on dynamic-shape models)
 and let the OpenVINO blob cache hit on every subsequent boot. The

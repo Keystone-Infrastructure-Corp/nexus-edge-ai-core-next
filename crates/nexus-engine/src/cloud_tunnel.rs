@@ -1081,7 +1081,12 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
                 online_cameras: 0,
                 queued_alerts: 0,
                 release,
-                tier: "dev".to_string(),
+                // Optional cloud-side capability diagnostic (wire `v=1`,
+                // repurposed in place). Populating it with the engine's real
+                // probed capability profile (from config `ep_priority` / the
+                // device manifest) is a follow-up; the cloud treats the
+                // omitted field as "unknown" until then.
+                capability_profile: None,
                 uptime_s: start.elapsed().as_secs(),
                 // See `build.rs` — release-tag at CI build-time, falls
                 // back to `CARGO_PKG_VERSION` for local dev builds.

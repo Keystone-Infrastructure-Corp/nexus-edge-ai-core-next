@@ -211,8 +211,8 @@ ep_priority = ["openvino", "cpu"]
 # plus yolo26n.hef for Hailo-8 boxes) | open_vocab | classifier_ensemble | mock
 kind = "yolo"
 # Pack preset — "320" / "640" / "1280" from models-manifest.json.
-#   T10 → 320 (lowest latency)
-#   T24 / T36 / T36-S / T64 → 640 (default operating point)
+#   cpu profile → 320 (lowest latency)
+#   all other profiles → 640 (default operating point)
 #   regional refinement → 1280 (per-frame second pass on uncertain regions)
 preset = "640"
 # pack_path = "/var/lib/nexus/models/yolo26n"

@@ -1,8 +1,8 @@
 //! Golden regression fixtures: per-box `Manifest` → generated `Config`.
 //!
 //! These lock the capability-based generator to the exact knob values the
-//! old hand-tuned `config/tiers/*.toml` templates set (cited per box), so
-//! deleting those templates can't silently change what a box gets. Each
+//! old hand-tuned per-box config templates set (cited per box), so
+//! removing those templates can't silently change what a box gets. Each
 //! case runs the full public path — `HardwareProfile::from_manifest` →
 //! `generate_config` — exactly as the `emit-config` CLI does.
 //!
@@ -33,10 +33,10 @@ fn config_for(m: &Manifest) -> nexus_config::Config {
     generate_config(&HardwareProfile::from_manifest(m))
 }
 
-/// T10 — Intel UHD N150 iGPU (the `.100` box). Tier template: `t10.toml`
-/// (`ep_priority = ["gpu","cpu"]`, preset 640, workers 1, 4/4 threads).
+/// Intel UHD N150 iGPU (the `.100` box). Golden knobs:
+/// `ep_priority = ["gpu","cpu"]`, preset 640, workers 1, 4/4 threads.
 #[test]
-fn t10_intel_igpu_n150() {
+fn intel_igpu_n150() {
     let m = manifest(
         4,
         4,
@@ -53,16 +53,15 @@ fn t10_intel_igpu_n150() {
     assert_eq!(c.runtime.worker_threads, 4);
     assert_eq!(c.runtime.blocking_threads, 4);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
-    // Generator improvement over t10's literal 256: RAM-bucketed headroom.
+    // Generator improvement over the N150 box's literal 256: RAM-bucketed headroom.
     assert_eq!(c.bus.capacity, 2048);
 }
 
-/// T36-S — Intel Lunar Lake (Arc 140V iGPU + NPU). Tier template:
-/// `t36s.toml` (`ep_priority = ["npu","cpu"]`, preset 960, workers 2,
-/// 8/8 threads). NPU wins inference; decode stays VA via the Arc media
-/// engine.
+/// Intel Lunar Lake (Arc 140V iGPU + NPU). Golden knobs:
+/// `ep_priority = ["npu","cpu"]`, preset 960, workers 2, 8/8 threads.
+/// NPU wins inference; decode stays VA via the Arc media engine.
 #[test]
-fn t36s_intel_npu_lunar_lake() {
+fn intel_npu_lunar_lake() {
     let m = manifest(
         8,
         8,
@@ -82,15 +81,15 @@ fn t36s_intel_npu_lunar_lake() {
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }
 
-/// T36 — discrete Intel Arc A380 dGPU. Tier template `t36.toml` set
-/// `ep_priority = ["openvino","cpu"]`, preset 960, workers 2. The probe
-/// can't yet distinguish a discrete Arc from an iGPU (both surface as
-/// `intel_arc_140v`/`intel_igpu`), so the generator emits the iGPU-class
-/// mapping: `"gpu"` (the explicit OpenVINO GPU device, valid for dGPU
-/// too), preset 640, workers 1. VRAM-based dGPU detection is the deferred
-/// enrichment that would restore 960/2.
+/// Discrete Intel Arc A380 dGPU. The discrete-Arc knobs would be
+/// `ep_priority = ["openvino","cpu"]`, preset 960, workers 2, but the
+/// probe can't yet distinguish a discrete Arc from an iGPU (both surface
+/// as `intel_arc_140v`/`intel_igpu`), so the generator emits the
+/// iGPU-class mapping: `"gpu"` (the explicit OpenVINO GPU device, valid
+/// for dGPU too), preset 640, workers 1. VRAM-based dGPU detection is the
+/// deferred enrichment that would restore 960/2.
 #[test]
-fn t36_discrete_arc_falls_back_to_igpu_class() {
+fn discrete_arc_falls_back_to_igpu_class() {
     let m = manifest(
         12,
         12,
@@ -109,12 +108,12 @@ fn t36_discrete_arc_falls_back_to_igpu_class() {
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }
 
-/// T24 — Beelink EQR7: Hailo-8 inference, AMD Radeon 680M decode-only
-/// (not on the ROCm allowlist). Tier template `t24.toml`
-/// (`ep_priority = ["hailo","cpu"]`, preset 640, workers 1, 16/16 threads,
-/// bus 2048). The decode-only AMD iGPU must NOT enter the inference chain.
+/// Beelink EQR7: Hailo-8 inference, AMD Radeon 680M decode-only (not on
+/// the ROCm allowlist). Golden knobs: `ep_priority = ["hailo","cpu"]`,
+/// preset 640, workers 1, 16/16 threads, bus 2048. The decode-only AMD
+/// iGPU must NOT enter the inference chain.
 #[test]
-fn t24_eqr7_hailo_with_amd_decode() {
+fn hailo_eqr7_with_amd_decode() {
     let m = manifest(
         8,
         16,
@@ -136,8 +135,8 @@ fn t24_eqr7_hailo_with_amd_decode() {
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }
 
-/// AMD Vulkan — Phoenix/Rembrandt APU NOT on the ROCm allowlist. Tier
-/// template `amd.toml` (`ep_priority = ["vulkan","cpu"]`, preset 640).
+/// AMD Vulkan — Phoenix/Rembrandt APU NOT on the ROCm allowlist. Golden
+/// knobs: `ep_priority = ["vulkan","cpu"]`, preset 640.
 #[test]
 fn amd_vulkan_igpu() {
     let m = manifest(
@@ -157,9 +156,8 @@ fn amd_vulkan_igpu() {
 }
 
 /// AMD ROCm — discrete AMD GPU on the allowlist (CDNA/RDNA2/RDNA3).
-/// No tier template existed (the installer applied a ROCm ep_priority
-/// override); the generator emits it directly: `ep_priority =
-/// ["rocm","cpu"]`, VA decode, RAM-bucketed bus.
+/// The generator emits it directly: `ep_priority = ["rocm","cpu"]`,
+/// VA decode, RAM-bucketed bus.
 #[test]
 fn amd_rocm_discrete() {
     let m = manifest(
@@ -178,12 +176,12 @@ fn amd_rocm_discrete() {
     assert_eq!(c.bus.capacity, 4096);
 }
 
-/// T64 — NVIDIA RTX. Tier template `t64.toml` ships the aspirational
+/// NVIDIA RTX. The aspirational mapping is
 /// `ep_priority = ["tensorrt","cuda","cpu"]`, but those EPs are M5-gated;
 /// the generator emits `["cpu"]` + software decode TODAY (matching the
 /// current "falls through to CPU" runtime reality). Flips at M5.
 #[test]
-fn t64_nvidia_is_cpu_today() {
+fn nvidia_is_cpu_today() {
     let m = manifest(
         8,
         16,

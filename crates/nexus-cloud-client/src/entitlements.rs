@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn not_suspended_for_active_plan() {
         let cache = EntitlementCache::new();
-        cache.store(jwt_with_claims(r#"{"plan":"t24","max_cameras":24}"#));
+        cache.store(jwt_with_claims(r#"{"plan":"pro","max_cameras":24}"#));
         assert!(!cache.is_suspended());
     }
 
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn suspended_when_max_cameras_zero() {
         let cache = EntitlementCache::new();
-        cache.store(jwt_with_claims(r#"{"plan":"t10","max_cameras":0}"#));
+        cache.store(jwt_with_claims(r#"{"plan":"starter","max_cameras":0}"#));
         assert!(cache.is_suspended());
     }
 

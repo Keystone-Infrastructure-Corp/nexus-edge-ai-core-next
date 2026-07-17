@@ -1095,10 +1095,10 @@ curl -fsS -X PUT -H 'Content-Type: application/json' \
 ```bash
 sudo -u nexus /opt/nexus/current/bin/nexus-probe \
     --out /var/lib/nexus/device-manifest.json
-jq '.recommended_tier, .accelerators' /var/lib/nexus/device-manifest.json
+jq '.recommended_profile, .accelerators' /var/lib/nexus/device-manifest.json
 ```
 
-The `recommended_tier` label (advisory metadata for the cloud) and the
+The `recommended_profile` label (advisory metadata for the cloud) and the
 detected `accelerators` should line up with the `ep_priority` in
 `/etc/nexus/nexus.toml`. If they disagree, regenerate the config by
 re-running the installer (it picks the right profile from the same
@@ -1653,8 +1653,8 @@ sudo cat /var/lib/nexus/state/bootstrap-password.txt
 # ---- §6.4 Confirm probe sees BOTH accelerators -------------------
 sudo -u nexus /opt/nexus/current/bin/nexus-probe \
     --out /var/lib/nexus/device-manifest.json
-jq '.recommended_tier, .accelerators' /var/lib/nexus/device-manifest.json
-# Expect: "t36s", and accelerators include both Arc 140V (iGPU)
+jq '.recommended_profile, .accelerators' /var/lib/nexus/device-manifest.json
+# Expect: "intel-npu", and accelerators include both Arc 140V (iGPU)
 #         and an NPU entry with provider "openvino" device "NPU".
 
 # ---- §6.4 Add a camera -------------------------------------------

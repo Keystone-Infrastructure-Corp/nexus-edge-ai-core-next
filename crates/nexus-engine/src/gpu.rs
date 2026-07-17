@@ -9,8 +9,8 @@
 //!     Everything is queryable: name, memory totals, utilization,
 //!     temperature.
 //!
-//!   * **Linux Intel iGPU** (T10 N100, T24 Iris Xe, T36 Arc A380,
-//!     T36-S Lunar Lake) — read `/sys/class/drm/card*/device/`:
+//!   * **Linux Intel iGPU** (N100, Iris Xe, Arc A380,
+//!     Lunar Lake) — read `/sys/class/drm/card*/device/`:
 //!     `vendor` (must be `0x8086`), `device` PCI ID for the
 //!     family name. Frequency is exposed at
 //!     `gt/gt0/rps_cur_freq_mhz` but utilization requires
@@ -1310,11 +1310,11 @@ mod intel {
     /// integrated graphics" + the raw ID for support tickets.
     fn intel_pci_name(device_id: &str) -> String {
         match device_id.to_ascii_lowercase().as_str() {
-            // Alder Lake-N (T10 / N100)
+            // Alder Lake-N (N100)
             "0x46d0" | "0x46d1" | "0x46d2" | "0x46d3" | "0x46d4" => {
                 "Intel UHD Graphics (Alder Lake-N)".to_string()
             }
-            // Raptor Lake-S UHD (T24 family / N305 etc.)
+            // Raptor Lake-S UHD (N305 etc.)
             "0xa780" | "0xa781" | "0xa782" | "0xa783" => "Intel UHD Graphics 770".to_string(),
             // Iris Xe — Tiger Lake / Alder Lake-P
             // (0x46a6 is Alder Lake-P GT2 — GMKTec NucBox M3
@@ -1322,9 +1322,9 @@ mod intel {
             "0x9a40" | "0x9a49" | "0x9a78" | "0x9ac0" | "0x9ac9" | "0x46a6" => {
                 "Intel Iris Xe Graphics".to_string()
             }
-            // Arc A-series (T36)
+            // Arc A-series
             "0x56a0" | "0x56a1" | "0x56a5" | "0x56a6" => "Intel Arc A380 / A580".to_string(),
-            // Lunar Lake (T36-S)
+            // Lunar Lake
             "0x6420" | "0x64a0" | "0x64b0" => "Intel Arc Graphics (Lunar Lake)".to_string(),
             other => format!("Intel integrated graphics ({other})"),
         }

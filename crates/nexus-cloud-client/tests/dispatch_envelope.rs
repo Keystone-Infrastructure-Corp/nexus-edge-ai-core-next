@@ -221,7 +221,7 @@ async fn dispatch_envelope_rejects_non_rpc_call() {
             online_cameras: 0,
             queued_alerts: 0,
             release: None,
-            tier: "t36".into(),
+            capability_profile: Some("hailo".into()),
             uptime_s: 0,
             version: "0.5.0".into(),
         }),

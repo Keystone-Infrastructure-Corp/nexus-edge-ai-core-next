@@ -114,14 +114,14 @@ ensure_dirs() {
 }
 
 # Add the service user to `render` and `video` groups so the engine can
-# open `/dev/dri/renderD128` (every iGPU/dGPU tier) and `/dev/accel/accel0`
-# (T36-S NPU). Also adds `hailo` (created by the HailoRT .deb postinst
-# on T24 boxes) so the engine can open `/dev/hailo0`. Idempotent:
+# open `/dev/dri/renderD128` (every iGPU/dGPU) and `/dev/accel/accel0`
+# (Intel NPU). Also adds `hailo` (created by the HailoRT .deb postinst
+# on Hailo boxes) so the engine can open `/dev/hailo0`. Idempotent:
 # usermod -aG is a no-op if the user is already a member. Groups that
 # don't exist on the host are silently skipped — `render` only exists
 # once the GPU userspace from §5 is installed, but the install script
 # may run before that on a freshly-flashed box. Same for `hailo` —
-# created only after HailoRT installs (T24-EQR7 boxes only); call this
+# created only after HailoRT installs (Hailo/EQR7 boxes only); call this
 # again after `install_drivers` to pick it up.
 #
 # HailoRT 4.23.x ships a udev rule that leaves /dev/hailo* WORLD-rw
@@ -356,18 +356,18 @@ EOF
 # What this provides (paired with §5 in docs/INSTALL.md):
 #
 #   intel-igpu      → kobuk-team PPA + iGPU + media + compute stack.
-#                     Covers UHD (Alder Lake-N / T10), Iris Xe (T24),
-#                     Arc 140V (Lunar Lake / T36-S iGPU side),
+#                     Covers UHD (Alder Lake-N), Iris Xe,
+#                     Arc 140V (Lunar Lake iGPU side),
 #                     Arc Graphics (Meteor Lake).
 #   intel-arc-dgpu  → identical PPA + package set; same DG2 stack
-#                     works for the A380 (T36). The PPA already
+#                     works for the A380. The PPA already
 #                     handles firmware via linux-firmware updates.
 #   intel-npu       → upstream linux-npu-driver tarball v1.32.1
 #                     (4 .deb files). Preconditions: Lunar Lake or
 #                     Meteor Lake hardware AND kernel >= 6.10. If
 #                     kernel is too old we install linux-generic-
 #                     hwe-24.04 and exit asking for a reboot.
-#   nvidia-gpu      → skipped with a warning. T64 lands when M5
+#   nvidia-gpu      → skipped with a warning. NVIDIA support lands when M5
 #                     ships the CUDA / TensorRT EPs.
 #
 # All sub-steps are idempotent: re-running install.sh sees the
@@ -450,7 +450,7 @@ install_drivers() {
     fi
 
     if (( has_nvidia )); then
-        warn "NVIDIA GPU detected — T64 tier lands when M5 ships the CUDA / TensorRT"
+        warn "NVIDIA GPU detected — NVIDIA support lands when M5 ships the CUDA / TensorRT"
         warn "execution providers. Skipping nvidia driver install for now; engine"
         warn "will run on the CPU EP fallback. See docs/INSTALL.md §5.4."
     fi
@@ -2424,8 +2424,8 @@ verify_signature() {
 # --- Config generation (nexus-probe emit-config) ------------------------------
 
 # Generate /etc/nexus/nexus.toml from the DETECTED hardware via
-# `nexus-probe emit-config`, replacing the old per-tier template copy
-# (`stage_tier_config`) and the `recommended_tier` lookup. nexus-probe
+# `nexus-probe emit-config`, replacing the old per-box template copy and
+# path-rewrite step. nexus-probe
 # builds a real, fully-defaulted `nexus_config::Config` from the box's
 # capabilities (inference EP order, decode mode, worker/blocking
 # threads, inference workers, model preset, bus capacity) and writes

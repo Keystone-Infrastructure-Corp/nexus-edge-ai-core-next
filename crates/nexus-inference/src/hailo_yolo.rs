@@ -29,7 +29,7 @@
 //! working backend.
 //!
 //! The router with `backend = Pool` + `fail_soft = true` builds N
-//! pool detectors + 1 fail-soft fallback, so even the simplest T24
+//! pool detectors + 1 fail-soft fallback, so even the simplest Hailo
 //! config (workers=1) triggers two `build` calls. To make that work
 //! without a vdevice-leasing protocol with HailoRT, we keep a
 //! process-wide cache of opened detectors keyed by canonical HEF

@@ -925,7 +925,7 @@ fn check_events_recent(client: &Client, base: &str) -> Outcome {
 /// [OpenVINO] You have selected wrong configuration value for the key 'device_type'.
 /// ```
 ///
-/// Verified in the field on T36-S Lunar Lake boxes provisioned with
+/// Verified in the field on Lunar Lake boxes provisioned with
 /// the pre-libze1 install.sh. `scripts/lib/install-common.sh` now
 /// installs `libze1` from `ppa:kobuk-team/intel-graphics`; this
 /// check is the operator-visible repair signal for boxes that were
