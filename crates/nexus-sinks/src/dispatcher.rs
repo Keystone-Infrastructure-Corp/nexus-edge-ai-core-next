@@ -293,10 +293,12 @@ async fn reclaim_snapshot_if_drained(
 
 /// Whether an alert is still young enough that a not-yet-available
 /// clip might still resolve. Covers three transient conditions:
+///
 ///   * the supervisor hasn't written the clip link yet (it does so a
 ///     few frames after enqueueing the outbox row);
 ///   * the recorder hasn't flushed the hot MP4 to disk yet;
 ///   * a disk-pressure eviction raced the clip close.
+///
 /// Past this window we stop waiting and deliver clip-less rather than
 /// hold the alarm forever. Sized (`CLIP_LINK_GRACE_SECS`) well inside
 /// the backoff horizon so waiting never exhausts a row's retries.
