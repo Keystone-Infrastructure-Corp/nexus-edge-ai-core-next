@@ -13,7 +13,7 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # only on hosts with gst-plugins-bad + -base dev headers (Linux CI
 # `system-libs` job, or a local GStreamer install), never on the default
 # macOS build.
-gstreamer-webrtc = ["gstreamer", "dep:gstreamer-webrtc", "dep:gstreamer-sdp"]
+gstreamer-webrtc = ["gstreamer", "dep:gstreamer-webrtc", "dep:gstreamer-sdp", "dep:gstreamer-rtp"]
 
 [dependencies]
 nexus-types = { workspace = true }
@@ -47,6 +47,9 @@ gstreamer-app = { workspace = true, optional = true }
 gstreamer-video = { workspace = true, optional = true }
 gstreamer-webrtc = { workspace = true, optional = true }
 gstreamer-sdp = { workspace = true, optional = true }
+# `v1_20` unlocks `RTPHeaderExtension` (added in GStreamer 1.20). The edge runs
+# 1.24, so this is safe; used for the transport-wide-cc probe on the payloader.
+gstreamer-rtp = { workspace = true, optional = true, features = ["v1_20"] }
 # M2.2: streaming hash for cold-replication. Same dep version as
 # `nexus-storage` to keep the workspace lock single-versioned.
 sha2 = "0.10"

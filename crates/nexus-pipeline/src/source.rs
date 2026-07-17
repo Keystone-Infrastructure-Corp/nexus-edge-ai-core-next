@@ -51,7 +51,7 @@ pub const RTSP_SOURCE_FRAME_HEIGHT: u32 = 540;
 /// per-frame bandwidth on black bars AND distort the operator's
 /// live view aspect. Matching detector width to supervisor width
 /// also eliminates the upscale step inside `from_config` when a
-/// T36-S camera runs the 1280 model against the old hardcoded
+/// camera runs the 1280 model against the old hardcoded
 /// 960 supervisor frame.
 pub const fn supervisor_frame_for(detector_width: u32) -> (u32, u32) {
     // (w * 9 / 16) rounded up to the next even integer.

@@ -111,7 +111,7 @@ Radeon. Setup details:
 The Lunar Lake iGPU + NPU 4 stack is the highest-throughput profile
 (~115 TOPS combined) but requires a kernel ≥ 6.10, OpenVINO ≥ 2024.4, and
 the Intel NPU driver trio installed out-of-band — see
-[INSTALL.md §5.3](INSTALL.md#53-tier-t36-s-lunar-lake--add-igpu--npu) and
+[INSTALL.md §5.3](INSTALL.md#53-lunar-lake--arc-140v-igpu--npu-4) and
 [nexus-edge-deploy OS_INSTALL.md §6.3](../../nexus-edge-deploy/docs/OS_INSTALL.md).
 The generator lists `npu` first with `cpu` as the fallback; if the NPU
 driver isn't present yet the engine falls through automatically — that's

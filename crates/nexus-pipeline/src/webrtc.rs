@@ -42,6 +42,8 @@
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppStreamType};
+use gstreamer_rtp as gst_rtp;
+use gstreamer_rtp::prelude::RTPHeaderExtensionExt;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 
@@ -49,7 +51,9 @@ use nexus_types::{CameraId, CodecKind};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+use std::time::Duration;
 
 use crate::preroll::NalSample;
 
@@ -99,25 +103,24 @@ pub struct IceServerCfg {
     pub credential: Option<String>,
 }
 
-/// An outbound signalling artefact produced by the edge answerer. The
-/// caller (the Phase F tunnel manager) forwards these to the cloud as
-/// `webrtc_answer` / `webrtc_ice_candidate` envelopes.
+/// An outbound signalling artefact produced by the edge publisher. The caller
+/// (the signalling bridge) forwards these to the cloud: `Offer` →
+/// `live_hd_offer`, `Connected` → `live_hd_publishing`.
 #[derive(Debug, Clone)]
 pub enum WebRtcEvent {
-    /// The local SDP answer is ready.
-    Answer {
-        /// The answer SDP text.
+    /// The local SDP **offer** is ready (publisher / offerer role), with the
+    /// gathered ICE candidates already baked into the SDP. The caller
+    /// forwards it to the SFU as `live_hd_offer`.
+    Offer {
+        /// The offer SDP text (ICE candidates baked in).
         sdp: String,
         /// Negotiated video codec label (`"h264"` / `"h265"`).
         codec: &'static str,
     },
-    /// A local ICE candidate was gathered.
-    IceCandidate {
-        /// The media-line index the candidate belongs to.
-        sdp_mline_index: u32,
-        /// The candidate attribute value (`candidate:…`).
-        candidate: String,
-    },
+    /// The peer connection reached `connected` (publisher role) — the edge
+    /// is now streaming media to the SFU. The caller forwards this as
+    /// `live_hd_publishing`.
+    Connected,
     /// The session failed while negotiating; the caller should tear down.
     Failed(String),
 }
@@ -135,17 +138,21 @@ pub struct WebRtcSession {
     _appsrc: AppSrc,
     events: mpsc::UnboundedSender<WebRtcEvent>,
     feed: JoinHandle<()>,
+    /// Adaptive-bitrate control loop (transcode sessions only); aborted on drop.
+    cc: Option<JoinHandle<()>>,
 }
 
 impl WebRtcSession {
-    /// Build the passthrough sub-pipeline for one camera and start pumping
-    /// its compressed NAL stream into the pipeline. Negotiation does not
-    /// begin until [`WebRtcSession::accept_offer`] is called.
+    /// Build a **publisher** (offerer) session that streams the camera
+    /// send-only to an SFU.
     ///
-    /// `nal_rx` is a fresh subscription to the camera's
-    /// [`crate::preroll_ingester::PreRollIngester`] broadcast; `codec` is
-    /// that ingester's `codec()`.
-    pub fn new(
+    /// Unlike [`WebRtcSession::new`], the edge creates the SDP offer, waits
+    /// for ICE gathering to complete (the SFU's `tracks/new` is a single
+    /// request — no trickle), and emits [`WebRtcEvent::Offer`] with the
+    /// candidates baked into the SDP. The SFU's answer arrives via
+    /// [`WebRtcSession::set_answer`], and once the peer connection is up the
+    /// session emits [`WebRtcEvent::Connected`].
+    pub fn new_publisher(
         session_id: String,
         camera_id: CameraId,
         codec: CodecKind,
@@ -154,18 +161,137 @@ impl WebRtcSession {
         nal_rx: broadcast::Receiver<NalSample>,
         events: mpsc::UnboundedSender<WebRtcEvent>,
     ) -> Result<Self, WebRtcError> {
-        if mode == WebRtcMode::Transcode {
-            return Err(WebRtcError::Unsupported(
-                "transcode fallback is not implemented in Phase E (passthrough only)".to_string(),
-            ));
-        }
+        let sess = Self::build_common(
+            session_id,
+            camera_id,
+            codec,
+            mode,
+            ice_servers,
+            nal_rx,
+            events,
+        )?;
+        sess.wire_offerer();
+        // Bring the pipeline up so `webrtcbin` opens its peer-connection,
+        // fires `on-negotiation-needed`, and begins gathering ICE.
+        sess.pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
+        Ok(sess)
+    }
+
+    /// Shared pipeline construction for both roles. Builds the passthrough
+    /// pipeline, applies ICE servers, and starts the NAL feed. The caller
+    /// wires the role-specific signalling afterwards.
+    fn build_common(
+        session_id: String,
+        camera_id: CameraId,
+        codec: CodecKind,
+        mode: WebRtcMode,
+        ice_servers: &[IceServerCfg],
+        nal_rx: broadcast::Receiver<NalSample>,
+        events: mpsc::UnboundedSender<WebRtcEvent>,
+    ) -> Result<Self, WebRtcError> {
         gst::init().map_err(|e| WebRtcError::Init(e.to_string()))?;
 
-        let desc = passthrough_pipeline_desc(codec);
-        let pipeline = gst::parse::launch(&desc)
-            .map_err(|e| WebRtcError::Build(format!("parse::launch: {e}")))?
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| WebRtcError::Build("downcast Pipeline".to_string()))?;
+        // Choose the media pipeline. Prefer a short-GOP hardware **transcode**
+        // (HW-decode the camera codec → re-encode H.264 with a ~2s keyframe
+        // interval, CBR, no B-frames): a long-GOP camera stream stalls for a
+        // full GOP after any packet loss on the UDP WebRTC path, whereas a
+        // short GOP recovers within ~1-2s. Falls back to raw passthrough on
+        // boxes without a HW encoder + matching decoder (e.g. macOS dev), or if
+        // the transcode pipeline fails to build. `mode` is advisory; the choice
+        // is driven by hardware availability.
+        let _ = mode;
+        let transcode = hw_h264_encoder().zip(hw_decoder(codec));
+        let (mut desc, mut transcoding) = match transcode {
+            Some((enc, dec)) => (transcode_pipeline_desc(codec, enc, dec), true),
+            None => (passthrough_pipeline_desc(codec), false),
+        };
+        let pipeline = match gst::parse::launch(&desc) {
+            Ok(p) => p,
+            Err(e) if transcoding => {
+                warn!(
+                    camera_id,
+                    error = %e,
+                    "webrtc transcode pipeline failed to build; falling back to passthrough"
+                );
+                transcoding = false;
+                desc = passthrough_pipeline_desc(codec);
+                gst::parse::launch(&desc)
+                    .map_err(|e| WebRtcError::Build(format!("parse::launch: {e}")))?
+            }
+            Err(e) => return Err(WebRtcError::Build(format!("parse::launch: {e}"))),
+        }
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| WebRtcError::Build("downcast Pipeline".to_string()))?;
+        debug!(camera_id, transcoding, "webrtc HD pipeline built");
+
+        // Per-camera transcode framerate. `videorate` normalises to a constant
+        // rate so the browser plays out smoothly on even RTP timestamps, but
+        // cameras run at different rates — so rather than hardcode one value,
+        // start the `ratecaps` filter at DEFAULT_TRANSCODE_FPS and adopt the
+        // camera's own declared framerate once the decoder negotiates it. A
+        // framerate-only caps change does not realloc VA surfaces, so it is
+        // safe even if `videorate` has already begun. Cameras that declare no
+        // rate (`framerate=0/1`) keep the default. Passthrough builds have no
+        // `ratecaps` element and skip this entirely.
+        if transcoding {
+            if let Some(ratecaps) = pipeline.by_name("ratecaps") {
+                ratecaps.set_property("caps", va_transcode_caps(DEFAULT_TRANSCODE_FPS, None));
+                if let Some(dec_src) = pipeline.by_name("dec").and_then(|d| d.static_pad("src")) {
+                    let ratecaps = ratecaps.clone();
+                    let _ = dec_src.add_probe(
+                        gst::PadProbeType::EVENT_DOWNSTREAM,
+                        move |_pad, info| {
+                            let Some(gst::PadProbeData::Event(ev)) = &info.data else {
+                                return gst::PadProbeReturn::Ok;
+                            };
+                            let gst::EventView::Caps(caps_ev) = ev.view() else {
+                                return gst::PadProbeReturn::Ok;
+                            };
+                            // Act on the first raw-video caps event (always
+                            // carries width/height). Adopt the camera's declared
+                            // framerate (default if it declares none), and cap
+                            // the output resolution to <=1080p so a 4MP source
+                            // is scaled down: a full-native re-encode makes
+                            // oversized keyframes that starve a shared uplink.
+                            let Some(s) = caps_ev.caps().structure(0) else {
+                                return gst::PadProbeReturn::Ok;
+                            };
+                            let (Ok(src_w), Ok(src_h)) =
+                                (s.get::<i32>("width"), s.get::<i32>("height"))
+                            else {
+                                return gst::PadProbeReturn::Ok;
+                            };
+                            let fps = s
+                                .get::<gst::Fraction>("framerate")
+                                .ok()
+                                .filter(|fr| fr.numer() > 0 && fr.denom() > 0)
+                                .map(|fr| (fr.numer() / fr.denom()).clamp(1, MAX_TRANSCODE_FPS))
+                                .unwrap_or(DEFAULT_TRANSCODE_FPS);
+                            let dims = capped_transcode_dims(src_w, src_h);
+                            ratecaps.set_property("caps", va_transcode_caps(fps, dims));
+                            match dims {
+                                Some((w, h)) => debug!(
+                                    camera_id,
+                                    src_w,
+                                    src_h,
+                                    out_w = w,
+                                    out_h = h,
+                                    fps,
+                                    "webrtc transcode capped resolution"
+                                ),
+                                None => debug!(
+                                    camera_id,
+                                    src_w, src_h, fps, "webrtc transcode framerate"
+                                ),
+                            }
+                            gst::PadProbeReturn::Remove
+                        },
+                    );
+                }
+            }
+        }
 
         let appsrc = pipeline
             .by_name("src")
@@ -175,6 +301,27 @@ impl WebRtcSession {
         let webrtc = pipeline
             .by_name("webrtc")
             .ok_or_else(|| WebRtcError::Build("webrtcbin 'webrtc' missing".to_string()))?;
+
+        // (Phase b probe) Add the transport-wide-cc RTP header extension to the
+        // payloader so the offer advertises TWCC. Combined with the twcc-stats
+        // logging in the congestion-control loop, this tells us whether the
+        // Cloudflare SFU returns TWCC feedback — the signal `rtpgccbwe` needs.
+        if let Some(pay) = pipeline.by_name("pay") {
+            match gst_rtp::RTPHeaderExtension::create_from_uri(RTP_TWCC_URI) {
+                Some(ext) => {
+                    ext.set_id(1);
+                    pay.emit_by_name::<()>("add-extension", &[&ext]);
+                    debug!(
+                        camera_id,
+                        "webrtc: added transport-wide-cc extension (id=1)"
+                    );
+                }
+                None => warn!(
+                    camera_id,
+                    "webrtc: could not create TWCC extension (rtpmanager missing?)"
+                ),
+            }
+        }
 
         // Tell appsrc the exact byte-stream codec so h264parse/rtppay
         // negotiate without a probe.
@@ -206,30 +353,38 @@ impl WebRtcSession {
             }
         }
 
-        // Local ICE candidates → events (relayed to the browser via cloud).
-        let ice_tx = events.clone();
-        webrtc.connect("on-ice-candidate", false, move |vals| {
-            let mline = vals.get(1).and_then(|v| v.get::<u32>().ok()).unwrap_or(0);
-            let candidate = vals
-                .get(2)
-                .and_then(|v| v.get::<String>().ok())
-                .unwrap_or_default();
-            let _ = ice_tx.send(WebRtcEvent::IceCandidate {
-                sdp_mline_index: mline,
-                candidate,
-            });
-            None
-        });
-        // We're the answerer, so we never create an offer on renegotiation;
-        // log for diagnostics only.
-        let sess = session_id.clone();
-        webrtc.connect("on-negotiation-needed", false, move |_vals| {
-            debug!(session = %sess, "webrtcbin on-negotiation-needed (answerer; ignored)");
-            None
-        });
-
         // Pump compressed NALs into appsrc, splicing in at the next IDR.
         let feed = tokio::spawn(feed_loop(appsrc.clone(), nal_rx, camera_id));
+
+        // Congestion control for the transcode path. Prefer `rtpgccbwe`
+        // (Google Congestion Control + pacing) when the bundled plugin is
+        // present: it spreads keyframe bursts under the uplink and drives the
+        // encoder off a delay-based estimate, so a higher sustained bitrate no
+        // longer triggers the loss spikes that plague pure loss-based AIMD.
+        // Fall back to the AIMD loop when the plugin is absent/unloadable.
+        // Passthrough builds have no `enc` element and skip both.
+        let cc = if transcoding {
+            match pipeline.by_name("enc") {
+                Some(enc) if gst::ElementFactory::find("rtpgccbwe").is_some() => {
+                    wire_gcc_congestion_control(&webrtc, &enc, camera_id);
+                    info!(
+                        camera_id,
+                        "webrtc congestion control: rtpgccbwe (paced GCC)"
+                    );
+                    None
+                }
+                Some(enc) => {
+                    info!(
+                        camera_id,
+                        "webrtc congestion control: AIMD (rtpgccbwe plugin unavailable)"
+                    );
+                    Some(spawn_congestion_control(webrtc.clone(), enc, camera_id))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             session_id,
@@ -240,108 +395,103 @@ impl WebRtcSession {
             _appsrc: appsrc,
             events,
             feed,
+            cc,
         })
     }
 
-    /// Apply the browser's SDP offer, create + adopt the local answer, and
-    /// emit [`WebRtcEvent::Answer`]. Also transitions the pipeline to
-    /// `Playing` so media starts flowing.
-    pub fn accept_offer(&self, sdp_offer: &str) -> Result<(), WebRtcError> {
-        let msg = gst_sdp::SDPMessage::parse_buffer(sdp_offer.as_bytes())
-            .map_err(|e| WebRtcError::Sdp(format!("parse offer: {e}")))?;
-        let offer =
-            gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Offer, msg);
-
-        let webrtc_for_local = self.webrtc.clone();
-        let events_ok = self.events.clone();
+    /// Wire the publisher/offerer negotiation: on `on-negotiation-needed`
+    /// create an offer, adopt it locally, and — once ICE gathering completes
+    /// — emit [`WebRtcEvent::Offer`] with the candidates baked into the SDP.
+    /// Also emit [`WebRtcEvent::Connected`] when the peer connection is up.
+    fn wire_offerer(&self) {
         let codec_label = self.codec.base();
-        // The RTP payload type the browser assigned to our codec lives in the
-        // negotiated answer; the payloader must stamp that exact number on the
-        // wire (see the `pay` reconfiguration below).
-        let encoding_name = if codec_label == "h265" {
-            "H265"
-        } else {
-            "H264"
-        };
-        let pay = self.pipeline.by_name("pay");
 
-        // Second stage: once the answer exists, adopt it locally + emit it.
-        let answer_promise = gst::Promise::with_change_func(move |reply| {
-            let answer = reply
-                .ok()
-                .flatten()
-                .and_then(|s| s.get::<gst_webrtc::WebRTCSessionDescription>("answer").ok());
-            let Some(answer) = answer else {
-                let _ = events_ok.send(WebRtcEvent::Failed(
-                    "create-answer: no answer in reply".to_string(),
-                ));
-                return;
-            };
-            // Re-stamp the payloader with the negotiated payload type BEFORE
-            // adopting the answer. The browser is the offerer, so it picks the
-            // payload numbers (e.g. pt 96 → VP8, H264 at 102/104/…). Our
-            // payloader defaults to pt=96; if we leave it there, every RTP
-            // packet is tagged 96, the browser maps 96 → VP8, cannot decode the
-            // H264 bytes, and drops them all (ICE connects, 0 fps, blank HD).
-            // Adopting the answer's pt makes the wire match what the browser
-            // expects to decode.
-            if let (Some(pay), Some(pt)) = (
-                pay.as_ref(),
-                negotiated_video_pt(answer.sdp(), encoding_name),
-            ) {
-                pay.set_property("pt", pt);
-            }
-            webrtc_for_local
-                .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
-            match answer.sdp().as_text() {
-                Ok(sdp) => {
-                    let _ = events_ok.send(WebRtcEvent::Answer {
-                        sdp,
-                        codec: codec_label,
-                    });
-                }
-                Err(e) => {
-                    let _ = events_ok.send(WebRtcEvent::Failed(format!("answer as_text: {e}")));
-                }
-            }
-        });
+        // create-offer → set-local → emit once gathered.
+        let webrtc_neg = self.webrtc.clone();
+        let events_neg = self.events.clone();
+        let session_neg = self.session_id.clone();
+        let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.webrtc
+            .connect("on-negotiation-needed", false, move |_vals| {
+                let webrtc = webrtc_neg.clone();
+                let events = events_neg.clone();
+                let session = session_neg.clone();
+                let emitted = std::sync::Arc::clone(&emitted);
+                let webrtc_for_local = webrtc.clone();
+                let offer_promise = gst::Promise::with_change_func(move |reply| {
+                    let offer = reply
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.get::<gst_webrtc::WebRTCSessionDescription>("offer").ok());
+                    let Some(offer) = offer else {
+                        let _ = events.send(WebRtcEvent::Failed(
+                            "create-offer: no offer in reply".to_string(),
+                        ));
+                        return;
+                    };
+                    webrtc_for_local.emit_by_name::<()>(
+                        "set-local-description",
+                        &[&offer, &None::<gst::Promise>],
+                    );
+                    emit_offer_when_gathered(
+                        &webrtc_for_local,
+                        &events,
+                        &session,
+                        codec_label,
+                        &emitted,
+                    );
+                });
+                webrtc
+                    .emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &offer_promise]);
+                None
+            });
 
-        // First stage: set the remote (offer); on success create the answer.
-        let webrtc_for_answer = self.webrtc.clone();
+        // connection established → Connected (publishing).
+        let events_conn = self.events.clone();
+        let session_conn = self.session_id.clone();
+        let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.webrtc
+            .connect("notify::connection-state", false, move |vals| {
+                let wb = vals.first().and_then(|v| v.get::<gst::Element>().ok())?;
+                let state =
+                    wb.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+                match state {
+                    gst_webrtc::WebRTCPeerConnectionState::Connected
+                        if !signalled.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+                    {
+                        debug!(session = %session_conn, "webrtc publisher connected");
+                        let _ = events_conn.send(WebRtcEvent::Connected);
+                    }
+                    gst_webrtc::WebRTCPeerConnectionState::Failed => {
+                        let _ = events_conn
+                            .send(WebRtcEvent::Failed("peer connection failed".to_string()));
+                    }
+                    _ => {}
+                }
+                None
+            });
+    }
+
+    /// Apply the SFU's SDP **answer** (publisher role). Media starts flowing
+    /// to the SFU once the DTLS/ICE connection is up (which fires
+    /// [`WebRtcEvent::Connected`]). The pipeline is already `Playing` from
+    /// [`WebRtcSession::new_publisher`], so no state change is needed here.
+    pub fn set_answer(&self, sdp_answer: &str) -> Result<(), WebRtcError> {
+        let msg = gst_sdp::SDPMessage::parse_buffer(sdp_answer.as_bytes())
+            .map_err(|e| WebRtcError::Sdp(format!("parse answer: {e}")))?;
+        let answer =
+            gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, msg);
         let events_err = self.events.clone();
         let remote_promise = gst::Promise::with_change_func(move |reply| {
             if let Err(e) = reply {
                 let _ = events_err.send(WebRtcEvent::Failed(format!(
-                    "set-remote-description: {e:?}"
+                    "set-remote-description(answer): {e:?}"
                 )));
-                return;
             }
-            webrtc_for_answer
-                .emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &answer_promise]);
         });
-
-        // Bring the pipeline up BEFORE applying the offer. `webrtcbin` only
-        // opens its internal peer-connection once it has reached at least the
-        // READY state; emitting `set-remote-description` / `create-answer`
-        // while the bin is still in NULL makes webrtcbin abort both async
-        // tasks with "Peerconnection is closed, aborting execution", so the
-        // create-answer promise resolves empty ("no answer in reply") and the
-        // browser hangs on "Negotiating HD". Starting the pipeline first keeps
-        // the SDP exchange on an open peer-connection.
-        self.pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| WebRtcError::State(format!("set Playing: {e}")))?;
-
         self.webrtc
-            .emit_by_name::<()>("set-remote-description", &[&offer, &remote_promise]);
-
+            .emit_by_name::<()>("set-remote-description", &[&answer, &remote_promise]);
         Ok(())
-    }
-
-    /// Add a remote ICE candidate received from the browser (via cloud).
-    pub fn add_ice_candidate(&self, sdp_mline_index: u32, candidate: &str) {
-        self.webrtc
-            .emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
     }
 
     /// The session's stable id (for logging / manager bookkeeping).
@@ -358,7 +508,65 @@ impl WebRtcSession {
 impl Drop for WebRtcSession {
     fn drop(&mut self) {
         self.feed.abort();
+        if let Some(cc) = &self.cc {
+            cc.abort();
+        }
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+/// Nominal frame spacing (~30 fps) used to keep the appsrc timeline strictly
+/// advancing when a sample lacks a usable PTS or repeats one.
+const FEED_FALLBACK_STEP: Duration = Duration::from_millis(33);
+
+/// Builds a clean, 0-based, **strictly-monotonic** presentation timeline from
+/// the camera's own per-AU timestamps so `rtph264pay` emits exactly one
+/// distinct RTP timestamp per access unit.
+///
+/// Why this exists: the pipeline used to run `appsrc do-timestamp=true`, which
+/// stamps each buffer with the pipeline running-time *at push*. Under the
+/// `block=true` back-pressure from `webrtcbin`, the feed pushes access units in
+/// bursts, so consecutive AUs got near-identical timestamps. `rtph264pay` then
+/// emitted colliding RTP timestamps and the browser's H.264 depacketiser could
+/// not tell one frame from the next — it only ever completed the occasional
+/// keyframe, so HD rendered frozen/black (confirmed via `chrome://webrtc-internals`:
+/// tens of MB received, `framesReceived` stuck at a handful, all keyframes).
+///
+/// The pre-roll ingester already hands us a monotonic `NalSample.pts` per AU
+/// (synthesised for cameras that drop it), so we stamp buffers with that
+/// instead — every frame gets a distinct, correctly-spaced RTP timestamp
+/// regardless of push cadence.
+struct FeedClock {
+    base: Option<Duration>,
+    last: Option<Duration>,
+}
+
+impl FeedClock {
+    fn new() -> Self {
+        Self {
+            base: None,
+            last: None,
+        }
+    }
+
+    /// Resolve the session-relative, strictly-advancing PTS for a sample.
+    /// Rebases the first seen timestamp to zero; a missing, duplicate, or
+    /// backward source timestamp is nudged forward by one nominal frame so two
+    /// AUs never share an RTP timestamp (the exact failure this guards against).
+    fn resolve(&mut self, sample: &NalSample) -> Duration {
+        let rel = match sample.pts.or(sample.dts) {
+            Some(raw) => {
+                let base = *self.base.get_or_insert(raw);
+                raw.saturating_sub(base)
+            }
+            None => self.last.map_or(Duration::ZERO, |l| l + FEED_FALLBACK_STEP),
+        };
+        let rel = match self.last {
+            Some(last) if rel <= last => last + FEED_FALLBACK_STEP,
+            _ => rel,
+        };
+        self.last = Some(rel);
+        rel
     }
 }
 
@@ -367,9 +575,19 @@ impl Drop for WebRtcSession {
 /// Splices in at the next keyframe (drops delta frames until an IDR) so a
 /// mid-GOP subscribe never feeds the browser a broken reference frame. A
 /// broadcast lag re-arms the splice (we may have dropped the frames between
-/// the last IDR and now).
-async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camera_id: CameraId) {
+/// the last IDR and now). The [`FeedClock`] persists across re-arms so the
+/// outbound RTP timeline stays monotonic even across a dropped-frame gap.
+/// Pump compressed NALs from a camera ingester into `appsrc`, splicing in at
+/// the next keyframe and re-arming the splice after a broadcast lag. Shared by
+/// the SFU ([`WebRtcSession`]) and MoQ ([`crate::moq_publish::MoqSession`])
+/// publishers — both feed the same per-camera NAL stream.
+pub(crate) async fn feed_loop(
+    appsrc: AppSrc,
+    mut rx: broadcast::Receiver<NalSample>,
+    camera_id: CameraId,
+) {
     let mut started = false;
+    let mut clock = FeedClock::new();
     loop {
         match rx.recv().await {
             Ok(sample) => {
@@ -380,7 +598,7 @@ async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camer
                     started = true;
                     debug!(camera_id, "webrtc feed: spliced in at keyframe");
                 }
-                if let Err(e) = push_nal(&appsrc, &sample) {
+                if let Err(e) = push_nal(&appsrc, &sample, &mut clock) {
                     warn!(camera_id, error = %e, "webrtc feed: push failed; ending");
                     break;
                 }
@@ -398,16 +616,23 @@ async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camer
     let _ = appsrc.end_of_stream();
 }
 
-/// Copy one NAL sample into a `gst::Buffer` and push it into `appsrc`.
-/// `appsrc` is configured `do-timestamp=true`, so we don't set PTS; we
-/// only flag delta (non-key) frames for the downstream payloader.
-fn push_nal(appsrc: &AppSrc, sample: &NalSample) -> Result<(), String> {
+/// Copy one NAL sample into a `gst::Buffer`, stamp it with the [`FeedClock`]'s
+/// monotonic PTS/DTS, and push it into `appsrc`. `appsrc` runs
+/// `do-timestamp=false` so these explicit timestamps drive `rtph264pay`'s RTP
+/// clock — see [`FeedClock`] for why auto-timestamping breaks frame assembly.
+fn push_nal(appsrc: &AppSrc, sample: &NalSample, clock: &mut FeedClock) -> Result<(), String> {
+    let ts = gst::ClockTime::from_nseconds(clock.resolve(sample).as_nanos() as u64);
     let mut buf = gst::Buffer::with_size(sample.data.len()).map_err(|e| format!("alloc: {e}"))?;
     {
         let bm = buf.get_mut().ok_or("buffer not unique")?;
         let mut map = bm.map_writable().map_err(|e| format!("map: {e}"))?;
         map.copy_from_slice(&sample.data);
         drop(map);
+        // Baseline/main-profile IP-camera live streams carry no B-frames, so
+        // DTS == PTS; setting both keeps `rtph264pay` from inferring a bogus
+        // reorder delay.
+        bm.set_pts(ts);
+        bm.set_dts(ts);
         if !sample.is_keyframe {
             bm.set_flags(gst::BufferFlags::DELTA_UNIT);
         }
@@ -418,14 +643,365 @@ fn push_nal(appsrc: &AppSrc, sample: &NalSample) -> Result<(), String> {
         .map_err(|e| format!("push_buffer: {e:?}"))
 }
 
+/// Emit the local offer (with ICE candidates baked in) once `webrtcbin` has
+/// finished gathering, guarding against a double emit. If gathering is
+/// already complete, emit immediately; otherwise subscribe to
+/// `notify::ice-gathering-state` and emit on the first `Complete`.
+fn emit_offer_when_gathered(
+    webrtc: &gst::Element,
+    events: &mpsc::UnboundedSender<WebRtcEvent>,
+    session: &str,
+    codec: &'static str,
+    emitted: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let state = webrtc.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+    if state == gst_webrtc::WebRTCICEGatheringState::Complete {
+        emit_local_offer(webrtc, events, session, codec, emitted);
+        return;
+    }
+    let events = events.clone();
+    let session = session.to_string();
+    let emitted = std::sync::Arc::clone(emitted);
+    webrtc.connect("notify::ice-gathering-state", false, move |vals| {
+        let wb = vals.first().and_then(|v| v.get::<gst::Element>().ok())?;
+        let st = wb.property::<gst_webrtc::WebRTCICEGatheringState>("ice-gathering-state");
+        if st == gst_webrtc::WebRTCICEGatheringState::Complete {
+            emit_local_offer(&wb, &events, &session, codec, &emitted);
+        }
+        None
+    });
+}
+
+/// Read `webrtcbin`'s `local-description` (now including gathered candidates)
+/// and emit it as [`WebRtcEvent::Offer`], at most once.
+fn emit_local_offer(
+    webrtc: &gst::Element,
+    events: &mpsc::UnboundedSender<WebRtcEvent>,
+    session: &str,
+    codec: &'static str,
+    emitted: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if emitted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(local) =
+        webrtc.property::<Option<gst_webrtc::WebRTCSessionDescription>>("local-description")
+    else {
+        let _ = events.send(WebRtcEvent::Failed(
+            "local-description is empty at ICE-complete".to_string(),
+        ));
+        return;
+    };
+    match local.sdp().as_text() {
+        Ok(sdp) => {
+            debug!(session = %session, "webrtc publisher offer ready (ICE gathered)");
+            let _ = events.send(WebRtcEvent::Offer { sdp, codec });
+        }
+        Err(e) => {
+            let _ = events.send(WebRtcEvent::Failed(format!("offer as_text: {e}")));
+        }
+    }
+}
+
+/// Default constant framerate for the HD transcode, used up front and kept for
+/// cameras that do not declare a source rate (e.g. an RTSP stream negotiating
+/// `framerate=0/1`). Both current reference cameras deliver ~24fps.
+const DEFAULT_TRANSCODE_FPS: i32 = 24;
+/// Upper bound on the transcode output framerate. A security live view does not
+/// need more, and it caps re-encode load for high-rate (e.g. 60fps) cameras.
+const MAX_TRANSCODE_FPS: i32 = 30;
+/// Upper bound on the transcode output resolution (1080p). A security HD live
+/// view does not need more, and re-encoding a camera's full native resolution
+/// (e.g. 4MP, 2688x1520) yields oversized keyframes that starve a shared
+/// uplink. Larger sources are scaled down aspect-preserving; smaller ones pass
+/// through unchanged (never upscaled).
+const MAX_TRANSCODE_WIDTH: i32 = 1920;
+const MAX_TRANSCODE_HEIGHT: i32 = 1080;
+
+/// Scale `(src_w, src_h)` down to fit within
+/// [`MAX_TRANSCODE_WIDTH`] x [`MAX_TRANSCODE_HEIGHT`], preserving aspect ratio
+/// and rounding to even dimensions (H.264 requires even). Returns `None` when
+/// the source already fits (no scaling, and never an upscale).
+fn capped_transcode_dims(src_w: i32, src_h: i32) -> Option<(i32, i32)> {
+    if src_w <= 0 || src_h <= 0 {
+        return None;
+    }
+    if src_w <= MAX_TRANSCODE_WIDTH && src_h <= MAX_TRANSCODE_HEIGHT {
+        return None;
+    }
+    let scale = f64::min(
+        f64::from(MAX_TRANSCODE_WIDTH) / f64::from(src_w),
+        f64::from(MAX_TRANSCODE_HEIGHT) / f64::from(src_h),
+    );
+    let even = |v: f64| ((v.round() as i32) & !1).max(2);
+    let mut w = even(f64::from(src_w) * scale);
+    let mut h = even(f64::from(src_h) * scale);
+    // Snap to the exact cap when within ~2% so a near-16:9 source (e.g. a 4MP
+    // 2688x1520 sensor at 1.768:1) lands on a clean 1920x1080 instead of
+    // 1910x1080. Genuinely different ratios (e.g. 4:3) stay far from the box
+    // edge and keep their true aspect (letterboxed by the browser).
+    if w >= MAX_TRANSCODE_WIDTH * 98 / 100 {
+        w = MAX_TRANSCODE_WIDTH;
+    }
+    if h >= MAX_TRANSCODE_HEIGHT * 98 / 100 {
+        h = MAX_TRANSCODE_HEIGHT;
+    }
+    Some((w, h))
+}
+
+/// A VAMemory raw-video caps fixing the output `framerate` and, when `dims` is
+/// `Some`, the output `width`/`height` — used to drive `videorate` +
+/// `vapostproc` via the `ratecaps` capsfilter.
+fn va_transcode_caps(fps: i32, dims: Option<(i32, i32)>) -> gst::Caps {
+    let mut builder = gst::Caps::builder("video/x-raw")
+        .features(["memory:VAMemory"])
+        .field("framerate", gst::Fraction::new(fps, 1));
+    if let Some((w, h)) = dims {
+        builder = builder.field("width", w).field("height", h);
+    }
+    builder.build()
+}
+
+/// URI of the transport-wide-cc RTP header extension (RMCAT draft). Added to
+/// the payloader so `webrtcbin` negotiates TWCC in the SDP. `rtpgccbwe` (the
+/// future GCC estimator) needs the receiver — Cloudflare's SFU — to return
+/// TWCC feedback; adding this + logging `twcc-stats` confirms whether it does,
+/// before we invest in cross-building the native `gst-plugins-rs` estimator.
+const RTP_TWCC_URI: &str =
+    "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+
+/// Bounds and step sizes for the manual AIMD (additive-increase,
+/// multiplicative-decrease) bitrate controller. The reference edge's uplink to
+/// Cloudflare is ~5.3 Mbps shared with the LBR wall + detection, so the ceiling
+/// stays modest; the floor keeps HD watchable.
+const CC_MIN_KBPS: u32 = 400;
+const CC_MAX_KBPS: u32 = 1800;
+const CC_START_KBPS: u32 = 1000;
+/// Additive increase (kbps) per control tick when the path is clean.
+const CC_INCREASE_KBPS: u32 = 100;
+/// Multiplicative decrease factor applied when loss is high.
+const CC_DECREASE_FACTOR: f64 = 0.8;
+/// RTCP `fraction-lost` (0..1) above which we back off, and below which we
+/// probe the bitrate upward. Between the two we hold (dead-band).
+const CC_LOSS_HIGH: f64 = 0.10;
+const CC_LOSS_LOW: f64 = 0.02;
+
+/// Bounds for `rtpgccbwe`, in BITS per second (its properties are bits/s, not
+/// kbps). The ceiling is deliberately high (8 Mbps, the gst-plugins-rs default)
+/// so `rtpgccbwe`'s own delay-based estimate — not an artificial cap — is the
+/// limit: on a typical uplink it climbs until the path pushes back (~4-5 Mbps
+/// for 1080p) instead of stopping short. Pacing keeps those higher sustained
+/// bitrates from bursting past the uplink the way un-paced keyframes did.
+const GCC_MIN_BPS: u32 = 400_000;
+const GCC_START_BPS: u32 = 1_200_000;
+const GCC_MAX_BPS: u32 = 8_000_000;
+
+/// Manual AIMD bitrate controller for the WebRTC transcode. `rtpgccbwe` (the
+/// stock GStreamer Google-Congestion-Control estimator) is not installed on the
+/// edge, so this is a lightweight stand-in: it reacts to the RTCP
+/// `fraction-lost` the browser reports back and nudges the encoder bitrate to
+/// track the available uplink — slow up, fast down. Pure + unit-testable.
+struct BitrateController {
+    kbps: u32,
+}
+
+impl BitrateController {
+    fn new() -> Self {
+        Self {
+            kbps: CC_START_KBPS,
+        }
+    }
+
+    /// Fold one loss observation (`fraction_lost` in 0..1) into the target
+    /// bitrate and return the new value (kbps), clamped to [MIN, MAX].
+    fn update(&mut self, fraction_lost: f64) -> u32 {
+        if fraction_lost > CC_LOSS_HIGH {
+            let reduced = (self.kbps as f64 * CC_DECREASE_FACTOR) as u32;
+            self.kbps = reduced.max(CC_MIN_KBPS);
+        } else if fraction_lost < CC_LOSS_LOW {
+            self.kbps = (self.kbps + CC_INCREASE_KBPS).min(CC_MAX_KBPS);
+        }
+        self.kbps
+    }
+}
+
+/// Wire `rtpgccbwe` as webrtcbin's aux-sender for the transcode path. The
+/// element paces the outbound RTP and produces a delay-based bandwidth
+/// estimate; on each `estimated-bitrate` change we retarget the `vah264enc`
+/// `bitrate` (kbps = bits/1000). This is the proactive replacement for the
+/// reactive [`spawn_congestion_control`] AIMD loop and is only wired when the
+/// bundled `libgstrsrtp.so` plugin registered `rtpgccbwe`.
+fn wire_gcc_congestion_control(webrtc: &gst::Element, enc: &gst::Element, camera_id: CameraId) {
+    let enc_weak = enc.downgrade();
+    // `request-aux-sender` fires during negotiation with (webrtcbin, session_id);
+    // it must return the element to splice into the send path (the pacer). We
+    // ignore the session id (single sendonly video) and return `None` (no aux
+    // sender) only if the element unexpectedly fails to build.
+    webrtc.connect("request-aux-sender", false, move |_values| {
+        let cc = gst::ElementFactory::make("rtpgccbwe").build().ok()?;
+        cc.set_property("min-bitrate", GCC_MIN_BPS);
+        cc.set_property("estimated-bitrate", GCC_START_BPS);
+        cc.set_property("max-bitrate", GCC_MAX_BPS);
+        let enc_weak = enc_weak.clone();
+        cc.connect_notify(Some("estimated-bitrate"), move |bwe, _pspec| {
+            let bits: u32 = bwe.property("estimated-bitrate");
+            let kbps = (bits / 1000).max(GCC_MIN_BPS / 1000);
+            if let Some(enc) = enc_weak.upgrade() {
+                let current: u32 = enc.property("bitrate");
+                if current != kbps {
+                    enc.set_property("bitrate", kbps);
+                    debug!(camera_id, kbps, "rtpgccbwe adjusted encoder bitrate");
+                }
+            }
+        });
+        Some(cc.to_value())
+    });
+}
+
+/// Spawn the adaptive-bitrate control loop for a transcode session. Every ~2s
+/// it asks `webrtcbin` for stats, reads the worst `fraction-lost` across the
+/// remote-inbound reports (the browser's RTCP feedback), feeds it to a
+/// [`BitrateController`], and applies the new target to the `vah264enc`
+/// `bitrate` property (kbps). If no loss report is available yet (early in the
+/// session, before RTCP flows) it holds the current bitrate — it never raises
+/// blindly. Aborted on session drop.
+fn spawn_congestion_control(
+    webrtc: gst::Element,
+    enc: gst::Element,
+    camera_id: CameraId,
+) -> JoinHandle<()> {
+    const CC_POLL: Duration = Duration::from_secs(2);
+    tokio::spawn(async move {
+        let controller = std::sync::Arc::new(parking_lot::Mutex::new(BitrateController::new()));
+        let mut ticker = tokio::time::interval(CC_POLL);
+        // The first tick fires immediately; consume it so RTCP has time to flow.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let enc = enc.clone();
+            let controller = std::sync::Arc::clone(&controller);
+            let promise = gst::Promise::with_change_func(move |reply| {
+                let Ok(Some(stats)) = reply else {
+                    return;
+                };
+                // The browser's RTCP receiver report surfaces as one or more
+                // `remote-inbound-rtp` sub-structures, each carrying
+                // `fraction-lost` (0..1). Take the worst across streams.
+                let mut worst: Option<f64> = None;
+                for (_field, value) in stats.iter() {
+                    if let Ok(sub) = value.get::<gst::Structure>() {
+                        if let Ok(fl) = sub.get::<f64>("fraction-lost") {
+                            worst = Some(worst.map_or(fl, |w| w.max(fl)));
+                        }
+                    }
+                }
+                let Some(loss) = worst else {
+                    // No feedback yet — hold; never raise the bitrate blindly.
+                    return;
+                };
+                let new_kbps = controller.lock().update(loss);
+                let current: u32 = enc.property("bitrate");
+                if new_kbps != current {
+                    enc.set_property("bitrate", new_kbps);
+                    debug!(
+                        camera_id,
+                        loss, new_kbps, "webrtc congestion control adjusted bitrate"
+                    );
+                }
+            });
+            webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        }
+    })
+}
+
+/// Name of an available hardware H.264 **encoder** for the transcode path, or
+/// `None` on boxes without one (e.g. macOS dev), where the caller falls back
+/// to passthrough. Pure aside from the plugin registry lookup.
+fn hw_h264_encoder() -> Option<&'static str> {
+    ["vah264enc", "vaapih264enc"]
+        .into_iter()
+        .find(|name| gst::ElementFactory::find(name).is_some())
+}
+
+/// Name of an available hardware **decoder** for the camera codec, matching
+/// [`hw_h264_encoder`] so the transcode chain stays fully on the GPU.
+fn hw_decoder(codec: CodecKind) -> Option<&'static str> {
+    let candidates: &[&str] = if codec.base() == "h265" {
+        &["vah265dec", "vaapih265dec"]
+    } else {
+        &["vah264dec", "vaapih264dec"]
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|name| gst::ElementFactory::find(name).is_some())
+}
+
+/// Build a **transcode** launch description: HW-decode the camera codec and
+/// re-encode to H.264 with a short GOP for smooth WebRTC over a lossy network.
+///
+/// Camera streams often use a multi-second GOP (this InSight uses ~15s). Over
+/// WebRTC (UDP) a single lost packet corrupts every delta frame until the next
+/// keyframe, so a long GOP means multi-second freezes on ~1% loss. Re-encoding
+/// with `key-int-max=48` (~2s @ 24fps), CBR, and no B-frames caps the recovery
+/// window at ~2s while leaving the camera untouched. The output is always
+/// H.264 (`encoding-name=H264`), which also covers the HEVC-camera →
+/// non-HEVC-browser case. `config-interval=1` repeats SPS/PPS once a second in
+/// the RTP stream for extra resilience. `videorate` normalises the camera's
+/// irregular frame delivery to a **constant** rate so the browser plays frames
+/// out smoothly on even RTP timestamps. Cameras run at different rates (this
+/// InSight declares 25fps; another declares none), so the target rate is not
+/// baked in here: the named `ratecaps` capsfilter is left unconstrained and
+/// [`WebRtcSession::build_common`] sets it — to [`DEFAULT_TRANSCODE_FPS`] up
+/// front, then to the camera's own declared framerate once the decoder
+/// negotiates it (see the `dec` src-pad probe). Pure — unit-testable without a
+/// runtime.
+fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> String {
+    let base = codec.base(); // "h264" | "h265"
+
+    // Uplink-constrained bitrate. The reference edge uploads only ~5.3 Mbps to
+    // Cloudflare (measured), shared with the LBR wall + detection; an un-paced
+    // 2.5 Mbps WebRTC stream's keyframe bursts overflowed that thin uplink and
+    // dropped ~50% of packets -> periodic multi-second freezes on BOTH cameras
+    // (independent of resolution). 1000 kbps keeps the average and keyframe
+    // bursts comfortably inside the uplink. The proper long-term fix is
+    // send-side congestion control (rtpgccbwe) for adaptive pacing.
+    let bitrate_kbps = 1000;
+    format!(
+        "appsrc name=src is-live=true do-timestamp=false format=time \
+             block=true max-bytes=8388608 stream-type=stream \
+           ! {base}parse \
+           ! {decoder} name=dec \
+           ! vapostproc \
+           ! videorate \
+           ! capsfilter name=ratecaps \
+           ! {encoder} name=enc key-int-max=48 b-frames=0 rate-control=cbr \
+             bitrate={bitrate_kbps} target-usage=6 \
+           ! h264parse config-interval=1 \
+           ! rtph264pay name=pay pt=96 config-interval=1 mtu=1200 \
+           ! application/x-rtp,media=video,encoding-name=H264,clock-rate=90000 \
+           ! webrtcbin name=webrtc latency=0 bundle-policy=max-bundle"
+    )
+}
+
 /// Build the passthrough launch description for a camera codec. Pure so it
 /// can be unit-tested without a GStreamer runtime.
 fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     let base = codec.base(); // "h264" | "h265"
     let encoding = if base == "h265" { "H265" } else { "H264" };
-    // `config-interval=-1` on parse + pay repeats SPS/PPS with every IDR so
-    // a mid-stream browser join can start decoding; `mtu=1200` keeps RTP
+    // `config-interval=0` (trust the source) on BOTH parse and pay: this
+    // InSight camera already emits SPS/PPS in every keyframe access unit, so
+    // `config-interval=-1` made h264parse re-insert them — doubling the
+    // parameter sets, which intermittently corrupts the keyframe (the browser
+    // receives it but never decodes it, so `keyFramesDecoded` stalls and HD
+    // freezes/blacks out). The camera supplies SPS/PPS at every IDR, so the
+    // browser still gets them without re-insertion. `mtu=1200` keeps RTP
     // packets inside a conservative WebRTC MTU.
+    //
+    // `do-timestamp=false`: the feed stamps each buffer with an explicit,
+    // monotonic PTS/DTS off the camera's own per-AU timeline (see `FeedClock`).
+    // Auto-timestamping collided RTP timestamps under back-pressure and left the
+    // browser unable to assemble delta frames (frozen/black HD).
     //
     // Do NOT pin a `payload` on the RTP caps: the browser's offer assigns the
     // payload types (e.g. pt 96 → VP8, H264 at 102/104/…). If we hardcode
@@ -435,45 +1011,13 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
     // Leaving the payload unset lets webrtcbin adopt the browser's H264/H265
     // payload type during answer negotiation.
     format!(
-        "appsrc name=src is-live=true do-timestamp=true format=time \
+        "appsrc name=src is-live=true do-timestamp=false format=time \
              block=true max-bytes=8388608 stream-type=stream \
-           ! {base}parse config-interval=-1 \
-           ! rtp{base}pay name=pay pt=96 config-interval=-1 mtu=1200 \
+           ! {base}parse config-interval=0 \
+           ! rtp{base}pay name=pay pt=96 config-interval=0 mtu=1200 \
            ! application/x-rtp,media=video,encoding-name={encoding},clock-rate=90000 \
            ! webrtcbin name=webrtc latency=0 bundle-policy=max-bundle"
     )
-}
-
-/// Scan a negotiated SDP for the video payload type the peer assigned to
-/// `encoding_name` (`"H264"` / `"H265"`). Returns the first matching
-/// `a=rtpmap:<pt> <ENC>/<clock>` payload number. Pure.
-fn negotiated_video_pt(sdp: &gst_sdp::SDPMessageRef, encoding_name: &str) -> Option<u32> {
-    for media in sdp.medias() {
-        if media.media() != Some("video") {
-            continue;
-        }
-        for attr in media.attributes() {
-            if attr.key() != "rtpmap" {
-                continue;
-            }
-            // Value looks like "102 H264/90000".
-            let Some(val) = attr.value() else { continue };
-            let mut parts = val.split_whitespace();
-            let (Some(pt), Some(enc)) = (parts.next(), parts.next()) else {
-                continue;
-            };
-            let matches = enc
-                .split('/')
-                .next()
-                .is_some_and(|e| e.eq_ignore_ascii_case(encoding_name));
-            if matches {
-                if let Ok(pt) = pt.parse::<u32>() {
-                    return Some(pt);
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Normalise a wire `stun:` URL into the `stun://host:port` form
@@ -519,6 +1063,9 @@ mod tests {
         assert!(d.contains("rtph264pay"), "{d}");
         assert!(d.contains("encoding-name=H264"), "{d}");
         assert!(d.contains("webrtcbin name=webrtc"), "{d}");
+        // We stamp PTS/DTS ourselves; auto-timestamping is what broke delta
+        // frame assembly in the browser.
+        assert!(d.contains("do-timestamp=false"), "{d}");
     }
 
     #[test]
@@ -531,16 +1078,111 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_pt_picks_matching_encoding() {
-        let sdp = "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
-                   m=video 9 UDP/TLS/RTP/SAVPF 96 102 104\r\n\
-                   a=rtpmap:96 VP8/90000\r\n\
-                   a=rtpmap:102 H264/90000\r\n\
-                   a=rtpmap:104 H265/90000\r\n";
-        let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
-        assert_eq!(negotiated_video_pt(&msg, "H264"), Some(102));
-        assert_eq!(negotiated_video_pt(&msg, "H265"), Some(104));
-        assert_eq!(negotiated_video_pt(&msg, "VP9"), None);
+    fn feed_clock_strictly_advances() {
+        let kf = |pts_ms: u64, key: bool| NalSample {
+            pts: Some(Duration::from_millis(pts_ms)),
+            dts: None,
+            is_keyframe: key,
+            data: vec![0u8],
+        };
+        let mut clock = FeedClock::new();
+        // First AU rebases to zero regardless of the camera's absolute clock.
+        assert_eq!(clock.resolve(&kf(1000, true)), Duration::ZERO);
+        // Normal ~40 ms spacing is preserved.
+        assert_eq!(clock.resolve(&kf(1040, false)), Duration::from_millis(40));
+        // A duplicate source timestamp is nudged forward, never repeated —
+        // colliding RTP timestamps are exactly what froze HD.
+        assert_eq!(clock.resolve(&kf(1040, false)), Duration::from_millis(73));
+        // A missing PTS still advances.
+        let no_pts = NalSample {
+            pts: None,
+            dts: None,
+            is_keyframe: false,
+            data: vec![0u8],
+        };
+        assert_eq!(clock.resolve(&no_pts), Duration::from_millis(106));
+        // A backward jump is clamped forward, keeping the timeline monotonic.
+        assert_eq!(clock.resolve(&kf(500, true)), Duration::from_millis(139));
+    }
+
+    #[test]
+    fn capped_transcode_dims_scales_down_4mp_only() {
+        // 4MP source (cam1, 2688x1520 = 1.768:1) is scaled to fit 1080p and
+        // snapped to a clean 1920x1080 (within ~2% of true 16:9).
+        assert_eq!(capped_transcode_dims(2688, 1520), Some((1920, 1080)));
+        // 4K (exactly 16:9) is scaled to exactly 1080p.
+        assert_eq!(capped_transcode_dims(3840, 2160), Some((1920, 1080)));
+        // A genuine 4:3 source keeps its aspect (letterboxed), not snapped.
+        assert_eq!(capped_transcode_dims(2048, 1536), Some((1440, 1080)));
+        // 720p (cam2) and 1080p already fit — never upscaled.
+        assert_eq!(capped_transcode_dims(1280, 720), None);
+        assert_eq!(capped_transcode_dims(1920, 1080), None);
+        // Degenerate inputs are left alone.
+        assert_eq!(capped_transcode_dims(0, 0), None);
+        // Output dimensions are always even (H.264 requirement).
+        let (w, h) = capped_transcode_dims(2688, 1520).unwrap();
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
+    }
+
+    #[test]
+    fn transcode_desc_h264() {
+        let d = transcode_pipeline_desc(CodecKind::H264, "vah264enc", "vah264dec");
+        assert!(d.contains("h264parse"), "{d}");
+        assert!(d.contains("vah264dec"), "{d}");
+        assert!(d.contains("vah264enc name=enc"), "{d}");
+        assert!(d.contains("key-int-max=48"), "{d}");
+        assert!(d.contains("rate-control=cbr"), "{d}");
+        assert!(d.contains("b-frames=0"), "{d}");
+        assert!(d.contains("videorate"), "{d}");
+        assert!(d.contains("capsfilter name=ratecaps"), "{d}");
+        assert!(d.contains("name=dec"), "{d}");
+        assert!(d.contains("encoding-name=H264"), "{d}");
+        assert!(d.contains("webrtcbin name=webrtc"), "{d}");
+    }
+
+    #[test]
+    fn transcode_desc_h265_outputs_h264() {
+        // An H.265 camera is decoded then re-encoded to H.264 for the browser.
+        let d = transcode_pipeline_desc(CodecKind::H265Plus, "vah264enc", "vah265dec");
+        assert!(d.contains("h265parse"), "{d}");
+        assert!(d.contains("vah265dec"), "{d}");
+        assert!(d.contains("vah264enc name=enc"), "{d}");
+        assert!(d.contains("encoding-name=H264"), "{d}");
+    }
+
+    #[test]
+    fn bitrate_controller_backs_off_on_loss() {
+        let mut c = BitrateController::new();
+        assert_eq!(c.kbps, CC_START_KBPS);
+        // Loss above the high threshold -> multiplicative decrease.
+        let after = c.update(0.20);
+        assert_eq!(after, (CC_START_KBPS as f64 * CC_DECREASE_FACTOR) as u32);
+        // Sustained loss drives it to the floor, never below.
+        for _ in 0..20 {
+            c.update(0.30);
+        }
+        assert_eq!(c.kbps, CC_MIN_KBPS);
+    }
+
+    #[test]
+    fn bitrate_controller_probes_up_when_clean() {
+        let mut c = BitrateController::new();
+        // Loss below the low threshold -> additive increase.
+        assert_eq!(c.update(0.0), CC_START_KBPS + CC_INCREASE_KBPS);
+        // A clean path drives it to the ceiling, never above.
+        for _ in 0..50 {
+            c.update(0.0);
+        }
+        assert_eq!(c.kbps, CC_MAX_KBPS);
+    }
+
+    #[test]
+    fn bitrate_controller_holds_in_deadband() {
+        let mut c = BitrateController::new();
+        // Loss between LOW and HIGH -> hold steady.
+        assert_eq!(c.update(0.05), CC_START_KBPS);
+        assert_eq!(c.kbps, CC_START_KBPS);
     }
 
     #[test]
@@ -574,69 +1216,4 @@ mod tests {
         // Non-TURN scheme.
         assert_eq!(turn_url_for("stun:host:3478", Some("u"), Some("p")), None);
     }
-
-    /// End-to-end answerer flow against a real `webrtcbin`. Requires the
-    /// GStreamer runtime + gst-plugins-bad `webrtc` element + libnice, so
-    /// it's `#[ignore]`d in the default run and executed manually with
-    /// `cargo test -p nexus-pipeline --features gstreamer-webrtc -- --ignored`
-    /// on a host that has GStreamer installed.
-    #[tokio::test]
-    #[ignore = "needs a live GStreamer webrtcbin runtime"]
-    async fn answer_from_canned_offer() {
-        let (_nal_tx, nal_rx) = broadcast::channel::<NalSample>(8);
-        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<WebRtcEvent>();
-
-        let session = WebRtcSession::new(
-            "test-session-1".to_string(),
-            1,
-            CodecKind::H264,
-            WebRtcMode::Passthrough,
-            &[],
-            nal_rx,
-            ev_tx,
-        )
-        .expect("build session");
-
-        session
-            .accept_offer(CANNED_H264_OFFER)
-            .expect("accept offer");
-
-        let evt = tokio::time::timeout(std::time::Duration::from_secs(5), ev_rx.recv())
-            .await
-            .expect("answer within 5s")
-            .expect("event channel open");
-        match evt {
-            WebRtcEvent::Answer { sdp, codec } => {
-                assert_eq!(codec, "h264");
-                assert!(sdp.contains("m=video"), "answer sdp: {sdp}");
-            }
-            other => panic!("expected an Answer, got {other:?}"),
-        }
-    }
-
-    /// A minimal browser-style recvonly H.264 offer (dummy but well-formed
-    /// fingerprint; DTLS never runs during answer creation).
-    const CANNED_H264_OFFER: &str = "v=0\r\n\
-o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
-s=-\r\n\
-t=0 0\r\n\
-a=group:BUNDLE 0\r\n\
-a=msid-semantic: WMS\r\n\
-m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
-c=IN IP4 0.0.0.0\r\n\
-a=rtcp:9 IN IP4 0.0.0.0\r\n\
-a=ice-ufrag:sTmA\r\n\
-a=ice-pwd:1TS7iGCGqZLtVQjSVGodpAsr\r\n\
-a=ice-options:trickle\r\n\
-a=fingerprint:sha-256 \
-AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:\
-AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
-a=setup:actpass\r\n\
-a=mid:0\r\n\
-a=recvonly\r\n\
-a=rtcp-mux\r\n\
-a=rtpmap:96 H264/90000\r\n\
-a=rtcp-fb:96 nack\r\n\
-a=rtcp-fb:96 nack pli\r\n\
-a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n";
 }

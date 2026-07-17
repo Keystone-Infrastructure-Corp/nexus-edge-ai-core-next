@@ -8,7 +8,7 @@
     {
       "id": "yolo26n",
       "task": "detect",
-      "_comment": "YOLOv26-nano. As of v0.1.19 the engine ships three STATIC-shape ONNX exports \u2014 yolo26n_640.onnx, yolo26n_960.onnx, yolo26n_1280.onnx \u2014 one per supported input size. Static shapes are mandatory for the Intel NPU plugin (which silently falls back to CPU on dynamic-shape models, observed on Lunar Lake k13) and let the OpenVINO blob cache hit on subsequent boots. Per-tier defaults: T10/T24=640, T36/T36-S=960, T64=640 (override per-camera to 1280 for plate/face detail). The legacy `yolo26n_dynamic.onnx` is deprecated and no longer shipped \u2014 regenerate with `python tools/models/gen_yolo26n.py --all-static` before tagging a release.",
+      "_comment": "YOLOv26-nano. As of v0.1.19 the engine ships three STATIC-shape ONNX exports \u2014 yolo26n_640.onnx, yolo26n_960.onnx, yolo26n_1280.onnx \u2014 one per supported input size. Static shapes are mandatory for the Intel NPU plugin (which silently falls back to CPU on dynamic-shape models, observed on Lunar Lake k13) and let the OpenVINO blob cache hit on subsequent boots. Per-profile defaults: 640 (iGPU/Hailo), 960 (NPU/dGPU); override per-camera to 1280 for plate/face detail. The legacy `yolo26n_dynamic.onnx` is deprecated and no longer shipped \u2014 regenerate with `python tools/models/gen_yolo26n.py --all-static` before tagging a release.",
       "license": "AGPL-3.0",
       "weights_dataset_license": "COCO:CC-BY-4.0",
       "input": {
@@ -84,14 +84,14 @@
       "presets": [
         {
           "name": "640",
-          "_comment": "Default operating point. Best precision/latency tradeoff on T10 / T24 (Iris Xe iGPU). Engine resolves this preset to yolo26n_640.onnx.",
+          "_comment": "Default operating point. Best precision/latency tradeoff on iGPU / Hailo boxes (e.g. Iris Xe). Engine resolves this preset to yolo26n_640.onnx.",
           "inputWidth": 640,
           "inputHeight": 640,
           "artifact": "yolo26n_640.onnx"
         },
         {
           "name": "960",
-          "_comment": "Mid operating point. Default on T36 (Arc A380 dGPU) and T36-S (Lunar Lake NPU 4). Engine resolves this preset to yolo26n_960.onnx.",
+          "_comment": "Mid operating point. Default on Arc A380 dGPU and Lunar Lake NPU boxes. Engine resolves this preset to yolo26n_960.onnx.",
           "inputWidth": 960,
           "inputHeight": 960,
           "artifact": "yolo26n_960.onnx"
@@ -130,7 +130,7 @@
     {
       "id": "yolo_world_v2_s",
       "task": "detect_open_vocab_text",
-      "_comment": "YOLO-World v2 (small) export. As of v0.1.22 the engine ships per-tier STATIC-shape ONNXs \u2014 yolo_world_v2_s_640.onnx (T10/T24 default) and yolo_world_v2_s_960.onnx (T36/T36-S default). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes, observed on Lunar Lake k13 under v0.1.18\u20130.1.20) and let the OpenVINO blob cache hit on subsequent boots. Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via `python tools/models/gen_yolo_world.py --all-static` whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff. 1280 is intentionally NOT shipped (overkill for the coarse semantic queries open-vocab is used for); the YOLOE multi-size export is deferred to M3.4 (prompt-set rework).",
+      "_comment": "YOLO-World v2 (small) export. As of v0.1.22 the engine ships per-size STATIC-shape ONNXs \u2014 yolo_world_v2_s_640.onnx (640 default) and yolo_world_v2_s_960.onnx (960 default). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes, observed on Lunar Lake k13 under v0.1.18\u20130.1.20) and let the OpenVINO blob cache hit on subsequent boots. Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via `python tools/models/gen_yolo_world.py --all-static` whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff. 1280 is intentionally NOT shipped (overkill for the coarse semantic queries open-vocab is used for); the YOLOE multi-size export is deferred to M3.4 (prompt-set rework).",
       "input": {
         "width": 640,
         "height": 640,

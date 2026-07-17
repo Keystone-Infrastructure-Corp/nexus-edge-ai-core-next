@@ -698,6 +698,8 @@ pub enum TypesError {
     InvalidRole(String),
     #[error("invalid codec: {0:?} (expected h264|h264_plus|h265|h265_plus)")]
     InvalidCodec(String),
+    #[error("invalid hd_transport: {0:?} (expected sfu|moq)")]
+    InvalidHdTransport(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +771,90 @@ impl std::str::FromStr for CodecKind {
             "h265_plus" => Ok(CodecKind::H265Plus),
             other => Err(TypesError::InvalidCodec(other.to_string())),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HD live-view transport
+// ---------------------------------------------------------------------------
+
+/// Which transport carries the HD (solo / expanded) live-view video for a
+/// core. Selected per-core by the cloud fleet setting `live-view.hd_transport`
+/// and pushed to the edge, where it is persisted in
+/// `engine_runtime_settings.hd_transport`, read live by the publisher selector,
+/// and advertised in the heartbeat `caps`. The always-on LBR grid wall is
+/// independent of this choice.
+///
+/// * `Sfu` — WebRTC through the Cloudflare Realtime SFU (+ TURN). Talk-down
+///   audio rides the same SFU session.
+/// * `Moq` — Media over QUIC relay for video; talk-down keeps a WebRTC/Opus
+///   path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub enum HdTransport {
+    /// Cloudflare Realtime SFU + TURN (WebRTC). The default.
+    #[default]
+    Sfu,
+    /// Media over QUIC relay (video) + WebRTC/Opus talk-down.
+    Moq,
+}
+
+impl HdTransport {
+    /// All variants in display order; used by UI dropdowns and tests.
+    pub fn all() -> [HdTransport; 2] {
+        [HdTransport::Sfu, HdTransport::Moq]
+    }
+
+    /// The heartbeat `caps` tag advertised while this transport is active, so
+    /// the cloud routes an expanding operator to the matching client adapter.
+    pub fn cap_tag(self) -> &'static str {
+        match self {
+            HdTransport::Sfu => "hd_sfu",
+            HdTransport::Moq => "hd_moq",
+        }
+    }
+}
+
+impl std::fmt::Display for HdTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            HdTransport::Sfu => "sfu",
+            HdTransport::Moq => "moq",
+        })
+    }
+}
+
+impl std::str::FromStr for HdTransport {
+    type Err = TypesError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "sfu" => Ok(HdTransport::Sfu),
+            "moq" => Ok(HdTransport::Moq),
+            other => Err(TypesError::InvalidHdTransport(other.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hd_transport_tests {
+    use super::HdTransport;
+    use std::str::FromStr;
+
+    #[test]
+    fn round_trips_default_and_cap_tags() {
+        assert_eq!(HdTransport::default(), HdTransport::Sfu);
+        for t in HdTransport::all() {
+            assert_eq!(HdTransport::from_str(&t.to_string()).unwrap(), t);
+        }
+        assert_eq!(HdTransport::Sfu.cap_tag(), "hd_sfu");
+        assert_eq!(HdTransport::Moq.cap_tag(), "hd_moq");
+        assert!(HdTransport::from_str("webrtc").is_err());
     }
 }
 

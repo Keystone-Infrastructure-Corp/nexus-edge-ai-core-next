@@ -150,6 +150,7 @@ gstreamer-video = "0.23"
 # feature, so default / macOS-CI builds never touch them.
 gstreamer-webrtc = "0.23"
 gstreamer-sdp = "0.23"
+gstreamer-rtp = "0.23"
 
 # IPC for worker-process backend
 interprocess = { version = "2", features = ["tokio"] }

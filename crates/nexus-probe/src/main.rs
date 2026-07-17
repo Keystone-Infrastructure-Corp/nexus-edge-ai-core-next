@@ -8,8 +8,8 @@
 //!   legacy behaviour, so `nexus-probe --out -` still emits the manifest.
 //! * **`emit-config`** — detect the hardware, derive a [`HardwareProfile`],
 //!   and write a complete, guaranteed-parseable `nexus.toml`. This replaces
-//!   the old "copy a `config/tiers/<tier>.toml` template and `sed`-rewrite
-//!   the paths" install step.
+//!   the old "copy a hand-tuned config template and `sed`-rewrite the
+//!   paths" install step.
 //! * **`accel-tags`** — print the host's accelerator tags (the same
 //!   vocabulary the installer's driver selection consumes) plus the
 //!   ROCm-vs-Vulkan verdict. The installer shells out to this instead of

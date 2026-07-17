@@ -851,18 +851,21 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             EnvelopeBody::LbrUnsubscribe(payload) => {
                 live_view.on_unsubscribe(payload);
             }
-            // Phase 10 (Phase F) — HD WebRTC signalling. The cloud sends a
-            // webrtc_offer for the single expanded camera; the bridge builds
-            // a passthrough webrtcbin session and pumps the answer + local
-            // ICE back out. webrtc_ice_candidate feeds the browser's trickle.
-            // No-op (logged) when the engine lacks the gstreamer-webrtc
-            // feature — the heartbeat never advertised `webrtc` then, so this
-            // is defence in depth.
-            EnvelopeBody::WebrtcOffer(payload) => {
-                webrtc.on_offer(payload, outbox);
+            // Phase 2 dual-transport — SFU HD publish signalling. The cloud
+            // sends live_hd_start for the single expanded camera; the bridge
+            // builds a send-only publisher webrtcbin, gathers ICE, and emits
+            // live_hd_offer. live_hd_answer carries the SFU's answer;
+            // live_hd_stop tears the publisher down. No-op (logged) without
+            // the gstreamer-webrtc feature — the heartbeat never advertised
+            // `hd_sfu` then, so this is defence in depth.
+            EnvelopeBody::LiveHdStart(payload) => {
+                webrtc.on_live_hd_start(payload, outbox);
             }
-            EnvelopeBody::WebrtcIceCandidate(payload) => {
-                webrtc.on_ice_candidate(payload);
+            EnvelopeBody::LiveHdAnswer(payload) => {
+                webrtc.on_live_hd_answer(payload);
+            }
+            EnvelopeBody::LiveHdStop(payload) => {
+                webrtc.on_live_hd_stop(payload);
             }
             other => {
                 if let EnvelopeBody::HeartbeatAck(ack) = other {
@@ -1037,6 +1040,10 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
         // within ~30 s with no engine restart. A failure here is
         // logged but never blocks the heartbeat itself.
         let name = crate::admin_runtime::read_display_name(&store).await;
+        // Dual-transport live view — read the per-core configured HD transport
+        // each tick so a cloud fleet flip is reflected in the advertised caps
+        // within one heartbeat, no restart.
+        let hd_transport = crate::admin_runtime::read_hd_transport(&store).await;
         // Phase 9 (M_OTA) — report the OTA status block so the
         // orchestrator can drive its rollout state machine + reconcile
         // committed versions. `recording_active` is best-effort false
@@ -1054,25 +1061,32 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
             body: EnvelopeBody::Heartbeat(HeartbeatPayload {
                 edge_ts_unix_ms: Some(now_unix_ms()),
                 name,
-                // Phase 10 — advertise the edge's live-view capabilities so
-                // the cloud enables the wall / greys HD per core. `live_view`
-                // (the LBR snapshot pump, Phase B) is available now; `webrtc`
-                // (the gstreamer-webrtc HD sub-pipeline, Phase E) is added
-                // once that feature is compiled in. Additive on wire `v=1`.
+                // Dual-transport live view — advertise the always-on LBR pump
+                // (`live_view`) plus the per-core configured HD transport
+                // (`hd_sfu` / `hd_moq`) so the cloud routes an expanding
+                // operator to the matching client adapter. `talkdown_webrtc`
+                // is advertised whenever the WebRTC/Opus talk-down
+                // sub-pipeline is compiled in. No back-compat: the old single
+                // `webrtc` tag is gone. Additive on wire `v=1`.
                 caps: Some({
-                    let caps = vec!["live_view".to_string()];
+                    // `mut` is only exercised when the talk-down sub-pipeline
+                    // is compiled in; suppress the unused-mut lint otherwise.
+                    #[cfg_attr(not(feature = "gstreamer-webrtc"), allow(unused_mut))]
+                    let mut caps =
+                        vec!["live_view".to_string(), hd_transport.cap_tag().to_string()];
                     #[cfg(feature = "gstreamer-webrtc")]
-                    let caps = {
-                        let mut caps = caps;
-                        caps.push("webrtc".to_string());
-                        caps
-                    };
+                    caps.push("talkdown_webrtc".to_string());
                     caps
                 }),
                 online_cameras: 0,
                 queued_alerts: 0,
                 release,
-                tier: "dev".to_string(),
+                // Optional cloud-side capability diagnostic (wire `v=1`,
+                // repurposed in place). Populating it with the engine's real
+                // probed capability profile (from config `ep_priority` / the
+                // device manifest) is a follow-up; the cloud treats the
+                // omitted field as "unknown" until then.
+                capability_profile: None,
                 uptime_s: start.elapsed().as_secs(),
                 // See `build.rs` — release-tag at CI build-time, falls
                 // back to `CARGO_PKG_VERSION` for local dev builds.

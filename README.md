@@ -4,7 +4,7 @@
 > M-Install Ckpts 1–3a.1, M-Admin (all 6 phases), M3.1–M3.3, M6
 > (identity + audit), and M7 Phase 1 (webhook sinks + cascading
 > delivery policy + UI + e2e) all shipped on `main`.** Suitable for
-> dogfooding on the reference hardware tiers; production deployment
+> dogfooding on the reference hardware profiles; production deployment
 > blocked on M5 (CUDA/TensorRT EPs), M7 Phase 2 (SureView), and M8
 > (bare-metal install + first customer trial) per
 > [`../nexus-cloud-console/docs/product/ROADMAP.md`](../nexus-cloud-console/docs/product/ROADMAP.md). Full operator CRUD UI shipped:
@@ -62,7 +62,7 @@ live alongside the main bus.
 
 The engine is **capability-based**: at install time `nexus-probe` detects the
 host's silicon and **generates** `/etc/nexus/nexus.toml` sized for it
-(`emit-config`) — there are no per-tier templates to pick from. Boxes already
+(`emit-config`) — there are no per-box templates to pick from. Boxes already
 on the desk are flagged ✅.
 
 | Profile (`--force-profile`) | Box                                       | Accelerator         | Status |

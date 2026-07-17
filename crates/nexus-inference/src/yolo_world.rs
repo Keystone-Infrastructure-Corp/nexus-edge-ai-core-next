@@ -566,9 +566,9 @@ fn default_nms_iou_threshold() -> f32 {
 /// Strategy:
 ///   1. Try `yolo_world_v2_s_<w>.onnx`. This is the only path that
 ///      hits in production from v0.1.22 onward — the release pipeline
-///      stages both `yolo_world_v2_s_640.onnx` (T10/T24 default) and
-///      `yolo_world_v2_s_960.onnx` (T36/T36-S default) so every
-///      per-tier configuration and the per-camera override surface is
+///      stages both `yolo_world_v2_s_640.onnx` (the 640 default) and
+///      `yolo_world_v2_s_960.onnx` (the 960 default) so every
+///      shipped configuration and the per-camera override surface is
 ///      satisfiable.
 ///   2. **One-cycle back-compat** — when `input_w == 640` AND the
 ///      size-suffixed file is missing AND the legacy unsuffixed
@@ -579,7 +579,7 @@ fn default_nms_iou_threshold() -> f32 {
 ///   3. Any other miss is a hard error — silently substituting a 640
 ///      file when 960 was asked for would (a) ship a lower-accuracy
 ///      model the operator didn't pick, and (b) on the most likely
-///      target hardware for this combination (T36-S Lunar Lake)
+///      target hardware for this combination (Lunar Lake)
 ///      degrade silently to CPU. Same trap class fixed in v0.1.21 for
 ///      yolo26n on the same hardware.
 ///
@@ -627,7 +627,7 @@ fn resolve_yolo_world_path(
          Fix: regenerate the missing file with \
          `python tools/models/gen_yolo_world.py --all-static` and \
          re-stage the model pack. Silent cross-size fallback is NOT \
-         provided here — on T36-S Lunar Lake it silently CPU-falls-back \
+         provided here — on Lunar Lake it silently CPU-falls-back \
          on the Intel NPU plugin, same trap fixed for yolo26n in v0.1.21.",
         pack = pack.display(),
         input_w = input_w,

@@ -2,9 +2,9 @@
 //!
 //! Turns a [`HardwareProfile`] (itself a pure function of a captured
 //! [`crate::Manifest`]) into a complete, guaranteed-parseable
-//! [`nexus_config::Config`]. This replaces the old discrete hardware-tier
-//! abstraction: instead of copying a hand-tuned `config/tiers/<tier>.toml`
-//! and rewriting paths with `sed`, the installer calls `nexus-probe
+//! [`nexus_config::Config`]. This replaces the old per-box config
+//! templates: instead of copying a hand-tuned template and rewriting
+//! paths with `sed`, the installer calls `nexus-probe
 //! emit-config` and the box's `/etc/nexus/nexus.toml` is derived directly
 //! from detected silicon.
 //!
@@ -30,7 +30,7 @@
 //! | `inference.model.preset` (+ `input_width`/`input_height`) | primary [`InferenceDevice`] |
 //! | `bus.capacity` | total RAM |
 //!
-//! The constant fields the tier templates also set (the `0.0.0.0` binds,
+//! The constant fields the old templates also set (the `0.0.0.0` binds,
 //! the in-process TLS listener, `recorder = "gstreamer"`, `backend =
 //! "pool"`, the bare-metal `pack_path`/`ui_root`) are applied here too so
 //! the generated file is a drop-in replacement for the old templates.
@@ -48,7 +48,7 @@ use crate::profile::{DecodeCapability, HardwareProfile, InferenceDevice};
 /// Bare-metal model-pack directory. The atomic-swap install layout keeps
 /// the active release under `/opt/nexus/current` (a symlink flipped on
 /// upgrade), so pinning the pack here means an OTA that ships a new pack
-/// needs no config edit. The old tier templates carried the Docker path
+/// needs no config edit. The old templates carried the Docker path
 /// `/usr/share/nexus/models` and the installer `sed`-rewrote it; the
 /// generator emits the final path directly.
 const PACK_PATH: &str = "/opt/nexus/current/share/models";
@@ -61,12 +61,12 @@ const UI_ROOT: &str = "/opt/nexus/current/share/ui";
 ///
 /// Starts from [`Config::default`] and overrides only the fields that
 /// differ from the defaults — the hardware-varying knobs plus the handful
-/// of constant production fields the old tier templates set explicitly.
+/// of constant production fields the old templates set explicitly.
 pub fn generate_config(profile: &HardwareProfile) -> Config {
     let mut cfg = Config::default();
 
     // --- runtime --------------------------------------------------------
-    // Thread pools scale with logical cores (matches every shipped tier:
+    // Thread pools scale with logical cores (matches every shipped box class:
     // N150 4T -> 4, Lunar Lake 8T -> 8, Arc box 12T -> 12, Ryzen 16T -> 16).
     // A probe that fails to read core count (0) falls back to a safe 4.
     let threads = if profile.cpu_logical == 0 {
@@ -151,8 +151,8 @@ fn ep_priority_for(device: InferenceDevice) -> Vec<String> {
 /// Detector-pool worker count.
 ///
 /// The only box class we can reliably detect today that benefits from more
-/// than one session is the Intel NPU (Lunar Lake), which the shipped T36-S
-/// template runs at 2. Discrete-GPU multi-worker sizing (Arc A380 → 2, RTX
+/// than one session is the Intel NPU (Lunar Lake), which the NPU profile
+/// runs at 2. Discrete-GPU multi-worker sizing (Arc A380 → 2, RTX
 /// → 3) needs VRAM detection, which is a deferred profile enrichment; until
 /// then every other device runs a single worker (the safe under-provision).
 fn workers_for(device: InferenceDevice) -> usize {
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn intel_npu_gets_two_workers_and_960_preset() {
-        // Lunar Lake (T36-S): NPU primary, 8 cores, 16 GiB.
+        // Lunar Lake: NPU primary, 8 cores, 16 GiB.
         let p = profile(
             8,
             16,
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn hailo_box_uses_hailo_ep_with_va_decode() {
-        // EQR7 (T24): Hailo inference, AMD iGPU decode-only, 16 cores, 24 GiB.
+        // EQR7: Hailo inference, AMD iGPU decode-only, 16 cores, 24 GiB.
         let p = profile(
             16,
             24,
