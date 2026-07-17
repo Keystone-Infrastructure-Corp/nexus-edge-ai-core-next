@@ -54,6 +54,23 @@ use crate::{backoff_for, SinkError, SinkId, SinkRegistry};
 /// publish — wired in Step 5).
 pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Grace window (seconds since the alert fired) during which an event
+/// with no linked clip is treated as "clip link still pending" — a
+/// transient retry — rather than "this alert genuinely has no clip" —
+/// deliver clip-less.
+///
+/// The supervisor commits the `alert_sink_outbox` row inside
+/// `record_event_and_enqueue`, then only links the clip a few frames
+/// later (after `recorder.open` runs). A dispatcher tick that lands in
+/// that sub-second window sees `get_event_clip_id → Ok(None)` even
+/// though a link is imminent, and would otherwise ship a clip-less
+/// alarm with no retry — the intermittent "SureView alert missing its
+/// clip" bug. We wait out this grace window before concluding an alert
+/// truly has no surrounding clip. Sized well above one frame cycle and
+/// comfortably inside the backoff horizon (`MAX_ATTEMPTS = 8`,
+/// ~63.5 s), so waiting never exhausts a row's retries.
+pub const CLIP_LINK_GRACE_SECS: i64 = 10;
+
 /// Max outbox rows pulled per sweep. Keeps a single pass bounded so
 /// a large backfill (e.g. delivery globally re-enabled after a long
 /// outage) doesn't monopolise the task — the next tick picks up the
@@ -291,6 +308,20 @@ async fn reclaim_snapshot_if_drained(
 ///      the row points at a sink the operator has since deleted,
 ///      and retrying buys nothing.
 ///   4. Actual delivery.
+/// Whether an alert is still young enough that a not-yet-available
+/// clip might still resolve. Covers three transient conditions:
+///   * the supervisor hasn't written the clip link yet (it does so a
+///     few frames after enqueueing the outbox row);
+///   * the recorder hasn't flushed the hot MP4 to disk yet;
+///   * a disk-pressure eviction raced the clip close.
+/// Past this window we stop waiting and deliver clip-less rather than
+/// hold the alarm forever. Sized (`CLIP_LINK_GRACE_SECS`) well inside
+/// the backoff horizon so waiting never exhausts a row's retries.
+fn within_clip_grace(event: &AlertEvent) -> bool {
+    Utc::now().signed_duration_since(event.captured_at)
+        < chrono::Duration::seconds(CLIP_LINK_GRACE_SECS)
+}
+
 pub async fn process_row(
     store: &Arc<Store>,
     registry: &Arc<SinkRegistry>,
@@ -411,12 +442,51 @@ pub async fn process_row(
                     match (clips_dir, clip.hot_path.as_deref()) {
                         (Some(dir), Some(rel)) => {
                             let abs = dir.join(rel);
-                            event.artifacts.clip = Some(abs.to_string_lossy().into_owned());
+                            // Verify the file is actually on disk before
+                            // stamping the path. The DB row can name a
+                            // hot_path whose file is either not yet flushed
+                            // by the recorder or was soft-evicted under disk
+                            // pressure moments ago. Stamping a vanished path
+                            // would let the sink's SMTP-time read silently
+                            // drop the clip (the re-read eviction window).
+                            if tokio::fs::try_exists(&abs).await.unwrap_or(false) {
+                                event.artifacts.clip = Some(abs.to_string_lossy().into_owned());
+                            } else if within_clip_grace(&event) {
+                                schedule_retry(
+                                    store,
+                                    snapshots_dir,
+                                    &row,
+                                    "clip hot file not yet on disk; awaiting recorder flush",
+                                )
+                                .await;
+                                return;
+                            } else {
+                                debug!(
+                                    outbox_id = row.id,
+                                    clip_id,
+                                    path = %abs.display(),
+                                    "clip hot file absent after grace; delivering without clip"
+                                );
+                            }
                         }
                         _ => {
-                            // Clip closed but no hot copy (soft-evicted to
-                            // cold, or clips_dir unset). Deliver without it
-                            // rather than blocking the alarm.
+                            // Clip closed but no hot copy in the DB
+                            // (soft-evicted to cold, or clips_dir unset).
+                            // Cold lives only in the cloud — there is no
+                            // local file to attach. Retry inside the grace
+                            // window in case an eviction raced the close;
+                            // after that, deliver clip-less rather than hold
+                            // the alarm forever.
+                            if clips_dir.is_some() && within_clip_grace(&event) {
+                                schedule_retry(
+                                    store,
+                                    snapshots_dir,
+                                    &row,
+                                    "clip has no hot path yet; awaiting recorder finalize",
+                                )
+                                .await;
+                                return;
+                            }
                             debug!(
                                 outbox_id = row.id,
                                 clip_id, "clip has no hot path; delivering without clip"
@@ -442,7 +512,29 @@ pub async fn process_row(
                 }
             },
             Ok(None) => {
-                // No clip linked to this alert — nothing to attach.
+                // No clip linked *yet*. The supervisor writes the clip
+                // link a few frames after it enqueues the outbox row
+                // (recorder.open has to run first), so a dispatcher tick
+                // that lands in that window sees no link even though one
+                // is imminent. Distinguish "link still pending" from
+                // "this alert genuinely has no clip" by the event's age:
+                // inside the grace window, retry; once it has elapsed the
+                // link would certainly have been written, so deliver
+                // clip-less rather than block the alarm forever.
+                if within_clip_grace(&event) {
+                    schedule_retry(
+                        store,
+                        snapshots_dir,
+                        &row,
+                        "clip link pending; awaiting supervisor clip link",
+                    )
+                    .await;
+                    return;
+                }
+                debug!(
+                    outbox_id = row.id,
+                    "no clip linked within grace window; delivering without clip"
+                );
             }
             Err(e) => {
                 warn!(
