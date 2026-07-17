@@ -253,6 +253,10 @@ impl AlertSink for SureViewEmailSink {
         &self.id
     }
 
+    fn wants_clip(&self) -> bool {
+        self.cfg.attach_clip
+    }
+
     async fn deliver(&self, event: &AlertEvent) -> Result<(), SinkError> {
         let attachments = self.collect_attachments(event).await;
         let message = self.build_message(event, attachments)?;

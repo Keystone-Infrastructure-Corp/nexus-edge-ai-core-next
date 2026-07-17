@@ -196,6 +196,17 @@ pub trait AlertSink: Send + Sync {
     /// semantics.
     async fn deliver(&self, event: &AlertEvent) -> Result<(), SinkError>;
 
+    /// Whether this sink attaches the surrounding motion clip (MP4)
+    /// to the delivered alert. Default `false`. When `true`, the
+    /// dispatcher defers delivery until the alert's linked clip has
+    /// finished recording (post-roll closed) and resolves
+    /// `event.artifacts.clip` to the on-disk path before calling
+    /// [`AlertSink::deliver`]. Sinks that never attach a clip skip
+    /// this wait entirely.
+    fn wants_clip(&self) -> bool {
+        false
+    }
+
     /// Synchronous health probe. Default returns
     /// [`SinkHealth::Unknown`]; impls override when they maintain a
     /// running success/failure window.

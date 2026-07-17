@@ -129,7 +129,7 @@ async fn enqueue_and_deliver(
         .into_iter()
         .next()
         .expect("one outbox row");
-    dispatcher::process_row(store, registry, &AllowAllPolicy, row.clone()).await;
+    dispatcher::process_row(store, registry, &AllowAllPolicy, None, row.clone()).await;
     store
         .outbox_for_event(&alert.event_id.to_string())
         .await
