@@ -40,6 +40,9 @@ pub mod preroll_ingester;
 pub mod thumbnail;
 
 #[cfg(feature = "gstreamer-webrtc")]
+pub mod moq_publish;
+
+#[cfg(feature = "gstreamer-webrtc")]
 pub mod webrtc;
 
 pub use cache::{LatestEntry, LatestFrameCache};
@@ -74,6 +77,9 @@ pub use source::RtspSource;
 
 #[cfg(feature = "gstreamer")]
 pub use source::SharedRtspSource;
+
+#[cfg(feature = "gstreamer-webrtc")]
+pub use moq_publish::{MoqError, MoqSession};
 
 #[cfg(feature = "gstreamer-webrtc")]
 pub use webrtc::{IceServerCfg, WebRtcError, WebRtcEvent, WebRtcMode, WebRtcSession};

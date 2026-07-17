@@ -577,7 +577,15 @@ impl FeedClock {
 /// broadcast lag re-arms the splice (we may have dropped the frames between
 /// the last IDR and now). The [`FeedClock`] persists across re-arms so the
 /// outbound RTP timeline stays monotonic even across a dropped-frame gap.
-async fn feed_loop(appsrc: AppSrc, mut rx: broadcast::Receiver<NalSample>, camera_id: CameraId) {
+/// Pump compressed NALs from a camera ingester into `appsrc`, splicing in at
+/// the next keyframe and re-arming the splice after a broadcast lag. Shared by
+/// the SFU ([`WebRtcSession`]) and MoQ ([`crate::moq_publish::MoqSession`])
+/// publishers — both feed the same per-camera NAL stream.
+pub(crate) async fn feed_loop(
+    appsrc: AppSrc,
+    mut rx: broadcast::Receiver<NalSample>,
+    camera_id: CameraId,
+) {
     let mut started = false;
     let mut clock = FeedClock::new();
     loop {
