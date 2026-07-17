@@ -653,10 +653,14 @@ mod tests {
             _ => panic!("expected alert body"),
         }
 
-        // Terminal (stored) outcome reclaims the local snapshot file.
+        // The sink no longer reclaims the snapshot itself — the file is a
+        // shared resource (other sinks attach it) and reclaim is centralised
+        // in the dispatcher, which deletes it only once every outbox row for
+        // the event is terminal. So a delivered alert MUST leave the file in
+        // place for the other sinks / the dispatcher sweep.
         assert!(
-            !dir.path().join(format!("{event_id}.jpg")).exists(),
-            "snapshot file should be removed after a stored delivery"
+            dir.path().join(format!("{event_id}.jpg")).exists(),
+            "snapshot file must survive delivery; reclaim is the dispatcher's job"
         );
     }
 
