@@ -484,6 +484,15 @@ pub struct LiveHdStartPayload {
     /// Optional. `passthrough` (default) or `transcode` to H.264 when the subscriber can't decode the native codec. Omitted = passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// MoQ-only. The cloud-chosen broadcast name the edge publishes under (stable per camera so every viewer subscribes the same fan-out). Omitted for `sfu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moq_broadcast: Option<String>,
+    /// MoQ-only. The signed publish JWT (operations:[publish]) the edge presents as `?jwt=`. Cloudflare mints + signs it; the api-gateway relays it here. Revoked on live_hd_stop. Omitted for `sfu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moq_publish_token: Option<String>,
+    /// MoQ-only. The relay WebTransport base URL the edge publisher dials (e.g. https://relay.cloudflare.mediaoverquic.com). The edge appends `?jwt=<moq_publish_token>` at the root path. Omitted for `sfu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moq_relay_url: Option<String>,
     /// Cloud-minted HD session id; echoed on every live_hd_* for this session.
     pub session_id: Uuid,
     /// Optional. Which camera stream to publish: `sub` (default) or `main`. Omitted = sub.
