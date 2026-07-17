@@ -1,17 +1,23 @@
-//! Phase 2 — edge WebRTC publisher bridge.
+//! Phase 2/3 — edge HD publisher bridge (dual-transport).
 //!
 //! Sits between the cloud tunnel ([`crate::cloud_tunnel`]) and the per-session
-//! [`nexus_pipeline::WebRtcSession`] (publisher role). An inbound
-//! `live_hd_start` builds a send-only publisher session for the camera that
-//! offers to the Cloudflare SFU (via the api-gateway), pumping out
-//! `live_hd_offer` + `live_hd_publishing`; an inbound `live_hd_answer` applies
-//! the SFU's answer and `live_hd_stop` tears the session down.
+//! publisher pipeline. An inbound `live_hd_start` builds a send-only publisher
+//! for the camera on the transport the cloud selected:
+//!
+//! * `sfu` → a [`nexus_pipeline::WebRtcSession`] (webrtcbin) that offers to the
+//!   Cloudflare SFU via the api-gateway, pumping out `live_hd_offer` +
+//!   `live_hd_publishing`; an inbound `live_hd_answer` applies the SFU's answer.
+//! * `moq` → a [`nexus_pipeline::MoqSession`] (moqsink) that publishes straight
+//!   to the Cloudflare MoQ relay using the `moq_*` coordinates in the payload.
+//!   MoQ has no signalling round-trip, so no `live_hd_offer` / `_answer`.
+//!
+//! `live_hd_stop` tears either session down.
 //!
 //! The type is compiled **unconditionally** so `cloud_tunnel.rs` can hold one
 //! `Arc<WebRtcBridge>` regardless of features. When the `gstreamer-webrtc`
-//! feature is off every method is a logged no-op — and the heartbeat also
-//! omits the `hd_sfu` capability, so a cloud never starts an HD publish on such
-//! a core in the first place.
+//! feature is off every method is a logged no-op — and the heartbeat also omits
+//! the `hd_sfu` / `hd_moq` capability, so a cloud never starts an HD publish on
+//! such a core in the first place.
 
 use std::sync::Arc;
 
@@ -24,11 +30,13 @@ use nexus_cloud_protocol::v1::{
     Envelope, EnvelopeBody, EnvelopeMeta, LiveHdOfferPayload, LiveHdPublishingPayload,
 };
 #[cfg(feature = "gstreamer-webrtc")]
-use nexus_pipeline::PreRollIngester;
+use nexus_pipeline::{NalSample, PreRollIngester};
 #[cfg(feature = "gstreamer-webrtc")]
-use nexus_types::CameraId;
+use nexus_types::{CameraId, CodecKind};
 #[cfg(feature = "gstreamer-webrtc")]
 use std::collections::HashMap;
+#[cfg(feature = "gstreamer-webrtc")]
+use tokio::sync::broadcast;
 #[cfg(feature = "gstreamer-webrtc")]
 use tracing::warn;
 
@@ -49,16 +57,32 @@ struct Inner {
     sessions: HashMap<String, ActiveSession>,
 }
 
+/// The transport-specific publisher pipeline behind an [`ActiveSession`].
+/// Dropping either variant tears its pipeline down.
+///
+/// `Moq` is held only for that `Drop` (the moqsink pipeline runs itself with no
+/// further calls), so its field is never read after construction; `Sfu` is also
+/// read for `set_answer`. The enum-level allow covers the `Moq` keep-alive.
+#[cfg(feature = "gstreamer-webrtc")]
+#[allow(dead_code)]
+enum HdSession {
+    /// SFU publisher (webrtcbin, offers to the Cloudflare SFU).
+    Sfu(nexus_pipeline::WebRtcSession),
+    /// MoQ publisher (moqsink, publishes to the Cloudflare relay).
+    Moq(nexus_pipeline::MoqSession),
+}
+
 #[cfg(feature = "gstreamer-webrtc")]
 struct ActiveSession {
     /// The camera this session streams — used to evict a stale prior session
     /// for the same camera when the browser reopens HD (the browser drops the
     /// old session client-side without closing it, so we must reclaim it here).
     camera_id: CameraId,
-    /// Dropping this tears the webrtcbin pipeline down.
-    _session: nexus_pipeline::WebRtcSession,
-    /// The task draining `WebRtcEvent`s → outbox envelopes.
-    pump: tokio::task::JoinHandle<()>,
+    /// Dropping this tears the publisher pipeline down.
+    _session: HdSession,
+    /// The task draining `WebRtcEvent`s → outbox envelopes (SFU only). MoQ has
+    /// no signalling round-trip, so its pump is `None`.
+    pump: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl WebRtcBridge {
@@ -131,7 +155,9 @@ impl WebRtcBridge {
         {
             let mut inner = self.inner.lock();
             for (_, active) in inner.sessions.drain() {
-                active.pump.abort();
+                if let Some(pump) = active.pump {
+                    pump.abort();
+                }
                 // `active._session` drops here → pipeline to NULL.
             }
         }
@@ -141,17 +167,18 @@ impl WebRtcBridge {
 #[cfg(feature = "gstreamer-webrtc")]
 impl WebRtcBridge {
     fn on_live_hd_start_impl(&self, payload: &LiveHdStartPayload, outbox: &Arc<TunnelOutbox>) {
-        use nexus_pipeline::{IceServerCfg, WebRtcMode, WebRtcSession};
-
-        // Only the SFU transport uses webrtcbin publish; MoQ (gated until
-        // preview) is a separate publisher path handled elsewhere.
-        if payload.transport != "sfu" {
-            debug!(
-                session_id = %payload.session_id,
-                transport = %payload.transport,
-                "live_hd_start for non-sfu transport; webrtc bridge ignoring",
-            );
-            return;
+        // Both dual-transport publishers are handled here; any other transport
+        // is unknown to this core and ignored.
+        match payload.transport.as_str() {
+            "sfu" | "moq" => {}
+            other => {
+                debug!(
+                    session_id = %payload.session_id,
+                    transport = other,
+                    "live_hd_start for unknown transport; ignoring",
+                );
+                return;
+            }
         }
 
         let Ok(cam_id) = CameraId::try_from(payload.camera_id) else {
@@ -175,7 +202,9 @@ impl WebRtcBridge {
             .collect();
         for id in stale {
             if let Some(prev) = inner.sessions.remove(&id) {
-                prev.pump.abort();
+                if let Some(pump) = prev.pump {
+                    pump.abort();
+                }
             }
         }
         let Some(ingester) = inner.ingesters.get(&cam_id).cloned() else {
@@ -189,66 +218,36 @@ impl WebRtcBridge {
         let codec = ingester.codec();
         let nal_rx = ingester.subscribe();
 
-        let ice_servers: Vec<IceServerCfg> = payload
-            .ice_servers
-            .as_ref()
-            .map(|servers| {
-                servers
-                    .iter()
-                    .map(|s| IceServerCfg {
-                        urls: s.urls.clone(),
-                        username: s.username.clone(),
-                        credential: s.credential.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mode = match payload.mode.as_deref() {
-            Some("transcode") => WebRtcMode::Transcode,
-            _ => WebRtcMode::Passthrough,
+        // Build the transport-specific publisher over the shared NAL feed.
+        let active = if payload.transport == "moq" {
+            build_moq_session(payload, cam_id, codec, nal_rx)
+        } else {
+            build_sfu_session(payload, cam_id, codec, nal_rx, outbox)
         };
-
-        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        let session = match WebRtcSession::new_publisher(
-            session_key.clone(),
-            cam_id,
-            codec,
-            mode,
-            &ice_servers,
-            nal_rx,
-            ev_tx,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(session_id = %payload.session_id, error = %e, "webrtc publisher build failed");
-                return;
-            }
-        };
-        let pump = tokio::spawn(pump_publisher_events(
-            session_key.clone(),
-            codec.base().to_string(),
-            ev_rx,
-            Arc::clone(outbox),
-        ));
-        inner.sessions.insert(
-            session_key.clone(),
-            ActiveSession {
-                camera_id: cam_id,
-                _session: session,
-                pump,
-            },
+        let Some(active) = active else { return };
+        inner.sessions.insert(session_key.clone(), active);
+        debug!(
+            session_id = %session_key,
+            camera_id = cam_id,
+            transport = %payload.transport,
+            "hd publisher started"
         );
-        debug!(session_id = %session_key, camera_id = cam_id, "webrtc publisher started");
     }
 
     fn on_live_hd_answer_impl(&self, payload: &LiveHdAnswerPayload) {
         let inner = self.inner.lock();
         match inner.sessions.get(&payload.session_id) {
-            Some(active) => {
-                if let Err(e) = active._session.set_answer(&payload.sdp) {
-                    warn!(session_id = %payload.session_id, error = %e, "webrtc set_answer failed");
+            Some(active) => match &active._session {
+                HdSession::Sfu(session) => {
+                    if let Err(e) = session.set_answer(&payload.sdp) {
+                        warn!(session_id = %payload.session_id, error = %e, "webrtc set_answer failed");
+                    }
                 }
-            }
+                HdSession::Moq(_) => debug!(
+                    session_id = %payload.session_id,
+                    "live_hd_answer for a MoQ session (no SDP handshake); ignoring"
+                ),
+            },
             None => debug!(
                 session_id = %payload.session_id,
                 "live_hd_answer for unknown session; dropping"
@@ -259,12 +258,117 @@ impl WebRtcBridge {
     fn on_live_hd_stop_impl(&self, payload: &LiveHdStopPayload) {
         let mut inner = self.inner.lock();
         if let Some(prev) = inner.sessions.remove(&payload.session_id) {
-            prev.pump.abort();
-            debug!(session_id = %payload.session_id, "webrtc publisher stopped");
+            if let Some(pump) = prev.pump {
+                pump.abort();
+            }
+            debug!(session_id = %payload.session_id, "hd publisher stopped");
         } else {
             debug!(session_id = %payload.session_id, "live_hd_stop for unknown session; no-op");
         }
     }
+}
+
+/// Build an SFU publisher (webrtcbin offerer) + its event pump.
+#[cfg(feature = "gstreamer-webrtc")]
+fn build_sfu_session(
+    payload: &LiveHdStartPayload,
+    cam_id: CameraId,
+    codec: CodecKind,
+    nal_rx: broadcast::Receiver<NalSample>,
+    outbox: &Arc<TunnelOutbox>,
+) -> Option<ActiveSession> {
+    use nexus_pipeline::{IceServerCfg, WebRtcMode, WebRtcSession};
+
+    let ice_servers: Vec<IceServerCfg> = payload
+        .ice_servers
+        .as_ref()
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|s| IceServerCfg {
+                    urls: s.urls.clone(),
+                    username: s.username.clone(),
+                    credential: s.credential.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mode = match payload.mode.as_deref() {
+        Some("transcode") => WebRtcMode::Transcode,
+        _ => WebRtcMode::Passthrough,
+    };
+
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session = match WebRtcSession::new_publisher(
+        payload.session_id.clone(),
+        cam_id,
+        codec,
+        mode,
+        &ice_servers,
+        nal_rx,
+        ev_tx,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(session_id = %payload.session_id, error = %e, "webrtc publisher build failed");
+            return None;
+        }
+    };
+    let pump = tokio::spawn(pump_publisher_events(
+        payload.session_id.clone(),
+        codec.base().to_string(),
+        ev_rx,
+        Arc::clone(outbox),
+    ));
+    Some(ActiveSession {
+        camera_id: cam_id,
+        _session: HdSession::Sfu(session),
+        pump: Some(pump),
+    })
+}
+
+/// Build a MoQ publisher (moqsink) from the `live_hd_start.moq_*` coordinates.
+/// MoQ has no signalling round-trip, so there is no event pump.
+#[cfg(feature = "gstreamer-webrtc")]
+fn build_moq_session(
+    payload: &LiveHdStartPayload,
+    cam_id: CameraId,
+    codec: CodecKind,
+    nal_rx: broadcast::Receiver<NalSample>,
+) -> Option<ActiveSession> {
+    use nexus_pipeline::MoqSession;
+
+    let (Some(relay_url), Some(broadcast_name), Some(token)) = (
+        payload.moq_relay_url.as_deref(),
+        payload.moq_broadcast.as_deref(),
+        payload.moq_publish_token.as_deref(),
+    ) else {
+        warn!(
+            session_id = %payload.session_id,
+            "live_hd_start moq: missing relay_url / broadcast / publish_token; dropping"
+        );
+        return None;
+    };
+    let session = match MoqSession::new_publisher(
+        payload.session_id.clone(),
+        cam_id,
+        codec,
+        relay_url,
+        broadcast_name,
+        token,
+        nal_rx,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(session_id = %payload.session_id, error = %e, "moq publisher build failed");
+            return None;
+        }
+    };
+    Some(ActiveSession {
+        camera_id: cam_id,
+        _session: HdSession::Moq(session),
+        pump: None,
+    })
 }
 
 /// Drain a publisher session's [`nexus_pipeline::WebRtcEvent`]s and forward
