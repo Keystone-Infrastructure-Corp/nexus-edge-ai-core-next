@@ -450,8 +450,13 @@ pub async fn process_row(
                     error = %e,
                     "sink dispatcher: get_event_clip_id failed; will retry"
                 );
-                schedule_retry(store, snapshots_dir, &row, &format!("clip lookup error: {e}"))
-                    .await;
+                schedule_retry(
+                    store,
+                    snapshots_dir,
+                    &row,
+                    &format!("clip lookup error: {e}"),
+                )
+                .await;
                 return;
             }
         }

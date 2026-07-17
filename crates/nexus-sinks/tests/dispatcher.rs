@@ -327,7 +327,15 @@ async fn exhausted_retries_become_dead() {
         .unwrap();
     assert_eq!(row_after_backdate.attempts, attempts_before_last);
 
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row_after_backdate).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        row_after_backdate,
+    )
+    .await;
 
     let after = store
         .outbox_for_event(&row.event_id)
@@ -355,7 +363,15 @@ async fn suppressed_by_policy_marks_suppressed() {
     registry.replace(vec![sink.clone()]);
 
     let (_alert, row) = enqueue_one(&store, 1, "rule.s", id.as_str()).await;
-    dispatcher::process_row(&store, &registry, &SuppressOnlyPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &SuppressOnlyPolicy,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     // Policy short-circuits BEFORE deliver() — sink never called.
     assert_eq!(sink.calls(), 0);
