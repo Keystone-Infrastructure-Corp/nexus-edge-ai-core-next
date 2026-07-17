@@ -290,18 +290,6 @@ impl CloudConsoleAlertSink {
             }
         }
     }
-
-    /// Delete the local snapshot for `event_id` once the alert reaches a
-    /// terminal delivery outcome. Best-effort + idempotent: a missing file
-    /// (never captured, or already reclaimed) is not an error.
-    async fn remove_local_snapshot(&self, event_id: &str) {
-        let path = self.snapshots_dir.join(format!("{event_id}.jpg"));
-        if let Err(e) = tokio::fs::remove_file(&path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                debug!(event = %event_id, "failed to remove local alert snapshot: {e}");
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -355,16 +343,15 @@ impl AlertSink for CloudConsoleAlertSink {
                 ))
             }
         };
-        // Reclaim the local snapshot once the alert reaches a TERMINAL
-        // outcome: on `stored` the cloud holds the blob; on `permanent` it
-        // never will. A transient outcome keeps the file so the retry can
-        // re-upload + re-attach the URL (the snapshot PUT is idempotent on
-        // the deterministic path, and the cloud row only carries the URL if
-        // the delivering envelope did). This bounds `<state_dir>/snapshots`
-        // for cloud-enrolled edges without a separate sweep.
-        if !matches!(outcome, Err(SinkError::Transient(_))) {
-            self.remove_local_snapshot(&event_id).await;
-        }
+        // NOTE: the local snapshot at `<state_dir>/snapshots/<event_id>.jpg`
+        // is a SHARED resource — external sinks (e.g. SureView email with
+        // `attach_snapshot`) attach the same file. Reclaiming it here, per
+        // this sink's terminal outcome, races a slower sink that has not yet
+        // delivered (the email sink defers until the motion clip finalises,
+        // which can be seconds after the cloud ack). So reclaim is
+        // centralised in the dispatcher, which deletes the JPEG only once
+        // NO outbox row for the event is still `pending`. See
+        // `nexus_sinks::dispatcher::reclaim_snapshot_if_drained`.
         outcome
     }
 }
@@ -666,10 +653,14 @@ mod tests {
             _ => panic!("expected alert body"),
         }
 
-        // Terminal (stored) outcome reclaims the local snapshot file.
+        // The sink no longer reclaims the snapshot itself — the file is a
+        // shared resource (other sinks attach it) and reclaim is centralised
+        // in the dispatcher, which deletes it only once every outbox row for
+        // the event is terminal. So a delivered alert MUST leave the file in
+        // place for the other sinks / the dispatcher sweep.
         assert!(
-            !dir.path().join(format!("{event_id}.jpg")).exists(),
-            "snapshot file should be removed after a stored delivery"
+            dir.path().join(format!("{event_id}.jpg")).exists(),
+            "snapshot file must survive delivery; reclaim is the dispatcher's job"
         );
     }
 

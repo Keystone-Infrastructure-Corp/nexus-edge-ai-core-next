@@ -130,6 +130,17 @@ pub struct SinkDispatcherConfig {
     /// resolution — clip-attaching sinks then behave as if the clip
     /// were unavailable.
     pub clips_dir: Option<std::path::PathBuf>,
+    /// Directory holding per-event alert snapshots
+    /// (`<snapshots_dir>/<event_id>.jpg`). The snapshot is a shared
+    /// resource: several sinks (the cloud audit sink that uploads it,
+    /// the SureView email sink that attaches it) point at the same
+    /// file via `event.artifacts.snapshot`. Reclaim is centralised
+    /// here — the file is deleted only once every outbox row for the
+    /// event has reached a terminal state, so a slow sink (e.g. an
+    /// email sink that defers until the motion clip finalises) never
+    /// has the JPEG deleted out from under it. `None` disables
+    /// reclaim (the file is simply left on disk).
+    pub snapshots_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for SinkDispatcherConfig {
@@ -138,6 +149,7 @@ impl Default for SinkDispatcherConfig {
             tick_interval: TICK_INTERVAL,
             batch_size: BATCH_SIZE,
             clips_dir: None,
+            snapshots_dir: None,
         }
     }
 }
@@ -209,7 +221,56 @@ async fn tick(
     debug!(n = rows.len(), "sink dispatcher: draining batch");
 
     for row in rows {
-        process_row(store, registry, policy, cfg.clips_dir.as_deref(), row).await;
+        process_row(
+            store,
+            registry,
+            policy,
+            cfg.clips_dir.as_deref(),
+            cfg.snapshots_dir.as_deref(),
+            row,
+        )
+        .await;
+    }
+}
+
+/// Reclaim the shared alert snapshot once every sink for this event has
+/// reached a terminal outcome.
+///
+/// The JPEG at `<snapshots_dir>/<event_id>.jpg` is shared by every sink
+/// that reads it (the cloud audit sink uploads it; the SureView email
+/// sink attaches it). Deleting it per individual delivery races a slower
+/// sink — e.g. an email sink that defers until the motion clip finalises
+/// would find the file gone. So reclaim is centralised here and only
+/// fires when no `pending` rows remain for the event. `None`
+/// `snapshots_dir` disables reclaim entirely.
+async fn reclaim_snapshot_if_drained(
+    store: &Arc<Store>,
+    snapshots_dir: Option<&std::path::Path>,
+    event_id: &str,
+) {
+    let Some(dir) = snapshots_dir else {
+        return;
+    };
+    match store.outbox_for_event(event_id).await {
+        Ok(rows) => {
+            if rows.iter().any(|r| r.status == OutboxStatus::Pending) {
+                // Another sink still needs the snapshot; leave it.
+                return;
+            }
+            let path = dir.join(format!("{event_id}.jpg"));
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    debug!(event = %event_id, "reclaimed alert snapshot");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    debug!(event = %event_id, error = %e, "reclaim snapshot: remove_file failed");
+                }
+            }
+        }
+        Err(e) => {
+            debug!(event = %event_id, error = %e, "reclaim snapshot: outbox_for_event failed");
+        }
     }
 }
 
@@ -235,6 +296,7 @@ pub async fn process_row(
     registry: &Arc<SinkRegistry>,
     policy: &dyn DeliveryPolicy,
     clips_dir: Option<&std::path::Path>,
+    snapshots_dir: Option<&std::path::Path>,
     row: OutboxRow,
 ) {
     // Belt-and-suspenders: outbox_pending should already filter
@@ -257,6 +319,7 @@ pub async fn process_row(
         Ok(None) => {
             mark_dead(
                 store,
+                snapshots_dir,
                 &row,
                 format!("event {} missing (likely clip-evicted)", row.event_id),
             )
@@ -269,7 +332,7 @@ pub async fn process_row(
                 error = %e,
                 "sink dispatcher: get_event failed; will retry"
             );
-            schedule_retry(store, &row, &format!("store error: {e}")).await;
+            schedule_retry(store, snapshots_dir, &row, &format!("store error: {e}")).await;
             return;
         }
     };
@@ -283,6 +346,7 @@ pub async fn process_row(
                 "sink dispatcher: outbox_mark_suppressed failed"
             );
         }
+        reclaim_snapshot_if_drained(store, snapshots_dir, &row.event_id).await;
         return;
     }
 
@@ -290,7 +354,13 @@ pub async fn process_row(
     let sink_id = match SinkId::parse(&row.sink_id) {
         Some(id) => id,
         None => {
-            mark_dead(store, &row, format!("malformed sink_id: {:?}", row.sink_id)).await;
+            mark_dead(
+                store,
+                snapshots_dir,
+                &row,
+                format!("malformed sink_id: {:?}", row.sink_id),
+            )
+            .await;
             return;
         }
     };
@@ -299,6 +369,7 @@ pub async fn process_row(
         None => {
             mark_dead(
                 store,
+                snapshots_dir,
                 &row,
                 format!("no sink registered for {}", row.sink_id),
             )
@@ -330,6 +401,7 @@ pub async fn process_row(
                     if clip.ended_at.is_none() {
                         schedule_retry(
                             store,
+                            snapshots_dir,
                             &row,
                             &format!("clip {clip_id} still recording; awaiting post-roll close"),
                         )
@@ -364,7 +436,8 @@ pub async fn process_row(
                         error = %e,
                         "sink dispatcher: get_clip failed; will retry"
                     );
-                    schedule_retry(store, &row, &format!("get_clip error: {e}")).await;
+                    schedule_retry(store, snapshots_dir, &row, &format!("get_clip error: {e}"))
+                        .await;
                     return;
                 }
             },
@@ -377,7 +450,13 @@ pub async fn process_row(
                     error = %e,
                     "sink dispatcher: get_event_clip_id failed; will retry"
                 );
-                schedule_retry(store, &row, &format!("clip lookup error: {e}")).await;
+                schedule_retry(
+                    store,
+                    snapshots_dir,
+                    &row,
+                    &format!("clip lookup error: {e}"),
+                )
+                .await;
                 return;
             }
         }
@@ -393,19 +472,25 @@ pub async fn process_row(
                     "sink dispatcher: outbox_mark_sent failed"
                 );
             }
+            reclaim_snapshot_if_drained(store, snapshots_dir, &row.event_id).await;
         }
         Err(SinkError::Permanent(msg)) => {
             // 4xx-class: don't burn retries on something that
             // will never succeed.
-            mark_dead(store, &row, format!("permanent: {msg}")).await;
+            mark_dead(store, snapshots_dir, &row, format!("permanent: {msg}")).await;
         }
         Err(SinkError::Transient(msg)) => {
-            schedule_retry(store, &row, &format!("transient: {msg}")).await;
+            schedule_retry(store, snapshots_dir, &row, &format!("transient: {msg}")).await;
         }
     }
 }
 
-async fn schedule_retry(store: &Arc<Store>, row: &OutboxRow, msg: &str) {
+async fn schedule_retry(
+    store: &Arc<Store>,
+    snapshots_dir: Option<&std::path::Path>,
+    row: &OutboxRow,
+    msg: &str,
+) {
     // `attempts + 1` is what the column will hold after
     // `outbox_mark_failed` bumps it; backoff_for takes the
     // post-bump value to schedule the next-try delay.
@@ -425,12 +510,23 @@ async fn schedule_retry(store: &Arc<Store>, row: &OutboxRow, msg: &str) {
         }
         None => {
             // Retries exhausted.
-            mark_dead(store, row, format!("max retries exceeded ({msg})")).await;
+            mark_dead(
+                store,
+                snapshots_dir,
+                row,
+                format!("max retries exceeded ({msg})"),
+            )
+            .await;
         }
     }
 }
 
-async fn mark_dead(store: &Arc<Store>, row: &OutboxRow, msg: String) {
+async fn mark_dead(
+    store: &Arc<Store>,
+    snapshots_dir: Option<&std::path::Path>,
+    row: &OutboxRow,
+    msg: String,
+) {
     if let Err(e) = store.outbox_mark_dead(row.id, &msg).await {
         warn!(
             outbox_id = row.id,
@@ -438,4 +534,5 @@ async fn mark_dead(store: &Arc<Store>, row: &OutboxRow, msg: String) {
             "sink dispatcher: outbox_mark_dead failed"
         );
     }
+    reclaim_snapshot_if_drained(store, snapshots_dir, &row.event_id).await;
 }
