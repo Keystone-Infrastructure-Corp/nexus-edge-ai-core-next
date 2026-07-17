@@ -151,13 +151,13 @@ impl YoloOrtDetector {
 ///   1. Try the exact-size file (`yolo26n_<w>.onnx`). This is the only
 ///      path that hits in production — the release tarball stages
 ///      `yolo26n_640.onnx`, `yolo26n_960.onnx`, and `yolo26n_1280.onnx`
-///      from `models/`, so every per-tier default and every
+///      from `models/`, so every shipped default and every
 ///      per-camera UI override is satisfiable.
 ///   2. **Dev escape hatch only.** Cross-size fallback (use 640 when
 ///      960 was asked for, etc.) and the legacy
 ///      `yolo26n_dynamic.onnx` file are gated behind
 ///      `NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1`. The reason: when an
-///      operator configures a camera at 960 on T36-S Lunar Lake but
+///      operator configures a camera at 960 on Lunar Lake but
 ///      only the 640 file is staged, silently degrading to 640
 ///      either (a) ships a lower-accuracy model the operator did NOT
 ///      pick, or (b) routes the model through the dynamic-shape

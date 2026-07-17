@@ -27,7 +27,7 @@ async fn enroll_roundtrips_against_canonical_cloud_shape() {
 
     // The request body must be exactly `{code, csr_pem, fingerprint}` —
     // no extra fields. wiremock's `body_json` does deep equality so an
-    // accidental `tier: "t36"` (the pre-Phase-1.7 shape) would fail.
+    // accidental stray field (e.g. a leftover `capability_profile`) would fail.
     let request_body = json!({
         "code": "XJ4K-PMQ7-9NAB",
         "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\ncsr\n-----END CERTIFICATE REQUEST-----\n",

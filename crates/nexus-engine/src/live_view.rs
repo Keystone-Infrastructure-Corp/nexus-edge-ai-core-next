@@ -66,8 +66,8 @@ const FOCUS_FPS: u32 = 8;
 
 /// Per-core global LBR encode budget (encodes/sec summed across every
 /// engaged camera). The hard backstop that makes LBR yield to inference —
-/// deliberately conservative; tuned per hardware tier later (T10 tighter
-/// than T24/T36). Encode (resize + JPEG) is the expensive step the budget
+/// deliberately conservative; tuned per hardware profile later (lower-power
+/// boxes tighter). Encode (resize + JPEG) is the expensive step the budget
 /// governs; the per-tick "did the scene change?" check is cheap + unbounded.
 const DEFAULT_BUDGET_PER_SEC: u32 = 24;
 

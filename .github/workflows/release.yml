@@ -286,7 +286,7 @@ jobs:
           echo "Staged model pack from $PACK_TAG:"
           ls -la models/
           # yolo26n ships as three per-size static-shape exports (640/960/1280).
-          # Per-tier defaults: T10/T24=640, T36/T36-S=960; 1280 is the
+          # Per-profile defaults: 640 (iGPU/Hailo), 960 (NPU/dGPU); 1280 is the
           # per-camera UI override for plate/face work. Static shapes are
           # mandatory for the Intel NPU plugin (silent CPU fallback on
           # dynamic shapes, observed on Lunar Lake k13 under v0.1.18).
@@ -508,7 +508,7 @@ jobs:
 
           # The live config is GENERATED on-box by `nexus-probe emit-config`
           # (see scripts/install.sh emit_config); nexus.example.toml ships as a
-          # human-readable reference only. The old per-tier templates were
+          # human-readable reference only. The old per-box templates were
           # retired with the capability-based generator (M_HWCONFIG).
           cp config/nexus.example.toml   "$R/etc-templates/nexus.example.toml"
 

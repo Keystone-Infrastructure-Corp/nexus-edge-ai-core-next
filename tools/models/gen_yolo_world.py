@@ -11,8 +11,8 @@ closed-vocab head:
   Per-camera config picks a *subset* of those prompts at runtime; the
   Rust detector filters detections to that subset before emitting them.
 * **Multi-size static exports (as of v0.1.22).** Mirrors `gen_yolo26n.py`
-  — ships per-tier static-shape ONNXs `yolo_world_v2_s_640.onnx`
-  (T10/T24 default) and `yolo_world_v2_s_960.onnx` (T36/T36-S default).
+  — ships per-size static-shape ONNXs `yolo_world_v2_s_640.onnx`
+  (640 default) and `yolo_world_v2_s_960.onnx` (960 default).
   Static shapes are mandatory for the Intel NPU plugin (which silently
   falls back to CPU on dynamic-shape models, observed on Lunar Lake k13
   under v0.1.18–v0.1.20) and let the OpenVINO blob cache hit on
@@ -152,8 +152,8 @@ def upsert_manifest_entry(
         "task": "detect_open_vocab_text",
         "_comment": (
             "YOLO-World v2 (small) export. As of v0.1.22 the engine ships "
-            "per-tier STATIC-shape ONNXs — yolo_world_v2_s_640.onnx "
-            "(T10/T24 default) and yolo_world_v2_s_960.onnx (T36/T36-S "
+            "per-size STATIC-shape ONNXs — yolo_world_v2_s_640.onnx "
+            "(640 default) and yolo_world_v2_s_960.onnx (960 "
             "default). Static shapes are mandatory for the Intel NPU plugin "
             "(silent CPU fallback on dynamic shapes, observed on Lunar Lake "
             "k13 under v0.1.18–0.1.20) and let the OpenVINO blob cache hit "
@@ -362,7 +362,7 @@ def main() -> int:
         default="640",
         help=(
             "Which preset name to write as `default_preset` in the manifest. "
-            "Defaults to 640 (matches T10/T24)."
+            "Defaults to 640 (the iGPU/Hailo default)."
         ),
     )
     args = parser.parse_args()

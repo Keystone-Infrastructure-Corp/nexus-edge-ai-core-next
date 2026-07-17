@@ -52,10 +52,10 @@ Environment=RUST_LOG=info,nexus=info
 # kernels and unsupported upstream — prefer the Vulkan path.
 # Environment=HSA_OVERRIDE_GFX_VERSION=10.3.0
 
-# T64 (CUDA + TensorRT) operators uncomment the CUDA path. The installed
+# NVIDIA (CUDA + TensorRT) operators uncomment the CUDA path. The installed
 # binary is built with --features ep-cuda,ep-tensorrt — the EP is only
 # activated when ep_priority in nexus.toml asks for it AND libcuda is
-# loadable, so leaving this commented on non-T64 boxes is harmless.
+# loadable, so leaving this commented on non-NVIDIA boxes is harmless.
 # Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime:/usr/local/cuda/lib64
 
 ExecStart=/opt/nexus/current/bin/nexus-engine --config /etc/nexus/nexus.toml
@@ -138,7 +138,7 @@ DeviceAllow=/dev/accel/accel0 rw
 DeviceAllow=/dev/nvidia0 rw
 DeviceAllow=/dev/nvidiactl rw
 DeviceAllow=/dev/nvidia-uvm rw
-# Hailo-8 M.2 (T24). The hailo_pci driver registers a private char
+# Hailo-8 M.2. The hailo_pci driver registers a private char
 # major (511 on Ubuntu 24.04 HWE), so neither char-drm nor /dev/accel/*
 # covers it; without this line DevicePolicy=closed denies the open
 # even though world perms are crw-rw-rw-.

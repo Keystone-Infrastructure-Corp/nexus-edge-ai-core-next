@@ -1045,7 +1045,7 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_path: Option<PathBuf>,
     /// Pack preset name — "320" / "640" / "1280" for the shipped yolo26n
-    /// dynamic model. T10 picks 320, T24/T36/T36-S/T64 pick 640.
+    /// dynamic model. The CPU profile picks 320, all others pick 640.
     #[serde(default = "default_preset")]
     pub preset: String,
     #[serde(default = "default_input_width")]
@@ -2481,8 +2481,8 @@ pub struct CameraBehavior {
     /// detector_downscale_to_height)` at startup. When the camera's
     /// hysteresis flips to downscaled, the supervisor picks this
     /// pre-built layer instead of the camera's normal detector.
-    /// Typical pairing: high-res 960 → low-res 640 on T36, or 1280 →
-    /// 960 on T36-S.
+    /// Typical pairing: high-res 960 → low-res 640, or 1280 →
+    /// 960.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector_downscale_to_width: Option<u32>,
     /// M_PERF_CROWD Phase E3 — companion to
@@ -2526,7 +2526,7 @@ pub struct CameraBehavior {
     /// the supervisor re-spawns its `FrameSource` against the new
     /// shared RGB stream. Set together with the threshold +
     /// sustained-secs knobs above to enable. `None` disables.
-    /// Typical pairing: 960 → 640 (T36) or 1280 → 960 (T36-S).
+    /// Typical pairing: 960 → 640 or 1280 → 960.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_downscale_to_width: Option<u32>,
     /// M_TILE_REINFER (G1) — opt-in cascaded re-inference on a small
@@ -2555,8 +2555,8 @@ pub struct CameraBehavior {
     /// `None` defaults to `3` at the call site (a 2×2 grid yields
     /// at most 4 cells; capping at 3 keeps the worst-case latency
     /// budget within one extra detector cost). Operators raise this
-    /// to allow more thorough coverage on T36-S, or lower it to
-    /// throttle compute on T24.
+    /// to allow more thorough coverage on higher-power boxes, or lower
+    /// it to throttle compute on lower-power ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tile_max_per_frame: Option<u32>,
     /// M_TILE_REINFER (G1) — grid preset (square-only to preserve
@@ -3433,7 +3433,7 @@ talk_down = { speaker_present = true, backchannel_codec = "PCMU", backchannel_ur
             .and_then(|p| p.parent())
             .expect("repo root above crates/nexus-config");
         let config_dir = repo_root.join("config");
-        // Scan the shipped top-level `config/` samples. The per-tier
+        // Scan the shipped top-level `config/` samples. The per-box
         // templates that used to live under `config/tiers/` were retired
         // with the capability-based generator (M_HWCONFIG): the live
         // /etc/nexus/nexus.toml is now produced by `nexus-probe

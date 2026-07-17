@@ -128,8 +128,8 @@ fn warn_openvino_unavailable_once() {
              (/dev/dri/renderD12x) or NPU (/dev/accel/accel0) device node \
              is reachable inside this container; OpenVINO entries are being \
              skipped and inference will run on CPU. For hardware \
-             acceleration, ensure the per-tier overlay \
-             (deploy/docker-compose.tNN.yml) is layered on top of the base \
+             acceleration, ensure the device overlay \
+             (deploy/docker-compose.<device>.yml) is layered on top of the base \
              compose file — it bind-mounts /dev/dri and adds the render \
              group to the container user. Override autodetection by setting \
              NEXUS_OPENVINO_DEVICE=force in the environment."
@@ -152,7 +152,7 @@ fn warn_openvino_unavailable_once() {
 ///
 /// The userspace runtime libs (rocm-hip-runtime, rocm-opencl-runtime, librocm_*.so,
 /// and a ROCm-enabled libonnxruntime.so) are installed via apt/package manager
-/// or containerized as a per-tier bundle, so device-node visibility is the
+/// or containerized as a per-device bundle, so device-node visibility is the
 /// check that depends on the host container configuration.
 ///
 /// Unlike the OpenVINO probe, this one verifies the device nodes are actually

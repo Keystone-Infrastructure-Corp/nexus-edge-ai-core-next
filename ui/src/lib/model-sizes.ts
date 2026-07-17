@@ -51,9 +51,9 @@ export function defaultSizeForKind(kind: string): number | undefined {
 export function describeSize(size: number): string {
   switch (size) {
     case 640:
-      return "640 × 640 — fastest, fits every tier";
+      return "640 × 640 — fastest, fits every box";
     case 960:
-      return "960 × 960 — balanced; default on T36 / T36-S";
+      return "960 × 960 — balanced; default on dGPU / NPU boxes";
     case 1280:
       return "1280 × 1280 — highest detail; opt-in for plate/face";
     default:

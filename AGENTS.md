@@ -5,7 +5,7 @@
 ## What this repo is
 
 The **edge engine** for Nexus Edge AI: a Rust workspace that runs on-premises camera
-appliances (T10 / T24 / T36 / T36-S tiers). It owns the GStreamer pipeline, ONNX-Runtime
+appliances (Intel iGPU, Intel NPU, Hailo, AMD, and NVIDIA hardware profiles). It owns the GStreamer pipeline, ONNX-Runtime
 inference, multi-object tracking, rules evaluation, motion-clip recording, the local
 admin/UI server, and the WSS tunnel client to the cloud. The engine is **functional in
 total isolation from any cloud** — the cloud control plane is an optional companion.
