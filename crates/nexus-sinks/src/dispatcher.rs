@@ -291,6 +291,20 @@ async fn reclaim_snapshot_if_drained(
     }
 }
 
+/// Whether an alert is still young enough that a not-yet-available
+/// clip might still resolve. Covers three transient conditions:
+///   * the supervisor hasn't written the clip link yet (it does so a
+///     few frames after enqueueing the outbox row);
+///   * the recorder hasn't flushed the hot MP4 to disk yet;
+///   * a disk-pressure eviction raced the clip close.
+/// Past this window we stop waiting and deliver clip-less rather than
+/// hold the alarm forever. Sized (`CLIP_LINK_GRACE_SECS`) well inside
+/// the backoff horizon so waiting never exhausts a row's retries.
+fn within_clip_grace(event: &AlertEvent) -> bool {
+    Utc::now().signed_duration_since(event.captured_at)
+        < chrono::Duration::seconds(CLIP_LINK_GRACE_SECS)
+}
+
 /// Process a single outbox row. Public so the test crate can drive
 /// the state machine without booting `run_dispatcher`'s timer loop.
 ///
@@ -308,20 +322,6 @@ async fn reclaim_snapshot_if_drained(
 ///      the row points at a sink the operator has since deleted,
 ///      and retrying buys nothing.
 ///   4. Actual delivery.
-/// Whether an alert is still young enough that a not-yet-available
-/// clip might still resolve. Covers three transient conditions:
-///   * the supervisor hasn't written the clip link yet (it does so a
-///     few frames after enqueueing the outbox row);
-///   * the recorder hasn't flushed the hot MP4 to disk yet;
-///   * a disk-pressure eviction raced the clip close.
-/// Past this window we stop waiting and deliver clip-less rather than
-/// hold the alarm forever. Sized (`CLIP_LINK_GRACE_SECS`) well inside
-/// the backoff horizon so waiting never exhausts a row's retries.
-fn within_clip_grace(event: &AlertEvent) -> bool {
-    Utc::now().signed_duration_since(event.captured_at)
-        < chrono::Duration::seconds(CLIP_LINK_GRACE_SECS)
-}
-
 pub async fn process_row(
     store: &Arc<Store>,
     registry: &Arc<SinkRegistry>,
