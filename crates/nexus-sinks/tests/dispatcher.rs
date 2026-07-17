@@ -698,7 +698,7 @@ async fn clip_hot_file_present_delivers_with_clip() {
         &store,
         &registry,
         &AllowAllPolicy,
-        Some(clips_dir.path().to_path_buf()),
+        Some(clips_dir.path()),
         None,
         row.clone(),
     )
@@ -740,7 +740,7 @@ async fn clip_hot_file_missing_within_grace_retries() {
         &store,
         &registry,
         &AllowAllPolicy,
-        Some(clips_dir.path().to_path_buf()),
+        Some(clips_dir.path()),
         None,
         row.clone(),
     )
@@ -785,7 +785,7 @@ async fn clip_soft_evicted_within_grace_retries() {
         &store,
         &registry,
         &AllowAllPolicy,
-        Some(clips_dir.path().to_path_buf()),
+        Some(clips_dir.path()),
         None,
         row.clone(),
     )
@@ -842,7 +842,7 @@ async fn clip_soft_evicted_after_grace_delivers_clipless() {
         &store,
         &registry,
         &AllowAllPolicy,
-        Some(clips_dir.path().to_path_buf()),
+        Some(clips_dir.path()),
         None,
         row.clone(),
     )
