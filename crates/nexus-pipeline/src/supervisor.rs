@@ -18,8 +18,8 @@ use nexus_tracker::{
     MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
 };
 use nexus_types::{
-    CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState, PipelineStatus, PixelFormat,
-    TrackLite, TrackedObject,
+    BBox, CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState, PipelineStatus,
+    PixelFormat, TrackLite, TrackedObject,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -57,6 +57,61 @@ const SIZE_STAT_INTERVAL_FRAMES: u32 = 60;
 /// recognisable console thumbnail, small enough to keep the blob cheap.
 const SNAPSHOT_JPEG_QUALITY: u8 = 72;
 
+/// Stroke half-width (in pixels) for the bounding box drawn onto an
+/// alert snapshot. A 3px-thick box (half-width 1) stays visible after
+/// JPEG compression without swamping small objects.
+const SNAPSHOT_BBOX_HALF_STROKE: i64 = 1;
+
+/// RGB colour of the alert bounding box (bright green, matches the
+/// live-view overlay).
+const SNAPSHOT_BBOX_RGB: [u8; 3] = [0x2e, 0xe6, 0x4a];
+
+/// Draw a filled-stroke rectangle for `bbox` onto an RGB24 buffer in
+/// place. Coordinates are in the same pixel space as the frame
+/// (`width` × `height`) — the alert snapshot is the supervisor frame,
+/// and `bbox` is stamped in supervisor-frame coordinates, so they map
+/// 1:1. Out-of-range edges are clamped; a degenerate box is a no-op.
+fn draw_bbox_rgb24(buf: &mut [u8], width: u32, height: u32, bbox: &BBox) {
+    let w = width as i64;
+    let h = height as i64;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let x1 = (bbox.x1.round() as i64).clamp(0, w - 1);
+    let y1 = (bbox.y1.round() as i64).clamp(0, h - 1);
+    let x2 = (bbox.x2.round() as i64).clamp(0, w - 1);
+    let y2 = (bbox.y2.round() as i64).clamp(0, h - 1);
+    if x2 <= x1 || y2 <= y1 {
+        return;
+    }
+    let s = SNAPSHOT_BBOX_HALF_STROKE;
+    let mut put = |x: i64, y: i64| {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return;
+        }
+        let idx = ((y * w + x) * 3) as usize;
+        if idx + 2 < buf.len() {
+            buf[idx] = SNAPSHOT_BBOX_RGB[0];
+            buf[idx + 1] = SNAPSHOT_BBOX_RGB[1];
+            buf[idx + 2] = SNAPSHOT_BBOX_RGB[2];
+        }
+    };
+    // Top + bottom edges (thickened by ±s rows).
+    for x in x1..=x2 {
+        for d in -s..=s {
+            put(x, y1 + d);
+            put(x, y2 + d);
+        }
+    }
+    // Left + right edges (thickened by ±s columns).
+    for y in y1..=y2 {
+        for d in -s..=s {
+            put(x1 + d, y);
+            put(x2 + d, y);
+        }
+    }
+}
+
 /// Encode an alert's supervisor frame to JPEG and persist it at
 /// `<snapshots_dir>/<event_id>.jpg`.
 ///
@@ -64,12 +119,18 @@ const SNAPSHOT_JPEG_QUALITY: u8 = 72;
 /// sink can locate the file for SAS upload without the path travelling
 /// through the durable outbox. Best-effort: any encode/write failure is
 /// logged and yields `None` so a missing thumbnail never blocks the
-/// alert itself. Encoding runs on the blocking pool because JPEG of a
+/// alert. Encoding runs on the blocking pool because JPEG of a
 /// 720p frame is a few milliseconds of CPU we keep off the async loop.
+///
+/// When `bbox` is `Some`, the object's bounding box is drawn onto the
+/// frame before encoding so the snapshot the operator (and downstream
+/// email/SureView sinks) sees is annotated, matching the "annotated
+/// snapshot" contract on [`nexus_types::Artifacts::snapshot`].
 async fn write_alert_snapshot(
     snapshots_dir: &Path,
     event_id: &str,
     frame: &Arc<Frame>,
+    bbox: Option<BBox>,
 ) -> Option<String> {
     // The supervisor frame is guaranteed RGB24 (see source.rs); guard
     // anyway so a future format change fails closed rather than writing
@@ -83,10 +144,16 @@ async fn write_alert_snapshot(
     let join = tokio::task::spawn_blocking(move || {
         use image::ImageEncoder as _;
         let path = dir.join(format!("{id}.jpg"));
+        // The frame buffer is shared (Arc<Frame>); copy it so the
+        // bbox stroke doesn't mutate pixels other subscribers see.
+        let mut pixels = frame.data.to_vec();
+        if let Some(bbox) = bbox {
+            draw_bbox_rgb24(&mut pixels, frame.width, frame.height, &bbox);
+        }
         let mut out = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, SNAPSHOT_JPEG_QUALITY)
             .write_image(
-                &frame.data[..],
+                &pixels[..],
                 frame.width,
                 frame.height,
                 image::ExtendedColorType::Rgb8,
@@ -997,7 +1064,7 @@ async fn run_camera(
                 // row. Best-effort: a missing thumbnail never blocks the
                 // alert. Also stamped onto `artifacts.snapshot` for bus
                 // subscribers / the local admin API.
-                if let Some(path) = write_alert_snapshot(&snapshots_dir, &event_id, &frame_arc).await
+                if let Some(path) = write_alert_snapshot(&snapshots_dir, &event_id, &frame_arc, ev.bbox).await
                 {
                     ev.artifacts.snapshot = Some(path);
                 }

@@ -140,7 +140,7 @@ async fn drain(store: &Arc<Store>, registry: &Arc<SinkRegistry>, mut row: Outbox
         if row.status != OutboxStatus::Pending {
             break;
         }
-        dispatcher::process_row(store, registry, &AllowAllPolicy, row.clone()).await;
+        dispatcher::process_row(store, registry, &AllowAllPolicy, None, row.clone()).await;
         row = store
             .outbox_for_event(&row.event_id)
             .await

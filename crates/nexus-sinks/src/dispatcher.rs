@@ -123,6 +123,13 @@ impl DeliveryPolicy for AllowAllPolicy {
 pub struct SinkDispatcherConfig {
     pub tick_interval: Duration,
     pub batch_size: i64,
+    /// Root directory `motion_clips.hot_path` values are relative to.
+    /// Threaded through so the dispatcher can resolve a linked clip's
+    /// on-disk MP4 path for sinks that attach it (see
+    /// [`crate::AlertSink::wants_clip`]). `None` disables clip
+    /// resolution — clip-attaching sinks then behave as if the clip
+    /// were unavailable.
+    pub clips_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for SinkDispatcherConfig {
@@ -130,6 +137,7 @@ impl Default for SinkDispatcherConfig {
         Self {
             tick_interval: TICK_INTERVAL,
             batch_size: BATCH_SIZE,
+            clips_dir: None,
         }
     }
 }
@@ -201,7 +209,7 @@ async fn tick(
     debug!(n = rows.len(), "sink dispatcher: draining batch");
 
     for row in rows {
-        process_row(store, registry, policy, row).await;
+        process_row(store, registry, policy, cfg.clips_dir.as_deref(), row).await;
     }
 }
 
@@ -226,6 +234,7 @@ pub async fn process_row(
     store: &Arc<Store>,
     registry: &Arc<SinkRegistry>,
     policy: &dyn DeliveryPolicy,
+    clips_dir: Option<&std::path::Path>,
     row: OutboxRow,
 ) {
     // Belt-and-suspenders: outbox_pending should already filter
@@ -243,7 +252,7 @@ pub async fn process_row(
     let now = Utc::now();
 
     // (1) Re-hydrate the event. Missing → terminal-dead.
-    let event = match store.get_event(&row.event_id).await {
+    let mut event = match store.get_event(&row.event_id).await {
         Ok(Some(ev)) => ev,
         Ok(None) => {
             mark_dead(
@@ -297,6 +306,82 @@ pub async fn process_row(
             return;
         }
     };
+
+    // (3.5) Clip resolution. Sinks that attach the surrounding motion
+    // clip (e.g. SureView email with `attach_clip`) need the MP4 on
+    // disk. The clip is linked to the event AFTER the alert fires and
+    // only finishes recording once the post-roll window closes —
+    // seconds after the outbox row was enqueued. So for a
+    // clip-attaching sink we:
+    //   * look up the event's linked clip_id;
+    //   * if the clip is still recording (`ended_at IS NULL`),
+    //     schedule a transient retry so we wait for the file to
+    //     finalise rather than sending a clip-less alarm;
+    //   * once closed, stamp the resolved absolute path onto
+    //     `event.artifacts.clip` so the sink attaches it.
+    // Events with no linked clip fall straight through (nothing to
+    // wait for). `payload_json` never carried the clip path because
+    // the event is serialised before the clip link, which is exactly
+    // why this resolution has to happen here at delivery time.
+    if sink.wants_clip() && event.artifacts.clip.is_none() {
+        match store.get_event_clip_id(&row.event_id).await {
+            Ok(Some(clip_id)) => match store.get_clip(clip_id).await {
+                Ok(Some(clip)) => {
+                    if clip.ended_at.is_none() {
+                        schedule_retry(
+                            store,
+                            &row,
+                            &format!("clip {clip_id} still recording; awaiting post-roll close"),
+                        )
+                        .await;
+                        return;
+                    }
+                    match (clips_dir, clip.hot_path.as_deref()) {
+                        (Some(dir), Some(rel)) => {
+                            let abs = dir.join(rel);
+                            event.artifacts.clip = Some(abs.to_string_lossy().into_owned());
+                        }
+                        _ => {
+                            // Clip closed but no hot copy (soft-evicted to
+                            // cold, or clips_dir unset). Deliver without it
+                            // rather than blocking the alarm.
+                            debug!(
+                                outbox_id = row.id,
+                                clip_id, "clip has no hot path; delivering without clip"
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    debug!(
+                        outbox_id = row.id,
+                        clip_id, "linked clip row missing; delivering without clip"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        outbox_id = row.id,
+                        error = %e,
+                        "sink dispatcher: get_clip failed; will retry"
+                    );
+                    schedule_retry(store, &row, &format!("get_clip error: {e}")).await;
+                    return;
+                }
+            },
+            Ok(None) => {
+                // No clip linked to this alert — nothing to attach.
+            }
+            Err(e) => {
+                warn!(
+                    outbox_id = row.id,
+                    error = %e,
+                    "sink dispatcher: get_event_clip_id failed; will retry"
+                );
+                schedule_retry(store, &row, &format!("clip lookup error: {e}")).await;
+                return;
+            }
+        }
+    }
 
     // (4) Actual delivery.
     match sink.deliver(&event).await {
