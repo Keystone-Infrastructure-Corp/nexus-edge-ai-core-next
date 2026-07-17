@@ -200,7 +200,7 @@ async fn delivers_pending_row_marks_sent() {
     registry.replace(vec![sink.clone()]);
 
     let (_alert, row) = enqueue_one(&store, 1, "rule.ok", id.as_str()).await;
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, row.clone()).await;
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
 
     assert_eq!(sink.calls(), 1);
     let after = store
@@ -233,7 +233,7 @@ async fn permanent_error_marks_dead() {
     registry.replace(vec![sink.clone()]);
 
     let (_alert, row) = enqueue_one(&store, 1, "rule.p", id.as_str()).await;
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, row.clone()).await;
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
 
     assert_eq!(sink.calls(), 1);
     let after = store
@@ -268,7 +268,7 @@ async fn transient_error_schedules_retry() {
 
     let (_alert, row) = enqueue_one(&store, 1, "rule.t", id.as_str()).await;
     let before = Utc::now();
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, row.clone()).await;
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
 
     assert_eq!(sink.calls(), 1);
     let after = store
@@ -327,7 +327,7 @@ async fn exhausted_retries_become_dead() {
         .unwrap();
     assert_eq!(row_after_backdate.attempts, attempts_before_last);
 
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, row_after_backdate).await;
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row_after_backdate).await;
 
     let after = store
         .outbox_for_event(&row.event_id)
@@ -355,7 +355,7 @@ async fn suppressed_by_policy_marks_suppressed() {
     registry.replace(vec![sink.clone()]);
 
     let (_alert, row) = enqueue_one(&store, 1, "rule.s", id.as_str()).await;
-    dispatcher::process_row(&store, &registry, &SuppressOnlyPolicy, None, row.clone()).await;
+    dispatcher::process_row(&store, &registry, &SuppressOnlyPolicy, None, None, row.clone()).await;
 
     // Policy short-circuits BEFORE deliver() — sink never called.
     assert_eq!(sink.calls(), 0);
@@ -386,7 +386,7 @@ async fn missing_sink_marks_dead() {
 
     let registry = Arc::new(SinkRegistry::new()); // EMPTY
     let (_alert, row) = enqueue_one(&store, 1, "rule.miss", "webhook:gone").await;
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, row.clone()).await;
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
 
     let after = store
         .outbox_for_event(&row.event_id)
@@ -448,7 +448,7 @@ async fn missing_event_marks_dead() {
             .unwrap();
     }
 
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, row.clone()).await;
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
 
     assert_eq!(sink.calls(), 0, "deliver() must not be called");
     let after = store
@@ -489,7 +489,7 @@ async fn malformed_sink_id_marks_dead() {
         .next()
         .unwrap();
 
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, row.clone()).await;
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
 
     let after = store
         .outbox_for_event(&row.event_id)

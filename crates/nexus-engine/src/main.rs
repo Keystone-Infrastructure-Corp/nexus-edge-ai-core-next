@@ -1130,6 +1130,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         let policy = delivery_policy.clone();
         let dispatcher_cfg = nexus_sinks::dispatcher::SinkDispatcherConfig {
             clips_dir: Some(clips_dir.clone()),
+            snapshots_dir: Some(snapshots_dir.clone()),
             ..Default::default()
         };
         tokio::spawn(async move {
