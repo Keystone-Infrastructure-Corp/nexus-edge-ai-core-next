@@ -202,6 +202,64 @@ pub fn frame_wall_clock(window_start: DateTime<Utc>, rebased_pts: Duration) -> D
         + chrono::Duration::from_std(rebased_pts).unwrap_or_else(|_| chrono::Duration::zero())
 }
 
+/// Bright-green stroke colour for burned-in alert-clip boxes (matches
+/// the alert snapshot in `supervisor.rs` and the live-view overlay).
+pub const BURN_BOX_RGB: [u8; 3] = [0x2e, 0xe6, 0x4a];
+
+/// Draw `b` (in the SAME pixel space as the buffer) onto a packed RGB24
+/// frame in place, with stroke half-width `half` (so the visible stroke
+/// is `2*half + 1` px — the encoder scales this up for native
+/// resolution). Coordinates are clamped to the frame; a degenerate box
+/// is a no-op. Mirrors `supervisor::draw_bbox_rgb24` but takes a
+/// [`BurnBox`] already scaled to native pixels via [`scale_box`].
+pub fn draw_burnbox_rgb24(buf: &mut [u8], width: u32, height: u32, b: &BurnBox, half: i64) {
+    let w = width as i64;
+    let h = height as i64;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let x1 = (b.x1.round() as i64).clamp(0, w - 1);
+    let y1 = (b.y1.round() as i64).clamp(0, h - 1);
+    let x2 = (b.x2.round() as i64).clamp(0, w - 1);
+    let y2 = (b.y2.round() as i64).clamp(0, h - 1);
+    if x2 <= x1 || y2 <= y1 {
+        return;
+    }
+    let mut put = |x: i64, y: i64| {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return;
+        }
+        let idx = ((y * w + x) * 3) as usize;
+        if idx + 2 < buf.len() {
+            buf[idx] = BURN_BOX_RGB[0];
+            buf[idx + 1] = BURN_BOX_RGB[1];
+            buf[idx + 2] = BURN_BOX_RGB[2];
+        }
+    };
+    // Top + bottom edges, thickened by +/- half rows.
+    for x in x1..=x2 {
+        for d in -half..=half {
+            put(x, y1 + d);
+            put(x, y2 + d);
+        }
+    }
+    // Left + right edges, thickened by +/- half columns.
+    for y in y1..=y2 {
+        for d in -half..=half {
+            put(x1 + d, y);
+            put(x2 + d, y);
+        }
+    }
+}
+
+/// Stroke half-width to use for a native frame of the given width, so
+/// the burned-in box stays visible after H.264 compression regardless
+/// of resolution (roughly 1px per 640px of width, min 1).
+#[must_use]
+pub fn burn_stroke_half(native_w: u32) -> i64 {
+    ((native_w / 640).max(1)) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +401,55 @@ mod tests {
 
         let inflight = alert_clip_inflight_path(Path::new("/var/lib/nexus/clips"), &rel);
         assert!(inflight.to_string_lossy().ends_with(".partial.mp4"));
+    }
+
+    #[test]
+    fn draw_burnbox_paints_border_not_interior() {
+        let (w, h) = (8u32, 8u32);
+        let mut buf = vec![0u8; (w * h * 3) as usize];
+        draw_burnbox_rgb24(
+            &mut buf,
+            w,
+            h,
+            &BurnBox {
+                x1: 1.0,
+                y1: 1.0,
+                x2: 6.0,
+                y2: 6.0,
+            },
+            0,
+        );
+        // A box corner is painted green...
+        let corner = ((w + 1) * 3) as usize;
+        assert_eq!(&buf[corner..corner + 3], &BURN_BOX_RGB);
+        // ...but the interior is untouched (only the border is drawn).
+        let center = ((3 * w + 3) * 3) as usize;
+        assert_eq!(&buf[center..center + 3], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn draw_burnbox_degenerate_is_noop() {
+        let mut buf = vec![5u8; 8 * 8 * 3];
+        let before = buf.clone();
+        draw_burnbox_rgb24(
+            &mut buf,
+            8,
+            8,
+            &BurnBox {
+                x1: 4.0,
+                y1: 4.0,
+                x2: 4.0,
+                y2: 4.0,
+            },
+            0,
+        );
+        assert_eq!(buf, before, "a zero-area box must paint nothing");
+    }
+
+    #[test]
+    fn burn_stroke_half_scales_with_width() {
+        assert_eq!(burn_stroke_half(320), 1); // min 1
+        assert_eq!(burn_stroke_half(640), 1);
+        assert_eq!(burn_stroke_half(1920), 3);
     }
 }
