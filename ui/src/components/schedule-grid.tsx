@@ -34,6 +34,21 @@ export function cloneGrid(g: boolean[][]): boolean[][] {
   return g.map((row) => row.slice());
 }
 
+// Half-hour label for a slot, e.g. slot 37 -> "18:30". slot 48 -> "24:00".
+function slotLabel(slot: number): string {
+  const h = Math.floor(slot / 2);
+  const m = slot % 2 === 0 ? "00" : "30";
+  return `${h.toString().padStart(2, "0")}:${m}`;
+}
+
+// Full 30-minute range a slot covers, e.g. slot 37 -> "18:30\u201319:00".
+// Shown as a hover tooltip so operators see exactly which block a cell is,
+// avoiding the off-by-one-slot mistake (leaving 18:30 suppressed when the
+// window was meant to open at 18:30 rather than 19:00).
+function slotRangeLabel(slot: number): string {
+  return `${slotLabel(slot)}\u2013${slotLabel(slot + 1)}`;
+}
+
 export function ScheduleGrid({
   grid,
   onChange,
@@ -134,6 +149,9 @@ export function ScheduleGrid({
                   {row.map((on, slot) => (
                     <td
                       key={slot}
+                      title={`${day} ${slotRangeLabel(slot)} \u00b7 ${
+                        on ? "delivery on" : "suppressed"
+                      }`}
                       onPointerDown={onPointerDown(di, slot)}
                       onPointerEnter={onPointerEnter(di, slot)}
                       style={{
