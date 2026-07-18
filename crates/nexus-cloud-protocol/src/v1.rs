@@ -175,6 +175,9 @@ pub struct ClipReplicatedPayload {
     pub duration_ms: u64,
     /// Core-local clip id. Dedup key on cloud INSERT (cores.id × edge_clip_id).
     pub edge_clip_id: String,
+    /// M-Alert-Clip — true when this is a short, burned-in alert clip (the alert's evidence, edge_clip_id prefixed `alert-`), not a passthrough motion clip. Cloud stores clips.is_alert_clip and the alert→clip resolver prefers it over the covering motion clip. Optional; defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_alert_clip: Option<bool>,
     /// Hex-encoded streaming SHA-256 of the clip bytes computed during MP4 write on the edge. Cloud stores in clips.sha256 and the Phase 6.17 integrity sweep verifies against Blob on read. Pairs with x-ms-blob-content-md5 set during PUT (ARCHITECTURE.md §8.5).
     pub sha256_hex: String,
     /// Final on-disk byte count after MP4 close. Used for tariff accounting + cold-storage cost projection.

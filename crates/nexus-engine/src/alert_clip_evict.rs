@@ -11,11 +11,20 @@
 //! reclaimed on *delivery completion*, not on age, so this runs on a
 //! short interval. It is a cheap indexed query when the feature is off
 //! (no `ready` rows exist), so it always runs regardless of config.
+//!
+//! M-Alert-Clip cloud delivery adds a second gate: a `ready` clip is
+//! only reclaimed once it has been cold-replicated to the cloud OR its
+//! [`COLD_GRACE`] window has elapsed. That keeps the burned-in evidence
+//! on the hot tier long enough for an enrolled core to ship it to the
+//! console, while still guaranteeing hot-space reclaim on un-enrolled /
+//! cold-disabled boxes (fail-open — the local experience never depends
+//! on cloud reachability).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use nexus_store::Store;
 use tracing::{debug, info, warn};
 
@@ -23,6 +32,14 @@ use tracing::{debug, info, warn};
 /// large backlog (e.g. after a delivery outage clears) doesn't monopolise
 /// the task; the next tick picks up the remainder.
 const EVICT_BATCH: i64 = 64;
+
+/// Grace window a `ready` alert clip is held on the hot tier waiting for
+/// cloud cold-replication before it is reclaimed regardless. Sized well
+/// above the cold replicator's retry cadence so an enrolled core reliably
+/// ships the clip first, yet short enough that hot space is always
+/// reclaimed promptly when there is no cloud (un-enrolled / cold
+/// disabled / backend down past the window).
+const COLD_GRACE: Duration = Duration::from_secs(15 * 60);
 
 /// Tunables for [`run_alert_clip_evictor`].
 pub struct AlertClipEvictorConfig {
@@ -67,7 +84,12 @@ pub async fn run_alert_clip_evictor(
 }
 
 async fn sweep(cfg: &AlertClipEvictorConfig, store: &Arc<Store>) {
-    let rows = match store.alert_clips_evictable(EVICT_BATCH).await {
+    let cold_grace_cutoff = Utc::now()
+        - chrono::Duration::from_std(COLD_GRACE).unwrap_or_else(|_| chrono::Duration::minutes(15));
+    let rows = match store
+        .alert_clips_evictable(EVICT_BATCH, cold_grace_cutoff)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "alert-clip evictor: alert_clips_evictable failed");

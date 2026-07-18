@@ -32,7 +32,7 @@ use futures::StreamExt;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_cloud_client::{ClipReplicatedProjection, TunnelError, TunnelOutbox};
 use nexus_storage::{BackendError, HealthStatus, Registry};
-use nexus_store::{ClipColdMark, ClipRow, Store};
+use nexus_store::{AlertClipColdMark, AlertClipRow, ClipColdMark, ClipRow, Store};
 use nexus_types::AlertEvent;
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -64,6 +64,20 @@ pub const BATCH_SIZE: i64 = 32;
 /// fires on the clip's camera. `bump_clip_priority` is idempotent so
 /// an Expedite + candidate alert on the same clip just lands at 2.
 pub const URGENT_CLIP_PRIORITY: i64 = 2;
+
+/// M-Alert-Clip cloud delivery — max alert clips drained per tick.
+/// Alert clips are small (seconds) and few (one per motion burst), so
+/// a small batch is plenty; the drain is a second pass after the
+/// motion batch and shares the same backend + throttle.
+pub const ALERT_COLD_BATCH: i64 = 8;
+
+/// M-Alert-Clip cloud delivery — minimum spacing between cold-upload
+/// attempts for a single alert clip. A clip whose last attempt is
+/// newer than `now - ALERT_COLD_RETRY` is held out of the pending set,
+/// so a persistently-unreachable backend is retried at ~1/min rather
+/// than every tick. The evictor's grace window is the ultimate
+/// backstop that reclaims a stuck alert clip from the hot tier.
+pub const ALERT_COLD_RETRY: Duration = Duration::from_secs(60);
 
 /// Configuration for the replicator task. All fields are owned so
 /// the spawn site can `clone()` and move into the spawn future.
@@ -447,26 +461,28 @@ async fn tick(
     // 4. Pull a batch of eligible pending clips and process
     // oldest-first. The floor predicate is applied in SQL so the
     // LIMIT window only ever contains upload-eligible clips.
-    let pending = match store.clips_pending_cold_upload(BATCH_SIZE, floor).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!(error = %e, "cold replicator: clips_pending_cold_upload failed");
-            return;
-        }
-    };
-    if pending.is_empty() {
-        debug!("cold replicator: no eligible pending clips this tick");
-        return;
-    }
-
-    // Sync the persistent bucket to the current admin throttle.
+    //
+    // Sync the persistent bucket to the current admin throttle FIRST.
     // `set_rate` preserves whatever credit accrued during the quiet
     // interval, so a normal "one clip every 30 s" workload is
     // effectively unthrottled at the moment of upload — and a burst
     // after a long quiet period is still smoothed by the bucket's
-    // 1-second capacity ceiling.
+    // 1-second capacity ceiling. Resolved up front because both the
+    // motion drain below AND the alert-clip drain (step 4b) share the
+    // throttle + backend handle.
     throttle.set_rate(policy.throttle_bps.max(0) as u64).await;
     let backend_handle = backend.handle().to_string();
+
+    let pending = match store.clips_pending_cold_upload(BATCH_SIZE, floor).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "cold replicator: clips_pending_cold_upload failed");
+            Vec::new()
+        }
+    };
+    if pending.is_empty() {
+        debug!("cold replicator: no eligible pending clips this tick");
+    }
 
     let mut uploaded = 0usize;
     let mut failed = 0usize;
@@ -569,13 +585,206 @@ async fn tick(
             }
         }
     }
-    info!(
-        backend = %backend_handle,
-        uploaded,
-        failed,
-        quarantined,
-        "cold replicator: batch complete"
-    );
+    if uploaded > 0 || failed > 0 || quarantined > 0 {
+        info!(
+            backend = %backend_handle,
+            uploaded,
+            failed,
+            quarantined,
+            "cold replicator: batch complete"
+        );
+    }
+
+    // 4b. Alert clips (M-Alert-Clip cloud delivery). A second drain
+    // pass, independent of the motion batch above — an alert clip can
+    // be pending when no motion clip is. Gated on a wired outbox
+    // because console delivery is the feature's whole point: with no
+    // cloud tunnel there is nowhere to deliver, and the evictor's
+    // grace window reclaims the transient hot file anyway.
+    if cfg.outbox.is_some() {
+        drain_alert_clips(cfg, store, &*backend, throttle, &backend_handle, floor).await;
+    }
+}
+
+/// M-Alert-Clip cloud delivery — drain up to [`ALERT_COLD_BATCH`]
+/// ready alert clips onto the active cold backend and emit a
+/// `clip_replicated` (`is_alert_clip = true`) envelope for each. Runs
+/// as a second pass inside [`tick`] after the motion drain, reusing
+/// the same backend, throttle, and enrollment floor.
+async fn drain_alert_clips(
+    cfg: &ColdReplicatorConfig,
+    store: &Arc<Store>,
+    backend: &dyn nexus_storage::ColdBackend,
+    throttle: &TokenBucket,
+    backend_handle: &str,
+    floor: Option<chrono::DateTime<Utc>>,
+) {
+    let now = Utc::now();
+    let retry_cutoff = now
+        - chrono::Duration::from_std(ALERT_COLD_RETRY)
+            .unwrap_or_else(|_| chrono::Duration::seconds(60));
+    let pending = match store
+        .alert_clips_pending_cold_upload(ALERT_COLD_BATCH, floor, retry_cutoff)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "cold replicator: alert_clips_pending_cold_upload failed");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let mut uploaded = 0usize;
+    let mut failed = 0usize;
+    for clip in pending {
+        match upload_alert_clip_one(cfg, store, backend, throttle, backend_handle, &clip).await {
+            Ok(()) => uploaded += 1,
+            Err(e) => {
+                failed += 1;
+                if let Err(se) = store
+                    .record_alert_clip_cold_failure(clip.id, Utc::now(), &e.to_string())
+                    .await
+                {
+                    warn!(
+                        alert_clip_id = clip.id,
+                        error = %se,
+                        "cold replicator: record_alert_clip_cold_failure failed"
+                    );
+                }
+                warn!(
+                    alert_clip_id = clip.id,
+                    error = %e,
+                    "cold replicator: alert clip upload failed"
+                );
+            }
+        }
+    }
+    if uploaded > 0 || failed > 0 {
+        info!(
+            backend = %backend_handle,
+            uploaded,
+            failed,
+            "cold replicator: alert-clip batch complete"
+        );
+    }
+}
+
+/// Per-alert-clip upload path. Mirrors [`upload_one`] but targets the
+/// `alert_clips` table and stamps `is_alert_clip = true` on the wire.
+///
+/// The cold-path basename is `alert-<id>` — a DISTINCT namespace from
+/// motion clips (which use the bare integer clip id) so the two can
+/// never collide in the cloud `(core_id, edge_clip_id)` unique index.
+/// The cloud recomputes the playback SAS path from `edge_clip_id`, so
+/// the PUT basename MUST equal the wire `edge_clip_id`.
+async fn upload_alert_clip_one(
+    cfg: &ColdReplicatorConfig,
+    store: &Arc<Store>,
+    backend: &dyn nexus_storage::ColdBackend,
+    throttle: &TokenBucket,
+    backend_handle: &str,
+    clip: &AlertClipRow,
+) -> Result<(), UploadError> {
+    let sha256 = clip.sha256.as_deref().ok_or(UploadError::MissingSha256)?;
+    let hot_path_rel = clip.path.as_str();
+    let edge_clip_id = format!("alert-{}", clip.id);
+
+    // Preserve the hot path's parent dir (human-navigable on gdrive /
+    // onedrive backends); for Azure only the basename becomes the blob
+    // name. Basename MUST equal `edge_clip_id`.
+    let cold_path = match std::path::Path::new(hot_path_rel).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            format!("{}/{edge_clip_id}.mp4", parent.display())
+        }
+        _ => format!("{edge_clip_id}.mp4"),
+    };
+
+    // Idempotent fast-path: backend already has a complete copy.
+    let cold_url = match backend.exists(&cold_path, sha256).await {
+        Ok(true) => {
+            debug!(
+                alert_clip_id = clip.id,
+                cold_path, "cold replicator: backend already has alert clip; stamping pointer only"
+            );
+            None
+        }
+        Ok(false) => {
+            let abs = cfg.clips_dir.join(hot_path_rel);
+            let bytes = tokio::fs::read(&abs)
+                .await
+                .map_err(|e| UploadError::HotRead {
+                    path: abs.display().to_string(),
+                    source: e,
+                })?;
+            throttle.acquire(bytes.len() as u64).await;
+            let receipt = backend
+                .put(&cold_path, &bytes, sha256)
+                .await
+                .map_err(UploadError::Backend)?;
+            receipt.cold_url
+        }
+        Err(e) => return Err(UploadError::Backend(e)),
+    };
+
+    store
+        .mark_alert_clip_cold_replicated(
+            clip.id,
+            &AlertClipColdMark {
+                cold_handle: backend_handle.to_string(),
+                cold_path,
+                cold_uploaded_at: Utc::now(),
+            },
+        )
+        .await
+        .map_err(UploadError::Store)?;
+
+    // Emit `clip_replicated` (is_alert_clip = true) after the local
+    // commit. Best-effort, fire-and-forget: a disconnect here is
+    // normal (boot-before-tunnel); the cloud falls back to the covering
+    // motion clip's time-join until the next successful replication.
+    // Only emit when the backend returned a URL-form receipt (LAN/USB
+    // backends don't have one) AND an outbox is wired.
+    if let (Some(outbox), Some(url)) = (cfg.outbox.as_ref(), cold_url) {
+        let camera_id = u64::try_from(clip.camera_id).unwrap_or(0);
+        let projection = ClipReplicatedProjection {
+            edge_clip_id,
+            camera_id,
+            blob_url: url,
+            started_at: clip.started_at,
+            duration_ms: u64::try_from(clip.duration_ms).unwrap_or(0),
+            size_bytes: u64::try_from(clip.size_bytes).unwrap_or(0),
+            sha256_hex: sha256.to_string(),
+            codec: Some("h264".to_string()),
+            container: Some("mp4".to_string()),
+            thumbnail_blob_url: None,
+            attached_history: None,
+            is_alert_clip: Some(true),
+        };
+        match outbox
+            .send(nexus_cloud_client::build_clip_replicated_envelope(
+                projection,
+            ))
+            .await
+        {
+            Ok(()) => debug!(
+                alert_clip_id = clip.id,
+                "cold replicator: alert clip_replicated emitted"
+            ),
+            Err(TunnelError::Disconnected) => debug!(
+                alert_clip_id = clip.id,
+                "cold replicator: tunnel disconnected; alert clip stamped cold, cloud falls back to motion clip"
+            ),
+            Err(e) => warn!(
+                alert_clip_id = clip.id,
+                error = %e,
+                "cold replicator: alert clip_replicated emit failed"
+            ),
+        }
+    }
+
+    Ok(())
 }
 
 /// Per-clip upload path. Idempotent: relies on
@@ -706,6 +915,7 @@ async fn upload_one(
             container: Some(clip.container.clone()),
             thumbnail_blob_url: None,
             attached_history,
+            is_alert_clip: None,
         };
         match outbox
             .send(nexus_cloud_client::build_clip_replicated_envelope(

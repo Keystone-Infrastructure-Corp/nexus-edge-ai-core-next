@@ -253,6 +253,12 @@ pub struct ClipReplicatedProjection {
     /// Phase 21.2 — set when the clip was pre-attached on edge
     /// (i.e. existed on disk before this core enrolled).
     pub attached_history: Option<bool>,
+    /// M-Alert-Clip — `Some(true)` when this is a short, burned-in alert
+    /// clip (`edge_clip_id` prefixed `alert-`), not a passthrough motion
+    /// clip. Cloud stamps `clips.is_alert_clip` so the alert→clip resolver
+    /// prefers it over the covering motion clip. `None` → cloud defaults
+    /// to `false`.
+    pub is_alert_clip: Option<bool>,
 }
 
 /// Pure-function projection. Public so engine tests can construct
@@ -269,6 +275,7 @@ pub fn build_clip_replicated_envelope(clip: ClipReplicatedProjection) -> Envelop
         container: clip.container,
         duration_ms: clip.duration_ms,
         edge_clip_id: clip.edge_clip_id,
+        is_alert_clip: clip.is_alert_clip,
         sha256_hex: clip.sha256_hex,
         size_bytes: clip.size_bytes,
         started_at: clip.started_at.to_rfc3339(),
@@ -649,6 +656,7 @@ mod tests {
             container: Some("mp4".into()),
             thumbnail_blob_url: None,
             attached_history: None,
+            is_alert_clip: None,
         })
         .await
         .expect("send");

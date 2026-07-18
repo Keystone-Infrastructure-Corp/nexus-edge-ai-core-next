@@ -629,6 +629,15 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let preferred_usb_label =
         nexus_pipeline::recorder::PreferredUsbLabel::new(initial_label.clone());
 
+    // Phase 2 Step 2.1b / M-Alert-Clip — single `Arc<Notify>` shared
+    // between the cold replicator (consumer) and its producers: the
+    // cloud-tunnel supervisor (post-enrollment backend install) and the
+    // alert-clip builder (a freshly-built alert clip kicks cloud
+    // replication immediately). Created HERE, before the recorder, so
+    // the same Arc reaches both the recorder and the replicator config
+    // built further below.
+    let cold_kick = std::sync::Arc::new(tokio::sync::Notify::new());
+
     let (recorder, webrtc_bridge) = build_recorder(
         &cfg.runtime.clips.recorder,
         store.clone(),
@@ -641,6 +650,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         usb_resolver.clone(),
         preferred_usb_label.clone(),
         cfg.runtime.clips.alert_clips.clone(),
+        cold_kick.clone(),
     )
     .await?;
     info!(
@@ -958,8 +968,8 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // supervisor calling `notify_one()` right after installing the
     // Azure backend drains any pre-enrollment clip backlog
     // immediately instead of waiting up to 5 min for the polling
-    // backstop.
-    let cold_kick = std::sync::Arc::new(tokio::sync::Notify::new());
+    // backstop. (Constructed earlier, before the recorder, so the
+    // alert-clip builder shares the same wake handle.)
     // Phase 2 · Step 2.8 — shared tunnel-handle slot. The cloud
     // tunnel reconnect loop publishes the active `Arc<Connection>`
     // into this on connect / clears on disconnect; the cold
@@ -2094,6 +2104,7 @@ async fn build_recorder(
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     alert_clips: nexus_config::AlertClipsConfig,
+    cold_kick: Arc<tokio::sync::Notify>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2119,6 +2130,7 @@ async fn build_recorder(
                 usb_resolver,
                 preferred_usb_label,
                 alert_clips,
+                cold_kick,
             )
             .await
         }
@@ -2138,6 +2150,7 @@ async fn build_gst_recorder(
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     alert_clips: nexus_config::AlertClipsConfig,
+    cold_kick: Arc<tokio::sync::Notify>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2245,7 +2258,8 @@ async fn build_gst_recorder(
         .with_bus(bus)
         .with_usb(usb_resolver, preferred_usb_label)
         .with_decode_mode(decode_mode)
-        .with_alert_clips(alert_clips);
+        .with_alert_clips(alert_clips)
+        .with_alert_cold_kick(cold_kick);
     Ok((Arc::new(rec), webrtc))
 }
 
@@ -2262,6 +2276,7 @@ async fn build_gst_recorder(
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     _alert_clips: nexus_config::AlertClipsConfig,
+    _cold_kick: Arc<tokio::sync::Notify>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,

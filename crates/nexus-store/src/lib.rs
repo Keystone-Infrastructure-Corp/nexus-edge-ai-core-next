@@ -21,7 +21,7 @@ pub mod sessions;
 pub mod sinks;
 pub mod users;
 pub mod visual_prompts;
-pub use alert_clip::{AlertClipId, AlertClipRow, NewAlertClip};
+pub use alert_clip::{AlertClipColdMark, AlertClipId, AlertClipRow, NewAlertClip};
 pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
 pub use entity::{EntityLocalRecord, EntityLocalUpsert};
 pub use fleet::FleetManagedMarker;
@@ -160,6 +160,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0026_alert_clips",
         include_str!("../migrations/0026_alert_clips.sql"),
+    ),
+    (
+        "0027_alert_clips_cold",
+        include_str!("../migrations/0027_alert_clips_cold.sql"),
     ),
 ];
 

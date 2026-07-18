@@ -49,6 +49,24 @@ pub struct AlertClipRow {
     pub state: String,
     pub duration_ms: i64,
     pub size_bytes: i64,
+    /// 64-char lowercase hex of the finalized MP4, stamped when the
+    /// builder marks the clip `ready`. `None` if hashing failed (the
+    /// clip still serves local sinks but is skipped by the cold
+    /// replicator, since the cloud `clip_replicated` envelope requires
+    /// `sha256_hex`). Migration 0027.
+    pub sha256: Option<String>,
+    /// Active cold backend handle when the clip was replicated, or
+    /// `None` while still hot-only. Migration 0027.
+    pub cold_handle: Option<String>,
+    /// Backend-relative path of the cold copy, or `None`. Migration 0027.
+    pub cold_path: Option<String>,
+    /// Wall-clock the clip was durably cold-replicated, or `None`.
+    /// Gates the P6 evictor: a hot alert file is only reclaimed after
+    /// this is set OR the grace window elapses. Migration 0027.
+    pub cold_uploaded_at: Option<DateTime<Utc>>,
+    /// Count of consecutive failed cold-upload attempts (diagnostics /
+    /// retry gating). Migration 0027.
+    pub cold_attempts: i64,
 }
 
 impl AlertClipRow {
@@ -70,6 +88,10 @@ fn alert_clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AlertClipRow,
         .get::<Option<String>, _>("ready_at")
         .map(|s| parse_dt(&s))
         .transpose()?;
+    let cold_uploaded_at = row
+        .get::<Option<String>, _>("cold_uploaded_at")
+        .map(|s| parse_dt(&s))
+        .transpose()?;
     Ok(AlertClipRow {
         id: row.get::<i64, _>("id"),
         camera_id: row.get::<i64, _>("camera_id") as CameraId,
@@ -79,11 +101,25 @@ fn alert_clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AlertClipRow,
         state: row.get::<String, _>("state"),
         duration_ms: row.get::<i64, _>("duration_ms"),
         size_bytes: row.get::<i64, _>("size_bytes"),
+        sha256: row.get::<Option<String>, _>("sha256"),
+        cold_handle: row.get::<Option<String>, _>("cold_handle"),
+        cold_path: row.get::<Option<String>, _>("cold_path"),
+        cold_uploaded_at,
+        cold_attempts: row.get::<i64, _>("cold_attempts"),
     })
 }
 
-const ALERT_CLIP_COLUMNS: &str =
-    "id, camera_id, path, started_at, ready_at, state, duration_ms, size_bytes";
+const ALERT_CLIP_COLUMNS: &str = "id, camera_id, path, started_at, ready_at, state, \
+     duration_ms, size_bytes, sha256, cold_handle, cold_path, cold_uploaded_at, cold_attempts";
+
+/// Args for [`Store::mark_alert_clip_cold_replicated`]. Mirrors
+/// [`crate::ClipColdMark`] for motion clips.
+#[derive(Debug, Clone)]
+pub struct AlertClipColdMark {
+    pub cold_handle: String,
+    pub cold_path: String,
+    pub cold_uploaded_at: DateTime<Utc>,
+}
 
 impl Store {
     /// Insert a fresh `building` alert clip and return its id. The
@@ -105,22 +141,27 @@ impl Store {
     }
 
     /// Stamp a built alert clip `ready`: record its final duration /
-    /// size and `ready_at = now`. Only transitions a `building` row, so
-    /// a late/duplicate call after eviction is a no-op error rather
-    /// than resurrecting a reclaimed clip.
+    /// size, `sha256`, and `ready_at = now`. Only transitions a
+    /// `building` row, so a late/duplicate call after eviction is a
+    /// no-op error rather than resurrecting a reclaimed clip. `sha256`
+    /// is `None` when hashing the finalized MP4 failed — the clip still
+    /// serves local sinks, but the cold replicator skips NULL-sha256
+    /// rows (the cloud `clip_replicated` envelope requires `sha256_hex`).
     pub async fn mark_alert_clip_ready(
         &self,
         id: AlertClipId,
         duration_ms: i64,
         size_bytes: i64,
+        sha256: Option<&str>,
     ) -> Result<(), StoreError> {
         let res = sqlx::query(
             "UPDATE alert_clips
-                SET state = 'ready', duration_ms = ?, size_bytes = ?, ready_at = ?
+                SET state = 'ready', duration_ms = ?, size_bytes = ?, sha256 = ?, ready_at = ?
               WHERE id = ? AND state = 'building'",
         )
         .bind(duration_ms)
         .bind(size_bytes)
+        .bind(sha256)
         .bind(Utc::now().to_rfc3339())
         .bind(id)
         .execute(&self.pool)
@@ -153,6 +194,94 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Stamp the cold pointer after a successful cold-replication PUT
+    /// (M-Alert-Clip cloud delivery). Records where the clip landed so
+    /// the P6 evictor can reclaim the hot file. Mirrors
+    /// [`Store::mark_cold_replicated`] for motion clips.
+    pub async fn mark_alert_clip_cold_replicated(
+        &self,
+        id: AlertClipId,
+        mark: &AlertClipColdMark,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE alert_clips
+                SET cold_handle = ?, cold_path = ?, cold_uploaded_at = ?
+              WHERE id = ?",
+        )
+        .bind(&mark.cold_handle)
+        .bind(&mark.cold_path)
+        .bind(mark.cold_uploaded_at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("alert_clip id={id}")));
+        }
+        Ok(())
+    }
+
+    /// Record a failed cold-upload attempt (increment `cold_attempts`,
+    /// stamp the error + attempt time). The `cold_last_attempt_at`
+    /// gate in [`Self::alert_clips_pending_cold_upload`] then holds the
+    /// clip out of the working set for `retry_after`, so a persistently
+    /// unreachable backend is retried at a bounded cadence rather than
+    /// every replicator tick. Unlike motion clips there is no
+    /// quarantine flag: the evictor's grace window is the ultimate
+    /// backstop that removes a stuck alert clip from the hot tier.
+    pub async fn record_alert_clip_cold_failure(
+        &self,
+        id: AlertClipId,
+        now: DateTime<Utc>,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE alert_clips
+                SET cold_attempts = cold_attempts + 1,
+                    cold_last_attempt_at = ?,
+                    cold_last_error = ?
+              WHERE id = ?",
+        )
+        .bind(now.to_rfc3339())
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Alert clips eligible for cold replication: `ready`, hashed, not
+    /// yet cold, and past the per-clip retry gate. `floor` mirrors the
+    /// motion-clip enrollment floor (pre-enrollment clips stay
+    /// local-only). `retry_cutoff` is `now - retry_after`: a clip whose
+    /// last attempt is newer than this is held back so a failing
+    /// backend isn't hammered every tick. Oldest-first, bounded by
+    /// `limit`.
+    pub async fn alert_clips_pending_cold_upload(
+        &self,
+        limit: i64,
+        floor: Option<DateTime<Utc>>,
+        retry_cutoff: DateTime<Utc>,
+    ) -> Result<Vec<AlertClipRow>, StoreError> {
+        let floor_str = floor.map(|f| f.to_rfc3339());
+        let rows = sqlx::query(&format!(
+            "SELECT {ALERT_CLIP_COLUMNS} FROM alert_clips
+              WHERE state = 'ready'
+                AND cold_uploaded_at IS NULL
+                AND sha256 IS NOT NULL
+                AND (cold_last_attempt_at IS NULL OR cold_last_attempt_at <= ?)
+                AND (? IS NULL OR started_at >= ?)
+              ORDER BY ready_at ASC
+              LIMIT ?"
+        ))
+        .bind(retry_cutoff.to_rfc3339())
+        .bind(&floor_str)
+        .bind(&floor_str)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(alert_clip_row_from_row).collect()
     }
 
     /// Fetch one alert clip by id.
@@ -234,14 +363,27 @@ impl Store {
         Ok(row.get::<i64, _>(0))
     }
 
-    /// Alert clips that are `ready` with no outstanding deliveries —
+    /// Alert clips that are `ready` with no outstanding deliveries AND
+    /// either already cold-replicated or past the cold grace window —
     /// the P6 evictor unlinks their hot files then calls
     /// [`Self::mark_alert_clip_evicted`]. Bounded by `limit` so one
     /// sweep stays cheap.
-    pub async fn alert_clips_evictable(&self, limit: i64) -> Result<Vec<AlertClipRow>, StoreError> {
+    ///
+    /// `cold_grace_cutoff` is `now - cold_grace`: a clip that has not
+    /// cold-replicated is held in the hot tier until this cutoff so an
+    /// enrolled core has time to ship it to the cloud. Past the cutoff
+    /// (un-enrolled, cold disabled, or a persistently-down backend) the
+    /// hot file is reclaimed anyway — the local experience never
+    /// depends on cloud reachability (fail-open).
+    pub async fn alert_clips_evictable(
+        &self,
+        limit: i64,
+        cold_grace_cutoff: DateTime<Utc>,
+    ) -> Result<Vec<AlertClipRow>, StoreError> {
         let rows = sqlx::query(&format!(
             "SELECT {ALERT_CLIP_COLUMNS} FROM alert_clips ac
               WHERE ac.state = 'ready'
+                AND (ac.cold_uploaded_at IS NOT NULL OR ac.ready_at <= ?)
                 AND NOT EXISTS (
                     SELECT 1 FROM alert_sink_outbox o
                       JOIN events e ON e.event_id = o.event_id
@@ -251,6 +393,7 @@ impl Store {
               ORDER BY ac.ready_at ASC
               LIMIT ?"
         ))
+        .bind(cold_grace_cutoff.to_rfc3339())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
