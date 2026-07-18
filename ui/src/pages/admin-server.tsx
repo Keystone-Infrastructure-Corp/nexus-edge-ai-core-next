@@ -723,15 +723,15 @@ export function AdminServerPage() {
                 toast.error("Watermarks must be 0..=100");
                 return;
               }
-              if (panic <= low) {
-                toast.error("panic_pct must be strictly greater than low_pct");
+              if (low <= panic) {
+                toast.error("low_pct must be strictly greater than panic_pct");
                 return;
               }
               wmMutation.mutate({ low_pct: low, panic_pct: panic });
             }}
           >
             <div className="flex flex-1 flex-col gap-1">
-              <Label htmlFor="wm-low">Low watermark (%)</Label>
+              <Label htmlFor="wm-low">Low watermark (% free)</Label>
               <Input
                 id="wm-low"
                 type="number"
@@ -744,7 +744,7 @@ export function AdminServerPage() {
               />
             </div>
             <div className="flex flex-1 flex-col gap-1">
-              <Label htmlFor="wm-panic">Panic watermark (%)</Label>
+              <Label htmlFor="wm-panic">Panic watermark (% free)</Label>
               <Input
                 id="wm-panic"
                 type="number"
@@ -766,7 +766,7 @@ export function AdminServerPage() {
             </Button>
           </form>
           <p className="text-xs text-muted-foreground">
-            Panic must be strictly greater than low. Persisted to
+            Panic must be strictly less than low. Persisted to
             <code className="font-mono"> engine_runtime_settings </code>
             and applied on next engine boot.
           </p>
