@@ -653,16 +653,27 @@ async fn link_closed_clip(store: &Arc<Store>, event_id: &str, hot_present: bool)
         .await
         .expect("close_clip");
     if !hot_present {
-        // Simulate a soft-eviction: the hot copy was reclaimed under
-        // disk pressure, clearing `hot_path`. `hot_handle` stays set
-        // to satisfy the `hot_handle IS NOT NULL OR cold_handle IS NOT
-        // NULL` CHECK; the dispatcher keys the soft-evict branch off
-        // `hot_path` being absent.
-        sqlx::query("UPDATE motion_clips SET hot_path = NULL WHERE id = ?")
-            .bind(clip_id)
-            .execute(store.pool())
-            .await
-            .unwrap();
+        // Simulate a soft-eviction: the cold replicator uploaded the
+        // clip and the hot copy was then reclaimed under disk pressure.
+        // The row schema requires at least one handle and, when the hot
+        // handle is present, a hot_path — so clearing the hot side must
+        // go hand-in-hand with populating the cold side to satisfy the
+        // `hot_handle IS NOT NULL OR cold_handle IS NOT NULL` and
+        // `cold_handle IS NULL OR (cold_path IS NOT NULL AND
+        // cold_uploaded_at IS NOT NULL)` CHECK constraints.
+        sqlx::query(
+            "UPDATE motion_clips \
+             SET hot_path = NULL, hot_handle = NULL, \
+                 cold_handle = 'local', cold_path = ?, \
+                 cold_uploaded_at = ? \
+             WHERE id = ?",
+        )
+        .bind(format!("cold/{event_id}.mp4"))
+        .bind(Utc::now())
+        .bind(clip_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
     }
     store
         .link_event_to_clip(event_id, clip_id)
