@@ -598,7 +598,13 @@ pub async fn post_discovery_scan(
     State(s): State<ApiState>,
     Json(req): Json<ScanReq>,
 ) -> Result<Json<SessionCreatedResp>, ApiError> {
-    let plan = validate_scan_req(&req).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let mut plan = validate_scan_req(&req).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+
+    // Hard camera-interface enforcement: when a camera NIC role is
+    // assigned, source-bind every probe socket to that NIC's IPv4 so
+    // the sweep can only egress the camera network. Unassigned →
+    // `None` → OS default routing (unchanged behaviour).
+    plan.bind_source = crate::network::camera_bind_ipv4(&s.store).await;
 
     let total_targets = plan.total_targets;
     let (session_id, inner) = s
@@ -616,6 +622,7 @@ pub async fn post_discovery_scan(
                 "ports": &plan.ports,
                 "concurrency": plan.concurrency,
                 "total_targets": total_targets,
+                "bind_source": plan.bind_source.map(|ip| ip.to_string()),
             }),
         )
         .await?;
@@ -771,6 +778,11 @@ pub(crate) struct ScanPlan {
     pub ports: Vec<u16>,
     pub concurrency: usize,
     pub total_targets: u32,
+    /// Source IPv4 the probe sockets bind to before connecting.
+    /// `Some` when a camera interface role is assigned — this is
+    /// the hard enforcement that discovery only egresses the
+    /// camera NIC. `None` preserves OS default routing.
+    pub bind_source: Option<std::net::Ipv4Addr>,
 }
 
 /// Apply the M_ADMIN.md guardrails to a [`ScanReq`]. Returns a
@@ -840,6 +852,7 @@ pub(crate) fn validate_scan_req(req: &ScanReq) -> Result<ScanPlan, String> {
         ports,
         concurrency,
         total_targets,
+        bind_source: None,
     })
 }
 

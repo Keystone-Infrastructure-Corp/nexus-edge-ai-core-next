@@ -22,13 +22,13 @@
 //! `DiscoveredDevice` to the session.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::debug;
@@ -51,6 +51,7 @@ pub(crate) async fn run_session(
 ) {
     let sem = Arc::new(Semaphore::new(plan.concurrency));
     let ports = Arc::new(plan.ports);
+    let bind_source = plan.bind_source;
     let mut joins = Vec::with_capacity(plan.total_targets as usize);
 
     for host in plan.cidr.hosts() {
@@ -66,7 +67,7 @@ pub(crate) async fn run_session(
                 Ok(p) => p,
                 Err(_) => return,
             };
-            let device = probe_host(IpAddr::V4(host), &ports).await;
+            let device = probe_host(IpAddr::V4(host), &ports, bind_source).await;
             let mut guard = inner.lock();
             guard.scanned = guard.scanned.saturating_add(1);
             if let Some(dev) = device {
@@ -91,10 +92,14 @@ pub(crate) async fn run_session(
 /// returns the highest-fidelity result: ONVIF beats RTSP-only
 /// (an NVT always speaks RTSP too, so reporting it as ONVIF is
 /// strictly more informative).
-async fn probe_host(host: IpAddr, ports: &[u16]) -> Option<DiscoveredDevice> {
+async fn probe_host(
+    host: IpAddr,
+    ports: &[u16],
+    bind: Option<Ipv4Addr>,
+) -> Option<DiscoveredDevice> {
     let mut tasks = Vec::with_capacity(ports.len());
     for &port in ports {
-        tasks.push(tokio::spawn(probe_one(host, port)));
+        tasks.push(tokio::spawn(probe_one(host, port, bind)));
     }
     let mut best: Option<DiscoveredDevice> = None;
     // Remember the RTSP port even when ONVIF wins the merge.
@@ -134,23 +139,27 @@ async fn probe_host(host: IpAddr, ports: &[u16]) -> Option<DiscoveredDevice> {
 }
 
 /// One TCP probe. Dispatches on port to RTSP vs ONVIF flavour.
-async fn probe_one(host: IpAddr, port: u16) -> Option<DiscoveredDevice> {
+async fn probe_one(host: IpAddr, port: u16, bind: Option<Ipv4Addr>) -> Option<DiscoveredDevice> {
     match port {
-        554 => probe_rtsp_options(host, port).await,
-        80 | 8080 => probe_onvif_soap(host, port).await,
+        554 => probe_rtsp_options(host, port, bind).await,
+        80 | 8080 => probe_onvif_soap(host, port, bind).await,
         // Unknown ports get the RTSP probe — most non-standard
         // RTSP deployments live on :8554 / :10554 / similar.
-        _ => probe_rtsp_options(host, port).await,
+        _ => probe_rtsp_options(host, port, bind).await,
     }
 }
 
-async fn probe_rtsp_options(host: IpAddr, port: u16) -> Option<DiscoveredDevice> {
+async fn probe_rtsp_options(
+    host: IpAddr,
+    port: u16,
+    bind: Option<Ipv4Addr>,
+) -> Option<DiscoveredDevice> {
     let req = format!(
         "OPTIONS rtsp://{host}:{port}/ RTSP/1.0\r\n\
          CSeq: 1\r\n\
          User-Agent: nexus-discovery/1\r\n\r\n"
     );
-    let buf = match request_response(host, port, req.as_bytes()).await {
+    let buf = match request_response(host, port, req.as_bytes(), bind).await {
         Ok(b) => b,
         Err(e) => {
             debug!(%host, port, error = %e, "RTSP OPTIONS probe failed");
@@ -200,7 +209,11 @@ async fn probe_rtsp_options(host: IpAddr, port: u16) -> Option<DiscoveredDevice>
 ///
 /// We deliberately do NOT count a 200 with an HTML body — that's
 /// just a web server on :80.
-async fn probe_onvif_soap(host: IpAddr, port: u16) -> Option<DiscoveredDevice> {
+async fn probe_onvif_soap(
+    host: IpAddr,
+    port: u16,
+    bind: Option<Ipv4Addr>,
+) -> Option<DiscoveredDevice> {
     const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
@@ -217,7 +230,7 @@ async fn probe_onvif_soap(host: IpAddr, port: u16) -> Option<DiscoveredDevice> {
         len = BODY.len(),
         body = BODY,
     );
-    let buf = match request_response(host, port, req.as_bytes()).await {
+    let buf = match request_response(host, port, req.as_bytes(), bind).await {
         Ok(b) => b,
         Err(e) => {
             debug!(%host, port, error = %e, "ONVIF SOAP probe failed");
@@ -272,9 +285,30 @@ async fn probe_onvif_soap(host: IpAddr, port: u16) -> Option<DiscoveredDevice> {
 /// `READ_TIMEOUT`). The reply size is intentionally bounded — we
 /// only need the response head; the full SOAP / SDP body is
 /// pulled by the inline Verify probe.
-async fn request_response(host: IpAddr, port: u16, payload: &[u8]) -> io::Result<Vec<u8>> {
+///
+/// When `bind` is `Some`, the connecting socket is source-bound to
+/// that local IPv4 (the assigned camera interface) so the probe can
+/// only leave via the camera NIC. A v6 target with a v4 bind (or a
+/// bind IP the kernel rejects) surfaces as a normal connect error
+/// and the host is simply counted as "no device".
+async fn request_response(
+    host: IpAddr,
+    port: u16,
+    payload: &[u8],
+    bind: Option<Ipv4Addr>,
+) -> io::Result<Vec<u8>> {
     let addr = SocketAddr::new(host, port);
-    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+    let connect = async {
+        match bind {
+            Some(src) if addr.is_ipv4() => {
+                let socket = TcpSocket::new_v4()?;
+                socket.bind(SocketAddr::new(IpAddr::V4(src), 0))?;
+                socket.connect(addr).await
+            }
+            _ => TcpStream::connect(addr).await,
+        }
+    };
+    let mut stream = timeout(CONNECT_TIMEOUT, connect)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
     stream.set_nodelay(true).ok();

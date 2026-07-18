@@ -777,6 +777,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/network/apply/status",
             get(crate::admin_network::get_apply_status),
         )
+        .route(
+            "/v1/admin/network/roles",
+            get(crate::admin_network::get_roles).put(crate::admin_network::put_roles),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.admin_auth.clone(),
             admin_auth::admin_auth_layer,

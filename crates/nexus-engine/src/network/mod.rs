@@ -33,6 +33,8 @@
 pub mod apply;
 pub mod enumerate;
 pub mod plan;
+pub mod roles;
 
 pub use enumerate::{list_interfaces, NetworkInterface};
 pub use plan::NetplanPlan;
+pub use roles::camera_bind_ipv4;
