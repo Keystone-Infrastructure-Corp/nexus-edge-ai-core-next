@@ -1669,10 +1669,15 @@ async fn run_alert_clip_builder(
     // Collect the post window, deduping against the pre snapshot's tail
     // PTS (a sample can straddle the snapshot/live boundary).
     let pre_tail_pts = pre.iter().filter_map(|s| s.pts).next_back();
+    // Hard cap on total collection so a continuous stream of coalescing
+    // alerts can't extend the deadline forever and starve the encode.
+    // Measured from now (~first arm) using the configured build timeout.
+    let hard_cap_ms =
+        Utc::now().timestamp_millis() + i64::from(cfg.build_timeout_secs.max(1)) * 1000;
     let mut post: Vec<NalSample> = Vec::new();
     loop {
         let now = Utc::now().timestamp_millis();
-        let dl = deadline.load(Ordering::Acquire);
+        let dl = deadline.load(Ordering::Acquire).min(hard_cap_ms);
         if now >= dl {
             break;
         }

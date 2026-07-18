@@ -71,6 +71,15 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// ~63.5 s), so waiting never exhausts a row's retries.
 pub const CLIP_LINK_GRACE_SECS: i64 = 10;
 
+/// How long the dispatcher waits for a linked **alert clip** to finish
+/// building (decode + burn-in + re-encode) before delivering the alarm
+/// clip-less. Sized above the builder's own `build_timeout_secs` cap
+/// (default 30 s) so a normally-building clip is always awaited, and
+/// inside the backoff horizon (~63.5 s) so waiting never exhausts a
+/// row's retries. Only consulted for events that carry an
+/// `alert_clip_id` (armed while `clips.alert_clips.enabled`).
+pub const ALERT_CLIP_BUILD_GRACE_SECS: i64 = 45;
+
 /// Max outbox rows pulled per sweep. Keeps a single pass bounded so
 /// a large backfill (e.g. delivery globally re-enabled after a long
 /// outage) doesn't monopolise the task — the next tick picks up the
@@ -307,6 +316,13 @@ fn within_clip_grace(event: &AlertEvent) -> bool {
         < chrono::Duration::seconds(CLIP_LINK_GRACE_SECS)
 }
 
+/// Whether an alert is still young enough to keep waiting for its alert
+/// clip to finish building. See [`ALERT_CLIP_BUILD_GRACE_SECS`].
+fn within_alert_clip_grace(event: &AlertEvent) -> bool {
+    Utc::now().signed_duration_since(event.captured_at)
+        < chrono::Duration::seconds(ALERT_CLIP_BUILD_GRACE_SECS)
+}
+
 /// Process a single outbox row. Public so the test crate can drive
 /// the state machine without booting `run_dispatcher`'s timer loop.
 ///
@@ -427,7 +443,75 @@ pub async fn process_row(
     // wait for). `payload_json` never carried the clip path because
     // the event is serialised before the clip link, which is exactly
     // why this resolution has to happen here at delivery time.
+    //
+    // (3.5a) M-Alert-Clip resolution runs FIRST. The short, burned-in
+    // alert clip is ready within ~post_secs, so a clip-attaching sink no
+    // longer waits out the up-to-5-min motion clip. Only events armed
+    // while `clips.alert_clips.enabled` carry an alert_clip_id; when one
+    // is present we resolve it (ready → attach; building → transient
+    // retry inside the grace window; failed/timed-out → clip-less) and
+    // DO NOT fall back to the motion clip. When absent, the motion-clip
+    // block (3.5b) below runs exactly as before.
+    let mut motion_clip_fallback = true;
     if sink.wants_clip() && event.artifacts.clip.is_none() {
+        match store.get_event_alert_clip(&row.event_id).await {
+            Ok(Some(alert_clip)) => {
+                motion_clip_fallback = false;
+                if alert_clip.is_ready() {
+                    if let Some(dir) = clips_dir {
+                        let abs = dir.join(&alert_clip.path);
+                        if tokio::fs::try_exists(&abs).await.unwrap_or(false) {
+                            event.artifacts.clip = Some(abs.to_string_lossy().into_owned());
+                        } else {
+                            debug!(
+                                outbox_id = row.id,
+                                path = %abs.display(),
+                                "alert clip file absent on disk; delivering clip-less"
+                            );
+                        }
+                    }
+                } else if alert_clip.state == "failed" {
+                    debug!(
+                        outbox_id = row.id,
+                        "alert clip build failed; delivering clip-less"
+                    );
+                } else if within_alert_clip_grace(&event) {
+                    // Still building — wait; the builder marks it
+                    // ready/failed within build_timeout_secs.
+                    schedule_retry(store, snapshots_dir, &row, "alert clip still building").await;
+                    return;
+                } else {
+                    debug!(
+                        outbox_id = row.id,
+                        state = %alert_clip.state,
+                        "alert clip not ready within grace; delivering clip-less"
+                    );
+                }
+            }
+            Ok(None) => {
+                // No alert clip linked — fall through to the motion clip.
+            }
+            Err(e) => {
+                warn!(
+                    outbox_id = row.id,
+                    error = %e,
+                    "sink dispatcher: get_event_alert_clip failed; will retry"
+                );
+                schedule_retry(
+                    store,
+                    snapshots_dir,
+                    &row,
+                    &format!("alert clip lookup: {e}"),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    // (3.5b) Motion-clip fallback — the pre-existing behaviour, now gated
+    // to run only when the event has NO alert clip (feature off).
+    if sink.wants_clip() && event.artifacts.clip.is_none() && motion_clip_fallback {
         match store.get_event_clip_id(&row.event_id).await {
             Ok(Some(clip_id)) => match store.get_clip(clip_id).await {
                 Ok(Some(clip)) => {
