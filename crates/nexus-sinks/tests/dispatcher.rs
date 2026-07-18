@@ -968,7 +968,7 @@ async fn alert_clip_ready_delivers_with_clip() {
         .await
         .unwrap();
     store
-        .mark_alert_clip_ready(acid, 8_000, 1_234)
+        .mark_alert_clip_ready(acid, 8_000, 1_234, None)
         .await
         .unwrap();
     // Materialise the file so the existence check passes.

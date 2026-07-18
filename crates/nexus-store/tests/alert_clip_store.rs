@@ -114,16 +114,28 @@ async fn alert_clip_lifecycle_and_eviction_gate() {
     assert_eq!(resolved.id, clip_id);
     assert!(!resolved.is_ready(), "clip is still building");
 
+    // A cutoff far in the FUTURE makes the cold-replication grace gate
+    // non-blocking, so these assertions isolate the *delivery* gate.
+    let grace_elapsed = Utc::now() + chrono::Duration::hours(1);
+    // A cutoff in the PAST keeps the grace gate BLOCKING (the clip's
+    // ready_at is ~now), so a ready-but-not-cold clip is held.
+    let grace_blocking = Utc::now() - chrono::Duration::hours(1);
+
     // Two pending deliveries across the two events; not evictable.
     assert_eq!(
         store.alert_clip_pending_deliveries(clip_id).await.unwrap(),
         2
     );
-    assert!(store.alert_clips_evictable(10).await.unwrap().is_empty());
+    assert!(store
+        .alert_clips_evictable(10, grace_elapsed)
+        .await
+        .unwrap()
+        .is_empty());
 
-    // Builder finishes → ready with real duration/size.
+    // Builder finishes → ready with real duration/size (sha256 None:
+    // this test does not exercise cold replication).
     store
-        .mark_alert_clip_ready(clip_id, 8_000, 1_234_567)
+        .mark_alert_clip_ready(clip_id, 8_000, 1_234_567, None)
         .await
         .unwrap();
     let resolved = store.get_event_alert_clip(&e2).await.unwrap().unwrap();
@@ -132,7 +144,11 @@ async fn alert_clip_lifecycle_and_eviction_gate() {
     assert_eq!(resolved.size_bytes, 1_234_567);
     assert!(resolved.ready_at.is_some());
     // Ready, but deliveries still pending → still NOT evictable.
-    assert!(store.alert_clips_evictable(10).await.unwrap().is_empty());
+    assert!(store
+        .alert_clips_evictable(10, grace_elapsed)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Deliver every sink of both events.
     for row in store.outbox_pending(100).await.unwrap() {
@@ -143,12 +159,28 @@ async fn alert_clip_lifecycle_and_eviction_gate() {
         0
     );
 
-    // Now evictable; eviction flips state to 'evicted' (row kept for audit).
-    let evictable = store.alert_clips_evictable(10).await.unwrap();
+    // Delivered, but NOT cold-replicated and within the grace window →
+    // still NOT evictable (M-Alert-Clip cloud-delivery gate).
+    assert!(store
+        .alert_clips_evictable(10, grace_blocking)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Past the grace window → evictable; eviction flips state to
+    // 'evicted' (row kept for audit).
+    let evictable = store
+        .alert_clips_evictable(10, grace_elapsed)
+        .await
+        .unwrap();
     assert_eq!(evictable.len(), 1);
     assert_eq!(evictable[0].id, clip_id);
     store.mark_alert_clip_evicted(clip_id).await.unwrap();
-    assert!(store.alert_clips_evictable(10).await.unwrap().is_empty());
+    assert!(store
+        .alert_clips_evictable(10, grace_elapsed)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
         store.get_alert_clip(clip_id).await.unwrap().unwrap().state,
         "evicted"
@@ -193,4 +225,145 @@ async fn deleting_alert_clip_nulls_link_but_keeps_event() {
         .await
         .unwrap();
     assert_eq!(still_there, 1, "the durable alert event must survive");
+}
+
+/// M-Alert-Clip cloud delivery — the cold-replication working set,
+/// pointer stamping, retry gate, and how cold-replication interacts
+/// with the eviction grace window.
+#[tokio::test]
+async fn alert_clip_cold_replication_lifecycle() {
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let sha = "b".repeat(64);
+    let clip_id = store
+        .insert_alert_clip(&NewAlertClip {
+            camera_id: 1,
+            started_at: Utc::now(),
+            path: "alert/1/2026-07-17/9.mp4".into(),
+        })
+        .await
+        .unwrap();
+
+    let future_retry = Utc::now() + chrono::Duration::hours(1);
+
+    // 'building' → not in the cold working set (only 'ready' rows are).
+    assert!(store
+        .alert_clips_pending_cold_upload(10, None, future_retry)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Ready but sha256 = None → still excluded (cloud envelope needs it).
+    store
+        .mark_alert_clip_ready(clip_id, 4_000, 100_000, None)
+        .await
+        .unwrap();
+    assert!(store
+        .alert_clips_pending_cold_upload(10, None, future_retry)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Re-stamp with a sha256 (simulates the builder hashing the MP4).
+    // mark_alert_clip_ready only transitions 'building', so set it
+    // directly to model a hashed ready row.
+    sqlx::query("UPDATE alert_clips SET sha256 = ? WHERE id = ?")
+        .bind(&sha)
+        .bind(clip_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    // Now eligible: ready + hashed + not cold.
+    let pending = store
+        .alert_clips_pending_cold_upload(10, None, future_retry)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, clip_id);
+    assert_eq!(pending[0].sha256.as_deref(), Some(sha.as_str()));
+
+    // A pre-enrollment floor AFTER the clip's started_at excludes it.
+    let floor_future = Utc::now() + chrono::Duration::hours(2);
+    assert!(store
+        .alert_clips_pending_cold_upload(10, Some(floor_future), future_retry)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Record a failure → the retry gate holds it out until the cutoff
+    // moves past the attempt time.
+    store
+        .record_alert_clip_cold_failure(clip_id, Utc::now(), "backend 503")
+        .await
+        .unwrap();
+    let past_retry = Utc::now() - chrono::Duration::hours(1);
+    assert!(
+        store
+            .alert_clips_pending_cold_upload(10, None, past_retry)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a just-failed clip is gated out until retry_after elapses"
+    );
+    assert_eq!(
+        store
+            .alert_clips_pending_cold_upload(10, None, future_retry)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "past the retry gate it is eligible again"
+    );
+    assert_eq!(
+        store
+            .get_alert_clip(clip_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cold_attempts,
+        1
+    );
+
+    // A ready clip that is NOT cold-replicated is held from eviction
+    // while inside the grace window (cutoff in the PAST).
+    let grace_blocking = Utc::now() - chrono::Duration::hours(1);
+    assert!(store
+        .alert_clips_evictable(10, grace_blocking)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Stamp the cold pointer → out of the pending set AND immediately
+    // evictable even inside the grace window (the cloud has it now).
+    store
+        .upsert_storage_backend("azure", "azure_blob", "{}")
+        .await
+        .unwrap();
+    store
+        .mark_alert_clip_cold_replicated(
+            clip_id,
+            &nexus_store::AlertClipColdMark {
+                cold_handle: "azure".into(),
+                cold_path: "org/core/alert-9.mp4".into(),
+                cold_uploaded_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .alert_clips_pending_cold_upload(10, None, future_retry)
+        .await
+        .unwrap()
+        .is_empty());
+    let evictable = store
+        .alert_clips_evictable(10, grace_blocking)
+        .await
+        .unwrap();
+    assert_eq!(evictable.len(), 1, "cold-replicated → evictable pre-grace");
+    assert_eq!(evictable[0].id, clip_id);
+    assert!(evictable[0].cold_uploaded_at.is_some());
 }

@@ -115,7 +115,7 @@ use nexus_store::{AlertClipId, ClipClose, ClipId, NewAlertClip, NewClip, Store};
 use nexus_types::{CameraId, CodecKind};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use crate::alert_clip::{
@@ -191,6 +191,13 @@ pub struct GstClipRecorder {
     /// an `Arc` so the spawned builder task can remove its own entry
     /// on completion.
     alert_inflight: Arc<PlMutex<HashMap<CameraId, AlertInflight>>>,
+    /// Optional wake handle shared with the cold replicator
+    /// (M-Alert-Clip cloud delivery). The builder fires `notify_one()`
+    /// the moment an alert clip is stamped `ready`, so the replicator
+    /// ships it to the cloud immediately instead of waiting up to 5 min
+    /// for its polling backstop. `None` (LAN-only / no cloud) leaves
+    /// alert clips to the replicator's normal cadence.
+    alert_cold_kick: Option<Arc<Notify>>,
 }
 
 struct OpenState {
@@ -259,6 +266,7 @@ impl GstClipRecorder {
             alert_clips_cfg: AlertClipsConfig::default(),
             alert_box_timelines: PlRwLock::new(HashMap::new()),
             alert_inflight: Arc::new(PlMutex::new(HashMap::new())),
+            alert_cold_kick: None,
         })
     }
 
@@ -303,6 +311,15 @@ impl GstClipRecorder {
     /// don't pass a config keep today's behaviour (no alert clips).
     pub fn with_alert_clips(mut self, cfg: AlertClipsConfig) -> Self {
         self.alert_clips_cfg = cfg;
+        self
+    }
+
+    /// Share the cold replicator's wake handle so a freshly-built alert
+    /// clip kicks cloud replication immediately (M-Alert-Clip cloud
+    /// delivery). Builder pattern; without it alert clips still ship on
+    /// the replicator's normal cadence, just with more latency.
+    pub fn with_alert_cold_kick(mut self, kick: Arc<Notify>) -> Self {
+        self.alert_cold_kick = Some(kick);
         self
     }
 
@@ -1221,6 +1238,7 @@ impl ClipRecorder for GstClipRecorder {
             live_rx,
             timeline,
             deadline,
+            self.alert_cold_kick.clone(),
         ));
         Some(alert_clip_id)
     }
@@ -1665,6 +1683,7 @@ async fn run_alert_clip_builder(
     mut live_rx: broadcast::Receiver<NalSample>,
     timeline: Option<Arc<PlMutex<BoxTimeline>>>,
     deadline: Arc<AtomicI64>,
+    cold_kick: Option<Arc<Notify>>,
 ) {
     // Collect the post window, deduping against the pre snapshot's tail
     // PTS (a sample can straddle the snapshot/live boundary).
@@ -1738,22 +1757,56 @@ async fn run_alert_clip_builder(
             if let Err(e) = fs::rename(&partial_path, &final_path).await {
                 warn!(camera_id, alert_clip_id, "alert clip rename failed: {e}");
                 let _ = store.mark_alert_clip_failed(alert_clip_id).await;
-            } else if let Err(e) = store
-                .mark_alert_clip_ready(alert_clip_id, stats.duration_ms, stats.size_bytes)
-                .await
-            {
-                warn!(
-                    camera_id,
-                    alert_clip_id, "mark_alert_clip_ready failed: {e}"
-                );
             } else {
-                info!(
-                    camera_id,
-                    alert_clip_id,
-                    duration_ms = stats.duration_ms,
-                    size_bytes = stats.size_bytes,
-                    "alert clip ready"
-                );
+                // Hash the finalized MP4 so the cold replicator can PUT
+                // it and stamp the cloud `clip_replicated` envelope's
+                // `sha256_hex`. Alert clips are seconds long, so a
+                // post-hoc read+hash is cheap. A hash failure is
+                // non-fatal: the clip still serves local sinks; the
+                // cold drain simply skips NULL-sha256 rows.
+                let sha256 = match hash_file_sha256(&final_path).await {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        warn!(
+                            camera_id,
+                            alert_clip_id,
+                            "alert clip sha256 failed; cloud replication will skip: {e}"
+                        );
+                        None
+                    }
+                };
+                if let Err(e) = store
+                    .mark_alert_clip_ready(
+                        alert_clip_id,
+                        stats.duration_ms,
+                        stats.size_bytes,
+                        sha256.as_deref(),
+                    )
+                    .await
+                {
+                    warn!(
+                        camera_id,
+                        alert_clip_id, "mark_alert_clip_ready failed: {e}"
+                    );
+                } else {
+                    info!(
+                        camera_id,
+                        alert_clip_id,
+                        duration_ms = stats.duration_ms,
+                        size_bytes = stats.size_bytes,
+                        "alert clip ready"
+                    );
+                    // Wake the cold replicator so it ships this alert
+                    // clip to the cloud now (M-Alert-Clip cloud
+                    // delivery) rather than on its 5-min backstop. Only
+                    // meaningful when hashed (an un-hashed clip is
+                    // skipped by the drain), so gate on `sha256`.
+                    if sha256.is_some() {
+                        if let Some(kick) = &cold_kick {
+                            kick.notify_one();
+                        }
+                    }
+                }
             }
         }
         Ok(Err(e)) => {
