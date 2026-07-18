@@ -35,12 +35,17 @@ use crate::preroll::{NalRingBuffer, NalSample};
 /// frame-aligned `detection_bbox` (M-Alert-Clip P1) so the burned-in
 /// box matches where the object actually is on each frame, not the
 /// EMA-smoothed live-view box.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BurnBox {
     pub x1: f32,
     pub y1: f32,
     pub x2: f32,
     pub y2: f32,
+    /// Detector class label for the object in this box (e.g. "person").
+    /// Rendered as the box's label chip; empty draws no chip.
+    pub label: String,
+    /// Detector confidence `0..1` for `label`, shown as "label 0.96".
+    pub confidence: f32,
 }
 
 /// One analysis frame's worth of boxes at a wall-clock instant, tagged
@@ -133,7 +138,7 @@ impl BoxTimeline {
 #[must_use]
 pub fn scale_box(b: &BurnBox, sup_w: u32, sup_h: u32, native_w: u32, native_h: u32) -> BurnBox {
     if sup_w == 0 || sup_h == 0 {
-        return *b;
+        return b.clone();
     }
     let sx = native_w as f32 / sup_w as f32;
     let sy = native_h as f32 / sup_h as f32;
@@ -142,6 +147,8 @@ pub fn scale_box(b: &BurnBox, sup_w: u32, sup_h: u32, native_w: u32, native_h: u
         y1: b.y1 * sy,
         x2: b.x2 * sx,
         y2: b.y2 * sy,
+        label: b.label.clone(),
+        confidence: b.confidence,
     }
 }
 
@@ -202,10 +209,10 @@ pub fn frame_wall_clock(window_start: DateTime<Utc>, rebased_pts: Duration) -> D
         + chrono::Duration::from_std(rebased_pts).unwrap_or_else(|_| chrono::Duration::zero())
 }
 
-/// Cyan (`#22d3ee`) stroke colour for burned-in alert-clip boxes,
-/// matching the alert snapshot in `supervisor.rs` and the console's
-/// alert-detail overlay so the single box reads identically everywhere.
-pub const BURN_BOX_RGB: [u8; 3] = [0x22, 0xd3, 0xee];
+/// Stroke colour for burned-in alert-clip boxes. Aliases the shared
+/// [`crate::overlay::ALERT_RGB`] (cyan `#22d3ee`) so the box, the label
+/// chip, and the alert snapshot never diverge.
+pub const BURN_BOX_RGB: [u8; 3] = crate::overlay::ALERT_RGB;
 
 /// Draw `b` (in the SAME pixel space as the buffer) onto a packed RGB24
 /// frame in place, with stroke half-width `half` (so the visible stroke
@@ -261,6 +268,16 @@ pub fn burn_stroke_half(native_w: u32) -> i64 {
     ((native_w / 640).max(1)) as i64
 }
 
+/// Integer font scale for the burned-in label chip at the given native
+/// width, so "person 0.96" stays legible after H.264 compression across
+/// resolutions (~8 px of text height per 640 px of width; e.g. 1× at
+/// 640, 2× at 1280, 3× at 1920). Clamped so a huge frame can't produce
+/// an absurd chip.
+#[must_use]
+pub fn label_scale(native_w: u32) -> i64 {
+    ((native_w / 640).clamp(1, 6)) as i64
+}
+
 // ---------------------------------------------------------------------------
 // GStreamer encode path (decode -> burn-in overlay -> re-encode).
 //
@@ -291,7 +308,9 @@ mod encode {
     use nexus_types::CodecKind;
     use tracing::warn;
 
-    use super::{burn_stroke_half, draw_burnbox_rgb24, frame_wall_clock, scale_box, BoxFrame};
+    use super::{
+        burn_stroke_half, draw_burnbox_rgb24, frame_wall_clock, label_scale, scale_box, BoxFrame,
+    };
     use crate::gst_clip_recorder::push_sample;
     use crate::preroll::NalSample;
 
@@ -531,9 +550,23 @@ mod encode {
             let wall = frame_wall_clock(window_start, rebased);
             if let Some(bf) = box_frames.iter().rev().find(|f| f.ts <= wall) {
                 let half = burn_stroke_half(native_w);
+                let chip_scale = label_scale(native_w);
                 for b in &bf.boxes {
                     let nb = scale_box(b, bf.sup_w, bf.sup_h, native_w, native_h);
                     draw_burnbox_rgb24(&mut data, native_w, native_h, &nb, half);
+                    // Label chip anchored to the box top-left, matching
+                    // the alert snapshot so the box + "person 0.96" read
+                    // identically across snapshot and clip.
+                    let chip = crate::overlay::label_text(&nb.label, Some(nb.confidence));
+                    crate::overlay::draw_label_chip_rgb24(
+                        &mut data,
+                        native_w,
+                        native_h,
+                        nb.x1.round() as i64,
+                        nb.y1.round() as i64,
+                        &chip,
+                        chip_scale,
+                    );
                 }
             }
 
@@ -612,6 +645,8 @@ mod tests {
             y1: 50.0,
             x2: 200.0,
             y2: 150.0,
+            label: "person".into(),
+            confidence: 0.9,
         };
         // 640x360 -> 1920x1080 is a uniform 3x.
         let s = scale_box(&b, 640, 360, 1920, 1080);
@@ -628,6 +663,8 @@ mod tests {
             y1: 2.0,
             x2: 3.0,
             y2: 4.0,
+            label: "person".into(),
+            confidence: 0.9,
         };
         assert_eq!(scale_box(&b, 0, 360, 1920, 1080), b);
         assert_eq!(scale_box(&b, 640, 0, 1920, 1080), b);
@@ -642,6 +679,8 @@ mod tests {
                     y1: 0.0,
                     x2: n as f32 + 10.0,
                     y2: 10.0,
+                    label: "person".into(),
+                    confidence: 0.9,
                 };
                 n
             ],
@@ -753,6 +792,8 @@ mod tests {
                 y1: 1.0,
                 x2: 6.0,
                 y2: 6.0,
+                label: "person".into(),
+                confidence: 0.9,
             },
             0,
         );
@@ -777,6 +818,8 @@ mod tests {
                 y1: 4.0,
                 x2: 4.0,
                 y2: 4.0,
+                label: "person".into(),
+                confidence: 0.9,
             },
             0,
         );
@@ -894,6 +937,8 @@ mod gst_tests {
                 y1: 40.0,
                 x2: 220.0,
                 y2: 190.0,
+                label: "person".into(),
+                confidence: 0.94,
             }],
             sup_w: 320,
             sup_h: 240,
