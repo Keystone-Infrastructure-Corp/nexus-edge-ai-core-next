@@ -468,6 +468,7 @@ mod tests {
                 x2: 250.0,
                 y2: 500.0,
             },
+            detection_bbox: None,
             age_frames: age,
             age_ms: u64::from(age) * 33,
             attributes: serde_json::Map::new(),

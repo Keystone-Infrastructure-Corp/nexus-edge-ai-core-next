@@ -421,7 +421,10 @@ impl RuleEvaluator {
                     track_id: Some(o.track_id),
                     label: o.label.clone(),
                     severity,
-                    bbox: Some(o.bbox),
+                    // Prefer the frame-aligned raw detection box (fixes the
+                    // alert snapshot drifting ahead/behind the object); fall
+                    // back to the smoothed box for predicted-only tracks.
+                    bbox: Some(o.detection_bbox.unwrap_or(o.bbox)),
                     frame_id,
                     captured_at: Utc::now(),
                     trace_id: trace_id.clone(),
@@ -502,6 +505,7 @@ mod tests {
                 x2: 10.0,
                 y2: 10.0,
             },
+            detection_bbox: None,
             age_frames: 5,
             age_ms,
             attributes: Default::default(),
@@ -544,6 +548,7 @@ mod tests {
             label: "person".into(),
             confidence: 0.9,
             bbox: BBox { x1, y1, x2, y2 },
+            detection_bbox: None,
             age_frames: 10,
             age_ms: 1000,
             attributes: Default::default(),

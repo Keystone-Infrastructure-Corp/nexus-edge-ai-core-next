@@ -160,6 +160,9 @@ impl Tracker for IouNaiveTracker {
                     label: t.label.clone(),
                     confidence: t.confidence,
                     bbox: t.bbox,
+                    // iou-naive only emits matched detections, so the emitted
+                    // box IS the raw detection box for this frame.
+                    detection_bbox: Some(t.bbox),
                     age_frames: t.age_frames,
                     age_ms: now.duration_since(t.born_at).as_millis() as u64,
                     attributes: d.attributes.clone(),

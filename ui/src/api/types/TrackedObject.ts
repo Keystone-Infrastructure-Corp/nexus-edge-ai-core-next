@@ -3,6 +3,14 @@ import type { BBox } from "./BBox";
 
 export type TrackedObject = { track_id: bigint, label: string, confidence: number, bbox: BBox, 
 /**
+ * Raw detection bbox for THIS frame: `Some(d.bbox)` when the track
+ * matched a detection on the current frame, `None` when the emitted
+ * position is predicted-only. Unlike the EMA-smoothed `bbox` (kept
+ * smooth for jitter-free live view), this is frame-aligned, so alert
+ * snapshots and burned-in alert clips draw this box. See M_ALERT_CLIP.
+ */
+detection_bbox: BBox | null, 
+/**
  * Frames since this track was first seen.
  */
 age_frames: number, 

@@ -267,6 +267,13 @@ pub struct TrackedObject {
     pub label: String,
     pub confidence: f32,
     pub bbox: BBox,
+    /// Raw detection bbox for THIS frame: `Some(d.bbox)` when the track
+    /// matched a detection on the current frame, `None` when the emitted
+    /// position is predicted-only. Unlike the EMA-smoothed `bbox` (kept
+    /// smooth for jitter-free live view), this is frame-aligned, so alert
+    /// snapshots and burned-in alert clips draw this box. See M_ALERT_CLIP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_bbox: Option<BBox>,
     /// Frames since this track was first seen.
     pub age_frames: u32,
     /// Wall-clock age of the track in milliseconds.
@@ -1121,6 +1128,7 @@ mod tests {
                 x2: 10.0,
                 y2: 20.0,
             },
+            detection_bbox: None,
             age_frames: 0,
             age_ms: 0,
             attributes: attrs.clone(),
