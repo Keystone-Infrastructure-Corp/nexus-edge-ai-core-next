@@ -19,6 +19,7 @@ mod admin_cli;
 mod admin_cloud;
 mod admin_network;
 mod admin_runtime;
+mod alert_clip_evict;
 mod api;
 mod audit_retention;
 mod auth;
@@ -639,6 +640,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         bus.clone(),
         usb_resolver.clone(),
         preferred_usb_label.clone(),
+        cfg.runtime.clips.alert_clips.clone(),
     )
     .await?;
     info!(
@@ -1006,6 +1008,25 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         tokio::spawn(async move {
             retention::run_retention(retention_cfg, store, async {
                 let _ = retention_shutdown_rx.await;
+            })
+            .await;
+        })
+    };
+
+    // M-Alert-Clip P6 — hot-storage reclaim for delivered alert clips.
+    // Short interval (driven by delivery completion, not age); a cheap
+    // no-op indexed query when the feature is off (no `ready` rows).
+    let (alert_clip_evict_shutdown_tx, alert_clip_evict_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let alert_clip_evict_cfg = alert_clip_evict::AlertClipEvictorConfig {
+        clips_dir: clips_dir.clone(),
+        interval: std::time::Duration::from_secs(60),
+    };
+    let alert_clip_evict_handle = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            alert_clip_evict::run_alert_clip_evictor(alert_clip_evict_cfg, store, async {
+                let _ = alert_clip_evict_shutdown_rx.await;
             })
             .await;
         })
@@ -1885,6 +1906,8 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retention_handle).await;
     let _ = audit_retention_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), audit_retention_handle).await;
+    let _ = alert_clip_evict_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), alert_clip_evict_handle).await;
     let _ = usb_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), usb_watch_handle).await;
     let _ = dispatcher_shutdown_tx.send(());
@@ -2070,6 +2093,7 @@ async fn build_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
+    alert_clips: nexus_config::AlertClipsConfig,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2094,6 +2118,7 @@ async fn build_recorder(
                 bus,
                 usb_resolver,
                 preferred_usb_label,
+                alert_clips,
             )
             .await
         }
@@ -2112,6 +2137,7 @@ async fn build_gst_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
+    alert_clips: nexus_config::AlertClipsConfig,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2218,7 +2244,8 @@ async fn build_gst_recorder(
         .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?
         .with_bus(bus)
         .with_usb(usb_resolver, preferred_usb_label)
-        .with_decode_mode(decode_mode);
+        .with_decode_mode(decode_mode)
+        .with_alert_clips(alert_clips);
     Ok((Arc::new(rec), webrtc))
 }
 
@@ -2234,6 +2261,7 @@ async fn build_gst_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
+    _alert_clips: nexus_config::AlertClipsConfig,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,

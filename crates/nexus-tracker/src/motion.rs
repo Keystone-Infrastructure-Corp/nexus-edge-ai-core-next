@@ -293,6 +293,7 @@ mod tests {
                 x2: 100.0,
                 y2: 200.0,
             },
+            detection_bbox: None,
             age_frames: 1,
             age_ms: 33,
             attributes: attrs,

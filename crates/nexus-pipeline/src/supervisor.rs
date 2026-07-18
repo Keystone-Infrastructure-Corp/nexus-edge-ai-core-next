@@ -474,6 +474,9 @@ async fn run_camera(
         let max_clip_bytes = clips_cfg.max_clip_bytes;
         let mut frames_since_size_stat: u32 = 0;
         let mut post_roll = PostRoll::new(clips_cfg.post_roll_secs);
+        // M-Alert-Clip: gate every alert-clip hook on the config flag so
+        // the hot path stays free when the feature is off (the default).
+        let alert_clips_enabled = clips_cfg.alert_clips.enabled;
 
         info!(camera_id = cfg.id, "pipeline running");
 
@@ -1024,6 +1027,33 @@ async fn run_camera(
                 tracked.clone()
             };
 
+            // M-Alert-Clip: feed this frame's frame-aligned detection
+            // boxes into the recorder's per-camera box timeline so an
+            // alert clip armed later can burn them into the pre-roll +
+            // post window. Prefers the raw `detection_bbox` (P1) over the
+            // EMA-smoothed `bbox`. No-op unless enabled; cheap.
+            if alert_clips_enabled {
+                let boxes: Vec<crate::alert_clip::BurnBox> = dynamic_tracked
+                    .iter()
+                    .map(|t| {
+                        let b = t.detection_bbox.unwrap_or(t.bbox);
+                        crate::alert_clip::BurnBox {
+                            x1: b.x1,
+                            y1: b.y1,
+                            x2: b.x2,
+                            y2: b.y2,
+                        }
+                    })
+                    .collect();
+                recorder.push_alert_boxes(
+                    cfg.id,
+                    frame.captured_at,
+                    boxes,
+                    current_supervisor_w,
+                    current_supervisor_h,
+                );
+            }
+
             // Phase 5.6 · slice 4c-ii — fire stable-track sightings
             // into the engine hook. Skips parked-car tracks the
             // static-object filter has masked off (same partition
@@ -1083,6 +1113,28 @@ async fn run_camera(
                     events_to_link.push(event_id);
                 }
                 let _ = bus.publish(topic::ALERT_EVENT, &ev).await;
+            }
+
+            // M-Alert-Clip: arm (or coalesce into) a short alert clip for
+            // this burst and link every event fired this frame to it, so
+            // clip-attaching sinks resolve the truncated clip within
+            // ~post_secs instead of waiting on the up-to-5-min motion
+            // clip. `arm_alert_clip` returns None (no-op) unless the
+            // feature is enabled and the camera has a pre-roll ingester.
+            if alert_clips_enabled && !events_to_link.is_empty() {
+                if let Some(alert_clip_id) =
+                    recorder.arm_alert_clip(cfg.id, frame.captured_at).await
+                {
+                    for eid in &events_to_link {
+                        if let Err(e) = store.link_event_alert_clip(eid, alert_clip_id).await {
+                            debug!(
+                                camera_id = cfg.id,
+                                event = %eid,
+                                "link_event_alert_clip failed: {e}"
+                            );
+                        }
+                    }
+                }
             }
 
             // Motion lifecycle. The emitter is pure — it just tells

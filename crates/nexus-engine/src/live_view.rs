@@ -398,6 +398,7 @@ mod tests {
                 x2: cx + 5.0,
                 y2: cy + 5.0,
             },
+            detection_bbox: None,
             age_frames: 3,
             age_ms: 100,
             attributes: serde_json::Map::new(),

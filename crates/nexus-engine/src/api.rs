@@ -2054,6 +2054,10 @@ async fn preview_rule(
             label: row.label.clone(),
             confidence: row.confidence,
             bbox: row.bbox,
+            // Reconstructed from a persisted motion_events row; we don't know
+            // whether that box was a live detection or a predicted position,
+            // so leave it None (rule eval falls back to `bbox`).
+            detection_bbox: None,
             age_frames: 0,
             age_ms: 0,
             attributes: Default::default(),

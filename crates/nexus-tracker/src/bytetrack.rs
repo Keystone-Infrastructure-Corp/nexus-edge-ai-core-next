@@ -211,6 +211,10 @@ impl Tracker for ByteTrackTracker {
                     label: t.label.clone(),
                     confidence: t.confidence,
                     bbox: t.display_bbox,
+                    // Frame-aligned raw detection box when this track matched
+                    // a detection on the current frame (missed_frames == 0 iff
+                    // matched, so t.bbox == d.bbox); None when predicted-only.
+                    detection_bbox: (t.missed_frames == 0).then_some(t.bbox),
                     age_frames: t.age_frames,
                     age_ms: now.duration_since(t.born_at).as_millis() as u64,
                     attributes: attrs,
@@ -517,6 +521,46 @@ mod tests {
         let t = ByteTrackTracker::new(cfg);
         let out = t.update(vec![det("person", 0.0, 0.05)]);
         assert!(out.is_empty(), "below low_confidence → no track");
+    }
+
+    #[test]
+    fn detection_bbox_is_raw_when_matched_none_when_predicted() {
+        // display smoothing lags the emitted `bbox`, but `detection_bbox`
+        // must carry the frame-aligned RAW detection box so alert snapshots
+        // and burned-in alert clips draw the object where it actually is.
+        let mut cfg = cfg_default();
+        cfg.display_smoothing_alpha = 0.5;
+        cfg.max_lost_frames = 2;
+        let t = ByteTrackTracker::new(cfg);
+        let _ = t.update(vec![det("person", 0.0, 0.9)]);
+        // Object moved to x=3. The emitted (smoothed) bbox lags between 0
+        // and 3; detection_bbox must equal the raw detection (x1 == 3.0).
+        let f2 = t.update(vec![det("person", 3.0, 0.9)]);
+        let p = f2
+            .iter()
+            .find(|o| o.label == "person")
+            .expect("person track in f2");
+        let raw = p
+            .detection_bbox
+            .expect("matched track carries a detection_bbox");
+        assert_eq!(raw.x1, 3.0, "detection_bbox must be the raw detection box");
+        assert!(
+            p.bbox.x1 > 0.0 && p.bbox.x1 < 3.0,
+            "sanity: the emitted bbox is still smoothed (lags the raw box)"
+        );
+
+        // Predicted-only frame (no detection): detection_bbox is None while
+        // the track is still emitted with a predicted `bbox`.
+        let f3 = t.update(vec![]);
+        let p = f3
+            .iter()
+            .find(|o| o.label == "person")
+            .expect("lost track still emitted");
+        assert_eq!(p.attributes["tracking.predicted_only"], true);
+        assert!(
+            p.detection_bbox.is_none(),
+            "predicted-only track must not carry a detection_bbox"
+        );
     }
 
     #[test]

@@ -307,6 +307,7 @@ impl ObjectBuilder {
             label: self.label,
             confidence: self.confidence,
             bbox: self.bbox,
+            detection_bbox: None,
             age_frames: self.age_frames,
             age_ms: self.age_ms,
             attributes: self.attributes,

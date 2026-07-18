@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alert_clip;
 pub mod audit;
 pub mod cloud;
 pub mod diag_snapshot;
@@ -20,6 +21,7 @@ pub mod sessions;
 pub mod sinks;
 pub mod users;
 pub mod visual_prompts;
+pub use alert_clip::{AlertClipId, AlertClipRow, NewAlertClip};
 pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
 pub use entity::{EntityLocalRecord, EntityLocalUpsert};
 pub use fleet::FleetManagedMarker;
@@ -154,6 +156,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0024_metrics_samples",
         include_str!("../migrations/0024_metrics_samples.sql"),
+    ),
+    (
+        "0026_alert_clips",
+        include_str!("../migrations/0026_alert_clips.sql"),
     ),
 ];
 

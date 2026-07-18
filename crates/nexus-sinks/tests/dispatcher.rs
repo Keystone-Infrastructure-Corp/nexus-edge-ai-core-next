@@ -31,7 +31,7 @@ use nexus_config::{CameraConfig, StoreConfig};
 use nexus_sinks::backoff::MAX_ATTEMPTS;
 use nexus_sinks::dispatcher::{self, AllowAllPolicy, DeliveryPolicy, DeliveryVerdict};
 use nexus_sinks::{AlertSink, SinkError, SinkId, SinkRegistry};
-use nexus_store::{ClipClose, NewClip};
+use nexus_store::{ClipClose, NewAlertClip, NewClip};
 use nexus_store::{OutboxRow, OutboxStatus, Store, SuppressionReason};
 use nexus_types::{AlertEvent, Artifacts, Severity};
 use tempfile::TempDir;
@@ -863,6 +863,183 @@ async fn clip_soft_evicted_after_grace_delivers_clipless() {
     .await;
 
     assert_eq!(sink.calls(), 1, "delivers clip-less once hot copy is gone");
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Sent);
+}
+
+// ---------------------------------------------------------------------------
+// M-Alert-Clip: the dispatcher resolves the short alert clip (ready in
+// ~post_secs) instead of waiting on the up-to-5-min motion clip.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn alert_clip_building_within_grace_retries() {
+    // The event carries an alert_clip_id whose clip is still building. A
+    // fresh alert must WAIT (retry), not ship clip-less or fall back to
+    // the motion clip.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "ac-building").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let (alert, row) = enqueue_one(&store, 1, "rule.ac.building", id.as_str()).await;
+    let acid = store
+        .insert_alert_clip(&NewAlertClip {
+            camera_id: 1,
+            started_at: Utc::now(),
+            path: "alert/1/x/1.mp4".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .link_event_alert_clip(&alert.event_id.to_string(), acid)
+        .await
+        .unwrap();
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(
+        sink.calls(),
+        0,
+        "must not deliver while the alert clip builds"
+    );
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Pending);
+    assert!(after
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("still building"));
+}
+
+#[tokio::test]
+async fn alert_clip_ready_delivers_with_clip() {
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "ac-ready").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let (alert, row) = enqueue_one(&store, 1, "rule.ac.ready", id.as_str()).await;
+    let rel = "alert/1/x/2.mp4";
+    let acid = store
+        .insert_alert_clip(&NewAlertClip {
+            camera_id: 1,
+            started_at: Utc::now(),
+            path: rel.into(),
+        })
+        .await
+        .unwrap();
+    store
+        .link_event_alert_clip(&alert.event_id.to_string(), acid)
+        .await
+        .unwrap();
+    store
+        .mark_alert_clip_ready(acid, 8_000, 1_234)
+        .await
+        .unwrap();
+    // Materialise the file so the existence check passes.
+    let abs = clips_dir.path().join(rel);
+    tokio::fs::create_dir_all(abs.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&abs, b"fake alert mp4").await.unwrap();
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(sink.calls(), 1, "delivers with the resolved alert clip");
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Sent);
+}
+
+#[tokio::test]
+async fn alert_clip_failed_delivers_clipless() {
+    // A failed build must NOT hold the alarm — deliver clip-less at once.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "ac-failed").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let (alert, row) = enqueue_one(&store, 1, "rule.ac.failed", id.as_str()).await;
+    let acid = store
+        .insert_alert_clip(&NewAlertClip {
+            camera_id: 1,
+            started_at: Utc::now(),
+            path: "alert/1/x/3.mp4".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .link_event_alert_clip(&alert.event_id.to_string(), acid)
+        .await
+        .unwrap();
+    store.mark_alert_clip_failed(acid).await.unwrap();
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(sink.calls(), 1, "delivers clip-less when the build failed");
     let after = store
         .outbox_for_event(&row.event_id)
         .await
