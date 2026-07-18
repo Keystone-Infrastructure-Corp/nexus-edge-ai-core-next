@@ -260,6 +260,342 @@ pub fn burn_stroke_half(native_w: u32) -> i64 {
     ((native_w / 640).max(1)) as i64
 }
 
+// ---------------------------------------------------------------------------
+// GStreamer encode path (decode -> burn-in overlay -> re-encode).
+//
+// Gated behind `feature = "gstreamer"`. Two coupled pipelines run in
+// lock-step: a decode pipeline (appsrc -> parse -> avdec -> RGB appsink)
+// feeds one frame at a time to a lazily-built encode pipeline (appsrc ->
+// scale -> H.264 encoder -> mp4mux -> filesink). The pull loop draws the
+// per-frame boxes onto each decoded RGB frame before re-pushing it, so
+// memory stays bounded (a few frames in flight) regardless of clip
+// length. Validated by the Linux CI integration job and the local
+// `gstreamer`-feature test below.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gstreamer")]
+pub use encode::{encode_alert_clip, AlertClipError, AlertClipStats};
+
+#[cfg(feature = "gstreamer")]
+mod encode {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use chrono::{DateTime, Utc};
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app::{AppSink, AppSrc};
+    use gstreamer_video::prelude::*;
+    use gstreamer_video::{VideoFormat, VideoFrameRef, VideoInfo};
+    use nexus_types::CodecKind;
+    use tracing::warn;
+
+    use super::{burn_stroke_half, draw_burnbox_rgb24, frame_wall_clock, scale_box, BoxFrame};
+    use crate::gst_clip_recorder::push_sample;
+    use crate::preroll::NalSample;
+
+    /// Inter-frame interval [`push_sample`] synthesises for a NAL with no
+    /// PTS/DTS (30 fps). Only ever used for the rare PTS-less startup
+    /// sample; real footage carries PTS.
+    const FALLBACK_INTERVAL_NS: u64 = 33_333_333;
+    /// How long to wait for the encode pipeline to finalise the moov atom
+    /// after EOS before giving up (the file is still usable if partially
+    /// muxed, but we prefer a clean close).
+    const EOS_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Final stats from a successful [`encode_alert_clip`].
+    #[derive(Debug, Clone, Copy)]
+    pub struct AlertClipStats {
+        pub duration_ms: i64,
+        pub size_bytes: i64,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum AlertClipError {
+        #[error("gstreamer: {0}")]
+        Gst(String),
+        #[error("io: {0}")]
+        Io(#[from] std::io::Error),
+        #[error("no frames decoded from the alert-clip window")]
+        NoFrames,
+        #[error("no H.264 encoder available on this host")]
+        NoEncoder,
+    }
+
+    /// First available H.264 encoder, hardware-first (matching the
+    /// live-view transcode preference in `webrtc.rs`) then software.
+    /// `None` on a box with no usable encoder — the caller marks the
+    /// clip failed and the dispatcher delivers the alarm clip-less.
+    fn pick_h264_encoder() -> Option<&'static str> {
+        [
+            "vah264enc",
+            "vaapih264enc",
+            "nvh264enc",
+            "x264enc",
+            "openh264enc",
+        ]
+        .into_iter()
+        .find(|n| gst::ElementFactory::find(n).is_some())
+    }
+
+    /// Even-round down — H.264 requires even width/height.
+    fn even(v: u32) -> u32 {
+        v & !1
+    }
+
+    /// Downscale target preserving aspect ratio, capped at `max_w`
+    /// (`0` disables the cap). Never upscales; floors at 2px.
+    fn capped_dims(w: u32, h: u32, max_w: u32) -> (u32, u32) {
+        if max_w == 0 || w <= max_w {
+            return (even(w).max(2), even(h).max(2));
+        }
+        let scale = f64::from(max_w) / f64::from(w);
+        (
+            even(max_w).max(2),
+            even((f64::from(h) * scale).round() as u32).max(2),
+        )
+    }
+
+    fn by_name_appsrc(p: &gst::Pipeline, name: &str) -> Result<AppSrc, AlertClipError> {
+        p.by_name(name)
+            .ok_or_else(|| AlertClipError::Gst(format!("element {name} missing")))?
+            .downcast::<AppSrc>()
+            .map_err(|_| AlertClipError::Gst(format!("{name} is not an appsrc")))
+    }
+
+    fn drain_eos(pipeline: &gst::Pipeline) -> Result<(), AlertClipError> {
+        let Some(bus) = pipeline.bus() else {
+            return Ok(());
+        };
+        let deadline = std::time::Instant::now() + EOS_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                warn!("alert-clip encode EOS timed out; file may be truncated");
+                return Ok(());
+            }
+            let timeout = gst::ClockTime::from_nseconds(remaining.as_nanos() as u64);
+            match bus.timed_pop(Some(timeout)) {
+                None => return Ok(()),
+                Some(msg) => match msg.view() {
+                    gst::MessageView::Eos(..) => return Ok(()),
+                    gst::MessageView::Error(e) => {
+                        return Err(AlertClipError::Gst(format!(
+                            "encode bus error: {} ({})",
+                            e.error(),
+                            e.debug().unwrap_or_default()
+                        )));
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    /// Decode `window` (H.264/H.265 byte-stream, keyframe-first), burn the
+    /// per-frame boxes from `box_frames` in (looked up by wall-clock,
+    /// hold-last), and re-encode to an MP4 at `out_partial`. The caller
+    /// renames `out_partial` to the final path once this returns `Ok`
+    /// (existence of the final path = "ready").
+    ///
+    /// `window_start` is the wall-clock of the window's first frame
+    /// (`alert_ts - pre`); box lookup uses `window_start + rebased_pts`.
+    pub fn encode_alert_clip(
+        window: &[NalSample],
+        codec: CodecKind,
+        box_frames: &[BoxFrame],
+        window_start: DateTime<Utc>,
+        out_partial: &Path,
+        max_encode_width: u32,
+    ) -> Result<AlertClipStats, AlertClipError> {
+        gst::init().map_err(|e| AlertClipError::Gst(format!("gst init: {e}")))?;
+        if window.is_empty() {
+            return Err(AlertClipError::NoFrames);
+        }
+        let encoder = pick_h264_encoder().ok_or(AlertClipError::NoEncoder)?;
+        let (parse, dec, in_media) = match codec.base() {
+            "h265" => ("h265parse", "avdec_h265", "video/x-h265"),
+            _ => ("h264parse", "avdec_h264", "video/x-h264"),
+        };
+
+        // --- Decode pipeline: appsrc -> parse -> avdec -> RGB appsink. ---
+        let dec_desc = format!(
+            "appsrc name=dsrc is-live=false format=time do-timestamp=false block=true \
+                 max-bytes=67108864 \
+             ! {parse} config-interval=0 \
+             ! {dec} \
+             ! videoconvert \
+             ! video/x-raw,format=RGB \
+             ! appsink name=dsink sync=false max-buffers=4 drop=false"
+        );
+        let dec_pipeline = gst::parse::launch(&dec_desc)
+            .map_err(|e| AlertClipError::Gst(format!("decode launch: {e}")))?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| AlertClipError::Gst("decode graph is not a pipeline".into()))?;
+        let dsrc = by_name_appsrc(&dec_pipeline, "dsrc")?;
+        dsrc.set_caps(Some(
+            &gst::Caps::builder(in_media)
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .build(),
+        ));
+        let dsink = dec_pipeline
+            .by_name("dsink")
+            .ok_or_else(|| AlertClipError::Gst("appsink dsink missing".into()))?
+            .downcast::<AppSink>()
+            .map_err(|_| AlertClipError::Gst("dsink is not an appsink".into()))?;
+        dec_pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| AlertClipError::Gst(format!("decode set Playing: {e}")))?;
+
+        // Push NALs from a helper thread so the pull loop drains
+        // concurrently — otherwise the decode appsink (max-buffers=4)
+        // fills and back-pressures the push, deadlocking a single-thread
+        // push-then-pull.
+        let base_pts = window.iter().find_map(|s| s.pts).unwrap_or(Duration::ZERO);
+        let window_owned: Vec<NalSample> = window.to_vec();
+        let dsrc_push = dsrc.clone();
+        let pusher = std::thread::spawn(move || {
+            let mut last: Option<u64> = None;
+            for s in &window_owned {
+                match push_sample(&dsrc_push, s, base_pts, last, FALLBACK_INTERVAL_NS) {
+                    Ok(w) => last = Some(w),
+                    Err(e) => {
+                        warn!("alert-clip decode push failed: {e}");
+                        break;
+                    }
+                }
+            }
+            let _ = dsrc_push.end_of_stream();
+        });
+
+        // --- Encode pipeline: built lazily once we know the native dims. ---
+        let mut enc: Option<(gst::Pipeline, AppSrc)> = None;
+        let mut first_pts_ns: Option<u64> = None;
+        let mut last_pts_ns: u64 = 0;
+
+        loop {
+            let sample = match dsink.pull_sample() {
+                Ok(s) => s,
+                Err(_) => break, // EOS (or error) ends the drain.
+            };
+            let buffer = sample
+                .buffer()
+                .ok_or_else(|| AlertClipError::Gst("decoded sample without buffer".into()))?;
+            let caps = sample
+                .caps()
+                .ok_or_else(|| AlertClipError::Gst("decoded sample without caps".into()))?;
+            let info = VideoInfo::from_caps(caps)
+                .map_err(|e| AlertClipError::Gst(format!("VideoInfo::from_caps: {e}")))?;
+            if info.format() != VideoFormat::Rgb {
+                return Err(AlertClipError::Gst(format!(
+                    "decode produced {:?}, expected RGB",
+                    info.format()
+                )));
+            }
+            let native_w = info.width();
+            let native_h = info.height();
+            let frame_ref = VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                .map_err(|_| AlertClipError::Gst("map decoded RGB frame".into()))?;
+            let plane = frame_ref
+                .plane_data(0)
+                .map_err(|_| AlertClipError::Gst("decoded plane_data".into()))?;
+            let stride = frame_ref.plane_stride().first().copied().unwrap_or(0) as usize;
+            let (w, h) = (native_w as usize, native_h as usize);
+            let row_bytes = w * 3;
+            if stride < row_bytes || plane.len() < stride * h {
+                return Err(AlertClipError::Gst("decoded RGB geometry mismatch".into()));
+            }
+            // Tight-pack into width*height*3 (drop row padding).
+            let mut data = Vec::with_capacity(row_bytes * h);
+            if stride == row_bytes {
+                data.extend_from_slice(&plane[..row_bytes * h]);
+            } else {
+                for y in 0..h {
+                    let s = y * stride;
+                    data.extend_from_slice(&plane[s..s + row_bytes]);
+                }
+            }
+
+            // Input PTS was rebased to the window base, so the first
+            // decoded frame anchors 0 for box lookup.
+            let pts_ns = buffer.pts().map(|t| t.nseconds()).unwrap_or(last_pts_ns);
+            if first_pts_ns.is_none() {
+                first_pts_ns = Some(pts_ns);
+            }
+            last_pts_ns = pts_ns;
+
+            // Burn the per-frame boxes in (hold-last by wall-clock).
+            let rebased = Duration::from_nanos(pts_ns.saturating_sub(first_pts_ns.unwrap_or(0)));
+            let wall = frame_wall_clock(window_start, rebased);
+            if let Some(bf) = box_frames.iter().rev().find(|f| f.ts <= wall) {
+                let half = burn_stroke_half(native_w);
+                for b in &bf.boxes {
+                    let nb = scale_box(b, bf.sup_w, bf.sup_h, native_w, native_h);
+                    draw_burnbox_rgb24(&mut data, native_w, native_h, &nb, half);
+                }
+            }
+
+            if enc.is_none() {
+                let (w2, h2) = capped_dims(native_w, native_h, max_encode_width);
+                let loc = out_partial.to_string_lossy().replace('"', "");
+                let enc_desc = format!(
+                    "appsrc name=esrc is-live=false format=time do-timestamp=false block=true \
+                     ! videoconvert ! videoscale \
+                     ! video/x-raw,width={w2},height={h2} \
+                     ! {encoder} \
+                     ! h264parse \
+                     ! mp4mux faststart=true \
+                     ! filesink location=\"{loc}\" sync=false"
+                );
+                let ep = gst::parse::launch(&enc_desc)
+                    .map_err(|e| AlertClipError::Gst(format!("encode launch: {e}")))?
+                    .downcast::<gst::Pipeline>()
+                    .map_err(|_| AlertClipError::Gst("encode graph is not a pipeline".into()))?;
+                let esrc = by_name_appsrc(&ep, "esrc")?;
+                esrc.set_caps(Some(
+                    &gst::Caps::builder("video/x-raw")
+                        .field("format", "RGB")
+                        .field("width", native_w as i32)
+                        .field("height", native_h as i32)
+                        .field("framerate", gst::Fraction::new(30, 1))
+                        .build(),
+                ));
+                ep.set_state(gst::State::Playing)
+                    .map_err(|e| AlertClipError::Gst(format!("encode set Playing: {e}")))?;
+                enc = Some((ep, esrc));
+            }
+            let (_, esrc) = enc.as_ref().expect("encode pipeline built above");
+            let mut buf = gst::Buffer::from_mut_slice(data);
+            if let Some(bref) = buf.get_mut() {
+                bref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
+            }
+            esrc.push_buffer(buf)
+                .map_err(|e| AlertClipError::Gst(format!("encode push_buffer: {e:?}")))?;
+        }
+
+        let _ = pusher.join();
+        let _ = dec_pipeline.set_state(gst::State::Null);
+
+        let (ep, esrc) = enc.ok_or(AlertClipError::NoFrames)?;
+        let _ = esrc.end_of_stream();
+        let drain = drain_eos(&ep);
+        let _ = ep.set_state(gst::State::Null);
+        drain?;
+
+        let size_bytes = std::fs::metadata(out_partial)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+        let duration_ms =
+            i64::try_from(last_pts_ns.saturating_sub(first_pts_ns.unwrap_or(0)) / 1_000_000)
+                .unwrap_or(0);
+        Ok(AlertClipStats {
+            duration_ms,
+            size_bytes,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +787,143 @@ mod tests {
         assert_eq!(burn_stroke_half(320), 1); // min 1
         assert_eq!(burn_stroke_half(640), 1);
         assert_eq!(burn_stroke_half(1920), 3);
+    }
+}
+
+// End-to-end encode test. Runs wherever GStreamer + an H.264 encoder are
+// present (the Linux CI `gstreamer` job, and local dev with `x264enc`).
+#[cfg(all(test, feature = "gstreamer"))]
+mod gst_tests {
+    use std::time::Duration as StdDuration;
+
+    use chrono::Utc;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app::AppSink;
+    use nexus_types::CodecKind;
+
+    use super::{encode_alert_clip, BoxFrame, BurnBox};
+    use crate::preroll::NalSample;
+
+    /// Generate a short synthetic H.264 byte-stream (AU-aligned, SPS/PPS
+    /// before every IDR) as a NAL sample vector — stand-in for what the
+    /// pre-roll ring + live tap hand the builder.
+    fn gen_h264_nals(num: i32, w: i32, h: i32) -> Vec<NalSample> {
+        gst::init().unwrap();
+        let desc = format!(
+            "videotestsrc num-buffers={num} is-live=false \
+             ! video/x-raw,width={w},height={h},framerate=30/1 \
+             ! x264enc key-int-max=15 tune=zerolatency \
+             ! h264parse config-interval=-1 \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=out sync=false"
+        );
+        let pipeline = gst::parse::launch(&desc)
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut out = Vec::new();
+        while let Ok(sample) = sink.pull_sample() {
+            let buffer = sample.buffer().unwrap();
+            let map = buffer.map_readable().unwrap();
+            let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+            let pts = buffer.pts().map(|t| StdDuration::from_nanos(t.nseconds()));
+            out.push(NalSample {
+                pts,
+                dts: pts,
+                is_keyframe,
+                data: map.to_vec(),
+            });
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        out
+    }
+
+    /// Decode `path` to EOS to prove the muxed MP4 is well-formed.
+    fn decode_ok(path: &std::path::Path) -> bool {
+        let loc = path.to_string_lossy().replace('"', "");
+        let desc = format!(
+            "filesrc location=\"{loc}\" ! qtdemux ! h264parse ! avdec_h264 ! fakesink sync=false"
+        );
+        let Ok(el) = gst::parse::launch(&desc) else {
+            return false;
+        };
+        let pipeline = el.downcast::<gst::Pipeline>().unwrap();
+        if pipeline.set_state(gst::State::Playing).is_err() {
+            return false;
+        }
+        let bus = pipeline.bus().unwrap();
+        let mut ok = false;
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match bus.timed_pop(Some(gst::ClockTime::from_seconds(1))) {
+                Some(msg) => match msg.view() {
+                    gst::MessageView::Eos(..) => {
+                        ok = true;
+                        break;
+                    }
+                    gst::MessageView::Error(..) => break,
+                    _ => {}
+                },
+                None => break,
+            }
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        ok
+    }
+
+    #[test]
+    fn encode_alert_clip_produces_playable_mp4_with_boxes() {
+        let nals = gen_h264_nals(20, 320, 240);
+        assert!(!nals.is_empty(), "generator produced no NALs");
+        assert!(nals[0].is_keyframe, "window must start on a keyframe");
+
+        let start = Utc::now();
+        // One box covering the object region for the whole clip.
+        let boxes = vec![BoxFrame {
+            ts: start,
+            boxes: vec![BurnBox {
+                x1: 40.0,
+                y1: 40.0,
+                x2: 220.0,
+                y2: 190.0,
+            }],
+            sup_w: 320,
+            sup_h: 240,
+        }];
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("alert.partial.mp4");
+        let stats = encode_alert_clip(&nals, CodecKind::H264, &boxes, start, &out, 0)
+            .expect("encode_alert_clip should succeed with x264enc present");
+
+        assert!(out.exists(), "output MP4 must exist");
+        assert!(stats.size_bytes > 0, "MP4 must be non-empty");
+        // ISO-BMFF: bytes 4..8 are the 'ftyp' box type.
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(
+            bytes.len() > 12 && &bytes[4..8] == b"ftyp",
+            "not an MP4 container"
+        );
+        assert!(decode_ok(&out), "muxed MP4 must decode to EOS cleanly");
+    }
+
+    #[test]
+    fn encode_with_downscale_cap_still_valid() {
+        let nals = gen_h264_nals(16, 640, 360);
+        let start = Utc::now();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("alert.partial.mp4");
+        // Cap encode width to 320 — exercises the videoscale path.
+        let stats = encode_alert_clip(&nals, CodecKind::H264, &[], start, &out, 320)
+            .expect("encode with downscale cap should succeed");
+        assert!(stats.size_bytes > 0);
+        assert!(decode_ok(&out));
     }
 }

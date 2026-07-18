@@ -1248,7 +1248,7 @@ fn contains_slice_nal(data: &[u8], codec: CodecKind) -> bool {
 /// Returns the PTS (in rebased nanoseconds) that was actually
 /// written to the buffer so the caller can use it as the
 /// synthesis anchor for the next sample.
-fn push_sample(
+pub(crate) fn push_sample(
     appsrc: &AppSrc,
     sample: &NalSample,
     base_pts: Duration,
