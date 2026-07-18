@@ -639,6 +639,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         bus.clone(),
         usb_resolver.clone(),
         preferred_usb_label.clone(),
+        cfg.runtime.clips.alert_clips.clone(),
     )
     .await?;
     info!(
@@ -2070,6 +2071,7 @@ async fn build_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
+    alert_clips: nexus_config::AlertClipsConfig,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2094,6 +2096,7 @@ async fn build_recorder(
                 bus,
                 usb_resolver,
                 preferred_usb_label,
+                alert_clips,
             )
             .await
         }
@@ -2112,6 +2115,7 @@ async fn build_gst_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
+    alert_clips: nexus_config::AlertClipsConfig,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2218,7 +2222,8 @@ async fn build_gst_recorder(
         .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?
         .with_bus(bus)
         .with_usb(usb_resolver, preferred_usb_label)
-        .with_decode_mode(decode_mode);
+        .with_decode_mode(decode_mode)
+        .with_alert_clips(alert_clips);
     Ok((Arc::new(rec), webrtc))
 }
 
@@ -2234,6 +2239,7 @@ async fn build_gst_recorder(
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
+    _alert_clips: nexus_config::AlertClipsConfig,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
