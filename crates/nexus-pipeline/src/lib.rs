@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alert_clip;
 pub mod cache;
 pub mod crowd_hysteresis;
 pub mod decode;
