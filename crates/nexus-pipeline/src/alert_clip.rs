@@ -202,9 +202,10 @@ pub fn frame_wall_clock(window_start: DateTime<Utc>, rebased_pts: Duration) -> D
         + chrono::Duration::from_std(rebased_pts).unwrap_or_else(|_| chrono::Duration::zero())
 }
 
-/// Bright-green stroke colour for burned-in alert-clip boxes (matches
-/// the alert snapshot in `supervisor.rs` and the live-view overlay).
-pub const BURN_BOX_RGB: [u8; 3] = [0x2e, 0xe6, 0x4a];
+/// Cyan (`#22d3ee`) stroke colour for burned-in alert-clip boxes,
+/// matching the alert snapshot in `supervisor.rs` and the console's
+/// alert-detail overlay so the single box reads identically everywhere.
+pub const BURN_BOX_RGB: [u8; 3] = [0x22, 0xd3, 0xee];
 
 /// Draw `b` (in the SAME pixel space as the buffer) onto a packed RGB24
 /// frame in place, with stroke half-width `half` (so the visible stroke
@@ -755,7 +756,7 @@ mod tests {
             },
             0,
         );
-        // A box corner is painted green...
+        // A box corner is painted the alert-box colour...
         let corner = ((w + 1) * 3) as usize;
         assert_eq!(&buf[corner..corner + 3], &BURN_BOX_RGB);
         // ...but the interior is untouched (only the border is drawn).
