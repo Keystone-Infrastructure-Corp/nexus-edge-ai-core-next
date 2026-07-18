@@ -165,6 +165,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0027_alert_clips_cold",
         include_str!("../migrations/0027_alert_clips_cold.sql"),
     ),
+    (
+        "0028_delivery_settings_alert_clip",
+        include_str!("../migrations/0028_delivery_settings_alert_clip.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]
@@ -975,7 +979,7 @@ impl Store {
     /// silently dropping the schedule and over-delivering.
     pub async fn delivery_settings_get(&self) -> Result<DeliverySettings, StoreError> {
         let row = sqlx::query(
-            "SELECT enabled, schedule_json, timezone, updated_at
+            "SELECT enabled, schedule_json, timezone, attach_alert_clip, updated_at
                FROM delivery_settings WHERE id = 1",
         )
         .fetch_one(&self.pool)
@@ -983,6 +987,7 @@ impl Store {
         let enabled: i64 = row.get("enabled");
         let schedule_json: Option<String> = row.try_get("schedule_json")?;
         let timezone: String = row.get("timezone");
+        let attach_alert_clip: i64 = row.get("attach_alert_clip");
         let updated_at_str: String = row.get("updated_at");
         let schedule = match schedule_json {
             Some(s) if !s.is_empty() => Some(serde_json::from_str::<DeliverySchedule>(&s)?),
@@ -992,6 +997,7 @@ impl Store {
             enabled: enabled != 0,
             schedule,
             timezone,
+            attach_alert_clip: attach_alert_clip != 0,
             updated_at: parse_sqlite_timestamp(&updated_at_str)?,
         })
     }
@@ -1037,12 +1043,14 @@ impl Store {
                 SET enabled = ?,
                     schedule_json = ?,
                     timezone = ?,
+                    attach_alert_clip = ?,
                     updated_at = ?
               WHERE id = 1",
         )
         .bind(settings.enabled as i64)
         .bind(schedule_json)
         .bind(&settings.timezone)
+        .bind(settings.attach_alert_clip as i64)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut **tx)
         .await?;

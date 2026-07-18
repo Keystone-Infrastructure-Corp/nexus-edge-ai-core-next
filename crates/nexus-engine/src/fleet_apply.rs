@@ -348,6 +348,10 @@ async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usiz
         schedule: Option<nexus_types::DeliverySchedule>,
         #[serde(default)]
         timezone: Option<String>,
+        /// M-Alert-Clip on/off. `None` (a cloud that predates the field)
+        /// preserves the stored value rather than resetting it.
+        #[serde(default)]
+        attach_alert_clip: Option<bool>,
     }
     let payload: DeliveryPayload = serde_json::from_value(effective.clone()).map_err(|e| {
         ApiError(
@@ -366,10 +370,20 @@ async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usiz
             format!("unknown IANA timezone: {timezone:?}"),
         ));
     }
+    let attach_alert_clip = match payload.attach_alert_clip {
+        Some(v) => v,
+        None => s
+            .store
+            .delivery_settings_get()
+            .await
+            .map(|d| d.attach_alert_clip)
+            .unwrap_or(true),
+    };
     let settings = nexus_types::DeliverySettings {
         enabled: payload.enabled,
         schedule: payload.schedule,
         timezone,
+        attach_alert_clip,
         updated_at: chrono::Utc::now(),
     };
     let mut tx = s.store.begin_tx().await?;

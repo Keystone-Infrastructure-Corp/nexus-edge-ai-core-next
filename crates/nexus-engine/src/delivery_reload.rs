@@ -12,6 +12,7 @@
 //! the store, so a Lagged subscriber that drops an intermediate
 //! signal still converges as soon as the next signal arrives.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -27,13 +28,19 @@ use tracing::{error, info, warn};
 /// Both subscribers are best-effort: a subscribe failure logs once
 /// and the task exits cleanly (manual API actions still update the
 /// DB; only the *hot* reload is lost, not the data).
+///
+/// `alert_clip_gate` mirrors `DeliverySettings.attach_alert_clip`: on
+/// every settings change the task re-reads it and stores it so the
+/// clip recorder's live gate (M-Alert-Clip) flips without a restart.
 pub fn spawn(
     bus: Arc<dyn Bus>,
     store: Arc<Store>,
     policy: Arc<CascadingPolicy>,
+    alert_clip_gate: Arc<AtomicBool>,
 ) -> (JoinHandle<()>, oneshot::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move { run(bus, store, policy, shutdown_rx).await });
+    let handle =
+        tokio::spawn(async move { run(bus, store, policy, alert_clip_gate, shutdown_rx).await });
     (handle, shutdown_tx)
 }
 
@@ -41,6 +48,7 @@ async fn run(
     bus: Arc<dyn Bus>,
     store: Arc<Store>,
     policy: Arc<CascadingPolicy>,
+    alert_clip_gate: Arc<AtomicBool>,
     shutdown: oneshot::Receiver<()>,
 ) {
     let mut settings_stream = match bus
@@ -97,6 +105,19 @@ async fn run(
                     Some(Ok(_)) => {
                         if let Err(e) = policy.reload_settings(&store).await {
                             warn!(error = %e, "M7 delivery reload: reload_settings failed");
+                        }
+                        // M-Alert-Clip: refresh the live recorder gate
+                        // from the freshly-written delivery settings so
+                        // toggling `attach_alert_clip` takes effect
+                        // without a restart.
+                        match store.delivery_settings_get().await {
+                            Ok(ds) => {
+                                alert_clip_gate.store(ds.attach_alert_clip, Ordering::Relaxed);
+                            }
+                            Err(e) => warn!(
+                                error = %e,
+                                "M7 delivery reload: delivery_settings_get for alert-clip gate failed"
+                            ),
                         }
                     }
                 }
