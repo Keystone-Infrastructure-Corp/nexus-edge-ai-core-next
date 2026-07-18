@@ -653,9 +653,12 @@ async fn link_closed_clip(store: &Arc<Store>, event_id: &str, hot_present: bool)
         .await
         .expect("close_clip");
     if !hot_present {
-        // Simulate a soft-eviction: the cold replicator uploaded the
-        // clip and the hot copy was reclaimed under disk pressure.
-        sqlx::query("UPDATE motion_clips SET hot_path = NULL, hot_handle = NULL WHERE id = ?")
+        // Simulate a soft-eviction: the hot copy was reclaimed under
+        // disk pressure, clearing `hot_path`. `hot_handle` stays set
+        // to satisfy the `hot_handle IS NOT NULL OR cold_handle IS NOT
+        // NULL` CHECK; the dispatcher keys the soft-evict branch off
+        // `hot_path` being absent.
+        sqlx::query("UPDATE motion_clips SET hot_path = NULL WHERE id = ?")
             .bind(clip_id)
             .execute(store.pool())
             .await
