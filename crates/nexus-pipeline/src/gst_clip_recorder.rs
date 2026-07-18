@@ -101,6 +101,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,13 +110,18 @@ use chrono::{DateTime, Utc};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppStreamType};
-use nexus_store::{ClipClose, ClipId, NewClip, Store};
+use nexus_config::AlertClipsConfig;
+use nexus_store::{AlertClipId, ClipClose, ClipId, NewAlertClip, NewClip, Store};
 use nexus_types::{CameraId, CodecKind};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
+use crate::alert_clip::{
+    alert_clip_inflight_path, alert_clip_rel_path, encode_alert_clip, trim_preroll, BoxFrame,
+    BoxTimeline, BurnBox,
+};
 use crate::preroll::NalSample;
 use crate::preroll_ingester::PreRollIngester;
 use crate::recorder::{ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError};
@@ -171,6 +177,20 @@ pub struct GstClipRecorder {
     /// the engine overrides it from `[runtime.decode] mode` via
     /// [`Self::with_decode_mode`].
     decode_mode: crate::decode::DecodeMode,
+    /// M-Alert-Clip configuration (defaults disabled). Set via
+    /// [`Self::with_alert_clips`]; when disabled every alert-clip
+    /// hook below is inert.
+    alert_clips_cfg: AlertClipsConfig,
+    /// Per-camera rolling box timeline the supervisor feeds via
+    /// [`ClipRecorder::push_alert_boxes`]; the builder snapshots it
+    /// to burn boxes into the decoded clip. `RwLock` over the map
+    /// (rare inserts on first frame per camera), `Mutex` per timeline
+    /// (one writer per gated frame, one reader per clip).
+    alert_box_timelines: PlRwLock<HashMap<CameraId, Arc<PlMutex<BoxTimeline>>>>,
+    /// Per-camera in-flight alert clip, for burst coalescing. Behind
+    /// an `Arc` so the spawned builder task can remove its own entry
+    /// on completion.
+    alert_inflight: Arc<PlMutex<HashMap<CameraId, AlertInflight>>>,
 }
 
 struct OpenState {
@@ -206,6 +226,18 @@ struct OpenState {
 // gst::Pipeline / AppSrc are Send + Sync by GObject contract, so
 // OpenState is auto-Send + auto-Sync.
 
+/// Per-camera in-flight alert clip, for burst coalescing (M-Alert-Clip).
+/// While one exists and its `deadline` hasn't passed, a new alert on the
+/// same camera coalesces into it (bumping the deadline) instead of
+/// starting a second clip.
+struct AlertInflight {
+    alert_clip_id: AlertClipId,
+    /// Collection deadline as unix milliseconds. The builder collects
+    /// the post window until `now >= deadline`; a coalescing alert
+    /// bumps it via an atomic store so the single clip spans the burst.
+    deadline: Arc<AtomicI64>,
+}
+
 impl GstClipRecorder {
     pub fn new(
         store: Arc<Store>,
@@ -224,6 +256,9 @@ impl GstClipRecorder {
             usb_resolver: None,
             preferred_usb_label: crate::recorder::PreferredUsbLabel::default(),
             decode_mode: crate::decode::DecodeMode::default(),
+            alert_clips_cfg: AlertClipsConfig::default(),
+            alert_box_timelines: PlRwLock::new(HashMap::new()),
+            alert_inflight: Arc::new(PlMutex::new(HashMap::new())),
         })
     }
 
@@ -260,6 +295,14 @@ impl GstClipRecorder {
     /// The engine wires this from `[runtime.decode] mode`.
     pub fn with_decode_mode(mut self, mode: crate::decode::DecodeMode) -> Self {
         self.decode_mode = mode;
+        self
+    }
+
+    /// Enable alert-clip building with the given config (M-Alert-Clip).
+    /// Builder pattern; the default is disabled, so callsites that
+    /// don't pass a config keep today's behaviour (no alert clips).
+    pub fn with_alert_clips(mut self, cfg: AlertClipsConfig) -> Self {
+        self.alert_clips_cfg = cfg;
         self
     }
 
@@ -1054,6 +1097,133 @@ impl ClipRecorder for GstClipRecorder {
         );
         Ok(true)
     }
+
+    fn push_alert_boxes(
+        &self,
+        camera_id: CameraId,
+        ts: DateTime<Utc>,
+        boxes: Vec<BurnBox>,
+        sup_w: u32,
+        sup_h: u32,
+    ) {
+        let cfg = &self.alert_clips_cfg;
+        if !cfg.enabled {
+            return;
+        }
+        // Keep a little more than the widest possible window so the
+        // pre-roll is always covered even under coalescing.
+        let retain = Duration::from_secs(u64::from(cfg.pre_secs + cfg.post_secs + 2));
+        let existing = self.alert_box_timelines.read().get(&camera_id).cloned();
+        let timeline = match existing {
+            Some(t) => t,
+            None => {
+                let t = Arc::new(PlMutex::new(BoxTimeline::new(retain)));
+                self.alert_box_timelines
+                    .write()
+                    .insert(camera_id, t.clone());
+                t
+            }
+        };
+        timeline.lock().push(BoxFrame {
+            ts,
+            boxes,
+            sup_w,
+            sup_h,
+        });
+    }
+
+    async fn arm_alert_clip(
+        &self,
+        camera_id: CameraId,
+        alert_ts: DateTime<Utc>,
+    ) -> Option<AlertClipId> {
+        let cfg = self.alert_clips_cfg.clone();
+        if !cfg.enabled {
+            return None;
+        }
+        let deadline_ms = alert_ts.timestamp_millis() + i64::from(cfg.post_secs) * 1000;
+
+        // Coalesce into an in-flight builder whose window is still open
+        // (one clip per motion burst). The parking_lot guard is dropped
+        // at the end of this block — never held across an await.
+        {
+            let inflight = self.alert_inflight.lock();
+            if let Some(entry) = inflight.get(&camera_id) {
+                if Utc::now().timestamp_millis() < entry.deadline.load(Ordering::Acquire) {
+                    let cur = entry.deadline.load(Ordering::Acquire);
+                    entry
+                        .deadline
+                        .store(cur.max(deadline_ms), Ordering::Release);
+                    return Some(entry.alert_clip_id);
+                }
+            }
+        }
+
+        // Start a fresh alert clip.
+        let ingester = self.ingesters.read().get(&camera_id).cloned()?;
+        let codec = ingester.codec();
+        // Snapshot + trim the pre-roll ring; derive the window-start
+        // wall-clock from the trimmed pre span so per-frame box lookup
+        // lands on the right instant.
+        let pre = trim_preroll(
+            ingester.snapshot(),
+            Duration::from_secs(u64::from(cfg.pre_secs)),
+        );
+        let pre_span = match (
+            pre.first().and_then(|s| s.pts),
+            pre.last().and_then(|s| s.pts),
+        ) {
+            (Some(a), Some(b)) if b >= a => b - a,
+            _ => Duration::from_secs(u64::from(cfg.pre_secs)),
+        };
+        let window_start = alert_ts
+            - chrono::Duration::from_std(pre_span)
+                .unwrap_or_else(|_| chrono::Duration::seconds(i64::from(cfg.pre_secs)));
+        let rel = alert_clip_rel_path(camera_id, window_start);
+        let alert_clip_id = match self
+            .store
+            .insert_alert_clip(&NewAlertClip {
+                camera_id,
+                started_at: window_start,
+                path: rel.to_string_lossy().into_owned(),
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(camera_id, "alert clip row insert failed: {e}");
+                return None;
+            }
+        };
+        // Subscribe to the live tap NOW so the post window loses no
+        // samples between arm and the spawned collector starting.
+        let live_rx = ingester.subscribe();
+        let timeline = self.alert_box_timelines.read().get(&camera_id).cloned();
+        let deadline = Arc::new(AtomicI64::new(deadline_ms));
+        self.alert_inflight.lock().insert(
+            camera_id,
+            AlertInflight {
+                alert_clip_id,
+                deadline: deadline.clone(),
+            },
+        );
+
+        tokio::spawn(run_alert_clip_builder(
+            self.store.clone(),
+            self.clips_dir.clone(),
+            self.alert_inflight.clone(),
+            cfg,
+            camera_id,
+            codec,
+            alert_clip_id,
+            window_start,
+            pre,
+            live_rx,
+            timeline,
+            deadline,
+        ));
+        Some(alert_clip_id)
+    }
 }
 
 /// Compute the lower-case hex sha256 of `path`. Reads the file in
@@ -1472,6 +1642,134 @@ async fn run_live_pump(
                 }
             }
         }
+    }
+}
+
+/// M-Alert-Clip builder task. Collects the post window off the live tap
+/// until the (coalesce-extendable) deadline, splices it after the
+/// pre-roll snapshot, and runs the blocking decode -> burn-in ->
+/// re-encode on the blocking pool, then stamps the `alert_clips` row
+/// ready (or failed). Spawned per burst by
+/// [`ClipRecorder::arm_alert_clip`].
+#[allow(clippy::too_many_arguments)]
+async fn run_alert_clip_builder(
+    store: Arc<Store>,
+    clips_dir: PathBuf,
+    inflight: Arc<PlMutex<HashMap<CameraId, AlertInflight>>>,
+    cfg: AlertClipsConfig,
+    camera_id: CameraId,
+    codec: CodecKind,
+    alert_clip_id: AlertClipId,
+    window_start: DateTime<Utc>,
+    pre: Vec<NalSample>,
+    mut live_rx: broadcast::Receiver<NalSample>,
+    timeline: Option<Arc<PlMutex<BoxTimeline>>>,
+    deadline: Arc<AtomicI64>,
+) {
+    // Collect the post window, deduping against the pre snapshot's tail
+    // PTS (a sample can straddle the snapshot/live boundary).
+    let pre_tail_pts = pre.iter().filter_map(|s| s.pts).next_back();
+    let mut post: Vec<NalSample> = Vec::new();
+    loop {
+        let now = Utc::now().timestamp_millis();
+        let dl = deadline.load(Ordering::Acquire);
+        if now >= dl {
+            break;
+        }
+        let remaining = Duration::from_millis((dl - now).max(0) as u64);
+        match tokio::time::timeout(remaining, live_rx.recv()).await {
+            Ok(Ok(sample)) => {
+                if let (Some(sp), Some(tp)) = (sample.pts, pre_tail_pts) {
+                    if sp <= tp {
+                        continue;
+                    }
+                }
+                post.push(sample);
+            }
+            // Lagged: the broadcast dropped some samples; the clip has a
+            // small gap but is still useful. Keep collecting.
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            // Timeout: re-check the deadline (a coalescing alert may have
+            // extended it) and loop.
+            Err(_) => {}
+        }
+    }
+
+    // Splice pre + post into one keyframe-first window.
+    let mut window = pre;
+    window.extend(post);
+
+    // Snapshot the box timeline for the encode (frame-aligned raw boxes).
+    let box_frames = timeline
+        .as_ref()
+        .map(|t| t.lock().snapshot())
+        .unwrap_or_default();
+
+    let rel = alert_clip_rel_path(camera_id, window_start);
+    let final_path = clips_dir.join(&rel);
+    let partial_path = alert_clip_inflight_path(&clips_dir, &rel);
+    if let Some(parent) = partial_path.parent() {
+        let _ = fs::create_dir_all(parent).await;
+    }
+
+    let enc_partial = partial_path.clone();
+    let max_w = cfg.max_encode_width;
+    let result = tokio::task::spawn_blocking(move || {
+        encode_alert_clip(
+            &window,
+            codec,
+            &box_frames,
+            window_start,
+            &enc_partial,
+            max_w,
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(stats)) => {
+            // Existence of the final path == "ready"; rename atomically.
+            if let Err(e) = fs::rename(&partial_path, &final_path).await {
+                warn!(camera_id, alert_clip_id, "alert clip rename failed: {e}");
+                let _ = store.mark_alert_clip_failed(alert_clip_id).await;
+            } else if let Err(e) = store
+                .mark_alert_clip_ready(alert_clip_id, stats.duration_ms, stats.size_bytes)
+                .await
+            {
+                warn!(
+                    camera_id,
+                    alert_clip_id, "mark_alert_clip_ready failed: {e}"
+                );
+            } else {
+                info!(
+                    camera_id,
+                    alert_clip_id,
+                    duration_ms = stats.duration_ms,
+                    size_bytes = stats.size_bytes,
+                    "alert clip ready"
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(camera_id, alert_clip_id, "alert clip encode failed: {e}");
+            let _ = fs::remove_file(&partial_path).await;
+            let _ = store.mark_alert_clip_failed(alert_clip_id).await;
+        }
+        Err(e) => {
+            warn!(
+                camera_id,
+                alert_clip_id, "alert clip encode task join failed: {e}"
+            );
+            let _ = store.mark_alert_clip_failed(alert_clip_id).await;
+        }
+    }
+
+    // Remove our in-flight entry — but only if it's still ours (a later
+    // burst that reused the camera slot must not be evicted by us).
+    let mut map = inflight.lock();
+    if map.get(&camera_id).map(|e| e.alert_clip_id) == Some(alert_clip_id) {
+        map.remove(&camera_id);
     }
 }
 

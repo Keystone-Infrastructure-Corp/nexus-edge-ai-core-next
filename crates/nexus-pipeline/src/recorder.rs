@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nexus_store::{ClipClose, ClipId, NewClip, Store};
+use nexus_store::{AlertClipId, ClipClose, ClipId, NewClip, Store};
 use nexus_types::{CameraId, CodecKind};
 use thiserror::Error;
 use tokio::fs;
@@ -272,6 +272,42 @@ pub trait ClipRecorder: Send + Sync {
     /// Default impl is a no-op so the stub recorder (which writes
     /// nothing muxable) doesn't have to opt in.
     async fn shutdown(&self) {}
+
+    /// Feed one gated frame's tracked-object boxes into the per-camera
+    /// alert-clip box timeline (M-Alert-Clip). The supervisor calls
+    /// this only while `clips.alert_clips.enabled`, so the default
+    /// no-op keeps the hot path free for every other recorder. `boxes`
+    /// are the frame-aligned raw detection boxes in supervisor-frame
+    /// coordinates, tagged with `sup_w` / `sup_h` for later scaling
+    /// onto the native-resolution decoded clip.
+    #[allow(unused_variables)]
+    fn push_alert_boxes(
+        &self,
+        camera_id: CameraId,
+        ts: DateTime<Utc>,
+        boxes: Vec<crate::alert_clip::BurnBox>,
+        sup_w: u32,
+        sup_h: u32,
+    ) {
+    }
+
+    /// Arm (or coalesce into) an alert clip for `camera_id` around
+    /// `alert_ts` (M-Alert-Clip). Returns the `alert_clips.id` the
+    /// caller links the firing event to via
+    /// [`nexus_store::Store::link_event_alert_clip`], or `None` when
+    /// the feature is off, no ingester exists for the camera, or the
+    /// row could not be created. The default no-op returns `None`;
+    /// the GStreamer recorder overrides it to snapshot the pre-roll
+    /// ring, collect the post window off the live tap, and spawn the
+    /// decode -> burn-in -> re-encode task.
+    #[allow(unused_variables)]
+    async fn arm_alert_clip(
+        &self,
+        camera_id: CameraId,
+        alert_ts: DateTime<Utc>,
+    ) -> Option<AlertClipId> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
