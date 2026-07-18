@@ -31,6 +31,7 @@ use nexus_config::{CameraConfig, StoreConfig};
 use nexus_sinks::backoff::MAX_ATTEMPTS;
 use nexus_sinks::dispatcher::{self, AllowAllPolicy, DeliveryPolicy, DeliveryVerdict};
 use nexus_sinks::{AlertSink, SinkError, SinkId, SinkRegistry};
+use nexus_store::{ClipClose, NewClip};
 use nexus_store::{OutboxRow, OutboxStatus, Store, SuppressionReason};
 use nexus_types::{AlertEvent, Artifacts, Severity};
 use tempfile::TempDir;
@@ -105,6 +106,7 @@ struct ScriptedSink {
     kind: &'static str,
     id: SinkId,
     calls: AtomicUsize,
+    wants_clip: bool,
     script: parking_lot::Mutex<Vec<Result<(), SinkError>>>,
 }
 
@@ -118,8 +120,16 @@ impl ScriptedSink {
             kind: "webhook",
             id,
             calls: AtomicUsize::new(0),
+            wants_clip: false,
             script: parking_lot::Mutex::new(script),
         }
+    }
+
+    /// Builder toggle: make this sink attach the surrounding clip, so
+    /// the dispatcher runs its clip-resolution / grace-window path.
+    fn wanting_clip(mut self) -> Self {
+        self.wants_clip = true;
+        self
     }
 
     fn calls(&self) -> usize {
@@ -134,6 +144,9 @@ impl AlertSink for ScriptedSink {
     }
     fn id(&self) -> &SinkId {
         &self.id
+    }
+    fn wants_clip(&self) -> bool {
+        self.wants_clip
     }
     async fn deliver(&self, _event: &AlertEvent) -> Result<(), SinkError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -516,4 +529,346 @@ async fn malformed_sink_id_marks_dead() {
         .unwrap();
     assert_eq!(after.status, OutboxStatus::Dead);
     assert!(after.last_error.as_deref().unwrap().contains("malformed"));
+}
+
+// ---------------------------------------------------------------------------
+// Clip-link grace window (intermittent "SureView alert missing its clip")
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn no_clip_linked_within_grace_schedules_retry() {
+    // A clip-attaching sink processes a *fresh* alert whose clip has
+    // not been linked yet (the supervisor links it a few frames after
+    // it enqueues the outbox row). The dispatcher must treat this as
+    // "link still pending" and schedule a retry rather than shipping a
+    // clip-less alarm.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    let id = SinkId::new("webhook", "clip-young").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    // sample_alert's captured_at is Utc::now() → inside the grace.
+    let (_alert, row) = enqueue_one(&store, 1, "rule.clip", id.as_str()).await;
+    let before = Utc::now();
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+
+    assert_eq!(sink.calls(), 0, "must not deliver while clip link pending");
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Pending);
+    assert_eq!(after.attempts, 1);
+    let scheduled = after.next_attempt_at.expect("retry scheduled");
+    assert!(scheduled > before);
+    assert!(after
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("clip link pending"));
+}
+
+#[tokio::test]
+async fn no_clip_linked_after_grace_delivers() {
+    // Same clip-attaching sink, but the alert is old enough that the
+    // clip would certainly have been linked by now if one existed.
+    // The dispatcher gives up waiting and delivers clip-less.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    let id = SinkId::new("webhook", "clip-old").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    // Backdate the alert well past CLIP_LINK_GRACE_SECS (10 s).
+    let mut alert = sample_alert(1, "rule.clip.old");
+    alert.captured_at = Utc::now() - chrono::Duration::seconds(30);
+    store
+        .record_event_and_enqueue(&alert, &[id.as_str()])
+        .await
+        .expect("enqueue");
+    let row = store
+        .outbox_for_event(&alert.event_id.to_string())
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+
+    assert_eq!(sink.calls(), 1, "delivers clip-less after grace elapses");
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Sent);
+}
+
+/// Open + close a clip, link it to the given event, and return the
+/// clip's relative hot path. `hot_present` controls whether the row
+/// keeps a hot pointer (soft-evicted clips have `hot_path = NULL`).
+async fn link_closed_clip(store: &Arc<Store>, event_id: &str, hot_present: bool) -> String {
+    let rel = format!("cam1/{event_id}.mp4");
+    let clip_id = store
+        .open_clip(&NewClip {
+            camera_id: 1,
+            started_at: Utc::now() - chrono::Duration::seconds(5),
+            hot_path: rel.clone(),
+            hot_handle: "local".into(),
+            codec: "h264".into(),
+            container: "mp4".into(),
+            frame_width: 960,
+            frame_height: 540,
+        })
+        .await
+        .expect("open_clip");
+    store
+        .close_clip(
+            clip_id,
+            &ClipClose {
+                ended_at: Utc::now(),
+                duration_ms: 4000,
+                size_bytes: 1024,
+                hot_path: Some(rel.clone()),
+                sha256: Some("deadbeef".into()),
+            },
+        )
+        .await
+        .expect("close_clip");
+    if !hot_present {
+        // Simulate a soft-eviction: the cold replicator uploaded the
+        // clip and the hot copy was then reclaimed under disk pressure.
+        // The row schema requires at least one handle and, when the hot
+        // handle is present, a hot_path — so clearing the hot side must
+        // go hand-in-hand with populating the cold side to satisfy the
+        // `hot_handle IS NOT NULL OR cold_handle IS NOT NULL` and
+        // `cold_handle IS NULL OR (cold_path IS NOT NULL AND
+        // cold_uploaded_at IS NOT NULL)` CHECK constraints.
+        sqlx::query(
+            "UPDATE motion_clips \
+             SET hot_path = NULL, hot_handle = NULL, \
+                 cold_handle = 'local', cold_path = ?, \
+                 cold_uploaded_at = ? \
+             WHERE id = ?",
+        )
+        .bind(format!("cold/{event_id}.mp4"))
+        .bind(Utc::now())
+        .bind(clip_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+    store
+        .link_event_to_clip(event_id, clip_id)
+        .await
+        .expect("link_event_to_clip");
+    rel
+}
+
+#[tokio::test]
+async fn clip_hot_file_present_delivers_with_clip() {
+    // A closed clip with a hot pointer whose MP4 is actually on disk
+    // resolves and delivers.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "clip-hot").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let (alert, row) = enqueue_one(&store, 1, "rule.clip.hot", id.as_str()).await;
+    let rel = link_closed_clip(&store, &alert.event_id.to_string(), true).await;
+    // Materialise the file on disk so the dispatcher's existence
+    // check passes.
+    let abs = clips_dir.path().join(&rel);
+    tokio::fs::create_dir_all(abs.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&abs, b"fake mp4 bytes").await.unwrap();
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(sink.calls(), 1, "delivers with the resolved clip");
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Sent);
+}
+
+#[tokio::test]
+async fn clip_hot_file_missing_within_grace_retries() {
+    // The DB names a hot_path but the MP4 isn't on disk (recorder
+    // still flushing, or a racing eviction) and the alert is fresh —
+    // retry rather than ship a clip-less alarm.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "clip-missing").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let (alert, row) = enqueue_one(&store, 1, "rule.clip.missing", id.as_str()).await;
+    // Link a closed clip but DO NOT create the file on disk.
+    link_closed_clip(&store, &alert.event_id.to_string(), true).await;
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(sink.calls(), 0, "must not deliver while hot file absent");
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Pending);
+    assert!(after
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("not yet on disk"));
+}
+
+#[tokio::test]
+async fn clip_soft_evicted_within_grace_retries() {
+    // Clip closed but soft-evicted (hot_path NULL); a fresh alert
+    // retries in case the eviction raced the close.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "clip-evicted").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let (alert, row) = enqueue_one(&store, 1, "rule.clip.evicted", id.as_str()).await;
+    link_closed_clip(&store, &alert.event_id.to_string(), false).await;
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(
+        sink.calls(),
+        0,
+        "must not deliver while soft-evict may be racing"
+    );
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Pending);
+    assert!(after.last_error.as_deref().unwrap().contains("no hot path"));
+}
+
+#[tokio::test]
+async fn clip_soft_evicted_after_grace_delivers_clipless() {
+    // Same soft-evicted clip, but the alert is old enough that the
+    // hot copy is gone for good — deliver clip-less rather than block.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "clip-evicted-old").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let mut alert = sample_alert(1, "rule.clip.evicted.old");
+    alert.captured_at = Utc::now() - chrono::Duration::seconds(30);
+    store
+        .record_event_and_enqueue(&alert, &[id.as_str()])
+        .await
+        .expect("enqueue");
+    let row = store
+        .outbox_for_event(&alert.event_id.to_string())
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    link_closed_clip(&store, &alert.event_id.to_string(), false).await;
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(sink.calls(), 1, "delivers clip-less once hot copy is gone");
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Sent);
 }
