@@ -62,10 +62,10 @@ const SNAPSHOT_JPEG_QUALITY: u8 = 72;
 /// JPEG compression without swamping small objects.
 const SNAPSHOT_BBOX_HALF_STROKE: i64 = 1;
 
-/// RGB colour of the alert bounding box (cyan `#22d3ee`), matching the
-/// console's alert-detail overlay so the single box reads identically in
-/// the snapshot JPEG, the burned-in alert clip, and the web UI.
-const SNAPSHOT_BBOX_RGB: [u8; 3] = [0x22, 0xd3, 0xee];
+/// RGB colour of the alert bounding box. Aliases the shared
+/// [`crate::overlay::ALERT_RGB`] (cyan `#22d3ee`) so the snapshot box,
+/// its label chip, and the burned-in alert clip never diverge.
+const SNAPSHOT_BBOX_RGB: [u8; 3] = crate::overlay::ALERT_RGB;
 
 /// Draw a filled-stroke rectangle for `bbox` onto an RGB24 buffer in
 /// place. Coordinates are in the same pixel space as the frame
@@ -132,6 +132,8 @@ async fn write_alert_snapshot(
     event_id: &str,
     frame: &Arc<Frame>,
     bbox: Option<BBox>,
+    label: &str,
+    confidence: Option<f32>,
 ) -> Option<String> {
     // The supervisor frame is guaranteed RGB24 (see source.rs); guard
     // anyway so a future format change fails closed rather than writing
@@ -142,6 +144,7 @@ async fn write_alert_snapshot(
     let dir = snapshots_dir.to_path_buf();
     let frame = Arc::clone(frame);
     let id = event_id.to_string();
+    let label = label.to_string();
     let join = tokio::task::spawn_blocking(move || {
         use image::ImageEncoder as _;
         let path = dir.join(format!("{id}.jpg"));
@@ -150,6 +153,19 @@ async fn write_alert_snapshot(
         let mut pixels = frame.data.to_vec();
         if let Some(bbox) = bbox {
             draw_bbox_rgb24(&mut pixels, frame.width, frame.height, &bbox);
+            // Label chip ("person 0.96") anchored to the box top-left,
+            // burned into the JPEG so the email / SureView copies show
+            // it too — identical to the burned-in alert clip.
+            let chip = crate::overlay::label_text(&label, confidence);
+            crate::overlay::draw_label_chip_rgb24(
+                &mut pixels,
+                frame.width,
+                frame.height,
+                bbox.x1.round() as i64,
+                bbox.y1.round() as i64,
+                &chip,
+                crate::alert_clip::label_scale(frame.width),
+            );
         }
         let mut out = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, SNAPSHOT_JPEG_QUALITY)
@@ -1043,6 +1059,8 @@ async fn run_camera(
                             y1: b.y1,
                             x2: b.x2,
                             y2: b.y2,
+                            label: t.label.clone(),
+                            confidence: t.confidence,
                         }
                     })
                     .collect();
@@ -1095,7 +1113,20 @@ async fn run_camera(
                 // row. Best-effort: a missing thumbnail never blocks the
                 // alert. Also stamped onto `artifacts.snapshot` for bus
                 // subscribers / the local admin API.
-                if let Some(path) = write_alert_snapshot(&snapshots_dir, &event_id, &frame_arc, ev.bbox).await
+                let snap_conf = ev
+                    .context
+                    .get("confidence")
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|f| f as f32);
+                if let Some(path) = write_alert_snapshot(
+                    &snapshots_dir,
+                    &event_id,
+                    &frame_arc,
+                    ev.bbox,
+                    &ev.label,
+                    snap_conf,
+                )
+                .await
                 {
                     ev.artifacts.snapshot = Some(path);
                 }
