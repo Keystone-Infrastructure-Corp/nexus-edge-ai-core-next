@@ -62,9 +62,10 @@ const SNAPSHOT_JPEG_QUALITY: u8 = 72;
 /// JPEG compression without swamping small objects.
 const SNAPSHOT_BBOX_HALF_STROKE: i64 = 1;
 
-/// RGB colour of the alert bounding box (bright green, matches the
-/// live-view overlay).
-const SNAPSHOT_BBOX_RGB: [u8; 3] = [0x2e, 0xe6, 0x4a];
+/// RGB colour of the alert bounding box (cyan `#22d3ee`), matching the
+/// console's alert-detail overlay so the single box reads identically in
+/// the snapshot JPEG, the burned-in alert clip, and the web UI.
+const SNAPSHOT_BBOX_RGB: [u8; 3] = [0x22, 0xd3, 0xee];
 
 /// Draw a filled-stroke rectangle for `bbox` onto an RGB24 buffer in
 /// place. Coordinates are in the same pixel space as the frame
