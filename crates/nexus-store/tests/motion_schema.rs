@@ -661,6 +661,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0022_fleet_managed_markers".to_string(),
             "0023_motion_clips_cold_backoff".to_string(),
             "0024_metrics_samples".to_string(),
+            "0026_alert_clips".to_string(),
         ]
     );
 }

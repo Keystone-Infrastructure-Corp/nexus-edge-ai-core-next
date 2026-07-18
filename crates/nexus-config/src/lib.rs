@@ -516,6 +516,11 @@ pub struct ClipsConfig {
     /// upload queue. Default 256 MiB.
     #[serde(default = "default_max_clip_bytes")]
     pub max_clip_bytes: u64,
+    /// M-Alert-Clip: short, burned-in alert clips delivered to sinks
+    /// promptly, independent of the 5-minute motion clip. All-defaulted;
+    /// disabled by default. See docs/edge-core/M_ALERT_CLIP.md.
+    #[serde(default)]
+    pub alert_clips: AlertClipsConfig,
 }
 
 impl Default for ClipsConfig {
@@ -532,6 +537,7 @@ impl Default for ClipsConfig {
             pre_roll_secs: default_pre_roll_secs(),
             preferred_usb_label: None,
             max_clip_bytes: default_max_clip_bytes(),
+            alert_clips: AlertClipsConfig::default(),
         }
     }
 }
@@ -572,6 +578,68 @@ fn default_max_clip_bytes() -> u64 {
     // 256 MiB. A healthy 30-60 s clip is a few MB; this only ever
     // trips on corrupt byte-exploding streams.
     256 * 1024 * 1024
+}
+
+/// M-Alert-Clip: configuration for the short, burned-in "alert clip"
+/// that covers only the alert timeframe and is delivered to sinks
+/// promptly, independent of the 5-minute motion clip. All-defaulted so
+/// an existing `[clips]` section keeps today's behaviour (disabled).
+/// See docs/edge-core/M_ALERT_CLIP.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertClipsConfig {
+    /// Master switch. Default `false`: no alert clips are built and
+    /// clip-attaching sinks keep resolving the 5-minute motion clip.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds of footage before the alert timestamp to include.
+    /// Effectively bounded by the ingester's `pre_roll_secs` (the
+    /// window can't include more than is buffered). Default 3.
+    #[serde(default = "default_alert_clip_pre_secs")]
+    pub pre_secs: u32,
+    /// Seconds of footage after the alert timestamp to keep collecting
+    /// before the clip is finalized. Sets the delivery-latency floor:
+    /// the clip is ready ~`post_secs` after the alert. Default 5.
+    #[serde(default = "default_alert_clip_post_secs")]
+    pub post_secs: u32,
+    /// Downscale cap (pixels of width) applied to the native frame
+    /// before the bbox burn-in re-encode, to bound per-alert CPU.
+    /// `0` disables the cap (encode at native width). Default 1280.
+    #[serde(default = "default_alert_clip_max_encode_width")]
+    pub max_encode_width: u32,
+    /// How long the sink dispatcher waits for the alert clip to
+    /// finalize before delivering the alarm clip-less. Should exceed
+    /// `post_secs` plus worst-case encode time. Default 30.
+    #[serde(default = "default_alert_clip_build_timeout_secs")]
+    pub build_timeout_secs: u32,
+}
+
+impl Default for AlertClipsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pre_secs: default_alert_clip_pre_secs(),
+            post_secs: default_alert_clip_post_secs(),
+            max_encode_width: default_alert_clip_max_encode_width(),
+            build_timeout_secs: default_alert_clip_build_timeout_secs(),
+        }
+    }
+}
+
+fn default_alert_clip_pre_secs() -> u32 {
+    3
+}
+
+fn default_alert_clip_post_secs() -> u32 {
+    5
+}
+
+fn default_alert_clip_max_encode_width() -> u32 {
+    1280
+}
+
+fn default_alert_clip_build_timeout_secs() -> u32 {
+    30
 }
 
 // ---------------------------------------------------------------------------
@@ -2866,6 +2934,27 @@ mod tests {
             ..Default::default()
         };
         assert!(!cfg.lan_proxy.enabled);
+    }
+
+    /// M-Alert-Clip P2 — alert clips are opt-in. With `[clips.alert_clips]`
+    /// absent (or defaulted) the feature is off and clip-attaching sinks
+    /// keep resolving the 5-minute motion clip. Pins the defaults so a
+    /// regression can't silently start building/evicting alert clips.
+    #[test]
+    fn alert_clips_are_off_by_default() {
+        let d = AlertClipsConfig::default();
+        assert!(!d.enabled);
+        assert_eq!(d.pre_secs, 3);
+        assert_eq!(d.post_secs, 5);
+        assert_eq!(d.max_encode_width, 1280);
+        assert_eq!(d.build_timeout_secs, 30);
+        // The ClipsConfig default embeds the disabled AlertClipsConfig.
+        assert!(!ClipsConfig::default().alert_clips.enabled);
+        // A `[clips]` section without `[clips.alert_clips]` deserialises to
+        // the disabled default (backward compatible with existing configs).
+        let clips: ClipsConfig = toml::from_str("").unwrap();
+        assert!(!clips.alert_clips.enabled);
+        assert_eq!(clips.alert_clips.post_secs, 5);
     }
 
     #[test]
