@@ -348,6 +348,17 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/sinks/config/{kind}/{name}",
             put(put_admin_sink).delete(delete_admin_sink),
         )
+        // M7 — on-demand sink delivery test. POSTs a synthetic,
+        // clearly-labelled "Nexus sink test" alert straight through
+        // the LIVE sink instance (bypassing the outbox) so an
+        // operator can verify a configured sink end-to-end from the
+        // console at any time. Sits one segment deeper than the
+        // `config/{kind}/{name}` param route (literal `test` suffix),
+        // so it never collides with the PUT/DELETE sibling.
+        .route(
+            "/v1/admin/sinks/config/{kind}/{name}/test",
+            axum::routing::post(post_admin_sink_test),
+        )
         // Phase 5.6 · R7 — per-camera re-ID emit telemetry +
         // [reid] config snapshot. Drives the `/admin/reid`
         // local diagnostic page. Returns shape-stable JSON
@@ -4883,6 +4894,149 @@ async fn delete_admin_sink(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Outcome of `POST /v1/admin/sinks/config/{kind}/{name}/test`.
+#[derive(serde::Serialize)]
+struct TestSinkOut {
+    /// The sink id (`<kind>:<name>`) that was exercised.
+    sink_id: String,
+    /// True ⇔ the sink accepted the synthetic alert (the remote
+    /// system took ownership — 2xx / accepted).
+    ok: bool,
+    /// Human-readable failure reason when `ok == false`; `None` on
+    /// success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// When `ok == false`, whether the dispatcher would treat the
+    /// failure as transient (worth a retry) vs permanent
+    /// (misconfiguration). `None` on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transient: Option<bool>,
+}
+
+/// On-demand delivery test for a single configured sink.
+///
+/// Resolves the *live* sink from the registry — so it exercises the
+/// exact instance the dispatcher uses, real secrets and all — and
+/// calls [`nexus_sinks::AlertSink::deliver`] once with a synthetic,
+/// clearly-labelled test alert. The `alert_sink_outbox` is bypassed
+/// entirely: this is a fire-once probe, not an enqueue, and no retry
+/// is attempted.
+///
+/// The synthetic alert is stamped `context.test = true`, carries a
+/// `"Nexus sink test"` label and the reserved `__nexus_sink_test__`
+/// rule id, and uses `camera_id = 0` so any per-camera alarm-point
+/// override falls back to the sink's default. A downstream monitoring
+/// station (SureView, etc.) can key off any of these to recognise a
+/// drill and avoid dispatching a real response.
+///
+/// Returns HTTP 200 with `{ ok, error?, transient? }` for BOTH a
+/// successful and a failed delivery — the *request* succeeded; the
+/// delivery outcome rides in the body so the console can render a
+/// precise message. A 4xx is reserved for a malformed sink id or a
+/// sink that isn't currently active.
+async fn post_admin_sink_test(
+    State(s): State<ApiState>,
+    Path((kind, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    admin: crate::auth::require_role::AdminContext,
+) -> Result<Json<TestSinkOut>, ApiError> {
+    let sink_id_str = format!("{kind}:{name}");
+    let sink_id = nexus_sinks::SinkId::parse(&sink_id_str).ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid sink id '{sink_id_str}'"),
+        )
+    })?;
+
+    // Resolve the LIVE sink — file, cloud, or reserved. A config that
+    // exists but failed to build (or a stale id) simply isn't in the
+    // registry; report that distinctly so the operator knows the sink
+    // is not actually running and a test would be meaningless.
+    let sink = s.sink_registry.get(&sink_id).ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "sink '{sink_id_str}' is not active — it may have failed to build from \
+                 its config, or the config changed and the engine has not reloaded yet"
+            ),
+        )
+    })?;
+
+    // Synthetic, unmistakably-a-test alert. `camera_id = 0` → sinks
+    // fall back to their default alarm point; `context.test = true` is
+    // the machine-readable "this is a drill" flag.
+    let mut context = serde_json::Map::new();
+    context.insert("test".to_string(), serde_json::Value::Bool(true));
+    context.insert(
+        "note".to_string(),
+        serde_json::Value::String(
+            "Manual delivery test from the Nexus console — no real detection occurred.".to_string(),
+        ),
+    );
+    let event = AlertEvent {
+        event_id: uuid::Uuid::now_v7(),
+        camera_id: 0,
+        rule_id: "__nexus_sink_test__".to_string(),
+        track_id: None,
+        label: "Nexus sink test".to_string(),
+        severity: nexus_types::Severity::Low,
+        bbox: None,
+        frame_id: 0,
+        captured_at: chrono::Utc::now(),
+        // 32-hex-lowercase, matching the cloud `alerts.trace_id` CHECK
+        // in case this exercises the reserved `cloud:console` sink.
+        trace_id: uuid::Uuid::now_v7().simple().to_string(),
+        frame_w: 0,
+        frame_h: 0,
+        artifacts: nexus_types::Artifacts::default(),
+        context,
+    };
+
+    let out = match sink.deliver(&event).await {
+        Ok(()) => TestSinkOut {
+            sink_id: sink_id_str.clone(),
+            ok: true,
+            error: None,
+            transient: None,
+        },
+        Err(e) => TestSinkOut {
+            sink_id: sink_id_str.clone(),
+            ok: false,
+            error: Some(e.to_string()),
+            transient: Some(e.is_transient()),
+        },
+    };
+
+    // Audit — a test fires a REAL delivery to the configured
+    // destination, so it belongs in the trail alongside config edits.
+    let after_json = serde_json::to_string(&serde_json::json!({
+        "ok": out.ok,
+        "error": out.error,
+        "transient": out.transient,
+    }))
+    .ok();
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        Some(&admin.0),
+        &headers,
+        peer.ip(),
+        "sink.config.test",
+        "admin/sinks",
+        Some(sink_id_str.as_str()),
+        if out.ok {
+            nexus_store::audit::AuditOutcome::Success
+        } else {
+            nexus_store::audit::AuditOutcome::Failure
+        },
+        None,
+        after_json.as_deref(),
+    )
+    .await;
+
+    Ok(Json(out))
+}
+
 // ===========================================================================
 // Phase 5.6 · R7 — re-identification local diagnostic.
 //
@@ -7921,6 +8075,27 @@ mod tests {
         assert_eq!(windows[0]["label"], "1h");
         assert_eq!(windows[1]["label"], "24h");
         assert_eq!(v["sinks"].as_array().unwrap().len(), 0);
+    }
+
+    /// POST /v1/admin/sinks/config/{kind}/{name}/test for a sink that
+    /// isn't in the live registry returns 409 (not active). Proves the
+    /// route is wired, sits behind the admin gate, and the not-active
+    /// branch fires — `build_test_router` ships an empty `SinkRegistry`
+    /// so every id resolves to "inactive".
+    #[tokio::test]
+    async fn sink_test_unknown_sink_returns_409() {
+        const SECRET: &[u8] = b"m7-sink-test-409-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/sinks/config/webhook/nope/test")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 
     /// M6 Phase 2 Step 2.9 — public auth-mode probe is reachable

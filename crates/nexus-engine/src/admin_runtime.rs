@@ -1248,7 +1248,11 @@ pub async fn put_watermarks(
 ) -> Result<Json<PutWatermarkOut>, ApiError> {
     // Resolve the effective values (incoming or fall-back to
     // current snapshot) so we can validate the combined pair
-    // against the FSM invariant `panic_pct > low_pct`.
+    // against the FSM invariant `low_pct > panic_pct`. These are
+    // FREE-SPACE thresholds: the sampler starts pruning when free
+    // space drops below `low_pct` and stops recording when it drops
+    // further below `panic_pct`, so `low_pct` must sit strictly above
+    // `panic_pct` (defaults: low=15, panic=5).
     let new_low = req.low_pct.unwrap_or(s.low_watermark_pct);
     let new_panic = req.panic_pct.unwrap_or(s.panic_watermark_pct);
 
@@ -1258,10 +1262,10 @@ pub async fn put_watermarks(
             "low_pct and panic_pct must be 0..=100".into(),
         ));
     }
-    if new_panic <= new_low {
+    if new_low <= new_panic {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            format!("panic_pct ({new_panic}) must be strictly greater than low_pct ({new_low})"),
+            format!("low_pct ({new_low}) must be strictly greater than panic_pct ({new_panic})"),
         ));
     }
 
@@ -1351,13 +1355,13 @@ pub async fn resolve_persisted_watermarks(store: &Store, toml_low: u8, toml_pani
     let low = persisted_low.unwrap_or(toml_low);
     let panic = persisted_panic.unwrap_or(toml_panic);
 
-    if panic <= low {
+    if low <= panic {
         tracing::warn!(
             persisted_low = ?persisted_low,
             persisted_panic = ?persisted_panic,
             toml_low,
             toml_panic,
-            "engine_runtime_settings watermark pair fails panic > low invariant; falling back to nexus.toml",
+            "engine_runtime_settings watermark pair fails low > panic invariant; falling back to nexus.toml",
         );
         return (toml_low, toml_panic);
     }
@@ -2320,8 +2324,8 @@ mod tests {
                 ui_pending: None,
             },
             watermarks: WatermarkOut {
-                low_pct: 80,
-                panic_pct: 95,
+                low_pct: 15,
+                panic_pct: 5,
                 pending_low_pct: None,
                 pending_panic_pct: None,
             },
@@ -2343,8 +2347,8 @@ mod tests {
         // Each top-level key is present and addresses the
         // corresponding section.
         assert_eq!(v["bind"]["current"], "0.0.0.0:8089");
-        assert_eq!(v["watermarks"]["low_pct"], 80);
-        assert_eq!(v["watermarks"]["panic_pct"], 95);
+        assert_eq!(v["watermarks"]["low_pct"], 15);
+        assert_eq!(v["watermarks"]["panic_pct"], 5);
         assert_eq!(v["inference"]["current"]["kind"], "yolov8");
         assert!(v["identity"]["display_name"].is_null());
     }
