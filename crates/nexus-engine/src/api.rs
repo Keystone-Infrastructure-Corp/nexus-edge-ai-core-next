@@ -4336,6 +4336,10 @@ struct PutAdminDeliveryReq {
     schedule: Option<nexus_types::DeliverySchedule>,
     #[serde(default)]
     timezone: Option<String>,
+    /// M-Alert-Clip on/off. `None` (omitted, e.g. a toggle-only PUT)
+    /// preserves the stored value rather than resetting it.
+    #[serde(default)]
+    attach_alert_clip: Option<bool>,
 }
 
 async fn get_admin_delivery(
@@ -4381,10 +4385,16 @@ async fn put_admin_delivery(
     }
     let before = s.store.delivery_settings_get().await.ok();
     let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
+    // Preserve the stored alert-clip toggle when the PUT omits it (a
+    // toggle-only delivery PUT must not silently re-enable it).
+    let attach_alert_clip = req
+        .attach_alert_clip
+        .unwrap_or_else(|| before.as_ref().map(|b| b.attach_alert_clip).unwrap_or(true));
     let settings = nexus_types::DeliverySettings {
         enabled: req.enabled,
         schedule: req.schedule,
         timezone,
+        attach_alert_clip,
         updated_at: chrono::Utc::now(),
     };
     let after_str = serde_json::to_string(&settings).ok();

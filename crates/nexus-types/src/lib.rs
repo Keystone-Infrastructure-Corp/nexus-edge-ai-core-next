@@ -626,6 +626,13 @@ impl DeliverySchedule {
     }
 }
 
+/// Serde default for boolean fields that default to `true` (e.g.
+/// [`DeliverySettings::attach_alert_clip`]) so a stored/wire form that
+/// predates the field deserializes to the on state.
+fn default_true() -> bool {
+    true
+}
+
 /// Global delivery configuration — one row in `delivery_settings`.
 ///
 /// `timezone` is an IANA name (`"America/Los_Angeles"`, `"UTC"`,
@@ -644,6 +651,19 @@ pub struct DeliverySettings {
     pub schedule: Option<DeliverySchedule>,
     /// IANA timezone name (e.g. `"America/Los_Angeles"`).
     pub timezone: String,
+    /// M-Alert-Clip: attach the short, burned-in truncated "alert
+    /// clip" to alert-sink deliveries. `true` by default — the edge
+    /// builds the clip covering only the alert timeframe (with the
+    /// tracked-object bbox drawn in), attaches it to clip-wanting
+    /// sinks, and cold-replicates it so the cloud console shows the
+    /// same evidence. `false` disables it: deliveries fall back to the
+    /// covering motion clip and nothing is built or replicated. This
+    /// is the operator-facing on/off in the delivery settings for
+    /// alert sinks; it is AND-gated by the edge capability switch
+    /// `clips.alert_clips.enabled`. Applied live on
+    /// `delivery.settings.changed` — no restart.
+    #[serde(default = "default_true")]
+    pub attach_alert_clip: bool,
     /// Last mutation timestamp. Set by the store on each put.
     pub updated_at: DateTime<Utc>,
 }
@@ -654,6 +674,7 @@ impl Default for DeliverySettings {
             enabled: true,
             schedule: None,
             timezone: "UTC".to_string(),
+            attach_alert_clip: true,
             updated_at: chrono::Utc::now(),
         }
     }

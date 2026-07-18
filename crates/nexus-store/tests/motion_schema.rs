@@ -663,6 +663,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0024_metrics_samples".to_string(),
             "0026_alert_clips".to_string(),
             "0027_alert_clips_cold".to_string(),
+            "0028_delivery_settings_alert_clip".to_string(),
         ]
     );
 }

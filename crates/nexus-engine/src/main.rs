@@ -638,6 +638,21 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // built further below.
     let cold_kick = std::sync::Arc::new(tokio::sync::Notify::new());
 
+    // M-Alert-Clip: live operator gate mirroring
+    // `DeliverySettings.attach_alert_clip`. Seeded from the stored
+    // delivery settings (default on) and flipped by the delivery-reload
+    // task on `delivery.settings.changed`, so an operator can disable
+    // alert clips per-org / per-core from the cloud console without a
+    // restart. Shared into both the recorder (reader) and the
+    // delivery-reload task (writer).
+    let alert_clip_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        store
+            .delivery_settings_get()
+            .await
+            .map(|d| d.attach_alert_clip)
+            .unwrap_or(true),
+    ));
+
     let (recorder, webrtc_bridge) = build_recorder(
         &cfg.runtime.clips.recorder,
         store.clone(),
@@ -651,6 +666,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         preferred_usb_label.clone(),
         cfg.runtime.clips.alert_clips.clone(),
         cold_kick.clone(),
+        alert_clip_gate.clone(),
     )
     .await?;
     info!(
@@ -1142,8 +1158,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             cascading_policy.clone(),
             entitlement_cache.clone(),
         ));
-    let (delivery_reload_handle, delivery_reload_shutdown_tx) =
-        delivery_reload::spawn(bus.clone(), store.clone(), cascading_policy.clone());
+    let (delivery_reload_handle, delivery_reload_shutdown_tx) = delivery_reload::spawn(
+        bus.clone(),
+        store.clone(),
+        cascading_policy.clone(),
+        alert_clip_gate.clone(),
+    );
     // M7 cloud-managed sinks — rebuild the registry on each
     // `sink.config.changed` signal (admin PUT/DELETE under
     // `/v1/admin/sinks/config/*`). file_sinks is the boot snapshot
@@ -2105,6 +2125,7 @@ async fn build_recorder(
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     alert_clips: nexus_config::AlertClipsConfig,
     cold_kick: Arc<tokio::sync::Notify>,
+    alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2131,6 +2152,7 @@ async fn build_recorder(
                 preferred_usb_label,
                 alert_clips,
                 cold_kick,
+                alert_clip_gate,
             )
             .await
         }
@@ -2151,6 +2173,7 @@ async fn build_gst_recorder(
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     alert_clips: nexus_config::AlertClipsConfig,
     cold_kick: Arc<tokio::sync::Notify>,
+    alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2259,7 +2282,8 @@ async fn build_gst_recorder(
         .with_usb(usb_resolver, preferred_usb_label)
         .with_decode_mode(decode_mode)
         .with_alert_clips(alert_clips)
-        .with_alert_cold_kick(cold_kick);
+        .with_alert_cold_kick(cold_kick)
+        .with_alert_clip_delivery_gate(alert_clip_gate);
     Ok((Arc::new(rec), webrtc))
 }
 
@@ -2277,6 +2301,7 @@ async fn build_gst_recorder(
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     _alert_clips: nexus_config::AlertClipsConfig,
     _cold_kick: Arc<tokio::sync::Notify>,
+    _alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,

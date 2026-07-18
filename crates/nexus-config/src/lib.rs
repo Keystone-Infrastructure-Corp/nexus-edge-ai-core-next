@@ -582,15 +582,20 @@ fn default_max_clip_bytes() -> u64 {
 
 /// M-Alert-Clip: configuration for the short, burned-in "alert clip"
 /// that covers only the alert timeframe and is delivered to sinks
-/// promptly, independent of the 5-minute motion clip. All-defaulted so
-/// an existing `[clips]` section keeps today's behaviour (disabled).
-/// See docs/edge-core/M_ALERT_CLIP.md.
+/// promptly, independent of the 5-minute motion clip. Enabled by
+/// default; operators disable it per-org / per-core from the cloud
+/// console's delivery settings (which flips the runtime
+/// `DeliverySettings.attach_alert_clip` gate) without editing this
+/// file. See docs/edge-core/M_ALERT_CLIP.md.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertClipsConfig {
-    /// Master switch. Default `false`: no alert clips are built and
-    /// clip-attaching sinks keep resolving the 5-minute motion clip.
-    #[serde(default)]
+    /// Capability switch. Default `true`: the edge builds alert clips
+    /// and clip-attaching sinks resolve them (the operator-facing on/off
+    /// lives in delivery settings, `DeliverySettings.attach_alert_clip`,
+    /// AND-gated with this). Set `false` here to hard-disable the
+    /// capability on a box regardless of the cloud toggle.
+    #[serde(default = "default_alert_clips_enabled")]
     pub enabled: bool,
     /// Seconds of footage before the alert timestamp to include.
     /// Effectively bounded by the ingester's `pre_roll_secs` (the
@@ -617,13 +622,17 @@ pub struct AlertClipsConfig {
 impl Default for AlertClipsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_alert_clips_enabled(),
             pre_secs: default_alert_clip_pre_secs(),
             post_secs: default_alert_clip_post_secs(),
             max_encode_width: default_alert_clip_max_encode_width(),
             build_timeout_secs: default_alert_clip_build_timeout_secs(),
         }
     }
+}
+
+fn default_alert_clips_enabled() -> bool {
+    true
 }
 
 fn default_alert_clip_pre_secs() -> u32 {
@@ -2936,25 +2945,29 @@ mod tests {
         assert!(!cfg.lan_proxy.enabled);
     }
 
-    /// M-Alert-Clip P2 — alert clips are opt-in. With `[clips.alert_clips]`
-    /// absent (or defaulted) the feature is off and clip-attaching sinks
-    /// keep resolving the 5-minute motion clip. Pins the defaults so a
-    /// regression can't silently start building/evicting alert clips.
+    /// M-Alert-Clip — alert clips are ON by default; operators disable
+    /// them per-org / per-core from the cloud console's delivery settings
+    /// (`DeliverySettings.attach_alert_clip`), not by editing config.
+    /// Pins the defaults so a regression can't silently change the
+    /// capability switch or the window/timeout tunables.
     #[test]
-    fn alert_clips_are_off_by_default() {
+    fn alert_clips_are_on_by_default() {
         let d = AlertClipsConfig::default();
-        assert!(!d.enabled);
+        assert!(d.enabled);
         assert_eq!(d.pre_secs, 3);
         assert_eq!(d.post_secs, 5);
         assert_eq!(d.max_encode_width, 1280);
         assert_eq!(d.build_timeout_secs, 30);
-        // The ClipsConfig default embeds the disabled AlertClipsConfig.
-        assert!(!ClipsConfig::default().alert_clips.enabled);
+        // The ClipsConfig default embeds the enabled AlertClipsConfig.
+        assert!(ClipsConfig::default().alert_clips.enabled);
         // A `[clips]` section without `[clips.alert_clips]` deserialises to
-        // the disabled default (backward compatible with existing configs).
+        // the enabled default.
         let clips: ClipsConfig = toml::from_str("").unwrap();
-        assert!(!clips.alert_clips.enabled);
+        assert!(clips.alert_clips.enabled);
         assert_eq!(clips.alert_clips.post_secs, 5);
+        // An explicit `enabled = false` still hard-disables the capability.
+        let off: ClipsConfig = toml::from_str("[alert_clips]\nenabled = false\n").unwrap();
+        assert!(!off.alert_clips.enabled);
     }
 
     #[test]

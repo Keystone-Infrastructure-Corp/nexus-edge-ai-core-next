@@ -101,7 +101,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -198,6 +198,15 @@ pub struct GstClipRecorder {
     /// for its polling backstop. `None` (LAN-only / no cloud) leaves
     /// alert clips to the replicator's normal cadence.
     alert_cold_kick: Option<Arc<Notify>>,
+    /// Live operator gate mirroring `DeliverySettings.attach_alert_clip`
+    /// (M-Alert-Clip). `None` (tests / no engine wiring) means "allowed".
+    /// When `Some(false)` the recorder builds no alert clips and stops
+    /// feeding the box timeline, so an operator can disable the feature
+    /// per-org / per-core from the cloud console's delivery settings
+    /// without a restart. AND-gated with the `alert_clips_cfg.enabled`
+    /// capability switch; updated by the engine on
+    /// `delivery.settings.changed`.
+    alert_clip_delivery_gate: Option<Arc<AtomicBool>>,
 }
 
 struct OpenState {
@@ -267,6 +276,7 @@ impl GstClipRecorder {
             alert_box_timelines: PlRwLock::new(HashMap::new()),
             alert_inflight: Arc::new(PlMutex::new(HashMap::new())),
             alert_cold_kick: None,
+            alert_clip_delivery_gate: None,
         })
     }
 
@@ -321,6 +331,27 @@ impl GstClipRecorder {
     pub fn with_alert_cold_kick(mut self, kick: Arc<Notify>) -> Self {
         self.alert_cold_kick = Some(kick);
         self
+    }
+
+    /// Share the live `DeliverySettings.attach_alert_clip` gate so an
+    /// operator can disable alert clips per-org / per-core from the
+    /// cloud console's delivery settings without a restart
+    /// (M-Alert-Clip). Builder pattern; without it alert clips follow
+    /// the `alert_clips` config capability alone.
+    pub fn with_alert_clip_delivery_gate(mut self, gate: Arc<AtomicBool>) -> Self {
+        self.alert_clip_delivery_gate = Some(gate);
+        self
+    }
+
+    /// Effective alert-clip enablement: the boot capability switch AND
+    /// the live operator delivery gate (when wired). A `None` gate
+    /// (tests / no engine wiring) is treated as "allowed".
+    fn alert_clips_active(&self) -> bool {
+        self.alert_clips_cfg.enabled
+            && self
+                .alert_clip_delivery_gate
+                .as_ref()
+                .is_none_or(|g| g.load(Ordering::Relaxed))
     }
 
     /// In-flight path the recorder will write for `(camera_id,
@@ -1124,7 +1155,7 @@ impl ClipRecorder for GstClipRecorder {
         sup_h: u32,
     ) {
         let cfg = &self.alert_clips_cfg;
-        if !cfg.enabled {
+        if !self.alert_clips_active() {
             return;
         }
         // Keep a little more than the widest possible window so the
@@ -1155,7 +1186,7 @@ impl ClipRecorder for GstClipRecorder {
         alert_ts: DateTime<Utc>,
     ) -> Option<AlertClipId> {
         let cfg = self.alert_clips_cfg.clone();
-        if !cfg.enabled {
+        if !self.alert_clips_active() {
             return None;
         }
         let deadline_ms = alert_ts.timestamp_millis() + i64::from(cfg.post_secs) * 1000;

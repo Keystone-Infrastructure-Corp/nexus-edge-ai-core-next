@@ -225,6 +225,7 @@ mod tests {
             enabled,
             schedule,
             timezone: "UTC".into(),
+            attach_alert_clip: true,
             updated_at: Utc::now(),
         }
     }
