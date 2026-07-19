@@ -16,6 +16,8 @@
 //! makes `record_event_and_enqueue` behave exactly like the pre-M7
 //! `record_event` (event row only, no outbox rows).
 
+use chrono::{DateTime, Utc};
+
 /// Resolves the alert-delivery sink ids an alert for a given rule
 /// should be enqueued to. See the module docs for the resolution
 /// contract; implementations are expected to be cheap (called once
@@ -36,5 +38,38 @@ pub struct NoopSinkRouter;
 impl SinkRouter for NoopSinkRouter {
     fn sinks_for(&self, _rule_id: &str) -> Vec<String> {
         Vec::new()
+    }
+}
+
+/// Decides whether an alert clip should be built — and the event
+/// marked `alerted` — for a rule firing at a given instant. `true`
+/// iff the alert *would be delivered* under the active M7 delivery
+/// cascade (global enabled AND rule enabled AND within schedule).
+///
+/// M-Event-Audit: the per-camera supervisor consults this at rule-fire,
+/// BEFORE arming the expensive decode → burn-in → re-encode alert clip,
+/// so an off-schedule match is still logged + linked to its motion clip
+/// but never builds an alert clip and never enters the cloud alert
+/// queue. `nexus-engine` supplies the concrete implementation over the
+/// shared `CascadingPolicy` (the same hot-reloaded cache the dispatcher
+/// reads, so arming and delivery can't disagree). Harnesses that don't
+/// wire delivery use [`NoopAlertClipScheduleGate`].
+pub trait AlertClipScheduleGate: Send + Sync {
+    /// `true` when an alert from `rule_id` at `at` would be delivered
+    /// (build the alert clip + mark the event `alerted`); `false` for
+    /// an off-schedule / suppressed match (motion clip only).
+    fn should_build(&self, rule_id: &str, at: DateTime<Utc>) -> bool;
+}
+
+/// An [`AlertClipScheduleGate`] that always arms — the
+/// pre-M-Event-Audit behaviour where every rule-fire builds an alert
+/// clip. Used by tests / harnesses that don't wire the M7 delivery
+/// cascade.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopAlertClipScheduleGate;
+
+impl AlertClipScheduleGate for NoopAlertClipScheduleGate {
+    fn should_build(&self, _rule_id: &str, _at: DateTime<Utc>) -> bool {
+        true
     }
 }

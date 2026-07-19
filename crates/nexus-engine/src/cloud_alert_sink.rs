@@ -47,7 +47,7 @@ use nexus_cloud_client::{build_alert_envelope, AlertProjection, TunnelOutbox};
 use nexus_cloud_protocol::v1::VerificationState;
 use nexus_sinks::dispatcher::{DeliveryPolicy, DeliveryVerdict};
 use nexus_sinks::{AlertSink, SinkError, SinkId};
-use nexus_store::{OutboxRow, SuppressionReason};
+use nexus_store::{OutboxRow, Store, SuppressionReason};
 use nexus_types::{AlertEvent, Severity};
 
 /// `<kind>` half of the reserved cloud sink id.
@@ -203,6 +203,9 @@ pub fn project_alert(event: &AlertEvent) -> AlertProjection {
         snapshot_blob_url: None,
         clip_blob_url: None,
         attached_history: None,
+        // Set by the sink's `deliver` from `Store::event_alerted`; the pure
+        // projection has no DB access, so default None here.
+        alerted: None,
         verification_state,
         trace_id: Some(event.trace_id.clone()).filter(|t| !t.is_empty()),
     }
@@ -240,6 +243,10 @@ pub struct CloudConsoleAlertSink {
     /// Late-bound snapshot uploader (installed post-enrollment). `None`
     /// until then — alerts still deliver, just without a thumbnail.
     uploader_slot: SnapshotUploaderSlot,
+    /// M-Event-Audit: read `events.alerted` at delivery to stamp the wire
+    /// verdict + gate the snapshot upload (off-schedule audit-only matches
+    /// skip it). `None` in tests / pre-wiring → treated as alerted.
+    store: Option<Arc<Store>>,
 }
 
 impl CloudConsoleAlertSink {
@@ -261,7 +268,17 @@ impl CloudConsoleAlertSink {
             pending_acks,
             snapshots_dir,
             uploader_slot,
+            store: None,
         }
+    }
+
+    /// Attach the local store so `deliver` can read each event's
+    /// M-Event-Audit `alerted` flag (stamped on the wire + used to gate the
+    /// snapshot upload). The engine calls this at boot; tests omit it.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<Store>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Best-effort thumbnail upload. If the supervisor wrote a snapshot for
@@ -305,11 +322,24 @@ impl AlertSink for CloudConsoleAlertSink {
     async fn deliver(&self, event: &AlertEvent) -> Result<(), SinkError> {
         let event_id = event.event_id.to_string();
         let mut projection = project_alert(event);
+        // M-Event-Audit: stamp the edge delivery-schedule verdict so the
+        // cloud routes this into the events audit (always) vs the alerts
+        // queue (only when alerted). A missing row / no store → None → the
+        // cloud treats it as an alert (legacy-safe).
+        let alerted = match &self.store {
+            Some(s) => s.event_alerted(&event_id).await.unwrap_or(None),
+            None => None,
+        };
+        projection.alerted = alerted;
         // Best-effort thumbnail: upload the rule-fire snapshot (if any) and
         // stamp its unsigned blob URL so the console renders the alert
-        // thumbnail. Never fails the delivery — see `maybe_upload_snapshot`.
-        if let Some(url) = self.maybe_upload_snapshot(&event_id).await {
-            projection.snapshot_blob_url = Some(url);
+        // thumbnail. Off-schedule audit-only matches (`Some(false)`) skip the
+        // upload — COGS: they rely on the motion clip in the footage browser.
+        // Never fails the delivery — see `maybe_upload_snapshot`.
+        if alerted != Some(false) {
+            if let Some(url) = self.maybe_upload_snapshot(&event_id).await {
+                projection.snapshot_blob_url = Some(url);
+            }
         }
         let (envelope, envelope_id) = build_alert_envelope(projection);
         // Register the pending-ack waiter BEFORE sending so a fast ack can't

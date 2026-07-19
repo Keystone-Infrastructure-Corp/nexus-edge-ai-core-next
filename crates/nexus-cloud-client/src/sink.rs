@@ -59,6 +59,11 @@ pub struct AlertProjection {
     /// App Insights trace ("View end-to-end trace"). `None` → no trace
     /// context on the envelope.
     pub trace_id: Option<String>,
+    /// M-Event-Audit: the edge delivery-schedule verdict. `Some(true)` =
+    /// alert (within schedule); `Some(false)` = audit-only off-schedule
+    /// match; `None` = legacy (cloud treats as alert). Routes the cloud
+    /// events-audit vs alerts-queue split.
+    pub alerted: Option<bool>,
 }
 
 /// Sink shell. Wraps any [`TunnelHandle`] impl so the engine can
@@ -161,6 +166,9 @@ pub fn build_alert_envelope(alert: AlertProjection) -> (Envelope, String) {
         snapshot_blob_url: alert.snapshot_blob_url,
         clip_blob_url: alert.clip_blob_url,
         attached_history: alert.attached_history,
+        // M-Event-Audit: edge delivery-schedule verdict for the cloud's
+        // events-audit vs alerts-queue routing (None → cloud treats as alert).
+        alerted: alert.alerted,
         // Phase 8.2: verification lifecycle is caller-chosen via the
         // projection — plain rule alerts fire `verified` (shown in the
         // console immediately), composite / verify-tagged rules fire
@@ -618,6 +626,7 @@ mod tests {
             attached_history: None,
             verification_state: Some(VerificationState::Verified),
             trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
+            alerted: None,
         })
         .await
         .expect("send");

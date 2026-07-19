@@ -21,6 +21,7 @@ import {
   getEventClipId,
   getEventDelivery,
   listEvents,
+  type EventListItem,
 } from "@/api/system";
 import type { AlertEvent, OutboxRow, OutboxStatus, Severity } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
@@ -49,6 +50,9 @@ export function EventsPage() {
   const [liveMode, setLiveMode] = useState(true);
   const [severity, setSeverity] = useState<Severity | "all">("all");
   const [cameraFilter, setCameraFilter] = useState("");
+  const [disposition, setDisposition] = useState<"all" | "alerts" | "audit">(
+    "all",
+  );
   const [focusId, setFocusId] = useState<string | null>(null);
 
   const listQuery = useQuery({
@@ -65,10 +69,13 @@ export function EventsPage() {
 
   // Merge SSE events on top of the polled list, dedup by event_id, sort
   // by captured_at desc.
-  const events = useMemo<AlertEvent[]>(() => {
-    const seen = new Map<string, AlertEvent>();
+  const events = useMemo<EventListItem[]>(() => {
+    const seen = new Map<string, EventListItem>();
     if (liveMode) {
-      for (const e of sse.events) seen.set(e.event_id, e);
+      // Live SSE payloads are AlertEvents without the audit `alerted`
+      // flag; default them to alert (true). The 30s poll reconciles the
+      // real disposition for off-schedule (audit-only) matches.
+      for (const e of sse.events) seen.set(e.event_id, { ...e, alerted: true });
     }
     for (const e of listQuery.data ?? []) {
       if (!seen.has(e.event_id)) seen.set(e.event_id, e);
@@ -82,11 +89,13 @@ export function EventsPage() {
     const lower = cameraFilter.trim().toLowerCase();
     return events.filter((e) => {
       if (severity !== "all" && e.severity !== severity) return false;
+      if (disposition === "alerts" && !e.alerted) return false;
+      if (disposition === "audit" && e.alerted) return false;
       if (lower && !String(e.camera_id).toLowerCase().includes(lower))
         return false;
       return true;
     });
-  }, [events, severity, cameraFilter]);
+  }, [events, severity, cameraFilter, disposition]);
 
   const focused = useMemo(
     () => events.find((e) => e.event_id === focusId) ?? null,
@@ -99,8 +108,10 @@ export function EventsPage() {
         <div>
           <h1 className="text-2xl font-semibold">Events</h1>
           <p className="text-sm text-muted-foreground">
-            Alert event stream with per-sink delivery status and clip
-            playback.
+            Full event audit with per-sink delivery status and clip
+            playback. Off-schedule matches are logged as{" "}
+            <span className="font-medium">Audit only</span> — no alert clip
+            or notification.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -147,6 +158,31 @@ export function EventsPage() {
           </span>
         </CardHeader>
         <CardContent className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">Show</label>
+            <div className="flex gap-1">
+              {(
+                [
+                  ["all", "All events"],
+                  ["alerts", "Alerts"],
+                  ["audit", "Audit only"],
+                ] as const
+              ).map(([key, text]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setDisposition(key)}
+                  className={`rounded-md border px-2.5 py-1 text-xs transition ${
+                    disposition === key
+                      ? "border-primary bg-primary/10 text-primary"
+                      : "border-border text-muted-foreground hover:border-border/80"
+                  }`}
+                >
+                  {text}
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="space-y-1">
             <label className="text-xs text-muted-foreground">Severity</label>
             <div className="flex gap-1">
@@ -228,7 +264,19 @@ export function EventsPage() {
                       <td className="px-3 py-2">
                         <SeverityBadge severity={e.severity} />
                       </td>
-                      <td className="px-3 py-2 font-medium">{e.label}</td>
+                      <td className="px-3 py-2 font-medium">
+                        <div className="flex items-center gap-2">
+                          {e.label}
+                          {!e.alerted ? (
+                            <Badge
+                              variant="outline"
+                              title="Off-schedule — logged to the audit; no alert clip or notification"
+                            >
+                              Audit only
+                            </Badge>
+                          ) : null}
+                        </div>
+                      </td>
                       <td className="px-3 py-2 text-muted-foreground">
                         {String(e.camera_id)}
                       </td>

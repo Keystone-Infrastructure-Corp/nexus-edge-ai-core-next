@@ -35,7 +35,7 @@ use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{
     ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError, MAX_CLIP_DURATION_MS,
 };
-use crate::sink_router::SinkRouter;
+use crate::sink_router::{AlertClipScheduleGate, SinkRouter};
 use crate::skip_policy::DetectorSkipPolicy;
 use crate::source::{FrameSource, VirtualSource};
 use crate::static_clear::StaticAnchorClearRegistry;
@@ -228,6 +228,12 @@ pub fn spawn_camera(
     // degrading the enqueue path to a plain event-record (pre-M7
     // behaviour) for harnesses that don't wire the dispatcher.
     sink_router: Arc<dyn SinkRouter>,
+    // M-Event-Audit: gates alert-clip arming (and the `events.alerted`
+    // stamp) on the live delivery schedule, so an off-schedule match is
+    // logged + linked to its motion clip but builds no alert clip.
+    // `NoopAlertClipScheduleGate` always arms (pre-M-Event-Audit
+    // behaviour) for harnesses that don't wire the delivery cascade.
+    alert_clip_gate: Arc<dyn AlertClipScheduleGate>,
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
@@ -254,6 +260,7 @@ pub fn spawn_camera(
         sighting_persist,
         effective_top_k,
         sink_router,
+        alert_clip_gate,
     ));
     CameraHandle { camera_id, task }
 }
@@ -283,6 +290,7 @@ async fn run_camera(
     sighting_persist: Arc<dyn EntityLocalPersist>,
     effective_top_k: Option<usize>,
     sink_router: Arc<dyn SinkRouter>,
+    alert_clip_gate: Arc<dyn AlertClipScheduleGate>,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -1068,8 +1076,18 @@ async fn run_camera(
             // to the clip that gets opened on this frame, not the
             // previous one.
             let mut events_to_link: Vec<String> = Vec::new();
+            // M-Event-Audit: set once at least one match this frame is
+            // within the delivery schedule (would be delivered). Gates
+            // the alert-clip arm below; an off-schedule frame logs its
+            // events + links the motion clip only.
+            let mut any_deliverable = false;
             for mut ev in events {
                 let event_id = ev.event_id.to_string();
+                // M-Event-Audit: does this rule-fire fall within the
+                // active delivery schedule (global + per-rule cascade)?
+                // Drives both the alert-clip arm and the `events.alerted`
+                // audit flag stamped by `record_event_and_enqueue`.
+                let alerted = alert_clip_gate.should_build(&ev.rule_id, frame.captured_at);
                 // Alert snapshot — persist a JPEG of the frame that fired
                 // this rule at a deterministic
                 // `<state_dir>/snapshots/<event_id>.jpg` path BEFORE the
@@ -1104,10 +1122,14 @@ async fn run_camera(
                 // with no sinks keeps today's behaviour.
                 let sinks = sink_router.sinks_for(&ev.rule_id);
                 let sink_refs: Vec<&str> = sinks.iter().map(String::as_str).collect();
-                if let Err(e) = store.record_event_and_enqueue(&ev, &sink_refs).await {
+                if let Err(e) = store
+                    .record_event_and_enqueue_classified(&ev, &sink_refs, alerted)
+                    .await
+                {
                     warn!(event = %ev.event_id, "store.record_event_and_enqueue failed: {e}");
                 } else {
                     events_to_link.push(event_id);
+                    any_deliverable |= alerted;
                 }
                 let _ = bus.publish(topic::ALERT_EVENT, &ev).await;
             }
@@ -1118,7 +1140,13 @@ async fn run_camera(
             // ~post_secs instead of waiting on the up-to-5-min motion
             // clip. `arm_alert_clip` returns None (no-op) unless the
             // feature is enabled and the camera has a pre-roll ingester.
-            if alert_clips_enabled && !events_to_link.is_empty() {
+            //
+            // M-Event-Audit: only arm when at least one recorded match
+            // this frame is within the delivery schedule
+            // (`any_deliverable`). Off-schedule matches keep their
+            // `events.clip_id` motion-clip link and skip the expensive
+            // decode -> burn-in -> re-encode entirely.
+            if alert_clips_enabled && any_deliverable {
                 if let Some(alert_clip_id) =
                     recorder.arm_alert_clip(cfg.id, frame.captured_at).await
                 {

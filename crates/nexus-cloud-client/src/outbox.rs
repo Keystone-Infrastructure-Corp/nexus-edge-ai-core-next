@@ -165,6 +165,7 @@ mod tests {
                 trace: None,
             },
             body: EnvelopeBody::Alert(AlertPayload {
+                alerted: None,
                 edge_event_id: "evt".into(),
                 ts: Utc::now().to_rfc3339(),
                 camera_id: 1,

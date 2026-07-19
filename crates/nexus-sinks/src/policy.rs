@@ -145,6 +145,29 @@ impl CascadingPolicy {
         self.rule_policies.store(Arc::new(policies));
         Ok(())
     }
+
+    /// Synchronous "would an alert from `rule_id` be delivered at
+    /// `now`?" — the exact cascade the dispatcher applies at delivery
+    /// time (global enabled AND rule enabled AND within schedule),
+    /// collapsed to a bool.
+    ///
+    /// M-Event-Audit exposes this so callers that must decide *before*
+    /// enqueue — the supervisor's alert-clip arming and the
+    /// `events.alerted` stamp — read the SAME hot-reloaded `ArcSwap`
+    /// caches the dispatcher reads. Sharing the cache is what keeps the
+    /// arming decision and the later delivery decision from ever
+    /// disagreeing across a `delivery.settings.changed` reload.
+    #[must_use]
+    pub fn would_deliver(&self, rule_id: &str, now: DateTime<Utc>) -> bool {
+        let settings_arc = self.settings.load_full();
+        let cached = &*settings_arc;
+        let rule_policies_arc = self.rule_policies.load_full();
+        let rule_policy = rule_policies_arc.get(rule_id);
+        matches!(
+            evaluate_cascade(&cached.settings, cached.tz, rule_policy, now),
+            DeliveryVerdict::Deliver
+        )
+    }
 }
 
 #[async_trait]
@@ -437,5 +460,65 @@ mod tests {
         // in the admin UI shouldn't crash the dispatcher.
         let tz = parse_tz_or_warn("Mars/Olympus_Mons");
         assert_eq!(tz, Tz::UTC);
+    }
+
+    /// Build a `CascadingPolicy` from a settings snapshot + rule map so
+    /// the `would_deliver` tests exercise the real `ArcSwap`-backed
+    /// read path (not just the pure `evaluate_cascade`).
+    fn policy_with(
+        settings: DeliverySettings,
+        rules: HashMap<RuleId, RuleDeliveryPolicy>,
+    ) -> CascadingPolicy {
+        CascadingPolicy {
+            settings: Arc::new(ArcSwap::from_pointee(CachedSettings::from_db(settings))),
+            rule_policies: Arc::new(ArcSwap::from_pointee(rules)),
+        }
+    }
+
+    #[test]
+    fn would_deliver_true_when_schedule_open() {
+        let policy = policy_with(settings(true, None), HashMap::new());
+        let rid: RuleId = "any-rule".into();
+        assert!(policy.would_deliver(&rid, monday_noon_utc()));
+    }
+
+    #[test]
+    fn would_deliver_false_off_global_schedule() {
+        // Global opens only Friday 08:00–08:30; we ask on Monday noon.
+        let mut sched = DeliverySchedule::never();
+        sched.grid[4][16] = true;
+        let policy = policy_with(settings(true, Some(sched)), HashMap::new());
+        let rid: RuleId = "any-rule".into();
+        assert!(!policy.would_deliver(&rid, monday_noon_utc()));
+    }
+
+    #[test]
+    fn would_deliver_honours_per_rule_override() {
+        // Global never; the rule opens Monday 12:00–12:30 → rule wins.
+        let rid: RuleId = "open-rule".into();
+        let mut rules = HashMap::new();
+        rules.insert(
+            rid.clone(),
+            RuleDeliveryPolicy {
+                enabled: true,
+                schedule: Some(one_slot_on(0, 24)),
+            },
+        );
+        let policy = policy_with(settings(true, Some(DeliverySchedule::never())), rules);
+        assert!(policy.would_deliver(&rid, monday_noon_utc()));
+
+        // A rule with no override falls back to the (never) global.
+        let other: RuleId = "inherits-global".into();
+        assert!(!policy.would_deliver(&other, monday_noon_utc()));
+    }
+
+    #[test]
+    fn would_deliver_false_when_globally_disabled() {
+        let policy = policy_with(
+            settings(false, Some(DeliverySchedule::always())),
+            HashMap::new(),
+        );
+        let rid: RuleId = "any-rule".into();
+        assert!(!policy.would_deliver(&rid, monday_noon_utc()));
     }
 }
