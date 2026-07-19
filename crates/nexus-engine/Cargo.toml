@@ -149,6 +149,9 @@ chrono-tz = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
+# WS-Discovery multicast egress-NIC pinning (`IP_MULTICAST_IF`) for
+# `discovery::onvif` — see the workspace-deps note.
+socket2 = { workspace = true }
 parking_lot = { workspace = true }
 arc-swap = { workspace = true }
 futures = { workspace = true }

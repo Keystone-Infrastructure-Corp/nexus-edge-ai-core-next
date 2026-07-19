@@ -249,6 +249,15 @@ dashmap = "6"
 # request is a static envelope built from `format!`). Pure Rust,
 # allocation-light.
 quick-xml = "0.36"
+# Low-level socket knob for `discovery::onvif`: WS-Discovery
+# multicast Probes must egress the operator-assigned camera NIC
+# (`IP_MULTICAST_IF`) on a multi-homed core, otherwise the kernel
+# routes 239.255.255.250 out the default (internet) NIC and the
+# Probe never reaches the camera LAN. `tokio::net::UdpSocket`
+# exposes no `set_multicast_if_v4`; socket2 does. Already in the
+# tree transitively via tokio (MIT OR Apache-2.0), so no net new
+# build cost.
+socket2 = "0.5"
 # MD5 for RTSP Digest auth (RFC 2617). The RTSP Verify probe
 # falls back to Digest when the camera answers DESCRIBE with
 # 401 + `WWW-Authenticate: Digest`. RustCrypto-aligned with the

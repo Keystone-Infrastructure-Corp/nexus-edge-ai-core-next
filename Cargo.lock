@@ -2394,6 +2394,7 @@ dependencies = [
  "serde_yaml",
  "sha1",
  "sha2",
+ "socket2 0.5.10",
  "sqlx",
  "sysinfo",
  "tar",
