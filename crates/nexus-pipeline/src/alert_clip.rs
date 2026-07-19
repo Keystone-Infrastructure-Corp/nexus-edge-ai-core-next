@@ -270,6 +270,30 @@ pub fn label_px(native_w: u32) -> f32 {
     (native_w as f32 * 0.0172).clamp(13.0, 34.0)
 }
 
+/// Re-pack a tightly-packed RGB24 frame (`row_bytes` = `width*3` per
+/// row, no padding) into GStreamer's default RGB stride, which rounds
+/// each row UP to a multiple of 4 bytes. Returns the input unchanged
+/// when `row_bytes` is already 4-aligned (the common case).
+///
+/// Without this the appsrc buffer we feed the alert-clip encoder is
+/// tighter than the stride the caps imply for any native width not
+/// divisible by 4, so every row shears — rotating the R/G/B channels
+/// (rainbow/blue discoloration) and ghosting the burned box + label.
+#[must_use]
+pub fn align_rgb_stride(tight: Vec<u8>, row_bytes: usize, h: usize) -> Vec<u8> {
+    let out_stride = (row_bytes + 3) & !3;
+    if out_stride == row_bytes {
+        return tight;
+    }
+    let mut padded = vec![0u8; out_stride * h];
+    for y in 0..h {
+        let s = y * row_bytes;
+        let d = y * out_stride;
+        padded[d..d + row_bytes].copy_from_slice(&tight[s..s + row_bytes]);
+    }
+    padded
+}
+
 // ---------------------------------------------------------------------------
 // GStreamer encode path (decode -> burn-in overlay -> re-encode).
 //
@@ -300,7 +324,7 @@ mod encode {
     use nexus_types::CodecKind;
     use tracing::warn;
 
-    use super::{frame_wall_clock, label_px, scale_box, BoxFrame};
+    use super::{align_rgb_stride, frame_wall_clock, label_px, scale_box, BoxFrame};
     use crate::gst_clip_recorder::push_sample;
     use crate::preroll::NalSample;
 
@@ -608,7 +632,15 @@ mod encode {
                 enc = Some((ep, esrc));
             }
             let (_, esrc) = enc.as_ref().expect("encode pipeline built above");
-            let mut buf = gst::Buffer::from_mut_slice(data);
+            // GStreamer's RGB stride is rounded UP to a multiple of 4
+            // bytes; our overlay buffer is tightly packed (`width*3` per
+            // row). For a native width whose `width*3` isn't 4-aligned the
+            // two disagree and every row reads a byte or two into the next
+            // — shearing the frame, rotating the R/G/B channels
+            // (rainbow/blue discoloration) and ghosting the burned box +
+            // label. Re-pack into the aligned stride the encoder expects.
+            let bytes = align_rgb_stride(data, row_bytes, h);
+            let mut buf = gst::Buffer::from_mut_slice(bytes);
             if let Some(bref) = buf.get_mut() {
                 bref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
             }
@@ -728,6 +760,27 @@ mod tests {
         let mut single = vec![one.clone()];
         dedupe_burn_boxes(&mut single);
         assert_eq!(single, vec![one]);
+    }
+
+    #[test]
+    fn align_rgb_stride_pads_unaligned_and_noops_aligned() {
+        // row_bytes 12 (mult of 4): returned unchanged.
+        let aligned = vec![1u8; 12 * 2];
+        assert_eq!(
+            align_rgb_stride(aligned.clone(), 12, 2),
+            aligned,
+            "already-aligned stride is a no-op"
+        );
+
+        // row_bytes 9 (NOT a mult of 4) → padded to 12 bytes/row so each
+        // row lands on the encoder's expected 4-aligned offset.
+        let tight: Vec<u8> = (0..18).collect(); // row0: 0..9, row1: 9..18
+        let out = align_rgb_stride(tight, 9, 2);
+        assert_eq!(out.len(), 12 * 2, "padded to 12-byte rows");
+        assert_eq!(&out[0..9], &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&out[9..12], &[0, 0, 0], "row 0 zero-padded");
+        assert_eq!(&out[12..21], &[9, 10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(&out[21..24], &[0, 0, 0], "row 1 zero-padded");
     }
 
     fn box_frame(base: DateTime<Utc>, ms: i64, n: usize) -> BoxFrame {
