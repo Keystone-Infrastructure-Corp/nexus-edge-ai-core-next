@@ -561,6 +561,15 @@ pub(crate) fn mark_finished(inner: &Mutex<SessionInner>, error: Option<String>) 
 pub async fn post_discovery_onvif(
     State(s): State<ApiState>,
 ) -> Result<Json<SessionCreatedResp>, ApiError> {
+    // Hard camera-interface enforcement, same as the CIDR scan:
+    // when a camera NIC role is assigned, source-bind the probe
+    // socket to that NIC's IPv4 AND pin the multicast egress
+    // interface to it (done inside `onvif::run_session` →
+    // `probe_network`), so the WS-Discovery Probe leaves via the
+    // camera network rather than the default (internet) NIC on a
+    // multi-homed core. Unassigned → `None` → OS routing.
+    let bind_source = crate::network::camera_bind_ipv4(&s.store).await;
+
     let (session_id, inner) = s.discovery_sessions.start(DiscoveryKind::Onvif, None);
     let started_at = inner.lock().started_at;
 
@@ -572,13 +581,15 @@ pub async fn post_discovery_onvif(
             "api",
             "discovery_onvif_start",
             &format!("session/{session_id}"),
-            &serde_json::json!({}),
+            &serde_json::json!({
+                "bind_source": bind_source.map(|ip| ip.to_string()),
+            }),
         )
         .await?;
 
     let sessions = s.discovery_sessions.clone();
     tokio::spawn(async move {
-        onvif::run_session(sessions, session_id, inner).await;
+        onvif::run_session(sessions, session_id, inner, bind_source).await;
     });
 
     Ok(Json(SessionCreatedResp {

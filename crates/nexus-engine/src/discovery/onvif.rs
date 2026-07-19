@@ -27,6 +27,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -50,8 +51,9 @@ pub(crate) async fn run_session(
     _sessions: DiscoverySessions,
     _session_id: Uuid,
     inner: Arc<Mutex<SessionInner>>,
+    bind: Option<Ipv4Addr>,
 ) {
-    match probe_network().await {
+    match probe_network(bind).await {
         Ok(devices) => {
             {
                 let mut guard = inner.lock();
@@ -70,13 +72,16 @@ pub(crate) async fn run_session(
 
 /// Send the two Probe envelopes, listen `LISTEN_WINDOW`, return
 /// the de-duplicated [`DiscoveredDevice`] list.
-async fn probe_network() -> Result<Vec<DiscoveredDevice>, String> {
-    // Bind on the wildcard with an OS-assigned port. On macOS
-    // and Linux we don't need to join the WS-Discovery group to
-    // receive unicast replies aimed at our ephemeral port.
-    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .await
-        .map_err(|e| format!("udp bind failed: {e}"))?;
+///
+/// `bind` is the camera-role NIC's IPv4 when an interface role is
+/// assigned (see [`crate::network::camera_bind_ipv4`]). When set,
+/// the probe socket is source-bound to that address AND its
+/// multicast egress interface is pinned to the same NIC, so the
+/// Probe leaves via the camera network even on a multi-homed core
+/// whose default route is the internet NIC. `None` preserves the
+/// prior wildcard-bind / OS-routing behaviour.
+async fn probe_network(bind: Option<Ipv4Addr>) -> Result<Vec<DiscoveredDevice>, String> {
+    let socket = build_probe_socket(bind)?;
     socket
         .set_multicast_loop_v4(false)
         .map_err(|e| format!("set_multicast_loop_v4 failed: {e}"))?;
@@ -135,6 +140,37 @@ async fn probe_network() -> Result<Vec<DiscoveredDevice>, String> {
     }
 
     Ok(devices)
+}
+
+/// Build the WS-Discovery UDP socket, optionally pinned to the
+/// camera NIC.
+///
+/// `bind == None` keeps the old behaviour: wildcard (`0.0.0.0`)
+/// bind, egress interface chosen by the kernel routing table.
+///
+/// `bind == Some(src)` (a camera NIC role is assigned) additionally
+/// source-binds to `src` (so unicast `ProbeMatch` replies return on
+/// the camera NIC) and sets `IP_MULTICAST_IF` to `src` so the
+/// multicast Probe egresses the camera NIC — without this the
+/// kernel routes `239.255.255.250` via the default (internet) NIC
+/// on a multi-homed core and the Probe never reaches the cameras,
+/// so autodetect returns zero even though a unicast CIDR scan of
+/// the same subnet finds them. `tokio::net::UdpSocket` has no
+/// `set_multicast_if_v4`, hence `socket2` + adopt-into-tokio.
+fn build_probe_socket(bind: Option<Ipv4Addr>) -> Result<UdpSocket, String> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| format!("udp socket create failed: {e}"))?;
+    if let Some(src) = bind {
+        sock.set_multicast_if_v4(&src)
+            .map_err(|e| format!("set_multicast_if_v4({src}) failed: {e}"))?;
+    }
+    let bind_ip = bind.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    sock.bind(&SocketAddr::new(IpAddr::V4(bind_ip), 0).into())
+        .map_err(|e| format!("udp bind ({bind_ip}) failed: {e}"))?;
+    sock.set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+    UdpSocket::from_std(std::net::UdpSocket::from(sock))
+        .map_err(|e| format!("tokio adopt (from_std) failed: {e}"))
 }
 
 /// Build a single Probe envelope scoped to one Type. The
