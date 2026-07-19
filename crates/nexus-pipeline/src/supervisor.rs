@@ -57,62 +57,6 @@ const SIZE_STAT_INTERVAL_FRAMES: u32 = 60;
 /// recognisable console thumbnail, small enough to keep the blob cheap.
 const SNAPSHOT_JPEG_QUALITY: u8 = 72;
 
-/// Stroke half-width (in pixels) for the bounding box drawn onto an
-/// alert snapshot. A 3px-thick box (half-width 1) stays visible after
-/// JPEG compression without swamping small objects.
-const SNAPSHOT_BBOX_HALF_STROKE: i64 = 1;
-
-/// RGB colour of the alert bounding box. Aliases the shared
-/// [`crate::overlay::ALERT_RGB`] (cyan `#22d3ee`) so the snapshot box,
-/// its label chip, and the burned-in alert clip never diverge.
-const SNAPSHOT_BBOX_RGB: [u8; 3] = crate::overlay::ALERT_RGB;
-
-/// Draw a filled-stroke rectangle for `bbox` onto an RGB24 buffer in
-/// place. Coordinates are in the same pixel space as the frame
-/// (`width` × `height`) — the alert snapshot is the supervisor frame,
-/// and `bbox` is stamped in supervisor-frame coordinates, so they map
-/// 1:1. Out-of-range edges are clamped; a degenerate box is a no-op.
-fn draw_bbox_rgb24(buf: &mut [u8], width: u32, height: u32, bbox: &BBox) {
-    let w = width as i64;
-    let h = height as i64;
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    let x1 = (bbox.x1.round() as i64).clamp(0, w - 1);
-    let y1 = (bbox.y1.round() as i64).clamp(0, h - 1);
-    let x2 = (bbox.x2.round() as i64).clamp(0, w - 1);
-    let y2 = (bbox.y2.round() as i64).clamp(0, h - 1);
-    if x2 <= x1 || y2 <= y1 {
-        return;
-    }
-    let s = SNAPSHOT_BBOX_HALF_STROKE;
-    let mut put = |x: i64, y: i64| {
-        if x < 0 || y < 0 || x >= w || y >= h {
-            return;
-        }
-        let idx = ((y * w + x) * 3) as usize;
-        if idx + 2 < buf.len() {
-            buf[idx] = SNAPSHOT_BBOX_RGB[0];
-            buf[idx + 1] = SNAPSHOT_BBOX_RGB[1];
-            buf[idx + 2] = SNAPSHOT_BBOX_RGB[2];
-        }
-    };
-    // Top + bottom edges (thickened by ±s rows).
-    for x in x1..=x2 {
-        for d in -s..=s {
-            put(x, y1 + d);
-            put(x, y2 + d);
-        }
-    }
-    // Left + right edges (thickened by ±s columns).
-    for y in y1..=y2 {
-        for d in -s..=s {
-            put(x1 + d, y);
-            put(x2 + d, y);
-        }
-    }
-}
-
 /// Encode an alert's supervisor frame to JPEG and persist it at
 /// `<snapshots_dir>/<event_id>.jpg`.
 ///
@@ -152,7 +96,19 @@ async fn write_alert_snapshot(
         // bbox stroke doesn't mutate pixels other subscribers see.
         let mut pixels = frame.data.to_vec();
         if let Some(bbox) = bbox {
-            draw_bbox_rgb24(&mut pixels, frame.width, frame.height, &bbox);
+            let (stroke, radius) = crate::overlay::box_metrics(frame.width, frame.height);
+            crate::overlay::draw_box_rgb24(
+                &mut pixels,
+                frame.width,
+                frame.height,
+                bbox.x1.round() as i64,
+                bbox.y1.round() as i64,
+                bbox.x2.round() as i64,
+                bbox.y2.round() as i64,
+                stroke,
+                radius,
+                crate::overlay::ALERT_RGB,
+            );
             // Label chip ("person 0.96") anchored to the box top-left,
             // burned into the JPEG so the email / SureView copies show
             // it too — identical to the burned-in alert clip.
