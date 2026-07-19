@@ -608,7 +608,7 @@ mod encode {
                 let enc_desc = format!(
                     "appsrc name=esrc is-live=false format=time do-timestamp=false block=true \
                      ! videoconvert ! videoscale \
-                     ! video/x-raw,width={w2},height={h2} \
+                     ! capsfilter name=enccaps \
                      ! {encoder} \
                      ! h264parse \
                      ! mp4mux faststart=true \
@@ -618,6 +618,29 @@ mod encode {
                     .map_err(|e| AlertClipError::Gst(format!("encode launch: {e}")))?
                     .downcast::<gst::Pipeline>()
                     .map_err(|_| AlertClipError::Gst("encode graph is not a pipeline".into()))?;
+                // Pin the encoder input to FULL-RANGE (pc) BT.709 I420 so
+                // the re-encode preserves the source camera's colorimetry.
+                // Without this, videoconvert defaults to LIMITED-range (tv)
+                // BT.601 / SMPTE170M — squeezing 0..255 into 16..235 and
+                // swapping the matrix, which crushes levels + shifts colour
+                // (the washed-out alert clip vs the full-range source).
+                // The overlay RGB is full-range 0..255, so a full-range
+                // BT.709 output round-trips it losslessly.
+                let colorimetry = gstreamer_video::VideoColorimetry::new(
+                    gstreamer_video::VideoColorRange::Range0_255,
+                    gstreamer_video::VideoColorMatrix::Bt709,
+                    gstreamer_video::VideoTransferFunction::Bt709,
+                    gstreamer_video::VideoColorPrimaries::Bt709,
+                );
+                let enc_caps = gst::Caps::builder("video/x-raw")
+                    .field("format", "I420")
+                    .field("width", w2 as i32)
+                    .field("height", h2 as i32)
+                    .field("colorimetry", colorimetry.to_string())
+                    .build();
+                ep.by_name("enccaps")
+                    .ok_or_else(|| AlertClipError::Gst("capsfilter enccaps missing".into()))?
+                    .set_property("caps", &enc_caps);
                 let esrc = by_name_appsrc(&ep, "esrc")?;
                 esrc.set_caps(Some(
                     &gst::Caps::builder("video/x-raw")
