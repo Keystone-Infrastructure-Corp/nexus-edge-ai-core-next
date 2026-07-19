@@ -164,7 +164,7 @@ async fn write_alert_snapshot(
                 bbox.x1.round() as i64,
                 bbox.y1.round() as i64,
                 &chip,
-                crate::alert_clip::label_scale(frame.width),
+                crate::alert_clip::label_px(frame.width),
             );
         }
         let mut out = Vec::new();
@@ -1047,23 +1047,32 @@ async fn run_camera(
             // M-Alert-Clip: feed this frame's frame-aligned detection
             // boxes into the recorder's per-camera box timeline so an
             // alert clip armed later can burn them into the pre-roll +
-            // post window. Prefers the raw `detection_bbox` (P1) over the
-            // EMA-smoothed `bbox`. No-op unless enabled; cheap.
+            // post window. No-op unless enabled; cheap.
+            //
+            // Only tracks with a REAL detection on THIS frame
+            // (`detection_bbox`) are burned. A predicted-only (coasting)
+            // track has no detection this frame and would otherwise be
+            // drawn at its stale EMA-smoothed position; as the tracker
+            // coasts / re-spawns fragment tracks for one object those
+            // stale boxes pile up into the "trailing" ghost boxes seen on
+            // the clip. Dropping coasting tracks and NMS-deduping the
+            // overlapping survivors yields one box per physical object.
             if alert_clips_enabled {
-                let boxes: Vec<crate::alert_clip::BurnBox> = dynamic_tracked
+                let mut boxes: Vec<crate::alert_clip::BurnBox> = dynamic_tracked
                     .iter()
-                    .map(|t| {
-                        let b = t.detection_bbox.unwrap_or(t.bbox);
-                        crate::alert_clip::BurnBox {
+                    .filter_map(|t| {
+                        let b = t.detection_bbox?;
+                        Some(crate::alert_clip::BurnBox {
                             x1: b.x1,
                             y1: b.y1,
                             x2: b.x2,
                             y2: b.y2,
                             label: t.label.clone(),
                             confidence: t.confidence,
-                        }
+                        })
                     })
                     .collect();
+                crate::alert_clip::dedupe_burn_boxes(&mut boxes);
                 recorder.push_alert_boxes(
                     cfg.id,
                     frame.captured_at,

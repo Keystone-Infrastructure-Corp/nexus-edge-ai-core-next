@@ -152,6 +152,58 @@ pub fn scale_box(b: &BurnBox, sup_w: u32, sup_h: u32, native_w: u32, native_h: u
     }
 }
 
+/// IoU above which [`dedupe_burn_boxes`] treats two boxes as the same
+/// physical object. Deliberately moderate: tracker fragments / coasting
+/// ghosts of one object overlap heavily, while two genuinely distinct
+/// objects standing close together stay below it.
+const BURN_DEDUPE_IOU: f32 = 0.45;
+
+/// Intersection-over-union of two boxes in the same coordinate space.
+/// `0.0` when they don't overlap or either is degenerate.
+fn burn_box_iou(a: &BurnBox, b: &BurnBox) -> f32 {
+    let ix1 = a.x1.max(b.x1);
+    let iy1 = a.y1.max(b.y1);
+    let ix2 = a.x2.min(b.x2);
+    let iy2 = a.y2.min(b.y2);
+    let inter = (ix2 - ix1).max(0.0) * (iy2 - iy1).max(0.0);
+    if inter <= 0.0 {
+        return 0.0;
+    }
+    let area_a = (a.x2 - a.x1).max(0.0) * (a.y2 - a.y1).max(0.0);
+    let area_b = (b.x2 - b.x1).max(0.0) * (b.y2 - b.y1).max(0.0);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// Collapse overlapping duplicate boxes so one physical object yields
+/// exactly one burned box. Greedy NMS: keep the highest-confidence box,
+/// then drop any remaining box whose IoU with an already-kept box
+/// exceeds [`BURN_DEDUPE_IOU`]. This removes the tracker-fragment /
+/// coasting-ghost "trail" (several stale boxes for one object) that the
+/// operator otherwise sees stacked on the alert clip.
+pub fn dedupe_burn_boxes(boxes: &mut Vec<BurnBox>) {
+    if boxes.len() < 2 {
+        return;
+    }
+    boxes.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut kept: Vec<BurnBox> = Vec::with_capacity(boxes.len());
+    for b in boxes.drain(..) {
+        if kept.iter().any(|k| burn_box_iou(k, &b) > BURN_DEDUPE_IOU) {
+            continue;
+        }
+        kept.push(b);
+    }
+    *boxes = kept;
+}
+
 /// Trim a pre-roll ring snapshot to at most `pre` seconds of
 /// **GOP-aligned** history, reusing the exact trim the live ring uses
 /// (so the result still starts on a keyframe and decodes cleanly). The
@@ -268,14 +320,13 @@ pub fn burn_stroke_half(native_w: u32) -> i64 {
     ((native_w / 640).max(1)) as i64
 }
 
-/// Integer font scale for the burned-in label chip at the given native
+/// Font pixel-height for the burned-in label chip at the given native
 /// width, so "person 0.96" stays legible after H.264 compression across
-/// resolutions (~8 px of text height per 640 px of width; e.g. 1× at
-/// 640, 2× at 1280, 3× at 1920). Clamped so a huge frame can't produce
-/// an absurd chip.
+/// resolutions while reading skinny. ~1.7% of width, clamped so a small
+/// frame stays readable and a huge one can't produce an absurd chip.
 #[must_use]
-pub fn label_scale(native_w: u32) -> i64 {
-    ((native_w / 640).clamp(1, 6)) as i64
+pub fn label_px(native_w: u32) -> f32 {
+    (native_w as f32 * 0.0172).clamp(13.0, 34.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +360,7 @@ mod encode {
     use tracing::warn;
 
     use super::{
-        burn_stroke_half, draw_burnbox_rgb24, frame_wall_clock, label_scale, scale_box, BoxFrame,
+        burn_stroke_half, draw_burnbox_rgb24, frame_wall_clock, label_px, scale_box, BoxFrame,
     };
     use crate::gst_clip_recorder::push_sample;
     use crate::preroll::NalSample;
@@ -550,7 +601,7 @@ mod encode {
             let wall = frame_wall_clock(window_start, rebased);
             if let Some(bf) = box_frames.iter().rev().find(|f| f.ts <= wall) {
                 let half = burn_stroke_half(native_w);
-                let chip_scale = label_scale(native_w);
+                let chip_px = label_px(native_w);
                 for b in &bf.boxes {
                     let nb = scale_box(b, bf.sup_w, bf.sup_h, native_w, native_h);
                     draw_burnbox_rgb24(&mut data, native_w, native_h, &nb, half);
@@ -565,7 +616,7 @@ mod encode {
                         nb.x1.round() as i64,
                         nb.y1.round() as i64,
                         &chip,
-                        chip_scale,
+                        chip_px,
                     );
                 }
             }
@@ -668,6 +719,58 @@ mod tests {
         };
         assert_eq!(scale_box(&b, 0, 360, 1920, 1080), b);
         assert_eq!(scale_box(&b, 640, 0, 1920, 1080), b);
+    }
+
+    #[test]
+    fn dedupe_burn_boxes_collapses_overlaps_keeps_distinct() {
+        let mk = |x1: f32, y1: f32, x2: f32, y2: f32, c: f32| BurnBox {
+            x1,
+            y1,
+            x2,
+            y2,
+            label: "person".into(),
+            confidence: c,
+        };
+        // Three heavily-overlapping ghosts of ONE object (the tracker
+        // fragment "trail") plus one far-away distinct object.
+        let mut boxes = vec![
+            mk(100.0, 100.0, 200.0, 300.0, 0.31), // coasting ghost
+            mk(104.0, 108.0, 205.0, 305.0, 0.80), // the real detection
+            mk(96.0, 94.0, 196.0, 296.0, 0.32),   // coasting ghost
+            mk(600.0, 100.0, 700.0, 300.0, 0.75), // a different person
+        ];
+        dedupe_burn_boxes(&mut boxes);
+        // The overlapping trio collapses to one box; the distant object
+        // survives → one box per physical object.
+        assert_eq!(boxes.len(), 2, "one box per physical object");
+        // The highest-confidence member of the cluster is the survivor.
+        assert!(boxes.iter().any(|b| (b.confidence - 0.80).abs() < 1e-6));
+        assert!(boxes.iter().any(|b| (b.confidence - 0.75).abs() < 1e-6));
+        // No two survivors overlap beyond the dedupe threshold.
+        for (i, a) in boxes.iter().enumerate() {
+            for b in &boxes[i + 1..] {
+                assert!(burn_box_iou(a, b) <= BURN_DEDUPE_IOU);
+            }
+        }
+    }
+
+    #[test]
+    fn dedupe_burn_boxes_small_inputs_are_noops() {
+        let mut empty: Vec<BurnBox> = vec![];
+        dedupe_burn_boxes(&mut empty);
+        assert!(empty.is_empty());
+
+        let one = BurnBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+            label: "car".into(),
+            confidence: 0.5,
+        };
+        let mut single = vec![one.clone()];
+        dedupe_burn_boxes(&mut single);
+        assert_eq!(single, vec![one]);
     }
 
     fn box_frame(base: DateTime<Utc>, ms: i64, n: usize) -> BoxFrame {
