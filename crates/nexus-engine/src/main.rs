@@ -944,6 +944,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     .await;
     let safety_cfg = storage_safety::StorageSafetyConfig {
         clips_dir: clips_dir.clone(),
+        snapshots_dir: Some(snapshots_dir.clone()),
         low_watermark_pct: effective_low_pct,
         panic_watermark_pct: effective_panic_pct,
         sample_interval: std::time::Duration::from_secs(

@@ -713,3 +713,108 @@ async fn delete_runtime_setting_tx_removes_row_distinct_from_null_write() {
     let still_absent = store.read_runtime_setting("ui_bind").await.unwrap();
     assert_eq!(still_absent, None);
 }
+
+#[tokio::test]
+async fn find_largest_quarantined_hot_clip_prefers_biggest() {
+    let (store, _dir) = fresh_store().await;
+    store.upsert_camera(&sample_camera(1, "c1")).await.unwrap();
+    let now = Utc::now();
+
+    // Two quarantined hot clips (small + huge) plus one healthy clip.
+    let small = store
+        .open_clip(&sample_clip(1, now - Duration::seconds(30)))
+        .await
+        .unwrap();
+    store
+        .close_clip(
+            small,
+            &ClipClose {
+                ended_at: now,
+                duration_ms: 1_000,
+                size_bytes: 10_000,
+                hot_path: None,
+                sha256: Some("a".into()),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .quarantine_clip(small, now, "size ceiling")
+        .await
+        .unwrap();
+
+    let huge = store
+        .open_clip(&sample_clip(1, now - Duration::seconds(20)))
+        .await
+        .unwrap();
+    store
+        .close_clip(
+            huge,
+            &ClipClose {
+                ended_at: now,
+                duration_ms: 1_000,
+                size_bytes: 2_000_000_000,
+                hot_path: None,
+                sha256: Some("b".into()),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .quarantine_clip(huge, now, "size ceiling")
+        .await
+        .unwrap();
+
+    let healthy = store
+        .open_clip(&sample_clip(1, now - Duration::seconds(10)))
+        .await
+        .unwrap();
+    store
+        .close_clip(
+            healthy,
+            &ClipClose {
+                ended_at: now,
+                duration_ms: 1_000,
+                size_bytes: 5_000_000,
+                hot_path: None,
+                sha256: Some("c".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let picked = store
+        .find_largest_quarantined_hot_clip()
+        .await
+        .unwrap()
+        .expect("a quarantined hot clip exists");
+    assert_eq!(picked.id, huge, "biggest quarantined clip wins");
+    assert!(picked.cold_quarantined);
+    assert_eq!(picked.size_bytes, 2_000_000_000);
+}
+
+#[tokio::test]
+async fn find_largest_quarantined_hot_clip_none_when_all_healthy() {
+    let (store, _dir) = fresh_store().await;
+    store.upsert_camera(&sample_camera(1, "c1")).await.unwrap();
+    let now = Utc::now();
+    let c = store.open_clip(&sample_clip(1, now)).await.unwrap();
+    store
+        .close_clip(
+            c,
+            &ClipClose {
+                ended_at: now,
+                duration_ms: 1_000,
+                size_bytes: 5_000_000,
+                hot_path: None,
+                sha256: Some("c".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .find_largest_quarantined_hot_clip()
+        .await
+        .unwrap()
+        .is_none());
+}

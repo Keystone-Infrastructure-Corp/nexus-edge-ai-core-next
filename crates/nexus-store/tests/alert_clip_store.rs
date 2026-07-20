@@ -367,3 +367,31 @@ async fn alert_clip_cold_replication_lifecycle() {
     assert_eq!(evictable[0].id, clip_id);
     assert!(evictable[0].cold_uploaded_at.is_some());
 }
+
+/// The storage-safety snapshot-orphan sweep leans on
+/// `existing_event_ids`: a recorded event's id comes back, a
+/// never-recorded id does not, and an empty input is a no-op.
+#[tokio::test]
+async fn existing_event_ids_returns_only_live_rows() {
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let a = sample_alert(1, "r1");
+    let live = a.event_id.to_string();
+    store
+        .record_event_and_enqueue(&a, &["webhook:s1"])
+        .await
+        .unwrap();
+
+    let missing = Uuid::now_v7().to_string();
+    let got = store
+        .existing_event_ids(&[live.clone(), missing.clone()])
+        .await
+        .unwrap();
+    assert!(got.contains(&live), "recorded event id is present");
+    assert!(!got.contains(&missing), "never-recorded id is absent");
+    assert_eq!(got.len(), 1);
+    assert!(store.existing_event_ids(&[]).await.unwrap().is_empty());
+}

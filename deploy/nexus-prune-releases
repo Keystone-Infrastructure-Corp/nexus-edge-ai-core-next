@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# nexus-prune-releases — pinned, root-owned old-release reaper for OTA.
+#
+# Installed by scripts/install.sh to /usr/local/sbin/nexus-prune-releases
+# (root:root 0755) — deliberately OUTSIDE the OTA-writable /opt/nexus tree so
+# the unprivileged `nexus` service user cannot tamper with it. It is the fifth
+# (and only reaping) command the nexus-update sudoers rule lets `nexus` run as
+# root, and it is invoked by the OTA apply path
+# (crates/nexus-engine/src/cloud_update.rs) AFTER a new release has booted
+# healthy, as:
+#
+#   sudo /usr/local/sbin/nexus-prune-releases <keep_version> [<keep_version> ...]
+#
+# It deletes every directory under /opt/nexus/releases EXCEPT the ones named on
+# the command line (the running version + the rollback target `previous_good`)
+# and whatever /opt/nexus/current points at. Release trees are large (bundled
+# ONNX Runtime libs + model packs, ~hundreds of MB each) and were previously
+# never reaped, so a long-lived box accumulated every version it ever ran. This
+# keeps only current + N-1.
+#
+# SAFETY — this is a `rm -rf` wrapper, so it is deliberately conservative:
+#   * The keep set is hard-validated: each argument must look like a version
+#     tag AND name an existing release dir. Anything else is ignored (warned).
+#   * The live `/opt/nexus/current` symlink target is ALWAYS kept, regardless
+#     of the arguments, so the running release can never be deleted out from
+#     under the engine.
+#   * FAIL-CLOSED on an empty keep set: if we cannot establish a single valid
+#     keep target we refuse to delete anything (a mis-invocation must never
+#     wipe every release). We would rather leak an old release than brick the
+#     box or destroy the rollback target.
+#   * sudo execs this with a literal argv (no shell), and the version charset
+#     guard blocks path separators / traversal / metachars, so the arguments
+#     can never escape /opt/nexus/releases.
+#
+# Best-effort + fail-open on the DELETES themselves: a transient rm failure
+# logs and the next OTA retries; a core update is NEVER blocked on release
+# hygiene. The only non-zero exit is a usage error (empty keep set).
+set -euo pipefail
+
+RELEASES_DIR="/opt/nexus/releases"
+CURRENT_LINK="/opt/nexus/current"
+
+log()  { printf 'nexus-prune-releases: %s\n' "$*"; }
+warn() { printf 'nexus-prune-releases: WARN: %s\n' "$*" >&2; }
+
+# Valid release-dir name: a version tag such as `v0.1.158` or a bare `0.1.158`,
+# or a rollback tag. The charset guard blocks path separators, `..` traversal,
+# spaces, and shell metachars outright.
+is_version() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+if [[ ! -d "$RELEASES_DIR" ]]; then
+    log "no releases dir ($RELEASES_DIR) — nothing to prune"
+    exit 0
+fi
+
+# Build the keep set from the arguments, hard-validated.
+declare -A keep=()
+for v in "$@"; do
+    if ! is_version "$v"; then
+        warn "ignoring invalid keep argument: '$v'"
+        continue
+    fi
+    if [[ -d "$RELEASES_DIR/$v" ]]; then
+        keep["$v"]=1
+    else
+        warn "keep version '$v' has no release dir; ignoring"
+    fi
+done
+
+# ALWAYS keep whatever `current` resolves to, even if it was not passed as an
+# argument — the running release must survive unconditionally.
+if [[ -L "$CURRENT_LINK" ]]; then
+    cur="$(basename "$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)")"
+    if [[ -n "$cur" && -d "$RELEASES_DIR/$cur" ]]; then
+        keep["$cur"]=1
+    fi
+fi
+
+# FAIL-CLOSED: never prune when we could not establish a single keep target.
+if (( ${#keep[@]} == 0 )); then
+    warn "empty keep set — refusing to prune (fail-closed)"
+    exit 2
+fi
+
+log "keeping: ${!keep[*]}"
+shopt -s nullglob
+removed=0
+for dir in "$RELEASES_DIR"/*/; do
+    name="$(basename "$dir")"
+    if [[ -n "${keep[$name]:-}" ]]; then
+        continue
+    fi
+    if rm -rf -- "$dir"; then
+        log "pruned old release: $name"
+        removed=$(( removed + 1 ))
+    else
+        warn "failed to prune '$name' (will retry next OTA)"
+    fi
+done
+log "pruned $removed old release(s)"
+exit 0

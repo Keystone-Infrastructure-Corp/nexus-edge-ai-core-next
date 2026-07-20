@@ -142,6 +142,23 @@ impl Store {
         .await?;
         Ok(r1.rows_affected() + r2.rows_affected())
     }
+
+    /// Aggressive pressure prune: drop every metrics sample older than
+    /// `cutoff_ms` outright, with no coarsening tier. Called by the
+    /// storage-safety ladder when the disk tips into Low/Panic to
+    /// reclaim the rolling host-metrics buffer — the cloud console
+    /// keeps its own copy, so shedding local history under disk
+    /// pressure is safe. Returns the number of rows deleted.
+    pub async fn prune_metrics_samples_older_than(
+        &self,
+        cutoff_ms: i64,
+    ) -> Result<u64, StoreError> {
+        let res = sqlx::query("DELETE FROM metrics_samples WHERE captured_at_ms < ?")
+            .bind(cutoff_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +331,41 @@ mod tests {
                 now_ms,
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn prune_older_than_drops_only_older() {
+        let (store, _tmp) = fresh_store().await;
+        let now_ms = 1_000_000_000_000i64 / FINE_INTERVAL_MS * FINE_INTERVAL_MS;
+        // Three samples: 3h old, 1h old, and "now".
+        for age_ms in [3 * 3_600_000i64, 3_600_000, 0] {
+            let t = now_ms - age_ms;
+            store
+                .insert_metrics_sample(t, &format!("{{\"captured_at_ms\":{t}}}"))
+                .await
+                .unwrap();
+        }
+        // Keep only the last 2h: the 3h-old sample is dropped.
+        let deleted = store
+            .prune_metrics_samples_older_than(now_ms - 2 * 3_600_000)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "only the 3h-old sample precedes the 2h cutoff");
+        let remaining = store
+            .list_metrics_samples(now_ms, 86_400, 5, None)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 2, "the 1h-old and current samples survive");
+    }
+
+    #[tokio::test]
+    async fn wal_checkpoint_truncate_is_ok() {
+        let (store, _tmp) = fresh_store().await;
+        store
+            .insert_metrics_sample(5_000, "{\"captured_at_ms\":5000}")
+            .await
+            .unwrap();
+        // Best-effort; a fresh store must at least not error.
+        store.checkpoint_wal_truncate().await.unwrap();
     }
 }

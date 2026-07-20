@@ -438,6 +438,12 @@ pub async fn finalize_pending_update(store: Arc<Store>, outbox: Arc<TunnelOutbox
         state.last_result = Some(phase::SUCCESS.to_string());
         state.crash_count = 0;
         write_state(&store, &state).await;
+
+        // Reclaim disk now that the new release has booted healthy: prune
+        // every release tree except the running one and the rollback target.
+        // Best-effort + non-fatal — release hygiene must never affect the
+        // update outcome (already reported success above).
+        prune_old_releases(&state).await;
         return;
     }
 
@@ -607,6 +613,48 @@ async fn flip_and_restart(version: &str) -> Result<(), &'static str> {
         }
     }
 }
+
+/// Prune stale release trees under `/opt/nexus/releases`, keeping only the
+/// running version and the rollback target (`previous_good`). Invoked from
+/// `finalize_pending_update` after an OTA has booted healthy, so we never
+/// delete a release we might still roll back to. Best-effort + non-fatal —
+/// release hygiene must never block or fail an update.
+///
+/// Root-gated by the pinned `/usr/local/sbin/nexus-prune-releases` wrapper
+/// (the fifth `nexus-update` sudoers rule), which itself always preserves the
+/// live `current` symlink target and fail-closes (deletes nothing) on an empty
+/// keep set — so even a bad invocation can never delete the running release.
+#[cfg(target_os = "linux")]
+async fn prune_old_releases(state: &UpdateState) {
+    let mut keep: Vec<&str> = Vec::new();
+    if let Some(v) = state.current_version.as_deref() {
+        keep.push(v);
+    }
+    if let Some(v) = state.previous_good.as_deref() {
+        if !keep.contains(&v) {
+            keep.push(v);
+        }
+    }
+    if keep.is_empty() {
+        return;
+    }
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.arg("/usr/local/sbin/nexus-prune-releases");
+    cmd.args(&keep);
+    match cmd.status() {
+        Ok(s) if s.success() => {
+            info!("update: pruned old releases (kept running + previous_good)")
+        }
+        Ok(s) => {
+            warn!(code = ?s.code(), "update: nexus-prune-releases exited non-zero (non-fatal)")
+        }
+        Err(e) => warn!(error = %e, "update: failed to spawn nexus-prune-releases (non-fatal)"),
+    }
+}
+
+/// Non-Linux stub — the dev workstation never prunes releases.
+#[cfg(not(target_os = "linux"))]
+async fn prune_old_releases(_state: &UpdateState) {}
 
 /// Non-Linux stub — the dev workstation never self-updates.
 #[cfg(not(target_os = "linux"))]

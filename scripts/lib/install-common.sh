@@ -2553,6 +2553,33 @@ install_systemd_unit() {
     systemctl daemon-reload
 }
 
+# --- journald size cap --------------------------------------------------------
+
+# Install the journald size-cap drop-in to
+# /etc/systemd/journald.conf.d/nexus.conf and restart systemd-journald so it
+# takes effect. Bounds the persistent journal (engine logs land in
+# `journalctl -u nexus-engine`) so unbounded log growth can't crowd out clip
+# storage on a small edge disk — the engine runs unprivileged and cannot vacuum
+# the journal itself. Best-effort: a missing template or a journald restart
+# hiccup logs a warning but never fails the install.
+install_journald_cap() {
+    local release_dir="$1"
+    local src="$release_dir/etc-templates/journald.conf.d/nexus.conf"
+    local target="/etc/systemd/journald.conf.d/nexus.conf"
+
+    if [[ ! -r "$src" ]]; then
+        warn "journald cap drop-in not in release ($src); skipping (journald stays at defaults)"
+        return 0
+    fi
+    install -d -o root -g root -m 0755 /etc/systemd/journald.conf.d
+    install -o root -g root -m 0644 "$src" "$target"
+    log "installed journald size cap: $target"
+    # Re-read config. Best-effort — logging must never block the install.
+    if ! systemctl restart systemd-journald 2>/dev/null; then
+        warn "could not restart systemd-journald; cap applies on next boot"
+    fi
+}
+
 # --- OTA sudoers allowlist ----------------------------------------------------
 
 # Phase 9 (M_OTA). Install the narrow sudoers rule that lets the
@@ -2606,6 +2633,32 @@ install_apply_deps_wrapper() {
     install -d -o root -g root -m 0755 /usr/local/sbin
     install -o root -g root -m 0755 "$src" "$target"
     log "installed OTA runtime-dep wrapper: $target"
+}
+
+# --- OTA old-release reaper wrapper -------------------------------------------
+
+# Install the pinned, root-owned old-release reaper to
+# /usr/local/sbin/nexus-prune-releases (root:root 0755) — OUTSIDE the
+# OTA-writable /opt/nexus tree so the unprivileged `nexus` user cannot tamper
+# with it. The OTA apply path (crates/nexus-engine/src/cloud_update.rs) invokes
+# it via the single nexus-update sudoers rule AFTER a new release boots healthy,
+# to delete stale release trees under /opt/nexus/releases (keeping only the
+# running version + the rollback target). Idempotent: a re-run refreshes the
+# wrapper in place. Like the dep wrapper, this is the ONLY place the reaper (the
+# thing with root `rm -rf` power) is updated — NEVER on an OTA — so its keep-set
+# policy can only change via a deliberate install.sh re-run.
+install_prune_releases_wrapper() {
+    local release_dir="$1"
+    local src="$release_dir/scripts/nexus-prune-releases"
+    local target="/usr/local/sbin/nexus-prune-releases"
+
+    if [[ ! -r "$src" ]]; then
+        warn "OTA old-release reaper not in release ($src); OTA release pruning disabled"
+        return 0
+    fi
+    install -d -o root -g root -m 0755 /usr/local/sbin
+    install -o root -g root -m 0755 "$src" "$target"
+    log "installed OTA old-release reaper: $target"
 }
 
 # --- Health check -------------------------------------------------------------

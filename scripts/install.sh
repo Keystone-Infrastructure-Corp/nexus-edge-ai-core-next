@@ -407,6 +407,11 @@ emit_config "$RELEASE_DIR" "$FORCE_PROFILE"
 
 install_systemd_unit "$RELEASE_DIR"
 
+# --- journald size cap --------------------------------------------------------
+# Bound the persistent journal so engine logs can't fill the edge disk.
+
+install_journald_cap "$RELEASE_DIR"
+
 # --- OTA sudoers allowlist ----------------------------------------------------
 
 install_update_sudoers "$RELEASE_DIR"
@@ -417,6 +422,13 @@ install_update_sudoers "$RELEASE_DIR"
 # requirements.txt) without an operator ever touching the box.
 
 install_apply_deps_wrapper "$RELEASE_DIR"
+
+# --- OTA old-release reaper wrapper -------------------------------------------
+# Root-owned reaper (/usr/local/sbin/nexus-prune-releases) that the OTA apply
+# path runs after a healthy boot to delete stale release trees, keeping only
+# the running version + the rollback target.
+
+install_prune_releases_wrapper "$RELEASE_DIR"
 
 # --- Atomic swap --------------------------------------------------------------
 
