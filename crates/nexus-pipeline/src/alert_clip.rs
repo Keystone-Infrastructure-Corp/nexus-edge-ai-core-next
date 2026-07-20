@@ -336,6 +336,17 @@ mod encode {
     /// after EOS before giving up (the file is still usable if partially
     /// muxed, but we prefer a clean close).
     const EOS_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Hard wall-clock cap on the whole decode→encode drain. Alert clips
+    /// are a handful of seconds long, so a drain that runs past this is a
+    /// wedged decoder (avdec stalls without emitting a sample or EOS —
+    /// observed after prolonged encode churn exhausts decoder resources),
+    /// not slow footage. Without this guard the drain's blocking
+    /// `pull_sample` hangs the `spawn_blocking` task forever: the
+    /// `.partial` is orphaned at 0 bytes, the tokio blocking thread never
+    /// returns, and the alert clip never finalises (so the console
+    /// silently falls back to the raw, box-less motion clip). Bail past
+    /// this deadline and let the caller mark the clip failed.
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Final stats from a successful [`encode_alert_clip`].
     #[derive(Debug, Clone, Copy)]
@@ -354,6 +365,33 @@ mod encode {
         NoFrames,
         #[error("no H.264 encoder available on this host")]
         NoEncoder,
+    }
+
+    /// RAII guard that drives every registered pipeline to `Null` on
+    /// drop. `encode_alert_clip` has many `?` / `return Err` early-exit
+    /// paths; without this, a leaked decode/encode pipeline stays
+    /// referenced (and its avdec / VA decoder resources allocated) after
+    /// an error return, and enough accumulated leaks eventually exhaust
+    /// the box's decoder resources so new alert-clip decodes stall
+    /// forever. Registering both pipelines here guarantees teardown
+    /// regardless of which path the function exits on.
+    struct PipelineGuard(Vec<gst::Pipeline>);
+
+    impl PipelineGuard {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn register(&mut self, p: gst::Pipeline) {
+            self.0.push(p);
+        }
+    }
+
+    impl Drop for PipelineGuard {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = p.set_state(gst::State::Null);
+            }
+        }
     }
 
     /// First available H.264 encoder, hardware-first (matching the
@@ -466,6 +504,10 @@ mod encode {
             .map_err(|e| AlertClipError::Gst(format!("decode launch: {e}")))?
             .downcast::<gst::Pipeline>()
             .map_err(|_| AlertClipError::Gst("decode graph is not a pipeline".into()))?;
+        // Ensure every pipeline is torn down on ANY exit path (error or
+        // success), not just the happy-path `set_state(Null)` below.
+        let mut pipeline_guard = PipelineGuard::new();
+        pipeline_guard.register(dec_pipeline.clone());
         let dsrc = by_name_appsrc(&dec_pipeline, "dsrc")?;
         dsrc.set_caps(Some(
             &gst::Caps::builder(in_media)
@@ -508,10 +550,32 @@ mod encode {
         let mut first_pts_ns: Option<u64> = None;
         let mut last_pts_ns: u64 = 0;
 
+        // Overall wall-clock guard on the decode drain. `pull_sample`
+        // blocks with no timeout, so a wedged decoder would hang this
+        // blocking task forever (see `DRAIN_TIMEOUT`). Poll
+        // `try_pull_sample` at a short cadence instead, checking EOS and
+        // the hard deadline between polls, and tear both pipelines down
+        // on a stall so the blocking thread + GStreamer resources are
+        // freed rather than leaked.
+        let drain_deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
         loop {
-            let sample = match dsink.pull_sample() {
-                Ok(s) => s,
-                Err(_) => break, // EOS (or error) ends the drain.
+            let sample = match dsink.try_pull_sample(Some(gst::ClockTime::from_seconds(1))) {
+                Some(s) => s,
+                None => {
+                    if dsink.is_eos() {
+                        break; // clean end of stream
+                    }
+                    if std::time::Instant::now() >= drain_deadline {
+                        let _ = dec_pipeline.set_state(gst::State::Null);
+                        if let Some((ep, _)) = enc.as_ref() {
+                            let _ = ep.set_state(gst::State::Null);
+                        }
+                        return Err(AlertClipError::Gst(
+                            "decode drain stalled (no sample or EOS before deadline)".into(),
+                        ));
+                    }
+                    continue; // still within budget — keep waiting
+                }
             };
             let buffer = sample
                 .buffer()
@@ -652,6 +716,7 @@ mod encode {
                 ));
                 ep.set_state(gst::State::Playing)
                     .map_err(|e| AlertClipError::Gst(format!("encode set Playing: {e}")))?;
+                pipeline_guard.register(ep.clone());
                 enc = Some((ep, esrc));
             }
             let (_, esrc) = enc.as_ref().expect("encode pipeline built above");
