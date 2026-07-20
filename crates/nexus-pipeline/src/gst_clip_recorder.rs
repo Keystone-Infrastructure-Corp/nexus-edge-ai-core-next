@@ -1189,6 +1189,16 @@ impl ClipRecorder for GstClipRecorder {
         if !self.alert_clips_active() {
             return None;
         }
+        // Honor the disk-full panic watermark, exactly as `open()` does for
+        // motion clips. Without this an alert clip is armed on a critically
+        // full disk, and its encoder pipeline (blocking appsrc → filesink)
+        // stalls forever on writes that can never complete, permanently
+        // wedging a tokio blocking thread. Enough stalled encoders saturate
+        // the blocking pool and freeze every camera pipeline at once.
+        if self.is_panic() {
+            debug!(camera_id, "recorder refused alert clip (panic mode)");
+            return None;
+        }
         let deadline_ms = alert_ts.timestamp_millis() + i64::from(cfg.post_secs) * 1000;
 
         // Coalesce into an in-flight builder whose window is still open
