@@ -817,7 +817,13 @@ pub struct OtlpConfig {
 }
 
 fn default_log_level() -> String {
-    "info,nexus=debug".to_string()
+    // Production default: quiet. `nexus=debug` here made every emit-config'd
+    // box log per-frame DEBUG (measurable journald + CPU overhead at 16
+    // cameras), and since `nexus-probe emit-config` serializes this default
+    // into /etc/nexus/nexus.toml, that verbosity shipped to every install.
+    // Mirrors the systemd unit's `RUST_LOG=info,nexus=info`. Dev configs that
+    // want DEBUG set it explicitly (see config/*.toml).
+    "info,nexus=info".to_string()
 }
 
 fn default_sample_ratio() -> f64 {

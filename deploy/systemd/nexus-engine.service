@@ -36,6 +36,22 @@ Environment=ORT_DYLIB_PATH=/opt/nexus/current/lib/onnxruntime/libonnxruntime.so
 Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime
 Environment=RUST_LOG=info,nexus=info
 
+# XDG_RUNTIME_DIR for the AMD legacy `vaapipostproc` GPU post-proc element.
+# On AMD (Mesa radeonsi) the decode chain uses `vaapih26Xdec ! vaapipostproc`
+# for GPU colour-convert/scale, because the new `va` plugin's `vapostproc`
+# renders all-green on radeonsi (verified on a Radeon 680M / gfx1035, Mesa
+# 25.2). `vaapipostproc` runs a GBM/GL probe at caps negotiation that requires
+# XDG_RUNTIME_DIR to point at an existing, writable, 0700 dir; without it the
+# element errors ("XDG_RUNTIME_DIR is invalid or not set") and the camera
+# silently falls back to the CPU-convert chain. As a system service the
+# `nexus` user has no login session (no /run/user/<uid>), so let systemd make
+# a private one: RuntimeDirectory=nexus creates /run/nexus (0700, owned by
+# nexus, torn down on stop). Harmless on Intel / NVIDIA — just an unused env
+# var and an empty runtime dir.
+RuntimeDirectory=nexus
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/nexus
+
 # AMD ROCm / Radeon GPU configuration.
 #
 # ROCm is enabled only for AMD GPUs it OFFICIALLY supports — discrete

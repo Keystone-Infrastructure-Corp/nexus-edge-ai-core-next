@@ -52,7 +52,7 @@ pub fn init(
     trace_handle: Option<TraceUploaderHandle>,
 ) -> Result<TelemetryGuard> {
     let env_filter =
-        EnvFilter::try_new(&cfg.log_level).unwrap_or_else(|_| EnvFilter::new("info,nexus=debug"));
+        EnvFilter::try_new(&cfg.log_level).unwrap_or_else(|_| EnvFilter::new("info,nexus=info"));
 
     let registry = tracing_subscriber::registry().with(env_filter);
 
