@@ -132,6 +132,67 @@ async fn record_event_and_enqueue_inserts_event_and_outbox_rows() {
 }
 
 #[tokio::test]
+async fn classified_record_sets_and_reads_alerted_flag() {
+    // M-Event-Audit: `record_event_and_enqueue_classified` stamps
+    // `events.alerted` from the delivery-schedule verdict, and the event
+    // is ALWAYS logged regardless of the flag.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    // Off-schedule (audit-only): still logged, alerted = false, no sinks.
+    let off = sample_alert(1, "rule.after_hours");
+    store
+        .record_event_and_enqueue_classified(&off, &[], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .event_alerted(&off.event_id.to_string())
+            .await
+            .unwrap(),
+        Some(false),
+        "off-schedule match must be logged as audit-only (alerted = false)"
+    );
+
+    // On-schedule (alert): alerted = true, enqueued to a sink.
+    let on = sample_alert(1, "rule.intrusion");
+    store
+        .record_event_and_enqueue_classified(&on, &["webhook:slack"], true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.event_alerted(&on.event_id.to_string()).await.unwrap(),
+        Some(true),
+        "on-schedule match must be marked alerted"
+    );
+
+    // Both events land in the audit regardless of disposition.
+    let n_events: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(n_events.0, 2, "logging is unconditional");
+
+    // The 2-arg wrapper defaults to alerted = true (legacy behaviour).
+    let legacy = sample_alert(1, "rule.legacy");
+    store.record_event_and_enqueue(&legacy, &[]).await.unwrap();
+    assert_eq!(
+        store
+            .event_alerted(&legacy.event_id.to_string())
+            .await
+            .unwrap(),
+        Some(true),
+        "the 2-arg wrapper defaults to alerted = true"
+    );
+
+    // Unknown event id → None.
+    assert_eq!(store.event_alerted("no-such-event").await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn record_event_and_enqueue_with_no_sinks_records_event_only() {
     let (store, _tmp) = fresh_store().await;
     store

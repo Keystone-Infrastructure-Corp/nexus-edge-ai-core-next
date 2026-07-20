@@ -2260,6 +2260,9 @@ fn preview_point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
 #[derive(serde::Deserialize)]
 struct EventsQuery {
     limit: Option<i64>,
+    /// M-Event-Audit filter: `true` = alert queue only, `false` =
+    /// audit-only (off-schedule) events, omitted = the full audit.
+    alerted: Option<bool>,
 }
 
 /// M_PERF_CROWD F1 — `?attributes=full` opts the SSE subscriber in
@@ -2271,13 +2274,32 @@ struct StreamMetadataQuery {
     attributes: Option<String>,
 }
 
+/// Events-list item: the recorded `AlertEvent` plus its M-Event-Audit
+/// `alerted` classification. The flag is flattened onto the event so
+/// existing consumers that read only the `AlertEvent` fields are
+/// unaffected, while the console can split Events (all) from Alerts
+/// (`alerted`).
+#[derive(serde::Serialize)]
+struct EventListItem {
+    #[serde(flatten)]
+    event: AlertEvent,
+    alerted: bool,
+}
+
 async fn list_events(
     State(s): State<ApiState>,
     Query(q): Query<EventsQuery>,
-) -> Result<Json<Vec<AlertEvent>>, ApiError> {
+) -> Result<Json<Vec<EventListItem>>, ApiError> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let evs = nexus_store::EventStore::list_recent_events(&*s.store, limit).await?;
-    Ok(Json(evs))
+    let evs = s
+        .store
+        .list_recent_events_with_alerted(limit, q.alerted)
+        .await?;
+    Ok(Json(
+        evs.into_iter()
+            .map(|(event, alerted)| EventListItem { event, alerted })
+            .collect(),
+    ))
 }
 
 async fn get_latest_frame_meta(

@@ -139,6 +139,11 @@ pub struct ReconcilerArgs {
     /// `start_camera` call so a hot-added camera routes alerts with
     /// the same per-rule `sinks` semantics as the boot-time ones.
     pub sink_router: Arc<dyn nexus_pipeline::SinkRouter>,
+    /// M-Event-Audit alert-clip schedule gate (delegates to the shared
+    /// `CascadingPolicy`). Cloned per `start_camera` so a freshly
+    /// spawned camera gates alert-clip arming on the same live delivery
+    /// schedule as the boot-time ones.
+    pub alert_clip_schedule_gate: Arc<dyn nexus_pipeline::AlertClipScheduleGate>,
     pub handles: HandleMap,
 }
 
@@ -426,6 +431,7 @@ async fn start_camera(
         args.sighting_persist.clone(),
         effective_top_k,
         args.sink_router.clone(),
+        args.alert_clip_schedule_gate.clone(),
     );
     args.handles.lock().insert(
         cam_id,

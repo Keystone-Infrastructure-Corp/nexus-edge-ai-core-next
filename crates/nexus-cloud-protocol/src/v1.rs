@@ -46,6 +46,9 @@ pub struct AlertAckPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertPayload {
+    /// M-Event-Audit (additive on v=1). Edge-computed delivery-schedule verdict for the firing rule at `ts`: true = the match fell within the active delivery cascade (global + per-rule enabled AND within schedule) and was promoted to an alert (→ cloud alerts queue + notifications); false = an audit-only off-schedule match (logged to the cloud `events` audit only — no queue row, no notification, no alert clip). Omitted by N-1 edges → the cloud treats it as true (legacy alerts predate the events/alerts split).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alerted: Option<bool>,
     /// Phase 21.2 — clip pre-attached on edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_history: Option<bool>,

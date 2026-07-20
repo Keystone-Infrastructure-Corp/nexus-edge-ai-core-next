@@ -116,8 +116,20 @@ export function getStaticObjectDefaults(): Promise<StaticObjectDefaults> {
 // Events.
 // ---------------------------------------------------------------------------
 
-export function listEvents(limit = 50): Promise<AlertEvent[]> {
-  return api.get<AlertEvent[]>("/events", { query: { limit } });
+/**
+ * M-Event-Audit: an event-list row is the recorded `AlertEvent` plus its
+ * `alerted` classification — `true` when the match fell within the delivery
+ * schedule (an alert), `false` for an audit-only off-schedule match.
+ */
+export type EventListItem = AlertEvent & { alerted: boolean };
+
+export function listEvents(
+  limit = 50,
+  alerted?: boolean,
+): Promise<EventListItem[]> {
+  const query: Record<string, string | number> = { limit };
+  if (alerted !== undefined) query.alerted = alerted ? "true" : "false";
+  return api.get<EventListItem[]>("/events", { query });
 }
 
 export function getEventDelivery(eventId: string): Promise<OutboxRow[]> {

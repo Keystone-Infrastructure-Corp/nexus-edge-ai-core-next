@@ -20,6 +20,7 @@ mod admin_cloud;
 mod admin_network;
 mod admin_runtime;
 mod alert_clip_evict;
+mod alert_clip_gate;
 mod api;
 mod audit_retention;
 mod auth;
@@ -830,6 +831,23 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         sink_router::EngineSinkRouter::new(evaluator.clone(), sink_registry.clone()),
     );
 
+    // M-Event-Audit: hydrate the M7 delivery cascade HERE (it was
+    // previously built just before the dispatcher) so the boot-time
+    // camera spawn can hand each supervisor a schedule gate backed by
+    // the SAME hot-reloaded `ArcSwap` cache the dispatcher reads. That
+    // shared cache is what keeps alert-clip arming (evaluation time) and
+    // sink delivery (dispatch time) from ever disagreeing across a
+    // `delivery.settings.changed` reload.
+    let cascading_policy = std::sync::Arc::new(
+        nexus_sinks::policy::CascadingPolicy::hydrate(&store)
+            .await
+            .context("M7: hydrate delivery policy from store")?,
+    );
+    let alert_clip_schedule_gate: std::sync::Arc<dyn nexus_pipeline::AlertClipScheduleGate> =
+        std::sync::Arc::new(alert_clip_gate::EngineAlertClipGate::new(
+            cascading_policy.clone(),
+        ));
+
     for cam in cameras {
         if !cam.ingest.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
@@ -899,6 +917,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             sighting_persist.clone(),
             effective_top_k,
             sink_router.clone(),
+            alert_clip_schedule_gate.clone(),
         );
         running.lock().insert(
             cam_id,
@@ -1142,13 +1161,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             pending_acks.clone(),
             snapshots_dir.clone(),
             snapshot_uploader_slot.clone(),
-        ),
+        )
+        .with_store(store.clone()),
     ));
-    let cascading_policy = std::sync::Arc::new(
-        nexus_sinks::policy::CascadingPolicy::hydrate(&store)
-            .await
-            .context("M7: hydrate delivery policy from store")?,
-    );
+    // `cascading_policy` was hydrated before the boot-time camera spawn
+    // (M-Event-Audit) so the alert-clip schedule gate shares its cache;
+    // reuse the same Arc here for the dispatcher's delivery policy.
     // Wrap the operator delivery policy so `cloud:*` rows are always-on
     // (the complete audit trail) except under entitlement suspension;
     // external sinks still get the full CascadingPolicy (schedule /
@@ -1226,6 +1244,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         sighting_persist: sighting_persist.clone(),
         sighting_hydration_window_secs: hydration_window_secs,
         sink_router: sink_router.clone(),
+        alert_clip_schedule_gate: alert_clip_schedule_gate.clone(),
         handles: running.clone(),
     });
 

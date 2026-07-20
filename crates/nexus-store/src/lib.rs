@@ -169,6 +169,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0028_delivery_settings_alert_clip",
         include_str!("../migrations/0028_delivery_settings_alert_clip.sql"),
     ),
+    (
+        "0029_events_alerted",
+        include_str!("../migrations/0029_events_alerted.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]
@@ -748,26 +752,106 @@ impl Store {
         }
     }
 
+    /// Read the `alerted` classification of a recorded event
+    /// (M-Event-Audit). `Some(true)` = promoted to an alert;
+    /// `Some(false)` = audit-only (off-schedule / suppressed);
+    /// `None` = no such event row. Backs the local admin API's
+    /// events/alerts split.
+    pub async fn event_alerted(&self, event_id: &str) -> Result<Option<bool>, StoreError> {
+        let row = sqlx::query("SELECT alerted FROM events WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| {
+            let a: i64 = r.get(0);
+            a != 0
+        }))
+    }
+
+    /// List recent events (newest first) paired with their
+    /// M-Event-Audit `alerted` classification. `only_alerted`:
+    /// `Some(true)` = the alert queue, `Some(false)` = audit-only
+    /// (off-schedule matches), `None` = the full event audit. Backs the
+    /// local admin API's Events / Alerts split.
+    pub async fn list_recent_events_with_alerted(
+        &self,
+        limit: i64,
+        only_alerted: Option<bool>,
+    ) -> Result<Vec<(AlertEvent, bool)>, StoreError> {
+        let rows = match only_alerted {
+            Some(a) => {
+                sqlx::query(
+                    "SELECT payload_json, alerted FROM events
+                      WHERE alerted = ? ORDER BY captured_at DESC LIMIT ?",
+                )
+                .bind(i64::from(a))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT payload_json, alerted FROM events
+                      ORDER BY captured_at DESC LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let s: String = r.get(0);
+            let alerted: i64 = r.get(1);
+            out.push((serde_json::from_str(&s)?, alerted != 0));
+        }
+        Ok(out)
+    }
+
+    /// Insert an `AlertEvent` AND one `alert_sink_outbox` row per
+    /// `sink_id`, treating the event as an alert (`alerted = true`).
+    ///
+    /// Thin wrapper over [`Self::record_event_and_enqueue_classified`]
+    /// for callers that don't schedule-classify (tests + the dev
+    /// test-injection endpoint). Real rule-fire recording in the
+    /// supervisor calls the classified form with the M-Event-Audit
+    /// delivery verdict.
+    pub async fn record_event_and_enqueue(
+        &self,
+        event: &AlertEvent,
+        sink_ids: &[&str],
+    ) -> Result<(), StoreError> {
+        self.record_event_and_enqueue_classified(event, sink_ids, true)
+            .await
+    }
+
     /// Insert an `AlertEvent` AND one `alert_sink_outbox` row per
     /// `sink_id` in a single transaction. If `sink_ids` is empty the
     /// behaviour is identical to `EventStore::record_event` (the
     /// event still lands; nothing is enqueued).
     ///
+    /// `alerted` (M-Event-Audit) classifies the row: `true` when the
+    /// match fell within the active delivery cascade
+    /// (`CascadingPolicy::would_deliver`) and was promoted to an alert,
+    /// `false` for an audit-only off-schedule match. It never gates the
+    /// write — the `events` row lands either way.
+    ///
     /// On any failure (including a `UNIQUE (event_id, sink_id)`
     /// violation from a duplicate enqueue) the entire transaction
     /// rolls back — neither the event nor any outbox row survives.
-    pub async fn record_event_and_enqueue(
+    pub async fn record_event_and_enqueue_classified(
         &self,
         event: &AlertEvent,
         sink_ids: &[&str],
+        alerted: bool,
     ) -> Result<(), StoreError> {
         let payload = serde_json::to_string(event)?;
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "INSERT INTO events (event_id, camera_id, rule_id, track_id, label,
-                                 severity, frame_id, captured_at, trace_id, payload_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                 severity, frame_id, captured_at, trace_id, payload_json, alerted)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(event.event_id.to_string())
         .bind(event.camera_id)
@@ -779,6 +863,7 @@ impl Store {
         .bind(event.captured_at.to_rfc3339())
         .bind(&event.trace_id)
         .bind(&payload)
+        .bind(i64::from(alerted))
         .execute(&mut *tx)
         .await?;
 

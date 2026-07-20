@@ -160,6 +160,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         std::sync::Arc::new(nexus_pipeline::NoopEntityLocalPersist),
         None,
         std::sync::Arc::new(FixedSinkRouter("webhook:test")),
+        std::sync::Arc::new(nexus_pipeline::NoopAlertClipScheduleGate),
     );
 
     // 4. Wait for the first AlertEvent. 5s budget covers the gate warmup
