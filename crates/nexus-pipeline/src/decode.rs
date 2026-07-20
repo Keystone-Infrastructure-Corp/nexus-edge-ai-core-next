@@ -11,13 +11,37 @@
 //! **`vapostproc` is kept on Intel but bypassed on AMD.** The obvious VA
 //! chain is `vah26Xdec ! vapostproc ! …` so the colour-convert/scale also
 //! runs on the GPU, and that is exactly what we do on Intel. But on Mesa
-//! `radeonsi` (AMD VCN) `vapostproc` emits all-green frames: its
-//! convert/download path is broken whether or not the caps pin system memory
-//! (verified on a Radeon 680M, gfx1035, Mesa 25.2). So on an AMD VA device
-//! the chain instead downloads the decoded surface to system-memory NV12 and
-//! does the cheap convert/scale on the CPU (the same tail as the software
-//! chain), still keeping GPU decode. The split is keyed on the DRM vendor via
-//! [`FactoryProbe::va_bypass_postproc`].
+//! `radeonsi` (AMD VCN) the new `va` plugin's `vapostproc` emits all-green
+//! frames: its convert/download path is broken whether or not the caps pin
+//! system memory (verified on a Radeon 680M, gfx1035, Mesa 25.2). So on an
+//! AMD VA device we never use `vapostproc`. Instead, in preference order:
+//!
+//! 1. **Legacy `gstreamer1.0-vaapi` GPU path** — if `vaapih26Xdec` +
+//!    `vaapipostproc` are registered: `vaapih26Xdec ! vaapipostproc !
+//!    videoconvert ! videorate`. The OLD `vaapipostproc` does the NV12→RGB
+//!    convert + downscale correctly on the GPU on the same Radeon 680M /
+//!    Mesa 25.2 where the new `vapostproc` fails (verified with a live
+//!    pipeline). `videoscale` is deliberately OMITTED so caps negotiation is
+//!    forced to put the scale on `vaapipostproc` (the GPU) rather than let a
+//!    downstream CPU `videoscale` claim it; the lone `videoconvert` is then
+//!    only a cheap small-frame format bridge (the GPU has already downscaled
+//!    to the target width/height). Keeps BOTH decode and convert/scale on
+//!    the GPU. `vaapipostproc` runs a GBM/GL probe that needs
+//!    `XDG_RUNTIME_DIR` set — the systemd unit provides it via
+//!    `RuntimeDirectory=nexus`.
+//! 2. **System-memory CPU-convert fallback** — otherwise `vah26Xdec !
+//!    video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert`. The
+//!    `video/x-raw,format=NV12` carries no `memory:VAMemory`/`memory:DMABuf`
+//!    feature, so the decoder downloads each frame to system memory and the
+//!    convert/scale runs on the CPU. The tail is ordered `videorate !
+//!    videoscale ! videoconvert` so frames are dropped FIRST (cheap, still
+//!    NV12), survivors are scaled while still subsampled NV12 (12 bpp,
+//!    cheaper than RGB), and the costly NV12→RGB convert runs LAST — on the
+//!    already-downscaled, rate-limited stream instead of at full resolution
+//!    and full frame rate.
+//!
+//! GPU decode (the expensive part) is preserved in both. The split is keyed
+//! on the DRM vendor via [`FactoryProbe::va_bypass_postproc`].
 //!
 //! Because a decoder is chosen on element *presence*, not on whether it
 //! actually renders, the ingest path pairs this with a runtime guard
@@ -27,8 +51,9 @@
 //!
 //! Selection is **fail-open**: if a requested hardware backend's elements are
 //! not registered, it degrades to software (the caller logs the downgrade)
-//! rather than failing the pipeline. The chain always ends with
-//! `videoconvert ! videoscale ! videorate` so the downstream
+//! rather than failing the pipeline. Every chain ends with some ordering of
+//! `videoconvert` / `videoscale` / `videorate` (the AMD legacy-`vaapipostproc`
+//! chain omits `videoscale` on purpose — see above) so the downstream
 //! `video/x-raw,format=RGB,width=..,height=..,framerate=../1` caps always
 //! resolve.
 //!
@@ -72,8 +97,9 @@ pub trait FactoryProbe {
 /// The chosen decode + post-process fragment plus metadata for logging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeChain {
-    /// GStreamer element fragment from the decoder through `videorate`,
-    /// e.g. `vah264dec ! video/x-raw,format=NV12 ! videoconvert ! videoscale ! videorate`.
+    /// GStreamer element fragment from the decoder through the
+    /// convert/scale/rate tail, e.g.
+    /// `vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate`.
     /// The caller appends
     /// `! video/x-raw,format=RGB,width=..,height=..,framerate=../1 ! appsink`.
     pub elements: String,
@@ -102,6 +128,16 @@ fn va_decoder(codec_base: &str) -> &'static str {
     }
 }
 
+/// Decoder factory name in the LEGACY `gstreamer1.0-vaapi` plugin (as opposed
+/// to the new `va` plugin's [`va_decoder`]). Only used on AMD, where the old
+/// `vaapipostproc` does GPU convert/scale correctly (see [`va_chain`]).
+fn vaapi_decoder(codec_base: &str) -> &'static str {
+    match codec_base {
+        "h265" => "vaapih265dec",
+        _ => "vaapih264dec",
+    }
+}
+
 fn msdk_decoder(codec_base: &str) -> &'static str {
     match codec_base {
         "h265" => "msdkh265dec",
@@ -126,39 +162,72 @@ fn software_chain(codec_base: &str) -> DecodeChain {
     }
 }
 
-fn va_chain(codec_base: &str, bypass_postproc: bool) -> DecodeChain {
-    let dec = va_decoder(codec_base);
-    if bypass_postproc {
-        // AMD radeonsi: `vapostproc` renders all-green frames regardless of
-        // whether its output caps pin system memory — the decoder is fine,
-        // its convert/download path is not (verified on a Radeon 680M /
-        // gfx1035, Mesa 25.2; every `vapostproc` variant tested came back
-        // byte-identically green). So decode on the GPU (`vah26Xdec`) but
-        // force the surface DOWN to system-memory NV12 (`video/x-raw,
-        // format=NV12` carries no `memory:VAMemory`/`memory:DMABuf` feature,
-        // so the decoder downloads each frame) and do the cheap convert/scale
-        // on the CPU, exactly like the software chain's tail. GPU decode (the
-        // expensive part) is preserved.
-        DecodeChain {
-            elements: format!(
-                "{dec} ! video/x-raw,format=NV12 ! videoconvert ! videoscale ! videorate"
-            ),
-            backend: DecodeBackend::Va,
-            hwaccel: true,
-            label: format!("va ({dec}, sysmem NV12 + cpu convert)"),
-        }
-    } else {
+fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> DecodeChain {
+    if !bypass_postproc {
         // Intel (and any other non-AMD VA device): `vapostproc` does GPU
         // colour-convert + scale correctly, so keep it. The trailing
         // videoconvert/videoscale are cheap no-ops when it already lands on
         // the requested RGB caps and a CPU safety net otherwise.
-        DecodeChain {
+        let dec = va_decoder(codec_base);
+        return DecodeChain {
             elements: format!("{dec} ! vapostproc ! videoconvert ! videoscale ! videorate"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
-        }
+        };
     }
+
+    // AMD radeonsi: the new `vapostproc` renders all-green frames regardless
+    // of its output caps (verified on a Radeon 680M / gfx1035, Mesa 25.2), so
+    // it is never used below.
+    if amd_vaapi_gpu {
+        // Preferred AMD path: the LEGACY `gstreamer1.0-vaapi` plugin's
+        // `vaapipostproc` does GPU convert + downscale correctly on the same
+        // hardware where the new `vapostproc` fails (verified with a live
+        // pipeline). `videoscale` is deliberately omitted so caps negotiation
+        // is forced to put the scale on `vaapipostproc` (GPU) instead of a
+        // downstream CPU `videoscale`; the lone `videoconvert` is then only a
+        // cheap small-frame format bridge once the GPU has already downscaled
+        // to the target width/height. Keeps BOTH decode and convert/scale on
+        // the GPU. (`vaapipostproc` needs `XDG_RUNTIME_DIR`; the systemd unit
+        // provides it via `RuntimeDirectory=nexus`.)
+        let dec = vaapi_decoder(codec_base);
+        return DecodeChain {
+            elements: format!("{dec} ! vaapipostproc ! videoconvert ! videorate"),
+            backend: DecodeBackend::Va,
+            hwaccel: true,
+            label: format!("va ({dec}+vaapipostproc, gpu convert)"),
+        };
+    }
+
+    // AMD fallback (no legacy vaapi plugin registered): decode on the GPU but
+    // force the surface DOWN to system-memory NV12 (`video/x-raw,format=NV12`
+    // carries no `memory:VAMemory`/`memory:DMABuf` feature, so the decoder
+    // downloads each frame) and do the convert/scale on the CPU. Ordered
+    // `videorate ! videoscale ! videoconvert` so frames are dropped first
+    // (cheap, still NV12), survivors are scaled while still subsampled NV12
+    // (12 bpp), and the costly NV12→RGB convert runs last on the
+    // already-downscaled, rate-limited stream — not at full resolution and
+    // full frame rate. GPU decode (the expensive part) is preserved.
+    let dec = va_decoder(codec_base);
+    DecodeChain {
+        elements: format!(
+            "{dec} ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+        ),
+        backend: DecodeBackend::Va,
+        hwaccel: true,
+        label: format!("va ({dec}, sysmem NV12 + cpu convert)"),
+    }
+}
+
+/// Build the VA chain for `codec_base` from a live probe: pick the Intel
+/// (`vapostproc`) path, the AMD legacy-`vaapipostproc` GPU path, or the AMD
+/// system-memory CPU-convert fallback. Keeps the AMD three-way decision in one
+/// place so both [`select_decode_chain`] call sites stay in sync.
+fn va_chain_for(codec_base: &str, probe: &impl FactoryProbe) -> DecodeChain {
+    let bypass = probe.va_bypass_postproc();
+    let amd_vaapi_gpu = bypass && amd_vaapi_gpu_available(probe, codec_base);
+    va_chain(codec_base, bypass, amd_vaapi_gpu)
 }
 
 fn msdk_chain(codec_base: &str) -> DecodeChain {
@@ -173,6 +242,15 @@ fn msdk_chain(codec_base: &str) -> DecodeChain {
 
 fn va_available(probe: &impl FactoryProbe, codec_base: &str) -> bool {
     probe.has(va_decoder(codec_base)) && probe.has("vapostproc")
+}
+
+/// Whether the LEGACY `gstreamer1.0-vaapi` GPU post-proc path is available for
+/// `codec_base`, i.e. both `vaapih26Xdec` and `vaapipostproc` are registered.
+/// Only consulted on AMD (see [`va_chain`]); on the Radeon 680M / Mesa 25.2
+/// this old `vaapipostproc` does GPU convert/scale correctly where the new
+/// `vapostproc` renders all-green.
+fn amd_vaapi_gpu_available(probe: &impl FactoryProbe, codec_base: &str) -> bool {
+    probe.has(vaapi_decoder(codec_base)) && probe.has("vaapipostproc")
 }
 
 fn msdk_available(probe: &impl FactoryProbe, codec_base: &str) -> bool {
@@ -205,7 +283,7 @@ pub fn select_decode_chain(
         DecodeMode::Software => software_chain(codec_base),
         DecodeMode::Auto | DecodeMode::Va => {
             if va_available(probe, codec_base) {
-                va_chain(codec_base, probe.va_bypass_postproc())
+                va_chain_for(codec_base, probe)
             } else {
                 software_chain(codec_base)
             }
@@ -214,7 +292,7 @@ pub fn select_decode_chain(
             if msdk_available(probe, codec_base) {
                 msdk_chain(codec_base)
             } else if va_available(probe, codec_base) {
-                va_chain(codec_base, probe.va_bypass_postproc())
+                va_chain_for(codec_base, probe)
             } else {
                 software_chain(codec_base)
             }
@@ -395,9 +473,12 @@ mod tests {
 
     #[test]
     fn amd_va_bypasses_vapostproc() {
-        // AMD radeonsi: vapostproc is broken (all-green), so the chain
-        // downloads system-memory NV12 and converts on the CPU instead,
-        // keeping GPU decode.
+        // AMD radeonsi WITHOUT the legacy gstreamer1.0-vaapi plugin: the new
+        // `vapostproc` is broken (all-green), so the chain downloads
+        // system-memory NV12 and converts on the CPU instead, keeping GPU
+        // decode. Tail ordered videorate ! videoscale ! videoconvert so the
+        // costly NV12→RGB convert runs last, on the downscaled/rate-limited
+        // stream.
         let c = select_decode_chain(
             "h264",
             DecodeMode::Auto,
@@ -405,9 +486,10 @@ mod tests {
         );
         assert_eq!(c.backend, DecodeBackend::Va);
         assert!(c.hwaccel);
+        assert!(!c.elements.contains("vapostproc"));
         assert_eq!(
             c.elements,
-            "vah264dec ! video/x-raw,format=NV12 ! videoconvert ! videoscale ! videorate"
+            "vah264dec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
         );
     }
 
@@ -422,6 +504,40 @@ mod tests {
         assert!(c
             .elements
             .starts_with("vah265dec ! video/x-raw,format=NV12 !"));
+    }
+
+    #[test]
+    fn amd_va_prefers_legacy_vaapi_gpu_postproc_when_present() {
+        // AMD with the legacy gstreamer1.0-vaapi plugin ALSO registered:
+        // prefer `vaapih264dec ! vaapipostproc` so convert+scale stay on the
+        // GPU (verified correct on Radeon 680M / Mesa 25.2). `videoscale` is
+        // omitted so the scale is forced onto vaapipostproc.
+        let c = select_decode_chain(
+            "h264",
+            DecodeMode::Auto,
+            &probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]),
+        );
+        assert_eq!(c.backend, DecodeBackend::Va);
+        assert!(c.hwaccel);
+        assert!(!c.elements.contains("videoscale"));
+        assert_eq!(
+            c.elements,
+            "vaapih264dec ! vaapipostproc ! videoconvert ! videorate"
+        );
+    }
+
+    #[test]
+    fn amd_va_legacy_vaapi_gpu_postproc_h265() {
+        let c = select_decode_chain(
+            "h265",
+            DecodeMode::Va,
+            &probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"]),
+        );
+        assert_eq!(c.backend, DecodeBackend::Va);
+        assert_eq!(
+            c.elements,
+            "vaapih265dec ! vaapipostproc ! videoconvert ! videorate"
+        );
     }
 
     #[test]
