@@ -20,11 +20,11 @@
 //! cold-disabled boxes (fail-open — the local experience never depends
 //! on cloud reachability).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use nexus_store::Store;
 use tracing::{debug, info, warn};
 
@@ -86,21 +86,34 @@ pub async fn run_alert_clip_evictor(
 async fn sweep(cfg: &AlertClipEvictorConfig, store: &Arc<Store>) {
     let cold_grace_cutoff = Utc::now()
         - chrono::Duration::from_std(COLD_GRACE).unwrap_or_else(|_| chrono::Duration::minutes(15));
-    let rows = match store
-        .alert_clips_evictable(EVICT_BATCH, cold_grace_cutoff)
-        .await
-    {
+    reclaim_evictable_alert_clips(store, &cfg.clips_dir, cold_grace_cutoff, EVICT_BATCH).await;
+}
+
+/// Reclaim up to `batch` evictable alert clips: unlink each hot MP4
+/// and flip its row to `evicted`. `cold_grace_cutoff` is passed
+/// straight through to [`Store::alert_clips_evictable`] — the periodic
+/// sweeper passes `now - COLD_GRACE` (hold un-replicated clips long
+/// enough for an enrolled core to ship them to the cloud), while the
+/// storage-safety pressure ladder passes `now` to drop the grace wait
+/// and reclaim delivered clips immediately. The delivery-drained gate
+/// lives inside the query, so this NEVER destroys an alert clip whose
+/// alarm is still being delivered. Returns the number reclaimed.
+pub async fn reclaim_evictable_alert_clips(
+    store: &Arc<Store>,
+    clips_dir: &Path,
+    cold_grace_cutoff: DateTime<Utc>,
+    batch: i64,
+) -> usize {
+    let rows = match store.alert_clips_evictable(batch, cold_grace_cutoff).await {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "alert-clip evictor: alert_clips_evictable failed");
-            return;
+            return 0;
         }
     };
-    if rows.is_empty() {
-        return;
-    }
+    let mut reclaimed = 0;
     for ac in rows {
-        let path = cfg.clips_dir.join(&ac.path);
+        let path = clips_dir.join(&ac.path);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => debug!(id = ac.id, path = %path.display(), "reclaimed alert clip"),
             // Already gone (double sweep, or never written): fine.
@@ -115,6 +128,9 @@ async fn sweep(cfg: &AlertClipEvictorConfig, store: &Arc<Store>) {
         }
         if let Err(e) = store.mark_alert_clip_evicted(ac.id).await {
             warn!(id = ac.id, error = %e, "alert-clip evictor: mark_alert_clip_evicted failed");
+        } else {
+            reclaimed += 1;
         }
     }
+    reclaimed
 }

@@ -752,6 +752,49 @@ impl Store {
         }
     }
 
+    /// Given candidate event ids parsed from snapshot filenames on
+    /// disk, return the subset that still have an `events` row. The
+    /// storage-safety snapshot sweep deletes the complement — a
+    /// `<event_id>.jpg` whose event was cascade-deleted (e.g. by a
+    /// motion-clip eviction) is dead weight and safe to reclaim under
+    /// disk pressure. Chunked to stay under SQLite's bound-variable
+    /// limit.
+    pub async fn existing_event_ids(
+        &self,
+        candidates: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let mut out = std::collections::HashSet::new();
+        for chunk in candidates.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT event_id FROM events WHERE event_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            for row in q.fetch_all(&self.pool).await? {
+                out.insert(row.get::<String, _>(0));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Force a WAL checkpoint in TRUNCATE mode so freed pages are
+    /// handed back to the filesystem and the `-wal` sidecar returns to
+    /// zero length. Best-effort: a busy checkpoint (a reader holding an
+    /// older snapshot) is not an error — the next call retries. Unlike
+    /// `VACUUM` it needs no scratch space, so it is safe to run when
+    /// the disk is already tight. Called by the storage-safety ladder
+    /// under disk pressure.
+    pub async fn checkpoint_wal_truncate(&self) -> Result<(), StoreError> {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Read the `alerted` classification of a recorded event
     /// (M-Event-Audit). `Some(true)` = promoted to an alert;
     /// `Some(false)` = audit-only (off-schedule / suppressed);

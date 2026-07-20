@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::Utc;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_pipeline::ClipRecorder;
 use nexus_store::Store;
@@ -47,6 +48,17 @@ use tracing::{debug, error, info, warn};
 /// panic mode. Prevents flapping when eviction frees just enough to
 /// dip back under the threshold.
 pub const HYSTERESIS_PCT: u8 = 5;
+
+/// Under disk pressure the rolling host-metrics buffer is coarsened
+/// hard: everything older than this is dropped outright (vs the
+/// steady-state 24h/60min two-tier retention). The cloud console keeps
+/// its own copy, so a tight local box need not hoard 24h of telemetry.
+const PRESSURE_METRICS_KEEP: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Max alert clips / orphan snapshots reclaimed per pressure tick.
+/// Bounds one tick so a large backlog can't monopolise the loop; the
+/// next tick continues down the ladder (footage is still evicted last).
+const PRESSURE_RECLAIM_BATCH: i64 = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
@@ -329,6 +341,10 @@ pub struct StoragePanicEvent {
 #[derive(Debug, Clone)]
 pub struct StorageSafetyConfig {
     pub clips_dir: PathBuf,
+    /// Where alert snapshots (`<event_id>.jpg`) live. The pressure
+    /// ladder reaps orphaned snapshots (event already cascade-deleted)
+    /// from here. `None` disables the snapshot sweep.
+    pub snapshots_dir: Option<PathBuf>,
     pub low_watermark_pct: u8,
     pub panic_watermark_pct: u8,
     pub sample_interval: Duration,
@@ -405,16 +421,32 @@ pub async fn run_storage_safety(
             _ => {}
         }
 
-        // Eviction: any time we are at Low or Panic, do round-robin
-        // per-camera oldest-clip eviction. One clip per tick keeps
-        // the loop bounded; the next tick will pick up if we still
-        // need to free more.
+        // One-shot per pressure episode: the moment we tip into
+        // Low/Panic, reclaim the cheapest SQLite bloat. WAL truncate
+        // returns freed pages to the FS; the metrics prune drops all
+        // but the last couple of hours of the rolling host-metrics
+        // buffer. Both are idempotent no-ops once done, so gating on
+        // the *transition* (not the level) runs them once per episode
+        // rather than every tick.
+        if matches!(
+            trans,
+            Transition::Entered(WatermarkLevel::Low | WatermarkLevel::Panic)
+        ) {
+            run_pressure_oneshot(&store).await;
+        }
+
+        // Reclaim ladder: at Low or Panic, reclaim the cheapest,
+        // most-disposable bytes FIRST and only fall through to
+        // deleting the operator's camera footage when nothing cheaper
+        // remains this tick. One action per tick keeps the loop
+        // bounded; the next tick continues down (or repeats) the
+        // ladder until free space recovers.
         if matches!(
             controller.level(),
             WatermarkLevel::Low | WatermarkLevel::Panic
         ) {
-            if let Err(e) = evict_one(&store, &cfg.clips_dir, &bus, &mut rr_cursor).await {
-                warn!(error = %e, "eviction step failed");
+            if let Err(e) = pressure_reclaim(&cfg, &store, &bus, &mut rr_cursor).await {
+                warn!(error = %e, "pressure reclaim step failed");
             }
         }
     }
@@ -436,6 +468,156 @@ async fn publish_storage_event(
     if let Err(e) = bus.publish(topic::STORAGE_PANIC, &payload).await {
         warn!(error = %e, "failed to publish storage.panic event");
     }
+}
+
+/// One-shot SQLite reclaim, run once per pressure episode (on the
+/// transition into Low/Panic). Cheap, non-footage, needs no scratch
+/// space — safe even when the disk is already tight.
+async fn run_pressure_oneshot(store: &Arc<Store>) {
+    match store.checkpoint_wal_truncate().await {
+        Ok(()) => debug!("pressure: WAL checkpoint (TRUNCATE) done"),
+        Err(e) => warn!(error = %e, "pressure: wal_checkpoint(TRUNCATE) failed"),
+    }
+    let keep = chrono::Duration::from_std(PRESSURE_METRICS_KEEP)
+        .unwrap_or_else(|_| chrono::Duration::hours(2));
+    let cutoff_ms = (Utc::now() - keep).timestamp_millis();
+    match store.prune_metrics_samples_older_than(cutoff_ms).await {
+        Ok(0) => {}
+        Ok(n) => info!(
+            pruned = n,
+            "pressure: aggressively pruned rolling metrics buffer"
+        ),
+        Err(e) => warn!(error = %e, "pressure: metrics prune failed"),
+    }
+}
+
+/// One step down the pressure reclaim ladder, in strict priority
+/// (cheapest / most-disposable first). Acts on the FIRST tier that has
+/// something to reclaim and returns — so the operator's camera footage
+/// (the final tier) is only touched once every cheaper tier is
+/// exhausted this tick:
+///
+///   1. Delivered alert clips — grace dropped (cutoff = now); the
+///      delivery-drained gate still protects in-flight evidence.
+///   2. Orphaned alert snapshots — the event was already
+///      cascade-deleted, so the `<event_id>.jpg` is dead weight.
+///   3. Quarantined / corrupt clips — biggest byte-explosion first.
+///   4. Motion footage — the existing soft→hard `evict_one` path.
+async fn pressure_reclaim(
+    cfg: &StorageSafetyConfig,
+    store: &Arc<Store>,
+    bus: &Arc<dyn Bus>,
+    rr_cursor: &mut usize,
+) -> anyhow::Result<()> {
+    // Tier 1 — delivered alert clips, cold-grace dropped.
+    let n = crate::alert_clip_evict::reclaim_evictable_alert_clips(
+        store,
+        &cfg.clips_dir,
+        Utc::now(),
+        PRESSURE_RECLAIM_BATCH,
+    )
+    .await;
+    if n > 0 {
+        info!(reclaimed = n, "pressure: reclaimed delivered alert clips");
+        return Ok(());
+    }
+
+    // Tier 2 — orphaned alert snapshots.
+    if let Some(dir) = cfg.snapshots_dir.as_deref() {
+        let n = sweep_orphan_snapshots(store, dir).await?;
+        if n > 0 {
+            info!(
+                reclaimed = n,
+                "pressure: reclaimed orphaned alert snapshots"
+            );
+            return Ok(());
+        }
+    }
+
+    // Tier 3 — quarantined / corrupt clips, biggest first.
+    if let Some(clip) = store.find_largest_quarantined_hot_clip().await? {
+        // Metadata FIRST (cascade removes motion_events + linked
+        // events), then unlink the hot file — mirrors evict_one's
+        // hard-evict ordering.
+        store.cascade_delete_clip_metadata(clip.id).await?;
+        if let Some(hot_path) = clip.hot_path.as_deref() {
+            let abs = cfg.clips_dir.join(hot_path);
+            match tokio::fs::remove_file(&abs).await {
+                Ok(()) => debug!(clip_id = clip.id, "pressure: quarantined clip file removed"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    clip_id = clip.id, error = %e,
+                    "pressure: quarantined clip unlink failed; orphan scan will reap"
+                ),
+            }
+        }
+        let payload = serde_json::json!({
+            "clip_id": clip.id,
+            "camera_id": clip.camera_id,
+            "freed_bytes": clip.size_bytes,
+            "reason": "quarantined",
+        });
+        if let Err(e) = bus.publish(topic::CLIP_HARD_EVICTED, &payload).await {
+            warn!(error = %e, "publish CLIP_HARD_EVICTED failed");
+        }
+        info!(
+            clip_id = clip.id,
+            freed_bytes = clip.size_bytes,
+            "pressure: hard-evicted quarantined corrupt clip"
+        );
+        return Ok(());
+    }
+
+    // Tier 4 — motion footage (LAST resort).
+    evict_one(store, &cfg.clips_dir, bus, rr_cursor).await
+}
+
+/// Reclaim alert-snapshot JPEGs whose `events` row no longer exists
+/// (cascade-deleted with their clip). Bounded to one directory scan of
+/// [`PRESSURE_RECLAIM_BATCH`] files per tick. A snapshot for a live
+/// event (row still present) is never touched — the sink dispatcher
+/// owns delivery-time reclaim; this only reaps true orphans. Returns
+/// the number of files reclaimed.
+async fn sweep_orphan_snapshots(store: &Arc<Store>, dir: &Path) -> anyhow::Result<usize> {
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        candidates.push((stem.to_string(), path));
+        if candidates.len() >= PRESSURE_RECLAIM_BATCH as usize {
+            break;
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
+    let live = store.existing_event_ids(&ids).await?;
+    let mut reclaimed = 0;
+    for (id, path) in candidates {
+        if live.contains(&id) {
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                debug!(event = %id, "pressure: reclaimed orphan snapshot");
+                reclaimed += 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(path = %path.display(), error = %e, "pressure: snapshot unlink failed"),
+        }
+    }
+    Ok(reclaimed)
 }
 
 /// Per-camera round-robin: walk the camera list once, picking the
@@ -843,6 +1025,7 @@ mod tests {
 
         let cfg = StorageSafetyConfig {
             clips_dir: clips_dir.clone(),
+            snapshots_dir: None,
             low_watermark_pct: 15,
             panic_watermark_pct: 5,
             sample_interval: Duration::from_millis(20),
@@ -1202,6 +1385,7 @@ mod tests {
         // Sample fast so the test runs end-to-end in seconds.
         let cfg = StorageSafetyConfig {
             clips_dir: clips_dir.clone(),
+            snapshots_dir: None,
             low_watermark_pct: 15,
             panic_watermark_pct: 5,
             sample_interval: Duration::from_millis(200),
@@ -1583,6 +1767,125 @@ mod tests {
         assert_eq!(
             count_after_second, 1,
             "cold-only clip MUST survive a second eviction pass"
+        );
+    }
+
+    /// The pressure ladder's snapshot tier reaps only JPEGs whose
+    /// `events` row is gone; a snapshot for a live event is kept.
+    #[tokio::test]
+    async fn sweep_orphan_snapshots_reaps_only_dead_events() {
+        use nexus_store::EventStore as _;
+        use nexus_types::{AlertEvent, Artifacts, Severity};
+
+        let (store, dir, _clips_dir) = build_store_with_mixed_clips(1, 0, 0).await;
+        let snaps = dir.path().join("snapshots");
+        tokio::fs::create_dir_all(&snaps).await.unwrap();
+
+        let live = uuid::Uuid::now_v7();
+        let ev = AlertEvent {
+            event_id: live,
+            camera_id: 1,
+            rule_id: "r1".into(),
+            track_id: Some(1),
+            label: "person".into(),
+            severity: Severity::High,
+            bbox: None,
+            frame_id: 1,
+            captured_at: chrono::Utc::now(),
+            trace_id: "t".into(),
+            artifacts: Artifacts::default(),
+            context: serde_json::Map::new(),
+            frame_w: 0,
+            frame_h: 0,
+        };
+        store.record_event(&ev).await.unwrap();
+
+        let orphan = uuid::Uuid::now_v7();
+        tokio::fs::write(snaps.join(format!("{live}.jpg")), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(snaps.join(format!("{orphan}.jpg")), b"x")
+            .await
+            .unwrap();
+
+        let reclaimed = sweep_orphan_snapshots(&store, &snaps).await.unwrap();
+        assert_eq!(reclaimed, 1, "only the orphan snapshot is reclaimed");
+        assert!(
+            snaps.join(format!("{live}.jpg")).exists(),
+            "live event's snapshot is kept"
+        );
+        assert!(
+            !snaps.join(format!("{orphan}.jpg")).exists(),
+            "orphan snapshot removed"
+        );
+    }
+
+    /// Tier 3 of the reclaim ladder: a quarantined (corrupt) clip is
+    /// hard-evicted — row cascade-deleted AND hot file unlinked.
+    #[tokio::test]
+    async fn pressure_reclaim_hard_evicts_quarantined_clip() {
+        let (store, _dir, clips_dir) = build_store_with_mixed_clips(1, 0, 0).await;
+        let now = chrono::Utc::now();
+        let rel = "1/quarantined.mp4".to_string();
+        let id = store
+            .open_clip(&NewClip {
+                camera_id: 1,
+                started_at: now,
+                hot_path: rel.clone(),
+                codec: "stub".into(),
+                container: "mp4".into(),
+                hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .unwrap();
+        store
+            .close_clip(
+                id,
+                &nexus_store::ClipClose {
+                    ended_at: now,
+                    duration_ms: 1_000,
+                    size_bytes: 2_000_000_000,
+                    hot_path: Some(rel.clone()),
+                    sha256: Some("q".into()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .quarantine_clip(id, now, "size ceiling")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(clips_dir.join("1"))
+            .await
+            .unwrap();
+        tokio::fs::write(clips_dir.join(&rel), b"x").await.unwrap();
+
+        let cfg = StorageSafetyConfig {
+            clips_dir: clips_dir.clone(),
+            snapshots_dir: None,
+            low_watermark_pct: 15,
+            panic_watermark_pct: 5,
+            sample_interval: Duration::from_millis(20),
+        };
+        let bus: Arc<dyn Bus> = Arc::new(nexus_bus::BroadcastBus::new(64));
+        let mut cursor = 0usize;
+        pressure_reclaim(&cfg, &store, &bus, &mut cursor)
+            .await
+            .unwrap();
+
+        assert!(
+            !clips_dir.join(&rel).exists(),
+            "quarantined clip file removed"
+        );
+        assert!(
+            store
+                .find_largest_quarantined_hot_clip()
+                .await
+                .unwrap()
+                .is_none(),
+            "quarantined row cascade-deleted"
         );
     }
 }

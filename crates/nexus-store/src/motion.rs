@@ -1211,6 +1211,31 @@ impl Store {
         row.map(clip_row_from_row).transpose()
     }
 
+    /// The largest quarantined clip still occupying hot storage.
+    /// Quarantined clips (`cold_quarantined = 1`) are corrupt
+    /// byte-explosions the cold replicator refuses to upload — pure
+    /// dead weight, often ~2 GiB each. Under disk pressure the
+    /// storage-safety ladder reclaims these FIRST, biggest-first,
+    /// because they free the most space for zero loss of usable
+    /// footage. Global (not per-camera): the ladder wants the single
+    /// biggest win regardless of which camera produced it.
+    ///
+    /// A quarantined clip has `cold_handle IS NULL` (never replicated)
+    /// so the caller reclaims it through the hard-evict cascade-delete
+    /// path. Returns `Ok(None)` when nothing is quarantined on hot.
+    pub async fn find_largest_quarantined_hot_clip(&self) -> Result<Option<ClipRow>, StoreError> {
+        let row = sqlx::query(&format!(
+            "{CLIP_SELECT_COLUMNS_BASE}
+              WHERE cold_quarantined = 1
+                AND hot_handle IS NOT NULL
+              ORDER BY size_bytes DESC
+              LIMIT 1"
+        ))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(clip_row_from_row).transpose()
+    }
+
     /// Soft-evict the hot pointer. Clears `hot_handle` + `hot_path`
     /// **only when a cold copy exists** — the WHERE-guard prevents
     /// the schema CHECK

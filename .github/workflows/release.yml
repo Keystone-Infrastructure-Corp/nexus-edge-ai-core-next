@@ -454,6 +454,7 @@ jobs:
           R="stage"
           mkdir -p "$R/bin" "$R/share/ui" "$R/share/models" \
                    "$R/etc-templates/systemd" \
+                   "$R/etc-templates/journald.conf.d" \
                    "$R/etc-templates/sudoers.d" \
                    "$R/scripts/lib"
 
@@ -515,6 +516,11 @@ jobs:
           cp deploy/systemd/nexus-engine.service \
              "$R/etc-templates/systemd/nexus-engine.service"
 
+          # journald size-cap drop-in (bounds engine log growth on the box —
+          # scripts/install.sh installs it to /etc/systemd/journald.conf.d/).
+          cp deploy/systemd/journald.conf.d/nexus.conf \
+             "$R/etc-templates/journald.conf.d/nexus.conf"
+
           # Phase 9 (M_OTA) — the OTA apply path shells out to `sudo`
           # for the three pinned commands whitelisted here. Installed by
           # scripts/install.sh to /etc/sudoers.d/nexus-update (0440 root).
@@ -533,8 +539,12 @@ jobs:
           # /usr/local/sbin/nexus-apply-deps (root:root 0755).
           cp deploy/apt-requirements.txt "$R/share/apt-requirements.txt"
           cp deploy/nexus-apply-deps     "$R/scripts/nexus-apply-deps"
+          # Root-owned old-release reaper the OTA apply path runs via sudo
+          # after a healthy boot; scripts/install.sh copies it to
+          # /usr/local/sbin/nexus-prune-releases (root:root 0755).
+          cp deploy/nexus-prune-releases "$R/scripts/nexus-prune-releases"
           chmod +x "$R/scripts/install.sh" "$R/scripts/uninstall.sh" \
-                   "$R/scripts/nexus-apply-deps"
+                   "$R/scripts/nexus-apply-deps" "$R/scripts/nexus-prune-releases"
 
           echo "$TAG" > "$R/VERSION"
 
