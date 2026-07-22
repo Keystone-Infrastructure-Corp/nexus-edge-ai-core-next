@@ -2635,32 +2635,6 @@ install_apply_deps_wrapper() {
     log "installed OTA runtime-dep wrapper: $target"
 }
 
-# --- OTA old-release reaper wrapper -------------------------------------------
-
-# Install the pinned, root-owned old-release reaper to
-# /usr/local/sbin/nexus-prune-releases (root:root 0755) — OUTSIDE the
-# OTA-writable /opt/nexus tree so the unprivileged `nexus` user cannot tamper
-# with it. The OTA apply path (crates/nexus-engine/src/cloud_update.rs) invokes
-# it via the single nexus-update sudoers rule AFTER a new release boots healthy,
-# to delete stale release trees under /opt/nexus/releases (keeping only the
-# running version + the rollback target). Idempotent: a re-run refreshes the
-# wrapper in place. Like the dep wrapper, this is the ONLY place the reaper (the
-# thing with root `rm -rf` power) is updated — NEVER on an OTA — so its keep-set
-# policy can only change via a deliberate install.sh re-run.
-install_prune_releases_wrapper() {
-    local release_dir="$1"
-    local src="$release_dir/scripts/nexus-prune-releases"
-    local target="/usr/local/sbin/nexus-prune-releases"
-
-    if [[ ! -r "$src" ]]; then
-        warn "OTA old-release reaper not in release ($src); OTA release pruning disabled"
-        return 0
-    fi
-    install -d -o root -g root -m 0755 /usr/local/sbin
-    install -o root -g root -m 0755 "$src" "$target"
-    log "installed OTA old-release reaper: $target"
-}
-
 # --- Health check -------------------------------------------------------------
 
 # Poll the API until /api/v1/health returns 200 or the timeout elapses.

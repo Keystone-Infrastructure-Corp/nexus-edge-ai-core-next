@@ -1,28 +1,49 @@
 #!/usr/bin/env bash
-# nexus-apply-deps — pinned, root-owned runtime-dependency installer for OTA.
+# nexus-apply-deps — pinned, root-owned OTA release-config applier.
 #
 # Installed by scripts/install.sh to /usr/local/sbin/nexus-apply-deps
 # (root:root 0755) — deliberately OUTSIDE the OTA-writable /opt/nexus tree so
 # the unprivileged `nexus` service user cannot tamper with it. It is the ONLY
 # command beyond `tar` / `ln` / `systemctl restart` that the nexus-update
 # sudoers rule lets `nexus` run as root, and it is invoked by the OTA apply
-# path (crates/nexus-engine/src/cloud_update.rs) as:
+# path (crates/nexus-engine/src/cloud_update.rs), right after the tarball is
+# extracted and BEFORE the `current` symlink is flipped, as:
 #
 #   sudo /usr/local/sbin/nexus-apply-deps /opt/nexus/releases/<version>
 #
-# It reads the release's declared apt packages from
-#   <release_dir>/share/apt-requirements.txt
-# and installs ONLY those that satisfy the hard allowlist below
-# (`gstreamer1.0-*` plus an explicit media set). A tampered requirements file
-# can therefore never coerce this into `apt-get install <arbitrary>` — the
-# allowlist is the load-bearing security control and it lives here, root-side,
-# NOT in the (nexus-writable) release tree.
+# Running as root on every OTA, it applies this release's privileged, root-side
+# bits — the actions the unprivileged engine cannot do itself — so they take
+# effect over a cloud OTA, not only a fresh install.sh run:
+#
+#   1. apt deps   installs the release's declared apt packages
+#                 (<release_dir>/share/apt-requirements.txt), filtered by the
+#                 hard allowlist below (`gstreamer1.0-*` + an explicit media
+#                 set). A tampered requirements file can never coerce this into
+#                 `apt-get install <arbitrary>` — the allowlist is the
+#                 load-bearing control and lives HERE, root-side, NOT in the
+#                 (nexus-writable) release tree.
+#   2. journald   installs the release's journald size-cap drop-in
+#                 (<release_dir>/etc-templates/journald.conf.d/nexus.conf) to
+#                 /etc/systemd/journald.conf.d/ so engine logs cannot crowd out
+#                 clip storage, and restarts systemd-journald.
+#   3. prune      reaps stale release trees under /opt/nexus/releases, keeping
+#                 only the incoming version (this script's argument) and
+#                 whatever `current` points at. Because it runs BEFORE the flip,
+#                 `current` is still the OUTGOING version — exactly the rollback
+#                 target — so the keep set is {new, previous_good}. It ALWAYS
+#                 keeps the `current` target and fail-closes (deletes nothing)
+#                 on an empty keep set.
+#
+# Every action is fixed, audited root code HERE — the signed release supplies
+# only DATA (apt list, journald config, which dirs exist), never new privileged
+# behaviour. Adding a NEW kind of privileged action is a deliberate edit to
+# this file, adopted via one install.sh/bootstrap run (the same one-time
+# adoption as the original nexus-apply-deps); thereafter it rides every OTA.
 #
 # Best-effort + fail-open: a missing file, a non-Debian host, or a transient
-# apt/network failure logs and exits 0 so a core update is NEVER blocked on an
-# optional plugin (matches the engine's local-first philosophy — only optional
-# features such as HD live view's libnice degrade). The sole non-zero exit is
-# a usage error (bad/missing release dir).
+# failure in any step logs and the script still exits 0 so a core update is
+# NEVER blocked on an optional plugin, log hygiene, or release pruning. The
+# sole non-zero exit is a usage error (bad/missing release dir).
 set -euo pipefail
 
 log()  { printf 'nexus-apply-deps: %s\n' "$*"; }
@@ -34,18 +55,24 @@ if [[ -z "$release_dir" || ! -d "$release_dir" ]]; then
     exit 2
 fi
 
-req="$release_dir/share/apt-requirements.txt"
-if [[ ! -r "$req" ]]; then
-    log "no apt-requirements.txt in release ($req) — nothing to do"
-    exit 0
-fi
+# Derive the on-box layout from the release-dir argument
+# (…/opt/nexus/releases/<version>). sudo authorises this wrapper ONLY with a
+# /opt/nexus/releases/* argument, so these resolve to the real tree:
+#   releases_dir = …/opt/nexus/releases     current_link = …/opt/nexus/current
+# NEXUS_JOURNALD_DIR is overridable ONLY for offline tests (a direct, non-sudo
+# invocation); under the real OTA sudo scrubs the environment, so production
+# always uses the real /etc path.
+releases_dir="$(dirname "$release_dir")"
+prefix="$(dirname "$releases_dir")"
+current_link="$prefix/current"
+journald_dir="${NEXUS_JOURNALD_DIR:-/etc/systemd/journald.conf.d}"
 
-# Hard allowlist. A package is installable iff this returns 0. `gstreamer1.0-*`
-# covers any current or future GStreamer plugin (the common case) without an
-# allowlist edit; the explicit set covers the non-gstreamer media runtime deps.
-# `-dev` / `-dbg` / `dkms` and anything not matching are refused — kernel and
-# driver packages (reboots, huge attack surface) stay in install.sh's
-# operator-gated --drivers path, never the unattended OTA wrapper.
+# Hard allowlist for apt. A package is installable iff this returns 0.
+# `gstreamer1.0-*` covers any current or future GStreamer plugin (the common
+# case) without an allowlist edit; the explicit set covers the non-gstreamer
+# media runtime deps. `-dev` / `-dbg` / `dkms` and anything not matching are
+# refused — kernel and driver packages (reboots, huge attack surface) stay in
+# install.sh's operator-gated --drivers path, never the unattended OTA wrapper.
 is_allowed() {
     local p="$1"
     # Charset guard: valid apt package names only. Blocks shell metachars,
@@ -60,47 +87,131 @@ is_allowed() {
     esac
 }
 
-# Parse: strip comments, trim whitespace, drop blanks.
-mapfile -t declared < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$req" | grep -v '^$' || true)
-
-allowed=()
-for p in "${declared[@]}"; do
-    if is_allowed "$p"; then
-        allowed+=("$p")
-    else
-        warn "refusing non-allowlisted package from requirements: '$p' (skipped)"
+# ---- 1. Runtime apt dependencies (release-declared, allowlist-gated) --------
+apply_apt_deps() {
+    local req="$release_dir/share/apt-requirements.txt"
+    if [[ ! -r "$req" ]]; then
+        log "no apt-requirements.txt in release ($req) — skipping deps"
+        return 0
     fi
-done
+    local declared allowed=() p
+    # Parse: strip comments, trim whitespace, drop blanks.
+    mapfile -t declared < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$req" | grep -v '^$' || true)
+    for p in "${declared[@]}"; do
+        if is_allowed "$p"; then
+            allowed+=("$p")
+        else
+            warn "refusing non-allowlisted package from requirements: '$p' (skipped)"
+        fi
+    done
+    if (( ${#allowed[@]} == 0 )); then
+        log "no allowlisted packages to install"
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "no apt-get on PATH (non-Debian host?) — cannot install: ${allowed[*]}"
+        return 0
+    fi
+    log "ensuring ${#allowed[@]} runtime package(s): ${allowed[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    # Refresh the package cache only if it is stale (>24h) to avoid a network
+    # hit on every apply. apt-get install is idempotent — already-present
+    # packages are a fast no-op, so re-running this on every update is cheap.
+    local cache=/var/cache/apt/pkgcache.bin stale=1 age
+    if [[ -r "$cache" ]]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+        (( age < 86400 )) && stale=0
+    fi
+    if (( stale )); then
+        apt-get update -qq || warn "apt-get update failed — continuing with existing cache"
+    fi
+    if apt-get install -y -qq --no-install-recommends "${allowed[@]}"; then
+        log "runtime dependencies satisfied"
+    else
+        warn "apt-get install returned non-zero — update proceeds; optional features may be degraded"
+    fi
+    return 0
+}
 
-if (( ${#allowed[@]} == 0 )); then
-    log "no allowlisted packages to install"
-    exit 0
-fi
+# ---- 2. journald size cap (release-supplied config) ------------------------
+# Installs the release's journald drop-in so engine logs cannot fill the edge
+# disk. The unprivileged engine cannot cap the journal itself; doing it here
+# means the cap rides every OTA, not just a fresh install.
+apply_journald_cap() {
+    local src="$release_dir/etc-templates/journald.conf.d/nexus.conf"
+    if [[ ! -r "$src" ]]; then
+        log "no journald cap in release ($src) — skipping"
+        return 0
+    fi
+    if ! install -d -m 0755 "$journald_dir" 2>/dev/null; then
+        warn "could not create $journald_dir — skipping journald cap"
+        return 0
+    fi
+    if install -m 0644 "$src" "$journald_dir/nexus.conf" 2>/dev/null; then
+        log "installed journald size cap: $journald_dir/nexus.conf"
+        # Re-read config. Best-effort; absent on non-systemd hosts (e.g. tests).
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl restart systemd-journald 2>/dev/null \
+                || warn "could not restart systemd-journald; cap applies next boot"
+        fi
+    else
+        warn "could not install journald cap (continuing)"
+    fi
+    return 0
+}
 
-if ! command -v apt-get >/dev/null 2>&1; then
-    warn "no apt-get on PATH (non-Debian host?) — cannot install: ${allowed[*]}"
-    exit 0
-fi
+# ---- 3. Prune stale release trees ------------------------------------------
+# Release trees are large (bundled ONNX Runtime + model packs, ~hundreds of MB)
+# and were never reaped, so a long-lived box accumulated every version it ran.
+# Keep only the version being installed (the argument) and whatever `current`
+# points at. On an OTA this runs BEFORE the symlink flip, so `current` is still
+# the OUTGOING version — exactly the rollback target (previous_good) we keep.
+# SAFETY (this is a `rm -rf` wrapper, so be conservative): always keep the
+# `current` target; fail-close (delete nothing) on an empty keep set; stay
+# bounded to $releases_dir.
+prune_old_releases() {
+    if [[ ! -d "$releases_dir" ]]; then
+        log "no releases dir ($releases_dir) — nothing to prune"
+        return 0
+    fi
+    # Defence-in-depth for a `rm -rf`: only ever operate on a real
+    # ".../releases" directory, no matter how this wrapper was invoked.
+    if [[ "$(basename "$releases_dir")" != "releases" ]]; then
+        warn "refusing to prune: $releases_dir is not a 'releases' directory"
+        return 0
+    fi
+    declare -A keep=()
+    local newv curv dir name removed=0
+    newv="$(basename "$release_dir")"
+    [[ -n "$newv" && -d "$releases_dir/$newv" ]] && keep["$newv"]=1
+    if [[ -L "$current_link" ]]; then
+        curv="$(basename "$(readlink -f "$current_link" 2>/dev/null || true)")"
+        [[ -n "$curv" && -d "$releases_dir/$curv" ]] && keep["$curv"]=1
+    fi
+    if (( ${#keep[@]} == 0 )); then
+        warn "empty keep set — refusing to prune releases (fail-closed)"
+        return 0
+    fi
+    log "keeping releases: ${!keep[*]}"
+    shopt -s nullglob
+    for dir in "$releases_dir"/*/; do
+        name="$(basename "$dir")"
+        [[ -n "${keep[$name]:-}" ]] && continue
+        if rm -rf -- "$dir"; then
+            log "pruned old release: $name"
+            removed=$(( removed + 1 ))
+        else
+            warn "failed to prune '$name' (will retry next OTA)"
+        fi
+    done
+    shopt -u nullglob
+    log "pruned $removed old release(s)"
+    return 0
+}
 
-log "ensuring ${#allowed[@]} runtime package(s): ${allowed[*]}"
-export DEBIAN_FRONTEND=noninteractive
-
-# Refresh the package cache only if it is stale (>24h) to avoid a network hit
-# on every apply. apt-get install is idempotent — already-present packages are
-# a fast no-op, so re-running this on every update is cheap.
-cache=/var/cache/apt/pkgcache.bin
-stale=1
-if [[ -r "$cache" ]]; then
-    age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
-    (( age < 86400 )) && stale=0
-fi
-if (( stale )); then
-    apt-get update -qq || warn "apt-get update failed — continuing with existing cache"
-fi
-
-if apt-get install -y -qq --no-install-recommends "${allowed[@]}"; then
-    log "runtime dependencies satisfied"
-else
-    warn "apt-get install returned non-zero — update proceeds; optional features may be degraded"
-fi
+# All three steps are best-effort and fail-open: a core update is NEVER blocked
+# on optional plugins, log hygiene, or release pruning.
+apply_apt_deps
+apply_journald_cap
+prune_old_releases
 exit 0

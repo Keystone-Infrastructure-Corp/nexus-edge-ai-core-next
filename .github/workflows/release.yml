@@ -539,12 +539,8 @@ jobs:
           # /usr/local/sbin/nexus-apply-deps (root:root 0755).
           cp deploy/apt-requirements.txt "$R/share/apt-requirements.txt"
           cp deploy/nexus-apply-deps     "$R/scripts/nexus-apply-deps"
-          # Root-owned old-release reaper the OTA apply path runs via sudo
-          # after a healthy boot; scripts/install.sh copies it to
-          # /usr/local/sbin/nexus-prune-releases (root:root 0755).
-          cp deploy/nexus-prune-releases "$R/scripts/nexus-prune-releases"
           chmod +x "$R/scripts/install.sh" "$R/scripts/uninstall.sh" \
-                   "$R/scripts/nexus-apply-deps" "$R/scripts/nexus-prune-releases"
+                   "$R/scripts/nexus-apply-deps"
 
           echo "$TAG" > "$R/VERSION"
 

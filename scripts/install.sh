@@ -423,13 +423,6 @@ install_update_sudoers "$RELEASE_DIR"
 
 install_apply_deps_wrapper "$RELEASE_DIR"
 
-# --- OTA old-release reaper wrapper -------------------------------------------
-# Root-owned reaper (/usr/local/sbin/nexus-prune-releases) that the OTA apply
-# path runs after a healthy boot to delete stale release trees, keeping only
-# the running version + the rollback target.
-
-install_prune_releases_wrapper "$RELEASE_DIR"
-
 # --- Atomic swap --------------------------------------------------------------
 
 previous="$(swap_current_symlink "$VERSION")"
