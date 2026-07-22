@@ -171,9 +171,10 @@ impl WebRtcBridge {
     /// proactively instead of waiting for a `live_hd_stop` that may never come.
     ///
     /// Holds a [`std::sync::Weak`] to the bridge so it stops itself once the
-    /// last owner (the cloud tunnel) drops. A no-op without `gstreamer-webrtc`.
+    /// last owner (the cloud tunnel) drops. Only compiled with
+    /// `gstreamer-webrtc` — the sole caller (`main`) is likewise gated.
+    #[cfg(feature = "gstreamer-webrtc")]
     pub fn spawn_reaper(self: &Arc<Self>) {
-        #[cfg(feature = "gstreamer-webrtc")]
         {
             let weak = Arc::downgrade(self);
             tokio::spawn(async move {
