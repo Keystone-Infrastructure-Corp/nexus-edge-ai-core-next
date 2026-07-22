@@ -130,6 +130,7 @@ export function CamerasPage() {
     path: string,
     username: string,
     password: string,
+    nameOverride?: string,
   ) => {
     // Embed credentials in the URL when supplied so the engine's RTSP
     // client picks them up without an extra `[cameras.*]` field. Both
@@ -153,9 +154,11 @@ export function CamerasPage() {
       // assigns the real i64 on save via POST /cameras. A
       // derived string id like `cam-<ip>` would fail the
       // server's `Path<i64>` extractor with HTTP 400.
-      name: device.vendor
-        ? `${device.vendor} ${device.model ?? ""}`.trim()
-        : device.ip,
+      name:
+        nameOverride?.trim() ||
+        (device.vendor
+          ? `${device.vendor} ${device.model ?? ""}`.trim()
+          : device.ip),
       url: rtsp,
       // Seed the codec from discovery so the operator doesn't
       // have to re-pick. `null` here means "let the admin API
@@ -1416,6 +1419,7 @@ function DiscoverySheet({
     path: string,
     username: string,
     password: string,
+    nameOverride?: string,
   ) => void;
 }) {
   const [mode, setMode] = useState<"onvif" | "scan">("onvif");
@@ -1426,6 +1430,9 @@ function DiscoverySheet({
   // Probe and embedded in every camera URL on Add.
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  // Session-global toggle: when on, an ONVIF-probed camera is named
+  // from its plain-text OSD overlay (falling back to the device name).
+  const [useOsdName, setUseOsdName] = useState(false);
 
   return (
     <Sheet
@@ -1499,11 +1506,24 @@ function DiscoverySheet({
         </div>
       </div>
       {mode === "onvif" ? (
+        <label className="mb-1 flex items-center gap-2 px-5 py-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={useOsdName}
+            onChange={(e) => setUseOsdName(e.target.checked)}
+            className="h-3 w-3 rounded border-border"
+          />
+          Name cameras from their on-screen text (OSD) when present,
+          otherwise use the device name
+        </label>
+      ) : null}
+      {mode === "onvif" ? (
         <DiscoveryRunner
           kind="onvif"
           onAdd={onAdd}
           username={username}
           password={password}
+          useOsdName={useOsdName}
         />
       ) : (
         <DiscoveryRunner
@@ -1511,6 +1531,7 @@ function DiscoverySheet({
           onAdd={onAdd}
           username={username}
           password={password}
+          useOsdName={false}
         />
       )}
     </Sheet>
@@ -1522,6 +1543,7 @@ function DiscoveryRunner({
   onAdd,
   username,
   password,
+  useOsdName,
 }: {
   kind: "onvif" | "scan";
   onAdd: (
@@ -1529,9 +1551,11 @@ function DiscoveryRunner({
     path: string,
     username: string,
     password: string,
+    nameOverride?: string,
   ) => void;
   username: string;
   password: string;
+  useOsdName: boolean;
 }) {
   const [cidr, setCidr] = useState("");
   const [ports, setPorts] = useState("554,80,8080");
@@ -1652,6 +1676,7 @@ function DiscoveryRunner({
           onAdd={onAdd}
           username={username}
           password={password}
+          useOsdName={useOsdName}
         />
       ) : null}
     </div>
@@ -1663,6 +1688,7 @@ function DiscoveredList({
   onAdd,
   username,
   password,
+  useOsdName,
 }: {
   session: DiscoverySessionView;
   onAdd: (
@@ -1670,9 +1696,11 @@ function DiscoveredList({
     path: string,
     username: string,
     password: string,
+    nameOverride?: string,
   ) => void;
   username: string;
   password: string;
+  useOsdName: boolean;
 }) {
   if (session.found.length === 0) {
     return (
@@ -1695,6 +1723,7 @@ function DiscoveredList({
           onAdd={onAdd}
           username={username}
           password={password}
+          useOsdName={useOsdName}
         />
       ))}
     </div>
@@ -1707,6 +1736,7 @@ function DiscoveredItem({
   onAdd,
   username,
   password,
+  useOsdName,
 }: {
   sessionId: string;
   device: DiscoveredDevice;
@@ -1715,9 +1745,11 @@ function DiscoveredItem({
     path: string,
     username: string,
     password: string,
+    nameOverride?: string,
   ) => void;
   username: string;
   password: string;
+  useOsdName: boolean;
 }) {
   const [probing, setProbing] = useState(false);
   const [probeError, setProbeError] = useState<string | null>(null);
@@ -1741,6 +1773,12 @@ function DiscoveredItem({
   /// operator can tell at a glance that the displayed paths are
   /// authoritative (vendor-reported) vs. heuristic.
   const [probedViaOnvif, setProbedViaOnvif] = useState(false);
+  // Text OSD (e.g. "PASTORS") captured on the last ONVIF probe, used
+  // by the "name cameras from OSD" discovery toggle. `null` until a
+  // probe returns one.
+  const [osdName, setOsdName] = useState<string | null>(null);
+  // Add-time OSD resolution in flight (see handleAdd).
+  const [adding, setAdding] = useState(false);
   const effectivePath = picked.trim() || "/";
 
   const onProbe = async () => {
@@ -1748,6 +1786,7 @@ function DiscoveredItem({
     setProbeError(null);
     setProbedOk(false);
     setProbedViaOnvif(false);
+    setOsdName(null);
     setStreams([]);
 
     // ONVIF Media path: when the device carries an XAddrs URL
@@ -1782,6 +1821,7 @@ function DiscoveredItem({
           setPicked(mapped[0]!.path);
           setProbedOk(true);
           setProbedViaOnvif(true);
+          setOsdName(onvif.osd_name ?? null);
           setProbing(false);
           return;
         }
@@ -1856,6 +1896,37 @@ function DiscoveredItem({
       ? streams
       : device.rtsp_paths.map((p) => ({ path: p }));
 
+  // "Add as camera" handler. When the "name cameras from OSD" toggle
+  // is on, resolve the OSD text before adding: prefer one captured by
+  // a prior Probe, otherwise — for an ONVIF device with creds the
+  // operator hasn't probed — fetch it once on demand so the toggle
+  // works even from a bare Add click. Any failure falls back silently
+  // to the device name (openFromDiscovered's default).
+  const handleAdd = async () => {
+    let nameOverride: string | undefined;
+    if (useOsdName) {
+      let resolved = osdName;
+      if (!resolved && device.onvif_xaddrs && username && password) {
+        setAdding(true);
+        try {
+          const r = await probeOnvifStreams(sessionId, {
+            xaddr: device.onvif_xaddrs,
+            username,
+            password,
+          });
+          resolved = r.osd_name ?? null;
+          setOsdName(resolved);
+        } catch {
+          // ignore — fall back to the device name
+        } finally {
+          setAdding(false);
+        }
+      }
+      if (resolved && resolved.trim()) nameOverride = resolved.trim();
+    }
+    onAdd(device, effectivePath, username, password, nameOverride);
+  };
+
   return (
     <div className="rounded-md border border-border p-3 text-sm">
       <div className="flex items-start justify-between gap-2">
@@ -1886,10 +1957,10 @@ function DiscoveredItem({
         </div>
         <Button
           size="sm"
-          onClick={() => onAdd(device, effectivePath, username, password)}
-          disabled={probing}
+          onClick={handleAdd}
+          disabled={probing || adding}
         >
-          Add as camera
+          {adding ? "Adding…" : "Add as camera"}
         </Button>
       </div>
 
@@ -1931,6 +2002,13 @@ function DiscoveredItem({
       {streams.length > 1 ? (
         <p className="mt-1 text-xs text-muted-foreground">
           {streams.length} streams available — pick one before Add.
+        </p>
+      ) : null}
+      {useOsdName && osdName ? (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Will name this camera{" "}
+          <span className="font-medium text-foreground">{osdName}</span> from
+          its OSD.
         </p>
       ) : null}
     </div>

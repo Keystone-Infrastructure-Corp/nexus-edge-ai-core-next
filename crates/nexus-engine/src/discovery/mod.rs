@@ -261,6 +261,16 @@ pub struct ProbeOnvifReq {
 pub struct ProbeOnvifResult {
     pub ok: bool,
     pub streams: Vec<onvif_media::MediaStream>,
+    /// First meaningful plain-text OSD overlay burned into the
+    /// camera's video (e.g. `"PASTORS"`), read best-effort via the
+    /// ONVIF Media2 `GetOSDs` call on the same probe. `None` when the
+    /// camera exposes no text OSD, doesn't answer `GetOSDs` (Media1-only
+    /// Profile-S firmware), or the read failed — the probe still
+    /// succeeds. The discovery UI's optional "name cameras from OSD"
+    /// toggle uses this as the camera name, falling back to the device
+    /// name when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osd_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -693,6 +703,20 @@ pub async fn post_probe_rtsp(
     Ok(Json(rtsp_probe::probe(&req).await))
 }
 
+/// Pick the camera's display-name OSD from a `GetOSDs` list: the
+/// first overlay carrying a non-empty plain-text string, skipping
+/// image OSDs and the date/time overlay (whose text the camera
+/// renders from its clock, so it arrives with no `PlainText`). This
+/// is the operator-assigned label like `"PASTORS"` or `"Front Door"`.
+fn osd_display_name(osds: &[onvif_deviceio::Osd]) -> Option<String> {
+    osds.iter()
+        .filter(|o| o.osd_type.as_deref() != Some("Image"))
+        .find_map(|o| {
+            let t = o.text.as_deref()?.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        })
+}
+
 /// `POST /api/v1/admin/discovery/sessions/:session_id/onvif-streams`
 ///
 /// Runs inline (≤5 s per profile, typically <2 s total for 2–4
@@ -725,14 +749,34 @@ pub async fn post_probe_onvif(
         )
         .await?;
     match onvif_media::query_streams(&req.xaddr, &req.username, &req.password).await {
-        Ok(streams) => Ok(Json(ProbeOnvifResult {
-            ok: !streams.is_empty(),
-            streams,
-            error: None,
-        })),
+        Ok(streams) => {
+            let ok = !streams.is_empty();
+            // Best-effort OSD read so the discovery UI's optional
+            // "name cameras from OSD" toggle has a value to use. Only
+            // attempted when the profile probe found streams (an empty
+            // result means the UI falls back to the RTSP sweep, where a
+            // Media2 GetOSDs would fail too). Never fails the probe: a
+            // camera with no text OSD, or Media1-only firmware that
+            // doesn't answer GetOSDs, just yields `None`.
+            let osd_name = if ok {
+                onvif_deviceio::get_osds(&req.xaddr, &req.username, &req.password, None)
+                    .await
+                    .ok()
+                    .and_then(|osds| osd_display_name(&osds))
+            } else {
+                None
+            };
+            Ok(Json(ProbeOnvifResult {
+                ok,
+                streams,
+                osd_name,
+                error: None,
+            }))
+        }
         Err(err) => Ok(Json(ProbeOnvifResult {
             ok: false,
             streams: Vec::new(),
+            osd_name: None,
             error: Some(err),
         })),
     }
@@ -891,6 +935,56 @@ mod tests {
                 "expected guardrail rejection for {cidr}, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn osd_display_name_prefers_first_plain_text_skipping_datetime_and_image() {
+        // The date/time overlay arrives with no PlainText (the camera
+        // renders it from its clock), and the image OSD is skipped, so
+        // the operator's text label wins — trimmed.
+        let osds = vec![
+            onvif_deviceio::Osd {
+                token: "osd0".into(),
+                osd_type: Some("Text".into()),
+                text: None, // date/time overlay
+                ..Default::default()
+            },
+            onvif_deviceio::Osd {
+                token: "osd1".into(),
+                osd_type: Some("Image".into()),
+                text: Some("logo".into()),
+                ..Default::default()
+            },
+            onvif_deviceio::Osd {
+                token: "osd2".into(),
+                osd_type: Some("Text".into()),
+                text: Some("  PASTORS  ".into()),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(osd_display_name(&osds), Some("PASTORS".to_string()));
+    }
+
+    #[test]
+    fn osd_display_name_none_when_no_meaningful_text() {
+        // Whitespace-only text and image OSDs yield no name, so the UI
+        // falls back to the device name.
+        let osds = vec![
+            onvif_deviceio::Osd {
+                token: "osd0".into(),
+                osd_type: Some("Text".into()),
+                text: Some("   ".into()),
+                ..Default::default()
+            },
+            onvif_deviceio::Osd {
+                token: "osd1".into(),
+                osd_type: Some("Image".into()),
+                text: Some("logo".into()),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(osd_display_name(&osds), None);
+        assert_eq!(osd_display_name(&[]), None);
     }
 
     #[test]
