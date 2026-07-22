@@ -162,6 +162,16 @@ impl MoqSession {
     }
 }
 
+impl MoqSession {
+    /// True once the NAL feed task has ended (broadcast closed, EOS, or the
+    /// relay consumer stalled past the shared push timeout). Mirrors
+    /// [`crate::WebRtcSession::feed_ended`] so the manager-side reaper can drop
+    /// dead MoQ publishers promptly and free their parked blocking-pool thread.
+    pub fn feed_ended(&self) -> bool {
+        self.feed.is_finished()
+    }
+}
+
 impl Drop for MoqSession {
     fn drop(&mut self) {
         self.feed.abort();

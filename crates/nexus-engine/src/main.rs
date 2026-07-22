@@ -2294,6 +2294,8 @@ async fn build_gst_recorder(
     // in v1 — a fresh HD expand picks up the current ingester.
     #[cfg(feature = "gstreamer-webrtc")]
     let webrtc = crate::webrtc_bridge::WebRtcBridge::new(std::sync::Arc::new(ingesters.clone()));
+    #[cfg(feature = "gstreamer-webrtc")]
+    webrtc.spawn_reaper();
     #[cfg(not(feature = "gstreamer-webrtc"))]
     let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
     let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, ingesters)
