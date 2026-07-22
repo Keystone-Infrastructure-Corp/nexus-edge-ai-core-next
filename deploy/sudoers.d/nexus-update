@@ -2,7 +2,7 @@
 #
 # Phase 9 (M_OTA) + Phase 10 (runtime-dep auto-install). Grants the
 # unprivileged `nexus` service user the narrow set of privileged
-# commands an OTA apply needs, and ONLY those five exact commands,
+# commands an OTA apply needs, and ONLY those four exact commands,
 # NOPASSWD (the engine runs unattended).
 #
 # Every command, argument, and path here MUST match byte-for-byte the
@@ -30,16 +30,14 @@
 #     scripts/install.sh, OUTSIDE the nexus-writable /opt/nexus tree) that
 #     enforces its OWN package allowlist (gstreamer1.0-* + an explicit
 #     media set) — so this rule does NOT grant general `apt`. The `*`
-#     wildcard does not cross `/`, so it cannot escape releases/.
-#   - `nexus-prune-releases *`: reap stale release trees under
-#     /opt/nexus/releases, keeping only the running version + the rollback
-#     target (`previous_good`). Invoked ONLY after an OTA has booted healthy.
-#     Like the dep wrapper this is a FIXED root-owned script at
-#     /usr/local/sbin/nexus-prune-releases (installed by scripts/install.sh,
-#     OUTSIDE the nexus-writable tree) that hard-validates its keep set, ALWAYS
-#     preserves the live `current` symlink target, and fail-closes (deletes
-#     nothing) on an empty keep set — so it can only ever delete non-running
-#     release dirs, never escape /opt/nexus/releases, and never brick the box.
+#     wildcard does not cross `/`, so it cannot escape releases/. The SAME
+#     wrapper also (as fixed, audited root code — NOT release-controlled)
+#     installs the release's journald size-cap drop-in and prunes stale
+#     release trees under /opt/nexus/releases (keeping the incoming version +
+#     the `current`/rollback one). Those extra actions need NO additional rule
+#     because the wrapper already runs as root under this one — which is what
+#     lets journald + release pruning ride a cloud OTA, not just a fresh
+#     install.
 #
 # The bytes of the artifact never transit this boundary — the engine
 # downloads + verifies them as the `nexus` user; sudo only touches
@@ -53,4 +51,3 @@ nexus ALL=(root) NOPASSWD: /usr/bin/tar -xzf /opt/nexus/staging/update.tar.gz -C
 nexus ALL=(root) NOPASSWD: /usr/bin/ln -sfn /opt/nexus/releases/* /opt/nexus/current
 nexus ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-engine
 nexus ALL=(root) NOPASSWD: /usr/local/sbin/nexus-apply-deps /opt/nexus/releases/*
-nexus ALL=(root) NOPASSWD: /usr/local/sbin/nexus-prune-releases *

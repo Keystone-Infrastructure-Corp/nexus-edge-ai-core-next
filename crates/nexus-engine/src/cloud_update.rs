@@ -438,12 +438,6 @@ pub async fn finalize_pending_update(store: Arc<Store>, outbox: Arc<TunnelOutbox
         state.last_result = Some(phase::SUCCESS.to_string());
         state.crash_count = 0;
         write_state(&store, &state).await;
-
-        // Reclaim disk now that the new release has booted healthy: prune
-        // every release tree except the running one and the rollback target.
-        // Best-effort + non-fatal — release hygiene must never affect the
-        // update outcome (already reported success above).
-        prune_old_releases(&state).await;
         return;
     }
 
@@ -549,22 +543,27 @@ async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str
         return Err("artifact_unavailable");
     }
 
-    // Install any runtime system dependencies this release declares
-    // (`share/apt-requirements.txt`) via the pinned, root-owned wrapper at
-    // `/usr/local/sbin/nexus-apply-deps` (installed by `scripts/install.sh`,
-    // whitelisted in `deploy/sudoers.d/nexus-update`). This is what lets an
-    // OTA pull in a NEW system package (e.g. `gstreamer1.0-nice` for HD live
-    // view) without an operator hand-touching the box. Best-effort and
-    // NON-FATAL: a missing or failed dep install must never block the version
-    // flip — the engine fail-opens locally and only optional features degrade.
-    // The wrapper enforces its own package allowlist, so a tampered manifest
-    // cannot coerce it into installing arbitrary packages.
+    // Apply this release's privileged, root-side bits via the pinned,
+    // root-owned wrapper at `/usr/local/sbin/nexus-apply-deps` (installed by
+    // `scripts/install.sh`, whitelisted in `deploy/sudoers.d/nexus-update`):
+    //   * install DECLARED apt runtime deps (`share/apt-requirements.txt`),
+    //   * install the journald size cap
+    //     (`etc-templates/journald.conf.d/nexus.conf`), and
+    //   * prune stale release trees — this runs BEFORE the symlink flip, so
+    //     `current` still points at the OUTGOING version, and the wrapper keeps
+    //     exactly the incoming version (its argument) + that rollback target.
+    // Running it here is what lets those privileged actions ride an OTA without
+    // an operator ever touching the box. Best-effort and NON-FATAL: none of it
+    // may block the version flip — the engine fail-opens locally and only
+    // optional features / hygiene degrade. The wrapper enforces its own
+    // allowlist + keep-set, so a tampered release tree cannot coerce it into
+    // arbitrary apt installs or deletions.
     match std::process::Command::new("sudo")
         .args(["/usr/local/sbin/nexus-apply-deps", &release_path])
         .status()
     {
         Ok(s) if s.success() => {
-            info!(release = %release_path, "update: runtime dependencies applied");
+            info!(release = %release_path, "update: release privileged config applied (deps + journald + prune)");
         }
         Ok(s) => {
             warn!(
@@ -613,48 +612,6 @@ async fn flip_and_restart(version: &str) -> Result<(), &'static str> {
         }
     }
 }
-
-/// Prune stale release trees under `/opt/nexus/releases`, keeping only the
-/// running version and the rollback target (`previous_good`). Invoked from
-/// `finalize_pending_update` after an OTA has booted healthy, so we never
-/// delete a release we might still roll back to. Best-effort + non-fatal —
-/// release hygiene must never block or fail an update.
-///
-/// Root-gated by the pinned `/usr/local/sbin/nexus-prune-releases` wrapper
-/// (the fifth `nexus-update` sudoers rule), which itself always preserves the
-/// live `current` symlink target and fail-closes (deletes nothing) on an empty
-/// keep set — so even a bad invocation can never delete the running release.
-#[cfg(target_os = "linux")]
-async fn prune_old_releases(state: &UpdateState) {
-    let mut keep: Vec<&str> = Vec::new();
-    if let Some(v) = state.current_version.as_deref() {
-        keep.push(v);
-    }
-    if let Some(v) = state.previous_good.as_deref() {
-        if !keep.contains(&v) {
-            keep.push(v);
-        }
-    }
-    if keep.is_empty() {
-        return;
-    }
-    let mut cmd = std::process::Command::new("sudo");
-    cmd.arg("/usr/local/sbin/nexus-prune-releases");
-    cmd.args(&keep);
-    match cmd.status() {
-        Ok(s) if s.success() => {
-            info!("update: pruned old releases (kept running + previous_good)")
-        }
-        Ok(s) => {
-            warn!(code = ?s.code(), "update: nexus-prune-releases exited non-zero (non-fatal)")
-        }
-        Err(e) => warn!(error = %e, "update: failed to spawn nexus-prune-releases (non-fatal)"),
-    }
-}
-
-/// Non-Linux stub — the dev workstation never prunes releases.
-#[cfg(not(target_os = "linux"))]
-async fn prune_old_releases(_state: &UpdateState) {}
 
 /// Non-Linux stub — the dev workstation never self-updates.
 #[cfg(not(target_os = "linux"))]
