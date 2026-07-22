@@ -4666,11 +4666,15 @@ async fn get_admin_sinks_health(
     }
     // Union with the live registry so configured-but-quiet sinks
     // still appear. `SinkId::to_string()` matches the format the
-    // outbox stores.
+    // outbox stores. `reserved_ids()` is included so subsystem-owned
+    // sinks (e.g. the always-on `cloud:console` audit sink) — which
+    // are excluded from `ids()` — are reported as `configured`, not
+    // mislabeled as orphaned dead-letter rows.
     let configured: std::collections::BTreeSet<String> = s
         .sink_registry
         .ids()
         .into_iter()
+        .chain(s.sink_registry.reserved_ids())
         .map(|id| id.to_string())
         .collect();
     for id in &configured {
@@ -6374,9 +6378,18 @@ mod tests {
     /// constructed router, the underlying store handle (so tests
     /// can introspect persisted rows), and the tempdir keep-alive
     /// guard.
-    async fn build_test_router(
+    /// Full test-router builder that also returns the `Arc<SinkRegistry>`
+    /// so tests can `insert_reserved` / register sinks before exercising
+    /// the sinks-health endpoint. `build_test_router` wraps this and drops
+    /// the handle (most tests never touch the registry).
+    async fn build_test_router_full(
         admin_secret: Option<&[u8]>,
-    ) -> (axum::Router, Arc<Store>, tempfile::TempDir) {
+    ) -> (
+        axum::Router,
+        Arc<Store>,
+        tempfile::TempDir,
+        Arc<nexus_sinks::SinkRegistry>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nexus.db");
         let store = Arc::new(
@@ -6417,6 +6430,7 @@ mod tests {
             nexus_rules::RuleEvaluator::new(&rules_cfg, &[])
                 .expect("empty rule set always compiles"),
         );
+        let sink_registry = Arc::new(nexus_sinks::SinkRegistry::new());
         let state = super::ApiState {
             store: store.clone(),
             bus,
@@ -6446,10 +6460,11 @@ mod tests {
                 kinds: vec![],
                 by_kind: std::collections::BTreeMap::new(),
             }),
-            // M7 Step 6 — empty sink registry by default; the
-            // delivery-policy tests below populate it when they
-            // exercise the sinks-health endpoint.
-            sink_registry: Arc::new(nexus_sinks::SinkRegistry::new()),
+            // M7 Step 6 — empty sink registry by default. Tests that
+            // exercise the sinks-health endpoint use
+            // `build_test_router_full` to grab the returned handle and
+            // `insert_reserved` before issuing the request.
+            sink_registry: sink_registry.clone(),
             // M7 cloud-managed sinks — no file sinks in tests.
             file_sinks: Arc::new(Vec::new()),
             // M6 — default LockoutConfig is fine for every test
@@ -6523,6 +6538,15 @@ mod tests {
             reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
         };
         let app = super::router(state);
+        (app, store, dir, sink_registry)
+    }
+
+    /// Common wrapper over [`build_test_router_full`] that drops the
+    /// sink-registry handle — most tests don't touch it.
+    async fn build_test_router(
+        admin_secret: Option<&[u8]>,
+    ) -> (axum::Router, Arc<Store>, tempfile::TempDir) {
+        let (app, store, dir, _reg) = build_test_router_full(admin_secret).await;
         (app, store, dir)
     }
 
@@ -8115,6 +8139,65 @@ mod tests {
         assert_eq!(windows[0]["label"], "1h");
         assert_eq!(windows[1]["label"], "24h");
         assert_eq!(v["sinks"].as_array().unwrap().len(), 0);
+    }
+
+    /// Minimal reserved-sink double for the sinks-health test: any id,
+    /// no-op delivery.
+    struct ReservedTestSink {
+        id: nexus_sinks::SinkId,
+    }
+
+    #[async_trait::async_trait]
+    impl nexus_sinks::AlertSink for ReservedTestSink {
+        fn kind(&self) -> &'static str {
+            "cloud"
+        }
+        fn id(&self) -> &nexus_sinks::SinkId {
+            &self.id
+        }
+        async fn deliver(
+            &self,
+            _event: &nexus_types::AlertEvent,
+        ) -> Result<(), nexus_sinks::SinkError> {
+            Ok(())
+        }
+    }
+
+    /// Regression: a *reserved* (subsystem-owned) sink such as the
+    /// always-on `cloud:console` audit sink is reported as `configured`,
+    /// not badged as an orphaned dead-letter row. The health handler
+    /// unions `reserved_ids()` into the configured set; before that fix
+    /// the reserved sink — excluded from `SinkRegistry::ids()` — fell
+    /// through to `configured: false` and the console rendered "orphan".
+    #[tokio::test]
+    async fn sinks_health_reserved_sink_is_configured_not_orphan() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-sinks-health-reserved-secret";
+        let (app, _store, _dir, registry) = build_test_router_full(Some(SECRET)).await;
+        registry.insert_reserved(Arc::new(ReservedTestSink {
+            id: nexus_sinks::SinkId::new("cloud", "console").unwrap(),
+        }));
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/sinks/health")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sinks = v["sinks"].as_array().expect("sinks array");
+        let row = sinks
+            .iter()
+            .find(|s| s["sink_id"] == "cloud:console")
+            .expect("reserved cloud:console sink must appear in sinks-health");
+        assert_eq!(
+            row["configured"], true,
+            "reserved sink must report `configured`, not orphan"
+        );
     }
 
     /// POST /v1/admin/sinks/config/{kind}/{name}/test for a sink that
