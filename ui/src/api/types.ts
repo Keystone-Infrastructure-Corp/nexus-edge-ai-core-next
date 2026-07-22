@@ -417,6 +417,14 @@ export interface ProbeOnvifResult {
   /// brute-force RTSP path sweep whenever this is `false`.
   ok: boolean;
   streams: OnvifMediaStream[];
+  /// First plain-text OSD overlay burned into the camera's video
+  /// (e.g. `"PASTORS"`), read best-effort via ONVIF Media2
+  /// `GetOSDs` during the same probe. Absent when the camera has
+  /// no text OSD, doesn't answer `GetOSDs` (Media1-only firmware),
+  /// or the read failed. The discovery "name cameras from OSD"
+  /// toggle uses this as the camera name, falling back to the
+  /// device name when absent.
+  osd_name?: string | null;
   /// Operator-facing failure reason (e.g. `"NotAuthorized"`,
   /// `"connect failed: timeout"`). Logged but not surfaced
   /// to the operator unless the RTSP fallback ALSO fails.
