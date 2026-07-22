@@ -598,9 +598,52 @@ pub(crate) async fn feed_loop(
                     started = true;
                     debug!(camera_id, "webrtc feed: spliced in at keyframe");
                 }
-                if let Err(e) = push_nal(&appsrc, &sample, &mut clock) {
-                    warn!(camera_id, error = %e, "webrtc feed: push failed; ending");
-                    break;
+                // Resolve the monotonic PTS on the async side so the
+                // `FeedClock` state stays here and is never moved into the
+                // blocking task below.
+                let ts_ns = clock.resolve(&sample).as_nanos() as u64;
+                // `appsrc` is configured `block=true`: when the consumer
+                // (webrtcbin / the browser PeerConnection, or webmux for MoQ)
+                // stalls, its queue fills and `push_buffer` blocks in
+                // libgstapp's GCond until the consumer drains. Running that on
+                // a core tokio worker is what wedged the whole engine — enough
+                // stalled live sessions pinned every async worker in
+                // `g_cond_wait`, starving the runtime so detection, the LBR
+                // live pump, and the cloud tunnel all froze. Push off the
+                // runtime instead, and bound it with a timeout so a dead
+                // consumer tears THIS session down rather than leaking a
+                // blocking-pool thread forever (session teardown sets the
+                // pipeline to Null, which flushes the appsrc and releases the
+                // still-blocked push).
+                let push_appsrc = appsrc.clone();
+                let is_keyframe = sample.is_keyframe;
+                let data = sample.data;
+                let push = tokio::task::spawn_blocking(move || {
+                    push_nal_bytes(&push_appsrc, &data, ts_ns, is_keyframe)
+                });
+                match tokio::time::timeout(FEED_PUSH_STALL_TIMEOUT, push).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => {
+                        warn!(camera_id, error = %e, "webrtc feed: push failed; ending");
+                        break;
+                    }
+                    Ok(Err(join_err)) => {
+                        warn!(camera_id, error = %join_err, "webrtc feed: push task panicked; ending");
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            camera_id,
+                            timeout_ms = FEED_PUSH_STALL_TIMEOUT.as_millis() as u64,
+                            "webrtc feed: consumer stalled (push_buffer blocked past timeout); \
+                             tearing down session"
+                        );
+                        // The blocking push is still parked on the appsrc
+                        // GCond; it unblocks when the session drop nulls the
+                        // pipeline. Do NOT send EOS here — that would race the
+                        // still-in-flight push on the same appsrc.
+                        return;
+                    }
                 }
             }
             Err(broadcast::error::RecvError::Lagged(dropped)) => {
@@ -616,24 +659,41 @@ pub(crate) async fn feed_loop(
     let _ = appsrc.end_of_stream();
 }
 
+/// Upper bound on how long a single `push_buffer` may block on a stalled
+/// consumer before the feed gives up and tears the session down. A healthy
+/// browser/webrtcbin drains within milliseconds; several seconds of block
+/// means the PeerConnection is dead (tab closed, network dropped, ICE gone).
+const FEED_PUSH_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Copy one NAL sample into a `gst::Buffer`, stamp it with the [`FeedClock`]'s
 /// monotonic PTS/DTS, and push it into `appsrc`. `appsrc` runs
 /// `do-timestamp=false` so these explicit timestamps drive `rtph264pay`'s RTP
 /// clock — see [`FeedClock`] for why auto-timestamping breaks frame assembly.
-fn push_nal(appsrc: &AppSrc, sample: &NalSample, clock: &mut FeedClock) -> Result<(), String> {
-    let ts = gst::ClockTime::from_nseconds(clock.resolve(sample).as_nanos() as u64);
-    let mut buf = gst::Buffer::with_size(sample.data.len()).map_err(|e| format!("alloc: {e}"))?;
+///
+/// The PTS is resolved by the caller ([`feed_loop`]) via [`FeedClock`] and
+/// passed in as `ts_ns`, so this function is pure blocking GStreamer work and
+/// can run under `spawn_blocking` without moving the clock off the async task.
+/// `push_buffer` here may block on a `block=true` appsrc when the consumer
+/// stalls — which is exactly why the caller runs it off the runtime.
+fn push_nal_bytes(
+    appsrc: &AppSrc,
+    data: &[u8],
+    ts_ns: u64,
+    is_keyframe: bool,
+) -> Result<(), String> {
+    let ts = gst::ClockTime::from_nseconds(ts_ns);
+    let mut buf = gst::Buffer::with_size(data.len()).map_err(|e| format!("alloc: {e}"))?;
     {
         let bm = buf.get_mut().ok_or("buffer not unique")?;
         let mut map = bm.map_writable().map_err(|e| format!("map: {e}"))?;
-        map.copy_from_slice(&sample.data);
+        map.copy_from_slice(data);
         drop(map);
         // Baseline/main-profile IP-camera live streams carry no B-frames, so
         // DTS == PTS; setting both keeps `rtph264pay` from inferring a bogus
         // reorder delay.
         bm.set_pts(ts);
         bm.set_dts(ts);
-        if !sample.is_keyframe {
+        if !is_keyframe {
             bm.set_flags(gst::BufferFlags::DELTA_UNIT);
         }
     }
