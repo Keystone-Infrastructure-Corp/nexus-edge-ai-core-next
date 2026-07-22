@@ -151,11 +151,6 @@ gstreamer-video = "0.23"
 gstreamer-webrtc = "0.23"
 gstreamer-sdp = "0.23"
 gstreamer-rtp = "0.23"
-
-# IPC for worker-process backend
-interprocess = { version = "2", features = ["tokio"] }
-shared_memory = "0.12"
-raw_sync = "0.1"
 # MessagePack via serde is the wire codec on the parent <-> worker pipe.
 # Picked over bincode 1.x because Detection.attributes is
 # `serde_json::Map<String, serde_json::Value>` (deserialize_any) + uses
@@ -352,7 +347,6 @@ futures-util = { version = "0.3", default-features = false, features = [
 ] }
 
 nexus-pipeline = { path = "crates/nexus-pipeline" }
-nexus-probe = { path = "crates/nexus-probe" }
 
 [profile.release]
 opt-level = 3
