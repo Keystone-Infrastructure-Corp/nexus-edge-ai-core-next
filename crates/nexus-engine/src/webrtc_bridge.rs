@@ -162,7 +162,35 @@ impl WebRtcBridge {
             }
         }
     }
+
+    /// Spawn the idle-session reaper: a background task that periodically drops
+    /// any live HD session whose NAL feed has ended (the browser tab closed or
+    /// the PeerConnection / relay consumer died without a `live_hd_stop`). Such
+    /// a session produces nothing and only keeps a still-parked `push_buffer`
+    /// blocking-pool thread alive until it is dropped; the reaper reclaims it
+    /// proactively instead of waiting for a `live_hd_stop` that may never come.
+    ///
+    /// Holds a [`std::sync::Weak`] to the bridge so it stops itself once the
+    /// last owner (the cloud tunnel) drops. A no-op without `gstreamer-webrtc`.
+    pub fn spawn_reaper(self: &Arc<Self>) {
+        #[cfg(feature = "gstreamer-webrtc")]
+        {
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(REAP_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    let Some(bridge) = weak.upgrade() else { break };
+                    bridge.reap_dead_sessions();
+                }
+            });
+        }
+    }
 }
+
+/// How often the idle-session reaper scans for dead HD sessions.
+#[cfg(feature = "gstreamer-webrtc")]
+const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(feature = "gstreamer-webrtc")]
 impl WebRtcBridge {
@@ -264,6 +292,39 @@ impl WebRtcBridge {
             debug!(session_id = %payload.session_id, "hd publisher stopped");
         } else {
             debug!(session_id = %payload.session_id, "live_hd_stop for unknown session; no-op");
+        }
+    }
+
+    /// Drop every session whose NAL feed has ended (see [`Self::spawn_reaper`]).
+    /// Dropping the `ActiveSession` runs the publisher's `Drop` (pipeline →
+    /// NULL), which unblocks the still-parked `push_buffer` and frees its
+    /// blocking-pool thread.
+    fn reap_dead_sessions(&self) {
+        let mut inner = self.inner.lock();
+        let dead: Vec<String> = inner
+            .sessions
+            .iter()
+            .filter(|(_, active)| active._session.feed_ended())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dead {
+            if let Some(prev) = inner.sessions.remove(&id) {
+                if let Some(pump) = prev.pump {
+                    pump.abort();
+                }
+                warn!(session_id = %id, "reaped idle hd publisher (feed ended without live_hd_stop)");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gstreamer-webrtc")]
+impl HdSession {
+    /// True once the underlying publisher's NAL feed task has ended.
+    fn feed_ended(&self) -> bool {
+        match self {
+            HdSession::Sfu(s) => s.feed_ended(),
+            HdSession::Moq(s) => s.feed_ended(),
         }
     }
 }

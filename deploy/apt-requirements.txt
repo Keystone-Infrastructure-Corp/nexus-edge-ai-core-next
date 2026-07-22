@@ -28,6 +28,15 @@ gstreamer1.0-plugins-bad
 gstreamer1.0-libav
 gstreamer1.0-vaapi
 
+# gstreamer1.0-plugins-ugly — provides the CPU `x264enc` H.264 encoder the
+# alert-clip re-encode prefers. Clip encode deliberately runs on the CPU so
+# it never contends with live hardware decode on a single-iGPU box's shared
+# VCS media engine (that contention wedges the GPU and freezes the live
+# fleet). Without x264enc the encoder falls back to `openh264enc` (also CPU,
+# lower quality) or, last resort, the hardware VA encoder. GPL — compatible
+# with the engine's AGPL-3.0-or-later license.
+gstreamer1.0-plugins-ugly
+
 # libnice — the ICE agent (nicesrc / nicesink) that webrtcbin loads for the
 # Phase 10 HD (WebRTC) solo live view. Missing it => an HD view negotiates
 # no candidates and never connects; the LBR live wall is unaffected.

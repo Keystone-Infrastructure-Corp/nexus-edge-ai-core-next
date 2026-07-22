@@ -503,6 +503,18 @@ impl WebRtcSession {
     pub fn camera_id(&self) -> CameraId {
         self.camera_id
     }
+
+    /// True once the NAL feed task has ended — either because the consumer
+    /// stalled past [`FEED_PUSH_STALL_TIMEOUT`] (the browser tab closed / the
+    /// PeerConnection died without a `live_hd_stop`), the broadcast closed, or
+    /// the feed hit EOS. A finished feed means the session is producing nothing
+    /// and is only holding a still-parked `push_buffer` blocking-pool thread
+    /// alive; the manager-side reaper uses this to drop such sessions promptly
+    /// (drop → pipeline Null → the parked push unblocks and the thread frees)
+    /// instead of waiting for a client disconnect that may never come.
+    pub fn feed_ended(&self) -> bool {
+        self.feed.is_finished()
+    }
 }
 
 impl Drop for WebRtcSession {

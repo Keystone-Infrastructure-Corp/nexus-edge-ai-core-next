@@ -313,7 +313,9 @@ pub use encode::{encode_alert_clip, AlertClipError, AlertClipStats};
 #[cfg(feature = "gstreamer")]
 mod encode {
     use std::path::Path;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use chrono::{DateTime, Utc};
     use gstreamer as gst;
@@ -336,6 +338,40 @@ mod encode {
     /// after EOS before giving up (the file is still usable if partially
     /// muxed, but we prefer a clean close).
     const EOS_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Absolute wall-clock cap on a single alert-clip encode. The decode
+    /// and encode appsrc/appsink run with `block=true`, so a stalled
+    /// encoder (e.g. the shared Intel VCS media engine wedged by 29 live
+    /// hardware decoders) parks `push_buffer`/`pull_sample` forever —
+    /// pinning the tokio blocking thread that `spawn_blocking`'d this
+    /// call and, once enough accumulate, starving the whole pool. A
+    /// watchdog forces both pipelines to `Null` at this deadline, which
+    /// flushes and unblocks the parked calls so the encode fails cleanly
+    /// instead of leaking. Alert clips are seconds long, so a healthy
+    /// encode finishes in well under this bound.
+    const ENCODE_DEADLINE: Duration = Duration::from_secs(45);
+
+    /// Forces every registered pipeline to `Null` on drop, so *every*
+    /// exit path (early `?`, deadlock, panic-unwind) tears the
+    /// decode/encode graphs down and releases their decoder/encoder
+    /// resources. Without this, an early return leaked a live pipeline
+    /// (avdec / VA context) and the accumulation eventually exhausted the
+    /// decoder, stalling all subsequent encodes. Also signals the
+    /// watchdog to stop.
+    struct EncodeGuard {
+        done: Arc<AtomicBool>,
+        watched: Arc<Mutex<Vec<gst::Pipeline>>>,
+    }
+
+    impl Drop for EncodeGuard {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::Relaxed);
+            if let Ok(watched) = self.watched.lock() {
+                for p in watched.iter() {
+                    let _ = p.set_state(gst::State::Null);
+                }
+            }
+        }
+    }
 
     /// Final stats from a successful [`encode_alert_clip`].
     #[derive(Debug, Clone, Copy)]
@@ -356,17 +392,25 @@ mod encode {
         NoEncoder,
     }
 
-    /// First available H.264 encoder, hardware-first (matching the
-    /// live-view transcode preference in `webrtc.rs`) then software.
-    /// `None` on a box with no usable encoder — the caller marks the
-    /// clip failed and the dispatcher delivers the alarm clip-less.
+    /// First available H.264 encoder, **software-first**. Clip re-encode
+    /// deliberately prefers a CPU encoder (`x264enc`, then `openh264enc`)
+    /// over the hardware VA/NV encoders: on single-iGPU boxes the GPU's
+    /// media engine is already saturated hardware-decoding every live
+    /// RTSP stream, and adding clip *encode* to the same engine
+    /// overcommits it — wedging the shared VCS and freezing the live
+    /// fleet. A short clip on the CPU is cheap and fully decouples clip
+    /// encode from live decode. The hardware encoders remain as a
+    /// last-resort fallback for boxes with no CPU H.264 encoder
+    /// installed. `None` on a box with no usable encoder — the caller
+    /// marks the clip failed and the dispatcher delivers the alarm
+    /// clip-less.
     fn pick_h264_encoder() -> Option<&'static str> {
         [
+            "x264enc",
+            "openh264enc",
             "vah264enc",
             "vaapih264enc",
             "nvh264enc",
-            "x264enc",
-            "openh264enc",
         ]
         .into_iter()
         .find(|n| gst::ElementFactory::find(n).is_some())
@@ -478,6 +522,45 @@ mod encode {
             .ok_or_else(|| AlertClipError::Gst("appsink dsink missing".into()))?
             .downcast::<AppSink>()
             .map_err(|_| AlertClipError::Gst("dsink is not an appsink".into()))?;
+
+        // Deadlock guard: register both pipelines with a watchdog that
+        // force-`Null`s them if this encode overruns `ENCODE_DEADLINE`
+        // (unblocking any `block=true` push/pull parked on a stalled
+        // encoder), and an `EncodeGuard` that `Null`s them on every exit
+        // path. The encode pipeline is registered later once it is built.
+        let done = Arc::new(AtomicBool::new(false));
+        let watched: Arc<Mutex<Vec<gst::Pipeline>>> =
+            Arc::new(Mutex::new(vec![dec_pipeline.clone()]));
+        let _guard = EncodeGuard {
+            done: Arc::clone(&done),
+            watched: Arc::clone(&watched),
+        };
+        {
+            let wd_done = Arc::clone(&done);
+            let wd_watched = Arc::clone(&watched);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + ENCODE_DEADLINE;
+                while Instant::now() < deadline {
+                    if wd_done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                if wd_done.load(Ordering::Relaxed) {
+                    return;
+                }
+                warn!(
+                    "alert-clip encode exceeded {}s deadline; forcing pipelines to Null",
+                    ENCODE_DEADLINE.as_secs()
+                );
+                if let Ok(watched) = wd_watched.lock() {
+                    for p in watched.iter() {
+                        let _ = p.set_state(gst::State::Null);
+                    }
+                }
+            });
+        }
+
         dec_pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| AlertClipError::Gst(format!("decode set Playing: {e}")))?;
@@ -618,6 +701,12 @@ mod encode {
                     .map_err(|e| AlertClipError::Gst(format!("encode launch: {e}")))?
                     .downcast::<gst::Pipeline>()
                     .map_err(|_| AlertClipError::Gst("encode graph is not a pipeline".into()))?;
+                // Register the encode pipeline so the watchdog + guard can
+                // tear it down too (it is built lazily, after the decode
+                // pipeline, once the native dims are known).
+                if let Ok(mut watched) = watched.lock() {
+                    watched.push(ep.clone());
+                }
                 // Pin the encoder input to FULL-RANGE (pc) BT.709 I420 so
                 // the re-encode preserves the source camera's colorimetry.
                 // Without this, videoconvert defaults to LIMITED-range (tv)
