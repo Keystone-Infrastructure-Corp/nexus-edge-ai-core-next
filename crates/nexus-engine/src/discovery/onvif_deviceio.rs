@@ -436,6 +436,16 @@ fn current_section(stack: &[String]) -> Option<&'static str> {
         .find_map(|s| OSD_SECTIONS.iter().copied().find(|sec| *sec == s.as_str()))
 }
 
+/// True for the element that wraps one OSD configuration in a
+/// `GetOSDsResponse`. ONVIF names the repeated element **`OSDs`**
+/// (plural, per the ver10/ver20 media schema: `GetOSDsResponse/OSDs`
+/// with `maxOccurs="unbounded"`), whereas the `SetOSD` / `CreateOSD`
+/// request bodies use the singular `OSD`. Field cameras return the
+/// plural form, so the parser accepts both spellings.
+fn is_osd_element(name: &str) -> bool {
+    name == "OSD" || name == "OSDs"
+}
+
 fn parse_osds(body: &str) -> Vec<Osd> {
     let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(true);
@@ -450,7 +460,7 @@ fn parse_osds(body: &str) -> Vec<Osd> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let n = local_name(&e.name());
-                if n == "OSD" {
+                if is_osd_element(&n) {
                     cur = Some(Osd {
                         token: attr_str(&e, "token").unwrap_or_default(),
                         ..Osd::default()
@@ -462,7 +472,7 @@ fn parse_osds(body: &str) -> Vec<Osd> {
             }
             Ok(Event::Empty(e)) => {
                 let n = local_name(&e.name());
-                if n == "OSD" {
+                if is_osd_element(&n) {
                     let token = attr_str(&e, "token").unwrap_or_default();
                     out.push(Osd {
                         token,
@@ -496,7 +506,7 @@ fn parse_osds(body: &str) -> Vec<Osd> {
                 }
                 capture = None;
                 stack.pop();
-                if n == "OSD" {
+                if is_osd_element(&n) {
                     if let Some(c) = cur.take() {
                         out.push(c);
                     }
@@ -591,18 +601,28 @@ mod tests {
 
     #[test]
     fn parses_osds() {
+        // Real cameras return each OSD as the **plural** `OSDs` element
+        // (ONVIF `GetOSDsResponse/OSDs`, maxOccurs unbounded). Regression:
+        // the parser used to match only the singular `OSD` (the spelling
+        // used by SetOSD/CreateOSD *requests*) and so returned nothing for
+        // a real GetOSDs response, silently defeating "name camera from OSD".
         let body = wrap(
             r#"<tr2:GetOSDsResponse>
-                <tr2:OSD token="OsdToken_100">
+                <tr2:OSDs token="OsdToken_100">
                     <tt:VideoSourceConfigurationToken>VideoSourceConfig_1</tt:VideoSourceConfigurationToken>
                     <tt:Type>Text</tt:Type>
                     <tt:Position><tt:Type>UpperLeft</tt:Type></tt:Position>
                     <tt:TextString><tt:Type>Plain</tt:Type><tt:PlainText>Front Door</tt:PlainText></tt:TextString>
-                </tr2:OSD>
+                </tr2:OSDs>
+                <tr2:OSDs token="OsdToken_101">
+                    <tt:VideoSourceConfigurationToken>VideoSourceConfig_1</tt:VideoSourceConfigurationToken>
+                    <tt:Type>Image</tt:Type>
+                    <tt:Position><tt:Type>LowerRight</tt:Type></tt:Position>
+                </tr2:OSDs>
             </tr2:GetOSDsResponse>"#,
         );
         let osds = parse_osds(&body);
-        assert_eq!(osds.len(), 1);
+        assert_eq!(osds.len(), 2);
         let o = &osds[0];
         assert_eq!(o.token, "OsdToken_100");
         assert_eq!(
@@ -612,6 +632,27 @@ mod tests {
         assert_eq!(o.osd_type.as_deref(), Some("Text"));
         assert_eq!(o.position.as_deref(), Some("UpperLeft"));
         assert_eq!(o.text.as_deref(), Some("Front Door"));
+        // Image OSDs parse too (with no text); osd_display_name skips them.
+        assert_eq!(osds[1].osd_type.as_deref(), Some("Image"));
+        assert_eq!(osds[1].text, None);
+    }
+
+    #[test]
+    fn parses_osds_accepts_singular_element() {
+        // `SetOSD`/`CreateOSD` bodies (and a few non-conforming cameras)
+        // use the singular `OSD`; the parser accepts both spellings.
+        let body = wrap(
+            r#"<tr2:GetOSDsResponse>
+                <tr2:OSD token="OsdToken_7">
+                    <tt:Type>Text</tt:Type>
+                    <tt:TextString><tt:Type>Plain</tt:Type><tt:PlainText>Bay 3</tt:PlainText></tt:TextString>
+                </tr2:OSD>
+            </tr2:GetOSDsResponse>"#,
+        );
+        let osds = parse_osds(&body);
+        assert_eq!(osds.len(), 1);
+        assert_eq!(osds[0].token, "OsdToken_7");
+        assert_eq!(osds[0].text.as_deref(), Some("Bay 3"));
     }
 
     #[test]
