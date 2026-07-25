@@ -597,8 +597,20 @@ async fn flip_and_restart(version: &str) -> Result<(), &'static str> {
             return Err("rollback_also_failed");
         }
     }
+    // `--no-block` enqueues the restart job and returns 0 IMMEDIATELY, before
+    // systemd stops this unit's control-group. Without it, the `sudo
+    // systemctl` child shares this engine's cgroup, so the unit-stop SIGTERM
+    // kills it before it can return — `.status()` is then non-zero and we emit
+    // a spurious terminal `failed` even though the restart (and the whole
+    // update) actually succeeds and the box boots the new version. Any drift
+    // here MUST be mirrored byte-for-byte in deploy/sudoers.d/nexus-update.
     let restart = std::process::Command::new("sudo")
-        .args(["/usr/bin/systemctl", "restart", "nexus-engine"])
+        .args([
+            "/usr/bin/systemctl",
+            "--no-block",
+            "restart",
+            "nexus-engine",
+        ])
         .status();
     match restart {
         Ok(s) if s.success() => Ok(()),
