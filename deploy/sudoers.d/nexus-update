@@ -20,9 +20,14 @@
 #     of the live symlink. The `*` wildcard covers the per-version
 #     release dir; sudo's wildcard does NOT cross `/`, so this cannot
 #     be coerced into linking an arbitrary tree outside releases/.
-#   - `systemctl restart nexus-engine`: restart into the new version.
-#     Pinned to the single unit; a compromised engine cannot pivot to
-#     `systemctl` against any other unit, `apt`, etc.
+#   - `systemctl --no-block restart nexus-engine`: restart into the new
+#     version. `--no-block` enqueues the job and returns immediately, BEFORE
+#     systemd stops this unit's control-group — without it the `sudo
+#     systemctl` child (same cgroup as the engine) is killed by the unit-stop
+#     SIGTERM before it can return, and the engine reports a spurious update
+#     `failed` even though the restart succeeds. Pinned to the single unit; a
+#     compromised engine cannot pivot to `systemctl` against any other unit,
+#     `apt`, etc.
 #   - `nexus-apply-deps /opt/nexus/releases/*`: install the new release's
 #     DECLARED apt runtime deps (share/apt-requirements.txt) so an OTA
 #     never needs an operator to hand-install a package. This is a FIXED
@@ -49,5 +54,5 @@
 #   sudo visudo -cf /etc/sudoers.d/nexus-update   # validate
 nexus ALL=(root) NOPASSWD: /usr/bin/tar -xzf /opt/nexus/staging/update.tar.gz -C /opt/nexus/releases
 nexus ALL=(root) NOPASSWD: /usr/bin/ln -sfn /opt/nexus/releases/* /opt/nexus/current
-nexus ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-engine
+nexus ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block restart nexus-engine
 nexus ALL=(root) NOPASSWD: /usr/local/sbin/nexus-apply-deps /opt/nexus/releases/*
