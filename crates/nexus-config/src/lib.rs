@@ -521,6 +521,21 @@ pub struct ClipsConfig {
     /// disabled by default. See docs/edge-core/M_ALERT_CLIP.md.
     #[serde(default)]
     pub alert_clips: AlertClipsConfig,
+    /// Guarantee every alert/event has an underlying full-resolution
+    /// motion clip. The cheap `MotionGate` and the motion tracker are
+    /// tuned for sustained movement, so a small / distant / briefly
+    /// moving object can trip a rule (fire an alert) on a keyframe pass
+    /// without the tracker ever declaring `Born` — leaving the event
+    /// with no surrounding native-resolution video. When this is set,
+    /// an alert firing on a frame with no clip open force-opens a
+    /// native-resolution motion clip (identical to the motion path,
+    /// including pre-roll) and each subsequent alert frame keeps it
+    /// open through the same `post_roll_secs` grace window. This is the
+    /// full-res, longer-capture motion clip — NOT the reduced-resolution
+    /// burned-in alert clip, which remains governed by `alert_clips`.
+    /// Default `true`.
+    #[serde(default = "default_record_motion_clip_on_alert")]
+    pub record_motion_clip_on_alert: bool,
 }
 
 impl Default for ClipsConfig {
@@ -538,6 +553,7 @@ impl Default for ClipsConfig {
             preferred_usb_label: None,
             max_clip_bytes: default_max_clip_bytes(),
             alert_clips: AlertClipsConfig::default(),
+            record_motion_clip_on_alert: default_record_motion_clip_on_alert(),
         }
     }
 }
@@ -578,6 +594,10 @@ fn default_max_clip_bytes() -> u64 {
     // 256 MiB. A healthy 30-60 s clip is a few MB; this only ever
     // trips on corrupt byte-exploding streams.
     256 * 1024 * 1024
+}
+
+fn default_record_motion_clip_on_alert() -> bool {
+    true
 }
 
 /// M-Alert-Clip: configuration for the short, burned-in "alert clip"
@@ -2974,6 +2994,22 @@ mod tests {
         // An explicit `enabled = false` still hard-disables the capability.
         let off: ClipsConfig = toml::from_str("[alert_clips]\nenabled = false\n").unwrap();
         assert!(!off.alert_clips.enabled);
+    }
+
+    /// Every alert/event must get an underlying full-resolution motion
+    /// clip by default, so a keyframe-only detection (no sustained
+    /// motion → no tracker `Born`) still leaves surrounding native-res
+    /// video. Pins the default ON and the explicit override OFF.
+    #[test]
+    fn record_motion_clip_on_alert_is_on_by_default() {
+        assert!(ClipsConfig::default().record_motion_clip_on_alert);
+        // Missing key deserialises to the enabled default.
+        let clips: ClipsConfig = toml::from_str("").unwrap();
+        assert!(clips.record_motion_clip_on_alert);
+        // Explicit `false` disables it (reverts to unlinked alerts on
+        // motionless frames).
+        let off: ClipsConfig = toml::from_str("record_motion_clip_on_alert = false\n").unwrap();
+        assert!(!off.record_motion_clip_on_alert);
     }
 
     #[test]

@@ -87,6 +87,17 @@ watermark_sample_interval_secs = 30
 # it so a runaway clip never head-of-line-blocks the upload queue.
 # Default 256 MiB.
 max_clip_bytes = 268435456
+# Guarantee every alert/event has an underlying full-resolution motion
+# clip. The cheap motion gate + tracker are tuned for sustained
+# movement, so a small / distant / briefly moving object can trip a
+# rule (fire an alert) without the tracker ever declaring motion —
+# leaving the event with no surrounding native-resolution video. When
+# true, an alert firing on a frame with no clip open force-opens a
+# native-resolution motion clip (same as the motion path, incl.
+# pre-roll) and keeps it open through post_roll_secs. This is the
+# full-res, longer-capture motion clip — NOT the reduced-resolution
+# burned-in alert clip (see [runtime.clips.alert_clips]). Default true.
+record_motion_clip_on_alert = true
 
 [server]
 api_bind = "0.0.0.0:8089"

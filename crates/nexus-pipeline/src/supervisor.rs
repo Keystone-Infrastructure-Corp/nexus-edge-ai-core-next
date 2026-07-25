@@ -458,6 +458,13 @@ async fn run_camera(
         // M-Alert-Clip: gate every alert-clip hook on the config flag so
         // the hot path stays free when the feature is off (the default).
         let alert_clips_enabled = clips_cfg.alert_clips.enabled;
+        // Guarantee every alert/event has an underlying full-resolution
+        // motion clip even when the motion tracker never declared `Born`
+        // for it (small / distant / brief motion that trips a rule on a
+        // keyframe pass). When enabled, an alert firing on a frame with
+        // no open clip force-opens a native-resolution motion clip and
+        // each alert frame keeps it open through `post_roll_secs`.
+        let record_motion_clip_on_alert = clips_cfg.record_motion_clip_on_alert;
 
         info!(camera_id = cfg.id, "pipeline running");
 
@@ -1224,10 +1231,52 @@ async fn run_camera(
 
             // Stamp events.clip_id for any alerts that fired this
             // frame, now that the motion lifecycle has had a chance
-            // to open a clip. Alerts on frames with no open clip
-            // simply stay unlinked (clip_id NULL) — the timeline UI
-            // shows them as "no surrounding video".
+            // to open a clip. When `record_motion_clip_on_alert` is
+            // set, an alert on a frame with no open clip force-opens a
+            // native-resolution motion clip so every event has
+            // surrounding full-res video — matching the motion clip
+            // (native resolution, pre-roll, post-roll), NOT the
+            // reduced-resolution burned-in alert clip. When the flag is
+            // off, alerts on frames with no open clip stay unlinked
+            // (clip_id NULL) and the timeline UI shows "no surrounding
+            // video".
             if !events_to_link.is_empty() {
+                if current_clip.is_none() && record_motion_clip_on_alert {
+                    match recorder
+                        .open(OpenClip {
+                            camera_id: cfg.id,
+                            started_at: frame.captured_at,
+                            frame_width: current_supervisor_w,
+                            frame_height: current_supervisor_h,
+                        })
+                        .await
+                    {
+                        Ok(handle) => {
+                            debug!(
+                                camera_id = cfg.id,
+                                clip_id = handle.clip_id,
+                                "alert-triggered motion clip opened (no live motion track)"
+                            );
+                            current_clip = Some(handle);
+                            clip_opened_at = Some(frame.captured_at);
+                        }
+                        Err(RecorderError::Refused) => {
+                            // Watermark sampler has paused new clips
+                            // (panic mode). The event stays unlinked;
+                            // nothing else to do this frame.
+                            debug!(
+                                camera_id = cfg.id,
+                                "recorder refused alert-triggered open (panic mode)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                camera_id = cfg.id,
+                                "alert-triggered recorder.open failed: {e}"
+                            );
+                        }
+                    }
+                }
                 if let Some(handle) = current_clip {
                     for event_id in &events_to_link {
                         if let Err(e) = store.link_event_to_clip(event_id, handle.clip_id).await {
@@ -1248,7 +1297,15 @@ async fn run_camera(
             // motion bursts inside `clips_cfg.post_roll_secs`
             // produce a single clip rather than two adjacent
             // micro-clips. Pre-roll is intentionally a separate PR.
-            let has_live_motion = emitter.live_track_count(cfg.id) > 0;
+            //
+            // An alert firing this frame counts as activity for the
+            // deferred close (same as live motion) so an
+            // alert-triggered clip — which may have opened with no
+            // live tracker track at all — stays open and captures the
+            // full post-roll window instead of closing on the very
+            // next frame.
+            let alert_kept_alive = record_motion_clip_on_alert && !events_to_link.is_empty();
+            let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
             let action = post_roll.tick(frame.captured_at, has_live_motion);
             if matches!(action, PostRollAction::CloseNow) {
                 if let Some(handle) = current_clip.take() {
