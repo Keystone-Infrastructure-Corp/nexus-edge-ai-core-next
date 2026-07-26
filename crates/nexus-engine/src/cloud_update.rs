@@ -11,18 +11,22 @@
 //! 2. Download the release tarball with `reqwest` (bytes never transit
 //!    the gateway) and re-verify `artifact_sha256` over the downloaded
 //!    bytes.
-//! 3. Extract into `/opt/nexus/releases/<version>/`, flip the
-//!    `/opt/nexus/current` symlink, and `systemctl restart
-//!    nexus-engine` — all three privileged steps gated by the pinned
-//!    `/etc/sudoers.d/nexus-update` rules.
+//! 3. Stage the verified tarball and hand the entire privileged sequence
+//!    (extract → deps/journald → flip `/opt/nexus/current` → `systemctl
+//!    restart nexus-engine`) to the single root-owned applier
+//!    `/usr/local/sbin/nexus-apply-release`, the ONLY command the pinned
+//!    `/etc/sudoers.d/nexus-update` rule grants. The sudoers grant is a
+//!    stable, argv-independent wildcard on that one path, so the engine's
+//!    privileged behaviour can evolve without ever editing sudoers again —
+//!    the argv-drift that once bricked an OTA is designed out.
 //! 4. Emit an `update_progress` envelope at every phase transition.
 //!    Dispatch is fire-and-forget; progress is routed by the cloud on
 //!    `assignment_id`, never as a sync RPC reply.
 //!
-//! Privileged work (`tar`, `ln`, `systemctl`) is Linux-only and gated
-//! behind `cfg(target_os = "linux")`; on every other platform the apply
-//! path fails closed with `failed:unsupported_platform` so the engine
-//! still compiles and the dev workstation never tries to self-update.
+//! Privileged work is Linux-only and gated behind `cfg(target_os =
+//! "linux")`; on every other platform the apply path fails closed with
+//! `failed:unsupported_platform` so the engine still compiles and the dev
+//! workstation never tries to self-update.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -62,14 +66,28 @@ const NEXUS_RELEASE_SIGNING_PUBKEY_V1: &str = "-----BEGIN PUBLIC KEY-----\nMCowB
 /// [`UpdateState`] single-row snapshot.
 const KEY_UPDATE_STATE: &str = "update.state";
 
-/// Fixed on-disk paths for the staged tarball + release tree. Pinned so
-/// the `/etc/sudoers.d/nexus-update` command rules can be exact.
+/// Fixed on-disk path the engine stages the verified tarball to before
+/// invoking the applier. Pinned so the root-owned applier can read it from a
+/// known location; the applier owns the release-tree + symlink layout.
 #[cfg(target_os = "linux")]
 const STAGED_TARBALL: &str = "/opt/nexus/staging/update.tar.gz";
+
+/// The single root-owned OTA applier — the ONLY command the pinned
+/// `/etc/sudoers.d/nexus-update` rule grants. Every privileged step
+/// (extract, deps/journald, symlink flip, restart, rollback reflip,
+/// post-health prune) goes through it via `sudo <path> <mode> <version>`.
+/// The sudoers grant is a stable wildcard on this fixed path, so this argv
+/// can change freely without any sudoers edit.
 #[cfg(target_os = "linux")]
-const RELEASES_DIR: &str = "/opt/nexus/releases";
+const APPLY_RELEASE_WRAPPER: &str = "/usr/local/sbin/nexus-apply-release";
+
+/// Build the argv (minus the leading `sudo`) for one applier invocation.
+/// Pure + total so it can be unit-tested without shelling out. `mode` is one
+/// of `apply` | `reflip` | `prune`.
 #[cfg(target_os = "linux")]
-const CURRENT_SYMLINK: &str = "/opt/nexus/current";
+fn apply_release_argv<'a>(mode: &'a str, version: &'a str) -> [&'a str; 3] {
+    [APPLY_RELEASE_WRAPPER, mode, version]
+}
 
 /// Update phase names — mirror the `update_progress.phase` enum in
 /// WIRE_PROTOCOL §4.
@@ -278,6 +296,16 @@ async fn apply_assignment(store: &Store, outbox: &TunnelOutbox, payload: &Update
         return;
     }
 
+    // 1b) Preflight the privileged surface BEFORE downloading a single byte.
+    //     Confirm sudo actually authorises the pinned applier; if the box's
+    //     sudoers has drifted (e.g. an old per-argv file left behind), abort
+    //     early with a distinct, actionable status instead of downloading,
+    //     staging, and half-applying an update that can never restart.
+    if let Err(code) = preflight_privileged() {
+        fail(store, outbox, &mut state, id, code).await;
+        return;
+    }
+
     // 2) Download the artifact.
     emit_progress(outbox, id, phase::FETCHING_ARTIFACT, Some(0), None).await;
     let bytes = match download_artifact(&payload.artifact_url).await {
@@ -438,6 +466,15 @@ pub async fn finalize_pending_update(store: Arc<Store>, outbox: Arc<TunnelOutbox
         state.last_result = Some(phase::SUCCESS.to_string());
         state.crash_count = 0;
         write_state(&store, &state).await;
+
+        // Now — and only now, with the new version proven healthy — reap
+        // stale release trees, keeping the running version and the rollback
+        // target (`previous_good`). Deferring the prune until here is what
+        // guarantees a failed apply can never delete the version we would roll
+        // back to. Best-effort; a prune failure never disturbs the success.
+        if let Some(prev) = state.previous_good.clone() {
+            tokio::task::spawn_blocking(move || prune_stale_releases(&prev));
+        }
         return;
     }
 
@@ -484,19 +521,20 @@ pub async fn finalize_pending_update(store: Arc<Store>, outbox: Arc<TunnelOutbox
 // Privileged install steps — Linux only.
 // ---------------------------------------------------------------------
 
-/// Extract the tarball, flip the `current` symlink, and restart.
+/// Stage the verified tarball, then hand the entire privileged apply
+/// sequence to the single root-owned applier.
 ///
-/// The release tarball carries a single top-level directory named after
-/// the **bare** version (e.g. `0.1.7/`) — the same `<version>` the cloud
-/// dispatches (`== NEXUS_BUILD_VERSION`; see the `package tarball` step in
-/// `.github/workflows/release.yml`). Extracting into `RELEASES_DIR` (no
-/// `--strip-components`) therefore lands the tree at
-/// `RELEASES_DIR/<version>/`, exactly where `flip_and_restart` points
-/// `current`.
+/// The engine (as the unprivileged `nexus` user) only writes the staged
+/// tarball; everything root — extract, deps/journald, symlink flip, restart —
+/// happens inside `/usr/local/sbin/nexus-apply-release apply <version>`, the
+/// one command the pinned sudoers rule grants. That release tarball carries a
+/// single top-level directory named after the **bare** version (e.g.
+/// `0.1.7/`), so the wrapper's `tar -C /opt/nexus/releases` lands the tree at
+/// `RELEASES_DIR/<version>/`, exactly where it then points `current`.
 #[cfg(target_os = "linux")]
 async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str> {
     use std::io::Write as _;
-    // Stage the tarball at the pinned path (matches the sudoers tar rule).
+    // Stage the tarball at the pinned path the applier reads.
     if let Some(parent) = std::path::Path::new(STAGED_TARBALL).parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             warn!(error = %e, dir = %parent.display(), "update: staging dir create failed");
@@ -512,115 +550,107 @@ async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str
     })?;
     drop(f);
 
-    // sudo tar -xzf <staged> -C /opt/nexus/releases. The tarball's top-level
-    // dir is the bare <version>, so this lands the tree at
-    // /opt/nexus/releases/<version>/.
-    let extract = std::process::Command::new("sudo")
-        .args(["/usr/bin/tar", "-xzf", STAGED_TARBALL, "-C", RELEASES_DIR])
+    // Hand the whole privileged sequence to the single applier. It extracts,
+    // applies the release's declared apt deps + journald cap (best-effort,
+    // WITHOUT pruning — the rollback target must survive a failed apply),
+    // flips `current`, and restarts the unit. A non-zero exit means the
+    // version did NOT take effect; the caller rolls the persisted version back.
+    let status = std::process::Command::new("sudo")
+        .arg("-n")
+        .args(apply_release_argv("apply", version))
         .status();
-    match extract {
-        Ok(s) if s.success() => {}
+    match status {
+        Ok(s) if s.success() => {
+            info!(
+                version,
+                "update: applier `apply` requested restart; awaiting SIGTERM"
+            );
+            Ok(())
+        }
         Ok(s) => {
-            warn!(code = ?s.code(), "update: `sudo tar` extract exited non-zero");
-            return Err("artifact_unavailable");
+            warn!(code = ?s.code(), "update: `nexus-apply-release apply` exited non-zero");
+            Err("apply_failed")
         }
         Err(e) => {
-            warn!(error = %e, "update: failed to spawn `sudo tar` extract");
-            return Err("artifact_unavailable");
+            warn!(error = %e, "update: failed to spawn `nexus-apply-release apply`");
+            Err("apply_failed")
         }
     }
+}
 
-    // Sanity-check that the expected release dir materialised BEFORE flipping
-    // the live symlink. A mismatch here (e.g. a tarball whose top-level dir
-    // is not the bare <version>) would otherwise leave `current` dangling and
-    // the unit failing status=203/EXEC after the restart — a silent brick.
-    let release_path = format!("{RELEASES_DIR}/{version}");
-    if !std::path::Path::new(&release_path).is_dir() {
-        warn!(
-            expected = %release_path,
-            "update: extracted release dir missing after tar (tarball top-level dir != bare version?)"
-        );
-        return Err("artifact_unavailable");
-    }
-
-    // Apply this release's privileged, root-side bits via the pinned,
-    // root-owned wrapper at `/usr/local/sbin/nexus-apply-deps` (installed by
-    // `scripts/install.sh`, whitelisted in `deploy/sudoers.d/nexus-update`):
-    //   * install DECLARED apt runtime deps (`share/apt-requirements.txt`),
-    //   * install the journald size cap
-    //     (`etc-templates/journald.conf.d/nexus.conf`), and
-    //   * prune stale release trees — this runs BEFORE the symlink flip, so
-    //     `current` still points at the OUTGOING version, and the wrapper keeps
-    //     exactly the incoming version (its argument) + that rollback target.
-    // Running it here is what lets those privileged actions ride an OTA without
-    // an operator ever touching the box. Best-effort and NON-FATAL: none of it
-    // may block the version flip — the engine fail-opens locally and only
-    // optional features / hygiene degrade. The wrapper enforces its own
-    // allowlist + keep-set, so a tampered release tree cannot coerce it into
-    // arbitrary apt installs or deletions.
-    match std::process::Command::new("sudo")
-        .args(["/usr/local/sbin/nexus-apply-deps", &release_path])
-        .status()
-    {
-        Ok(s) if s.success() => {
-            info!(release = %release_path, "update: release privileged config applied (deps + journald + prune)");
+/// Re-point `/opt/nexus/current` to the named (already-on-disk) release and
+/// restart the unit — the rollback path. Delegates to the same applier in
+/// `reflip` mode (no tarball, no deps).
+#[cfg(target_os = "linux")]
+async fn flip_and_restart(version: &str) -> Result<(), &'static str> {
+    let status = std::process::Command::new("sudo")
+        .arg("-n")
+        .args(apply_release_argv("reflip", version))
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => {
+            warn!(code = ?s.code(), "update: `nexus-apply-release reflip` exited non-zero");
+            Err("rollback_also_failed")
         }
+        Err(e) => {
+            warn!(error = %e, "update: failed to spawn `nexus-apply-release reflip`");
+            Err("rollback_also_failed")
+        }
+    }
+}
+
+/// Preflight the privileged surface: confirm sudo authorises the pinned
+/// applier NOPASSWD before we download or stage anything. `sudo -n -l <cmd>`
+/// exits 0 iff the invoking user may run `<cmd>` without a password; a drifted
+/// or missing sudoers file makes it non-zero (and, with `-n`, it never blocks
+/// on a password prompt). Returns `privsurface_drift` on any failure so the
+/// terminal status names the real, operator-actionable cause.
+#[cfg(target_os = "linux")]
+fn preflight_privileged() -> Result<(), &'static str> {
+    // Pass representative args so the probe matches the sudoers pattern, which
+    // is `nexus-apply-release *` (a trailing arg is required). `sudo -l` only
+    // CHECKS authorisation against sudoers — it never executes the wrapper —
+    // so the placeholder mode/version are inert.
+    let status = std::process::Command::new("sudo")
+        .args(["-n", "-l", APPLY_RELEASE_WRAPPER, "preflight", "probe"])
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
         Ok(s) => {
             warn!(
                 code = ?s.code(),
-                "update: nexus-apply-deps exited non-zero; proceeding with flip (optional features may degrade)"
+                wrapper = APPLY_RELEASE_WRAPPER,
+                "update: preflight failed — sudo does not authorise the OTA applier (sudoers drift?)"
             );
+            Err("privsurface_drift")
         }
         Err(e) => {
-            warn!(error = %e, "update: failed to spawn nexus-apply-deps; proceeding with flip");
+            warn!(error = %e, "update: failed to spawn `sudo -n -l` preflight");
+            Err("privsurface_drift")
         }
     }
-
-    flip_and_restart(version).await
 }
 
-/// Flip `/opt/nexus/current` to the named release and restart the unit.
+/// Best-effort post-health reap of stale release trees, keeping only the
+/// running version and the rollback target (`previous_good`, passed as the
+/// argument). Deferred until AFTER the new version boots healthy so a failed
+/// apply can never delete the rollback target. Never fails the caller.
 #[cfg(target_os = "linux")]
-async fn flip_and_restart(version: &str) -> Result<(), &'static str> {
-    let release_path = format!("{RELEASES_DIR}/{version}");
-    let link = std::process::Command::new("sudo")
-        .args(["/usr/bin/ln", "-sfn", &release_path, CURRENT_SYMLINK])
-        .status();
-    match link {
-        Ok(s) if s.success() => {}
+fn prune_stale_releases(keep_version: &str) {
+    match std::process::Command::new("sudo")
+        .arg("-n")
+        .args(apply_release_argv("prune", keep_version))
+        .status()
+    {
+        Ok(s) if s.success() => {
+            info!(keep = keep_version, "update: post-health prune complete");
+        }
         Ok(s) => {
-            warn!(code = ?s.code(), target = %release_path, "update: `sudo ln` symlink flip exited non-zero");
-            return Err("rollback_also_failed");
+            warn!(code = ?s.code(), "update: post-health prune exited non-zero (non-fatal)");
         }
         Err(e) => {
-            warn!(error = %e, "update: failed to spawn `sudo ln` symlink flip");
-            return Err("rollback_also_failed");
-        }
-    }
-    // `--no-block` enqueues the restart job and returns 0 IMMEDIATELY, before
-    // systemd stops this unit's control-group. Without it, the `sudo
-    // systemctl` child shares this engine's cgroup, so the unit-stop SIGTERM
-    // kills it before it can return — `.status()` is then non-zero and we emit
-    // a spurious terminal `failed` even though the restart (and the whole
-    // update) actually succeeds and the box boots the new version. Any drift
-    // here MUST be mirrored byte-for-byte in deploy/sudoers.d/nexus-update.
-    let restart = std::process::Command::new("sudo")
-        .args([
-            "/usr/bin/systemctl",
-            "--no-block",
-            "restart",
-            "nexus-engine",
-        ])
-        .status();
-    match restart {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => {
-            warn!(code = ?s.code(), "update: `sudo systemctl restart` exited non-zero");
-            Err("rollback_also_failed")
-        }
-        Err(e) => {
-            warn!(error = %e, "update: failed to spawn `sudo systemctl restart`");
-            Err("rollback_also_failed")
+            warn!(error = %e, "update: failed to spawn post-health prune (non-fatal)");
         }
     }
 }
@@ -636,6 +666,16 @@ async fn install_release(_bytes: &[u8], _version: &str) -> Result<(), &'static s
 async fn flip_and_restart(_version: &str) -> Result<(), &'static str> {
     Err("unsupported_platform")
 }
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+fn preflight_privileged() -> Result<(), &'static str> {
+    Err("unsupported_platform")
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+fn prune_stale_releases(_keep_version: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -698,5 +738,25 @@ mod tests {
         assert!(sha256_matches(data, &hex_lower));
         assert!(sha256_matches(data, &hex_lower.to_uppercase()));
         assert!(!sha256_matches(data, &"0".repeat(64)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_release_argv_is_stable_and_pinned() {
+        // The applier path is pinned outside the nexus-writable tree, and the
+        // argv is exactly [wrapper, mode, version] for every mode — this is
+        // what the frozen sudoers wildcard (`nexus-apply-release *`) matches.
+        assert_eq!(
+            apply_release_argv("apply", "0.1.171"),
+            ["/usr/local/sbin/nexus-apply-release", "apply", "0.1.171"]
+        );
+        assert_eq!(
+            apply_release_argv("reflip", "0.1.170"),
+            ["/usr/local/sbin/nexus-apply-release", "reflip", "0.1.170"]
+        );
+        assert_eq!(
+            apply_release_argv("prune", "0.1.170"),
+            ["/usr/local/sbin/nexus-apply-release", "prune", "0.1.170"]
+        );
     }
 }

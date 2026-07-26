@@ -108,12 +108,17 @@ The wedge plan that drives the next three phases of work is
    (systemd). There is no Docker on the edge, no sidecar updater, no shared socket. The
    small amount of privileged work an OTA needs (extract into
    `/opt/nexus/releases/<version>/`, install that release's declared apt runtime
-   deps via the pinned root-owned `/usr/local/sbin/nexus-apply-deps` wrapper, flip
-   `/opt/nexus/current`, run `systemctl restart nexus-engine`) is gated through a
-   single `/etc/sudoers.d/nexus-update` entry in [deploy/sudoers.d/](deploy/sudoers.d/)
-   that whitelists only those exact commands. The dep wrapper lives outside the
-   OTA-writable tree and enforces its own package allowlist, so it never grants
-   general `apt`. See
+   deps + journald cap, flip `/opt/nexus/current`, run `systemctl restart
+   nexus-engine`, prune stale releases) is performed by a SINGLE pinned, root-owned
+   applier `/usr/local/sbin/nexus-apply-release` (modes `apply`/`reflip`/`prune`,
+   delegating deps to `/usr/local/sbin/nexus-apply-deps`). The
+   `/etc/sudoers.d/nexus-update` entry in [deploy/sudoers.d/](deploy/sudoers.d/)
+   grants exactly ONE command — a stable, argv-independent wildcard on that applier —
+   so the engine's privileged behaviour can change without ever editing sudoers again
+   (the old per-argv rules coupled sudoers byte-for-byte to the engine's `Command`
+   calls, and drift there could brick an OTA). Both wrappers live outside the
+   OTA-writable tree and enforce their own arg/package allowlists, so the grant never
+   confers general `apt`, `tar`, `ln`, `systemctl`, or `rm`. See
    [REPO_BOUNDARY R8](../nexus-cloud-console/docs/REPO_BOUNDARY.md#r8-edge-runs-as-a-single-nexus-engine-process-privileged-work-is-sudoers-gated).
 
 ## Conventions

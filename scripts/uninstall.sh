@@ -111,6 +111,15 @@ if [[ -e /etc/sudoers.d/nexus-update ]]; then
     rm -f /etc/sudoers.d/nexus-update
 fi
 
+# --- Remove the root-owned OTA wrappers (outside $NEXUS_PREFIX) ----------------
+
+for w in /usr/local/sbin/nexus-apply-release /usr/local/sbin/nexus-apply-deps; do
+    if [[ -e "$w" ]]; then
+        log "removing $w"
+        rm -f "$w"
+    fi
+done
+
 # --- Remove binaries under $NEXUS_PREFIX --------------------------------------
 
 if (( KEEP_RELEASES )); then

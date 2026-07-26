@@ -2988,10 +2988,13 @@ install_journald_cap() {
 # --- OTA sudoers allowlist ----------------------------------------------------
 
 # Phase 9 (M_OTA). Install the narrow sudoers rule that lets the
-# unprivileged `nexus` service user run the three pinned OTA commands
-# (tar extract, symlink flip, self restart) as root NOPASSWD. Validated
-# with `visudo -cf` before it lands so a malformed file can never wedge
-# sudo for the whole box.
+# unprivileged `nexus` service user run the SINGLE pinned OTA applier
+# (/usr/local/sbin/nexus-apply-release, which internally does extract →
+# deps/journald → symlink flip → restart) as root NOPASSWD. The grant is an
+# argv-independent wildcard on that one fixed path, so the engine's privileged
+# behaviour can change without ever re-editing this file. Validated with
+# `visudo -cf` before it lands so a malformed file can never wedge sudo for
+# the whole box.
 install_update_sudoers() {
     local release_dir="$1"
     local src="$release_dir/etc-templates/sudoers.d/nexus-update"
@@ -3038,6 +3041,29 @@ install_apply_deps_wrapper() {
     install -d -o root -g root -m 0755 /usr/local/sbin
     install -o root -g root -m 0755 "$src" "$target"
     log "installed OTA runtime-dep wrapper: $target"
+}
+
+# Phase 9 (M_OTA, frozen-privilege refactor). Install the pinned, root-owned
+# SINGLE OTA applier to /usr/local/sbin/nexus-apply-release (root:root 0755) —
+# OUTSIDE the OTA-writable /opt/nexus tree. This is the ONE command the
+# nexus-update sudoers rule grants; it internally does extract → deps/journald
+# (via nexus-apply-deps) → symlink flip → restart (mode `apply`), plus `reflip`
+# (rollback) and post-health `prune`. Because the sudoers grant is a stable
+# wildcard on this fixed path, the engine's privileged behaviour can change
+# without ever editing sudoers again — the class of argv-drift bricks that took
+# down a cloud OTA is gone. Idempotent: a re-run refreshes the wrapper in place.
+install_apply_release_wrapper() {
+    local release_dir="$1"
+    local src="$release_dir/scripts/nexus-apply-release"
+    local target="/usr/local/sbin/nexus-apply-release"
+
+    if [[ ! -r "$src" ]]; then
+        warn "OTA release applier not in release ($src); OTA apply will fail"
+        return 0
+    fi
+    install -d -o root -g root -m 0755 /usr/local/sbin
+    install -o root -g root -m 0755 "$src" "$target"
+    log "installed OTA release applier: $target"
 }
 
 # --- Health check -------------------------------------------------------------

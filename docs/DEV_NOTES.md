@@ -283,8 +283,12 @@ The cloud-orchestrated updater is **in-process** — it lives in
 [`crates/nexus-engine/src/cloud_update.rs`](../crates/nexus-engine/src/cloud_update.rs),
 not a separate binary. It reacts to `update_assignment` /
 `update_rollback` frames off the cloud tunnel. Flow: Ed25519-verify
-the release manifest → download + SHA-256 → sudoers-gated
-extract/flip/restart → post-restart health check. Each step is
+the release manifest → preflight the privileged surface (`sudo -n -l`
+the applier) → download + SHA-256 → stage the tarball and hand the
+whole privileged sequence to the single root-owned applier
+`/usr/local/sbin/nexus-apply-release apply <version>`
+(extract → deps/journald → flip → restart) → post-restart health
+check → post-health prune. Each step is
 reported as an `update_progress` phase (`verifying_signature`,
 `fetching_artifact`, `draining`, `restarting`, `verifying_health`,
 `success`, `failed:<code>`). `UpdateState` is persisted in the
@@ -305,9 +309,18 @@ Dev/test notes:
   post-restart version mismatch (`crash_count >= 3`), self-issuing a
   local `handle_rollback` to `previous_good` with `actor_token: None`
   (never crosses the tunnel, so no token to verify).
-- The privileged commands must stay byte-for-byte in sync with
-  [`deploy/sudoers.d/nexus-update`](../deploy/sudoers.d/nexus-update);
-  any drift breaks the extract/flip/restart step at runtime.
+- The privileged surface is a SINGLE frozen sudoers grant on
+  `/usr/local/sbin/nexus-apply-release`
+  ([`deploy/sudoers.d/nexus-update`](../deploy/sudoers.d/nexus-update)).
+  Because the grant is an argv-independent wildcard, the engine's
+  `Command` argv can change without any sudoers edit — the old
+  per-command byte-for-byte coupling (which could brick an OTA on
+  drift) is gone. A drifted/old sudoers file is caught by the
+  `sudo -n -l` preflight, failing fast with `failed:privsurface_drift`
+  instead of a half-applied update. Adding a NEW kind of privileged
+  action is a deliberate edit to the applier
+  ([`deploy/nexus-apply-release`](../deploy/nexus-apply-release)),
+  adopted via one install.sh run.
 
 ## See also
 

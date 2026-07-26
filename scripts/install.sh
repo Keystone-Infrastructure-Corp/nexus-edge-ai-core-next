@@ -425,6 +425,14 @@ install_update_sudoers "$RELEASE_DIR"
 
 install_apply_deps_wrapper "$RELEASE_DIR"
 
+# --- OTA release applier (single privileged entrypoint) -----------------------
+# Root-owned applier (/usr/local/sbin/nexus-apply-release) — the ONE command
+# the nexus-update sudoers rule grants. Does extract → deps → flip → restart
+# (apply), plus rollback (reflip) and post-health prune. Installing it is what
+# lets the sudoers grant stay a frozen, argv-independent wildcard.
+
+install_apply_release_wrapper "$RELEASE_DIR"
+
 # --- Atomic swap --------------------------------------------------------------
 
 previous="$(swap_current_symlink "$VERSION")"

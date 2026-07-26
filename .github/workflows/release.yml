@@ -93,6 +93,8 @@ jobs:
   #   └── scripts/
   #       ├── install.sh                  (in-tarball installer)
   #       ├── uninstall.sh
+  #       ├── nexus-apply-release         (single root-owned OTA applier;
+  #       │                                copied to /usr/local/sbin on install)
   #       ├── nexus-apply-deps            (pinned OTA runtime-dep installer;
   #       │                                copied to /usr/local/sbin on install)
   #       └── lib/install-common.sh
@@ -539,8 +541,13 @@ jobs:
           # /usr/local/sbin/nexus-apply-deps (root:root 0755).
           cp deploy/apt-requirements.txt "$R/share/apt-requirements.txt"
           cp deploy/nexus-apply-deps     "$R/scripts/nexus-apply-deps"
+          # Phase 9 (frozen-privilege refactor) — the SINGLE privileged OTA
+          # applier the nexus-update sudoers rule grants; scripts/install.sh
+          # copies it to /usr/local/sbin/nexus-apply-release (root:root 0755).
+          cp deploy/nexus-apply-release  "$R/scripts/nexus-apply-release"
           chmod +x "$R/scripts/install.sh" "$R/scripts/uninstall.sh" \
-                   "$R/scripts/nexus-apply-deps"
+                   "$R/scripts/nexus-apply-deps" \
+                   "$R/scripts/nexus-apply-release"
 
           echo "$TAG" > "$R/VERSION"
 
