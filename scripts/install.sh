@@ -142,9 +142,11 @@ Host-preparation flags (all ON by default — opt out per-step):
                                     * AMD Radeon iGPU/dGPU (Mesa VA-API)
                                     * Hailo-8 / 8L M.2 (HailoRT .debs;
                                       see --hailo-deb-url below)
-                                    * NVIDIA GPU (driver install pending M5)
+                                    * NVIDIA GPU (proprietary driver +
+                                      CUDA runtime + CUDA ONNX Runtime)
                                   If the Intel NPU needs an HWE kernel
-                                  upgrade, install.sh stages the kernel
+                                  upgrade, or the NVIDIA driver needs to
+                                  displace nouveau, install.sh stages it
                                   and exits asking for a reboot.
   --hailo-deb-url <url>           HailoRT runtime .deb presigned URL
                                   (right-click the developer-zone link).
