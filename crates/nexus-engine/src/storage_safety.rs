@@ -72,7 +72,6 @@ const MAX_RECLAIM_STEPS_PER_TICK: u32 = 64;
 /// batch.
 const RECLAIM_REPROBE_EVERY: u32 = 8;
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
     #[error("io: {0}")]
@@ -481,10 +480,7 @@ pub async fn run_storage_safety(
                         signal.set(controller.level());
                         if matches!(lvl, Transition::Exited(WatermarkLevel::Ok)) {
                             recorder.set_panic(false);
-                            info!(
-                                free_pct = p,
-                                "storage recovered to Ok during reclaim batch"
-                            );
+                            info!(free_pct = p, "storage recovered to Ok during reclaim batch");
                             publish_storage_event(&bus, &cfg, controller.level(), p).await;
                         }
                         if controller.level() == WatermarkLevel::Ok {
