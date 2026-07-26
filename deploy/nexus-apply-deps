@@ -3,13 +3,14 @@
 #
 # Installed by scripts/install.sh to /usr/local/sbin/nexus-apply-deps
 # (root:root 0755) — deliberately OUTSIDE the OTA-writable /opt/nexus tree so
-# the unprivileged `nexus` service user cannot tamper with it. It is the ONLY
-# command beyond `tar` / `ln` / `systemctl restart` that the nexus-update
-# sudoers rule lets `nexus` run as root, and it is invoked by the OTA apply
-# path (crates/nexus-engine/src/cloud_update.rs), right after the tarball is
-# extracted and BEFORE the `current` symlink is flipped, as:
+# the unprivileged `nexus` service user cannot tamper with it. It is invoked
+# (already as root, no sudo) by the single OTA applier
+# /usr/local/sbin/nexus-apply-release during `apply`, right after the tarball
+# is extracted and BEFORE the `current` symlink is flipped, as:
 #
-#   sudo /usr/local/sbin/nexus-apply-deps /opt/nexus/releases/<version>
+#   /usr/local/sbin/nexus-apply-deps /opt/nexus/releases/<version> --no-prune
+#
+# (install.sh calls it directly, without --no-prune, on a fresh install.)
 #
 # Running as root on every OTA, it applies this release's privileged, root-side
 # bits — the actions the unprivileged engine cannot do itself — so they take
@@ -51,8 +52,18 @@ warn() { printf 'nexus-apply-deps: WARN: %s\n' "$*" >&2; }
 
 release_dir="${1:-}"
 if [[ -z "$release_dir" || ! -d "$release_dir" ]]; then
-    warn "usage: nexus-apply-deps <release_dir> (got '${1:-}')"
+    warn "usage: nexus-apply-deps <release_dir> [--no-prune] (got '${1:-}')"
     exit 2
+fi
+
+# Optional `--no-prune`: skip step 3. The single privileged OTA entrypoint
+# (/usr/local/sbin/nexus-apply-release) calls us with --no-prune during
+# `apply` so a failed apply can never delete the rollback target; pruning is
+# deferred to its post-health `prune` mode. A direct install.sh call omits the
+# flag and prunes as before.
+prune_enabled=1
+if [[ "${2:-}" == "--no-prune" ]]; then
+    prune_enabled=0
 fi
 
 # Derive the on-box layout from the release-dir argument
@@ -213,5 +224,9 @@ prune_old_releases() {
 # on optional plugins, log hygiene, or release pruning.
 apply_apt_deps
 apply_journald_cap
-prune_old_releases
+if (( prune_enabled )); then
+    prune_old_releases
+else
+    log "--no-prune: skipping release pruning (deferred to post-health prune)"
+fi
 exit 0

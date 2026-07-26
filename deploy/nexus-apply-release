@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# nexus-apply-release — pinned, root-owned OTA release applier (the SINGLE
+# privileged entrypoint of the OTA path).
+#
+# Installed by scripts/install.sh to /usr/local/sbin/nexus-apply-release
+# (root:root 0755) — deliberately OUTSIDE the OTA-writable /opt/nexus tree so
+# the unprivileged `nexus` service user cannot tamper with it. It is the ONLY
+# command the `nexus-update` sudoers rule lets `nexus` run as root:
+#
+#   nexus ALL=(root) NOPASSWD: /usr/local/sbin/nexus-apply-release *
+#
+# WHY THIS EXISTS — the frozen privileged surface.
+# ------------------------------------------------
+# The OTA path used to whitelist the *exact argv* of four separate commands
+# (`tar -xzf …`, `nexus-apply-deps …`, `ln -sfn …`, `systemctl --no-block
+# restart …`) in /etc/sudoers.d/nexus-update. That coupled the sudoers file
+# byte-for-byte to the engine's `std::process::Command` argv: any drift — a new
+# flag, a reordered arg, an old sudoers file left on a box — made `sudo` refuse
+# the command and BRICKED the OTA (an OTA cannot rewrite its own sudoers, which
+# lives outside the nexus-writable tree). See the postmortem: an old sudoers
+# line without `--no-block` rejected the restart and both the apply AND the
+# rollback failed → `failed:rollback_also_failed`.
+#
+# This wrapper removes that whole class of failure: the sudoers grant is now a
+# STABLE, argv-independent wildcard on ONE fixed path. The engine's privileged
+# behaviour can evolve freely (this file is fixed, audited root code); the
+# signed release supplies only DATA (which files exist, the apt list, the
+# journald config), never new privileged behaviour or new argv. Adding a NEW
+# kind of privileged action is a deliberate edit to THIS file, adopted via one
+# install.sh/bootstrap run; thereafter it rides every OTA without ever touching
+# sudoers again.
+#
+# MODES (arg1 is a fixed subcommand — the sudoers `*` matches it plus the
+# version, but this script validates both strictly before doing anything):
+#
+#   apply  <version>   Full OTA apply. Extract the staged tarball
+#                      (/opt/nexus/staging/update.tar.gz) into
+#                      /opt/nexus/releases, verify releases/<version>/
+#                      materialised, apply the release's privileged root-side
+#                      bits (apt deps + journald cap, via nexus-apply-deps,
+#                      WITHOUT pruning), flip /opt/nexus/current → the new
+#                      release, and `systemctl --no-block restart
+#                      nexus-engine`. Prune is deliberately NOT run here so the
+#                      rollback target survives a failed apply.
+#
+#   reflip <version>   Rollback / re-point only. The release is already on disk
+#                      and was Ed25519-verified at its original apply; flip
+#                      `current` back to it and restart. No tarball, no deps.
+#
+#   prune  <version>   Reap stale release trees under /opt/nexus/releases,
+#                      keeping ONLY the `current` target and <version>. Run by
+#                      the NEW engine AFTER it has booted and passed its health
+#                      check, so a rollback target is never deleted before the
+#                      new version proves healthy.
+#
+# EXIT CODES. `apply`/`reflip` return NON-ZERO on any hard failure (extract,
+# missing release dir, symlink flip, or restart) so the engine can report a
+# real terminal `failed` and roll back. The apt/journald sub-steps and `prune`
+# are best-effort and never fail the apply. `--no-block` on the restart is
+# load-bearing (see the byte-for-byte note in
+# crates/nexus-engine/src/cloud_update.rs) — the sudo child shares the engine
+# cgroup and is SIGTERM'd on unit stop before it can return.
+set -euo pipefail
+
+log()  { printf 'nexus-apply-release: %s\n' "$*"; }
+warn() { printf 'nexus-apply-release: WARN: %s\n' "$*" >&2; }
+die()  { printf 'nexus-apply-release: ERROR: %s\n' "$*" >&2; exit 1; }
+
+mode="${1:-}"
+version="${2:-}"
+
+# Fixed on-box layout. NEXUS_PREFIX is overridable ONLY for offline tests (a
+# direct, non-sudo invocation); under the real OTA sudo scrubs the environment,
+# so production always uses the real /opt/nexus tree.
+prefix="${NEXUS_PREFIX:-/opt/nexus}"
+releases_dir="$prefix/releases"
+current_link="$prefix/current"
+staged_tarball="$prefix/staging/update.tar.gz"
+apply_deps="/usr/local/sbin/nexus-apply-deps"
+
+# Strict validation of the release version. sudo's `*` never matches `/`, but
+# defence-in-depth: a version is a bounded token of the release-tag charset,
+# never a path. This is the load-bearing guard that lets the sudoers grant be a
+# simple wildcard.
+validate_version() {
+    [[ -n "$version" ]] || die "missing <version> for '$mode'"
+    [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+        || die "invalid version '$version' (charset)"
+    [[ "$version" != *".."* ]] || die "invalid version '$version' (path traversal)"
+}
+
+release_path=""
+resolve_release_path() {
+    release_path="$releases_dir/$version"
+}
+
+# ---- symlink flip + unit restart (shared by apply + reflip) -----------------
+# The two operations that MUST succeed for the version to take effect. Any
+# failure here is a hard, non-zero exit so the engine reports a terminal state.
+flip_and_restart() {
+    if ! ln -sfn "$release_path" "$current_link"; then
+        die "failed to flip $current_link -> $release_path"
+    fi
+    log "flipped $current_link -> $release_path"
+    # --no-block: enqueue the restart job and return 0 immediately, BEFORE
+    # systemd stops this unit's cgroup (which would SIGTERM this very process
+    # and make the restart look failed). Mirror any change to the engine's
+    # expectation in crates/nexus-engine/src/cloud_update.rs.
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl --no-block restart nexus-engine; then
+            die "systemctl --no-block restart nexus-engine failed"
+        fi
+        log "restart enqueued for nexus-engine"
+    else
+        warn "no systemctl on PATH — skipping restart (test host?)"
+    fi
+}
+
+do_apply() {
+    validate_version
+    resolve_release_path
+
+    [[ -r "$staged_tarball" ]] || die "staged tarball not found: $staged_tarball"
+    install -d -m 0755 "$releases_dir" 2>/dev/null || true
+
+    # Extract the staged tarball. Its single top-level dir is the bare
+    # <version>, so (no --strip-components) the tree lands at
+    # releases/<version>/.
+    if ! tar -xzf "$staged_tarball" -C "$releases_dir"; then
+        die "tar extract failed: $staged_tarball -> $releases_dir"
+    fi
+    [[ -d "$release_path" ]] \
+        || die "extracted release dir missing: $release_path (tarball top-level != bare version?)"
+    log "extracted release: $release_path"
+
+    # Privileged, best-effort root-side bits (apt deps + journald cap). We are
+    # already root, so call the deps wrapper directly (no sudo). --no-prune:
+    # pruning is deferred to the post-health `prune` mode so a failed apply can
+    # never delete the rollback target.
+    if [[ -x "$apply_deps" ]]; then
+        if "$apply_deps" "$release_path" --no-prune; then
+            log "applied release privileged config (deps + journald)"
+        else
+            warn "nexus-apply-deps exited non-zero; proceeding with flip (optional features may degrade)"
+        fi
+    else
+        warn "no $apply_deps on box — skipping deps/journald (optional features may degrade)"
+    fi
+
+    flip_and_restart
+}
+
+do_reflip() {
+    validate_version
+    resolve_release_path
+    [[ -d "$release_path" ]] || die "rollback target not on disk: $release_path"
+    flip_and_restart
+}
+
+# ---- prune (post-health; best-effort, never fails the caller) ---------------
+# Keep ONLY the `current` target and <version>. Fail-closed (delete nothing) on
+# an empty keep set; stay bounded to $releases_dir; only ever operate on a real
+# ".../releases" dir. This is a `rm -rf` wrapper, so be conservative.
+do_prune() {
+    validate_version
+    if [[ ! -d "$releases_dir" ]]; then
+        log "no releases dir ($releases_dir) — nothing to prune"
+        return 0
+    fi
+    if [[ "$(basename "$releases_dir")" != "releases" ]]; then
+        warn "refusing to prune: $releases_dir is not a 'releases' directory"
+        return 0
+    fi
+    declare -A keep=()
+    local curv dir name removed=0
+    [[ -d "$releases_dir/$version" ]] && keep["$version"]=1
+    if [[ -L "$current_link" ]]; then
+        curv="$(basename "$(readlink -f "$current_link" 2>/dev/null || true)")"
+        [[ -n "$curv" && -d "$releases_dir/$curv" ]] && keep["$curv"]=1
+    fi
+    if (( ${#keep[@]} == 0 )); then
+        warn "empty keep set — refusing to prune releases (fail-closed)"
+        return 0
+    fi
+    log "keeping releases: ${!keep[*]}"
+    shopt -s nullglob
+    for dir in "$releases_dir"/*/; do
+        name="$(basename "$dir")"
+        [[ -n "${keep[$name]:-}" ]] && continue
+        if rm -rf -- "$dir"; then
+            log "pruned old release: $name"
+            removed=$(( removed + 1 ))
+        else
+            warn "failed to prune '$name' (will retry next OTA)"
+        fi
+    done
+    shopt -u nullglob
+    log "pruned $removed old release(s)"
+    return 0
+}
+
+case "$mode" in
+    apply)  do_apply ;;
+    reflip) do_reflip ;;
+    prune)  do_prune ;;
+    *)      die "usage: nexus-apply-release {apply|reflip|prune} <version> (got mode='${mode}')" ;;
+esac
+
+exit 0

@@ -1,58 +1,46 @@
 # nexus-update sudoers entry — installed to /etc/sudoers.d/nexus-update
 #
 # Phase 9 (M_OTA) + Phase 10 (runtime-dep auto-install). Grants the
-# unprivileged `nexus` service user the narrow set of privileged
-# commands an OTA apply needs, and ONLY those four exact commands,
-# NOPASSWD (the engine runs unattended).
+# unprivileged `nexus` service user exactly ONE privileged command: the pinned,
+# root-owned OTA applier at /usr/local/sbin/nexus-apply-release.
 #
-# Every command, argument, and path here MUST match byte-for-byte the
-# `std::process::Command` invocations in
-# `crates/nexus-engine/src/cloud_update.rs` (`install_release` +
-# `flip_and_restart`). sudo matches the command line against these
-# rules; any drift (a renamed path, an extra flag) makes the apply
-# fail closed with a sudo password prompt that never gets answered.
+# WHY A SINGLE STABLE GRANT (and not per-command argv rules).
+# ----------------------------------------------------------
+# This file used to whitelist the *exact argv* of four separate commands
+# (`tar`, `ln`, `systemctl --no-block restart`, `nexus-apply-deps`). That
+# coupled these bytes to the engine's `std::process::Command` calls: any drift
+# — a new flag, a reordered arg, or simply an OLD copy of this file left on a
+# box — made sudo refuse the command and BRICKED the OTA (an OTA cannot rewrite
+# its own sudoers, which lives outside the nexus-writable tree). A real
+# postmortem: an old sudoers line missing `--no-block` rejected the restart, so
+# BOTH the apply and the rollback failed → `failed:rollback_also_failed`, and
+# the box silently kept running the deleted old binary.
 #
-# Scope rationale:
-#   - `tar -xzf <staged> -C <releases>`: extract the verified tarball
-#     (signature + sha256 already checked in-process by the engine
-#     BEFORE this runs) into /opt/nexus/releases/<version>/.
-#   - `ln -sfn /opt/nexus/releases/* /opt/nexus/current`: atomic flip
-#     of the live symlink. The `*` wildcard covers the per-version
-#     release dir; sudo's wildcard does NOT cross `/`, so this cannot
-#     be coerced into linking an arbitrary tree outside releases/.
-#   - `systemctl --no-block restart nexus-engine`: restart into the new
-#     version. `--no-block` enqueues the job and returns immediately, BEFORE
-#     systemd stops this unit's control-group — without it the `sudo
-#     systemctl` child (same cgroup as the engine) is killed by the unit-stop
-#     SIGTERM before it can return, and the engine reports a spurious update
-#     `failed` even though the restart succeeds. Pinned to the single unit; a
-#     compromised engine cannot pivot to `systemctl` against any other unit,
-#     `apt`, etc.
-#   - `nexus-apply-deps /opt/nexus/releases/*`: install the new release's
-#     DECLARED apt runtime deps (share/apt-requirements.txt) so an OTA
-#     never needs an operator to hand-install a package. This is a FIXED
-#     root-owned wrapper at /usr/local/sbin/nexus-apply-deps (installed by
-#     scripts/install.sh, OUTSIDE the nexus-writable /opt/nexus tree) that
-#     enforces its OWN package allowlist (gstreamer1.0-* + an explicit
-#     media set) — so this rule does NOT grant general `apt`. The `*`
-#     wildcard does not cross `/`, so it cannot escape releases/. The SAME
-#     wrapper also (as fixed, audited root code — NOT release-controlled)
-#     installs the release's journald size-cap drop-in and prunes stale
-#     release trees under /opt/nexus/releases (keeping the incoming version +
-#     the `current`/rollback one). Those extra actions need NO additional rule
-#     because the wrapper already runs as root under this one — which is what
-#     lets journald + release pruning ride a cloud OTA, not just a fresh
-#     install.
+# The grant below is now argv-independent and FROZEN. All privileged OTA
+# behaviour lives in the fixed, audited root-owned wrapper
+# /usr/local/sbin/nexus-apply-release (extract → deps/journald → symlink flip →
+# restart, plus `reflip` for rollback and post-health `prune`). The engine's
+# privileged behaviour can evolve freely without ever touching this file again;
+# the signed release supplies only DATA, never new argv. Changing the privileged
+# surface is a deliberate edit to the wrapper, adopted via one install.sh run.
 #
-# The bytes of the artifact never transit this boundary — the engine
-# downloads + verifies them as the `nexus` user; sudo only touches
-# already-staged, already-verified files.
+# Security scope:
+#   - Pinned to a SINGLE absolute path outside the nexus-writable /opt/nexus
+#     tree, so a compromised engine cannot swap the wrapper.
+#   - The trailing `*` matches the subcommand + version argument
+#     (`apply <version>`, `reflip <version>`, `prune <version>`). sudo's `*`
+#     does NOT cross `/`, so no path argument can be smuggled through; the
+#     wrapper additionally validates the version charset and rejects path
+#     traversal before doing anything.
+#   - The wrapper enforces its own apt allowlist and `rm -rf` keep-set, so this
+#     rule grants NO general `apt`, `systemctl`, `tar`, or `rm` power.
+#
+# The bytes of the artifact never transit this boundary — the engine downloads
+# + verifies (Ed25519 signature + sha256) them as the `nexus` user and stages
+# the tarball; the wrapper only touches already-staged, already-verified files.
 #
 # Install:
 #   sudo install -m 0440 -o root -g root deploy/sudoers.d/nexus-update \
 #       /etc/sudoers.d/nexus-update
 #   sudo visudo -cf /etc/sudoers.d/nexus-update   # validate
-nexus ALL=(root) NOPASSWD: /usr/bin/tar -xzf /opt/nexus/staging/update.tar.gz -C /opt/nexus/releases
-nexus ALL=(root) NOPASSWD: /usr/bin/ln -sfn /opt/nexus/releases/* /opt/nexus/current
-nexus ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block restart nexus-engine
-nexus ALL=(root) NOPASSWD: /usr/local/sbin/nexus-apply-deps /opt/nexus/releases/*
+nexus ALL=(root) NOPASSWD: /usr/local/sbin/nexus-apply-release *
