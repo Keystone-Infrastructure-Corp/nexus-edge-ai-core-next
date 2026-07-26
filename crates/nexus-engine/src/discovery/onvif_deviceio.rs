@@ -188,6 +188,16 @@ pub async fn create_text_osd(
 }
 
 /// Update an existing plain-text OSD.
+///
+/// Uses read-modify-write: fetch the camera's current OSD and echo it back
+/// verbatim with ONLY the plain text + position patched. Many firmwares
+/// (Hikvision / Dahua) fault a stripped-down `SetOSD` with
+/// `ter:InvalidParameter` when it drops fields they returned (FontColor,
+/// FontSize, `IsPersistentText`, DateFormat, …) or changes the
+/// `VideoSourceConfigurationToken`; echoing the camera's own OSD back
+/// sidesteps that whole class of rejection. Falls back to a freshly
+/// synthesized body when the current OSD can't be read (e.g. the camera is
+/// unreachable, or the token isn't in `GetOSDs`).
 pub async fn set_text_osd(
     endpoint: &str,
     username: &str,
@@ -197,12 +207,35 @@ pub async fn set_text_osd(
     position: &str,
     text: &str,
 ) -> Result<(), String> {
-    let osd = osd_text_body(Some(osd_token), video_source_config_token, position, text);
+    let osd = read_modify_osd(endpoint, username, password, osd_token, position, text)
+        .await
+        .unwrap_or_else(|| {
+            osd_text_body(Some(osd_token), video_source_config_token, position, text)
+        });
     let body = format!("<tr2:SetOSD>{osd}</tr2:SetOSD>");
     MEDIA2
         .call(endpoint, username, password, "SetOSD", &body)
         .await
         .map(|_| ())
+}
+
+/// Fetch the camera's OSDs and return the target OSD (by token) as a
+/// ready-to-send `<tr2:OSD>` element with its plain text + position patched
+/// and every other field preserved. `None` when the OSD can't be fetched or
+/// the token isn't present, so the caller can synthesize a minimal body.
+async fn read_modify_osd(
+    endpoint: &str,
+    username: &str,
+    password: &str,
+    osd_token: &str,
+    position: &str,
+    text: &str,
+) -> Option<String> {
+    let resp = MEDIA2
+        .call(endpoint, username, password, "GetOSDs", "<tr2:GetOSDs/>")
+        .await
+        .ok()?;
+    patch_osd_subtree(&resp, osd_token, position, text)
 }
 
 /// Delete an OSD.
@@ -236,6 +269,125 @@ fn osd_text_body(osd_token: Option<&str>, vsct: &str, position: &str, text: &str
         pos = xml_escape(position),
         text = xml_escape(text),
     )
+}
+
+/// Re-emit the OSD whose `token` matches, taken from a `GetOSDs` response, as
+/// a ready-to-send `<tr2:OSD token="…">…</tr2:OSD>` element: child element
+/// prefixes are normalized to `tt:` (the SetOSD envelope declares `tt`/`tr2`)
+/// and only the `Position/Type` and `TextString/PlainText` leaves are
+/// patched. Every other field the camera returned (FontColor, FontSize,
+/// `IsPersistentText`, DateFormat, …) is echoed back verbatim so the round
+/// trip doesn't trip `ter:InvalidParameter`. `None` when the token isn't
+/// found (the caller then synthesizes a minimal body).
+fn patch_osd_subtree(
+    response: &str,
+    osd_token: &str,
+    position: &str,
+    text: &str,
+) -> Option<String> {
+    let mut reader = Reader::from_str(response);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out = String::new();
+    let mut in_target = false;
+    let mut found = false;
+    // Local names of the OSD wrapper's currently-open child elements.
+    let mut stack: Vec<String> = Vec::new();
+    // Depth of a patched leaf (`Position/Type`, `TextString/PlainText`) whose
+    // original text + close tag we suppress — we already emitted the full
+    // replacement element at its start.
+    let mut suppress: Option<usize> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let n = local_name(&e.name());
+                if !in_target {
+                    if is_osd_element(&n) && attr_str(&e, "token").as_deref() == Some(osd_token) {
+                        in_target = true;
+                        found = true;
+                        out.push_str(&format!("<tr2:OSD token=\"{}\">", xml_escape(osd_token)));
+                    }
+                    // Elements outside the target OSD are skipped entirely.
+                } else {
+                    stack.push(n.clone());
+                    if suppress.is_some() {
+                        // Inside an already-emitted patched leaf — drop nested content.
+                    } else {
+                        let parent = (stack.len() >= 2).then(|| stack[stack.len() - 2].as_str());
+                        if n == "PlainText" && parent == Some("TextString") {
+                            out.push_str(&format!(
+                                "<tt:PlainText>{}</tt:PlainText>",
+                                xml_escape(text)
+                            ));
+                            suppress = Some(stack.len());
+                        } else if n == "Type" && parent == Some("Position") {
+                            out.push_str(&format!("<tt:Type>{}</tt:Type>", xml_escape(position)));
+                            suppress = Some(stack.len());
+                        } else {
+                            out.push_str(&format!("<tt:{n}{}>", osd_attrs(&e)));
+                        }
+                    }
+                }
+            }
+            Ok(Event::Empty(e)) if in_target && suppress.is_none() => {
+                let n = local_name(&e.name());
+                let parent = stack.last().map(String::as_str);
+                if n == "PlainText" && parent == Some("TextString") {
+                    out.push_str(&format!(
+                        "<tt:PlainText>{}</tt:PlainText>",
+                        xml_escape(text)
+                    ));
+                } else if n == "Type" && parent == Some("Position") {
+                    out.push_str(&format!("<tt:Type>{}</tt:Type>", xml_escape(position)));
+                } else {
+                    out.push_str(&format!("<tt:{n}{}/>", osd_attrs(&e)));
+                }
+            }
+            Ok(Event::Text(t)) if in_target && suppress.is_none() => {
+                if let Ok(s) = t.unescape() {
+                    out.push_str(&xml_escape(&s));
+                }
+            }
+            Ok(Event::End(_)) if in_target => {
+                if stack.is_empty() {
+                    // Closing the OSD wrapper itself.
+                    out.push_str("</tr2:OSD>");
+                    break;
+                }
+                let d = stack.len();
+                let n = stack.pop().unwrap_or_default();
+                if suppress == Some(d) {
+                    suppress = None; // full element already emitted; skip its close
+                } else if suppress.is_none() {
+                    out.push_str(&format!("</tt:{n}>"));
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    (found && out.ends_with("</tr2:OSD>")).then_some(out)
+}
+
+/// Serialize a start element's attributes as ` local="value"` pairs, dropping
+/// namespace declarations (the SetOSD envelope re-declares `tt`/`tr2`).
+fn osd_attrs(e: &BytesStart) -> String {
+    let mut s = String::new();
+    for a in e.attributes().flatten() {
+        let raw = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
+        if raw == "xmlns" || raw.starts_with("xmlns:") {
+            continue;
+        }
+        let ln = raw.rsplit(':').next().unwrap_or(raw);
+        let v = a
+            .unescape_value()
+            .map(|v| v.into_owned())
+            .unwrap_or_default();
+        s.push_str(&format!(" {ln}=\"{}\"", xml_escape(&v)));
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +787,77 @@ mod tests {
         // Image OSDs parse too (with no text); osd_display_name skips them.
         assert_eq!(osds[1].osd_type.as_deref(), Some("Image"));
         assert_eq!(osds[1].text, None);
+    }
+
+    #[test]
+    fn patch_osd_subtree_preserves_camera_fields() {
+        // A camera OSD carrying extra fields (IsPersistentText, FontSize,
+        // FontColor) that strict firmwares require echoed back on SetOSD.
+        let resp = wrap(
+            r#"<tr2:GetOSDsResponse>
+                <tr2:OSDs token="OsdToken_100">
+                    <tt:VideoSourceConfigurationToken>VideoSourceConfig_1</tt:VideoSourceConfigurationToken>
+                    <tt:Type>Text</tt:Type>
+                    <tt:Position><tt:Type>UpperLeft</tt:Type></tt:Position>
+                    <tt:TextString IsPersistentText="true"><tt:Type>Plain</tt:Type><tt:FontSize>32</tt:FontSize><tt:FontColor><tt:Color X="1" Y="0" Z="0"/></tt:FontColor><tt:PlainText>Front Door</tt:PlainText></tt:TextString>
+                </tr2:OSDs>
+                <tr2:OSDs token="OsdToken_101"><tt:Type>Image</tt:Type></tr2:OSDs>
+            </tr2:GetOSDsResponse>"#,
+        );
+        let osd =
+            patch_osd_subtree(&resp, "OsdToken_100", "LowerRight", "Dock 7").expect("patched");
+        // Well-formed as a SetOSD body under the standard tt/tr2 envelope.
+        assert_well_formed(&wrap(&format!("<tr2:SetOSD>{osd}</tr2:SetOSD>")));
+        // Wrapper renamed to the singular request element, carrying the token.
+        assert!(osd.starts_with("<tr2:OSD token=\"OsdToken_100\">"), "{osd}");
+        assert!(osd.ends_with("</tr2:OSD>"), "{osd}");
+        // Only the text + position leaves change.
+        assert!(osd.contains("<tt:PlainText>Dock 7</tt:PlainText>"), "{osd}");
+        assert!(
+            osd.contains("<tt:Position><tt:Type>LowerRight</tt:Type></tt:Position>"),
+            "{osd}"
+        );
+        assert!(!osd.contains("Front Door"), "{osd}");
+        assert!(!osd.contains("UpperLeft"), "{osd}");
+        // Everything else the camera returned is echoed back verbatim.
+        assert!(
+            osd.contains("<tt:VideoSourceConfigurationToken>VideoSourceConfig_1</tt:VideoSourceConfigurationToken>"),
+            "{osd}"
+        );
+        assert!(osd.contains("IsPersistentText=\"true\""), "{osd}");
+        assert!(osd.contains("<tt:FontSize>32</tt:FontSize>"), "{osd}");
+        assert!(osd.contains("<tt:Color X=\"1\" Y=\"0\" Z=\"0\"/>"), "{osd}");
+        // The top-level Text type and the TextString Plain type are NOT the
+        // position leaf and must survive unchanged.
+        assert!(osd.contains("<tt:Type>Text</tt:Type>"), "{osd}");
+        assert!(osd.contains("<tt:Type>Plain</tt:Type>"), "{osd}");
+    }
+
+    #[test]
+    fn patch_osd_subtree_patches_empty_plaintext() {
+        // A self-closed <PlainText/> must still receive the new text.
+        let resp = wrap(
+            r#"<tr2:GetOSDsResponse><tr2:OSDs token="T">
+                <tt:VideoSourceConfigurationToken>V1</tt:VideoSourceConfigurationToken>
+                <tt:Type>Text</tt:Type>
+                <tt:Position><tt:Type>UpperLeft</tt:Type></tt:Position>
+                <tt:TextString><tt:Type>Plain</tt:Type><tt:PlainText/></tt:TextString>
+            </tr2:OSDs></tr2:GetOSDsResponse>"#,
+        );
+        let osd = patch_osd_subtree(&resp, "T", "UpperRight", "Hello").expect("patched");
+        assert!(osd.contains("<tt:PlainText>Hello</tt:PlainText>"), "{osd}");
+        assert!(
+            osd.contains("<tt:Position><tt:Type>UpperRight</tt:Type></tt:Position>"),
+            "{osd}"
+        );
+    }
+
+    #[test]
+    fn patch_osd_subtree_missing_token_is_none() {
+        let resp = wrap(
+            r#"<tr2:GetOSDsResponse><tr2:OSDs token="A"><tt:Type>Text</tt:Type></tr2:OSDs></tr2:GetOSDsResponse>"#,
+        );
+        assert!(patch_osd_subtree(&resp, "Z", "UpperLeft", "x").is_none());
     }
 
     #[test]
