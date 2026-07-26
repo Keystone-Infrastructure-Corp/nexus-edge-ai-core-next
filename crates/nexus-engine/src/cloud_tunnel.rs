@@ -867,6 +867,12 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             EnvelopeBody::LiveHdStop(payload) => {
                 webrtc.on_live_hd_stop(payload);
             }
+            // Cloud-computed downlink hint: clamp the running publisher's
+            // encoder to the slowest browser viewer's measured receive path.
+            // Closes the end-to-end congestion loop the raw SFU doesn't relay.
+            EnvelopeBody::LiveHdBitrate(payload) => {
+                webrtc.on_live_hd_bitrate(payload);
+            }
             other => {
                 if let EnvelopeBody::HeartbeatAck(ack) = other {
                     outbox.update_caps(ack.cloud_capabilities.as_deref());

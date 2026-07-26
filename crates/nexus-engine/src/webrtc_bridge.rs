@@ -22,7 +22,9 @@
 use std::sync::Arc;
 
 use nexus_cloud_client::TunnelOutbox;
-use nexus_cloud_protocol::v1::{LiveHdAnswerPayload, LiveHdStartPayload, LiveHdStopPayload};
+use nexus_cloud_protocol::v1::{
+    LiveHdAnswerPayload, LiveHdBitratePayload, LiveHdStartPayload, LiveHdStopPayload,
+};
 use tracing::debug;
 
 #[cfg(feature = "gstreamer-webrtc")]
@@ -146,6 +148,21 @@ impl WebRtcBridge {
         debug!(
             session_id = %payload.session_id,
             "live_hd_stop ignored: engine built without the gstreamer-webrtc feature",
+        );
+    }
+
+    /// Handle an inbound `live_hd_bitrate`: clamp the running publisher's
+    /// encoder ceiling to the cloud-computed downlink target (the slowest
+    /// browser viewer's measured receive path). SFU sessions only; MoQ has no
+    /// edge-side rate control.
+    pub fn on_live_hd_bitrate(&self, payload: &LiveHdBitratePayload) {
+        #[cfg(feature = "gstreamer-webrtc")]
+        self.on_live_hd_bitrate_impl(payload);
+        #[cfg(not(feature = "gstreamer-webrtc"))]
+        debug!(
+            session_id = %payload.session_id,
+            target_kbps = payload.target_kbps,
+            "live_hd_bitrate ignored: engine built without the gstreamer-webrtc feature",
         );
     }
 
@@ -280,6 +297,28 @@ impl WebRtcBridge {
             None => debug!(
                 session_id = %payload.session_id,
                 "live_hd_answer for unknown session; dropping"
+            ),
+        }
+    }
+
+    fn on_live_hd_bitrate_impl(&self, payload: &LiveHdBitratePayload) {
+        let inner = self.inner.lock();
+        match inner.sessions.get(&payload.session_id) {
+            Some(active) => match &active._session {
+                HdSession::Sfu(session) => {
+                    // target_kbps is bounded [600, 4000] by the cloud; the
+                    // pipeline clamps again defensively.
+                    let kbps = u32::try_from(payload.target_kbps).unwrap_or(u32::MAX);
+                    session.set_max_bitrate_kbps(kbps);
+                }
+                HdSession::Moq(_) => debug!(
+                    session_id = %payload.session_id,
+                    "live_hd_bitrate for a MoQ session (no edge-side rate control); ignoring"
+                ),
+            },
+            None => debug!(
+                session_id = %payload.session_id,
+                "live_hd_bitrate for unknown session; dropping"
             ),
         }
     }

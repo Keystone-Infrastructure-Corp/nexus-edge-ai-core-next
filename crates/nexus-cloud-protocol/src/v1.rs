@@ -446,6 +446,16 @@ pub struct LiveHdAnswerPayload {
     pub session_id: Uuid,
 }
 
+/// Cloud → Edge. Phase 2 adaptive-bitrate (additive on v=1). Carries a client-measured downlink hint so the edge encoder tracks the SLOWEST real subscriber's receive path instead of the fat edge→SFU relay leg. Background: over the Cloudflare SFU the edge's rtpgccbwe/TWCC only observes the edge→CF publish leg (datacenter-class), so it ramps to its static ceiling and over-sends into a browser whose CF→client downlink is narrower — packets drop, the browser floods PLI, the forced IDR also can't fit, and the stream goes black with no end-to-end feedback path. The api-gateway samples each viewer's inbound-rtp stats, derives a target, takes the MIN across all viewers of the shared publisher, and sends this. The edge clamps the running session's rtpgccbwe `max-bitrate` (and encoder `bitrate`) to `target_kbps`. Idempotent; a hint for an unknown/torn-down session is dropped. Routed by session_id (the live_hd_start publish session).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveHdBitratePayload {
+    /// Echoes the live_hd_start.session_id (the shared publisher's cloud↔edge handshake id).
+    pub session_id: Uuid,
+    /// Target encoder ceiling in kbps for this publisher, the min across all viewers' measured downlinks. Clamped by the cloud to [600, 4000]: 4000 is the relay-safe ceiling above which the delay-based estimate has been observed to run away and collapse the return feedback (the edge never raises past it); 600 keeps 1080p watchable at the floor. The edge applies min(GCC_MAX, target_kbps).
+    pub target_kbps: u64,
+}
+
 /// Edge → Cloud. Phase 2 (additive on v=1). The edge's SDP offer to publish its local HD track. The api-gateway relays it to the Cloudflare SFU (tracks/new, location=local) and returns the SFU's answer as live_hd_answer. ICE is bundled in the SDP (the edge waits for gathering-complete before sending). Routed by session_id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -722,6 +732,7 @@ pub enum EnvelopeBody {
     LiveHdAnswer(LiveHdAnswerPayload),
     LiveHdPublishing(LiveHdPublishingPayload),
     LiveHdStop(LiveHdStopPayload),
+    LiveHdBitrate(LiveHdBitratePayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.
