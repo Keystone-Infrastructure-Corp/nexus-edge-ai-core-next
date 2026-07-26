@@ -23,10 +23,11 @@
 //!
 //! **Keyframe on join.** Camera GOPs are 2–4 s, so a fresh subscriber that
 //! started mid-GOP would show a decode-artefact smear until the next IDR.
-//! There is no camera force-keyframe plumbing on the edge yet (see the cloud
-//! repo's `docs/cloud-console/PHASE_10_LIVE_VIEW.md`, Phase E), so the feed
-//! **splices in at the next keyframe** — it drops delta frames until it sees
-//! an IDR, then starts pushing. That guarantees the browser's decoder begins
+//! The feed **splices in at the next keyframe** — it drops delta frames until
+//! it sees an IDR, then starts pushing. On the transcode path, browser PLI/FIR
+//! keyframe requests are additionally forwarded to the encoder (see
+//! [`wire_keyframe_on_pli`]) so a mid-stream reference loss recovers on demand
+//! rather than waiting a full GOP. That guarantees the browser's decoder begins
 //! on a clean intra frame.
 //!
 //! **Transcode fallback** (HEVC camera + non-HEVC browser) is an exception
@@ -363,6 +364,14 @@ impl WebRtcSession {
         // longer triggers the loss spikes that plague pure loss-based AIMD.
         // Fall back to the AIMD loop when the plugin is absent/unloadable.
         // Passthrough builds have no `enc` element and skip both.
+        // Forward browser-driven PLI/FIR keyframe requests to the encoder so a
+        // viewer that lost reference frames recovers on the next RTP frame
+        // instead of waiting up to `key-int-max` (~2s) — or, when a delta-only
+        // gap outlasts the GOP, never recovering (black) at all.
+        if transcoding {
+            wire_keyframe_on_pli(&pipeline, camera_id);
+        }
+
         let cc = if transcoding {
             match pipeline.by_name("enc") {
                 Some(enc) if gst::ElementFactory::find("rtpgccbwe").is_some() => {
@@ -859,14 +868,16 @@ const CC_LOSS_HIGH: f64 = 0.10;
 const CC_LOSS_LOW: f64 = 0.02;
 
 /// Bounds for `rtpgccbwe`, in BITS per second (its properties are bits/s, not
-/// kbps). The ceiling is deliberately high (8 Mbps, the gst-plugins-rs default)
-/// so `rtpgccbwe`'s own delay-based estimate — not an artificial cap — is the
-/// limit: on a typical uplink it climbs until the path pushes back (~4-5 Mbps
-/// for 1080p) instead of stopping short. Pacing keeps those higher sustained
-/// bitrates from bursting past the uplink the way un-paced keyframes did.
+/// kbps). The ceiling is capped at 4 Mbps rather than the gst-plugins-rs 8 Mbps
+/// default: over a Cloudflare TURN **relay** the delay-based estimate has been
+/// observed to run away to the 8 Mbps ceiling, saturate the relayed path, and
+/// collapse the return TWCC feedback — after which media flow silently dies and
+/// the viewer goes black with no recovery. 4 Mbps keeps 1080p watchable while
+/// staying inside the reference edge's ~5.3 Mbps shared uplink even when the
+/// media is relayed rather than sent peer-to-peer.
 const GCC_MIN_BPS: u32 = 400_000;
 const GCC_START_BPS: u32 = 1_200_000;
-const GCC_MAX_BPS: u32 = 8_000_000;
+const GCC_MAX_BPS: u32 = 4_000_000;
 
 /// Manual AIMD bitrate controller for the WebRTC transcode. `rtpgccbwe` (the
 /// stock GStreamer Google-Congestion-Control estimator) is not installed on the
@@ -895,6 +906,49 @@ impl BitrateController {
         }
         self.kbps
     }
+}
+
+/// Forward browser keyframe requests (RTCP PLI/FIR) to the encoder. `webrtcbin`
+/// translates an inbound PLI/FIR into an upstream `GstForceKeyUnit` custom
+/// event; we intercept it on the payloader's src pad and re-issue a
+/// force-key-unit directly to the encoder's sink pad so `vah264enc` emits a
+/// fresh IDR immediately. Without this, a viewer that loses reference frames
+/// (e.g. after a relay hiccup) has to wait up to `key-int-max` (~2s) for the
+/// next scheduled keyframe — and if the gap outlasts the GOP it stays black
+/// forever. Only meaningful on the transcode path (the `enc`/`pay` elements
+/// exist); passthrough has no encoder to retarget.
+fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
+    let Some(enc) = pipeline.by_name("enc") else {
+        return;
+    };
+    let Some(pay) = pipeline.by_name("pay") else {
+        return;
+    };
+    let Some(pay_src) = pay.static_pad("src") else {
+        return;
+    };
+    let enc_weak = enc.downgrade();
+    let _ = pay_src.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_pad, info| {
+        let Some(gst::PadProbeData::Event(ev)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let is_fku = matches!(ev.view(), gst::EventView::CustomUpstream(_))
+            && ev
+                .structure()
+                .is_some_and(|s| s.name() == "GstForceKeyUnit");
+        if is_fku {
+            if let Some(enc) = enc_weak.upgrade() {
+                if let Some(sink) = enc.static_pad("sink") {
+                    let s = gst::Structure::builder("GstForceKeyUnit")
+                        .field("all-headers", true)
+                        .build();
+                    let _ = sink.send_event(gst::event::CustomUpstream::new(s));
+                    debug!(camera_id, "webrtc: PLI/FIR -> forced encoder keyframe");
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
 }
 
 /// Wire `rtpgccbwe` as webrtcbin's aux-sender for the transcode path. The
