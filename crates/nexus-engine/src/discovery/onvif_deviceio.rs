@@ -279,6 +279,14 @@ fn osd_text_body(osd_token: Option<&str>, vsct: &str, position: &str, text: &str
 /// `IsPersistentText`, DateFormat, …) is echoed back verbatim so the round
 /// trip doesn't trip `ter:InvalidParameter`. `None` when the token isn't
 /// found (the caller then synthesizes a minimal body).
+///
+/// A camera that has an OSD but has never had text set on it omits
+/// `TextString` (or its `PlainText` child) from `GetOSDs` entirely. Patching
+/// only the leaves that already exist would then echo the OSD back unchanged
+/// — `SetOSD` returns success and the operator's text is silently dropped.
+/// The missing subtrees are therefore synthesized: a `PlainText` is appended
+/// inside an existing `TextString`, and a whole `TextString` (or `Position`)
+/// is appended before the closing wrapper when absent.
 fn patch_osd_subtree(
     response: &str,
     osd_token: &str,
@@ -297,6 +305,15 @@ fn patch_osd_subtree(
     // original text + close tag we suppress — we already emitted the full
     // replacement element at its start.
     let mut suppress: Option<usize> = None;
+    // Which of the two patch targets the camera actually returned, so the
+    // absent ones can be synthesized rather than silently skipped.
+    let mut saw_text_string = false;
+    let mut saw_plain_text = false;
+    let mut saw_position = false;
+    let mut saw_position_type = false;
+
+    let plain_text_el = || format!("<tt:PlainText>{}</tt:PlainText>", xml_escape(text));
+    let position_type_el = || format!("<tt:Type>{}</tt:Type>", xml_escape(position));
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -315,14 +332,19 @@ fn patch_osd_subtree(
                         // Inside an already-emitted patched leaf — drop nested content.
                     } else {
                         let parent = (stack.len() >= 2).then(|| stack[stack.len() - 2].as_str());
-                        if n == "PlainText" && parent == Some("TextString") {
-                            out.push_str(&format!(
-                                "<tt:PlainText>{}</tt:PlainText>",
-                                xml_escape(text)
-                            ));
+                        if stack.len() == 1 && n == "TextString" {
+                            saw_text_string = true;
+                            out.push_str(&format!("<tt:{n}{}>", osd_attrs(&e)));
+                        } else if stack.len() == 1 && n == "Position" {
+                            saw_position = true;
+                            out.push_str(&format!("<tt:{n}{}>", osd_attrs(&e)));
+                        } else if n == "PlainText" && parent == Some("TextString") {
+                            saw_plain_text = true;
+                            out.push_str(&plain_text_el());
                             suppress = Some(stack.len());
                         } else if n == "Type" && parent == Some("Position") {
-                            out.push_str(&format!("<tt:Type>{}</tt:Type>", xml_escape(position)));
+                            saw_position_type = true;
+                            out.push_str(&position_type_el());
                             suppress = Some(stack.len());
                         } else {
                             out.push_str(&format!("<tt:{n}{}>", osd_attrs(&e)));
@@ -333,13 +355,27 @@ fn patch_osd_subtree(
             Ok(Event::Empty(e)) if in_target && suppress.is_none() => {
                 let n = local_name(&e.name());
                 let parent = stack.last().map(String::as_str);
-                if n == "PlainText" && parent == Some("TextString") {
+                if stack.is_empty() && n == "TextString" {
+                    // `<tt:TextString/>` — expand it so the text lands.
+                    saw_text_string = true;
+                    saw_plain_text = true;
                     out.push_str(&format!(
-                        "<tt:PlainText>{}</tt:PlainText>",
-                        xml_escape(text)
+                        "<tt:TextString><tt:Type>Plain</tt:Type>{}</tt:TextString>",
+                        plain_text_el()
                     ));
+                } else if stack.is_empty() && n == "Position" {
+                    saw_position = true;
+                    saw_position_type = true;
+                    out.push_str(&format!(
+                        "<tt:Position>{}</tt:Position>",
+                        position_type_el()
+                    ));
+                } else if n == "PlainText" && parent == Some("TextString") {
+                    saw_plain_text = true;
+                    out.push_str(&plain_text_el());
                 } else if n == "Type" && parent == Some("Position") {
-                    out.push_str(&format!("<tt:Type>{}</tt:Type>", xml_escape(position)));
+                    saw_position_type = true;
+                    out.push_str(&position_type_el());
                 } else {
                     out.push_str(&format!("<tt:{n}{}/>", osd_attrs(&e)));
                 }
@@ -351,7 +387,21 @@ fn patch_osd_subtree(
             }
             Ok(Event::End(_)) if in_target => {
                 if stack.is_empty() {
-                    // Closing the OSD wrapper itself.
+                    // Closing the OSD wrapper itself. Anything the camera
+                    // never reported is appended here, in XSD sequence order
+                    // (Position precedes TextString).
+                    if !saw_position {
+                        out.push_str(&format!(
+                            "<tt:Position>{}</tt:Position>",
+                            position_type_el()
+                        ));
+                    }
+                    if !saw_text_string {
+                        out.push_str(&format!(
+                            "<tt:TextString><tt:Type>Plain</tt:Type>{}</tt:TextString>",
+                            plain_text_el()
+                        ));
+                    }
                     out.push_str("</tr2:OSD>");
                     break;
                 }
@@ -360,6 +410,15 @@ fn patch_osd_subtree(
                 if suppress == Some(d) {
                     suppress = None; // full element already emitted; skip its close
                 } else if suppress.is_none() {
+                    // A `TextString` / `Position` the camera returned without
+                    // the leaf we patch gets it appended before the close.
+                    if d == 1 && n == "TextString" && !saw_plain_text {
+                        saw_plain_text = true;
+                        out.push_str(&plain_text_el());
+                    } else if d == 1 && n == "Position" && !saw_position_type {
+                        saw_position_type = true;
+                        out.push_str(&position_type_el());
+                    }
                     out.push_str(&format!("</tt:{n}>"));
                 }
             }
@@ -850,6 +909,90 @@ mod tests {
             osd.contains("<tt:Position><tt:Type>UpperRight</tt:Type></tt:Position>"),
             "{osd}"
         );
+    }
+
+    #[test]
+    fn patch_osd_subtree_synthesizes_missing_text_string() {
+        // A camera that has never had text set on this OSD omits TextString
+        // from GetOSDs entirely (this is verbatim what the reference PTZ
+        // returns). Echoing it back unchanged made SetOSD a silent no-op:
+        // the request succeeded and the operator's text never landed.
+        let resp = wrap(
+            r#"<tr2:GetOSDsResponse><tr2:OSDs token="OsdToken_101">
+                <tt:VideoSourceConfigurationToken>VideoSourceToken</tt:VideoSourceConfigurationToken>
+                <tt:Type>Text</tt:Type>
+                <tt:Position><tt:Type>Custom</tt:Type></tt:Position>
+            </tr2:OSDs></tr2:GetOSDsResponse>"#,
+        );
+        let osd = patch_osd_subtree(&resp, "OsdToken_101", "UpperLeft", "Gate 4").expect("patched");
+        assert_well_formed(&wrap(&format!("<tr2:SetOSD>{osd}</tr2:SetOSD>")));
+        assert!(
+            osd.contains("<tt:TextString><tt:Type>Plain</tt:Type><tt:PlainText>Gate 4</tt:PlainText></tt:TextString>"),
+            "{osd}"
+        );
+        assert!(
+            osd.contains("<tt:Position><tt:Type>UpperLeft</tt:Type></tt:Position>"),
+            "{osd}"
+        );
+        // Synthesized TextString goes after Position, per the XSD sequence.
+        assert!(
+            osd.find("<tt:Position>") < osd.find("<tt:TextString>"),
+            "{osd}"
+        );
+        assert!(!osd.contains("Custom"), "{osd}");
+    }
+
+    #[test]
+    fn patch_osd_subtree_appends_plaintext_into_existing_text_string() {
+        // TextString present but with no PlainText child — the text must be
+        // appended inside it rather than dropped.
+        let resp = wrap(
+            r#"<tr2:GetOSDsResponse><tr2:OSDs token="T">
+                <tt:Type>Text</tt:Type>
+                <tt:Position><tt:Type>UpperLeft</tt:Type></tt:Position>
+                <tt:TextString><tt:Type>Plain</tt:Type><tt:FontSize>32</tt:FontSize></tt:TextString>
+            </tr2:OSDs></tr2:GetOSDsResponse>"#,
+        );
+        let osd = patch_osd_subtree(&resp, "T", "LowerLeft", "Dock 7").expect("patched");
+        assert_well_formed(&wrap(&format!("<tr2:SetOSD>{osd}</tr2:SetOSD>")));
+        assert!(
+            osd.contains(
+                "<tt:FontSize>32</tt:FontSize><tt:PlainText>Dock 7</tt:PlainText></tt:TextString>"
+            ),
+            "{osd}"
+        );
+    }
+
+    #[test]
+    fn patch_osd_subtree_synthesizes_missing_position() {
+        let resp = wrap(
+            r#"<tr2:GetOSDsResponse><tr2:OSDs token="T">
+                <tt:Type>Text</tt:Type>
+                <tt:TextString><tt:Type>Plain</tt:Type><tt:PlainText>old</tt:PlainText></tt:TextString>
+            </tr2:OSDs></tr2:GetOSDsResponse>"#,
+        );
+        let osd = patch_osd_subtree(&resp, "T", "LowerRight", "new").expect("patched");
+        assert_well_formed(&wrap(&format!("<tr2:SetOSD>{osd}</tr2:SetOSD>")));
+        assert!(
+            osd.contains("<tt:Position><tt:Type>LowerRight</tt:Type></tt:Position>"),
+            "{osd}"
+        );
+        assert!(osd.contains("<tt:PlainText>new</tt:PlainText>"), "{osd}");
+        assert!(!osd.contains("old"), "{osd}");
+    }
+
+    #[test]
+    fn patch_osd_subtree_expands_self_closed_text_string() {
+        let resp = wrap(
+            r#"<tr2:GetOSDsResponse><tr2:OSDs token="T">
+                <tt:Type>Text</tt:Type>
+                <tt:Position><tt:Type>UpperLeft</tt:Type></tt:Position>
+                <tt:TextString/>
+            </tr2:OSDs></tr2:GetOSDsResponse>"#,
+        );
+        let osd = patch_osd_subtree(&resp, "T", "UpperLeft", "Hi").expect("patched");
+        assert_well_formed(&wrap(&format!("<tr2:SetOSD>{osd}</tr2:SetOSD>")));
+        assert!(osd.contains("<tt:PlainText>Hi</tt:PlainText>"), "{osd}");
     }
 
     #[test]
