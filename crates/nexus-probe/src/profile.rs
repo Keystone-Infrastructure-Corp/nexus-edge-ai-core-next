@@ -137,6 +137,13 @@ pub struct HardwareProfile {
     pub inference: Vec<InferenceDevice>,
     /// Whether hardware-accelerated decode is available.
     pub decode: DecodeCapability,
+    /// Total VRAM of the discrete inference GPU in MiB, when it could be
+    /// read. Populated for NVIDIA (via `nvidia-smi`); `None` on every
+    /// other box class and whenever the driver is not yet live. The
+    /// generator sizes the detector pool against it and under-provisions
+    /// on `None`.
+    #[serde(default)]
+    pub vram_mib: Option<u64>,
 }
 
 impl HardwareProfile {
@@ -165,6 +172,7 @@ impl HardwareProfile {
             ram_bytes: m.memory.total_kib.saturating_mul(1024),
             inference,
             decode: decode_capability(&m.accelerators),
+            vram_mib: m.accelerators.nvidia_vram_mib,
         }
     }
 

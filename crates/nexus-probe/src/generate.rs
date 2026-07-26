@@ -107,10 +107,10 @@ pub fn generate_config(profile: &HardwareProfile) -> Config {
     // --- inference ------------------------------------------------------
     let device = profile.primary_inference();
     cfg.inference.backend = InferenceBackendKind::Pool;
-    cfg.inference.workers = workers_for(device);
+    cfg.inference.workers = workers_for(device, profile.vram_mib);
     cfg.inference.ep_priority = ep_priority_for(device);
     cfg.inference.model.pack_path = Some(PathBuf::from(PACK_PATH));
-    let preset = preset_for(device);
+    let preset = preset_for(device, profile.vram_mib);
     cfg.inference.model.preset = preset.to_string();
     // Redundant when `pack_path` is set (the engine resolves `preset`
     // against the manifest and ignores these), but kept for parity with
@@ -157,27 +157,61 @@ fn ep_priority_for(device: InferenceDevice) -> Vec<String> {
 
 /// Detector-pool worker count.
 ///
-/// The only box class we can reliably detect today that benefits from more
-/// than one session is the Intel NPU (Lunar Lake), which the NPU profile
-/// runs at 2. Discrete-GPU multi-worker sizing (Arc A380 → 2, RTX
-/// → 3) needs VRAM detection, which is a deferred profile enrichment; until
-/// then every other device runs a single worker (the safe under-provision).
-fn workers_for(device: InferenceDevice) -> usize {
+/// The Intel NPU (Lunar Lake) runs 2. NVIDIA scales with VRAM — see
+/// [`nvidia_sizing`]. Every other device runs a single worker (the safe
+/// under-provision) because we have no reliable capacity signal for it.
+fn workers_for(device: InferenceDevice, vram_mib: Option<u64>) -> usize {
     match device {
         InferenceDevice::IntelNpu => 2,
+        InferenceDevice::Nvidia => nvidia_sizing(vram_mib).0,
         _ => 1,
     }
 }
 
 /// Model-pack preset (the square detector input edge).
 ///
-/// The NPU (Lunar Lake) has the headroom to run 960; everything else we can
-/// reliably detect runs 640. Operators bump per-camera in the UI for
-/// plate/face work.
-fn preset_for(device: InferenceDevice) -> u32 {
+/// The NPU (Lunar Lake) has the headroom to run 960; NVIDIA scales with
+/// VRAM (see [`nvidia_sizing`]); everything else we can reliably detect
+/// runs 640. Operators bump per-camera in the UI for plate/face work.
+fn preset_for(device: InferenceDevice, vram_mib: Option<u64>) -> u32 {
     match device {
         InferenceDevice::IntelNpu => 960,
+        InferenceDevice::Nvidia => nvidia_sizing(vram_mib).1,
         _ => 640,
+    }
+}
+
+/// `(workers, preset)` for an NVIDIA box, bucketed by total VRAM.
+///
+/// One FP32 YOLO session at 640 costs roughly 1 GiB of VRAM once the CUDA
+/// context, weights, and cuDNN workspace are counted; 960 costs a little
+/// over twice that. The buckets keep the whole pool comfortably inside the
+/// card so a session never fails to open mid-install:
+///
+/// | VRAM | workers | preset | representative card |
+/// |---|---|---|---|
+/// | unknown | 1 | 640 | driver not live yet |
+/// | < 4 GiB | 1 | 640 | GTX 1050 |
+/// | < 8 GiB | 2 | 640 | **Quadro P2000 (5 GiB)** |
+/// | < 12 GiB | 2 | 960 | RTX 4060 |
+/// | >= 12 GiB | 3 | 960 | RTX 3060 12G / 4070+ |
+///
+/// `None` (driver not live, or `nvidia-smi` unreadable) deliberately gets
+/// the most conservative bucket rather than an optimistic guess: an
+/// under-provisioned pool runs slower, an over-provisioned one fails to
+/// start.
+///
+/// Preset stays at 640 below 8 GiB regardless of worker count. Pascal-class
+/// silicon has no Tensor Cores, so 960 costs roughly 2.2x the compute for a
+/// modest accuracy gain — throughput on a P2000 is better spent on a second
+/// 640 worker than on one wider one.
+fn nvidia_sizing(vram_mib: Option<u64>) -> (usize, u32) {
+    match vram_mib {
+        None => (1, 640),
+        Some(mib) if mib < 4_096 => (1, 640),
+        Some(mib) if mib < 8_192 => (2, 640),
+        Some(mib) if mib < 12_288 => (2, 960),
+        Some(_) => (3, 960),
     }
 }
 
@@ -262,13 +296,36 @@ mod tests {
         inference: Vec<InferenceDevice>,
         decode: DecodeCapability,
     ) -> HardwareProfile {
+        profile_vram(cpu_logical, ram_gib, inference, decode, None)
+    }
+
+    fn profile_vram(
+        cpu_logical: usize,
+        ram_gib: u64,
+        inference: Vec<InferenceDevice>,
+        decode: DecodeCapability,
+        vram_mib: Option<u64>,
+    ) -> HardwareProfile {
         HardwareProfile {
             cpu_physical: cpu_logical.max(1),
             cpu_logical,
             ram_bytes: ram_gib * 1024 * 1024 * 1024,
             inference,
             decode,
+            vram_mib,
         }
+    }
+
+    /// An NVIDIA box with the given VRAM (MiB), sized like the reference
+    /// workstation: 8 logical cores, 16 GiB RAM, NVDEC decode.
+    fn nvidia_profile(vram_mib: Option<u64>) -> HardwareProfile {
+        profile_vram(
+            8,
+            16,
+            vec![InferenceDevice::Nvidia, InferenceDevice::Cpu],
+            DecodeCapability::Nvdec,
+            vram_mib,
+        )
     }
 
     #[test]
@@ -350,6 +407,59 @@ mod tests {
         let c = generate_config(&p);
         assert_eq!(c.inference.ep_priority, vec!["rocm", "cpu"]);
         assert_eq!(c.bus.capacity, 4096);
+    }
+
+    /// The reference NVIDIA box: a 5 GiB Quadro P2000. Two 640 workers fit
+    /// comfortably; 960 is deliberately withheld from Pascal-class silicon.
+    #[test]
+    fn nvidia_p2000_gets_two_640_workers() {
+        let p = nvidia_profile(Some(5_059));
+        let c = generate_config(&p);
+        assert_eq!(c.inference.workers, 2);
+        assert_eq!(c.inference.model.preset, "640");
+        assert_eq!(c.inference.model.input_width, 640);
+    }
+
+    /// Unknown VRAM (driver not live yet, or `nvidia-smi` unreadable) must
+    /// under-provision rather than guess: an under-sized pool is slow, an
+    /// over-sized one fails to open a session.
+    #[test]
+    fn nvidia_unknown_vram_under_provisions() {
+        let c = generate_config(&nvidia_profile(None));
+        assert_eq!(c.inference.workers, 1);
+        assert_eq!(c.inference.model.preset, "640");
+    }
+
+    #[test]
+    fn nvidia_sizing_buckets_scale_with_vram() {
+        // Bucket boundaries, exercised through the public generator.
+        for (mib, workers, preset) in [
+            (2_048_u64, 1_usize, "640"), // GTX 1050, 2 GiB
+            (4_096, 2, "640"),           // bucket edge
+            (8_192, 2, "960"),           // RTX 4060, 8 GiB
+            (12_288, 3, "960"),          // RTX 3060, 12 GiB
+            (24_576, 3, "960"),          // RTX 4090, 24 GiB
+        ] {
+            let c = generate_config(&nvidia_profile(Some(mib)));
+            assert_eq!(c.inference.workers, workers, "workers at {mib} MiB");
+            assert_eq!(c.inference.model.preset, preset, "preset at {mib} MiB");
+        }
+    }
+
+    /// VRAM sizing is NVIDIA-only — it must not leak into other box classes
+    /// that never populate `vram_mib`.
+    #[test]
+    fn vram_does_not_resize_non_nvidia_devices() {
+        let p = profile_vram(
+            16,
+            32,
+            vec![InferenceDevice::AmdRocm, InferenceDevice::Cpu],
+            DecodeCapability::Va,
+            Some(24_576),
+        );
+        let c = generate_config(&p);
+        assert_eq!(c.inference.workers, 1);
+        assert_eq!(c.inference.model.preset, "640");
     }
 
     #[test]
