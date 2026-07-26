@@ -202,7 +202,7 @@ export function SystemPage() {
                       Per-engine utilization
                     </span>
                     <span className="text-[11px] text-muted-foreground">
-                      video decode / enhance carry the camera load
+                      video engines carry the camera decode load
                     </span>
                   </div>
                   {m.gpu.engines.map((e) => (
@@ -250,6 +250,53 @@ export function SystemPage() {
                       : "—"
                   }
                 />
+                {/* Power, clocks, fan and driver identity come from
+                    NVML and so are NVIDIA-only. Render each one only
+                    when the backend actually sampled it, otherwise an
+                    Intel or AMD box would show a wall of dashes. A
+                    missing reading on NVIDIA is also normal — passively
+                    cooled boards report no fan at all. */}
+                {m.gpu.power_w !== null && m.gpu.power_w !== undefined ? (
+                  <Field
+                    label="Power"
+                    value={
+                      m.gpu.power_limit_w !== null &&
+                      m.gpu.power_limit_w !== undefined
+                        ? `${m.gpu.power_w.toFixed(1)} / ${m.gpu.power_limit_w.toFixed(0)} W`
+                        : `${m.gpu.power_w.toFixed(1)} W`
+                    }
+                  />
+                ) : null}
+                {m.gpu.graphics_clock_mhz !== null &&
+                m.gpu.graphics_clock_mhz !== undefined ? (
+                  <Field
+                    label="Graphics clock"
+                    value={`${m.gpu.graphics_clock_mhz.toLocaleString()} MHz`}
+                  />
+                ) : null}
+                {m.gpu.memory_clock_mhz !== null &&
+                m.gpu.memory_clock_mhz !== undefined ? (
+                  <Field
+                    label="Memory clock"
+                    value={`${m.gpu.memory_clock_mhz.toLocaleString()} MHz`}
+                  />
+                ) : null}
+                {m.gpu.fan_speed_pct !== null &&
+                m.gpu.fan_speed_pct !== undefined ? (
+                  <Field label="Fan" value={`${m.gpu.fan_speed_pct}%`} />
+                ) : null}
+                {m.gpu.driver_version ? (
+                  <Field label="Driver" value={m.gpu.driver_version} />
+                ) : null}
+                {m.gpu.cuda_version ? (
+                  <Field label="CUDA" value={m.gpu.cuda_version} />
+                ) : null}
+                {m.gpu.compute_capability ? (
+                  <Field
+                    label="Compute capability"
+                    value={m.gpu.compute_capability}
+                  />
+                ) : null}
               </div>
               {(m.gpu.utilization_pct === null ||
                 m.gpu.utilization_pct === undefined) &&
@@ -549,12 +596,15 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-// Friendly labels for the Intel GPU engine classes the engine
-// reports per-engine utilization for. Falls back to the raw class
-// string so a future engine class still renders something readable.
+// Friendly labels for the GPU engine classes the engine reports
+// per-engine utilization for — the full set on Intel iGPUs, and
+// video-decode (NVDEC) / video-encode (NVENC) on NVIDIA. Falls back
+// to the raw class string so a future engine class still renders
+// something readable.
 const ENGINE_LABELS: Record<string, string> = {
   render: "Render / 3D",
   "video-decode": "Video decode",
+  "video-encode": "Video encode",
   "video-enhance": "Video enhance",
   copy: "Copy / blitter",
   compute: "Compute",
