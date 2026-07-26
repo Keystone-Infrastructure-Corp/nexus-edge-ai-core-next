@@ -33,6 +33,7 @@ future automated agents who need to skip the same potholes we already hit.
   cargo check  --locked -p nexus-pipeline --features gstreamer
   cargo check  --locked -p nexus-inference --features ort,ep-cpu \
        ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib
+  cargo check  --locked -p nexus-inference --features ort,ep-cuda   # compile-only
   cd ui && npm install && npm run typecheck && npm run build
   ```
 
@@ -44,6 +45,27 @@ future automated agents who need to skip the same potholes we already hit.
   1.22.x dylib still loads fine on macOS for dev work. The Linux production
   path pins the matched 1.24.0 tarball; see `.github/workflows/ci.yml` and
   `docs/INSTALL.md §7.4`. Set `ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib`.
+
+- `--features ort,ep-cuda` **compiles anywhere**, including macOS and every
+  CI runner, because the CUDA provider is `dlopen`'d when a session opens,
+  not linked at build time. That makes `cargo check -p nexus-inference
+  --features ort,ep-cuda` a genuine gate on the `ep-cuda` code path
+  (the `CUDAExecutionProvider` builder API) with no GPU present — it runs in
+  CI for exactly this reason. What it cannot prove is *attachment*: ORT
+  silently skips a provider it cannot load, so a CUDA-less
+  `libonnxruntime.so` yields a CPU session with no error. Verifying the EP
+  actually binds requires the reference NVIDIA box.
+
+- The engine's own `ORT_DYLIB_PATH` on an NVIDIA deployment is **not** the
+  one inside the release tree. The release tarball bundles the
+  OpenVINO-flavoured runtime; `install.sh` stages a CUDA-capable build into
+  `/opt/nexus/vendor/onnxruntime-cuda/` and repoints the loader with a
+  systemd drop-in (`10-ort-cuda.conf`). The vendor directory lives outside
+  the release tree so it survives OTA flips of the `/opt/nexus/current`
+  symlink. To reproduce locally, download
+  `onnxruntime-linux-x64-gpu-<ver>.tgz` (the plain `-gpu-` asset — the
+  `_cuda13` variant drops Pascal) and point `ORT_DYLIB_PATH` and
+  `LD_LIBRARY_PATH` at its `lib/`.
 
 ## Cargo / Rust
 

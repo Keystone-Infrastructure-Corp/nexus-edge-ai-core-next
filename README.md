@@ -5,7 +5,7 @@
 > (identity + audit), and M7 Phase 1 (webhook sinks + cascading
 > delivery policy + UI + e2e) all shipped on `main`.** Suitable for
 > dogfooding on the reference hardware profiles; production deployment
-> blocked on M5 (CUDA/TensorRT EPs), M7 Phase 2 (SureView), and M8
+> blocked on M7 Phase 2 (SureView), and M8
 > (bare-metal install + first customer trial) per
 > [`../nexus-cloud-console/docs/product/ROADMAP.md`](../nexus-cloud-console/docs/product/ROADMAP.md). Full operator CRUD UI shipped:
 > cameras (ONVIF + CIDR discovery), rules (visual + raw CEL),
@@ -72,7 +72,7 @@ on the desk are flagged ✅.
 | `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS)             | Radeon 680M (Vulkan)| ✅ shipping |
 | `intel-igpu`                | Lenovo P3 Tiny + Arc A380                 | Intel Arc A380 dGPU | not yet sourced |
 | `intel-npu`                 | GMKtec K13 / EVO-X1 (Lunar Lake 256V)     | Arc 140V + NPU 4    | ✅ ordered |
-| `nvidia`                    | Lenovo P3 Tower + RTX 4060                | NVIDIA RTX 4060     | post-beta |
+| `nvidia`                    | Lenovo P3 Tower + Quadro P2000 / RTX      | NVIDIA dGPU (CUDA)  | ✅ shipping |
 
 Sustained camera count is **sized empirically per box** — it depends on
 resolution, codec, frame rate, motion duty-cycle, and model preset, so
@@ -90,7 +90,14 @@ opt-in via `--force-profile amd-vulkan`; the System tab shows the
 Radeon's VRAM, temperature, and utilization%. ROCm is reserved for the
 discrete RDNA/CDNA GPUs it officially supports (classified from the PCI
 device ID at install time) — never force-fit onto an unsupported iGPU.
-NVIDIA emits a CPU `ep_priority` until M5 wires the CUDA/TensorRT EPs.
+NVIDIA runs inference on the CUDA execution provider and decodes on the
+card's NVDEC block; worker count and detector preset scale with VRAM.
+Because the release tarball bundles the OpenVINO-flavoured ONNX Runtime
+(which has no CUDA provider), `install.sh` installs the proprietary
+driver plus CUDA runtime and stages a CUDA-capable ONNX Runtime into
+`/opt/nexus/vendor/`, repointing the loader with a systemd drop-in.
+TensorRT is intentionally not used — it needs a separate multi-GB
+install and only pays off on Tensor-Core (Turing+) silicon.
 
 `nexus-probe emit-config` generates the right `ep_priority`, decode mode,
 worker/thread sizing, and model preset for the detected box automatically

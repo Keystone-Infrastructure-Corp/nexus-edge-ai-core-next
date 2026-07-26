@@ -28,7 +28,7 @@ actual box); without it, `nexus-probe` auto-selects by detected hardware.
 | `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8 M.2        | Hailo-8 (26 TOPS)              | `hailo, cpu`                 | host AMD Radeon (VA)    | 640    |
 | `amd-vulkan`                | Beelink EQR7 (Ryzen 7 7735HS), Radeon 680M/780M    | AMD iGPU (ORT Vulkan/WebGPU)   | `vulkan, cpu`                | AMD VCN (radeonsi VA)   | 640    |
 | `amd-rocm`                  | discrete RDNA/CDNA GPU on the ROCm allowlist       | AMD dGPU (ORT ROCm)            | `rocm, cpu`                  | AMD VCN (radeonsi VA)   | 960    |
-| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + RTX 4060              | NVIDIA (CUDA/TensorRT — M5)    | `cpu` **today**              | NVDEC (M5)              | 640    |
+| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + Quadro P2000 or RTX    | NVIDIA dGPU (ORT CUDA)         | `cuda, cpu`                  | NVDEC (nvcodec)         | 640 / 960 |
 | `cpu`                       | any host with no usable accelerator                | CPU                            | `cpu`                        | software                | 640    |
 
 Notes on the matrix:
@@ -36,12 +36,26 @@ Notes on the matrix:
 - **Decode is orthogonal to inference.** Every Intel/AMD GPU — including a
   decode-only iGPU sitting next to a Hailo-8 or NPU — gives hardware
   H.264/HEVC decode through the unified `va` GStreamer path
-  (`vah26Xdec` + `vapostproc` over libva). Hailo-8 and the Intel NPU are
-  **inference-only** and never decode; the host iGPU does. See
+  (`vah26Xdec` + `vapostproc` over libva). NVIDIA decodes on its own NVDEC
+  block (`nvh26Xdec`, from the `nvcodec` plugin). Hailo-8 and the Intel NPU
+  are **inference-only** and never decode; the host iGPU does. See
   [INSTALL.md](INSTALL.md) for the decode plumbing.
-- **NVIDIA emits `ep_priority = ["cpu"]` today.** CUDA/TensorRT EPs and
-  NVDEC land in M5; until then an NVIDIA box falls through to CPU and is
-  not a meaningful production target.
+- **A box with both an iGPU and a discrete NVIDIA card decodes on VA, not
+  NVDEC.** Inference still goes to the NVIDIA card; keeping decode on the
+  integrated media engine leaves the dGPU's whole budget for inference.
+- **NVIDIA needs the installer to stage a CUDA runtime.** The release
+  tarball bundles the OpenVINO-flavoured ONNX Runtime, which has no CUDA
+  provider. `scripts/install.sh` installs the proprietary driver plus the
+  CUDA runtime and fetches a CUDA-capable ONNX Runtime into
+  `/opt/nexus/vendor/onnxruntime-cuda`, then repoints the loader with a
+  systemd drop-in. Without that stage the session falls through to the
+  trailing `cpu` entry. TensorRT is deliberately **not** in the chain: it
+  needs a separate multi-GB install and only pays off on Tensor-Core
+  (Turing+) silicon.
+- **NVIDIA preset and worker count scale with VRAM** (read from
+  `nvidia-smi`): <4 GiB → 1×640, <8 GiB → 2×640 (Quadro P2000),
+  <12 GiB → 2×960, ≥12 GiB → 3×960. Unknown VRAM under-provisions to
+  1×640 rather than guessing.
 - **AMD ROCm vs Vulkan** is decided from the PCI device ID against a
   default-deny allowlist (CDNA MI100/200/300, RDNA2 RX6000, RDNA3 RX7000).
   Phoenix/Rembrandt iGPUs (gfx1035/1103) are **not** on the allowlist and
@@ -75,10 +89,11 @@ the output always parses and satisfies `deny_unknown_fields` by
 construction:
 
 - `[inference].ep_priority` — from the inference ranking
-  (Hailo > Intel NPU > Intel GPU > AMD ROCm > AMD Vulkan > NVIDIA→CPU > CPU).
+  (Hailo > Intel NPU > Intel GPU > AMD ROCm > AMD Vulkan > NVIDIA > CPU).
 - `[runtime.decode].mode` — `va` when a VA-capable Intel/AMD GPU is
-  present, else `software`.
-- `[inference].workers` — 2–3 for a discrete GPU with ≥6 GB VRAM, else 1.
+  present, `nvdec` on an NVIDIA GPU, else `software`.
+- `[inference].workers` — 2 for the Intel NPU, 1–3 for an NVIDIA GPU by
+  VRAM, else 1.
 - `[inference.model].preset` (+ derived input width/height) — `960`/`1280`
   for big discrete GPUs, `640` for iGPU/Hailo/NPU/low-power N-series.
 - `[runtime].worker_threads` / `blocking_threads` — from the CPU logical
