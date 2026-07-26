@@ -131,10 +131,15 @@ pub fn generate_config(profile: &HardwareProfile) -> Config {
 /// * Intel iGPU/Arc uses `"gpu"`, the explicit OpenVINO GPU device. Plain
 ///   `"openvino"` resolves to the AUTO plugin which can silently land on
 ///   CPU, so the iGPU path must say `"gpu"`.
-/// * NVIDIA emits `["cpu"]` **today** — the CUDA / TensorRT EPs are gated
-///   behind milestone M5. The profile still records the silicon as
-///   `Nvidia` honestly; only this mapping is conservative. When M5 lands
-///   this flips to `["tensorrt", "cuda", "cpu"]`.
+/// * NVIDIA emits `["cuda", "cpu"]`. The CUDA EP only attaches when the
+///   installer has staged a CUDA-capable ONNX Runtime — the release
+///   tarball's bundled runtime is the OpenVINO build, which has no CUDA
+///   provider. `_install_ort_cuda` in `scripts/lib/install-common.sh`
+///   fetches it into `/opt/nexus/vendor/onnxruntime-cuda` and repoints
+///   the loader with a systemd drop-in. Without that the session falls
+///   through to the trailing `"cpu"`, which is why CPU stays in the list.
+///   TensorRT is deliberately NOT in this chain: it needs a separate
+///   multi-GB install and only pays off on Tensor-Core (Turing+) GPUs.
 fn ep_priority_for(device: InferenceDevice) -> Vec<String> {
     let tokens: &[&str] = match device {
         InferenceDevice::Hailo => &["hailo", "cpu"],
@@ -142,7 +147,7 @@ fn ep_priority_for(device: InferenceDevice) -> Vec<String> {
         InferenceDevice::IntelGpu => &["gpu", "cpu"],
         InferenceDevice::AmdRocm => &["rocm", "cpu"],
         InferenceDevice::AmdVulkan => &["vulkan", "cpu"],
-        InferenceDevice::Nvidia => &["cpu"],
+        InferenceDevice::Nvidia => &["cuda", "cpu"],
         InferenceDevice::Cpu => &["cpu"],
     };
     tokens.iter().map(|s| (*s).to_string()).collect()
@@ -346,9 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_emits_cpu_ep_and_software_decode_today() {
-        // CUDA / TensorRT are M5-gated; until then NVIDIA falls through to
-        // the CPU EP and has no VA decode path.
+    fn nvidia_emits_cuda_ep_with_cpu_fallback() {
+        // The CUDA EP only binds when the installer has staged a
+        // CUDA-capable ONNX Runtime; `cpu` stays in the chain as the
+        // fail-soft terminal fallback. TensorRT is deliberately absent.
         let p = profile(
             16,
             16,
@@ -356,8 +362,8 @@ mod tests {
             DecodeCapability::Software,
         );
         let c = generate_config(&p);
-        assert_eq!(c.inference.ep_priority, vec!["cpu"]);
-        assert_eq!(c.runtime.decode.mode, DecodeMode::Software);
+        assert_eq!(c.inference.ep_priority, vec!["cuda", "cpu"]);
+        assert!(!c.inference.ep_priority.iter().any(|e| e == "tensorrt"));
     }
 
     #[test]

@@ -137,6 +137,30 @@ fn warn_openvino_unavailable_once() {
     });
 }
 
+/// CUDA device ordinal for the CUDA EP.
+///
+/// Defaults to 0 — every reference NVIDIA box is single-GPU. Set
+/// `NEXUS_CUDA_DEVICE` to pin a specific GPU on a multi-GPU host (the
+/// ordinal matches `nvidia-smi -L`). A malformed value warns once and
+/// falls back to 0 rather than failing the session open, keeping this
+/// consistent with the fail-soft posture of the rest of EP selection.
+#[cfg(feature = "ep-cuda")]
+fn cuda_device_id() -> i32 {
+    match std::env::var("NEXUS_CUDA_DEVICE") {
+        Err(_) => 0,
+        Ok(raw) => match raw.trim().parse::<i32>() {
+            Ok(id) if id >= 0 => id,
+            _ => {
+                warn!(
+                    value = %raw,
+                    "NEXUS_CUDA_DEVICE is not a non-negative integer; using CUDA device 0"
+                );
+                0
+            }
+        },
+    }
+}
+
 /// Returns true iff this container can drive an AMD Radeon GPU through the ROCm EP.
 ///
 /// We detect via kernel-level device nodes:
@@ -364,8 +388,17 @@ fn selected_for_priority_inner(
             #[cfg(feature = "ep-cuda")]
             "cuda" => {
                 use ort::execution_providers::CUDAExecutionProvider;
-                dispatchers.push(CUDAExecutionProvider::default().build());
-                names.push("cuda".into());
+                // Single-GPU boxes (every reference NVIDIA build) want
+                // device 0. `NEXUS_CUDA_DEVICE` pins a specific GPU on a
+                // multi-GPU host; a non-numeric value falls back to 0
+                // rather than failing the session open.
+                let device_id = cuda_device_id();
+                dispatchers.push(
+                    CUDAExecutionProvider::default()
+                        .with_device_id(device_id)
+                        .build(),
+                );
+                names.push(format!("cuda(device {device_id})"));
             }
             #[cfg(not(feature = "ep-cuda"))]
             "cuda" => warn!(

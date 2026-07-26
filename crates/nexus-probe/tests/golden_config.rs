@@ -176,12 +176,14 @@ fn amd_rocm_discrete() {
     assert_eq!(c.bus.capacity, 4096);
 }
 
-/// NVIDIA RTX. The aspirational mapping is
-/// `ep_priority = ["tensorrt","cuda","cpu"]`, but those EPs are M5-gated;
-/// the generator emits `["cpu"]` + software decode TODAY (matching the
-/// current "falls through to CPU" runtime reality). Flips at M5.
+/// NVIDIA dGPU. Emits `ep_priority = ["cuda","cpu"]` — the CUDA EP binds
+/// only once the installer has staged a CUDA-capable ONNX Runtime into
+/// `/opt/nexus/vendor/onnxruntime-cuda`, so `cpu` stays as the fail-soft
+/// terminal fallback. TensorRT is deliberately excluded: it needs a
+/// separate multi-GB install and only pays off on Tensor-Core (Turing+)
+/// silicon, which the reference Pascal card does not have.
 #[test]
-fn nvidia_is_cpu_today() {
+fn nvidia_selects_cuda_ep() {
     let m = manifest(
         8,
         16,
@@ -192,8 +194,8 @@ fn nvidia_is_cpu_today() {
         },
     );
     let c = config_for(&m);
-    assert_eq!(c.inference.ep_priority, vec!["cpu"]);
-    assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Software);
+    assert_eq!(c.inference.ep_priority, vec!["cuda", "cpu"]);
+    assert!(!c.inference.ep_priority.iter().any(|e| e == "tensorrt"));
 }
 
 /// Pure CPU box — no accelerators. Software everywhere, single worker.
