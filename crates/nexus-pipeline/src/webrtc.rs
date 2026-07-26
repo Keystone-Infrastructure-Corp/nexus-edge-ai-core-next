@@ -908,6 +908,16 @@ impl BitrateController {
     }
 }
 
+/// Minimum spacing between encoder-forced IDRs driven by inbound PLI/FIR. A
+/// struggling viewer floods PLIs (one per lost reference), and each forced IDR
+/// is a full 20–40 KB frame with `all-headers`. Honouring every PLI at 1080p
+/// emits keyframes far faster than the GCC-collapsed bitrate budget can carry
+/// (~8 Mbps of IDR against a ~1.3 Mbps estimate), which congests the send path,
+/// causes more loss, provokes still more PLIs, and spirals the stream to black.
+/// One forced keyframe per second is enough to recover a genuine reference loss
+/// while a PLI storm is coalesced into a single IDR.
+const FORCED_KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+
 /// Forward browser keyframe requests (RTCP PLI/FIR) to the encoder. `webrtcbin`
 /// translates an inbound PLI/FIR into an upstream `GstForceKeyUnit` custom
 /// event; we intercept it on the payloader's src pad and re-issue a
@@ -917,6 +927,11 @@ impl BitrateController {
 /// next scheduled keyframe — and if the gap outlasts the GOP it stays black
 /// forever. Only meaningful on the transcode path (the `enc`/`pay` elements
 /// exist); passthrough has no encoder to retarget.
+///
+/// Forced IDRs are debounced to [`FORCED_KEYFRAME_MIN_INTERVAL`]: within the
+/// cooldown the redundant upstream FKU is dropped (`PadProbeReturn::Drop`) so
+/// the encoder is not driven into a keyframe storm that outruns the congestion
+/// budget and blacks the stream out.
 fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
     let Some(enc) = pipeline.by_name("enc") else {
         return;
@@ -928,6 +943,7 @@ fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
         return;
     };
     let enc_weak = enc.downgrade();
+    let last_forced: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
     let _ = pay_src.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_pad, info| {
         let Some(gst::PadProbeData::Event(ev)) = &info.data else {
             return gst::PadProbeReturn::Ok;
@@ -936,15 +952,26 @@ fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
             && ev
                 .structure()
                 .is_some_and(|s| s.name() == "GstForceKeyUnit");
-        if is_fku {
-            if let Some(enc) = enc_weak.upgrade() {
-                if let Some(sink) = enc.static_pad("sink") {
-                    let s = gst::Structure::builder("GstForceKeyUnit")
-                        .field("all-headers", true)
-                        .build();
-                    let _ = sink.send_event(gst::event::CustomUpstream::new(s));
-                    debug!(camera_id, "webrtc: PLI/FIR -> forced encoder keyframe");
-                }
+        if !is_fku {
+            return gst::PadProbeReturn::Ok;
+        }
+        // Debounce: swallow PLIs that arrive inside the cooldown so a viewer's
+        // PLI flood collapses to a single IDR instead of a keyframe storm.
+        let now = std::time::Instant::now();
+        {
+            let mut last = last_forced.lock();
+            if last.is_some_and(|t| now.duration_since(t) < FORCED_KEYFRAME_MIN_INTERVAL) {
+                return gst::PadProbeReturn::Drop;
+            }
+            *last = Some(now);
+        }
+        if let Some(enc) = enc_weak.upgrade() {
+            if let Some(sink) = enc.static_pad("sink") {
+                let s = gst::Structure::builder("GstForceKeyUnit")
+                    .field("all-headers", true)
+                    .build();
+                let _ = sink.send_event(gst::event::CustomUpstream::new(s));
+                debug!(camera_id, "webrtc: PLI/FIR -> forced encoder keyframe");
             }
         }
         gst::PadProbeReturn::Ok
