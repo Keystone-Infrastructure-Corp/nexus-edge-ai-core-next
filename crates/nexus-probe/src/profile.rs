@@ -59,7 +59,10 @@ pub enum DecodeCapability {
     /// VA-API decode is available (an Intel or AMD GPU with a media engine
     /// is present). Maps to `[runtime.decode] mode = "va"`.
     Va,
-    /// No VA-capable GPU detected — decode stays in software. Maps to
+    /// NVDEC decode is available (an NVIDIA GPU is present). Maps to
+    /// `[runtime.decode] mode = "nvdec"`.
+    Nvdec,
+    /// No hardware decoder detected — decode stays in software. Maps to
     /// `[runtime.decode] mode = "software"`.
     Software,
 }
@@ -134,6 +137,13 @@ pub struct HardwareProfile {
     pub inference: Vec<InferenceDevice>,
     /// Whether hardware-accelerated decode is available.
     pub decode: DecodeCapability,
+    /// Total VRAM of the discrete inference GPU in MiB, when it could be
+    /// read. Populated for NVIDIA (via `nvidia-smi`); `None` on every
+    /// other box class and whenever the driver is not yet live. The
+    /// generator sizes the detector pool against it and under-provisions
+    /// on `None`.
+    #[serde(default)]
+    pub vram_mib: Option<u64>,
 }
 
 impl HardwareProfile {
@@ -162,6 +172,7 @@ impl HardwareProfile {
             ram_bytes: m.memory.total_kib.saturating_mul(1024),
             inference,
             decode: decode_capability(&m.accelerators),
+            vram_mib: m.accelerators.nvidia_vram_mib,
         }
     }
 
@@ -206,12 +217,21 @@ fn rank_inference(acc: &Accelerators) -> Vec<InferenceDevice> {
     }
 }
 
-/// VA-API decode is available whenever an Intel or AMD GPU with a media
-/// engine is present. Hailo, Intel NPU, and (for now) NVIDIA do not
-/// contribute a VA decode path on their own.
+/// Pick the hardware decode path this host can drive.
+///
+/// VA-API whenever an Intel or AMD GPU with a media engine is present;
+/// NVDEC on an NVIDIA GPU (every card the engine targets carries an
+/// NVDEC block — 4th-gen on the reference Pascal, covering H.264 and
+/// 8-bit HEVC). VA wins when both are present, because the integrated
+/// media engine leaves the discrete GPU free for inference.
+///
+/// Hailo and the Intel NPU are inference-only and contribute no decode
+/// path of their own.
 fn decode_capability(acc: &Accelerators) -> DecodeCapability {
     if acc.intel_igpu || acc.intel_arc_140v || acc.amd_igpu {
         DecodeCapability::Va
+    } else if acc.nvidia_gpu {
+        DecodeCapability::Nvdec
     } else {
         DecodeCapability::Software
     }
@@ -356,9 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_records_silicon_but_decode_is_software_today() {
-        // NVIDIA dGPU: recorded as Nvidia in the chain (generator maps it
-        // to CPU EP today); no VA decode path -> Software.
+    fn nvidia_takes_the_inference_slot_and_nvdec_decode() {
+        // NVIDIA dGPU with no integrated media engine: Nvidia leads the
+        // inference chain and the card's NVDEC block handles decode.
         let m = manifest_with(
             CpuInfo::default(),
             MemoryInfo::default(),
@@ -372,7 +392,25 @@ mod tests {
             p.inference,
             vec![InferenceDevice::Nvidia, InferenceDevice::Cpu]
         );
-        assert_eq!(p.decode, DecodeCapability::Software);
+        assert_eq!(p.decode, DecodeCapability::Nvdec);
+    }
+
+    #[test]
+    fn nvidia_beside_an_intel_igpu_keeps_va_decode() {
+        // Workstation shape (iGPU + discrete NVIDIA): inference goes to the
+        // NVIDIA card while decode stays on the Intel media engine, so the
+        // dGPU's whole budget is left to inference.
+        let m = manifest_with(
+            CpuInfo::default(),
+            MemoryInfo::default(),
+            Accelerators {
+                nvidia_gpu: true,
+                intel_igpu: true,
+                ..Default::default()
+            },
+        );
+        let p = HardwareProfile::from_manifest(&m);
+        assert_eq!(p.decode, DecodeCapability::Va);
     }
 
     #[test]

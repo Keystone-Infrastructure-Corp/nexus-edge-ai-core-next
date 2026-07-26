@@ -71,6 +71,17 @@ pub struct Accelerators {
     pub intel_arc_140v: bool,
     pub intel_npu: bool,
     pub nvidia_gpu: bool,
+    /// Total VRAM of NVIDIA GPU 0 in MiB, read from `nvidia-smi`. `None`
+    /// when no NVIDIA card is present, or when the proprietary driver is
+    /// not yet live (`nvidia-smi` missing or erroring) — which is also the
+    /// state on a box awaiting the post-driver-install reboot. Consumers
+    /// treat `None` as "unknown" and under-provision rather than guess.
+    ///
+    /// GPU 0 specifically, because that is the device the CUDA execution
+    /// provider binds by default (see `cuda_device_id` in
+    /// `nexus-inference`).
+    #[serde(default)]
+    pub nvidia_vram_mib: Option<u64>,
     pub apple_silicon: bool,
     /// AMD Radeon iGPU (Phoenix-class Ryzen 7000/8000 APUs) or any
     /// AMD dGPU. Used for hardware H.264/HEVC decode via VA-API
@@ -237,6 +248,11 @@ fn probe_accelerators() -> Accelerators {
         // lspci can't name it; keep it as an additional positive.
         intel_npu: det.intel_npu || !accel_nodes.is_empty(),
         nvidia_gpu: det.nvidia_gpu,
+        nvidia_vram_mib: if det.nvidia_gpu {
+            probe_nvidia_vram_mib()
+        } else {
+            None
+        },
         apple_silicon: cfg!(all(target_os = "macos", target_arch = "aarch64")),
         amd_igpu: det.amd_igpu,
         hailo: det.hailo,
@@ -246,6 +262,42 @@ fn probe_accelerators() -> Accelerators {
         render_nodes,
         accel_nodes,
     }
+}
+
+/// Total VRAM of NVIDIA GPU 0, in MiB, via `nvidia-smi`.
+///
+/// Returns `None` whenever the answer is not trustworthy: no driver, an
+/// erroring `nvidia-smi`, or unparseable output. Callers under-provision
+/// on `None` rather than guessing.
+///
+/// The installer runs `install_drivers` before `emit-config`, so by the
+/// time the generated `nexus.toml` is written the driver is live and this
+/// answers. When the driver install demands a reboot the installer exits
+/// before generating a config at all, and the post-reboot re-run probes a
+/// working driver.
+fn probe_nvidia_vram_mib() -> Option<u64> {
+    let out = shell_out(
+        "nvidia-smi",
+        &[
+            "--query-gpu=memory.total",
+            "--format=csv,noheader,nounits",
+            "--id=0",
+        ],
+    )?;
+    parse_nvidia_smi_vram_mib(&out)
+}
+
+/// Parse `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits`
+/// output (a bare MiB integer per GPU) into the first GPU's VRAM.
+///
+/// Rejects zero, which `nvidia-smi` reports for a GPU in an error state
+/// and which would otherwise bucket as an absurdly small card.
+fn parse_nvidia_smi_vram_mib(out: &str) -> Option<u64> {
+    out.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .and_then(|l| l.parse::<u64>().ok())
+        .filter(|mib| *mib > 0)
 }
 
 /// Accelerator presence derived from a single pass over `lspci -nn`. The
@@ -783,6 +835,26 @@ mod tests {
         assert!(!detect_accel_from_lspci("VGA ... [8086:a780]").intel_arc_dgpu);
         // 5690: third char '9' is not in a..f, so not an Arc dGPU.
         assert!(!detect_accel_from_lspci("VGA ... [8086:5690]").intel_arc_dgpu);
+    }
+
+    #[test]
+    fn nvidia_smi_vram_parses_first_gpu() {
+        // `--format=csv,noheader,nounits` emits a bare MiB integer per GPU.
+        assert_eq!(parse_nvidia_smi_vram_mib("5059\n"), Some(5059));
+        // Multi-GPU: GPU 0 wins, matching the CUDA EP's default device.
+        assert_eq!(parse_nvidia_smi_vram_mib("8192\n24576\n"), Some(8192));
+        assert_eq!(parse_nvidia_smi_vram_mib("  12288  "), Some(12288));
+    }
+
+    #[test]
+    fn nvidia_smi_vram_rejects_untrustworthy_output() {
+        assert_eq!(parse_nvidia_smi_vram_mib(""), None);
+        // A GPU in an error state reports 0 — never a real bucket.
+        assert_eq!(parse_nvidia_smi_vram_mib("0\n"), None);
+        // Header row (a missing `noheader`) must not parse as a size.
+        assert_eq!(parse_nvidia_smi_vram_mib("memory.total [MiB]\n"), None);
+        // Units left in (a missing `nounits`) must not silently truncate.
+        assert_eq!(parse_nvidia_smi_vram_mib("5059 MiB\n"), None);
     }
 
     #[test]

@@ -284,8 +284,9 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DecodeMode {
-    /// Probe for the best available hardware backend (libva `va`) and
-    /// fall back to software when no VA decoder is registered. Default.
+    /// Probe for the best available hardware backend (libva `va`, then
+    /// NVIDIA `nvdec`) and fall back to software when neither is
+    /// registered. Default.
     #[default]
     Auto,
     /// Force the libva `va` backend (`vah26Xdec` + `vapostproc`). Falls
@@ -294,6 +295,10 @@ pub enum DecodeMode {
     /// Force the Intel Media-SDK backend (`msdkh26Xdec` + `msdkvpp`).
     /// Falls back to VA, then software.
     Msdk,
+    /// Force the NVIDIA NVDEC backend (`nvh26Xdec`, from the `nvcodec`
+    /// plugin). Falls back to software with a warning if the plugin is
+    /// missing or the driver's NVDEC userspace is unreachable.
+    Nvdec,
     /// Force the software backend (`avdec_h26X`). Always available.
     Software,
 }
@@ -3315,6 +3320,7 @@ capacity = 2048
             ("auto", DecodeMode::Auto),
             ("va", DecodeMode::Va),
             ("msdk", DecodeMode::Msdk),
+            ("nvdec", DecodeMode::Nvdec),
             ("software", DecodeMode::Software),
         ] {
             let src = format!("[decode]\nmode = \"{token}\"\n");

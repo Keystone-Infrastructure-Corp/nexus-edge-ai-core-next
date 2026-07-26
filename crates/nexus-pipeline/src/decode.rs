@@ -73,6 +73,8 @@ pub enum DecodeBackend {
     Va,
     /// Intel Media-SDK (`msdkh26Xdec` + `msdkvpp`).
     Msdk,
+    /// NVIDIA NVDEC (`nvh26Xdec`, from the `nvcodec` plugin).
+    Nvdec,
     /// Software (`avdec_h26X`).
     Software,
 }
@@ -113,11 +115,13 @@ pub struct DecodeChain {
 
 impl DecodeChain {
     /// Whether the selected backend differs from a hardware request, i.e.
-    /// the requested mode was `Va`/`Msdk` but selection fell open to
-    /// software. The caller uses this to emit a one-line WARN.
+    /// the requested mode was `Va`/`Msdk`/`Nvdec` but selection fell open
+    /// to software. The caller uses this to emit a one-line WARN.
     pub fn downgraded_from(&self, requested: DecodeMode) -> bool {
-        matches!(requested, DecodeMode::Va | DecodeMode::Msdk)
-            && self.backend == DecodeBackend::Software
+        matches!(
+            requested,
+            DecodeMode::Va | DecodeMode::Msdk | DecodeMode::Nvdec
+        ) && self.backend == DecodeBackend::Software
     }
 }
 
@@ -125,6 +129,13 @@ fn va_decoder(codec_base: &str) -> &'static str {
     match codec_base {
         "h265" => "vah265dec",
         _ => "vah264dec",
+    }
+}
+
+fn nvdec_decoder(codec_base: &str) -> &'static str {
+    match codec_base {
+        "h265" => "nvh265dec",
+        _ => "nvh264dec",
     }
 }
 
@@ -240,6 +251,30 @@ fn msdk_chain(codec_base: &str) -> DecodeChain {
     }
 }
 
+/// NVDEC decode with CPU convert/scale.
+///
+/// `nvh26Xdec` can emit either `video/x-raw(memory:CUDAMemory)` or plain
+/// system-memory `video/x-raw`; because the next element here is
+/// `videoconvert` (system memory only), negotiation settles on the latter
+/// and the decoder downloads NV12 itself. Decode runs on the GPU's NVDEC
+/// block, convert/scale stay on the CPU — deliberately mirroring the AMD
+/// "sysmem NV12 + cpu convert" chain, which is the shape already proven in
+/// production here.
+///
+/// A fully GPU-resident tail (`cudaconvertscale ! cudadownload`) would
+/// avoid the CPU colour conversion, but element availability varies across
+/// GStreamer versions and it cannot be validated without the hardware, so
+/// it is left as a future optimisation rather than an untested default.
+fn nvdec_chain(codec_base: &str) -> DecodeChain {
+    let dec = nvdec_decoder(codec_base);
+    DecodeChain {
+        elements: format!("{dec} ! videoconvert ! videoscale ! videorate"),
+        backend: DecodeBackend::Nvdec,
+        hwaccel: true,
+        label: format!("nvdec ({dec}, sysmem NV12 + cpu convert)"),
+    }
+}
+
 fn va_available(probe: &impl FactoryProbe, codec_base: &str) -> bool {
     probe.has(va_decoder(codec_base)) && probe.has("vapostproc")
 }
@@ -257,6 +292,15 @@ fn msdk_available(probe: &impl FactoryProbe, codec_base: &str) -> bool {
     probe.has(msdk_decoder(codec_base)) && probe.has("msdkvpp")
 }
 
+/// Whether NVDEC decode is available for `codec_base`. Only the decoder
+/// element is required — [`nvdec_chain`] converts on the CPU, so there is
+/// no postproc counterpart to probe. The `nvcodec` plugin only registers
+/// `nvh26Xdec` when it can dlopen `libnvcuvid.so`, so a registered factory
+/// already implies a working driver-side NVDEC userspace.
+fn nvdec_available(probe: &impl FactoryProbe, codec_base: &str) -> bool {
+    probe.has(nvdec_decoder(codec_base))
+}
+
 /// Pick the decode + post-process fragment for one camera.
 ///
 /// `codec_base` is the collapsed codec family (`"h264"` or `"h265"`); any
@@ -266,10 +310,15 @@ fn msdk_available(probe: &impl FactoryProbe, codec_base: &str) -> bool {
 ///
 /// Fail-open semantics:
 /// * `Software` — always the software chain.
-/// * `Auto` — VA if available, else software.
+/// * `Auto` — VA if available, else NVDEC, else software.
 /// * `Va` — VA if available, else software (caller warns; see
 ///   [`DecodeChain::downgraded_from`]).
 /// * `Msdk` — MSDK if available, else VA, else software.
+/// * `Nvdec` — NVDEC if available, else software (caller warns).
+///
+/// `Auto` prefers VA over NVDEC so that a box with both an integrated
+/// media engine and a discrete NVIDIA card decodes on the iGPU, leaving
+/// the dGPU's budget entirely to inference.
 ///
 /// Callers on macOS pass [`DecodeMode::Software`] (the only registered
 /// decoders there are the `avdec_*` software ones; `vtdec` deadlocks a
@@ -281,9 +330,25 @@ pub fn select_decode_chain(
 ) -> DecodeChain {
     match mode {
         DecodeMode::Software => software_chain(codec_base),
-        DecodeMode::Auto | DecodeMode::Va => {
+        DecodeMode::Auto => {
             if va_available(probe, codec_base) {
                 va_chain_for(codec_base, probe)
+            } else if nvdec_available(probe, codec_base) {
+                nvdec_chain(codec_base)
+            } else {
+                software_chain(codec_base)
+            }
+        }
+        DecodeMode::Va => {
+            if va_available(probe, codec_base) {
+                va_chain_for(codec_base, probe)
+            } else {
+                software_chain(codec_base)
+            }
+        }
+        DecodeMode::Nvdec => {
+            if nvdec_available(probe, codec_base) {
+                nvdec_chain(codec_base)
             } else {
                 software_chain(codec_base)
             }
@@ -554,6 +619,58 @@ mod tests {
         let c = select_decode_chain("h264", DecodeMode::Va, &none());
         assert_eq!(c.backend, DecodeBackend::Software);
         assert!(c.downgraded_from(DecodeMode::Va));
+    }
+
+    #[test]
+    fn nvdec_request_selects_nvcodec_h264() {
+        let c = select_decode_chain("h264", DecodeMode::Nvdec, &probe(&["nvh264dec"]));
+        assert_eq!(c.backend, DecodeBackend::Nvdec);
+        assert!(c.hwaccel);
+        assert_eq!(
+            c.elements,
+            "nvh264dec ! videoconvert ! videoscale ! videorate"
+        );
+        assert!(!c.downgraded_from(DecodeMode::Nvdec));
+    }
+
+    #[test]
+    fn nvdec_request_selects_nvcodec_h265() {
+        let c = select_decode_chain("h265", DecodeMode::Nvdec, &probe(&["nvh265dec"]));
+        assert_eq!(c.backend, DecodeBackend::Nvdec);
+        assert_eq!(
+            c.elements,
+            "nvh265dec ! videoconvert ! videoscale ! videorate"
+        );
+    }
+
+    /// The nvcodec plugin registers per-codec decoders independently, so an
+    /// H.265 stream on a card whose `nvh265dec` is absent must fall open to
+    /// software rather than mis-selecting the H.264 element.
+    #[test]
+    fn nvdec_request_falls_open_to_software_and_flags_downgrade() {
+        let c = select_decode_chain("h265", DecodeMode::Nvdec, &probe(&["nvh264dec"]));
+        assert_eq!(c.backend, DecodeBackend::Software);
+        assert!(c.downgraded_from(DecodeMode::Nvdec));
+    }
+
+    #[test]
+    fn auto_uses_nvdec_when_va_is_absent() {
+        let c = select_decode_chain("h264", DecodeMode::Auto, &probe(&["nvh264dec"]));
+        assert_eq!(c.backend, DecodeBackend::Nvdec);
+        assert!(c.hwaccel);
+    }
+
+    /// On a box carrying both an integrated media engine and a discrete
+    /// NVIDIA card, `Auto` must decode on VA so the dGPU stays free for
+    /// inference.
+    #[test]
+    fn auto_prefers_va_over_nvdec_when_both_are_present() {
+        let c = select_decode_chain(
+            "h264",
+            DecodeMode::Auto,
+            &probe(&["vah264dec", "vapostproc", "nvh264dec"]),
+        );
+        assert_eq!(c.backend, DecodeBackend::Va);
     }
 
     #[test]

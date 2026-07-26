@@ -223,6 +223,12 @@ jobs:
           cargo check --locked -p nexus-pipeline  --features gstreamer
           cargo check --locked -p nexus-pipeline  --features gstreamer-webrtc
           cargo check --locked -p nexus-inference --features ort,ep-cpu
+          # CUDA execution provider: compile-only. No GitHub-hosted runner
+          # has an NVIDIA GPU, and the CUDA provider is dlopen'd at session
+          # open, so this gates the ep-cuda code path (CUDAExecutionProvider
+          # builder API) without needing hardware. Real attachment is
+          # verified manually on the reference box.
+          cargo check --locked -p nexus-inference --features ort,ep-cuda
           cargo check --locked -p nexus-engine    --features gstreamer
           cargo check --locked -p nexus-engine    --features gstreamer-webrtc
           # ep-cpu implies `ort`, so this is the only job that compiles the

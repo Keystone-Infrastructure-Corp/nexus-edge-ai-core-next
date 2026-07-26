@@ -520,9 +520,9 @@ export interface SystemMemoryInfo {
 }
 
 export interface GpuEngineUtil {
-  /// Engine class: `"render"`, `"video-decode"`, `"video-enhance"`,
-  /// `"copy"`, or `"compute"`. Instances of the same class are
-  /// averaged into one entry.
+  /// Engine class: `"render"`, `"video-decode"`, `"video-encode"`,
+  /// `"video-enhance"`, `"copy"`, or `"compute"`. Instances of the
+  /// same class are averaged into one entry.
   class: string;
   /// 0–100 utilization for this engine class.
   utilization_pct: number;
@@ -535,13 +535,33 @@ export interface SystemGpuInfo {
   mem_used_bytes: number | null;
   utilization_pct: number | null;
   temp_c: number | null;
-  /// Per-engine-class utilization for Intel iGPUs (i915 on Alder
-  /// Lake / Raptor Lake, xe on Lunar Lake / Battlemage). One entry
-  /// per engine class, each with its own 0–100 reading. Absent or
-  /// empty on NVIDIA, AMD, Apple, and while the Intel PMU baseline
-  /// is warming up. The `utilization_pct` above stays the overall
-  /// aggregate, so existing readouts are unchanged.
+  /// Per-engine-class utilization. Intel iGPUs (i915 on Alder Lake
+  /// / Raptor Lake, xe on Lunar Lake / Battlemage) report the full
+  /// engine set; NVIDIA reports `"video-decode"` (NVDEC) and
+  /// `"video-encode"` (NVENC). Absent or empty on AMD and Apple,
+  /// and while the Intel PMU baseline is warming up. The
+  /// `utilization_pct` above stays the overall aggregate, so
+  /// existing readouts are unchanged.
   engines?: GpuEngineUtil[];
+  /// Board power draw in watts. NVIDIA only.
+  power_w?: number | null;
+  /// Board power cap in watts, the denominator for `power_w`.
+  /// NVIDIA only.
+  power_limit_w?: number | null;
+  /// Current graphics/core clock in MHz. NVIDIA only.
+  graphics_clock_mhz?: number | null;
+  /// Current memory clock in MHz. NVIDIA only.
+  memory_clock_mhz?: number | null;
+  /// Fan speed as a percentage of maximum. NVIDIA only, and absent
+  /// on passively-cooled boards.
+  fan_speed_pct?: number | null;
+  /// Host GPU driver version, e.g. `"580.65.06"`. NVIDIA only.
+  driver_version?: string | null;
+  /// CUDA driver version the installed driver speaks, e.g.
+  /// `"12.9"`. NVIDIA only.
+  cuda_version?: string | null;
+  /// CUDA compute capability, e.g. `"6.1"` for Pascal. NVIDIA only.
+  compute_capability?: string | null;
   /// Operator-facing reason when `utilization_pct` is `null`.
   /// Populated by the engine when PMU init or sampling failed
   /// (e.g. "missing CAP_PERFMON", "i915 PMU not exposed");

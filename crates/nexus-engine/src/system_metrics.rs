@@ -97,32 +97,39 @@ pub struct MemoryInfo {
     pub swap_used_bytes: u64,
 }
 
-/// One Intel GPU engine class with its own utilization reading.
+/// One GPU engine class with its own utilization reading.
 ///
-/// Intel iGPUs split work across distinct hardware engines —
-/// render/3D, video-decode, video-enhance, copy/blitter, compute —
-/// each clocked independently. On a headless video appliance the
-/// render engine sits near 0% while the video-decode and
-/// video-enhance engines carry the real load, so the single
+/// GPUs split work across distinct hardware engines — render/3D,
+/// video-decode, video-encode, video-enhance, copy/blitter,
+/// compute — each clocked independently. On a headless video
+/// appliance the render engine sits near 0% while the video
+/// engines carry the real load, so the single
 /// `GpuInfo::utilization_pct` aggregate can look misleadingly idle.
 /// This per-class breakdown surfaces where the work actually is.
 ///
-/// Populated for the Intel sysfs/PMU backend only (both the i915
-/// driver on Alder Lake / Raptor Lake and the xe driver on Lunar
-/// Lake / Battlemage); empty on NVIDIA, AMD, and Apple.
+/// Populated by two backends:
+/// - Intel sysfs/PMU (both the i915 driver on Alder Lake / Raptor
+///   Lake and the xe driver on Lunar Lake / Battlemage), which
+///   reports the full engine set.
+/// - NVIDIA NVML, which reports `"video-decode"` (NVDEC) and
+///   `"video-encode"` (NVENC). NVML exposes no render/compute
+///   split, so those classes are absent there — the headline
+///   `utilization_pct` already covers the SM.
+///
+/// Empty on AMD and Apple.
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuEngineUtil {
     /// Stable engine class: `"render"`, `"video-decode"`,
-    /// `"video-enhance"`, `"copy"`, or `"compute"`. Instances of
-    /// the same class (e.g. two video-decode engines) are averaged
-    /// into one entry.
+    /// `"video-encode"`, `"video-enhance"`, `"copy"`, or
+    /// `"compute"`. Instances of the same class (e.g. two
+    /// video-decode engines) are averaged into one entry.
     pub class: String,
     /// 0–100 utilization for this engine class over the sampling
     /// window.
     pub utilization_pct: f32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct GpuInfo {
     pub kind: String,
     pub name: String,
@@ -130,14 +137,49 @@ pub struct GpuInfo {
     pub mem_used_bytes: Option<u64>,
     pub utilization_pct: Option<f32>,
     pub temp_c: Option<f32>,
-    /// Per-engine-class utilization breakdown for Intel iGPUs.
-    /// Empty on every other backend (and while the Intel PMU
-    /// baseline is warming up). The aggregate `utilization_pct`
-    /// above is unchanged when this is populated, so consumers
-    /// that only read the headline number — including the existing
-    /// Alder Lake path — keep working untouched.
+    /// Per-engine-class utilization breakdown. Intel iGPUs report
+    /// the full engine set; NVIDIA reports NVDEC/NVENC. Empty on
+    /// AMD and Apple, and while the Intel PMU baseline is warming
+    /// up. The aggregate `utilization_pct` above is unchanged when
+    /// this is populated, so consumers that only read the headline
+    /// number — including the existing Alder Lake path — keep
+    /// working untouched.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub engines: Vec<GpuEngineUtil>,
+    /// Board power draw in watts. NVIDIA (NVML) only; `None` on
+    /// Intel, AMD, and Apple, and on NVIDIA boards with no power
+    /// sensor. Mirrors the Hailo card's power readout so the GPU
+    /// card carries the same operator signal.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub power_w: Option<f32>,
+    /// Board power cap in watts (NVML `power_management_limit`).
+    /// Gives `power_w` a denominator so the System page can render
+    /// "45 / 75 W" rather than a bare number.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub power_limit_w: Option<f32>,
+    /// Current graphics/core clock in MHz. NVIDIA only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub graphics_clock_mhz: Option<u32>,
+    /// Current memory clock in MHz. NVIDIA only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub memory_clock_mhz: Option<u32>,
+    /// Fan speed as a percentage of maximum, 0–100. NVIDIA only,
+    /// and `None` on passively-cooled boards (datacentre cards and
+    /// some low-profile Quadros report no fan at all).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fan_speed_pct: Option<u32>,
+    /// Host GPU driver version, e.g. `"580.65.06"`. Static for the
+    /// lifetime of the process — read once at backend init.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub driver_version: Option<String>,
+    /// CUDA driver version the installed driver speaks, e.g.
+    /// `"12.9"`. Lets an operator confirm the installer staged a
+    /// CUDA runtime the driver can actually talk to.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cuda_version: Option<String>,
+    /// CUDA compute capability, e.g. `"6.1"` for Pascal. Static.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub compute_capability: Option<String>,
     /// Operator-facing explanation when `utilization_pct` is `None`.
     /// `Some("...")` describes which PMU init / sampling step
     /// failed; `None` means utilization is being reported normally.

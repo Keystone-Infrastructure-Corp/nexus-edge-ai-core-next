@@ -127,6 +127,7 @@ mod nvidia {
     use nvml_wrapper::Nvml;
 
     use super::GpuInfo;
+    use crate::system_metrics::GpuEngineUtil;
 
     pub(super) struct NvidiaState {
         nvml: Nvml,
@@ -134,6 +135,18 @@ mod nvidia {
         // first GPU — multi-GPU edge boxes are out of scope.
         name: String,
         mem_total: Option<u64>,
+        // Identity fields that cannot change while the process is
+        // alive. Reading them once keeps the 1 s metrics poll cheap
+        // (each NVML call is an FFI round-trip).
+        driver_version: Option<String>,
+        cuda_version: Option<String>,
+        compute_capability: Option<String>,
+    }
+
+    /// NVML reports the CUDA driver version as a packed integer:
+    /// `major * 1000 + minor * 10`. 12090 → `"12.9"`.
+    fn format_cuda_version(packed: i32) -> String {
+        format!("{}.{}", packed / 1000, (packed % 1000) / 10)
     }
 
     pub(super) fn try_init() -> Option<NvidiaState> {
@@ -155,16 +168,33 @@ mod nvidia {
         let device = nvml.device_by_index(0).ok()?;
         let name = device.name().unwrap_or_else(|_| "NVIDIA GPU".to_string());
         let mem_total = device.memory_info().ok().map(|m| m.total);
-        tracing::info!(name = %name, "GPU backend: NVIDIA via NVML");
+        let driver_version = nvml.sys_driver_version().ok();
+        let cuda_version = nvml.sys_cuda_driver_version().ok().map(format_cuda_version);
+        let compute_capability = device
+            .cuda_compute_capability()
+            .ok()
+            .map(|c| format!("{}.{}", c.major, c.minor));
+        tracing::info!(
+            name = %name,
+            driver = driver_version.as_deref().unwrap_or("unknown"),
+            cuda = cuda_version.as_deref().unwrap_or("unknown"),
+            compute_capability = compute_capability.as_deref().unwrap_or("unknown"),
+            "GPU backend: NVIDIA via NVML"
+        );
         Some(NvidiaState {
             nvml,
             name,
             mem_total,
+            driver_version,
+            cuda_version,
+            compute_capability,
         })
     }
 
     impl NvidiaState {
         pub(super) fn snapshot(&mut self) -> Option<GpuInfo> {
+            use nvml_wrapper::enum_wrappers::device::Clock;
+
             let device = self.nvml.device_by_index(0).ok()?;
             let mem = device.memory_info().ok();
             let util = device.utilization_rates().ok().map(|u| u.gpu as f32);
@@ -178,6 +208,43 @@ mod nvidia {
             } else {
                 None
             };
+
+            // NVDEC / NVENC utilization. These are the only per-engine
+            // counters NVML exposes, and NVDEC is the one that matters
+            // most here: the pipeline decodes on the NVDEC block, and
+            // without this reading there is no way to tell a working
+            // hardware decode path from a silent fall back to software.
+            // Both calls fail on cards without the respective block, so
+            // a failure is expected rather than exceptional — drop the
+            // entry and let the UI hide the row.
+            let mut engines = Vec::new();
+            if let Ok(dec) = device.decoder_utilization() {
+                engines.push(GpuEngineUtil {
+                    class: "video-decode".to_string(),
+                    utilization_pct: dec.utilization as f32,
+                });
+            }
+            if let Ok(enc) = device.encoder_utilization() {
+                engines.push(GpuEngineUtil {
+                    class: "video-encode".to_string(),
+                    utilization_pct: enc.utilization as f32,
+                });
+            }
+
+            // NVML reports power and its cap in milliwatts.
+            let power_w = device.power_usage().ok().map(|mw| mw as f32 / 1000.0);
+            let power_limit_w = device
+                .power_management_limit()
+                .ok()
+                .map(|mw| mw as f32 / 1000.0);
+
+            // Fan speed is a percentage of maximum. Passively-cooled
+            // boards report zero fans, which is not an error.
+            let fan_speed_pct = match device.num_fans() {
+                Ok(n) if n > 0 => device.fan_speed(0).ok(),
+                _ => None,
+            };
+
             Some(GpuInfo {
                 kind: "nvidia".to_string(),
                 name: self.name.clone(),
@@ -185,7 +252,15 @@ mod nvidia {
                 mem_used_bytes: mem.map(|m| m.used),
                 utilization_pct: util,
                 temp_c: temp,
-                engines: Vec::new(),
+                engines,
+                power_w,
+                power_limit_w,
+                graphics_clock_mhz: device.clock_info(Clock::Graphics).ok(),
+                memory_clock_mhz: device.clock_info(Clock::Memory).ok(),
+                fan_speed_pct,
+                driver_version: self.driver_version.clone(),
+                cuda_version: self.cuda_version.clone(),
+                compute_capability: self.compute_capability.clone(),
                 utilization_status,
             })
         }
@@ -501,6 +576,9 @@ mod intel {
                 temp_c: None,
                 engines,
                 utilization_status,
+                // Power / clocks / fan / driver identity are NVML-only
+                // today; the Intel PMU path exposes none of them.
+                ..Default::default()
             }
         }
     }
@@ -1672,6 +1750,9 @@ mod amd {
                 temp_c,
                 engines: Vec::new(),
                 utilization_status,
+                // amdgpu sysfs does expose power/clock nodes, but this
+                // backend does not read them yet.
+                ..Default::default()
             }
         }
     }
@@ -1784,6 +1865,7 @@ mod apple {
                      name is detected via system_profiler"
                         .to_string(),
                 ),
+                ..Default::default()
             }
         }
     }

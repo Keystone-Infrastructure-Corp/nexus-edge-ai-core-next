@@ -450,9 +450,13 @@ install_drivers() {
     fi
 
     if (( has_nvidia )); then
-        warn "NVIDIA GPU detected — NVIDIA support lands when M5 ships the CUDA / TensorRT"
-        warn "execution providers. Skipping nvidia driver install for now; engine"
-        warn "will run on the CPU EP fallback. See docs/INSTALL.md §5.4."
+        # Proprietary driver + CUDA runtime (may exit 0 asking for a reboot
+        # when nouveau still holds the GPU), then swap the engine's ONNX
+        # Runtime for a CUDA-capable build. The bundled runtime is the
+        # OpenVINO one and has no CUDA provider, so without the second
+        # step the CUDA EP silently never attaches.
+        _drivers_nvidia_cuda
+        _install_ort_cuda
     fi
 
     if (( has_amd )); then
@@ -517,13 +521,14 @@ verify_accelerators() {
         return 0
     fi
 
-    local has_igpu=0 has_arc=0 has_npu=0 has_amd=0 has_hailo=0
+    local has_igpu=0 has_arc=0 has_npu=0 has_amd=0 has_hailo=0 has_nvidia=0
     while IFS= read -r tag; do
         case "$tag" in
             intel-igpu)     has_igpu=1 ;;
             intel-arc-dgpu) has_arc=1 ;;
             intel-npu)      has_npu=1 ;;
             amd-igpu)       has_amd=1 ;;
+            nvidia-gpu)     has_nvidia=1 ;;
             hailo-m2)       has_hailo=1 ;;
         esac
     done <<<"$tags"
@@ -538,6 +543,9 @@ verify_accelerators() {
     fi
     if (( has_amd )); then
         _verify_amd_gpu_userspace || true
+    fi
+    if (( has_nvidia )); then
+        _verify_nvidia_userspace || true
     fi
     if (( has_hailo )); then
         _verify_hailo_userspace || true
@@ -573,6 +581,34 @@ _verify_va_gst_decoder() {
     else
         log "  [info] GStreamer VA decoders unavailable (${missing[*]}); pipeline will fall back to software decode"
         log "         (gstreamer1.0-plugins-bad missing, or libva driver not visible to GStreamer)"
+    fi
+    return 0
+}
+
+# GStreamer NVDEC counterpart of _verify_va_gst_decoder. The nvcodec
+# plugin (gstreamer1.0-plugins-bad) only registers nvh264dec / nvh265dec
+# when it can dlopen libnvcuvid.so at plugin-scan time, so this probe
+# proves BOTH that the plugin is installed and that the NVIDIA driver's
+# NVDEC userspace is reachable. Bonus probe — hardware decode is
+# optional and the engine fails open to the software `avdec_*` chain, so
+# this never affects the caller's return code.
+_verify_nvdec_gst_decoder() {
+    if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
+        log "  [info] gst-inspect-1.0 not on PATH (gstreamer1.0-tools missing); skipping NVDEC probe"
+        return 0
+    fi
+    local missing=()
+    local dec
+    for dec in nvh264dec nvh265dec; do
+        if ! gst-inspect-1.0 "$dec" >/dev/null 2>&1; then
+            missing+=("$dec")
+        fi
+    done
+    if (( ${#missing[@]} == 0 )); then
+        log "  [ OK ] GStreamer NVDEC decoders loadable (nvh264dec, nvh265dec) -- hardware decode chain available"
+    else
+        log "  [info] GStreamer NVDEC decoders unavailable (${missing[*]}); pipeline will fall back to software decode"
+        log "         (gstreamer1.0-plugins-bad missing, or libnvcuvid.so not visible to GStreamer)"
     fi
     return 0
 }
@@ -735,6 +771,59 @@ _verify_amd_gpu_userspace() {
         log "  [info] VA-API Mesa Gallium not active (hardware decode unavailable; engine still works on software decode)"
     fi
     _verify_va_gst_decoder
+
+    return $(( ok ? 0 : 1 ))
+}
+
+# Verify the NVIDIA userspace the CUDA execution provider depends on.
+# Four things must line up before inference actually runs on the GPU:
+#   1. Kernel driver bound  : nvidia-smi enumerates at least one GPU.
+#   2. CUDA runtime present : libcudart.so.12 resolvable.
+#   3. CUDA ORT staged      : the vendor dir + systemd drop-in exist, so
+#                             the engine loads a runtime that HAS a CUDA
+#                             provider (the bundled one is OpenVINO).
+#   4. Provider deps resolve: ldd on the provider reports nothing missing.
+# Non-fatal — the engine falls back to the CPU EP, so this warns loudly
+# rather than failing the install.
+_verify_nvidia_userspace() {
+    local ok=1
+
+    log "verifying NVIDIA GPU userspace..."
+
+    if _nvidia_driver_live; then
+        log "  [ OK ] NVIDIA driver active: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1)"
+    else
+        warn "  [FAIL] nvidia-smi does not enumerate a GPU — driver not bound"
+        warn "         (reboot to let the proprietary module replace nouveau,"
+        warn "          then re-run install.sh)"
+        return 1
+    fi
+
+    local cuda_lib
+    cuda_lib="$(_nvidia_cuda_lib_dir)"
+    if [[ -n "$cuda_lib" ]]; then
+        log "  [ OK ] CUDA 12 runtime present ($cuda_lib)"
+    else
+        warn "  [FAIL] no libcudart.so.12 under /usr/local — CUDA runtime missing"
+        warn "         fix: sudo apt-get install cuda-libraries-12-9"
+        ok=0
+    fi
+
+    local vendor_dir="${NEXUS_ORT_CUDA_DIR:-/opt/nexus/vendor/onnxruntime-cuda}"
+    local dropin="/etc/systemd/system/nexus-engine.service.d/10-ort-cuda.conf"
+    if [[ -e "$vendor_dir/libonnxruntime_providers_cuda.so" && -f "$dropin" ]]; then
+        log "  [ OK ] CUDA ONNX Runtime staged ($vendor_dir) and wired via $(basename "$dropin")"
+        if [[ -n "$cuda_lib" ]]; then
+            _ort_cuda_check_deps "$vendor_dir" "$cuda_lib"
+        fi
+    else
+        warn "  [FAIL] CUDA ONNX Runtime not staged — the bundled runtime is the"
+        warn "         OpenVINO build and has NO CUDA provider, so inference will"
+        warn "         silently run on CPU. Re-run install.sh to stage it."
+        ok=0
+    fi
+
+    _verify_nvdec_gst_decoder
 
     return $(( ok ? 0 : 1 ))
 }
@@ -2270,6 +2359,322 @@ _drivers_hailo_pcie() {
     else
         warn "HailoRT installed but /dev/hailo0 not yet present — reboot and re-run install.sh to verify"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# NVIDIA CUDA — proprietary driver + CUDA runtime + CUDA-capable ORT.
+#
+# Three-part install, mirroring the AMD ROCm tier:
+#   _drivers_nvidia_cuda  kernel driver (nouveau blacklisted) + the CUDA
+#                         runtime libraries the ORT provider links against.
+#   _install_ort_cuda     stage a CUDA-flavoured ONNX Runtime into
+#                         /opt/nexus/vendor and repoint the loader at it.
+#   _verify_nvidia_userspace  post-install probes (called from
+#                         verify_accelerators).
+#
+# Why the ORT swap is required: the release tarball bundles the OPENVINO
+# build of libonnxruntime, which contains no CUDA provider. ort 2.0
+# silently skips an execution provider that fails to attach, so without
+# this an NVIDIA box would report ep_priority = ["cuda","cpu"], log
+# nothing alarming, and run every frame on the CPU.
+# ---------------------------------------------------------------------------
+
+# Map the host Ubuntu release onto NVIDIA's CUDA repo directory name.
+# Echoes e.g. `ubuntu2404`. Empty output = unsupported release.
+_nvidia_repo_distro() {
+    local vid
+    vid="$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-}")"
+    case "$vid" in
+        24.04) echo "ubuntu2404" ;;
+        22.04) echo "ubuntu2204" ;;
+        *)     echo "" ;;
+    esac
+}
+
+# True when the NVIDIA kernel driver is bound and enumerating a GPU.
+_nvidia_driver_live() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
+    nvidia-smi -L 2>/dev/null | grep -q '^GPU 0'
+}
+
+# Resolve the directory holding libcudart.so.12 / libcublas.so.12 etc.
+# Prefers the /usr/local/cuda symlink, falls back to the highest
+# versioned CUDA 12 tree. Echoes empty when no CUDA runtime is present.
+_nvidia_cuda_lib_dir() {
+    local d
+    for d in /usr/local/cuda/lib64 /usr/local/cuda/targets/x86_64-linux/lib; do
+        [[ -e "$d/libcudart.so.12" ]] && { echo "$d"; return 0; }
+    done
+    while IFS= read -r d; do
+        [[ -e "$d/libcudart.so.12" ]] && { echo "$d"; return 0; }
+    done < <(ls -d /usr/local/cuda-12*/lib64 /usr/local/cuda-12*/targets/x86_64-linux/lib 2>/dev/null | sort -rV)
+    echo ""
+}
+
+_drivers_nvidia_cuda() {
+    # x86_64 only. Jetson / ARM64 use a completely different stack
+    # (L4T BSP, no cuda-keyring repo) and are out of scope.
+    if [[ "$(uname -m)" != "x86_64" ]]; then
+        warn "NVIDIA: $(uname -m) is not x86_64 — skipping CUDA install"
+        warn "        (Jetson/L4T boards need the NVIDIA JetPack BSP instead)"
+        return 0
+    fi
+
+    local distro
+    distro="$(_nvidia_repo_distro)"
+    if [[ -z "$distro" ]]; then
+        warn "NVIDIA: no CUDA repo for this Ubuntu release; skipping driver install"
+        warn "        (supported: 24.04, 22.04) — engine will use the CPU EP"
+        return 0
+    fi
+
+    local cuda_ver="${NEXUS_CUDA_APT_VERSION:-12-9}"
+
+    # Idempotent short-circuit: driver live AND the runtime libs the ORT
+    # CUDA provider needs are already resolvable.
+    if _nvidia_driver_live && [[ -n "$(_nvidia_cuda_lib_dir)" ]] \
+        && compgen -G "/usr/lib/x86_64-linux-gnu/libcudnn.so.9*" >/dev/null; then
+        log "NVIDIA driver + CUDA runtime + cuDNN already installed"
+        return 0
+    fi
+
+    log "installing NVIDIA driver + CUDA $cuda_ver runtime (for the CUDA execution provider)"
+
+    # Blacklist nouveau. The NVIDIA packages ship their own blacklist, but
+    # writing ours first means the initramfs rebuild below happens once
+    # rather than being triggered mid-install by the driver postinst.
+    local blacklist=/etc/modprobe.d/nexus-blacklist-nouveau.conf
+    if [[ ! -f "$blacklist" ]]; then
+        cat > "$blacklist" <<'NOUVEAU'
+# Installed by nexus install.sh — the open-source nouveau driver conflicts
+# with the proprietary NVIDIA kernel module (which the CUDA execution
+# provider requires). Delete this file and run `update-initramfs -u` to
+# revert to nouveau.
+blacklist nouveau
+options nouveau modeset=0
+NOUVEAU
+        update-initramfs -u >/dev/null 2>&1 \
+            || warn "NVIDIA: update-initramfs failed; nouveau may still claim the GPU after reboot"
+    fi
+
+    # NVIDIA's CUDA apt repo carries the driver, the runtime libraries and
+    # cuDNN 9 from one signed source.
+    local keyring=/usr/share/keyrings/cuda-archive-keyring.gpg
+    if [[ ! -s "$keyring" ]]; then
+        local base="https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64"
+        local tmpdeb
+        tmpdeb="$(mktemp -t nexus-cuda-keyring.XXXXXX.deb)"
+        if curl -fsSL "${base}/cuda-keyring_1.1-1_all.deb" -o "$tmpdeb" \
+            && DEBIAN_FRONTEND=noninteractive dpkg -i "$tmpdeb" >/dev/null 2>&1; then
+            log "NVIDIA: installed cuda-keyring (repo ${distro})"
+        else
+            rm -f "$tmpdeb"
+            warn "NVIDIA: could not install cuda-keyring from developer.download.nvidia.com;"
+            warn "        skipping CUDA install — engine will use the CPU EP."
+            return 0
+        fi
+        rm -f "$tmpdeb"
+    fi
+
+    apt-get update -qq || true
+
+    # Driver branch. R580 is the LAST branch supporting Maxwell / Pascal /
+    # Volta (the reference Quadro P2000 is Pascal, sm_61) and still covers
+    # every newer architecture, so it is the safe universal default. Newer
+    # branches would silently drop the P2000. Falls back to the unpinned
+    # metapackage if the branch is not in the repo.
+    local drv_pkg="${NEXUS_NVIDIA_DRIVER_PACKAGE:-cuda-drivers-580}"
+    if ! apt-cache show "$drv_pkg" >/dev/null 2>&1; then
+        warn "NVIDIA: $drv_pkg not in the repo; falling back to the unpinned cuda-drivers"
+        warn "        (verify the resulting branch still supports this GPU's architecture)"
+        drv_pkg="cuda-drivers"
+    fi
+
+    # Deliberately NOT the full cuda-toolkit (~4 GB of nvcc/samples/docs).
+    # cuda-libraries-<ver> carries exactly the DT_NEEDED set of
+    # libonnxruntime_providers_cuda.so: libcudart, libcublas(Lt), libcufft,
+    # libcurand. libcudnn.so.9 comes from libcudnn9-cuda-12.
+    local pkgs=("$drv_pkg" "cuda-libraries-${cuda_ver}" "libcudnn9-cuda-12")
+    local aptlog
+    aptlog="$(mktemp -t nexus-cuda-apt.XXXXXX)"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >"$aptlog" 2>&1; then
+        warn "NVIDIA: package install failed (${pkgs[*]}); engine will use the CPU EP"
+        tail -n 15 "$aptlog" | while IFS= read -r l; do warn "  $l"; done
+        rm -f "$aptlog"
+        return 0
+    fi
+    rm -f "$aptlog"
+
+    if _nvidia_driver_live; then
+        log "NVIDIA driver active: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+        return 0
+    fi
+
+    # Driver staged but the kernel module is not bound yet — nouveau still
+    # holds the GPU until the initramfs is reloaded. Exit cleanly BEFORE
+    # anything is staged (install_drivers runs before ensure_user), exactly
+    # like the Intel NPU HWE-kernel path.
+    warn ""
+    warn "========================================================="
+    warn "REBOOT REQUIRED — NVIDIA driver + CUDA runtime staged."
+    warn ""
+    warn "nouveau is still bound to the GPU; the proprietary module"
+    warn "takes over on the next boot."
+    warn ""
+    warn "After reboot, re-run the same install.sh one-liner; it"
+    warn "will skip everything already installed and proceed with"
+    warn "the CUDA ONNX Runtime + engine install."
+    warn "========================================================="
+    warn ""
+    exit 0
+}
+
+# Stage a CUDA-capable ONNX Runtime and point the engine's loader at it.
+#
+# Uses the official onnxruntime-linux-x64-gpu tarball (same source and
+# version as the bundled CPU/OpenVINO runtime, so the ort api-21 ABI
+# contract holds). Deliberately NOT the `gpu_cuda13` variant: CUDA 13
+# dropped Pascal, which the reference P2000 is.
+_install_ort_cuda() {
+    # Nothing to bind to until the kernel driver is live.
+    if ! _nvidia_driver_live; then
+        warn "NVIDIA: driver not enumerating a GPU; skipping CUDA ONNX Runtime fetch"
+        warn "        (engine uses the bundled OpenVINO/CPU runtime)"
+        return 0
+    fi
+
+    local cuda_lib
+    cuda_lib="$(_nvidia_cuda_lib_dir)"
+    if [[ -z "$cuda_lib" ]]; then
+        warn "NVIDIA: no CUDA 12 runtime (libcudart.so.12) found under /usr/local;"
+        warn "        skipping CUDA ONNX Runtime fetch — engine uses the CPU EP."
+        return 0
+    fi
+
+    local ort_ver="${NEXUS_ORT_CUDA_VERSION:-1.24.1}"
+    local vendor_dir="${NEXUS_ORT_CUDA_DIR:-/opt/nexus/vendor/onnxruntime-cuda}"
+    local marker="$vendor_dir/.nexus-ort-cuda-version"
+
+    # Idempotent short-circuit: already installed at the target version.
+    if [[ -f "$marker" ]] && grep -qx "$ort_ver" "$marker" 2>/dev/null \
+        && [[ -e "$vendor_dir/libonnxruntime.so" ]]; then
+        log "CUDA ONNX Runtime $ort_ver already installed ($vendor_dir)"
+        _ort_cuda_check_deps "$vendor_dir" "$cuda_lib"
+        _ort_cuda_write_dropin "$vendor_dir" "$cuda_lib"
+        return 0
+    fi
+
+    log "installing CUDA ONNX Runtime $ort_ver (provider for NVIDIA inference)"
+
+    local stem="onnxruntime-linux-x64-gpu-${ort_ver}"
+    local url="https://github.com/microsoft/onnxruntime/releases/download/v${ort_ver}/${stem}.tgz"
+
+    local tmpdir
+    tmpdir="$(mktemp -d -t nexus-ort-cuda.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+
+    log "  fetching ${stem}.tgz (~209 MB)…"
+    if ! curl -fsSL "$url" -o "$tmpdir/ort.tgz"; then
+        warn "CUDA ONNX Runtime download failed ($url); engine will use the"
+        warn "bundled OpenVINO/CPU runtime — NVIDIA GPU inference disabled."
+        return 0
+    fi
+
+    if ! tar -xzf "$tmpdir/ort.tgz" -C "$tmpdir"; then
+        warn "CUDA ORT tarball extract failed; NVIDIA GPU inference disabled"
+        return 0
+    fi
+
+    local libsrc="$tmpdir/$stem/lib"
+    if [[ ! -e "$libsrc/libonnxruntime.so" ]]; then
+        warn "CUDA ORT tarball layout unexpected (no lib/libonnxruntime.so)"
+        return 0
+    fi
+
+    # Stage the runtime + the two provider .so files ORT dlopens at
+    # session-create time. libonnxruntime_providers_tensorrt.so is
+    # deliberately NOT staged: TensorRT is a separate multi-GB install and
+    # is not in any generated ep_priority, so shipping it would only
+    # produce dlopen noise.
+    install -d -m 0755 "$vendor_dir"
+    cp -a "$libsrc"/libonnxruntime.so* "$vendor_dir"/ 2>/dev/null || true
+    cp -a "$libsrc"/libonnxruntime_providers_shared.so "$vendor_dir"/ 2>/dev/null || true
+    cp -a "$libsrc"/libonnxruntime_providers_cuda.so "$vendor_dir"/ 2>/dev/null || true
+
+    if [[ ! -e "$vendor_dir/libonnxruntime.so" ]]; then
+        warn "CUDA ORT staged but libonnxruntime.so missing; NVIDIA GPU disabled"
+        return 0
+    fi
+
+    _ort_cuda_check_deps "$vendor_dir" "$cuda_lib"
+
+    printf '%s\n' "$ort_ver" > "$marker"
+    log "CUDA ONNX Runtime $ort_ver staged at $vendor_dir"
+
+    _ort_cuda_write_dropin "$vendor_dir" "$cuda_lib"
+}
+
+# Report any unresolved DT_NEEDED entry of the CUDA provider.
+#
+# Unlike the ROCm wheel (whose auditwheel-hashed sonames need symlink
+# bridging), the official tarball links against plain sonames
+# — libcudart.so.12, libcublas.so.12, libcublasLt.so.12, libcufft.so.11,
+# libcurand.so.10, libcudnn.so.9 — so a correct LD_LIBRARY_PATH is all
+# that is required. This is therefore a diagnostic, not a repair: it
+# turns a silent CPU fallback into a named missing library.
+_ort_cuda_check_deps() {
+    local vendor_dir="$1" cuda_lib="$2"
+    local provider="$vendor_dir/libonnxruntime_providers_cuda.so"
+    [[ -e "$provider" ]] || return 0
+    command -v ldd >/dev/null 2>&1 || return 0
+
+    local missing=()
+    local lib
+    while read -r lib; do
+        [[ -n "$lib" ]] && missing+=("$lib")
+    done < <(LD_LIBRARY_PATH="$vendor_dir:$cuda_lib" ldd "$provider" 2>/dev/null \
+        | awk '/not found/ {print $1}')
+
+    if (( ${#missing[@]} )); then
+        warn "CUDA ORT: provider has unresolved dependencies: ${missing[*]}"
+        warn "          the CUDA EP will fail to attach and inference will run on CPU."
+        warn "          install the matching CUDA runtime / cuDNN packages and re-run install.sh."
+    else
+        log "CUDA ORT: all provider dependencies resolved against $cuda_lib"
+    fi
+}
+
+# Write the systemd drop-in that repoints the engine's ORT loader at the
+# CUDA runtime. Kept separate so the idempotent path can refresh it even
+# when the .so files are already present. Only OVERRIDES the two ORT env
+# vars — everything else in the base unit still applies.
+_ort_cuda_write_dropin() {
+    local vendor_dir="$1" cuda_lib="$2"
+    local dropin_dir="/etc/systemd/system/nexus-engine.service.d"
+    local dropin="$dropin_dir/10-ort-cuda.conf"
+
+    install -d -m 0755 "$dropin_dir"
+    cat > "$dropin" <<EOF
+# Auto-generated by nexus install.sh (_install_ort_cuda). Repoints the
+# ONNX Runtime loader at the CUDA-capable runtime from the official
+# onnxruntime-linux-x64-gpu release tarball. The engine binary is built
+# against ort api-21 so this ${NEXUS_ORT_CUDA_VERSION:-1.24.1} runtime
+# loads cleanly. Overrides only the two ORT env vars from the base unit.
+#
+# The vendor dir carries libonnxruntime.so + its provider siblings;
+# ${cuda_lib} carries libcudart / libcublas / libcufft / libcurand.
+# libcudnn.so.9 ships to the default loader path (/usr/lib/x86_64-linux-gnu).
+#
+# Remove this file (and 'systemctl daemon-reload && systemctl restart
+# nexus-engine') to fall back to the bundled OpenVINO/CPU runtime.
+[Service]
+Environment=ORT_DYLIB_PATH=${vendor_dir}/libonnxruntime.so
+Environment=LD_LIBRARY_PATH=${vendor_dir}:${cuda_lib}
+EOF
+
+    log "wrote systemd drop-in $dropin (ORT_DYLIB_PATH -> CUDA runtime)"
+    systemctl daemon-reload 2>/dev/null || true
 }
 
 # --- Atomic-swap symlink ------------------------------------------------------

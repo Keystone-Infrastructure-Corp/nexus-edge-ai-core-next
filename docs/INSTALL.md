@@ -36,7 +36,7 @@
     - [Intel mini PCs (Beelink, GMKtec)](#intel-mini-pcs-beelink-gmktec)
     - [Intel Arc A380 dGPU](#intel-arc-a380-dgpu)
     - [Lunar Lake (GMKtec K13 / EVO-X1)](#lunar-lake-gmktec-k13--evo-x1)
-    - [NVIDIA RTX 4060](#nvidia-rtx-4060)
+    - [NVIDIA dGPU](#nvidia-dgpu)
   - [3. Install Ubuntu 24.04 LTS Server](#3-install-ubuntu-2404-lts-server)
     - [3.1 Download + verify the ISO](#31-download--verify-the-iso)
     - [3.2 Write the ISO to USB](#32-write-the-iso-to-usb)
@@ -49,7 +49,7 @@
     - [5.1 Intel UHD / Iris Xe iGPU](#51-intel-uhd--iris-xe-igpu)
     - [5.2 Intel Arc A380 dGPU](#52-intel-arc-a380-dgpu)
     - [5.3 Lunar Lake — Arc 140V iGPU + NPU 4](#53-lunar-lake--arc-140v-igpu--npu-4)
-    - [5.4 NVIDIA RTX 4060](#54-nvidia-rtx-4060)
+    - [5.4 NVIDIA dGPU — CUDA + NVDEC](#54-nvidia-dgpu--cuda--nvdec)
     - [5.5 Beelink EQR7 — AMD Ryzen + Hailo-8 M.2](#55-beelink-eqr7--amd-ryzen--hailo-8-m2)
   - [6. Install the engine](#6-install-the-engine)
     - [6.1 One-liner from GitHub Releases](#61-one-liner-from-github-releases)
@@ -102,7 +102,7 @@ value to pass if you ever need to pin it). Full background:
 | `hailo`                     | Beelink EQR7 (Ryzen 7 7735HS) + Hailo-8 M.2         | Hailo-8 (26 TOPS)         | `hailo, cpu`            | shipping      |
 | `intel-igpu`                | Lenovo P3 Tiny / HP Z2 Mini + Arc A380              | Intel Arc A380 6 GB dGPU   | `gpu, cpu`              | shipping      |
 | `intel-npu`                 | GMKtec K13 AI / EVO-X1 (Ultra 7 256V Lunar Lake)    | Arc 140V Xe2 + NPU 4       | `npu, cpu`              | shipping      |
-| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + RTX 4060               | NVIDIA RTX 4060 8 GB       | `cpu` (M5 → tensorrt)   | post-beta — CUDA/TensorRT EPs land in M5; until then it falls through to CPU and is **not** a meaningful deployment |
+| `nvidia`                    | Lenovo P3 Tower / HP Z2 G9 + Quadro P2000 or RTX    | NVIDIA dGPU (CUDA)         | `cuda, cpu`             | shipping — installer stages the driver, CUDA runtime and a CUDA ONNX Runtime; decode on NVDEC; see §5.4 |
 
 **Camera baseline (every profile):** 1080p H.264 over RTSP (or H.265 with
 hardware decode), 15 fps capture, motion-gated to the detector. One
@@ -168,7 +168,7 @@ common foot-gun on the boxes we ship.
   don't see the option, the BIOS is too old; update first.
 - **HWE kernel required** — see §3.6.
 
-### NVIDIA RTX 4060
+### NVIDIA dGPU
 
 - **Above 4G Decoding** — ON.
 - **Resizable BAR** — ON.
@@ -332,11 +332,7 @@ What the installer **does NOT** do (the bits that still need you):
 
 1. **BIOS settings** (§2) — physical access; never automated.
 2. **Ubuntu install** (§3) — must complete before §4.
-3. **NVIDIA driver install** (§5.4) — the NVIDIA box is post-beta; the engine
-   doesn't ship a CUDA or TensorRT execution provider yet (M5). The
-   installer detects the card, warns, and leaves the host driver
-   alone so you can manage it however you prefer.
-4. **Static IP / VLAN config** — the engine's admin UI ships a
+3. **Static IP / VLAN config** — the engine's admin UI ships a
    Network page that drives netplan via a tiny privileged helper
    (§6.5). Configure cameras with DHCP first, then convert to
    static through the UI — much harder to lock yourself out of.
@@ -357,8 +353,9 @@ in [Appendix C](#12-appendix-c--build-from-source-developer-only).
 > troubleshooting, or operators who want to understand what's
 > happening). Read your box's subsection, then continue at §6.
 >
-> **Exception:** NVIDIA (§5.4) is detect-only — the installer warns
-> and skips because the engine has no GPU EP yet.
+> **Note:** NVIDIA (§5.4) may require one reboot mid-install when
+> `nouveau` still holds the GPU. The installer says so and exits
+> cleanly; re-run the identical command afterwards.
 
 ### 5.1 Intel UHD / Iris Xe iGPU
 
@@ -589,54 +586,116 @@ nexus-engine` to pick it up.
 > `intel-npu` profile in [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md)
 > for the full reasoning.
 
-### 5.4 NVIDIA RTX 4060
+### 5.4 NVIDIA dGPU — CUDA + NVDEC
 
-> **Status:** the NVIDIA box is post-beta. The CUDA + TensorRT EPs land in M5.
-> Until then the engine compiles fine and exposes `cuda` /
-> `tensorrt` in `ep_priority`, but the actual session opens against
-> the CPU EP. It is **not** a meaningful production deployment yet.
-> Set the box up to be ready for M5; verify with `nvidia-smi` only.
+> **Status:** First-class. `install.sh` detects the card and does the
+> whole bring-up itself — proprietary driver, CUDA runtime, cuDNN, and a
+> CUDA-capable ONNX Runtime. Inference runs on the GPU via
+> `ep_priority = ["cuda", "cpu"]` and decode runs on the card's NVDEC
+> block. **There are no manual steps below to perform** — this section
+> documents what the installer does and how to verify it.
+
+#### What `install.sh` does
+
+Everything here is automatic. It runs before the engine is staged, so a
+half-configured box is never left behind.
+
+1. **Blacklists `nouveau`** in `/etc/modprobe.d/nexus-blacklist-nouveau.conf`
+   and rebuilds the initramfs. The open-source driver holds the GPU and
+   must be out of the way before the proprietary one loads.
+2. **Installs the proprietary driver and CUDA runtime** from NVIDIA's
+   CUDA keyring repo: `cuda-drivers-580`, `cuda-libraries-12-9`, and
+   `libcudnn9-cuda-12`.
+3. **Stages a CUDA-capable ONNX Runtime** into
+   `/opt/nexus/vendor/onnxruntime-cuda/` and writes a systemd drop-in at
+   `/etc/systemd/system/nexus-engine.service.d/10-ort-cuda.conf` that
+   repoints `ORT_DYLIB_PATH` and `LD_LIBRARY_PATH` at it.
+
+Step 3 exists because the release tarball bundles the **OpenVINO**-flavoured
+`libonnxruntime.so`, which has no CUDA provider compiled in. ORT silently
+skips a provider it cannot attach, so without this the engine would run on
+the CPU EP with no error. The vendor directory sits outside the
+release tree deliberately: it survives OTA updates flipping the
+`/opt/nexus/current` symlink, so the CUDA runtime is fetched once.
+
+**R580 is the last driver branch supporting Pascal**, and CUDA 12.x is the
+last major version supporting it. Both pins are what keep a Quadro P2000
+working; do not bump to CUDA 13.
+
+#### Reboot
+
+If `nouveau` still holds the GPU when the driver lands, the installer
+prints a **REBOOT REQUIRED** banner and exits `0` **before** staging the
+engine. Reboot and re-run the same `install.sh` command — it is
+idempotent, and the second pass finds the driver live and continues
+through ORT staging, config generation, and service install.
 
 ```bash
-# Step 1 — blacklist nouveau, rebuild initramfs.
-echo -e "blacklist nouveau\noptions nouveau modeset=0" \
-  | sudo tee /etc/modprobe.d/blacklist-nouveau.conf
-sudo update-initramfs -u
 sudo reboot
+# then re-run the identical install command
 ```
 
+#### Overrides
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NEXUS_NVIDIA_DRIVER_PACKAGE` | `cuda-drivers-580` | Driver branch. Falls back to unpinned `cuda-drivers` if the pin is unavailable. |
+| `NEXUS_CUDA_APT_VERSION` | `12-9` | CUDA runtime version suffix. |
+| `NEXUS_ORT_CUDA_VERSION` | `1.24.1` | ONNX Runtime version. Must match the ABI the engine was built against. |
+| `NEXUS_ORT_CUDA_DIR` | `/opt/nexus/vendor/onnxruntime-cuda` | Where the CUDA runtime is staged. |
+| `NEXUS_CUDA_DEVICE` | `0` | Which GPU the CUDA EP binds, on a multi-GPU host. Read by the engine at runtime, not by the installer. |
+
+Pass `--no-drivers` to skip the whole driver stage (steps 1–3) if you
+manage the NVIDIA stack yourself. The engine will then fall through to the
+CPU EP unless you stage a CUDA ONNX Runtime and drop-in by hand.
+
+#### Verify
+
+`install.sh` runs these checks itself and prints the results, but to
+confirm by hand:
+
 ```bash
-# Step 2 — install the proprietary driver. ubuntu-drivers picks the
-# best matching version for the card.
-sudo apt install -y ubuntu-drivers-common
-sudo ubuntu-drivers autoinstall
-sudo reboot
+# Driver live — expect a table listing the card.
 nvidia-smi
-# Expect a table listing the RTX 4060.
+
+# CUDA ONNX Runtime staged, and the drop-in pointing at it.
+ls /opt/nexus/vendor/onnxruntime-cuda/
+cat /etc/systemd/system/nexus-engine.service.d/10-ort-cuda.conf
+
+# Generated config: GPU inference + NVDEC decode.
+grep -E 'ep_priority|workers|preset' /etc/nexus/nexus.toml
+grep -A1 'runtime.decode' /etc/nexus/nexus.toml
+# Expect ep_priority = ["cuda", "cpu"] and mode = "nvdec".
+
+# NVDEC decoders registered (from the nvcodec GStreamer plugin).
+gst-inspect-1.0 nvh264dec >/dev/null && echo "nvh264dec OK"
+
+# The CUDA EP actually attached at boot (not a silent CPU fallback).
+sudo journalctl -u nexus-engine | grep -i 'execution provider'
 ```
 
-```bash
-# Step 3 — CUDA 12.4 + cuDNN 9 from NVIDIA's keyring.
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install -y cuda-toolkit-12-4 cudnn9-cuda-12
+Worker count and detector preset scale with VRAM, read from `nvidia-smi`:
 
-echo 'export PATH=/usr/local/cuda-12.4/bin:$PATH' \
-  | sudo tee /etc/profile.d/cuda.sh
-echo '/usr/local/cuda-12.4/lib64' \
-  | sudo tee /etc/ld.so.conf.d/cuda.conf
-sudo ldconfig
-```
+| VRAM | Workers | Preset | Representative card |
+| --- | --- | --- | --- |
+| unknown | 1 | 640 | driver not live yet |
+| < 4 GiB | 1 | 640 | GTX 1050 |
+| < 8 GiB | 2 | 640 | Quadro P2000 (5 GiB) |
+| < 12 GiB | 2 | 960 | RTX 4060 |
+| ≥ 12 GiB | 3 | 960 | RTX 3060 12G / 4070+ |
 
-```bash
-# Step 4 — TensorRT 10 (when M5 lands; can install ahead of time).
-sudo apt install -y tensorrt
-```
+Preset stays at 640 below 8 GiB regardless of worker count: Pascal-class
+silicon has no Tensor Cores, so 960 costs roughly 2.2× the compute for a
+modest accuracy gain. A second 640 worker is the better use of a P2000.
+
+> **TensorRT is deliberately not used.** It needs a separate multi-GB
+> install and only pays off on Tensor-Core (Turing+) silicon, which the
+> reference Pascal card does not have. The `ep-tensorrt` Cargo feature
+> still compiles, but `tensorrt` is not in any generated `ep_priority`
+> and the installer never stages it.
 
 `install.sh` (§6) adds the `nexus` service user to `render` and
-`video` automatically. Run `nvidia-smi` to confirm the host driver
-is healthy before proceeding.
+`video` automatically.
 
 ---
 
@@ -1356,7 +1415,7 @@ file /tmp/cam1.jpg
 curl -fsS http://localhost:8089/api/v1/backends | jq
 # Expect: every slot in `state: "ready"` with the EP your hardware expects:
 #   Intel iGPU / NPU boxes → "openvino" (or "npu" on Lunar Lake if NPU stack present)
-#   NVIDIA box             → "cpu" today; "tensorrt" / "cuda" once M5 lands
+#   NVIDIA box             → "cuda" (installer stages a CUDA ONNX Runtime)
 #   anything          → "cpu" as last-resort fallback
 ```
 
@@ -1517,7 +1576,7 @@ yet — that's M2.2 (cold-mirror replication).
 | Camera stuck on `connecting` for > 2 min | RTSP transport mismatch (camera serves UDP, engine asks TCP), bad credentials, blocked port. | Test with `gst-launch-1.0 -v rtspsrc location=<url> ! fakesink` from the host. If the password contains `!`, run `set +H` first and single-quote the URL. |
 | `vainfo` succeeds for your login but engine logs say "no VAAPI device" | `nexus` user not in `render` group. | `sudo usermod -aG render nexus && sudo systemctl restart nexus-engine`. Re-running `install.sh` does this automatically. |
 | `/dev/accel/accel0` missing on Lunar Lake | Kernel < 6.10, NPU disabled in BIOS, or driver trio not installed. | `uname -r` ≥ 6.10 (§3.6); §2 BIOS; §5.3 driver install. |
-| `nvidia-smi` works on the host but engine reports CPU EP only | the NVIDIA box is post-beta; M5 hasn't landed. | Expected. The engine falls through to CPU until M5. |
+| `nvidia-smi` works on the host but engine reports CPU EP only | the CUDA ONNX Runtime was never staged, so ORT silently skipped the CUDA provider and fell through to the trailing `cpu` entry. The bundled `libonnxruntime.so` is the OpenVINO build and has no CUDA provider. | `ls /opt/nexus/vendor/onnxruntime-cuda/` and `cat /etc/systemd/system/nexus-engine.service.d/10-ort-cuda.conf`. If either is missing, re-run `install.sh` without `--no-drivers` (§5.4). If both exist, `ldd /opt/nexus/vendor/onnxruntime-cuda/libonnxruntime_providers_cuda.so` will name the missing CUDA/cuDNN library. |
 | `/api/v1/backends` shows all slots `state: "ready"` but every camera returns generic / mock-looking detection labels | `ep_priority` lists both `openvino` and `npu`. ORT's `RegisterExecutionProviderLibrary` is one-shot per session — the duplicate trips a "Provider OpenVINOExecutionProvider has already been registered" error and the yolo loader silently falls back to the mock detector. | Set `ep_priority = ["npu", "cpu"]` (`intel-npu`) or `ep_priority = ["gpu", "cpu"]` (`intel-igpu`) — never both. A generated config already does this; see [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md). |
 | Camera reaches `streaming` once then stays at 0 fps after every subsequent reconnect, but VLC against the same URL works fine | IP-camera firmware (e.g. InSight CS-series) enforces one RTSP session per stream path. | Power-cycle the camera, confirm no other VMS / external probe is hitting the same `url`, and verify the engine is on `recorder = "gstreamer"` (§6.4). |
 | Recorder writes 0-byte mp4 files | `recorder = "stub"` (the runtime default when `[runtime.clips]` is missing). | Add `[runtime.clips] recorder = "gstreamer"` to `/etc/nexus/nexus.toml` and restart. |
@@ -1748,7 +1807,7 @@ sudo ldconfig
 # Build. Feature flags by accelerator:
 #   Intel iGPU             →  gstreamer,ort,ep-cpu,ep-openvino
 #   Intel NPU (Lunar Lake) →  gstreamer,ort,ep-cpu,ep-openvino   # NPU via OpenVINO
-#   NVIDIA (post-beta)     →  gstreamer,ort,ep-cpu,ep-cuda,ep-tensorrt
+#   NVIDIA                 →  gstreamer,ort,ep-cpu,ep-cuda
 # `gstreamer` is mandatory — without it, RTSP support is `#[cfg]`'d out.
 FEATURES="gstreamer,ort,ep-cpu,ep-openvino"
 git clone https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next.git
