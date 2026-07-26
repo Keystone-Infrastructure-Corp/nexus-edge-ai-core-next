@@ -54,6 +54,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::preroll::NalSample;
@@ -141,6 +142,14 @@ pub struct WebRtcSession {
     feed: JoinHandle<()>,
     /// Adaptive-bitrate control loop (transcode sessions only); aborted on drop.
     cc: Option<JoinHandle<()>>,
+    /// Weak handle to the `rtpgccbwe` pacer once negotiation splices it in
+    /// (transcode + plugin present only). Held so a cloud-relayed
+    /// `live_hd_bitrate` can clamp its `max-bitrate` at runtime to the slowest
+    /// browser viewer's measured downlink — the raw SFU never relays that
+    /// estimate back to the publisher, so this is the only end-to-end feedback
+    /// path. `None`/empty for passthrough, the AIMD fallback, or before the
+    /// aux-sender request fires.
+    gcc: Arc<parking_lot::Mutex<Option<gst::glib::WeakRef<gst::Element>>>>,
 }
 
 impl WebRtcSession {
@@ -372,10 +381,13 @@ impl WebRtcSession {
             wire_keyframe_on_pli(&pipeline, camera_id);
         }
 
+        let gcc: Arc<parking_lot::Mutex<Option<gst::glib::WeakRef<gst::Element>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+
         let cc = if transcoding {
             match pipeline.by_name("enc") {
                 Some(enc) if gst::ElementFactory::find("rtpgccbwe").is_some() => {
-                    wire_gcc_congestion_control(&webrtc, &enc, camera_id);
+                    wire_gcc_congestion_control(&webrtc, &enc, camera_id, Arc::clone(&gcc));
                     info!(
                         camera_id,
                         "webrtc congestion control: rtpgccbwe (paced GCC)"
@@ -405,6 +417,7 @@ impl WebRtcSession {
             events,
             feed,
             cc,
+            gcc,
         })
     }
 
@@ -511,6 +524,56 @@ impl WebRtcSession {
     /// The camera this session streams.
     pub fn camera_id(&self) -> CameraId {
         self.camera_id
+    }
+
+    /// Clamp the outbound HD bitrate to the cloud-computed downlink target
+    /// (kbps), the slowest browser viewer's measured receive path.
+    ///
+    /// Over the raw Cloudflare SFU the local `rtpgccbwe` estimator only sees
+    /// the fat edge→CF publish leg, so it ramps to the 4 Mbps ceiling
+    /// regardless of the operator's real CF→browser downlink; when that
+    /// downlink is slower the edge over-sends, loss spikes, the browser floods
+    /// PLIs, and the stream blacks out with no feedback loop. This is the
+    /// missing feedback: we lower the pacer's `max-bitrate` so GCC settles at
+    /// or below the true downlink, and clamp the encoder immediately so the
+    /// drop takes effect on the next frame rather than waiting for the next
+    /// estimate.
+    ///
+    /// Bounds mirror the pacer's own limits (`GCC_MIN_BPS`..`GCC_MAX_BPS`); the
+    /// cloud already clamps to [600, 4000] kbps. No-op on passthrough / AIMD
+    /// sessions or before the aux-sender has been requested.
+    pub fn set_max_bitrate_kbps(&self, kbps: u32) {
+        let bps = kbps.saturating_mul(1000).clamp(GCC_MIN_BPS, GCC_MAX_BPS);
+        let capped_kbps = bps / 1000;
+
+        let Some(gcc) = self
+            .gcc
+            .lock()
+            .as_ref()
+            .and_then(gst::glib::WeakRef::upgrade)
+        else {
+            debug!(
+                camera_id = self.camera_id,
+                kbps = capped_kbps,
+                "set_max_bitrate_kbps: no rtpgccbwe pacer (passthrough/AIMD or not yet negotiated); ignoring"
+            );
+            return;
+        };
+        gcc.set_property("max-bitrate", bps);
+
+        // Clamp the encoder down immediately if it is currently above the new
+        // ceiling; let GCC drive it back up when the estimate recovers.
+        if let Some(enc) = self.pipeline.by_name("enc") {
+            let current: u32 = enc.property("bitrate");
+            if current > capped_kbps {
+                enc.set_property("bitrate", capped_kbps);
+            }
+        }
+        debug!(
+            camera_id = self.camera_id,
+            kbps = capped_kbps,
+            "set_max_bitrate_kbps: clamped rtpgccbwe max-bitrate to browser downlink"
+        );
     }
 
     /// True once the NAL feed task has ended — either because the consumer
@@ -984,7 +1047,12 @@ fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
 /// `bitrate` (kbps = bits/1000). This is the proactive replacement for the
 /// reactive [`spawn_congestion_control`] AIMD loop and is only wired when the
 /// bundled `libgstrsrtp.so` plugin registered `rtpgccbwe`.
-fn wire_gcc_congestion_control(webrtc: &gst::Element, enc: &gst::Element, camera_id: CameraId) {
+fn wire_gcc_congestion_control(
+    webrtc: &gst::Element,
+    enc: &gst::Element,
+    camera_id: CameraId,
+    gcc_slot: Arc<parking_lot::Mutex<Option<gst::glib::WeakRef<gst::Element>>>>,
+) {
     let enc_weak = enc.downgrade();
     // `request-aux-sender` fires during negotiation with (webrtcbin, session_id);
     // it must return the element to splice into the send path (the pacer). We
@@ -995,6 +1063,9 @@ fn wire_gcc_congestion_control(webrtc: &gst::Element, enc: &gst::Element, camera
         cc.set_property("min-bitrate", GCC_MIN_BPS);
         cc.set_property("estimated-bitrate", GCC_START_BPS);
         cc.set_property("max-bitrate", GCC_MAX_BPS);
+        // Publish a weak handle so a cloud `live_hd_bitrate` can clamp
+        // `max-bitrate` at runtime to the slowest viewer's real downlink.
+        *gcc_slot.lock() = Some(cc.downgrade());
         let enc_weak = enc_weak.clone();
         cc.connect_notify(Some("estimated-bitrate"), move |bwe, _pspec| {
             let bits: u32 = bwe.property("estimated-bitrate");
