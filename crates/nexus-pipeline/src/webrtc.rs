@@ -366,8 +366,8 @@ impl WebRtcSession {
         // Passthrough builds have no `enc` element and skip both.
         // Forward browser-driven PLI/FIR keyframe requests to the encoder so a
         // viewer that lost reference frames recovers on the next RTP frame
-        // instead of waiting up to `key-int-max` (~2s) — or, when a delta-only
-        // gap outlasts the GOP, never recovering (black) at all.
+        // instead of waiting up to the scheduled GOP (`key-int-max`, ~4s) — or,
+        // when a delta-only gap outlasts the GOP, never recovering (black).
         if transcoding {
             wire_keyframe_on_pli(&pipeline, camera_id);
         }
@@ -908,15 +908,30 @@ impl BitrateController {
     }
 }
 
+/// Minimum spacing between encoder-forced IDRs driven by inbound PLI/FIR. A
+/// struggling viewer floods PLIs (one per lost reference), and each forced IDR
+/// is a full 20–40 KB frame with `all-headers`. Honouring every PLI at 1080p
+/// emits keyframes far faster than the GCC-collapsed bitrate budget can carry
+/// (~8 Mbps of IDR against a ~1.3 Mbps estimate), which congests the send path,
+/// causes more loss, provokes still more PLIs, and spirals the stream to black.
+/// One forced keyframe per second is enough to recover a genuine reference loss
+/// while a PLI storm is coalesced into a single IDR.
+const FORCED_KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+
 /// Forward browser keyframe requests (RTCP PLI/FIR) to the encoder. `webrtcbin`
 /// translates an inbound PLI/FIR into an upstream `GstForceKeyUnit` custom
 /// event; we intercept it on the payloader's src pad and re-issue a
 /// force-key-unit directly to the encoder's sink pad so `vah264enc` emits a
 /// fresh IDR immediately. Without this, a viewer that loses reference frames
-/// (e.g. after a relay hiccup) has to wait up to `key-int-max` (~2s) for the
-/// next scheduled keyframe — and if the gap outlasts the GOP it stays black
-/// forever. Only meaningful on the transcode path (the `enc`/`pay` elements
+/// (e.g. after a relay hiccup) has to wait up to the scheduled GOP
+/// (`key-int-max`, ~4s) for the next keyframe — and if the gap outlasts the GOP
+/// it stays black forever. Only meaningful on the transcode path (the `enc`/`pay` elements
 /// exist); passthrough has no encoder to retarget.
+///
+/// Forced IDRs are debounced to [`FORCED_KEYFRAME_MIN_INTERVAL`]: within the
+/// cooldown the redundant upstream FKU is dropped (`PadProbeReturn::Drop`) so
+/// the encoder is not driven into a keyframe storm that outruns the congestion
+/// budget and blacks the stream out.
 fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
     let Some(enc) = pipeline.by_name("enc") else {
         return;
@@ -928,6 +943,7 @@ fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
         return;
     };
     let enc_weak = enc.downgrade();
+    let last_forced: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
     let _ = pay_src.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_pad, info| {
         let Some(gst::PadProbeData::Event(ev)) = &info.data else {
             return gst::PadProbeReturn::Ok;
@@ -936,15 +952,26 @@ fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
             && ev
                 .structure()
                 .is_some_and(|s| s.name() == "GstForceKeyUnit");
-        if is_fku {
-            if let Some(enc) = enc_weak.upgrade() {
-                if let Some(sink) = enc.static_pad("sink") {
-                    let s = gst::Structure::builder("GstForceKeyUnit")
-                        .field("all-headers", true)
-                        .build();
-                    let _ = sink.send_event(gst::event::CustomUpstream::new(s));
-                    debug!(camera_id, "webrtc: PLI/FIR -> forced encoder keyframe");
-                }
+        if !is_fku {
+            return gst::PadProbeReturn::Ok;
+        }
+        // Debounce: swallow PLIs that arrive inside the cooldown so a viewer's
+        // PLI flood collapses to a single IDR instead of a keyframe storm.
+        let now = std::time::Instant::now();
+        {
+            let mut last = last_forced.lock();
+            if last.is_some_and(|t| now.duration_since(t) < FORCED_KEYFRAME_MIN_INTERVAL) {
+                return gst::PadProbeReturn::Drop;
+            }
+            *last = Some(now);
+        }
+        if let Some(enc) = enc_weak.upgrade() {
+            if let Some(sink) = enc.static_pad("sink") {
+                let s = gst::Structure::builder("GstForceKeyUnit")
+                    .field("all-headers", true)
+                    .build();
+                let _ = sink.send_event(gst::event::CustomUpstream::new(s));
+                debug!(camera_id, "webrtc: PLI/FIR -> forced encoder keyframe");
             }
         }
         gst::PadProbeReturn::Ok
@@ -1063,14 +1090,67 @@ fn hw_decoder(codec: CodecKind) -> Option<&'static str> {
         .find(|name| gst::ElementFactory::find(name).is_some())
 }
 
+/// Maximum keyframe interval (frames) for the transcode encoder. At the
+/// transcode fps (~24) this is ~4s between *scheduled* keyframes. WebRTC
+/// recovers from loss via PLI-driven forced keyframes (see
+/// [`wire_keyframe_on_pli`]), so a longer scheduled GOP is safe and — crucially
+/// — emits far fewer oversized IDR bursts onto the GCC-paced uplink, giving the
+/// send-side estimator room to ramp back up between keyframes.
+const TRANSCODE_KEY_INT_MAX: u32 = 96;
+
+/// CPB (VBV/HRD) buffer bound, expressed as a multiple of the target bitrate
+/// (so a 1-second buffer). With `cpb-size`/`cpb-length` left at the driver
+/// default (auto), the VA encoders sized the HRD buffer at ~2.5–3s, letting a
+/// single IDR balloon to 300–355 KB at `bitrate=1000` — far past the ~250 KB
+/// that one 2s GOP's paced budget can drain, which congested the uplink and
+/// forced the client into a reopen loop. Bounding the CPB to ~1s of bits makes
+/// the encoder raise IDR QP so keyframes stay within the paced budget.
+const TRANSCODE_CPB_SECONDS: u32 = 1;
+
+/// Encoder-family-specific rate-control arguments for the transcode chain.
+///
+/// The two candidate HW H.264 encoders ([`hw_h264_encoder`]) take *different*
+/// property names for the same concepts, so the launch string must branch on
+/// the selected element to stay correct across hardware profiles:
+///
+/// - Modern `va` plugin (`vah264enc`, Intel/AMD): `key-int-max`, `b-frames`,
+///   `cpb-size` (in **Kbits**), `target-usage`.
+/// - Legacy `gstreamer-vaapi` (`vaapih264enc`): `keyframe-period`,
+///   `max-bframes`, `cpb-length` (in **milliseconds**), `quality-level`.
+///
+/// Both are pinned to CBR with a long GOP and a ~1s CPB so no single keyframe
+/// can burst the paced uplink budget. Pure.
+fn encoder_rate_control_args(encoder: &str, bitrate_kbps: u32) -> String {
+    if encoder.starts_with("vaapi") {
+        // Legacy gstreamer-vaapi. `cpb-length` is in milliseconds.
+        let cpb_ms = TRANSCODE_CPB_SECONDS * 1000;
+        format!(
+            "keyframe-period={key} max-bframes=0 rate-control=cbr \
+             bitrate={bitrate_kbps} cpb-length={cpb_ms} quality-level=6",
+            key = TRANSCODE_KEY_INT_MAX,
+        )
+    } else {
+        // Modern va plugin. `cpb-size` is in Kbits; a 1s buffer is bitrate*1.
+        let cpb_kbits = bitrate_kbps * TRANSCODE_CPB_SECONDS;
+        format!(
+            "key-int-max={key} b-frames=0 rate-control=cbr \
+             bitrate={bitrate_kbps} cpb-size={cpb_kbits} target-usage=6",
+            key = TRANSCODE_KEY_INT_MAX,
+        )
+    }
+}
+
 /// Build a **transcode** launch description: HW-decode the camera codec and
-/// re-encode to H.264 with a short GOP for smooth WebRTC over a lossy network.
+/// re-encode to H.264 with a bounded-keyframe CBR profile for smooth WebRTC
+/// over a lossy, congestion-controlled network.
 ///
 /// Camera streams often use a multi-second GOP (this InSight uses ~15s). Over
 /// WebRTC (UDP) a single lost packet corrupts every delta frame until the next
-/// keyframe, so a long GOP means multi-second freezes on ~1% loss. Re-encoding
-/// with `key-int-max=48` (~2s @ 24fps), CBR, and no B-frames caps the recovery
-/// window at ~2s while leaving the camera untouched. The output is always
+/// keyframe, so a long source GOP means multi-second freezes on ~1% loss.
+/// Re-encoding to CBR with no B-frames, a bounded CPB (see
+/// [`encoder_rate_control_args`] / [`TRANSCODE_CPB_SECONDS`]) so keyframes fit
+/// the GCC-paced budget, and a [`TRANSCODE_KEY_INT_MAX`]-frame GOP keeps
+/// recovery smooth while leaving the camera untouched. The output is always
 /// H.264 (`encoding-name=H264`), which also covers the HEVC-camera →
 /// non-HEVC-browser case. `config-interval=1` repeats SPS/PPS once a second in
 /// the RTP stream for extra resilience. `videorate` normalises the camera's
@@ -1093,6 +1173,7 @@ fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> St
     // bursts comfortably inside the uplink. The proper long-term fix is
     // send-side congestion control (rtpgccbwe) for adaptive pacing.
     let bitrate_kbps = 1000;
+    let enc_args = encoder_rate_control_args(encoder, bitrate_kbps);
     format!(
         "appsrc name=src is-live=true do-timestamp=false format=time \
              block=true max-bytes=8388608 stream-type=stream \
@@ -1101,8 +1182,7 @@ fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> St
            ! vapostproc \
            ! videorate \
            ! capsfilter name=ratecaps \
-           ! {encoder} name=enc key-int-max=48 b-frames=0 rate-control=cbr \
-             bitrate={bitrate_kbps} target-usage=6 \
+           ! {encoder} name=enc {enc_args} \
            ! h264parse config-interval=1 \
            ! rtph264pay name=pay pt=96 config-interval=1 mtu=1200 \
            ! application/x-rtp,media=video,encoding-name=H264,clock-rate=90000 \
@@ -1257,14 +1337,31 @@ mod tests {
         assert!(d.contains("h264parse"), "{d}");
         assert!(d.contains("vah264dec"), "{d}");
         assert!(d.contains("vah264enc name=enc"), "{d}");
-        assert!(d.contains("key-int-max=48"), "{d}");
+        assert!(d.contains("key-int-max=96"), "{d}");
         assert!(d.contains("rate-control=cbr"), "{d}");
         assert!(d.contains("b-frames=0"), "{d}");
+        // Bounded CPB (Kbits) keeps IDRs inside the GCC-paced budget.
+        assert!(d.contains("cpb-size=1000"), "{d}");
         assert!(d.contains("videorate"), "{d}");
         assert!(d.contains("capsfilter name=ratecaps"), "{d}");
         assert!(d.contains("name=dec"), "{d}");
         assert!(d.contains("encoding-name=H264"), "{d}");
         assert!(d.contains("webrtcbin name=webrtc"), "{d}");
+    }
+
+    #[test]
+    fn transcode_desc_legacy_vaapi_uses_matching_props() {
+        // The legacy gstreamer-vaapi element takes different property names;
+        // the launch string must branch so it stays valid on those boxes.
+        let d = transcode_pipeline_desc(CodecKind::H264, "vaapih264enc", "vaapih264dec");
+        assert!(d.contains("vaapih264enc name=enc"), "{d}");
+        assert!(d.contains("keyframe-period=96"), "{d}");
+        assert!(d.contains("max-bframes=0"), "{d}");
+        assert!(d.contains("cpb-length=1000"), "{d}");
+        assert!(d.contains("rate-control=cbr"), "{d}");
+        // Must NOT leak the va-plugin-only property names.
+        assert!(!d.contains("key-int-max"), "{d}");
+        assert!(!d.contains("cpb-size"), "{d}");
     }
 
     #[test]
