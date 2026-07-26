@@ -253,44 +253,78 @@ pub(crate) fn compute_password_digest(nonce: &[u8], created: &str, password: &st
     B64.encode(hasher.finalize())
 }
 
-/// Extract `<env:Fault><env:Reason><env:Text>...` for SOAP 1.2
-/// faults, `<faultstring>...` for SOAP 1.1, or a `<Subcode>`
-/// value (e.g. `ter:NotAuthorized`) when that's all the camera
-/// returns. `None` when the body isn't a fault.
+/// Extract the most useful text from a SOAP `<Fault>`: the deepest
+/// `<Subcode><Value>` ONVIF code combined with the human-readable
+/// `<Reason><Text>` (SOAP 1.2) or `<faultstring>` (SOAP 1.1) — e.g.
+/// `ter:InvalidParameter: The VideoSourceConfigurationToken is invalid`.
+/// Falls back to whichever half is present. `None` when the body isn't a
+/// fault.
 pub(crate) fn extract_fault_reason(body: &str) -> Option<String> {
     let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
-    let mut in_target = false;
-    let mut text_acc = String::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut capture = false;
+    let mut acc = String::new();
+    // The DEEPEST `<Subcode><Value>` (the most specific ONVIF error code —
+    // e.g. `ter:InvalidParameter` nested under `ter:InvalidArgVal`) and the
+    // human-readable `<Reason><Text>` / `<faultstring>`. Cameras name the
+    // offending field in the Reason text, so surfacing BOTH turns a bare
+    // `ter:InvalidParameter` into an actionable message
+    // (`ter:InvalidParameter: The VideoSourceConfigurationToken is invalid`).
+    let mut subcode: Option<String> = None;
+    let mut reason: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let n = local_name(&e.name());
-                if n == "Text" || n == "faultstring" || n == "Subcode" {
-                    in_target = true;
-                    text_acc.clear();
+                let parent = stack.last().map(String::as_str);
+                // `<Value>` directly under `<Code>` is the SOAP role
+                // (soap:Sender/Receiver) — only the ones under `<Subcode>`
+                // carry the ONVIF `ter:*` code.
+                capture = (n == "Value" && parent == Some("Subcode"))
+                    || (n == "Text" && parent == Some("Reason"))
+                    || n == "faultstring";
+                if capture {
+                    acc.clear();
                 }
+                stack.push(n);
             }
-            Ok(Event::Text(t)) if in_target => {
+            Ok(Event::Text(t)) if capture => {
                 if let Ok(s) = t.unescape() {
-                    text_acc.push_str(&s);
+                    acc.push_str(&s);
                 }
             }
-            Ok(Event::End(e)) => {
-                let n = local_name(&e.name());
-                if (n == "Text" || n == "faultstring") && !text_acc.trim().is_empty() {
-                    return Some(text_acc.trim().to_string());
+            Ok(Event::End(_)) => {
+                let n = stack.pop();
+                if capture {
+                    let v = acc.trim().to_string();
+                    if !v.is_empty() {
+                        match n.as_deref() {
+                            // Outer subcode is emitted first, inner last, so
+                            // last-write-wins yields the deepest (most
+                            // specific) code.
+                            Some("Value") => subcode = Some(v),
+                            Some("Text") | Some("faultstring") if reason.is_none() => {
+                                reason = Some(v);
+                            }
+                            _ => {}
+                        }
+                    }
+                    capture = false;
                 }
-                if n == "Subcode" && !text_acc.trim().is_empty() {
-                    return Some(text_acc.trim().to_string());
-                }
-                in_target = false;
             }
-            Ok(Event::Eof) | Err(_) => return None,
+            Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
+    }
+
+    match (subcode, reason) {
+        (Some(sc), Some(rs)) => Some(format!("{sc}: {rs}")),
+        (Some(sc), None) => Some(sc),
+        (None, Some(rs)) => Some(rs),
+        (None, None) => None,
     }
 }
 
@@ -458,6 +492,29 @@ mod tests {
         assert!(
             reason.contains("Not") && reason.contains("Authorized"),
             "unexpected reason: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn fault_reason_combines_deepest_subcode_and_text() {
+        // ONVIF nests the specific code under a generic one; the human
+        // message names the offending parameter. Both matter for OSD
+        // debugging, where a bare `ter:InvalidParameter` is useless.
+        let body = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+  <s:Body><s:Fault>
+    <s:Code>
+      <s:Value>s:Sender</s:Value>
+      <s:Subcode>
+        <s:Value>ter:InvalidArgVal</s:Value>
+        <s:Subcode><s:Value>ter:InvalidParameter</s:Value></s:Subcode>
+      </s:Subcode>
+    </s:Code>
+    <s:Reason><s:Text xml:lang="en">The VideoSourceConfigurationToken is invalid</s:Text></s:Reason>
+  </s:Fault></s:Body>
+</s:Envelope>"#;
+        assert_eq!(
+            extract_fault_reason(body).as_deref(),
+            Some("ter:InvalidParameter: The VideoSourceConfigurationToken is invalid"),
         );
     }
 
