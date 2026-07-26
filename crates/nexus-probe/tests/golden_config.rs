@@ -196,6 +196,8 @@ fn nvidia_selects_cuda_ep() {
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["cuda", "cpu"]);
     assert!(!c.inference.ep_priority.iter().any(|e| e == "tensorrt"));
+    // The card's NVDEC block handles decode on a box with no iGPU.
+    assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Nvdec);
 }
 
 /// Pure CPU box — no accelerators. Software everywhere, single worker.

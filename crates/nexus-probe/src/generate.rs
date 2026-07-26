@@ -24,7 +24,7 @@
 //! | Knob | Source |
 //! |---|---|
 //! | `runtime.worker_threads` / `blocking_threads` | CPU logical cores |
-//! | `runtime.decode.mode` | [`DecodeCapability`] (VA vs software) |
+//! | `runtime.decode.mode` | [`DecodeCapability`] (VA / NVDEC / software) |
 //! | `inference.ep_priority` | primary [`InferenceDevice`] |
 //! | `inference.workers` | primary [`InferenceDevice`] |
 //! | `inference.model.preset` (+ `input_width`/`input_height`) | primary [`InferenceDevice`] |
@@ -83,9 +83,11 @@ pub fn generate_config(profile: &HardwareProfile) -> Config {
     cfg.runtime.clips.recorder = RecorderKind::Gstreamer;
 
     // Hardware-decode strategy. `Va` whenever an Intel/AMD media engine is
-    // present; `Software` otherwise (Hailo/NPU/NVIDIA-only or pure CPU).
+    // present, `Nvdec` on an NVIDIA GPU, `Software` otherwise (Hailo/NPU
+    // or pure CPU).
     cfg.runtime.decode.mode = match profile.decode {
         DecodeCapability::Va => DecodeMode::Va,
+        DecodeCapability::Nvdec => DecodeMode::Nvdec,
         DecodeCapability::Software => DecodeMode::Software,
     };
 
@@ -441,7 +443,7 @@ mod tests {
             ),
             (
                 vec![InferenceDevice::Nvidia, InferenceDevice::Cpu],
-                DecodeCapability::Software,
+                DecodeCapability::Nvdec,
             ),
             (vec![InferenceDevice::Cpu], DecodeCapability::Software),
         ] {

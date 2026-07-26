@@ -38,13 +38,18 @@ blocking_threads = 8
 # a CPU-bound and a comfortable box on multi-camera installs.
 #   "auto"     — (default) use VA-API hardware decode
 #                (vah264dec/vah265dec ! vapostproc) when the GPU +
-#                GStreamer VA plugin are present, otherwise fall back
-#                to software (avdec_h264/avdec_h265). Always safe.
+#                GStreamer VA plugin are present, else NVIDIA NVDEC
+#                (nvh264dec/nvh265dec) when the nvcodec plugin is
+#                present, otherwise fall back to software
+#                (avdec_h264/avdec_h265). Always safe.
 #   "va"       — force VA-API; still fails open to software if the
 #                VA plugin/driver is missing (logged as a warning).
 #   "msdk"     — force Intel Media SDK (msdkh264dec ! msdkvpp); falls
 #                back to VA then software. Only for boxes where MSDK
 #                outperforms the libva path.
+#   "nvdec"    — force NVIDIA NVDEC (nvh264dec/nvh265dec, from the
+#                nvcodec plugin); falls back to software if the
+#                proprietary driver or plugin is missing.
 #   "software" — force CPU decode. Use to rule out a flaky GPU driver.
 # Omit this whole section to get "auto" (zero-migration upgrade).
 mode = "auto"
