@@ -1211,6 +1211,30 @@ fn encoder_rate_control_args(encoder: &str, bitrate_kbps: u32) -> String {
     }
 }
 
+/// Leaky decoupling queue inserted between the (frame-domain) payloader input
+/// and `webrtcbin`, present on BOTH the transcode and passthrough paths.
+///
+/// Without it the whole chain is rigid: `webrtcbin` (and its `rtpgccbwe` pacer)
+/// back-pressures the payloader → the parser → the encoder → the `block=true`
+/// `appsrc`, so `appsrc.push_buffer` blocks. The feed's
+/// [`FEED_PUSH_STALL_TIMEOUT`] (5 s) then ends the feed task and the manager
+/// reaps the whole publisher — a transient pacing backlog on a *healthy* link
+/// (measured live: `rtpgccbwe` still ramping to the 4 Mbps ceiling when the
+/// stall fired) turns into a full teardown + ~15-20 s cold rebuild, i.e. the
+/// residual HD black-out.
+///
+/// The queue absorbs that back-pressure instead: bounded to ~300 ms and
+/// `leaky=downstream` (drop the OLDEST queued frame when full, keep the
+/// newest), it drops a few encoded access units under a burst rather than
+/// stalling the source. The browser sees those as ordinary loss and recovers
+/// on the next frame via the already-wired PLI → forced-keyframe on our encoder
+/// (transcode) — far cheaper than rebuilding the PeerConnection. Because it
+/// leaks frame-domain buffers *after* the local decoder/encoder, the transcode
+/// decoder never sees a broken bitstream (only the remote browser experiences
+/// the drop, which WebRTC is built to handle).
+const EGRESS_QUEUE: &str = "queue name=egress leaky=downstream max-size-time=300000000 \
+     max-size-bytes=0 max-size-buffers=0";
+
 /// Build a **transcode** launch description: HW-decode the camera codec and
 /// re-encode to H.264 with a bounded-keyframe CBR profile for smooth WebRTC
 /// over a lossy, congestion-controlled network.
@@ -1255,6 +1279,7 @@ fn transcode_pipeline_desc(codec: CodecKind, encoder: &str, decoder: &str) -> St
            ! capsfilter name=ratecaps \
            ! {encoder} name=enc {enc_args} \
            ! h264parse config-interval=1 \
+           ! {EGRESS_QUEUE} \
            ! rtph264pay name=pay pt=96 config-interval=1 mtu=1200 \
            ! application/x-rtp,media=video,encoding-name=H264,clock-rate=90000 \
            ! webrtcbin name=webrtc latency=0 bundle-policy=max-bundle"
@@ -1291,6 +1316,7 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
         "appsrc name=src is-live=true do-timestamp=false format=time \
              block=true max-bytes=8388608 stream-type=stream \
            ! {base}parse config-interval=0 \
+           ! {EGRESS_QUEUE} \
            ! rtp{base}pay name=pay pt=96 config-interval=0 mtu=1200 \
            ! application/x-rtp,media=video,encoding-name={encoding},clock-rate=90000 \
            ! webrtcbin name=webrtc latency=0 bundle-policy=max-bundle"
@@ -1340,6 +1366,9 @@ mod tests {
         assert!(d.contains("rtph264pay"), "{d}");
         assert!(d.contains("encoding-name=H264"), "{d}");
         assert!(d.contains("webrtcbin name=webrtc"), "{d}");
+        // Leaky egress queue decouples webrtcbin/pacer back-pressure from the
+        // source so a transient stall drops frames instead of tearing down.
+        assert!(d.contains("queue name=egress leaky=downstream"), "{d}");
         // We stamp PTS/DTS ourselves; auto-timestamping is what broke delta
         // frame assembly in the browser.
         assert!(d.contains("do-timestamp=false"), "{d}");
@@ -1418,6 +1447,9 @@ mod tests {
         assert!(d.contains("name=dec"), "{d}");
         assert!(d.contains("encoding-name=H264"), "{d}");
         assert!(d.contains("webrtcbin name=webrtc"), "{d}");
+        // Leaky egress queue sits after the encoder/parser, before the
+        // payloader, so pacer back-pressure never reaches the source.
+        assert!(d.contains("queue name=egress leaky=downstream"), "{d}");
     }
 
     #[test]
