@@ -1065,12 +1065,17 @@ const FEC_PERCENTAGE: u32 = 25;
 ///
 /// By default webrtcbin negotiates the FEC payload types as `pt -1` — i.e. the
 /// RED and ULPFEC encoders are created but disabled, so the stream is protected
-/// by retransmission only. Setting `fec-type = UlpRed` on the transceiver
+/// by retransmission only. Setting `fec-type = ulp-red` on the transceiver
 /// makes the offer advertise real RED/ULPFEC payload types and emit parity
 /// packets at [`FEC_PERCENTAGE`]; `do-nack = true` keeps retransmission wired as
 /// the second layer. The transceiver already exists once the payloader's src
 /// pad is linked to webrtcbin's request sink pad at parse time, so we fetch
 /// index 0 and configure it before the offer is generated.
+///
+/// `fec-type` is set via its GEnum value nick (`ulp-red`) rather than the Rust
+/// `WebRTCFECType` enum because that binding is gated behind the `v1_14_1`
+/// gstreamer-webrtc feature, which this build does not enable; the nick form
+/// carries no such feature dependency.
 fn configure_fec(webrtc: &gst::Element, camera_id: CameraId) {
     let transceiver = webrtc
         .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&0u32]);
@@ -1081,7 +1086,7 @@ fn configure_fec(webrtc: &gst::Element, camera_id: CameraId) {
         );
         return;
     };
-    transceiver.set_property("fec-type", gst_webrtc::WebRTCFECType::UlpRed);
+    transceiver.set_property_from_str("fec-type", "ulp-red");
     transceiver.set_property("fec-percentage", FEC_PERCENTAGE);
     transceiver.set_property("do-nack", true);
     info!(
