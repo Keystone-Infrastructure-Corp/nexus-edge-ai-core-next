@@ -1078,7 +1078,7 @@ const FEC_PERCENTAGE: u32 = 25;
 /// carries no such feature dependency.
 fn configure_fec(webrtc: &gst::Element, camera_id: CameraId) {
     let transceiver = webrtc
-        .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&0u32]);
+        .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&0i32]);
     let Some(transceiver) = transceiver else {
         warn!(
             camera_id,
