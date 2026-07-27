@@ -1072,8 +1072,8 @@ const FEC_PERCENTAGE: u32 = 25;
 /// pad is linked to webrtcbin's request sink pad at parse time, so we fetch
 /// index 0 and configure it before the offer is generated.
 fn configure_fec(webrtc: &gst::Element, camera_id: CameraId) {
-    let transceiver =
-        webrtc.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&0u32]);
+    let transceiver = webrtc
+        .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&0u32]);
     let Some(transceiver) = transceiver else {
         warn!(
             camera_id,
