@@ -333,6 +333,12 @@ impl WebRtcSession {
             }
         }
 
+        // Enable RED/ULPFEC (+ keep NACK) on the send transceiver so the viewer
+        // leg recovers bursty downlink loss from parity instead of round-trip
+        // retransmits. The transceiver exists now that `pay ! webrtc` linked the
+        // request sink pad during parse.
+        configure_fec(&webrtc, camera_id);
+
         // Tell appsrc the exact byte-stream codec so h264parse/rtppay
         // negotiate without a probe.
         let caps_name = if codec.base() == "h265" {
@@ -1039,6 +1045,55 @@ fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
         }
         gst::PadProbeReturn::Ok
     });
+}
+
+/// FEC redundancy the send transceiver advertises, in percent of media rate.
+///
+/// The HD viewer leg (SFU → browser) suffers bursty downlink loss at the
+/// 1080p bitrate that the low-bitrate grid never sees — measured ~8 % RTP loss
+/// with repeated freezes while the same workstation renders every LBR tile
+/// cleanly. Pure NACK/RTX cannot keep up across Cloudflare RTT: a lost
+/// reference packet costs a full round-trip to retransmit, and by the time it
+/// arrives the jitter buffer has already frozen. Forward error correction
+/// (RED + ULPFEC) sends redundant parity so the browser reconstructs the
+/// missing packets locally, with no round-trip. 25 % covers an ~8 % loss rate
+/// with burst headroom while staying well under the parity overhead that would
+/// itself congest the link (webrtcbin caps the useful range at 100 %).
+const FEC_PERCENTAGE: u32 = 25;
+
+/// Enable RED/ULPFEC (and keep NACK/RTX) on webrtcbin's send transceiver.
+///
+/// By default webrtcbin negotiates the FEC payload types as `pt -1` — i.e. the
+/// RED and ULPFEC encoders are created but disabled, so the stream is protected
+/// by retransmission only. Setting `fec-type = ulp-red` on the transceiver
+/// makes the offer advertise real RED/ULPFEC payload types and emit parity
+/// packets at [`FEC_PERCENTAGE`]; `do-nack = true` keeps retransmission wired as
+/// the second layer. The transceiver already exists once the payloader's src
+/// pad is linked to webrtcbin's request sink pad at parse time, so we fetch
+/// index 0 and configure it before the offer is generated.
+///
+/// `fec-type` is set via its GEnum value nick (`ulp-red`) rather than the Rust
+/// `WebRTCFECType` enum because that binding is gated behind the `v1_14_1`
+/// gstreamer-webrtc feature, which this build does not enable; the nick form
+/// carries no such feature dependency.
+fn configure_fec(webrtc: &gst::Element, camera_id: CameraId) {
+    let transceiver = webrtc
+        .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&0u32]);
+    let Some(transceiver) = transceiver else {
+        warn!(
+            camera_id,
+            "webrtc: no send transceiver to configure FEC (offer not yet built?)"
+        );
+        return;
+    };
+    transceiver.set_property_from_str("fec-type", "ulp-red");
+    transceiver.set_property("fec-percentage", FEC_PERCENTAGE);
+    transceiver.set_property("do-nack", true);
+    info!(
+        camera_id,
+        fec_percentage = FEC_PERCENTAGE,
+        "webrtc: enabled RED/ULPFEC + NACK on send transceiver"
+    );
 }
 
 /// Wire `rtpgccbwe` as webrtcbin's aux-sender for the transcode path. The
