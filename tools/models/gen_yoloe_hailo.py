@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate Hailo-8 HEF artifact for the YOLOE text-mode detector.
 
-One size ships: 640. Source-of-truth ONNX MUST exist at
-`models/yoloe26_s.onnx` \u2014 generate it first with:
+Four native-16:9 shapes ship: 512x288, 1024x576, 1536x864, 2048x1152.
+Source-of-truth ONNX files MUST exist under `models/` \u2014 generate it first with:
 
     python tools/models/gen_yoloe.py \\
         --prompts tools/models/yoloe_default_prompts.txt
@@ -15,7 +15,10 @@ NO public Hailo Model Zoo build exists for YOLOE; local DFC compile
 only.
 
 Output:
-    models/yoloe26_s_640_hailo.hef     (~18 MB)
+    models/yoloe26_s_512x288_hailo.hef
+    models/yoloe26_s_1024x576_hailo.hef
+    models/yoloe26_s_1536x864_hailo.hef
+    models/yoloe26_s_2048x1152_hailo.hef
 """
 
 from __future__ import annotations
@@ -34,28 +37,43 @@ from gen_hailo_common import (
 )
 
 MODEL_ID = "yoloe26_s"
-STATIC_SIZES = (640,)
+# Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k).
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864), (2048, 1152))
 ALLS_DIR = Path(__file__).resolve().parent / "alls"
 
 
-def hef_path_for(size: int) -> Path:
-    return MODELS_DIR / f"yoloe26_s_{size}_hailo.hef"
+def parse_shape(text: str) -> tuple[int, int]:
+    """Parse a `WxH` shape string (e.g. "512x288") into `(w, h)`."""
+
+    try:
+        w_str, h_str = text.lower().split("x", 1)
+        return int(w_str), int(h_str)
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --shape {text!r}; expected WxH like 512x288"
+        )
 
 
-def build_one(size: int) -> int:
-    # Source ONNX is unsized (no per-size variants in gen_yoloe.py); the
-    # 640 manifest entry covers the only operating point.
-    onnx = MODELS_DIR / "yoloe26_s.onnx"
+def hef_path_for(w: int, h: int) -> Path:
+    return MODELS_DIR / f"yoloe26_s_{w}x{h}_hailo.hef"
+
+
+def onnx_path_for(w: int, h: int) -> Path:
+    return MODELS_DIR / f"yoloe26_s_{w}x{h}.onnx"
+
+
+def build_one(w: int, h: int) -> int:
+    onnx = onnx_path_for(w, h)
     if not onnx.exists():
         print(
             f"[gen_yoloe_hailo] FATAL: {onnx} missing. Run "
-            f"`python tools/models/gen_yoloe.py --prompts "
-            f"tools/models/yoloe_default_prompts.txt` first."
+            f"`python tools/models/gen_yoloe.py --all-static` first to "
+            f"regenerate the baked-prompt ONNXs."
         )
         return 1
     require_hailo_sdk()
 
-    hef_out = hef_path_for(size)
+    hef_out = hef_path_for(w, h)
     calib = ensure_calibration_set("coco-val2017-1024")
     rc = compile_with_dfc(
         onnx,
@@ -86,16 +104,28 @@ def build_one(size: int) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compile yoloe26_s HEF for Hailo-8")
+    parser = argparse.ArgumentParser(description="Compile yoloe26_s HEFs for Hailo-8")
     parser.add_argument(
-        "--size",
-        type=int,
-        choices=STATIC_SIZES,
-        default=640,
-        help="Operating size (only 640 ships).",
+        "--shape",
+        type=parse_shape,
+        help="Compile a single shape (WxH, e.g. 512x288). Omit for --all.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Compile all four shapes: "
+        + ", ".join(f"{w}x{h}" for w, h in STATIC_SHAPES),
     )
     args = parser.parse_args()
-    return build_one(args.size)
+    if not (args.shape or args.all):
+        args.all = True
+
+    shapes = [args.shape] if args.shape else list(STATIC_SHAPES)
+    for w, h in shapes:
+        rc = build_one(w, h)
+        if rc != 0:
+            return rc
+    return 0
 
 
 if __name__ == "__main__":

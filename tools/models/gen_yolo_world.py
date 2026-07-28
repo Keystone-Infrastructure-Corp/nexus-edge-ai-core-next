@@ -10,50 +10,42 @@ closed-vocab head:
   producing a YOLOv8-style detector with one class per prompt.
   Per-camera config picks a *subset* of those prompts at runtime; the
   Rust detector filters detections to that subset before emitting them.
-* **Multi-size static exports (as of v0.1.22).** Mirrors `gen_yolo26n.py`
-  — ships per-size static-shape ONNXs `yolo_world_v2_s_640.onnx`
-  (640 default) and `yolo_world_v2_s_960.onnx` (960 default).
+* **Native 16:9 static exports.** Mirrors `gen_yolo26n.py` — ships
+  per-shape static ONNXs on the exact-16:9 ∩ stride-32 ladder
+  (W=512k, H=288k): `yolo_world_v2_s_512x288.onnx`,
+  `yolo_world_v2_s_1024x576.onnx`, `yolo_world_v2_s_1536x864.onnx`,
+  `yolo_world_v2_s_2048x1152.onnx`. The 16:9 supervisor frame is no
+  longer stretched into a square tensor — see
+  `docs/edge-core/M_NATIVE_ASPECT.md` in the cloud-console repo.
   Static shapes are mandatory for the Intel NPU plugin (which silently
   falls back to CPU on dynamic-shape models, observed on Lunar Lake k13
   under v0.1.18–v0.1.20) and let the OpenVINO blob cache hit on
-  subsequent boots. The legacy unsuffixed `yolo_world_v2_s.onnx` (640
-  only) is no longer produced; the engine resolver keeps one cycle of
-  back-compat for pre-v0.1.22 packs already staged on disk.
-
-  1280 is intentionally NOT shipped — open-vocab YOLO-World is used
-  for coarse semantic queries ("forklift", "person wearing hardhat")
-  where 1280 ~7×s the inference cost without commensurate accuracy.
-  The 1280 use case (plate / face) is on the YOLO26n closed-vocab
-  head, not here.
+  subsequent boots. The legacy square/unsuffixed `yolo_world_v2_s.onnx`
+  is no longer produced.
 
 Run from the workspace root with the model-gen venv active:
 
     source .venv-modelgen/bin/activate
-    # Generate all static-size variants in one ultralytics session
+    # Generate all static-shape variants in one ultralytics session
     # (saves the import + checkpoint-load overhead vs. N invocations):
     python tools/models/gen_yolo_world.py --all-static
     # …or one at a time:
-    python tools/models/gen_yolo_world.py --imgsz 640
-    python tools/models/gen_yolo_world.py --imgsz 960
+    python tools/models/gen_yolo_world.py --shape 512x288
+    python tools/models/gen_yolo_world.py --shape 1024x576
 
 Output:
-    models/yolo_world_v2_s_640.onnx   (~50–80 MB)
-    models/yolo_world_v2_s_960.onnx   (~50–80 MB)
+    models/yolo_world_v2_s_512x288.onnx    (~50–80 MB)
+    models/yolo_world_v2_s_1024x576.onnx   (~50–80 MB)
+    models/yolo_world_v2_s_1536x864.onnx   (~50–80 MB)
+    models/yolo_world_v2_s_2048x1152.onnx  (~50–80 MB)
 
 Weights file size is constant w.r.t. input shape — only the activation
-tensors grow at runtime — so the 960 variant adds ~50–80 MB to the
-release tarball, not 9× that.
+tensors grow at runtime — so each extra shape adds ~50–80 MB to the
+release tarball, not the pixel ratio.
 
 The prompt file lives under `tools/models/` (tracked) so the prompt
 vocabulary is reproducible; the ONNX itself stays under `models/`
-(gitignored) per the same policy as `yolo26n_{640,960,1280}.onnx`.
-
-Note: this script does NOT ship size variants of `yoloe26_s.onnx`. The
-upstream YOLOE export pathway is being reworked in M3.4 (visual prompts
-via prompt-sets, static-export rework) and will regenerate the YOLOE
-ONNX per prompt-set anyway. Adding a parallel multi-size loop here
-would be thrown away in M3.4 Phase B — size variance moves into
-`build_prompt_set.py` instead.
+(gitignored) per the same policy as `yolo26n_<W>x<H>.onnx`.
 """
 
 from __future__ import annotations
@@ -69,16 +61,28 @@ from typing import List
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = REPO_ROOT / "models"
-STATIC_SIZES = (640, 960)
-LEGACY_OUTPUT = MODELS_DIR / "yolo_world_v2_s.onnx"  # pre-v0.1.22, no longer produced by default
+# Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k).
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864), (2048, 1152))
 DEFAULT_PROMPTS = Path(__file__).resolve().parent / "yolo_world_default_prompts.txt"
 DEFAULT_BASE_MODEL = "yolov8s-worldv2.pt"
 
 
-def static_output_for(imgsz: int) -> Path:
-    """Where the static-mode export writes the per-size ONNX."""
+def parse_shape(text: str) -> tuple[int, int]:
+    """Parse a `WxH` shape string (e.g. "512x288") into `(w, h)`."""
 
-    return MODELS_DIR / f"yolo_world_v2_s_{imgsz}.onnx"
+    try:
+        w_str, h_str = text.lower().split("x", 1)
+        return int(w_str), int(h_str)
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --shape {text!r}; expected WxH like 512x288"
+        )
+
+
+def static_output_for(w: int, h: int) -> Path:
+    """Where the static-mode export writes the per-shape ONNX."""
+
+    return MODELS_DIR / f"yolo_world_v2_s_{w}x{h}.onnx"
 
 
 def sha256_file(path: Path) -> str:
@@ -125,7 +129,7 @@ def upsert_manifest_entry(
     informational / forward-compatible with a future Rust
     ModelRegistry port.
 
-    `sized_artifacts` is a list of `{"imgsz": int, "path": str, "sha": str}`.
+    `sized_artifacts` is a list of `{"w": int, "h": int, "path": str, "sha": str}`.
     """
 
     manifest_path = MODELS_DIR / "models-manifest.json"
@@ -139,36 +143,32 @@ def upsert_manifest_entry(
         )
     models = manifest.setdefault("models", [])
 
-    # Sort by imgsz ascending so the manifest reads naturally and diffs
+    # Sort by width ascending so the manifest reads naturally and diffs
     # cleanly across runs.
-    sized_artifacts = sorted(sized_artifacts, key=lambda a: a["imgsz"])
-    default_imgsz = next(
-        (a["imgsz"] for a in sized_artifacts if str(a["imgsz"]) == default_preset),
-        sized_artifacts[0]["imgsz"],
+    sized_artifacts = sorted(sized_artifacts, key=lambda a: a["w"])
+    default_art = next(
+        (a for a in sized_artifacts if f"{a['w']}x{a['h']}" == default_preset),
+        sized_artifacts[0],
     )
 
     entry = {
         "id": model_id,
         "task": "detect_open_vocab_text",
         "_comment": (
-            "YOLO-World v2 (small) export. As of v0.1.22 the engine ships "
-            "per-size STATIC-shape ONNXs — yolo_world_v2_s_640.onnx "
-            "(640 default) and yolo_world_v2_s_960.onnx (960 "
-            "default). Static shapes are mandatory for the Intel NPU plugin "
-            "(silent CPU fallback on dynamic shapes, observed on Lunar Lake "
-            "k13 under v0.1.18–0.1.20) and let the OpenVINO blob cache hit "
-            "on subsequent boots. Prompts are baked into the graph at export "
-            "time; per-camera config picks a subset at runtime. Regenerate "
-            "via `python tools/models/gen_yolo_world.py --all-static` "
-            "whenever the prompt vocabulary changes — the manifest sha256 "
-            "values below will refresh and the engine's loader will catch "
-            "the diff. 1280 is intentionally NOT shipped (overkill for the "
-            "coarse semantic queries open-vocab is used for); the YOLOE "
-            "multi-size export is deferred to M3.4 (prompt-set rework)."
+            "YOLO-World v2 (small) export on the native 16:9 ladder "
+            "(512x288 / 1024x576 / 1536x864 / 2048x1152). Static shapes are "
+            "mandatory for the Intel NPU plugin (silent CPU fallback on "
+            "dynamic shapes, observed on Lunar Lake k13 under v0.1.18–0.1.20) "
+            "and let the OpenVINO blob cache hit on subsequent boots. Prompts "
+            "are baked into the graph at export time; per-camera config picks "
+            "a subset at runtime. Regenerate via "
+            "`python tools/models/gen_yolo_world.py --all-static` whenever the "
+            "prompt vocabulary changes — the manifest sha256 values below will "
+            "refresh and the engine's loader will catch the diff."
         ),
         "input": {
-            "width": default_imgsz,
-            "height": default_imgsz,
+            "width": default_art["w"],
+            "height": default_art["h"],
             "channels": 3,
             "format": "RGB",
         },
@@ -180,16 +180,16 @@ def upsert_manifest_entry(
             {
                 "backend": "onnx",
                 "path": a["path"],
-                "preset": str(a["imgsz"]),
+                "preset": f"{a['w']}x{a['h']}",
                 "sha256": a["sha"],
             }
             for a in sized_artifacts
         ],
         "presets": [
             {
-                "name": str(a["imgsz"]),
-                "inputWidth": a["imgsz"],
-                "inputHeight": a["imgsz"],
+                "name": f"{a['w']}x{a['h']}",
+                "inputWidth": a["w"],
+                "inputHeight": a["h"],
                 "artifact": a["path"],
             }
             for a in sized_artifacts
@@ -209,7 +209,7 @@ def upsert_manifest_entry(
         models.append(entry)
 
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    sizes = ", ".join(str(a["imgsz"]) for a in sized_artifacts)
+    sizes = ", ".join(f"{a['w']}x{a['h']}" for a in sized_artifacts)
     print(
         f"[gen_yolo_world] manifest upserted: {model_id} "
         f"({len(prompts)} prompts, sizes [{sizes}], default {default_preset})"
@@ -219,7 +219,8 @@ def upsert_manifest_entry(
 def export_yolo_world(
     base_model: str,
     prompts: List[str],
-    imgsz: int,
+    w: int,
+    h: int,
     opset: int,
     output: Path,
 ) -> None:
@@ -235,13 +236,14 @@ def export_yolo_world(
     # call the model behaves like a closed-vocab YOLO-v8 with C = len(prompts).
     model.set_classes(prompts)
 
-    print(f"[gen_yolo_world] exporting ONNX (imgsz={imgsz}, opset={opset})")
+    print(f"[gen_yolo_world] exporting ONNX (1x3x{h}x{w}, opset={opset})")
+    # ultralytics takes imgsz as [height, width] — height first.
     model.export(
         format="onnx",
         dynamic=False,  # Static for predictability; per-camera always
         # uses the same input dims for the open-vocab head.
         opset=opset,
-        imgsz=imgsz,
+        imgsz=[h, w],
         simplify=True,
         nms=False,  # keep raw YOLOv8 head — Rust postprocess does NMS.
     )
@@ -319,11 +321,17 @@ def main() -> int:
         type=Path,
         default=None,
         help=(
-            "Override the output ONNX path. Defaults: per-size mode → "
-            "models/yolo_world_v2_s_<imgsz>.onnx. Ignored under --all-static."
+            "Override the output ONNX path. Default: per-shape mode → "
+            "models/yolo_world_v2_s_<W>x<H>.onnx. Ignored under --all-static."
         ),
     )
-    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument(
+        "--shape",
+        type=parse_shape,
+        default=(512, 288),
+        help="Input shape as WxH (default 512x288). Ladder rung: "
+        "512x288 | 1024x576 | 1536x864 | 2048x1152.",
+    )
     parser.add_argument(
         "--opset",
         type=int,
@@ -350,28 +358,28 @@ def main() -> int:
         "--all-static",
         action="store_true",
         help=(
-            f"Generate all static-shape ONNXs in one ultralytics session: "
-            f"{', '.join(str(s) for s in STATIC_SIZES)}. Saves the import + "
-            f"checkpoint load + set_classes overhead vs. N separate "
-            f"invocations. This is the release-pipeline path."
+            "Generate all static-shape ONNXs in one ultralytics session: "
+            + ", ".join(f"{w}x{h}" for w, h in STATIC_SHAPES)
+            + ". Saves the import + checkpoint load + set_classes overhead "
+            "vs. N separate invocations. This is the release-pipeline path."
         ),
     )
     parser.add_argument(
         "--default-preset",
         type=str,
-        default="640",
+        default="512x288",
         help=(
             "Which preset name to write as `default_preset` in the manifest. "
-            "Defaults to 640 (the iGPU/Hailo default)."
+            "Defaults to 512x288 (the Standard tier / iGPU/Hailo default)."
         ),
     )
     args = parser.parse_args()
 
-    # Default mode if neither --all-static nor --imgsz with --output was
+    # Default mode if neither --all-static nor --shape with --output was
     # explicitly mode-selected: --all-static. Matches what the release
     # workflow expects to find uploaded against a tag.
     explicit_single = (
-        any(arg.startswith("--imgsz") for arg in sys.argv[1:])
+        any(arg.startswith("--shape") for arg in sys.argv[1:])
         or args.output is not None
     )
     if not args.all_static and not explicit_single:
@@ -386,40 +394,41 @@ def main() -> int:
     print(f"[gen_yolo_world] prompts ({len(prompts)}): {prompts}")
 
     if args.all_static:
-        sizes = list(STATIC_SIZES)
+        shapes = list(STATIC_SHAPES)
     else:
-        sizes = [args.imgsz]
+        shapes = [args.shape]
 
     sized_artifacts: List[dict] = []
-    for sz in sizes:
+    for w, h in shapes:
         output = (
             args.output
             if (args.output is not None and not args.all_static)
-            else static_output_for(sz)
+            else static_output_for(w, h)
         )
         try:
             export_yolo_world(
                 base_model=args.base_model,
                 prompts=prompts,
-                imgsz=sz,
+                w=w,
+                h=h,
                 opset=args.opset,
                 output=output,
             )
         except Exception as ex:  # noqa: BLE001
-            print(f"[gen_yolo_world] ERROR exporting imgsz={sz}: {ex}")
+            print(f"[gen_yolo_world] ERROR exporting {w}x{h}: {ex}")
             return 1
 
         if not args.skip_smoke:
             try:
-                smoke_check(output, sz, sz)
+                smoke_check(output, w, h)
             except Exception as ex:  # noqa: BLE001
                 print(f"[gen_yolo_world] ERROR smoke-loading {output}: {ex}")
                 return 1
 
         sha = sha256_file(output)
         size_mb = output.stat().st_size / (1024 * 1024)
-        print(f"[gen_yolo_world] imgsz={sz} sha256 {sha}  size {size_mb:.2f} MB")
-        sized_artifacts.append({"imgsz": sz, "path": output.name, "sha": sha})
+        print(f"[gen_yolo_world] {w}x{h} sha256 {sha}  size {size_mb:.2f} MB")
+        sized_artifacts.append({"w": w, "h": h, "path": output.name, "sha": sha})
 
     upsert_manifest_entry(
         model_id=args.manifest_id,
