@@ -68,6 +68,7 @@ import { FleetManagedBadge } from "@/components/fleet-managed-badge";
 import {
   defaultShapeForKind,
   describeShape,
+  SHAPE_LADDER,
   shapeFromKey,
   shapeKey,
   shapesForKind,
@@ -458,7 +459,42 @@ function CameraEditor({
     const ttlChanged =
       (original?.anchor_ttl_secs ?? null) !==
       (draft.anchor_ttl_secs ?? null);
-    return modelChanged || ttlChanged;
+    // `supervisor_width` respawns the camera (supervisor dims change) —
+    // see reconciler `start_camera`.
+    const supervisorChanged =
+      (original?.supervisor_width ?? null) !== (draft.supervisor_width ?? null);
+    return modelChanged || ttlChanged || supervisorChanged;
+  })();
+
+  // M_NATIVE_ASPECT — live tiling-geometry preview. The supervisor
+  // (analysis) frame can be a larger native-16:9 ladder rung than the
+  // model input; when it divides evenly by the tile grid, each tile is
+  // pixel-identical to the model input (zero resampling).
+  const modelInputW =
+    (draft.model_override as ModelOverride | null)?.input_width ?? 512;
+  const modelInputH =
+    (draft.model_override as ModelOverride | null)?.input_height ?? 288;
+  const supervisorHeight = (w: number) => {
+    const h = Math.floor((w * 9) / 16);
+    return h % 2 === 0 ? h : h + 1;
+  };
+  const tilePreview = (() => {
+    const supW = draft.supervisor_width ?? modelInputW;
+    const supH = supervisorHeight(supW);
+    const cols = draft.tile_grid === "g3x3" ? 3 : 2;
+    const rows = cols;
+    const tileW = Math.floor(supW / cols);
+    const tileH = Math.floor(supH / rows);
+    const exact = tileW === modelInputW && tileH === modelInputH;
+    const maxTiles =
+      typeof draft.tile_max_per_frame === "number"
+        ? draft.tile_max_per_frame
+        : 3;
+    const text = exact
+      ? `Analysis ${supW} × ${supH} · grid ${cols} × ${rows} → tiles ${tileW} × ${tileH} · native 1:1 ✓`
+      : `Analysis ${supW} × ${supH} · grid ${cols} × ${rows} → tiles ${tileW} × ${tileH} → resampled to ${modelInputW} × ${modelInputH} ⚠`;
+    const cost = `Worst case ≈ ${(maxTiles * tileW * tileH).toLocaleString()} px/frame at ${maxTiles} tile(s).`;
+    return { text, cost, exact };
   })();
 
   const mutation = useMutation({
@@ -918,6 +954,50 @@ function CameraEditor({
                 Square grids preserve 16:9 framing per cell.
               </span>
             </div>
+          </div>
+
+          {/* M_NATIVE_ASPECT — analysis (supervisor) frame width, decoupled
+              from the model input so tiles divide the frame 1:1. */}
+          <div className="mt-3 flex flex-col gap-1 text-sm">
+            <label
+              htmlFor="supervisor-width"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              Analysis frame (native 16:9)
+            </label>
+            <select
+              id="supervisor-width"
+              value={
+                typeof draft.supervisor_width === "number"
+                  ? String(draft.supervisor_width)
+                  : ""
+              }
+              onChange={(e) => {
+                const v = e.target.value;
+                set("supervisor_width", v === "" ? undefined : Number(v));
+              }}
+              disabled={draft.tile_enabled !== true}
+              className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+            >
+              <option value="">Match model input (default)</option>
+              {SHAPE_LADDER.filter((s) => s.w >= modelInputW).map((s) => (
+                <option key={s.w} value={String(s.w)}>
+                  {s.tier} — {s.w} × {s.h}
+                </option>
+              ))}
+            </select>
+            <span
+              className={
+                tilePreview.exact
+                  ? "text-[11px] text-emerald-600 dark:text-emerald-400"
+                  : "text-[11px] text-amber-600 dark:text-amber-400"
+              }
+            >
+              {tilePreview.text}
+            </span>
+            <span className="text-[11px] text-muted-foreground">
+              {tilePreview.cost}
+            </span>
           </div>
         </SheetSection>
 

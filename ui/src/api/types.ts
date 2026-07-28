@@ -152,6 +152,11 @@ export interface CameraConfig {
   tile_trigger?: number;
   tile_max_per_frame?: number;
   tile_grid?: TileGridConfig;
+  // M_NATIVE_ASPECT — analysis (supervisor) frame width, decoupled from
+  // the detector input width. Undefined = derive from the model input.
+  // Must be a native-16:9 ladder rung (512 | 1024 | 1536 | 2048) >= the
+  // model input; flattens from `CameraBehavior::supervisor_width`.
+  supervisor_width?: number;
   zones?: ZoneConfig[];
   /// ONVIF device-control endpoint + credentials. Required for the
   /// PTZ / imaging / device-control surface; auto-populated when the
