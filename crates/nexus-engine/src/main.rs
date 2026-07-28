@@ -861,10 +861,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // Fresh per-camera tracker — see the comment on `cfg.tracker`
         // above for why sharing one Arc across cameras is wrong.
         let tracker: Arc<dyn nexus_tracker::Tracker> = Arc::from(build_tracker(&cfg.tracker));
-        // Per-camera supervisor (analysis) RGB frame size: matches
-        // the camera's resolved detector input width so we don't
-        // burn CPU upscaling a 1280-trained net's input to a fixed
-        // 960 only to downscale back. See
+        // Per-camera supervisor (analysis) RGB frame size. Defaults to
+        // the camera's resolved detector input width; M_NATIVE_ASPECT
+        // lets a camera analyse at a larger native-16:9 ladder rung
+        // (`behavior.supervisor_width`) so the tile grid divides the
+        // frame into exact model-sized tiles. See
         // `nexus_pipeline::supervisor_frame_for`.
         let det_w = cam
             .detector
@@ -872,7 +873,9 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             .as_ref()
             .map(|m| m.input_width)
             .unwrap_or(cfg.inference.model.input_width);
-        let (sup_w, sup_h) = nexus_pipeline::supervisor_frame_for(det_w);
+        // Clamp up so the supervisor frame never drops below the model input.
+        let sup_input = cam.behavior.supervisor_width.unwrap_or(det_w).max(det_w);
+        let (sup_w, sup_h) = nexus_pipeline::supervisor_frame_for(sup_input);
         // M_TILE_REINFER (G1) Phase B2.1 — effective per-camera `top_k`
         // for the post-merge cascade re-cap; matches the equivalent
         // computation in `reconciler::start_camera`.
@@ -2213,17 +2216,19 @@ async fn build_gst_recorder(
         if !cam.ingest.enabled {
             continue;
         }
-        // Per-camera supervisor (RGB analysis) frame size, derived
-        // from the camera's resolved detector input width via
-        // `nexus_pipeline::supervisor_frame_for`. Matches what the
-        // engine spawn site will pass to `spawn_camera`.
+        // Per-camera supervisor (RGB analysis) frame size. Defaults to
+        // the camera's resolved detector input width; M_NATIVE_ASPECT
+        // allows a larger native-16:9 ladder rung via
+        // `behavior.supervisor_width`. Matches what the engine spawn
+        // site passes to `spawn_camera`.
         let det_w = cam
             .detector
             .model_override
             .as_ref()
             .map(|m| m.input_width)
             .unwrap_or(default_detector_width);
-        let (rgb_w, rgb_h) = nexus_pipeline::supervisor_frame_for(det_w);
+        let sup_input = cam.behavior.supervisor_width.unwrap_or(det_w).max(det_w);
+        let (rgb_w, rgb_h) = nexus_pipeline::supervisor_frame_for(sup_input);
         // Autodetect codec for cameras stored with `codec=None`
         // (operator picked "auto", or row predates the column).
         // Mirrors what `create_camera` does at create-time; needed

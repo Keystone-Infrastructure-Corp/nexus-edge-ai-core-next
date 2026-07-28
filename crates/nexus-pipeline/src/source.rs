@@ -33,31 +33,35 @@ pub const RTSP_SOURCE_FRAME_WIDTH: u32 = 960;
 pub const RTSP_SOURCE_FRAME_HEIGHT: u32 = 540;
 
 /// Compute the supervisor (analysis) RGB frame size for a camera
-/// whose detector takes `detector_width` square inputs.
+/// analysing at `width` pixels wide.
 ///
-/// Returns a 16:9 frame whose width equals the detector size and
-/// whose height is `detector_width * 9 / 16` rounded up to an even
-/// integer (videoscale's caps negotiation prefers even dims; YUV
-/// chroma planes can't represent odd dimensions cleanly).
+/// `width` is the camera's supervisor width — the detector input width
+/// by default, or a larger native-16:9 ladder rung when decoupled per
+/// camera via `CameraBehavior::supervisor_width` (so a tile grid divides
+/// the frame evenly into model-sized tiles). Returns a 16:9 frame whose
+/// width equals `width` and whose height is `width * 9 / 16` rounded up
+/// to an even integer (videoscale's caps negotiation prefers even dims;
+/// YUV chroma planes can't represent odd dimensions cleanly). On the
+/// exact-16:9 ∩ stride-32 ladder there is no rounding.
 ///
 /// Examples:
-///   * `supervisor_frame_for(640)`  -> `(640,  360)`
-///   * `supervisor_frame_for(960)`  -> `(960,  540)`
-///   * `supervisor_frame_for(1280)` -> `(1280, 720)`
+///   * `supervisor_frame_for(512)`  -> `(512,  288)`
+///   * `supervisor_frame_for(1024)` -> `(1024, 576)`
+///   * `supervisor_frame_for(1536)` -> `(1536, 864)`
+///   * `supervisor_frame_for(2048)` -> `(2048, 1152)`
 ///
-/// Rationale: cameras universally publish 16:9 streams (1080p,
-/// 720p, 4K all 16:9). videoscale will letterbox non-16:9 sources
-/// to fit; a square supervisor frame would waste ~33% of
-/// per-frame bandwidth on black bars AND distort the operator's
-/// live view aspect. Matching detector width to supervisor width
-/// also eliminates the upscale step inside `from_config` when a
-/// camera runs the 1280 model against the old hardcoded
-/// 960 supervisor frame.
-pub const fn supervisor_frame_for(detector_width: u32) -> (u32, u32) {
+/// Rationale: cameras universally publish 16:9 streams (1080p, 720p, 4K
+/// all 16:9), so producing a 16:9 supervisor frame is a plain rescale.
+/// The detector input is native 16:9 too (M_NATIVE_ASPECT), so this frame
+/// is fed to the model WITHOUT letterboxing OR stretching — no aspect
+/// distortion, no invented rows. (Note the distinct, genuinely
+/// letterboxed step for a non-16:9 *camera*: `videoscale add-borders=true`
+/// pads it into this 16:9 supervisor frame upstream.)
+pub const fn supervisor_frame_for(width: u32) -> (u32, u32) {
     // (w * 9 / 16) rounded up to the next even integer.
-    let h_raw = detector_width * 9 / 16;
+    let h_raw = width * 9 / 16;
     let h = (h_raw + 1) & !1;
-    (detector_width, h)
+    (width, h)
 }
 
 /// Hard ceiling on the gap between consecutive frames before a

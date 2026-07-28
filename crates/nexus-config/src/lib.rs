@@ -2814,6 +2814,18 @@ pub struct CameraBehavior {
     /// — the reconciler only respawns on URL change today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_ttl_secs: Option<u32>,
+    /// M_NATIVE_ASPECT — analysis (supervisor) frame width, decoupled
+    /// from the detector input width. `None` (default) derives the
+    /// supervisor width from the resolved detector input width. When set
+    /// it MUST be a native-16:9 ladder rung (512 | 1024 | 1536 | 2048)
+    /// ≥ the detector input width: the engine analyses at this width and
+    /// tiles it into model-sized tiles, giving exact 1:1 tiles with zero
+    /// resampling (e.g. supervisor 1536×864 + model 512×288 → a 3×3 grid
+    /// of 512×288 tiles). A value below the detector width is clamped up
+    /// to it. Restart required (read once at supervisor start; the
+    /// reconciler respawns when the supervisor dims change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_width: Option<u32>,
     /// M_PERF_CROWD Phase E1 — adaptive detector cadence under crowd.
     /// Threshold (number of currently-tracked objects, EMA-smoothed)
     /// at or above which `DetectorSkipPolicy` becomes active. When
