@@ -13,6 +13,7 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

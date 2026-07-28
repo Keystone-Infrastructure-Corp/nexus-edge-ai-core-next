@@ -665,6 +665,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0027_alert_clips_cold".to_string(),
             "0028_delivery_settings_alert_clip".to_string(),
             "0029_events_alerted".to_string(),
+            "0030_native_aspect_shape_remap".to_string(),
         ]
     );
 }

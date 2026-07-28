@@ -173,6 +173,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0029_events_alerted",
         include_str!("../migrations/0029_events_alerted.sql"),
     ),
+    (
+        "0030_native_aspect_shape_remap",
+        include_str!("../migrations/0030_native_aspect_shape_remap.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

@@ -242,7 +242,17 @@ mod tests {
     use serde_json::json;
 
     fn model(preset: &str) -> ModelConfig {
-        serde_json::from_value(json!({ "kind": "yolo", "preset": preset })).expect("model config")
+        let (w, h) = preset
+            .split_once('x')
+            .map(|(a, b)| (a.parse::<u32>().unwrap(), b.parse::<u32>().unwrap()))
+            .expect("preset must be WxH");
+        serde_json::from_value(json!({
+            "kind": "yolo",
+            "preset": preset,
+            "input_width": w,
+            "input_height": h,
+        }))
+        .expect("model config")
     }
 
     fn camera(
@@ -368,21 +378,21 @@ mod tests {
 
         // Two cameras with the same override → Some.
         let uniform = [
-            camera(1, &[], Some(model("640"))),
-            camera(2, &[], Some(model("640"))),
+            camera(1, &[], Some(model("512x288"))),
+            camera(2, &[], Some(model("512x288"))),
         ];
         assert!(hash_detector_config(&uniform).is_some());
 
         // Different presets → None (= drift).
         let divergent = [
-            camera(1, &[], Some(model("640"))),
-            camera(2, &[], Some(model("1280"))),
+            camera(1, &[], Some(model("512x288"))),
+            camera(2, &[], Some(model("1536x864"))),
         ];
         assert!(hash_detector_config(&divergent).is_none());
     }
 
     /// FROZEN cross-repo vector. The default detector override
-    /// (`{kind:"yolo", preset:"640"}`, every other field defaulted)
+    /// (`{kind:"yolo", 512×288}`, every other field defaulted)
     /// canonicalizes to the shape the cloud's `normalize_detector_config`
     /// produces and hashes to this exact SHA. It MUST stay byte-identical
     /// to the cloud's `project_runtime_sha(Category::DetectorConfig, …)`
@@ -396,20 +406,20 @@ mod tests {
         // The `ModelConfig` round-trip drops `pack_path` / `members` /
         // caps and emits the `f32` `score_threshold` as its shortest
         // decimal (`0.3`).
-        let json = serde_json::to_string(&model("640")).unwrap();
+        let json = serde_json::to_string(&model("512x288")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             canonical_json(&value),
-            r#"{"input_height":640,"input_width":640,"kind":"yolo","preset":"640","score_threshold":0.3}"#
+            r#"{"input_height":288,"input_width":512,"kind":"yolo","preset":"512x288","score_threshold":0.3}"#
         );
 
         let uniform = [
-            camera(1, &[], Some(model("640"))),
-            camera(2, &[], Some(model("640"))),
+            camera(1, &[], Some(model("512x288"))),
+            camera(2, &[], Some(model("512x288"))),
         ];
         assert_eq!(
             hash_detector_config(&uniform),
-            Some("fe93ff4c4f303ec691e924306f4f9c1bbc6334171d346ed497e8ee3b4e8b567a".to_owned()),
+            Some("5c14a4012b1233ed210e7cdeb28a629e7bfe20a85e37db0338bd4d0c245dd142".to_owned()),
         );
     }
 
