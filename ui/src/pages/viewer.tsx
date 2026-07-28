@@ -5,9 +5,10 @@
 // `<img>`. Click a tile to expand to a fullscreen modal.
 //
 // Coordinate systems:
-//   - Supervisor (detector) frame is per-camera, 16:9 derived from the
-//     camera's resolved detector input width (640→640×360, 960→960×540,
-//     1280→1280×720). Every bbox in `latest.json` is in those units.
+//   - Supervisor (analysis) frame is per-camera, 16:9 on the native
+//     ladder (512×288 / 1024×576 / 1536×864 / 2048×1152), optionally a
+//     larger rung than the model input (CameraBehavior.supervisor_width).
+//     Every bbox in `latest.json` is in those units.
 //   - `FrameMetadata.width` / `.height` carry the actual source dims for
 //     a given snapshot — always trust these, never hardcode 960×540.
 //   - Zone polygons are normalised [0..1] — multiply by canvas dims.
