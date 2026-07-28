@@ -141,10 +141,41 @@ The wedge plan that drives the next three phases of work is
   a separate passthrough chain at native camera resolution; bbox coords need
   scaling when overlaying on the MP4 — read per-clip `frame_width`/`frame_height`
   off the tracks API rather than hardcoding any value.
-- **UI is `ui/` (Vite + TS + vanilla `h()` helper).** Per-tab modules live in
-  `ui/src/ui/`; new tabs register in `ui/src/main.ts` `TABS` array. Forbidden:
-  `style: "string"` props (use object); arbitrary DOM-property assignment for getter-only
-  attributes like `list` / `form` (use `setAttribute`).
+- **The shipped detector models are square, and the 16:9 frame is stretched to
+  fit them — not letterboxed.** Preprocessing is a plain bilinear resize to
+  (`input_w` × `input_h`) with box coords scaled back by independent
+  `image_dim / input_dim` factors per axis (see the module docs in
+  [crates/nexus-inference/src/yolo.rs](crates/nexus-inference/src/yolo.rs)).
+  Three consequences an agent should not have to re-derive:
+  - ~44% of every input tensor's rows exist only because of that stretch
+    (360 real rows scaled into 640).
+  - Geometry is distorted 1.78× vertically, so anything reasoning about real-world
+    shape or aspect ratio from raw model-space coords is wrong.
+  - Tiles rarely divide the frame evenly — `grid_cells` at 3×3 on a 640×360 frame
+    yields 213 px cells plus a ragged 214 px edge, and each tile is then stretched
+    again to the square input.
+
+  Some docstrings in `source.rs` claim the frame is letterboxed into the model
+  input; that is **wrong** and is scheduled for correction. Note the distinct,
+  genuinely-letterboxed step upstream: `videoscale add-borders=true` letterboxes a
+  non-16:9 *camera* into the 16:9 supervisor frame. Replacing the square inputs
+  with a native-16:9 shape ladder is planned in
+  [M_NATIVE_ASPECT.md](../nexus-cloud-console/docs/edge-core/M_NATIVE_ASPECT.md);
+  until it lands, square inputs are current reality.
+- **UI is `ui/` (Vite 5 + React 18 + TypeScript 5 + Tailwind 3).** Entry point is
+  `ui/src/main.tsx`; routes are code-defined with TanStack Router in
+  `ui/src/router.tsx`. Layout:
+  - `ui/src/pages/` — one `.tsx` per route (`cameras.tsx`, `admin-server.tsx`, …)
+  - `ui/src/components/ui/` — shadcn/ui primitives;
+    `ui/src/components/` — shared widgets; `ui/src/components/layout/` — chrome
+  - `ui/src/api/` — typed fetch clients, with wire types in `ui/src/api/types.ts`
+  - `ui/src/lib/` — framework-free helpers; `ui/src/hooks/` — React hooks
+
+  Server state goes through TanStack Query (`useQuery` / `useMutation`) — do not
+  hand-roll `useEffect` + `fetch`. Forms use `react-hook-form` + `zod`; toasts use
+  `sonner`; icons are `lucide-react`. Unit tests are Vitest + Testing Library;
+  e2e is Playwright under `ui/e2e/`, pinned to `workers: 1` because admin settings
+  are a global singleton and parallel specs race on them.
 
 ## Workflow
 
