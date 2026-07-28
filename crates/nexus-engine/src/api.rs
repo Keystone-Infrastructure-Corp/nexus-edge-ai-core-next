@@ -2471,10 +2471,18 @@ async fn get_static_object_defaults(State(s): State<ApiState>) -> Json<StaticObj
     })
 }
 
-async fn get_latest_frame_jpeg(
-    State(s): State<ApiState>,
-    Path(id): Path<CameraId>,
-) -> Result<Response, ApiError> {
+/// JPEG-encode a camera's most recent **analysis (supervisor) frame** —
+/// the low-bit-rate stream the pipeline already decodes and runs
+/// detection over (`supervisor_frame_for()`, e.g. 960x540 RGB).
+///
+/// Shared by `GET /api/v1/cameras/:id/frames/latest` and by the ONVIF
+/// snapshot route's fallback path
+/// ([`crate::device_control::snapshot_get`]), which reaches for it when
+/// the camera has no ONVIF endpoint configured or answers
+/// `GetSnapshotUri` with `ter:ActionNotSupported` — a very common gap on
+/// Profile-S-only devices. The frame is already in memory, so this costs
+/// one JPEG encode and never touches the camera.
+pub(crate) fn latest_frame_jpeg(s: &ApiState, id: CameraId) -> Result<Vec<u8>, ApiError> {
     let entry = s
         .cache
         .get(id)
@@ -2502,7 +2510,14 @@ async fn get_latest_frame_jpeg(
             image::ExtendedColorType::Rgb8,
         )
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(out)
+}
 
+async fn get_latest_frame_jpeg(
+    State(s): State<ApiState>,
+    Path(id): Path<CameraId>,
+) -> Result<Response, ApiError> {
+    let out = latest_frame_jpeg(&s, id)?;
     Ok((
         StatusCode::OK,
         [
