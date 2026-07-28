@@ -5,7 +5,7 @@
 //! per-camera config supplies a *subset* of those baked classes, the
 //! visual path:
 //!
-//! 1. Loads `yoloe26_s_vp.onnx` whose graph takes **two** inputs:
+//! 1. Loads `yoloe26_s_vp_<W>x<H>.onnx` whose graph takes **two** inputs:
 //!    `(image_tensor, visual_prompt_embeddings)`. The embeddings tensor
 //!    is `[1, N, D]` where `N` is the number of attached visual
 //!    prompts for the camera and `D` is the encoder's embedding
@@ -86,9 +86,9 @@ pub struct YoloeVisualDetector {
 
 impl YoloeVisualDetector {
     /// Build from an [`InferenceConfig`] + a [`VisualPromptStore`].
-    /// Resolves the ONNX as `model.pack_path / yoloe26_s_vp.onnx`.
-    /// Returns an error any other way — same contract as
-    /// [`crate::yoloe::YoloeDetector::from_config`].
+    /// Resolves the ONNX as `model.pack_path / yoloe26_s_vp_<W>x<H>.onnx`
+    /// (native-16:9 ladder). Returns an error any other way — same
+    /// contract as [`crate::yoloe::YoloeDetector::from_config`].
     pub fn from_config(
         cfg: &InferenceConfig,
         embedding_dim: usize,
@@ -97,12 +97,15 @@ impl YoloeVisualDetector {
         let pack = cfg.model.pack_path.as_ref().ok_or_else(|| {
             InferenceError::ModelLoad(
                 "yoloe_visual detector needs inference.model.pack_path; \
-                 point it at the directory holding yoloe26_s_vp.onnx + \
+                 point it at the directory holding yoloe26_s_vp_<W>x<H>.onnx + \
                  models-manifest.json"
                     .into(),
             )
         })?;
-        let onnx_path = pack.join("yoloe26_s_vp.onnx");
+        let onnx_path = pack.join(format!(
+            "yoloe26_s_vp_{}x{}.onnx",
+            cfg.model.input_width, cfg.model.input_height
+        ));
         Self::open(
             &onnx_path,
             cfg.model.input_width,
