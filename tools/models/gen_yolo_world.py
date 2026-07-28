@@ -203,6 +203,18 @@ def upsert_manifest_entry(
 
     for i, m in enumerate(models):
         if m.get("id") == model_id:
+            # This upsert owns only the ONNX exports. Preserve any
+            # operator-authored non-ONNX artifacts (Hailo HEF entries) and
+            # their `-hef` presets so regenerating ONNX never clobbers the
+            # hand-authored HEF metadata that `gen_*_hailo.py` patches.
+            preserved_artifacts = [
+                a for a in m.get("artifacts", []) if a.get("backend") != "onnx"
+            ]
+            preserved_presets = [
+                p for p in m.get("presets", []) if p.get("name", "").endswith("-hef")
+            ]
+            entry["artifacts"].extend(preserved_artifacts)
+            entry["presets"].extend(preserved_presets)
             models[i] = entry
             break
     else:
