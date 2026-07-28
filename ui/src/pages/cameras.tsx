@@ -66,9 +66,11 @@ import { Sheet, SheetSection } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FleetManagedBadge } from "@/components/fleet-managed-badge";
 import {
-  defaultSizeForKind,
-  describeSize,
-  sizesForKind,
+  defaultShapeForKind,
+  describeShape,
+  shapeFromKey,
+  shapeKey,
+  shapesForKind,
 } from "@/lib/model-sizes";
 
 const EMPTY_CAMERA: CameraConfig = {
@@ -968,9 +970,9 @@ function ModelOverrideEditor({
   const entries = catalog.data?.kinds ?? [];
   const kind = value?.kind ?? "";
   const selected = entries.find((e) => e.kind === kind);
-  const availableSizes = sizesForKind(kind);
-  const showSizePicker = availableSizes.length > 1;
-  const fixedSize = availableSizes.length === 1 ? availableSizes[0] : undefined;
+  const availableShapes = shapesForKind(kind);
+  const showSizePicker = availableShapes.length > 1;
+  const fixedShape = availableShapes.length === 1 ? availableShapes[0] : undefined;
 
   // Patch helper — merges a partial update, then strips any field that
   // collapsed to `""` / `null` / `undefined` so the wire payload only
@@ -990,9 +992,9 @@ function ModelOverrideEditor({
     }
   };
 
-  // Snap size fields when the kind changes so we never persist an
-  // (kind, size) combo the engine doesn't ship a file for. Per-kind
-  // size tables live in `lib/model-sizes.ts`.
+  // Snap shape fields when the kind changes so we never persist a
+  // (kind, shape) combo the engine doesn't ship a file for. Per-kind
+  // shape tables live in `lib/model-sizes.ts`.
   const switchKind = (nextKind: string) => {
     if (nextKind === kind) return;
     if (!nextKind) {
@@ -1005,9 +1007,9 @@ function ModelOverrideEditor({
       });
       return;
     }
-    const opts = sizesForKind(nextKind);
+    const opts = shapesForKind(nextKind);
     if (opts.length === 0) {
-      // Single-size or no-size kind: clear size fields and let the engine apply its default.
+      // No-shape kind: clear shape fields and let the engine apply its default.
       patch({
         kind: nextKind,
         preset: undefined,
@@ -1016,17 +1018,21 @@ function ModelOverrideEditor({
       });
       return;
     }
-    const current = value?.input_width;
-    const keep = current && opts.includes(current) ? current : defaultSizeForKind(nextKind);
+    // Keep the current shape if the new kind ships it, else snap to Standard.
+    const curKey =
+      value?.input_width && value?.input_height
+        ? `${value.input_width}x${value.input_height}`
+        : "";
+    const keep = shapeFromKey(nextKind, curKey) ?? defaultShapeForKind(nextKind);
     if (!keep) {
       patch({ kind: nextKind });
       return;
     }
     patch({
       kind: nextKind,
-      preset: String(keep),
-      input_width: keep,
-      input_height: keep,
+      preset: shapeKey(keep),
+      input_width: keep.w,
+      input_height: keep.h,
     });
   };
 
@@ -1073,23 +1079,27 @@ function ModelOverrideEditor({
         <div className="rounded-md border border-border/60 bg-muted/20 p-3 space-y-3">
           <p className="text-xs text-muted-foreground">
             Leave any field blank to inherit the engine default. The
-            router dedups inference layers by <em>(kind, input size)</em>,
-            so structural fields (size, pack path) only take effect when
-            the engine restarts — pick a size that the kind's model
-            registry actually ships.
+            router dedups inference layers by <em>(kind, input shape)</em>,
+            so structural fields (shape, pack path) only take effect when
+            the engine restarts — pick a native-16:9 tier that the kind's
+            model registry actually ships.
           </p>
 
           <div className="space-y-2">
-            <Label htmlFor="cam-model-size">Input size</Label>
+            <Label htmlFor="cam-model-size">Analysis tier</Label>
             {showSizePicker ? (
               <>
                 <select
                   id="cam-model-size"
                   className="h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm"
-                  value={value?.input_width ? String(value.input_width) : ""}
+                  value={
+                    value?.input_width && value?.input_height
+                      ? `${value.input_width}x${value.input_height}`
+                      : ""
+                  }
                   onChange={(e) => {
-                    const raw = e.target.value;
-                    if (raw === "") {
+                    const shape = shapeFromKey(kind, e.target.value);
+                    if (!shape) {
                       // Clear all three coupled fields atomically.
                       patch({
                         preset: undefined,
@@ -1098,37 +1108,38 @@ function ModelOverrideEditor({
                       });
                       return;
                     }
-                    const n = Number(raw);
                     patch({
-                      preset: raw,
-                      input_width: n,
-                      input_height: n,
+                      preset: shapeKey(shape),
+                      input_width: shape.w,
+                      input_height: shape.h,
                     });
                   }}
                 >
                   <option value="">(use tier default)</option>
-                  {availableSizes.map((sz) => (
-                    <option key={sz} value={String(sz)}>
-                      {describeSize(sz)}
+                  {availableShapes.map((s) => (
+                    <option key={shapeKey(s)} value={shapeKey(s)}>
+                      {describeShape(s)}
                     </option>
                   ))}
                 </select>
                 <p className="text-xs text-muted-foreground">
                   The router picks the matching
-                  <code className="mx-1 font-mono">{kind}_&lt;size&gt;.onnx</code>
-                  from the pack at boot. Only sizes the pack actually ships
-                  for this kind are listed — a mismatched size would silently
-                  CPU-fall-back on Intel NPU hardware (engine v0.1.22 hard
-                  fails on missing per-size files instead).
+                  <code className="mx-1 font-mono">{kind}_&lt;W&gt;x&lt;H&gt;.onnx</code>
+                  from the pack at boot. Named native-16:9 tiers only — a
+                  mismatched shape would silently CPU-fall-back on Intel NPU
+                  hardware (the engine hard fails on missing per-shape files
+                  instead).
                 </p>
               </>
-            ) : fixedSize !== undefined ? (
+            ) : fixedShape !== undefined ? (
               <p className="text-xs text-muted-foreground">
-                Fixed at <code className="font-mono">{fixedSize} × {fixedSize}</code>
+                Fixed at{" "}
+                <code className="font-mono">
+                  {fixedShape.w} × {fixedShape.h}
+                </code>
                 {" — "}
-                <code className="font-mono">{kind}</code> ships exactly one
-                per-size variant today. Multi-size export is on the M3.4
-                roadmap (prompt-set rework).
+                <code className="font-mono">{kind}</code> ships a single
+                input shape.
               </p>
             ) : (
               <p className="text-xs text-muted-foreground">

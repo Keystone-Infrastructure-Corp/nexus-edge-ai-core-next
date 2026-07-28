@@ -54,9 +54,12 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatBytes, formatPct } from "@/lib/format";
 import {
-  defaultSizeForKind,
-  describeSize,
-  sizesForKind,
+  defaultShapeForKind,
+  describeShape,
+  type ModelShape,
+  shapeFromKey,
+  shapeKey,
+  shapesForKind,
 } from "@/lib/model-sizes";
 
 export function AdminServerPage() {
@@ -238,11 +241,10 @@ export function AdminServerPage() {
   const [modelSeeded, setModelSeeded] = useState(false);
   useEffect(() => {
     if (modelQuery.data && !modelSeeded) {
-      // Seed from pending if present, otherwise current. Width/height
-      // are derived from preset (see the per-kind size table in
-      // `lib/model-sizes.ts`) — the engine treats `(input_width,
-      // input_height) = (Number(preset), Number(preset))` for every
-      // shipped square model.
+      // Seed from pending if present, otherwise current. `preset` is the
+      // canonical "<W>x<H>" native-16:9 shape label; input_width/height
+      // are that shape's dims (see the per-kind shape table in
+      // `lib/model-sizes.ts`).
       const src = modelQuery.data.pending ?? modelQuery.data.current;
       setModelDraft({
         kind: src.kind,
@@ -254,23 +256,21 @@ export function AdminServerPage() {
     }
   }, [modelQuery.data, modelSeeded]);
 
-  // Snap preset when kind changes so we never persist a (kind, size)
-  // combo the engine doesn't ship a per-size ONNX for. If the current
-  // preset is still valid for the new kind, keep it; else pick the
-  // first option; else (no-size kind like mock / classifier_ensemble)
+  // Snap preset when kind changes so we never persist a (kind, shape)
+  // combo the engine doesn't ship a per-shape ONNX for. If the current
+  // shape is still valid for the new kind, keep it; else snap to the
+  // Standard tier; else (no-shape kind like mock / classifier_ensemble)
   // clear the preset entirely and the engine applies its kind default.
   const switchModelKind = (nextKind: string) => {
     if (nextKind === modelDraft.kind) return;
-    const opts = sizesForKind(nextKind);
+    const opts = shapesForKind(nextKind);
     let nextPreset = modelDraft.preset;
     if (opts.length === 0) {
       nextPreset = "";
     } else {
-      const cur = Number(modelDraft.preset);
-      const keep = Number.isFinite(cur) && opts.includes(cur)
-        ? cur
-        : defaultSizeForKind(nextKind);
-      nextPreset = keep === undefined ? "" : String(keep);
+      const keep =
+        shapeFromKey(nextKind, modelDraft.preset) ?? defaultShapeForKind(nextKind);
+      nextPreset = keep ? shapeKey(keep) : "";
     }
     setModelDraft({ ...modelDraft, kind: nextKind, preset: nextPreset });
   };
@@ -875,15 +875,16 @@ export function AdminServerPage() {
                 toast.error("Kind is required");
                 return;
               }
-              const presetOpts = sizesForKind(modelDraft.kind);
-              // For multi-size kinds the operator MUST pick a preset that the
+              const shapeOpts = shapesForKind(modelDraft.kind);
+              // For multi-shape kinds the operator MUST pick a shape the
               // pack actually ships at — the engine resolver hard fails on
-              // missing per-size files (silent-CPU-fallback trap on Intel NPU).
-              if (presetOpts.length > 0) {
-                const p = Number(modelDraft.preset);
-                if (!presetOpts.includes(p)) {
+              // missing per-shape files (silent-CPU-fallback trap on Intel NPU).
+              let picked: ModelShape | undefined;
+              if (shapeOpts.length > 0) {
+                picked = shapeFromKey(modelDraft.kind, modelDraft.preset);
+                if (!picked) {
                   toast.error(
-                    `Preset must be one of ${presetOpts.join(" / ")} for kind ${modelDraft.kind}`,
+                    `Shape must be one of ${shapeOpts.map(shapeKey).join(" / ")} for kind ${modelDraft.kind}`,
                   );
                   return;
                 }
@@ -892,24 +893,17 @@ export function AdminServerPage() {
                 toast.error("Score threshold must be in 0.0..=1.0");
                 return;
               }
-              // Width/height are derived from preset — every shipped model is
-              // square (yolo26n_640/960/1280, yolo_world_v2_s_640/960, etc.).
-              // For kinds that ship a single fixed-size ONNX (yoloe*,
-              // classifier_ensemble, mock) we send the current engine
-              // dimensions back unchanged so the PUT contract stays satisfied;
-              // changing them on the wire is meaningless because the resolver
-              // ignores the request.
+              // input_width/height come straight from the picked native-16:9
+              // ladder rung. For kinds that ship a single fixed-size ONNX
+              // (classifier_ensemble, mock) we echo the current engine
+              // dimensions back so the PUT contract stays satisfied; changing
+              // them is meaningless because the resolver ignores the request.
               const current = modelQuery.data?.current;
-              const presetNum = modelDraft.preset.trim() === ""
-                ? null
-                : Number(modelDraft.preset);
-              const w = presetNum ?? current?.input_width ?? 0;
-              const h = presetNum ?? current?.input_height ?? 0;
+              const w = picked?.w ?? current?.input_width ?? 0;
+              const h = picked?.h ?? current?.input_height ?? 0;
               modelMutation.mutate({
                 kind: modelDraft.kind.trim(),
-                preset: modelDraft.preset.trim() === ""
-                  ? (current?.preset ?? "")
-                  : modelDraft.preset.trim(),
+                preset: picked ? shapeKey(picked) : (current?.preset ?? ""),
                 input_width: w,
                 input_height: h,
                 score_threshold: thr,
@@ -951,9 +945,9 @@ export function AdminServerPage() {
             </div>
             <div className="flex flex-col gap-1">
               <Label htmlFor="model-preset">
-                Input size {sizesForKind(modelDraft.kind).length === 0 ? "(fixed)" : "(W × H)"}
+                Analysis tier {shapesForKind(modelDraft.kind).length === 0 ? "(fixed)" : "(native 16:9)"}
               </Label>
-              {sizesForKind(modelDraft.kind).length > 1 ? (
+              {shapesForKind(modelDraft.kind).length > 1 ? (
                 <select
                   id="model-preset"
                   className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
@@ -964,16 +958,14 @@ export function AdminServerPage() {
                   disabled={modelQuery.isLoading || modelMutation.isPending}
                   data-testid="model-preset-input"
                 >
-                  {sizesForKind(modelDraft.kind).map((sz) => (
-                    <option key={sz} value={String(sz)}>
-                      {describeSize(sz)}
+                  {shapesForKind(modelDraft.kind).map((s) => (
+                    <option key={shapeKey(s)} value={shapeKey(s)}>
+                      {describeShape(s)}
                     </option>
                   ))}
                   {/* Forward-compat: keep an unknown current preset selectable. */}
                   {modelDraft.preset
-                    && !sizesForKind(modelDraft.kind).includes(
-                      Number(modelDraft.preset),
-                    ) ? (
+                    && !shapeFromKey(modelDraft.kind, modelDraft.preset) ? (
                     <option value={modelDraft.preset}>{modelDraft.preset}</option>
                   ) : null}
                 </select>
@@ -983,18 +975,16 @@ export function AdminServerPage() {
                   data-testid="model-preset-input"
                 >
                   <code className="font-mono">
-                    {modelDraft.preset
-                      ? `${modelDraft.preset} × ${modelDraft.preset}`
-                      : "fixed by model"}
+                    {modelDraft.preset ? modelDraft.preset : "fixed by model"}
                   </code>
                 </div>
               )}
               <p className="text-xs text-muted-foreground">
-                Width and height are set automatically from the picked size —
-                every shipped detector ONNX is square. The engine's per-kind
-                resolver hard fails on a missing per-size file (silent
-                CPU-fallback trap on Intel NPU, fixed in v0.1.22), so only
-                sizes the kind's pack actually ships are listed here.
+                Named tiers only — width and height are set from the picked
+                native-16:9 rung (no free-text pixels). The engine's per-kind
+                resolver hard fails on a missing per-shape file (silent
+                CPU-fallback trap on Intel NPU), so only shapes the kind's
+                pack actually ships are listed here.
               </p>
             </div>
             <div className="flex flex-col gap-1">

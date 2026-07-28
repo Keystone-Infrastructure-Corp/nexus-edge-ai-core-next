@@ -1,62 +1,91 @@
-// Per-kind ONNX input-size table.
+// Per-kind ONNX input-shape table (M_NATIVE_ASPECT).
 //
-// As of engine v0.1.22 the per-detector resolver is strict — it picks a
-// `<model>_<W>.onnx` file out of the pack by exact size match and hard
-// fails when missing (see `resolve_yolo26n_path` in `yolo.rs` and
-// `resolve_yolo_world_path` in `yolo_world.rs`). The Intel NPU plugin
-// silently falls back to CPU on dynamic shapes or wrong-size static
-// shapes, so the operator MUST pick a size that the kind actually
-// ships at — letting them free-type pixels invites a silent CPU
-// downgrade in prod that no metric surfaces.
+// The engine ships detectors on the native 16:9 ladder (exact 16:9 ∩
+// stride-32, W=512k / H=288k) and the per-detector resolver is strict —
+// it picks a `<model>_<W>x<H>.onnx` file out of the pack by exact shape
+// match and hard-fails when missing (see `resolve_yolo26n_path` in
+// `yolo.rs`, `resolve_yolo_world_path` in `yolo_world.rs`). The Intel
+// NPU plugin silently falls back to CPU on dynamic or wrong-shape static
+// inputs, so the operator MUST pick a shape the kind actually ships at —
+// letting them free-type pixels invites a silent CPU downgrade in prod
+// that no metric surfaces (hence named tiers only, no free-text entry).
 //
-// This table mirrors what `tools/models/gen_*.py --all-static` writes
-// to `models/models-manifest.json`. Keep it in lockstep when a new
-// per-size variant ships.
-//
-//   yolo            (yolo26n)        — 640 / 960 / 1280
-//   yolo_world      (yolo_world_v2_s)— 640 / 960   (1280 intentionally not shipped)
-//   yoloe           (yoloe26_s)      — single fixed size (multi-size deferred to M3.4)
-//   yoloe_promptfree                  — single fixed size
-//   yoloe_visual                      — single fixed size
-//   classifier_ensemble / mock        — no detector input (classifier or stub)
+// This table mirrors what `tools/models/gen_*.py --all-static` writes to
+// `models/models-manifest.json`. Keep it in lockstep with the pack.
 
-/** Sizes (square — w == h) the kind's pack actually ships. Empty
- *  means "no size choice — the kind ships exactly one ONNX and the
- *  engine's defaults apply". */
-export const MODEL_KIND_SIZES: Record<string, readonly number[]> = {
-  yolo: [640, 960, 1280],
-  yolo_world: [640, 960],
-  yoloe: [640],
-  yoloe_promptfree: [640],
-  yoloe_visual: [640],
-  // mock / classifier_ensemble: omit on purpose — UI hides the size
+/** A native-16:9 detector input shape and its human-facing tier name. */
+export type ModelShape = {
+  readonly w: number;
+  readonly h: number;
+  readonly tier: string; // "Standard" | "Long range" | "High detail" | "Maximum"
+};
+
+/** The full native-16:9 ladder (exact 16:9 ∩ stride-32). Detector kinds
+ *  that ship every rung reference this directly. */
+export const SHAPE_LADDER: readonly ModelShape[] = [
+  { w: 512, h: 288, tier: "Standard" },
+  { w: 1024, h: 576, tier: "Long range" },
+  { w: 1536, h: 864, tier: "High detail" },
+  { w: 2048, h: 1152, tier: "Maximum" },
+];
+
+/** Shapes the kind's pack actually ships. Empty means "no shape choice —
+ *  the kind ships a single fixed input and the engine defaults apply".
+ *  Every detector ships the full ladder as of M_NATIVE_ASPECT. */
+export const MODEL_KIND_SHAPES: Record<string, readonly ModelShape[]> = {
+  yolo: SHAPE_LADDER,
+  yolo_world: SHAPE_LADDER,
+  yoloe: SHAPE_LADDER,
+  yoloe_promptfree: SHAPE_LADDER,
+  yoloe_visual: SHAPE_LADDER,
+  // mock / classifier_ensemble: omit on purpose — UI hides the shape
   // section entirely for kinds not in this map.
 };
 
-/** Sizes available for a given kind; empty array if the kind isn't
+/** Shapes available for a given kind; empty array if the kind isn't
  *  recognised or doesn't take a detector-input choice. */
-export function sizesForKind(kind: string | undefined | null): readonly number[] {
+export function shapesForKind(kind: string | undefined | null): readonly ModelShape[] {
   if (!kind) return [];
-  return MODEL_KIND_SIZES[kind] ?? [];
+  return MODEL_KIND_SHAPES[kind] ?? [];
 }
 
-/** First sensible size for a kind (used to auto-snap when the operator
- *  switches kinds and the previously-selected size isn't supported). */
-export function defaultSizeForKind(kind: string): number | undefined {
-  const opts = sizesForKind(kind);
-  return opts[0];
+/** First sensible shape for a kind (Standard tier — used to auto-snap
+ *  when the operator switches kinds and the previously-selected shape
+ *  isn't supported). */
+export function defaultShapeForKind(
+  kind: string | undefined | null,
+): ModelShape | undefined {
+  return shapesForKind(kind)[0];
 }
 
-/** Human-readable hint for the size dropdown. */
-export function describeSize(size: number): string {
-  switch (size) {
-    case 640:
-      return "640 × 640 — fastest, fits every box";
-    case 960:
-      return "960 × 960 — balanced; default on dGPU / NPU boxes";
-    case 1280:
-      return "1280 × 1280 — highest detail; opt-in for plate/face";
+/** The canonical `"<W>x<H>"` preset string for a shape — matches the
+ *  engine's `preset` label and the `<model>_<W>x<H>.onnx` filename. */
+export function shapeKey(s: ModelShape): string {
+  return `${s.w}x${s.h}`;
+}
+
+/** Resolve a `"<W>x<H>"` preset string to a shape from a kind's set, or
+ *  `undefined` if it isn't one the kind ships. */
+export function shapeFromKey(
+  kind: string | undefined | null,
+  key: string,
+): ModelShape | undefined {
+  return shapesForKind(kind).find((s) => shapeKey(s) === key);
+}
+
+/** Human-readable hint for the shape dropdown: tier + dims + a relative
+ *  cost cue vs. the pre-migration square tier it replaces. */
+export function describeShape(s: ModelShape): string {
+  switch (`${s.w}x${s.h}`) {
+    case "512x288":
+      return "Standard — 512 × 288 · fastest, fits every box (36% the cost of the old 640 tier)";
+    case "1024x576":
+      return "Long range — 1024 × 576 · balanced (64% the cost of the old 960 tier)";
+    case "1536x864":
+      return "High detail — 1536 × 864 · plate / face detail (81% the cost of the old 1280 tier)";
+    case "2048x1152":
+      return "Maximum — 2048 × 1152 · widest reach";
     default:
-      return `${size} × ${size}`;
+      return `${s.tier} — ${s.w} × ${s.h}`;
   }
 }
