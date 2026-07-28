@@ -89,8 +89,7 @@ impl YoloeDetector {
                     .into(),
             )
         })?;
-        let onnx_path =
-            resolve_yoloe_path(pack, cfg.model.input_width, cfg.model.input_height)?;
+        let onnx_path = resolve_yoloe_path(pack, cfg.model.input_width, cfg.model.input_height)?;
         let manifest_path = pack.join("models-manifest.json");
         let vocab = load_vocab_from_manifest(&manifest_path, "yoloe26_s")?;
         Self::open(
@@ -197,11 +196,7 @@ impl YoloeDetector {
 /// Pick the shape-matched `yoloe26_s_<W>x<H>.onnx` inside `pack`.
 /// Strict — mirrors `resolve_yolo_world_path`; no cross-shape fallback
 /// (Intel NPU CPU-fallback trap, closed for yolo26n in v0.1.21).
-fn resolve_yoloe_path(
-    pack: &Path,
-    input_w: u32,
-    input_h: u32,
-) -> Result<PathBuf, InferenceError> {
+fn resolve_yoloe_path(pack: &Path, input_w: u32, input_h: u32) -> Result<PathBuf, InferenceError> {
     let primary = pack.join(format!("yoloe26_s_{input_w}x{input_h}.onnx"));
     if primary.exists() {
         info!(

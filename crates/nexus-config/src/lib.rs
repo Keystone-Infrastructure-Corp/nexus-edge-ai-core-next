@@ -1317,8 +1317,7 @@ fn default_score_threshold() -> f32 {
 
 /// The native-16:9 shape ladder — exact 16:9 ∩ stride-32 (W=512k, H=288k).
 /// Every shipped detector input shape is one of these rungs.
-pub const SHAPE_LADDER: [(u32, u32); 4] =
-    [(512, 288), (1024, 576), (1536, 864), (2048, 1152)];
+pub const SHAPE_LADDER: [(u32, u32); 4] = [(512, 288), (1024, 576), (1536, 864), (2048, 1152)];
 
 /// Map a legacy square (or otherwise off-ladder) `(w, h)` to the nearest
 /// native-16:9 ladder rung. The three shipped legacy squares map by
@@ -3433,7 +3432,10 @@ to = ["ops@example.com"]
         };
         parent.remap_legacy_shapes();
         assert_eq!(
-            (parent.members[0].input_width, parent.members[0].input_height),
+            (
+                parent.members[0].input_width,
+                parent.members[0].input_height
+            ),
             (1024, 576)
         );
         assert_eq!(parent.members[0].preset, "1024x576");
