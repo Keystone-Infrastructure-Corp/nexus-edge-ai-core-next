@@ -157,6 +157,17 @@ export interface CameraConfig {
   // Must be a native-16:9 ladder rung (512 | 1024 | 1536 | 2048) >= the
   // model input; flattens from `CameraBehavior::supervisor_width`.
   supervisor_width?: number;
+  // M_PERF_CROWD (E3) — adaptive detector-input downscale under sustained
+  // crowd. `detector_downscale_to_width`/`_height` name the lower-res native
+  // ladder rung the router pre-builds as a second inference layer; the
+  // supervisor swaps to it when the crowd EMA stays >=
+  // `detector_downscale_crowded_threshold` for `_sustained_secs`, and swaps
+  // back on the reverse edge. All four flatten from the Rust
+  // `CameraBehavior`; leave undefined to keep E3 off.
+  detector_downscale_to_width?: number;
+  detector_downscale_to_height?: number;
+  detector_downscale_crowded_threshold?: number;
+  detector_downscale_sustained_secs?: number;
   zones?: ZoneConfig[];
   /// ONVIF device-control endpoint + credentials. Required for the
   /// PTZ / imaging / device-control surface; auto-populated when the

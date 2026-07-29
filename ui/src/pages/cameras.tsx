@@ -999,6 +999,110 @@ function CameraEditor({
               {tilePreview.cost}
             </span>
           </div>
+
+          {/* M_PERF_CROWD E3 — adaptive detector-input downscale under
+              sustained crowd. Same native-tier vocabulary as the analysis
+              frame above (D6: named tiers, no free-text pixels). */}
+          <div className="mt-3 flex flex-col gap-1 text-sm">
+            <label
+              htmlFor="downscale-target"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              Crowd downscale detector (native 16:9)
+            </label>
+            <select
+              id="downscale-target"
+              value={
+                typeof draft.detector_downscale_to_width === "number"
+                  ? String(draft.detector_downscale_to_width)
+                  : ""
+              }
+              onChange={(e) => {
+                const rung = SHAPE_LADDER.find(
+                  (s) => String(s.w) === e.target.value,
+                );
+                set("detector_downscale_to_width", rung ? rung.w : undefined);
+                set("detector_downscale_to_height", rung ? rung.h : undefined);
+              }}
+              className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+            >
+              <option value="">Off — always full-res</option>
+              {SHAPE_LADDER.filter((s) => s.w < modelInputW).map((s) => (
+                <option key={s.w} value={String(s.w)}>
+                  {s.tier} — {s.w} × {s.h}
+                </option>
+              ))}
+            </select>
+            <span className="text-[11px] text-muted-foreground">
+              Under sustained crowd the detector swaps to this lower-res layer
+              to keep cadence, then swaps back when the scene clears.
+            </span>
+            <div className="mt-1 flex gap-2">
+              <div className="flex flex-1 flex-col gap-1">
+                <label
+                  htmlFor="downscale-threshold"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Crowd threshold (objects)
+                </label>
+                <input
+                  id="downscale-threshold"
+                  type="number"
+                  min={0}
+                  inputMode="numeric"
+                  value={
+                    typeof draft.detector_downscale_crowded_threshold ===
+                    "number"
+                      ? String(draft.detector_downscale_crowded_threshold)
+                      : ""
+                  }
+                  onChange={(e) =>
+                    set(
+                      "detector_downscale_crowded_threshold",
+                      e.target.value === ""
+                        ? undefined
+                        : Number(e.target.value),
+                    )
+                  }
+                  disabled={
+                    typeof draft.detector_downscale_to_width !== "number"
+                  }
+                  className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+                />
+              </div>
+              <div className="flex flex-1 flex-col gap-1">
+                <label
+                  htmlFor="downscale-secs"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Sustained window (s)
+                </label>
+                <input
+                  id="downscale-secs"
+                  type="number"
+                  min={0}
+                  inputMode="numeric"
+                  value={
+                    typeof draft.detector_downscale_sustained_secs === "number"
+                      ? String(draft.detector_downscale_sustained_secs)
+                      : ""
+                  }
+                  onChange={(e) =>
+                    set(
+                      "detector_downscale_sustained_secs",
+                      e.target.value === ""
+                        ? undefined
+                        : Number(e.target.value),
+                    )
+                  }
+                  disabled={
+                    typeof draft.detector_downscale_to_width !== "number"
+                  }
+                  className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+                />
+              </div>
+            </div>
+          </div>
         </SheetSection>
 
         <SheetSection
