@@ -2,6 +2,8 @@
 
 import { api } from "@/api/client";
 import type {
+  AdminSinksResp,
+  AdminSinkView,
   ColdReplicaState,
   DeliverySettings,
   OAuthProvider,
@@ -13,9 +15,11 @@ import type {
   PutColdReq,
   PutRuleDeliveryReq,
   RuleDeliveryResp,
+  SinkConfig,
   SinksHealthResp,
   StorageBackendOut,
   StorageResponse,
+  TestSinkOut,
   UsbPreferredOut,
 } from "@/api/types";
 
@@ -86,4 +90,50 @@ export function putRuleDelivery(ruleId: string, req: PutRuleDeliveryReq) {
 
 export function getSinksHealth() {
   return api.get<SinksHealthResp>("/admin/sinks/health");
+}
+
+// --- Sink configuration ---------------------------------------------------
+
+/**
+ * Sentinel the engine substitutes for every secret field in an admin
+ * GET response, and which a PUT echoes back to mean "leave the stored
+ * secret unchanged". MUST match
+ * `nexus_config::SinkConfig::REDACTED_SECRET`.
+ */
+export const REDACTED_SECRET = "__nexus_secret_redacted__";
+
+export function getSinks() {
+  return api.get<AdminSinksResp>("/admin/sinks");
+}
+
+/**
+ * Create or replace a runtime sink. The path id must agree with the
+ * body — the engine rejects a mismatch with 400 so a UI bug can't
+ * upsert under the wrong key. A successful PUT makes the engine
+ * rebuild its live `SinkRegistry` without a restart.
+ */
+export function putSink(kind: string, name: string, config: SinkConfig) {
+  return api.put<AdminSinkView>(
+    `/admin/sinks/config/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`,
+    config,
+  );
+}
+
+/** Deletes a runtime sink. 404s for a sink pinned in nexus.toml. */
+export function deleteSink(kind: string, name: string) {
+  return api.delete<void>(
+    `/admin/sinks/config/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`,
+  );
+}
+
+/**
+ * Fires one synthetic alert at the LIVE sink instance (real secrets
+ * and all), bypassing the outbox. Resolves with HTTP 200 for both a
+ * successful and a failed delivery — the outcome rides in the body.
+ */
+export function testSink(kind: string, name: string) {
+  return api.post<TestSinkOut>(
+    `/admin/sinks/config/${encodeURIComponent(kind)}/${encodeURIComponent(name)}/test`,
+    {},
+  );
 }
