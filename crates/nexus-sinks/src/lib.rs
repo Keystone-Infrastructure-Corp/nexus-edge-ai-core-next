@@ -40,6 +40,11 @@ use nexus_types::AlertEvent;
 
 pub mod backoff;
 pub mod dispatcher;
+#[cfg(feature = "email")]
+pub mod email;
+/// Best-effort artifact attachment reader shared by the SMTP sinks.
+#[cfg(any(feature = "email", feature = "sureview-email"))]
+mod mail_attach;
 pub mod policy;
 #[cfg(feature = "sureview")]
 pub mod sureview;
@@ -328,7 +333,12 @@ pub fn build_sinks_from_config(
     // push into the vec; suppress the unused-mut warning under
     // every feature combination that has no enabled sink kinds.
     #[cfg_attr(
-        not(any(feature = "webhook", feature = "sureview", feature = "sureview-email")),
+        not(any(
+            feature = "webhook",
+            feature = "sureview",
+            feature = "sureview-email",
+            feature = "email"
+        )),
         allow(unused_mut)
     )]
     let mut out: Vec<Arc<dyn AlertSink>> = Vec::with_capacity(sinks.len());
@@ -365,6 +375,17 @@ pub fn build_sinks_from_config(
                 return Err(SinkError::Permanent(format!(
                     "sureview_email sink '{}' configured but binary was built without --features sureview-email",
                     s.name
+                )));
+            }
+            #[cfg(feature = "email")]
+            nexus_config::SinkConfig::Email(e) => {
+                out.push(Arc::new(email::EmailSink::new(e)?));
+            }
+            #[cfg(not(feature = "email"))]
+            nexus_config::SinkConfig::Email(e) => {
+                return Err(SinkError::Permanent(format!(
+                    "email sink '{}' configured but binary was built without --features email",
+                    e.name
                 )));
             }
         }
