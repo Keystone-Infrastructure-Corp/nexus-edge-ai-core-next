@@ -112,6 +112,12 @@ jobs:
   rtp-plugin:
     name: build rtpgccbwe plugin (gst-plugins-rs)
     runs-on: ubuntu-24.04
+    # Engine releases only. `models-*` tags are data-only model-pack releases
+    # (see header) reused by every engine cut — they must not stamp their tag
+    # into Cargo.toml's `version` or build an engine tarball. Without this
+    # guard, publishing `models-vN` fails the run at the version stamp
+    # ("unexpected character 'm' while parsing major version number").
+    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') }}
     steps:
       - uses: dtolnay/rust-toolchain@stable
 
@@ -161,6 +167,10 @@ jobs:
     name: build + attach bare-metal tarball
     runs-on: ubuntu-22.04
     needs: rtp-plugin
+    # Engine releases only — skip data-only `models-*` model-pack tags (the
+    # `register release with cloud orchestrator` job `needs: tarball`, so it
+    # skips too). See the rtp-plugin guard above for the rationale.
+    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') }}
     env:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       ORT_VERSION: "1.24.1"
