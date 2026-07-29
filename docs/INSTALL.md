@@ -619,8 +619,10 @@ release tree deliberately: it survives OTA updates flipping the
 `/opt/nexus/current` symlink, so the CUDA runtime is fetched once.
 
 **R580 is the last driver branch supporting Pascal**, and CUDA 12.x is the
-last major version supporting it. Both pins are what keep a Quadro P2000
-working; do not bump to CUDA 13.
+last major version supporting it. cuDNN 9.10.2 is also the last release whose
+support matrix includes Pascal (`sm_61`); cuDNN 9.11 and later fail at runtime
+with `cudaErrorNoKernelImageForDevice`. The installer pins all three constraints
+for pre-Turing cards. Do not bump them independently.
 
 #### Reboot
 
@@ -641,6 +643,7 @@ sudo reboot
 | --- | --- | --- |
 | `NEXUS_NVIDIA_DRIVER_PACKAGE` | `cuda-drivers-580` | Driver branch. Falls back to unpinned `cuda-drivers` if the pin is unavailable. |
 | `NEXUS_CUDA_APT_VERSION` | `12-9` | CUDA runtime version suffix. |
+| `NEXUS_CUDNN_LEGACY_VERSION` | `9.10.2.21-1` | Exact Pascal/Volta/Maxwell-compatible cuDNN package version. Used only for compute capability below 7.5. |
 | `NEXUS_ORT_CUDA_VERSION` | `1.24.1` | ONNX Runtime version. Must match the ABI the engine was built against. |
 | `NEXUS_ORT_CUDA_DIR` | `/opt/nexus/vendor/onnxruntime-cuda` | Where the CUDA runtime is staged. |
 | `NEXUS_CUDA_DEVICE` | `0` | Which GPU the CUDA EP binds, on a multi-GPU host. Read by the engine at runtime, not by the installer. |
@@ -1577,6 +1580,7 @@ yet — that's M2.2 (cold-mirror replication).
 | `vainfo` succeeds for your login but engine logs say "no VAAPI device" | `nexus` user not in `render` group. | `sudo usermod -aG render nexus && sudo systemctl restart nexus-engine`. Re-running `install.sh` does this automatically. |
 | `/dev/accel/accel0` missing on Lunar Lake | Kernel < 6.10, NPU disabled in BIOS, or driver trio not installed. | `uname -r` ≥ 6.10 (§3.6); §2 BIOS; §5.3 driver install. |
 | `nvidia-smi` works on the host but engine reports CPU EP only | the CUDA ONNX Runtime was never staged, so ORT silently skipped the CUDA provider and fell through to the trailing `cpu` entry. The bundled `libonnxruntime.so` is the OpenVINO build and has no CUDA provider. | `ls /opt/nexus/vendor/onnxruntime-cuda/` and `cat /etc/systemd/system/nexus-engine.service.d/10-ort-cuda.conf`. If either is missing, re-run `install.sh` without `--no-drivers` (§5.4). If both exist, `ldd /opt/nexus/vendor/onnxruntime-cuda/libonnxruntime_providers_cuda.so` will name the missing CUDA/cuDNN library. |
+| Pascal/Volta/Maxwell inference repeatedly fails with `no kernel image is available for execution on the device` / `CUDNN_BACKEND_API_FAILED` | cuDNN 9.11 or later is installed; those releases removed pre-Turing kernels even though CUDA 12 and driver R580 still support the card. | Re-run the current `install.sh` without `--no-drivers`. It pins and, when necessary, downgrades `libcudnn9-cuda-12` to `9.10.2.21-1`, then restart the engine. Verify with `readlink -f /usr/lib/x86_64-linux-gnu/libcudnn.so.9` and a real snapshot/inference, not `ldd` alone. |
 | `/api/v1/backends` shows all slots `state: "ready"` but every camera returns generic / mock-looking detection labels | `ep_priority` lists both `openvino` and `npu`. ORT's `RegisterExecutionProviderLibrary` is one-shot per session — the duplicate trips a "Provider OpenVINOExecutionProvider has already been registered" error and the yolo loader silently falls back to the mock detector. | Set `ep_priority = ["npu", "cpu"]` (`intel-npu`) or `ep_priority = ["gpu", "cpu"]` (`intel-igpu`) — never both. A generated config already does this; see [HARDWARE_MATRIX.md](HARDWARE_MATRIX.md). |
 | Camera reaches `streaming` once then stays at 0 fps after every subsequent reconnect, but VLC against the same URL works fine | IP-camera firmware (e.g. InSight CS-series) enforces one RTSP session per stream path. | Power-cycle the camera, confirm no other VMS / external probe is hitting the same `url`, and verify the engine is on `recorder = "gstreamer"` (§6.4). |
 | Recorder writes 0-byte mp4 files | `recorder = "stub"` (the runtime default when `[runtime.clips]` is missing). | Add `[runtime.clips] recorder = "gstreamer"` to `/etc/nexus/nexus.toml` and restart. |
