@@ -905,6 +905,129 @@ export interface PutRuleDeliveryReq {
 }
 
 // ---------------------------------------------------------------------------
+// Sink configuration (hand-mirrored from `nexus_config::SinkConfig` and the
+// `AdminSinkView` / `AdminSinksResp` / `TestSinkOut` shapes in
+// crates/nexus-engine/src/api.rs).
+//
+// Secret discipline: every secret field is replaced by
+// `REDACTED_SECRET` (see @/api/storage) in the GET response. A PUT
+// that echoes the sentinel back means "keep the stored secret"; the
+// engine re-fills it from the db. A brand-new sink must carry its
+// secret in plaintext exactly once, on the create PUT.
+// ---------------------------------------------------------------------------
+
+export type SureviewRegion = "us" | "eu";
+
+/** Generic HTTP webhook sink. `hmac_secret` is a secret. */
+export interface WebhookSinkConfig {
+  kind: "webhook";
+  name: string;
+  url: string;
+  headers: Record<string, string>;
+  hmac_secret?: string | null;
+  timeout_secs: number;
+}
+
+/** SureView Ops "HTTP Alarms" sink. `api_key` is a secret. */
+export interface SureviewSinkConfig {
+  kind: "sureview";
+  name: string;
+  region: SureviewRegion;
+  endpoint?: string | null;
+  api_key: string;
+  system_identifier: string;
+  system_identifiers: Record<string, string>;
+  location?: string | null;
+  timeout_secs: number;
+}
+
+/**
+ * SureView Ops "SMTP / Email Alarms" sink — a monitoring-vendor alarm
+ * point where the destination address IS the identifier. Distinct from
+ * {@link EmailSinkConfig}. `password` is a secret.
+ */
+export interface SureviewEmailSinkConfig {
+  kind: "sureview_email";
+  name: string;
+  region: SureviewRegion;
+  smtp_host?: string | null;
+  smtp_port: number;
+  starttls: boolean;
+  from_address: string;
+  alarm_email: string;
+  alarm_emails: Record<string, string>;
+  location?: string | null;
+  attach_snapshot: boolean;
+  attach_clip: boolean;
+  username?: string | null;
+  password?: string | null;
+  timeout_secs: number;
+}
+
+/**
+ * Generic email sink — one message per alert through the site's OWN
+ * SMTP relay to an explicit recipient list. `password` is a secret and
+ * is paired with `username` (the engine rejects a half-configured
+ * pair).
+ */
+export interface EmailSinkConfig {
+  kind: "email";
+  name: string;
+  smtp_host: string;
+  smtp_port: number;
+  starttls: boolean;
+  from_address: string;
+  from_name?: string | null;
+  to: string[];
+  cc: string[];
+  reply_to?: string | null;
+  subject_prefix?: string | null;
+  attach_snapshot: boolean;
+  attach_clip: boolean;
+  username?: string | null;
+  password?: string | null;
+  timeout_secs: number;
+}
+
+export type SinkConfig =
+  | EmailSinkConfig
+  | WebhookSinkConfig
+  | SureviewSinkConfig
+  | SureviewEmailSinkConfig;
+
+export type SinkKind = SinkConfig["kind"];
+
+/** Where a sink's definition lives, and therefore whether it's editable. */
+export type SinkSource = "file" | "cloud";
+
+export interface AdminSinkView {
+  /** `"<kind>:<name>"` — the dispatcher's SinkId. */
+  sink_id: string;
+  kind: string;
+  name: string;
+  /**
+   * `"file"` = pinned in nexus.toml (read-only here); `"cloud"` = a
+   * runtime `alert_sinks` row (editable / deletable).
+   */
+  source: SinkSource;
+  /** True ⇔ this sink id is present in the live SinkRegistry. */
+  active: boolean;
+  config: SinkConfig;
+}
+
+export interface AdminSinksResp {
+  sinks: AdminSinkView[];
+}
+
+/** Outcome of `POST /admin/sinks/config/{kind}/{name}/test`. */
+export interface TestSinkOut {
+  sink_id: string;
+  ok: boolean;
+  error?: string;
+  transient?: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Sink health.
 // ---------------------------------------------------------------------------
 

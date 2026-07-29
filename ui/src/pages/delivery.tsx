@@ -30,6 +30,7 @@ import {
   ScheduleGrid,
   makeEmptyGrid,
 } from "@/components/schedule-grid";
+import { SinksCard } from "@/components/sinks-card";
 
 // Slots: 0..47 (half-hour each). Schedule grid is rendered by the
 // shared `ScheduleGrid` component; we only deal with the boolean
@@ -67,7 +68,8 @@ export function DeliveryPage() {
         <div>
           <h1 className="text-2xl font-semibold">Delivery</h1>
           <p className="text-sm text-muted-foreground">
-            Outbox dispatch settings, weekly schedule, and per-sink health.
+            Alert sinks, outbox dispatch settings, weekly schedule, and
+            per-sink health.
           </p>
         </div>
         <FleetManagedBadge category="delivery_settings" />
@@ -91,6 +93,8 @@ export function DeliveryPage() {
           }
         />
       )}
+
+      <SinksCard />
 
       <SinkHealthCard
         data={healthQuery.data?.sinks ?? []}

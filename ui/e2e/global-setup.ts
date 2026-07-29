@@ -159,8 +159,12 @@ export default async function globalSetup() {
   let adminOtp = "";
   let stdoutBuf = "";
   let stderrBuf = "";
-  // Bootstrap line emits via `tracing::warn!(... one_time_password = %otp, ...)`.
-  // OTP is URL_SAFE_NO_PAD base64 (chars: A-Z, a-z, 0-9, _, -), ~43 chars for 32 bytes.
+  // Legacy path: older engines minted a bootstrap admin at boot and
+  // logged `tracing::warn!(... one_time_password = %otp, ...)`. Current
+  // engines defer the first admin to the UI's first-run-setup form and
+  // log nothing secret, so this regex normally never matches — see the
+  // `provisionAdmin` fallback below. Kept so the harness still works
+  // against an older binary.
   const otpRegex = /one_time_password[=:]\s*([A-Za-z0-9_-]{16,})/i;
 
   const scrape = (chunk: Buffer, isStderr: boolean) => {
@@ -217,14 +221,47 @@ export default async function globalSetup() {
     );
   }
 
-  if (!adminOtp) {
-    // Engine is healthy but we never matched the OTP. Likely the regex
-    // missed; surface the captured logs so it's obvious why.
+  // A previous run's engine can still own the fixed port, in which case
+  // the health probe above succeeds against the STALE process while our
+  // child dies on bind. Everything after this point would then target
+  // the wrong engine (and first-run-setup would 409), so fail loudly.
+  if (child.exitCode !== null) {
     throw new Error(
-      `engine healthy but no admin OTP captured\n` +
+      `engine exited immediately (code ${child.exitCode}) but ${baseUrl} answered — ` +
+        `a stale engine is probably still bound to that port. ` +
+        `Try \`pkill -f target/debug/nexus-engine\` or set E2E_PORT.\n` +
         `--- stdout ---\n${stdoutBuf}\n` +
         `--- stderr ---\n${stderrBuf}\n`,
     );
+  }
+
+  if (!adminOtp) {
+    // Current engines boot against an empty `users` table and wait for
+    // the operator to claim the admin account through the SPA's
+    // first-run form (`POST /api/v1/auth/first-run-setup`, gated on
+    // `GET /auth/info` reporting `first_run_pending: true`). Claim it
+    // here so every spec has a working admin credential. The endpoint
+    // is unauthenticated by design and 409s once any user exists, so
+    // this is a one-shot per fresh workdir.
+    const password = `e2e-${randomBytes(18).toString("hex")}`;
+    const res = await fetch(`${baseUrl}/api/v1/auth/first-run-setup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password }),
+    });
+    if (!res.ok) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+      throw new Error(
+        `first-run-setup failed: HTTP ${res.status} ${await res.text()}\n` +
+          `--- stdout ---\n${stdoutBuf}\n` +
+          `--- stderr ---\n${stderrBuf}\n`,
+      );
+    }
+    adminOtp = password;
   }
 
   // M-Install Checkpoint 3c — the engine now ships a first-boot

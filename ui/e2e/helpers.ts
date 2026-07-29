@@ -20,15 +20,16 @@ export function readSidecar(): Sidecar {
 }
 
 /**
- * Mint a fresh admin session by hitting the bootstrap OTP login flow.
+ * Mint a fresh admin session using the credential globalSetup provisioned.
  * Sets the session in localStorage so the SPA's `_app` route gate passes.
  */
 export async function loginAsAdmin(page: Page): Promise<void> {
   const sidecar = readSidecar();
   if (!sidecar.adminOtp) {
     throw new Error(
-      "no admin OTP captured during globalSetup — engine did not emit a bootstrap OTP, " +
-        "or the regex in global-setup.ts failed to match. Try RUST_LOG=info E2E_VERBOSE=1.",
+      "no admin credential captured during globalSetup — neither the legacy " +
+        "bootstrap-OTP log line nor POST /api/v1/auth/first-run-setup produced one. " +
+        "Try RUST_LOG=info E2E_VERBOSE=1.",
     );
   }
 
@@ -42,7 +43,7 @@ export async function loginAsAdmin(page: Page): Promise<void> {
   });
   if (!res.ok) {
     throw new Error(
-      `bootstrap login failed: HTTP ${res.status} ${await res.text()}`,
+      `admin login failed: HTTP ${res.status} ${await res.text()}`,
     );
   }
   const tokens = (await res.json()) as {
