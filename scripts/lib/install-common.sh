@@ -776,13 +776,17 @@ _verify_amd_gpu_userspace() {
 }
 
 # Verify the NVIDIA userspace the CUDA execution provider depends on.
-# Four things must line up before inference actually runs on the GPU:
+# Five things must line up before inference actually runs on the GPU:
 #   1. Kernel driver bound  : nvidia-smi enumerates at least one GPU.
 #   2. CUDA runtime present : libcudart.so.12 resolvable.
-#   3. CUDA ORT staged      : the vendor dir + systemd drop-in exist, so
+#   3. cuDNN supports the   : cuDNN >= 9.11 dropped pre-Turing kernels, so a
+#      GPU                    Pascal/Volta card + a current cuDNN builds a
+#                             session fine and then fails EVERY Conv at run
+#                             time. Nothing else in this function catches it.
+#   4. CUDA ORT staged      : the vendor dir + systemd drop-in exist, so
 #                             the engine loads a runtime that HAS a CUDA
 #                             provider (the bundled one is OpenVINO).
-#   4. Provider deps resolve: ldd on the provider reports nothing missing.
+#   5. Provider deps resolve: ldd on the provider reports nothing missing.
 # Non-fatal — the engine falls back to the CPU EP, so this warns loudly
 # rather than failing the install.
 _verify_nvidia_userspace() {
@@ -806,6 +810,26 @@ _verify_nvidia_userspace() {
     else
         warn "  [FAIL] no libcudart.so.12 under /usr/local — CUDA runtime missing"
         warn "         fix: sudo apt-get install cuda-libraries-12-9"
+        ok=0
+    fi
+
+    local cudnn_ver legacy_ver="${NEXUS_CUDNN_LEGACY_VERSION:-9.10.2.21-1}"
+    cudnn_ver="$(dpkg-query -W -f='${Version}' libcudnn9-cuda-12 2>/dev/null)"
+    if [[ -z "$cudnn_ver" ]]; then
+        warn "  [FAIL] libcudnn9-cuda-12 not installed — the ORT CUDA provider"
+        warn "         links libcudnn.so.9 and will fail to load"
+        warn "         fix: sudo apt-get install libcudnn9-cuda-12"
+        ok=0
+    elif _nvidia_cudnn_compatible; then
+        log "  [ OK ] cuDNN $cudnn_ver supports this GPU (compute capability $(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1))"
+    else
+        warn "  [FAIL] cuDNN $cudnn_ver does NOT support this GPU (compute capability"
+        warn "         $(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)). cuDNN 9.11+ removed pre-Turing kernels: the CUDA EP"
+        warn "         attaches and builds a session, then every Conv fails at run"
+        warn "         time with cudaErrorNoKernelImageForDevice (209). /api/v1/backends"
+        warn "         still reports state=ready, so this is invisible from the UI."
+        warn "         fix: sudo apt-get install -y --allow-downgrades libcudnn9-cuda-12=$legacy_ver"
+        warn "              sudo apt-mark hold libcudnn9-cuda-12"
         ok=0
     fi
 
@@ -2397,6 +2421,29 @@ _nvidia_driver_live() {
     nvidia-smi -L 2>/dev/null | grep -q '^GPU 0'
 }
 
+# cuDNN 9.11 removed kernels for architectures older than Turing. NVIDIA's
+# 9.10.2 support matrix still lists compute capabilities 5.0 through 7.0;
+# current cuDNN builds start at Turing (7.5). Return true for the legacy tier.
+_nvidia_pre_turing() {
+    local capability major minor
+    capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+        | head -1 | tr -d '[:space:]')"
+    [[ "$capability" =~ ^([0-9]+)\.([0-9]+)$ ]] || return 1
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    (( major < 7 || (major == 7 && minor < 5) ))
+}
+
+_nvidia_cudnn_compatible() {
+    local installed
+    installed="$(dpkg-query -W -f='${Version}' libcudnn9-cuda-12 2>/dev/null)" || return 1
+    if _nvidia_pre_turing; then
+        dpkg --compare-versions "$installed" le '9.10.2.21-1'
+    else
+        return 0
+    fi
+}
+
 # Resolve the directory holding libcudart.so.12 / libcublas.so.12 etc.
 # Prefers the /usr/local/cuda symlink, falls back to the highest
 # versioned CUDA 12 tree. Echoes empty when no CUDA runtime is present.
@@ -2431,9 +2478,9 @@ _drivers_nvidia_cuda() {
     local cuda_ver="${NEXUS_CUDA_APT_VERSION:-12-9}"
 
     # Idempotent short-circuit: driver live AND the runtime libs the ORT
-    # CUDA provider needs are already resolvable.
+    # CUDA provider needs are already present and support this GPU.
     if _nvidia_driver_live && [[ -n "$(_nvidia_cuda_lib_dir)" ]] \
-        && compgen -G "/usr/lib/x86_64-linux-gnu/libcudnn.so.9*" >/dev/null; then
+        && _nvidia_cudnn_compatible; then
         log "NVIDIA driver + CUDA runtime + cuDNN already installed"
         return 0
     fi
@@ -2494,10 +2541,25 @@ NOUVEAU
     # cuda-libraries-<ver> carries exactly the DT_NEEDED set of
     # libonnxruntime_providers_cuda.so: libcudart, libcublas(Lt), libcufft,
     # libcurand. libcudnn.so.9 comes from libcudnn9-cuda-12.
-    local pkgs=("$drv_pkg" "cuda-libraries-${cuda_ver}" "libcudnn9-cuda-12")
+    local cudnn_pkg="libcudnn9-cuda-12"
+    if _nvidia_driver_live && _nvidia_pre_turing; then
+        local cudnn_ver="${NEXUS_CUDNN_LEGACY_VERSION:-9.10.2.21-1}"
+        local cudnn_pin=/etc/apt/preferences.d/nexus-cudnn-legacy
+        cat > "$cudnn_pin" <<EOF
+# Nexus: cuDNN 9.11+ removed pre-Turing (compute capability < 7.5) kernels.
+Package: libcudnn9-cuda-12
+Pin: version ${cudnn_ver}
+Pin-Priority: 1001
+EOF
+        cudnn_pkg="libcudnn9-cuda-12=${cudnn_ver}"
+        log "NVIDIA: pre-Turing GPU detected; pinning compatible cuDNN $cudnn_ver"
+    fi
+
+    local pkgs=("$drv_pkg" "cuda-libraries-${cuda_ver}" "$cudnn_pkg")
     local aptlog
     aptlog="$(mktemp -t nexus-cuda-apt.XXXXXX)"
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >"$aptlog" 2>&1; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades \
+        "${pkgs[@]}" >"$aptlog" 2>&1; then
         warn "NVIDIA: package install failed (${pkgs[*]}); engine will use the CPU EP"
         tail -n 15 "$aptlog" | while IFS= read -r l; do warn "  $l"; done
         rm -f "$aptlog"
