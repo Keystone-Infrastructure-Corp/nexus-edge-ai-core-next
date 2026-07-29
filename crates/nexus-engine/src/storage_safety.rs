@@ -60,6 +60,18 @@ const PRESSURE_METRICS_KEEP: Duration = Duration::from_secs(2 * 60 * 60);
 /// next tick continues down the ladder (footage is still evicted last).
 const PRESSURE_RECLAIM_BATCH: i64 = 64;
 
+/// Max reclaim ladder steps run in a single sample tick. A single
+/// step per tick can't keep up with a fleet ingesting many clips per
+/// sample interval, so we drain a bounded batch each tick. The cap
+/// keeps one tick's work bounded; the next tick resumes if still under
+/// pressure.
+const MAX_RECLAIM_STEPS_PER_TICK: u32 = 64;
+
+/// Within a reclaim batch, re-probe free space every N steps so we
+/// stop as soon as the disk recovers instead of over-evicting the full
+/// batch.
+const RECLAIM_REPROBE_EVERY: u32 = 8;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
     #[error("io: {0}")]
@@ -438,15 +450,44 @@ pub async fn run_storage_safety(
         // Reclaim ladder: at Low or Panic, reclaim the cheapest,
         // most-disposable bytes FIRST and only fall through to
         // deleting the operator's camera footage when nothing cheaper
-        // remains this tick. One action per tick keeps the loop
-        // bounded; the next tick continues down (or repeats) the
-        // ladder until free space recovers.
+        // remains. Each ladder step is bounded, but a SINGLE step per
+        // tick can't keep up with a busy fleet (many cameras ingesting
+        // faster than one clip / sample_interval evicts), so the disk
+        // creeps toward panic and never recovers. Drain a bounded
+        // BATCH per tick instead: keep stepping until the ladder is
+        // exhausted (`Ok(false)`), a per-tick cap is hit, or a periodic
+        // re-probe shows free space climbed back out of the pressure
+        // band. The cap keeps one tick's work bounded.
         if matches!(
             controller.level(),
             WatermarkLevel::Low | WatermarkLevel::Panic
         ) {
-            if let Err(e) = pressure_reclaim(&cfg, &store, &bus, &mut rr_cursor).await {
-                warn!(error = %e, "pressure reclaim step failed");
+            for step in 0..MAX_RECLAIM_STEPS_PER_TICK {
+                match pressure_reclaim(&cfg, &store, &bus, &mut rr_cursor).await {
+                    Ok(true) => {}
+                    Ok(false) => break, // ladder exhausted this tick
+                    Err(e) => {
+                        warn!(error = %e, "pressure reclaim step failed");
+                        break;
+                    }
+                }
+                // Re-probe periodically so we stop as soon as free
+                // space recovers, rather than over-evicting a full
+                // batch every tick.
+                if step % RECLAIM_REPROBE_EVERY == RECLAIM_REPROBE_EVERY - 1 {
+                    if let Ok(p) = probe.free_pct().await {
+                        let lvl = controller.observe(p);
+                        signal.set(controller.level());
+                        if matches!(lvl, Transition::Exited(WatermarkLevel::Ok)) {
+                            recorder.set_panic(false);
+                            info!(free_pct = p, "storage recovered to Ok during reclaim batch");
+                            publish_storage_event(&bus, &cfg, controller.level(), p).await;
+                        }
+                        if controller.level() == WatermarkLevel::Ok {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -503,12 +544,16 @@ async fn run_pressure_oneshot(store: &Arc<Store>) {
 ///      cascade-deleted, so the `<event_id>.jpg` is dead weight.
 ///   3. Quarantined / corrupt clips — biggest byte-explosion first.
 ///   4. Motion footage — the existing soft→hard `evict_one` path.
+///
+/// Returns `Ok(true)` if this step reclaimed something (so the caller
+/// can immediately take another step), `Ok(false)` when every tier is
+/// exhausted for now (cold-only footage left, or nothing to reclaim).
 async fn pressure_reclaim(
     cfg: &StorageSafetyConfig,
     store: &Arc<Store>,
     bus: &Arc<dyn Bus>,
     rr_cursor: &mut usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // Tier 1 — delivered alert clips, cold-grace dropped.
     let n = crate::alert_clip_evict::reclaim_evictable_alert_clips(
         store,
@@ -519,7 +564,7 @@ async fn pressure_reclaim(
     .await;
     if n > 0 {
         info!(reclaimed = n, "pressure: reclaimed delivered alert clips");
-        return Ok(());
+        return Ok(true);
     }
 
     // Tier 2 — orphaned alert snapshots.
@@ -530,7 +575,7 @@ async fn pressure_reclaim(
                 reclaimed = n,
                 "pressure: reclaimed orphaned alert snapshots"
             );
-            return Ok(());
+            return Ok(true);
         }
     }
 
@@ -565,7 +610,7 @@ async fn pressure_reclaim(
             freed_bytes = clip.size_bytes,
             "pressure: hard-evicted quarantined corrupt clip"
         );
-        return Ok(());
+        return Ok(true);
     }
 
     // Tier 4 — motion footage (LAST resort).
@@ -649,17 +694,17 @@ async fn sweep_orphan_snapshots(store: &Arc<Store>, dir: &Path) -> anyhow::Resul
 /// the safety floor, and the soft path leaves cold alone. Operator
 /// intervention via the admin API is the only way to reclaim cold.
 ///
-/// Returns `Ok(())` whether or not a clip was actually evicted; the
-/// caller logs and tries again next tick.
+/// Returns `Ok(true)` if a clip was evicted this call, `Ok(false)`
+/// when every camera was empty or cold-only (nothing reclaimable).
 async fn evict_one(
     store: &Arc<Store>,
     clips_dir: &Path,
     bus: &Arc<dyn Bus>,
     rr_cursor: &mut usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let cams: Vec<CameraId> = store.cameras_with_clips().await?;
     if cams.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let n = cams.len();
     for offset in 0..n {
@@ -680,7 +725,7 @@ async fn evict_one(
                         clip_id = clip.id,
                         "soft candidate had no hot_path; skipping"
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
             };
             let abs = clips_dir.join(hot_path);
@@ -716,7 +761,7 @@ async fn evict_one(
                         "soft-evict: remove_file failed; aborting this round (orphan-file scan will reap)"
                     );
                     *rr_cursor = idx + 1;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
 
@@ -744,7 +789,7 @@ async fn evict_one(
                 }
             }
             *rr_cursor = idx + 1;
-            return Ok(());
+            return Ok(true);
         }
 
         // ----- Pass 2: hard-evict (cascade-delete, no cold copy) -----
@@ -801,7 +846,7 @@ async fn evict_one(
                 warn!(error = %e, "publish CLIP_HARD_EVICTED failed");
             }
             *rr_cursor = idx + 1;
-            return Ok(());
+            return Ok(true);
         }
 
         // This camera has no soft AND no hard candidate — every
@@ -814,7 +859,7 @@ async fn evict_one(
     }
     // Nothing to evict (every camera was either empty or cold-only).
     *rr_cursor = rr_cursor.wrapping_add(1);
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
