@@ -1876,6 +1876,14 @@ pub enum SinkConfig {
     /// `<kind>:<name>` SinkId).
     #[serde(rename = "sureview_email")]
     SureViewEmail(SureViewEmailSinkConfig),
+    /// Generic SMTP email sink — one message per alert to an
+    /// operator-chosen recipient list, through the site's own relay
+    /// (Microsoft 365, Google Workspace, Exchange connector, on-prem
+    /// MTA). Unlike [`SinkConfig::SureViewEmail`] this is not tied to
+    /// any monitoring vendor's alarm-point semantics: it carries a
+    /// real `to` / `cc` list, an operator-filterable subject prefix,
+    /// and an HTML body alongside the plain-text alternative.
+    Email(EmailSinkConfig),
 }
 
 impl SinkConfig {
@@ -1885,6 +1893,7 @@ impl SinkConfig {
             SinkConfig::Webhook(_) => "webhook",
             SinkConfig::SureView(_) => "sureview",
             SinkConfig::SureViewEmail(_) => "sureview_email",
+            SinkConfig::Email(_) => "email",
         }
     }
 
@@ -1895,6 +1904,7 @@ impl SinkConfig {
             SinkConfig::Webhook(cfg) => &cfg.name,
             SinkConfig::SureView(cfg) => &cfg.name,
             SinkConfig::SureViewEmail(cfg) => &cfg.name,
+            SinkConfig::Email(cfg) => &cfg.name,
         }
     }
 
@@ -1906,6 +1916,7 @@ impl SinkConfig {
             SinkConfig::Webhook(cfg) => cfg.validate(),
             SinkConfig::SureView(cfg) => cfg.validate(),
             SinkConfig::SureViewEmail(cfg) => cfg.validate(),
+            SinkConfig::Email(cfg) => cfg.validate(),
         }
     }
 
@@ -1932,6 +1943,11 @@ impl SinkConfig {
                 s.api_key = Self::REDACTED_SECRET.to_string();
             }
             SinkConfig::SureViewEmail(s) => {
+                if s.password.is_some() {
+                    s.password = Some(Self::REDACTED_SECRET.to_string());
+                }
+            }
+            SinkConfig::Email(s) => {
                 if s.password.is_some() {
                     s.password = Some(Self::REDACTED_SECRET.to_string());
                 }
@@ -1963,6 +1979,11 @@ impl SinkConfig {
             {
                 new.password = old.password.clone();
             }
+            (SinkConfig::Email(new), SinkConfig::Email(old))
+                if new.password.as_deref() == Some(Self::REDACTED_SECRET) =>
+            {
+                new.password = old.password.clone();
+            }
             _ => {}
         }
     }
@@ -1977,6 +1998,7 @@ impl SinkConfig {
             SinkConfig::Webhook(w) => w.hmac_secret.as_deref() == Some(Self::REDACTED_SECRET),
             SinkConfig::SureView(s) => s.api_key == Self::REDACTED_SECRET,
             SinkConfig::SureViewEmail(s) => s.password.as_deref() == Some(Self::REDACTED_SECRET),
+            SinkConfig::Email(s) => s.password.as_deref() == Some(Self::REDACTED_SECRET),
         }
     }
 }
@@ -2378,6 +2400,177 @@ impl SureViewEmailSinkConfig {
         if self.timeout_secs == 0 {
             return Err(ConfigError::Validation(format!(
                 "sureview_email sink '{}' timeout_secs must be > 0",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Generic SMTP email sink configuration — "email this alert to
+/// these people".
+///
+/// Distinct from [`SureViewEmailSinkConfig`], which is hard-wired to
+/// SureView's alarm-point model (the destination address *is* the
+/// alarm point, so there is one recipient, a fixed subject shape, and
+/// no HTML part). This sink is the operator-facing one: an explicit
+/// recipient list, a subject an operator can filter their mailbox on,
+/// and a readable HTML body alongside the plain-text alternative.
+///
+/// The relay is whatever the site already uses — Microsoft 365,
+/// Google Workspace, a corporate Exchange connector, or an on-prem
+/// MTA. Credentials stay on the box: they are entered through the
+/// admin API, persisted in the edge-resident `alert_sinks` table, and
+/// redacted by [`SinkConfig::redact_secrets`] before any GET response
+/// leaves the appliance.
+///
+/// ```toml
+/// [[sinks]]
+/// kind = "email"
+/// name = "site-ops"
+/// smtp_host = "smtp.example.com"
+/// from_address = "nexus@example.com"
+/// from_name = "Nexus Edge AI"
+/// to = ["ops@example.com", "security@example.com"]
+/// subject_prefix = "[North Yard]"
+/// username = "nexus@example.com"
+/// password = "app-password"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailSinkConfig {
+    /// Operator-chosen identifier (the `<name>` of the SinkId).
+    /// Must be unique across the `[[sinks]]` list. Stable across
+    /// config reloads — outbox rows reference it by string.
+    pub name: String,
+    /// SMTP relay hostname. Required — unlike the SureView sink
+    /// there is no vendor default to fall back on.
+    pub smtp_host: String,
+    /// SMTP submission port. Defaults to 587 (STARTTLS submission).
+    #[serde(default = "default_email_smtp_port")]
+    pub smtp_port: u16,
+    /// Negotiate STARTTLS on the connection. Defaults to `true`;
+    /// set `false` only for a plaintext relay on a trusted LAN.
+    #[serde(default = "default_true")]
+    pub starttls: bool,
+    /// Envelope / header `From` address. Most relays require this to
+    /// be an address they are authorised to send as.
+    pub from_address: String,
+    /// Optional display name shown beside `from_address` in a mail
+    /// client (`Nexus Edge AI <nexus@example.com>`).
+    #[serde(default)]
+    pub from_name: Option<String>,
+    /// Recipients. Must be non-empty — a sink with nobody to mail is
+    /// a silent no-op, so it is rejected at validation instead.
+    pub to: Vec<String>,
+    /// Optional carbon-copy recipients.
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// Optional `Reply-To`. Useful when `from_address` is a no-reply
+    /// mailbox but replies should reach a monitored inbox.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// Optional literal prefix for the subject line, e.g.
+    /// `"[North Yard]"`. Gives operators a stable string to build
+    /// mailbox rules on when one relay serves several sites.
+    #[serde(default)]
+    pub subject_prefix: Option<String>,
+    /// Attach the alert's annotated snapshot (JPG) when the event
+    /// carries one. Defaults to `true` — a still frame is the whole
+    /// point of an alert email. Best-effort: a missing or unreadable
+    /// file is logged and the mail still goes out.
+    #[serde(default = "default_true")]
+    pub attach_snapshot: bool,
+    /// Attach the alert's motion clip (MP4) when the event carries
+    /// one. Defaults to `false` because clips routinely exceed relay
+    /// message-size limits; best-effort and size-capped when enabled.
+    #[serde(default)]
+    pub attach_clip: bool,
+    /// Optional SMTP AUTH username. Most hosted relays require it.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional SMTP AUTH password (paired with `username`). Secret —
+    /// redacted on the admin GET surface, never leaves the box.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Per-attempt SMTP timeout in seconds. Defaults to 15. The
+    /// dispatcher's retry backoff wraps it.
+    #[serde(default = "default_email_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_email_smtp_port() -> u16 {
+    587
+}
+
+fn default_email_timeout_secs() -> u64 {
+    15
+}
+
+impl EmailSinkConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.name.is_empty() {
+            return Err(ConfigError::Validation(
+                "email sink name must be non-empty".into(),
+            ));
+        }
+        if self.name.contains(':') {
+            return Err(ConfigError::Validation(format!(
+                "email sink name '{}' must not contain ':' (reserved as SinkId separator)",
+                self.name
+            )));
+        }
+        if self.smtp_host.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "email sink '{}' smtp_host must be non-empty",
+                self.name
+            )));
+        }
+        if self.smtp_port == 0 {
+            return Err(ConfigError::Validation(format!(
+                "email sink '{}' smtp_port must be > 0",
+                self.name
+            )));
+        }
+        if !self.from_address.contains('@') {
+            return Err(ConfigError::Validation(format!(
+                "email sink '{}' from_address '{}' is not a valid email",
+                self.name, self.from_address
+            )));
+        }
+        // A sink with no recipients would accept every outbox row and
+        // deliver nothing, which is indistinguishable from working.
+        if self.to.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "email sink '{}' must have at least one 'to' recipient",
+                self.name
+            )));
+        }
+        for addr in self.to.iter().chain(self.cc.iter()) {
+            if !addr.contains('@') {
+                return Err(ConfigError::Validation(format!(
+                    "email sink '{}' recipient '{addr}' is not a valid email",
+                    self.name
+                )));
+            }
+        }
+        if let Some(reply_to) = &self.reply_to {
+            if !reply_to.contains('@') {
+                return Err(ConfigError::Validation(format!(
+                    "email sink '{}' reply_to '{reply_to}' is not a valid email",
+                    self.name
+                )));
+            }
+        }
+        if self.username.is_some() != self.password.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "email sink '{}' username and password must be set together",
+                self.name
+            )));
+        }
+        if self.timeout_secs == 0 {
+            return Err(ConfigError::Validation(format!(
+                "email sink '{}' timeout_secs must be > 0",
                 self.name
             )));
         }
@@ -2952,6 +3145,125 @@ fn default_reid_min_crop_h_px() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal valid generic-email sink, mutated per assertion below.
+    fn email_sink_cfg() -> EmailSinkConfig {
+        EmailSinkConfig {
+            name: "site-ops".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            starttls: true,
+            from_address: "nexus@example.com".to_string(),
+            from_name: None,
+            to: vec!["ops@example.com".to_string()],
+            cc: Vec::new(),
+            reply_to: None,
+            subject_prefix: None,
+            attach_snapshot: true,
+            attach_clip: false,
+            username: None,
+            password: None,
+            timeout_secs: 15,
+        }
+    }
+
+    /// The `kind = "email"` discriminator is the `<kind>` half of every
+    /// `alert_sink_outbox.sink_id` — pin it so a serde rename can never
+    /// silently orphan historical outbox rows.
+    #[test]
+    fn email_sink_kind_tag_is_stable() {
+        let cfg = SinkConfig::Email(email_sink_cfg());
+        assert_eq!(cfg.kind(), "email");
+        assert_eq!(cfg.name(), "site-ops");
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["kind"], "email");
+    }
+
+    /// Minimal TOML (only the required fields) must parse, with every
+    /// optional field falling back to its documented default.
+    #[test]
+    fn email_sink_parses_from_minimal_toml() {
+        let toml = r#"
+kind = "email"
+name = "site-ops"
+smtp_host = "smtp.example.com"
+from_address = "nexus@example.com"
+to = ["ops@example.com"]
+"#;
+        let cfg: SinkConfig = toml::from_str(toml).unwrap();
+        let SinkConfig::Email(e) = &cfg else {
+            panic!("expected an email sink, got {cfg:?}");
+        };
+        assert_eq!(e.smtp_port, 587);
+        assert!(e.starttls);
+        assert!(e.attach_snapshot, "snapshots ride along by default");
+        assert!(!e.attach_clip, "clips are opt-in (relay size limits)");
+        assert_eq!(e.timeout_secs, 15);
+        cfg.validate().unwrap();
+    }
+
+    /// A sink with no recipients would accept every outbox row and
+    /// deliver nothing — indistinguishable from working. Reject it.
+    #[test]
+    fn email_sink_rejects_empty_recipient_list() {
+        let mut e = email_sink_cfg();
+        e.to.clear();
+        assert!(SinkConfig::Email(e).validate().is_err());
+    }
+
+    #[test]
+    fn email_sink_rejects_malformed_addresses() {
+        for mutate in [
+            (|e: &mut EmailSinkConfig| e.from_address = "nope".into()) as fn(&mut EmailSinkConfig),
+            |e| e.to = vec!["nope".into()],
+            |e| e.cc = vec!["nope".into()],
+            |e| e.reply_to = Some("nope".into()),
+        ] {
+            let mut e = email_sink_cfg();
+            mutate(&mut e);
+            assert!(
+                SinkConfig::Email(e.clone()).validate().is_err(),
+                "expected rejection for {e:?}"
+            );
+        }
+    }
+
+    /// Half-configured SMTP AUTH silently authenticates as nobody, so
+    /// the pair must be all-or-nothing.
+    #[test]
+    fn email_sink_rejects_half_configured_auth() {
+        let mut e = email_sink_cfg();
+        e.username = Some("nexus@example.com".into());
+        assert!(SinkConfig::Email(e).validate().is_err());
+    }
+
+    /// The relay password must never leave the appliance, and echoing
+    /// the sentinel back on a PUT must restore the stored value rather
+    /// than overwrite it with the sentinel.
+    #[test]
+    fn email_sink_password_round_trips_through_redaction() {
+        let mut stored = email_sink_cfg();
+        stored.username = Some("nexus@example.com".into());
+        stored.password = Some("s3cret".into());
+        let stored = SinkConfig::Email(stored);
+
+        let mut leaving = stored.clone();
+        leaving.redact_secrets();
+        assert!(leaving.has_redacted_secret());
+        assert!(
+            !serde_json::to_string(&leaving).unwrap().contains("s3cret"),
+            "live password escaped the box"
+        );
+
+        // The console echoes the sentinel back for an unchanged secret.
+        let mut incoming = leaving;
+        incoming.restore_redacted_secrets_from(&stored);
+        assert!(!incoming.has_redacted_secret());
+        let SinkConfig::Email(e) = incoming else {
+            unreachable!()
+        };
+        assert_eq!(e.password.as_deref(), Some("s3cret"));
+    }
 
     #[test]
     fn defaults_validate() {

@@ -333,6 +333,50 @@ capacity = 1024
 # # ep_priority = ["cuda", "cpu"]     # NVIDIA
 
 # -----------------------------------------------------------------
+# Alert delivery sinks (optional)
+#
+# Where a matched rule's alert is delivered. Sinks defined here are
+# read once at boot; sinks created through the admin API / cloud
+# console live in the local DB and WIN on a `<kind>:<name>` collision.
+# A rule with an empty `sinks` list delivers to every configured sink.
+#
+# Renaming a sink is not supported — outbox rows reference the
+# historical `<kind>:<name>` by string. Delete and re-add instead.
+# -----------------------------------------------------------------
+
+# Generic email through the site's own SMTP relay (Microsoft 365,
+# Google Workspace, an Exchange connector, or an on-prem MTA). One
+# message per alert, plain-text + HTML, with the annotated snapshot
+# attached by default.
+#
+# [[sinks]]
+# kind = "email"
+# name = "site-ops"
+# smtp_host = "smtp.example.com"
+# # smtp_port = 587          # default 587 (STARTTLS submission)
+# # starttls = true          # default true; false only on a trusted LAN
+# from_address = "nexus@example.com"
+# # from_name = "Nexus Edge AI"
+# to = ["ops@example.com", "security@example.com"]
+# # cc = ["records@example.com"]
+# # reply_to = "security@example.com"
+# # subject_prefix = "[North Yard]"   # lets operators build mailbox rules
+# # attach_snapshot = true   # default true
+# # attach_clip = false      # default false — clips often exceed relay limits
+# # username = "nexus@example.com"
+# # password = "app-password"         # never leaves the box; redacted on read
+# # timeout_secs = 15
+
+# HTTP webhook with an optional HMAC-SHA256 signature header.
+#
+# [[sinks]]
+# kind = "webhook"
+# name = "primary"
+# url = "https://example.com/nexus"
+# # hmac_secret = "shared-secret"
+# # timeout_secs = 10
+
+# -----------------------------------------------------------------
 # Cameras (DB is the source of truth; this seeds an empty DB)
 # -----------------------------------------------------------------
 [[cameras]]

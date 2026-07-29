@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tracing::{debug, trace, warn};
 
-use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
+use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::AsyncSmtpTransport;
 use lettre::{AsyncTransport, Message, Tokio1Executor};
@@ -42,22 +42,13 @@ use lettre::{AsyncTransport, Message, Tokio1Executor};
 use nexus_config::SureViewEmailSinkConfig;
 use nexus_types::AlertEvent;
 
+use crate::mail_attach::{read_attachment, MAX_CLIP_BYTES, MAX_SNAPSHOT_BYTES};
 use crate::{AlertSink, SinkError, SinkHealth, SinkId};
 
 /// Discriminator string for `SinkId::kind()`. Stable wire value
 /// stored in every `alert_sink_outbox.sink_id` column — DO NOT
 /// rename without a migration that rewrites historical rows.
 pub const KIND: &str = "sureview_email";
-
-/// Cap on an attached snapshot (JPG). Snapshots are small; anything
-/// larger is almost certainly the wrong file, so skip it rather than
-/// risk a 552 "message too large" reply.
-const MAX_SNAPSHOT_BYTES: u64 = 5 * 1024 * 1024;
-
-/// Cap on an attached motion clip (MP4). SMTP relays commonly reject
-/// messages over ~25 MB; we stay well under and skip oversized clips
-/// (the alarm still fires, just without the clip attached).
-const MAX_CLIP_BYTES: u64 = 20 * 1024 * 1024;
 
 /// SureView "SMTP / Email Alarms" wire details, isolated so the
 /// message shape stays in one place and stays unit-testable without
@@ -282,59 +273,6 @@ impl AlertSink for SureViewEmailSink {
     }
 }
 
-/// MIME content type for an attachment, inferred from its file
-/// extension. Falls back to `text/plain` for unknown types (lettre
-/// requires a parseable content type; the static strings here always
-/// parse).
-fn content_type_for(path: &str) -> ContentType {
-    let lower = path.to_ascii_lowercase();
-    let mime = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if lower.ends_with(".png") {
-        "image/png"
-    } else if lower.ends_with(".mp4") {
-        "video/mp4"
-    } else {
-        "application/octet-stream"
-    };
-    ContentType::parse(mime).unwrap_or(ContentType::TEXT_PLAIN)
-}
-
-/// Read one attachment from disk, capped at `max_bytes`. Returns
-/// `None` (with a log line) on any problem so the caller can send the
-/// alarm without it.
-async fn read_attachment(path: &str, max_bytes: u64) -> Option<SinglePart> {
-    match tokio::fs::metadata(path).await {
-        Ok(meta) if meta.len() > max_bytes => {
-            warn!(
-                path,
-                size = meta.len(),
-                max = max_bytes,
-                "attachment too large, skipping"
-            );
-            return None;
-        }
-        Ok(_) => {}
-        Err(e) => {
-            debug!(path, error = %e, "attachment not available, skipping");
-            return None;
-        }
-    }
-    let bytes = match tokio::fs::read(path).await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(path, error = %e, "attachment read failed, skipping");
-            return None;
-        }
-    };
-    let filename = std::path::Path::new(path)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("attachment")
-        .to_string();
-    Some(Attachment::new(filename).body(bytes, content_type_for(path)))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -460,32 +398,5 @@ mod tests {
         let msg = s.build_message(&sample_event(), Vec::new()).unwrap();
         let formatted = String::from_utf8(msg.formatted()).unwrap();
         assert!(formatted.contains("cam42point@us.sureviewops.com"));
-    }
-
-    #[test]
-    fn content_type_inference() {
-        assert_eq!(
-            content_type_for("/x/a.jpg"),
-            ContentType::parse("image/jpeg").unwrap()
-        );
-        assert_eq!(
-            content_type_for("/x/a.JPEG"),
-            ContentType::parse("image/jpeg").unwrap()
-        );
-        assert_eq!(
-            content_type_for("/x/a.mp4"),
-            ContentType::parse("video/mp4").unwrap()
-        );
-        assert_eq!(
-            content_type_for("/x/a.bin"),
-            ContentType::parse("application/octet-stream").unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn read_attachment_skips_missing_file() {
-        assert!(read_attachment("/no/such/file.jpg", MAX_SNAPSHOT_BYTES)
-            .await
-            .is_none());
     }
 }

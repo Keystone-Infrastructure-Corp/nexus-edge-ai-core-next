@@ -100,11 +100,14 @@ nexus-storage = { workspace = true }
 # practice) can drop it. The `sureview` feature adds the SureView
 # Ops/Response central-monitoring sink (HTTP Alarms JSON POST); the
 # `sureview-email` feature adds the SureView SMTP / Email Alarms sink
-# (lettre over rustls), independent of the HTTP one.
+# (lettre over rustls), independent of the HTTP one. The `email`
+# feature adds the generic operator-facing SMTP sink (site's own relay,
+# explicit recipient list); it shares lettre with `sureview-email`.
 nexus-sinks = { workspace = true, features = [
     "webhook",
     "sureview",
     "sureview-email",
+    "email",
 ] }
 # Cloud cold backends (Google Drive, OneDrive). Brings reqwest +
 # OAuth + per-provider HTTP. The crate is always-on in nexus-engine

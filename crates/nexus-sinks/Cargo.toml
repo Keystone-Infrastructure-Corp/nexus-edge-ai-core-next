@@ -59,11 +59,11 @@ url = { workspace = true, optional = true }
 # SureView's HTTP Alarms receiver wants the account API Key sent
 # base64-encoded in the Authorization header.
 base64 = { workspace = true, optional = true }
-# SMTP client for the SureView "SMTP / Email Alarms" sink. Optional
-# behind `sureview-email`; reuses the rustls stack reqwest already
-# pulls so HTTP-only builds skip it entirely. tokio (already a hard
-# dep with the `full` feature set) supplies the async fs read for
-# best-effort clip / snapshot attachments.
+# SMTP client for the email sinks. Optional behind `email` /
+# `sureview-email`; reuses the rustls stack reqwest already pulls so
+# HTTP-only builds skip it entirely. tokio (already a hard dep with
+# the `full` feature set) supplies the async fs read for best-effort
+# clip / snapshot attachments.
 lettre = { workspace = true, optional = true }
 
 [features]
@@ -80,6 +80,12 @@ sureview = ["dep:reqwest", "dep:url", "dep:base64"]
 # address via lettre over tokio + rustls. Independent of the HTTP
 # `sureview` feature — a deployment can enable either or both.
 sureview-email = ["dep:lettre"]
+# Builds the generic `EmailSink` impl: one message per alert through
+# the site's own SMTP relay (M365, Google Workspace, Exchange, on-prem
+# MTA) to an operator-chosen recipient list, with a plain-text +
+# HTML body and best-effort snapshot / clip attachments. Shares the
+# lettre stack with `sureview-email` but is otherwise independent.
+email = ["dep:lettre"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
