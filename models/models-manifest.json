@@ -51,8 +51,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo26n @ 512x288 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo26n_512x288.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo26n_512x288_hailo.hef",
           "preset": "512x288-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "d1131deda27b7815dafa3922264808e036e321764c77997e96b6f2bbfebf3f2f",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo26n_512x288.onnx",
@@ -65,8 +64,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo26n @ 1024x576 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo26n_1024x576.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo26n_1024x576_hailo.hef",
           "preset": "1024x576-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "18f6a439edd83d3f24cfa4418c0b7fbfc9a69f1110f069992ccdf85864eeb2c3",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo26n_1024x576.onnx",
@@ -79,8 +77,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo26n @ 1536x864 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo26n_1536x864.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo26n_1536x864_hailo.hef",
           "preset": "1536x864-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "1221f21cf1d32ec3365aaeaa7c7351ef2bce982e163921b7caa8edaec2fdaa74",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo26n_1536x864.onnx",
@@ -203,8 +200,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo_world_v2_s @ 512x288 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo_world_v2_s_512x288.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo_world_v2_s_512x288_hailo.hef",
           "preset": "512x288-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "cb8cd730c38cba222b878955ac9b57b6128146177f1f9040012b7e79ee5555fd",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo_world_v2_s_512x288.onnx",
@@ -217,8 +213,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo_world_v2_s @ 1024x576 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo_world_v2_s_1024x576.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo_world_v2_s_1024x576_hailo.hef",
           "preset": "1024x576-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "3582c4e2e7dcf9dbbd769d7b9dedfbd0e01dee442a21fbe32f80458c1579c392",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo_world_v2_s_1024x576.onnx",
@@ -231,8 +226,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo_world_v2_s @ 1536x864 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo_world_v2_s_1536x864.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo_world_v2_s_1536x864_hailo.hef",
           "preset": "1536x864-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "ec9726ae6cd71a2228feab1c435415675e228a1455d167ca38a805ea75aea8d7",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo_world_v2_s_1536x864.onnx",
@@ -245,8 +239,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo_world_v2_s @ 2048x1152 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo_world_v2_s_2048x1152.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo_world_v2_s_2048x1152_hailo.hef",
           "preset": "2048x1152-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "45cdda1acd65e74756785ef01de0239e63833e5b185d5d2ca927dba32aa6f53b",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo_world_v2_s_2048x1152.onnx",
@@ -401,8 +394,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yoloe26_s @ 512x288 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yoloe26_s_512x288.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yoloe26_s_512x288_hailo.hef",
           "preset": "512x288-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "10de77874ad4ea9cc97a8fe16df86018b9b8893ab95e69670a3139b84f64e8aa",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yoloe26_s_512x288.onnx",
@@ -415,8 +407,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yoloe26_s @ 1024x576 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yoloe26_s_1024x576.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yoloe26_s_1024x576_hailo.hef",
           "preset": "1024x576-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "107c3edc7619285eb95f7016a6185e1ce2ee98649ed2ee849f0e668195236c84",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yoloe26_s_1024x576.onnx",
@@ -429,8 +420,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yoloe26_s @ 1536x864 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yoloe26_s_1536x864.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yoloe26_s_1536x864_hailo.hef",
           "preset": "1536x864-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "2e090a4f29dd4bf523dd963c9329fc1b69bcf94eb01f72357e563f68f6c53754",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yoloe26_s_1536x864.onnx",
