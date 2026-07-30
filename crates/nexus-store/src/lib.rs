@@ -223,6 +223,13 @@ impl Store {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
+            // Fail fast when the pool is saturated so callers can log/drop
+            // work instead of waiting forever and cascading backpressure.
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            // Periodically recycle idle/old connections to reduce the chance
+            // of long-lived stale handles during sustained load.
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .max_lifetime(std::time::Duration::from_secs(3600))
             .connect_with(opts)
             .await?;
 
