@@ -90,8 +90,7 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo26n @ 2048x1152 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo26n_2048x1152.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo26n_2048x1152_hailo.hef",
           "preset": "2048x1152-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
+          "sha256": "f11e79cedda4386ffc7c6f377dcb8fac84fe377eb4c6d5ee841c86f65ef04b50",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo26n_2048x1152.onnx",
