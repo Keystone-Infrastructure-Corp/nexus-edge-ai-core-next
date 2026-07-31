@@ -27,7 +27,14 @@
 #                 (<release_dir>/etc-templates/journald.conf.d/nexus.conf) to
 #                 /etc/systemd/journald.conf.d/ so engine logs cannot crowd out
 #                 clip storage, and restarts systemd-journald.
-#   3. prune      reaps stale release trees under /opt/nexus/releases, keeping
+#   3. groups     ensures the unprivileged `nexus` service user is in the
+#                 `systemd-journal` group so the engine can read its own journal
+#                 (`journalctl -u nexus-engine`) and bundle recent logs into the
+#                 diagnostics tarball. The systemd unit's SupplementaryGroups=
+#                 covers a fresh install; this covers an OTA'd box, whose unit
+#                 file is never re-applied. Read-only membership, takes effect
+#                 on the restart the applier runs next.
+#   4. prune      reaps stale release trees under /opt/nexus/releases, keeping
 #                 only the incoming version (this script's argument) and
 #                 whatever `current` points at. Because it runs BEFORE the flip,
 #                 `current` is still the OUTGOING version — exactly the rollback
@@ -56,7 +63,7 @@ if [[ -z "$release_dir" || ! -d "$release_dir" ]]; then
     exit 2
 fi
 
-# Optional `--no-prune`: skip step 3. The single privileged OTA entrypoint
+# Optional `--no-prune`: skip step 4 (prune). The single privileged OTA entrypoint
 # (/usr/local/sbin/nexus-apply-release) calls us with --no-prune during
 # `apply` so a failed apply can never delete the rollback target; pruning is
 # deferred to its post-health `prune` mode. A direct install.sh call omits the
@@ -171,7 +178,43 @@ apply_journald_cap() {
     return 0
 }
 
-# ---- 3. Prune stale release trees ------------------------------------------
+# ---- 3. Service-user group membership (release-independent, self-healing) --
+# Ensure the unprivileged `nexus` service user is in the `systemd-journal`
+# group so the engine can read its own system-journal logs
+# (`journalctl -u nexus-engine`) and bundle them into the diagnostics tarball
+# for stream-drop / pipeline triage. The engine cannot join a group itself, and
+# the systemd unit's `SupplementaryGroups=systemd-journal` only reaches a box on
+# a fresh install.sh run — the unit file is never re-applied over an OTA. So,
+# mirroring the journald-cap step, we grant it here, root-side, on every OTA.
+# Idempotent (`usermod -aG` is a no-op if already a member) and fail-open. This
+# is a read-only group membership, NOT a sudo/privilege grant.
+apply_service_groups() {
+    local user="nexus" group="systemd-journal"
+    if ! id -u "$user" >/dev/null 2>&1; then
+        log "service user '$user' absent — skipping '$group' grant"
+        return 0
+    fi
+    if ! getent group "$group" >/dev/null 2>&1; then
+        log "group '$group' absent on host — skipping"
+        return 0
+    fi
+    if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$group"; then
+        log "service user '$user' already in '$group'"
+        return 0
+    fi
+    if ! command -v usermod >/dev/null 2>&1; then
+        warn "no usermod on PATH — cannot add '$user' to '$group'"
+        return 0
+    fi
+    if usermod -aG "$group" "$user"; then
+        log "added '$user' to '$group' (effective on next engine restart)"
+    else
+        warn "could not add '$user' to '$group' (continuing)"
+    fi
+    return 0
+}
+
+# ---- 4. Prune stale release trees ------------------------------------------
 # Release trees are large (bundled ONNX Runtime + model packs, ~hundreds of MB)
 # and were never reaped, so a long-lived box accumulated every version it ran.
 # Keep only the version being installed (the argument) and whatever `current`
@@ -220,10 +263,11 @@ prune_old_releases() {
     return 0
 }
 
-# All three steps are best-effort and fail-open: a core update is NEVER blocked
-# on optional plugins, log hygiene, or release pruning.
+# Every step is best-effort and fail-open: a core update is NEVER blocked on
+# optional plugins, log hygiene, journal-group membership, or release pruning.
 apply_apt_deps
 apply_journald_cap
+apply_service_groups
 if (( prune_enabled )); then
     prune_old_releases
 else

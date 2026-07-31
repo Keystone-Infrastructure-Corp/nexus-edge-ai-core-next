@@ -108,7 +108,9 @@ The wedge plan that drives the next three phases of work is
    (systemd). There is no Docker on the edge, no sidecar updater, no shared socket. The
    small amount of privileged work an OTA needs (extract into
    `/opt/nexus/releases/<version>/`, install that release's declared apt runtime
-   deps + journald cap, flip `/opt/nexus/current`, run `systemctl restart
+   deps + journald cap, ensure the `nexus` service user's `systemd-journal` group
+   membership (so the engine can read its own journal for the diagnostics bundle),
+   flip `/opt/nexus/current`, run `systemctl restart
    nexus-engine`, prune stale releases) is performed by a SINGLE pinned, root-owned
    applier `/usr/local/sbin/nexus-apply-release` (modes `apply`/`reflip`/`prune`,
    delegating deps to `/usr/local/sbin/nexus-apply-deps`). The

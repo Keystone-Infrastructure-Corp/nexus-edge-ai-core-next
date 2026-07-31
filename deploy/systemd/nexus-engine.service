@@ -25,7 +25,19 @@ Wants=network-online.target
 Type=simple
 User=nexus
 Group=nexus
-SupplementaryGroups=video render
+# video + render: accelerator device access (/dev/dri, /dev/accel, /dev/hailo).
+# systemd-journal: read access to the system journal so the engine can bundle
+#   its own recent logs (`journalctl -u nexus-engine`) into the diagnostics
+#   tarball for stream-drop / pipeline troubleshooting. Read-only, and NOT a
+#   sudoers/privilege change — `SupplementaryGroups=` adds the GID to the
+#   service process directly (the group is created by the systemd package on
+#   every host, so it always resolves). See `admin_runtime::collect_journal_log`.
+#   NOTE: this directive only reaches a box on a fresh install.sh run — the unit
+#   file is never re-applied over an OTA. An upgraded box instead gets the
+#   `nexus`-user `systemd-journal` membership self-healed on every OTA by
+#   `deploy/nexus-apply-deps` (apply_service_groups), which systemd's initgroups
+#   picks up on the restart the applier runs next.
+SupplementaryGroups=video render systemd-journal
 WorkingDirectory=/var/lib/nexus
 
 # ORT shared libs ship inside the release at lib/onnxruntime/. The ort
