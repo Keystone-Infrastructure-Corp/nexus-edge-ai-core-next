@@ -1329,7 +1329,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // is down). The cloud upserts the per-core camera list so the
     // site dashboard can show cameras the operator configured
     // locally — even ones that have never produced an alert.
-    let roster_handle = roster::spawn(store.clone(), bus.clone(), cloud_outbox.clone());
+    let roster_handle = roster::spawn(
+        store.clone(),
+        bus.clone(),
+        cloud_outbox.clone(),
+        cfg.inference.model.kind.clone(),
+    );
 
     // Phase 7.5.5 — fleet-state-hash publisher. Subscribes to
     // `topic::CONFIG_CHANGED` + `topic::DELIVERY_SETTINGS_CHANGED` and
