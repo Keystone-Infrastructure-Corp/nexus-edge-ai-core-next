@@ -218,9 +218,12 @@ export function AdminDiagnosticsPage() {
             <code className="font-mono">.tar.gz</code> containing the
             sanitised <code className="font-mono">nexus.toml</code>, current
             host metrics, the last 24h of motion events, the recent
-            admin-audit log, and the registered storage backends. Secrets
-            (API keys, RTSP passwords, OIDC client secrets) are stripped
-            before the bundle hits the wire.
+            admin-audit log, the registered storage backends, and the recent
+            engine logs (<code className="font-mono">nexus-engine.log</code>,
+            24h of <code className="font-mono">journalctl</code> output — the
+            first place to look for stream drops). Secrets (API keys, RTSP
+            passwords, OIDC client secrets, and any credentials embedded in
+            log URLs) are stripped before the bundle hits the wire.
           </p>
         </CardContent>
       </Card>

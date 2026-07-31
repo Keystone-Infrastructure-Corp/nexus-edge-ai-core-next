@@ -27,9 +27,12 @@
 //!    replacement for `nexus-doctor bundle --output …`.
 //!    Streams a `.tar.gz` with: redacted `nexus.toml`, system
 //!    metrics snapshot, last-1000 audit rows, last-100 motion
-//!    events, build info. Tar is built on a `spawn_blocking`
-//!    worker that writes through a `GzEncoder` wrapping the
-//!    sender half of a bounded mpsc; axum streams the
+//!    events, build info, and the recent engine journal
+//!    (`journalctl -u nexus-engine`, 24h window, URL credentials
+//!    redacted) — the last is what an operator reaches for when
+//!    troubleshooting stream drops. Tar is built on a
+//!    `spawn_blocking` worker that writes through a `GzEncoder`
+//!    wrapping the sender half of a bounded mpsc; axum streams the
 //!    receiver half. Memory stays O(buffer size).
 //!
 //! ## Why restart-based vs hot-reload
@@ -755,6 +758,20 @@ fn discovery_error_to_tag(e: &crate::auth::oidc::OidcError) -> (&'static str, St
 
 const DEFAULT_AUDIT_LIMIT: i64 = 1000;
 const DEFAULT_MOTION_LIMIT: i64 = 100;
+/// Default number of recent journal lines to bundle when the caller
+/// doesn't override `log_lines`. ~10k lines is a few hours on a busy
+/// multi-camera box and gzips to well under a megabyte.
+const DEFAULT_LOG_LINES: i64 = 10_000;
+/// Hard ceiling on requested journal lines. Guards the local streaming
+/// download (which, unlike the cloud collector, has no `max_bytes`
+/// budget) against a pathological `?log_lines=` value.
+const MAX_LOG_LINES: i64 = 200_000;
+/// Absolute byte cap on the collected + redacted journal text baked into
+/// the tarball, independent of the line cap. The most-recent bytes are
+/// kept; anything older is dropped with a marker at the top.
+const MAX_LOG_BYTES: usize = 32 * 1024 * 1024;
+/// systemd unit whose journal the diagnostics bundle captures.
+const ENGINE_UNIT: &str = "nexus-engine.service";
 
 #[derive(Debug, Deserialize)]
 pub struct ExportQuery {
@@ -776,6 +793,12 @@ pub struct ExportQuery {
     /// `X-Nexus-Diag-Sqlite` response header reports `failed`.
     #[serde(default)]
     pub include_sqlite: Option<bool>,
+    /// Cap on the number of recent engine journal lines
+    /// (`journalctl -u nexus-engine`, 24h window) to bundle into
+    /// `nexus-engine.log`. Default 10 000; capped at 200 000. `0`
+    /// omits the log body (a short note is written instead).
+    #[serde(default)]
+    pub log_lines: Option<i64>,
 }
 
 pub async fn get_diagnostics_export(
@@ -794,13 +817,17 @@ pub async fn get_diagnostics_export(
         .unwrap_or(DEFAULT_MOTION_LIMIT)
         .clamp(0, 10_000);
     let include_sqlite = q.include_sqlite.unwrap_or(false);
+    let log_lines = q
+        .log_lines
+        .unwrap_or(DEFAULT_LOG_LINES)
+        .clamp(0, MAX_LOG_LINES);
 
     // Gather everything that needs the tokio runtime BEFORE
     // we hand off to spawn_blocking. The tar writer itself
     // runs sync; pre-computing the bytes here keeps the
     // blocking task pure-CPU and avoids smuggling a Handle
     // across the thread boundary.
-    let snapshot = build_snapshot(&s, audit_limit, motion_limit, include_sqlite).await;
+    let snapshot = build_snapshot(&s, audit_limit, motion_limit, include_sqlite, log_lines).await;
     let sqlite_status = snapshot.sqlite_status;
 
     audit_admin_action(
@@ -822,6 +849,8 @@ pub async fn get_diagnostics_export(
                 "redacted": true,
                 "include_sqlite": include_sqlite,
                 "sqlite_included": sqlite_status == SqliteSnapshotStatus::Included,
+                "log_lines": log_lines,
+                "log_status": snapshot.journal_status.as_str(),
             })
             .to_string(),
         ),
@@ -891,6 +920,13 @@ struct DiagnosticsSnapshot {
     motion_events_json: String,
     storage_backends_json: String,
     build_info_json: String,
+    /// Recent engine journal (`journalctl -u nexus-engine`), URL
+    /// credentials redacted, size-capped. Always present — on a read
+    /// failure it holds a short explanatory note instead of log lines.
+    journal_log: String,
+    /// Whether the journal was collected, empty, or unavailable —
+    /// surfaced in the export audit record.
+    journal_status: JournalStatus,
     /// Secret-scrubbed copy of the live SQLite state DB. `Some` only
     /// when `include_sqlite` was requested AND the snapshot succeeded.
     sqlite_bytes: Option<Vec<u8>>,
@@ -925,11 +961,36 @@ impl SqliteSnapshotStatus {
     }
 }
 
+/// Disposition of the bundled engine journal for one export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalStatus {
+    /// `journalctl` returned log lines that were bundled.
+    Collected,
+    /// `journalctl` ran but produced no entries for the window (fresh
+    /// boot, or the caller passed `log_lines=0`).
+    Empty,
+    /// `journalctl` could not be run or was denied read access to the
+    /// system journal. The tarball still ships, with an explanatory note
+    /// in place of the log body.
+    Unavailable,
+}
+
+impl JournalStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Collected => "collected",
+            Self::Empty => "empty",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 async fn build_snapshot(
     s: &ApiState,
     audit_limit: i64,
     motion_limit: i64,
     include_sqlite: bool,
+    log_lines: i64,
 ) -> DiagnosticsSnapshot {
     let now = Utc::now();
 
@@ -1029,6 +1090,10 @@ async fn build_snapshot(
         (None, SqliteSnapshotStatus::Omitted)
     };
 
+    // Recent engine journal for stream-drop / pipeline troubleshooting.
+    // Never aborts the export: a failure yields an explanatory note.
+    let (journal_log, journal_status) = collect_journal_log(log_lines).await;
+
     DiagnosticsSnapshot {
         redacted_config_toml,
         system_metrics_json,
@@ -1036,6 +1101,8 @@ async fn build_snapshot(
         motion_events_json,
         storage_backends_json,
         build_info_json,
+        journal_log,
+        journal_status,
         sqlite_bytes,
         sqlite_status,
         audit_count,
@@ -1083,6 +1150,168 @@ fn auth_mode_str(m: AuthMode) -> &'static str {
     }
 }
 
+/// Strip `user:pass@` credentials from any `scheme://userinfo@host` URL
+/// embedded in `input`, replacing the userinfo with `<redacted>`.
+///
+/// The diagnostics tarball uploads to cloud Blob (edge Hard Rule 6 — no
+/// camera credentials over the tunnel). The engine keys its own pipeline
+/// logs on `camera_id` rather than the URL, but a GStreamer / reqwest
+/// error string could still echo an endpoint with embedded credentials,
+/// so every log (and stderr) line is run through this scrub before it can
+/// enter the bundle.
+///
+/// The authority component ends at the first `/`, `?`, `#`, or any
+/// whitespace / quote / delimiter — mirroring how a URL parser tokenises
+/// it — so a stray `@` inside a query string (`?to=a@b`) is never
+/// mistaken for userinfo.
+fn redact_url_credentials(input: &str) -> String {
+    const MARKER: &str = "://";
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find(MARKER) {
+        let after = pos + MARKER.len();
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        let authority_end = tail
+            .find(|c: char| {
+                matches!(
+                    c,
+                    '/' | '?'
+                        | '#'
+                        | '"'
+                        | '\''
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | ','
+                ) || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        match authority.find('@') {
+            // Userinfo present → keep only the host after '@'.
+            Some(at) => {
+                out.push_str("<redacted>@");
+                out.push_str(&authority[at + 1..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Keep at most the last `max_bytes` of `s`, trimming from the front on a
+/// UTF-8 char + line boundary and prefixing a marker noting how much was
+/// dropped. The tail (most-recent lines) is what matters when reading
+/// back logs, so we drop the oldest.
+fn cap_tail_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    if let Some(nl) = s[start..].find('\n') {
+        start += nl + 1;
+    }
+    format!(
+        "# … {start} earlier bytes truncated to stay within the {max_bytes}-byte log cap …\n{}",
+        &s[start..]
+    )
+}
+
+/// Collect the most-recent engine journal lines for the diagnostics
+/// bundle via `journalctl -u nexus-engine`.
+///
+/// The engine logs to the systemd journal (stdout → journald); that is
+/// the only durable log store on the box and, crucially, it survives the
+/// process restarts a crash-looping stream drop can trigger — an
+/// in-process ring buffer would lose exactly the pre-crash lines an
+/// operator needs. Read access comes from the `systemd-journal`
+/// supplementary group granted in `deploy/systemd/nexus-engine.service`.
+///
+/// Never fails the export: on a missing binary, non-zero exit, or denied
+/// journal access the returned text is a short human-readable note and
+/// the status is [`JournalStatus::Unavailable`]. Output is credential-
+/// scrubbed ([`redact_url_credentials`]) and byte-capped
+/// ([`cap_tail_bytes`]) before it can enter the tarball.
+async fn collect_journal_log(max_lines: i64) -> (String, JournalStatus) {
+    let header = format!(
+        "# nexus-engine journal — unit {ENGINE_UNIT}, last {max_lines} lines, 24h window, \
+         URL credentials redacted\n# generated {}\n\n",
+        Utc::now().to_rfc3339(),
+    );
+
+    if max_lines <= 0 {
+        return (
+            format!("{header}(log collection disabled: log_lines=0)\n"),
+            JournalStatus::Empty,
+        );
+    }
+
+    // `journalctl` reads the persistent/volatile system journal directly;
+    // filtering by `--unit` needs system-journal read access, which the
+    // service's `systemd-journal` supplementary group provides. `LC_ALL=C`
+    // + `SYSTEMD_COLORS=0` keep the output stable and ANSI-free.
+    let output = tokio::process::Command::new("journalctl")
+        .arg(format!("--unit={ENGINE_UNIT}"))
+        .arg("--since=24 hours ago")
+        .arg(format!("--lines={max_lines}"))
+        .arg("--output=short-iso")
+        .arg("--no-pager")
+        .arg("--quiet")
+        .env("LC_ALL", "C")
+        .env("SYSTEMD_COLORS", "0")
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let raw = String::from_utf8_lossy(&out.stdout);
+            if raw.trim().is_empty() {
+                return (
+                    format!("{header}(no journal entries in the last 24h)\n"),
+                    JournalStatus::Empty,
+                );
+            }
+            let capped = cap_tail_bytes(&redact_url_credentials(&raw), MAX_LOG_BYTES);
+            (format!("{header}{capped}"), JournalStatus::Collected)
+        }
+        Ok(out) => {
+            let code = out.status.code();
+            let stderr = redact_url_credentials(String::from_utf8_lossy(&out.stderr).trim());
+            tracing::warn!(
+                exit_code = ?code,
+                "diagnostics journal collection failed; bundling without logs"
+            );
+            let detail = if stderr.is_empty() {
+                "no stderr".to_string()
+            } else {
+                stderr
+            };
+            (
+                format!("{header}(journalctl exited with status {code:?}: {detail})\n"),
+                JournalStatus::Unavailable,
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not run journalctl for diagnostics bundle");
+            (
+                format!("{header}(journalctl unavailable: {e})\n"),
+                JournalStatus::Unavailable,
+            )
+        }
+    }
+}
+
 fn write_tar_entries<W: Write>(
     tar: &mut tar::Builder<W>,
     snap: &DiagnosticsSnapshot,
@@ -1104,6 +1333,7 @@ fn write_tar_entries<W: Write>(
         mtime,
     )?;
     write_entry(tar, "build-info.json", &snap.build_info_json, mtime)?;
+    write_entry(tar, "nexus-engine.log", &snap.journal_log, mtime)?;
     if let Some(bytes) = &snap.sqlite_bytes {
         write_entry_bytes(tar, "state/nexus-state.sqlite", bytes, mtime)?;
     }
@@ -2351,5 +2581,96 @@ mod tests {
         assert_eq!(v["watermarks"]["panic_pct"], 5);
         assert_eq!(v["inference"]["current"]["kind"], "yolov8");
         assert!(v["identity"]["display_name"].is_null());
+    }
+
+    #[test]
+    fn redact_strips_url_userinfo() {
+        // RTSP with embedded creds — the classic camera-URL leak.
+        assert_eq!(
+            redact_url_credentials("connect rtsp://admin:s3cret@10.0.0.5:554/stream failed"),
+            "connect rtsp://<redacted>@10.0.0.5:554/stream failed"
+        );
+        // No userinfo → untouched.
+        assert_eq!(
+            redact_url_credentials("GET https://host.example/path?a=1"),
+            "GET https://host.example/path?a=1"
+        );
+        // A stray '@' in a query string is NOT userinfo — must survive.
+        assert_eq!(
+            redact_url_credentials("https://host/cb?to=a@b.com"),
+            "https://host/cb?to=a@b.com"
+        );
+        // Two URLs on one line, both scrubbed independently.
+        assert_eq!(
+            redact_url_credentials("a rtsp://u:p@h1/s and http://x:y@h2/ b"),
+            "a rtsp://<redacted>@h1/s and http://<redacted>@h2/ b"
+        );
+        // Nothing URL-shaped → identity.
+        assert_eq!(redact_url_credentials("plain log line"), "plain log line");
+    }
+
+    #[test]
+    fn cap_tail_keeps_recent_and_marks_truncation() {
+        // 20-byte, 4-line input.
+        let s = "aaaa\nbbbb\ncccc\ndddd\n";
+        // Under the cap → returned verbatim.
+        assert_eq!(cap_tail_bytes(s, 1000), s);
+        // Over the cap → oldest dropped, tail kept, marker prepended.
+        let capped = cap_tail_bytes(s, 8);
+        assert!(capped.starts_with("# \u{2026}"), "got: {capped:?}");
+        assert!(capped.ends_with("dddd\n"), "got: {capped:?}");
+        assert!(!capped.contains("aaaa"), "oldest line must be dropped");
+    }
+
+    #[tokio::test]
+    async fn journal_log_disabled_when_zero_lines() {
+        // log_lines=0 must not shell out — returns the note + Empty.
+        let (text, status) = collect_journal_log(0).await;
+        assert_eq!(status, JournalStatus::Empty);
+        assert!(text.contains("log_lines=0"), "got: {text}");
+        assert!(text.contains("nexus-engine journal"), "got: {text}");
+    }
+
+    #[test]
+    fn tar_entries_include_engine_log() {
+        let snap = DiagnosticsSnapshot {
+            redacted_config_toml: "cfg".into(),
+            system_metrics_json: "{}".into(),
+            audit_json: "[]".into(),
+            motion_events_json: "[]".into(),
+            storage_backends_json: "[]".into(),
+            build_info_json: "{}".into(),
+            journal_log: "2026-07-31T00:00:00+0000 host nexus-engine[1]: rtsp session failed\n"
+                .into(),
+            journal_status: JournalStatus::Collected,
+            sqlite_bytes: None,
+            sqlite_status: SqliteSnapshotStatus::Omitted,
+            audit_count: 0,
+            motion_count: 0,
+            generated_at: Utc::now(),
+        };
+
+        let mut buf = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut buf);
+            write_tar_entries(&mut tar, &snap).unwrap();
+            tar.finish().unwrap();
+        }
+
+        let mut names = Vec::new();
+        let mut archive = tar::Archive::new(&buf[..]);
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            names.push(entry.path().unwrap().to_string_lossy().into_owned());
+        }
+        assert!(
+            names.iter().any(|n| n == "nexus-engine.log"),
+            "engine log missing from bundle: {names:?}"
+        );
+        // sqlite omitted → snapshot entry must not appear.
+        assert!(
+            !names.iter().any(|n| n.contains("nexus-state.sqlite")),
+            "unexpected sqlite entry: {names:?}"
+        );
     }
 }
