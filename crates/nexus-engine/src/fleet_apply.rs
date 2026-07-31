@@ -19,7 +19,7 @@
 //! where `effective` is the cloud-resolved (org → site → core folded)
 //! value for the category. The `db_key` segment is one of `rules`,
 //! `text_prompts`, `visual_prompts`, `detector_config`,
-//! `delivery_settings`.
+//! `delivery_settings`, `alert_sinks`, `live_view`.
 //!
 //! # Apply semantics (v1)
 //!
@@ -62,7 +62,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use nexus_bus::{topic, BusExt};
-use nexus_config::{ModelConfig, RuleConfig};
+use nexus_config::{ModelConfig, RuleConfig, SinkConfig};
 use nexus_store::audit::AuditOutcome;
 use nexus_types::{HdTransport, RuleId, VisualPromptId};
 use serde::{Deserialize, Serialize};
@@ -210,6 +210,7 @@ async fn apply_category(
         "visual_prompts" => apply_visual_prompts(s, effective).await,
         "detector_config" => apply_detector_config(s, effective).await,
         "delivery_settings" => apply_delivery_settings(s, effective).await,
+        "alert_sinks" => apply_alert_sinks(s, effective).await,
         "live_view" => apply_live_view(s, effective).await,
         other => Err(ApiError(
             StatusCode::NOT_FOUND,
@@ -394,6 +395,107 @@ async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usiz
         .publish(topic::DELIVERY_SETTINGS_CHANGED, &serde_json::json!({}))
         .await;
     Ok(1)
+}
+
+/// `alert_sinks` — `effective` is a JSON array of full
+/// [`SinkConfig`] objects (the same shape
+/// `PUT /v1/admin/sinks/config/{kind}/{name}` accepts).
+///
+/// REPLACE semantics over the **cloud-managed** sink set only: every
+/// entry is upserted into `alert_sinks` keyed by `<kind>:<name>`, and
+/// any existing db row the fleet no longer lists is deleted. Sinks
+/// pinned in `nexus.toml` (`source: "file"`) are untouched — they are
+/// not rows, so the fleet can never remove what the local operator
+/// hard-coded. A db row that shadows a file sink still wins at
+/// registry-build time (migration `0021_alert_sinks.sql`).
+///
+/// # Secret discipline
+///
+/// The cloud never stores a live secret (REPO_BOUNDARY R7), so every
+/// secret field in a fleet payload arrives as
+/// [`SinkConfig::REDACTED_SECRET`]. Each entry is re-filled from this
+/// core's own stored config before validation — first from the
+/// `alert_sinks` row, then from a same-id `nexus.toml` sink — using
+/// the same [`SinkConfig::restore_redacted_secrets_from`] contract the
+/// interactive admin PUT uses. A brand-new sink whose *required*
+/// secret has nothing to restore from is rejected with a `400` naming
+/// the sink, so the cloud records that target as failed and the
+/// operator knows to supply the secret once on that core (its own
+/// Delivery tab, or `nexus.toml`). Sinks whose secrets are optional
+/// (webhook `hmac_secret`, SMTP `password`) apply cleanly with no
+/// secret at all.
+///
+/// The whole payload is resolved and validated up-front so a bad
+/// entry fails atomically — nothing is persisted.
+async fn apply_alert_sinks(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+    let sinks: Vec<SinkConfig> = serde_json::from_value(effective.clone())
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("alert_sinks payload: {e}")))?;
+
+    // File sinks indexed by `<kind>:<name>` — the secondary restore
+    // source, so an operator who pinned the secret in `nexus.toml` can
+    // still have the fleet manage the sink's non-secret fields.
+    let file_by_id: std::collections::HashMap<String, &SinkConfig> = s
+        .file_sinks
+        .iter()
+        .map(|c| (format!("{}:{}", c.kind(), c.name()), c))
+        .collect();
+
+    let mut resolved: Vec<(String, SinkConfig)> = Vec::with_capacity(sinks.len());
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mut cfg in sinks {
+        let sink_id = format!("{}:{}", cfg.kind(), cfg.name());
+        if !keep.insert(sink_id.clone()) {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("duplicate sink {sink_id:?} in alert_sinks payload"),
+            ));
+        }
+        if let Some(row) = s.store.alert_sink_get(&sink_id).await? {
+            if let Ok(existing) = serde_json::from_str::<SinkConfig>(&row.config_json) {
+                cfg.restore_redacted_secrets_from(&existing);
+            }
+        }
+        if cfg.has_redacted_secret() {
+            if let Some(existing) = file_by_id.get(&sink_id) {
+                cfg.restore_redacted_secrets_from(existing);
+            }
+        }
+        if cfg.has_redacted_secret() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "sink {sink_id:?} requires a secret that this core does not have yet — \
+                     set it once on this core (Delivery tab or nexus.toml); the fleet \
+                     payload carries only the redaction sentinel"
+                ),
+            ));
+        }
+        cfg.validate()
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("sink {sink_id:?}: {e}")))?;
+        resolved.push((sink_id, cfg));
+    }
+
+    for row in s.store.alert_sinks_list().await? {
+        if !keep.contains(&row.sink_id) {
+            s.store.alert_sink_delete(&row.sink_id).await?;
+        }
+    }
+    for (sink_id, cfg) in &resolved {
+        let config_json = serde_json::to_string(cfg).map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialise sink {sink_id:?}: {e}"),
+            )
+        })?;
+        s.store
+            .alert_sink_upsert(sink_id, cfg.kind(), cfg.name(), &config_json)
+            .await?;
+    }
+    let _ = s
+        .bus
+        .publish(topic::SINK_CONFIG_CHANGED, &serde_json::json!({}))
+        .await;
+    Ok(resolved.len())
 }
 
 /// `visual_prompts` — attach/detach reconcile with create-by-image.
