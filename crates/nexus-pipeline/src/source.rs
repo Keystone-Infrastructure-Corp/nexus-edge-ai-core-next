@@ -48,7 +48,6 @@ pub const RTSP_SOURCE_FRAME_HEIGHT: u32 = 540;
 ///   * `supervisor_frame_for(512)`  -> `(512,  288)`
 ///   * `supervisor_frame_for(1024)` -> `(1024, 576)`
 ///   * `supervisor_frame_for(1536)` -> `(1536, 864)`
-///   * `supervisor_frame_for(2048)` -> `(2048, 1152)`
 ///
 /// Rationale: cameras universally publish 16:9 streams (1080p, 720p, 4K
 /// all 16:9), so producing a 16:9 supervisor frame is a plain rescale.

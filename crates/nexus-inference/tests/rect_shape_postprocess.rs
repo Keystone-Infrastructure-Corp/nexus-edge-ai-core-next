@@ -33,8 +33,8 @@ const FEATURES: &[usize] = &[6, 48, 84];
 ///   8400  = 640×640   (the pre-migration square count)
 ///   3024  = 512×288   (Standard tier)
 ///   12096 = 1024×576  (Long range)
-///   48384 = 2048×1152 (Maximum)
-const ANCHORS: &[usize] = &[8400, 3024, 12096, 48384];
+///   27216 = 1536×864  (High detail)
+const ANCHORS: &[usize] = &[8400, 3024, 12096, 27216];
 
 #[test]
 fn orients_features_first_export_to_anchor_rows() {

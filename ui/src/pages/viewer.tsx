@@ -6,7 +6,7 @@
 //
 // Coordinate systems:
 //   - Supervisor (analysis) frame is per-camera, 16:9 on the native
-//     ladder (512×288 / 1024×576 / 1536×864 / 2048×1152), optionally a
+//     ladder (512×288 / 1024×576 / 1536×864), optionally a
 //     larger rung than the model input (CameraBehavior.supervisor_width).
 //     Every bbox in `latest.json` is in those units.
 //   - `FrameMetadata.width` / `.height` carry the actual source dims for

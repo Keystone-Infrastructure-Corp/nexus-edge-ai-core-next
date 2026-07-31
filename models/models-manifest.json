@@ -1,14 +1,14 @@
 {
   "version": "v2",
   "pack_version": "v5",
-  "_pack_version_comment": "Bumped only when ONNX/HEF bytes change OR a new artifact filename is introduced. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX (`gen_*.py --all-static`) -> compile HEFs (`gen_*_hailo.py`) -> bump this field -> commit -> `gh release create models-v5 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build. v5 (M_NATIVE_ASPECT) retires the square inputs: every detector ships the native 16:9 ladder (512x288/1024x576/1536x864/2048x1152) for both ONNX and Hailo-8 HEF; dinov2-s-v1 stays 224 (crop encoder). All rectangular HEFs are operator-compiled via the DFC (no public prebuilt) and ship sha256=PENDING_COMPILE + requires_compile=true until compiled. See /memories/repo/nexus-models-manifest-pending-compile.md and tools/models/README.md \u00a7'Hailo HEF compilation'.",
+  "_pack_version_comment": "Bumped only when ONNX/HEF bytes change OR a new artifact filename is introduced. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX (`gen_*.py --all-static`) -> compile HEFs (`gen_*_hailo.py`) -> bump this field -> commit -> `gh release create models-v5 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build. v5 (M_NATIVE_ASPECT) retires the square inputs: every detector ships the native 16:9 ladder (512x288/1024x576/1536x864) for both ONNX and Hailo-8 HEF; dinov2-s-v1 stays 224 (crop encoder). All rectangular HEFs are operator-compiled via the DFC (no public prebuilt) and ship sha256=PENDING_COMPILE + requires_compile=true until compiled. See /memories/repo/nexus-models-manifest-pending-compile.md and tools/models/README.md \u00a7'Hailo HEF compilation'.",
   "_comment": "Model pack v2 manifest. See models/MODEL_PACK_V2.md for the schema reference. Paths are resolved relative to this file. sha256 is verified at engine load time when artifact verification is wired up (W-DETECT D5).",
   "_generated_by": "models/tools/generate_model_pack.py (or hand-edited at the repo root for the ship-in-tree models below)",
   "models": [
     {
       "id": "yolo26n",
       "task": "detect",
-      "_comment": "YOLOv26-nano on the native 16:9 ladder (512x288 / 1024x576 / 1536x864 / 2048x1152 \u2014 exact 16:9 \u2229 stride-32, W=512k / H=288k; see docs/edge-core/M_NATIVE_ASPECT.md). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes) and let the OpenVINO blob cache hit on subsequent boots. Per-camera shape override picks a rung; default 512x288. Regenerate with `python tools/models/gen_yolo26n.py --all-static` before tagging a release. Detector output is NMS-baked [1,300,6]; the Hailo path cuts the graph at the six FPN head convs (raw multi-output, CPU NMS).",
+      "_comment": "YOLOv26-nano on the native 16:9 ladder (512x288 / 1024x576 / 1536x864 \u2014 exact 16:9 \u2229 stride-32, W=512k / H=288k; see docs/edge-core/M_NATIVE_ASPECT.md). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes) and let the OpenVINO blob cache hit on subsequent boots. Per-camera shape override picks a rung; default 512x288. Regenerate with `python tools/models/gen_yolo26n.py --all-static` before tagging a release. Detector output is NMS-baked [1,300,6]; the Hailo path cuts the graph at the six FPN head convs (raw multi-output, CPU NMS).",
       "license": "AGPL-3.0",
       "weights_dataset_license": "COCO:CC-BY-4.0",
       "input": {
@@ -39,12 +39,6 @@
           "path": "yolo26n_1536x864.onnx",
           "preset": "1536x864",
           "sha256": "488018d8b4de363056ca85f099db3b08b7c4b730aee1bfc5ea59931dc419c2a3"
-        },
-        {
-          "backend": "onnx",
-          "path": "yolo26n_2048x1152.onnx",
-          "preset": "2048x1152",
-          "sha256": "ed2e650df82843f5b9337e6dadb1ae145901b056438262bef5faecc075b238ce"
         },
         {
           "backend": "hef",
@@ -84,19 +78,6 @@
             "script": "tools/models/gen_yolo26n_hailo.py --shape 1536x864",
             "calibration": "coco-val2017-1024"
           }
-        },
-        {
-          "backend": "hef",
-          "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo26n @ 2048x1152 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo26n_2048x1152.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
-          "path": "yolo26n_2048x1152_hailo.hef",
-          "preset": "2048x1152-hef",
-          "sha256": "f11e79cedda4386ffc7c6f377dcb8fac84fe377eb4c6d5ee841c86f65ef04b50",
-          "_compile": {
-            "tool": "hailo-dataflow-compiler",
-            "source_onnx": "yolo26n_2048x1152.onnx",
-            "script": "tools/models/gen_yolo26n_hailo.py --shape 2048x1152",
-            "calibration": "coco-val2017-1024"
-          }
         }
       ],
       "presets": [
@@ -119,12 +100,6 @@
           "artifact": "yolo26n_1536x864.onnx"
         },
         {
-          "name": "2048x1152",
-          "inputWidth": 2048,
-          "inputHeight": 1152,
-          "artifact": "yolo26n_2048x1152.onnx"
-        },
-        {
           "name": "512x288-hef",
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 backed 512x288 path. Ships PENDING_COMPILE until the operator runs the compile script on a host with the Hailo Dataflow Compiler.",
           "inputWidth": 512,
@@ -144,13 +119,6 @@
           "inputWidth": 1536,
           "inputHeight": 864,
           "artifact": "yolo26n_1536x864_hailo.hef"
-        },
-        {
-          "name": "2048x1152-hef",
-          "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 backed 2048x1152 path. Ships PENDING_COMPILE until the operator runs the compile script on a host with the Hailo Dataflow Compiler.",
-          "inputWidth": 2048,
-          "inputHeight": 1152,
-          "artifact": "yolo26n_2048x1152_hailo.hef"
         }
       ],
       "default_preset": "512x288"
@@ -158,7 +126,7 @@
     {
       "id": "yolo_world_v2_s",
       "task": "detect_open_vocab_text",
-      "_comment": "YOLO-World v2 (small) export on the native 16:9 ladder (512x288 / 1024x576 / 1536x864 / 2048x1152). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes, observed on Lunar Lake k13 under v0.1.18\u20130.1.20) and let the OpenVINO blob cache hit on subsequent boots. Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via `python tools/models/gen_yolo_world.py --all-static` whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff.",
+      "_comment": "YOLO-World v2 (small) export on the native 16:9 ladder (512x288 / 1024x576 / 1536x864). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes, observed on Lunar Lake k13 under v0.1.18\u20130.1.20) and let the OpenVINO blob cache hit on subsequent boots. Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via `python tools/models/gen_yolo_world.py --all-static` whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff.",
       "input": {
         "width": 512,
         "height": 288,
@@ -187,12 +155,6 @@
           "path": "yolo_world_v2_s_1536x864.onnx",
           "preset": "1536x864",
           "sha256": "dc0675215833925f29f3e7fbdcb3f16b3f944d341a6cbd510450974bf23612ff"
-        },
-        {
-          "backend": "onnx",
-          "path": "yolo_world_v2_s_2048x1152.onnx",
-          "preset": "2048x1152",
-          "sha256": "9f7d7919c7a6204c21427179c59506546e980acf7d6e7364a98d0f9703dcec5a"
         },
         {
           "backend": "hef",
@@ -232,19 +194,6 @@
             "script": "tools/models/gen_yolo_world_hailo.py --shape 1536x864",
             "calibration": "coco-val2017-1024"
           }
-        },
-        {
-          "backend": "hef",
-          "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo_world_v2_s @ 2048x1152 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo_world_v2_s_2048x1152.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
-          "path": "yolo_world_v2_s_2048x1152_hailo.hef",
-          "preset": "2048x1152-hef",
-          "sha256": "45cdda1acd65e74756785ef01de0239e63833e5b185d5d2ca927dba32aa6f53b",
-          "_compile": {
-            "tool": "hailo-dataflow-compiler",
-            "source_onnx": "yolo_world_v2_s_2048x1152.onnx",
-            "script": "tools/models/gen_yolo_world_hailo.py --shape 2048x1152",
-            "calibration": "coco-val2017-1024"
-          }
         }
       ],
       "presets": [
@@ -267,12 +216,6 @@
           "artifact": "yolo_world_v2_s_1536x864.onnx"
         },
         {
-          "name": "2048x1152",
-          "inputWidth": 2048,
-          "inputHeight": 1152,
-          "artifact": "yolo_world_v2_s_2048x1152.onnx"
-        },
-        {
           "name": "512x288-hef",
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 backed 512x288 path. Ships PENDING_COMPILE until the operator runs the compile script on a host with the Hailo Dataflow Compiler.",
           "inputWidth": 512,
@@ -292,13 +235,6 @@
           "inputWidth": 1536,
           "inputHeight": 864,
           "artifact": "yolo_world_v2_s_1536x864_hailo.hef"
-        },
-        {
-          "name": "2048x1152-hef",
-          "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 backed 2048x1152 path. Ships PENDING_COMPILE until the operator runs the compile script on a host with the Hailo Dataflow Compiler.",
-          "inputWidth": 2048,
-          "inputHeight": 1152,
-          "artifact": "yolo_world_v2_s_2048x1152_hailo.hef"
         }
       ],
       "default_preset": "512x288",
@@ -352,7 +288,7 @@
     {
       "id": "yoloe26_s",
       "task": "detect_open_vocab_text",
-      "_comment": "YOLOE (small) text-mode export on the native 16:9 ladder (512x288 / 1024x576 / 1536x864 / 2048x1152). Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via tools/models/gen_yoloe.py whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff.",
+      "_comment": "YOLOE (small) text-mode export on the native 16:9 ladder (512x288 / 1024x576 / 1536x864). Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via tools/models/gen_yoloe.py whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff.",
       "input": {
         "width": 512,
         "height": 288,
@@ -381,12 +317,6 @@
           "path": "yoloe26_s_1536x864.onnx",
           "preset": "1536x864",
           "sha256": "fa5692d2060c70af979db68921258be80f04c4f5401cc9f48caafd6a7fa2b8eb"
-        },
-        {
-          "backend": "onnx",
-          "path": "yoloe26_s_2048x1152.onnx",
-          "preset": "2048x1152",
-          "sha256": "8d1864c0fc3886f76c9868bcd08d9e5ba70633e8c2d35e84d19c12f1010afe9a"
         },
         {
           "backend": "hef",
@@ -426,20 +356,6 @@
             "script": "tools/models/gen_yoloe_hailo.py --shape 1536x864",
             "calibration": "coco-val2017-1024"
           }
-        },
-        {
-          "backend": "hef",
-          "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yoloe26_s @ 2048x1152 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yoloe26_s_2048x1152.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
-          "path": "yoloe26_s_2048x1152_hailo.hef",
-          "preset": "2048x1152-hef",
-          "sha256": "PENDING_COMPILE",
-          "requires_compile": true,
-          "_compile": {
-            "tool": "hailo-dataflow-compiler",
-            "source_onnx": "yoloe26_s_2048x1152.onnx",
-            "script": "tools/models/gen_yoloe_hailo.py --shape 2048x1152",
-            "calibration": "coco-val2017-1024"
-          }
         }
       ],
       "presets": [
@@ -462,12 +378,6 @@
           "artifact": "yoloe26_s_1536x864.onnx"
         },
         {
-          "name": "2048x1152",
-          "inputWidth": 2048,
-          "inputHeight": 1152,
-          "artifact": "yoloe26_s_2048x1152.onnx"
-        },
-        {
           "name": "512x288-hef",
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 backed 512x288 path. Ships PENDING_COMPILE until the operator runs the compile script on a host with the Hailo Dataflow Compiler.",
           "inputWidth": 512,
@@ -487,13 +397,6 @@
           "inputWidth": 1536,
           "inputHeight": 864,
           "artifact": "yoloe26_s_1536x864_hailo.hef"
-        },
-        {
-          "name": "2048x1152-hef",
-          "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 backed 2048x1152 path. Ships PENDING_COMPILE until the operator runs the compile script on a host with the Hailo Dataflow Compiler.",
-          "inputWidth": 2048,
-          "inputHeight": 1152,
-          "artifact": "yoloe26_s_2048x1152_hailo.hef"
         }
       ],
       "default_preset": "512x288",

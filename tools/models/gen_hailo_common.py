@@ -418,7 +418,7 @@ def download_public_hef(name: str, dest: Path) -> int:
     """Download a prebuilt HEF from the Hailo Model Zoo S3 mirror.
 
     Currently unused: every shipped shape is on the native 16:9 ladder
-    (512x288 / 1024x576 / 1536x864 / 2048x1152) and has no public
+    (512x288 / 1024x576 / 1536x864) and has no public
     prebuilt, so all HEFs are compiled locally via the DFC. Retained for
     the square public-prebuilt path in case a Zoo-supported square shape
     is ever reintroduced.

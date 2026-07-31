@@ -3,7 +3,7 @@
 Generate the closed-vocab YOLOv26-nano ONNX detectors that power M1's
 `YoloOrtDetector`. The engine ships STATIC-shape exports on the native
 16:9 ladder — `yolo26n_512x288.onnx`, `yolo26n_1024x576.onnx`,
-`yolo26n_1536x864.onnx`, `yolo26n_2048x1152.onnx` — one per supported
+`yolo26n_1536x864.onnx` — one per supported
 input shape (matched to per-profile defaults and the per-camera shape
 override). Every shape is exact 16:9 with both dimensions multiples of
 32 (W=512k, H=288k), so the detector no longer stretches the 16:9
@@ -18,13 +18,13 @@ dynamic export is retired.
 Run from the workspace root with the model-gen venv active:
 
     source .venv-modelgen/bin/activate
-    # Generate all four static models in one ultralytics session
+    # Generate all three static models in one ultralytics session
     # (saves ~30s of import + checkpoint-load overhead vs. 4 invocations):
     python tools/models/gen_yolo26n.py --all-static
     # …or one at a time:
     python tools/models/gen_yolo26n.py --static --shape 512x288
     python tools/models/gen_yolo26n.py --static --shape 1024x576
-    python tools/models/gen_yolo26n.py --static --shape 2048x1152
+    python tools/models/gen_yolo26n.py --static --shape 1536x864
 
 Each invocation patches the matching `artifacts[].sha256` entry in
 `models/models-manifest.json` so the engine's load-time checksum
@@ -34,7 +34,6 @@ Outputs:
     models/yolo26n_512x288.onnx    (1×3×288×512, image input → output0 [1,300,6])
     models/yolo26n_1024x576.onnx
     models/yolo26n_1536x864.onnx
-    models/yolo26n_2048x1152.onnx
 """
 
 from __future__ import annotations
@@ -51,7 +50,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = REPO_ROOT / "models"
 # Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k). The only
 # family that satisfies both YOLO's multiple-of-32 rule and exact 16:9.
-STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864), (2048, 1152))
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864))
 
 
 def parse_shape(text: str) -> tuple[int, int]:
@@ -130,7 +129,7 @@ def main() -> int:
         type=parse_shape,
         default=(512, 288),
         help="Input shape as WxH (default 512x288). Static mode pins to this. "
-        "Must be a native-16:9 ladder rung: 512x288 | 1024x576 | 1536x864 | 2048x1152.",
+        "Must be a native-16:9 ladder rung: 512x288 | 1024x576 | 1536x864.",
     )
     parser.add_argument(
         "--opset",

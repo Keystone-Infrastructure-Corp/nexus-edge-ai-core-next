@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate Hailo-8 HEF artifacts for the closed-vocab yolo26n detector.
 
-Four native-16:9 shapes ship: 512x288, 1024x576, 1536x864, 2048x1152
+Three native-16:9 shapes ship: 512x288, 1024x576, 1536x864
 (exact 16:9 ∩ stride-32, W=512k / H=288k — see
 `docs/edge-core/M_NATIVE_ASPECT.md`). Source-of-truth ONNX files at
 each shape MUST already exist under `models/` \u2014 generate them first with:
@@ -18,7 +18,6 @@ Outputs:
     models/yolo26n_512x288_hailo.hef
     models/yolo26n_1024x576_hailo.hef
     models/yolo26n_1536x864_hailo.hef
-    models/yolo26n_2048x1152_hailo.hef
 
 Each invocation patches the matching `artifacts[].sha256` entry in
 `models/models-manifest.json` and removes the `requires_compile`
@@ -43,7 +42,7 @@ from gen_hailo_common import (
 
 MODEL_ID = "yolo26n"
 # Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k).
-STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864), (2048, 1152))
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864))
 ALLS_DIR = Path(__file__).resolve().parent / "alls"
 
 

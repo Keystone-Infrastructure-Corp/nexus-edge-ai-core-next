@@ -26,13 +26,13 @@ repo's `models/` directory by absolute path.
 
 | Script | Output | Used by |
 |---|---|---|
-| `gen_yolo26n.py` | `models/yolo26n_{512x288,1024x576,1536x864,2048x1152}.onnx` (~10 MB each) | M1 closed-vocab detector (`YoloOrtDetector`); ships the native 16:9 ladder (M_NATIVE_ASPECT, exact 16:9 &cap; stride-32). `--all-static` is the release path. |
-| `gen_yolo_world.py` | `models/yolo_world_v2_s_{512x288,1024x576,1536x864,2048x1152}.onnx` (~50&nbsp;MB each) | M3 open-vocab detector (`YoloWorldDetector`). Embeds the text encoder into the graph and bakes the operator-supplied prompt vocabulary as fixed text inputs. Ships the full native 16:9 ladder; `--all-static` is the release path. |
-| `gen_yoloe.py` | `models/yoloe26_s_{512x288,1024x576,1536x864,2048x1152}.onnx` (~42&nbsp;MB each) | M3.1 text-mode YOLOE detector (`YoloeDetector`). Mirrors `gen_yolo_world.py` against the upstream `ultralytics.YOLOE` checkpoint; native 16:9 ladder, `--all-static`. |
+| `gen_yolo26n.py` | `models/yolo26n_{512x288,1024x576,1536x864}.onnx` (~10 MB each) | M1 closed-vocab detector (`YoloOrtDetector`); ships the native 16:9 ladder (M_NATIVE_ASPECT, exact 16:9 &cap; stride-32). `--all-static` is the release path. |
+| `gen_yolo_world.py` | `models/yolo_world_v2_s_{512x288,1024x576,1536x864}.onnx` (~50&nbsp;MB each) | M3 open-vocab detector (`YoloWorldDetector`). Embeds the text encoder into the graph and bakes the operator-supplied prompt vocabulary as fixed text inputs. Ships the full native 16:9 ladder; `--all-static` is the release path. |
+| `gen_yoloe.py` | `models/yoloe26_s_{512x288,1024x576,1536x864}.onnx` (~42&nbsp;MB each) | M3.1 text-mode YOLOE detector (`YoloeDetector`). Mirrors `gen_yolo_world.py` against the upstream `ultralytics.YOLOE` checkpoint; native 16:9 ladder, `--all-static`. |
 | `gen_yoloe_visual.py` | `models/yoloe26_s_image_encoder.onnx` (~15–20 MB) | M3.1 visual-prompt encoder for `YoloeVisualDetector`. Run AFTER `gen_yoloe.py`; produces the standalone image-embedding ONNX the engine's admin upload path uses to encode reference crops. |
-| `gen_yolo26n_hailo.py` | `models/yolo26n_{512x288,1024x576,1536x864,2048x1152}_hailo.hef` (~6&ndash;20&nbsp;MB each) | M_HAILO_EP + M_NATIVE_ASPECT — Hailo-8 quantized build of yolo26n. No rectangular shape has a public Hailo Model Zoo prebuild, so **every** shape is a local DFC compile from the per-shape ONNX. |
-| `gen_yolo_world_hailo.py` | `models/yolo_world_v2_s_{512x288,1024x576,1536x864,2048x1152}_hailo.hef` | M_HAILO_EP — Hailo-8 quantized open-vocab. Prompts must already be baked into the ONNX (see `gen_yolo_world.py`); changing the vocab requires re-running both generators. |
-| `gen_yoloe_hailo.py` | `models/yoloe26_s_{512x288,1024x576,1536x864,2048x1152}_hailo.hef` | M_HAILO_EP — Hailo-8 quantized YOLOE. Same prompt-baking caveat as YOLO-World. |
+| `gen_yolo26n_hailo.py` | `models/yolo26n_{512x288,1024x576,1536x864}_hailo.hef` (~6&ndash;20&nbsp;MB each) | M_HAILO_EP + M_NATIVE_ASPECT — Hailo-8 quantized build of yolo26n. No rectangular shape has a public Hailo Model Zoo prebuild, so **every** shape is a local DFC compile from the per-shape ONNX. |
+| `gen_yolo_world_hailo.py` | `models/yolo_world_v2_s_{512x288,1024x576,1536x864}_hailo.hef` | M_HAILO_EP — Hailo-8 quantized open-vocab. Prompts must already be baked into the ONNX (see `gen_yolo_world.py`); changing the vocab requires re-running both generators. |
+| `gen_yoloe_hailo.py` | `models/yoloe26_s_{512x288,1024x576,1536x864}_hailo.hef` | M_HAILO_EP — Hailo-8 quantized YOLOE. Same prompt-baking caveat as YOLO-World. |
 | `gen_dinov2_hailo.py` | `models/dinov2_s_224_hailo.hef` (~25&nbsp;MB) | M_HAILO_EP \u2014 Hailo-8 quantized appearance backbone. Calibrated on ImageNet-val. Re-tune the cloud linker's `COSINE_MAX` if switching the appearance pipeline to this HEF in production (int8 quant may shift cosine distances by <1%). |
 
 Run them from the repo root with the venv active:
@@ -145,7 +145,7 @@ working pack for Hailo hosts running detector-only workloads.
   systemctl stop nexus-engine`) — it can hog ~4 GB and starve the DFC into
   swap-thrash. The v5 pack was compiled at `optimization_level=2` (QAT) +
   `compiler_optimization_level=1`.
-* **native 16:9 ladder** (512x288 / 1024x576 / 1536x864 / 2048x1152): all
+* **native 16:9 ladder** (512x288 / 1024x576 / 1536x864): all
   local DFC builds — no public Model Zoo prebuild exists at any rectangular
   shape. Most shapes exceed one Hailo-8 context and compile Multi-Context
   ("Single context flow failed: Recoverable" is normal). Per-shape fps on a

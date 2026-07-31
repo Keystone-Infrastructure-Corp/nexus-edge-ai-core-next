@@ -13,7 +13,7 @@
 //!   * `open(hef_path, frame_w, frame_h, threshold)` opens a HailoRT
 //!     `InferSession`. The session owns the vdevice + HEF + vstreams.
 //!   * Per-frame: bilinear resize the RGB24 source to the HEF's input
-//!     dims (512×288 / 1024×576 / 1536×864 / 2048×1152), then `infer_blocking`
+//!     dims (512×288 / 1024×576 / 1536×864), then `infer_blocking`
 //!     returns normalized NMS_BY_CLASS detections decoded into our
 //!     `Detection` wire type via the COCO→domain label map shared
 //!     with `yolo.rs`.
@@ -77,7 +77,7 @@ fn session_cache() -> &'static Mutex<HashMap<PathBuf, Weak<HailoYoloDetector>>> 
 pub struct HailoYoloDetector {
     session: Mutex<InferSession>,
     /// Network input geometry — set from the HEF, not the operator
-    /// config. Reads back as 512×288 / 1024×576 / 1536×864 / 2048×1152
+    /// config. Reads back as 512×288 / 1024×576 / 1536×864
     /// depending on which shape HEF the pack staged.
     input_w: u32,
     input_h: u32,

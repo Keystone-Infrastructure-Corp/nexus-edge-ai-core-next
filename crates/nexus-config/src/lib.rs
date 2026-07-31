@@ -1156,7 +1156,7 @@ pub struct ModelConfig {
     /// detector fan-out — see `members` below) | `"mock"`.
     ///
     /// `yolo` matches the v1 ship — `models/yolo26n_<W>x<H>.onnx` on the
-    /// native 16:9 ladder (512x288 … 2048x1152).
+    /// native 16:9 ladder (512x288 … 1536x864).
     #[serde(default = "default_model_kind")]
     pub kind: String,
     /// Optional model-pack directory containing `models-manifest.json`.
@@ -1317,7 +1317,7 @@ fn default_score_threshold() -> f32 {
 
 /// The native-16:9 shape ladder — exact 16:9 ∩ stride-32 (W=512k, H=288k).
 /// Every shipped detector input shape is one of these rungs.
-pub const SHAPE_LADDER: [(u32, u32); 4] = [(512, 288), (1024, 576), (1536, 864), (2048, 1152)];
+pub const SHAPE_LADDER: [(u32, u32); 3] = [(512, 288), (1024, 576), (1536, 864)];
 
 /// Map a legacy square (or otherwise off-ladder) `(w, h)` to the nearest
 /// native-16:9 ladder rung. The three shipped legacy squares map by
@@ -2816,7 +2816,7 @@ pub struct CameraBehavior {
     /// M_NATIVE_ASPECT — analysis (supervisor) frame width, decoupled
     /// from the detector input width. `None` (default) derives the
     /// supervisor width from the resolved detector input width. When set
-    /// it MUST be a native-16:9 ladder rung (512 | 1024 | 1536 | 2048)
+    /// it MUST be a native-16:9 ladder rung (512 | 1024 | 1536)
     /// ≥ the detector input width: the engine analyses at this width and
     /// tiles it into model-sized tiles, giving exact 1:1 tiles with zero
     /// resampling (e.g. supervisor 1536×864 + model 512×288 → a 3×3 grid

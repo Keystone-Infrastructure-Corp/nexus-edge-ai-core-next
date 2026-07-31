@@ -12,7 +12,7 @@ each class index 0..N-1 maps to a prompt in `prompts[]`.
 Run from the workspace root with the model-gen venv active:
 
     source .venv-modelgen/bin/activate
-    # all four shapes in one session:
+    # all three shapes in one session:
     python tools/models/gen_yoloe.py --all-static \\
         --prompts tools/models/yoloe_default_prompts.txt
     # …or one shape at a time:
@@ -26,7 +26,6 @@ Output:
     models/yoloe26_s_512x288.onnx    (~25–35 MB; smaller than YOLO-World v2 s)
     models/yoloe26_s_1024x576.onnx
     models/yoloe26_s_1536x864.onnx
-    models/yoloe26_s_2048x1152.onnx
 
 The prompt file lives under `tools/models/` (tracked) so the prompt
 vocabulary is reproducible; the ONNX itself stays under `models/`
@@ -58,7 +57,7 @@ from typing import List
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = REPO_ROOT / "models"
 # Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k).
-STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864), (2048, 1152))
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864))
 DEFAULT_PROMPTS = Path(__file__).resolve().parent / "yoloe_default_prompts.txt"
 # Ultralytics 8.4.x consolidated the YOLOE release assets on the segmentation
 # checkpoints (`yoloe-26{n,s,l,x}-seg.pt` and `yoloe-v8{s,m,l}-seg.pt`); the
@@ -153,7 +152,7 @@ def upsert_manifest_entry(
         "task": "detect_open_vocab_text",
         "_comment": (
             "YOLOE (small) text-mode export on the native 16:9 ladder "
-            "(512x288 / 1024x576 / 1536x864 / 2048x1152). Prompts are baked "
+            "(512x288 / 1024x576 / 1536x864). Prompts are baked "
             "into the graph at export time; per-camera config picks a subset "
             "at runtime. Regenerate via tools/models/gen_yoloe.py whenever "
             "the prompt vocabulary changes — the manifest sha256 values below "
@@ -334,7 +333,7 @@ def main() -> int:
         type=parse_shape,
         default=(512, 288),
         help="Input shape as WxH (default 512x288). Ladder rung: "
-        "512x288 | 1024x576 | 1536x864 | 2048x1152.",
+        "512x288 | 1024x576 | 1536x864.",
     )
     parser.add_argument(
         "--opset",

@@ -540,7 +540,7 @@ fn default_nms_iou_threshold() -> f32 {
 ///
 /// Strategy:
 ///   1. Try `yolo_world_v2_s_<W>x<H>.onnx`. The release pipeline stages
-///      every native-16:9 ladder rung (512x288 … 2048x1152) so every
+///      every native-16:9 ladder rung (512x288 … 1536x864) so every
 ///      shipped configuration and the per-camera override surface is
 ///      satisfiable.
 ///   2. Any miss is a hard error — silently substituting a different

@@ -17,7 +17,7 @@
 export type ModelShape = {
   readonly w: number;
   readonly h: number;
-  readonly tier: string; // "Standard" | "Long range" | "High detail" | "Maximum"
+  readonly tier: string; // "Standard" | "Long range" | "High detail"
 };
 
 /** The full native-16:9 ladder (exact 16:9 ∩ stride-32). Detector kinds
@@ -26,7 +26,6 @@ export const SHAPE_LADDER: readonly ModelShape[] = [
   { w: 512, h: 288, tier: "Standard" },
   { w: 1024, h: 576, tier: "Long range" },
   { w: 1536, h: 864, tier: "High detail" },
-  { w: 2048, h: 1152, tier: "Maximum" },
 ];
 
 /** Shapes the kind's pack actually ships. Empty means "no shape choice —
@@ -83,8 +82,6 @@ export function describeShape(s: ModelShape): string {
       return "Long range — 1024 × 576 · balanced (64% the cost of the old 960 tier)";
     case "1536x864":
       return "High detail — 1536 × 864 · plate / face detail (81% the cost of the old 1280 tier)";
-    case "2048x1152":
-      return "Maximum — 2048 × 1152 · widest reach";
     default:
       return `${s.tier} — ${s.w} × ${s.h}`;
   }

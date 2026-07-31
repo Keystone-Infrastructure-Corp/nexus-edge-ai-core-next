@@ -134,7 +134,7 @@ The wedge plan that drives the next three phases of work is
   (`gstreamer-webrtc`), test injection (`test-injection`). NEVER add a feature gate via
   `cfg(debug_assertions)` for anything testing-related — use an explicit Cargo feature.
 - **Frame contract is per-camera:** the supervisor (analysis) frame is RGB,
-  16:9, on the native ladder (512×288 / 1024×576 / 1536×864 / 2048×1152 — exact
+  16:9, on the native ladder (512×288 / 1024×576 / 1536×864 — exact
   16:9 ∩ stride-32, W=512k / H=288k). By default its width equals the resolved
   detector input width; a camera may analyse at a *larger* rung via
   `CameraBehavior::supervisor_width` (decoupled from the model input) so the tile

@@ -295,7 +295,7 @@ jobs:
           echo "Staged model pack from $PACK_TAG:"
           ls -la models/
           # Detectors ship as native-16:9 static-shape exports on the
-          # ladder (512x288 / 1024x576 / 1536x864 / 2048x1152). Static
+          # ladder (512x288 / 1024x576 / 1536x864). Static
           # shapes are mandatory for the Intel NPU plugin (silent CPU
           # fallback on dynamic shapes, observed on Lunar Lake k13 under
           # v0.1.18).

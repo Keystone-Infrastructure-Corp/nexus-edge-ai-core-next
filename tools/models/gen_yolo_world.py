@@ -13,8 +13,8 @@ closed-vocab head:
 * **Native 16:9 static exports.** Mirrors `gen_yolo26n.py` — ships
   per-shape static ONNXs on the exact-16:9 ∩ stride-32 ladder
   (W=512k, H=288k): `yolo_world_v2_s_512x288.onnx`,
-  `yolo_world_v2_s_1024x576.onnx`, `yolo_world_v2_s_1536x864.onnx`,
-  `yolo_world_v2_s_2048x1152.onnx`. The 16:9 supervisor frame is no
+  `yolo_world_v2_s_1024x576.onnx`, `yolo_world_v2_s_1536x864.onnx`.
+  The 16:9 supervisor frame is no
   longer stretched into a square tensor — see
   `docs/edge-core/M_NATIVE_ASPECT.md` in the cloud-console repo.
   Static shapes are mandatory for the Intel NPU plugin (which silently
@@ -37,7 +37,6 @@ Output:
     models/yolo_world_v2_s_512x288.onnx    (~50–80 MB)
     models/yolo_world_v2_s_1024x576.onnx   (~50–80 MB)
     models/yolo_world_v2_s_1536x864.onnx   (~50–80 MB)
-    models/yolo_world_v2_s_2048x1152.onnx  (~50–80 MB)
 
 Weights file size is constant w.r.t. input shape — only the activation
 tensors grow at runtime — so each extra shape adds ~50–80 MB to the
@@ -62,7 +61,7 @@ from typing import List
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = REPO_ROOT / "models"
 # Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k).
-STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864), (2048, 1152))
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864))
 DEFAULT_PROMPTS = Path(__file__).resolve().parent / "yolo_world_default_prompts.txt"
 DEFAULT_BASE_MODEL = "yolov8s-worldv2.pt"
 
@@ -156,7 +155,7 @@ def upsert_manifest_entry(
         "task": "detect_open_vocab_text",
         "_comment": (
             "YOLO-World v2 (small) export on the native 16:9 ladder "
-            "(512x288 / 1024x576 / 1536x864 / 2048x1152). Static shapes are "
+            "(512x288 / 1024x576 / 1536x864). Static shapes are "
             "mandatory for the Intel NPU plugin (silent CPU fallback on "
             "dynamic shapes, observed on Lunar Lake k13 under v0.1.18–0.1.20) "
             "and let the OpenVINO blob cache hit on subsequent boots. Prompts "
@@ -342,7 +341,7 @@ def main() -> int:
         type=parse_shape,
         default=(512, 288),
         help="Input shape as WxH (default 512x288). Ladder rung: "
-        "512x288 | 1024x576 | 1536x864 | 2048x1152.",
+        "512x288 | 1024x576 | 1536x864.",
     )
     parser.add_argument(
         "--opset",

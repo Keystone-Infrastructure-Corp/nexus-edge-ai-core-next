@@ -590,18 +590,18 @@ mod tests {
         let cams = vec![cam_640.clone(), cam_960.clone(), cam_1280, cam_960_dup];
         let router = InferenceRouter::build(&cfg, &cams).unwrap();
 
-        // Default cfg is 640×640 mock — so cam_640's identity collides
-        // with the default and we should see exactly three distinct
-        // layers: mock@640x640 (default + cam_640 + cam_960_dup share
-        // none of these, only the default's size), mock@960x960,
-        // mock@1280x1280. Actually only the default layer is at 640,
-        // cam_640's override is its own identity but happens to equal
-        // the default → also collides into one layer.
+        // Default cfg is 512×288 mock (the native-ladder default). The
+        // three camera overrides (640, 960, 1280) are each their own
+        // identity and none collides with the 512×288 default, while
+        // cam_960_dup collides with cam_960 — so we see exactly four
+        // distinct layers: mock@512x288 (default), mock@640x640,
+        // mock@960x960, mock@1280x1280, with no duplicate 960 layer.
         let keys = router.layer_keys();
+        assert!(keys.iter().any(|k| k == "mock@512x288"), "got {keys:?}");
         assert!(keys.iter().any(|k| k == "mock@640x640"), "got {keys:?}");
         assert!(keys.iter().any(|k| k == "mock@960x960"), "got {keys:?}");
         assert!(keys.iter().any(|k| k == "mock@1280x1280"), "got {keys:?}");
-        // Exactly three distinct identities — no duplicate 960 layer.
-        assert_eq!(keys.len(), 3, "got {keys:?}");
+        // Exactly four distinct identities — no duplicate 960 layer.
+        assert_eq!(keys.len(), 4, "got {keys:?}");
     }
 }

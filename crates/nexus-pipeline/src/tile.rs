@@ -368,22 +368,6 @@ mod tests {
                 h: 288
             }
         );
-
-        // supervisor 2048×1152, 2×2 → four 1024×576 tiles (== 1024×576 model)
-        let cells = grid_cells(2048, 1152, TileGridConfig::G2x2);
-        assert_eq!(cells.len(), 4);
-        for cell in &cells {
-            assert_eq!((cell.w, cell.h), (1024, 576), "cell {cell:?} not 1024×576");
-        }
-        assert_eq!(
-            cells[2],
-            TileRoi {
-                x: 0,
-                y: 576,
-                w: 1024,
-                h: 576
-            }
-        );
     }
 
     #[test]

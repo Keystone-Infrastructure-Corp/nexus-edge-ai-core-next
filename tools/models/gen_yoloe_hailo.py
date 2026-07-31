@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate Hailo-8 HEF artifact for the YOLOE text-mode detector.
 
-Four native-16:9 shapes ship: 512x288, 1024x576, 1536x864, 2048x1152.
+Three native-16:9 shapes ship: 512x288, 1024x576, 1536x864.
 Source-of-truth ONNX files MUST exist under `models/` \u2014 generate it first with:
 
     python tools/models/gen_yoloe.py \\
@@ -18,7 +18,6 @@ Output:
     models/yoloe26_s_512x288_hailo.hef
     models/yoloe26_s_1024x576_hailo.hef
     models/yoloe26_s_1536x864_hailo.hef
-    models/yoloe26_s_2048x1152_hailo.hef
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ from gen_hailo_common import (
 
 MODEL_ID = "yoloe26_s"
 # Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k).
-STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864), (2048, 1152))
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864))
 ALLS_DIR = Path(__file__).resolve().parent / "alls"
 
 

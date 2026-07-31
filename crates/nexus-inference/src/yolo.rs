@@ -68,7 +68,6 @@ impl YoloOrtDetector {
     ///   * 512×288   → `yolo26n_512x288.onnx`
     ///   * 1024×576  → `yolo26n_1024x576.onnx`
     ///   * 1536×864  → `yolo26n_1536x864.onnx`
-    ///   * 2048×1152 → `yolo26n_2048x1152.onnx`
     ///
     /// Any other shape hard-fails unless the dev escape hatch
     /// `NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1` is set (then it falls back to
@@ -153,7 +152,7 @@ impl YoloOrtDetector {
 /// Strategy:
 ///   1. Try the exact-shape file (`yolo26n_<W>x<H>.onnx`). This is the
 ///      only path that hits in production — the release tarball stages
-///      every native-16:9 ladder rung (512x288 … 2048x1152) from
+///      every native-16:9 ladder rung (512x288 … 1536x864) from
 ///      `models/`, so every shipped default and every per-camera UI
 ///      override is satisfiable.
 ///   2. **Dev escape hatch only.** Cross-shape fallback (use 512x288
@@ -168,7 +167,7 @@ impl YoloOrtDetector {
 ///      than refusing to start with a clear error pointing at the
 ///      missing file.
 ///   3. With the escape hatch on, try every ladder rung in
-///      512x288 / 1024x576 / 1536x864 / 2048x1152 order.
+///      512x288 / 1024x576 / 1536x864 order.
 ///
 /// Returns `ModelLoad` if no candidate matches (or only an out-of-size
 /// candidate exists with the escape hatch off). The selected path is
@@ -213,7 +212,7 @@ fn resolve_yolo26n_path(
     }
 
     // Dev mode only. Try every ship-shape file.
-    for (w, h) in [(512u32, 288u32), (1024, 576), (1536, 864), (2048, 1152)] {
+    for (w, h) in [(512u32, 288u32), (1024, 576), (1536, 864)] {
         let candidate = pack.join(format!("yolo26n_{w}x{h}.onnx"));
         if candidate.exists() {
             warn!(
@@ -232,7 +231,7 @@ fn resolve_yolo26n_path(
     let listing = list_pack_yolo26n_files(pack);
     Err(InferenceError::ModelLoad(format!(
         "no yolo26n_*.onnx in pack {}; expected yolo26n_{input_w}x{input_h}.onnx \
-         (or one of yolo26n_{{512x288,1024x576,1536x864,2048x1152}}.onnx). Available: [{}]",
+         (or one of yolo26n_{{512x288,1024x576,1536x864}}.onnx). Available: [{}]",
         pack.display(),
         listing
     )))
