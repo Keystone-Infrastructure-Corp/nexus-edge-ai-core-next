@@ -134,34 +134,37 @@ The wedge plan that drives the next three phases of work is
   (`gstreamer-webrtc`), test injection (`test-injection`). NEVER add a feature gate via
   `cfg(debug_assertions)` for anything testing-related — use an explicit Cargo feature.
 - **Frame contract is per-camera:** the supervisor (analysis) frame is RGB,
-  16:9, derived from the resolved detector input width (640→640×360, 960→960×540,
-  1280→1280×720). See `supervisor_frame_for(detector_width)` in
+  16:9, on the native ladder (512×288 / 1024×576 / 1536×864 — exact
+  16:9 ∩ stride-32, W=512k / H=288k). By default its width equals the resolved
+  detector input width; a camera may analyse at a *larger* rung via
+  `CameraBehavior::supervisor_width` (decoupled from the model input) so the tile
+  grid divides the frame into exact model-sized tiles. See
+  `supervisor_frame_for(width)` in
   [crates/nexus-pipeline/src/source.rs](crates/nexus-pipeline/src/source.rs).
   Detector / tracker / re-ID all share one camera's resolution. Clip recording is
   a separate passthrough chain at native camera resolution; bbox coords need
   scaling when overlaying on the MP4 — read per-clip `frame_width`/`frame_height`
   off the tracks API rather than hardcoding any value.
-- **The shipped detector models are square, and the 16:9 frame is stretched to
-  fit them — not letterboxed.** Preprocessing is a plain bilinear resize to
-  (`input_w` × `input_h`) with box coords scaled back by independent
-  `image_dim / input_dim` factors per axis (see the module docs in
-  [crates/nexus-inference/src/yolo.rs](crates/nexus-inference/src/yolo.rs)).
-  Three consequences an agent should not have to re-derive:
-  - ~44% of every input tensor's rows exist only because of that stretch
-    (360 real rows scaled into 640).
-  - Geometry is distorted 1.78× vertically, so anything reasoning about real-world
-    shape or aspect ratio from raw model-space coords is wrong.
-  - Tiles rarely divide the frame evenly — `grid_cells` at 3×3 on a 640×360 frame
-    yields 213 px cells plus a ragged 214 px edge, and each tile is then stretched
-    again to the square input.
+- **The shipped detector models are native 16:9, matching the supervisor frame
+  — no stretch, no letterbox.** Preprocessing is a plain bilinear resize of the
+  16:9 supervisor frame to the model's (`input_w` × `input_h`) 16:9 input, with
+  box coords scaled back by the per-axis `image_dim / input_dim` factors (see the
+  module docs in
+  [crates/nexus-inference/src/yolo.rs](crates/nexus-inference/src/yolo.rs)). The
+  exact-16:9 ∩ stride-32 ladder means:
+  - No invented rows: the model input is 16:9, so the whole tensor is real
+    pixels (the old square inputs stretched a 640×360 frame into 640×640 — ~44%
+    invented rows — that is gone).
+  - Geometry is undistorted: real-world shape / aspect reasoning from model-space
+    coords is now valid.
+  - Tiles divide the frame exactly on the ladder — `grid_cells(1536, 864, G3x3)`
+    yields nine pixel-identical 512×288 tiles (== the 512×288 model input), zero
+    resampling.
 
-  Some docstrings in `source.rs` claim the frame is letterboxed into the model
-  input; that is **wrong** and is scheduled for correction. Note the distinct,
-  genuinely-letterboxed step upstream: `videoscale add-borders=true` letterboxes a
-  non-16:9 *camera* into the 16:9 supervisor frame. Replacing the square inputs
-  with a native-16:9 shape ladder is planned in
-  [M_NATIVE_ASPECT.md](../nexus-cloud-console/docs/edge-core/M_NATIVE_ASPECT.md);
-  until it lands, square inputs are current reality.
+  Note the distinct, genuinely-letterboxed step upstream: `videoscale
+  add-borders=true` letterboxes a non-16:9 *camera* into the 16:9 supervisor
+  frame. The native-16:9 model shapes and the supervisor-decoupling design are in
+  [M_NATIVE_ASPECT.md](../nexus-cloud-console/docs/edge-core/M_NATIVE_ASPECT.md).
 - **UI is `ui/` (Vite 5 + React 18 + TypeScript 5 + Tailwind 3).** Entry point is
   `ui/src/main.tsx`; routes are code-defined with TanStack Router in
   `ui/src/router.tsx`. Layout:

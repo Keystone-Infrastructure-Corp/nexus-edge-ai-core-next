@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use nexus_types::{CameraId, CodecKind, VisualPromptId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 use url::Url;
 
 #[derive(Debug, Error)]
@@ -123,7 +124,8 @@ pub struct Config {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let txt = std::fs::read_to_string(path)?;
-        let cfg: Config = toml::from_str(&txt)?;
+        let mut cfg: Config = toml::from_str(&txt)?;
+        cfg.normalize_shapes();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -140,9 +142,24 @@ impl Config {
     pub fn load_with_compat(path: impl AsRef<Path>) -> Result<(Self, CompatNotice), ConfigError> {
         let txt = std::fs::read_to_string(path)?;
         reject_legacy_auth_mode(&txt)?;
-        let cfg: Config = toml::from_str(&txt)?;
+        let mut cfg: Config = toml::from_str(&txt)?;
+        cfg.normalize_shapes();
         cfg.validate()?;
         Ok((cfg, CompatNotice::default()))
+    }
+
+    /// Remap legacy square (or otherwise off-ladder) detector input
+    /// shapes to the native 16:9 ladder, in place. Applied at load after
+    /// deserialize and before [`Config::validate`]. Never fails — each
+    /// remap emits a `warn!`, and the fleet-config hash bumps once on
+    /// upgrade (intended; see docs/edge-core/M_NATIVE_ASPECT.md §5).
+    pub fn normalize_shapes(&mut self) {
+        self.inference.model.remap_legacy_shapes();
+        for cam in &mut self.cameras {
+            if let Some(m) = cam.detector.model_override.as_mut() {
+                m.remap_legacy_shapes();
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1138,13 +1155,14 @@ pub struct ModelConfig {
     /// | `"classifier_ensemble"` | `"ensemble"` (M3.2 same-camera multi-
     /// detector fan-out — see `members` below) | `"mock"`.
     ///
-    /// `yolo` matches the v1 ship — `models/yolo26n_<size>.onnx` driven
-    /// by a model-pack manifest with 320 / 640 / 1280 presets.
+    /// `yolo` matches the v1 ship — `models/yolo26n_<W>x<H>.onnx` on the
+    /// native 16:9 ladder (512x288 … 1536x864).
     #[serde(default = "default_model_kind")]
     pub kind: String,
     /// Optional model-pack directory containing `models-manifest.json`.
-    /// When set, the engine resolves `preset` against the manifest and
-    /// ignores `input_width` / `input_height`.
+    /// When set, the engine loads the shape-matched artifact
+    /// (`<model>_<W>x<H>.*`) from it, keyed on `input_width` /
+    /// `input_height`.
     ///
     /// `skip_serializing_if` keeps `None` out of the serialized form so the
     /// fleet-config hash (`nexus-engine` `fleet_hash`) matches the cloud's
@@ -1152,8 +1170,10 @@ pub struct ModelConfig {
     /// `pack_path` rather than emitting `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_path: Option<PathBuf>,
-    /// Pack preset name — "320" / "640" / "1280" for the shipped yolo26n
-    /// dynamic model. The CPU profile picks 320, all others pick 640.
+    /// Pack preset label — the canonical `"<W>x<H>"` shape string (e.g.
+    /// "512x288"). A display/label mirror of `input_width`×`input_height`;
+    /// the resolver keys on those two fields, not this string. Legacy
+    /// bare-width presets ("640") are normalized at load.
     #[serde(default = "default_preset")]
     pub preset: String,
     #[serde(default = "default_input_width")]
@@ -1224,6 +1244,35 @@ impl Default for ModelConfig {
     }
 }
 
+impl ModelConfig {
+    /// Remap a legacy square (or off-ladder) input shape to the native
+    /// 16:9 ladder, in place, recursively for ensemble members. Emits a
+    /// `warn!` per remap; never fails. Also normalizes `preset` to the
+    /// canonical `"<W>x<H>"` form the (w,h)-keyed resolver expects, so
+    /// legacy bare-width presets ("640") stop shadowing the real shape.
+    pub fn remap_legacy_shapes(&mut self) {
+        if let Some((w, h)) = remap_to_ladder(self.input_width, self.input_height) {
+            let from = format!("{}x{}", self.input_width, self.input_height);
+            let to = format!("{w}x{h}");
+            warn!(
+                %from,
+                %to,
+                kind = %self.kind,
+                "config: remapped legacy detector input shape to the native 16:9 ladder"
+            );
+            self.input_width = w;
+            self.input_height = h;
+        }
+        let canonical = format!("{}x{}", self.input_width, self.input_height);
+        if self.preset != canonical {
+            self.preset = canonical;
+        }
+        for member in &mut self.members {
+            member.remap_legacy_shapes();
+        }
+    }
+}
+
 fn default_workers() -> usize {
     1
 }
@@ -1254,16 +1303,43 @@ fn default_model_kind() -> String {
     "yolo".into()
 }
 fn default_preset() -> String {
-    "640".into()
+    "512x288".into()
 }
 fn default_input_width() -> u32 {
-    640
+    512
 }
 fn default_input_height() -> u32 {
-    640
+    288
 }
 fn default_score_threshold() -> f32 {
     0.30
+}
+
+/// The native-16:9 shape ladder — exact 16:9 ∩ stride-32 (W=512k, H=288k).
+/// Every shipped detector input shape is one of these rungs.
+pub const SHAPE_LADDER: [(u32, u32); 3] = [(512, 288), (1024, 576), (1536, 864)];
+
+/// Map a legacy square (or otherwise off-ladder) `(w, h)` to the nearest
+/// native-16:9 ladder rung. The three shipped legacy squares map by
+/// intent (640→512×288, 960→1024×576, 1280→1536×864); anything else
+/// snaps to the rung closest in pixel count. Returns `None` when the
+/// shape is already an exact ladder rung.
+fn remap_to_ladder(w: u32, h: u32) -> Option<(u32, u32)> {
+    if SHAPE_LADDER.contains(&(w, h)) {
+        return None;
+    }
+    Some(match (w, h) {
+        (640, 640) => (512, 288),
+        (960, 960) => (1024, 576),
+        (1280, 1280) => (1536, 864),
+        _ => {
+            let target = u64::from(w) * u64::from(h);
+            *SHAPE_LADDER
+                .iter()
+                .min_by_key(|(lw, lh)| (u64::from(*lw) * u64::from(*lh)).abs_diff(target))
+                .expect("SHAPE_LADDER is non-empty")
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2737,6 +2813,18 @@ pub struct CameraBehavior {
     /// — the reconciler only respawns on URL change today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_ttl_secs: Option<u32>,
+    /// M_NATIVE_ASPECT — analysis (supervisor) frame width, decoupled
+    /// from the detector input width. `None` (default) derives the
+    /// supervisor width from the resolved detector input width. When set
+    /// it MUST be a native-16:9 ladder rung (512 | 1024 | 1536)
+    /// ≥ the detector input width: the engine analyses at this width and
+    /// tiles it into model-sized tiles, giving exact 1:1 tiles with zero
+    /// resampling (e.g. supervisor 1536×864 + model 512×288 → a 3×3 grid
+    /// of 512×288 tiles). A value below the detector width is clamped up
+    /// to it. Restart required (read once at supervisor start; the
+    /// reconciler respawns when the supervisor dims change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_width: Option<u32>,
     /// M_PERF_CROWD Phase E1 — adaptive detector cadence under crowd.
     /// Threshold (number of currently-tracked objects, EMA-smoothed)
     /// at or above which `DetectorSkipPolicy` becomes active. When
@@ -3272,6 +3360,85 @@ to = ["ops@example.com"]
             ..Default::default()
         };
         cfg.validate().unwrap();
+    }
+
+    // --- M_NATIVE_ASPECT Phase 5: legacy shape remap ------------------------
+
+    #[test]
+    fn default_model_shape_is_on_the_ladder() {
+        let m = ModelConfig::default();
+        assert_eq!((m.input_width, m.input_height), (512, 288));
+        assert_eq!(m.preset, "512x288");
+        assert!(SHAPE_LADDER.contains(&(m.input_width, m.input_height)));
+    }
+
+    #[test]
+    fn remap_legacy_squares_to_ladder() {
+        for (sq, want) in [
+            ((640u32, 640u32), (512u32, 288u32)),
+            ((960, 960), (1024, 576)),
+            ((1280, 1280), (1536, 864)),
+        ] {
+            let mut m = ModelConfig {
+                input_width: sq.0,
+                input_height: sq.1,
+                preset: sq.0.to_string(),
+                ..Default::default()
+            };
+            m.remap_legacy_shapes();
+            assert_eq!((m.input_width, m.input_height), want, "{sq:?}");
+            assert_eq!(m.preset, format!("{}x{}", want.0, want.1));
+        }
+    }
+
+    #[test]
+    fn remap_off_ladder_square_snaps_to_nearest_rung() {
+        // 320² (102_400 px) is closest to the 512×288 rung (147_456 px).
+        let mut m = ModelConfig {
+            input_width: 320,
+            input_height: 320,
+            preset: "320".into(),
+            ..Default::default()
+        };
+        m.remap_legacy_shapes();
+        assert_eq!((m.input_width, m.input_height), (512, 288));
+        assert_eq!(m.preset, "512x288");
+    }
+
+    #[test]
+    fn remap_is_idempotent_for_ladder_shapes() {
+        let mut m = ModelConfig {
+            input_width: 1536,
+            input_height: 864,
+            preset: "1536x864".into(),
+            ..Default::default()
+        };
+        m.remap_legacy_shapes();
+        assert_eq!((m.input_width, m.input_height), (1536, 864));
+        assert_eq!(m.preset, "1536x864");
+    }
+
+    #[test]
+    fn remap_recurses_into_ensemble_members() {
+        let mut parent = ModelConfig {
+            kind: "ensemble".into(),
+            members: vec![ModelConfig {
+                input_width: 960,
+                input_height: 960,
+                preset: "960".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        parent.remap_legacy_shapes();
+        assert_eq!(
+            (
+                parent.members[0].input_width,
+                parent.members[0].input_height
+            ),
+            (1024, 576)
+        );
+        assert_eq!(parent.members[0].preset, "1024x576");
     }
 
     /// Phase 7.6.6 / REPO_BOUNDARY R5c §5 — the generic LAN device proxy

@@ -88,3 +88,4 @@ path = "src/bin/nexus-inference-worker.rs"
 tokio = { workspace = true }
 url = { workspace = true }
 tempfile = { workspace = true }
+ndarray = { workspace = true }

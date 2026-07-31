@@ -28,6 +28,37 @@ pub enum InferenceError {
     Io(#[from] std::io::Error),
 }
 
+/// Orient a raw detector output tensor to a `[num_anchors, features]`
+/// 2-D plane, transparently handling either export orientation.
+///
+/// YOLO-family "raw" heads (`nms=False`) export the detection tensor as
+/// `[1, features, anchors]` — e.g. `[1, 4+C, N]` — or its transpose
+/// `[1, anchors, features]`. `features` (`4 + num_classes`, tens) is
+/// always far smaller than `anchors` (`N = Σ(W/s · H/s)`, thousands), so
+/// we treat the LONGER axis as the anchor (row) axis.
+///
+/// This is shape-dynamic **by construction** — it never names an anchor
+/// count. It holds for every native-16:9 rung (N = 3024 @ 512×288,
+/// 9576 @ 1024×576, …) exactly as it did for the square N = 8400 @ 640².
+/// A 2-D input is returned as-is; any other rank yields `None`.
+#[cfg(feature = "ort")]
+pub fn orient_pred_rows(view: ndarray::ArrayViewD<'_, f32>) -> Option<ndarray::Array2<f32>> {
+    use ndarray::{s, Ix2};
+    match view.shape().len() {
+        3 => {
+            let (dim1, dim2) = (view.shape()[1], view.shape()[2]);
+            let plane = view.slice(s![0, .., ..]).to_owned();
+            if dim1 >= dim2 {
+                plane.into_dimensionality::<Ix2>().ok()
+            } else {
+                plane.reversed_axes().into_dimensionality::<Ix2>().ok()
+            }
+        }
+        2 => view.to_owned().into_dimensionality::<Ix2>().ok(),
+        _ => None,
+    }
+}
+
 #[async_trait]
 pub trait Detector: Send + Sync {
     /// Run detection on a single frame against an optional prompt list. The

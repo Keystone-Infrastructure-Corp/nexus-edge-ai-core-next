@@ -236,7 +236,10 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             .as_ref()
             .map(|m| m.input_width)
             .unwrap_or(args.default_detector_width);
-        let want_dims = nexus_pipeline::supervisor_frame_for(det_w);
+        // M_NATIVE_ASPECT — supervisor width may be decoupled from the
+        // detector input (clamped up so it never drops below it).
+        let sup_input = cam.behavior.supervisor_width.unwrap_or(det_w).max(det_w);
+        let want_dims = nexus_pipeline::supervisor_frame_for(sup_input);
         match current.get(&cam_id) {
             Some(entry)
                 if entry.url == url

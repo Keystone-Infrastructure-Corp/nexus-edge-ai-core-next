@@ -328,6 +328,48 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    // ---- grid_cells: native-16:9 exact division ----------------------------
+
+    /// M_NATIVE_ASPECT — the native 16:9 ladder rungs are integer
+    /// multiples of each other, so tiling a larger-rung supervisor frame
+    /// produces cells that are pixel-identical to a smaller-rung model
+    /// input (zero resampling). Pins that EVERY cell — not just the
+    /// first — is exactly the model shape for the supported combinations.
+    #[test]
+    fn grid_cells_native_16x9_divide_exactly() {
+        // supervisor 1536×864, 3×3 → nine 512×288 tiles (== 512×288 model)
+        let cells = grid_cells(1536, 864, TileGridConfig::G3x3);
+        assert_eq!(cells.len(), 9);
+        for cell in &cells {
+            assert_eq!((cell.w, cell.h), (512, 288), "cell {cell:?} not 512×288");
+        }
+        assert_eq!(
+            cells[0],
+            TileRoi {
+                x: 0,
+                y: 0,
+                w: 512,
+                h: 288
+            }
+        );
+
+        // supervisor 1024×576, 2×2 → four 512×288 tiles
+        let cells = grid_cells(1024, 576, TileGridConfig::G2x2);
+        assert_eq!(cells.len(), 4);
+        for cell in &cells {
+            assert_eq!((cell.w, cell.h), (512, 288), "cell {cell:?} not 512×288");
+        }
+        assert_eq!(
+            cells[0],
+            TileRoi {
+                x: 0,
+                y: 0,
+                w: 512,
+                h: 288
+            }
+        );
+    }
+
     #[test]
     fn pick_tiles_max_zero_returns_empty() {
         let dets = vec![det_at(100.0, 100.0)];

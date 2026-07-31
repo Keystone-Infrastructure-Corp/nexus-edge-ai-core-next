@@ -417,8 +417,11 @@ def _calibration_loader(calibration_dir: Path, runner):
 def download_public_hef(name: str, dest: Path) -> int:
     """Download a prebuilt HEF from the Hailo Model Zoo S3 mirror.
 
-    Used only by `gen_yolo26n_hailo.py --size 640`. Other sizes +
-    models have no public build and require DFC compilation.
+    Currently unused: every shipped shape is on the native 16:9 ladder
+    (512x288 / 1024x576 / 1536x864) and has no public
+    prebuilt, so all HEFs are compiled locally via the DFC. Retained for
+    the square public-prebuilt path in case a Zoo-supported square shape
+    is ever reintroduced.
     """
 
     url = f"{HAILO_MODEL_ZOO_URL_BASE}/{name}"

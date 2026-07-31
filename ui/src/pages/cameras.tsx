@@ -66,9 +66,12 @@ import { Sheet, SheetSection } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FleetManagedBadge } from "@/components/fleet-managed-badge";
 import {
-  defaultSizeForKind,
-  describeSize,
-  sizesForKind,
+  defaultShapeForKind,
+  describeShape,
+  SHAPE_LADDER,
+  shapeFromKey,
+  shapeKey,
+  shapesForKind,
 } from "@/lib/model-sizes";
 
 const EMPTY_CAMERA: CameraConfig = {
@@ -456,7 +459,42 @@ function CameraEditor({
     const ttlChanged =
       (original?.anchor_ttl_secs ?? null) !==
       (draft.anchor_ttl_secs ?? null);
-    return modelChanged || ttlChanged;
+    // `supervisor_width` respawns the camera (supervisor dims change) —
+    // see reconciler `start_camera`.
+    const supervisorChanged =
+      (original?.supervisor_width ?? null) !== (draft.supervisor_width ?? null);
+    return modelChanged || ttlChanged || supervisorChanged;
+  })();
+
+  // M_NATIVE_ASPECT — live tiling-geometry preview. The supervisor
+  // (analysis) frame can be a larger native-16:9 ladder rung than the
+  // model input; when it divides evenly by the tile grid, each tile is
+  // pixel-identical to the model input (zero resampling).
+  const modelInputW =
+    (draft.model_override as ModelOverride | null)?.input_width ?? 512;
+  const modelInputH =
+    (draft.model_override as ModelOverride | null)?.input_height ?? 288;
+  const supervisorHeight = (w: number) => {
+    const h = Math.floor((w * 9) / 16);
+    return h % 2 === 0 ? h : h + 1;
+  };
+  const tilePreview = (() => {
+    const supW = draft.supervisor_width ?? modelInputW;
+    const supH = supervisorHeight(supW);
+    const cols = draft.tile_grid === "g3x3" ? 3 : 2;
+    const rows = cols;
+    const tileW = Math.floor(supW / cols);
+    const tileH = Math.floor(supH / rows);
+    const exact = tileW === modelInputW && tileH === modelInputH;
+    const maxTiles =
+      typeof draft.tile_max_per_frame === "number"
+        ? draft.tile_max_per_frame
+        : 3;
+    const text = exact
+      ? `Analysis ${supW} × ${supH} · grid ${cols} × ${rows} → tiles ${tileW} × ${tileH} · native 1:1 ✓`
+      : `Analysis ${supW} × ${supH} · grid ${cols} × ${rows} → tiles ${tileW} × ${tileH} → resampled to ${modelInputW} × ${modelInputH} ⚠`;
+    const cost = `Worst case ≈ ${(maxTiles * tileW * tileH).toLocaleString()} px/frame at ${maxTiles} tile(s).`;
+    return { text, cost, exact };
   })();
 
   const mutation = useMutation({
@@ -917,6 +955,154 @@ function CameraEditor({
               </span>
             </div>
           </div>
+
+          {/* M_NATIVE_ASPECT — analysis (supervisor) frame width, decoupled
+              from the model input so tiles divide the frame 1:1. */}
+          <div className="mt-3 flex flex-col gap-1 text-sm">
+            <label
+              htmlFor="supervisor-width"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              Analysis frame (native 16:9)
+            </label>
+            <select
+              id="supervisor-width"
+              value={
+                typeof draft.supervisor_width === "number"
+                  ? String(draft.supervisor_width)
+                  : ""
+              }
+              onChange={(e) => {
+                const v = e.target.value;
+                set("supervisor_width", v === "" ? undefined : Number(v));
+              }}
+              disabled={draft.tile_enabled !== true}
+              className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+            >
+              <option value="">Match model input (default)</option>
+              {SHAPE_LADDER.filter((s) => s.w >= modelInputW).map((s) => (
+                <option key={s.w} value={String(s.w)}>
+                  {s.tier} — {s.w} × {s.h}
+                </option>
+              ))}
+            </select>
+            <span
+              className={
+                tilePreview.exact
+                  ? "text-[11px] text-emerald-600 dark:text-emerald-400"
+                  : "text-[11px] text-amber-600 dark:text-amber-400"
+              }
+            >
+              {tilePreview.text}
+            </span>
+            <span className="text-[11px] text-muted-foreground">
+              {tilePreview.cost}
+            </span>
+          </div>
+
+          {/* M_PERF_CROWD E3 — adaptive detector-input downscale under
+              sustained crowd. Same native-tier vocabulary as the analysis
+              frame above (D6: named tiers, no free-text pixels). */}
+          <div className="mt-3 flex flex-col gap-1 text-sm">
+            <label
+              htmlFor="downscale-target"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              Crowd downscale detector (native 16:9)
+            </label>
+            <select
+              id="downscale-target"
+              value={
+                typeof draft.detector_downscale_to_width === "number"
+                  ? String(draft.detector_downscale_to_width)
+                  : ""
+              }
+              onChange={(e) => {
+                const rung = SHAPE_LADDER.find(
+                  (s) => String(s.w) === e.target.value,
+                );
+                set("detector_downscale_to_width", rung ? rung.w : undefined);
+                set("detector_downscale_to_height", rung ? rung.h : undefined);
+              }}
+              className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+            >
+              <option value="">Off — always full-res</option>
+              {SHAPE_LADDER.filter((s) => s.w < modelInputW).map((s) => (
+                <option key={s.w} value={String(s.w)}>
+                  {s.tier} — {s.w} × {s.h}
+                </option>
+              ))}
+            </select>
+            <span className="text-[11px] text-muted-foreground">
+              Under sustained crowd the detector swaps to this lower-res layer
+              to keep cadence, then swaps back when the scene clears.
+            </span>
+            <div className="mt-1 flex gap-2">
+              <div className="flex flex-1 flex-col gap-1">
+                <label
+                  htmlFor="downscale-threshold"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Crowd threshold (objects)
+                </label>
+                <input
+                  id="downscale-threshold"
+                  type="number"
+                  min={0}
+                  inputMode="numeric"
+                  value={
+                    typeof draft.detector_downscale_crowded_threshold ===
+                    "number"
+                      ? String(draft.detector_downscale_crowded_threshold)
+                      : ""
+                  }
+                  onChange={(e) =>
+                    set(
+                      "detector_downscale_crowded_threshold",
+                      e.target.value === ""
+                        ? undefined
+                        : Number(e.target.value),
+                    )
+                  }
+                  disabled={
+                    typeof draft.detector_downscale_to_width !== "number"
+                  }
+                  className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+                />
+              </div>
+              <div className="flex flex-1 flex-col gap-1">
+                <label
+                  htmlFor="downscale-secs"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Sustained window (s)
+                </label>
+                <input
+                  id="downscale-secs"
+                  type="number"
+                  min={0}
+                  inputMode="numeric"
+                  value={
+                    typeof draft.detector_downscale_sustained_secs === "number"
+                      ? String(draft.detector_downscale_sustained_secs)
+                      : ""
+                  }
+                  onChange={(e) =>
+                    set(
+                      "detector_downscale_sustained_secs",
+                      e.target.value === ""
+                        ? undefined
+                        : Number(e.target.value),
+                    )
+                  }
+                  disabled={
+                    typeof draft.detector_downscale_to_width !== "number"
+                  }
+                  className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
+                />
+              </div>
+            </div>
+          </div>
         </SheetSection>
 
         <SheetSection
@@ -968,9 +1154,9 @@ function ModelOverrideEditor({
   const entries = catalog.data?.kinds ?? [];
   const kind = value?.kind ?? "";
   const selected = entries.find((e) => e.kind === kind);
-  const availableSizes = sizesForKind(kind);
-  const showSizePicker = availableSizes.length > 1;
-  const fixedSize = availableSizes.length === 1 ? availableSizes[0] : undefined;
+  const availableShapes = shapesForKind(kind);
+  const showSizePicker = availableShapes.length > 1;
+  const fixedShape = availableShapes.length === 1 ? availableShapes[0] : undefined;
 
   // Patch helper — merges a partial update, then strips any field that
   // collapsed to `""` / `null` / `undefined` so the wire payload only
@@ -990,9 +1176,9 @@ function ModelOverrideEditor({
     }
   };
 
-  // Snap size fields when the kind changes so we never persist an
-  // (kind, size) combo the engine doesn't ship a file for. Per-kind
-  // size tables live in `lib/model-sizes.ts`.
+  // Snap shape fields when the kind changes so we never persist a
+  // (kind, shape) combo the engine doesn't ship a file for. Per-kind
+  // shape tables live in `lib/model-sizes.ts`.
   const switchKind = (nextKind: string) => {
     if (nextKind === kind) return;
     if (!nextKind) {
@@ -1005,9 +1191,9 @@ function ModelOverrideEditor({
       });
       return;
     }
-    const opts = sizesForKind(nextKind);
+    const opts = shapesForKind(nextKind);
     if (opts.length === 0) {
-      // Single-size or no-size kind: clear size fields and let the engine apply its default.
+      // No-shape kind: clear shape fields and let the engine apply its default.
       patch({
         kind: nextKind,
         preset: undefined,
@@ -1016,17 +1202,21 @@ function ModelOverrideEditor({
       });
       return;
     }
-    const current = value?.input_width;
-    const keep = current && opts.includes(current) ? current : defaultSizeForKind(nextKind);
+    // Keep the current shape if the new kind ships it, else snap to Standard.
+    const curKey =
+      value?.input_width && value?.input_height
+        ? `${value.input_width}x${value.input_height}`
+        : "";
+    const keep = shapeFromKey(nextKind, curKey) ?? defaultShapeForKind(nextKind);
     if (!keep) {
       patch({ kind: nextKind });
       return;
     }
     patch({
       kind: nextKind,
-      preset: String(keep),
-      input_width: keep,
-      input_height: keep,
+      preset: shapeKey(keep),
+      input_width: keep.w,
+      input_height: keep.h,
     });
   };
 
@@ -1073,23 +1263,27 @@ function ModelOverrideEditor({
         <div className="rounded-md border border-border/60 bg-muted/20 p-3 space-y-3">
           <p className="text-xs text-muted-foreground">
             Leave any field blank to inherit the engine default. The
-            router dedups inference layers by <em>(kind, input size)</em>,
-            so structural fields (size, pack path) only take effect when
-            the engine restarts — pick a size that the kind's model
-            registry actually ships.
+            router dedups inference layers by <em>(kind, input shape)</em>,
+            so structural fields (shape, pack path) only take effect when
+            the engine restarts — pick a native-16:9 tier that the kind's
+            model registry actually ships.
           </p>
 
           <div className="space-y-2">
-            <Label htmlFor="cam-model-size">Input size</Label>
+            <Label htmlFor="cam-model-size">Analysis tier</Label>
             {showSizePicker ? (
               <>
                 <select
                   id="cam-model-size"
                   className="h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm"
-                  value={value?.input_width ? String(value.input_width) : ""}
+                  value={
+                    value?.input_width && value?.input_height
+                      ? `${value.input_width}x${value.input_height}`
+                      : ""
+                  }
                   onChange={(e) => {
-                    const raw = e.target.value;
-                    if (raw === "") {
+                    const shape = shapeFromKey(kind, e.target.value);
+                    if (!shape) {
                       // Clear all three coupled fields atomically.
                       patch({
                         preset: undefined,
@@ -1098,37 +1292,38 @@ function ModelOverrideEditor({
                       });
                       return;
                     }
-                    const n = Number(raw);
                     patch({
-                      preset: raw,
-                      input_width: n,
-                      input_height: n,
+                      preset: shapeKey(shape),
+                      input_width: shape.w,
+                      input_height: shape.h,
                     });
                   }}
                 >
                   <option value="">(use tier default)</option>
-                  {availableSizes.map((sz) => (
-                    <option key={sz} value={String(sz)}>
-                      {describeSize(sz)}
+                  {availableShapes.map((s) => (
+                    <option key={shapeKey(s)} value={shapeKey(s)}>
+                      {describeShape(s)}
                     </option>
                   ))}
                 </select>
                 <p className="text-xs text-muted-foreground">
                   The router picks the matching
-                  <code className="mx-1 font-mono">{kind}_&lt;size&gt;.onnx</code>
-                  from the pack at boot. Only sizes the pack actually ships
-                  for this kind are listed — a mismatched size would silently
-                  CPU-fall-back on Intel NPU hardware (engine v0.1.22 hard
-                  fails on missing per-size files instead).
+                  <code className="mx-1 font-mono">{kind}_&lt;W&gt;x&lt;H&gt;.onnx</code>
+                  from the pack at boot. Named native-16:9 tiers only — a
+                  mismatched shape would silently CPU-fall-back on Intel NPU
+                  hardware (the engine hard fails on missing per-shape files
+                  instead).
                 </p>
               </>
-            ) : fixedSize !== undefined ? (
+            ) : fixedShape !== undefined ? (
               <p className="text-xs text-muted-foreground">
-                Fixed at <code className="font-mono">{fixedSize} × {fixedSize}</code>
+                Fixed at{" "}
+                <code className="font-mono">
+                  {fixedShape.w} × {fixedShape.h}
+                </code>
                 {" — "}
-                <code className="font-mono">{kind}</code> ships exactly one
-                per-size variant today. Multi-size export is on the M3.4
-                roadmap (prompt-set rework).
+                <code className="font-mono">{kind}</code> ships a single
+                input shape.
               </p>
             ) : (
               <p className="text-xs text-muted-foreground">

@@ -32,6 +32,9 @@ Thumbs.db
 /*.pt
 /*.onnx
 /mobileclip2_b.ts
+# CLIP text-encoder cache pulled by ultralytics `set_classes` during the
+# YOLO-World / YOLOE prompt-baking export (gen_yolo_world.py, gen_yoloe.py).
+/weights/
 *.db
 *.db-journal
 *.db-wal

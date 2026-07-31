@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use ndarray::{s, Array2, Array4, Ix2};
+use ndarray::{s, Array2, Array4};
 use nexus_config::{CameraConfigUpdate, InferenceConfig};
 use nexus_types::{BBox, CameraId, Detection, Frame, PixelFormat};
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -68,25 +68,20 @@ pub struct YoloWorldDetector {
 
 impl YoloWorldDetector {
     /// Build from an [`InferenceConfig`]. Resolves the ONNX via
-    /// [`resolve_yolo_world_path`] — strict per-size selection
+    /// [`resolve_yolo_world_path`] — strict per-shape selection
     /// mirroring `YoloOrtDetector::from_config`. The vocabulary is
     /// read from the matching entry in `models-manifest.json`.
     ///
-    /// Strict resolution: a camera configured at `(yolo_world, 960)`
-    /// requires `yolo_world_v2_s_960.onnx` to be present in the pack.
-    /// No silent cross-size fallback (which would CPU-fall-back on
-    /// Intel NPU, exactly the trap v0.1.21 closed for yolo26n). The
-    /// one back-compat door: when `input_w == 640` AND the size-
-    /// suffixed file is missing AND the legacy unsuffixed
-    /// `yolo_world_v2_s.onnx` exists, the legacy file is used with a
-    /// loud WARN. That door closes one release after every shipped
-    /// release tarball stops including the legacy file.
+    /// Strict resolution: a camera configured at `(yolo_world, 1024×576)`
+    /// requires `yolo_world_v2_s_1024x576.onnx` to be present in the pack.
+    /// No silent cross-shape fallback (which would CPU-fall-back on
+    /// Intel NPU, exactly the trap v0.1.21 closed for yolo26n).
     pub fn from_config(cfg: &InferenceConfig) -> Result<Self, InferenceError> {
         let pack = cfg.model.pack_path.as_ref().ok_or_else(|| {
             InferenceError::ModelLoad(
                 "yolo-world detector needs inference.model.pack_path; \
                  point it at the directory holding the \
-                 yolo_world_v2_s_<size>.onnx files + models-manifest.json"
+                 yolo_world_v2_s_<W>x<H>.onnx files + models-manifest.json"
                     .into(),
             )
         })?;
@@ -316,27 +311,7 @@ fn run_yolo_world(
     //   [1, 4 + C, N]  where C == len(vocab) and N is the anchor count.
     // We transpose to [N, 4+C] so the row loop matches the closed-vocab path.
     let shape: Vec<usize> = view.shape().to_vec();
-    let pred: Array2<f32> = match shape.len() {
-        3 => {
-            let dim1 = shape[1];
-            let dim2 = shape[2];
-            if dim1 >= dim2 {
-                view.slice(s![0, .., ..])
-                    .to_owned()
-                    .into_dimensionality::<Ix2>()
-                    .ok()
-            } else {
-                view.slice(s![0, .., ..])
-                    .to_owned()
-                    .reversed_axes()
-                    .into_dimensionality::<Ix2>()
-                    .ok()
-            }
-        }
-        2 => view.to_owned().into_dimensionality::<Ix2>().ok(),
-        _ => None,
-    }
-    .ok_or_else(|| {
+    let pred: Array2<f32> = crate::detectors::orient_pred_rows(view).ok_or_else(|| {
         InferenceError::Failed(format!(
             "unexpected output shape {:?} (want 2-D or 3-D)",
             shape
@@ -560,28 +535,18 @@ fn default_nms_iou_threshold() -> f32 {
 }
 
 /// Pick the right `yolo_world_v2_s_*.onnx` inside `pack` for the
-/// requested input size. **Strict by default** — the matching half of
+/// requested input shape. **Strict by default** — the matching half of
 /// what `resolve_yolo26n_path` does for the closed-vocab head.
 ///
 /// Strategy:
-///   1. Try `yolo_world_v2_s_<w>.onnx`. This is the only path that
-///      hits in production from v0.1.22 onward — the release pipeline
-///      stages both `yolo_world_v2_s_640.onnx` (the 640 default) and
-///      `yolo_world_v2_s_960.onnx` (the 960 default) so every
+///   1. Try `yolo_world_v2_s_<W>x<H>.onnx`. The release pipeline stages
+///      every native-16:9 ladder rung (512x288 … 1536x864) so every
 ///      shipped configuration and the per-camera override surface is
 ///      satisfiable.
-///   2. **One-cycle back-compat** — when `input_w == 640` AND the
-///      size-suffixed file is missing AND the legacy unsuffixed
-///      `yolo_world_v2_s.onnx` exists, use the legacy file with a
-///      loud WARN. This door covers operators who already have a
-///      v0.1.21-or-earlier pack staged on disk; it disappears one
-///      release after the workflow stops shipping the unsuffixed file.
-///   3. Any other miss is a hard error — silently substituting a 640
-///      file when 960 was asked for would (a) ship a lower-accuracy
-///      model the operator didn't pick, and (b) on the most likely
-///      target hardware for this combination (Lunar Lake)
-///      degrade silently to CPU. Same trap class fixed in v0.1.21 for
-///      yolo26n on the same hardware.
+///   2. Any miss is a hard error — silently substituting a different
+///      shape would (a) ship a model the operator didn't pick, and (b)
+///      on the most likely target hardware (Lunar Lake) degrade
+///      silently to CPU. Same trap class fixed in v0.1.21 for yolo26n.
 ///
 /// Returns `ModelLoad` if no candidate matches. The selected path is
 /// logged at INFO so the operator can see exactly which ONNX served
@@ -591,46 +556,29 @@ fn resolve_yolo_world_path(
     input_w: u32,
     input_h: u32,
 ) -> Result<PathBuf, InferenceError> {
-    let primary = pack.join(format!("yolo_world_v2_s_{input_w}.onnx"));
+    let primary = pack.join(format!("yolo_world_v2_s_{input_w}x{input_h}.onnx"));
     if primary.exists() {
         info!(
             requested_w = input_w,
             requested_h = input_h,
             chosen = %primary.display(),
-            "yolo-world: picked size-matched ONNX"
+            "yolo-world: picked shape-matched ONNX"
         );
         return Ok(primary);
     }
 
-    // One-cycle back-compat: legacy unsuffixed name was 640-only.
-    if input_w == 640 {
-        let legacy = pack.join("yolo_world_v2_s.onnx");
-        if legacy.exists() {
-            warn!(
-                requested_w = input_w,
-                requested_h = input_h,
-                legacy = %legacy.display(),
-                "yolo-world: falling back to legacy unsuffixed \
-                 yolo_world_v2_s.onnx (pre-v0.1.22 model pack). \
-                 Regenerate the pack with \
-                 `python tools/models/gen_yolo_world.py --all-static` \
-                 — this back-compat path will be removed in a future release."
-            );
-            return Ok(legacy);
-        }
-    }
-
     let listing = list_pack_yolo_world_files(pack);
     Err(InferenceError::ModelLoad(format!(
-        "yolo-world: pack {pack} is missing the size-matched ONNX \
-         `yolo_world_v2_s_{input_w}.onnx`. Available in pack: [{listing}]. \
+        "yolo-world: pack {pack} is missing the shape-matched ONNX \
+         `yolo_world_v2_s_{input_w}x{input_h}.onnx`. Available in pack: [{listing}]. \
          Fix: regenerate the missing file with \
          `python tools/models/gen_yolo_world.py --all-static` and \
-         re-stage the model pack. Silent cross-size fallback is NOT \
+         re-stage the model pack. Silent cross-shape fallback is NOT \
          provided here — on Lunar Lake it silently CPU-falls-back \
          on the Intel NPU plugin, same trap fixed for yolo26n in v0.1.21.",
         pack = pack.display(),
         input_w = input_w,
+        input_h = input_h,
         listing = listing,
     )))
 }
@@ -783,9 +731,9 @@ mod tests {
 
     // --- resolver: strict-pack contract -------------------------------------
     //
-    // Same model as `yolo::tests::resolver_*` — exact-size match in
-    // prod, hard-fail on miss, single one-cycle back-compat door for
-    // pre-v0.1.22 packs that only have the unsuffixed legacy file.
+    // Same model as `yolo::tests::resolver_*` — exact-shape match in
+    // prod, hard-fail on any miss. No cross-shape fallback (Intel NPU
+    // CPU-fallback trap, closed for yolo26n in v0.1.21).
 
     use std::fs;
     use tempfile::TempDir;
@@ -795,43 +743,28 @@ mod tests {
     }
 
     #[test]
-    fn yolo_world_resolver_picks_exact_size_match() {
+    fn yolo_world_resolver_picks_exact_shape_match() {
         let tmp = TempDir::new().unwrap();
         let pack = tmp.path();
-        touch(pack, "yolo_world_v2_s_640.onnx");
-        touch(pack, "yolo_world_v2_s_960.onnx");
+        touch(pack, "yolo_world_v2_s_512x288.onnx");
+        touch(pack, "yolo_world_v2_s_1024x576.onnx");
 
-        let p = resolve_yolo_world_path(pack, 960, 960).unwrap();
-        assert_eq!(p, pack.join("yolo_world_v2_s_960.onnx"));
+        let p = resolve_yolo_world_path(pack, 1024, 576).unwrap();
+        assert_eq!(p, pack.join("yolo_world_v2_s_1024x576.onnx"));
     }
 
     #[test]
-    fn yolo_world_resolver_uses_legacy_unsuffixed_at_640_only() {
+    fn yolo_world_resolver_refuses_cross_shape_fallback() {
         let tmp = TempDir::new().unwrap();
         let pack = tmp.path();
-        touch(pack, "yolo_world_v2_s.onnx");
+        // Pack has 512x288 only.
+        touch(pack, "yolo_world_v2_s_512x288.onnx");
 
-        let p = resolve_yolo_world_path(pack, 640, 640).unwrap();
-        assert_eq!(p, pack.join("yolo_world_v2_s.onnx"));
-    }
-
-    #[test]
-    fn yolo_world_resolver_refuses_legacy_unsuffixed_at_960() {
-        let tmp = TempDir::new().unwrap();
-        let pack = tmp.path();
-        // Pack only has the legacy unsuffixed file (640-only) but
-        // operator asked for 960 — must NOT silently substitute.
-        touch(pack, "yolo_world_v2_s.onnx");
-
-        let err = resolve_yolo_world_path(pack, 960, 960).unwrap_err();
+        let err = resolve_yolo_world_path(pack, 1024, 576).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("yolo_world_v2_s_960.onnx"),
+            msg.contains("yolo_world_v2_s_1024x576.onnx"),
             "error should name the missing file: {msg}"
-        );
-        assert!(
-            msg.contains("yolo_world_v2_s.onnx"),
-            "error should list what IS staged so operators can self-diagnose: {msg}"
         );
         assert!(
             msg.contains("CPU-falls-back"),
@@ -840,26 +773,11 @@ mod tests {
     }
 
     #[test]
-    fn yolo_world_resolver_refuses_cross_size_fallback() {
-        let tmp = TempDir::new().unwrap();
-        let pack = tmp.path();
-        // Pack has 640 only.
-        touch(pack, "yolo_world_v2_s_640.onnx");
-
-        let err = resolve_yolo_world_path(pack, 960, 960).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("yolo_world_v2_s_960.onnx"),
-            "error should name the missing file: {msg}"
-        );
-    }
-
-    #[test]
     fn yolo_world_resolver_hard_fails_on_empty_pack() {
         let tmp = TempDir::new().unwrap();
         let pack = tmp.path();
-        let err = resolve_yolo_world_path(pack, 640, 640).unwrap_err();
+        let err = resolve_yolo_world_path(pack, 512, 288).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("yolo_world_v2_s_640.onnx"), "{msg}");
+        assert!(msg.contains("yolo_world_v2_s_512x288.onnx"), "{msg}");
     }
 }

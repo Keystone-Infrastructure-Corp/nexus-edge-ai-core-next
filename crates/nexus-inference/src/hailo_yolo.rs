@@ -5,15 +5,15 @@
 //!
 //! Wire path:
 //!   * `from_config` defers to `yolo.rs::resolve_hailo_hef`, which
-//!     picks the size-matched `yolo26n_<W>_hailo.hef` (pack v4+) or
-//!     falls back to the legacy `yolo26n.hef` (pack v3). When that
-//!     returns `Some` AND `ep_priority` contains `"hailo"`, this
+//!     picks the shape-matched `yolo26n_<W>x<H>_hailo.hef` on the
+//!     native-16:9 ladder. When that returns `Some` AND `ep_priority`
+//!     contains `"hailo"`, this
 //!     detector is built. Otherwise `build_detector_for_yolo` keeps
 //!     its existing ORT/ONNX path.
 //!   * `open(hef_path, frame_w, frame_h, threshold)` opens a HailoRT
 //!     `InferSession`. The session owns the vdevice + HEF + vstreams.
 //!   * Per-frame: bilinear resize the RGB24 source to the HEF's input
-//!     dims (640×640 / 960×960 / 1280×1280), then `infer_blocking`
+//!     dims (512×288 / 1024×576 / 1536×864), then `infer_blocking`
 //!     returns normalized NMS_BY_CLASS detections decoded into our
 //!     `Detection` wire type via the COCO→domain label map shared
 //!     with `yolo.rs`.
@@ -77,8 +77,8 @@ fn session_cache() -> &'static Mutex<HashMap<PathBuf, Weak<HailoYoloDetector>>> 
 pub struct HailoYoloDetector {
     session: Mutex<InferSession>,
     /// Network input geometry — set from the HEF, not the operator
-    /// config. Reads back as 640×640 / 960×960 / 1280×1280 depending
-    /// on which size HEF the pack staged.
+    /// config. Reads back as 512×288 / 1024×576 / 1536×864
+    /// depending on which shape HEF the pack staged.
     input_w: u32,
     input_h: u32,
     /// Operator-supplied threshold applied AFTER on-chip NMS — the
@@ -92,9 +92,9 @@ pub struct HailoYoloDetector {
 impl HailoYoloDetector {
     /// Build from a resolved [`InferenceConfig`]. Caller must have
     /// already established that the pack-resolved HEF
-    /// (`yolo26n_<W>_hailo.hef` or legacy `yolo26n.hef`) exists —
-    /// the dispatcher in `crate::yolo::build_detector_for_yolo` does
-    /// that check before calling.
+    /// (`yolo26n_<W>x<H>_hailo.hef`) exists — the dispatcher in
+    /// `crate::yolo::build_detector_for_yolo` does that check before
+    /// calling.
     pub fn from_config(cfg: &InferenceConfig, hef_path: &Path) -> Result<Self, InferenceError> {
         Self::open(hef_path, cfg.model.score_threshold)
     }

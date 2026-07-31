@@ -22,7 +22,7 @@
 #   3. Commit + push.
 #   4. `gh release create models-vN --prerelease --title "Model pack vN"`
 #      `gh release upload models-vN models/yolo26n_*.onnx \`
-#         `models/yolo_world_v2_s_*.onnx models/yoloe26_s.onnx \`
+#         `models/yolo_world_v2_s_*.onnx models/yoloe26_s_*.onnx \`
 #         `models/dinov2_s_224.onnx \`
 #         `models/models-manifest.json`
 #
@@ -112,6 +112,12 @@ jobs:
   rtp-plugin:
     name: build rtpgccbwe plugin (gst-plugins-rs)
     runs-on: ubuntu-24.04
+    # Engine releases only. `models-*` tags are data-only model-pack releases
+    # (see header) reused by every engine cut — they must not stamp their tag
+    # into Cargo.toml's `version` or build an engine tarball. Without this
+    # guard, publishing `models-vN` fails the run at the version stamp
+    # ("unexpected character 'm' while parsing major version number").
+    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') }}
     steps:
       - uses: dtolnay/rust-toolchain@stable
 
@@ -161,6 +167,10 @@ jobs:
     name: build + attach bare-metal tarball
     runs-on: ubuntu-22.04
     needs: rtp-plugin
+    # Engine releases only — skip data-only `models-*` model-pack tags (the
+    # `register release with cloud orchestrator` job `needs: tarball`, so it
+    # skips too). See the rtp-plugin guard above for the rationale.
+    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') }}
     env:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       ORT_VERSION: "1.24.1"
@@ -235,7 +245,7 @@ jobs:
       #   3. Commit + push.
       #   4. `gh release create models-vN --prerelease --title "Model pack vN"`
       #      `gh release upload models-vN models/yolo26n_*.onnx \`
-      #         `models/yolo_world_v2_s_*.onnx models/yoloe26_s.onnx \`
+      #         `models/yolo_world_v2_s_*.onnx models/yoloe26_s_*.onnx \`
       #         `models/dinov2_s_224.onnx \`
       #         `models/models-manifest.json`
       #
@@ -271,12 +281,9 @@ jobs:
           # committed copy that actions/checkout placed on disk.
           gh release download "$PACK_TAG" \
             --repo "${{ github.repository }}" \
-            --pattern 'yolo26n_640.onnx' \
-            --pattern 'yolo26n_960.onnx' \
-            --pattern 'yolo26n_1280.onnx' \
-            --pattern 'yolo_world_v2_s_640.onnx' \
-            --pattern 'yolo_world_v2_s_960.onnx' \
-            --pattern 'yoloe26_s.onnx' \
+            --pattern 'yolo26n_*x*.onnx' \
+            --pattern 'yolo_world_v2_s_*x*.onnx' \
+            --pattern 'yoloe26_s_*x*.onnx' \
             --pattern 'dinov2_s_224.onnx' \
             --pattern 'yolo26n_*_hailo.hef' \
             --pattern 'yolo_world_v2_s_*_hailo.hef' \
@@ -287,11 +294,11 @@ jobs:
             --clobber
           echo "Staged model pack from $PACK_TAG:"
           ls -la models/
-          # yolo26n ships as three per-size static-shape exports (640/960/1280).
-          # Per-profile defaults: 640 (iGPU/Hailo), 960 (NPU/dGPU); 1280 is the
-          # per-camera UI override for plate/face work. Static shapes are
-          # mandatory for the Intel NPU plugin (silent CPU fallback on
-          # dynamic shapes, observed on Lunar Lake k13 under v0.1.18).
+          # Detectors ship as native-16:9 static-shape exports on the
+          # ladder (512x288 / 1024x576 / 1536x864). Static
+          # shapes are mandatory for the Intel NPU plugin (silent CPU
+          # fallback on dynamic shapes, observed on Lunar Lake k13 under
+          # v0.1.18).
           #
           # dinov2_s_224.onnx is the Phase 5.6 appearance-embedding
           # backbone (Meta facebook/dinov2-small, Apache-2.0). 384-dim
@@ -305,9 +312,14 @@ jobs:
           # `python tools/models/gen_*_hailo.py` after acquiring DFC,
           # then `gh release upload models-vN models/*_hailo.hef`. We
           # only check the ONNX files in the required-files loop below.
-          for f in yolo26n_640.onnx yolo26n_960.onnx yolo26n_1280.onnx yolo_world_v2_s_640.onnx yolo_world_v2_s_960.onnx yoloe26_s.onnx dinov2_s_224.onnx models-manifest.json; do
+          # The required ONNX set is derived from models-manifest.json
+          # (the single source of truth; jq is pre-installed on the
+          # GitHub runner image) so a NEW native-16:9 shape can never be
+          # silently absent from the pack. HEFs stay tolerated-missing.
+          required_onnx=$(jq -r '.models[].artifacts[] | select(.backend=="onnx") | .path' models/models-manifest.json | sort -u)
+          for f in $required_onnx models-manifest.json; do
             if [ ! -s "models/$f" ]; then
-              echo "::error::Required model asset 'models/$f' missing from release $PACK_TAG. Upload via 'gh release upload $PACK_TAG models/$f' (or bump pack_version in models/models-manifest.json to a release that has it)."
+              echo "::error::Required model asset 'models/$f' missing from release $PACK_TAG (expected per models-manifest.json). Upload via 'gh release upload $PACK_TAG models/$f' (or bump pack_version in models/models-manifest.json to a release that has it)."
               exit 1
             fi
           done
@@ -484,14 +496,15 @@ jobs:
           # extractor (model_id "dinov2-s-v1") instead of falling back
           # to the mock (model_id "mock_dinov2-s-v1") which the cloud
           # edge-gateway allowlist correctly rejects.
-          cp -a models/yolo26n_640.onnx \
-                models/yolo26n_960.onnx \
-                models/yolo26n_1280.onnx \
-                models/yolo_world_v2_s_640.onnx \
-                models/yolo_world_v2_s_960.onnx \
-                models/yoloe26_s.onnx \
-                models/dinov2_s_224.onnx \
-                models/models-manifest.json "$R/share/models/"
+          # ONNX set is manifest-driven (single source of truth, jq
+          # pre-installed on the runner) so a new native-16:9 shape is
+          # staged automatically. The required-files check above already
+          # verified every one of these exists on disk.
+          onnx=()
+          while IFS= read -r p; do onnx+=("models/$p"); done < <(
+              jq -r '.models[].artifacts[] | select(.backend=="onnx") | .path' models/models-manifest.json | sort -u
+          )
+          cp -a "${onnx[@]}" models/models-manifest.json "$R/share/models/"
           # Hailo-8 HEFs (pack v4+) — tolerated-missing per the pattern
           # whitelist in the download step. Operators on non-Hailo boxes
           # never look at these files; on Hailo boxes the engine resolves

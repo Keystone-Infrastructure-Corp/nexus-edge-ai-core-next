@@ -1,34 +1,39 @@
 #!/usr/bin/env python3
 """
 Generate the closed-vocab YOLOv26-nano ONNX detectors that power M1's
-`YoloOrtDetector`. As of v0.1.19 the engine ships three STATIC-shape
-exports — `yolo26n_640.onnx`, `yolo26n_960.onnx`, `yolo26n_1280.onnx` —
-one per supported input size (matched to per-profile defaults and the
-per-camera size override). Static shapes are mandatory for the Intel
-NPU plugin (which silently falls back to CPU on dynamic-shape models)
-and let the OpenVINO blob cache hit on every subsequent boot. The
-older `yolo26n_dynamic.onnx` is deprecated; the dynamic export mode
-is preserved here only for niche dev workflows.
+`YoloOrtDetector`. The engine ships STATIC-shape exports on the native
+16:9 ladder — `yolo26n_512x288.onnx`, `yolo26n_1024x576.onnx`,
+`yolo26n_1536x864.onnx` — one per supported
+input shape (matched to per-profile defaults and the per-camera shape
+override). Every shape is exact 16:9 with both dimensions multiples of
+32 (W=512k, H=288k), so the detector no longer stretches the 16:9
+supervisor frame into a square tensor. See
+`docs/edge-core/M_NATIVE_ASPECT.md` in the cloud-console repo.
+
+Static shapes are mandatory for the Intel NPU plugin (which silently
+falls back to CPU on dynamic-shape models) and let the OpenVINO blob
+cache hit on every subsequent boot. The legacy `yolo26n_dynamic.onnx`
+dynamic export is retired.
 
 Run from the workspace root with the model-gen venv active:
 
     source .venv-modelgen/bin/activate
     # Generate all three static models in one ultralytics session
-    # (saves ~30s of import + checkpoint-load overhead vs. 3 invocations):
+    # (saves ~30s of import + checkpoint-load overhead vs. 4 invocations):
     python tools/models/gen_yolo26n.py --all-static
     # …or one at a time:
-    python tools/models/gen_yolo26n.py --static --imgsz 640
-    python tools/models/gen_yolo26n.py --static --imgsz 960
-    python tools/models/gen_yolo26n.py --static --imgsz 1280
+    python tools/models/gen_yolo26n.py --static --shape 512x288
+    python tools/models/gen_yolo26n.py --static --shape 1024x576
+    python tools/models/gen_yolo26n.py --static --shape 1536x864
 
 Each invocation patches the matching `artifacts[].sha256` entry in
 `models/models-manifest.json` so the engine's load-time checksum
 verification (when wired) sees fresh values.
 
 Outputs:
-    models/yolo26n_640.onnx   (1×3×640×640, 1ch image input → output0 [1,300,6])
-    models/yolo26n_960.onnx
-    models/yolo26n_1280.onnx
+    models/yolo26n_512x288.onnx    (1×3×288×512, image input → output0 [1,300,6])
+    models/yolo26n_1024x576.onnx
+    models/yolo26n_1536x864.onnx
 """
 
 from __future__ import annotations
@@ -43,20 +48,33 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = REPO_ROOT / "models"
-DYNAMIC_OUTPUT = MODELS_DIR / "yolo26n_dynamic.onnx"
-STATIC_SIZES = (640, 960, 1280)
+# Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k). The only
+# family that satisfies both YOLO's multiple-of-32 rule and exact 16:9.
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864))
 
 
-def static_output_for(imgsz: int) -> Path:
-    """Where the static-mode export writes the per-size ONNX."""
+def parse_shape(text: str) -> tuple[int, int]:
+    """Parse a `WxH` shape string (e.g. "512x288") into `(w, h)`."""
 
-    return MODELS_DIR / f"yolo26n_{imgsz}.onnx"
+    try:
+        w_str, h_str = text.lower().split("x", 1)
+        return int(w_str), int(h_str)
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --shape {text!r}; expected WxH like 512x288"
+        )
 
 
-def static_artifact_path(imgsz: int) -> str:
-    """The `path` field in `models-manifest.json` for this size."""
+def static_output_for(w: int, h: int) -> Path:
+    """Where the static-mode export writes the per-shape ONNX."""
 
-    return f"yolo26n_{imgsz}.onnx"
+    return MODELS_DIR / f"yolo26n_{w}x{h}.onnx"
+
+
+def static_artifact_path(w: int, h: int) -> str:
+    """The `path` field in `models-manifest.json` for this shape."""
+
+    return f"yolo26n_{w}x{h}.onnx"
 
 
 def sha256_file(path: Path) -> str:
@@ -96,22 +114,22 @@ def update_manifest_sha(model_id: str, artifact_path: str, new_sha: str) -> None
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Export yolo26n ONNX (static or dynamic)")
+    parser = argparse.ArgumentParser(description="Export yolo26n ONNX (static shapes)")
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
         help=(
-            "Override the output ONNX path. Defaults: static → "
-            "models/yolo26n_<imgsz>.onnx; dynamic → models/yolo26n_dynamic.onnx."
+            "Override the output ONNX path. Default: "
+            "models/yolo26n_<W>x<H>.onnx."
         ),
     )
     parser.add_argument(
-        "--imgsz",
-        type=int,
-        default=640,
-        help="Input size in pixels (default 640). Static mode pins to this; "
-        "dynamic mode uses it only as the anchor for the dynamic axes.",
+        "--shape",
+        type=parse_shape,
+        default=(512, 288),
+        help="Input shape as WxH (default 512x288). Static mode pins to this. "
+        "Must be a native-16:9 ladder rung: 512x288 | 1024x576 | 1536x864.",
     )
     parser.add_argument(
         "--opset",
@@ -123,27 +141,21 @@ def main() -> int:
     mode.add_argument(
         "--static",
         action="store_true",
-        help="Export a static-shape ONNX (1x3x<imgsz>x<imgsz>). Required for "
+        help="Export a single static-shape ONNX (1x3xHxW). Required for "
         "the Intel NPU plugin and for OpenVINO blob caching to hit.",
     )
     mode.add_argument(
         "--all-static",
         action="store_true",
-        help=f"Generate all three static-shape ONNXs in one ultralytics session: "
-        f"{', '.join(str(s) for s in STATIC_SIZES)}. Saves the import + checkpoint "
-        f"load overhead vs. three separate invocations.",
-    )
-    mode.add_argument(
-        "--dynamic",
-        action="store_true",
-        help="Export the legacy dynamic-axis ONNX (yolo26n_dynamic.onnx). "
-        "Kept for niche dev workflows — production releases ship the three static models.",
+        help="Generate all four static-shape ONNXs in one ultralytics session: "
+        + ", ".join(f"{w}x{h}" for w, h in STATIC_SHAPES)
+        + ". Saves the import + checkpoint load overhead vs. four separate invocations.",
     )
     args = parser.parse_args()
 
     # Default mode if none requested: --all-static. Matches what the release
     # workflow expects to find uploaded against a tag.
-    if not (args.static or args.all_static or args.dynamic):
+    if not (args.static or args.all_static):
         args.all_static = True
 
     try:
@@ -160,36 +172,21 @@ def main() -> int:
         print(f"[gen_yolo26n] ERROR: checkpoint load failed: {ex}")
         return 1
 
-    sizes: list[int]
+    shapes: list[tuple[int, int]]
     if args.all_static:
-        sizes = list(STATIC_SIZES)
-    elif args.static:
-        sizes = [args.imgsz]
-    else:
-        sizes = []  # dynamic path below
+        shapes = list(STATIC_SHAPES)
+    else:  # args.static
+        shapes = [args.shape]
 
-    for sz in sizes:
-        output = args.output if (args.output and not args.all_static) else static_output_for(sz)
+    for w, h in shapes:
+        output = args.output if (args.output and not args.all_static) else static_output_for(w, h)
         rc = export_one(
             model,
-            imgsz=sz,
+            w=w,
+            h=h,
             opset=args.opset,
-            dynamic=False,
             output=output,
-            manifest_artifact=static_artifact_path(sz),
-        )
-        if rc != 0:
-            return rc
-
-    if args.dynamic:
-        output = args.output or DYNAMIC_OUTPUT
-        rc = export_one(
-            model,
-            imgsz=args.imgsz,
-            opset=args.opset,
-            dynamic=True,
-            output=output,
-            manifest_artifact="yolo26n_dynamic.onnx",
+            manifest_artifact=static_artifact_path(w, h),
         )
         if rc != 0:
             return rc
@@ -200,24 +197,25 @@ def main() -> int:
 def export_one(
     model,
     *,
-    imgsz: int,
+    w: int,
+    h: int,
     opset: int,
-    dynamic: bool,
     output: Path,
     manifest_artifact: str,
 ) -> int:
     """Run one ultralytics export → copy to `output` → patch manifest sha."""
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    shape = f"1x3x{imgsz}x{imgsz}" if not dynamic else f"Bx3xHxW (anchor {imgsz})"
+    shape = f"1x3x{h}x{w}"
     print(f"[gen_yolo26n] exporting ({shape}, opset={opset}) → {output}")
 
     try:
+        # ultralytics takes imgsz as [height, width] — height first.
         model.export(
             format="onnx",
-            dynamic=dynamic,
+            dynamic=False,
             opset=opset,
-            imgsz=imgsz,
+            imgsz=[h, w],
         )
     except Exception as ex:  # noqa: BLE001
         print(f"[gen_yolo26n] ERROR: export failed: {ex}")

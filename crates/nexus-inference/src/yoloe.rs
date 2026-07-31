@@ -75,20 +75,21 @@ pub struct YoloeDetector {
 
 impl YoloeDetector {
     /// Build from an [`InferenceConfig`]. Resolves the ONNX as
-    /// `model.pack_path / yoloe26_s.onnx` and the vocabulary from
-    /// the matching entry in `models-manifest.json`. Returns an error
-    /// any other way so we never silently fall through to a mock under
-    /// prod config — same contract as `YoloOrtDetector::from_config`.
+    /// `model.pack_path / yoloe26_s_<W>x<H>.onnx` (native-16:9 ladder)
+    /// and the vocabulary from the matching entry in
+    /// `models-manifest.json`. Returns an error any other way so we
+    /// never silently fall through to a mock under prod config — same
+    /// contract as `YoloOrtDetector::from_config`.
     pub fn from_config(cfg: &InferenceConfig) -> Result<Self, InferenceError> {
         let pack = cfg.model.pack_path.as_ref().ok_or_else(|| {
             InferenceError::ModelLoad(
                 "yoloe detector needs inference.model.pack_path; \
-                 point it at the directory holding yoloe26_s.onnx + \
+                 point it at the directory holding yoloe26_s_<W>x<H>.onnx + \
                  models-manifest.json"
                     .into(),
             )
         })?;
-        let onnx_path = pack.join("yoloe26_s.onnx");
+        let onnx_path = resolve_yoloe_path(pack, cfg.model.input_width, cfg.model.input_height)?;
         let manifest_path = pack.join("models-manifest.json");
         let vocab = load_vocab_from_manifest(&manifest_path, "yoloe26_s")?;
         Self::open(
@@ -189,6 +190,58 @@ impl YoloeDetector {
         out.sort_unstable();
         out.dedup();
         out
+    }
+}
+
+/// Pick the shape-matched `yoloe26_s_<W>x<H>.onnx` inside `pack`.
+/// Strict — mirrors `resolve_yolo_world_path`; no cross-shape fallback
+/// (Intel NPU CPU-fallback trap, closed for yolo26n in v0.1.21).
+fn resolve_yoloe_path(pack: &Path, input_w: u32, input_h: u32) -> Result<PathBuf, InferenceError> {
+    let primary = pack.join(format!("yoloe26_s_{input_w}x{input_h}.onnx"));
+    if primary.exists() {
+        info!(
+            requested_w = input_w,
+            requested_h = input_h,
+            chosen = %primary.display(),
+            "yoloe: picked shape-matched ONNX"
+        );
+        return Ok(primary);
+    }
+
+    let listing = list_pack_yoloe_files(pack);
+    Err(InferenceError::ModelLoad(format!(
+        "yoloe: pack {pack} is missing the shape-matched ONNX \
+         `yoloe26_s_{input_w}x{input_h}.onnx`. Available in pack: [{listing}]. \
+         Fix: regenerate the missing file with \
+         `python tools/models/gen_yoloe.py --all-static` and re-stage \
+         the model pack. Silent cross-shape fallback is NOT provided \
+         here — on Lunar Lake it silently CPU-falls-back on the Intel \
+         NPU plugin, same trap fixed for yolo26n in v0.1.21.",
+        pack = pack.display(),
+        input_w = input_w,
+        input_h = input_h,
+        listing = listing,
+    )))
+}
+
+/// Enumerate the `yoloe26_s*.onnx` files present in a pack, for
+/// self-diagnosing resolver errors.
+fn list_pack_yoloe_files(pack: &Path) -> String {
+    let mut found: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(pack) {
+        for ent in entries.flatten() {
+            if let Some(name) = ent.file_name().to_str() {
+                if name.starts_with("yoloe26_s") && name.ends_with(".onnx") {
+                    found.push(name.to_string());
+                }
+            }
+        }
+    }
+    found.sort();
+    if found.is_empty() {
+        "<none>".to_string()
+    } else {
+        found.join(", ")
     }
 }
 
@@ -359,29 +412,10 @@ fn run_yoloe(
         ));
     }
 
-    // Path (a): raw YOLOv8 head — shape [1, 4 + C, N]; transpose to
-    // [N, 4+C] so the row loop matches the closed-vocab YOLO path.
-    let pred: Array2<f32> = match shape.len() {
-        3 => {
-            let dim1 = shape[1];
-            let dim2 = shape[2];
-            if dim1 >= dim2 {
-                view.slice(s![0, .., ..])
-                    .to_owned()
-                    .into_dimensionality::<Ix2>()
-                    .ok()
-            } else {
-                view.slice(s![0, .., ..])
-                    .to_owned()
-                    .reversed_axes()
-                    .into_dimensionality::<Ix2>()
-                    .ok()
-            }
-        }
-        2 => view.to_owned().into_dimensionality::<Ix2>().ok(),
-        _ => None,
-    }
-    .ok_or_else(|| {
+    // Path (a): raw YOLOv8 head — shape [1, 4 + C, N]; orient to
+    // [N, 4+C] so the row loop matches the closed-vocab YOLO path
+    // (shape-dynamic — see `orient_pred_rows`).
+    let pred: Array2<f32> = crate::detectors::orient_pred_rows(view).ok_or_else(|| {
         InferenceError::Failed(format!(
             "unexpected output shape {:?} (want 2-D or 3-D)",
             shape

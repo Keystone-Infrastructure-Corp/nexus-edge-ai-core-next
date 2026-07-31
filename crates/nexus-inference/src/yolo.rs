@@ -1,7 +1,7 @@
 //! Real ORT-backed YOLO detector.
 //!
 //! Mirrors the v1 `nexus-edge-ai-core` `YoloDetector` close enough that
-//! the same models/yolo26n_<size>.onnx + same COCO→domain label table
+//! the same models/yolo26n_<W>x<H>.onnx + same COCO→domain label table
 //! produces equivalent detections — only the host language changes.
 //!
 //! Wiring (gated by the `ort` cargo feature):
@@ -24,7 +24,7 @@
 //!     - ≥85     → YOLOv5: `[cx, cy, w, h, objectness, c0..cN]`
 //!     - else    → YOLOv8: `[cx, cy, w, h, c0..cN]`
 //!
-//!     The shipped `yolo26n_<size>.onnx` exports are NMS-free (6 cols),
+//!     The shipped `yolo26n_<W>x<H>.onnx` exports are NMS-free (6 cols),
 //!     so that's the hot path.
 //!
 //!   * Filtering: confidence threshold + COCO→domain label mapping. Every
@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ndarray::{s, Array2, Array4, Ix2};
+use ndarray::{s, Array2, Array4};
 use nexus_config::InferenceConfig;
 use nexus_types::{BBox, Detection, Frame, PixelFormat};
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -61,17 +61,19 @@ pub struct YoloOrtDetector {
 
 impl YoloOrtDetector {
     /// Build from a resolved [`InferenceConfig`]. Picks the ONNX artifact
-    /// inside `model.pack_path` by matching the configured `input_width`
-    /// against the per-size files the engine ships:
+    /// inside `model.pack_path` by matching the configured
+    /// `(input_width, input_height)` against the native-16:9 ladder
+    /// files the engine ships:
     ///
-    ///   * 640  → `yolo26n_640.onnx`
-    ///   * 960  → `yolo26n_960.onnx`
-    ///   * 1280 → `yolo26n_1280.onnx`
+    ///   * 512×288   → `yolo26n_512x288.onnx`
+    ///   * 1024×576  → `yolo26n_1024x576.onnx`
+    ///   * 1536×864  → `yolo26n_1536x864.onnx`
     ///
-    /// Any other size falls back to whichever per-size file exists, then
-    /// to the legacy `yolo26n_dynamic.onnx` (preserved for niche dev
-    /// workflows). Returns `ModelLoad` if none of the candidates exist —
-    /// we never silently fall back to mock under prod config.
+    /// Any other shape hard-fails unless the dev escape hatch
+    /// `NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1` is set (then it falls back to
+    /// whichever ladder file exists). Returns `ModelLoad` if none of the
+    /// candidates exist — we never silently fall back to mock under prod
+    /// config.
     ///
     /// Note: static-shape ONNX is mandatory for the Intel NPU plugin
     /// (which otherwise silently routes every op to CPU, observed on
@@ -81,7 +83,7 @@ impl YoloOrtDetector {
         let pack = cfg.model.pack_path.as_ref().ok_or_else(|| {
             InferenceError::ModelLoad(
                 "yolo detector needs inference.model.pack_path; \
-                 point it at the directory holding the yolo26n_<size>.onnx files"
+                 point it at the directory holding the yolo26n_<W>x<H>.onnx files"
                     .into(),
             )
         })?;
@@ -144,29 +146,28 @@ impl YoloOrtDetector {
     }
 }
 
-/// Pick the right `yolo26n_*.onnx` inside `pack` for the requested input
-/// size. **Strict by default**: only the exact-size file matches.
+/// Pick the right `yolo26n_<W>x<H>.onnx` inside `pack` for the requested
+/// input shape. **Strict by default**: only the exact-shape file matches.
 ///
 /// Strategy:
-///   1. Try the exact-size file (`yolo26n_<w>.onnx`). This is the only
-///      path that hits in production — the release tarball stages
-///      `yolo26n_640.onnx`, `yolo26n_960.onnx`, and `yolo26n_1280.onnx`
-///      from `models/`, so every shipped default and every
-///      per-camera UI override is satisfiable.
-///   2. **Dev escape hatch only.** Cross-size fallback (use 640 when
-///      960 was asked for, etc.) and the legacy
-///      `yolo26n_dynamic.onnx` file are gated behind
+///   1. Try the exact-shape file (`yolo26n_<W>x<H>.onnx`). This is the
+///      only path that hits in production — the release tarball stages
+///      every native-16:9 ladder rung (512x288 … 1536x864) from
+///      `models/`, so every shipped default and every per-camera UI
+///      override is satisfiable.
+///   2. **Dev escape hatch only.** Cross-shape fallback (use 512x288
+///      when 1024x576 was asked for, etc.) is gated behind
 ///      `NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1`. The reason: when an
-///      operator configures a camera at 960 on Lunar Lake but
-///      only the 640 file is staged, silently degrading to 640
-///      either (a) ships a lower-accuracy model the operator did NOT
-///      pick, or (b) routes the model through the dynamic-shape
-///      pathway which the Intel NPU plugin silently shunts to CPU
-///      (observed on Lunar Lake k13 under v0.1.18–v0.1.20). Both are
-///      worse failure modes than refusing to start with a clear
-///      error pointing at the missing file.
-///   3. With the escape hatch on, try every ship-size in 640/960/1280
-///      order, then `yolo26n_dynamic.onnx`.
+///      operator configures a camera at 1024x576 on Lunar Lake but
+///      only the 512x288 file is staged, silently degrading either
+///      (a) ships a lower-accuracy model the operator did NOT pick, or
+///      (b) routes the model through a mismatched-shape pathway which
+///      the Intel NPU plugin silently shunts to CPU (observed on Lunar
+///      Lake k13 under v0.1.18–v0.1.20). Both are worse failure modes
+///      than refusing to start with a clear error pointing at the
+///      missing file.
+///   3. With the escape hatch on, try every ladder rung in
+///      512x288 / 1024x576 / 1536x864 order.
 ///
 /// Returns `ModelLoad` if no candidate matches (or only an out-of-size
 /// candidate exists with the escape hatch off). The selected path is
@@ -177,28 +178,27 @@ fn resolve_yolo26n_path(
     input_w: u32,
     input_h: u32,
 ) -> Result<PathBuf, InferenceError> {
-    // Square inputs only — the shipped exports are 1×3×N×N. Non-square
-    // is a latent dev case; pick the per-width file and let the
-    // preprocessor handle the asymmetric stretch (it does anyway).
-    let primary = pack.join(format!("yolo26n_{input_w}.onnx"));
+    // Native 16:9 shapes — the shipped exports are 1×3×H×W on the
+    // exact-16:9 ∩ stride-32 ladder. Pick the shape-matched file.
+    let primary = pack.join(format!("yolo26n_{input_w}x{input_h}.onnx"));
     if primary.exists() {
         info!(
             requested_w = input_w,
             requested_h = input_h,
             chosen = %primary.display(),
-            "yolo: picked size-matched ONNX"
+            "yolo: picked shape-matched ONNX"
         );
         return Ok(primary);
     }
 
     // From here down: only reachable when the operator's pack is
-    // missing the size they asked for. That is a misconfiguration. Hard
+    // missing the shape they asked for. That is a misconfiguration. Hard
     // fail unless the dev escape hatch is set.
     if !size_fallback_allowed() {
         let listing = list_pack_yolo26n_files(pack);
         return Err(InferenceError::ModelLoad(format!(
-            "yolo: pack {pack} is missing the size-matched ONNX \
-             `yolo26n_{input_w}.onnx`. Available in pack: [{listing}]. \
+            "yolo: pack {pack} is missing the shape-matched ONNX \
+             `yolo26n_{input_w}x{input_h}.onnx`. Available in pack: [{listing}]. \
              Fix: regenerate the missing file with \
              `python tools/models/gen_yolo26n.py --all-static` and \
              re-stage the model pack. For a dev escape hatch (NOT for \
@@ -206,20 +206,21 @@ fn resolve_yolo26n_path(
              dynamic shapes), set `NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1`.",
             pack = pack.display(),
             input_w = input_w,
+            input_h = input_h,
             listing = listing,
         )));
     }
 
-    // Dev mode only. Try every ship-size file.
-    for sz in [640u32, 960, 1280] {
-        let candidate = pack.join(format!("yolo26n_{sz}.onnx"));
+    // Dev mode only. Try every ship-shape file.
+    for (w, h) in [(512u32, 288u32), (1024, 576), (1536, 864)] {
+        let candidate = pack.join(format!("yolo26n_{w}x{h}.onnx"));
         if candidate.exists() {
             warn!(
                 requested_w = input_w,
                 requested_h = input_h,
                 fallback = %candidate.display(),
                 "yolo: NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1 — requested \
-                 size has no matching ONNX in pack; falling back to \
+                 shape has no matching ONNX in pack; falling back to \
                  nearest available. This silently CPU-falls-back on \
                  Intel NPU — do not use in production."
             );
@@ -227,25 +228,10 @@ fn resolve_yolo26n_path(
         }
     }
 
-    // Legacy dev fallback. Production releases do NOT include this file.
-    let legacy = pack.join("yolo26n_dynamic.onnx");
-    if legacy.exists() {
-        warn!(
-            requested_w = input_w,
-            requested_h = input_h,
-            legacy = %legacy.display(),
-            "yolo: NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1 — using \
-             deprecated yolo26n_dynamic.onnx. DO NOT ship this in \
-             prod; the Intel NPU plugin silently falls back to CPU on \
-             dynamic shapes (observed on Lunar Lake k13 under v0.1.18)."
-        );
-        return Ok(legacy);
-    }
-
     let listing = list_pack_yolo26n_files(pack);
     Err(InferenceError::ModelLoad(format!(
-        "no yolo26n_*.onnx in pack {}; expected yolo26n_{input_w}.onnx \
-         (or one of yolo26n_{{640,960,1280}}.onnx). Available: [{}]",
+        "no yolo26n_*.onnx in pack {}; expected yolo26n_{input_w}x{input_h}.onnx \
+         (or one of yolo26n_{{512x288,1024x576,1536x864}}.onnx). Available: [{}]",
         pack.display(),
         listing
     )))
@@ -360,32 +346,9 @@ fn run_yolo(
         .map_err(|e| InferenceError::Failed(format!("extract array: {e}")))?;
 
     let shape: Vec<usize> = view.shape().to_vec();
-    // Normalize to (rows, cols) regardless of export orientation.
-    let pred: Array2<f32> = match shape.len() {
-        3 => {
-            // [batch, dim1, dim2] — keep batch=0.
-            let dim1 = shape[1];
-            let dim2 = shape[2];
-            // Ultralytics historically exports (1, 84, N) for v8 and
-            // (1, N, 6) for the NMS-free yolo26 head. Treat the longer
-            // axis as the row axis.
-            if dim1 >= dim2 {
-                view.slice(s![0, .., ..])
-                    .to_owned()
-                    .into_dimensionality::<Ix2>()
-                    .ok()
-            } else {
-                view.slice(s![0, .., ..])
-                    .to_owned()
-                    .reversed_axes()
-                    .into_dimensionality::<Ix2>()
-                    .ok()
-            }
-        }
-        2 => view.to_owned().into_dimensionality::<Ix2>().ok(),
-        _ => None,
-    }
-    .ok_or_else(|| {
+    // Orient to [num_anchors, features] regardless of export
+    // orientation (shape-dynamic — see `orient_pred_rows`).
+    let pred: Array2<f32> = crate::detectors::orient_pred_rows(view).ok_or_else(|| {
         InferenceError::Failed(format!(
             "unexpected output shape {:?} (want 2-D or 3-D)",
             shape
@@ -580,12 +543,11 @@ pub(crate) fn map_coco_to_domain_label(class_id: i32) -> Option<&'static str> {
 /// between mock and real ORT impls without a typed cast at the call site.
 ///
 /// M_HAILO_EP: if `inference.ep_priority` puts `"hailo"` first AND a
-/// size-matched HEF (`yolo26n_<W>_hailo.hef`, pack v4+) or the legacy
-/// `yolo26n.hef` (pack v3) exists in the model pack, we dispatch to
-/// the Hailo-8 backed detector instead of the ORT one. This keeps a
-/// single `kind = "yolo"` config entry working for both x86_64 +
-/// Intel/AMD GPU boxes (ONNX) and Hailo-8 M.2 boxes (HEF) \u2014 the
-/// operator just changes `ep_priority` in their tier toml.
+/// shape-matched HEF (`yolo26n_<W>x<H>_hailo.hef`) exists in the model
+/// pack, we dispatch to the Hailo-8 backed detector instead of the ORT
+/// one. This keeps a single `kind = "yolo"` config entry working for
+/// both x86_64 + Intel/AMD GPU boxes (ONNX) and Hailo-8 M.2 boxes (HEF)
+/// — the operator just changes `ep_priority` in their tier toml.
 pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceError> {
     #[cfg(feature = "ep-hailo")]
     {
@@ -616,24 +578,22 @@ pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector
     }
 }
 
-/// Look for a size-matched yolo26n HEF artifact next to the ONNX pack.
+/// Look for a shape-matched yolo26n HEF artifact next to the ONNX pack.
 /// Returns `Some(path)` only when the operator opted in via
 /// `ep_priority` AND a usable HEF exists on disk; otherwise falls
 /// through to ONNX.
 ///
-/// Resolution order (first existing wins):
-///   1. `yolo26n_<W>_hailo.hef` — pack v4+ convention. Exact size
-///      match against `cfg.model.input_width`, so a camera configured
-///      at 960 dispatches to the 960 HEF and one at 640 to the 640
-///      HEF on the same host.
-///   2. `yolo26n.hef` — legacy pack v3 layout. Single 640-only file.
-///      Kept so old model packs still boot on the new engine.
+/// Resolution: `yolo26n_<W>x<H>_hailo.hef` — exact shape match against
+/// `(cfg.model.input_width, cfg.model.input_height)`, so a camera
+/// configured at 1024×576 dispatches to that HEF and one at 512×288 to
+/// its HEF on the same host. No cross-shape or legacy-square fallback:
+/// a missing shape falls through to ONNX rather than silently running a
+/// wrong-shape HEF.
 ///
-/// Why both checks (priority + file): a host that ships the HEF in
-/// its model pack but doesn't have a Hailo chip would otherwise
-/// silently get the Hailo path and fail to open it. Requiring
-/// `ep_priority` to mention "hailo" keeps the dispatcher under
-/// operator control.
+/// Why the priority + file check: a host that ships the HEF in its
+/// model pack but doesn't have a Hailo chip would otherwise silently
+/// get the Hailo path and fail to open it. Requiring `ep_priority` to
+/// mention "hailo" keeps the dispatcher under operator control.
 #[cfg(feature = "ep-hailo")]
 fn resolve_hailo_hef(cfg: &InferenceConfig) -> Option<PathBuf> {
     let wants_hailo = cfg
@@ -645,12 +605,9 @@ fn resolve_hailo_hef(cfg: &InferenceConfig) -> Option<PathBuf> {
     }
     let pack = cfg.model.pack_path.as_ref()?;
     let w = cfg.model.input_width;
-    let size_matched = pack.join(format!("yolo26n_{w}_hailo.hef"));
-    if size_matched.exists() {
-        return Some(size_matched);
-    }
-    let legacy = pack.join("yolo26n.hef");
-    legacy.exists().then_some(legacy)
+    let h = cfg.model.input_height;
+    let shape_matched = pack.join(format!("yolo26n_{w}x{h}_hailo.hef"));
+    shape_matched.exists().then_some(shape_matched)
 }
 
 #[cfg(test)]
@@ -729,36 +686,36 @@ mod tests {
     }
 
     #[test]
-    fn resolver_picks_exact_size_match() {
+    fn resolver_picks_exact_shape_match() {
         let _g = ENV_LOCK.lock();
         let _strict = EnvVarGuard::unset("NEXUS_ALLOW_MODEL_SIZE_FALLBACK");
         let tmp = TempDir::new().unwrap();
         let pack = tmp.path();
-        touch(pack, "yolo26n_640.onnx");
-        touch(pack, "yolo26n_960.onnx");
-        touch(pack, "yolo26n_1280.onnx");
+        touch(pack, "yolo26n_512x288.onnx");
+        touch(pack, "yolo26n_1024x576.onnx");
+        touch(pack, "yolo26n_1536x864.onnx");
 
-        let p = resolve_yolo26n_path(pack, 960, 960).unwrap();
-        assert_eq!(p, pack.join("yolo26n_960.onnx"));
+        let p = resolve_yolo26n_path(pack, 1024, 576).unwrap();
+        assert_eq!(p, pack.join("yolo26n_1024x576.onnx"));
     }
 
     #[test]
-    fn resolver_strict_refuses_cross_size_fallback() {
+    fn resolver_strict_refuses_cross_shape_fallback() {
         let _g = ENV_LOCK.lock();
         let _strict = EnvVarGuard::unset("NEXUS_ALLOW_MODEL_SIZE_FALLBACK");
         let tmp = TempDir::new().unwrap();
         let pack = tmp.path();
-        // Pack only has 640 but operator asks for 960.
-        touch(pack, "yolo26n_640.onnx");
+        // Pack only has 512x288 but operator asks for 1024x576.
+        touch(pack, "yolo26n_512x288.onnx");
 
-        let err = resolve_yolo26n_path(pack, 960, 960).unwrap_err();
+        let err = resolve_yolo26n_path(pack, 1024, 576).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("yolo26n_960.onnx"),
+            msg.contains("yolo26n_1024x576.onnx"),
             "error should name the missing file: {msg}"
         );
         assert!(
-            msg.contains("yolo26n_640.onnx"),
+            msg.contains("yolo26n_512x288.onnx"),
             "error should list what IS staged so operators can self-diagnose: {msg}"
         );
         assert!(
@@ -768,45 +725,17 @@ mod tests {
     }
 
     #[test]
-    fn resolver_strict_refuses_dynamic_fallback() {
-        let _g = ENV_LOCK.lock();
-        let _strict = EnvVarGuard::unset("NEXUS_ALLOW_MODEL_SIZE_FALLBACK");
-        let tmp = TempDir::new().unwrap();
-        let pack = tmp.path();
-        // Pack only has the deprecated dynamic file.
-        touch(pack, "yolo26n_dynamic.onnx");
-
-        let err = resolve_yolo26n_path(pack, 960, 960).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("yolo26n_960.onnx"),
-            "error should name the requested file: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolver_dev_escape_hatch_allows_cross_size_fallback() {
+    fn resolver_dev_escape_hatch_allows_cross_shape_fallback() {
         let _g = ENV_LOCK.lock();
         let _on = EnvVarGuard::set("NEXUS_ALLOW_MODEL_SIZE_FALLBACK", "1");
         let tmp = TempDir::new().unwrap();
         let pack = tmp.path();
-        touch(pack, "yolo26n_640.onnx");
+        touch(pack, "yolo26n_512x288.onnx");
 
-        // With escape hatch on, asking for 960 falls back to 640.
-        let p = resolve_yolo26n_path(pack, 960, 960).unwrap();
-        assert_eq!(p, pack.join("yolo26n_640.onnx"));
-    }
-
-    #[test]
-    fn resolver_dev_escape_hatch_allows_dynamic_fallback() {
-        let _g = ENV_LOCK.lock();
-        let _on = EnvVarGuard::set("NEXUS_ALLOW_MODEL_SIZE_FALLBACK", "1");
-        let tmp = TempDir::new().unwrap();
-        let pack = tmp.path();
-        touch(pack, "yolo26n_dynamic.onnx");
-
-        let p = resolve_yolo26n_path(pack, 960, 960).unwrap();
-        assert_eq!(p, pack.join("yolo26n_dynamic.onnx"));
+        // With escape hatch on, asking for 1024x576 falls back to the
+        // nearest available ladder rung (512x288).
+        let p = resolve_yolo26n_path(pack, 1024, 576).unwrap();
+        assert_eq!(p, pack.join("yolo26n_512x288.onnx"));
     }
 
     #[test]
@@ -816,7 +745,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let pack = tmp.path();
         // No files staged at all.
-        let err = resolve_yolo26n_path(pack, 640, 640).unwrap_err();
+        let err = resolve_yolo26n_path(pack, 512, 288).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no yolo26n_*.onnx in pack"), "{msg}");
     }

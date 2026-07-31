@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generate Hailo-8 HEF artifacts for the YOLO-World v2 open-vocab detector.
 
-Two sizes ship: 640 and 960. Source-of-truth ONNX files at each size
+Three native-16:9 shapes ship: 512x288, 1024x576, 1536x864.
+Source-of-truth ONNX files at each shape
 MUST already exist under `models/` \u2014 generate them first with:
 
     python tools/models/gen_yolo_world.py --all-static
@@ -13,12 +14,13 @@ inference. The HEF inherits this property: changing the vocab
 requires re-running gen_yolo_world.py (regenerates ONNX) AND
 re-running this script (regenerates HEF).
 
-NO public Hailo Model Zoo build exists for YOLO-World; both sizes
-require local DFC compilation.
+NO public Hailo Model Zoo build exists for YOLO-World; every shape
+requires local DFC compilation.
 
 Outputs:
-    models/yolo_world_v2_s_640_hailo.hef     (~20 MB)
-    models/yolo_world_v2_s_960_hailo.hef     (~40 MB)
+    models/yolo_world_v2_s_512x288_hailo.hef
+    models/yolo_world_v2_s_1024x576_hailo.hef
+    models/yolo_world_v2_s_1536x864_hailo.hef
 """
 
 from __future__ import annotations
@@ -37,20 +39,33 @@ from gen_hailo_common import (
 )
 
 MODEL_ID = "yolo_world_v2_s"
-STATIC_SIZES = (640, 960)
+# Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k).
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864))
 ALLS_DIR = Path(__file__).resolve().parent / "alls"
 
 
-def hef_path_for(size: int) -> Path:
-    return MODELS_DIR / f"yolo_world_v2_s_{size}_hailo.hef"
+def parse_shape(text: str) -> tuple[int, int]:
+    """Parse a `WxH` shape string (e.g. "512x288") into `(w, h)`."""
+
+    try:
+        w_str, h_str = text.lower().split("x", 1)
+        return int(w_str), int(h_str)
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --shape {text!r}; expected WxH like 512x288"
+        )
 
 
-def onnx_path_for(size: int) -> Path:
-    return MODELS_DIR / f"yolo_world_v2_s_{size}.onnx"
+def hef_path_for(w: int, h: int) -> Path:
+    return MODELS_DIR / f"yolo_world_v2_s_{w}x{h}_hailo.hef"
 
 
-def build_one(size: int) -> int:
-    onnx = onnx_path_for(size)
+def onnx_path_for(w: int, h: int) -> Path:
+    return MODELS_DIR / f"yolo_world_v2_s_{w}x{h}.onnx"
+
+
+def build_one(w: int, h: int) -> int:
+    onnx = onnx_path_for(w, h)
     if not onnx.exists():
         print(
             f"[gen_yolo_world_hailo] FATAL: {onnx} missing. Run "
@@ -60,7 +75,7 @@ def build_one(size: int) -> int:
         return 1
     require_hailo_sdk()
 
-    hef_out = hef_path_for(size)
+    hef_out = hef_path_for(w, h)
     calib = ensure_calibration_set("coco-val2017-1024")
     rc = compile_with_dfc(
         onnx,
@@ -93,23 +108,23 @@ def build_one(size: int) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compile yolo_world_v2_s HEFs for Hailo-8")
     parser.add_argument(
-        "--size",
-        type=int,
-        choices=STATIC_SIZES,
-        help="Compile a single size. Omit for --all.",
+        "--shape",
+        type=parse_shape,
+        help="Compile a single shape (WxH, e.g. 512x288). Omit for --all.",
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help=f"Compile both sizes: {', '.join(str(s) for s in STATIC_SIZES)}",
+        help="Compile all four shapes: "
+        + ", ".join(f"{w}x{h}" for w, h in STATIC_SHAPES),
     )
     args = parser.parse_args()
-    if not (args.size or args.all):
+    if not (args.shape or args.all):
         args.all = True
 
-    sizes = [args.size] if args.size else list(STATIC_SIZES)
-    for sz in sizes:
-        rc = build_one(sz)
+    shapes = [args.shape] if args.shape else list(STATIC_SHAPES)
+    for w, h in shapes:
+        rc = build_one(w, h)
         if rc != 0:
             return rc
     return 0

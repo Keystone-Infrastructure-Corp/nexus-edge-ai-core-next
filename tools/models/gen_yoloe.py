@@ -12,15 +12,24 @@ each class index 0..N-1 maps to a prompt in `prompts[]`.
 Run from the workspace root with the model-gen venv active:
 
     source .venv-modelgen/bin/activate
-    python tools/models/gen_yoloe.py \\
+    # all three shapes in one session:
+    python tools/models/gen_yoloe.py --all-static \\
         --prompts tools/models/yoloe_default_prompts.txt
+    # …or one shape at a time:
+    python tools/models/gen_yoloe.py --shape 512x288
+
+Ships per-shape static ONNXs on the native 16:9 ∩ stride-32 ladder
+(W=512k, H=288k) — matching gen_yolo26n.py / gen_yolo_world.py. See
+`docs/edge-core/M_NATIVE_ASPECT.md` in the cloud-console repo.
 
 Output:
-    models/yoloe26_s.onnx   (~25–35 MB; smaller than YOLO-World v2 s)
+    models/yoloe26_s_512x288.onnx    (~25–35 MB; smaller than YOLO-World v2 s)
+    models/yoloe26_s_1024x576.onnx
+    models/yoloe26_s_1536x864.onnx
 
 The prompt file lives under `tools/models/` (tracked) so the prompt
 vocabulary is reproducible; the ONNX itself stays under `models/`
-(gitignored) per the same policy as `yolo26n_{640,960,1280}.onnx`.
+(gitignored) per the same policy as `yolo26n_<W>x<H>.onnx`.
 
 NOTE on upstream availability: as of M3.1 the ultralytics PyPI release
 shipping the `YOLOE` symbol is moving rapidly. If `from ultralytics
@@ -47,7 +56,8 @@ from typing import List
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = REPO_ROOT / "models"
-DEFAULT_OUTPUT = MODELS_DIR / "yoloe26_s.onnx"
+# Native 16:9 ladder: exact 16:9 ∩ stride-32 (W=512k, H=288k).
+STATIC_SHAPES = ((512, 288), (1024, 576), (1536, 864))
 DEFAULT_PROMPTS = Path(__file__).resolve().parent / "yoloe_default_prompts.txt"
 # Ultralytics 8.4.x consolidated the YOLOE release assets on the segmentation
 # checkpoints (`yoloe-26{n,s,l,x}-seg.pt` and `yoloe-v8{s,m,l}-seg.pt`); the
@@ -56,6 +66,24 @@ DEFAULT_PROMPTS = Path(__file__).resolve().parent / "yoloe_default_prompts.txt"
 # ultralytics auto-strips the segmentation head when we export with the
 # detection task. The Rust loader only consumes the detection output anyway.
 DEFAULT_BASE_MODEL = "yoloe-26s-seg.pt"
+
+
+def parse_shape(text: str) -> tuple[int, int]:
+    """Parse a `WxH` shape string (e.g. "512x288") into `(w, h)`."""
+
+    try:
+        w_str, h_str = text.lower().split("x", 1)
+        return int(w_str), int(h_str)
+    except (ValueError, AttributeError):
+        raise argparse.ArgumentTypeError(
+            f"invalid --shape {text!r}; expected WxH like 512x288"
+        )
+
+
+def static_output_for(w: int, h: int) -> Path:
+    """Where the static-mode export writes the per-shape ONNX."""
+
+    return MODELS_DIR / f"yoloe26_s_{w}x{h}.onnx"
 
 
 def sha256_file(path: Path) -> str:
@@ -87,11 +115,9 @@ def read_prompts(path: Path) -> List[str]:
 def upsert_manifest_entry(
     *,
     model_id: str,
-    artifact_path: str,
-    sha: str,
-    input_w: int,
-    input_h: int,
+    sized_artifacts: List[dict],
     prompts: List[str],
+    default_preset: str,
 ) -> None:
     """Insert/update a YOLOE entry in `models/models-manifest.json`.
 
@@ -113,19 +139,28 @@ def upsert_manifest_entry(
         )
     models = manifest.setdefault("models", [])
 
+    # Sort by width ascending so the manifest reads naturally and diffs
+    # cleanly across runs.
+    sized_artifacts = sorted(sized_artifacts, key=lambda a: a["w"])
+    default_art = next(
+        (a for a in sized_artifacts if f"{a['w']}x{a['h']}" == default_preset),
+        sized_artifacts[0],
+    )
+
     entry = {
         "id": model_id,
         "task": "detect_open_vocab_text",
         "_comment": (
-            "YOLOE (small) text-mode export. Prompts are baked into the "
-            "graph at export time; per-camera config picks a subset at "
-            "runtime. Regenerate via tools/models/gen_yoloe.py whenever "
-            "the prompt vocabulary changes — the manifest sha256 below "
+            "YOLOE (small) text-mode export on the native 16:9 ladder "
+            "(512x288 / 1024x576 / 1536x864). Prompts are baked "
+            "into the graph at export time; per-camera config picks a subset "
+            "at runtime. Regenerate via tools/models/gen_yoloe.py whenever "
+            "the prompt vocabulary changes — the manifest sha256 values below "
             "will refresh and the engine's loader will catch the diff."
         ),
         "input": {
-            "width": input_w,
-            "height": input_h,
+            "width": default_art["w"],
+            "height": default_art["h"],
             "channels": 3,
             "format": "RGB",
         },
@@ -138,39 +173,57 @@ def upsert_manifest_entry(
         "artifacts": [
             {
                 "backend": "onnx",
-                "path": artifact_path,
-                "sha256": sha,
+                "path": a["path"],
+                "preset": f"{a['w']}x{a['h']}",
+                "sha256": a["sha"],
             }
+            for a in sized_artifacts
         ],
         "presets": [
             {
-                "name": str(input_w),
-                "inputWidth": input_w,
-                "inputHeight": input_h,
+                "name": f"{a['w']}x{a['h']}",
+                "inputWidth": a["w"],
+                "inputHeight": a["h"],
+                "artifact": a["path"],
             }
+            for a in sized_artifacts
         ],
-        "default_preset": str(input_w),
+        "default_preset": default_preset,
         "prompts": prompts,
     }
 
     for i, m in enumerate(models):
         if m.get("id") == model_id:
+            # This upsert owns only the ONNX exports. Preserve any
+            # operator-authored non-ONNX artifacts (Hailo HEF entries) and
+            # their `-hef` presets so regenerating ONNX never clobbers the
+            # hand-authored HEF metadata that `gen_*_hailo.py` patches.
+            preserved_artifacts = [
+                a for a in m.get("artifacts", []) if a.get("backend") != "onnx"
+            ]
+            preserved_presets = [
+                p for p in m.get("presets", []) if p.get("name", "").endswith("-hef")
+            ]
+            entry["artifacts"].extend(preserved_artifacts)
+            entry["presets"].extend(preserved_presets)
             models[i] = entry
             break
     else:
         models.append(entry)
 
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    sizes = ", ".join(f"{a['w']}x{a['h']}" for a in sized_artifacts)
     print(
         f"[gen_yoloe] manifest upserted: {model_id} "
-        f"({len(prompts)} prompts, sha {sha[:12]}…)"
+        f"({len(prompts)} prompts, sizes [{sizes}], default {default_preset})"
     )
 
 
 def export_yoloe(
     base_model: str,
     prompts: List[str],
-    imgsz: int,
+    w: int,
+    h: int,
     opset: int,
     output: Path,
 ) -> None:
@@ -194,13 +247,14 @@ def export_yoloe(
     # detector with C = len(prompts).
     model.set_classes(prompts)
 
-    print(f"[gen_yoloe] exporting ONNX (imgsz={imgsz}, opset={opset})")
+    print(f"[gen_yoloe] exporting ONNX (1x3x{h}x{w}, opset={opset})")
+    # ultralytics takes imgsz as [height, width] — height first.
     model.export(
         format="onnx",
         dynamic=False,  # Static for predictability — open-vocab head
         # always runs at the configured input size.
         opset=opset,
-        imgsz=imgsz,
+        imgsz=[h, w],
         simplify=True,
         nms=False,  # keep raw YOLOv8 head — Rust postprocess does NMS.
     )
@@ -270,10 +324,17 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_OUTPUT,
-        help=f"Output ONNX path (default: {DEFAULT_OUTPUT.relative_to(REPO_ROOT)})",
+        default=None,
+        help="Override the output ONNX path. Default: per-shape mode → "
+        "models/yoloe26_s_<W>x<H>.onnx. Ignored under --all-static.",
     )
-    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument(
+        "--shape",
+        type=parse_shape,
+        default=(512, 288),
+        help="Input shape as WxH (default 512x288). Ladder rung: "
+        "512x288 | 1024x576 | 1536x864.",
+    )
     parser.add_argument(
         "--opset",
         type=int,
@@ -295,7 +356,28 @@ def main() -> int:
         action="store_true",
         help="Skip the onnxruntime smoke load (use only when debugging exports).",
     )
+    parser.add_argument(
+        "--all-static",
+        action="store_true",
+        help="Generate all static-shape ONNXs in one ultralytics session: "
+        + ", ".join(f"{w}x{h}" for w, h in STATIC_SHAPES)
+        + ". This is the release-pipeline path.",
+    )
+    parser.add_argument(
+        "--default-preset",
+        type=str,
+        default="512x288",
+        help="Which preset name to write as `default_preset` in the manifest "
+        "(default 512x288, the Standard tier).",
+    )
     args = parser.parse_args()
+
+    explicit_single = (
+        any(arg.startswith("--shape") for arg in sys.argv[1:])
+        or args.output is not None
+    )
+    if not args.all_static and not explicit_single:
+        args.all_static = True
 
     try:
         prompts = read_prompts(args.prompts)
@@ -304,38 +386,52 @@ def main() -> int:
         return 1
 
     print(f"[gen_yoloe] prompts: {prompts}")
-    try:
-        export_yoloe(
-            base_model=args.base_model,
-            prompts=prompts,
-            imgsz=args.imgsz,
-            opset=args.opset,
-            output=args.output,
-        )
-    except Exception as ex:  # noqa: BLE001
-        print(f"[gen_yoloe] ERROR exporting: {ex}")
-        return 1
 
-    if not args.skip_smoke:
+    if args.all_static:
+        shapes = list(STATIC_SHAPES)
+    else:
+        shapes = [args.shape]
+
+    sized_artifacts: List[dict] = []
+    for w, h in shapes:
+        output = (
+            args.output
+            if (args.output is not None and not args.all_static)
+            else static_output_for(w, h)
+        )
         try:
-            smoke_check(args.output, args.imgsz, args.imgsz)
+            export_yoloe(
+                base_model=args.base_model,
+                prompts=prompts,
+                w=w,
+                h=h,
+                opset=args.opset,
+                output=output,
+            )
         except Exception as ex:  # noqa: BLE001
-            print(f"[gen_yoloe] ERROR smoke-loading: {ex}")
+            print(f"[gen_yoloe] ERROR exporting {w}x{h}: {ex}")
             return 1
 
-    sha = sha256_file(args.output)
-    size_mb = args.output.stat().st_size / (1024 * 1024)
-    print(f"[gen_yoloe] sha256 {sha}")
-    print(f"[gen_yoloe] size   {size_mb:.2f} MB")
+        if not args.skip_smoke:
+            try:
+                smoke_check(output, w, h)
+            except Exception as ex:  # noqa: BLE001
+                print(f"[gen_yoloe] ERROR smoke-loading {output}: {ex}")
+                return 1
+
+        sha = sha256_file(output)
+        size_mb = output.stat().st_size / (1024 * 1024)
+        print(f"[gen_yoloe] {w}x{h} sha256 {sha}  size {size_mb:.2f} MB")
+        sized_artifacts.append({"w": w, "h": h, "path": output.name, "sha": sha})
+
     upsert_manifest_entry(
         model_id=args.manifest_id,
-        artifact_path=args.output.name,
-        sha=sha,
-        input_w=args.imgsz,
-        input_h=args.imgsz,
+        sized_artifacts=sized_artifacts,
         prompts=prompts,
+        default_preset=args.default_preset,
     )
-    print(f"[gen_yoloe] success: {args.output}")
+    for a in sized_artifacts:
+        print(f"[gen_yoloe] success: models/{a['path']}")
     return 0
 
 
