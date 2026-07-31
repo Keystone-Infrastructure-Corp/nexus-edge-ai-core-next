@@ -8,8 +8,8 @@
 //! ### What crosses the tunnel
 //!
 //! Only camera metadata: id, name, scheme-derived kind, enabled flag,
-//! optional model-override kind. Credentials (RTSP password, ONVIF
-//! secret) NEVER cross the tunnel — AGENTS.md Rule 6.
+//! source codec, and the effective detector kind. Credentials (RTSP
+//! password, ONVIF secret) NEVER cross the tunnel — AGENTS.md Rule 6.
 //!
 //! ### When we publish
 //!
@@ -65,7 +65,14 @@ fn seed_revision() -> u64 {
 }
 
 /// Build a `camera_roster` envelope from the current store snapshot.
-async fn build_envelope(store: &Store, revision: u64) -> anyhow::Result<Envelope> {
+///
+/// `default_model_kind` is `inference.model.kind` — the detector a
+/// camera runs when it has no `model_override`.
+async fn build_envelope(
+    store: &Store,
+    revision: u64,
+    default_model_kind: &str,
+) -> anyhow::Result<Envelope> {
     let cams = store.list_cameras().await?;
     let snapshot_ts = Utc::now().to_rfc3339();
     let entries: Vec<CameraRosterEntry> = cams
@@ -75,7 +82,19 @@ async fn build_envelope(store: &Store, revision: u64) -> anyhow::Result<Envelope
             // ids should be impossible (SQLite rowid alias is always
             // >=1) but guard anyway.
             let edge_camera_id = u64::try_from(c.id).unwrap_or(0);
-            let model_kind = c.detector.model_override.as_ref().map(|m| m.kind.clone());
+            // The wire field is "active detector kind on this camera",
+            // NOT "override, if any" — so resolve the same way
+            // `Config::validate` does and always report something.
+            // Sending the override alone left the cloud console's
+            // Detector column blank for every camera running the
+            // engine default, which is most of them.
+            let model_kind = Some(
+                c.detector
+                    .model_override
+                    .as_ref()
+                    .map_or(default_model_kind, |m| m.kind.as_str())
+                    .to_string(),
+            );
             // `_plus` is a vendor SVC label; the wire enum is
             // base codecs only, so collapse via `.base()`.
             let codec = Some(
@@ -120,12 +139,17 @@ async fn build_envelope(store: &Store, revision: u64) -> anyhow::Result<Envelope
 }
 
 /// Try one publish. Returns true on success, false otherwise.
-async fn try_publish(store: &Store, outbox: &TunnelOutbox, revision_counter: &AtomicU64) -> bool {
+async fn try_publish(
+    store: &Store,
+    outbox: &TunnelOutbox,
+    revision_counter: &AtomicU64,
+    default_model_kind: &str,
+) -> bool {
     if !outbox.is_connected() {
         return false;
     }
     let revision = revision_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let env = match build_envelope(store, revision).await {
+    let env = match build_envelope(store, revision, default_model_kind).await {
         Ok(e) => e,
         Err(e) => {
             warn!(error = %e, "roster publisher: snapshot build failed");
@@ -157,7 +181,18 @@ async fn try_publish(store: &Store, outbox: &TunnelOutbox, revision_counter: &At
 /// Spawn the long-running roster publisher task. Returns its join
 /// handle so the engine shutdown path can abort it alongside the
 /// other long-lived tasks.
-pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, outbox: Arc<TunnelOutbox>) -> JoinHandle<()> {
+///
+/// `default_model_kind` is a boot-time snapshot of
+/// `inference.model.kind`, used to resolve each entry's effective
+/// detector. Consistent with `AppState::current_inference_model`,
+/// which snapshots the same value — changing the global detector is
+/// a restart-scoped operation.
+pub fn spawn(
+    store: Arc<Store>,
+    bus: Arc<dyn Bus>,
+    outbox: Arc<TunnelOutbox>,
+    default_model_kind: String,
+) -> JoinHandle<()> {
     let revision_counter = Arc::new(AtomicU64::new(seed_revision()));
     let dirty = Arc::new(AtomicBool::new(true));
     tokio::spawn(async move {
@@ -196,7 +231,7 @@ pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, outbox: Arc<TunnelOutbox>) ->
                                 .is_none_or(|k| k == "camera");
                             if is_camera_event {
                                 dirty.store(true, Ordering::Relaxed);
-                                if try_publish(&store, &outbox, &revision_counter).await {
+                                if try_publish(&store, &outbox, &revision_counter, &default_model_kind).await {
                                     dirty.store(false, Ordering::Relaxed);
                                 }
                             }
@@ -212,7 +247,7 @@ pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, outbox: Arc<TunnelOutbox>) ->
                 }
                 () = tokio::time::sleep(RETRY_TICK) => {
                     if dirty.load(Ordering::Relaxed)
-                        && try_publish(&store, &outbox, &revision_counter).await
+                        && try_publish(&store, &outbox, &revision_counter, &default_model_kind).await
                     {
                         dirty.store(false, Ordering::Relaxed);
                     }
@@ -316,7 +351,9 @@ mod tests {
             .await
             .unwrap();
 
-        let env = build_envelope(&store, 42).await.expect("build envelope");
+        let env = build_envelope(&store, 42, "yolo")
+            .await
+            .expect("build envelope");
         let json = serde_json::to_string(&env).expect("serialize envelope");
 
         // The camera URL is rtsp://, so "onvif" can only appear in the
@@ -341,5 +378,76 @@ mod tests {
             !json.contains(secret_backchannel),
             "camera_roster envelope leaked the talk-down backchannel URL"
         );
+    }
+
+    /// The wire field is "active detector kind on this camera", so a
+    /// camera with no `model_override` must still report the engine
+    /// default rather than omitting the field — otherwise the cloud
+    /// console's Detector column is blank for every stock camera.
+    #[tokio::test]
+    async fn camera_roster_reports_effective_detector_kind() {
+        use nexus_config::{
+            CameraBehavior, CameraConfig, CameraDetector, CameraIngest, CameraOnvif,
+            CameraTalkDown, ModelConfig, StoreConfig,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nexus.db");
+        let store = Store::open(&StoreConfig {
+            url: format!("sqlite://{}?mode=rwc", db_path.display()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+
+        let cam = |id: i64, name: &str, model_override: Option<ModelConfig>| CameraConfig {
+            id,
+            name: name.into(),
+            ingest: CameraIngest {
+                url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                enabled: true,
+                max_fps: 0,
+                codec: None,
+            },
+            detector: CameraDetector {
+                prompts: vec![],
+                visual_prompts: vec![],
+                model_override,
+            },
+            behavior: CameraBehavior::default(),
+            onvif: CameraOnvif::default(),
+            talk_down: CameraTalkDown::default(),
+            zones: vec![],
+        };
+
+        let overridden = ModelConfig {
+            kind: "yoloe".into(),
+            ..Default::default()
+        };
+
+        store.upsert_camera(&cam(1, "stock", None)).await.unwrap();
+        store
+            .upsert_camera(&cam(2, "custom", Some(overridden)))
+            .await
+            .unwrap();
+
+        let env = build_envelope(&store, 7, "yolo_world")
+            .await
+            .expect("build envelope");
+        let EnvelopeBody::CameraRoster(payload) = env.body else {
+            panic!("expected a camera_roster body");
+        };
+
+        let kind_of = |id: u64| {
+            payload
+                .cameras
+                .iter()
+                .find(|c| c.edge_camera_id == id)
+                .unwrap_or_else(|| panic!("camera {id} missing from roster"))
+                .model_kind
+                .clone()
+        };
+        assert_eq!(kind_of(1).as_deref(), Some("yolo_world"));
+        assert_eq!(kind_of(2).as_deref(), Some("yoloe"));
     }
 }
