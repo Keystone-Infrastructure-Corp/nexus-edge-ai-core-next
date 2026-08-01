@@ -72,16 +72,16 @@ export function shapeFromKey(
   return shapesForKind(kind).find((s) => shapeKey(s) === key);
 }
 
-/** Human-readable hint for the shape dropdown: tier + dims + a relative
- *  cost cue vs. the pre-migration square tier it replaces. */
+/** Human-readable hint for the shape dropdown: tier + dims + a short
+ *  qualitative cue for what the tier is good at. */
 export function describeShape(s: ModelShape): string {
   switch (`${s.w}x${s.h}`) {
     case "512x288":
-      return "Standard — 512 × 288 · fastest, fits every box (36% the cost of the old 640 tier)";
+      return "Standard — 512 × 288 · fastest, fits every box";
     case "1024x576":
-      return "Long range — 1024 × 576 · balanced (64% the cost of the old 960 tier)";
+      return "Long range — 1024 × 576 · balanced";
     case "1536x864":
-      return "High detail — 1536 × 864 · plate / face detail (81% the cost of the old 1280 tier)";
+      return "High detail — 1536 × 864 · plate / face detail";
     default:
       return `${s.tier} — ${s.w} × ${s.h}`;
   }
