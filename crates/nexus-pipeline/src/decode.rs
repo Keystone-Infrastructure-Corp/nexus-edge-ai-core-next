@@ -454,6 +454,86 @@ fn va_device_is_amd() -> bool {
     }
 }
 
+/// Process-wide cache of GStreamer contexts negotiated by the first
+/// pipeline that needed each type. Keyed by context type
+/// (`gst.vaapi.Display`, `gst.gl.GLDisplay`, `gst.gl.GLContext`, …).
+#[cfg(feature = "gstreamer")]
+static SHARED_CONTEXTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, gstreamer::Context>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Whether context sharing is enabled. Opt out with
+/// `NEXUS_SHARED_GL_CONTEXT=0` if a box turns out to serialise decode
+/// behind one VA display.
+#[cfg(feature = "gstreamer")]
+fn shared_contexts_enabled() -> bool {
+    !matches!(
+        std::env::var("NEXUS_SHARED_GL_CONTEXT").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
+/// Make `pipeline` join the process-wide VA/GL display instead of
+/// standing up its own.
+///
+/// `vaapipostproc` (the legacy `gstreamer1.0-vaapi` path we prefer on
+/// AMD, see the module docs) runs a GBM/GL probe on realize, and by
+/// default every pipeline that does so creates its own `GstGLDisplay`
+/// and its own Mesa driver instance. With one ingest pipeline per
+/// camera that scales linearly: on a 50-camera box it accounted for
+/// roughly 1,200 of the engine's 1,331 threads (Mesa `util_queue`
+/// workers named `<proc>:sh*` / `:disk$*`) and drove VRAM to 91% of a
+/// 4 GB carve-out.
+///
+/// The fix is the standard GStreamer context dance: answer
+/// `need-context` from a cache that `have-context` fills, so pipeline
+/// #2..#N adopt pipeline #1's display. It has to run on a **sync**
+/// bus handler — `need-context` is posted during state change and the
+/// element has already fallen back to creating its own display by the
+/// time an async watch would see it.
+///
+/// Returns `BusSyncReply::Pass` so any existing async bus watch on the
+/// same pipeline keeps receiving every message unchanged. Call at most
+/// once per pipeline: `Bus::set_sync_handler` panics if a handler is
+/// already installed.
+#[cfg(feature = "gstreamer")]
+pub fn install_shared_display_context(pipeline: &gstreamer::Pipeline) {
+    use gstreamer::prelude::*;
+
+    if !shared_contexts_enabled() {
+        return;
+    }
+    let Some(bus) = pipeline.bus() else {
+        return;
+    };
+    bus.set_sync_handler(move |_bus, msg| {
+        match msg.view() {
+            gstreamer::MessageView::NeedContext(need) => {
+                let ctx_type = need.context_type();
+                let cached = SHARED_CONTEXTS
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(ctx_type).cloned());
+                if let (Some(ctx), Some(src)) = (cached, msg.src()) {
+                    if let Some(el) = src.downcast_ref::<gstreamer::Element>() {
+                        el.set_context(&ctx);
+                    }
+                }
+            }
+            gstreamer::MessageView::HaveContext(have) => {
+                let ctx = have.context();
+                if let Ok(mut m) = SHARED_CONTEXTS.lock() {
+                    // First pipeline to negotiate a given type wins;
+                    // later ones are handed this one instead.
+                    m.entry(ctx.context_type().to_string()).or_insert(ctx);
+                }
+            }
+            _ => {}
+        }
+        gstreamer::BusSyncReply::Pass
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
