@@ -221,6 +221,26 @@ fail_soft = true
 # Hailo is not an ORT EP — it's a parallel runtime. Listing it here is
 # safe on non-Hailo boxes (the binary falls through to the next EP).
 ep_priority = ["openvino", "cpu"]
+# ORT intra-op thread-pool size, PER SESSION. Commented out == auto.
+#
+# Leave this unset unless you have profiled the box. ORT's own default
+# is "one thread per logical core, for every session independently",
+# which on a `workers = 2` box means 3 detector sessions (2 workers +
+# the fail_soft fallback) each claiming every core — plus the re-ID
+# session, plus ~5 GStreamer threads per camera. The auto-sizer instead
+# gives each session `cores / sessions` on the CPU EP, or a small fixed
+# pool when a real accelerator (OpenVINO/NPU/GPU, CUDA, TensorRT,
+# Hailo, CoreML) took the graph and the CPU pool only handles leftovers.
+# ort_intra_threads = 4
+#
+# Let ORT thread-pool workers busy-wait (`SpinPause`) before blocking.
+# Off by default, which is the opposite of ORT's default. Spinning wins
+# only when a session owns the machine and runs inferences back-to-back.
+# On a shared box an oversubscribed pool burns whole timeslices spinning
+# at fork-join barriers on a peer thread that has been descheduled —
+# while occupying the cores that peer needs to run. Turn on only for a
+# dedicated single-purpose inference box.
+# ort_allow_spinning = false
 
 [inference.model]
 # yolo (default, closed-vocab; ships per-size: yolo26n_640.onnx / _960.onnx / _1280.onnx,
@@ -328,9 +348,19 @@ capacity = 1024
 # # graph. `0` disables either floor.
 # min_crop_w_px = 40
 # min_crop_h_px = 96
+# # DINOv2-S is a Vision Transformer. On the CPU EP it is far heavier
+# # than the CNN detector, so name the accelerator EXPLICITLY here —
+# # a bare "openvino" resolves to device_type=AUTO, which can only
+# # place the graph on a device whose OpenVINO plugin is loaded. On a
+# # box that exposes only an NPU, "openvino" silently lands on CPU.
 # # ep_priority = ["coreml", "cpu"]   # macOS dev
-# # ep_priority = ["openvino", "cpu"] # Intel iGPU/NPU
+# # ep_priority = ["openvino", "cpu"] # Intel iGPU/dGPU
+# # ep_priority = ["npu", "cpu"]      # Intel NPU (Lunar Lake etc.)
 # # ep_priority = ["cuda", "cpu"]     # NVIDIA
+# # Same ORT thread-pool knobs as [inference]; auto by default, and the
+# # auto-sizer already accounts for the detector sessions in-process.
+# # ort_intra_threads = 2
+# # ort_allow_spinning = false
 
 # -----------------------------------------------------------------
 # Alert delivery sinks (optional)

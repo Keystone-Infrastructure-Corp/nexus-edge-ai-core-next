@@ -20,6 +20,8 @@ fn cfg() -> InferenceConfig {
         restart_backoff_ms: 0,
         fail_soft: false,
         ep_priority: vec!["cpu".into()],
+        ort_intra_threads: None,
+        ort_allow_spinning: false,
         model: ModelConfig {
             kind: "mock".into(),
             ..Default::default()

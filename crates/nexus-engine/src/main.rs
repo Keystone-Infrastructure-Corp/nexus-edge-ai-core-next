@@ -781,7 +781,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         Arc<dyn nexus_pipeline::SightingHook>,
         nexus_pipeline::supervisor::SightingSchedulerConfig,
     ) = if cfg.reid.enabled {
-        let extractor = build_reid_extractor(&cfg.reid);
+        let extractor = build_reid_extractor(&cfg.reid, &cfg.inference);
         let hook = cloud_sighting::CloudEntitySightingHook::spawn(
             extractor,
             cloud_outbox.clone(),
@@ -2076,7 +2076,11 @@ fn log_inference_summary(cfg: &InferenceConfig, has_pool: bool, router: &Inferen
 ///   `cloud_sighting::run_worker` short-circuits when the
 ///   extractor's `model_id` starts with `"mock_"`, so no cloud
 ///   round-trip is wasted.
-fn build_reid_extractor(cfg: &nexus_config::ReidConfig) -> Arc<dyn nexus_reid::Extractor> {
+fn build_reid_extractor(
+    cfg: &nexus_config::ReidConfig,
+    #[cfg_attr(not(feature = "ort"), allow(unused_variables))]
+    inference: &nexus_config::InferenceConfig,
+) -> Arc<dyn nexus_reid::Extractor> {
     #[cfg(feature = "ort")]
     {
         let explicit = cfg.model_path.clone();
@@ -2093,10 +2097,22 @@ fn build_reid_extractor(cfg: &nexus_config::ReidConfig) -> Arc<dyn nexus_reid::E
                 .filter(|p| p.exists())
         });
         if let Some(path) = candidate {
+            // The extractor session shares the process with every
+            // detector session, so the auto-sizer must divide the box
+            // by all of them — not just by this one. DINOv2-S is a ViT:
+            // on the CPU EP it will happily take every core it is
+            // offered and then spend the time spinning at fork-join
+            // barriers it can't win against the camera pipelines.
+            let tuning = nexus_inference::session_tuning::SessionTuning::new(
+                cfg.ort_intra_threads,
+                cfg.ort_allow_spinning,
+                inference.ort_session_count() + 1,
+            );
             match nexus_reid::ort_dinov2::DinoV2Extractor::open(
                 &path,
                 cfg.model_id.clone(),
                 cfg.ep_priority.as_slice(),
+                tuning,
             ) {
                 Ok(x) => {
                     info!(

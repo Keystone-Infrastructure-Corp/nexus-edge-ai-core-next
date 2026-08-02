@@ -181,8 +181,17 @@ fn build_yolo_detector() -> Arc<dyn Detector> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.30);
     let ep_priority = parse_ep_priority_env();
-    match nexus_inference::yolo::YoloOrtDetector::open(&path, input_w, input_h, score, &ep_priority)
-    {
+    // One worker process == one session, so the auto-sizer gets the
+    // whole box. The pool-of-processes fan-out is bounded by the
+    // parent's `workers`, and each child is separately scheduled.
+    match nexus_inference::yolo::YoloOrtDetector::open(
+        &path,
+        input_w,
+        input_h,
+        score,
+        &ep_priority,
+        nexus_inference::session_tuning::SessionTuning::default(),
+    ) {
         Ok(d) => Arc::new(d),
         Err(e) => {
             eprintln!("[nexus-inference-worker] yolo open failed: {e}, using mock");
@@ -270,6 +279,7 @@ fn build_yolo_world_detector() -> Arc<dyn Detector> {
         None,
         vocab,
         &parse_ep_priority_env(),
+        nexus_inference::session_tuning::SessionTuning::default(),
     ) {
         Ok(d) => Arc::new(d),
         Err(e) => {
@@ -357,6 +367,7 @@ fn build_yoloe_detector() -> Arc<dyn Detector> {
         None,
         vocab,
         &parse_ep_priority_env(),
+        nexus_inference::session_tuning::SessionTuning::default(),
     ) {
         Ok(d) => Arc::new(d),
         Err(e) => {
@@ -478,6 +489,7 @@ async fn build_yoloe_visual_detector() -> Arc<dyn Detector> {
         embedding_dim,
         visual_store,
         &ep_priority,
+        nexus_inference::session_tuning::SessionTuning::default(),
     ) {
         Ok(d) => Arc::new(d),
         Err(e) => {

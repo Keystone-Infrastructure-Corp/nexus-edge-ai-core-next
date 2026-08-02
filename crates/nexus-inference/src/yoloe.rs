@@ -42,13 +42,13 @@ use async_trait::async_trait;
 use ndarray::{s, Array2, Array4, Ix2};
 use nexus_config::{CameraConfigUpdate, InferenceConfig};
 use nexus_types::{BBox, CameraId, Detection, Frame, PixelFormat};
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
-use crate::execution_providers;
+use crate::session_tuning::{self, SessionTuning};
 
 /// One YOLOE ONNX session + the prompt vocabulary it was exported
 /// with + a per-camera subset filter.
@@ -101,6 +101,11 @@ impl YoloeDetector {
             cfg.model.nms_spatial_bucket_size_px,
             vocab,
             &cfg.ep_priority,
+            SessionTuning::new(
+                cfg.ort_intra_threads,
+                cfg.ort_allow_spinning,
+                cfg.ort_session_count(),
+            ),
         )
     }
 
@@ -108,7 +113,9 @@ impl YoloeDetector {
     /// vocabulary. `ep_priority` controls which ORT execution
     /// providers are registered — see
     /// [`crate::execution_providers::selected_for_priority`]. Pass
-    /// `&[]` for CPU-only (the default fallback path).
+    /// `&[]` for CPU-only (the default fallback path). `tuning`
+    /// controls the session's thread pools — see
+    /// [`crate::session_tuning`].
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         model_path: &Path,
@@ -119,6 +126,7 @@ impl YoloeDetector {
         nms_spatial_bucket_size_px: Option<u32>,
         vocab: Vec<String>,
         ep_priority: &[String],
+        tuning: SessionTuning,
     ) -> Result<Self, InferenceError> {
         if vocab.is_empty() {
             return Err(InferenceError::ModelLoad(
@@ -127,21 +135,8 @@ impl YoloeDetector {
                     .into(),
             ));
         }
-        let (eps, ep_names) = execution_providers::selected_for_priority(ep_priority);
-        let session = Session::builder()
-            .map_err(|e| InferenceError::ModelLoad(format!("session builder: {e}")))?
-            // ORT_ENABLE_ALL (99) — valid on every ONNX Runtime ABI.
-            // NOT `Level3`: in ort 2.0-rc that maps to ORT_ENABLE_LAYOUT (3),
-            // a level introduced in ONNX Runtime 1.22 that the ROCm 1.21
-            // runtime rejects with "graph_optimization_level is not valid".
-            .with_optimization_level(GraphOptimizationLevel::All)
-            .map_err(|e| InferenceError::ModelLoad(format!("opt level: {e}")))?
-            .with_execution_providers(eps)
-            .map_err(|e| InferenceError::ModelLoad(format!("EP register: {e}")))?
-            .commit_from_file(model_path)
-            .map_err(|e| {
-                InferenceError::ModelLoad(format!("load {}: {e}", model_path.display()))
-            })?;
+        let built = session_tuning::build_session(model_path, ep_priority, &tuning)
+            .map_err(InferenceError::ModelLoad)?;
         let vocab_index = build_vocab_index(&vocab);
         info!(
             model = %model_path.display(),
@@ -149,11 +144,12 @@ impl YoloeDetector {
             nms_spatial_bucket_size_px,
             vocab_len = vocab.len(),
             ep_requested = ?ep_priority,
-            ep_registered = ?ep_names,
+            ep_registered = ?built.ep_names,
+            intra_threads = built.intra_threads,
             "yoloe ORT detector ready"
         );
         Ok(Self {
-            session: Mutex::new(session),
+            session: Mutex::new(built.session),
             input_w,
             input_h,
             score_threshold,
