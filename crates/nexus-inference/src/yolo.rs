@@ -41,13 +41,13 @@ use async_trait::async_trait;
 use ndarray::{s, Array2, Array4};
 use nexus_config::InferenceConfig;
 use nexus_types::{BBox, Detection, Frame, PixelFormat};
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
-use crate::execution_providers;
+use crate::session_tuning::{self, SessionTuning};
 
 /// Real ORT-backed YOLO detector.
 pub struct YoloOrtDetector {
@@ -94,6 +94,11 @@ impl YoloOrtDetector {
             cfg.model.input_height,
             cfg.model.score_threshold,
             &cfg.ep_priority,
+            SessionTuning::new(
+                cfg.ort_intra_threads,
+                cfg.ort_allow_spinning,
+                cfg.ort_session_count(),
+            ),
         )
     }
 
@@ -101,29 +106,18 @@ impl YoloOrtDetector {
     /// the operator-supplied EP list from `[inference]` in nexus.toml
     /// — see [`crate::execution_providers::selected_for_priority`]
     /// for how it gets translated to ORT dispatchers. Pass `&[]` for
-    /// CPU-only (the default fallback path).
+    /// CPU-only (the default fallback path). `tuning` controls the
+    /// session's thread pools — see [`crate::session_tuning`].
     pub fn open(
         model_path: &Path,
         input_w: u32,
         input_h: u32,
         score_threshold: f32,
         ep_priority: &[String],
+        tuning: SessionTuning,
     ) -> Result<Self, InferenceError> {
-        let (eps, ep_names) = execution_providers::selected_for_priority(ep_priority);
-        let session = Session::builder()
-            .map_err(|e| InferenceError::ModelLoad(format!("session builder: {e}")))?
-            // ORT_ENABLE_ALL (99) — valid on every ONNX Runtime ABI.
-            // NOT `Level3`: in ort 2.0-rc that maps to ORT_ENABLE_LAYOUT (3),
-            // a level introduced in ONNX Runtime 1.22 that the ROCm 1.21
-            // runtime rejects with "graph_optimization_level is not valid".
-            .with_optimization_level(GraphOptimizationLevel::All)
-            .map_err(|e| InferenceError::ModelLoad(format!("opt level: {e}")))?
-            .with_execution_providers(eps)
-            .map_err(|e| InferenceError::ModelLoad(format!("EP register: {e}")))?
-            .commit_from_file(model_path)
-            .map_err(|e| {
-                InferenceError::ModelLoad(format!("load {}: {e}", model_path.display()))
-            })?;
+        let built = session_tuning::build_session(model_path, ep_priority, &tuning)
+            .map_err(InferenceError::ModelLoad)?;
         // ORT 2.0 silently skips an EP that fails to attach at runtime
         // (no .so / no device). `ep_registered` is the list we *asked*
         // the session builder to register; the actual runtime EP per
@@ -133,11 +127,12 @@ impl YoloOrtDetector {
             model = %model_path.display(),
             input_w, input_h, score_threshold,
             ep_requested = ?ep_priority,
-            ep_registered = ?ep_names,
+            ep_registered = ?built.ep_names,
+            intra_threads = built.intra_threads,
             "yolo ORT detector ready"
         );
         Ok(Self {
-            session: Mutex::new(session),
+            session: Mutex::new(built.session),
             input_w,
             input_h,
             score_threshold,

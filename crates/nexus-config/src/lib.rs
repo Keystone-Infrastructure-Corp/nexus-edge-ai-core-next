@@ -1135,9 +1135,59 @@ pub struct InferenceConfig {
     /// Ordered list of EPs to try at session-init time.
     #[serde(default = "default_ep_priority")]
     pub ep_priority: Vec<String>,
+    /// ORT intra-op thread-pool size, **per session**.
+    ///
+    /// `None` (the default) auto-sizes: `cores / ort_session_count()`
+    /// when the session lands on the CPU EP, or a small fixed pool
+    /// when an accelerator EP (OpenVINO / NPU / GPU / CUDA / TensorRT
+    /// / CoreML / Vulkan) attached and the CPU pool only services
+    /// fallback nodes.
+    ///
+    /// Left unset, ORT defaults this to the machine's logical core
+    /// count *for every session independently*, which massively
+    /// oversubscribes a box that also runs N camera pipelines — the
+    /// threads then spend most of their time in `SpinPause()` at
+    /// fork-join barriers rather than doing arithmetic.
+    #[serde(default)]
+    pub ort_intra_threads: Option<usize>,
+    /// Let ORT thread-pool workers busy-wait before blocking.
+    ///
+    /// **Disabled by default**, which is the opposite of ORT's own
+    /// default. Spinning only pays off when a session owns the
+    /// machine and runs inferences back-to-back. Here the engine also
+    /// runs GStreamer decode/convert threads for every camera, so a
+    /// spinning ORT worker steals the core its own preempted peer
+    /// needs to reach the barrier — the spin actively prolongs the
+    /// wait it is spinning on. Enable only on a dedicated box.
+    #[serde(default)]
+    pub ort_allow_spinning: bool,
     /// Concrete model (open-vocab, ensemble, …).
     #[serde(default)]
     pub model: ModelConfig,
+}
+
+impl InferenceConfig {
+    /// How many ORT sessions the detector layer will open in this
+    /// process for this config.
+    ///
+    /// `backend = "pool"` builds one detector per worker **plus** one
+    /// more for the `fail_soft` in-process fallback (see
+    /// `nexus_inference::build`). Each of those is an independent ORT
+    /// session with its own intra-op thread pool, so this is the
+    /// divisor for auto-sizing those pools.
+    ///
+    /// `pool_worker_kind = "process"` is excluded: those detectors are
+    /// built inside the child `nexus-inference-worker` processes, each
+    /// of which sees a single session.
+    pub fn ort_session_count(&self) -> usize {
+        match self.backend {
+            InferenceBackendKind::InProcess => 1,
+            InferenceBackendKind::Pool => match self.pool_worker_kind {
+                PoolWorkerKind::Process => 1,
+                PoolWorkerKind::Thread => self.workers.max(1) + usize::from(self.fail_soft),
+            },
+        }
+    }
 }
 
 impl Default for InferenceConfig {
@@ -1149,6 +1199,8 @@ impl Default for InferenceConfig {
             restart_backoff_ms: default_restart_backoff_ms(),
             fail_soft: true,
             ep_priority: default_ep_priority(),
+            ort_intra_threads: None,
+            ort_allow_spinning: false,
             model: ModelConfig::default(),
         }
     }
@@ -3220,8 +3272,23 @@ pub struct ReidConfig {
     pub min_crop_h_px: u32,
     /// EP priority list for the ORT session. Ignored when
     /// `model_path` is `None`. Default mirrors `[inference].ep_priority`.
+    ///
+    /// **Note for accelerator boxes:** bare `"openvino"` resolves to
+    /// OpenVINO `device_type = AUTO`, which can only place the graph on
+    /// a device whose OpenVINO plugin is actually loaded. On a box that
+    /// only exposes one accelerator, name it explicitly (`"npu"` /
+    /// `"gpu"`) or the ViT silently lands on the CPU EP.
     #[serde(default = "default_ep_priority")]
     pub ep_priority: Vec<String>,
+    /// ORT intra-op thread-pool size for the extractor session.
+    /// `None` (default) auto-sizes — see
+    /// [`InferenceConfig::ort_intra_threads`].
+    #[serde(default)]
+    pub ort_intra_threads: Option<usize>,
+    /// Let the extractor's ORT thread pool busy-wait before blocking.
+    /// Disabled by default — see [`InferenceConfig::ort_allow_spinning`].
+    #[serde(default)]
+    pub ort_allow_spinning: bool,
 }
 
 impl Default for ReidConfig {
@@ -3238,6 +3305,8 @@ impl Default for ReidConfig {
             min_crop_w_px: default_reid_min_crop_w_px(),
             min_crop_h_px: default_reid_min_crop_h_px(),
             ep_priority: default_ep_priority(),
+            ort_intra_threads: None,
+            ort_allow_spinning: false,
         }
     }
 }

@@ -28,6 +28,8 @@ pub mod health;
 pub mod nms;
 pub mod pool;
 pub mod router;
+#[cfg(feature = "ort")]
+pub mod session_tuning;
 pub mod visual_prompts;
 pub mod visual_store_sqlite;
 pub mod worker_proto;

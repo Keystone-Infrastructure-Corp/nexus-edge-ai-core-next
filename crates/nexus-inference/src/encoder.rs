@@ -42,13 +42,13 @@
 use std::path::{Path, PathBuf};
 
 use ndarray::Array4;
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
 use crate::detectors::InferenceError;
-use crate::execution_providers;
+use crate::session_tuning::{self, SessionTuning};
 
 /// One image-encoder ONNX session. Cheap to clone (the underlying
 /// `Session` lives behind a `Mutex` so concurrent admin uploads
@@ -102,31 +102,26 @@ impl ImageEncoder {
                 "embedding_dim must be > 0".into(),
             ));
         }
-        let (eps, ep_names) = execution_providers::selected_for_priority(ep_priority);
-        let session = Session::builder()
-            .map_err(|e| InferenceError::ModelLoad(format!("session builder: {e}")))?
-            // ORT_ENABLE_ALL (99) — valid on every ONNX Runtime ABI.
-            // NOT `Level3`: in ort 2.0-rc that maps to ORT_ENABLE_LAYOUT (3),
-            // a level introduced in ONNX Runtime 1.22 that the ROCm 1.21
-            // runtime rejects with "graph_optimization_level is not valid".
-            .with_optimization_level(GraphOptimizationLevel::All)
-            .map_err(|e| InferenceError::ModelLoad(format!("opt level: {e}")))?
-            .with_execution_providers(eps)
-            .map_err(|e| InferenceError::ModelLoad(format!("EP register: {e}")))?
-            .commit_from_file(model_path)
-            .map_err(|e| {
-                InferenceError::ModelLoad(format!("load {}: {e}", model_path.display()))
-            })?;
+        // The encoder is an admin-side, one-shot-per-upload session that
+        // runs *alongside* the live detector + re-ID sessions. It must
+        // not assume it owns the box, so it shares the same conservative
+        // threading policy as everything else. There is no operator knob
+        // because there is no `[encoder]` config block — the defaults
+        // are the right answer for a control-plane session.
+        let built =
+            session_tuning::build_session(model_path, ep_priority, &SessionTuning::default())
+                .map_err(InferenceError::ModelLoad)?;
         let model_id = model_id.into();
         info!(
             model = %model_path.display(),
             input_w, input_h, embedding_dim, model_id = %model_id,
             ep_requested = ?ep_priority,
-            ep_registered = ?ep_names,
+            ep_registered = ?built.ep_names,
+            intra_threads = built.intra_threads,
             "yoloe image encoder ready"
         );
         Ok(Self {
-            session: Mutex::new(session),
+            session: Mutex::new(built.session),
             input_w,
             input_h,
             embedding_dim,
