@@ -1019,14 +1019,36 @@ impl From<nexus_store::StoreError> for ApiError {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// `GET /api/v1/health` — unauthenticated liveness + self-assessment.
+///
+/// `status` is `"ok"` unless the engine is running with a known loss of
+/// function, in which case it is `"degraded"` and `issues[]` explains
+/// why. Today the only such condition is a detector that failed to build
+/// (see [`nexus_inference::health`]) — the engine keeps recording and
+/// streaming, but reports zero detections, so an operator watching only
+/// the alert count would otherwise see silence and assume all is well.
 async fn health() -> Json<serde_json::Value> {
+    let degradations = nexus_inference::health::degradations();
+    let issues: Vec<serde_json::Value> = degradations
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "component": "detector",
+                "code": "detector_unavailable",
+                "kind": d.kind,
+                "detail": d.reason,
+            })
+        })
+        .collect();
+
     Json(serde_json::json!({
-        "status": "ok",
+        "status": if issues.is_empty() { "ok" } else { "degraded" },
         // `NEXUS_BUILD_VERSION` is computed in `build.rs` from the
         // release tag (`NEXUS_RELEASE_VERSION`, e.g. `v0.1.27` →
         // `0.1.27`) at CI build-time, falling back to
         // `CARGO_PKG_VERSION` for local dev builds.
         "version": env!("NEXUS_BUILD_VERSION"),
+        "issues": issues,
     }))
 }
 

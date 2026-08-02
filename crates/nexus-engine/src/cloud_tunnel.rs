@@ -32,7 +32,9 @@ use nexus_cloud_client::{
     EnvelopeContext, RpcDispatcher, RpcResponseCache, SystemMethodPolicy, TrustedKey, TunnelClient,
     TunnelHandle, VerifiedActor, VerifierBuilder,
 };
-use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload};
+use nexus_cloud_protocol::v1::{
+    EdgeDegradation, EdgeHealth, Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload,
+};
 use nexus_storage::Registry;
 use nexus_storage_cloud::{AzureBlobBackend, GatewaySasIssuer};
 use nexus_store::cloud::CloudEnrollment;
@@ -1055,6 +1057,14 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
         // committed versions. `recording_active` is best-effort false
         // here; the SIGTERM drain is the real recording-safety guarantee.
         let release = Some(crate::cloud_update::release_status_for_heartbeat(&store, false).await);
+        // Fail-loud health roll-up. A detector that could not load its
+        // model leaves the engine fully "online" from the tunnel's point
+        // of view — it records, streams, and answers RPC — while
+        // producing zero detections. Without this field the cloud sees a
+        // green core and an operator sees only silence, which is
+        // indistinguishable from a genuinely quiet site. Recomputed each
+        // tick so a repaired detector clears within one heartbeat.
+        let health = Some(edge_health());
         let env = Envelope {
             meta: EnvelopeMeta {
                 id: uuid::Uuid::now_v7().to_string(),
@@ -1087,6 +1097,7 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
                 online_cameras: 0,
                 queued_alerts: 0,
                 release,
+                health,
                 // Optional cloud-side capability diagnostic (wire `v=1`,
                 // repurposed in place). Populating it with the engine's real
                 // probed capability profile (from config `ep_priority` / the
@@ -1111,4 +1122,104 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Wire cap on `EdgeDegradation.detail` (`proto/v1.json`). Resolver
+/// diagnostics name every shape present in the model pack and can run long,
+/// so truncate here rather than letting the gateway reject the envelope.
+const HEALTH_DETAIL_MAX: usize = 512;
+
+/// Wire cap on `EdgeHealth.issues` (`proto/v1.json`). The registry holds
+/// distinct conditions, not per-occurrence events, so overflow is not
+/// expected; the clamp exists so a future subsystem that registers many
+/// conditions cannot make the heartbeat unserialisable.
+const HEALTH_ISSUES_MAX: usize = 16;
+
+/// Build the heartbeat's health roll-up from the process-wide degradation
+/// registry.
+///
+/// `status` is `degraded` iff at least one issue is open, matching the
+/// schema's stated invariant. Only `detector` conditions exist today; new
+/// subsystems append here and the cloud renders unknown `code`s verbatim.
+fn edge_health() -> EdgeHealth {
+    let issues: Vec<EdgeDegradation> = nexus_inference::health::degradations()
+        .into_iter()
+        .take(HEALTH_ISSUES_MAX)
+        .map(|d| EdgeDegradation {
+            component: "detector".to_string(),
+            code: "detector_unavailable".to_string(),
+            detail: truncate_detail(&format!("{}: {}", d.kind, d.reason)),
+        })
+        .collect();
+    EdgeHealth {
+        status: if issues.is_empty() { "ok" } else { "degraded" }.to_string(),
+        issues: Some(issues),
+    }
+}
+
+/// Truncate to at most [`HEALTH_DETAIL_MAX`] **bytes** without splitting a
+/// UTF-8 code point. `String::truncate` panics on a non-boundary index, and
+/// resolver diagnostics can contain non-ASCII (operator-set model paths), so
+/// walk back to the nearest boundary first.
+fn truncate_detail(s: &str) -> String {
+    if s.len() <= HEALTH_DETAIL_MAX {
+        return s.to_string();
+    }
+    let mut end = HEALTH_DETAIL_MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn short_detail_is_passed_through_unchanged() {
+        assert_eq!(truncate_detail("boom"), "boom");
+    }
+
+    #[test]
+    fn long_detail_is_clamped_to_the_wire_cap() {
+        let long = "x".repeat(HEALTH_DETAIL_MAX * 2);
+        assert_eq!(truncate_detail(&long).len(), HEALTH_DETAIL_MAX);
+    }
+
+    /// A multi-byte code point straddling the cap must not panic and must
+    /// not produce invalid UTF-8. Resolver diagnostics echo operator-set
+    /// model paths, which are not guaranteed ASCII.
+    #[test]
+    fn truncation_never_splits_a_code_point() {
+        // 'é' is 2 bytes, so the 512-byte boundary lands mid-character.
+        let s = format!("{}é", "x".repeat(HEALTH_DETAIL_MAX - 1));
+        let out = truncate_detail(&s);
+        assert_eq!(out.len(), HEALTH_DETAIL_MAX - 1);
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    /// The registry is process-global, so assert on presence of our own
+    /// kind rather than on an exact issue count — a sibling test in the
+    /// same binary may have registered its own degradation.
+    #[test]
+    fn degradations_map_to_wire_issues_and_flip_the_status() {
+        let kind = "cloud_tunnel_health_test";
+        nexus_inference::health::record_degraded(kind, "model pack has no 640x640 export");
+
+        let health = edge_health();
+        assert_eq!(health.status, "degraded");
+        let issue = health
+            .issues
+            .as_ref()
+            .expect("issues present when degraded")
+            .iter()
+            .find(|i| i.detail.starts_with(kind))
+            .expect("our degradation is on the wire");
+        assert_eq!(issue.component, "detector");
+        assert_eq!(issue.code, "detector_unavailable");
+        assert!(issue.detail.contains("no 640x640 export"));
+
+        nexus_inference::health::clear_degraded(kind);
+    }
 }

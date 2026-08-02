@@ -620,11 +620,11 @@ pub fn build_detector_for_yolo_world(
     cfg: &InferenceConfig,
 ) -> Result<Arc<dyn Detector>, InferenceError> {
     match YoloWorldDetector::from_config(cfg) {
-        Ok(d) => Ok(Arc::new(d)),
-        Err(e) => {
-            warn!("yolo-world ORT detector unavailable, falling back to mock: {e}");
-            Ok(Arc::new(crate::detectors::MockDetector::new()))
+        Ok(d) => {
+            crate::health::clear_degraded("yolo_world");
+            Ok(Arc::new(d))
         }
+        Err(e) => Ok(crate::health::degraded_detector("yolo_world", e)),
     }
 }
 

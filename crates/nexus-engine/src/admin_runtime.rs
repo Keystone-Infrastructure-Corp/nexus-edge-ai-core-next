@@ -1906,12 +1906,58 @@ async fn read_persisted_model(store: &Store) -> Option<nexus_config::ModelConfig
 /// Failure modes are all loud (`warn!`) but non-fatal — a
 /// corrupt JSON row falls back to the on-disk config so the
 /// engine still boots.
+///
+/// ## Legacy shape remap (important)
+///
+/// The persisted blob is applied *after* the config loader has run, so
+/// it never passes through [`nexus_config::Config::normalize_shapes`].
+/// That matters because M_NATIVE_ASPECT replaced the old square model
+/// shapes (640x640, 960x960, 1280x1280) with an exact-16:9 ladder
+/// (512x288 / 1024x576 / 1536x864), and the pack no longer contains the
+/// square ONNX files.
+///
+/// A legacy square shape can be persisted in three places. That
+/// migration remapped two of them — `nexus.toml` (via the loader) and
+/// `cameras.config_json` (via store migration `0030`) — but **not** this
+/// row, `engine_runtime_settings.inference_model_json`, which is written
+/// whenever an operator saves a global default through
+/// `PUT /v1/admin/server/inference`. A box carrying such a row would
+/// come back from an OTA demanding `yolo26n_640x640.onnx`, fail to
+/// resolve it, and (before the accompanying detector-health change) fall
+/// back to the synthetic mock detector — fabricating a `person` alert on
+/// every frame of every camera.
+///
+/// Remapping here closes that third path: the stale square self-heals to
+/// its ladder equivalent on the next boot.
 pub async fn resolve_persisted_inference_model(
     store: &Store,
     toml_model: &nexus_config::ModelConfig,
 ) -> nexus_config::ModelConfig {
     match read_persisted_model(store).await {
-        Some(persisted) => {
+        Some(mut persisted) => {
+            let before = (
+                persisted.input_width,
+                persisted.input_height,
+                persisted.preset.clone(),
+            );
+            persisted.remap_legacy_shapes();
+            let after = (
+                persisted.input_width,
+                persisted.input_height,
+                persisted.preset.clone(),
+            );
+            if before != after {
+                tracing::warn!(
+                    from_w = before.0,
+                    from_h = before.1,
+                    from_preset = %before.2,
+                    to_w = after.0,
+                    to_h = after.1,
+                    to_preset = %after.2,
+                    "remapped legacy shape in persisted inference.model to the native-16:9 \
+                     ladder; the square ONNX no longer ships in the model pack",
+                );
+            }
             tracing::warn!(
                 kind = %persisted.kind,
                 preset = %persisted.preset,

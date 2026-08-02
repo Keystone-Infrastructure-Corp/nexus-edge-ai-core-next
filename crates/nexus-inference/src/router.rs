@@ -444,9 +444,10 @@ mod tests {
     #[test]
     fn router_falls_back_to_default_for_unknown_override_kind() {
         let cfg = cfg_with_kind("mock");
-        // "no_such_kind" still gets a layer (build_detector falls back to
-        // MockDetector with a warn), but the contract here is that even
-        // an explicitly-unknown override resolves to *some* detector and
+        // "no_such_kind" still gets a layer (build_detector degrades to
+        // an UnavailableDetector that reports zero detections and flags
+        // engine health), but the contract here is that even an
+        // explicitly-unknown override resolves to *some* detector and
         // the engine never panics on the hot path. Verify that with an
         // override the router didn't see at build time, the default kind
         // is what wins.

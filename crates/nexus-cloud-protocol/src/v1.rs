@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop, live_hd_bitrate. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -277,6 +277,29 @@ pub struct DiagReadyPayload {
     pub status: String,
 }
 
+/// Additive on v=1. One machine-routable loss-of-function condition, referenced by `EdgeHealth.issues`. The cloud renders these verbatim on the core detail page; `detail` is written to be actionable by an operator without shell access to the box. NOTE: named `EdgeDegradation` rather than `EdgeHealthIssue` so it sorts BEFORE `EdgeHealth` — the TS emitter writes `$defs` in sorted order and zod evaluates `z.object` shapes eagerly, so a referent that sorts after its referrer is a temporal-dead-zone ReferenceError at module load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeDegradation {
+    /// Stable machine-readable cause. Defined codes: `detector_unavailable` (the configured model could not be loaded, so the engine reports zero detections). Unknown codes MUST render as the raw string rather than being dropped, so a newer edge can report a condition an older console has no special-casing for.
+    pub code: String,
+    /// Subsystem that is impaired, e.g. `detector`. Used to group issues in the UI.
+    pub component: String,
+    /// Operator-facing explanation, truncated by the edge to 512 chars. For `detector_unavailable` this carries the model resolver's diagnostic, which names both the shape that was requested and the shapes present in the model pack.
+    pub detail: String,
+}
+
+/// Additive on v=1. Edge-reported health roll-up carried on the heartbeat. `ok` means every subsystem the edge self-checks is functioning; `degraded` means the engine is up (still recording, streaming, and answering the tunnel) but has a known loss of function described in `issues`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeHealth {
+    /// Open loss-of-function conditions. Empty or omitted when `status` is `ok`. Capped at 16 — the edge reports distinct conditions, not per-occurrence events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issues: Option<Vec<EdgeDegradation>>,
+    /// Roll-up over `issues`. `degraded` iff `issues` is non-empty.
+    pub status: String,
+}
+
 /// Cloud → Edge. Push triggered by Stripe webhook or initial enrollment. Edge persists + applies immediately.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -372,6 +395,9 @@ pub struct HeartbeatPayload {
     /// Phase 1.15: edge wall-clock for skew tracking (gateway writes EMA to cores.last_skew_ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_ts_unix_ms: Option<u64>,
+    /// Additive on v=1. Edge self-assessment of loss-of-function conditions that leave the engine running but not doing its job (e.g. the object detector failed to load its model, so no detections are produced at all). Distinct from `cores.status`, which tracks tunnel connectivity: a core can be perfectly online and still be blind. Omitted by pre-health edges, which the cloud treats as `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<EdgeHealth>,
     /// Phase C: operator-set engine display name (admin/server/identity). Gateway upserts into cores.name as a cache; UI renders this everywhere a core is listed. Omitted by pre-Phase-C edges; empty string is treated identically to omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
