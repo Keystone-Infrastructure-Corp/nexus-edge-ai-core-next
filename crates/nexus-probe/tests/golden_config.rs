@@ -34,7 +34,7 @@ fn config_for(m: &Manifest) -> nexus_config::Config {
 }
 
 /// Intel UHD N150 iGPU (the `.100` box). Golden knobs:
-/// `ep_priority = ["gpu","cpu"]`, preset 640, workers 1, 4/4 threads.
+/// `ep_priority = ["gpu","cpu"]`, preset 512x288, workers 1, 4/4 threads.
 #[test]
 fn intel_igpu_n150() {
     let m = manifest(
@@ -49,7 +49,7 @@ fn intel_igpu_n150() {
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["gpu", "cpu"]);
     assert_eq!(c.inference.workers, 1);
-    assert_eq!(c.inference.model.preset, "640");
+    assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 4);
     assert_eq!(c.runtime.blocking_threads, 4);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
@@ -58,7 +58,7 @@ fn intel_igpu_n150() {
 }
 
 /// Intel Lunar Lake (Arc 140V iGPU + NPU). Golden knobs:
-/// `ep_priority = ["npu","cpu"]`, preset 960, workers 2, 8/8 threads.
+/// `ep_priority = ["npu","cpu"]`, preset 512x288, workers 2, 8/8 threads.
 /// NPU wins inference; decode stays VA via the Arc media engine.
 #[test]
 fn intel_npu_lunar_lake() {
@@ -76,18 +76,18 @@ fn intel_npu_lunar_lake() {
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["npu", "cpu"]);
     assert_eq!(c.inference.workers, 2);
-    assert_eq!(c.inference.model.preset, "960");
+    assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 8);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }
 
 /// Discrete Intel Arc A380 dGPU. The discrete-Arc knobs would be
-/// `ep_priority = ["openvino","cpu"]`, preset 960, workers 2, but the
-/// probe can't yet distinguish a discrete Arc from an iGPU (both surface
-/// as `intel_arc_140v`/`intel_igpu`), so the generator emits the
-/// iGPU-class mapping: `"gpu"` (the explicit OpenVINO GPU device, valid
-/// for dGPU too), preset 640, workers 1. VRAM-based dGPU detection is the
-/// deferred enrichment that would restore 960/2.
+/// `ep_priority = ["openvino","cpu"]`, workers 2, but the probe can't yet
+/// distinguish a discrete Arc from an iGPU (both surface as
+/// `intel_arc_140v`/`intel_igpu`), so the generator emits the iGPU-class
+/// mapping: `"gpu"` (the explicit OpenVINO GPU device, valid for dGPU
+/// too), workers 1. VRAM-based dGPU detection is the deferred enrichment
+/// that would restore workers 2. Preset is the uniform install default.
 #[test]
 fn discrete_arc_falls_back_to_igpu_class() {
     let m = manifest(
@@ -103,14 +103,14 @@ fn discrete_arc_falls_back_to_igpu_class() {
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["gpu", "cpu"]);
     assert_eq!(c.inference.workers, 1);
-    assert_eq!(c.inference.model.preset, "640");
+    assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 12);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }
 
 /// Beelink EQR7: Hailo-8 inference, AMD Radeon 680M decode-only (not on
 /// the ROCm allowlist). Golden knobs: `ep_priority = ["hailo","cpu"]`,
-/// preset 640, workers 1, 16/16 threads, bus 2048. The decode-only AMD
+/// preset 512x288, workers 1, 16/16 threads, bus 2048. The decode-only AMD
 /// iGPU must NOT enter the inference chain.
 #[test]
 fn hailo_eqr7_with_amd_decode() {
@@ -128,7 +128,7 @@ fn hailo_eqr7_with_amd_decode() {
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["hailo", "cpu"]);
     assert_eq!(c.inference.workers, 1);
-    assert_eq!(c.inference.model.preset, "640");
+    assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 16);
     assert_eq!(c.runtime.blocking_threads, 16);
     assert_eq!(c.bus.capacity, 2048);
@@ -136,7 +136,7 @@ fn hailo_eqr7_with_amd_decode() {
 }
 
 /// AMD Vulkan — Phoenix/Rembrandt APU NOT on the ROCm allowlist. Golden
-/// knobs: `ep_priority = ["vulkan","cpu"]`, preset 640.
+/// knobs: `ep_priority = ["vulkan","cpu"]`, preset 512x288.
 #[test]
 fn amd_vulkan_igpu() {
     let m = manifest(
@@ -151,7 +151,7 @@ fn amd_vulkan_igpu() {
     );
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["vulkan", "cpu"]);
-    assert_eq!(c.inference.model.preset, "640");
+    assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }
 
