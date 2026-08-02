@@ -60,6 +60,7 @@ mod roster;
 mod setup;
 mod sink_router;
 mod sinks_reload;
+mod ssh_ca;
 mod state_hashes;
 mod storage_safety;
 mod system_metrics;
@@ -1579,6 +1580,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // every successful extract. Drive `/v1/admin/reid/status`.
         reid_config: Arc::new(cfg.reid.clone()),
         lan_proxy_enabled: cfg.lan_proxy.enabled,
+        remote_access_enabled: cfg.remote_access.enabled,
         reid_stats: reid_stats.clone(),
     };
 

@@ -580,6 +580,32 @@ async fn run(
         dispatcher.as_ref().map(|d| d.verifier().clone()),
         Arc::clone(&cloud_outbox),
     ));
+    // Adopt the cloud's SSH certificate authority. Runs once per engine
+    // start, and only when BOTH the box owner opted in locally and the
+    // cloud actually shipped a CA in the enrollment bundle. Idempotent, so
+    // it also repairs a drop-in an OS-level sshd reconfiguration removed.
+    // Deliberately fire-and-forget: a box with no sshd, or a failed
+    // adoption, must never delay or block the control tunnel — remote
+    // shell just stays unavailable and every later session open reports
+    // the failure to the console.
+    if remote_shell.is_enabled() {
+        if let Some(ca) = enrollment.ssh_ca_public_key.clone() {
+            tokio::spawn(async move {
+                match crate::ssh_ca::install_ca(&ca).await {
+                    Ok(()) => info!("remote access: SSH CA adopted"),
+                    Err(e) => warn!(
+                        reason = e.code(),
+                        "remote access: SSH CA adoption failed; native sessions will be refused"
+                    ),
+                }
+            });
+        } else {
+            warn!(
+                "remote access is enabled locally but this enrollment carries no SSH CA; \
+                 re-enroll against a cloud that has one provisioned"
+            );
+        }
+    }
     let mut backoff = BACKOFF_MIN;
     let core_id = enrollment.core_id.clone();
     loop {

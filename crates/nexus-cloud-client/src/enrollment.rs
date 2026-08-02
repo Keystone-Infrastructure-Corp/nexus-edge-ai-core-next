@@ -108,6 +108,15 @@ pub struct EnrollmentResponse {
     /// it for future revocation lookups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_cert_serial: Option<String>,
+    /// Remote shell (admin-granted support access) — OpenSSH-format public
+    /// key of the cloud's SSH certificate authority, single-line
+    /// `authorized_keys` form. The engine never uses this key itself; it
+    /// stages it for the pinned root-owned applier, which installs it as
+    /// `TrustedUserCAKeys`. `None` when the cloud has no SSH CA
+    /// provisioned or predates the remote-shell release — in which case
+    /// the appliance simply has no remote-shell capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_ca_public_key: Option<String>,
 }
 
 /// Phase 1.7 client. The constructor pins the cloud-console base URL;

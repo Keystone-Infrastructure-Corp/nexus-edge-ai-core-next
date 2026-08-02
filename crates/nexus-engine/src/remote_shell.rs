@@ -125,6 +125,40 @@ impl RemoteShellManager {
         }
     }
 
+    /// Whether the box owner opted this appliance in. Read by the tunnel
+    /// supervisor to decide whether to adopt the cloud's SSH CA at all — a
+    /// core with remote access off never installs `TrustedUserCAKeys`, so
+    /// the capability is absent rather than merely unused.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.cfg.enabled
+    }
+
+    /// Push the current live-session set to sshd's `AuthorizedPrincipalsFile`.
+    ///
+    /// The certificate the cloud mints for a session carries that session's
+    /// UUID as its only principal, so this file is the revocation surface:
+    /// dropping a UUID here refuses the next authentication attempt even
+    /// though the certificate is still cryptographically valid and unexpired.
+    /// Called on every open and every close, including refusals, so a crashed
+    /// or force-killed session can never leave a usable principal behind.
+    ///
+    /// Fire-and-forget on purpose. The byte pump must not wait on a `sudo`
+    /// round trip, and a failure here is fail-*closed* for new logins in the
+    /// open direction (no principal → no login) while an already-established
+    /// TCP session is still killed by the pump's own cancellation path.
+    fn resync_principals(&self) {
+        let live: std::collections::BTreeSet<String> = self.live.lock().keys().cloned().collect();
+        tokio::spawn(async move {
+            if let Err(e) = crate::ssh_ca::sync_principals(live).await {
+                warn!(
+                    reason = e.code(),
+                    "remote access: could not sync session principals"
+                );
+            }
+        });
+    }
+
     /// Handle an inbound `shell_session_open`.
     ///
     /// Returns immediately; the session itself runs on a detached task
@@ -165,6 +199,10 @@ impl RemoteShellManager {
                 },
             );
         }
+        // Authorise this session's principal BEFORE announcing the session as
+        // open. The recipient still has to paste an ssh command, so the
+        // applier round trip is never on a latency-sensitive path.
+        self.resync_principals();
 
         info!(
             session_id = %session_id,
@@ -176,6 +214,7 @@ impl RemoteShellManager {
         tokio::spawn(async move {
             let outcome = this.run(&payload, cancel_rx, &stop_slot).await;
             this.live.lock().remove(&outcome.session_id);
+            this.resync_principals();
             info!(
                 session_id = %outcome.session_id,
                 reason = outcome.reason,
@@ -403,4 +442,69 @@ impl Outcome {
             detail: Some(detail),
         }
     }
+}
+
+/// Response body for `POST /api/v1/admin/remote-access/restart-sshd`.
+#[derive(Debug, serde::Serialize)]
+pub struct RestartSshdResponse {
+    /// Always `true` on the success path — present so the console can
+    /// distinguish "we restarted it" from a 2xx with no effect.
+    pub restarted: bool,
+}
+
+/// `POST /v1/admin/remote-access/restart-sshd` — operator recovery for a
+/// wedged sshd, reached from the cloud console as an `rpc_call`.
+///
+/// This is intentionally the *only* sshd control surface exposed to the
+/// cloud. It cannot change configuration, cannot enable remote access, and
+/// cannot create logins; the privileged applier validates the config with
+/// `sshd -t` and refuses to restart a broken one, so the worst outcome of a
+/// spurious call is a few seconds of dropped SSH connectivity — never a
+/// lockout.
+///
+/// # Errors
+/// * `403` when remote access is disabled on this appliance. A core whose
+///   owner never opted in does not expose an sshd control at all.
+/// * `500` when the privileged applier is missing or the restart fails.
+pub async fn post_admin_restart_sshd(
+    axum::extract::State(s): axum::extract::State<crate::api::ApiState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
+) -> Result<axum::Json<RestartSshdResponse>, crate::api::ApiError> {
+    let enabled = s.remote_access_enabled;
+    let result = if enabled {
+        crate::ssh_ca::restart_sshd().await.map_err(|e| {
+            crate::api::ApiError(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sshd restart failed: {}", e.code()),
+            )
+        })
+    } else {
+        Err(crate::api::ApiError(
+            axum::http::StatusCode::FORBIDDEN,
+            "remote access is disabled on this appliance".to_string(),
+        ))
+    };
+    let outcome = if result.is_ok() {
+        nexus_store::audit::AuditOutcome::Success
+    } else {
+        nexus_store::audit::AuditOutcome::Failure
+    };
+    crate::auth::admin_audit::audit_admin_action(
+        &s.store,
+        session.as_ref(),
+        &headers,
+        peer.ip(),
+        "remote_access.sshd.restart",
+        "remote_access",
+        None,
+        outcome,
+        None,
+        None,
+    )
+    .await;
+    result?;
+    info!("remote access: sshd restarted on operator request");
+    Ok(axum::Json(RestartSshdResponse { restarted: true }))
 }

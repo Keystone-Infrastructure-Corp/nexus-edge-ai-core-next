@@ -27,11 +27,18 @@
 # Security scope:
 #   - Pinned to a SINGLE absolute path outside the nexus-writable /opt/nexus
 #     tree, so a compromised engine cannot swap the wrapper.
-#   - The trailing `*` matches the subcommand + version argument
-#     (`apply <version>`, `reflip <version>`, `prune <version>`). sudo's `*`
-#     does NOT cross `/`, so no path argument can be smuggled through; the
-#     wrapper additionally validates the version charset and rejects path
-#     traversal before doing anything.
+#   - The trailing `*` matches the subcommand + its argument
+#     (`apply <version>`, `reflip <version>`, `prune <version>`, and the
+#     argument-less remote-shell modes `ssh-ca-install`,
+#     `ssh-principals-sync`, `sshd-restart`). sudo's `*` does NOT cross `/`,
+#     so no path argument can be smuggled through — which is exactly why the
+#     ssh modes read their input from fixed engine-writable staging paths
+#     under /var/lib/nexus/ssh/ rather than taking a filename. The wrapper
+#     additionally validates the version charset, rejects path traversal, and
+#     charset-validates every staged principal before doing anything.
+#   - Adding these modes required NO edit to the grant below. That is the
+#     whole point of the argv-independent wildcard: privileged behaviour
+#     evolves in the audited root-owned wrapper, never in sudoers.
 #   - The wrapper enforces its own apt allowlist and `rm -rf` keep-set, so this
 #     rule grants NO general `apt`, `systemctl`, `tar`, or `rm` power.
 #
