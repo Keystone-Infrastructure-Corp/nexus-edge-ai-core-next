@@ -279,6 +279,7 @@ fn build_yolo_world_detector() -> Arc<dyn Detector> {
         None,
         vocab,
         &parse_ep_priority_env(),
+        nexus_inference::session_tuning::SessionTuning::default(),
     ) {
         Ok(d) => Arc::new(d),
         Err(e) => {
@@ -366,6 +367,7 @@ fn build_yoloe_detector() -> Arc<dyn Detector> {
         None,
         vocab,
         &parse_ep_priority_env(),
+        nexus_inference::session_tuning::SessionTuning::default(),
     ) {
         Ok(d) => Arc::new(d),
         Err(e) => {
@@ -487,6 +489,7 @@ async fn build_yoloe_visual_detector() -> Arc<dyn Detector> {
         embedding_dim,
         visual_store,
         &ep_priority,
+        nexus_inference::session_tuning::SessionTuning::default(),
     ) {
         Ok(d) => Arc::new(d),
         Err(e) => {

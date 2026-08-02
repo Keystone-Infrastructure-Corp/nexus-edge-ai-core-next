@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
+use nexus_inference::session_tuning::SessionTuning;
 use nexus_inference::yoloe::{load_vocab_from_manifest_public, YoloeDetector};
 use nexus_inference::Detector;
 use nexus_types::{Frame, PixelFormat};
@@ -92,8 +93,18 @@ async fn yoloe_smoke_runs_on_synthetic_frame() {
         .expect("vocab must load from manifest");
     assert!(!vocab.is_empty(), "manifest yoloe26_s.prompts[] is empty");
 
-    let det = YoloeDetector::open(&model, 640, 640, 0.10, 0.50, None, vocab.clone(), &[])
-        .expect("yoloe session must open");
+    let det = YoloeDetector::open(
+        &model,
+        640,
+        640,
+        0.10,
+        0.50,
+        None,
+        vocab.clone(),
+        &[],
+        SessionTuning::default(),
+    )
+    .expect("yoloe session must open");
 
     let prompts: Vec<String> = vocab.iter().take(3).cloned().collect();
     let frame = synth_frame(1280, 720);
