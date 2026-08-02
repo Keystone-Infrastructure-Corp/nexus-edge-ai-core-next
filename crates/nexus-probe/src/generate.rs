@@ -27,7 +27,7 @@
 //! | `runtime.decode.mode` | [`DecodeCapability`] (VA / NVDEC / software) |
 //! | `inference.ep_priority` | primary [`InferenceDevice`] |
 //! | `inference.workers` | primary [`InferenceDevice`] |
-//! | `inference.model.preset` (+ `input_width`/`input_height`) | primary [`InferenceDevice`] |
+//! | `inference.model.preset` (+ `input_width`/`input_height`) | fixed [`DEFAULT_PRESET`] |
 //! | `bus.capacity` | total RAM |
 //!
 //! The constant fields the old templates also set (the `0.0.0.0` binds,
@@ -110,14 +110,14 @@ pub fn generate_config(profile: &HardwareProfile) -> Config {
     cfg.inference.workers = workers_for(device, profile.vram_mib);
     cfg.inference.ep_priority = ep_priority_for(device);
     cfg.inference.model.pack_path = Some(PathBuf::from(PACK_PATH));
-    let preset = preset_for(device, profile.vram_mib);
-    cfg.inference.model.preset = preset.to_string();
+    let (input_w, input_h) = DEFAULT_PRESET;
+    cfg.inference.model.preset = format!("{input_w}x{input_h}");
     // Redundant when `pack_path` is set (the engine resolves `preset`
     // against the manifest and ignores these), but kept for parity with
     // the old templates and as a sane fallback if the pack ever lacks the
     // preset.
-    cfg.inference.model.input_width = preset;
-    cfg.inference.model.input_height = preset;
+    cfg.inference.model.input_width = input_w;
+    cfg.inference.model.input_height = input_h;
 
     // --- bus ------------------------------------------------------------
     cfg.bus.capacity = bus_capacity_for(profile.ram_bytes);
@@ -155,6 +155,25 @@ fn ep_priority_for(device: InferenceDevice) -> Vec<String> {
     tokens.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// Model-pack preset every fresh install starts on — the bottom rung of
+/// the native-16:9 ladder (`nexus_config::SHAPE_LADDER`).
+///
+/// This is deliberately uniform across hardware. The preset does not just
+/// size the detector input: it sizes the *supervisor* frame, which the
+/// detector, tracker AND re-ID crop extractor all share
+/// (`nexus_pipeline::source::supervisor_frame_for`). Moving up one rung is
+/// 4x the pixels, which surfaces more small objects, which multiplies
+/// track count, which multiplies the 224x224 DINOv2 crops re-ID emits per
+/// track. A box sized on detector throughput alone will happily pick a rung
+/// that then drowns the sighting queue — that is exactly what an Intel NPU
+/// box provisioned at 1024x576 did in production.
+///
+/// So: start conservative on every box and let an operator raise it per
+/// deployment (admin UI -> `PUT /v1/admin/server/inference`, or per-camera
+/// via `CameraBehavior::supervisor_width`) once the real camera count and
+/// re-ID load on that site are known. Install time does not know either.
+const DEFAULT_PRESET: (u32, u32) = (512, 288);
+
 /// Detector-pool worker count.
 ///
 /// The Intel NPU (Lunar Lake) runs 2. NVIDIA scales with VRAM — see
@@ -163,55 +182,42 @@ fn ep_priority_for(device: InferenceDevice) -> Vec<String> {
 fn workers_for(device: InferenceDevice, vram_mib: Option<u64>) -> usize {
     match device {
         InferenceDevice::IntelNpu => 2,
-        InferenceDevice::Nvidia => nvidia_sizing(vram_mib).0,
+        InferenceDevice::Nvidia => nvidia_sizing(vram_mib),
         _ => 1,
     }
 }
 
-/// Model-pack preset (the square detector input edge).
+/// Worker count for an NVIDIA box, bucketed by total VRAM.
 ///
-/// The NPU (Lunar Lake) has the headroom to run 960; NVIDIA scales with
-/// VRAM (see [`nvidia_sizing`]); everything else we can reliably detect
-/// runs 640. Operators bump per-camera in the UI for plate/face work.
-fn preset_for(device: InferenceDevice, vram_mib: Option<u64>) -> u32 {
-    match device {
-        InferenceDevice::IntelNpu => 960,
-        InferenceDevice::Nvidia => nvidia_sizing(vram_mib).1,
-        _ => 640,
-    }
-}
-
-/// `(workers, preset)` for an NVIDIA box, bucketed by total VRAM.
+/// One FP32 YOLO session at the install-default 512x288 costs well under
+/// 1 GiB of VRAM once the CUDA context, weights, and cuDNN workspace are
+/// counted. The buckets keep the whole pool comfortably inside the card so
+/// a session never fails to open mid-install:
 ///
-/// One FP32 YOLO session at 640 costs roughly 1 GiB of VRAM once the CUDA
-/// context, weights, and cuDNN workspace are counted; 960 costs a little
-/// over twice that. The buckets keep the whole pool comfortably inside the
-/// card so a session never fails to open mid-install:
-///
-/// | VRAM | workers | preset | representative card |
-/// |---|---|---|---|
-/// | unknown | 1 | 640 | driver not live yet |
-/// | < 4 GiB | 1 | 640 | GTX 1050 |
-/// | < 8 GiB | 2 | 640 | **Quadro P2000 (5 GiB)** |
-/// | < 12 GiB | 2 | 960 | RTX 4060 |
-/// | >= 12 GiB | 3 | 960 | RTX 3060 12G / 4070+ |
+/// | VRAM | workers | representative card |
+/// |---|---|---|
+/// | unknown | 1 | driver not live yet |
+/// | < 4 GiB | 1 | GTX 1050 |
+/// | < 8 GiB | 2 | **Quadro P2000 (5 GiB)** |
+/// | < 12 GiB | 2 | RTX 4060 |
+/// | >= 12 GiB | 3 | RTX 3060 12G / 4070+ |
 ///
 /// `None` (driver not live, or `nvidia-smi` unreadable) deliberately gets
 /// the most conservative bucket rather than an optimistic guess: an
 /// under-provisioned pool runs slower, an over-provisioned one fails to
 /// start.
 ///
-/// Preset stays at 640 below 8 GiB regardless of worker count. Pascal-class
-/// silicon has no Tensor Cores, so 960 costs roughly 2.2x the compute for a
-/// modest accuracy gain — throughput on a P2000 is better spent on a second
-/// 640 worker than on one wider one.
-fn nvidia_sizing(vram_mib: Option<u64>) -> (usize, u32) {
+/// This sizes the pool only. The preset is [`DEFAULT_PRESET`] on every box
+/// regardless of VRAM — a card with headroom for a wider detector does not
+/// imply the CPU has headroom for the re-ID crops that wider analysis
+/// frame generates.
+fn nvidia_sizing(vram_mib: Option<u64>) -> usize {
     match vram_mib {
-        None => (1, 640),
-        Some(mib) if mib < 4_096 => (1, 640),
-        Some(mib) if mib < 8_192 => (2, 640),
-        Some(mib) if mib < 12_288 => (2, 960),
-        Some(_) => (3, 960),
+        None => 1,
+        Some(mib) if mib < 4_096 => 1,
+        Some(mib) if mib < 8_192 => 2,
+        Some(mib) if mib < 12_288 => 2,
+        Some(_) => 3,
     }
 }
 
@@ -343,15 +349,18 @@ mod tests {
         assert_eq!(c.runtime.worker_threads, 4);
         assert_eq!(c.runtime.blocking_threads, 4);
         assert_eq!(c.inference.workers, 1);
-        assert_eq!(c.inference.model.preset, "640");
-        assert_eq!(c.inference.model.input_width, 640);
+        assert_eq!(c.inference.model.preset, "512x288");
+        assert_eq!(c.inference.model.input_width, 512);
         assert_eq!(c.inference.backend, InferenceBackendKind::Pool);
         assert_eq!(c.runtime.clips.recorder, RecorderKind::Gstreamer);
     }
 
     #[test]
-    fn intel_npu_gets_two_workers_and_960_preset() {
-        // Lunar Lake: NPU primary, 8 cores, 16 GiB.
+    fn intel_npu_gets_two_workers_at_the_default_preset() {
+        // Lunar Lake: NPU primary, 8 cores, 16 GiB. The NPU has detector
+        // headroom for a wider rung, but the preset also sizes the
+        // supervisor frame that re-ID crops come from, so it stays at the
+        // uniform default until an operator raises it per site.
         let p = profile(
             8,
             16,
@@ -361,8 +370,8 @@ mod tests {
         let c = generate_config(&p);
         assert_eq!(c.inference.ep_priority, vec!["npu", "cpu"]);
         assert_eq!(c.inference.workers, 2);
-        assert_eq!(c.inference.model.preset, "960");
-        assert_eq!(c.inference.model.input_width, 960);
+        assert_eq!(c.inference.model.preset, "512x288");
+        assert_eq!(c.inference.model.input_width, 512);
         assert_eq!(c.runtime.decode.mode, DecodeMode::Va);
     }
 
@@ -409,15 +418,15 @@ mod tests {
         assert_eq!(c.bus.capacity, 4096);
     }
 
-    /// The reference NVIDIA box: a 5 GiB Quadro P2000. Two 640 workers fit
-    /// comfortably; 960 is deliberately withheld from Pascal-class silicon.
+    /// The reference NVIDIA box: a 5 GiB Quadro P2000. Two workers fit
+    /// comfortably at the install-default preset.
     #[test]
-    fn nvidia_p2000_gets_two_640_workers() {
+    fn nvidia_p2000_gets_two_workers() {
         let p = nvidia_profile(Some(5_059));
         let c = generate_config(&p);
         assert_eq!(c.inference.workers, 2);
-        assert_eq!(c.inference.model.preset, "640");
-        assert_eq!(c.inference.model.input_width, 640);
+        assert_eq!(c.inference.model.preset, "512x288");
+        assert_eq!(c.inference.model.input_width, 512);
     }
 
     /// Unknown VRAM (driver not live yet, or `nvidia-smi` unreadable) must
@@ -427,22 +436,23 @@ mod tests {
     fn nvidia_unknown_vram_under_provisions() {
         let c = generate_config(&nvidia_profile(None));
         assert_eq!(c.inference.workers, 1);
-        assert_eq!(c.inference.model.preset, "640");
+        assert_eq!(c.inference.model.preset, "512x288");
     }
 
     #[test]
     fn nvidia_sizing_buckets_scale_with_vram() {
-        // Bucket boundaries, exercised through the public generator.
-        for (mib, workers, preset) in [
-            (2_048_u64, 1_usize, "640"), // GTX 1050, 2 GiB
-            (4_096, 2, "640"),           // bucket edge
-            (8_192, 2, "960"),           // RTX 4060, 8 GiB
-            (12_288, 3, "960"),          // RTX 3060, 12 GiB
-            (24_576, 3, "960"),          // RTX 4090, 24 GiB
+        // Bucket boundaries, exercised through the public generator. VRAM
+        // scales the pool only — the preset is uniform across every box.
+        for (mib, workers) in [
+            (2_048_u64, 1_usize), // GTX 1050, 2 GiB
+            (4_096, 2),           // bucket edge
+            (8_192, 2),           // RTX 4060, 8 GiB
+            (12_288, 3),          // RTX 3060, 12 GiB
+            (24_576, 3),          // RTX 4090, 24 GiB
         ] {
             let c = generate_config(&nvidia_profile(Some(mib)));
             assert_eq!(c.inference.workers, workers, "workers at {mib} MiB");
-            assert_eq!(c.inference.model.preset, preset, "preset at {mib} MiB");
+            assert_eq!(c.inference.model.preset, "512x288", "preset at {mib} MiB");
         }
     }
 
@@ -459,7 +469,7 @@ mod tests {
         );
         let c = generate_config(&p);
         assert_eq!(c.inference.workers, 1);
-        assert_eq!(c.inference.model.preset, "640");
+        assert_eq!(c.inference.model.preset, "512x288");
     }
 
     #[test]
