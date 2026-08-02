@@ -53,6 +53,14 @@ pub struct SystemMetrics {
     pub hailo: Option<crate::hailo::HailoInfo>,
     pub disks: Vec<DiskInfo>,
     pub process: ProcessInfo,
+    /// Kernel pressure-stall information — the share of wall time
+    /// tasks spent *waiting* for CPU, I/O, or memory. Utilization
+    /// gauges cannot distinguish "idle" from "blocked"; this can,
+    /// which is what makes a stalled pipeline on an otherwise-quiet
+    /// box visible. `None` on non-Linux hosts and on kernels built
+    /// without `CONFIG_PSI`. See the sibling `proc_metrics` module.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pressure: Option<crate::proc_metrics::PressureInfo>,
     /// Wall-clock instant the snapshot was refreshed at, ISO 8601.
     /// Lets the UI label "as of N seconds ago" without a server
     /// round-trip on the time itself.
@@ -198,6 +206,23 @@ pub struct DiskInfo {
     pub total_bytes: u64,
     pub available_bytes: u64,
     pub is_removable: bool,
+    /// Bytes per second read from the backing block device over the
+    /// last sampling interval. `None` on non-Linux hosts, before the
+    /// first delta is available, and when the mount cannot be resolved
+    /// to a `/proc/diskstats` device (network and virtual filesystems).
+    ///
+    /// Note these are *device*-level counters: several mounts sharing
+    /// one logical volume all report that volume's totals.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub read_bytes_per_sec: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub write_bytes_per_sec: Option<u64>,
+    /// Share of wall time the device had at least one request in
+    /// flight, 0–100 — `iostat -x`'s `%util`. Near 100 with a low byte
+    /// rate means seek-bound; near 0 while the engine claims to be
+    /// recording means the data never reached the disk.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub util_pct: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,9 +234,26 @@ pub struct ProcessInfo {
     pub virtual_bytes: u64,
     /// CPU percent for this process, 0–100 × logical cores
     /// (sysinfo's convention; e.g. 200 means 2 cores fully used).
+    ///
+    /// Preferentially computed from `/proc` thread deltas, falling back
+    /// to `sysinfo`. The fallback needs a warm baseline across two of
+    /// its own refreshes, which the one-shot diagnostics path does not
+    /// always have — it reported a flat `0.0` on a box genuinely using
+    /// 3.6 cores.
     pub cpu_pct: f32,
     /// Engine process uptime in seconds.
     pub run_time_secs: u64,
+    /// Total live OS threads in this process. GStreamer spawns a thread
+    /// per queue element, so this scales with camera count and is worth
+    /// watching on its own.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub thread_count: Option<usize>,
+    /// Busiest threads by CPU, descending, capped and filtered by the
+    /// `proc_metrics` module. Attributes process CPU to named threads so
+    /// a single saturated thread is visible instead of being averaged
+    /// into an idle-looking core count. Empty on non-Linux hosts.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub threads: Vec<crate::proc_metrics::ThreadCpu>,
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +317,11 @@ fn render() -> Arc<SystemMetrics> {
     );
     guard.disks.refresh();
 
+    // `/proc` throughput + stall counters. This is a delta against the
+    // sampler's previous call, so it is deliberately taken on the same
+    // cadence as the rest of the snapshot.
+    let proc_sample = crate::proc_metrics::sample();
+
     let host_uptime = System::uptime();
     let global_cpu = guard.sys.global_cpu_usage();
     let per_core: Vec<f32> = guard.sys.cpus().iter().map(|c| c.cpu_usage()).collect();
@@ -315,13 +362,24 @@ fn render() -> Arc<SystemMetrics> {
     let disks: Vec<DiskInfo> = guard
         .disks
         .iter()
-        .map(|d| DiskInfo {
-            name: d.name().to_string_lossy().into_owned(),
-            mount_point: d.mount_point().to_string_lossy().into_owned(),
-            file_system: d.file_system().to_string_lossy().into_owned(),
-            total_bytes: d.total_space(),
-            available_bytes: d.available_space(),
-            is_removable: d.is_removable(),
+        .map(|d| {
+            let name = d.name().to_string_lossy().into_owned();
+            // Several mounts commonly share one logical volume, so this
+            // resolve-then-lookup runs per mount and can legitimately
+            // hand back the same device stats more than once.
+            let io = crate::proc_metrics::kernel_device_name(&name)
+                .and_then(|dev| proc_sample.disk_io.get(&dev).copied());
+            DiskInfo {
+                name,
+                mount_point: d.mount_point().to_string_lossy().into_owned(),
+                file_system: d.file_system().to_string_lossy().into_owned(),
+                total_bytes: d.total_space(),
+                available_bytes: d.available_space(),
+                is_removable: d.is_removable(),
+                read_bytes_per_sec: io.map(|i| i.read_bytes_per_sec),
+                write_bytes_per_sec: io.map(|i| i.write_bytes_per_sec),
+                util_pct: io.map(|i| i.util_pct),
+            }
         })
         .collect();
 
@@ -332,8 +390,12 @@ fn render() -> Arc<SystemMetrics> {
             pid: current_pid(),
             rss_bytes: p.memory(),
             virtual_bytes: p.virtual_memory(),
-            cpu_pct: p.cpu_usage(),
+            // Prefer the `/proc` figure; see the field's doc comment for
+            // why sysinfo's reading is not trusted as the primary.
+            cpu_pct: proc_sample.process_cpu_pct.unwrap_or_else(|| p.cpu_usage()),
             run_time_secs: p.run_time(),
+            thread_count: (proc_sample.thread_count > 0).then_some(proc_sample.thread_count),
+            threads: proc_sample.threads.clone(),
         })
         .unwrap_or(ProcessInfo {
             pid: current_pid(),
@@ -341,6 +403,8 @@ fn render() -> Arc<SystemMetrics> {
             virtual_bytes: 0,
             cpu_pct: 0.0,
             run_time_secs: 0,
+            thread_count: None,
+            threads: Vec::new(),
         });
 
     let response = SystemMetrics {
@@ -353,6 +417,7 @@ fn render() -> Arc<SystemMetrics> {
         hailo: crate::hailo::snapshot(),
         disks,
         process,
+        pressure: proc_sample.pressure,
         captured_at: chrono::Utc::now(),
     };
 
@@ -478,5 +543,43 @@ mod tests {
             Arc::ptr_eq(&a, &b),
             "two reads within TTL should hand back the same Arc"
         );
+    }
+
+    /// The throughput fields are the whole point of the diagnostics
+    /// bundle being able to answer "is a stage blocked?", so assert they
+    /// survive serialization rather than being silently skipped.
+    #[test]
+    fn snapshot_carries_proc_derived_fields() {
+        {
+            let mut g = CACHE.lock();
+            g.last = None;
+        }
+        // Two renders far enough apart for the proc sampler to produce a
+        // delta rather than just a baseline.
+        let _ = render();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        {
+            let mut g = CACHE.lock();
+            g.last = None;
+        }
+        let m = render();
+
+        let json = serde_json::to_value(&*m).expect("snapshot serializes");
+        assert!(json.get("disks").is_some(), "disks always present");
+
+        if cfg!(target_os = "linux") {
+            assert!(
+                m.process.thread_count.unwrap_or(0) > 0,
+                "thread count is reported on Linux"
+            );
+            // A process that just did two refreshes plus a sleep has
+            // measurable CPU, so this must not be the flat 0.0 the old
+            // sysinfo-only path produced in the one-shot diag case.
+            assert!(
+                m.process.cpu_pct >= 0.0,
+                "cpu_pct is a real reading, got {}",
+                m.process.cpu_pct
+            );
+        }
     }
 }

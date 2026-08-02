@@ -506,6 +506,8 @@ export interface SystemMetrics {
   hailo: SystemHailoInfo | null;
   disks: SystemDiskInfo[];
   process: SystemProcessInfo;
+  /// Absent on non-Linux hosts and on kernels without `CONFIG_PSI`.
+  pressure?: SystemPressureInfo;
   captured_at: string;
 }
 
@@ -658,6 +660,15 @@ export interface SystemDiskInfo {
   total_bytes: number;
   available_bytes: number;
   is_removable: boolean;
+  /// Backing block-device throughput over the last sampling interval.
+  /// Absent on non-Linux hosts, on the first poll after start (no delta
+  /// yet), and for mounts that resolve to no `/proc/diskstats` device.
+  /// Device-level: mounts sharing a logical volume repeat its figures.
+  read_bytes_per_sec?: number;
+  write_bytes_per_sec?: number;
+  /// 0–100 share of wall time the device had a request in flight
+  /// (`iostat -x`'s `%util`).
+  util_pct?: number;
 }
 
 export interface SystemProcessInfo {
@@ -666,6 +677,37 @@ export interface SystemProcessInfo {
   virtual_bytes: number;
   cpu_pct: number;
   run_time_secs: number;
+  /// Live OS threads in the engine process. GStreamer spawns a thread
+  /// per queue element, so this scales with camera count.
+  thread_count?: number;
+  /// Busiest threads by CPU, descending. Absent/empty on non-Linux.
+  threads?: SystemThreadCpu[];
+}
+
+export interface SystemThreadCpu {
+  tid: number;
+  name: string;
+  /// 0–100 per logical core, so one fully-busy thread reads ~100.
+  cpu_pct: number;
+}
+
+/// Kernel pressure-stall figures: the share of wall time tasks spent
+/// *waiting* on a resource. `some` is "at least one task stalled",
+/// `full` is "every runnable task stalled". Utilization cannot tell
+/// idle from blocked; this can.
+export interface SystemPressureStat {
+  some_avg10: number;
+  some_avg60: number;
+  some_avg300: number;
+  full_avg10: number;
+  full_avg60: number;
+  full_avg300: number;
+}
+
+export interface SystemPressureInfo {
+  cpu: SystemPressureStat | null;
+  io: SystemPressureStat | null;
+  memory: SystemPressureStat | null;
 }
 
 // ---------------------------------------------------------------------------
