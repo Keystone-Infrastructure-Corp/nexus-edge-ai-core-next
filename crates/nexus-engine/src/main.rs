@@ -1050,6 +1050,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let retention_cfg = retention::RetentionConfig {
         clips_dir: clips_dir.clone(),
         retention_days: cfg.runtime.clips.motion_clips_retention_days,
+        outbox_retention_days: cfg.runtime.delivery.outbox_retention_days,
         interval: std::time::Duration::from_secs(24 * 60 * 60),
     };
     let retention_handle = {

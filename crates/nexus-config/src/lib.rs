@@ -270,6 +270,11 @@ pub struct RuntimeConfig {
     /// than `retention_days`. Defaults to 365 days.
     #[serde(default)]
     pub audit: RuntimeAuditConfig,
+    /// M7 alert-delivery retention. Daily sweeper trims terminal
+    /// `alert_sink_outbox` rows. Defaults are safe for existing
+    /// configs that predate the knob.
+    #[serde(default)]
+    pub delivery: RuntimeDeliveryConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -283,6 +288,7 @@ impl Default for RuntimeConfig {
             decode: RuntimeDecodeConfig::default(),
             auth: RuntimeAuthConfig::default(),
             audit: RuntimeAuditConfig::default(),
+            delivery: RuntimeDeliveryConfig::default(),
         }
     }
 }
@@ -439,6 +445,37 @@ impl Default for RuntimeAuditConfig {
 
 fn default_audit_retention_days() -> u32 {
     365
+}
+
+/// M7 alert-delivery retention. The `alert_sink_outbox` is an
+/// append-only delivery ledger that nothing ever trimmed, so it grew
+/// without bound on busy sites (a 29-camera box reached ~82 k rows in
+/// eleven days). The daily sweeper now deletes **terminal** rows
+/// (`sent` / `suppressed` / `dead`) past the horizon; `pending` rows
+/// are live work and are never swept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeDeliveryConfig {
+    /// How long terminal `alert_sink_outbox` rows live before the
+    /// daily sweeper deletes them. Default: 30 days — long enough to
+    /// answer "was this alarm delivered?" for any realistic incident
+    /// review, short enough to keep the dispatcher's per-second
+    /// `outbox_pending` scan cheap. Set to 0 to disable trimming and
+    /// retain the full ledger forever.
+    #[serde(default = "default_outbox_retention_days")]
+    pub outbox_retention_days: u32,
+}
+
+impl Default for RuntimeDeliveryConfig {
+    fn default() -> Self {
+        Self {
+            outbox_retention_days: default_outbox_retention_days(),
+        }
+    }
+}
+
+fn default_outbox_retention_days() -> u32 {
+    30
 }
 
 // ---------------------------------------------------------------------------

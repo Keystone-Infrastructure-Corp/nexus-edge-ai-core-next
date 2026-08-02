@@ -20,6 +20,8 @@
 //! | `missing_sink_marks_dead`                  | registry miss                   |
 //! | `missing_event_marks_dead`                 | events row cascade-deleted      |
 //! | `malformed_sink_id_marks_dead`             | poison-pill outbox row          |
+//! | `alert_clip_wait_does_not_consume_retry_budget` | clip wait ≠ delivery attempt |
+//! | `future_dated_event_does_not_wait_forever` | clock-skew wait bound           |
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -567,7 +569,10 @@ async fn no_clip_linked_within_grace_schedules_retry() {
         .next()
         .unwrap();
     assert_eq!(after.status, OutboxStatus::Pending);
-    assert_eq!(after.attempts, 1);
+    assert_eq!(
+        after.attempts, 0,
+        "waiting on the clip link must not spend the delivery retry budget"
+    );
     let scheduled = after.next_attempt_at.expect("retry scheduled");
     assert!(scheduled > before);
     assert!(after
@@ -937,6 +942,148 @@ async fn alert_clip_building_within_grace_retries() {
         .as_deref()
         .unwrap()
         .contains("still building"));
+}
+
+#[tokio::test]
+async fn alert_clip_wait_does_not_consume_retry_budget() {
+    // Regression: a slow alert-clip build used to burn the SAME
+    // `attempts` counter that delivery retries draw from. Field data
+    // showed 75-92% of *successful* SureView deliveries arriving with
+    // 5+ of the 8 attempts already spent on waiting, so one transient
+    // SMTP blip after a slow build killed an alarm that should have
+    // been retried.
+    //
+    // Waiting is not a delivery attempt: no `deliver()` call happens,
+    // so `attempts` must stay put no matter how many sweeps observe
+    // the still-building clip. The wait is bounded by the wall-clock
+    // grace window instead.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "ac-budget").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let (alert, row) = enqueue_one(&store, 1, "rule.ac.budget", id.as_str()).await;
+    let acid = store
+        .insert_alert_clip(&NewAlertClip {
+            camera_id: 1,
+            started_at: Utc::now(),
+            path: "alert/1/x/budget.mp4".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .link_event_alert_clip(&alert.event_id.to_string(), acid)
+        .await
+        .unwrap();
+
+    // Far more sweeps than MAX_ATTEMPTS — under the old shared-budget
+    // behaviour the row would have been marked `dead` partway through.
+    for _ in 0..(MAX_ATTEMPTS + 4) {
+        dispatcher::process_row(
+            &store,
+            &registry,
+            &AllowAllPolicy,
+            Some(clips_dir.path()),
+            None,
+            row.clone(),
+        )
+        .await;
+    }
+
+    assert_eq!(sink.calls(), 0, "clip never became ready");
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        after.status,
+        OutboxStatus::Pending,
+        "waiting must never mark the alarm dead"
+    );
+    assert_eq!(
+        after.attempts, 0,
+        "the full retry budget must remain available for delivery"
+    );
+}
+
+#[tokio::test]
+async fn future_dated_event_does_not_wait_forever() {
+    // Clip waits are bounded ONLY by wall-clock age now, so a
+    // future-dated `captured_at` (clock step / NTP correction) must not
+    // read as "forever young" and wedge the alarm. A negative age is
+    // treated as past the grace window: deliver clip-less rather than
+    // never deliver.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "ac-future").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let mut alert = sample_alert(1, "rule.ac.future");
+    alert.captured_at = Utc::now() + chrono::Duration::seconds(3600);
+    store
+        .record_event_and_enqueue(&alert, &[id.as_str()])
+        .await
+        .expect("enqueue");
+    let row = store
+        .outbox_for_event(&alert.event_id.to_string())
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let acid = store
+        .insert_alert_clip(&NewAlertClip {
+            camera_id: 1,
+            started_at: Utc::now(),
+            path: "alert/1/x/future.mp4".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .link_event_alert_clip(&alert.event_id.to_string(), acid)
+        .await
+        .unwrap();
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(
+        sink.calls(),
+        1,
+        "a future-dated alert must still be delivered, clip-less"
+    );
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Sent);
 }
 
 #[tokio::test]

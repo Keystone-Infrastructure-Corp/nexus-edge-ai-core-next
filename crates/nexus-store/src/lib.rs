@@ -1067,6 +1067,37 @@ impl Store {
         Ok(())
     }
 
+    /// Non-terminal **wait**: reschedule the row without bumping
+    /// `attempts`.
+    ///
+    /// Used when the dispatcher defers a row because a local artifact
+    /// (clip link, alert-clip build, recorder flush) isn't ready yet.
+    /// Like [`Self::outbox_mark_suppressed`], `attempts` is NOT bumped
+    /// because no `deliver()` call happened — the retry budget exists
+    /// to bound *delivery* failures, and waiting on our own pipeline
+    /// must not consume it. The wait is bounded by the caller's
+    /// wall-clock grace window, not by `MAX_ATTEMPTS`.
+    pub async fn outbox_mark_waiting(
+        &self,
+        id: i64,
+        last_error: &str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE alert_sink_outbox
+                SET status = 'pending',
+                    last_error = ?,
+                    next_attempt_at = ?
+              WHERE id = ?",
+        )
+        .bind(last_error)
+        .bind(next_attempt_at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Terminal failure after exhausting retries.
     pub async fn outbox_mark_dead(&self, id: i64, last_error: &str) -> Result<(), StoreError> {
         sqlx::query(
@@ -1104,6 +1135,50 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Retention sweeper: hard-delete **terminal** outbox rows older
+    /// than `cutoff`, bounded by `limit`. Returns the number deleted.
+    ///
+    /// The outbox is an append-only delivery ledger and nothing ever
+    /// trimmed it, so on a busy site it grows without bound — a
+    /// 29-camera box accumulated ~82 k rows in eleven days. The rows
+    /// are small, but the table backs the dispatcher's hot
+    /// `outbox_pending` sweep every second, so unbounded growth is a
+    /// slow, silent tax on every tick.
+    ///
+    /// Only `sent` / `suppressed` / `dead` rows are eligible:
+    /// `pending` rows are live work and must never be swept out from
+    /// under the dispatcher, however old they look.
+    ///
+    /// Both sides of the age test go through `datetime()` because
+    /// `created_at` is written by the column's `DEFAULT
+    /// (CURRENT_TIMESTAMP)`, which yields SQLite's space-separated
+    /// `YYYY-MM-DD HH:MM:SS`, while every other timestamp we bind is
+    /// RFC3339. A raw string compare between the two formats agrees on
+    /// the date but diverges on the boundary day (`' ' < 'T'`), which
+    /// would delete same-day rows that are actually inside the
+    /// horizon. Normalising costs the index on this once-a-day,
+    /// batch-bounded DELETE — worth it for a correct cutoff.
+    pub async fn prune_outbox_terminal_older_than(
+        &self,
+        cutoff: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        let res = sqlx::query(
+            "DELETE FROM alert_sink_outbox
+              WHERE id IN (
+                    SELECT id FROM alert_sink_outbox
+                     WHERE status IN ('sent', 'suppressed', 'dead')
+                       AND datetime(created_at) < datetime(?)
+                     LIMIT ?
+              )",
+        )
+        .bind(cutoff.to_rfc3339())
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     // ---- M7 Step 5: delivery_settings + per-rule policy ----
