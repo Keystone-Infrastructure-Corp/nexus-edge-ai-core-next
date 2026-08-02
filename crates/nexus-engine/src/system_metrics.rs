@@ -510,8 +510,16 @@ pub async fn get_metrics_history(
 mod tests {
     use super::*;
 
+    /// `CACHE` is a process-global and every test below resets it, so the
+    /// harness running them on separate threads is enough to break them:
+    /// one test's `last = None` lands between another's two `render()`
+    /// calls and the second call rebuilds instead of hitting the cache.
+    /// Serialise them rather than weakening the assertions.
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn render_produces_non_empty_snapshot() {
+        let _serial = TEST_SERIAL.lock();
         // Two renders so the CPU % delta is computed.
         let _ = render();
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -533,6 +541,7 @@ mod tests {
 
     #[test]
     fn cache_returns_same_snapshot_within_ttl() {
+        let _serial = TEST_SERIAL.lock();
         {
             let mut g = CACHE.lock();
             g.last = None;
@@ -550,6 +559,7 @@ mod tests {
     /// survive serialization rather than being silently skipped.
     #[test]
     fn snapshot_carries_proc_derived_fields() {
+        let _serial = TEST_SERIAL.lock();
         {
             let mut g = CACHE.lock();
             g.last = None;

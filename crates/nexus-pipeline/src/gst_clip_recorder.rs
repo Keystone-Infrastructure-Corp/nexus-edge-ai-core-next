@@ -235,8 +235,40 @@ struct OpenState {
     /// already-in-flight sample finishes before we send EOS.
     pump_stop: Option<oneshot::Sender<()>>,
     /// Handle to the live-pump task. Awaited at `close()` so we know
-    /// no further `push_buffer()` calls are racing the EOS we send.
-    pump_handle: Option<tokio::task::JoinHandle<()>>,
+    /// no further `push_buffer()` calls are racing the EOS we send,
+    /// and so we can read back its [`PumpStats`].
+    pump_handle: Option<tokio::task::JoinHandle<PumpStats>>,
+    /// Media-timeline PTS (ns, rebased so the clip starts at zero) of
+    /// the last sample the pre-roll prepend wrote. Used as the clip's
+    /// media duration when the live pump never pushed anything.
+    preroll_last_written_pts_ns: Option<u64>,
+}
+
+/// Handed to the live pump once the pre-roll prepend has finished and
+/// the `motion_clips` row exists. Until it arrives the pump buffers
+/// live samples rather than pushing them — see [`run_live_pump`].
+#[derive(Debug)]
+struct PumpGate {
+    clip_id: ClipId,
+    /// PTS of the last sample the pre-roll prepend pushed. The pump
+    /// de-dups against this so a sample straddling the snapshot/live
+    /// boundary is not written twice.
+    last_pushed_pts: Option<Duration>,
+    /// Rebased media PTS (ns) the pre-roll prepend left the timeline at.
+    last_written_pts_ns: Option<u64>,
+}
+
+/// What the live pump reports back to `close()`.
+#[derive(Debug, Default, Clone, Copy)]
+struct PumpStats {
+    /// Samples the pump never got to push: broadcast overruns plus any
+    /// gate-backlog overflow. Non-zero means the recording has holes
+    /// and the clip row is stamped `degraded`.
+    dropped: u64,
+    /// Rebased media PTS (ns) of the last sample pushed into appsrc.
+    /// `close()` derives the clip's duration from this instead of the
+    /// wall clock.
+    last_written_pts_ns: Option<u64>,
 }
 
 // gst::Pipeline / AppSrc are Send + Sync by GObject contract, so
@@ -566,6 +598,33 @@ impl ClipRecorder for GstClipRecorder {
             }
             out
         };
+        // Live pump: forwards every new broadcast sample into appsrc
+        // until close() signals stop.
+        //
+        // SPAWNED BEFORE the pre-roll prepend and the `motion_clips`
+        // INSERT, on purpose. `live_rx` was subscribed at the top of
+        // this function, and tokio's broadcast silently overwrites the
+        // OLDEST buffered sample once its 512-slot ring wraps (~8 s at
+        // 30 fps). The oldest sample is the GOP's IDR, so anything that
+        // keeps this task from polling `live_rx` costs the recording
+        // every keyframe from that point on -- which is exactly what
+        // the serial pre-roll push plus the SQLite INSERT below used to
+        // do: clips played back fine for the pre-roll window and then
+        // decayed into a keyframe-less, undecodable tail. The pump now
+        // drains from t=0 and buffers what it reads until `gate_tx`
+        // hands it the clip id and the pre-roll's PTS cursor.
+        let (gate_tx, gate_rx) = oneshot::channel::<PumpGate>();
+        let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
+        let pump_handle = tokio::spawn(run_live_pump(
+            args.camera_id,
+            codec,
+            appsrc.clone(),
+            live_rx,
+            base_pts,
+            gate_rx,
+            pump_stop_rx,
+        ));
+
         let appsrc_for_blocking = appsrc.clone();
         let (preroll_count, preroll_last_written_pts_ns) =
             match tokio::task::spawn_blocking(move || {
@@ -593,17 +652,18 @@ impl ClipRecorder for GstClipRecorder {
             {
                 Ok(Ok((n, last))) => (n, last),
                 Ok(Err(e)) => {
+                    pump_handle.abort();
                     let _ = pipeline.set_state(gst::State::Null);
                     return Err(e);
                 }
                 Err(join_err) => {
+                    pump_handle.abort();
                     let _ = pipeline.set_state(gst::State::Null);
                     return Err(RecorderError::Io(std::io::Error::other(format!(
                         "preroll spawn_blocking: {join_err}"
                     ))));
                 }
             };
-        let last_pushed_pts: Option<Duration> = snapshot_tail_pts;
 
         let rel = crate::recorder::clip_rel_path(&self.clips_dir, &path);
         let new = NewClip {
@@ -622,29 +682,19 @@ impl ClipRecorder for GstClipRecorder {
         let clip_id = match self.store.open_clip(&new).await {
             Ok(id) => id,
             Err(e) => {
+                pump_handle.abort();
                 let _ = pipeline.set_state(gst::State::Null);
                 return Err(e.into());
             }
         };
 
-        // Live pump: forward every new broadcast sample into appsrc
-        // until close() signals stop. De-dup against the snapshot's
-        // tail by PTS. Lagged broadcast errors are logged but the
-        // pump keeps running — a brief glitch is preferable to
-        // killing the recording outright.
-        let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
-        let pump_appsrc = appsrc.clone();
-        let pump_handle = tokio::spawn(run_live_pump(
-            args.camera_id,
+        // Open the gate. The pump flushes whatever it buffered while
+        // the prepend + INSERT ran, then streams normally.
+        let _ = gate_tx.send(PumpGate {
             clip_id,
-            codec,
-            pump_appsrc,
-            live_rx,
-            base_pts,
-            last_pushed_pts,
-            preroll_last_written_pts_ns,
-            pump_stop_rx,
-        ));
+            last_pushed_pts: snapshot_tail_pts,
+            last_written_pts_ns: preroll_last_written_pts_ns,
+        });
 
         self.open.lock().await.insert(
             clip_id,
@@ -659,6 +709,7 @@ impl ClipRecorder for GstClipRecorder {
                 appsrc,
                 pump_stop: Some(pump_stop_tx),
                 pump_handle: Some(pump_handle),
+                preroll_last_written_pts_ns,
             },
         );
         info!(
@@ -684,6 +735,7 @@ impl ClipRecorder for GstClipRecorder {
         // Step 1: signal the live pump to stop and wait for it. Once
         // the pump returns we know no more push_buffer() calls are
         // racing the EOS we're about to send.
+        let mut pump_stats = PumpStats::default();
         if let Some(stop_tx) = state.pump_stop.take() {
             let _ = stop_tx.send(());
         }
@@ -694,7 +746,7 @@ impl ClipRecorder for GstClipRecorder {
             // anyway; appsrc is robust against parallel push during
             // EOS in practice.
             match tokio::time::timeout(Duration::from_secs(2), handle).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(s)) => pump_stats = s,
                 Ok(Err(e)) => {
                     warn!(error = %e, "live pump task panicked during close")
                 }
@@ -754,7 +806,31 @@ impl ClipRecorder for GstClipRecorder {
         let _ = drain.await;
         let _ = pipeline.set_state(gst::State::Null);
 
-        let duration_ms = (args.ended_at - state.started_at).num_milliseconds().max(0);
+        let wall_ms = (args.ended_at - state.started_at).num_milliseconds().max(0);
+        // Duration comes from the MEDIA timeline, not the wall clock.
+        // A recording that lost samples is genuinely shorter than the
+        // window it spans, and the old wall-clock value let a 761 KB
+        // file claim to be five minutes of video -- which the footage
+        // timeline then honoured, producing a scrubber that seeks into
+        // frames that were never written. `last_written_pts_ns` is the
+        // rebased PTS of the final sample the muxer accepted; add one
+        // frame interval so the last frame's own duration counts.
+        let media_ms = media_duration_ms(
+            pump_stats
+                .last_written_pts_ns
+                .or(state.preroll_last_written_pts_ns),
+        );
+        let duration_ms = if media_ms > 0 { media_ms } else { wall_ms };
+        if media_ms > 0 && wall_ms > 0 && (media_ms as f64) < 0.9 * wall_ms as f64 {
+            warn!(
+                camera_id = state.camera_id,
+                clip_id = handle.clip_id,
+                media_ms,
+                wall_ms,
+                dropped = pump_stats.dropped,
+                "gst recorder: clip media timeline is materially shorter than its wall-clock span"
+            );
+        }
 
         // M2.1 spec: discard sub-3s clips. The pipeline + filesink
         // are already torn down so we can safely unlink the file.
@@ -849,6 +925,32 @@ impl ClipRecorder for GstClipRecorder {
         // ClipClose below.
         let rel_for_event = rel.clone();
         let sha256_for_event = sha256.clone();
+
+        // Make sample loss loud and durable. A dropped sample on a
+        // drop-oldest broadcast ring is an evicted IDR, so the clip
+        // has holes that only show up as decoder errors on playback.
+        if pump_stats.dropped > 0 {
+            warn!(
+                camera_id = state.camera_id,
+                clip_id = handle.clip_id,
+                dropped = pump_stats.dropped,
+                media_ms,
+                wall_ms,
+                size_bytes,
+                "gst recorder: clip recorded with gaps -- live samples never reached the muxer"
+            );
+            if let Err(e) = self
+                .store
+                .mark_clip_degraded(handle.clip_id, pump_stats.dropped as i64)
+                .await
+            {
+                warn!(
+                    clip_id = handle.clip_id,
+                    error = %e,
+                    "gst recorder: failed to stamp degraded clip"
+                );
+            }
+        }
 
         self.store
             .close_clip(
@@ -1547,12 +1649,31 @@ pub(crate) fn push_sample(
 /// the first place.
 const FALLBACK_FRAME_INTERVAL_NS: u64 = 33_333_333;
 
+/// Convert the muxer's last-accepted rebased PTS into a clip duration
+/// in milliseconds. The PTS is the *start* of the final sample, so one
+/// frame interval is added to account for that frame's own on-screen
+/// time. `None` (nothing was ever written) yields 0, which `close()`
+/// treats as "fall back to the wall clock".
+fn media_duration_ms(last_written_pts_ns: Option<u64>) -> i64 {
+    last_written_pts_ns
+        .map(|ns| ((ns + FALLBACK_FRAME_INTERVAL_NS) / 1_000_000) as i64)
+        .unwrap_or(0)
+}
+
 /// Forward live broadcast samples into appsrc until the stop signal
 /// fires. De-dups against the snapshot tail by skipping any sample
 /// whose PTS is `<=` the last PTS we pushed during snapshot prepend.
 /// Each push runs inside `spawn_blocking` because appsrc is
 /// configured with `block=true` and the underlying push can stall
 /// for tens of ms on filesink/disk pressure.
+///
+/// Runs in two phases. Until `gate` resolves the clip row does not
+/// exist yet and the pre-roll prepend is still writing the head of
+/// the timeline, so the pump only *buffers* what it reads off the
+/// broadcast. Draining from t=0 is the whole point: an unpolled
+/// `broadcast::Receiver` loses its oldest samples (IDR first) once
+/// the ring wraps. Once the gate opens the backlog is flushed in
+/// order and the pump streams normally.
 ///
 /// Same-PTS coalescing: an in-flight `pending` slot holds the most
 /// recent NalSample until either (a) a new sample arrives with a
@@ -1561,25 +1682,68 @@ const FALLBACK_FRAME_INTERVAL_NS: u64 = 33_333_333;
 /// the 200 ms flush timer fires without a new arrival (flush
 /// `pending` so a stalled stream doesn't strand the last AU). See
 /// the module docstring + [`coalesce_same_pts`] for the pathology.
-#[allow(clippy::too_many_arguments)]
 async fn run_live_pump(
     camera_id: CameraId,
-    clip_id: ClipId,
     codec: CodecKind,
     appsrc: AppSrc,
     mut live_rx: broadcast::Receiver<NalSample>,
     base_pts: Duration,
-    mut last_pushed_pts: Option<Duration>,
-    mut last_written_pts_ns: Option<u64>,
+    gate: oneshot::Receiver<PumpGate>,
     mut stop: oneshot::Receiver<()>,
-) {
+) -> PumpStats {
+    let mut stats = PumpStats::default();
     let mut pending: Option<NalSample> = None;
+    // Samples read off the broadcast before the pre-roll gate opened.
+    // Sized for ~2 min at 30 fps: the gate normally opens in
+    // milliseconds, so this only has to absorb a pathological SQLite
+    // stall, and it is bounded so a wedged `open()` cannot grow it
+    // without limit.
+    const PUMP_GATE_BACKLOG_MAX: usize = 4096;
+    let mut backlog: std::collections::VecDeque<NalSample> =
+        std::collections::VecDeque::with_capacity(64);
     // Inactivity flush: if no new sample arrives within 200 ms,
     // drain `pending` so a stalled or low-FPS stream doesn't sit
     // on the last buffered AU forever. 200 ms is well over 6× a
     // 30 fps inter-frame interval — a healthy stream will always
     // displace `pending` on the next recv() before the timer fires.
     const LIVE_PUMP_FLUSH_AFTER: Duration = Duration::from_millis(200);
+
+    // Local helper: apply the de-dup + coalesce policy to one sample,
+    // pushing whatever that flushes. Shared by the gate-backlog drain
+    // and the steady-state loop so both obey identical ordering rules.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_sample(
+        camera_id: CameraId,
+        clip_id: ClipId,
+        codec: CodecKind,
+        appsrc: &AppSrc,
+        sample: NalSample,
+        base_pts: Duration,
+        pending: &mut Option<NalSample>,
+        last_pushed_pts: &mut Option<Duration>,
+        last_written_pts_ns: &mut Option<u64>,
+    ) -> Result<(), ()> {
+        // De-dup: skip anything whose PTS is at-or-before the last
+        // sample we pushed from the snapshot.
+        if let (Some(spts), Some(last)) = (sample.pts, *last_pushed_pts) {
+            if spts <= last {
+                return Ok(());
+            }
+        }
+        if let Some(to_push) = coalesce_same_pts(pending, sample, codec) {
+            push_one(
+                camera_id,
+                clip_id,
+                appsrc,
+                to_push,
+                base_pts,
+                last_pushed_pts,
+                last_written_pts_ns,
+            )
+            .await?;
+        }
+        Ok(())
+    }
 
     // Local helper: push one sample, updating cursor state. Returns
     // `Ok(())` on success or `Err(())` if the push failed (caller
@@ -1625,6 +1789,94 @@ async fn run_live_pump(
         }
     }
 
+    // ---- Phase 1: buffer until the pre-roll gate opens ----
+    //
+    // The clip row does not exist yet and the pre-roll prepend still
+    // owns the head of the timeline, so we cannot push. We *must*
+    // still drain `live_rx`: an unpolled broadcast receiver loses its
+    // OLDEST entries when the ring wraps, and the oldest entry is the
+    // GOP's IDR.
+    let mut gate = gate;
+    let gate = loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop => {
+                debug!(camera_id, "live pump stopped before the pre-roll gate opened");
+                return stats;
+            }
+            opened = &mut gate => match opened {
+                Ok(g) => break g,
+                Err(_) => {
+                    // open() failed after spawning us and dropped the
+                    // sender. Nothing to record.
+                    debug!(camera_id, "pre-roll gate dropped; ending pump");
+                    return stats;
+                }
+            },
+            recv = live_rx.recv() => match recv {
+                Ok(sample) => {
+                    if backlog.len() >= PUMP_GATE_BACKLOG_MAX {
+                        // Should be unreachable: the gate opens after
+                        // one SQLite INSERT plus the pre-roll push, and
+                        // the cap is ~2 min of 30 fps video. If we do
+                        // hit it, drop-oldest matches broadcast's own
+                        // policy and we account for it.
+                        backlog.pop_front();
+                        stats.dropped += 1;
+                    }
+                    backlog.push_back(sample);
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    stats.dropped += n;
+                    warn!(
+                        camera_id, dropped = n,
+                        "live pump lagged before the pre-roll gate opened; samples dropped"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    debug!(camera_id, "live broadcast closed before the gate; ending pump");
+                    return stats;
+                }
+            }
+        }
+    };
+    let PumpGate {
+        clip_id,
+        mut last_pushed_pts,
+        mut last_written_pts_ns,
+    } = gate;
+
+    // ---- Phase 2: flush the backlog, then stream ----
+    let buffered = backlog.len();
+    for sample in backlog.drain(..) {
+        if handle_sample(
+            camera_id,
+            clip_id,
+            codec,
+            &appsrc,
+            sample,
+            base_pts,
+            &mut pending,
+            &mut last_pushed_pts,
+            &mut last_written_pts_ns,
+        )
+        .await
+        .is_err()
+        {
+            stats.last_written_pts_ns = last_written_pts_ns;
+            return stats;
+        }
+    }
+    if buffered > 0 {
+        debug!(
+            camera_id,
+            clip_id,
+            buffered,
+            dropped = stats.dropped,
+            "live pump flushed pre-roll gate backlog"
+        );
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -1644,7 +1896,7 @@ async fn run_live_pump(
                         );
                     }
                 }
-                return;
+                break;
             }
             _ = tokio::time::sleep(LIVE_PUMP_FLUSH_AFTER), if pending.is_some() => {
                 // Inactivity flush — the pending AU has been
@@ -1667,41 +1919,37 @@ async fn run_live_pump(
                         camera_id, clip_id, &appsrc, last, base_pts,
                         &mut last_pushed_pts, &mut last_written_pts_ns,
                     ).await.is_err() {
-                        return;
+                        break;
                     }
                 }
             }
             recv = live_rx.recv() => match recv {
                 Ok(sample) => {
-                    // De-dup: skip anything whose PTS is at-or-before
-                    // the last sample we pushed from the snapshot.
-                    if let (Some(spts), Some(last)) = (sample.pts, last_pushed_pts) {
-                        if spts <= last {
-                            continue;
-                        }
-                    }
-                    if let Some(to_push) = coalesce_same_pts(&mut pending, sample, codec) {
-                        if push_one(
-                            camera_id, clip_id, &appsrc, to_push, base_pts,
-                            &mut last_pushed_pts, &mut last_written_pts_ns,
-                        ).await.is_err() {
-                            return;
-                        }
+                    if handle_sample(
+                        camera_id, clip_id, codec, &appsrc, sample, base_pts,
+                        &mut pending, &mut last_pushed_pts, &mut last_written_pts_ns,
+                    ).await.is_err() {
+                        break;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
+                    stats.dropped += n;
                     warn!(camera_id, clip_id, dropped = n, "live pump lagged; samples dropped");
                     // Fall through and keep recv()ing from the new
                     // tail — short glitch in the recording but the
-                    // clip continues.
+                    // clip continues. The count is stamped on the
+                    // clip row at close() so the gap is visible.
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     debug!(camera_id, clip_id, "live broadcast closed; ending pump");
-                    return;
+                    break;
                 }
             }
         }
     }
+
+    stats.last_written_pts_ns = last_written_pts_ns;
+    stats
 }
 
 /// M-Alert-Clip builder task. Collects the post window off the live tap
@@ -2059,6 +2307,19 @@ mod tests {
             Some(Duration::from_millis(66)),
             "merged AU must inherit slice's PTS when header had none"
         );
+    }
+
+    #[test]
+    fn media_duration_counts_the_final_frame() {
+        // Nothing written -> 0, which close() reads as "use the wall
+        // clock".
+        assert_eq!(media_duration_ms(None), 0);
+        // A single sample at PTS 0 is still one frame long, not zero,
+        // otherwise every one-frame clip would look empty.
+        assert_eq!(media_duration_ms(Some(0)), 33);
+        // 10 s of 30 fps video: last sample starts at 9.9667 s and
+        // occupies one more frame interval.
+        assert_eq!(media_duration_ms(Some(9_966_666_667)), 10_000);
     }
 
     #[test]
