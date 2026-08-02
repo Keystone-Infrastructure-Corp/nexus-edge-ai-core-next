@@ -41,6 +41,7 @@ pub mod error;
 pub mod jti_cache;
 pub mod outbox;
 pub mod response_cache;
+pub mod shell;
 pub mod sink;
 pub mod trace_layer;
 pub mod trace_uploader;
@@ -54,6 +55,7 @@ pub use error::{DispatchError, InvalidReason, RejectReason};
 pub use jti_cache::JtiReplayCache;
 pub use outbox::{caps as cloud_capabilities, TunnelOutbox};
 pub use response_cache::RpcResponseCache;
+pub use shell::{pump as pump_shell, ShellStop, ShellTally};
 pub use sink::{
     build_alert_envelope, build_clip_replicated_envelope, build_diag_ready_envelope,
     build_lbr_frame_envelope, AlertProjection, ClipReplicatedProjection, CloudConsoleSink,
@@ -62,4 +64,4 @@ pub use trace_uploader::{
     now_unix_ns, BatchTransport, ReqwestMtlsTransport, Span, SpanKind, SpanStatus, TraceBatch,
     TraceUploader, TraceUploaderConfig, TraceUploaderError, TraceUploaderHandle,
 };
-pub use tunnel::{TunnelClient, TunnelError, TunnelHandle};
+pub use tunnel::{SideChannel, TunnelClient, TunnelError, TunnelHandle};

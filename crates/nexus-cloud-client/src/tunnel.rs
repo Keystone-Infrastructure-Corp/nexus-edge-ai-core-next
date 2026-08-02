@@ -200,6 +200,58 @@ impl TunnelClient {
         &self.gateway_url
     }
 
+    /// Host (and port, if explicit) of the configured gateway URL.
+    ///
+    /// The remote-shell side channel is only allowed to dial this exact
+    /// authority — see [`Self::connect_side_channel`].
+    #[must_use]
+    pub fn gateway_authority(&self) -> Option<String> {
+        authority_of(&self.gateway_url)
+    }
+
+    /// Open a SECOND, non-enveloped WSS connection for a remote-shell
+    /// byte pipe, reusing the same mTLS identity as the control tunnel.
+    ///
+    /// The side channel deliberately does not ride the control tunnel:
+    /// that socket has a single writer draining three priority queues,
+    /// and an interactive shell's byte stream would either starve the
+    /// heartbeat or be starved by it. A separate socket keeps both
+    /// well-behaved.
+    ///
+    /// `url` MUST resolve to the same host:port as the control tunnel.
+    /// A cloud that could name any authority here would turn every core
+    /// into an outbound pivot, and the operator's firewall exception was
+    /// only ever granted for one destination.
+    ///
+    /// # Errors
+    ///
+    /// * [`TunnelError::Handshake`] — `url` names a different authority
+    ///   than the control tunnel, or the WSS handshake failed.
+    /// * [`TunnelError::TlsConfig`] — the mTLS identity failed to load.
+    pub async fn connect_side_channel(&self, url: &str) -> Result<SideChannel, TunnelError> {
+        let expected = self
+            .gateway_authority()
+            .ok_or_else(|| TunnelError::Handshake("gateway url has no host".into()))?;
+        let actual = authority_of(url)
+            .ok_or_else(|| TunnelError::Handshake("side channel url has no host".into()))?;
+        if actual != expected {
+            return Err(TunnelError::Handshake(format!(
+                "side channel authority `{actual}` is not the control tunnel's `{expected}`"
+            )));
+        }
+
+        let tls_config = build_client_config(&self.cert_pem, &self.key_pem, &self.ca_chain_pem)
+            .map_err(TunnelError::TlsConfig)?;
+        let connector = Connector::Rustls(Arc::new(tls_config));
+
+        let (ws_stream, _resp) =
+            tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector))
+                .await
+                .map_err(|e| TunnelError::Handshake(e.to_string()))?;
+
+        Ok(ws_stream)
+    }
+
     /// Open the WSS+mTLS connection and spawn the reader/writer pair.
     ///
     /// # Errors
@@ -406,6 +458,24 @@ impl<T: TunnelHandle + ?Sized> TunnelHandle for Arc<T> {
     }
 }
 
+/// A live remote-shell side channel: a raw WSS stream carrying binary
+/// frames in both directions with no envelope wrapper.
+pub type SideChannel =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Extract `host[:port]` from a `ws(s)://` URL without pulling in a URL
+/// parser. Returns `None` if there is no authority component.
+fn authority_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r)?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    // Strip any userinfo — it is not part of the destination identity.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    Some(host.to_ascii_lowercase())
+}
+
 /// Build a [`ClientConfig`] with mTLS identity + a root store seeded
 /// from a union of `ca_chain_pem` (the internal CA we trust the gateway
 /// against when it terminates TLS itself) and Mozilla's public CA
@@ -474,5 +544,37 @@ mod tests {
         let cert_pem = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
         let ca_pem = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
         assert!(build_client_config(cert_pem, b"", ca_pem).is_err());
+    }
+
+    #[test]
+    fn authority_ignores_path_and_case() {
+        assert_eq!(
+            authority_of("wss://Gateway.Example:443/v1/tunnel").as_deref(),
+            Some("gateway.example:443"),
+        );
+        assert_eq!(
+            authority_of("wss://gateway.example/v1/shell/abc").as_deref(),
+            Some("gateway.example"),
+        );
+        assert_eq!(authority_of("not-a-url"), None);
+    }
+
+    #[tokio::test]
+    async fn side_channel_refuses_a_foreign_host() {
+        let client = TunnelClient::new("wss://gateway.example/v1/tunnel", b"", b"", b"");
+        let err = client
+            .connect_side_channel("wss://attacker.example/v1/shell/abc")
+            .await
+            .expect_err("a different authority must be refused");
+        assert!(matches!(err, TunnelError::Handshake(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn side_channel_refuses_a_different_port_on_the_same_host() {
+        let client = TunnelClient::new("wss://gateway.example/v1/tunnel", b"", b"", b"");
+        assert!(client
+            .connect_side_channel("wss://gateway.example:8443/v1/shell/abc")
+            .await
+            .is_err());
     }
 }
