@@ -54,6 +54,7 @@ mod npu;
 mod oauth_sessions;
 mod proc_metrics;
 mod reconciler;
+mod remote_shell;
 mod retention;
 mod roster;
 mod setup;
@@ -1409,6 +1410,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         Some(trace_rx),
         loopback_admin_base.clone(),
         cloud_passthrough_admin_secret,
+        cfg.remote_access.clone(),
     );
 
     // Phase 9 (M_OTA) — boot-time finalize of any update that was

@@ -111,6 +111,7 @@ pub fn spawn_tunnel(
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
     admin_secret: Option<Arc<String>>,
+    remote_access: nexus_config::RemoteAccessConfig,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -193,6 +194,7 @@ pub fn spawn_tunnel(
             live_view,
             webrtc,
             store,
+            remote_access,
             rx,
         )
         .await;
@@ -558,6 +560,7 @@ async fn run(
     live_view: Arc<crate::live_view::LiveViewManager>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
+    remote_access: nexus_config::RemoteAccessConfig,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let client = TunnelClient::new(
@@ -566,6 +569,17 @@ async fn run(
         enrollment.private_key_pem.clone(),
         enrollment.ca_chain_pem.clone(),
     );
+    // Remote shell. Built once per engine, not per reconnect: sessions
+    // ride their own socket, so a control-tunnel blip does not have to
+    // kill an operator's shell mid-keystroke. A real disconnect does
+    // — see the `close_all` on the reconnect path below — because a
+    // session the console can no longer revoke has no business running.
+    let remote_shell = Arc::new(crate::remote_shell::RemoteShellManager::new(
+        remote_access,
+        client.clone(),
+        dispatcher.as_ref().map(|d| d.verifier().clone()),
+        Arc::clone(&cloud_outbox),
+    ));
     let mut backoff = BACKOFF_MIN;
     let core_id = enrollment.core_id.clone();
     loop {
@@ -602,6 +616,7 @@ async fn run(
                     &store,
                     &live_view,
                     &webrtc,
+                    &remote_shell,
                 );
                 tokio::select! {
                     biased;
@@ -622,6 +637,7 @@ async fn run(
                 cloud_outbox.set_handle(None);
                 live_view.clear_all();
                 webrtc.clear_all();
+                remote_shell.close_all();
             }
             Err(e) => {
                 warn!(
@@ -712,6 +728,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     store: &Arc<Store>,
     live_view: &Arc<crate::live_view::LiveViewManager>,
     webrtc: &Arc<crate::webrtc_bridge::WebRtcBridge>,
+    remote_shell: &Arc<crate::remote_shell::RemoteShellManager>,
 ) {
     let Some(mut rx) = inbound else {
         debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
@@ -874,6 +891,16 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             // Closes the end-to-end congestion loop the raw SFU doesn't relay.
             EnvelopeBody::LiveHdBitrate(payload) => {
                 webrtc.on_live_hd_bitrate(payload);
+            }
+            // Remote shell. Verified out-of-band here rather than on the
+            // reply-bound RpcCall path for the same reason `diag_collect`
+            // is: a session outlives by orders of magnitude the 30-second
+            // token that authorised opening it.
+            EnvelopeBody::ShellSessionOpen(payload) => {
+                remote_shell.on_open(payload.clone());
+            }
+            EnvelopeBody::ShellSessionClose(payload) => {
+                remote_shell.on_close(payload);
             }
             other => {
                 if let EnvelopeBody::HeartbeatAck(ack) = other {
