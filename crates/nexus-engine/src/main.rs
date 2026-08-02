@@ -52,6 +52,7 @@ mod models_catalog;
 mod network;
 mod npu;
 mod oauth_sessions;
+mod proc_metrics;
 mod reconciler;
 mod retention;
 mod roster;
