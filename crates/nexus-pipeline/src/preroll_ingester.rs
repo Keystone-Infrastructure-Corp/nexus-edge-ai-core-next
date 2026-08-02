@@ -628,6 +628,11 @@ async fn run_session(
         .downcast::<gst::Pipeline>()
         .map_err(|_| IngesterError::Pipeline("downcast Pipeline".into()))?;
 
+    // Join the process-wide VA/GL display rather than standing up a
+    // per-camera one. Must be installed before the first state change
+    // so the sync handler sees `need-context`.
+    crate::decode::install_shared_display_context(&pipeline);
+
     let sink = pipeline
         .by_name("tap")
         .ok_or_else(|| IngesterError::AppSink("appsink 'tap' not found".into()))?

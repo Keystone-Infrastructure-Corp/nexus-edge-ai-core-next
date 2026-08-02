@@ -71,6 +71,8 @@ pub use supervisor::{spawn_camera, CameraHandle};
 pub use gst_clip_recorder::GstClipRecorder;
 
 #[cfg(feature = "gstreamer")]
+pub use decode::install_shared_display_context;
+#[cfg(feature = "gstreamer")]
 pub use decode::GstFactoryProbe;
 
 #[cfg(feature = "gstreamer")]
