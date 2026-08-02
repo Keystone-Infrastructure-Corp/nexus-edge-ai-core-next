@@ -97,7 +97,6 @@ pub const ALERT_CLIP_BUILD_GRACE_SECS: i64 = 45;
 /// avoidable latency after the clip is already on disk.
 pub const CLIP_WAIT_POLL_SECS: i64 = 1;
 
-
 /// Max outbox rows pulled per sweep. Keeps a single pass bounded so
 /// a large backfill (e.g. delivery globally re-enabled after a long
 /// outage) doesn't monopolise the task — the next tick picks up the
