@@ -155,6 +155,66 @@ impl Detector for MockDetector {
 }
 
 // ---------------------------------------------------------------------------
+// UnavailableDetector — the production substitute for a detector whose
+// model could not be loaded.
+// ---------------------------------------------------------------------------
+
+/// A detector that reports **zero** detections, forever.
+///
+/// This is what a failed model load degrades to in production. It exists
+/// because the two obvious alternatives are both worse:
+///
+/// * **Substituting [`MockDetector`]** (the historical behaviour) makes
+///   the engine fabricate a `person` box on every frame of every camera.
+///   Downstream rules cannot tell a synthetic box from a real one, so a
+///   single missing `.onnx` file becomes a fleet-wide flood of alerts
+///   for people who were never there. Silently inventing evidence is the
+///   worst possible failure mode for a security product.
+/// * **Aborting engine startup** takes the whole box dark: no live view,
+///   no recording, no cloud tunnel — and therefore no way for the
+///   console to tell an operator *why* it went dark. It also trips a
+///   systemd restart loop. That conflicts with the engine's fail-open
+///   contract (`AGENTS.md` rule 5).
+///
+/// So the engine stays up, keeps recording and streaming, emits no
+/// detections at all, and shouts about it: `ERROR` at the failure site
+/// plus a [`crate::health`] entry that drives `status: "degraded"` on
+/// the health endpoint and in the cloud console.
+pub struct UnavailableDetector;
+
+impl Default for UnavailableDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UnavailableDetector {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Detector for UnavailableDetector {
+    async fn detect(
+        &self,
+        _frame: &Frame,
+        _prompts: &[String],
+    ) -> Result<Vec<Detection>, InferenceError> {
+        // Deliberately not an Err: the pipeline treats a detect() error
+        // as a transient per-frame fault and retries/logs per frame,
+        // which would produce one log line per frame per camera. The
+        // condition is permanent for the life of the process and is
+        // already reported once, loudly, via `health::record_degraded`.
+        Ok(Vec::new())
+    }
+
+    fn name(&self) -> &'static str {
+        "unavailable"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OpenVocabDetector — wraps an open-vocab ONNX model (e.g. YOLO-World).
 //
 // M0 ships the trait + a mock body. M1/M3 wires the real ORT session behind

@@ -732,11 +732,11 @@ pub fn build_detector_for_yoloe(
     cfg: &InferenceConfig,
 ) -> Result<Arc<dyn Detector>, InferenceError> {
     match YoloeDetector::from_config(cfg) {
-        Ok(d) => Ok(Arc::new(d)),
-        Err(e) => {
-            warn!("yoloe ORT detector unavailable, falling back to mock: {e}");
-            Ok(Arc::new(crate::detectors::MockDetector::new()))
+        Ok(d) => {
+            crate::health::clear_degraded("yoloe");
+            Ok(Arc::new(d))
         }
+        Err(e) => Ok(crate::health::degraded_detector("yoloe", e)),
     }
 }
 

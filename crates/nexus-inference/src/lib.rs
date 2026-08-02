@@ -24,6 +24,7 @@ pub mod encoder;
 pub mod ensemble;
 #[cfg(feature = "ort")]
 pub mod execution_providers;
+pub mod health;
 pub mod nms;
 pub mod pool;
 pub mod router;
@@ -52,10 +53,11 @@ pub use backends::{
 pub use caps::{MinBBoxAreaDetector, TopKDetector};
 pub use detectors::{
     label_matches_any_prompt, ClassifierEnsembleDetector, Detector, InferenceError, MockDetector,
-    OpenVocabDetector,
+    OpenVocabDetector, UnavailableDetector,
 };
 #[cfg(feature = "ort")]
 pub use encoder::ImageEncoder;
+pub use health::{degradations, is_degraded, DetectorDegradation};
 pub use pool::{BackendStatus, DetectorPool};
 pub use router::InferenceRouter;
 pub use visual_prompts::{InMemoryVisualPromptStore, VisualPromptBinding, VisualPromptStore};
@@ -371,21 +373,19 @@ fn build_detector_kind(
                     (_ctx.visual_prompt_store.clone(), _ctx.visual_embedding_dim)
                 {
                     match crate::yoloe_visual::YoloeVisualDetector::from_config(cfg, dim, store) {
-                        Ok(d) => return Ok(Arc::new(d)),
+                        Ok(d) => {
+                            crate::health::clear_degraded("yoloe_visual");
+                            return Ok(Arc::new(d));
+                        }
                         Err(e) => {
-                            warn!(
-                                "yoloe_visual ORT detector unavailable, \
-                                 falling back to mock: {e}"
-                            );
-                            return Ok(Arc::new(MockDetector::new()));
+                            return Ok(crate::health::degraded_detector("yoloe_visual", e));
                         }
                     }
                 }
-                warn!(
-                    "yoloe_visual requires a VisualPromptStore + embedding_dim \
-                     in BuildContext; falling back to mock"
-                );
-                Ok(Arc::new(MockDetector::new()))
+                Ok(crate::health::degraded_detector(
+                    "yoloe_visual",
+                    "requires a VisualPromptStore + embedding_dim in BuildContext",
+                ))
             }
             #[cfg(not(feature = "ort"))]
             {
@@ -396,16 +396,16 @@ fn build_detector_kind(
                 Ok(Arc::new(MockDetector::new()))
             }
         }
-        // M3.3 — yoloe_promptfree wraps an inner yoloe (or mock) with a
+        // M3.3 — yoloe_promptfree wraps an inner yoloe (or, when the
+        // inner model fails to load, an UnavailableDetector) with a
         // top-k post-NMS truncation. The wrapper's name() is what the
-        // router reports, so dispatch must produce it even when the
-        // inner falls back to mock.
+        // router reports, so dispatch must produce it either way.
         "yoloe_promptfree" => {
             let inner: Arc<dyn Detector> = {
                 #[cfg(feature = "ort")]
                 {
                     crate::yoloe::build_detector_for_yoloe(cfg)
-                        .unwrap_or_else(|_| Arc::new(MockDetector::new()))
+                        .unwrap_or_else(|e| crate::health::degraded_detector("yoloe_promptfree", e))
                 }
                 #[cfg(not(feature = "ort"))]
                 {
@@ -450,9 +450,12 @@ fn build_detector_kind(
             )))
         }
         "mock" => Ok(Arc::new(MockDetector::new())),
-        other => {
-            warn!(kind = %other, "unknown model kind, falling back to mock");
-            Ok(Arc::new(MockDetector::new()))
-        }
+        other => Ok(crate::health::degraded_detector(
+            other,
+            format!(
+                "unknown inference.model.kind {other:?}; expected one of yolo, yolo_world, \
+                 yoloe, yoloe_visual, yoloe_promptfree, classifier_ensemble, ensemble, mock"
+            ),
+        )),
     }
 }

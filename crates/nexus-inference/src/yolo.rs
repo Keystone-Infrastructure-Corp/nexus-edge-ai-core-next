@@ -570,11 +570,11 @@ pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector
         }
     }
     match YoloOrtDetector::from_config(cfg) {
-        Ok(d) => Ok(Arc::new(d)),
-        Err(e) => {
-            warn!("yolo ORT detector unavailable, falling back to mock: {e}");
-            Ok(Arc::new(crate::detectors::MockDetector::new()))
+        Ok(d) => {
+            crate::health::clear_degraded("yolo");
+            Ok(Arc::new(d))
         }
+        Err(e) => Ok(crate::health::degraded_detector("yolo", e)),
     }
 }
 
