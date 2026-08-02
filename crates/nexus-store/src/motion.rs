@@ -375,6 +375,29 @@ impl Store {
         Ok(row.get::<i64, _>(0))
     }
 
+    /// Flag a clip as recorded with gaps. Called by the recorder at
+    /// close when the live pump reports dropped samples, which on a
+    /// drop-oldest broadcast ring means missing IDRs — i.e. the file
+    /// stops being decodable somewhere after the pre-roll window.
+    /// Kept off [`ClipClose`] deliberately: this is the exceptional
+    /// path, and every healthy close should stay a single UPDATE.
+    pub async fn mark_clip_degraded(
+        &self,
+        clip_id: ClipId,
+        dropped_samples: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE motion_clips
+                SET dropped_samples = ?, degraded = 1
+              WHERE id = ?",
+        )
+        .bind(dropped_samples)
+        .bind(clip_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Stamp the close metadata on an in-progress clip. Optionally
     /// updates `hot_path` too — set when the recorder renamed the
     /// file from its in-flight name to the final
