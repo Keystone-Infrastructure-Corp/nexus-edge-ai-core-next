@@ -42,6 +42,9 @@ pub const RETENTION_BATCH_SIZE: i64 = 500;
 pub struct RetentionConfig {
     pub clips_dir: PathBuf,
     pub retention_days: u32,
+    /// How long terminal `alert_sink_outbox` rows are kept. `0`
+    /// disables outbox trimming entirely (retain the full ledger).
+    pub outbox_retention_days: u32,
     /// How often to sweep. In production this is 24h; tests pass
     /// shorter intervals.
     pub interval: Duration,
@@ -91,6 +94,42 @@ pub async fn run_retention(
                 }
             }
             Err(e) => warn!(error = %e, "retention sweep failed"),
+        }
+
+        match sweep_outbox_once(&store, cfg.outbox_retention_days).await {
+            Ok(0) => debug!("outbox retention idle"),
+            Ok(deleted) => info!(deleted, "outbox retention sweep complete"),
+            Err(e) => warn!(error = %e, "outbox retention sweep failed"),
+        }
+    }
+}
+
+/// Trim terminal `alert_sink_outbox` rows past the horizon.
+///
+/// Split out from [`sweep_once`] because it touches a different table
+/// with different safety rules: clip retention unlinks files and
+/// cascades metadata, whereas this is a pure row delete that must
+/// never touch `pending` work.
+///
+/// `retention_days == 0` disables trimming — the same "retain forever"
+/// escape hatch the audit sweeper offers, for operators who treat the
+/// delivery ledger as a compliance artifact.
+pub async fn sweep_outbox_once(store: &Arc<Store>, retention_days: u32) -> anyhow::Result<u64> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
+    let mut total = 0u64;
+    // Loop in bounded batches so a first sweep against a long-neglected
+    // table doesn't issue one enormous DELETE and stall the writer lock
+    // that the dispatcher needs every second.
+    loop {
+        let deleted = store
+            .prune_outbox_terminal_older_than(cutoff, RETENTION_BATCH_SIZE)
+            .await?;
+        total += deleted;
+        if deleted < RETENTION_BATCH_SIZE as u64 {
+            return Ok(total);
         }
     }
 }
@@ -290,6 +329,91 @@ mod tests {
         (clip_id, abs)
     }
 
+    /// Helper: insert an `events` row plus one `alert_sink_outbox` row
+    /// in a given status, backdated by `age_days`. Raw SQL because the
+    /// outbox is normally only written through the alert path, and
+    /// this test cares purely about the retention predicate.
+    async fn seed_outbox(
+        store: &Arc<Store>,
+        event_id: &str,
+        status: &str,
+        age_days: i64,
+    ) -> anyhow::Result<()> {
+        let ts = (Utc::now() - chrono::Duration::days(age_days))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        sqlx::query(
+            "INSERT INTO events (event_id, camera_id, rule_id, label, severity,
+                                 frame_id, captured_at, trace_id, payload_json)
+             VALUES (?, 1, 'rule.x', 'person', 'info', 0, ?, 'trace', '{}')",
+        )
+        .bind(event_id)
+        .bind(&ts)
+        .execute(store.pool())
+        .await?;
+        let reason = if status == "suppressed" {
+            Some("global_disabled")
+        } else {
+            None
+        };
+        sqlx::query(
+            "INSERT INTO alert_sink_outbox
+                (event_id, sink_id, status, suppression_reason, created_at)
+             VALUES (?, 'webhook:x', ?, ?, ?)",
+        )
+        .bind(event_id)
+        .bind(status)
+        .bind(reason)
+        .bind(&ts)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn outbox_ids(store: &Arc<Store>) -> Vec<String> {
+        sqlx::query_scalar::<_, String>("SELECT event_id FROM alert_sink_outbox ORDER BY event_id")
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn outbox_retention_trims_only_old_terminal_rows() {
+        let (store, _dir, _clips_dir) = fixture().await;
+
+        seed_outbox(&store, "old-sent", "sent", 60).await.unwrap();
+        seed_outbox(&store, "old-suppressed", "suppressed", 60)
+            .await
+            .unwrap();
+        seed_outbox(&store, "old-dead", "dead", 60).await.unwrap();
+        // Live work, however stale it looks — must survive.
+        seed_outbox(&store, "old-pending", "pending", 60)
+            .await
+            .unwrap();
+        // Inside the horizon.
+        seed_outbox(&store, "new-sent", "sent", 1).await.unwrap();
+
+        let deleted = sweep_outbox_once(&store, 30).await.unwrap();
+
+        assert_eq!(deleted, 3, "the three old terminal rows");
+        assert_eq!(
+            outbox_ids(&store).await,
+            vec!["new-sent".to_string(), "old-pending".to_string()],
+            "pending work and in-horizon rows must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_retention_disabled_by_zero() {
+        let (store, _dir, _clips_dir) = fixture().await;
+        seed_outbox(&store, "ancient", "sent", 5_000).await.unwrap();
+
+        let deleted = sweep_outbox_once(&store, 0).await.unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(outbox_ids(&store).await, vec!["ancient".to_string()]);
+    }
+
     #[tokio::test]
     async fn retention_evicts_only_clips_older_than_cutoff() {
         let (store, _dir, clips_dir) = fixture().await;
@@ -383,6 +507,7 @@ mod tests {
         let cfg = RetentionConfig {
             clips_dir: clips_dir.clone(),
             retention_days: 30,
+            outbox_retention_days: 30,
             interval: Duration::from_secs(3600), // long; we only want the first tick
         };
         let store2 = store.clone();

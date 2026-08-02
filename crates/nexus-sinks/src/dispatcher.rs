@@ -66,19 +66,36 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// though a link is imminent, and would otherwise ship a clip-less
 /// alarm with no retry — the intermittent "SureView alert missing its
 /// clip" bug. We wait out this grace window before concluding an alert
-/// truly has no surrounding clip. Sized well above one frame cycle and
-/// comfortably inside the backoff horizon (`MAX_ATTEMPTS = 8`,
-/// ~63.5 s), so waiting never exhausts a row's retries.
+/// truly has no surrounding clip.
+///
+/// Clip waits are rescheduled via [`schedule_clip_wait`], which does
+/// NOT consume the delivery retry budget, so this window is bounded
+/// purely by wall-clock age and is independent of `MAX_ATTEMPTS`.
 pub const CLIP_LINK_GRACE_SECS: i64 = 10;
 
 /// How long the dispatcher waits for a linked **alert clip** to finish
 /// building (decode + burn-in + re-encode) before delivering the alarm
 /// clip-less. Sized above the builder's own `build_timeout_secs` cap
-/// (default 30 s) so a normally-building clip is always awaited, and
-/// inside the backoff horizon (~63.5 s) so waiting never exhausts a
-/// row's retries. Only consulted for events that carry an
-/// `alert_clip_id` (armed while `clips.alert_clips.enabled`).
+/// (default 30 s) so a normally-building clip is always awaited. Only
+/// consulted for events that carry an `alert_clip_id` (armed while
+/// `clips.alert_clips.enabled`).
+///
+/// As with [`CLIP_LINK_GRACE_SECS`], waiting is rescheduled without
+/// bumping `attempts`, so this window does not eat into the retry
+/// budget reserved for delivery failures.
 pub const ALERT_CLIP_BUILD_GRACE_SECS: i64 = 45;
+
+/// Delay before re-examining a row that is waiting on a local artifact
+/// (clip link, alert-clip build, recorder flush).
+///
+/// A flat poll rather than an exponential backoff: the wait is bounded
+/// by a wall-clock grace window, not by an attempt count, and the
+/// artifact typically becomes available at an unpredictable point
+/// inside that window. Polling at the dispatcher's own tick rate
+/// delivers the alarm promptly once the clip lands, instead of
+/// stalling behind a doubling backoff that can add tens of seconds of
+/// avoidable latency after the clip is already on disk.
+pub const CLIP_WAIT_POLL_SECS: i64 = 1;
 
 /// Max outbox rows pulled per sweep. Keeps a single pass bounded so
 /// a large backfill (e.g. delivery globally re-enabled after a long
@@ -309,18 +326,34 @@ async fn reclaim_snapshot_if_drained(
 ///   * a disk-pressure eviction raced the clip close.
 ///
 /// Past this window we stop waiting and deliver clip-less rather than
-/// hold the alarm forever. Sized (`CLIP_LINK_GRACE_SECS`) well inside
-/// the backoff horizon so waiting never exhausts a row's retries.
+/// hold the alarm forever.
 fn within_clip_grace(event: &AlertEvent) -> bool {
-    Utc::now().signed_duration_since(event.captured_at)
-        < chrono::Duration::seconds(CLIP_LINK_GRACE_SECS)
+    within_grace(event, CLIP_LINK_GRACE_SECS)
 }
 
 /// Whether an alert is still young enough to keep waiting for its alert
 /// clip to finish building. See [`ALERT_CLIP_BUILD_GRACE_SECS`].
 fn within_alert_clip_grace(event: &AlertEvent) -> bool {
-    Utc::now().signed_duration_since(event.captured_at)
-        < chrono::Duration::seconds(ALERT_CLIP_BUILD_GRACE_SECS)
+    within_grace(event, ALERT_CLIP_BUILD_GRACE_SECS)
+}
+
+/// Shared age test behind the two clip grace windows.
+///
+/// Since clip waits no longer consume the `attempts` budget (see
+/// [`schedule_clip_wait`]), this wall-clock window is the ONLY thing
+/// bounding a wait — so it must never be satisfiable indefinitely. A
+/// `captured_at` in the future (clock step, NTP correction, or a
+/// camera-supplied timestamp ahead of ours) yields a negative age,
+/// which a naive `age < grace` test would treat as "still young"
+/// forever, wedging the alarm until the clock caught up.
+///
+/// Requiring a non-negative age closes that: a future-dated event is
+/// treated as past its grace window and delivered immediately,
+/// clip-less if need be. Shipping an alarm without a clip is always
+/// preferable to never shipping it.
+fn within_grace(event: &AlertEvent, grace_secs: i64) -> bool {
+    let age = Utc::now().signed_duration_since(event.captured_at);
+    age >= chrono::Duration::zero() && age < chrono::Duration::seconds(grace_secs)
 }
 
 /// Process a single outbox row. Public so the test crate can drive
@@ -477,8 +510,9 @@ pub async fn process_row(
                     );
                 } else if within_alert_clip_grace(&event) {
                     // Still building — wait; the builder marks it
-                    // ready/failed within build_timeout_secs.
-                    schedule_retry(store, snapshots_dir, &row, "alert clip still building").await;
+                    // ready/failed within build_timeout_secs. Waiting
+                    // does not spend the delivery retry budget.
+                    schedule_clip_wait(store, &row, "alert clip still building").await;
                     return;
                 } else {
                     debug!(
@@ -516,9 +550,8 @@ pub async fn process_row(
             Ok(Some(clip_id)) => match store.get_clip(clip_id).await {
                 Ok(Some(clip)) => {
                     if clip.ended_at.is_none() {
-                        schedule_retry(
+                        schedule_clip_wait(
                             store,
-                            snapshots_dir,
                             &row,
                             &format!("clip {clip_id} still recording; awaiting post-roll close"),
                         )
@@ -538,9 +571,8 @@ pub async fn process_row(
                             if tokio::fs::try_exists(&abs).await.unwrap_or(false) {
                                 event.artifacts.clip = Some(abs.to_string_lossy().into_owned());
                             } else if within_clip_grace(&event) {
-                                schedule_retry(
+                                schedule_clip_wait(
                                     store,
-                                    snapshots_dir,
                                     &row,
                                     "clip hot file not yet on disk; awaiting recorder flush",
                                 )
@@ -564,9 +596,8 @@ pub async fn process_row(
                             // after that, deliver clip-less rather than hold
                             // the alarm forever.
                             if clips_dir.is_some() && within_clip_grace(&event) {
-                                schedule_retry(
+                                schedule_clip_wait(
                                     store,
-                                    snapshots_dir,
                                     &row,
                                     "clip has no hot path yet; awaiting recorder finalize",
                                 )
@@ -608,9 +639,8 @@ pub async fn process_row(
                 // link would certainly have been written, so deliver
                 // clip-less rather than block the alarm forever.
                 if within_clip_grace(&event) {
-                    schedule_retry(
+                    schedule_clip_wait(
                         store,
-                        snapshots_dir,
                         &row,
                         "clip link pending; awaiting supervisor clip link",
                     )
@@ -696,6 +726,34 @@ async fn schedule_retry(
             )
             .await;
         }
+    }
+}
+
+/// Defer a row that is waiting on a local artifact, WITHOUT consuming
+/// the delivery retry budget.
+///
+/// The `attempts` counter exists to bound how many times we hammer a
+/// remote endpoint. Waiting for our own pipeline to finish writing a
+/// clip is not a delivery attempt — no `deliver()` call happens — so
+/// it must not spend that budget. Callers gate every clip wait on a
+/// wall-clock grace window (`within_clip_grace` /
+/// `within_alert_clip_grace`) measured from `event.captured_at`, which
+/// is what bounds the wait; once the window elapses the caller falls
+/// through and delivers clip-less.
+///
+/// Before this split, a slow alert-clip build (up to
+/// `ALERT_CLIP_BUILD_GRACE_SECS`) burned five or six of the eight
+/// attempts, leaving almost nothing for the SMTP/HTTP handoff — so a
+/// single transient endpoint blip on top of a slow build killed an
+/// alarm that should have been retried.
+async fn schedule_clip_wait(store: &Arc<Store>, row: &OutboxRow, msg: &str) {
+    let next_at = Utc::now() + chrono::Duration::seconds(CLIP_WAIT_POLL_SECS);
+    if let Err(e) = store.outbox_mark_waiting(row.id, msg, next_at).await {
+        warn!(
+            outbox_id = row.id,
+            error = %e,
+            "sink dispatcher: outbox_mark_waiting failed"
+        );
     }
 }
 
