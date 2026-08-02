@@ -344,6 +344,23 @@ impl RuleEvaluator {
             };
 
             for o in objects {
+                // Rules fire on evidence from THIS frame only. A
+                // predicted-only ("coasting") track carries no
+                // detection on this frame — ByteTrack keeps emitting
+                // it for up to `max_lost_frames` ticks after the
+                // detector last saw it, parked at its stale
+                // EMA-smoothed position with a frozen confidence.
+                // Evaluating those produced "trailing" alerts: a fresh
+                // event every `cooldown_ms` for an object that had
+                // already left, whose snapshot burned the stale box
+                // onto an empty frame while the alert clip — which
+                // already gates on `detection_bbox` — correctly showed
+                // nothing. `detection_bbox` is `Some` iff the tracker
+                // matched a real detection this frame, so it is both
+                // the gate and the box we report.
+                let Some(detection_bbox) = o.detection_bbox else {
+                    continue;
+                };
                 if o.age_ms < cfg.debounce.min_track_age_ms {
                     continue;
                 }
@@ -421,10 +438,11 @@ impl RuleEvaluator {
                     track_id: Some(o.track_id),
                     label: o.label.clone(),
                     severity,
-                    // Prefer the frame-aligned raw detection box (fixes the
-                    // alert snapshot drifting ahead/behind the object); fall
-                    // back to the smoothed box for predicted-only tracks.
-                    bbox: Some(o.detection_bbox.unwrap_or(o.bbox)),
+                    // The frame-aligned raw detection box (fixes the alert
+                    // snapshot drifting ahead/behind the object). Never the
+                    // smoothed box: predicted-only tracks are filtered out
+                    // above, so there is no stale fallback to draw.
+                    bbox: Some(detection_bbox),
                     frame_id,
                     captured_at: Utc::now(),
                     trace_id: trace_id.clone(),
@@ -495,17 +513,18 @@ mod tests {
     use nexus_types::BBox;
 
     fn obj(label: &str, conf: f32, age_ms: u64) -> TrackedObject {
+        let bbox = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+        };
         TrackedObject {
             track_id: 1,
             label: label.into(),
             confidence: conf,
-            bbox: BBox {
-                x1: 0.0,
-                y1: 0.0,
-                x2: 10.0,
-                y2: 10.0,
-            },
-            detection_bbox: None,
+            bbox,
+            detection_bbox: Some(bbox),
             age_frames: 5,
             age_ms,
             attributes: Default::default(),
@@ -543,12 +562,13 @@ mod tests {
     }
 
     fn obj_at_pixels(x1: f32, y1: f32, x2: f32, y2: f32) -> TrackedObject {
+        let bbox = BBox { x1, y1, x2, y2 };
         TrackedObject {
             track_id: 7,
             label: "person".into(),
             confidence: 0.9,
-            bbox: BBox { x1, y1, x2, y2 },
-            detection_bbox: None,
+            bbox,
+            detection_bbox: Some(bbox),
             age_frames: 10,
             age_ms: 1000,
             attributes: Default::default(),
@@ -697,6 +717,76 @@ mod tests {
         assert!(
             alerts.is_empty(),
             "unresolved zone id ⇒ suppress, not fall back to no-gate"
+        );
+    }
+
+    #[test]
+    fn predicted_only_track_never_fires() {
+        // A coasting track: the tracker still emits it (ByteTrack keeps
+        // `Lost` tracks alive for `max_lost_frames` ticks) but there is
+        // no detection on this frame. Firing here produced a fresh
+        // "trailing" alert every `cooldown_ms` for an object that had
+        // already left the scene, and the alert snapshot burned the
+        // stale smoothed box onto an empty frame.
+        let rule = rule_with_zones(None);
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let mut coasting = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        coasting.detection_bbox = None;
+
+        let alerts = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[coasting]);
+        assert!(
+            alerts.is_empty(),
+            "predicted-only track must not fire, got {alerts:?}"
+        );
+    }
+
+    #[test]
+    fn a_coasting_track_cannot_re_fire_after_cooldown_expires() {
+        // The reported failure mode end to end: one real detection
+        // fires once, then the object leaves and the track coasts. Even
+        // with the cooldown fully elapsed, no further alert may be
+        // produced from the frames where the detector saw nothing.
+        let mut rule = rule_with_zones(None);
+        rule.debounce.cooldown_ms = 0; // maximally permissive
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+
+        let live = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        let first = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[live]);
+        assert_eq!(first.len(), 1, "the real detection should fire once");
+
+        let mut coasting = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        coasting.detection_bbox = None;
+        for frame_id in 2..32 {
+            let alerts = ev.evaluate(1, frame_id, &"t".into(), 100, 100, &[], &[coasting.clone()]);
+            assert!(
+                alerts.is_empty(),
+                "coasting frame {frame_id} re-fired: {alerts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alert_carries_the_raw_detection_box_not_the_smoothed_one() {
+        // `bbox` is the EMA-smoothed display box and lags the object;
+        // `detection_bbox` is frame-aligned. The event — and therefore
+        // the burned-in alert snapshot — must use the latter.
+        let rule = rule_with_zones(None);
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let mut o = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        let raw = BBox {
+            x1: 18.0,
+            y1: 18.0,
+            x2: 48.0,
+            y2: 48.0,
+        };
+        o.detection_bbox = Some(raw);
+
+        let alerts = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[o]);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            alerts[0].bbox,
+            Some(raw),
+            "event must carry the frame-aligned detection box"
         );
     }
 }
