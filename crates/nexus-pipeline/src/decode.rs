@@ -416,6 +416,102 @@ pub fn rgb_frame_looks_degenerate(rgb: &[u8]) -> bool {
         && bmax - bmin <= FLAT_CHANNEL_DELTA
 }
 
+/// How many recent frame fingerprints [`FrameLoopDetector`] keeps. Must
+/// exceed the deepest surface/buffer pool we expect to cycle through;
+/// observed depths in the field were 4–6, and the RGB branch itself only
+/// carries `queue max-size-buffers=8` + `appsink max-buffers=4`.
+pub const FRAME_LOOP_WINDOW: usize = 12;
+
+/// Consecutive looping frames before [`FrameLoopDetector`] trips. At the
+/// 15 fps supervisor cap this is ~2 s of provably recycled video — long
+/// enough that a burst of coincidental repeats cannot fire it, short enough
+/// that the operator never watches more than a couple of seconds of stale
+/// footage before the session is rebuilt.
+pub const FRAME_LOOP_TRIP: u32 = 30;
+
+/// Byte stride at which [`frame_fingerprint`] samples the frame. Prime, so
+/// consecutive samples rotate through the R/G/B channels instead of reading
+/// one channel forever.
+const FINGERPRINT_STRIDE: usize = 31;
+
+/// FNV-1a over a strided sample of a tight-packed RGB24 frame.
+///
+/// Cheap enough to run on the streaming thread (~1/31 of the bytes we
+/// already memcpy) and sensitive enough that a person moving anywhere in
+/// frame changes it, which is what the loop detector needs: it must never
+/// call two genuinely different frames identical.
+pub fn frame_fingerprint(rgb: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < rgb.len() {
+        h ^= u64::from(rgb[i]);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += FINGERPRINT_STRIDE;
+    }
+    // Fold the length in so a truncated frame can't collide with a full one.
+    h ^= rgb.len() as u64;
+    h.wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// Detects a decode path that has stopped advancing and is instead
+/// re-serving a small set of already-delivered frames in a fixed cycle.
+///
+/// This is a distinct failure from a stall: `frame_id`, `last_frame_at` and
+/// the wire timestamp all keep advancing normally, so every liveness signal
+/// the engine has reports the camera as healthy while the picture on the
+/// wall is seconds old. The only observable is the pixel content itself.
+///
+/// A **period of 1** (this frame identical to the one before it) is
+/// explicitly *not* a loop — that is what a genuinely static night scene or
+/// a `videorate` duplicating up to the configured framerate looks like, and
+/// tearing those sessions down would be a self-inflicted outage. Only a
+/// repeat at distance ≥ 2, i.e. `… A B C D A B C D …`, counts.
+#[derive(Debug, Default)]
+pub struct FrameLoopDetector {
+    recent: std::collections::VecDeque<u64>,
+    hits: u32,
+}
+
+impl FrameLoopDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one frame. Returns `Some(period)` once the stream has looped
+    /// for [`FRAME_LOOP_TRIP`] consecutive frames, and resets so a caller
+    /// that chooses not to act still gets a bounded log rate.
+    pub fn observe(&mut self, fingerprint: u64) -> Option<usize> {
+        let identical_to_previous = self.recent.back() == Some(&fingerprint);
+        // Distance back to the most recent frame with this content.
+        let period = if identical_to_previous {
+            None
+        } else {
+            self.recent
+                .iter()
+                .rev()
+                .position(|f| *f == fingerprint)
+                .map(|back| back + 1)
+        };
+
+        self.recent.push_back(fingerprint);
+        if self.recent.len() > FRAME_LOOP_WINDOW {
+            self.recent.pop_front();
+        }
+
+        match period {
+            Some(p) => {
+                self.hits += 1;
+                if self.hits >= FRAME_LOOP_TRIP {
+                    self.hits = 0;
+                    return Some(p);
+                }
+            }
+            None => self.hits = 0,
+        }
+        None
+    }
+}
+
 /// Production [`FactoryProbe`] backed by the live GStreamer registry.
 #[cfg(feature = "gstreamer")]
 pub struct GstFactoryProbe;
@@ -454,9 +550,75 @@ fn va_device_is_amd() -> bool {
     }
 }
 
-/// Process-wide cache of GStreamer contexts negotiated by the first
-/// pipeline that needed each type. Keyed by context type
-/// (`gst.vaapi.Display`, `gst.gl.GLDisplay`, `gst.gl.GLContext`, …).
+/// Context types that are safe to hand from one pipeline to another.
+///
+/// A *display* is a connection to the driver (VADisplay / EGLDisplay / GBM
+/// device). It is refcounted, internally locked, and explicitly designed by
+/// upstream GStreamer to be shared process-wide — and it is the object that
+/// owns the Mesa driver instance, its `util_queue` worker pool and the
+/// `gldisplay-event` thread, so sharing it captures essentially all of the
+/// thread/VRAM win this module exists for.
+///
+/// A GL **context** is not in this list, deliberately. `GstGLContext` is
+/// bound to the thread that made it current; the sanctioned way for a second
+/// pipeline to use the same GPU state is to create its own context that
+/// *shares* with the first (`gst_gl_display_create_context`), which the
+/// elements do for themselves once they are handed the display. Handing the
+/// same `GstGLContext` object to N pipelines running on N streaming threads
+/// puts N threads on one context concurrently, which in Mesa surfaces as
+/// stale texture/PBO readback — decoded frames that cycle through the last
+/// few pool entries instead of advancing. Same reasoning for the per-element
+/// `gst.gl.app_context` / `gst.gl.local_context` handles.
+///
+/// # Why the VA *decoder* displays are not in this list either
+///
+/// The same "cycle through the last few pool entries" failure was measured
+/// on a 29-camera Intel box sharing `gst.va.display.handle` across 29
+/// `vah265dec` pipelines: 4–5 of 8 sampled cameras served byte-identical
+/// JPEGs on a short rotating cycle (period 2–6) while `frame_id` and the
+/// wire timestamp advanced normally — i.e. every liveness signal reported
+/// the camera healthy while the wall showed footage seconds stale. The
+/// effect toggled cleanly with `NEXUS_SHARED_GL_CONTEXT`:
+///
+/// | sharing | runs | cameras looping (of 8) |
+/// |---------|------|------------------------|
+/// | on      | 3    | 4, 4, 5                |
+/// | off     | 2    | 0, 0                   |
+///
+/// Cross-camera payload identity was 0 in every run, so the corruption is
+/// *within* each decoder's surface pool, not a mix-up between pipelines:
+/// N decoders driving one `VADisplay` race on that display's internal
+/// surface bookkeeping and re-hand a previously-decoded surface back to
+/// the sink.
+///
+/// Dropping these two costs nothing that this module exists for. The
+/// thread/VRAM win is owned by `gst.gl.GLDisplay` — that is the object
+/// holding the Mesa driver instance and its `util_queue` pool, created by
+/// the GBM/GL probe `vaapipostproc` runs on realize. `vapostproc` (the new
+/// `va` plugin, our Intel path) never runs that probe, so sharing its VA
+/// display bought no threads and only ever carried the risk.
+///
+/// `gst.vaapi.Display` (legacy AMD path) is removed on the same reasoning
+/// rather than direct measurement — we have no AMD box under test. If an
+/// AMD thread-count regression shows up, re-measure there before adding it
+/// back: a visible thread/VRAM regression is recoverable, silently stale
+/// video on a surveillance wall is not.
+#[cfg(feature = "gstreamer")]
+const SHAREABLE_CONTEXT_TYPES: &[&str] = &[
+    // Created by the GBM/GL probe `vaapipostproc` runs on realize. This is
+    // the one that owns the Mesa driver instance + `util_queue` workers,
+    // and the only one this module needs to share.
+    "gst.gl.GLDisplay",
+];
+
+#[cfg(feature = "gstreamer")]
+fn context_is_shareable(ctx_type: &str) -> bool {
+    SHAREABLE_CONTEXT_TYPES.contains(&ctx_type)
+}
+
+/// Process-wide cache of the display contexts negotiated by the first
+/// pipeline that needed each type. Keyed by context type; only types in
+/// [`SHAREABLE_CONTEXT_TYPES`] are ever stored or served.
 #[cfg(feature = "gstreamer")]
 static SHARED_CONTEXTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, gstreamer::Context>>,
@@ -492,6 +654,11 @@ fn shared_contexts_enabled() -> bool {
 /// element has already fallen back to creating its own display by the
 /// time an async watch would see it.
 ///
+/// Only the display-type contexts in [`SHAREABLE_CONTEXT_TYPES`] are
+/// cached and served; every other type (notably `gst.gl.GLContext`)
+/// falls through so each pipeline negotiates its own. See that
+/// constant for why sharing a GL *context* object is not safe.
+///
 /// Returns `BusSyncReply::Pass` so any existing async bus watch on the
 /// same pipeline keeps receiving every message unchanged. Call at most
 /// once per pipeline: `Bus::set_sync_handler` panics if a handler is
@@ -510,10 +677,14 @@ pub fn install_shared_display_context(pipeline: &gstreamer::Pipeline) {
         match msg.view() {
             gstreamer::MessageView::NeedContext(need) => {
                 let ctx_type = need.context_type();
-                let cached = SHARED_CONTEXTS
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(ctx_type).cloned());
+                let cached = if context_is_shareable(ctx_type) {
+                    SHARED_CONTEXTS
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(ctx_type).cloned())
+                } else {
+                    None
+                };
                 if let (Some(ctx), Some(src)) = (cached, msg.src()) {
                     if let Some(el) = src.downcast_ref::<gstreamer::Element>() {
                         el.set_context(&ctx);
@@ -522,10 +693,14 @@ pub fn install_shared_display_context(pipeline: &gstreamer::Pipeline) {
             }
             gstreamer::MessageView::HaveContext(have) => {
                 let ctx = have.context();
+                let ctx_type = ctx.context_type().to_string();
+                if !context_is_shareable(&ctx_type) {
+                    return gstreamer::BusSyncReply::Pass;
+                }
                 if let Ok(mut m) = SHARED_CONTEXTS.lock() {
                     // First pipeline to negotiate a given type wins;
                     // later ones are handed this one instead.
-                    m.entry(ctx.context_type().to_string()).or_insert(ctx);
+                    m.entry(ctx_type).or_insert(ctx);
                 }
             }
             _ => {}
@@ -832,5 +1007,81 @@ mod tests {
     fn degenerate_detector_ignores_empty_or_subpixel() {
         assert!(!rgb_frame_looks_degenerate(&[]));
         assert!(!rgb_frame_looks_degenerate(&[1, 2]));
+    }
+
+    #[test]
+    fn loop_detector_trips_on_a_fixed_cycle() {
+        let mut d = FrameLoopDetector::new();
+        let mut tripped = None;
+        // `… A B C D E F A B C D E F …` — a 6-deep recycled pool.
+        for i in 0..(FRAME_LOOP_TRIP as usize + 12) {
+            if let Some(p) = d.observe((i % 6) as u64 + 1) {
+                tripped = Some(p);
+                break;
+            }
+        }
+        assert_eq!(tripped, Some(6));
+    }
+
+    #[test]
+    fn loop_detector_ignores_a_static_scene() {
+        // Every frame identical to the one before it: an empty room at
+        // night, or `videorate` padding up to the configured framerate.
+        // Never a loop, however long it runs.
+        let mut d = FrameLoopDetector::new();
+        for _ in 0..1000 {
+            assert_eq!(d.observe(42), None);
+        }
+    }
+
+    #[test]
+    fn loop_detector_ignores_advancing_video() {
+        let mut d = FrameLoopDetector::new();
+        for i in 0..1000u64 {
+            assert_eq!(d.observe(i), None);
+        }
+    }
+
+    #[test]
+    fn loop_detector_resets_on_a_single_new_frame() {
+        // A cycle that is broken before the trip count never fires.
+        let mut d = FrameLoopDetector::new();
+        for round in 0..10u64 {
+            for i in 0..6u64 {
+                assert_eq!(d.observe(i + 1), None);
+            }
+            assert_eq!(d.observe(1_000 + round), None);
+        }
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_single_byte_changes() {
+        let a = vec![7u8; 4096];
+        let mut b = a.clone();
+        b[FINGERPRINT_STRIDE * 3] = 8;
+        assert_eq!(frame_fingerprint(&a), frame_fingerprint(&a));
+        assert_ne!(frame_fingerprint(&a), frame_fingerprint(&b));
+        assert_ne!(frame_fingerprint(&a), frame_fingerprint(&a[..2048]));
+    }
+
+    #[cfg(feature = "gstreamer")]
+    #[test]
+    fn only_the_gl_display_is_shared() {
+        // The GBM/GL display owns the Mesa driver instance + `util_queue`
+        // workers — the whole reason this module shares anything.
+        assert!(context_is_shareable("gst.gl.GLDisplay"));
+
+        // VA *decoder* displays are NOT shared: N decoders on one
+        // `VADisplay` race on its surface bookkeeping and re-serve
+        // already-delivered frames on a short rotating cycle while
+        // `frame_id` keeps advancing (measured on a 29-camera Intel box;
+        // see SHAREABLE_CONTEXT_TYPES).
+        assert!(!context_is_shareable("gst.va.display.handle"));
+        assert!(!context_is_shareable("gst.vaapi.Display"));
+
+        // A GL context is per-thread; pipeline #2 must make its own.
+        assert!(!context_is_shareable("gst.gl.GLContext"));
+        assert!(!context_is_shareable("gst.gl.app_context"));
+        assert!(!context_is_shareable("gst.gl.local_context"));
     }
 }
