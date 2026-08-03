@@ -634,39 +634,27 @@ async fn schema_migrations_table_records_apply_order() {
         .await
         .unwrap();
     let ids: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
+
+    // Derived from the migrations directory, NOT hardcoded. A literal
+    // expected-list here gets regenerated from whatever the code happens
+    // to emit, so it silently enshrines gaps as intended behaviour: this
+    // assertion used to jump straight from `0024_metrics_samples` to
+    // `0026_alert_clips`, recording the never-registered
+    // `0025_outbox_entitlement_suppression` as if it were deliberate.
+    // Reading the directory turns a committed-but-unregistered migration
+    // into a test failure instead of a fixture update.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut expected: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read migrations dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .map(|p| p.file_stem().expect("stem").to_string_lossy().into_owned())
+        .collect();
+    expected.sort();
+
     assert_eq!(
-        ids,
-        vec![
-            "0001_initial".to_string(),
-            "0002_motion_clips".to_string(),
-            "0003_events_clip_cascade".to_string(),
-            "0004_storage_backends".to_string(),
-            "0005_runtime_settings".to_string(),
-            "0006_alert_sink_outbox".to_string(),
-            "0007_delivery_settings".to_string(),
-            "0008_rules_delivery_policy".to_string(),
-            "0009_audit_log".to_string(),
-            "0010_local_users".to_string(),
-            "0011_auth_refresh_tokens".to_string(),
-            "0012_visual_prompts".to_string(),
-            "0013_cloud_enrollment".to_string(),
-            "0014_storage_backends_azure_blob".to_string(),
-            "0015_motion_clips_priority".to_string(),
-            "0016_cloud_enrollment_attach_replay".to_string(),
-            "0017_motion_clips_frame_size".to_string(),
-            "0018_entity_local_state".to_string(),
-            "0019_auth_refresh_idle".to_string(),
-            "0020_cloud_enrollment_server_cert".to_string(),
-            "0021_alert_sinks".to_string(),
-            "0022_fleet_managed_markers".to_string(),
-            "0023_motion_clips_cold_backoff".to_string(),
-            "0024_metrics_samples".to_string(),
-            "0026_alert_clips".to_string(),
-            "0027_alert_clips_cold".to_string(),
-            "0028_delivery_settings_alert_clip".to_string(),
-            "0029_events_alerted".to_string(),
-            "0030_native_aspect_shape_remap".to_string(),
-        ]
+        ids, expected,
+        "every migration file on disk must be applied and recorded in schema_migrations"
     );
 }
 
