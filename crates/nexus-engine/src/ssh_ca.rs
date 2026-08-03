@@ -65,7 +65,10 @@ pub enum SshCaError {
     ApplierFailed,
     /// The supplied CA public key is not a plausible single-line SSH key.
     MalformedKey,
-    /// Compiled for a platform with no privileged applier.
+    /// Compiled for a platform with no privileged applier. The mirror image
+    /// of the enum-level allow above: on Linux this is the one variant that
+    /// is never constructed.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     UnsupportedPlatform,
 }
 
