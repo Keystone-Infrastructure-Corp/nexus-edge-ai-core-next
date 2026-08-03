@@ -34,7 +34,9 @@
 //! means the tunnel is momentarily down and the next snapshot supersedes the
 //! dropped one.
 
-use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -70,6 +72,27 @@ const FOCUS_FPS: u32 = 8;
 /// boxes tighter). Encode (resize + JPEG) is the expensive step the budget
 /// governs; the per-tick "did the scene change?" check is cheap + unbounded.
 const DEFAULT_BUDGET_PER_SEC: u32 = 24;
+
+/// How many recently-seen frame content hashes each pump remembers when
+/// looking for a repeating cycle. Field-observed periods were 2–6; eight
+/// gives headroom without making the scan meaningful work.
+const LOOP_WINDOW: usize = 8;
+
+/// Consecutive cycle hits before the pump logs. Keeps an incidental repeat
+/// quiet while a sustained loop gets reported exactly once per episode.
+const LOOP_LOG_TRIP: u32 = 12;
+
+/// Hash of the decoded frame's pixels.
+///
+/// Deliberately over the *frame* rather than the encoded JPEG: `encode_lbr`
+/// is deterministic, so identical pixels imply an identical payload, and
+/// hashing first lets a looping camera skip the resize+JPEG entirely
+/// (saving both the CPU and the budget token the encode would have spent).
+fn frame_content_hash(frame: &Frame) -> u64 {
+    let mut h = DefaultHasher::new();
+    frame.data.hash(&mut h);
+    h.finish()
+}
 
 /// Shared token bucket capping total LBR encodes/sec across all pumps.
 struct LbrBudget {
@@ -248,6 +271,11 @@ fn spawn_pump(
     tokio::spawn(async move {
         let mut last_frame_id: Option<u64> = None;
         let mut last_sig: u64 = 0;
+        // Rolling window of recent frame content hashes + the current
+        // run of suppressed cycle hits. See the loop-guard comment below.
+        let mut recent: VecDeque<u64> = VecDeque::with_capacity(LOOP_WINDOW);
+        let mut loop_hits: u32 = 0;
+        let mut loop_logged = false;
         // Force the first available frame to emit immediately so a fresh
         // cell paints without waiting for motion or the keepalive tick.
         let mut last_emit = Instant::now()
@@ -268,10 +296,69 @@ fn spawn_pump(
                 let scene_changed = new_frame && sig != last_sig;
                 let keepalive_due = now.duration_since(last_emit) >= KEEPALIVE_INTERVAL;
 
+                // Loop guard. A decoder that re-serves already-delivered
+                // surfaces produces a short rotating cycle of pixel-identical
+                // frames while `frame_id` keeps advancing — which the checks
+                // above cannot see, so the wall renders convincing "live"
+                // video that is actually seconds stale (each tile arriving
+                // with a fresh `now_unix_ms()` wire timestamp).
+                //
+                // Distance matters. A repeat at distance 1 is an unchanged
+                // scene (H.265 skip blocks decode bit-identically) and is
+                // legitimate — the keepalive path below exists for exactly
+                // that. A repeat at distance >= 2 means content we already
+                // sent came back *after other frames*, which live video
+                // cannot do. Suppress those so the cloud stops replaying
+                // them, but still honour the keepalive so the tile stays
+                // alive (stale-but-1fps beats a dead cell, and beats a
+                // fake-smooth loop).
+                let cycle = if new_frame {
+                    let h = frame_content_hash(&entry.frame);
+                    let d = recent
+                        .iter()
+                        .rev()
+                        .position(|&p| p == h)
+                        .map(|i| i + 1)
+                        .filter(|&d| d >= 2);
+                    if recent.len() == LOOP_WINDOW {
+                        recent.pop_front();
+                    }
+                    recent.push_back(h);
+                    d
+                } else {
+                    None
+                };
+
+                if let Some(period) = cycle {
+                    loop_hits = loop_hits.saturating_add(1);
+                    if loop_hits >= LOOP_LOG_TRIP && !loop_logged {
+                        loop_logged = true;
+                        warn!(
+                            camera_id,
+                            period,
+                            hits = loop_hits,
+                            "live view: decoded frames are repeating on a fixed cycle; \
+                             suppressing duplicate lbr_frame sends (video is stale \
+                             even though frame ids advance)"
+                        );
+                    }
+                } else if new_frame {
+                    if loop_logged {
+                        debug!(camera_id, "live view: frame cycle cleared");
+                    }
+                    loop_hits = 0;
+                    loop_logged = false;
+                }
+                let stale_dup = cycle.is_some() && !keepalive_due;
+
                 // Encode only when there is a NEW frame to send and either
                 // the scene changed or a keepalive is due — and the shared
                 // budget has a token to spare (else skip this tick).
-                if new_frame && (scene_changed || keepalive_due) && budget.try_acquire() {
+                if new_frame
+                    && (scene_changed || keepalive_due)
+                    && !stale_dup
+                    && budget.try_acquire()
+                {
                     match encode_lbr(entry.frame.as_ref(), tile_w) {
                         Ok(jpeg) => {
                             let env = build_lbr_frame_envelope(

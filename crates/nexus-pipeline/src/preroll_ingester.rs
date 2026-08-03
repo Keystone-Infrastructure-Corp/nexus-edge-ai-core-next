@@ -79,8 +79,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::decode::{
-    rgb_frame_looks_degenerate, select_decode_chain, DecodeMode, GstFactoryProbe,
-    DECODE_VALIDATION_FRAMES,
+    frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, DecodeMode,
+    FrameLoopDetector, GstFactoryProbe, DECODE_VALIDATION_FRAMES, FRAME_LOOP_TRIP,
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
@@ -715,6 +715,11 @@ async fn run_session(
         let validation_done_cb = Arc::new(AtomicBool::new(false));
         let force_software_cb = force_software.clone();
         let guard_hwaccel = rgb_hwaccel;
+        // Per-session frame-loop guard state. Unlike the flat-frame guard
+        // above this stays armed for the whole session: a decode path can
+        // start out perfectly healthy and only begin recycling surfaces
+        // hours later.
+        let loop_detector_cb = Arc::new(parking_lot::Mutex::new(FrameLoopDetector::new()));
         rgb_sink.set_callbacks(
             AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -808,6 +813,31 @@ async fn run_session(
                         } else {
                             validation_done_cb.store(true, Ordering::Relaxed);
                         }
+                    }
+
+                    // Frame-loop guard. A recycled decoder surface pool
+                    // re-serves a short cycle of already-delivered frames
+                    // while `frame_id`, the stall watchdog's
+                    // `last_frame_at` and the wire timestamp all keep
+                    // advancing — every liveness signal we have reports
+                    // the camera as healthy while the wall shows footage
+                    // seconds old. Ending the session gets the supervisor
+                    // to rebuild the pipeline (fresh pool) on the same
+                    // chain; we deliberately do NOT latch
+                    // `force_software`, because a rebuild usually clears
+                    // it and dropping every camera on the box to CPU
+                    // decode is far more damaging than one reconnect.
+                    if let Some(period) = loop_detector_cb.lock().observe(frame_fingerprint(&data))
+                    {
+                        error!(
+                            camera_id,
+                            period,
+                            frames = FRAME_LOOP_TRIP,
+                            "decoded frames are repeating on a fixed cycle \
+                             (stale video with advancing frame ids); \
+                             rebuilding the camera session"
+                        );
+                        return Err(gst::FlowError::Error);
                     }
 
                     let frame_id = {
