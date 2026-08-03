@@ -12,9 +12,27 @@
 //! chain is `vah26Xdec ! vapostproc ! …` so the colour-convert/scale also
 //! runs on the GPU, and that is exactly what we do on Intel. But on Mesa
 //! `radeonsi` (AMD VCN) the new `va` plugin's `vapostproc` emits all-green
-//! frames: its convert/download path is broken whether or not the caps pin
-//! system memory (verified on a Radeon 680M, gfx1035, Mesa 25.2). So on an
-//! AMD VA device we never use `vapostproc`. Instead, in preference order:
+//! frames: **its output buffer is never written**. A green frame decodes to
+//! exactly one distinct colour covering 100% of the pixels — `(0,134,0)` is
+//! simply what an all-zero NV12 buffer becomes under a BT.601-limited
+//! convert. VPP reports success; `GST_DEBUG=va*:4` logs no VA error.
+//!
+//! Root cause is **surface tiling**, measured on a Radeon 680M (gfx1035,
+//! Mesa 25.2.8): `AMD_DEBUG=notiling` makes `vapostproc` pixel-accurate
+//! against the CPU reference, while `AMD_DEBUG=nodcc` changes nothing.
+//! radeonsi allocates the VPP *output* surface tiled and the readback path
+//! consumes it as linear, so downstream sees an unwritten buffer. The
+//! decoder's own readback handles tiling correctly (the bypass chain below
+//! is pixel-accurate with tiling on), and legacy `vaapipostproc` uses a
+//! copy-based readback and is unaffected — so this is specific to
+//! `vapostproc`'s output surface, not to VA readback in general.
+//!
+//! `AMD_DEBUG=notiling` is **not** shipped as a workaround: it is a
+//! process-global Mesa flag that makes every surface linear, and the engine
+//! runs ORT inference on the same iGPU. Nor is this waiting on a GStreamer
+//! bump — GStreamer 1.26.6 / plugins-bad 1.26.5 was staged against the same
+//! Mesa and its `vapostproc` is byte-identically broken. So on an AMD VA
+//! device we never use `vapostproc`. Instead, in preference order:
 //!
 //! 1. **Legacy `gstreamer1.0-vaapi` GPU path** — if `vaapih26Xdec` +
 //!    `vaapipostproc` are registered: `vaapih26Xdec ! vaapipostproc !
@@ -591,18 +609,30 @@ fn va_device_is_amd() -> bool {
 /// surface bookkeeping and re-hand a previously-decoded surface back to
 /// the sink.
 ///
-/// Dropping these two costs nothing that this module exists for. The
-/// thread/VRAM win is owned by `gst.gl.GLDisplay` — that is the object
+/// Dropping these two costs very little of what this module exists for.
+/// The thread/VRAM win is owned by `gst.gl.GLDisplay` — that is the object
 /// holding the Mesa driver instance and its `util_queue` pool, created by
 /// the GBM/GL probe `vaapipostproc` runs on realize. `vapostproc` (the new
 /// `va` plugin, our Intel path) never runs that probe, so sharing its VA
 /// display bought no threads and only ever carried the risk.
 ///
-/// `gst.vaapi.Display` (legacy AMD path) is removed on the same reasoning
-/// rather than direct measurement — we have no AMD box under test. If an
-/// AMD thread-count regression shows up, re-measure there before adding it
-/// back: a visible thread/VRAM regression is recoverable, silently stale
-/// video on a surveillance wall is not.
+/// `gst.vaapi.Display` (legacy AMD path) has since been measured directly on
+/// a Radeon 680M box (3 cameras on the legacy `vaapipostproc` chain, 638
+/// poll rounds per phase, toggled with `NEXUS_SHARED_GL_CONTEXT`):
+///
+/// | sharing | threads (min/med/max of 33) | cameras looping | cross-camera identical |
+/// |---------|-----------------------------|-----------------|------------------------|
+/// | on      | 131 / 131 / 131             | 0 of 3          | 0                      |
+/// | off     | 138 / 138 / 138             | 0 of 3          | 0                      |
+///
+/// So on AMD the removal is safe but not free: **+7 threads for 3 cameras**,
+/// ~2.3 per camera, with `gst.gl.GLDisplay` still shared. (Scaling that to a
+/// 29-camera box is extrapolation — only 3 were measured.) AMD never
+/// reproduced the looping itself, so here the removal is *preventative*: the
+/// shared-display pattern is the measured root cause on Intel and keeping it
+/// live on one vendor would leave a latent hazard plus a second code path. A
+/// visible thread/VRAM regression is recoverable; silently stale video on a
+/// surveillance wall is not.
 #[cfg(feature = "gstreamer")]
 const SHAREABLE_CONTEXT_TYPES: &[&str] = &[
     // Created by the GBM/GL probe `vaapipostproc` runs on realize. This is
