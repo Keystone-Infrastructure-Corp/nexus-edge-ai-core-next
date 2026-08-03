@@ -45,7 +45,7 @@ use nexus_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Hardcoded Ed25519 release-signing public key (SPKI PEM).
@@ -80,6 +80,60 @@ const STAGED_TARBALL: &str = "/opt/nexus/staging/update.tar.gz";
 /// can change freely without any sudoers edit.
 #[cfg(target_os = "linux")]
 const APPLY_RELEASE_WRAPPER: &str = "/usr/local/sbin/nexus-apply-release";
+
+/// How long a freshly-installed release gets to re-establish the cloud
+/// tunnel before it is judged unreachable and rolled back.
+///
+/// Ten minutes is chosen against the reconnect backoff ceiling (60 s) and
+/// the heartbeat cadence (30 s): a release that is going to work will
+/// prove it inside the first minute or two, so this window is almost
+/// entirely slack for a site whose uplink comes back slowly after a power
+/// event. Erring long is cheap — the box is up and working locally the
+/// whole time — whereas erring short means rolling back a good release.
+const TUNNEL_PROOF_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Poll cadence while waiting for that proof.
+const TUNNEL_PROOF_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait for the tunnel to complete an authenticated connect plus one
+/// heartbeat. Returns `false` on timeout.
+async fn await_tunnel_proof(liveness: &crate::cloud_liveness::TunnelLiveness) -> bool {
+    let deadline = tokio::time::Instant::now() + TUNNEL_PROOF_WINDOW;
+    loop {
+        if liveness.heartbeat_since_boot() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(TUNNEL_PROOF_POLL).await;
+    }
+}
+
+/// The release this appliance would fall back to, if any.
+pub async fn previous_good_version(store: &Arc<Store>) -> Option<String> {
+    read_state(store).await.previous_good
+}
+
+/// Flip `/opt/nexus/current` back to `version` and restart the unit.
+///
+/// Shared by the OTA failure paths and the go-dark watchdog. The
+/// persisted state is updated BEFORE the flip, because the flip ends this
+/// process — anything written after it is a write that may never happen.
+pub async fn reflip_to(store: &Arc<Store>, version: &str) {
+    let mut state = read_state(store).await;
+    state.current_version = Some(version.to_string());
+    state.last_phase = Some(phase::RESTARTING.to_string());
+    state.last_result = Some("rolled_back".to_string());
+    state.last_attempt_at = Some(Utc::now().to_rfc3339());
+    write_state(store, &state).await;
+    if let Err(code) = flip_and_restart(version).await {
+        error!(
+            code,
+            version, "update: reflip to the previous-good release failed"
+        );
+    }
+}
 
 /// Build the argv (minus the leading `sudo`) for one applier invocation.
 /// Pure + total so it can be unit-tested without shelling out. `mode` is one
@@ -440,9 +494,30 @@ pub async fn handle_rollback(
 
 /// Boot-time finalisation of an in-flight update. Called early in
 /// `main`. If the previous boot committed an update (`last_phase ==
-/// restarting`) and the running version now matches the target, emit
-/// `verifying_health` + `success`. Otherwise apply the crash-loop guard.
-pub async fn finalize_pending_update(store: Arc<Store>, outbox: Arc<TunnelOutbox>) {
+/// restarting`) and the running version now matches the target, wait for
+/// the cloud tunnel to prove itself and then emit `verifying_health` +
+/// `success`. Otherwise apply the crash-loop guard.
+///
+/// ## Why success waits for the tunnel
+///
+/// "The new binary is running" is a much weaker claim than it looks. An
+/// engine can come up, serve its local UI, record, and evaluate rules
+/// while being completely unable to re-establish the cloud tunnel — and
+/// that is precisely the release we must never bless, because blessing it
+/// is what makes the appliance permanently unreachable. So the success
+/// path additionally requires an authenticated connect plus one heartbeat
+/// on THIS binary. If that does not happen inside
+/// [`TUNNEL_PROOF_WINDOW`], the release is rolled back even though
+/// nothing crashed.
+///
+/// This is deliberately spawned rather than awaited by `main`: the proof
+/// takes minutes, and nothing else about bringing the engine up should
+/// wait on the cloud (Hard Rule 5 — fail open locally).
+pub async fn finalize_pending_update(
+    store: Arc<Store>,
+    outbox: Arc<TunnelOutbox>,
+    liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
+) {
     let mut state = read_state(&store).await;
     if state.last_phase.as_deref() != Some(phase::RESTARTING) {
         return;
@@ -454,7 +529,43 @@ pub async fn finalize_pending_update(store: Arc<Store>, outbox: Arc<TunnelOutbox
         .unwrap_or_else(|| format!("recover-{}", Uuid::now_v7()));
 
     if state.current_version.as_deref() == Some(running) {
-        // The new version is up — success.
+        // The binary took. Now make it prove it can still be reached.
+        if !await_tunnel_proof(&liveness).await {
+            warn!(
+                signal = "ota_tunnel_proof_failed",
+                version = running,
+                window_s = TUNNEL_PROOF_WINDOW.as_secs(),
+                "update: the new release is running but never re-established the \
+                 cloud tunnel; rolling back rather than blessing an unreachable \
+                 appliance"
+            );
+            emit_progress(
+                &outbox,
+                &assignment_id,
+                phase::FAILED,
+                None,
+                Some(format!("{}:tunnel_not_reestablished", phase::FAILED)),
+            )
+            .await;
+            if let Some(target) = state.previous_good.clone() {
+                state.crash_count = 0;
+                state.last_result = Some(format!("{}:tunnel_not_reestablished", phase::FAILED));
+                write_state(&store, &state).await;
+                reflip_to(&store, &target).await;
+            } else {
+                error!(
+                    signal = "ota_tunnel_proof_no_rollback_target",
+                    "update: no previous-good release to fall back to; this \
+                     appliance is running an unreachable version and needs local \
+                     intervention"
+                );
+                state.last_phase = Some(phase::FAILED.to_string());
+                state.last_result = Some(format!("{}:tunnel_not_reestablished", phase::FAILED));
+                write_state(&store, &state).await;
+            }
+            return;
+        }
+        // The new version is up and reachable — success.
         info!(
             version = running,
             "update: post-restart health OK; finalising success"

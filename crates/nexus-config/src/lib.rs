@@ -124,6 +124,52 @@ pub struct Config {
     /// destination.
     #[serde(default)]
     pub remote_access: RemoteAccessConfig,
+    /// Cloud-side behaviour that is a property of THIS box rather than
+    /// of the enrollment: currently just the go-dark watchdog window.
+    #[serde(default)]
+    pub cloud: CloudConfig,
+}
+
+/// Per-appliance cloud behaviour.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloudConfig {
+    /// Hours the cloud tunnel may be dark before the engine reflips to
+    /// its previous-good release.
+    ///
+    /// `0` disables the watchdog. The default (12 h) is chosen to be far
+    /// longer than any plausible transient — ISP outages, DHCP renewals,
+    /// a site losing power overnight — while still being short enough
+    /// that a bad release is undone the same day rather than on the next
+    /// site visit. The watchdog fires at most once per boot regardless.
+    #[serde(default = "default_dark_window_hours")]
+    pub dark_window_hours: u64,
+}
+
+const fn default_dark_window_hours() -> u64 {
+    12
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            dark_window_hours: default_dark_window_hours(),
+        }
+    }
+}
+
+impl CloudConfig {
+    /// The configured window, or `None` when the watchdog is disabled.
+    #[must_use]
+    pub fn dark_window(&self) -> Option<std::time::Duration> {
+        if self.dark_window_hours == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(
+                self.dark_window_hours * 3600,
+            ))
+        }
+    }
 }
 
 impl Config {

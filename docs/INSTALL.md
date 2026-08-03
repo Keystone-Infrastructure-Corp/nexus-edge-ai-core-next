@@ -74,7 +74,9 @@
     - [8.0 Admin UI tour](#80-admin-ui-tour)
     - [8.1 Logs](#81-logs)
     - [8.2 Backups](#82-backups)
-    - [8.3 Forward-looking](#83-forward-looking)
+    - [8.3 Remote shell (off by default)](#83-remote-shell-off-by-default)
+    - [8.4 Go-dark insurance](#84-go-dark-insurance)
+    - [8.5 Forward-looking](#85-forward-looking)
   - [9. Troubleshooting](#9-troubleshooting)
   - [10. Appendix A — End-to-end Intel iGPU transcript](#10-appendix-a--end-to-end-intel-igpu-transcript)
   - [11. Appendix B — End-to-end Lunar Lake (NPU) transcript](#11-appendix-b--end-to-end-lunar-lake-npu-transcript)
@@ -1556,7 +1558,69 @@ sudo systemctl start nexus-engine
 Restore is the inverse. There's no incremental clip backup story
 yet — that's M2.2 (cold-mirror replication).
 
-### 8.3 Forward-looking
+### 8.3 Remote shell (off by default)
+
+Nexus support cannot open a shell on this box. Access exists only if
+**you** enable it here, and then only for a session **your** org
+administrator explicitly grants, for a duration they choose, to a
+person they choose. There is no standing credential and no path that
+starts on our side.
+
+Enabling it is two steps, both yours:
+
+```toml
+# /etc/nexus/nexus.toml
+[remote_access]
+enabled = true            # opt in
+target = "127.0.0.1:22"   # must be local; sshd must be listening here
+max_session_secs = 1800   # hard local ceiling — the cloud may ask for
+                          # less, never for more
+```
+
+```bash
+sudo systemctl restart nexus-engine
+```
+
+Notes worth knowing before you turn it on:
+
+- The engine dials `target` itself. The cloud never names a
+  destination, so a compromised cloud cannot aim this at your
+  network.
+- Sessions run as the unprivileged **`nexus-remote`** account. It is
+  password-locked, is **not** in `sudo`, and is in `nexus`, `adm`, and
+  `systemd-journal` so it can read logs and engine state.
+- Every session appears in your console with who granted it, when, and
+  for how long. Browser-mode sessions are recorded in full and are
+  replayable.
+- `max_session_secs` is enforced locally. Setting it low is a real
+  ceiling, not a hint.
+- Setting `enabled = false` and restarting is a complete kill switch
+  and does not require us.
+
+### 8.4 Go-dark insurance
+
+Every remote capability — updates, rollback, remote shell, diagnostics
+— rides one outbound tunnel. The nastiest failure mode is a release
+that runs perfectly on this box and can never dial home again: locally
+healthy, remotely gone, and only recoverable with a site visit.
+
+Two things guard against it, both on by default:
+
+1. After an update, the engine waits for the tunnel to come back
+   before it reports success. If it does not within 10 minutes, the
+   engine rolls itself back to its previous-good release.
+2. If the tunnel stays dark for longer than the dark window at any
+   other time, the engine reflips to previous-good once per boot.
+
+```toml
+[cloud]
+dark_window_hours = 12   # 0 disables the watchdog entirely
+```
+
+Leave it on unless you have a specific reason — the failure it catches
+is the one you cannot fix remotely by definition.
+
+### 8.5 Forward-looking
 
 - **M2.2 — Cold storage replication.** Operators will be able to
   point clip storage at a LAN folder, Google Drive, or OneDrive.

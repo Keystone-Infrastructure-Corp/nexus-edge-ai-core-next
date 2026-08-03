@@ -112,6 +112,7 @@ pub fn spawn_tunnel(
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
     admin_secret: Option<Arc<String>>,
     remote_access: nexus_config::RemoteAccessConfig,
+    liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -195,6 +196,7 @@ pub fn spawn_tunnel(
             webrtc,
             store,
             remote_access,
+            liveness,
             rx,
         )
         .await;
@@ -561,6 +563,7 @@ async fn run(
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
     remote_access: nexus_config::RemoteAccessConfig,
+    liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let client = TunnelClient::new(
@@ -630,7 +633,7 @@ async fn run(
                 cloud_outbox.set_handle(Some(
                     conn.clone() as Arc<dyn nexus_cloud_client::TunnelHandle>
                 ));
-                let pump = pump_heartbeats(&*conn, &core_id, store.clone());
+                let pump = pump_heartbeats(&*conn, &core_id, store.clone(), &liveness);
                 let dispatch = pump_rpc_dispatch(
                     &*conn,
                     inbound,
@@ -1086,7 +1089,15 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     debug!(core_id = %core_id, "inbound channel closed; dispatch pump exiting");
 }
 
-async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc<Store>) {
+async fn pump_heartbeats<H: TunnelHandle>(
+    handle: &H,
+    _core_id: &str,
+    store: Arc<Store>,
+    liveness: &crate::cloud_liveness::TunnelLiveness,
+) {
+    // Reaching this function at all means the WSS handshake and the mTLS
+    // client-certificate check both succeeded.
+    liveness.mark_authenticated();
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let start = std::time::Instant::now();
@@ -1167,6 +1178,10 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
             warn!(error = %e, "heartbeat send failed; pump exiting");
             return;
         }
+        // Go-dark signal. Measured from process start, not wall-clock, so
+        // an NTP step on a freshly-booted appliance cannot fabricate hours
+        // of apparent silence.
+        liveness.mark_heartbeat(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
 }
 

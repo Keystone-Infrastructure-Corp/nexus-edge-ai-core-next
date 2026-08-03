@@ -335,6 +335,18 @@ enabled = true
 #                          # never for more
 
 # -----------------------------------------------------------------
+# Cloud (go-dark insurance)
+# -----------------------------------------------------------------
+# Every remote-access path runs over one outbound tunnel. A release that
+# comes up working locally but can never re-establish that tunnel leaves
+# an appliance that is fine and unreachable — and nothing else notices.
+# If the tunnel stays dark this long, the engine reflips to its
+# previous-good release, at most once per boot, and logs loudly.
+# Set to 0 to disable.
+# [cloud]
+# dark_window_hours = 12
+
+# -----------------------------------------------------------------
 # Bus
 # -----------------------------------------------------------------
 [bus]
