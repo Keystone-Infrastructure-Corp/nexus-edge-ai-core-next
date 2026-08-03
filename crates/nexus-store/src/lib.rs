@@ -158,6 +158,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0024_metrics_samples.sql"),
     ),
     (
+        "0025_outbox_entitlement_suppression",
+        include_str!("../migrations/0025_outbox_entitlement_suppression.sql"),
+    ),
+    (
         "0026_alert_clips",
         include_str!("../migrations/0026_alert_clips.sql"),
     ),
@@ -176,6 +180,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0030_native_aspect_shape_remap",
         include_str!("../migrations/0030_native_aspect_shape_remap.sql"),
+    ),
+    (
+        "0031_motion_clips_degraded",
+        include_str!("../migrations/0031_motion_clips_degraded.sql"),
     ),
 ];
 
@@ -1496,6 +1504,53 @@ fn strip_sql_line_comments(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::strip_sql_line_comments;
+
+    /// Every `migrations/*.sql` file MUST appear in [`super::MIGRATIONS`].
+    ///
+    /// A file that is committed but never registered is invisible at
+    /// runtime: `include_str!` is never called on it, the columns or
+    /// constraints it declares never exist on a live database, and the
+    /// code that writes them fails against real SQLite while every test
+    /// that only exercises the Rust side still passes. Two shipped that
+    /// way — `0025_outbox_entitlement_suppression` (so writing the
+    /// `entitlement_suspended` suppression reason hit the older CHECK
+    /// constraint) and `0031_motion_clips_degraded` (so
+    /// `mark_clip_degraded` wrote to columns that did not exist, and the
+    /// recorder swallowed the error as a warning).
+    #[test]
+    fn every_migration_file_is_registered() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read migrations dir")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+            .map(|p| p.file_stem().expect("stem").to_string_lossy().into_owned())
+            .collect();
+        on_disk.sort();
+
+        let registered: Vec<String> = super::MIGRATIONS
+            .iter()
+            .map(|(id, _)| (*id).to_string())
+            .collect();
+
+        let missing: Vec<&String> = on_disk.iter().filter(|f| !registered.contains(f)).collect();
+        assert!(
+            missing.is_empty(),
+            "migration files committed but NOT registered in MIGRATIONS: {missing:?} \
+             — they will never run, so the schema they declare will not exist"
+        );
+
+        let mut sorted = registered.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, on_disk,
+            "MIGRATIONS must list exactly the .sql files on disk (no phantom ids)"
+        );
+        assert_eq!(
+            registered, sorted,
+            "MIGRATIONS must be in ascending id order — that is the apply order"
+        );
+    }
 
     #[test]
     fn strips_full_line_comment() {
