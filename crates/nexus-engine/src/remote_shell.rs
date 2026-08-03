@@ -297,12 +297,7 @@ impl RemoteShellManager {
         // Refuse a second host outright rather than dialling it and
         // seeing what happens.
         let expected = self.tunnel.gateway_authority().unwrap_or_default();
-        let actual = payload
-            .side_channel_url
-            .split_once("://")
-            .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+        let actual = side_channel_host(&payload.side_channel_url);
         if actual.is_empty() || actual != expected {
             return Err((
                 reason::BAD_SIDE_CHANNEL_HOST,
@@ -378,11 +373,10 @@ impl RemoteShellManager {
     fn deadline(&self, expires_at: &str) -> tokio::time::Instant {
         let local_cap =
             tokio::time::Instant::now() + Duration::from_secs(self.cfg.max_session_secs);
-        let Ok(cloud) = DateTime::parse_from_rfc3339(expires_at) else {
+        let Ok(remaining) = remaining_until(expires_at, Utc::now()) else {
             return local_cap;
         };
-        let remaining = cloud.with_timezone(&Utc) - Utc::now();
-        let Ok(remaining) = remaining.to_std() else {
+        let Some(remaining) = remaining else {
             // Already past — end as soon as the loop runs.
             return tokio::time::Instant::now();
         };
@@ -507,4 +501,176 @@ pub async fn post_admin_restart_sshd(
     result?;
     info!("remote access: sshd restarted on operator request");
     Ok(axum::Json(RestartSshdResponse { restarted: true }))
+}
+
+/// The authority (`host[:port]`) a side-channel URL would dial, lower-cased.
+///
+/// Pulled out of [`ShellSupervisor::admit`] because it is the whole of the
+/// "no second host" invariant: the engine opens exactly one outbound
+/// destination, and a `shell_session_open` that names any other one is
+/// refused rather than followed. Returns an empty string for anything it
+/// cannot read as a URL, which `admit` treats as a refusal — an
+/// unparseable destination is not a safe destination.
+fn side_channel_host(url: &str) -> String {
+    url.split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// How much of the cloud's deadline is left.
+///
+/// `Err(())` means the timestamp could not be read at all; the caller
+/// falls back to the local ceiling rather than to "forever". `Ok(None)`
+/// means the deadline has already passed.
+fn remaining_until(expires_at: &str, now: DateTime<Utc>) -> Result<Option<Duration>, ()> {
+    let cloud = DateTime::parse_from_rfc3339(expires_at).map_err(|_| ())?;
+    Ok((cloud.with_timezone(&Utc) - now).to_std().ok())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::{remaining_until, side_channel_host};
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn the_authority_is_read_out_of_a_normal_url() {
+        assert_eq!(
+            side_channel_host("wss://gw.nexus.example/shell/abc?t=1"),
+            "gw.nexus.example"
+        );
+        assert_eq!(
+            side_channel_host("wss://gw.nexus.example"),
+            "gw.nexus.example"
+        );
+        assert_eq!(
+            side_channel_host("wss://gw.nexus.example:8443/shell"),
+            "gw.nexus.example:8443"
+        );
+    }
+
+    /// The comparison in `admit` is case-sensitive, so the parse has to
+    /// normalise. Otherwise `WSS://GW.…` would read as a different host
+    /// from the tunnel's and a legitimate session would be refused.
+    #[test]
+    fn case_is_normalised_so_a_real_host_is_not_refused_for_its_spelling() {
+        assert_eq!(
+            side_channel_host("WSS://GW.Nexus.Example/shell"),
+            "gw.nexus.example"
+        );
+    }
+
+    /// A forged envelope's most valuable move is to name its own host.
+    /// These must all parse to something that will not equal the
+    /// tunnel's authority.
+    #[test]
+    fn another_host_never_parses_as_ours() {
+        let ours = "gw.nexus.example";
+        for url in [
+            "wss://evil.example/shell",
+            "wss://gw.nexus.example.evil.example/shell",
+            "wss://evil.example/wss://gw.nexus.example",
+            "wss://evil.example#gw.nexus.example",
+            "wss://evil.example?h=gw.nexus.example",
+        ] {
+            assert_ne!(side_channel_host(url), ours, "{url}");
+        }
+    }
+
+    /// Userinfo is deliberately *not* stripped: `user@gw.nexus.example`
+    /// is a different authority string from `gw.nexus.example`, so it
+    /// fails the equality check and the session is refused. That is the
+    /// safe direction — the alternative is a parser that helpfully
+    /// discards the part of the URL an attacker controls.
+    #[test]
+    fn a_userinfo_prefix_is_refused_rather_than_stripped() {
+        assert_ne!(
+            side_channel_host("wss://evil.example@gw.nexus.example/shell"),
+            "gw.nexus.example"
+        );
+    }
+
+    /// Empty means "cannot tell", and `admit` refuses on empty.
+    #[test]
+    fn an_unreadable_url_yields_nothing_to_match_against() {
+        for url in ["", "gw.nexus.example/shell", "://gw", "not a url"] {
+            let host = side_channel_host(url);
+            assert!(
+                host.is_empty() || host != "gw.nexus.example",
+                "{url} -> {host}"
+            );
+        }
+        assert!(side_channel_host("").is_empty());
+        assert!(side_channel_host("gw.nexus.example/shell").is_empty());
+    }
+
+    #[test]
+    fn a_future_deadline_reports_what_is_left() {
+        let left = remaining_until("2026-01-01T00:15:00Z", now())
+            .expect("parses")
+            .expect("still ahead");
+        assert_eq!(left.as_secs(), 900);
+    }
+
+    /// A cloud clock ahead of ours must not extend the session past the
+    /// local ceiling — the caller takes the minimum of the two, and this
+    /// is the input that makes that clamp matter.
+    #[test]
+    fn a_far_future_deadline_is_still_just_a_number_for_the_caller_to_clamp() {
+        let left = remaining_until("2030-01-01T00:00:00Z", now())
+            .expect("parses")
+            .expect("still ahead");
+        assert!(left.as_secs() > 60 * 60 * 24 * 365);
+    }
+
+    /// Already expired means "end immediately" — never "no limit". The
+    /// exactly-now boundary is a zero duration rather than `None`, which
+    /// the caller turns into the same instant; both paths end the
+    /// session on the next loop.
+    #[test]
+    fn a_past_or_present_deadline_leaves_nothing() {
+        assert!(remaining_until("2025-12-31T23:59:00Z", now())
+            .expect("parses")
+            .is_none());
+        assert_eq!(
+            remaining_until("2026-01-01T00:00:00Z", now())
+                .expect("parses")
+                .expect("zero, not absent")
+                .as_secs(),
+            0
+        );
+    }
+
+    /// The failure that matters: garbage must be distinguishable from
+    /// "no time left", because the caller's fallbacks differ (local
+    /// ceiling vs. end now) and the dangerous third option — treating an
+    /// unparseable timestamp as unlimited — must be unreachable.
+    #[test]
+    fn an_unparseable_timestamp_is_an_error_not_an_absence() {
+        for bad in ["", "soon", "2026-01-01", "1767225600"] {
+            assert!(remaining_until(bad, now()).is_err(), "{bad}");
+        }
+    }
+
+    /// Offsets other than `Z` are normal in RFC 3339 and must not be
+    /// mistaken for garbage.
+    #[test]
+    fn a_non_utc_offset_is_understood() {
+        let left = remaining_until("2026-01-01T01:15:00+01:00", now())
+            .expect("parses")
+            .expect("still ahead");
+        assert_eq!(left.as_secs(), 900);
+        // Sanity: the offset is actually applied, not ignored.
+        let naive = remaining_until("2026-01-01T01:15:00Z", now())
+            .expect("parses")
+            .expect("still ahead");
+        assert_eq!(naive - left, ChronoDuration::hours(1).to_std().unwrap());
+    }
 }
