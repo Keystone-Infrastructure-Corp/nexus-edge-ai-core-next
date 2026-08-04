@@ -1,0 +1,39 @@
+-- 0033_fleet_marker_apply_mode.sql
+--
+-- Phase 7.5 · Step 7.5.11 — record the apply MODE and the fleet-managed key
+-- set on each `fleet_managed_markers` row.
+--
+-- Step 7.5.5 made fleet apply unconditionally REPLACE: every apply deleted
+-- local entries the cloud did not list. That silently destroyed
+-- operator-authored rules / prompts / sinks whenever an operator pushed an
+-- override with the console's "merge" apply mode selected, because the mode
+-- was a cloud-hierarchy-fold concept that never reached the edge at all.
+--
+-- 7.5.11 sends the mode through and makes it mean something here:
+--
+--   * `replace` — unchanged 7.5.5 behaviour. The fleet owns the whole
+--     category; any local entry not in the payload is deleted.
+--   * `merge`   — the fleet owns only the entries it pushes. Entries are
+--     upserted, and the ONLY deletions are of keys this core previously
+--     received from the fleet and that the fleet no longer lists. Purely
+--     local entries are never touched.
+--
+-- `managed_keys` is the JSON array of per-category identities the last apply
+-- pushed, which is what makes that bounded deletion possible:
+--
+--   rules          -> rule `id`
+--   text_prompts   -> the prompt string itself
+--   visual_prompts -> prompt `name`
+--   alert_sinks    -> `<kind>:<name>` (the edge's SinkId)
+--
+-- It is also what keeps drift detection honest under `merge`: the edge's
+-- `core_state_hashes` digest for a merge-managed category is computed over
+-- the live state RESTRICTED to these keys, so it stays byte-comparable with
+-- the cloud's projection of the effective payload (which knows nothing about
+-- local entries). See `fleet_hash.rs`.
+--
+-- Both columns are nullable. A NULL `mode` means "written before 7.5.11" and
+-- is read as `replace`, so an existing row keeps its current semantics until
+-- the next apply rewrites it.
+ALTER TABLE fleet_managed_markers ADD COLUMN mode TEXT;
+ALTER TABLE fleet_managed_markers ADD COLUMN managed_keys TEXT;

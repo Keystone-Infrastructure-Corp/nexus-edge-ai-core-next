@@ -13,7 +13,8 @@
 //!
 //! ```json
 //! { "effective": <category-specific payload>,
-//!   "scope": { "type": "org|site|core|camera", "id": "<uuid>" } }
+//!   "scope": { "type": "org|site|core|camera", "id": "<uuid>" },
+//!   "mode": "replace|merge" }
 //! ```
 //!
 //! where `effective` is the cloud-resolved (org → site → core folded)
@@ -21,20 +22,41 @@
 //! `text_prompts`, `visual_prompts`, `detector_config`,
 //! `delivery_settings`, `alert_sinks`, `live_view`.
 //!
-//! # Apply semantics (v1)
+//! # Apply semantics
 //!
-//! * **Replace, not overlay.** Phase 7.5.5 — a fleet apply *overwrites*
-//!   the local state for the category: the edge reconciles its
-//!   configuration to exactly the `effective` payload, deleting local
-//!   items the fleet no longer lists (`rules` not in the set are
-//!   removed; `visual_prompts` not in the set are detached). Fleet
-//!   management wins over operator-local edits. The apply is idempotent:
-//!   applying the same payload twice is a no-op.
+//! * **`mode` decides what a push is allowed to delete.** Phase 7.5.5
+//!   made apply unconditionally REPLACE; Phase 7.5.11 made that the
+//!   `replace` case of a cloud-supplied mode, because the console's
+//!   "merge" selection was a hierarchy-fold concept that never reached
+//!   the edge — so an operator who picked `merge` still had their
+//!   locally-authored rules and prompts deleted.
+//!   - `replace` — the fleet owns the whole category. The edge
+//!     reconciles to exactly the `effective` payload, deleting local
+//!     items the fleet no longer lists (`rules` not in the set are
+//!     removed; `visual_prompts` not in the set are detached).
+//!   - `merge` — the fleet owns only the entries it pushes. Listed
+//!     entries are upserted, and the ONLY deletions are of keys a
+//!     previous fleet apply pushed to this core (the marker's
+//!     `managed_keys`) that the fleet no longer lists. Purely local
+//!     entries are never touched, so `merge` can never destroy operator
+//!     work — while the fleet can still retract its own entries.
+//!   - An absent `mode` (a cloud that predates 7.5.11) reads as
+//!     `replace`, preserving the previous contract.
+//!
+//!   The distinction only applies to the **list-shaped** categories
+//!   (`rules`, `text_prompts`, `visual_prompts`, `alert_sinks`). The
+//!   object-shaped ones (`detector_config`, `delivery_settings`,
+//!   `live_view`) hold a single value with no local entries to lose, so
+//!   both modes write that value; the cloud has already folded them
+//!   field-by-field. The apply is idempotent under both modes: applying
+//!   the same payload twice is a no-op.
 //! * **Per-category fleet-managed marker.** Every successful apply
 //!   upserts a [`nexus_store::FleetManagedMarker`] row recording that the
-//!   category is fleet-managed, the apply scope, and the canonical
-//!   SHA-256 of the effective payload. The local admin UI reads these to
-//!   badge a category as "Fleet-managed".
+//!   category is fleet-managed, the apply scope, the mode, the key set
+//!   the fleet now owns, and the canonical SHA-256 of the effective
+//!   payload. The local admin UI reads these to badge a category as
+//!   "Fleet-managed"; `merge` applies and `fleet_hash` read back
+//!   `managed_keys` from the same row.
 //! * **Per-camera categories apply core-wide.** `text_prompts`,
 //!   `visual_prompts`, and `detector_config` are applied to **every**
 //!   local camera on this core, regardless of the `scope.type`. The
@@ -82,6 +104,42 @@ pub struct FleetApplyReq {
     /// does not influence targeting on the edge (see module docs).
     #[serde(default)]
     pub scope: Option<FleetScope>,
+    /// How this push reconciles against local state. Absent on a cloud
+    /// that predates Phase 7.5.11, which read as unconditional replace.
+    #[serde(default)]
+    pub mode: FleetApplyMode,
+}
+
+/// What a fleet apply is allowed to delete. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetApplyMode {
+    /// The fleet owns the whole category; unlisted local entries are
+    /// deleted. The default, so an older cloud keeps 7.5.5 semantics.
+    #[default]
+    Replace,
+    /// The fleet owns only what it pushes; deletion is bounded to keys a
+    /// previous fleet apply pushed to this core.
+    Merge,
+}
+
+impl FleetApplyMode {
+    /// The `fleet_managed_markers.mode` column value.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Merge => "merge",
+        }
+    }
+}
+
+/// What one category's apply did: how many targets it touched, and the
+/// key set the fleet now owns (persisted as the marker's
+/// `managed_keys`). Empty for the object-shaped categories, which have
+/// no per-entry identity.
+struct AppliedCategory {
+    targets: usize,
+    managed_keys: Vec<String>,
 }
 
 /// The `scope` half of [`FleetApplyReq`].
@@ -132,7 +190,21 @@ pub async fn post_admin_fleet_apply(
     session: Option<SessionContext>,
     Json(req): Json<FleetApplyReq>,
 ) -> Result<Json<FleetApplyResponse>, ApiError> {
-    let result = apply_category(&s, &category, &req.effective).await;
+    // Keys a previous fleet apply pushed for this category. Under
+    // `merge` this is the exact set the fleet is allowed to retract;
+    // anything else on the box is operator-local and stays.
+    let prev_keys = match s.store.fleet_marker_get(&category).await {
+        Ok(marker) => marker.and_then(|m| m.managed_keys).unwrap_or_default(),
+        Err(e) => {
+            // Provenance is unreadable — fail closed for `merge` by
+            // treating the fleet as owning nothing, so the apply adds
+            // without deleting rather than guessing at deletions.
+            tracing::warn!(category = %category, error = %e, "fleet marker read failed");
+            Vec::new()
+        }
+    };
+
+    let result = apply_category(&s, &category, &req.effective, req.mode, &prev_keys).await;
     let outcome = if result.is_ok() {
         AuditOutcome::Success
     } else {
@@ -152,10 +224,14 @@ pub async fn post_admin_fleet_apply(
         after_str.as_deref(),
     )
     .await;
-    let targets = result?;
+    let AppliedCategory {
+        targets,
+        managed_keys,
+    } = result?;
     // Record that the category is now fleet-managed (badge source for
     // the local admin UI) along with the canonical hash of what we
-    // applied and the original apply scope.
+    // applied, the mode it was applied with, the keys the fleet now
+    // owns, and the original apply scope.
     let effective_sha = crate::fleet_hash::sha256_canonical(&req.effective);
     let (scope_type, scope_id) = match &req.scope {
         Some(scope) => (Some(scope.scope_type.as_str()), Some(scope.id.as_str())),
@@ -163,7 +239,14 @@ pub async fn post_admin_fleet_apply(
     };
     if let Err(e) = s
         .store
-        .fleet_marker_upsert(&category, scope_type, scope_id, Some(&effective_sha))
+        .fleet_marker_upsert(&nexus_store::FleetMarkerWrite {
+            category: &category,
+            scope_type,
+            scope_id,
+            effective_sha256: Some(&effective_sha),
+            mode: Some(req.mode.as_str()),
+            managed_keys: Some(&managed_keys),
+        })
         .await
     {
         tracing::warn!(category = %category, error = %e, "fleet-managed marker upsert failed");
@@ -173,10 +256,16 @@ pub async fn post_admin_fleet_apply(
             category = %category,
             scope_type = %scope.scope_type,
             scope_id = %scope.id,
+            mode = req.mode.as_str(),
             targets,
             "fleet apply ok"
         ),
-        None => tracing::info!(category = %category, targets, "fleet apply ok"),
+        None => tracing::info!(
+            category = %category,
+            mode = req.mode.as_str(),
+            targets,
+            "fleet apply ok"
+        ),
     }
     Ok(Json(FleetApplyResponse { category, targets }))
 }
@@ -199,18 +288,24 @@ pub async fn get_admin_fleet_managed(
 }
 
 /// Dispatch on the `db_key` category segment.
+///
+/// `prev_keys` is the marker's `managed_keys` from the previous apply —
+/// the set a `merge` apply may retract. It is ignored under `replace`,
+/// and by the object-shaped categories under both modes.
 async fn apply_category(
     s: &ApiState,
     category: &str,
     effective: &Value,
-) -> Result<usize, ApiError> {
+    mode: FleetApplyMode,
+    prev_keys: &[String],
+) -> Result<AppliedCategory, ApiError> {
     match category {
-        "rules" => apply_rules(s, effective).await,
-        "text_prompts" => apply_text_prompts(s, effective).await,
-        "visual_prompts" => apply_visual_prompts(s, effective).await,
+        "rules" => apply_rules(s, effective, mode, prev_keys).await,
+        "text_prompts" => apply_text_prompts(s, effective, mode, prev_keys).await,
+        "visual_prompts" => apply_visual_prompts(s, effective, mode, prev_keys).await,
         "detector_config" => apply_detector_config(s, effective).await,
         "delivery_settings" => apply_delivery_settings(s, effective).await,
-        "alert_sinks" => apply_alert_sinks(s, effective).await,
+        "alert_sinks" => apply_alert_sinks(s, effective, mode, prev_keys).await,
         "live_view" => apply_live_view(s, effective).await,
         other => Err(ApiError(
             StatusCode::NOT_FOUND,
@@ -219,13 +314,50 @@ async fn apply_category(
     }
 }
 
+/// The set of keys a `merge` apply is allowed to delete: keys the fleet
+/// pushed last time (`prev_keys`) that it no longer lists (`keep`).
+/// Under `replace` the fleet owns everything, so *any* local key outside
+/// `keep` is deletable and this returns `None` to mean "unbounded".
+fn retractable<'a>(
+    mode: FleetApplyMode,
+    prev_keys: &'a [String],
+    keep: &std::collections::HashSet<&str>,
+) -> Option<std::collections::HashSet<&'a str>> {
+    match mode {
+        FleetApplyMode::Replace => None,
+        FleetApplyMode::Merge => Some(
+            prev_keys
+                .iter()
+                .map(String::as_str)
+                .filter(|k| !keep.contains(k))
+                .collect(),
+        ),
+    }
+}
+
+/// Whether a local entry keyed `key` should be deleted by this apply.
+/// `retract` is [`retractable`]'s result: `None` (replace) deletes
+/// anything the fleet does not list; `Some(set)` (merge) deletes only
+/// what the fleet previously owned and has now dropped.
+fn should_delete(
+    retract: Option<&std::collections::HashSet<&str>>,
+    keep: &std::collections::HashSet<&str>,
+    key: &str,
+) -> bool {
+    match retract {
+        None => !keep.contains(key),
+        Some(set) => set.contains(key),
+    }
+}
+
 /// `live_view` — `effective` is a JSON object `{ "hd_transport": "sfu"|"moq" }`.
-/// REPLACE semantics: persists the core's HD live-view transport into
+/// Persists the core's HD live-view transport into
 /// `engine_runtime_settings.hd_transport`. The heartbeat pump re-reads it each
 /// tick, so the advertised `hd_*` cap flips within one heartbeat — no restart.
 /// The paired local operator surface is `PUT /v1/admin/live-view/transport`;
-/// both write the same setting.
-async fn apply_live_view(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+/// both write the same setting. Object-shaped: `replace` and `merge` behave
+/// identically (see module docs).
+async fn apply_live_view(s: &ApiState, effective: &Value) -> Result<AppliedCategory, ApiError> {
     let transport: HdTransport = effective
         .get("hd_transport")
         .and_then(Value::as_str)
@@ -249,16 +381,26 @@ async fn apply_live_view(s: &ApiState, effective: &Value) -> Result<usize, ApiEr
                 format!("persist hd_transport: {e}"),
             )
         })?;
-    Ok(1)
+    Ok(AppliedCategory {
+        targets: 1,
+        managed_keys: Vec::new(),
+    })
 }
 
 /// `rules` — `effective` is a JSON array of full [`RuleConfig`]
-/// objects. Every rule's CEL `when` clause is compiled up-front so a
-/// bad payload fails atomically (nothing is persisted). REPLACE
-/// semantics: rules in the payload are upserted by id and any local
-/// rule whose id is not in the payload is deleted, all within one
-/// transaction. The live evaluator is hot-reloaded afterwards.
-async fn apply_rules(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+/// objects, keyed by rule `id`. Every rule's CEL `when` clause is
+/// compiled up-front so a bad payload fails atomically (nothing is
+/// persisted). Rules in the payload are upserted by id and the
+/// mode-bounded delete set is removed, all within one transaction —
+/// under `replace` that is every local rule the fleet does not list,
+/// under `merge` only the rules the fleet itself previously pushed and
+/// has now dropped. The live evaluator is hot-reloaded afterwards.
+async fn apply_rules(
+    s: &ApiState,
+    effective: &Value,
+    mode: FleetApplyMode,
+    prev_keys: &[String],
+) -> Result<AppliedCategory, ApiError> {
     let rules: Vec<RuleConfig> = serde_json::from_value(effective.clone())
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rules payload: {e}")))?;
     for rule in &rules {
@@ -276,10 +418,11 @@ async fn apply_rules(s: &ApiState, effective: &Value) -> Result<usize, ApiError>
         }
     }
     let keep: std::collections::HashSet<&str> = rules.iter().map(|r| r.id.as_str()).collect();
+    let retract = retractable(mode, prev_keys, &keep);
     let existing = s.store.list_rules().await?;
     let mut tx = s.store.begin_tx().await?;
     for rule in &existing {
-        if !keep.contains(rule.id.as_str()) {
+        if should_delete(retract.as_ref(), &keep, rule.id.as_str()) {
             s.store.delete_rule_tx(&mut tx, &rule.id).await?;
         }
     }
@@ -289,22 +432,57 @@ async fn apply_rules(s: &ApiState, effective: &Value) -> Result<usize, ApiError>
     nexus_store::Store::commit_tx(tx).await?;
     let reload_id: RuleId = "fleet-apply".to_string();
     crate::api::reload_rules_into_evaluator(s, "fleet-apply", &reload_id).await;
-    Ok(rules.len())
+    Ok(AppliedCategory {
+        targets: rules.len(),
+        managed_keys: rules.iter().map(|r| r.id.clone()).collect(),
+    })
 }
 
-/// `text_prompts` — `effective` is a JSON array of strings. The list
-/// is written to every local camera's `detector.prompts`.
-async fn apply_text_prompts(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+/// `text_prompts` — `effective` is a JSON array of strings, keyed by the
+/// prompt string itself, written to every local camera's
+/// `detector.prompts`.
+///
+/// Under `replace` a camera's list becomes exactly the fleet list. Under
+/// `merge` each camera keeps the prompts it holds that the fleet neither
+/// lists now nor pushed before, and the fleet list is appended after
+/// them — so an operator's own prompts survive while the fleet can still
+/// retract one it previously pushed. The fleet block keeps the cloud's
+/// order, which is what lets `fleet_hash` reproduce the cloud's
+/// projection from the managed subset.
+async fn apply_text_prompts(
+    s: &ApiState,
+    effective: &Value,
+    mode: FleetApplyMode,
+    prev_keys: &[String],
+) -> Result<AppliedCategory, ApiError> {
     let prompts: Vec<String> = serde_json::from_value(effective.clone()).map_err(|e| {
         ApiError(
             StatusCode::BAD_REQUEST,
             format!("text_prompts payload: {e}"),
         )
     })?;
+    let keep: std::collections::HashSet<&str> = prompts.iter().map(String::as_str).collect();
+    let retract = retractable(mode, prev_keys, &keep);
     let mut cameras = s.store.list_cameras().await?;
     let mut tx = s.store.begin_tx().await?;
     for cam in &mut cameras {
-        cam.detector.prompts = prompts.clone();
+        cam.detector.prompts = match mode {
+            FleetApplyMode::Replace => prompts.clone(),
+            FleetApplyMode::Merge => {
+                let mut merged: Vec<String> = cam
+                    .detector
+                    .prompts
+                    .iter()
+                    .filter(|p| {
+                        !keep.contains(p.as_str())
+                            && !should_delete(retract.as_ref(), &keep, p.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                merged.extend(prompts.iter().cloned());
+                merged
+            }
+        };
         s.store.upsert_camera_tx(&mut tx, cam).await?;
     }
     nexus_store::Store::commit_tx(tx).await?;
@@ -312,12 +490,20 @@ async fn apply_text_prompts(s: &ApiState, effective: &Value) -> Result<usize, Ap
         .bus
         .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
         .await;
-    Ok(cameras.len())
+    Ok(AppliedCategory {
+        targets: cameras.len(),
+        managed_keys: prompts,
+    })
 }
 
 /// `detector_config` — `effective` is a [`ModelConfig`] object,
 /// applied as every local camera's `detector.model_override`.
-async fn apply_detector_config(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+/// Object-shaped: a single value with no local entries to lose, so
+/// `replace` and `merge` behave identically (see module docs).
+async fn apply_detector_config(
+    s: &ApiState,
+    effective: &Value,
+) -> Result<AppliedCategory, ApiError> {
     let model: ModelConfig = serde_json::from_value(effective.clone()).map_err(|e| {
         ApiError(
             StatusCode::BAD_REQUEST,
@@ -335,13 +521,20 @@ async fn apply_detector_config(s: &ApiState, effective: &Value) -> Result<usize,
         .bus
         .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
         .await;
-    Ok(cameras.len())
+    Ok(AppliedCategory {
+        targets: cameras.len(),
+        managed_keys: Vec::new(),
+    })
 }
 
 /// `delivery_settings` — `effective` is a `{enabled, schedule?,
 /// timezone?}` object (the same shape `PUT /v1/admin/delivery`
-/// accepts). The singleton row is upserted.
-async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+/// accepts). The singleton row is upserted. Object-shaped: `replace`
+/// and `merge` behave identically (see module docs).
+async fn apply_delivery_settings(
+    s: &ApiState,
+    effective: &Value,
+) -> Result<AppliedCategory, ApiError> {
     #[derive(Deserialize)]
     struct DeliveryPayload {
         enabled: bool,
@@ -394,19 +587,24 @@ async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usiz
         .bus
         .publish(topic::DELIVERY_SETTINGS_CHANGED, &serde_json::json!({}))
         .await;
-    Ok(1)
+    Ok(AppliedCategory {
+        targets: 1,
+        managed_keys: Vec::new(),
+    })
 }
 
 /// `alert_sinks` — `effective` is a JSON array of full
 /// [`SinkConfig`] objects (the same shape
 /// `PUT /v1/admin/sinks/config/{kind}/{name}` accepts).
 ///
-/// REPLACE semantics over the **cloud-managed** sink set only: every
-/// entry is upserted into `alert_sinks` keyed by `<kind>:<name>`, and
-/// any existing db row the fleet no longer lists is deleted. Sinks
-/// pinned in `nexus.toml` (`source: "file"`) are untouched — they are
-/// not rows, so the fleet can never remove what the local operator
-/// hard-coded. A db row that shadows a file sink still wins at
+/// Reconciles the **cloud-managed** sink set only, keyed by
+/// `<kind>:<name>`: every entry is upserted into `alert_sinks`, and the
+/// mode-bounded delete set is removed — under `replace` every db row
+/// the fleet no longer lists, under `merge` only the rows the fleet
+/// itself previously pushed and has now dropped. Sinks pinned in
+/// `nexus.toml` (`source: "file"`) are untouched under both modes —
+/// they are not rows, so the fleet can never remove what the local
+/// operator hard-coded. A db row that shadows a file sink still wins at
 /// registry-build time (migration `0021_alert_sinks.sql`).
 ///
 /// # Secret discipline
@@ -427,7 +625,12 @@ async fn apply_delivery_settings(s: &ApiState, effective: &Value) -> Result<usiz
 ///
 /// The whole payload is resolved and validated up-front so a bad
 /// entry fails atomically — nothing is persisted.
-async fn apply_alert_sinks(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+async fn apply_alert_sinks(
+    s: &ApiState,
+    effective: &Value,
+    mode: FleetApplyMode,
+    prev_keys: &[String],
+) -> Result<AppliedCategory, ApiError> {
     let sinks: Vec<SinkConfig> = serde_json::from_value(effective.clone())
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("alert_sinks payload: {e}")))?;
 
@@ -475,8 +678,10 @@ async fn apply_alert_sinks(s: &ApiState, effective: &Value) -> Result<usize, Api
         resolved.push((sink_id, cfg));
     }
 
+    let keep_refs: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
+    let retract = retractable(mode, prev_keys, &keep_refs);
     for row in s.store.alert_sinks_list().await? {
-        if !keep.contains(&row.sink_id) {
+        if should_delete(retract.as_ref(), &keep_refs, row.sink_id.as_str()) {
             s.store.alert_sink_delete(&row.sink_id).await?;
         }
     }
@@ -495,7 +700,10 @@ async fn apply_alert_sinks(s: &ApiState, effective: &Value) -> Result<usize, Api
         .bus
         .publish(topic::SINK_CONFIG_CHANGED, &serde_json::json!({}))
         .await;
-    Ok(resolved.len())
+    Ok(AppliedCategory {
+        targets: resolved.len(),
+        managed_keys: resolved.into_iter().map(|(sink_id, _)| sink_id).collect(),
+    })
 }
 
 /// `visual_prompts` — attach/detach reconcile with create-by-image.
@@ -504,12 +712,21 @@ async fn apply_alert_sinks(s: &ApiState, effective: &Value) -> Result<usize, Api
 /// that is *not* present locally but carries an `image_url` is
 /// downloaded (the bytes verified against `sha256`), encoded, and
 /// created before attaching; an unknown name *without* an `image_url`
-/// is a `400` so the cloud records the target as failed. REPLACE
-/// semantics: on every local camera the resolved prompts are attached
-/// and any currently-attached prompt the fleet no longer lists is
-/// detached. A repeated identical apply is a no-op (the create path
-/// is skipped because the name now resolves locally).
-async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, ApiError> {
+/// is a `400` so the cloud records the target as failed.
+///
+/// On every local camera the resolved prompts are attached, and the
+/// mode-bounded detach set is detached — under `replace` any
+/// currently-attached prompt the fleet no longer lists, under `merge`
+/// only prompts the fleet itself previously attached (the marker's
+/// `managed_keys`, which are prompt *names*) and has now dropped. A
+/// repeated identical apply is a no-op under both modes (the create
+/// path is skipped because the name now resolves locally).
+async fn apply_visual_prompts(
+    s: &ApiState,
+    effective: &Value,
+    mode: FleetApplyMode,
+    prev_keys: &[String],
+) -> Result<AppliedCategory, ApiError> {
     let entries: Vec<FleetVisualPromptEntry> =
         serde_json::from_value(effective.clone()).map_err(|e| {
             ApiError(
@@ -539,6 +756,24 @@ async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, 
         ));
     }
     let keep: std::collections::HashSet<VisualPromptId> = ids.iter().copied().collect();
+    // Under `merge`, detachment is bounded to the prompts a previous
+    // fleet apply attached. `managed_keys` holds names, so resolve them
+    // back to ids; a name that no longer exists locally is already gone
+    // and simply drops out of the set.
+    let retract: Option<std::collections::HashSet<VisualPromptId>> = match mode {
+        FleetApplyMode::Replace => None,
+        FleetApplyMode::Merge => {
+            let mut set = std::collections::HashSet::new();
+            for name in prev_keys {
+                if let Ok(Some(summary)) = s.store.get_visual_prompt_by_name(name).await {
+                    if !keep.contains(&summary.id) {
+                        set.insert(summary.id);
+                    }
+                }
+            }
+            Some(set)
+        }
+    };
     let cameras = s.store.list_cameras().await?;
     let mut changed = false;
     for cam in &cameras {
@@ -549,9 +784,13 @@ async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, 
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let current_set: std::collections::HashSet<VisualPromptId> =
             current.iter().copied().collect();
-        // Detach prompts the fleet no longer lists.
+        // Detach the prompts this apply is allowed to retract.
         for vp_id in &current {
-            if !keep.contains(vp_id) {
+            let detach = match &retract {
+                None => !keep.contains(vp_id),
+                Some(set) => set.contains(vp_id),
+            };
+            if detach {
                 s.store
                     .detach_camera_visual_prompt(cam.id, *vp_id)
                     .await
@@ -576,7 +815,10 @@ async fn apply_visual_prompts(s: &ApiState, effective: &Value) -> Result<usize, 
             .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
             .await;
     }
-    Ok(ids.len())
+    Ok(AppliedCategory {
+        targets: ids.len(),
+        managed_keys: entries.iter().map(|e| e.name.clone()).collect(),
+    })
 }
 
 /// Upper bound on a fleet-pushed reference image. Mirrors the cloud
@@ -692,4 +934,79 @@ async fn fetch_and_create_visual_prompt(
         content_type.as_deref(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set<'a>(items: &[&'a str]) -> std::collections::HashSet<&'a str> {
+        items.iter().copied().collect()
+    }
+
+    fn owned(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A body without `mode` — every cloud predating Phase 7.5.11 —
+    /// must read as `replace` so the 7.5.5 contract is preserved.
+    #[test]
+    fn absent_mode_defaults_to_replace() {
+        let req: FleetApplyReq =
+            serde_json::from_value(serde_json::json!({ "effective": [] })).expect("parse");
+        assert_eq!(req.mode, FleetApplyMode::Replace);
+
+        for (wire, expected) in [
+            ("replace", FleetApplyMode::Replace),
+            ("merge", FleetApplyMode::Merge),
+        ] {
+            let req: FleetApplyReq =
+                serde_json::from_value(serde_json::json!({ "effective": [], "mode": wire }))
+                    .expect("parse");
+            assert_eq!(req.mode, expected);
+        }
+    }
+
+    /// `replace` owns the whole category: anything the fleet does not
+    /// list is deletable, whoever created it.
+    #[test]
+    fn replace_deletes_every_unlisted_key() {
+        let keep = set(&["fleet-a"]);
+        let prev = owned(&["fleet-a", "fleet-retired"]);
+        let retract = retractable(FleetApplyMode::Replace, &prev, &keep);
+        assert!(retract.is_none(), "replace is unbounded");
+
+        assert!(!should_delete(retract.as_ref(), &keep, "fleet-a"));
+        assert!(should_delete(retract.as_ref(), &keep, "fleet-retired"));
+        // The reported bug: a purely local rule, deleted by a push.
+        assert!(should_delete(retract.as_ref(), &keep, "operator-local"));
+    }
+
+    /// `merge` owns only what it pushed. This is the regression guard
+    /// for the reported data loss: an operator's own entries survive a
+    /// merge push, while the fleet can still retract its own.
+    #[test]
+    fn merge_deletes_only_previously_fleet_owned_keys() {
+        let keep = set(&["fleet-a"]);
+        let prev = owned(&["fleet-a", "fleet-retired"]);
+        let retract = retractable(FleetApplyMode::Merge, &prev, &keep);
+
+        // Still listed → kept.
+        assert!(!should_delete(retract.as_ref(), &keep, "fleet-a"));
+        // Fleet-pushed before, dropped now → retracted.
+        assert!(should_delete(retract.as_ref(), &keep, "fleet-retired"));
+        // Never fleet-pushed → untouchable.
+        assert!(!should_delete(retract.as_ref(), &keep, "operator-local"));
+    }
+
+    /// A first-ever `merge` apply has no provenance to retract from, so
+    /// it is purely additive — it can never delete anything.
+    #[test]
+    fn first_merge_apply_deletes_nothing() {
+        let keep = set(&["fleet-a"]);
+        let retract = retractable(FleetApplyMode::Merge, &[], &keep);
+        assert!(!should_delete(retract.as_ref(), &keep, "operator-local"));
+        assert!(!should_delete(retract.as_ref(), &keep, "fleet-a"));
+        assert!(!should_delete(retract.as_ref(), &keep, "anything-else"));
+    }
 }

@@ -299,6 +299,15 @@ export interface FleetManagedMarker {
   scope_type?: string | null;
   scope_id?: string | null;
   effective_sha256?: string | null;
+  /**
+   * Apply mode of the last fleet push (Phase 7.5.11). `replace` means the
+   * fleet owns the whole category and unlisted local entries are deleted;
+   * `merge` means it owns only `managed_keys`. Absent on markers written
+   * before 7.5.11, which are read as `replace`.
+   */
+  mode?: "replace" | "merge" | null;
+  /** Identities the fleet currently owns for this category. */
+  managed_keys?: string[] | null;
   applied_at: string;
 }
 
