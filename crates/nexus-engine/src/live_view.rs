@@ -78,8 +78,16 @@ const DEFAULT_BUDGET_PER_SEC: u32 = 24;
 /// gives headroom without making the scan meaningful work.
 const LOOP_WINDOW: usize = 8;
 
-/// Consecutive cycle hits before the pump logs. Keeps an incidental repeat
-/// quiet while a sustained loop gets reported exactly once per episode.
+/// How many recent samples the log decision is evaluated over. The pump
+/// counts cycle hits *within* this window rather than requiring an unbroken
+/// run: one genuinely fresh frame slipping through a recycled pool used to
+/// reset the counter, which kept a persistent loop permanently unreported.
+/// At the 4 fps grid cadence this is ~12 s.
+const LOOP_EVAL_WINDOW: usize = 48;
+
+/// Cycle hits within [`LOOP_EVAL_WINDOW`] before the pump logs. Keeps an
+/// incidental repeat quiet while a sustained loop gets reported exactly
+/// once per episode.
 const LOOP_LOG_TRIP: u32 = 12;
 
 /// Hash of the decoded frame's pixels.
@@ -274,6 +282,7 @@ fn spawn_pump(
         // Rolling window of recent frame content hashes + the current
         // run of suppressed cycle hits. See the loop-guard comment below.
         let mut recent: VecDeque<u64> = VecDeque::with_capacity(LOOP_WINDOW);
+        let mut loop_outcomes: VecDeque<bool> = VecDeque::with_capacity(LOOP_EVAL_WINDOW);
         let mut loop_hits: u32 = 0;
         let mut loop_logged = false;
         // Force the first available frame to emit immediately so a fresh
@@ -329,6 +338,14 @@ fn spawn_pump(
                     None
                 };
 
+                if new_frame {
+                    loop_outcomes.push_back(cycle.is_some());
+                    if loop_outcomes.len() > LOOP_EVAL_WINDOW
+                        && loop_outcomes.pop_front() == Some(true)
+                    {
+                        loop_hits = loop_hits.saturating_sub(1);
+                    }
+                }
                 if let Some(period) = cycle {
                     loop_hits = loop_hits.saturating_add(1);
                     if loop_hits >= LOOP_LOG_TRIP && !loop_logged {
@@ -342,11 +359,12 @@ fn spawn_pump(
                              even though frame ids advance)"
                         );
                     }
-                } else if new_frame {
-                    if loop_logged {
-                        debug!(camera_id, "live view: frame cycle cleared");
-                    }
-                    loop_hits = 0;
+                } else if new_frame && loop_logged && loop_hits == 0 {
+                    // Only declare the episode over once the whole
+                    // evaluation window has drained of cycle hits. Clearing
+                    // on the first fresh frame re-armed the log on every
+                    // gap in an ongoing loop.
+                    debug!(camera_id, "live view: frame cycle cleared");
                     loop_logged = false;
                 }
                 let stale_dup = cycle.is_some() && !keepalive_due;

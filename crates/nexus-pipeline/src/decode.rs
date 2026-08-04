@@ -440,11 +440,24 @@ pub fn rgb_frame_looks_degenerate(rgb: &[u8]) -> bool {
 /// carries `queue max-size-buffers=8` + `appsink max-buffers=4`.
 pub const FRAME_LOOP_WINDOW: usize = 12;
 
-/// Consecutive looping frames before [`FrameLoopDetector`] trips. At the
-/// 15 fps supervisor cap this is ~2 s of provably recycled video — long
-/// enough that a burst of coincidental repeats cannot fire it, short enough
-/// that the operator never watches more than a couple of seconds of stale
-/// footage before the session is rebuilt.
+/// How many recent observations the trip decision is evaluated over.
+///
+/// The detector counts looping frames *within this window* rather than
+/// requiring an unbroken run. A recycled surface pool does not always hand
+/// back a stale surface — a genuinely fresh frame slips through whenever
+/// the race resolves the other way — and under a consecutive-run rule a
+/// single such frame reset the counter to zero, so an intermittent loop
+/// could run indefinitely without ever tripping.
+///
+/// At the 15 fps supervisor cap this is ~6 s of video.
+pub const FRAME_LOOP_EVAL_WINDOW: usize = 90;
+
+/// Looping frames within [`FRAME_LOOP_EVAL_WINDOW`] before the detector
+/// trips. One in three frames provably recycled is far outside anything a
+/// healthy decoder produces — repeats at distance 1 (static scenes,
+/// `videorate` padding) are excluded before they ever reach this count —
+/// while still being slack enough that a short coincidental burst cannot
+/// tear down a working session.
 pub const FRAME_LOOP_TRIP: u32 = 30;
 
 /// Byte stride at which [`frame_fingerprint`] samples the frame. Prime, so
@@ -487,7 +500,14 @@ pub fn frame_fingerprint(rgb: &[u8]) -> u64 {
 #[derive(Debug, Default)]
 pub struct FrameLoopDetector {
     recent: std::collections::VecDeque<u64>,
+    /// Per-observation loop/no-loop outcomes over the trip window.
+    outcomes: std::collections::VecDeque<bool>,
     hits: u32,
+    /// Period of the most recent looping frame, reported on trip so the
+    /// operator log names the cycle depth actually seen.
+    last_period: usize,
+    observed: u64,
+    duplicates: u64,
 }
 
 impl FrameLoopDetector {
@@ -495,9 +515,19 @@ impl FrameLoopDetector {
         Self::default()
     }
 
-    /// Record one frame. Returns `Some(period)` once the stream has looped
-    /// for [`FRAME_LOOP_TRIP`] consecutive frames, and resets so a caller
-    /// that chooses not to act still gets a bounded log rate.
+    /// Frames observed and, of those, how many repeated at distance ≥ 2.
+    ///
+    /// Reported even when the detector never trips: without it a loop that
+    /// stays under [`FRAME_LOOP_TRIP`] is completely invisible, which is
+    /// the only reason its magnitude in the field is unknown.
+    #[must_use]
+    pub fn stats(&self) -> (u64, u64) {
+        (self.observed, self.duplicates)
+    }
+
+    /// Record one frame. Returns `Some(period)` once [`FRAME_LOOP_TRIP`]
+    /// of the last [`FRAME_LOOP_EVAL_WINDOW`] frames looped, and resets so
+    /// a caller that chooses not to act still gets a bounded log rate.
     pub fn observe(&mut self, fingerprint: u64) -> Option<usize> {
         let identical_to_previous = self.recent.back() == Some(&fingerprint);
         // Distance back to the most recent frame with this content.
@@ -516,15 +546,22 @@ impl FrameLoopDetector {
             self.recent.pop_front();
         }
 
-        match period {
-            Some(p) => {
-                self.hits += 1;
-                if self.hits >= FRAME_LOOP_TRIP {
-                    self.hits = 0;
-                    return Some(p);
-                }
-            }
-            None => self.hits = 0,
+        self.observed = self.observed.saturating_add(1);
+        let looped = period.is_some();
+        if let Some(p) = period {
+            self.duplicates = self.duplicates.saturating_add(1);
+            self.last_period = p;
+            self.hits += 1;
+        }
+        self.outcomes.push_back(looped);
+        if self.outcomes.len() > FRAME_LOOP_EVAL_WINDOW && self.outcomes.pop_front() == Some(true) {
+            self.hits = self.hits.saturating_sub(1);
+        }
+
+        if self.hits >= FRAME_LOOP_TRIP {
+            self.hits = 0;
+            self.outcomes.clear();
+            return Some(self.last_period);
         }
         None
     }
@@ -1073,15 +1110,42 @@ mod tests {
     }
 
     #[test]
-    fn loop_detector_resets_on_a_single_new_frame() {
-        // A cycle that is broken before the trip count never fires.
+    fn loop_detector_trips_on_an_intermittently_broken_cycle() {
+        // A recycled surface pool does not hand back a stale surface every
+        // single time — a genuinely fresh frame slips through whenever the
+        // race resolves the other way. Under the old consecutive-run rule
+        // one such frame reset the counter to zero, so this pattern ran
+        // forever without ever tripping.
         let mut d = FrameLoopDetector::new();
-        for round in 0..10u64 {
+        let mut tripped = None;
+        'outer: for round in 0..20u64 {
             for i in 0..6u64 {
-                assert_eq!(d.observe(i + 1), None);
+                if let Some(p) = d.observe(i + 1) {
+                    tripped = Some(p);
+                    break 'outer;
+                }
             }
-            assert_eq!(d.observe(1_000 + round), None);
+            if let Some(p) = d.observe(1_000 + round) {
+                tripped = Some(p);
+                break;
+            }
         }
+        assert_eq!(tripped, Some(7));
+    }
+
+    #[test]
+    fn loop_detector_tolerates_sparse_duplicates() {
+        // A few repeats scattered through otherwise advancing video — the
+        // residual measured on healthy cameras — must never tear a working
+        // session down.
+        let mut d = FrameLoopDetector::new();
+        for i in 0..1_000u64 {
+            let fp = if i % 25 == 24 { i - 3 } else { i };
+            assert_eq!(d.observe(fp), None);
+        }
+        let (observed, duplicates) = d.stats();
+        assert_eq!(observed, 1_000);
+        assert_eq!(duplicates, 40);
     }
 
     #[test]
