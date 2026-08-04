@@ -182,6 +182,30 @@ The wedge plan that drives the next three phases of work is
   e2e is Playwright under `ui/e2e/`, pinned to `workers: 1` because admin settings
   are a global singleton and parallel specs race on them.
 
+## Engineering vault (ADR / SPEC / BUG) — lives in the cloud repo
+
+This repo has no local Obsidian vault. The engineering vault lives at
+[nexus-cloud-console/.obsidian-vault/](../nexus-cloud-console/.obsidian-vault/), since
+only that repo's root carries `.obsidian/`. Add or update a record **there**, not here, in
+the same PR whenever your change in this repo is:
+
+- **ADR-worthy** — an edge architectural decision with stated alternatives and
+  consequences (e.g. the trait-pool fail-soft pattern, the native-aspect ladder).
+- **SPEC-worthy** — a milestone (`M2`, `M3`, `M6`, `M7`, `M_ADMIN`, `M_OTA`, …) with a
+  goal and acceptance criteria; one spec per milestone doc is the norm.
+- **BUG-worthy** — a concrete defect with a stated symptom, root cause, and resolution.
+
+Use the templates at
+`../nexus-cloud-console/.obsidian-vault/templates/_template-{adr,spec,bug}.md`, continue
+the existing `ADR-NNN`/`SPEC-NNN`/`BUG-NNN` numbering found in
+`../nexus-cloud-console/.obsidian-vault/{decisions,specs,bugs}/`, and cite this repo's
+docs with `[[docs/edge-core/<file>#Heading]]` wikilinks — those paths are relative to the
+cloud repo, since `docs/edge-core/` physically lives there, not here. Verify heading text
+is exact (grep `^#{1,6} ` in the source doc) and that every link resolves before
+considering the change done. Same duplication-avoidance and judgment rules as the cloud
+repo's AGENTS.md apply: don't spawn a near-duplicate record, don't convert routine
+implementation notes, do cross-link ADR/SPEC/BUG records that relate to each other.
+
 ## Workflow
 
 0. **Always rebase before committing.** Before staging any commit, run
@@ -201,6 +225,9 @@ The wedge plan that drives the next three phases of work is
 4. macOS-local clippy does NOT catch every Linux-only clippy issue (`#[cfg(target_os
    = "linux")]` gates, `nix` integer width). If your change touches a Linux-gated
    block, expect at least one CI round-trip.
+5. If the change is decision/spec/bug-worthy, add or update the corresponding record in
+   the cloud repo's engineering vault (see "Engineering vault" above) before considering
+   it merged.
 
 ## Terminal output discipline (cost control)
 
