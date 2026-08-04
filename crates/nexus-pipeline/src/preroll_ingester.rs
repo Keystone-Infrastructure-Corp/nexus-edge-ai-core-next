@@ -80,10 +80,15 @@ use uuid::Uuid;
 
 use crate::decode::{
     frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, DecodeMode,
-    FrameLoopDetector, GstFactoryProbe, DECODE_VALIDATION_FRAMES, FRAME_LOOP_TRIP,
+    FrameLoopDetector, GstFactoryProbe, DECODE_VALIDATION_FRAMES, FRAME_LOOP_EVAL_WINDOW,
+    FRAME_LOOP_TRIP,
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
+
+/// How often the per-camera duplicate-frame rate is logged, in frames.
+/// ~30 s at the 15 fps supervisor cap.
+const FRAME_LOOP_STATS_INTERVAL: u64 = 450;
 
 /// How many in-flight live samples the broadcast channel buffers
 /// per subscriber. Tokio's broadcast drops the OLDEST sample when
@@ -833,11 +838,31 @@ async fn run_session(
                             camera_id,
                             period,
                             frames = FRAME_LOOP_TRIP,
+                            window = FRAME_LOOP_EVAL_WINDOW,
                             "decoded frames are repeating on a fixed cycle \
                              (stale video with advancing frame ids); \
                              rebuilding the camera session"
                         );
                         return Err(gst::FlowError::Error);
+                    }
+
+                    // Duplicate-rate telemetry. The guard above only speaks
+                    // when it tears a session down, so a loop that stays
+                    // under the trip ratio is otherwise invisible and its
+                    // real magnitude unmeasurable — sampling the admin frame
+                    // API from outside is far too coarse to see a cycle that
+                    // is only a handful of frames deep.
+                    {
+                        let (observed, duplicates) = loop_detector_cb.lock().stats();
+                        if observed % FRAME_LOOP_STATS_INTERVAL == 0 && duplicates > 0 {
+                            debug!(
+                                camera_id,
+                                observed,
+                                duplicates,
+                                per_mille = (duplicates.saturating_mul(1000)) / observed.max(1),
+                                "decode duplicate-frame rate"
+                            );
+                        }
                     }
 
                     let frame_id = {
