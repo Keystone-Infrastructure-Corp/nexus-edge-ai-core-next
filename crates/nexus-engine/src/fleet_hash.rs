@@ -550,6 +550,48 @@ mod tests {
         );
     }
 
+    /// FROZEN cross-repo vector for `rules`. A rule authored by the
+    /// console — which emits neither `verify` (no UI for it) nor the
+    /// debounce knobs beyond `cooldown_ms` — round-trips through the
+    /// typed `RuleConfig` here, filling every serde default, and hashes
+    /// to this exact SHA.
+    ///
+    /// It MUST stay byte-identical to the cloud's
+    /// `project_runtime_sha(Category::Rules, …)` frozen vector in
+    /// api-gateway `handlers/fleet.rs`
+    /// (`rules_projection_normalizes_to_edge_form`). The cloud cannot
+    /// import `nexus-config` (repo boundary R1), so it replicates this
+    /// serialization by hand in `normalize_rule`; if either side drifts,
+    /// one of the two frozen hashes breaks. Before `normalize_rule`
+    /// existed the cloud hashed the console payload verbatim, so `rules`
+    /// reported permanent drift the moment it was applied.
+    #[test]
+    fn rules_default_frozen_vector() {
+        let from_console = json!({
+            "id": "r1",
+            "name": "Person Detected",
+            "when": "object.label == 'person'",
+            "severity": "warning",
+            "camera_filter": null,
+            "zones": null,
+            "cooldown_ms": 30000,
+            "enabled": true,
+            "sinks": [],
+        });
+        let rule: nexus_config::RuleConfig =
+            serde_json::from_value(from_console).expect("console payload deserializes");
+        let arr = Value::Array(vec![serde_json::to_value(&rule).unwrap()]);
+
+        assert_eq!(
+            canonical_json(&arr),
+            r#"[{"camera_filter":null,"consecutive_frames":2,"cooldown_ms":30000,"enabled":true,"id":"r1","min_track_age_ms":500,"name":"Person Detected","severity":"warning","sinks":[],"verify":false,"when":"object.label == 'person'","zones":null}]"#
+        );
+        assert_eq!(
+            sha256_canonical(&arr),
+            "287fd83ed4c1b99c190d9c14e5f4bfe5e75eb30434d3a2281d13620b4d7864bb"
+        );
+    }
+
     /// On a fresh store: no rules, no cameras → both `None`; delivery
     /// is always present (seeded singleton).
     #[tokio::test]
