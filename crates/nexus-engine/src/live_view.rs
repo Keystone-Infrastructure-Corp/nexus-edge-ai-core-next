@@ -82,7 +82,11 @@ const LOOP_WINDOW: usize = 8;
 /// counts cycle hits *within* this window rather than requiring an unbroken
 /// run: one genuinely fresh frame slipping through a recycled pool used to
 /// reset the counter, which kept a persistent loop permanently unreported.
-/// At the 4 fps grid cadence this is ~12 s.
+///
+/// Note the window counts *new-frame* observations, not pump ticks, so it
+/// spans `LOOP_EVAL_WINDOW / cache_update_rate` seconds — roughly 25 s at
+/// the gate's 2 fps LBR baseline, not the 12 s a naive read against
+/// [`GRID_FPS`] would suggest.
 const LOOP_EVAL_WINDOW: usize = 48;
 
 /// Cycle hits within [`LOOP_EVAL_WINDOW`] before the pump logs. Keeps an
