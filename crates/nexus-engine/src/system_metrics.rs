@@ -463,7 +463,7 @@ pub async fn get_system_metrics(session: SessionContext) -> Result<Response, Res
 #[derive(Debug, Deserialize)]
 pub struct MetricsHistoryQuery {
     /// How far back from now to include, in seconds. Defaults to 24h;
-    /// clamped to `[1, 86_400]`.
+    /// clamped to `[1, 604_800]` (the 7-day retention cap).
     window_secs: Option<i64>,
     /// Downsample bucket width in seconds. Defaults to 300 (5 min);
     /// clamped to `>= 5`. Pass `5` for full resolution — note only the
@@ -477,7 +477,8 @@ pub struct MetricsHistoryQuery {
 }
 
 /// `GET /api/v1/admin/system/metrics-history` — rolling window of host
-/// metrics samples for the cloud console's "last 24 hours" trend view.
+/// metrics samples for the cloud console's trend view, sliced to any of
+/// its window presets (5 minutes … 7 days).
 ///
 /// Admin-gated: the cloud console reaches it through the generic
 /// `/admin/*` passthrough proxy, which is itself viewer+ RBAC'd on the
@@ -489,7 +490,7 @@ pub async fn get_metrics_history(
     State(s): State<crate::api::ApiState>,
     Query(q): Query<MetricsHistoryQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, crate::api::ApiError> {
-    let window_secs = q.window_secs.unwrap_or(86_400).clamp(1, 86_400);
+    let window_secs = q.window_secs.unwrap_or(86_400).clamp(1, 604_800);
     let bucket_secs = q.bucket_secs.unwrap_or(300).max(5);
     let now_ms = chrono::Utc::now().timestamp_millis();
     let payloads = s

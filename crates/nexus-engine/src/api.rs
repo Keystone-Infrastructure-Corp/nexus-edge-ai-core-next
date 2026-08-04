@@ -372,7 +372,7 @@ pub fn router(state: ApiState) -> Router {
         // regardless of whether reid is enabled, so the UI can
         // render a clear "feature off" empty state.
         .route("/v1/admin/reid/status", get(get_admin_reid_status))
-        // M-Dashboard follow-up — rolling 24h host-metrics history for
+        // M-Dashboard follow-up — rolling 7-day host-metrics history for
         // the cloud console's per-core trend view. Admin-gated (reached
         // via the cloud `/admin/*` passthrough proxy, viewer+ RBAC'd
         // cloud-side). Read-only host telemetry; see

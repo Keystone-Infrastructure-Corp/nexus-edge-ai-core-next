@@ -1,12 +1,13 @@
-//! Rolling 24-hour buffer of host [`SystemMetrics`] snapshots
+//! Rolling 7-day buffer of host [`SystemMetrics`] snapshots
 //! (migration `0024_metrics_samples.sql`).
 //!
 //! The engine samples `nexus-engine`'s `system_metrics::render()` every
 //! 5 seconds and calls [`Store::insert_metrics_sample`] with the full
 //! JSON blob. The cloud console reads it back via the admin
-//! metrics-history endpoint to draw a "last 24 hours" trend view for a
-//! core while that core is online. Nothing here ever crosses the tunnel
-//! on its own — the pull is on-demand and viewer-gated.
+//! metrics-history endpoint to draw a trend view for a core while that
+//! core is online, sliced to any of its window presets (5m … 7d).
+//! Nothing here ever crosses the tunnel on its own — the pull is
+//! on-demand and viewer-gated.
 //!
 //! ## Two-tier retention
 //!
@@ -15,8 +16,9 @@
 //!
 //! * **< 60 min:** full 5-second resolution (powers the console's
 //!   "full resolution" toggle and its live tail).
-//! * **60 min .. 24 h:** coarsened to one sample per 5-minute boundary.
-//! * **> 24 h:** dropped.
+//! * **60 min .. 7 days:** coarsened to one sample per 5-minute
+//!   boundary (~2 000 rows/day).
+//! * **> 7 days:** dropped.
 //!
 //! The row key `captured_at_ms` is floored to the 5-second sample grid
 //! at insert time (the true capture instant is preserved inside
@@ -44,8 +46,10 @@ const FINE_INTERVAL_MS: i64 = 5_000;
 const COARSE_BUCKET_MS: i64 = 300_000;
 /// Keep full 5-second resolution for the most recent 60 minutes.
 const FINE_WINDOW_MS: i64 = 60 * 60 * 1000;
-/// Hard cap — nothing older than 24 hours survives a prune.
-const MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+/// Hard cap — nothing older than 7 days survives a prune. Beyond the
+/// fine window rows sit on 5-minute boundaries, so the coarse tier costs
+/// ~2 000 rows/day.
+const MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 impl Store {
     /// Insert one metrics sample. `captured_at_ms` is the wall-clock
@@ -121,7 +125,7 @@ impl Store {
     /// Returns the total number of rows deleted. Idempotent — safe to
     /// call on every sweeper tick.
     pub async fn prune_metrics_samples(&self, now_ms: i64) -> Result<u64, StoreError> {
-        // Tier 1 — hard 24h cap.
+        // Tier 1 — hard 7-day cap.
         let day_floor = now_ms.saturating_sub(MAX_AGE_MS);
         let r1 = sqlx::query("DELETE FROM metrics_samples WHERE captured_at_ms < ?")
             .bind(day_floor)
@@ -308,6 +312,37 @@ mod tests {
             }
             b += FINE_INTERVAL_MS;
         }
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_coarse_out_to_seven_days() {
+        let (store, _tmp) = fresh_store().await;
+        let now_ms = 1_000_000_000_000i64 / COARSE_BUCKET_MS * COARSE_BUCKET_MS;
+        let day_ms = 24 * 60 * 60 * 1000;
+        let two_days = now_ms - 2 * day_ms;
+        let eight_days = now_ms - 8 * day_ms;
+        // Off-boundary sibling of the 2-day sample: past the fine window,
+        // so tier 2 must coarsen it away even though tier 1 spares it.
+        let two_days_off = two_days + FINE_INTERVAL_MS;
+        for t in [eight_days, two_days, two_days_off, now_ms] {
+            store
+                .insert_metrics_sample(t, &format!("{{\"captured_at_ms\":{t}}}"))
+                .await
+                .unwrap();
+        }
+        store.prune_metrics_samples(now_ms).await.unwrap();
+
+        let rows = store
+            .list_metrics_samples(now_ms, 604_800, 5, None)
+            .await
+            .unwrap();
+        let survivors: Vec<i64> = rows.iter().map(|p| ts_of(p)).collect();
+        assert_eq!(
+            survivors,
+            vec![two_days, now_ms],
+            "5-min boundaries must survive out to 7 days; older rows and \
+             off-boundary rows past the fine window must not"
+        );
     }
 
     #[tokio::test]

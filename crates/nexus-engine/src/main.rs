@@ -1287,12 +1287,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // Host-metrics sampler + retention sweeper. Samples the cached
     // `system_metrics::render()` snapshot every 5 seconds into the
     // `metrics_samples` table so the cloud console can draw a rolling
-    // "last 24 hours" trend view for this core while it is online, and
-    // prunes on a 60-second tick (two-tier retention: full 5s
-    // resolution for the most recent hour, coarsened to 5-minute
-    // boundaries beyond that, dropped past 24h — see
-    // `nexus_store::metrics`). Fail-open: a store hiccup logs and the
-    // loop continues; the sampler never blocks the pipeline.
+    // trend view for this core while it is online, and prunes on a
+    // 60-second tick (two-tier retention: full 5s resolution for the
+    // most recent hour, coarsened to 5-minute boundaries beyond that,
+    // dropped past 7 days — see `nexus_store::metrics`). Fail-open: a
+    // store hiccup logs and the loop continues; the sampler never
+    // blocks the pipeline.
     {
         let store = store.clone();
         tokio::spawn(async move {
