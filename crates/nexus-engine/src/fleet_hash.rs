@@ -10,10 +10,9 @@
 //!
 //! # Canonical category contract
 //!
-//! Phase 7.5.5 apply uses REPLACE semantics: a fleet apply overwrites the
-//! local state for the category on every camera. The per-category
-//! canonical value is therefore defined so the edge reports the single
-//! fleet-shaped value when (and only when) it is uniformly applied:
+//! The per-category canonical value is defined so the edge reports the
+//! single fleet-shaped value when (and only when) it is uniformly
+//! applied:
 //!
 //! * **rules** — JSON array of full rule objects, sorted by `id`. `None`
 //!   when the edge has no rules.
@@ -32,6 +31,23 @@
 //!
 //! When a per-camera category is non-uniform the hash is `None`, which
 //! the cloud renders as drift against its single projected value.
+//!
+//! # Merge-managed subsets (Phase 7.5.11)
+//!
+//! Under `replace` the edge's whole state for a category *is* the fleet
+//! payload, so hashing everything is right. Under `merge` it is not: the
+//! edge deliberately keeps operator-local entries the cloud has never
+//! seen, so a whole-state digest could never equal the cloud's
+//! projection of the effective payload and the console would show
+//! permanent, un-clearable drift (and re-push on every auto-apply tick).
+//!
+//! So for a list-shaped category whose marker says `mode = 'merge'`, the
+//! digest is taken over **only the keys that marker records as
+//! fleet-managed** — the exact set the cloud projected. Local-only
+//! entries are invisible to drift, which is precisely the contract
+//! `merge` promises. If an operator edits or deletes a *fleet-managed*
+//! entry the subset changes and drift still fires. This is what lets the
+//! whole feature ship with no cloud-side hashing change.
 
 use std::collections::BTreeSet;
 
@@ -52,11 +68,13 @@ pub struct CategoryHashes {
 
 /// Compute the per-category canonical hashes from the live store state.
 pub async fn compute(store: &Store) -> anyhow::Result<CategoryHashes> {
-    let rules = hash_rules(store).await?;
+    let managed = MergeManaged::load(store).await;
+    let rules = hash_rules(store, managed.keys("rules")).await?;
     let cameras = store.list_cameras().await?;
-    let text_prompts = hash_text_prompts(&cameras);
+    let text_prompts = hash_text_prompts(&cameras, managed.keys("text_prompts"));
     let detector_config = hash_detector_config(&cameras);
-    let visual_prompts = hash_visual_prompts(store, &cameras).await?;
+    let visual_prompts =
+        hash_visual_prompts(store, &cameras, managed.keys("visual_prompts")).await?;
     let delivery_settings = hash_delivery_settings(store).await?;
     Ok(CategoryHashes {
         rules,
@@ -67,9 +85,50 @@ pub async fn compute(store: &Store) -> anyhow::Result<CategoryHashes> {
     })
 }
 
+/// The fleet-managed key sets for categories last applied with `merge`.
+///
+/// A category is absent when it was never fleet-applied or was applied
+/// with `replace` — in both cases the digest covers the whole local
+/// state, as it did before Phase 7.5.11.
+#[derive(Debug, Default)]
+struct MergeManaged(std::collections::HashMap<String, Vec<String>>);
+
+impl MergeManaged {
+    /// Reads the markers. A read failure degrades to "no merge-managed
+    /// categories", i.e. whole-state digests — the pre-7.5.11 behaviour,
+    /// which at worst over-reports drift rather than hiding it.
+    async fn load(store: &Store) -> Self {
+        let markers = match store.list_fleet_managed_markers().await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "fleet markers unreadable; hashing whole local state");
+                return Self::default();
+            }
+        };
+        Self(
+            markers
+                .into_iter()
+                .filter(|m| m.mode.as_deref() == Some("merge"))
+                .filter_map(|m| m.managed_keys.map(|keys| (m.category, keys)))
+                .collect(),
+        )
+    }
+
+    fn keys(&self, category: &str) -> Option<&[String]> {
+        self.0.get(category).map(Vec::as_slice)
+    }
+}
+
 /// `rules` — array of full rule objects sorted by `id`.
-async fn hash_rules(store: &Store) -> anyhow::Result<Option<String>> {
+///
+/// When `managed` is `Some`, only rules the fleet owns are hashed; local
+/// rules are excluded so the digest matches the cloud's projection.
+async fn hash_rules(store: &Store, managed: Option<&[String]>) -> anyhow::Result<Option<String>> {
     let mut rules = store.list_rules().await?;
+    if let Some(managed) = managed {
+        let owned: std::collections::HashSet<&str> = managed.iter().map(String::as_str).collect();
+        rules.retain(|r| owned.contains(r.id.as_str()));
+    }
     if rules.is_empty() {
         return Ok(None);
     }
@@ -84,13 +143,35 @@ async fn hash_rules(store: &Store) -> anyhow::Result<Option<String>> {
 }
 
 /// `text_prompts` — the ordered prompt list shared by every camera.
-fn hash_text_prompts(cameras: &[nexus_config::CameraConfig]) -> Option<String> {
+///
+/// When `managed` is `Some`, the projection is the managed list **in the
+/// order the cloud sent it**, narrowed to the prompts every camera still
+/// carries. Dropping one on any camera changes the digest, so an
+/// operator deleting a fleet-pushed prompt still shows as drift, while
+/// their own prompts stay invisible to it.
+fn hash_text_prompts(
+    cameras: &[nexus_config::CameraConfig],
+    managed: Option<&[String]>,
+) -> Option<String> {
     let first = cameras.first()?;
-    let shared = &first.detector.prompts;
-    if shared.is_empty() || !cameras.iter().all(|c| &c.detector.prompts == shared) {
+    let shared: Vec<String> = match managed {
+        None => {
+            let shared = &first.detector.prompts;
+            if !cameras.iter().all(|c| &c.detector.prompts == shared) {
+                return None;
+            }
+            shared.clone()
+        }
+        Some(managed) => managed
+            .iter()
+            .filter(|p| cameras.iter().all(|c| c.detector.prompts.contains(p)))
+            .cloned()
+            .collect(),
+    };
+    if shared.is_empty() {
         return None;
     }
-    let arr = Value::Array(shared.iter().map(|p| Value::String(p.clone())).collect());
+    let arr = Value::Array(shared.into_iter().map(Value::String).collect());
     Some(sha256_canonical(&arr))
 }
 
@@ -123,14 +204,18 @@ fn hash_detector_config(cameras: &[nexus_config::CameraConfig]) -> Option<String
 }
 
 /// `visual_prompts` — the sorted attached-prompt-name set shared by every
-/// camera.
+/// camera. When `managed` is `Some`, only fleet-owned names count toward
+/// the set, so locally-attached prompts do not read as drift.
 async fn hash_visual_prompts(
     store: &Store,
     cameras: &[nexus_config::CameraConfig],
+    managed: Option<&[String]>,
 ) -> anyhow::Result<Option<String>> {
     if cameras.is_empty() {
         return Ok(None);
     }
+    let owned: Option<std::collections::HashSet<&str>> =
+        managed.map(|m| m.iter().map(String::as_str).collect());
     // id -> name for every visual prompt on this core.
     let summaries = store.list_visual_prompts().await?;
     let name_of: std::collections::HashMap<_, _> =
@@ -142,6 +227,7 @@ async fn hash_visual_prompts(
         let names: BTreeSet<String> = ids
             .iter()
             .filter_map(|id| name_of.get(id).cloned())
+            .filter(|name| owned.as_ref().is_none_or(|o| o.contains(name.as_str())))
             .collect();
         match &shared {
             None => shared = Some(names),
@@ -341,29 +427,70 @@ mod tests {
     #[test]
     fn text_prompts_uniform_vs_divergent() {
         // No cameras → no shared list.
-        assert!(hash_text_prompts(&[]).is_none());
+        assert!(hash_text_prompts(&[], None).is_none());
 
         // Empty prompts on the only camera → None.
-        assert!(hash_text_prompts(&[camera(1, &[], None)]).is_none());
+        assert!(hash_text_prompts(&[camera(1, &[], None)], None).is_none());
 
         // Two cameras agreeing → Some, stable.
         let uniform = [
             camera(1, &["person", "car"], None),
             camera(2, &["person", "car"], None),
         ];
-        let h = hash_text_prompts(&uniform).expect("uniform → Some");
-        assert_eq!(hash_text_prompts(&uniform), Some(h.clone()));
+        let h = hash_text_prompts(&uniform, None).expect("uniform → Some");
+        assert_eq!(hash_text_prompts(&uniform, None), Some(h.clone()));
 
         // Order matters: a reordered list is a different category value.
         let reordered = [camera(1, &["car", "person"], None)];
-        assert_ne!(hash_text_prompts(&reordered), Some(h));
+        assert_ne!(hash_text_prompts(&reordered, None), Some(h));
 
         // Cameras disagreeing → None (= drift).
         let divergent = [
             camera(1, &["person"], None),
             camera(2, &["person", "car"], None),
         ];
-        assert!(hash_text_prompts(&divergent).is_none());
+        assert!(hash_text_prompts(&divergent, None).is_none());
+    }
+
+    /// Phase 7.5.11 — a merge-managed `text_prompts` category digests
+    /// only the fleet-owned prompts, so operator-local prompts (and
+    /// cameras disagreeing *about local prompts*) never read as drift,
+    /// while the digest still equals the cloud's projection of the
+    /// effective payload.
+    #[test]
+    fn text_prompts_merge_managed_subset_ignores_local() {
+        let managed: Vec<String> = vec!["person".into(), "car".into()];
+
+        // The cloud's projection: exactly the managed list, in order.
+        let fleet_only = [camera(1, &["person", "car"], None)];
+        let cloud_view = hash_text_prompts(&fleet_only, None).expect("fleet-only → Some");
+
+        // Same core after the operator adds a local prompt to one camera
+        // and a different one to the other. Under `replace` semantics
+        // this is drift twice over (non-uniform, and ≠ cloud). Under
+        // `merge` it hashes to exactly the cloud's projection.
+        let with_local = [
+            camera(1, &["person", "car", "my-dog"], None),
+            camera(2, &["person", "car", "delivery-van"], None),
+        ];
+        assert!(hash_text_prompts(&with_local, None).is_none());
+        assert_eq!(
+            hash_text_prompts(&with_local, Some(&managed)),
+            Some(cloud_view.clone())
+        );
+
+        // Deleting a *fleet-owned* prompt from one camera still drifts.
+        let fleet_prompt_deleted = [
+            camera(1, &["person", "my-dog"], None),
+            camera(2, &["person", "car"], None),
+        ];
+        assert_ne!(
+            hash_text_prompts(&fleet_prompt_deleted, Some(&managed)),
+            Some(cloud_view)
+        );
+
+        // A merge push of nothing owns nothing → no category value.
+        assert!(hash_text_prompts(&with_local, Some(&[])).is_none());
     }
 
     /// `detector_config` reduces to a hash only when every camera shares
@@ -420,6 +547,48 @@ mod tests {
         assert_eq!(
             hash_detector_config(&uniform),
             Some("5c14a4012b1233ed210e7cdeb28a629e7bfe20a85e37db0338bd4d0c245dd142".to_owned()),
+        );
+    }
+
+    /// FROZEN cross-repo vector for `rules`. A rule authored by the
+    /// console — which emits neither `verify` (no UI for it) nor the
+    /// debounce knobs beyond `cooldown_ms` — round-trips through the
+    /// typed `RuleConfig` here, filling every serde default, and hashes
+    /// to this exact SHA.
+    ///
+    /// It MUST stay byte-identical to the cloud's
+    /// `project_runtime_sha(Category::Rules, …)` frozen vector in
+    /// api-gateway `handlers/fleet.rs`
+    /// (`rules_projection_normalizes_to_edge_form`). The cloud cannot
+    /// import `nexus-config` (repo boundary R1), so it replicates this
+    /// serialization by hand in `normalize_rule`; if either side drifts,
+    /// one of the two frozen hashes breaks. Before `normalize_rule`
+    /// existed the cloud hashed the console payload verbatim, so `rules`
+    /// reported permanent drift the moment it was applied.
+    #[test]
+    fn rules_default_frozen_vector() {
+        let from_console = json!({
+            "id": "r1",
+            "name": "Person Detected",
+            "when": "object.label == 'person'",
+            "severity": "warning",
+            "camera_filter": null,
+            "zones": null,
+            "cooldown_ms": 30000,
+            "enabled": true,
+            "sinks": [],
+        });
+        let rule: nexus_config::RuleConfig =
+            serde_json::from_value(from_console).expect("console payload deserializes");
+        let arr = Value::Array(vec![serde_json::to_value(&rule).unwrap()]);
+
+        assert_eq!(
+            canonical_json(&arr),
+            r#"[{"camera_filter":null,"consecutive_frames":2,"cooldown_ms":30000,"enabled":true,"id":"r1","min_track_age_ms":500,"name":"Person Detected","severity":"warning","sinks":[],"verify":false,"when":"object.label == 'person'","zones":null}]"#
+        );
+        assert_eq!(
+            sha256_canonical(&arr),
+            "287fd83ed4c1b99c190d9c14e5f4bfe5e75eb30434d3a2281d13620b4d7864bb"
         );
     }
 

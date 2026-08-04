@@ -24,7 +24,7 @@ pub mod visual_prompts;
 pub use alert_clip::{AlertClipColdMark, AlertClipId, AlertClipRow, NewAlertClip};
 pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
 pub use entity::{EntityLocalRecord, EntityLocalUpsert};
-pub use fleet::FleetManagedMarker;
+pub use fleet::{FleetManagedMarker, FleetMarkerWrite};
 pub use motion::{
     ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
     MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket, NewClip, NewMotionEvent,
@@ -188,6 +188,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0032_cloud_enrollment_ssh_ca",
         include_str!("../migrations/0032_cloud_enrollment_ssh_ca.sql"),
+    ),
+    (
+        "0033_fleet_marker_apply_mode",
+        include_str!("../migrations/0033_fleet_marker_apply_mode.sql"),
     ),
 ];
 
