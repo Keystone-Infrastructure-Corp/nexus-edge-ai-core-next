@@ -28,6 +28,7 @@ mod auth_bootstrap;
 mod cloud_alert_sink;
 mod cloud_audit;
 mod cloud_enroll;
+mod cloud_liveness;
 mod cloud_sighting;
 mod cloud_tunnel;
 mod cloud_update;
@@ -54,11 +55,13 @@ mod npu;
 mod oauth_sessions;
 mod proc_metrics;
 mod reconciler;
+mod remote_shell;
 mod retention;
 mod roster;
 mod setup;
 mod sink_router;
 mod sinks_reload;
+mod ssh_ca;
 mod state_hashes;
 mod storage_safety;
 mod system_metrics;
@@ -1395,6 +1398,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // persists across tunnel reconnects; the supervisor drives it from the
     // inbound lbr_subscribe / lbr_unsubscribe envelopes.
     let live_view_manager = live_view::LiveViewManager::new(cache.clone(), cloud_outbox.clone());
+    // Go-dark insurance. One shared signal, two independent consumers:
+    // the OTA success gate below, and the watchdog further down. See
+    // `cloud_liveness` for why an unreachable-but-working appliance is
+    // the failure mode worth its own machinery.
+    let tunnel_liveness = std::sync::Arc::new(cloud_liveness::TunnelLiveness::new());
+
     let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(
         store.clone(),
         registry.clone(),
@@ -1409,6 +1418,8 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         Some(trace_rx),
         loopback_admin_base.clone(),
         cloud_passthrough_admin_secret,
+        cfg.remote_access.clone(),
+        tunnel_liveness.clone(),
     );
 
     // Phase 9 (M_OTA) — boot-time finalize of any update that was
@@ -1417,7 +1428,24 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // the assignment SUCCESS and emit a terminal `update_progress`;
     // otherwise count the crash and auto-rollback once the threshold is
     // crossed. Runs after the outbox exists so progress can be sent.
-    cloud_update::finalize_pending_update(store.clone(), cloud_outbox.clone()).await;
+    //
+    // Spawned, not awaited: the success path now waits for the tunnel to
+    // prove itself, which takes minutes, and nothing local may wait on
+    // the cloud.
+    tokio::spawn(cloud_update::finalize_pending_update(
+        store.clone(),
+        cloud_outbox.clone(),
+        tunnel_liveness.clone(),
+    ));
+
+    // Go-dark watchdog, independent of OTA: catches the cases that do not
+    // arrive on an update boundary (expired client cert, rotation bug, a
+    // cloud-side change this release cannot tolerate).
+    tokio::spawn(cloud_liveness::run_cloud_liveness_watchdog(
+        store.clone(),
+        tunnel_liveness.clone(),
+        cfg.cloud.dark_window(),
+    ));
 
     let cache_jobs = cold_read_cache::CacheJobs::new(
         store.clone(),
@@ -1577,6 +1605,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // every successful extract. Drive `/v1/admin/reid/status`.
         reid_config: Arc::new(cfg.reid.clone()),
         lan_proxy_enabled: cfg.lan_proxy.enabled,
+        remote_access_enabled: cfg.remote_access.enabled,
         reid_stats: reid_stats.clone(),
     };
 

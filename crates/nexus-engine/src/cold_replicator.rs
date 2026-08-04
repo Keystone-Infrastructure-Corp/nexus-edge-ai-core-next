@@ -1573,6 +1573,7 @@ mod tests {
             attach_replay_after: None,
             server_cert_pem: None,
             server_private_key_pem: None,
+            ssh_ca_public_key: None,
         };
         store.set_cloud_enrollment(&enrollment).await.unwrap();
         // Reload to capture the DB-default enrolled_at.
@@ -1646,6 +1647,7 @@ mod tests {
             attach_replay_after: Some(Utc::now() - ChronoDuration::days(30)),
             server_cert_pem: None,
             server_private_key_pem: None,
+            ssh_ca_public_key: None,
         };
         store.set_cloud_enrollment(&enrollment).await.unwrap();
 

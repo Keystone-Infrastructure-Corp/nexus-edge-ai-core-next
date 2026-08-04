@@ -185,6 +185,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0031_motion_clips_degraded",
         include_str!("../migrations/0031_motion_clips_degraded.sql"),
     ),
+    (
+        "0032_cloud_enrollment_ssh_ca",
+        include_str!("../migrations/0032_cloud_enrollment_ssh_ca.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

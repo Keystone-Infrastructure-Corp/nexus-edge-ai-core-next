@@ -1,0 +1,24 @@
+-- Remote shell (admin-granted support access): persistence for the cloud's
+-- SSH certificate authority public key.
+--
+-- Enrollment already carries three cloud-issued trust artefacts — the mTLS
+-- client leaf, the internal CA chain, and the Ed25519 actor-token verifying
+-- key. This adds a fourth: the OpenSSH-format public key of the cloud's SSH
+-- CA, in `authorized_keys` single-line form (e.g. `ssh-ed25519 AAAA... `).
+--
+-- The engine never uses this key itself. It stages it for the pinned,
+-- root-owned applier (`nexus-apply-release ssh-ca-install`), which installs it
+-- as `TrustedUserCAKeys` so sshd will accept certificates the cloud signs for
+-- a claimed support session. Persisting it here means CA adoption is
+-- re-applied idempotently on every boot without another enrollment round-trip,
+-- which matters because the drop-in lives outside the OTA-writable tree and
+-- can be lost to an OS-level sshd reconfiguration.
+--
+-- NULLable because:
+--   * Cores enrolled before this release have no CA on file. They simply have
+--     no remote-shell capability until they re-enroll — the feature fails
+--     closed, exactly like `[remote_access] enabled = false`.
+--   * A cloud deployment that has not provisioned an SSH CA omits the field
+--     entirely; enrollment must still succeed.
+
+ALTER TABLE cloud_enrollment ADD COLUMN ssh_ca_public_key TEXT;

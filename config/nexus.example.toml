@@ -312,6 +312,41 @@ enabled = true
 # enabled = true
 
 # -----------------------------------------------------------------
+# Remote shell (opt-in, off by default)
+# -----------------------------------------------------------------
+# Lets an org owner/admin hand a support engineer a time-boxed shell on
+# this appliance from the cloud console, without opening an inbound port
+# or standing up a VPN. The session rides an outbound WSS side channel to
+# the same cloud host the control tunnel is already connected to.
+#
+# Two independent switches must BOTH be on before a session can happen:
+# this one (the box owner's consent) and the org's remote-access policy in
+# the console (the tenant's consent). Neither side can enable the other.
+#
+# `target` is deliberately NOT something the cloud can specify. The engine
+# only ever connects to the address configured here, and refuses to start
+# if it is not a loopback / private / link-local address — otherwise the
+# appliance would be a general-purpose pivot into the customer's LAN.
+#
+# [remote_access]
+# enabled = false          # opt in here; requires sshd on this box
+# target = "127.0.0.1:22"  # must be local (loopback, RFC1918, link-local)
+# max_session_secs = 1800  # hard local ceiling; the cloud can ask for less,
+#                          # never for more
+
+# -----------------------------------------------------------------
+# Cloud (go-dark insurance)
+# -----------------------------------------------------------------
+# Every remote-access path runs over one outbound tunnel. A release that
+# comes up working locally but can never re-establish that tunnel leaves
+# an appliance that is fine and unreachable — and nothing else notices.
+# If the tunnel stays dark this long, the engine reflips to its
+# previous-good release, at most once per boot, and logs loudly.
+# Set to 0 to disable.
+# [cloud]
+# dark_window_hours = 12
+
+# -----------------------------------------------------------------
 # Bus
 # -----------------------------------------------------------------
 [bus]

@@ -119,6 +119,57 @@ pub struct Config {
     /// Ships OFF; opt-in per deployment.
     #[serde(default)]
     pub lan_proxy: LanProxyConfig,
+    /// Remote shell. Ships OFF. The box owner opts in here; the cloud
+    /// can never turn it on remotely, and it can never name the pipe's
+    /// destination.
+    #[serde(default)]
+    pub remote_access: RemoteAccessConfig,
+    /// Cloud-side behaviour that is a property of THIS box rather than
+    /// of the enrollment: currently just the go-dark watchdog window.
+    #[serde(default)]
+    pub cloud: CloudConfig,
+}
+
+/// Per-appliance cloud behaviour.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloudConfig {
+    /// Hours the cloud tunnel may be dark before the engine reflips to
+    /// its previous-good release.
+    ///
+    /// `0` disables the watchdog. The default (12 h) is chosen to be far
+    /// longer than any plausible transient — ISP outages, DHCP renewals,
+    /// a site losing power overnight — while still being short enough
+    /// that a bad release is undone the same day rather than on the next
+    /// site visit. The watchdog fires at most once per boot regardless.
+    #[serde(default = "default_dark_window_hours")]
+    pub dark_window_hours: u64,
+}
+
+const fn default_dark_window_hours() -> u64 {
+    12
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            dark_window_hours: default_dark_window_hours(),
+        }
+    }
+}
+
+impl CloudConfig {
+    /// The configured window, or `None` when the watchdog is disabled.
+    #[must_use]
+    pub fn dark_window(&self) -> Option<std::time::Duration> {
+        if self.dark_window_hours == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(
+                self.dark_window_hours * 3600,
+            ))
+        }
+    }
 }
 
 impl Config {
@@ -163,6 +214,13 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.remote_access.enabled && !self.remote_access.target_is_local() {
+            return Err(ConfigError::Validation(format!(
+                "remote_access.target '{}' must be a loopback or private address — \
+                 the shell pipe terminates on this appliance, not on the internet",
+                self.remote_access.target
+            )));
+        }
         if self.inference.workers == 0
             && matches!(self.inference.backend, InferenceBackendKind::Pool)
         {
@@ -3178,6 +3236,92 @@ pub struct LanProxyConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Remote shell
+// ---------------------------------------------------------------------------
+
+/// `[remote_access]` block. **Disabled by default.**
+///
+/// When `enabled = true`, a `shell_session_open` from the cloud makes
+/// the engine dial a second WSS side channel back to the SAME host its
+/// control tunnel already talks to, and pipe those bytes to [`Self::target`].
+///
+/// Two properties are load-bearing and deliberately live here rather
+/// than on the wire:
+///
+/// * **The destination is local config, never a wire field.** If the
+///   cloud could name the target, a compromised control plane could use
+///   any core as a pivot into its owner's LAN. The `shell_session_open`
+///   payload has no `target` field at all.
+/// * **Consent is local.** An org admin grants access in the console,
+///   but the box owner still had to switch this on. Neither party can
+///   act alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAccessConfig {
+    /// Master switch. Defaults `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Where the byte pipe terminates. Defaults to the local sshd.
+    /// Must be a loopback or private address — see
+    /// [`Self::target_is_local`].
+    #[serde(default = "default_shell_target")]
+    pub target: String,
+    /// Ceiling the engine enforces on its own, independent of whatever
+    /// deadline the cloud sends. A session is torn down at the earlier
+    /// of the two, so a wedged or hostile broker cannot hold a shell
+    /// open past what the box owner agreed to.
+    #[serde(default = "default_shell_max_session_secs")]
+    pub max_session_secs: u64,
+}
+
+fn default_shell_target() -> String {
+    "127.0.0.1:22".to_string()
+}
+
+const fn default_shell_max_session_secs() -> u64 {
+    1800
+}
+
+impl Default for RemoteAccessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target: default_shell_target(),
+            max_session_secs: default_shell_max_session_secs(),
+        }
+    }
+}
+
+impl RemoteAccessConfig {
+    /// Whether [`Self::target`] resolves to loopback or an RFC1918 /
+    /// unique-local address.
+    ///
+    /// The pipe exists to reach a service on the appliance itself. A
+    /// target on the public internet would make the appliance a relay,
+    /// which is not a thing anyone asked for, so it is refused at
+    /// config-validation time rather than at session time.
+    #[must_use]
+    pub fn target_is_local(&self) -> bool {
+        let Some((host, _port)) = self.target.rsplit_once(':') else {
+            return false;
+        };
+        let host = host.trim_matches(['[', ']']);
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(v4)) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local()
+            }
+            Ok(std::net::IpAddr::V6(v6)) => {
+                v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 5.6 — cross-camera re-identification
 // ---------------------------------------------------------------------------
 
@@ -3559,6 +3703,67 @@ to = ["ops@example.com"]
             ..Default::default()
         };
         assert!(!cfg.lan_proxy.enabled);
+    }
+
+    /// Remote shell is opt-in on the appliance itself, independent of
+    /// anything the org enables in the cloud console. Both switches must
+    /// be on for a session to be possible, and this pins the edge half.
+    #[test]
+    fn remote_access_is_off_by_default() {
+        assert!(!RemoteAccessConfig::default().enabled);
+        let cfg = Config {
+            cameras: vec![],
+            ..Default::default()
+        };
+        assert!(!cfg.remote_access.enabled);
+        assert_eq!(cfg.remote_access.target, "127.0.0.1:22");
+    }
+
+    /// The shell target is a *local* address by construction — the point
+    /// of the feature is reaching this box's own sshd, not turning the
+    /// appliance into a jump host for the rest of the customer's LAN.
+    #[test]
+    fn remote_access_target_must_be_local() {
+        for good in [
+            "127.0.0.1:22",
+            "localhost:22",
+            "192.168.1.10:22",
+            "10.0.0.4:2222",
+            "172.16.5.5:22",
+            "169.254.1.1:22",
+            "[::1]:22",
+        ] {
+            let c = RemoteAccessConfig {
+                enabled: true,
+                target: good.to_string(),
+                ..Default::default()
+            };
+            assert!(c.target_is_local(), "{good} should be local");
+        }
+        for bad in ["8.8.8.8:22", "example.com:22", "203.0.113.7:2222"] {
+            let c = RemoteAccessConfig {
+                enabled: true,
+                target: bad.to_string(),
+                ..Default::default()
+            };
+            assert!(!c.target_is_local(), "{bad} should not be local");
+        }
+    }
+
+    /// A non-local target is a hard config error, not a warning: better to
+    /// refuse to start than to quietly ship an SSRF pivot.
+    #[test]
+    fn validate_refuses_a_public_shell_target() {
+        let cfg = Config {
+            cameras: vec![],
+            remote_access: RemoteAccessConfig {
+                enabled: true,
+                target: "8.8.8.8:22".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     /// M-Alert-Clip — alert clips are ON by default; operators disable

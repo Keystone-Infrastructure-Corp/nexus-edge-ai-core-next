@@ -227,6 +227,12 @@ pub async fn perform_enrollment(
             .server_cert_pem
             .as_ref()
             .map(|_| server_csr.private_key_pem),
+        // Remote shell — the cloud's SSH CA public key. Persisted verbatim;
+        // validation and installation happen in `crate::ssh_ca` when the
+        // appliance actually has `[remote_access] enabled = true`. Storing it
+        // unconditionally means flipping the local opt-in later does not
+        // require a re-enrollment.
+        ssh_ca_public_key: resp.ssh_ca_public_key,
     };
     if persisted.server_cert_pem.is_none() {
         warn!(

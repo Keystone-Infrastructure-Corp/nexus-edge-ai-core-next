@@ -59,6 +59,14 @@ pub struct CloudEnrollment {
     /// edge-side during enrollment so the key never leaves the
     /// appliance. Always paired: both `Some` or both `None`.
     pub server_private_key_pem: Option<String>,
+    /// OpenSSH-format public key of the cloud's SSH certificate
+    /// authority, in single-line `authorized_keys` form. Staged for the
+    /// privileged applier so sshd will trust certificates the cloud signs
+    /// for a claimed support session (see `nexus-engine`'s `ssh_ca`
+    /// module). `None` for cores enrolled before the remote-shell
+    /// release and for clouds that have not provisioned a CA — in both
+    /// cases the appliance simply has no remote-shell capability.
+    pub ssh_ca_public_key: Option<String>,
 }
 
 impl Store {
@@ -73,8 +81,9 @@ impl Store {
             INSERT INTO cloud_enrollment
                 (id, core_id, gateway_url, cert_pem, private_key_pem,
                  ca_chain_pem, entitlement_jwt, signing_key_pem, signing_kid,
-                 attach_replay_after, server_cert_pem, server_private_key_pem)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 attach_replay_after, server_cert_pem, server_private_key_pem,
+                 ssh_ca_public_key)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 core_id                = excluded.core_id,
                 gateway_url            = excluded.gateway_url,
@@ -87,6 +96,7 @@ impl Store {
                 attach_replay_after    = excluded.attach_replay_after,
                 server_cert_pem        = excluded.server_cert_pem,
                 server_private_key_pem = excluded.server_private_key_pem,
+                ssh_ca_public_key      = excluded.ssh_ca_public_key,
                 enrolled_at            = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             "#,
         )
@@ -101,6 +111,7 @@ impl Store {
         .bind(e.attach_replay_after.map(|ts| ts.to_rfc3339()))
         .bind(e.server_cert_pem.as_deref())
         .bind(e.server_private_key_pem.as_deref())
+        .bind(e.ssh_ca_public_key.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -117,7 +128,8 @@ impl Store {
             SELECT core_id, gateway_url, cert_pem, private_key_pem,
                    ca_chain_pem, entitlement_jwt, signing_key_pem,
                    signing_kid, enrolled_at, attach_replay_after,
-                   server_cert_pem, server_private_key_pem
+                   server_cert_pem, server_private_key_pem,
+                   ssh_ca_public_key
               FROM cloud_enrollment
              WHERE id = 1
             "#,
@@ -152,6 +164,7 @@ impl Store {
             attach_replay_after,
             server_cert_pem: row.try_get("server_cert_pem")?,
             server_private_key_pem: row.try_get("server_private_key_pem")?,
+            ssh_ca_public_key: row.try_get("ssh_ca_public_key")?,
         }))
     }
 
@@ -237,6 +250,10 @@ mod tests {
             attach_replay_after: None,
             server_cert_pem: None,
             server_private_key_pem: None,
+            ssh_ca_public_key: Some(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGf3xQ9k1s2Ab4cDeFgHiJkLmNoPqRsTuVwXyZ012345 nexus-ca"
+                    .into(),
+            ),
         }
     }
 

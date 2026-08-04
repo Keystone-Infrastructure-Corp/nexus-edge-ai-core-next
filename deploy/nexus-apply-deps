@@ -100,6 +100,7 @@ is_allowed() {
         *-dev | *-dbg | *dkms*)                     return 1 ;;
         gstreamer1.0-*)                             return 0 ;;
         va-driver-all | vainfo | libnice10 | \
+        openssh-server | \
         mesa-va-drivers | intel-media-va-driver-non-free) return 0 ;;
         *)                                          return 1 ;;
     esac

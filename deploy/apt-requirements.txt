@@ -47,3 +47,10 @@ gstreamer1.0-nice
 # falls back to software x264enc and pegs a CPU core per camera at 1080p+.
 va-driver-all
 vainfo
+
+# openssh-server — the local sshd the remote-shell feature pipes to, and,
+# independently of that feature, the LAN-local recovery path when a box has
+# lost its cloud tunnel. Listening only on the customer's own LAN; the
+# engine never opens an inbound port and only ever dials 127.0.0.1:22 when
+# an operator has explicitly set `[remote_access] enabled = true`.
+openssh-server

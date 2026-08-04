@@ -53,6 +53,35 @@
 #                      check, so a rollback target is never deleted before the
 #                      new version proves healthy.
 #
+#   ssh-ca-install     Remote-shell (admin-granted support access). Adopt the
+#                      cloud's SSH certificate authority: read the CA public
+#                      key the engine staged at $state/ssh/ca.pub, validate it
+#                      is a single well-formed SSH public key, install it to
+#                      /etc/ssh/nexus_ca.pub, ensure the unprivileged
+#                      `nexus-remote` login account exists, drop
+#                      /etc/ssh/sshd_config.d/60-nexus-ca.conf, `sshd -t`, and
+#                      reload sshd. Idempotent — safe to run on every boot.
+#
+#   ssh-principals-sync
+#                      Rewrite the per-session principal allowlist from
+#                      $state/ssh/principals (one session UUID per line) to
+#                      /etc/ssh/nexus_principals/nexus-remote. Every line is
+#                      charset-validated as a UUID before ANY byte is written;
+#                      an unparsable file is rejected whole (fail-closed, the
+#                      previous allowlist survives). No sshd reload needed —
+#                      AuthorizedPrincipalsFile is read per authentication.
+#
+#   sshd-restart       Validate the sshd config (`sshd -t`) and restart the ssh
+#                      unit. Operator recovery path for a wedged sshd, reached
+#                      from the cloud console. REFUSES to restart when `sshd
+#                      -t` fails, so a bad config can never lock the box out.
+#
+# NOTE ON ARGUMENTS. sudo's `*` does NOT match `/`, so no mode may accept a
+# path argument — that is precisely why the three ssh modes above read their
+# input from FIXED, engine-writable staging paths under $state/ssh/ instead of
+# taking a filename. Argv stays free of separators and the sudoers grant stays
+# a simple, frozen wildcard.
+#
 # EXIT CODES. `apply`/`reflip` return NON-ZERO on any hard failure (extract,
 # missing release dir, symlink flip, or restart) so the engine can report a
 # real terminal `failed` and roll back. The apt/journald sub-steps and `prune`
@@ -77,6 +106,24 @@ releases_dir="$prefix/releases"
 current_link="$prefix/current"
 staged_tarball="$prefix/staging/update.tar.gz"
 apply_deps="/usr/local/sbin/nexus-apply-deps"
+
+# Remote-shell (admin-granted support access) layout. `state_dir` is the
+# engine-writable tree the unprivileged `nexus` user stages handoff files in;
+# everything under /etc/ssh is root-owned and only ever written by this script.
+state_dir="${NEXUS_STATE_DIR:-/var/lib/nexus}"
+ssh_stage_dir="$state_dir/ssh"
+ssh_ca_stage="$ssh_stage_dir/ca.pub"
+ssh_principals_stage="$ssh_stage_dir/principals"
+ssh_ca_installed="/etc/ssh/nexus_ca.pub"
+ssh_dropin="/etc/ssh/sshd_config.d/60-nexus-ca.conf"
+ssh_principals_dir="/etc/ssh/nexus_principals"
+# The dedicated, unprivileged login the session certificates map onto. It is
+# deliberately NOT in `sudo`: a cloud-brokered session must not silently confer
+# root. It gets `nexus` (read engine state), `adm` + `systemd-journal` (read
+# logs) so support can actually diagnose. Escalation stays a human decision
+# made with a real password at the console.
+ssh_account="nexus-remote"
+ssh_account_groups="nexus,adm,systemd-journal"
 
 # Strict validation of the release version. sudo's `*` never matches `/`, but
 # defence-in-depth: a version is a bounded token of the release-tag charset,
@@ -199,11 +246,178 @@ do_prune() {
     return 0
 }
 
+# ---- remote shell: SSH certificate authority adoption ----------------------
+# Which unit carries sshd on this box. Debian/Ubuntu ship `ssh.service`;
+# RHEL-likes ship `sshd.service`. Resolve once, prefer whichever is enabled.
+sshd_unit() {
+    local u
+    for u in ssh sshd; do
+        if systemctl list-unit-files "$u.service" >/dev/null 2>&1 \
+            && systemctl cat "$u.service" >/dev/null 2>&1; then
+            printf '%s' "$u"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# `sshd -t` — parse+validate the FULL effective config. Load-bearing: every
+# mode that touches sshd config runs this BEFORE reloading, so a malformed
+# drop-in can never lock the operator out of their own appliance.
+sshd_validate() {
+    local sshd_bin
+    sshd_bin="$(command -v sshd || true)"
+    [[ -x "$sshd_bin" ]] || sshd_bin=/usr/sbin/sshd
+    if [[ ! -x "$sshd_bin" ]]; then
+        warn "no sshd binary found — skipping config validation (test host?)"
+        return 0
+    fi
+    "$sshd_bin" -t
+}
+
+sshd_reload() {
+    local unit
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "no systemctl on PATH — skipping sshd reload (test host?)"
+        return 0
+    fi
+    unit="$(sshd_unit)" || { warn "no ssh/sshd unit on this box — skipping reload"; return 0; }
+    if ! systemctl reload "$unit"; then
+        warn "systemctl reload $unit failed; trying restart"
+        systemctl restart "$unit" || die "could not reload or restart $unit"
+    fi
+    log "reloaded $unit"
+}
+
+# Ensure the dedicated, unprivileged login the session certificates map onto.
+# Idempotent. Deliberately NOT added to `sudo` — see $ssh_account_groups above.
+ensure_ssh_account() {
+    local g
+    if id -u "$ssh_account" >/dev/null 2>&1; then
+        log "login '$ssh_account' already present"
+    else
+        useradd --create-home --shell /bin/bash \
+                --comment "Nexus admin-granted remote support access" \
+                "$ssh_account" \
+            || die "failed to create login '$ssh_account'"
+        log "created login '$ssh_account'"
+    fi
+    # Never a usable password: certificate auth only.
+    passwd --lock "$ssh_account" >/dev/null 2>&1 || true
+    # Best-effort supplementary groups — a missing group on a given box must
+    # not fail CA adoption.
+    IFS=',' read -r -a _groups <<< "$ssh_account_groups"
+    for g in "${_groups[@]}"; do
+        getent group "$g" >/dev/null 2>&1 || continue
+        usermod -aG "$g" "$ssh_account" >/dev/null 2>&1 \
+            || warn "could not add '$ssh_account' to group '$g'"
+    done
+}
+
+do_ssh_ca_install() {
+    [[ -r "$ssh_ca_stage" ]] || die "no staged CA public key at $ssh_ca_stage"
+    # Exactly one line, and `ssh-keygen -l` must accept it as a public key.
+    # This is the whole trust decision, so validate before installing.
+    local lines
+    lines="$(grep -cve '^[[:space:]]*$' "$ssh_ca_stage" || true)"
+    [[ "$lines" == "1" ]] \
+        || die "staged CA key must be exactly one key line (got $lines)"
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        ssh-keygen -l -f "$ssh_ca_stage" >/dev/null 2>&1 \
+            || die "staged CA key at $ssh_ca_stage is not a valid SSH public key"
+    else
+        warn "no ssh-keygen on PATH — installing CA key without validation (test host?)"
+    fi
+
+    ensure_ssh_account
+
+    install -o root -g root -m 0644 "$ssh_ca_stage" "$ssh_ca_installed" \
+        || die "failed to install CA key to $ssh_ca_installed"
+    log "installed CA key -> $ssh_ca_installed"
+
+    install -d -o root -g root -m 0755 "$ssh_principals_dir"
+    # Always TRUNCATE the principal allowlist on CA adoption. This mode runs at
+    # engine start, and at engine start no session is live by definition. A
+    # hard kill (SIGKILL, power loss) can otherwise leave a stale principal on
+    # disk that would still authorise a certificate the operator believes was
+    # revoked. Truncating here makes engine start the backstop.
+    install -o root -g root -m 0644 /dev/null "$ssh_principals_dir/$ssh_account"
+
+    install -d -o root -g root -m 0755 /etc/ssh/sshd_config.d
+    # Global directives only — NO `Match` block. A Match block in a drop-in
+    # terminates the global section for every line sshd reads afterwards
+    # (including the rest of the main sshd_config, which is Included from the
+    # top on Debian/Ubuntu), which would silently reconfigure unrelated logins.
+    # Per-session restrictions belong in the certificate itself, minted with
+    # `-O clear -O permit-pty`, which is where the cloud CA puts them.
+    cat > "$ssh_dropin" <<EOF
+# Managed by nexus-apply-release (ssh-ca-install) — do not edit by hand.
+# Admin-granted remote support access. Both directives are inert until the
+# cloud issues a session certificate AND the session's principal is present in
+# $ssh_principals_dir/$ssh_account.
+TrustedUserCAKeys $ssh_ca_installed
+AuthorizedPrincipalsFile $ssh_principals_dir/%u
+EOF
+    chmod 0644 "$ssh_dropin"
+    chown root:root "$ssh_dropin"
+    log "wrote $ssh_dropin"
+
+    if ! sshd_validate; then
+        rm -f "$ssh_dropin"
+        die "sshd -t rejected the config; removed $ssh_dropin and left sshd untouched"
+    fi
+    sshd_reload
+}
+
+do_ssh_principals_sync() {
+    [[ -d "$ssh_principals_dir" ]] \
+        || die "CA not adopted yet (no $ssh_principals_dir) — run ssh-ca-install first"
+    local target="$ssh_principals_dir/$ssh_account"
+    local tmp="$target.tmp.$$"
+
+    # An absent staging file means "no live sessions" — revoke everything.
+    if [[ ! -e "$ssh_principals_stage" ]]; then
+        : > "$tmp"
+    else
+        # Validate EVERY line before writing ANY byte. One bad line rejects the
+        # whole file and leaves the previous allowlist in place (fail-closed).
+        local line n=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+            [[ "$line" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+                || die "refusing principals sync: line $((n + 1)) is not a session UUID"
+            n=$(( n + 1 ))
+            (( n <= 64 )) || die "refusing principals sync: more than 64 live sessions"
+        done < "$ssh_principals_stage"
+        grep -Eve '^[[:space:]]*$' "$ssh_principals_stage" > "$tmp" || : > "$tmp"
+    fi
+
+    chown root:root "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$target" || { rm -f "$tmp"; die "failed to install $target"; }
+    log "synced $(grep -cve '^[[:space:]]*$' "$target" || true) live session principal(s)"
+}
+
+do_sshd_restart() {
+    sshd_validate || die "sshd -t failed — refusing to restart (config is broken)"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "no systemctl on PATH — skipping sshd restart (test host?)"
+        return 0
+    fi
+    local unit
+    unit="$(sshd_unit)" || die "no ssh/sshd unit on this box"
+    systemctl restart "$unit" || die "systemctl restart $unit failed"
+    log "restarted $unit"
+}
+
 case "$mode" in
     apply)  do_apply ;;
     reflip) do_reflip ;;
     prune)  do_prune ;;
-    *)      die "usage: nexus-apply-release {apply|reflip|prune} <version> (got mode='${mode}')" ;;
+    ssh-ca-install)      do_ssh_ca_install ;;
+    ssh-principals-sync) do_ssh_principals_sync ;;
+    sshd-restart)        do_sshd_restart ;;
+    *)      die "usage: nexus-apply-release {apply|reflip|prune} <version> | {ssh-ca-install|ssh-principals-sync|sshd-restart} (got mode='${mode}')" ;;
 esac
 
 exit 0

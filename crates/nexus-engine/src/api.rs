@@ -286,6 +286,13 @@ pub struct ApiState {
     /// is opt-in per REPO_BOUNDARY R5c §5). When `false`,
     /// `crate::lan_proxy::proxy_request` rejects every call.
     pub lan_proxy_enabled: bool,
+    /// Whether admin-granted remote shell support access is enabled on
+    /// this appliance. Sourced from `[remote_access] enabled` at boot;
+    /// defaults `false`. Gates the sshd control surface exposed to the
+    /// cloud (`POST /v1/admin/remote-access/restart-sshd`) so a core
+    /// whose owner never opted in has no sshd control at all.
+    /// Restart-required, like `lan_proxy_enabled`.
+    pub remote_access_enabled: bool,
     /// Phase 5.6 · R7 — shared with the `CloudEntitySightingHook`
     /// worker (writer) and the `/v1/admin/reid/status` endpoint
     /// (reader). Always present even when `reid.enabled = false`
@@ -629,6 +636,14 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/v1/admin/proxy",
             axum::routing::post(crate::lan_proxy::proxy_request),
+        )
+        // Remote shell (admin-granted support access) — operator recovery
+        // for a wedged sshd. Reached from the cloud console as an
+        // `rpc_call` with path `/admin/remote-access/restart-sshd`. Gated
+        // on `[remote_access] enabled`; see `crate::remote_shell`.
+        .route(
+            "/v1/admin/remote-access/restart-sshd",
+            axum::routing::post(crate::remote_shell::post_admin_restart_sshd),
         )
         // Phase 7.5 · Step 7.5.4 — cloud fleet-settings apply. The
         // cloud api-gateway fans a resolved category value out to
@@ -6572,6 +6587,7 @@ mod tests {
             // route tests exercise the real handler; the default-off
             // behaviour is pinned by the nexus-config default test.
             lan_proxy_enabled: true,
+            remote_access_enabled: false,
             reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
         };
         let app = super::router(state);

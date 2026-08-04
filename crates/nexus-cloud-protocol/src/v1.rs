@@ -611,6 +611,72 @@ pub struct RpcResponsePayload {
     pub status: u64,
 }
 
+/// Structural shape of the JWT body inside a remote-shell `actor_token`. Deliberately a SEPARATE type from ActorTokenClaims, not a variant of it: the `aud` const differs, and this token binds to a `session_id` instead of an (http_method, path) pair. Keeping them structurally incompatible means an /admin/* RPC token can never satisfy a shell verifier and vice versa, even if a future verifier bug relaxed the `aud` check. Not transmitted standalone — included so codegen produces a typed verifier struct on the edge side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellActorTokenClaims {
+    pub aud: String,
+    pub core_id: Uuid,
+    /// MUST be iat + 30 s. Authorizes OPENING the pipe only; the session's own `expires_at` governs how long it may live.
+    pub exp: UnixSeconds,
+    pub iat: UnixSeconds,
+    /// https://entitlement.nexus.example
+    pub iss: String,
+    pub jti: Uuid,
+    pub org_id: Uuid,
+    pub role: String,
+    /// MUST equal `shell_session_open.session_id`. Binds the token to exactly one session so it cannot be replayed to open a second pipe.
+    pub session_id: Uuid,
+    /// `user:<uuid>` of the org admin who ISSUED the grant, or `system:shell-broker`. Never the recipient — the recipient holds no Nexus account (REMOTE_SHELL_PLAN §1.1 R8).
+    pub sub: String,
+}
+
+/// Cloud → Edge. Remote shell kill switch. Tears down a live session immediately. Idempotent: closing an unknown or already-closed `session_id` is a no-op and is NOT an error. Carries no actor_token by design — revocation must work even when token minting is degraded, and the worst a spurious close can do is end a session early.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellSessionClosePayload {
+    /// Why the cloud is closing it. Surfaced verbatim in the engine's local audit line and in the recipient's terminal.
+    pub reason: String,
+    /// Session to tear down.
+    pub session_id: Uuid,
+}
+
+/// Edge → Cloud. Remote shell. Terminal notification for a session, whether it ended by recipient disconnect, expiry, byte ceiling, kill switch, or local failure. Routed on `session_id`, not envelope `in_reply_to` — a session outlives the 30-second actor_token that opened it, so this is a fire-and-confirm pattern rather than a synchronous RPC reply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellSessionClosedPayload {
+    /// Bytes relayed sshd → recipient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_down: Option<u64>,
+    /// Bytes relayed recipient → sshd. Zero when the session never attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_up: Option<u64>,
+    /// Optional operator-facing detail. The edge MUST scrub paths and secrets before populating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// `disabled_on_core` means `[remote_access] enabled = false` — the box owner never opted in, and no pipe was opened. `bad_side_channel_host` means the cloud tried to point the engine at a host other than its own tunnel endpoint, which is treated as hostile and logged loudly.
+    pub reason: String,
+    /// Echoes `shell_session_open.session_id`. The cloud binds on this to close out the `shell_sessions` row.
+    pub session_id: Uuid,
+}
+
+/// Cloud → Edge. Remote shell. Instructs the engine to open a SECOND, non-enveloped binary WSS side-channel to `side_channel_url` and pipe it to the locally configured sshd. Sent ONLY once a human recipient has claimed a grant and their leg has landed at shell-broker — never at grant time (see REMOTE_SHELL_PLAN §5). The engine refuses unless `[remote_access] enabled = true` in nexus.toml. Note there is deliberately NO `target` field: the pipe destination comes exclusively from the engine's own config, so a compromised cloud cannot use a core as an SSRF pivot into the customer LAN.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellSessionOpenPayload {
+    /// REQUIRED. Edge verifies signature, `aud = nexus-edge-shell` (NOT `nexus-edge-rpc` — a distinct audience so an `/admin/*` RPC token can never be replayed as a shell grant), `core_id`, `jti` freshness, and `exp > now`. Minted at attach time with a 30-second TTL; it authorizes OPENING the pipe only, never its continuation.
+    pub actor_token: ActorTokenJwt,
+    /// Hard session expiry. The engine tears the pipe down at this instant regardless of cloud liveness, so a wedged broker cannot hold a shell open.
+    pub expires_at: Timestamp,
+    /// Optional byte ceiling across both directions. The engine closes with `close_reason = byte_limit` when exceeded. Defense-in-depth: shell-broker enforces the same cap cloud-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Cloud-minted session id. Echoed in `shell_session_close` / `shell_session_closed` and encoded in the SSH certificate principal for native-mode sessions.
+    pub session_id: Uuid,
+    /// `wss://<host>/v1/shell/<session_id>`. The engine MUST verify the host equals the control tunnel's own host before dialling — no second DNS name, no second port, no new outbound firewall rule. A mismatch is rejected with `close_reason = bad_side_channel_host`.
+    pub side_channel_url: String,
+}
+
 pub type Timestamp = String;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -744,6 +810,9 @@ pub enum EnvelopeBody {
     EntitySightingBatch(EntitySightingBatchPayload),
     DiagCollect(DiagCollectPayload),
     DiagReady(DiagReadyPayload),
+    ShellSessionOpen(ShellSessionOpenPayload),
+    ShellSessionClose(ShellSessionClosePayload),
+    ShellSessionClosed(ShellSessionClosedPayload),
     CoreStateHashes(CoreStateHashesPayload),
     ModelCatalog(ModelCatalogPayload),
     UpdateAssignment(UpdateAssignmentPayload),

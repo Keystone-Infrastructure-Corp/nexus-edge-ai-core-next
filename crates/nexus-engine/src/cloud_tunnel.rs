@@ -111,6 +111,8 @@ pub fn spawn_tunnel(
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
     admin_secret: Option<Arc<String>>,
+    remote_access: nexus_config::RemoteAccessConfig,
+    liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -193,6 +195,8 @@ pub fn spawn_tunnel(
             live_view,
             webrtc,
             store,
+            remote_access,
+            liveness,
             rx,
         )
         .await;
@@ -558,6 +562,8 @@ async fn run(
     live_view: Arc<crate::live_view::LiveViewManager>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
+    remote_access: nexus_config::RemoteAccessConfig,
+    liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let client = TunnelClient::new(
@@ -566,6 +572,43 @@ async fn run(
         enrollment.private_key_pem.clone(),
         enrollment.ca_chain_pem.clone(),
     );
+    // Remote shell. Built once per engine, not per reconnect: sessions
+    // ride their own socket, so a control-tunnel blip does not have to
+    // kill an operator's shell mid-keystroke. A real disconnect does
+    // — see the `close_all` on the reconnect path below — because a
+    // session the console can no longer revoke has no business running.
+    let remote_shell = Arc::new(crate::remote_shell::RemoteShellManager::new(
+        remote_access,
+        client.clone(),
+        dispatcher.as_ref().map(|d| d.verifier().clone()),
+        Arc::clone(&cloud_outbox),
+    ));
+    // Adopt the cloud's SSH certificate authority. Runs once per engine
+    // start, and only when BOTH the box owner opted in locally and the
+    // cloud actually shipped a CA in the enrollment bundle. Idempotent, so
+    // it also repairs a drop-in an OS-level sshd reconfiguration removed.
+    // Deliberately fire-and-forget: a box with no sshd, or a failed
+    // adoption, must never delay or block the control tunnel — remote
+    // shell just stays unavailable and every later session open reports
+    // the failure to the console.
+    if remote_shell.is_enabled() {
+        if let Some(ca) = enrollment.ssh_ca_public_key.clone() {
+            tokio::spawn(async move {
+                match crate::ssh_ca::install_ca(&ca).await {
+                    Ok(()) => info!("remote access: SSH CA adopted"),
+                    Err(e) => warn!(
+                        reason = e.code(),
+                        "remote access: SSH CA adoption failed; native sessions will be refused"
+                    ),
+                }
+            });
+        } else {
+            warn!(
+                "remote access is enabled locally but this enrollment carries no SSH CA; \
+                 re-enroll against a cloud that has one provisioned"
+            );
+        }
+    }
     let mut backoff = BACKOFF_MIN;
     let core_id = enrollment.core_id.clone();
     loop {
@@ -590,7 +633,7 @@ async fn run(
                 cloud_outbox.set_handle(Some(
                     conn.clone() as Arc<dyn nexus_cloud_client::TunnelHandle>
                 ));
-                let pump = pump_heartbeats(&*conn, &core_id, store.clone());
+                let pump = pump_heartbeats(&*conn, &core_id, store.clone(), &liveness);
                 let dispatch = pump_rpc_dispatch(
                     &*conn,
                     inbound,
@@ -602,6 +645,7 @@ async fn run(
                     &store,
                     &live_view,
                     &webrtc,
+                    &remote_shell,
                 );
                 tokio::select! {
                     biased;
@@ -622,6 +666,7 @@ async fn run(
                 cloud_outbox.set_handle(None);
                 live_view.clear_all();
                 webrtc.clear_all();
+                remote_shell.close_all();
             }
             Err(e) => {
                 warn!(
@@ -712,6 +757,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     store: &Arc<Store>,
     live_view: &Arc<crate::live_view::LiveViewManager>,
     webrtc: &Arc<crate::webrtc_bridge::WebRtcBridge>,
+    remote_shell: &Arc<crate::remote_shell::RemoteShellManager>,
 ) {
     let Some(mut rx) = inbound else {
         debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
@@ -875,6 +921,16 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             EnvelopeBody::LiveHdBitrate(payload) => {
                 webrtc.on_live_hd_bitrate(payload);
             }
+            // Remote shell. Verified out-of-band here rather than on the
+            // reply-bound RpcCall path for the same reason `diag_collect`
+            // is: a session outlives by orders of magnitude the 30-second
+            // token that authorised opening it.
+            EnvelopeBody::ShellSessionOpen(payload) => {
+                remote_shell.on_open(payload.clone());
+            }
+            EnvelopeBody::ShellSessionClose(payload) => {
+                remote_shell.on_close(payload);
+            }
             other => {
                 if let EnvelopeBody::HeartbeatAck(ack) = other {
                     outbox.update_caps(ack.cloud_capabilities.as_deref());
@@ -1033,7 +1089,15 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     debug!(core_id = %core_id, "inbound channel closed; dispatch pump exiting");
 }
 
-async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc<Store>) {
+async fn pump_heartbeats<H: TunnelHandle>(
+    handle: &H,
+    _core_id: &str,
+    store: Arc<Store>,
+    liveness: &crate::cloud_liveness::TunnelLiveness,
+) {
+    // Reaching this function at all means the WSS handshake and the mTLS
+    // client-certificate check both succeeded.
+    liveness.mark_authenticated();
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let start = std::time::Instant::now();
@@ -1114,6 +1178,10 @@ async fn pump_heartbeats<H: TunnelHandle>(handle: &H, _core_id: &str, store: Arc
             warn!(error = %e, "heartbeat send failed; pump exiting");
             return;
         }
+        // Go-dark signal. Measured from process start, not wall-clock, so
+        // an NTP step on a freshly-booted appliance cannot fabricate hours
+        // of apparent silence.
+        liveness.mark_heartbeat(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
 }
 

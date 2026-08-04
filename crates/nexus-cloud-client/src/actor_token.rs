@@ -34,7 +34,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
 use ed25519_dalek::{Signature, Verifier as DalekVerifier, VerifyingKey};
-use nexus_cloud_protocol::v1::ActorTokenClaims;
+use nexus_cloud_protocol::v1::{ActorTokenClaims, ShellActorTokenClaims};
 use serde::Deserialize;
 
 use crate::error::{InvalidReason, RejectReason};
@@ -42,6 +42,11 @@ use crate::jti_cache::JtiReplayCache;
 
 /// Audience claim that all `actor_token`s targeting the engine MUST carry.
 pub const EXPECTED_AUDIENCE: &str = "nexus-edge-rpc";
+
+/// Audience claim carried by remote-shell grants. Distinct from
+/// [`EXPECTED_AUDIENCE`] on purpose: a token minted to call an
+/// `/admin/*` RPC must never be usable to open a shell, and vice versa.
+pub const SHELL_AUDIENCE: &str = "nexus-edge-shell";
 
 /// Clock-skew window per Phase 1.15. ±30 s on both sides.
 pub const CLOCK_SKEW_SECS: i64 = 30;
@@ -217,6 +222,99 @@ impl Verifier {
         token: &str,
         envelope: EnvelopeContext<'_>,
     ) -> Result<VerifiedActor, RejectReason> {
+        let claims_bytes = self.verified_claims_bytes(token)?;
+
+        // Signature OK — parse claims.
+        let claims: ActorTokenClaims = serde_json::from_slice(&claims_bytes)
+            .map_err(|_| RejectReason::Invalid(InvalidReason::MalformedClaims))?;
+
+        if claims.aud != EXPECTED_AUDIENCE {
+            return Err(RejectReason::Invalid(InvalidReason::WrongAudience));
+        }
+        if claims.core_id != self.inner.core_id {
+            return Err(RejectReason::Invalid(InvalidReason::WrongCoreId));
+        }
+        if claims.http_method != envelope.method {
+            return Err(RejectReason::Invalid(InvalidReason::MethodMismatch));
+        }
+        if claims.path != envelope.path {
+            return Err(RejectReason::Invalid(InvalidReason::PathMismatch));
+        }
+
+        self.check_window(claims.iat, claims.exp)?;
+
+        Ok(VerifiedActor {
+            sub: claims.sub,
+            role: claims.role,
+            jti: claims.jti,
+            org_id: claims.org_id,
+        })
+    }
+
+    /// Verify a remote-shell `actor_token` — the grant that authorises
+    /// opening ONE byte pipe to the local sshd.
+    ///
+    /// This is a deliberately separate entry point from
+    /// [`Self::verify_no_replay`], mirroring the schema's decision to
+    /// keep [`ShellActorTokenClaims`] structurally incompatible with
+    /// [`ActorTokenClaims`]: the audience differs, and a shell token
+    /// binds to a `session_id` rather than an `(http_method, path)`
+    /// pair. An `/admin/*` RPC token therefore cannot be replayed as a
+    /// shell grant even if a future audience check regressed — the
+    /// claim shapes simply do not deserialise into one another.
+    ///
+    /// `session_id` is the id carried on the `shell_session_open`
+    /// envelope; binding it here is what stops one 30-second token from
+    /// opening a second pipe.
+    ///
+    /// The `jti` is consumed from the replay cache on success, so a
+    /// captured token cannot re-open the same session either.
+    ///
+    /// # Errors
+    ///
+    /// [`RejectReason::Invalid`] for any failure — bad signature,
+    /// wrong audience, wrong core, wrong session, outside the validity
+    /// window, or replay.
+    pub fn verify_shell(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<VerifiedActor, RejectReason> {
+        let claims_bytes = self.verified_claims_bytes(token)?;
+
+        let claims: ShellActorTokenClaims = serde_json::from_slice(&claims_bytes)
+            .map_err(|_| RejectReason::Invalid(InvalidReason::MalformedClaims))?;
+
+        if claims.aud != SHELL_AUDIENCE {
+            return Err(RejectReason::Invalid(InvalidReason::WrongAudience));
+        }
+        if claims.core_id != self.inner.core_id {
+            return Err(RejectReason::Invalid(InvalidReason::WrongCoreId));
+        }
+        // Same class of failure as a path mismatch on an RPC token: the
+        // token authorises a different thing than the one being asked for.
+        if claims.session_id != session_id {
+            return Err(RejectReason::Invalid(InvalidReason::PathMismatch));
+        }
+
+        self.check_window(claims.iat, claims.exp)?;
+
+        if !self.inner.replay.insert_keyed(&claims.jti, None) {
+            return Err(RejectReason::Invalid(InvalidReason::Replay));
+        }
+
+        Ok(VerifiedActor {
+            sub: claims.sub,
+            role: claims.role,
+            jti: claims.jti,
+            org_id: claims.org_id,
+        })
+    }
+
+    /// Decode the compact JWS, resolve its key by `kid`, and verify the
+    /// Ed25519 signature. Returns the raw claims bytes — the caller
+    /// decides which claim shape to parse them as.
+    fn verified_claims_bytes(&self, token: &str) -> Result<Vec<u8>, RejectReason> {
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
             return Err(RejectReason::Invalid(InvalidReason::MalformedJws));
@@ -274,28 +372,17 @@ impl Verifier {
             .verify(signing_input.as_bytes(), &signature)
             .map_err(|_| RejectReason::Invalid(InvalidReason::BadSignature))?;
 
-        // Signature OK — parse claims.
-        let claims: ActorTokenClaims = serde_json::from_slice(&claims_bytes)
-            .map_err(|_| RejectReason::Invalid(InvalidReason::MalformedClaims))?;
+        Ok(claims_bytes)
+    }
 
-        if claims.aud != EXPECTED_AUDIENCE {
-            return Err(RejectReason::Invalid(InvalidReason::WrongAudience));
-        }
-        if claims.core_id != self.inner.core_id {
-            return Err(RejectReason::Invalid(InvalidReason::WrongCoreId));
-        }
-        if claims.http_method != envelope.method {
-            return Err(RejectReason::Invalid(InvalidReason::MethodMismatch));
-        }
-        if claims.path != envelope.path {
-            return Err(RejectReason::Invalid(InvalidReason::PathMismatch));
-        }
-
+    /// Enforce the `iat` / `exp` validity window with the shared skew
+    /// allowance.
+    fn check_window(&self, iat: u64, exp: u64) -> Result<(), RejectReason> {
         let now = Utc::now().timestamp();
         // `iat` and `exp` are `u64` in the schema; widen carefully.
-        let iat_i = i64::try_from(claims.iat)
+        let iat_i = i64::try_from(iat)
             .map_err(|_| RejectReason::Invalid(InvalidReason::MalformedClaims))?;
-        let exp_i = i64::try_from(claims.exp)
+        let exp_i = i64::try_from(exp)
             .map_err(|_| RejectReason::Invalid(InvalidReason::MalformedClaims))?;
         if iat_i > now + CLOCK_SKEW_SECS {
             return Err(RejectReason::Invalid(InvalidReason::NotYetValid));
@@ -303,13 +390,7 @@ impl Verifier {
         if exp_i <= now - CLOCK_SKEW_SECS {
             return Err(RejectReason::Invalid(InvalidReason::Expired));
         }
-
-        Ok(VerifiedActor {
-            sub: claims.sub,
-            role: claims.role,
-            jti: claims.jti,
-            org_id: claims.org_id,
-        })
+        Ok(())
     }
 }
 
