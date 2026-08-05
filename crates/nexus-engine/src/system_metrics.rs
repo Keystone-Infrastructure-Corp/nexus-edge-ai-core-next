@@ -459,6 +459,18 @@ pub async fn get_system_metrics(session: SessionContext) -> Result<Response, Res
 // History handler.
 // ---------------------------------------------------------------------------
 
+/// Window used when the caller names none: 24 hours.
+const DEFAULT_WINDOW_SECS: i64 = 86_400;
+/// Longest answerable window. Must track the retention cap in
+/// [`nexus_store::metrics`] — asking for more than the store keeps would
+/// silently return a short series rather than an error.
+const MAX_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+/// Bucket width used when the caller names none: 5 minutes.
+const DEFAULT_BUCKET_SECS: i64 = 300;
+/// The engine's native sampling cadence. A finer bucket cannot yield
+/// more points, so requests below this are floored rather than rejected.
+const MIN_BUCKET_SECS: i64 = 5;
+
 /// Query params for [`get_metrics_history`].
 #[derive(Debug, Deserialize)]
 pub struct MetricsHistoryQuery {
@@ -476,6 +488,22 @@ pub struct MetricsHistoryQuery {
     since_ms: Option<i64>,
 }
 
+impl MetricsHistoryQuery {
+    /// Resolve the raw params into the `(window_secs, bucket_secs)` the
+    /// store is asked for. Split out of the handler so the clamps stay
+    /// unit-testable without standing up an `ApiState`.
+    fn resolve(&self) -> (i64, i64) {
+        (
+            self.window_secs
+                .unwrap_or(DEFAULT_WINDOW_SECS)
+                .clamp(1, MAX_WINDOW_SECS),
+            self.bucket_secs
+                .unwrap_or(DEFAULT_BUCKET_SECS)
+                .max(MIN_BUCKET_SECS),
+        )
+    }
+}
+
 /// `GET /api/v1/admin/system/metrics-history` — rolling window of host
 /// metrics samples for the cloud console's trend view, sliced to any of
 /// its window presets (5 minutes … 7 days).
@@ -490,8 +518,7 @@ pub async fn get_metrics_history(
     State(s): State<crate::api::ApiState>,
     Query(q): Query<MetricsHistoryQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, crate::api::ApiError> {
-    let window_secs = q.window_secs.unwrap_or(86_400).clamp(1, 604_800);
-    let bucket_secs = q.bucket_secs.unwrap_or(300).max(5);
+    let (window_secs, bucket_secs) = q.resolve();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let payloads = s
         .store
@@ -592,5 +619,47 @@ mod tests {
                 m.process.cpu_pct
             );
         }
+    }
+
+    fn query(window_secs: Option<i64>, bucket_secs: Option<i64>) -> MetricsHistoryQuery {
+        MetricsHistoryQuery {
+            window_secs,
+            bucket_secs,
+            since_ms: None,
+        }
+    }
+
+    #[test]
+    fn history_query_defaults_to_24h_at_5min_buckets() {
+        assert_eq!(query(None, None).resolve(), (86_400, 300));
+    }
+
+    /// The console's longest preset is 7 days. If this cap regresses to
+    /// the old 24h value the 3d/7d chips silently return a short series
+    /// instead of failing, so pin it explicitly.
+    #[test]
+    fn history_query_admits_the_full_seven_day_window() {
+        assert_eq!(
+            query(Some(604_800), Some(1_800)).resolve(),
+            (604_800, 1_800)
+        );
+        // Every console preset must survive the clamp untouched.
+        for preset_secs in [300, 900, 3_600, 86_400, 259_200, 604_800] {
+            let (window, _) = query(Some(preset_secs), None).resolve();
+            assert_eq!(window, preset_secs, "preset {preset_secs}s must not clamp");
+        }
+    }
+
+    #[test]
+    fn history_query_clamps_out_of_range_input() {
+        // Beyond retention: clamped down, not rejected.
+        assert_eq!(query(Some(i64::MAX), None).resolve().0, 604_800);
+        // Zero/negative windows would make the store's floor exceed now.
+        assert_eq!(query(Some(0), None).resolve().0, 1);
+        assert_eq!(query(Some(-99), None).resolve().0, 1);
+        // Sub-cadence buckets can't add points, so they floor to 5s.
+        assert_eq!(query(None, Some(1)).resolve().1, 5);
+        assert_eq!(query(None, Some(0)).resolve().1, 5);
+        assert_eq!(query(None, Some(-7)).resolve().1, 5);
     }
 }

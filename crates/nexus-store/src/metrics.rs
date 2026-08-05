@@ -263,6 +263,64 @@ mod tests {
         assert_eq!(buckets.len(), ts.len(), "one representative per bucket");
     }
 
+    /// Slicing by window is the whole point of the console's presets, so
+    /// prove a narrow window actually excludes older samples rather than
+    /// relying on the caller to trim.
+    #[tokio::test]
+    async fn window_secs_bounds_the_returned_series() {
+        let (store, _tmp) = fresh_store().await;
+        let (now_ms, _inserted) = seed_90min(&store).await;
+        // Every console preset that fits inside the 90-minute seed.
+        for window_secs in [300i64, 900, 3_600] {
+            let rows = store
+                .list_metrics_samples(now_ms, window_secs, 5, None)
+                .await
+                .unwrap();
+            let ts: Vec<i64> = rows.iter().map(|p| ts_of(p)).collect();
+            let floor = now_ms - window_secs * 1000;
+            assert!(
+                ts.iter().all(|t| *t >= floor),
+                "{window_secs}s window leaked a sample older than its floor"
+            );
+            assert_eq!(
+                ts.len() as i64,
+                window_secs * 1000 / FINE_INTERVAL_MS + 1,
+                "{window_secs}s window must be fully populated at 5s cadence"
+            );
+            assert_eq!(ts.last().copied(), Some(now_ms), "window ends at now");
+        }
+        // The widest preset spans the whole seed.
+        let week = store
+            .list_metrics_samples(now_ms, 604_800, 5, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            week.len(),
+            90 * 60 / 5 + 1,
+            "7-day window must return the entire seeded series"
+        );
+    }
+
+    /// A cursor left over from a wider window must not resurrect samples
+    /// the caller's current window excludes.
+    #[tokio::test]
+    async fn stale_since_cursor_cannot_widen_the_window() {
+        let (store, _tmp) = fresh_store().await;
+        let (now_ms, _inserted) = seed_90min(&store).await;
+        let stale = now_ms - 90 * 60 * 1000;
+        let rows = store
+            .list_metrics_samples(now_ms, 300, 5, Some(stale))
+            .await
+            .unwrap();
+        let ts: Vec<i64> = rows.iter().map(|p| ts_of(p)).collect();
+        let floor = now_ms - 300 * 1000;
+        assert!(
+            ts.iter().all(|t| *t >= floor),
+            "stale cursor must be clamped up to the window floor"
+        );
+        assert_eq!(ts.len(), 61, "5-minute window at 5s cadence");
+    }
+
     #[tokio::test]
     async fn prune_keeps_fine_recent_and_coarsens_old() {
         let (store, _tmp) = fresh_store().await;
