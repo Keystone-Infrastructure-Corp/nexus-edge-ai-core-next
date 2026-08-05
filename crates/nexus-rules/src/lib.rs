@@ -24,6 +24,8 @@ use thiserror::Error;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+const STATIC_ALERT_EPOCH_ATTRIBUTE_KEY: &str = "tracker.static_alert_epoch";
+
 #[derive(Debug, Error)]
 pub enum RulesError {
     #[error("compile: rule {0}: {1}")]
@@ -191,9 +193,17 @@ fn json_to_cel(v: &JsonValue) -> CelValue {
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Clone)]
+struct StaticAlertState {
+    epoch: u64,
+    consecutive_hits: u32,
+    emitted: bool,
+}
+
+#[derive(Default, Clone)]
 struct TrackState {
     consecutive_hits: u32,
     last_emitted_unix_ms: i64,
+    static_alerts: HashMap<u64, StaticAlertState>,
 }
 
 pub struct RuleEvaluator {
@@ -343,6 +353,13 @@ impl RuleEvaluator {
                 }
             };
 
+            let key = (cfg.id.clone(), camera_id, 0u64);
+            state
+                .entry(key.clone())
+                .or_default()
+                .static_alerts
+                .retain(|track_id, _| objects.iter().any(|o| o.track_id == *track_id));
+
             for o in objects {
                 // Rules fire on evidence from THIS frame only. A
                 // predicted-only ("coasting") track carries no
@@ -390,22 +407,48 @@ impl RuleEvaluator {
                 // not per track: the fixed `0` collapses every track on
                 // this camera onto one debounce entry so tracker ID
                 // churn can't bypass `cooldown_ms`.
-                let key = (cfg.id.clone(), camera_id, 0u64);
                 let entry = state.entry(key.clone()).or_default();
+                let static_alert_epoch = o
+                    .attributes
+                    .get(STATIC_ALERT_EPOCH_ATTRIBUTE_KEY)
+                    .and_then(JsonValue::as_u64);
 
-                if !matched {
-                    entry.consecutive_hits = 0;
-                    continue;
-                }
-                entry.consecutive_hits = entry.consecutive_hits.saturating_add(1);
-
-                if entry.consecutive_hits < cfg.debounce.consecutive_frames {
-                    continue;
+                if let Some(epoch) = static_alert_epoch {
+                    let static_alert = entry.static_alerts.entry(o.track_id).or_default();
+                    if static_alert.epoch != epoch {
+                        *static_alert = StaticAlertState {
+                            epoch,
+                            ..StaticAlertState::default()
+                        };
+                    }
+                    if static_alert.emitted {
+                        continue;
+                    }
+                    if !matched {
+                        static_alert.consecutive_hits = 0;
+                        continue;
+                    }
+                    static_alert.consecutive_hits = static_alert.consecutive_hits.saturating_add(1);
+                    if static_alert.consecutive_hits < cfg.debounce.consecutive_frames {
+                        continue;
+                    }
+                } else {
+                    if !matched {
+                        entry.consecutive_hits = 0;
+                        continue;
+                    }
+                    entry.consecutive_hits = entry.consecutive_hits.saturating_add(1);
+                    if entry.consecutive_hits < cfg.debounce.consecutive_frames {
+                        continue;
+                    }
                 }
                 if now_ms - entry.last_emitted_unix_ms < cfg.debounce.cooldown_ms as i64 {
                     continue;
                 }
                 entry.last_emitted_unix_ms = now_ms;
+                if static_alert_epoch.is_some() {
+                    entry.static_alerts.entry(o.track_id).or_default().emitted = true;
+                }
 
                 let severity = parse_severity(&cfg.predicate.severity);
                 debug!(rule = %cfg.id, label = %o.label, "rule fired");
@@ -763,6 +806,76 @@ mod tests {
                 "coasting frame {frame_id} re-fired: {alerts:?}"
             );
         }
+    }
+
+    #[test]
+    fn parking_vehicle_alerts_once_per_static_gate_epoch() {
+        let mut rule = rule_with_zones(None);
+        rule.predicate.when = "object.label == 'vehicle.car'".into();
+        rule.debounce.consecutive_frames = 2;
+        rule.debounce.cooldown_ms = 0;
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let mut vehicle = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        vehicle.label = "vehicle.car".into();
+        vehicle.attributes.insert(
+            STATIC_ALERT_EPOCH_ATTRIBUTE_KEY.into(),
+            JsonValue::Number(0.into()),
+        );
+
+        let first_debounce = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        assert!(first_debounce.is_empty());
+        let first_alert = ev.evaluate(1, 2, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        assert_eq!(first_alert.len(), 1);
+
+        for frame_id in 3..20 {
+            let alerts = ev.evaluate(1, frame_id, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+            assert!(alerts.is_empty(), "epoch 0 re-fired on frame {frame_id}");
+        }
+
+        vehicle.attributes.insert(
+            STATIC_ALERT_EPOCH_ATTRIBUTE_KEY.into(),
+            JsonValue::Number(1.into()),
+        );
+        let break_debounce = ev.evaluate(1, 20, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        assert!(break_debounce.is_empty());
+        let break_alert = ev.evaluate(1, 21, &"t".into(), 100, 100, &[], &[vehicle]);
+        assert_eq!(
+            break_alert.len(),
+            1,
+            "gate break should start a new alert epoch"
+        );
+    }
+
+    #[test]
+    fn simultaneous_parking_vehicles_debounce_independently() {
+        let mut rule = rule_with_zones(None);
+        rule.predicate.when = "object.label == 'vehicle.car'".into();
+        rule.debounce.consecutive_frames = 2;
+        rule.debounce.cooldown_ms = 0;
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+
+        let mut first = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        first.track_id = 10;
+        first.label = "vehicle.car".into();
+        first.attributes.insert(
+            STATIC_ALERT_EPOCH_ATTRIBUTE_KEY.into(),
+            JsonValue::Number(0.into()),
+        );
+        let mut second = first.clone();
+        second.track_id = 20;
+
+        let objects = vec![first, second];
+        assert!(ev
+            .evaluate(1, 1, &"t".into(), 100, 100, &[], &objects)
+            .is_empty());
+        assert_eq!(
+            ev.evaluate(1, 2, &"t".into(), 100, 100, &[], &objects)
+                .len(),
+            2
+        );
+        assert!(ev
+            .evaluate(1, 3, &"t".into(), 100, 100, &[], &objects)
+            .is_empty());
     }
 
     #[test]

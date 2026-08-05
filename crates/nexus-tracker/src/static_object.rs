@@ -50,6 +50,10 @@ pub const STATIC_ATTRIBUTE_KEY: &str = "tracker.is_static";
 pub const EMA_ATTRIBUTE_KEY: &str = "tracker.movement_ema";
 pub const STATIC_FRAMES_ATTRIBUTE_KEY: &str = "tracker.static_frames";
 pub const MOVING_FRAMES_ATTRIBUTE_KEY: &str = "tracker.moving_consecutive_frames";
+/// Monotonic per-track generation for parking-lot alert deduplication. It
+/// starts at zero and advances only when sustained movement breaks a closed
+/// static-object gate.
+pub const ALERT_EPOCH_ATTRIBUTE_KEY: &str = "tracker.static_alert_epoch";
 
 /// Helper that mirrors the convention used by the supervisor: returns
 /// `true` iff `o.attributes[STATIC_ATTRIBUTE_KEY] == true`. Centralised
@@ -74,6 +78,18 @@ struct PerTrackState {
     /// Whether this track has crossed `dwell_frames` and is currently
     /// being suppressed.
     static_promoted: bool,
+    /// Alert generation for this physical parking episode. The rule layer
+    /// emits at most once per generation while still honoring its normal
+    /// debounce before the first emission.
+    alert_epoch: u64,
+    /// Pixel center of the anchor this track owns, recorded when it was
+    /// promoted. Demotion erases the anchor by *this* position, not by
+    /// the track's current one: a vehicle that has driven far enough to
+    /// break the static gate has necessarily left its own
+    /// `match_distance_pixels` radius, so matching on the live center
+    /// would leave the anchor orphaned and blind the parking space to
+    /// every future arrival.
+    anchor_center: Option<(f32, f32)>,
 }
 
 /// Persisted record of a known-static vehicle location for a camera.
@@ -165,6 +181,18 @@ impl StaticObjectFilter {
         &self.anchors
     }
 
+    /// Is `label` eligible for static-anchor promotion on this camera?
+    /// Vehicles always are; Phase 8.1 `static_anchor_classes` adds
+    /// equipment labels. Single source of truth for both the
+    /// classification pass and the attribute-stamping pass.
+    fn is_anchor_eligible(&self, label: &str) -> bool {
+        is_vehicle_label(label)
+            || self
+                .extra_anchor_classes
+                .iter()
+                .any(|c| c == &label.to_lowercase())
+    }
+
     /// Wipe every persisted anchor and per-track state for this
     /// camera, then remove the on-disk registry file (so a restart
     /// doesn't resurrect what the operator just cleared). Used by
@@ -229,12 +257,7 @@ impl StaticObjectFilter {
         let mut suppress_verdict: Vec<bool> = Vec::with_capacity(objects.len());
 
         for o in objects.iter() {
-            if !is_vehicle_label(&o.label)
-                && !self
-                    .extra_anchor_classes
-                    .iter()
-                    .any(|c| c == &o.label.to_lowercase())
-            {
+            if !self.is_anchor_eligible(&o.label) {
                 suppress_verdict.push(false);
                 continue;
             }
@@ -256,7 +279,9 @@ impl StaticObjectFilter {
                     let dx = (center.0 - px) as f64;
                     let dy = (center.1 - py) as f64;
                     if (dx * dx + dy * dy).sqrt() > cfg_reset_px {
+                        let next_alert_epoch = state.alert_epoch.saturating_add(1);
                         *state = PerTrackState::default();
+                        state.alert_epoch = next_alert_epoch;
                     }
                 }
             }
@@ -300,19 +325,39 @@ impl StaticObjectFilter {
                 None
             };
 
-            // Demote: matched a persistent anchor AND moving again.
-            if let Some(idx) = matched_anchor_index {
-                if state.moving_consecutive_frames >= cfg_sig_frames {
+            // Demote only after sustained movement. Clearing
+            // `static_promoted` before the registry upsert below is
+            // essential: otherwise the erased anchor is recreated in the
+            // same frame and the vehicle never starts a fresh dwell cycle.
+            let broke_static_gate = state.moving_consecutive_frames >= cfg_sig_frames
+                && (state.static_promoted || matched_anchor_index.is_some());
+            if broke_static_gate {
+                // Erase this track's own anchor. Prefer the position it
+                // was parked at (`anchor_center`) over the live center —
+                // by the time the gate breaks the vehicle is typically
+                // well outside `match_distance_pixels` of its anchor, so
+                // `matched_anchor_index` is `None` and matching on the
+                // live center would strand the anchor in the registry.
+                let probe = state.anchor_center.take();
+                let stale_index = match probe {
+                    Some(parked_at) => {
+                        Self::match_anchor(&self.anchors, &label_lc, parked_at, cfg_match_dist)
+                    }
+                    None => matched_anchor_index,
+                };
+                if let Some(idx) = stale_index {
                     self.anchors.remove(idx);
                     dirty = true;
-                } else {
-                    // Still parked — refresh `last_seen` so the TTL
-                    // sweep doesn't prune an anchor whose vehicle is
-                    // visibly still there. In-memory update only; the
-                    // disk write is debounced to structural changes
-                    // (promote / demote / sweep / centroid drift).
-                    self.anchors[idx].last_seen_unix_ms = Some(frame_ms);
                 }
+                state.static_promoted = false;
+                state.static_frames = 0;
+                state.alert_epoch = state.alert_epoch.saturating_add(1);
+            } else if let Some(idx) = matched_anchor_index {
+                // Still parked — refresh `last_seen` so the TTL sweep
+                // doesn't prune an anchor whose vehicle is visibly still
+                // there. In-memory update only; the disk write is debounced
+                // to structural changes (promote / demote / sweep / drift).
+                self.anchors[idx].last_seen_unix_ms = Some(frame_ms);
             }
 
             // The post-demotion match (we may have just removed it):
@@ -328,34 +373,49 @@ impl StaticObjectFilter {
             // Promote into the registry while we hold the suppression
             // verdict — doing this lazily on the next frame would lose
             // anchors across a fast restart.
-            if state.static_promoted
-                && cfg_persistence
-                && Self::upsert_anchor(
+            //
+            // `moving_consecutive_frames == 0` keeps a departing vehicle
+            // from minting a fresh anchor along its exit path: it stays
+            // `static_promoted` until the gate actually breaks, and
+            // without this guard each frame of the drive-off would push
+            // a new anchor once it cleared `match_distance_pixels`,
+            // littering the lot with permanent blind spots.
+            if state.static_promoted && cfg_persistence && state.moving_consecutive_frames == 0 {
+                let (anchor_at, mutated) = Self::upsert_anchor(
                     &mut self.anchors,
                     &label_lc,
                     center,
                     cfg_match_dist,
                     frame_ms,
-                )
-            {
-                dirty = true;
+                );
+                // Remember which anchor this track owns so demotion can
+                // erase it after the vehicle has moved away from it.
+                state.anchor_center = Some(anchor_at);
+                if mutated {
+                    dirty = true;
+                }
             }
 
             suppress_verdict.push(suppress);
         }
 
         // Stamp the attribute on suppressed tracks, plus the
-        // diagnostic EMA / counter triple on every vehicle-labelled
+        // diagnostic EMA / counter triple on every anchor-eligible
         // track. The UI's static-debug toggle reads the diagnostic
         // attrs to show *why* the FSM made the call it did (so an
         // operator can tell `ema = 5.0` (truly slow) apart from
         // `ema = 35.99` (just under the cliff)).
+        //
+        // Eligibility here MUST match the classification loop above:
+        // every track the FSM keeps state for also carries the alert
+        // epoch, otherwise nexus-rules silently falls back to the
+        // legacy camera-scoped cooldown for that class (BUG-020).
         for (o, suppress) in objects.iter_mut().zip(suppress_verdict.iter().copied()) {
             if suppress {
                 o.attributes
                     .insert(STATIC_ATTRIBUTE_KEY.to_string(), Value::Bool(true));
             }
-            if is_vehicle_label(&o.label) {
+            if self.is_anchor_eligible(&o.label) {
                 if let Some(state) = self.state_by_track.get(&o.track_id) {
                     // `f64 -> serde_json::Number` may fail for NaN /
                     // Inf; `from_f64` returns `Option`. EMA should
@@ -371,6 +431,10 @@ impl StaticObjectFilter {
                     o.attributes.insert(
                         MOVING_FRAMES_ATTRIBUTE_KEY.to_string(),
                         Value::Number(state.moving_consecutive_frames.into()),
+                    );
+                    o.attributes.insert(
+                        ALERT_EPOCH_ATTRIBUTE_KEY.to_string(),
+                        Value::Number(state.alert_epoch.into()),
                     );
                 }
             }
@@ -443,14 +507,16 @@ impl StaticObjectFilter {
         None
     }
 
-    /// Inserts or merges. Returns true if the registry mutated.
+    /// Inserts or merges. Returns the resolved anchor center (so the
+    /// caller can remember which anchor a track owns) and whether the
+    /// registry mutated.
     fn upsert_anchor(
         anchors: &mut Vec<StaticAnchor>,
         label_lc: &str,
         center: (f32, f32),
         max_dist_px: f32,
         now_ms: i64,
-    ) -> bool {
+    ) -> ((f32, f32), bool) {
         if let Some(idx) = Self::match_anchor(anchors, label_lc, center, max_dist_px) {
             // Average toward the new observation — same shape as v1
             // (`(old + new) * 0.5`). Tiny drift; only triggers a save
@@ -463,11 +529,11 @@ impl StaticObjectFilter {
             let new_cx = (anchors[idx].center_x + center.0) * 0.5;
             let new_cy = (anchors[idx].center_y + center.1) * 0.5;
             if (new_cx - prev.0).abs() < 0.01 && (new_cy - prev.1).abs() < 0.01 {
-                return false;
+                return (prev, false);
             }
             anchors[idx].center_x = new_cx;
             anchors[idx].center_y = new_cy;
-            true
+            ((new_cx, new_cy), true)
         } else {
             anchors.push(StaticAnchor {
                 label: label_lc.to_string(),
@@ -475,7 +541,7 @@ impl StaticObjectFilter {
                 center_y: center.1,
                 last_seen_unix_ms: Some(now_ms),
             });
-            true
+            (center, true)
         }
     }
 
@@ -603,9 +669,13 @@ mod tests {
     }
 
     fn person(track_id: TrackId, cx: f32, cy: f32) -> TrackedObject {
+        labeled(track_id, "person", cx, cy)
+    }
+
+    fn labeled(track_id: TrackId, label: &str, cx: f32, cy: f32) -> TrackedObject {
         TrackedObject {
             track_id,
-            label: "person".into(),
+            label: label.into(),
             confidence: 0.95,
             bbox: BBox {
                 x1: cx - 10.0,
@@ -669,6 +739,83 @@ mod tests {
             f.filter(&frame(1, i, i as i64 * 33), &mut objs);
             assert_eq!(objs.len(), 1, "frame {i}: moving track must pass through");
         }
+    }
+
+    #[test]
+    fn extra_anchor_class_receives_alert_epoch_attribute() {
+        // Phase 8.1 equipment classes participate in the suppression FSM,
+        // so they MUST also carry the alert-epoch attribute — otherwise
+        // nexus-rules falls back to the legacy camera-scoped cooldown and
+        // re-alerts a stationary ladder every cooldown window (BUG-020,
+        // equipment variant).
+        let cfg = StaticObjectConfig {
+            dwell_frames: 3,
+            significant_movement_pixels: 10,
+            significant_movement_frames: 2,
+            movement_ema_alpha: 1.0,
+            match_distance_pixels: 5,
+            track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
+            persistence_enabled: false,
+        };
+        let mut f =
+            StaticObjectFilter::with_anchor_classes(cfg, 1, None, vec!["ladder".to_string()]);
+
+        let mut objs = vec![labeled(9, "ladder", 400.0, 400.0)];
+        f.classify(&frame(1, 0, 0), &mut objs);
+
+        assert_eq!(
+            objs[0].attributes.get(ALERT_EPOCH_ATTRIBUTE_KEY),
+            Some(&serde_json::json!(0)),
+            "equipment anchor classes must be stamped with the alert epoch"
+        );
+    }
+
+    #[test]
+    fn departing_vehicle_erases_the_anchor_it_parked_on() {
+        // A vehicle that breaks the static gate has, by definition,
+        // moved further than `significant_movement_pixels` for several
+        // frames — which is normally well outside the anchor's
+        // `match_distance_pixels` radius. Demotion must still find and
+        // erase the anchor it parked on, otherwise the spot keeps a
+        // permanent anchor that silently suppresses every future
+        // arrival (and the newcomer's own match keeps refreshing the
+        // TTL, so the sweep never reclaims it either).
+        let cfg = StaticObjectConfig {
+            dwell_frames: 3,
+            significant_movement_pixels: 10,
+            significant_movement_frames: 2,
+            movement_ema_alpha: 1.0,
+            match_distance_pixels: 5,
+            track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
+            persistence_enabled: true,
+        };
+        let mut f = StaticObjectFilter::new(cfg, 1, None);
+
+        for i in 0..6 {
+            let mut objs = vec![vehicle(7, 500.0, 500.0)];
+            f.classify(&frame(1, i, i as i64 * 33), &mut objs);
+        }
+        assert_eq!(f.anchors().len(), 1, "parked vehicle registers one anchor");
+
+        // Drive off at 50px/frame — ten times the match radius.
+        for i in 1..=3u64 {
+            let mut objs = vec![vehicle(7, 500.0 + i as f32 * 50.0, 500.0)];
+            f.classify(&frame(1, 5 + i, (5 + i) as i64 * 33), &mut objs);
+            assert!(
+                f.anchors().len() <= 1,
+                "a departing vehicle must not mint new anchors along its exit \
+                 path (got {} after moving frame {i})",
+                f.anchors().len()
+            );
+        }
+
+        assert!(
+            f.anchors().is_empty(),
+            "breaking the static gate must erase the vehicle's own anchor, \
+             leaving the parking space free to alert on the next arrival"
+        );
     }
 
     #[test]
@@ -787,6 +934,53 @@ mod tests {
     }
 
     #[test]
+    fn breaking_static_gate_advances_epoch_and_requires_fresh_dwell() {
+        let cfg = StaticObjectConfig {
+            dwell_frames: 3,
+            significant_movement_pixels: 10,
+            significant_movement_frames: 2,
+            movement_ema_alpha: 1.0,
+            match_distance_pixels: 30,
+            track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
+            persistence_enabled: true,
+        };
+        let mut f = StaticObjectFilter::new(cfg, 1, None);
+
+        for i in 0..3 {
+            let mut objs = vec![vehicle(11, 500.0, 500.0)];
+            f.classify(&frame(1, i, i as i64 * 33), &mut objs);
+            if i == 2 {
+                assert!(is_object_static(&objs[0]));
+            }
+        }
+        assert_eq!(f.anchors().len(), 1);
+
+        let mut moving = vec![vehicle(11, 512.0, 500.0)];
+        f.classify(&frame(1, 3, 99), &mut moving);
+        assert!(is_object_static(&moving[0]));
+
+        let mut broke_gate = vec![vehicle(11, 524.0, 500.0)];
+        f.classify(&frame(1, 4, 132), &mut broke_gate);
+        assert!(!is_object_static(&broke_gate[0]));
+        assert_eq!(
+            broke_gate[0]
+                .attributes
+                .get(ALERT_EPOCH_ATTRIBUTE_KEY)
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(f.anchors().is_empty(), "demotion must not reinsert anchor");
+
+        let mut stopped = vec![vehicle(11, 524.0, 500.0)];
+        f.classify(&frame(1, 5, 165), &mut stopped);
+        assert!(
+            !is_object_static(&stopped[0]),
+            "demoted vehicle must complete a fresh dwell cycle"
+        );
+    }
+
+    #[test]
     fn registry_round_trips_through_disk() {
         let tmp = std::env::temp_dir().join(format!(
             "nexus-static-{}.json",
@@ -869,6 +1063,14 @@ mod tests {
             objs.len(),
             1,
             "track-id-reuse guard should let the new physical object through"
+        );
+        assert_eq!(
+            objs[0]
+                .attributes
+                .get(ALERT_EPOCH_ATTRIBUTE_KEY)
+                .and_then(Value::as_u64),
+            Some(1),
+            "reused track_id must begin a fresh alert epoch"
         );
 
         // And it should stay through on the very next frame (state
