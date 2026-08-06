@@ -149,18 +149,68 @@ flip_and_restart() {
         die "failed to flip $current_link -> $release_path"
     fi
     log "flipped $current_link -> $release_path"
-    # --no-block: enqueue the restart job and return 0 immediately, BEFORE
-    # systemd stops this unit's cgroup (which would SIGTERM this very process
-    # and make the restart look failed). Mirror any change to the engine's
-    # expectation in crates/nexus-engine/src/cloud_update.rs.
+    # The restart MUST be issued from outside this unit's cgroup. `systemctl
+    # --no-block` still returns before the job runs, but the caller chain
+    # (engine -> sudo -> this script) lives in nexus-engine.service, so the
+    # stop job SIGTERMs this process a few milliseconds later — usually before
+    # it can exit 0, which the engine then reports to the cloud as a failed
+    # apply even though the release took effect. `systemd-run` parks the
+    # restart in a transient unit of its own; the short sleep lets this script
+    # exit 0 and lets the engine record the outcome first.
+    # Mirror any change to the engine's expectation in
+    # crates/nexus-engine/src/cloud_update.rs.
     if command -v systemctl >/dev/null 2>&1; then
-        if ! systemctl --no-block restart nexus-engine; then
-            die "systemctl --no-block restart nexus-engine failed"
+        if command -v systemd-run >/dev/null 2>&1 &&
+            systemd-run --collect --quiet --unit="nexus-ota-restart-$$" \
+                /bin/sh -c 'sleep 3; exec systemctl restart nexus-engine'; then
+            log "restart scheduled for nexus-engine (transient unit)"
+        elif systemctl --no-block restart nexus-engine; then
+            log "restart enqueued for nexus-engine (--no-block fallback)"
+        else
+            die "failed to schedule restart of nexus-engine"
         fi
-        log "restart enqueued for nexus-engine"
     else
         warn "no systemctl on PATH — skipping restart (test host?)"
     fi
+}
+
+# Refresh the pinned appliers from the release that is about to be flipped in.
+#
+# Both wrappers live outside the OTA-writable /opt/nexus tree and are normally
+# only installed by scripts/install.sh. That means a bug fixed in either script
+# could NEVER reach an already-installed box over the air — every fix required
+# a manual re-run of the installer per site. Refreshing them here closes that
+# gap without widening the trust boundary: the engine has already verified the
+# tarball's Ed25519 signature before invoking us, and we were about to execute
+# that same tree as root anyway.
+#
+# The copy is an atomic rename, NOT an in-place write: this script is currently
+# executing and bash reads it incrementally by file offset, so truncating the
+# live inode (what `install`/`cp` do) would corrupt the rest of this run. The
+# rename swaps in a new inode and leaves ours intact until exit.
+refresh_appliers() {
+    local src dst tmp name
+    for name in nexus-apply-release nexus-apply-deps; do
+        src="$release_path/scripts/$name"
+        dst="/usr/local/sbin/$name"
+        [[ -r "$src" ]] || continue
+        if cmp -s "$src" "$dst" 2>/dev/null; then
+            continue
+        fi
+        tmp="$(mktemp "/usr/local/sbin/.$name.XXXXXX")" || {
+            warn "could not stage applier refresh for $name; keeping installed copy"
+            continue
+        }
+        if cat "$src" >"$tmp" \
+            && chown root:root "$tmp" \
+            && chmod 0755 "$tmp" \
+            && mv -f "$tmp" "$dst"; then
+            log "refreshed applier from release: $dst"
+        else
+            rm -f "$tmp"
+            warn "applier refresh failed for $name; keeping installed copy"
+        fi
+    done
 }
 
 do_apply() {
@@ -179,6 +229,10 @@ do_apply() {
     [[ -d "$release_path" ]] \
         || die "extracted release dir missing: $release_path (tarball top-level != bare version?)"
     log "extracted release: $release_path"
+
+    # Pick up any applier fix shipped in this release before we use the deps
+    # wrapper below or flip the symlink.
+    refresh_appliers
 
     # Privileged, best-effort root-side bits (apt deps + journald cap). We are
     # already root, so call the deps wrapper directly (no sudo). --no-prune:

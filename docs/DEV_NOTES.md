@@ -321,6 +321,26 @@ Dev/test notes:
   action is a deliberate edit to the applier
   ([`deploy/nexus-apply-release`](../deploy/nexus-apply-release)),
   adopted via one install.sh run.
+- The applier **restarts the engine out of its own cgroup**
+  (`systemd-run --collect` transient unit, `--no-block` fallback).
+  It has to: the engine spawns the applier, so the applier runs
+  inside `nexus-engine.service`; a direct `systemctl restart` there
+  gets the applier SIGTERM'd by the unit stop job before it can
+  exit 0. The engine correspondingly treats "applier died by signal
+  **and** `/opt/nexus/current` already names the target" as a
+  successful apply — without that, a perfectly good update reported
+  `failed:apply_failed` to the cloud and rolled `current_version`
+  back to `previous_good`. Both halves must stay in sync; see
+  `current_release_is` in
+  [`cloud_update.rs`](../crates/nexus-engine/src/cloud_update.rs).
+- `apply` **refreshes both wrappers** (`nexus-apply-release`,
+  `nexus-apply-deps`) from `<release>/scripts/` before flipping, via
+  an atomic rename (never an in-place write — the applier is the
+  running script). Without this, an applier fix could only reach a
+  box through a manual `install.sh` re-run, so applier bugs were
+  effectively unshippable over the air. The trust boundary is
+  unchanged: the engine has already Ed25519-verified the tarball and
+  the applier was about to execute that same tree as root.
 
 ## See also
 

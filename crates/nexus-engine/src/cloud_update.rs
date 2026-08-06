@@ -72,6 +72,12 @@ const KEY_UPDATE_STATE: &str = "update.state";
 #[cfg(target_os = "linux")]
 const STAGED_TARBALL: &str = "/opt/nexus/staging/update.tar.gz";
 
+/// The symlink the applier flips to activate a release. World-readable, so
+/// the unprivileged engine can read it back to confirm an apply landed even
+/// when the applier could not report its own exit status.
+#[cfg(target_os = "linux")]
+const CURRENT_LINK: &str = "/opt/nexus/current";
+
 /// The single root-owned OTA applier — the ONLY command the pinned
 /// `/etc/sudoers.d/nexus-update` rule grants. Every privileged step
 /// (extract, deps/journald, symlink flip, restart, rollback reflip,
@@ -678,6 +684,20 @@ async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str
             );
             Ok(())
         }
+        // `ExitStatus::code() == None` means the applier died by signal. Its
+        // last act is `systemctl restart nexus-engine`, and the applier runs
+        // inside THIS unit's cgroup (we spawned it), so systemd's stop job
+        // routinely SIGTERMs it before it can exit 0 — a successful apply
+        // that merely could not report itself. `current` already pointing at
+        // the target is proof the flip landed.
+        Ok(s) if s.code().is_none() && current_release_is(version) => {
+            info!(
+                version,
+                "update: applier signalled by the restart it requested; \
+                 `current` already points at the target — treating as applied"
+            );
+            Ok(())
+        }
         Ok(s) => {
             warn!(code = ?s.code(), "update: `nexus-apply-release apply` exited non-zero");
             Err("apply_failed")
@@ -687,6 +707,25 @@ async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str
             Err("apply_failed")
         }
     }
+}
+
+/// True when `/opt/nexus/current` resolves to a release directory named
+/// exactly `version`.
+///
+/// The symlink and its parents are world-readable, so the unprivileged engine
+/// can check the applier's work without any privileged help.
+#[cfg(target_os = "linux")]
+fn current_release_is(version: &str) -> bool {
+    std::fs::read_link(CURRENT_LINK).is_ok_and(|target| release_dir_matches(&target, version))
+}
+
+/// True when the final component of a `current` symlink target names exactly
+/// `version` (the applier lays releases out as `<releases_dir>/<version>/`).
+#[cfg(any(target_os = "linux", test))]
+fn release_dir_matches(link_target: &std::path::Path, version: &str) -> bool {
+    link_target
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy() == version)
 }
 
 /// Re-point `/opt/nexus/current` to the named (already-on-disk) release and
@@ -700,6 +739,16 @@ async fn flip_and_restart(version: &str) -> Result<(), &'static str> {
         .status();
     match status {
         Ok(s) if s.success() => Ok(()),
+        // Same self-inflicted signal as the `apply` path: the reflip's own
+        // `systemctl restart` tears down the cgroup the applier runs in.
+        Ok(s) if s.code().is_none() && current_release_is(version) => {
+            info!(
+                version,
+                "update: reflip applier signalled by the restart it requested; \
+                 `current` already points at the target — treating as applied"
+            );
+            Ok(())
+        }
         Ok(s) => {
             warn!(code = ?s.code(), "update: `nexus-apply-release reflip` exited non-zero");
             Err("rollback_also_failed")
@@ -795,6 +844,25 @@ mod tests {
     use super::*;
     use ed25519_dalek::pkcs8::EncodePublicKey;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn release_dir_matches_exact_version_component() {
+        let link = std::path::Path::new("/opt/nexus/releases/0.1.185");
+        assert!(release_dir_matches(link, "0.1.185"));
+        // A prefix is not a match — 0.1.18 must not satisfy 0.1.185.
+        assert!(!release_dir_matches(link, "0.1.18"));
+        assert!(!release_dir_matches(link, "0.1.180"));
+    }
+
+    #[test]
+    fn release_dir_matches_tolerates_trailing_slash_and_rejects_junk() {
+        assert!(release_dir_matches(
+            std::path::Path::new("/opt/nexus/releases/0.1.185/"),
+            "0.1.185"
+        ));
+        assert!(!release_dir_matches(std::path::Path::new("/"), "0.1.185"));
+        assert!(!release_dir_matches(std::path::Path::new(""), "0.1.185"));
+    }
 
     fn sample_payload() -> UpdateAssignmentPayload {
         UpdateAssignmentPayload {
