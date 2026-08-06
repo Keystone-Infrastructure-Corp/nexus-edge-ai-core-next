@@ -24,6 +24,7 @@ use nexus_config::TelemetryConfig;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{trace::Sampler, Resource};
+use std::io::IsTerminal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 pub struct TelemetryGuard {
@@ -56,12 +57,22 @@ pub fn init(
 
     let registry = tracing_subscriber::registry().with(env_filter);
 
+    // ANSI only when stderr is a real terminal. Under systemd stderr is a
+    // journald socket, and `tracing-subscriber` colourises unconditionally
+    // by default — which writes raw SGR escapes into every journal record
+    // (and into the formatted-field buffers the registry keeps alive per
+    // open span). `journalctl` does not strip them, so `grep`/`jq` over the
+    // journal matches against escape-laden text. Autodetect instead of
+    // hardcoding: interactive `cargo run` keeps colour, the service does not.
+    let ansi = std::io::stderr().is_terminal();
+
     let fmt_layer = if cfg.json_logs {
         tracing_subscriber::fmt::layer().json().boxed()
     } else {
         tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_line_number(false)
+            .with_ansi(ansi)
             .compact()
             .boxed()
     };
