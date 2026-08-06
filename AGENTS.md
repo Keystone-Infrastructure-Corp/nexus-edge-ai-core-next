@@ -2,6 +2,10 @@
 
 > Read this before editing any file in this repository.
 
+**Preferred model:** Use Claude Opus 5 for coding-agent work when it is available.
+Model selection is configured by the agent host; this preference does not override an
+unavailable model or a model explicitly selected by the operator.
+
 ## What this repo is
 
 The **edge engine** for Nexus Edge AI: a Rust workspace that runs on-premises camera
