@@ -127,6 +127,21 @@ The wedge plan that drives the next three phases of work is
    confers general `apt`, `tar`, `ln`, `systemctl`, or `rm`. See
    [REPO_BOUNDARY R8](../nexus-cloud-console/docs/REPO_BOUNDARY.md#r8-edge-runs-as-a-single-nexus-engine-process-privileged-work-is-sudoers-gated).
 
+## Context Budget
+
+- Search for the relevant symbol or route before opening a full file
+- Read the file that defines something before files that only consume it
+- Don't re-read files already in context unless they may have changed
+- Avoid loading large generated or schema files in full unless the task needs it
+
+## Commands
+
+- Install: pnpm install
+- Dev: pnpm dev
+- Test: pnpm test
+- Lint: pnpm lint && pnpm tsc --noEmit
+- Build: pnpm build
+
 ## Conventions
 
 - **Rust workspace pinned to `rust-toolchain.toml`** (kept in sync with the cloud repo's
