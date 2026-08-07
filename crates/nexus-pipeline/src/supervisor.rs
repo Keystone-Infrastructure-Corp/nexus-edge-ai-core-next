@@ -5,6 +5,7 @@
 //! that opens child spans for `decode/gate/infer/track/rules`. That's how
 //! the `trace_id` field on [`nexus_types::Frame`] is actually backed.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -524,804 +525,833 @@ async fn run_camera(
                 frame_id,
                 trace_id = %trace_id,
             );
-            let _enter = frame_span.enter();
 
-            let pass = {
-                let _g = info_span!("frame.gate").entered();
-                gate.allow(&frame)
-            };
-            if !pass {
-                debug!(camera_id = cfg.id, frame_id, "gate dropped frame");
-                stats.observe_dropped(cfg.id);
-                continue;
-            }
+            // BUG-024 — this span MUST be attached with `.instrument()`,
+            // never entered with `Span::enter()`. `Entered` is a
+            // thread-local construct: `Registry::enter` pushes the span
+            // id onto a `ThreadLocal<SpanStack>` and the guard's drop
+            // pops from whatever worker happens to be running. With
+            // `.await` points inside the guard's scope the tokio
+            // work-stealing scheduler can migrate this task mid-frame,
+            // the exit then pops the wrong thread's stack, and the span
+            // is never closed. Orphaned entries also stay at the top of
+            // the original worker's stack and become the contextual
+            // parent of every span opened there afterwards — and a span
+            // isn't closed until its children close — so leaked spans
+            // chain and no link can ever be released. That leaked ~7% of
+            // all frames on a 29-camera site, ~500 MB/h, until the unit
+            // saturated its cgroup `MemoryHigh`. `Instrumented` enters
+            // and exits inside each `poll`, so enter/exit always pair on
+            // the thread that is actually polling.
+            //
+            // Consequence for the body below: it is an `async` block, so
+            // `continue` / `break` for the frame loop are expressed as
+            // `return ControlFlow::Continue(())` / `ControlFlow::Break(())`.
+            let flow = async {
+                let pass = {
+                    let _g = info_span!("frame.gate").entered();
+                    gate.allow(&frame)
+                };
+                if !pass {
+                    debug!(camera_id = cfg.id, frame_id, "gate dropped frame");
+                    stats.observe_dropped(cfg.id);
+                    return ControlFlow::Continue(());
+                }
 
-            // M2.1: enforce MAX_CLIP_DURATION_MS. If the currently
-            // open clip has been writing for >= 5 min, close it now
-            // so a fresh one opens on the next Born (or right below
-            // if motion is still live). Done BEFORE motion/event
-            // handling so any alerts/motion on this frame attach
-            // to the new clip rather than the about-to-be-closed
-            // one.
-            let mut force_reopen_after_rotation = false;
-            if let (Some(handle), Some(opened_at)) = (current_clip, clip_opened_at) {
-                let age_ms = (frame.captured_at - opened_at).num_milliseconds();
-                let duration_exceeded = age_ms >= MAX_CLIP_DURATION_MS;
+                // M2.1: enforce MAX_CLIP_DURATION_MS. If the currently
+                // open clip has been writing for >= 5 min, close it now
+                // so a fresh one opens on the next Born (or right below
+                // if motion is still live). Done BEFORE motion/event
+                // handling so any alerts/motion on this frame attach
+                // to the new clip rather than the about-to-be-closed
+                // one.
+                let mut force_reopen_after_rotation = false;
+                if let (Some(handle), Some(opened_at)) = (current_clip, clip_opened_at) {
+                    let age_ms = (frame.captured_at - opened_at).num_milliseconds();
+                    let duration_exceeded = age_ms >= MAX_CLIP_DURATION_MS;
 
-                // Byte-cap guard. Sampled every SIZE_STAT_INTERVAL_FRAMES
-                // to keep the per-frame fast path syscall-free. Rotates
-                // on the same close+reopen path as the duration cap so a
-                // corrupt byte-exploding stream can't produce a single
-                // multi-GiB clip that wedges the cold replicator.
-                let mut size_exceeded = false;
-                if max_clip_bytes > 0 {
-                    frames_since_size_stat += 1;
-                    if frames_since_size_stat >= SIZE_STAT_INTERVAL_FRAMES {
+                    // Byte-cap guard. Sampled every SIZE_STAT_INTERVAL_FRAMES
+                    // to keep the per-frame fast path syscall-free. Rotates
+                    // on the same close+reopen path as the duration cap so a
+                    // corrupt byte-exploding stream can't produce a single
+                    // multi-GiB clip that wedges the cold replicator.
+                    let mut size_exceeded = false;
+                    if max_clip_bytes > 0 {
+                        frames_since_size_stat += 1;
+                        if frames_since_size_stat >= SIZE_STAT_INTERVAL_FRAMES {
+                            frames_since_size_stat = 0;
+                            if let Some(size_bytes) = recorder.inflight_size_bytes(handle).await {
+                                if size_bytes >= max_clip_bytes {
+                                    size_exceeded = true;
+                                    warn!(
+                                        camera_id = cfg.id,
+                                        clip_id = handle.clip_id,
+                                        size_bytes,
+                                        max_bytes = max_clip_bytes,
+                                        "rotating clip: max size reached \
+                                         (likely corrupt byte-exploding stream)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if duration_exceeded || size_exceeded {
+                        if duration_exceeded {
+                            debug!(
+                                camera_id = cfg.id,
+                                clip_id = handle.clip_id,
+                                age_ms,
+                                max_ms = MAX_CLIP_DURATION_MS,
+                                "rotating clip: max duration reached"
+                            );
+                        }
+                        if let Err(e) = recorder
+                            .close(
+                                handle,
+                                ClipFinal {
+                                    ended_at: frame.captured_at,
+                                },
+                            )
+                            .await
+                        {
+                            warn!(
+                                camera_id = cfg.id,
+                                "recorder.close (rotation) failed: {e}"
+                            );
+                        }
+                        current_clip = None;
+                        clip_opened_at = None;
                         frames_since_size_stat = 0;
-                        if let Some(size_bytes) = recorder.inflight_size_bytes(handle).await {
-                            if size_bytes >= max_clip_bytes {
-                                size_exceeded = true;
+                        // Reset post-roll so the rotation isn't observed
+                        // as a motion-end window.
+                        post_roll.reset();
+                        // If motion was still live (Born was already
+                        // emitted prior to this frame), the upcoming
+                        // motion lifecycle will see Live decisions but
+                        // NOT another Born — so the existing
+                        // open-on-Born trigger won't re-open. Flag it
+                        // so the decisions loop opens on the first
+                        // decision regardless of kind.
+                        force_reopen_after_rotation = emitter.live_track_count(cfg.id) > 0;
+                    }
+                }
+
+                // M_PERF_CROWD Phase E1 — decide BEFORE running the
+                // detector whether this frame is one that the skip policy
+                // wants to drop. On a skip frame the detector is bypassed
+                // entirely; the tracker still runs below with an empty
+                // detection slice so ByteTrack's predict() advances and
+                // existing tracks age normally.
+                let skip_detector = skip_policy.should_skip();
+                // M_PERF_CROWD Phase E3 — pick the detector for THIS
+                // frame based on the hysteresis state observed on the
+                // PREVIOUS frame. `detector_low_res` is only ever `Some`
+                // when the camera opted in AND the router pre-built the
+                // low-res layer; if either side is missing the supervisor
+                // stays on the high-res detector regardless of crowd.
+                let active_detector: &Arc<dyn Detector> = match (detector_downscaled, &detector_low_res)
+                {
+                    (true, Some(low)) => low,
+                    _ => &detector,
+                };
+                let detections = if skip_detector {
+                    debug!(
+                        camera_id = cfg.id,
+                        frame_id, "detector skipped (crowd skip policy)"
+                    );
+                    Vec::new()
+                } else {
+                    let span = info_span!("frame.infer", model = %active_detector.name());
+                    match active_detector
+                        .detect(&frame, &prompts)
+                        .instrument(span)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            error!(camera_id = cfg.id, "detect failed: {e}");
+                            return ControlFlow::Continue(());
+                        }
+                    }
+                };
+                // Per-camera `prompts` whitelist applied uniformly across
+                // every detector kind. Open-vocab models (yolo_world,
+                // yoloe) also receive `prompts` as input to scope their
+                // classes; this retain is idempotent for them. Closed-vocab
+                // YOLO/COCO ignores the input `prompts` and emits every
+                // mapped class, so this is the only enforcement point
+                // that catches it. Empty prompts disables the filter
+                // (see `label_matches_any_prompt`).
+                let detections: Vec<_> = if prompts.is_empty() || skip_detector {
+                    detections
+                } else {
+                    let before = detections.len();
+                    let kept: Vec<_> = detections
+                        .into_iter()
+                        .filter(|d| label_matches_any_prompt(&d.label, &prompts))
+                        .collect();
+                    if before != kept.len() {
+                        debug!(
+                            camera_id = cfg.id,
+                            frame_id,
+                            before,
+                            after = kept.len(),
+                            "prompts whitelist dropped detections"
+                        );
+                    }
+                    kept
+                };
+                if !skip_detector {
+                    detected += 1;
+                }
+
+                // M_TILE_REINFER (G1) — Phase B2 cascade: when this
+                // camera opted in via behavior.tile_enabled = Some(true)
+                // AND the stage-1 detection count crossed
+                // behavior.tile_trigger AND we're not on a skipped
+                // frame (E1 invariant: G1 disabled when E1 skip fires
+                // same tick), re-run the SAME active_detector on a small
+                // set of cropped sub-regions chosen by stage-1 density.
+                // Stage-2 detections are mapped back to parent-frame
+                // coordinates and concatenated with stage-1 before the
+                // single tracker.update() call below.
+                //
+                // On crop or inference error we fall through to
+                // stage-1-only (fail-soft) — the cascade is a compute-
+                // optimality knob, not a correctness one. The merged
+                // detection set is NOT re-deduped here; the tracker's
+                // association layer handles overlapping boxes from
+                // adjacent tiles as it would for any duplicate
+                // detection. See docs/edge-core/M_TILE_REINFER.md.
+                let detections = if !skip_detector
+                    && cfg.behavior.tile_enabled == Some(true)
+                    && cfg.behavior.tile_trigger.is_some_and(|t| {
+                        let trigger = t as usize;
+                        trigger > 0 && detections.len() >= trigger
+                    }) {
+                    let grid: crate::tile::TileGridConfig = cfg
+                        .behavior
+                        .tile_grid
+                        .map(Into::into)
+                        .unwrap_or(crate::tile::TileGridConfig::G2x2);
+                    let max_tiles = cfg.behavior.tile_max_per_frame.unwrap_or(3);
+                    let tiles =
+                        crate::tile::pick_tiles(&detections, frame.width, frame.height, grid, max_tiles);
+                    if tiles.is_empty() {
+                        detections
+                    } else {
+                        let span =
+                            info_span!("frame.tile_infer", model = %active_detector.name(), tiles = tiles.len());
+                        let tile_started = std::time::Instant::now();
+                        match crate::tile_executor::run_tile_inference(
+                            active_detector.as_ref(),
+                            &frame,
+                            &tiles,
+                            &prompts,
+                        )
+                        .instrument(span)
+                        .await
+                        {
+                            Ok(stage2) => {
+                                let tile_elapsed_ms =
+                                    tile_started.elapsed().as_millis().min(u128::from(u64::MAX))
+                                        as u64;
+                                // Apply the same per-camera prompts
+                                // whitelist to stage-2 outputs that the
+                                // stage-1 block applied above. Idempotent
+                                // for open-vocab detectors that already
+                                // honour `prompts`; required for
+                                // closed-vocab YOLO/COCO which emits all
+                                // mapped classes regardless.
+                                let stage2: Vec<_> = if prompts.is_empty() {
+                                    stage2
+                                } else {
+                                    stage2
+                                        .into_iter()
+                                        .filter(|d| label_matches_any_prompt(&d.label, &prompts))
+                                        .collect()
+                                };
+                                // M_TILE_REINFER (G1) — Phase B3 telemetry:
+                                // record one tile invocation with the
+                                // post-whitelist stage-2 count and elapsed
+                                // wall-clock ms. `added` is what actually
+                                // reaches the tracker so the UI can show
+                                // "stage-2 detections / cascade".
+                                stats.observe_tile_invocation(
+                                    cfg.id,
+                                    stage2.len() as u64,
+                                    tile_elapsed_ms,
+                                );
+                                debug!(
+                                    camera_id = cfg.id,
+                                    frame_id,
+                                    stage1 = detections.len(),
+                                    tiles = tiles.len(),
+                                    stage2 = stage2.len(),
+                                    tile_ms = tile_elapsed_ms,
+                                    "tile cascade merged stage-2 detections"
+                                );
+                                let mut merged = detections;
+                                merged.extend(stage2);
+                                // M_TILE_REINFER (G1) — Phase B2.1: enforce
+                                // the operator's `top_k` GLOBALLY across the
+                                // merged stage-1 + stage-2 vector. The stage-1
+                                // wrapper and the per-tile wrapper each
+                                // already capped to ≤k, so worst-case input
+                                // here is `k × (1 + max_tiles)` — without
+                                // this call the tracker would see up to that
+                                // many boxes per cascade frame, silently
+                                // exceeding the configured cap. Idempotent
+                                // when `merged.len() ≤ k` (skips the sort).
+                                if let Some(k) = effective_top_k {
+                                    nexus_inference::caps::apply_top_k(&mut merged, k);
+                                }
+                                merged
+                            }
+                            Err(e) => {
+                                // Fail-soft to stage-1 only. The
+                                // alternative — dropping the frame — would
+                                // make the cascade a correctness risk
+                                // rather than a recall booster.
                                 warn!(
                                     camera_id = cfg.id,
-                                    clip_id = handle.clip_id,
-                                    size_bytes,
-                                    max_bytes = max_clip_bytes,
-                                    "rotating clip: max size reached \
-                                     (likely corrupt byte-exploding stream)"
+                                    frame_id,
+                                    tiles = tiles.len(),
+                                    "tile cascade failed, falling back to stage-1: {e}"
+                                );
+                                detections
+                            }
+                        }
+                    }
+                } else {
+                    detections
+                };
+
+                let mut tracked = {
+                    let _g = info_span!("frame.track", tracker = tracker.name()).entered();
+                    tracker.update(detections)
+                };
+                // M_PERF_CROWD Phase E1 — feed the post-tracker
+                // tracked-object count back into the skip policy's EMA so
+                // the next frame's skip decision reflects current crowd
+                // density. No-op when the policy is disabled.
+                skip_policy.observe(tracked.len());
+                // M_PERF_CROWD Phase E3 — same tracked-object count drives
+                // the input-downscale hysteresis. The returned bool is the
+                // desired downscale state for the NEXT frame; on the
+                // current frame we already committed to a detector above.
+                // No-op when the policy is disabled.
+                detector_downscaled =
+                    crowd_hysteresis.observe(tracked.len(), std::time::Instant::now());
+                // M_PERF_CROWD Phase E2 — sustained-crowd supervisor
+                // frame downscale. Independent hysteresis (asymmetric
+                // up/down windows) over the same tracked-object EMA. On
+                // a state flip and only when the camera opted in via
+                // `behavior.supervisor_downscale_to_width`, ask the
+                // recorder to rebuild its pre-roll ingester at the new
+                // RGB dims; on success, close any open clip (so its
+                // recorded `frame_width` matches the pixels going
+                // forward), update `current_supervisor_*`, and break to
+                // the outer loop which will spawn a fresh
+                // `FrameSource` against the new shared RGB tap. No-op
+                // when the policy is disabled or when the recorder has
+                // no RGB-tap ingester for this camera (e.g. stub
+                // recorder in tests).
+                let want_supervisor_downscale =
+                    supervisor_hysteresis.observe(tracked.len(), std::time::Instant::now());
+                if want_supervisor_downscale != supervisor_downscaled {
+                    if let Some(downscale_w) = cfg.behavior.supervisor_downscale_to_width {
+                        let (target_w, target_h) = if want_supervisor_downscale {
+                            crate::source::supervisor_frame_for(downscale_w)
+                        } else {
+                            (original_supervisor_w, original_supervisor_h)
+                        };
+                        match recorder.resize_camera_rgb_tap(cfg.id, target_w, target_h) {
+                            Ok(true) => {
+                                info!(
+                                    camera_id = cfg.id,
+                                    target_w,
+                                    target_h,
+                                    downscaled = want_supervisor_downscale,
+                                    "supervisor frame size flipped (crowd hysteresis); rebuilding source"
+                                );
+                                supervisor_downscaled = want_supervisor_downscale;
+                                current_supervisor_w = target_w;
+                                current_supervisor_h = target_h;
+                                if let Some(handle) = current_clip.take() {
+                                    if let Err(e) = recorder
+                                        .close(
+                                            handle,
+                                            ClipFinal {
+                                                ended_at: frame.captured_at,
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            camera_id = cfg.id,
+                                            "recorder.close (RGB tap resize) failed: {e}"
+                                        );
+                                    }
+                                    clip_opened_at = None;
+                                    post_roll.reset();
+                                }
+                                rebuild_source = true;
+                                return ControlFlow::Break(());
+                            }
+                            Ok(false) => {
+                                // Recorder reports no rebuild needed
+                                // (stub recorder, ingester absent, or
+                                // dims already match). Record the new
+                                // desired state so we don't re-poll the
+                                // recorder every frame, but don't
+                                // restart the source.
+                                supervisor_downscaled = want_supervisor_downscale;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    camera_id = cfg.id,
+                                    "resize_camera_rgb_tap failed: {e}; staying on current dims"
+                                );
+                                supervisor_downscaled = want_supervisor_downscale;
+                            }
+                        }
+                    } else {
+                        // Threshold + sustained-secs are set but the
+                        // operator forgot the target width. Record the
+                        // state so we don't log every frame; the
+                        // operator's `nexus-doctor` config check should
+                        // surface this misconfiguration.
+                        supervisor_downscaled = want_supervisor_downscale;
+                    }
+                }
+                // M-Admin Phase 2 Step 1 — exclusion-zone enforcement.
+                // Drop any tracked object whose bbox centre lies inside
+                // a `ZoneKind::Exclusion` polygon for this camera, BEFORE
+                // the annotator runs so excluded objects never enter
+                // per-track state, the L7 cache, the FRAME_METADATA bus
+                // event, or the rule evaluator. No-op when the camera
+                // has no exclusion zones (the common case).
+                {
+                    let _g = info_span!("frame.zone_filter").entered();
+                    let dropped = filter_excluded_zones(&frame, &zones, &mut tracked);
+                    if dropped > 0 {
+                        debug!(
+                            camera_id = cfg.id,
+                            frame_id, dropped, "exclusion zone filter dropped objects"
+                        );
+                    }
+                    // M_PERF_CROWD Phase B1 — per-zone min-bbox-area
+                    // override. Fast path no-op when no zone declares
+                    // `min_bbox_area_px_override`; otherwise drops tracked
+                    // objects whose centre lies in an override zone and
+                    // whose bbox area is below that zone's threshold.
+                    // Layered on top of the global
+                    // `ModelConfig::min_bbox_area_px` (which fires at the
+                    // inference wrapper before tracking).
+                    let dropped = filter_zone_min_area(&frame, &zones, &mut tracked);
+                    if dropped > 0 {
+                        debug!(
+                            camera_id = cfg.id,
+                            frame_id, dropped, "per-zone min-area override dropped objects"
+                        );
+                    }
+                }
+                {
+                    let _g = info_span!("frame.annotate", annotator = annotator.name()).entered();
+                    // Phase 8.1: hand the annotator the prior-frame static
+                    // anchor set (empty when parking_lot_mode is off) so it
+                    // can stamp `motion.near_static_vehicle_*`.
+                    let anchors = static_filter
+                        .as_ref()
+                        .map(|f| f.anchors())
+                        .unwrap_or(&[]);
+                    annotator.annotate(&frame, &zones, anchors, &mut tracked);
+                }
+                if let Some(sf) = static_filter.as_mut() {
+                    let _g = info_span!("frame.static_filter", filter = sf.name()).entered();
+                    // Mark suppressed tracks (writes
+                    // `tracker.is_static = true` into the object's
+                    // attributes map) but do NOT remove them. The live
+                    // viewer needs to see them to render the
+                    // "static" indicator; the partition below keeps
+                    // them out of rule eval + the motion lifecycle.
+                    sf.classify(&frame, &mut tracked);
+                }
+                let tracked_arc = Arc::new(tracked.clone());
+
+                // L7 cache update — see ARCHITECTURE.md.
+                let frame_arc = Arc::new(frame.clone());
+                cache.put(cfg.id, frame_arc.clone(), tracked_arc.clone());
+
+                // Lightweight metadata onto the bus. `objects` is
+                // `Arc<Vec<TrackedObject>>` (M_PERF_CROWD D1) so we
+                // reuse the same allocation as `LatestFrameCache`
+                // instead of cloning the vec a second time per frame.
+                let meta = FrameMetadata {
+                    camera_id: cfg.id,
+                    frame_id,
+                    captured_at: frame.captured_at,
+                    width: frame.width,
+                    height: frame.height,
+                    trace_id: trace_id.clone(),
+                    objects: Arc::clone(&tracked_arc),
+                };
+                let _ = bus.publish(topic::FRAME_METADATA, &meta).await;
+                // M_PERF_CROWD F1 — same per-frame cadence on the
+                // bandwidth-relief lite topic. Drops the per-object
+                // `attributes` map (~400–600 B/object) so the SSE
+                // overlay subscriber's broadcast buffer no longer
+                // dominates `BusError::Lagged` under crowd load. The
+                // attributes panel still subscribes to the full topic
+                // via `?attributes=full`.
+                let meta_lite = FrameMetadataLite {
+                    camera_id: meta.camera_id,
+                    frame_id: meta.frame_id,
+                    captured_at: meta.captured_at,
+                    width: meta.width,
+                    height: meta.height,
+                    trace_id: meta.trace_id.clone(),
+                    objects: Arc::new(tracked.iter().map(TrackLite::from).collect()),
+                };
+                let _ = bus
+                    .publish(topic::FRAME_METADATA_LITE, &meta_lite)
+                    .await;
+
+                // Partition: rules and the motion lifecycle only see
+                // non-static tracks. A parked car shouldn't keep firing
+                // rules or generating motion_events rows, but it MUST
+                // still appear in the L7 cache + FRAME_METADATA above
+                // so the live viewer can draw it (de-emphasised) and
+                // so the operator can see the static-suppression in
+                // action. When `static_filter` is `None`, no object can
+                // be marked static so we just clone the full slice.
+                let dynamic_tracked: Vec<TrackedObject> = if static_filter.is_some() {
+                    tracked
+                        .iter()
+                        .filter(|t| !is_object_static(t))
+                        .cloned()
+                        .collect()
+                } else {
+                    tracked.clone()
+                };
+
+                // M-Alert-Clip: feed this frame's frame-aligned detection
+                // boxes into the recorder's per-camera box timeline so an
+                // alert clip armed later can burn them into the pre-roll +
+                // post window. No-op unless enabled; cheap.
+                //
+                // Only tracks with a REAL detection on THIS frame
+                // (`detection_bbox`) are burned. A predicted-only (coasting)
+                // track has no detection this frame and would otherwise be
+                // drawn at its stale EMA-smoothed position; as the tracker
+                // coasts / re-spawns fragment tracks for one object those
+                // stale boxes pile up into the "trailing" ghost boxes seen on
+                // the clip. Dropping coasting tracks and NMS-deduping the
+                // overlapping survivors yields one box per physical object.
+                if alert_clips_enabled {
+                    let mut boxes: Vec<crate::alert_clip::BurnBox> = dynamic_tracked
+                        .iter()
+                        .filter_map(|t| {
+                            let b = t.detection_bbox?;
+                            Some(crate::alert_clip::BurnBox {
+                                x1: b.x1,
+                                y1: b.y1,
+                                x2: b.x2,
+                                y2: b.y2,
+                                label: t.label.clone(),
+                                confidence: t.confidence,
+                            })
+                        })
+                        .collect();
+                    crate::alert_clip::dedupe_burn_boxes(&mut boxes);
+                    recorder.push_alert_boxes(
+                        cfg.id,
+                        frame.captured_at,
+                        boxes,
+                        current_supervisor_w,
+                        current_supervisor_h,
+                    );
+                }
+
+                // Phase 5.6 · slice 4c-ii — fire stable-track sightings
+                // into the engine hook. Skips parked-car tracks the
+                // static-object filter has masked off (same partition
+                // as rule eval + motion lifecycle).
+                sighting_scheduler.tick(
+                    &frame_arc,
+                    &dynamic_tracked,
+                    frame.captured_at,
+                    sighting_hook.as_ref(),
+                );
+
+                let events = {
+                    let _g = info_span!("frame.rules").entered();
+                    evaluator.evaluate(
+                        cfg.id,
+                        frame_id,
+                        &trace_id,
+                        frame.width,
+                        frame.height,
+                        &zones,
+                        &dynamic_tracked,
+                    )
+                };
+                // Record + publish the events now so the row exists.
+                // We defer the events.clip_id stamp until AFTER the
+                // motion lifecycle has run for this frame, because a
+                // new alert + first Born in the same frame must link
+                // to the clip that gets opened on this frame, not the
+                // previous one.
+                let mut events_to_link: Vec<String> = Vec::new();
+                // M-Event-Audit: set once at least one match this frame is
+                // within the delivery schedule (would be delivered). Gates
+                // the alert-clip arm below; an off-schedule frame logs its
+                // events + links the motion clip only.
+                let mut any_deliverable = false;
+                for mut ev in events {
+                    let event_id = ev.event_id.to_string();
+                    // M-Event-Audit: does this rule-fire fall within the
+                    // active delivery schedule (global + per-rule cascade)?
+                    // Drives both the alert-clip arm and the `events.alerted`
+                    // audit flag stamped by `record_event_and_enqueue`.
+                    let alerted = alert_clip_gate.should_build(&ev.rule_id, frame.captured_at);
+                    // Alert snapshot — persist a JPEG of the frame that fired
+                    // this rule at a deterministic
+                    // `<state_dir>/snapshots/<event_id>.jpg` path BEFORE the
+                    // outbox row is written, so the cloud-console sink (if
+                    // enrolled) always finds the file when it processes the
+                    // row. Best-effort: a missing thumbnail never blocks the
+                    // alert. Also stamped onto `artifacts.snapshot` for bus
+                    // subscribers / the local admin API.
+                    let snap_conf = ev
+                        .context
+                        .get("confidence")
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|f| f as f32);
+                    if let Some(path) = write_alert_snapshot(
+                        &snapshots_dir,
+                        &event_id,
+                        &frame_arc,
+                        ev.bbox,
+                        &ev.label,
+                        snap_conf,
+                    )
+                    .await
+                    {
+                        ev.artifacts.snapshot = Some(path);
+                    }
+                    // M7 per-rule sink routing — resolve which configured
+                    // sinks this rule delivers to, then record the event
+                    // and enqueue an `alert_sink_outbox` row per sink in a
+                    // single transaction. An empty resolution records the
+                    // event with no outbox rows (identical to the pre-M7
+                    // `record_event`), so a `NoopSinkRouter` or a config
+                    // with no sinks keeps today's behaviour.
+                    let sinks = sink_router.sinks_for(&ev.rule_id);
+                    let sink_refs: Vec<&str> = sinks.iter().map(String::as_str).collect();
+                    if let Err(e) = store
+                        .record_event_and_enqueue_classified(&ev, &sink_refs, alerted)
+                        .await
+                    {
+                        warn!(event = %ev.event_id, "store.record_event_and_enqueue failed: {e}");
+                    } else {
+                        events_to_link.push(event_id);
+                        any_deliverable |= alerted;
+                    }
+                    let _ = bus.publish(topic::ALERT_EVENT, &ev).await;
+                }
+
+                // M-Alert-Clip: arm (or coalesce into) a short alert clip for
+                // this burst and link every event fired this frame to it, so
+                // clip-attaching sinks resolve the truncated clip within
+                // ~post_secs instead of waiting on the up-to-5-min motion
+                // clip. `arm_alert_clip` returns None (no-op) unless the
+                // feature is enabled and the camera has a pre-roll ingester.
+                //
+                // M-Event-Audit: only arm when at least one recorded match
+                // this frame is within the delivery schedule
+                // (`any_deliverable`). Off-schedule matches keep their
+                // `events.clip_id` motion-clip link and skip the expensive
+                // decode -> burn-in -> re-encode entirely.
+                if alert_clips_enabled && any_deliverable {
+                    if let Some(alert_clip_id) =
+                        recorder.arm_alert_clip(cfg.id, frame.captured_at).await
+                    {
+                        for eid in &events_to_link {
+                            if let Err(e) = store.link_event_alert_clip(eid, alert_clip_id).await {
+                                debug!(
+                                    camera_id = cfg.id,
+                                    event = %eid,
+                                    "link_event_alert_clip failed: {e}"
                                 );
                             }
                         }
                     }
                 }
 
-                if duration_exceeded || size_exceeded {
-                    if duration_exceeded {
-                        debug!(
-                            camera_id = cfg.id,
-                            clip_id = handle.clip_id,
-                            age_ms,
-                            max_ms = MAX_CLIP_DURATION_MS,
-                            "rotating clip: max duration reached"
-                        );
+                // Motion lifecycle. The emitter is pure — it just tells
+                // us what changed. We turn its decisions into open/close
+                // recorder calls + motion_events rows here.
+                //
+                // The synchronous emitter.tick() runs inside the span
+                // via in_scope(); we don't hold an EnteredSpan guard
+                // across recorder/store awaits because EnteredSpan is
+                // !Send and would break tokio::spawn.
+                let decisions = info_span!("frame.motion")
+                    .in_scope(|| emitter.tick(cfg.id, &dynamic_tracked, frame.captured_at));
+                for d in &decisions {
+                    let should_open = current_clip.is_none()
+                        && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);
+                    if should_open {
+                        match recorder
+                            .open(OpenClip {
+                                camera_id: cfg.id,
+                                started_at: d.captured_at,
+                                frame_width: current_supervisor_w,
+                                frame_height: current_supervisor_h,
+                            })
+                            .await
+                        {
+                            Ok(handle) => {
+                                current_clip = Some(handle);
+                                clip_opened_at = Some(d.captured_at);
+                                // One-shot — only the first decision in
+                                // this frame triggers the post-rotation
+                                // reopen.
+                                force_reopen_after_rotation = false;
+                            }
+                            Err(RecorderError::Refused) => {
+                                // Watermark sampler has paused new
+                                // clips. Drop ALL motion events for
+                                // this frame: the schema requires
+                                // clip_id NOT NULL and we have no
+                                // open clip to attach to.
+                                debug!(
+                                    camera_id = cfg.id,
+                                    "recorder refused open (panic mode); dropping motion frame"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(camera_id = cfg.id, "recorder.open failed: {e}");
+                                break;
+                            }
+                        }
                     }
-                    if let Err(e) = recorder
-                        .close(
-                            handle,
-                            ClipFinal {
-                                ended_at: frame.captured_at,
-                            },
-                        )
-                        .await
-                    {
-                        warn!(
-                            camera_id = cfg.id,
-                            "recorder.close (rotation) failed: {e}"
-                        );
-                    }
-                    current_clip = None;
-                    clip_opened_at = None;
-                    frames_since_size_stat = 0;
-                    // Reset post-roll so the rotation isn't observed
-                    // as a motion-end window.
-                    post_roll.reset();
-                    // If motion was still live (Born was already
-                    // emitted prior to this frame), the upcoming
-                    // motion lifecycle will see Live decisions but
-                    // NOT another Born — so the existing
-                    // open-on-Born trigger won't re-open. Flag it
-                    // so the decisions loop opens on the first
-                    // decision regardless of kind.
-                    force_reopen_after_rotation = emitter.live_track_count(cfg.id) > 0;
-                }
-            }
-
-            // M_PERF_CROWD Phase E1 — decide BEFORE running the
-            // detector whether this frame is one that the skip policy
-            // wants to drop. On a skip frame the detector is bypassed
-            // entirely; the tracker still runs below with an empty
-            // detection slice so ByteTrack's predict() advances and
-            // existing tracks age normally.
-            let skip_detector = skip_policy.should_skip();
-            // M_PERF_CROWD Phase E3 — pick the detector for THIS
-            // frame based on the hysteresis state observed on the
-            // PREVIOUS frame. `detector_low_res` is only ever `Some`
-            // when the camera opted in AND the router pre-built the
-            // low-res layer; if either side is missing the supervisor
-            // stays on the high-res detector regardless of crowd.
-            let active_detector: &Arc<dyn Detector> = match (detector_downscaled, &detector_low_res)
-            {
-                (true, Some(low)) => low,
-                _ => &detector,
-            };
-            let detections = if skip_detector {
-                debug!(
-                    camera_id = cfg.id,
-                    frame_id, "detector skipped (crowd skip policy)"
-                );
-                Vec::new()
-            } else {
-                let span = info_span!("frame.infer", model = %active_detector.name());
-                match active_detector
-                    .detect(&frame, &prompts)
-                    .instrument(span)
-                    .await
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        error!(camera_id = cfg.id, "detect failed: {e}");
+                    let Some(handle) = current_clip else {
+                        // Open was refused earlier in this frame and
+                        // we have no clip to stamp. Skip silently —
+                        // the next Born will retry recorder.open.
                         continue;
-                    }
-                }
-            };
-            // Per-camera `prompts` whitelist applied uniformly across
-            // every detector kind. Open-vocab models (yolo_world,
-            // yoloe) also receive `prompts` as input to scope their
-            // classes; this retain is idempotent for them. Closed-vocab
-            // YOLO/COCO ignores the input `prompts` and emits every
-            // mapped class, so this is the only enforcement point
-            // that catches it. Empty prompts disables the filter
-            // (see `label_matches_any_prompt`).
-            let detections: Vec<_> = if prompts.is_empty() || skip_detector {
-                detections
-            } else {
-                let before = detections.len();
-                let kept: Vec<_> = detections
-                    .into_iter()
-                    .filter(|d| label_matches_any_prompt(&d.label, &prompts))
-                    .collect();
-                if before != kept.len() {
-                    debug!(
-                        camera_id = cfg.id,
-                        frame_id,
-                        before,
-                        after = kept.len(),
-                        "prompts whitelist dropped detections"
-                    );
-                }
-                kept
-            };
-            if !skip_detector {
-                detected += 1;
-            }
-
-            // M_TILE_REINFER (G1) — Phase B2 cascade: when this
-            // camera opted in via behavior.tile_enabled = Some(true)
-            // AND the stage-1 detection count crossed
-            // behavior.tile_trigger AND we're not on a skipped
-            // frame (E1 invariant: G1 disabled when E1 skip fires
-            // same tick), re-run the SAME active_detector on a small
-            // set of cropped sub-regions chosen by stage-1 density.
-            // Stage-2 detections are mapped back to parent-frame
-            // coordinates and concatenated with stage-1 before the
-            // single tracker.update() call below.
-            //
-            // On crop or inference error we fall through to
-            // stage-1-only (fail-soft) — the cascade is a compute-
-            // optimality knob, not a correctness one. The merged
-            // detection set is NOT re-deduped here; the tracker's
-            // association layer handles overlapping boxes from
-            // adjacent tiles as it would for any duplicate
-            // detection. See docs/edge-core/M_TILE_REINFER.md.
-            let detections = if !skip_detector
-                && cfg.behavior.tile_enabled == Some(true)
-                && cfg.behavior.tile_trigger.is_some_and(|t| {
-                    let trigger = t as usize;
-                    trigger > 0 && detections.len() >= trigger
-                }) {
-                let grid: crate::tile::TileGridConfig = cfg
-                    .behavior
-                    .tile_grid
-                    .map(Into::into)
-                    .unwrap_or(crate::tile::TileGridConfig::G2x2);
-                let max_tiles = cfg.behavior.tile_max_per_frame.unwrap_or(3);
-                let tiles =
-                    crate::tile::pick_tiles(&detections, frame.width, frame.height, grid, max_tiles);
-                if tiles.is_empty() {
-                    detections
-                } else {
-                    let span =
-                        info_span!("frame.tile_infer", model = %active_detector.name(), tiles = tiles.len());
-                    let tile_started = std::time::Instant::now();
-                    match crate::tile_executor::run_tile_inference(
-                        active_detector.as_ref(),
-                        &frame,
-                        &tiles,
-                        &prompts,
-                    )
-                    .instrument(span)
-                    .await
-                    {
-                        Ok(stage2) => {
-                            let tile_elapsed_ms =
-                                tile_started.elapsed().as_millis().min(u128::from(u64::MAX))
-                                    as u64;
-                            // Apply the same per-camera prompts
-                            // whitelist to stage-2 outputs that the
-                            // stage-1 block applied above. Idempotent
-                            // for open-vocab detectors that already
-                            // honour `prompts`; required for
-                            // closed-vocab YOLO/COCO which emits all
-                            // mapped classes regardless.
-                            let stage2: Vec<_> = if prompts.is_empty() {
-                                stage2
-                            } else {
-                                stage2
-                                    .into_iter()
-                                    .filter(|d| label_matches_any_prompt(&d.label, &prompts))
-                                    .collect()
-                            };
-                            // M_TILE_REINFER (G1) — Phase B3 telemetry:
-                            // record one tile invocation with the
-                            // post-whitelist stage-2 count and elapsed
-                            // wall-clock ms. `added` is what actually
-                            // reaches the tracker so the UI can show
-                            // "stage-2 detections / cascade".
-                            stats.observe_tile_invocation(
-                                cfg.id,
-                                stage2.len() as u64,
-                                tile_elapsed_ms,
-                            );
-                            debug!(
-                                camera_id = cfg.id,
-                                frame_id,
-                                stage1 = detections.len(),
-                                tiles = tiles.len(),
-                                stage2 = stage2.len(),
-                                tile_ms = tile_elapsed_ms,
-                                "tile cascade merged stage-2 detections"
-                            );
-                            let mut merged = detections;
-                            merged.extend(stage2);
-                            // M_TILE_REINFER (G1) — Phase B2.1: enforce
-                            // the operator's `top_k` GLOBALLY across the
-                            // merged stage-1 + stage-2 vector. The stage-1
-                            // wrapper and the per-tile wrapper each
-                            // already capped to ≤k, so worst-case input
-                            // here is `k × (1 + max_tiles)` — without
-                            // this call the tracker would see up to that
-                            // many boxes per cascade frame, silently
-                            // exceeding the configured cap. Idempotent
-                            // when `merged.len() ≤ k` (skips the sort).
-                            if let Some(k) = effective_top_k {
-                                nexus_inference::caps::apply_top_k(&mut merged, k);
-                            }
-                            merged
-                        }
-                        Err(e) => {
-                            // Fail-soft to stage-1 only. The
-                            // alternative — dropping the frame — would
-                            // make the cascade a correctness risk
-                            // rather than a recall booster.
-                            warn!(
-                                camera_id = cfg.id,
-                                frame_id,
-                                tiles = tiles.len(),
-                                "tile cascade failed, falling back to stage-1: {e}"
-                            );
-                            detections
-                        }
-                    }
-                }
-            } else {
-                detections
-            };
-
-            let mut tracked = {
-                let _g = info_span!("frame.track", tracker = tracker.name()).entered();
-                tracker.update(detections)
-            };
-            // M_PERF_CROWD Phase E1 — feed the post-tracker
-            // tracked-object count back into the skip policy's EMA so
-            // the next frame's skip decision reflects current crowd
-            // density. No-op when the policy is disabled.
-            skip_policy.observe(tracked.len());
-            // M_PERF_CROWD Phase E3 — same tracked-object count drives
-            // the input-downscale hysteresis. The returned bool is the
-            // desired downscale state for the NEXT frame; on the
-            // current frame we already committed to a detector above.
-            // No-op when the policy is disabled.
-            detector_downscaled =
-                crowd_hysteresis.observe(tracked.len(), std::time::Instant::now());
-            // M_PERF_CROWD Phase E2 — sustained-crowd supervisor
-            // frame downscale. Independent hysteresis (asymmetric
-            // up/down windows) over the same tracked-object EMA. On
-            // a state flip and only when the camera opted in via
-            // `behavior.supervisor_downscale_to_width`, ask the
-            // recorder to rebuild its pre-roll ingester at the new
-            // RGB dims; on success, close any open clip (so its
-            // recorded `frame_width` matches the pixels going
-            // forward), update `current_supervisor_*`, and break to
-            // the outer loop which will spawn a fresh
-            // `FrameSource` against the new shared RGB tap. No-op
-            // when the policy is disabled or when the recorder has
-            // no RGB-tap ingester for this camera (e.g. stub
-            // recorder in tests).
-            let want_supervisor_downscale =
-                supervisor_hysteresis.observe(tracked.len(), std::time::Instant::now());
-            if want_supervisor_downscale != supervisor_downscaled {
-                if let Some(downscale_w) = cfg.behavior.supervisor_downscale_to_width {
-                    let (target_w, target_h) = if want_supervisor_downscale {
-                        crate::source::supervisor_frame_for(downscale_w)
-                    } else {
-                        (original_supervisor_w, original_supervisor_h)
                     };
-                    match recorder.resize_camera_rgb_tap(cfg.id, target_w, target_h) {
-                        Ok(true) => {
-                            info!(
-                                camera_id = cfg.id,
-                                target_w,
-                                target_h,
-                                downscaled = want_supervisor_downscale,
-                                "supervisor frame size flipped (crowd hysteresis); rebuilding source"
-                            );
-                            supervisor_downscaled = want_supervisor_downscale;
-                            current_supervisor_w = target_w;
-                            current_supervisor_h = target_h;
-                            if let Some(handle) = current_clip.take() {
-                                if let Err(e) = recorder
-                                    .close(
-                                        handle,
-                                        ClipFinal {
-                                            ended_at: frame.captured_at,
-                                        },
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        camera_id = cfg.id,
-                                        "recorder.close (RGB tap resize) failed: {e}"
-                                    );
-                                }
-                                clip_opened_at = None;
-                                post_roll.reset();
+                    if let Err(e) = insert_motion_decision(&store, handle, d).await {
+                        warn!(camera_id = cfg.id, "insert_motion_event failed: {e}");
+                    }
+                }
+
+                // Stamp events.clip_id for any alerts that fired this
+                // frame, now that the motion lifecycle has had a chance
+                // to open a clip. When `record_motion_clip_on_alert` is
+                // set, an alert on a frame with no open clip force-opens a
+                // native-resolution motion clip so every event has
+                // surrounding full-res video — matching the motion clip
+                // (native resolution, pre-roll, post-roll), NOT the
+                // reduced-resolution burned-in alert clip. When the flag is
+                // off, alerts on frames with no open clip stay unlinked
+                // (clip_id NULL) and the timeline UI shows "no surrounding
+                // video".
+                if !events_to_link.is_empty() {
+                    if current_clip.is_none() && record_motion_clip_on_alert {
+                        match recorder
+                            .open(OpenClip {
+                                camera_id: cfg.id,
+                                started_at: frame.captured_at,
+                                frame_width: current_supervisor_w,
+                                frame_height: current_supervisor_h,
+                            })
+                            .await
+                        {
+                            Ok(handle) => {
+                                debug!(
+                                    camera_id = cfg.id,
+                                    clip_id = handle.clip_id,
+                                    "alert-triggered motion clip opened (no live motion track)"
+                                );
+                                current_clip = Some(handle);
+                                clip_opened_at = Some(frame.captured_at);
                             }
-                            rebuild_source = true;
-                            break;
-                        }
-                        Ok(false) => {
-                            // Recorder reports no rebuild needed
-                            // (stub recorder, ingester absent, or
-                            // dims already match). Record the new
-                            // desired state so we don't re-poll the
-                            // recorder every frame, but don't
-                            // restart the source.
-                            supervisor_downscaled = want_supervisor_downscale;
-                        }
-                        Err(e) => {
-                            warn!(
-                                camera_id = cfg.id,
-                                "resize_camera_rgb_tap failed: {e}; staying on current dims"
-                            );
-                            supervisor_downscaled = want_supervisor_downscale;
+                            Err(RecorderError::Refused) => {
+                                // Watermark sampler has paused new clips
+                                // (panic mode). The event stays unlinked;
+                                // nothing else to do this frame.
+                                debug!(
+                                    camera_id = cfg.id,
+                                    "recorder refused alert-triggered open (panic mode)"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    camera_id = cfg.id,
+                                    "alert-triggered recorder.open failed: {e}"
+                                );
+                            }
                         }
                     }
-                } else {
-                    // Threshold + sustained-secs are set but the
-                    // operator forgot the target width. Record the
-                    // state so we don't log every frame; the
-                    // operator's `nexus-doctor` config check should
-                    // surface this misconfiguration.
-                    supervisor_downscaled = want_supervisor_downscale;
-                }
-            }
-            // M-Admin Phase 2 Step 1 — exclusion-zone enforcement.
-            // Drop any tracked object whose bbox centre lies inside
-            // a `ZoneKind::Exclusion` polygon for this camera, BEFORE
-            // the annotator runs so excluded objects never enter
-            // per-track state, the L7 cache, the FRAME_METADATA bus
-            // event, or the rule evaluator. No-op when the camera
-            // has no exclusion zones (the common case).
-            {
-                let _g = info_span!("frame.zone_filter").entered();
-                let dropped = filter_excluded_zones(&frame, &zones, &mut tracked);
-                if dropped > 0 {
-                    debug!(
-                        camera_id = cfg.id,
-                        frame_id, dropped, "exclusion zone filter dropped objects"
-                    );
-                }
-                // M_PERF_CROWD Phase B1 — per-zone min-bbox-area
-                // override. Fast path no-op when no zone declares
-                // `min_bbox_area_px_override`; otherwise drops tracked
-                // objects whose centre lies in an override zone and
-                // whose bbox area is below that zone's threshold.
-                // Layered on top of the global
-                // `ModelConfig::min_bbox_area_px` (which fires at the
-                // inference wrapper before tracking).
-                let dropped = filter_zone_min_area(&frame, &zones, &mut tracked);
-                if dropped > 0 {
-                    debug!(
-                        camera_id = cfg.id,
-                        frame_id, dropped, "per-zone min-area override dropped objects"
-                    );
-                }
-            }
-            {
-                let _g = info_span!("frame.annotate", annotator = annotator.name()).entered();
-                // Phase 8.1: hand the annotator the prior-frame static
-                // anchor set (empty when parking_lot_mode is off) so it
-                // can stamp `motion.near_static_vehicle_*`.
-                let anchors = static_filter
-                    .as_ref()
-                    .map(|f| f.anchors())
-                    .unwrap_or(&[]);
-                annotator.annotate(&frame, &zones, anchors, &mut tracked);
-            }
-            if let Some(sf) = static_filter.as_mut() {
-                let _g = info_span!("frame.static_filter", filter = sf.name()).entered();
-                // Mark suppressed tracks (writes
-                // `tracker.is_static = true` into the object's
-                // attributes map) but do NOT remove them. The live
-                // viewer needs to see them to render the
-                // "static" indicator; the partition below keeps
-                // them out of rule eval + the motion lifecycle.
-                sf.classify(&frame, &mut tracked);
-            }
-            let tracked_arc = Arc::new(tracked.clone());
-
-            // L7 cache update — see ARCHITECTURE.md.
-            let frame_arc = Arc::new(frame.clone());
-            cache.put(cfg.id, frame_arc.clone(), tracked_arc.clone());
-
-            // Lightweight metadata onto the bus. `objects` is
-            // `Arc<Vec<TrackedObject>>` (M_PERF_CROWD D1) so we
-            // reuse the same allocation as `LatestFrameCache`
-            // instead of cloning the vec a second time per frame.
-            let meta = FrameMetadata {
-                camera_id: cfg.id,
-                frame_id,
-                captured_at: frame.captured_at,
-                width: frame.width,
-                height: frame.height,
-                trace_id: trace_id.clone(),
-                objects: Arc::clone(&tracked_arc),
-            };
-            let _ = bus.publish(topic::FRAME_METADATA, &meta).await;
-            // M_PERF_CROWD F1 — same per-frame cadence on the
-            // bandwidth-relief lite topic. Drops the per-object
-            // `attributes` map (~400–600 B/object) so the SSE
-            // overlay subscriber's broadcast buffer no longer
-            // dominates `BusError::Lagged` under crowd load. The
-            // attributes panel still subscribes to the full topic
-            // via `?attributes=full`.
-            let meta_lite = FrameMetadataLite {
-                camera_id: meta.camera_id,
-                frame_id: meta.frame_id,
-                captured_at: meta.captured_at,
-                width: meta.width,
-                height: meta.height,
-                trace_id: meta.trace_id.clone(),
-                objects: Arc::new(tracked.iter().map(TrackLite::from).collect()),
-            };
-            let _ = bus
-                .publish(topic::FRAME_METADATA_LITE, &meta_lite)
-                .await;
-
-            // Partition: rules and the motion lifecycle only see
-            // non-static tracks. A parked car shouldn't keep firing
-            // rules or generating motion_events rows, but it MUST
-            // still appear in the L7 cache + FRAME_METADATA above
-            // so the live viewer can draw it (de-emphasised) and
-            // so the operator can see the static-suppression in
-            // action. When `static_filter` is `None`, no object can
-            // be marked static so we just clone the full slice.
-            let dynamic_tracked: Vec<TrackedObject> = if static_filter.is_some() {
-                tracked
-                    .iter()
-                    .filter(|t| !is_object_static(t))
-                    .cloned()
-                    .collect()
-            } else {
-                tracked.clone()
-            };
-
-            // M-Alert-Clip: feed this frame's frame-aligned detection
-            // boxes into the recorder's per-camera box timeline so an
-            // alert clip armed later can burn them into the pre-roll +
-            // post window. No-op unless enabled; cheap.
-            //
-            // Only tracks with a REAL detection on THIS frame
-            // (`detection_bbox`) are burned. A predicted-only (coasting)
-            // track has no detection this frame and would otherwise be
-            // drawn at its stale EMA-smoothed position; as the tracker
-            // coasts / re-spawns fragment tracks for one object those
-            // stale boxes pile up into the "trailing" ghost boxes seen on
-            // the clip. Dropping coasting tracks and NMS-deduping the
-            // overlapping survivors yields one box per physical object.
-            if alert_clips_enabled {
-                let mut boxes: Vec<crate::alert_clip::BurnBox> = dynamic_tracked
-                    .iter()
-                    .filter_map(|t| {
-                        let b = t.detection_bbox?;
-                        Some(crate::alert_clip::BurnBox {
-                            x1: b.x1,
-                            y1: b.y1,
-                            x2: b.x2,
-                            y2: b.y2,
-                            label: t.label.clone(),
-                            confidence: t.confidence,
-                        })
-                    })
-                    .collect();
-                crate::alert_clip::dedupe_burn_boxes(&mut boxes);
-                recorder.push_alert_boxes(
-                    cfg.id,
-                    frame.captured_at,
-                    boxes,
-                    current_supervisor_w,
-                    current_supervisor_h,
-                );
-            }
-
-            // Phase 5.6 · slice 4c-ii — fire stable-track sightings
-            // into the engine hook. Skips parked-car tracks the
-            // static-object filter has masked off (same partition
-            // as rule eval + motion lifecycle).
-            sighting_scheduler.tick(
-                &frame_arc,
-                &dynamic_tracked,
-                frame.captured_at,
-                sighting_hook.as_ref(),
-            );
-
-            let events = {
-                let _g = info_span!("frame.rules").entered();
-                evaluator.evaluate(
-                    cfg.id,
-                    frame_id,
-                    &trace_id,
-                    frame.width,
-                    frame.height,
-                    &zones,
-                    &dynamic_tracked,
-                )
-            };
-            // Record + publish the events now so the row exists.
-            // We defer the events.clip_id stamp until AFTER the
-            // motion lifecycle has run for this frame, because a
-            // new alert + first Born in the same frame must link
-            // to the clip that gets opened on this frame, not the
-            // previous one.
-            let mut events_to_link: Vec<String> = Vec::new();
-            // M-Event-Audit: set once at least one match this frame is
-            // within the delivery schedule (would be delivered). Gates
-            // the alert-clip arm below; an off-schedule frame logs its
-            // events + links the motion clip only.
-            let mut any_deliverable = false;
-            for mut ev in events {
-                let event_id = ev.event_id.to_string();
-                // M-Event-Audit: does this rule-fire fall within the
-                // active delivery schedule (global + per-rule cascade)?
-                // Drives both the alert-clip arm and the `events.alerted`
-                // audit flag stamped by `record_event_and_enqueue`.
-                let alerted = alert_clip_gate.should_build(&ev.rule_id, frame.captured_at);
-                // Alert snapshot — persist a JPEG of the frame that fired
-                // this rule at a deterministic
-                // `<state_dir>/snapshots/<event_id>.jpg` path BEFORE the
-                // outbox row is written, so the cloud-console sink (if
-                // enrolled) always finds the file when it processes the
-                // row. Best-effort: a missing thumbnail never blocks the
-                // alert. Also stamped onto `artifacts.snapshot` for bus
-                // subscribers / the local admin API.
-                let snap_conf = ev
-                    .context
-                    .get("confidence")
-                    .and_then(serde_json::Value::as_f64)
-                    .map(|f| f as f32);
-                if let Some(path) = write_alert_snapshot(
-                    &snapshots_dir,
-                    &event_id,
-                    &frame_arc,
-                    ev.bbox,
-                    &ev.label,
-                    snap_conf,
-                )
-                .await
-                {
-                    ev.artifacts.snapshot = Some(path);
-                }
-                // M7 per-rule sink routing — resolve which configured
-                // sinks this rule delivers to, then record the event
-                // and enqueue an `alert_sink_outbox` row per sink in a
-                // single transaction. An empty resolution records the
-                // event with no outbox rows (identical to the pre-M7
-                // `record_event`), so a `NoopSinkRouter` or a config
-                // with no sinks keeps today's behaviour.
-                let sinks = sink_router.sinks_for(&ev.rule_id);
-                let sink_refs: Vec<&str> = sinks.iter().map(String::as_str).collect();
-                if let Err(e) = store
-                    .record_event_and_enqueue_classified(&ev, &sink_refs, alerted)
-                    .await
-                {
-                    warn!(event = %ev.event_id, "store.record_event_and_enqueue failed: {e}");
-                } else {
-                    events_to_link.push(event_id);
-                    any_deliverable |= alerted;
-                }
-                let _ = bus.publish(topic::ALERT_EVENT, &ev).await;
-            }
-
-            // M-Alert-Clip: arm (or coalesce into) a short alert clip for
-            // this burst and link every event fired this frame to it, so
-            // clip-attaching sinks resolve the truncated clip within
-            // ~post_secs instead of waiting on the up-to-5-min motion
-            // clip. `arm_alert_clip` returns None (no-op) unless the
-            // feature is enabled and the camera has a pre-roll ingester.
-            //
-            // M-Event-Audit: only arm when at least one recorded match
-            // this frame is within the delivery schedule
-            // (`any_deliverable`). Off-schedule matches keep their
-            // `events.clip_id` motion-clip link and skip the expensive
-            // decode -> burn-in -> re-encode entirely.
-            if alert_clips_enabled && any_deliverable {
-                if let Some(alert_clip_id) =
-                    recorder.arm_alert_clip(cfg.id, frame.captured_at).await
-                {
-                    for eid in &events_to_link {
-                        if let Err(e) = store.link_event_alert_clip(eid, alert_clip_id).await {
-                            debug!(
-                                camera_id = cfg.id,
-                                event = %eid,
-                                "link_event_alert_clip failed: {e}"
-                            );
+                    if let Some(handle) = current_clip {
+                        for event_id in &events_to_link {
+                            if let Err(e) = store.link_event_to_clip(event_id, handle.clip_id).await {
+                                warn!(
+                                    event = %event_id,
+                                    clip_id = handle.clip_id,
+                                    "link_event_to_clip failed: {e}"
+                                );
+                            }
                         }
                     }
                 }
-            }
 
-            // Motion lifecycle. The emitter is pure — it just tells
-            // us what changed. We turn its decisions into open/close
-            // recorder calls + motion_events rows here.
-            //
-            // The synchronous emitter.tick() runs inside the span
-            // via in_scope(); we don't hold an EnteredSpan guard
-            // across recorder/store awaits because EnteredSpan is
-            // !Send and would break tokio::spawn.
-            let decisions = info_span!("frame.motion")
-                .in_scope(|| emitter.tick(cfg.id, &dynamic_tracked, frame.captured_at));
-            for d in &decisions {
-                let should_open = current_clip.is_none()
-                    && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);
-                if should_open {
-                    match recorder
-                        .open(OpenClip {
-                            camera_id: cfg.id,
-                            started_at: d.captured_at,
-                            frame_width: current_supervisor_w,
-                            frame_height: current_supervisor_h,
-                        })
-                        .await
-                    {
-                        Ok(handle) => {
-                            current_clip = Some(handle);
-                            clip_opened_at = Some(d.captured_at);
-                            // One-shot — only the first decision in
-                            // this frame triggers the post-rotation
-                            // reopen.
-                            force_reopen_after_rotation = false;
+                // Close the clip when the post-roll grace window
+                // elapses without motion returning. Pre-B3 this fired
+                // immediately on `live_track_count == 0`; B3 wraps that
+                // condition in a deferred-close timer so two short
+                // motion bursts inside `clips_cfg.post_roll_secs`
+                // produce a single clip rather than two adjacent
+                // micro-clips. Pre-roll is intentionally a separate PR.
+                //
+                // An alert firing this frame counts as activity for the
+                // deferred close (same as live motion) so an
+                // alert-triggered clip — which may have opened with no
+                // live tracker track at all — stays open and captures the
+                // full post-roll window instead of closing on the very
+                // next frame.
+                let alert_kept_alive = record_motion_clip_on_alert && !events_to_link.is_empty();
+                let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
+                let action = post_roll.tick(frame.captured_at, has_live_motion);
+                if matches!(action, PostRollAction::CloseNow) {
+                    if let Some(handle) = current_clip.take() {
+                        if let Err(e) = recorder
+                            .close(
+                                handle,
+                                ClipFinal {
+                                    ended_at: frame.captured_at,
+                                },
+                            )
+                            .await
+                        {
+                            warn!(camera_id = cfg.id, "recorder.close failed: {e}");
                         }
-                        Err(RecorderError::Refused) => {
-                            // Watermark sampler has paused new
-                            // clips. Drop ALL motion events for
-                            // this frame: the schema requires
-                            // clip_id NOT NULL and we have no
-                            // open clip to attach to.
-                            debug!(
-                                camera_id = cfg.id,
-                                "recorder refused open (panic mode); dropping motion frame"
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(camera_id = cfg.id, "recorder.open failed: {e}");
-                            break;
-                        }
+                        clip_opened_at = None;
                     }
                 }
-                let Some(handle) = current_clip else {
-                    // Open was refused earlier in this frame and
-                    // we have no clip to stamp. Skip silently —
-                    // the next Born will retry recorder.open.
-                    continue;
-                };
-                if let Err(e) = insert_motion_decision(&store, handle, d).await {
-                    warn!(camera_id = cfg.id, "insert_motion_event failed: {e}");
-                }
-            }
 
-            // Stamp events.clip_id for any alerts that fired this
-            // frame, now that the motion lifecycle has had a chance
-            // to open a clip. When `record_motion_clip_on_alert` is
-            // set, an alert on a frame with no open clip force-opens a
-            // native-resolution motion clip so every event has
-            // surrounding full-res video — matching the motion clip
-            // (native resolution, pre-roll, post-roll), NOT the
-            // reduced-resolution burned-in alert clip. When the flag is
-            // off, alerts on frames with no open clip stay unlinked
-            // (clip_id NULL) and the timeline UI shows "no surrounding
-            // video".
-            if !events_to_link.is_empty() {
-                if current_clip.is_none() && record_motion_clip_on_alert {
-                    match recorder
-                        .open(OpenClip {
-                            camera_id: cfg.id,
-                            started_at: frame.captured_at,
-                            frame_width: current_supervisor_w,
-                            frame_height: current_supervisor_h,
-                        })
-                        .await
-                    {
-                        Ok(handle) => {
-                            debug!(
-                                camera_id = cfg.id,
-                                clip_id = handle.clip_id,
-                                "alert-triggered motion clip opened (no live motion track)"
-                            );
-                            current_clip = Some(handle);
-                            clip_opened_at = Some(frame.captured_at);
-                        }
-                        Err(RecorderError::Refused) => {
-                            // Watermark sampler has paused new clips
-                            // (panic mode). The event stays unlinked;
-                            // nothing else to do this frame.
-                            debug!(
-                                camera_id = cfg.id,
-                                "recorder refused alert-triggered open (panic mode)"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                camera_id = cfg.id,
-                                "alert-triggered recorder.open failed: {e}"
-                            );
-                        }
-                    }
-                }
-                if let Some(handle) = current_clip {
-                    for event_id in &events_to_link {
-                        if let Err(e) = store.link_event_to_clip(event_id, handle.clip_id).await {
-                            warn!(
-                                event = %event_id,
-                                clip_id = handle.clip_id,
-                                "link_event_to_clip failed: {e}"
-                            );
-                        }
-                    }
-                }
+                ControlFlow::Continue(())
             }
-
-            // Close the clip when the post-roll grace window
-            // elapses without motion returning. Pre-B3 this fired
-            // immediately on `live_track_count == 0`; B3 wraps that
-            // condition in a deferred-close timer so two short
-            // motion bursts inside `clips_cfg.post_roll_secs`
-            // produce a single clip rather than two adjacent
-            // micro-clips. Pre-roll is intentionally a separate PR.
-            //
-            // An alert firing this frame counts as activity for the
-            // deferred close (same as live motion) so an
-            // alert-triggered clip — which may have opened with no
-            // live tracker track at all — stays open and captures the
-            // full post-roll window instead of closing on the very
-            // next frame.
-            let alert_kept_alive = record_motion_clip_on_alert && !events_to_link.is_empty();
-            let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
-            let action = post_roll.tick(frame.captured_at, has_live_motion);
-            if matches!(action, PostRollAction::CloseNow) {
-                if let Some(handle) = current_clip.take() {
-                    if let Err(e) = recorder
-                        .close(
-                            handle,
-                            ClipFinal {
-                                ended_at: frame.captured_at,
-                            },
-                        )
-                        .await
-                    {
-                        warn!(camera_id = cfg.id, "recorder.close failed: {e}");
-                    }
-                    clip_opened_at = None;
-                }
+            .instrument(frame_span)
+            .await;
+            if flow.is_break() {
+                break;
             }
         }
 

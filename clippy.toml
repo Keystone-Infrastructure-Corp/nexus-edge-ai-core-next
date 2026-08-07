@@ -1,0 +1,19 @@
+# Clippy configuration for the Nexus edge engine.
+#
+# BUG-024 guard. `tracing::span::Entered` — the guard returned by
+# `Span::enter()` — is `Send`, unlike `EnteredSpan` (returned by
+# `Span::entered()`), which carries a `PhantomNotSend` specifically to stop
+# this mistake. So holding an `Entered` across an `.await` compiles cleanly
+# inside a `tokio::spawn`ed task even though enter/exit are thread-local: when
+# the work-stealing scheduler migrates the task, the exit pops the wrong
+# worker's `SpanStack`, the span is never closed, and the orphaned stack entry
+# becomes the contextual parent of every span opened on that worker afterwards
+# — chaining leaked spans so none can ever be released. On a 29-camera site
+# that leaked ~500 MB/h until the unit saturated its cgroup `MemoryHigh`.
+#
+# Use `.instrument(span)` on the future instead; `Instrumented` enters and
+# exits inside each `poll`, so enter/exit always pair on the polling thread.
+await-holding-invalid-types = [
+    "tracing::span::Entered",
+    "tracing::span::EnteredSpan",
+]
