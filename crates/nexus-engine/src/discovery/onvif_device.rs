@@ -58,6 +58,11 @@ pub struct Capabilities {
     pub events_xaddr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analytics_xaddr: Option<String>,
+    /// `Device/Network/.../NTP` — how many NTP servers the camera
+    /// accepts. `Some(0)` means it advertises no NTP support; `None`
+    /// means it didn't report the capability at all (most cameras).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ntp_servers_max: Option<u32>,
 }
 
 /// System clock state (`GetSystemDateAndTime`).
@@ -439,6 +444,10 @@ fn parse_capabilities(body: &str) -> Capabilities {
     // Which capability category we're inside.
     let mut category: Option<&'static str> = None;
     let mut capture_xaddr = false;
+    // `NTP` lives at Device/Network/Extension/Extension/NTP, so track the
+    // Device>Network subtree rather than an exact path.
+    let mut in_device_network = false;
+    let mut capture_ntp = false;
     let mut acc = String::new();
 
     loop {
@@ -450,13 +459,19 @@ fn parse_capabilities(body: &str) -> Capabilities {
                 "DeviceIO" => category = Some("device_io"),
                 "Events" => category = Some("events"),
                 "Analytics" => category = Some("analytics"),
+                "Device" => category = Some("device"),
+                "Network" if category == Some("device") => in_device_network = true,
+                "NTP" if in_device_network => {
+                    capture_ntp = true;
+                    acc.clear();
+                }
                 "XAddr" if category.is_some() => {
                     capture_xaddr = true;
                     acc.clear();
                 }
                 _ => {}
             },
-            Ok(Event::Text(t)) if capture_xaddr => {
+            Ok(Event::Text(t)) if capture_xaddr || capture_ntp => {
                 if let Ok(s) = t.unescape() {
                     acc.push_str(&s);
                 }
@@ -489,7 +504,12 @@ fn parse_capabilities(body: &str) -> Capabilities {
                     }
                     capture_xaddr = false;
                 }
-                "PTZ" | "Imaging" | "Media" | "DeviceIO" | "Events" | "Analytics" => {
+                "NTP" if capture_ntp => {
+                    caps.ntp_servers_max = acc.trim().parse::<u32>().ok();
+                    capture_ntp = false;
+                }
+                "Network" if in_device_network => in_device_network = false,
+                "PTZ" | "Imaging" | "Media" | "DeviceIO" | "Events" | "Analytics" | "Device" => {
                     category = None;
                 }
                 _ => {}
@@ -744,6 +764,32 @@ mod tests {
             Some("http://192.168.1.64/onvif/events")
         );
         assert_eq!(caps.analytics_xaddr, None);
+        assert_eq!(caps.ntp_servers_max, None);
+    }
+
+    #[test]
+    fn parses_ntp_capability_nested_under_device_network_extensions() {
+        let body = wrap(
+            r#"<tds:GetCapabilitiesResponse><tds:Capabilities>
+                <tt:Device>
+                    <tt:XAddr>http://192.168.1.64/onvif/device_service</tt:XAddr>
+                    <tt:Network>
+                        <tt:IPFilter>false</tt:IPFilter>
+                        <tt:Extension><tt:Extension>
+                            <tt:NTP>2</tt:NTP>
+                        </tt:Extension></tt:Extension>
+                    </tt:Network>
+                </tt:Device>
+                <tt:Media><tt:XAddr>http://192.168.1.64/onvif/media</tt:XAddr></tt:Media>
+            </tds:Capabilities></tds:GetCapabilitiesResponse>"#,
+        );
+        let caps = parse_capabilities(&body);
+        assert_eq!(caps.ntp_servers_max, Some(2));
+        // The Device XAddr must not leak into a service-specific slot.
+        assert_eq!(
+            caps.media_xaddr.as_deref(),
+            Some("http://192.168.1.64/onvif/media")
+        );
     }
 
     #[test]
