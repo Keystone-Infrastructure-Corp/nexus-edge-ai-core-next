@@ -112,12 +112,21 @@ fn build_before_json(method: &str, envelope: EnvelopeContext<'_>, actor: &Verifi
     // Hand-rolled to avoid a serde_json::to_string round-trip for a
     // shape with zero possibility of nested escaping (every value is
     // a constrained ASCII identifier).
+    //
+    // Phase 11.E2: `actor_org_id` is emitted only when the human was acting
+    // for a different org than the one that owns this core. Emitting it
+    // always, as null, would put a field on every ordinary row to describe a
+    // case that almost never applies.
+    let acting = actor.actor_org_id.as_ref().map_or_else(String::new, |org| {
+        format!(r#","actor_org_id":"{}""#, json_escape(org))
+    });
     format!(
-        r#"{{"method":"{}","http_method":"{}","path":"{}","org_id":"{}"}}"#,
+        r#"{{"method":"{}","http_method":"{}","path":"{}","org_id":"{}"{}}}"#,
         json_escape(method),
         json_escape(envelope.method),
         json_escape(envelope.path),
         json_escape(&actor.org_id),
+        acting,
     )
 }
 
@@ -177,6 +186,16 @@ mod tests {
             role: "operator".into(),
             jti: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c101".into(),
             org_id: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c102".into(),
+            actor_org_id: None,
+        }
+    }
+
+    /// A monitoring-station operator reaching into a customer's estate: the
+    /// token's `org_id` is the CUSTOMER, `actor_org_id` the station.
+    fn station_actor() -> VerifiedActor {
+        VerifiedActor {
+            actor_org_id: Some("0190f7be-7c6a-7d4f-8f01-d9b1f0c0c999".into()),
+            ..human_actor()
         }
     }
 
@@ -186,7 +205,41 @@ mod tests {
             role: "system".into(),
             jti: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c200".into(),
             org_id: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c201".into(),
+            actor_org_id: None,
         }
+    }
+
+    /// Phase 11.E2 — the on-box record has to name the company, not just the
+    /// human. Without this the appliance's own audit can say a setting
+    /// changed and who typed it, but not who they were working for, which is
+    /// the question someone standing at the box actually asks.
+    #[test]
+    fn acting_org_is_recorded_only_when_the_human_was_acting_for_one() {
+        let envelope = EnvelopeContext {
+            method: "POST",
+            path: "/admin/cameras",
+        };
+
+        let ordinary = build_before_json("camera.create", envelope, &human_actor());
+        assert!(
+            !ordinary.contains("actor_org_id"),
+            "an ordinary mutation must not carry an empty acting-org field: {ordinary}"
+        );
+
+        let station = build_before_json("camera.create", envelope, &station_actor());
+        assert!(
+            station.contains(r#""actor_org_id":"0190f7be-7c6a-7d4f-8f01-d9b1f0c0c999""#),
+            "a cross-org mutation must name the acting org: {station}"
+        );
+        // The target org is unchanged: the row still says whose estate it is.
+        assert!(station.contains(r#""org_id":"0190f7be-7c6a-7d4f-8f01-d9b1f0c0c102""#));
+        // And it is still valid JSON, which the hand-rolled formatter makes
+        // worth asserting rather than assuming.
+        let parsed: serde_json::Value = serde_json::from_str(&station).expect("valid JSON");
+        assert_eq!(
+            parsed["actor_org_id"],
+            "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c999"
+        );
     }
 
     #[tokio::test]

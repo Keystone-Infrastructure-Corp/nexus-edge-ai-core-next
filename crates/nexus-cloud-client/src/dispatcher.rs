@@ -443,5 +443,8 @@ fn anonymous_read_actor() -> VerifiedActor {
         role: ANONYMOUS_READ_ROLE.to_string(),
         jti: String::new(),
         org_id: String::new(),
+        // An unauthenticated read has no human behind it, so there is no org
+        // it could have been acting for.
+        actor_org_id: None,
     }
 }

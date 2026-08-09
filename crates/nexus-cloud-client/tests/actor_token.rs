@@ -27,6 +27,8 @@ use serde_json::json;
 
 const CORE_ID: &str = "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c0c0";
 const ORG_ID: &str = "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c0c1";
+/// The monitoring org a station operator acts as (Phase 11.E2).
+const MONITORING_ORG_ID: &str = "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c0c2";
 
 fn fresh_key(kid: &str) -> (SigningKey, TrustedKey) {
     let sk = SigningKey::generate(&mut OsRng);
@@ -67,6 +69,8 @@ struct TokenSpec {
     iat: i64,
     exp: i64,
     kid: String,
+    /// Phase 11.E2 — set when the human was acting for a monitoring org.
+    actor_org_id: Option<String>,
 }
 
 impl TokenSpec {
@@ -83,6 +87,7 @@ impl TokenSpec {
             iat: now - 5,
             exp: now + 60,
             kid: kid.into(),
+            actor_org_id: None,
         }
     }
 }
@@ -102,6 +107,10 @@ fn mint(sk: &SigningKey, spec: &TokenSpec) -> String {
         "role": spec.role,
         "sub": spec.sub,
     });
+    let mut claims = claims;
+    if let Some(acting) = spec.actor_org_id.as_ref() {
+        claims["actor_org_id"] = json!(acting);
+    }
     let h = b64url(serde_json::to_vec(&header).unwrap());
     let c = b64url(serde_json::to_vec(&claims).unwrap());
     let signing_input = format!("{h}.{c}");
@@ -407,4 +416,58 @@ async fn system_sub_entitlement_update_accepted() {
         .await
         .expect("system entitlement update accepted");
     assert_eq!(body, b"ok");
+}
+
+// -----------------------------------------------------------------------------
+// Phase 11.E2 — the acting org survives verification.
+// -----------------------------------------------------------------------------
+
+/// A cross-org mutation carries TWO orgs: `org_id` is whose estate is being
+/// changed, `actor_org_id` is who is doing it. The engine authorises on
+/// neither — the cloud decided that against a live `monitoring_grants` row
+/// before minting — but it has to RECORD both, or the on-box audit can say a
+/// setting changed and who typed it while losing which company they worked
+/// for.
+///
+/// The absent case is asserted alongside, because "no acting org" and "acting
+/// org we failed to parse" must not look the same downstream.
+#[test]
+fn acting_org_claim_reaches_the_verified_actor() {
+    let (sk, verifier) = build_verifier_with("k1");
+    let now = Utc::now().timestamp();
+
+    let mut spec = TokenSpec::fresh(now, "POST", "/admin/cameras", "k1");
+    spec.actor_org_id = Some(MONITORING_ORG_ID.to_owned());
+    let token = mint(&sk, &spec);
+
+    let actor = verifier
+        .verify(
+            &token,
+            EnvelopeContext {
+                method: "POST",
+                path: "/admin/cameras",
+            },
+        )
+        .expect("token with an acting org must still verify");
+    assert_eq!(
+        actor.actor_org_id.as_deref(),
+        Some(MONITORING_ORG_ID),
+        "the acting org must survive verification"
+    );
+    assert_eq!(actor.org_id, ORG_ID, "org_id still names the target estate");
+
+    // An ordinary, same-org mutation leaves it unset rather than echoing the
+    // target org — a row that always names an acting org cannot be used to
+    // find the ones that had a station behind them.
+    let plain = mint(&sk, &TokenSpec::fresh(now, "POST", "/admin/sites", "k1"));
+    let actor = verifier
+        .verify(
+            &plain,
+            EnvelopeContext {
+                method: "POST",
+                path: "/admin/sites",
+            },
+        )
+        .expect("ordinary token verifies");
+    assert_eq!(actor.actor_org_id, None);
 }
