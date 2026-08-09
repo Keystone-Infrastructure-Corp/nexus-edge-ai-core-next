@@ -660,7 +660,7 @@ pub struct ShellSessionClosedPayload {
     pub session_id: Uuid,
 }
 
-/// Cloud → Edge. Remote shell. Instructs the engine to open a SECOND, non-enveloped binary WSS side-channel to `side_channel_url` and pipe it to the locally configured sshd. Sent ONLY once a human recipient has claimed a grant and their leg has landed at shell-broker — never at grant time (see REMOTE_SHELL_PLAN §5). The engine refuses unless `[remote_access] enabled = true` in nexus.toml. Note there is deliberately NO `target` field: the pipe destination comes exclusively from the engine's own config, so a compromised cloud cannot use a core as an SSRF pivot into the customer LAN.
+/// Cloud → Edge. Remote shell. Instructs the engine to open a SECOND, non-enveloped binary WSS side-channel to `side_channel_url` and pipe it to the locally configured sshd. Sent ONLY once a human recipient has claimed a grant — never at grant time (see REMOTE_SHELL_PLAN §5). The side channel terminates on edge-gateway, the same service and the same FQDN as the control tunnel (SPEC-032); the interpreter that gives the bytes meaning dials that leg from the cloud side. The engine refuses unless `[remote_access] enabled = true` in nexus.toml. Note there is deliberately NO `target` field: the pipe destination comes exclusively from the engine's own config, so a compromised cloud cannot use a core as an SSRF pivot into the customer LAN.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellSessionOpenPayload {
@@ -668,12 +668,12 @@ pub struct ShellSessionOpenPayload {
     pub actor_token: ActorTokenJwt,
     /// Hard session expiry. The engine tears the pipe down at this instant regardless of cloud liveness, so a wedged broker cannot hold a shell open.
     pub expires_at: Timestamp,
-    /// Optional byte ceiling across both directions. The engine closes with `close_reason = byte_limit` when exceeded. Defense-in-depth: shell-broker enforces the same cap cloud-side.
+    /// Optional byte ceiling across both directions. The engine closes with `close_reason = byte_limit` when exceeded. Defense-in-depth: edge-gateway enforces the same cap cloud-side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
     /// Cloud-minted session id. Echoed in `shell_session_close` / `shell_session_closed` and encoded in the SSH certificate principal for native-mode sessions.
     pub session_id: Uuid,
-    /// `wss://<host>/v1/shell/<session_id>`. The engine MUST verify the host equals the control tunnel's own host before dialling — no second DNS name, no second port, no new outbound firewall rule. A mismatch is rejected with `close_reason = bad_side_channel_host`.
+    /// `wss://<host>/v1/shell/edge/<session_id>`, where `<host>` is the control tunnel's own authority — the URL is derived cloud-side from the edge-gateway replica holding this core's tunnel, so it cannot name anything else (SPEC-032). The engine MUST still verify the host equals its control tunnel's before dialling — no second DNS name, no second port, no new outbound firewall rule. A mismatch is rejected with `close_reason = bad_side_channel_host`.
     pub side_channel_url: String,
 }
 
