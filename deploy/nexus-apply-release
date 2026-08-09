@@ -174,6 +174,59 @@ flip_and_restart() {
     fi
 }
 
+# ---- escaping the caller's mount namespace ---------------------------------
+# Is <dir> writable by this process, really?
+#
+# A read-only MOUNT is invisible to `[[ -w ]]`, which reads the mode bits and
+# always says yes for root. Only an attempted write distinguishes the two.
+host_mounts_writable() {
+    local dir="$1" probe
+    [[ -d "$dir" ]] || return 1
+    probe="$dir/.nexus-apply-probe.$$"
+    if (: > "$probe") 2>/dev/null; then
+        rm -f "$probe"
+        return 0
+    fi
+    return 1
+}
+
+# Run ONE command on the host mounts, escaping the calling service's namespace
+# if we are in one.
+#
+# The engine invokes this script with `sudo` from inside nexus-engine.service,
+# which sets ProtectSystem=full (=> /usr, /boot, /etc read-only) with only
+# /var/lib/nexus, /opt/nexus and /tmp writable. `sudo` changes credentials, not
+# mounts, so being root inside that namespace buys nothing — every write to
+# /etc or /usr fails, and for useradd it fails with the thoroughly misleading
+# "cannot lock /etc/passwd; try again later". See BUG-032.
+#
+# Everything privileged an OTA does outside /opt runs through here: the applier
+# self-refresh (/usr/local/sbin), the unit refresh (/etc/systemd/system), and
+# the deps wrapper (apt unpacking into /usr, the journald drop-in in /etc, the
+# service-user group in /etc/group). Without it those steps fail — and because
+# they are all documented as best-effort and fail-open, they fail SILENTLY.
+#
+# Wrapping the individual sub-steps, rather than re-execing the whole `apply`
+# mode: do_apply's process model is load-bearing (the sudo child shares the
+# engine cgroup and is SIGTERM'd on unit stop, which is why the restart is
+# --no-block, and what BUG-023 was about), and a transient unit would outlive
+# the restart and change it.
+run_on_host_mounts() {
+    local probe_dir="$1"; shift
+    if host_mounts_writable "$probe_dir"; then
+        "$@"
+        return $?
+    fi
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        warn "$probe_dir is read-only for this process and systemd-run is unavailable"
+        return 1
+    fi
+    systemd-run --quiet --pipe --wait --collect \
+        --unit="nexus-apply-host-$$-${RANDOM}" \
+        --setenv=NEXUS_APPLY_UNSANDBOXED=1 \
+        "$@"
+}
+
 # Refresh the pinned appliers from the release that is about to be flipped in.
 #
 # Both wrappers live outside the OTA-writable /opt/nexus tree and are normally
@@ -204,7 +257,7 @@ refresh_appliers() {
         if cat "$src" >"$tmp" \
             && chown root:root "$tmp" \
             && chmod 0755 "$tmp" \
-            && mv -f "$tmp" "$dst"; then
+            && run_on_host_mounts /usr/local/sbin mv -f "$tmp" "$dst"; then
             log "refreshed applier from release: $dst"
         else
             rm -f "$tmp"
@@ -213,10 +266,79 @@ refresh_appliers() {
     done
 }
 
+# Refresh the systemd unit from the release, the way refresh_appliers does for
+# the two wrappers.
+#
+# Safe because the base unit is already RELEASE-owned, not operator-owned:
+# install.sh copies etc-templates/systemd/nexus-engine.service verbatim, and
+# every host- and tier-specific setting lives in a drop-in under
+# nexus-engine.service.d/ (ORT provider, ROCm overrides, …). Drop-ins compose
+# on top of whatever we install here, so refreshing the base clobbers nothing
+# an installer or an operator put on the box.
+#
+# Fail-closed, because a bad unit is worse than a stale one:
+#   * validate the candidate before it goes anywhere near /etc;
+#   * keep the outgoing unit as `.prev` so do_reflip can restore it — flipping
+#     the release symlink back does NOT undo a unit change, so without this a
+#     bad unit would outlive its own rollback;
+#   * any failure leaves the installed unit exactly as it was.
+refresh_systemd_unit() {
+    local src="$release_path/etc-templates/systemd/nexus-engine.service"
+    local dst="/etc/systemd/system/nexus-engine.service"
+
+    [[ -r "$src" ]] || { log "no systemd unit in release — keeping installed unit"; return 0; }
+    cmp -s "$src" "$dst" 2>/dev/null && return 0
+
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        local verify
+        if ! verify="$(systemd-analyze verify "$src" 2>&1)"; then
+            warn "release systemd unit failed validation; keeping installed unit"
+            [[ -n "$verify" ]] && warn "systemd-analyze: ${verify//$'\n'/ | }"
+            return 0
+        fi
+    else
+        warn "no systemd-analyze on PATH — installing release unit unvalidated"
+    fi
+
+    if [[ -r "$dst" ]] && ! run_on_host_mounts /etc/systemd/system \
+        cp -a "$dst" "$dst.prev"; then
+        warn "could not snapshot the current unit; keeping installed unit"
+        return 0
+    fi
+    if ! run_on_host_mounts /etc/systemd/system \
+        install -o root -g root -m 0644 "$src" "$dst"; then
+        warn "could not install release unit; keeping installed unit"
+        return 0
+    fi
+    log "refreshed systemd unit from release: $dst"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        run_on_host_mounts /etc/systemd/system systemctl daemon-reload \
+            || warn "daemon-reload failed; the new unit applies on next reload"
+    fi
+    return 0
+}
+
+# Put back the unit refresh_systemd_unit displaced. Rolling the release symlink
+# back does not undo a unit change, so a rollback that skipped this could leave
+# the previous release running under the newer release's unit.
+restore_systemd_unit() {
+    local dst="/etc/systemd/system/nexus-engine.service"
+    [[ -r "$dst.prev" ]] || return 0
+    if run_on_host_mounts /etc/systemd/system cp -a "$dst.prev" "$dst"; then
+        log "restored the previous systemd unit"
+        run_on_host_mounts /etc/systemd/system rm -f "$dst.prev" || true
+        command -v systemctl >/dev/null 2>&1 \
+            && { run_on_host_mounts /etc/systemd/system systemctl daemon-reload || true; }
+    else
+        warn "could not restore $dst.prev; leaving the installed unit in place"
+    fi
+    return 0
+}
+
 do_apply() {
     validate_version
     resolve_release_path
-
     [[ -r "$staged_tarball" ]] || die "staged tarball not found: $staged_tarball"
     install -d -m 0755 "$releases_dir" 2>/dev/null || true
 
@@ -233,13 +355,17 @@ do_apply() {
     # Pick up any applier fix shipped in this release before we use the deps
     # wrapper below or flip the symlink.
     refresh_appliers
+    refresh_systemd_unit
 
     # Privileged, best-effort root-side bits (apt deps + journald cap). We are
     # already root, so call the deps wrapper directly (no sudo). --no-prune:
     # pruning is deferred to the post-health `prune` mode so a failed apply can
     # never delete the rollback target.
     if [[ -x "$apply_deps" ]]; then
-        if "$apply_deps" "$release_path" --no-prune; then
+        # On the host mounts: this installs apt packages (unpacking into /usr),
+        # the journald drop-in (/etc), and the service-user group membership
+        # (/etc/group) — all read-only inside the engine's namespace (BUG-032).
+        if run_on_host_mounts /usr "$apply_deps" "$release_path" --no-prune; then
             log "applied release privileged config (deps + journald)"
         else
             warn "nexus-apply-deps exited non-zero; proceeding with flip (optional features may degrade)"
@@ -255,6 +381,7 @@ do_reflip() {
     validate_version
     resolve_release_path
     [[ -d "$release_path" ]] || die "rollback target not on disk: $release_path"
+    restore_systemd_unit
     flip_and_restart
 }
 
@@ -301,35 +428,19 @@ do_prune() {
 }
 
 # ---- remote shell: SSH certificate authority adoption ----------------------
-# Escape the calling service's mount namespace, if we are in one.
+# Escape the calling service's mount namespace for a whole mode.
 #
-# The engine invokes us with `sudo` from inside nexus-engine.service, which
-# sets ProtectSystem=full (=> /usr, /boot, /etc read-only) with only
-# /var/lib/nexus, /opt/nexus and /tmp writable. That is exactly right for the
-# OTA path, which only ever writes /opt. It is fatal for the remote-shell
-# modes, whose whole job is writing /etc/ssh: `sudo` changes credentials, not
-# mounts, so being root inside that namespace buys nothing and every write
-# fails with "Read-only file system" (or, for useradd, the far more
-# misleading "cannot lock /etc/passwd; try again later"). See BUG-032.
+# Same reasoning as run_on_host_mounts, applied to the three remote-shell modes
+# whose every action targets /etc/ssh, so wrapping each write individually would
+# be noise. Deliberately NOT used for `apply` — see the note above.
 #
-# Re-exec through PID 1 instead. systemd starts a transient unit on the host
-# mounts, so the same script runs with a writable /etc. Deliberately done
-# HERE and not by widening the unit's ReadWritePaths: install.sh writes the
-# unit and an OTA never re-applies it, so a unit-file fix would reach fresh
-# installs only and leave every deployed appliance broken. This script ships
-# in the release tarball, so it self-heals on the next update.
+# Fixed here rather than by widening the unit's ReadWritePaths because
+# install.sh writes the unit and, before refresh_systemd_unit below, an OTA
+# never re-applied it.
 reexec_on_host_mounts() {
     [[ -n "${NEXUS_APPLY_UNSANDBOXED:-}" ]] && return 0
     [[ -d /etc/ssh ]] || die "/etc/ssh does not exist — is openssh-server installed?"
-
-    # Probe by writing, not by testing permission bits: a read-only MOUNT is
-    # invisible to `[[ -w ]]`, which only reads the mode and always says yes
-    # for root.
-    local probe="/etc/ssh/.nexus-apply-probe.$$"
-    if (: > "$probe") 2>/dev/null; then
-        rm -f "$probe"
-        return 0
-    fi
+    host_mounts_writable /etc/ssh && return 0
 
     command -v systemd-run >/dev/null 2>&1 \
         || die "/etc is read-only for this process and systemd-run is unavailable"
