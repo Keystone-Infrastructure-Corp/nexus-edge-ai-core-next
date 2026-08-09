@@ -301,6 +301,46 @@ do_prune() {
 }
 
 # ---- remote shell: SSH certificate authority adoption ----------------------
+# Escape the calling service's mount namespace, if we are in one.
+#
+# The engine invokes us with `sudo` from inside nexus-engine.service, which
+# sets ProtectSystem=full (=> /usr, /boot, /etc read-only) with only
+# /var/lib/nexus, /opt/nexus and /tmp writable. That is exactly right for the
+# OTA path, which only ever writes /opt. It is fatal for the remote-shell
+# modes, whose whole job is writing /etc/ssh: `sudo` changes credentials, not
+# mounts, so being root inside that namespace buys nothing and every write
+# fails with "Read-only file system" (or, for useradd, the far more
+# misleading "cannot lock /etc/passwd; try again later"). See BUG-032.
+#
+# Re-exec through PID 1 instead. systemd starts a transient unit on the host
+# mounts, so the same script runs with a writable /etc. Deliberately done
+# HERE and not by widening the unit's ReadWritePaths: install.sh writes the
+# unit and an OTA never re-applies it, so a unit-file fix would reach fresh
+# installs only and leave every deployed appliance broken. This script ships
+# in the release tarball, so it self-heals on the next update.
+reexec_on_host_mounts() {
+    [[ -n "${NEXUS_APPLY_UNSANDBOXED:-}" ]] && return 0
+    [[ -d /etc/ssh ]] || die "/etc/ssh does not exist — is openssh-server installed?"
+
+    # Probe by writing, not by testing permission bits: a read-only MOUNT is
+    # invisible to `[[ -w ]]`, which only reads the mode and always says yes
+    # for root.
+    local probe="/etc/ssh/.nexus-apply-probe.$$"
+    if (: > "$probe") 2>/dev/null; then
+        rm -f "$probe"
+        return 0
+    fi
+
+    command -v systemd-run >/dev/null 2>&1 \
+        || die "/etc is read-only for this process and systemd-run is unavailable"
+
+    log "/etc is read-only in this mount namespace; re-running on the host mounts"
+    exec systemd-run --quiet --pipe --wait --collect \
+        --unit="nexus-apply-ssh-$mode-$$" \
+        --setenv=NEXUS_APPLY_UNSANDBOXED=1 \
+        "$0" "$mode"
+}
+
 # Which unit carries sshd on this box. Debian/Ubuntu ship `ssh.service`;
 # RHEL-likes ship `sshd.service`. Resolve once, prefer whichever is enabled.
 sshd_unit() {
@@ -366,6 +406,10 @@ ensure_ssh_account() {
         usermod -aG "$g" "$ssh_account" >/dev/null 2>&1 \
             || warn "could not add '$ssh_account' to group '$g'"
     done
+    # Explicit: the loop's exit status is its last iteration's, and under
+    # `set -e` a failing group add would otherwise abort CA adoption — the
+    # opposite of the best-effort this block claims to be (BUG-032).
+    return 0
 }
 
 do_ssh_ca_install() {
@@ -468,9 +512,9 @@ case "$mode" in
     apply)  do_apply ;;
     reflip) do_reflip ;;
     prune)  do_prune ;;
-    ssh-ca-install)      do_ssh_ca_install ;;
-    ssh-principals-sync) do_ssh_principals_sync ;;
-    sshd-restart)        do_sshd_restart ;;
+    ssh-ca-install)      reexec_on_host_mounts; do_ssh_ca_install ;;
+    ssh-principals-sync) reexec_on_host_mounts; do_ssh_principals_sync ;;
+    sshd-restart)        reexec_on_host_mounts; do_sshd_restart ;;
     *)      die "usage: nexus-apply-release {apply|reflip|prune} <version> | {ssh-ca-install|ssh-principals-sync|sshd-restart} (got mode='${mode}')" ;;
 esac
 
