@@ -80,6 +80,20 @@ pub struct VerifiedActor {
     /// Tenant the token was minted for. Equals `Verifier`'s `core_id`
     /// resolution context.
     pub org_id: String,
+    /// Phase 11.E2 — the org the human was ACTING AS, when that differs from
+    /// [`Self::org_id`]. Present only for a monitoring-station operator
+    /// reaching into a customer's estate; `None` for the ordinary case where
+    /// the human belongs to the org that owns this core.
+    ///
+    /// Audit-only, and deliberately so: the engine does not authorise on it.
+    /// Whether a station may act at all was decided in the cloud, against a
+    /// live `monitoring_grants` row, before the token was minted — re-deciding
+    /// it here from an unverifiable claim would invent a second, weaker
+    /// authority. What the edge owes is the record: without this field the
+    /// on-box audit can say a mutation happened and who typed it, but not
+    /// which company they were working for, which is the question an operator
+    /// standing at the appliance actually asks.
+    pub actor_org_id: Option<String>,
 }
 
 /// What the verifier was asked to authorise.
@@ -248,6 +262,7 @@ impl Verifier {
             role: claims.role,
             jti: claims.jti,
             org_id: claims.org_id,
+            actor_org_id: claims.actor_org_id.map(|id| id.to_string()),
         })
     }
 
@@ -308,6 +323,10 @@ impl Verifier {
             role: claims.role,
             jti: claims.jti,
             org_id: claims.org_id,
+            // `ShellActorTokenClaims` has no acting-org field: a shell grant is
+            // issued under the customer's own remote-access policy, not under a
+            // monitoring grant, so there is no second org to name.
+            actor_org_id: None,
         })
     }
 
