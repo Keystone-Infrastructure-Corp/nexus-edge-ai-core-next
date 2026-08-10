@@ -3414,8 +3414,10 @@ pub struct ReidConfig {
     /// Default 96. `0` disables the filter.
     #[serde(default = "default_reid_min_crop_h_px")]
     pub min_crop_h_px: u32,
-    /// EP priority list for the ORT session. Ignored when
-    /// `model_path` is `None`. Default mirrors `[inference].ep_priority`.
+    /// EP priority list for the ORT session. Applies to the auto-discovered
+    /// release-staged `dinov2_s_224.onnx` too, not just an explicit
+    /// `model_path`. `nexus-probe emit-config` pins this per box; the
+    /// default chain below matches no shipped hardware.
     ///
     /// **Note for accelerator boxes:** bare `"openvino"` resolves to
     /// OpenVINO `device_type = AUTO`, which can only place the graph on

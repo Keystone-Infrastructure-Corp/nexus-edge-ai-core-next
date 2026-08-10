@@ -27,6 +27,7 @@
 //! | `runtime.decode.mode` | [`DecodeCapability`] (VA / NVDEC / software) |
 //! | `inference.ep_priority` | primary [`InferenceDevice`] |
 //! | `inference.workers` | primary [`InferenceDevice`] |
+//! | `reid.ep_priority` | [`HardwareProfile::reid`] |
 //! | `inference.model.preset` (+ `input_width`/`input_height`) | fixed [`DEFAULT_PRESET`] |
 //! | `bus.capacity` | total RAM |
 //!
@@ -118,6 +119,13 @@ pub fn generate_config(profile: &HardwareProfile) -> Config {
     // preset.
     cfg.inference.model.input_width = input_w;
     cfg.inference.model.input_height = input_h;
+
+    // --- reid -----------------------------------------------------------
+    // Must be pinned even though `[reid] enabled` defaults to false: the
+    // config default is a generic `["openvino", "tensorrt", "cuda", "cpu"]`
+    // chain that matches no shipped box, so an operator flipping re-id on
+    // later would silently get the CPU EP.
+    cfg.reid.ep_priority = ep_priority_for(profile.reid);
 
     // --- bus ------------------------------------------------------------
     cfg.bus.capacity = bus_capacity_for(profile.ram_bytes);
@@ -317,6 +325,7 @@ mod tests {
             cpu_logical,
             ram_bytes: ram_gib * 1024 * 1024 * 1024,
             inference,
+            reid: InferenceDevice::Cpu,
             decode,
             vram_mib,
         }
@@ -579,6 +588,46 @@ mod tests {
                 parsed.runtime.decode.mode,
                 generate_config(&p).runtime.decode.mode
             );
+        }
+    }
+
+    /// `[reid] ep_priority` tracks `profile.reid`, not the detector chain —
+    /// the whole point of the split. A Hailo detector box whose extractor
+    /// device is an AMD iGPU must emit `["vulkan", "cpu"]` for re-id while
+    /// the detector stays on `["hailo", "cpu"]`.
+    #[test]
+    fn reid_ep_priority_follows_reid_device_not_detector() {
+        let mut p = profile(
+            16,
+            24,
+            vec![InferenceDevice::Hailo, InferenceDevice::Cpu],
+            DecodeCapability::Va,
+        );
+        p.reid = InferenceDevice::AmdVulkan;
+        let c = generate_config(&p);
+        assert_eq!(c.inference.ep_priority, vec!["hailo", "cpu"]);
+        assert_eq!(c.reid.ep_priority, vec!["vulkan", "cpu"]);
+    }
+
+    /// The generic `["openvino", "tensorrt", "cuda", "cpu"]` config default
+    /// matches no shipped box and silently lands the ViT on CPU. Every
+    /// generated config must overwrite it.
+    #[test]
+    fn reid_ep_priority_never_left_at_the_config_default() {
+        let default_chain = Config::default().reid.ep_priority;
+        for dev in [
+            InferenceDevice::IntelGpu,
+            InferenceDevice::IntelNpu,
+            InferenceDevice::AmdRocm,
+            InferenceDevice::AmdVulkan,
+            InferenceDevice::Nvidia,
+            InferenceDevice::Cpu,
+        ] {
+            let mut p = profile(8, 16, vec![dev, InferenceDevice::Cpu], DecodeCapability::Va);
+            p.reid = dev;
+            let got = generate_config(&p).reid.ep_priority;
+            assert_ne!(got, default_chain, "{dev:?} left the default chain");
+            assert_eq!(got.last().map(String::as_str), Some("cpu"));
         }
     }
 }
