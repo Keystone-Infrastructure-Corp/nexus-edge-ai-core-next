@@ -48,6 +48,17 @@ Environment=ORT_DYLIB_PATH=/opt/nexus/current/lib/onnxruntime/libonnxruntime.so
 Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime
 Environment=RUST_LOG=info,nexus=info
 
+# Cap glibc's per-thread malloc arenas (BUG-036). The engine runs 140+ threads,
+# and glibc will stand up an arena per thread that contends, each reserving
+# 64 MiB and never handing it back. Mapping-level attribution of a 4.7 GB
+# retention on a 16-thread box found ~1.5 GB of it sitting in those arenas.
+# Measured A/B at four cameras (scripts/perf-bench/bug036-arena-ab.sh):
+# throughput identical at 60.09 frames/s, CPU 11.7% vs 12.1% (noise), retained
+# RSS 3357 MB -> 2857 MB. That measurement is at ~11% CPU, so it shows no
+# regression at low load rather than proving none exists at saturation --
+# revisit if a capacity ramp ever shows allocator contention.
+Environment=MALLOC_ARENA_MAX=2
+
 # XDG_RUNTIME_DIR for the AMD legacy `vaapipostproc` GPU post-proc element.
 # On AMD (Mesa radeonsi) the decode chain uses `vaapih26Xdec ! vaapipostproc`
 # for GPU colour-convert/scale, because the new `va` plugin's `vapostproc`
