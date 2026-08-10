@@ -49,6 +49,14 @@ bench_ids() {
     'import json,sys; print(" ".join(str(c["id"]) for c in json.load(sys.stdin) if "perfbench" in c.get("url","")))'
 }
 
+# Attribute RSS by mapping when PROFILE=1 and the profiler is staged alongside.
+PROFILE=${PROFILE:-0}
+SMAPS=${SMAPS:-/tmp/smaps-cat.py}
+profile() {
+  [[ $PROFILE == 1 && -r $SMAPS ]] || return 0
+  python3 "$SMAPS" "$(pid)" "$1" >>"$OUT" 2>&1
+}
+
 pubs_up()   { pgrep -cf 'ffmpeg .*perfbench-' 2>/dev/null || echo 0; }
 pubs_kill() { pkill -f 'ffmpeg .*perfbench-' 2>/dev/null; sleep 3; }
 pubs_start() {
@@ -70,6 +78,7 @@ sudo systemctl restart nexus-engine
 sleep 45
 BASE_RSS=$(rss_mb); BASE_THR=$(threads)
 log "baseline (real cameras only): rss_mb=$BASE_RSS threads=$BASE_THR"
+profile baseline
 
 pubs_start
 for i in $(seq 0 $((N - 1))); do
@@ -79,6 +88,7 @@ done
 sleep 40
 START_RSS=$(rss_mb); START_THR=$(threads)
 log "after $N cameras started: rss_mb=$START_RSS threads=$START_THR (publishers=$(pubs_up))"
+profile started
 
 MARK=$(date --iso-8601=seconds)
 for c in $(seq 1 "$CYCLES"); do
@@ -95,6 +105,10 @@ for id in $(bench_ids); do api DELETE "/admin/cameras/$id" >/dev/null; done
 sleep 60
 END_RSS=$(rss_mb); END_THR=$(threads)
 log "settled back to real cameras only: rss_mb=$END_RSS threads=$END_THR"
+profile settled
+if [[ $PROFILE == 1 && -r /tmp/smaps-baseline.json && -r /tmp/smaps-settled.json ]]; then
+  python3 "$SMAPS" --diff /tmp/smaps-baseline.json /tmp/smaps-settled.json >>"$OUT" 2>&1
+fi
 
 GROWTH=$((END_RSS - BASE_RSS))
 THR_GROWTH=$((END_THR - BASE_THR))
