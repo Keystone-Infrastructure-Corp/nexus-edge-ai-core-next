@@ -54,3 +54,24 @@ vainfo
 # engine never opens an inbound port and only ever dials 127.0.0.1:22 when
 # an operator has explicitly set `[remote_access] enabled = true`.
 openssh-server
+
+# Remote-support diagnostics (ADR-066). The shipped image is minimized, so
+# without these a support engineer's first move in a time-boxed session is
+# discovering the tool is absent and that they cannot run `apt`. All are
+# read-only inspection tools; the privileged ones are reachable only through
+# the pinned nexus-diag wrapper, never as a general sudo grant.
+#
+# tcpdump      — RTSP/ONVIF camera faults are the most common issue class on
+#                this product and are invisible without a capture.
+# lsof, strace — engine fd leaks and wedged pipelines.
+# smartmontools, lm-sensors — dying eMMC/NVMe and thermal throttling, both of
+#                which present as "cameras randomly drop".
+# pciutils, usbutils — confirm the accelerator/capture device is even on the
+#                bus before blaming the driver stack.
+tcpdump
+lsof
+strace
+smartmontools
+lm-sensors
+pciutils
+usbutils

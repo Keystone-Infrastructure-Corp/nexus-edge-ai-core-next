@@ -3078,6 +3078,31 @@ install_update_sudoers() {
     log "installed OTA sudoers allowlist: $target"
 }
 
+# ADR-066. Install the remote-support grant on a fresh install. On an
+# already-deployed box the same file arrives with the release and is installed by
+# nexus-apply-release during ssh-ca-install instead. Non-fatal if absent: a box
+# without the grant still gets a working read-only support session.
+install_diag_sudoers() {
+    local release_dir="$1"
+    local src="$release_dir/etc-templates/sudoers.d/nexus-diag"
+    local target="/etc/sudoers.d/nexus-diag"
+
+    if [[ ! -r "$src" ]]; then
+        warn "remote-support sudoers template not in release ($src); support keeps read-only access"
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    install -o root -g root -m 0440 "$src" "$tmp"
+    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "remote-support sudoers file failed visudo validation: $src"
+    fi
+    install -o root -g root -m 0440 "$tmp" "$target"
+    rm -f "$tmp"
+    log "installed remote-support sudoers grant: $target"
+}
+
 # --- OTA runtime-dependency installer wrapper ---------------------------------
 
 # Phase 10. Install the pinned, root-owned runtime-dependency wrapper to
@@ -3126,6 +3151,26 @@ install_apply_release_wrapper() {
     install -d -o root -g root -m 0755 /usr/local/sbin
     install -o root -g root -m 0755 "$src" "$target"
     log "installed OTA release applier: $target"
+}
+
+# ADR-066. Install the pinned, root-owned remote-support diagnostic wrapper to
+# /usr/local/sbin/nexus-diag (root:root 0755) — OUTSIDE the OTA-writable
+# /opt/nexus tree, same as the other two appliers. This is the ONE command the
+# nexus-diag sudoers rule grants the `nexus-remote` support login; the grant
+# itself is written by nexus-apply-release during ssh-ca-install, so it only
+# appears on boxes where an operator has enabled remote access. Idempotent.
+install_diag_wrapper() {
+    local release_dir="$1"
+    local src="$release_dir/scripts/nexus-diag"
+    local target="/usr/local/sbin/nexus-diag"
+
+    if [[ ! -r "$src" ]]; then
+        warn "remote-support diagnostic wrapper not in release ($src); support keeps read-only access"
+        return 0
+    fi
+    install -d -o root -g root -m 0755 /usr/local/sbin
+    install -o root -g root -m 0755 "$src" "$target"
+    log "installed remote-support diagnostic wrapper: $target"
 }
 
 # --- Health check -------------------------------------------------------------

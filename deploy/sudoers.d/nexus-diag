@@ -1,0 +1,48 @@
+# nexus-diag sudoers entry — installed to /etc/sudoers.d/nexus-diag (0440 root)
+#
+# ADR-066. Grants the admin-granted remote-support login `nexus-remote` exactly
+# ONE privileged command: the pinned, root-owned diagnostic wrapper at
+# /usr/local/sbin/nexus-diag.
+#
+# WHY SUPPORT NEEDS ANY ROOT AT ALL.
+# ----------------------------------
+# `nexus-remote` is an unprivileged, password-locked login that exists only
+# while a time-boxed, org-approved grant is live. Its groups (nexus, adm,
+# systemd-journal, video, render) cover reading the journal, the engine's state
+# and the accelerators. They do not cover restarting the engine, capturing
+# camera traffic, or reading SMART/thermal state — which is most of what a
+# support call is actually about. The alternative to this file is a support
+# engineer who can see the problem and not fix it, or a general sudo grant that
+# would make a cloud-brokered session silently equal to root.
+#
+# WHY A WILDCARD AND NOT PER-COMMAND RULES.
+# -----------------------------------------
+# Same reasoning as /etc/sudoers.d/nexus-update, and the same postmortem behind
+# it: per-argv rules couple this file byte-for-byte to a caller's argv, and any
+# drift — a new flag, a reordered argument, or simply an old copy of this file
+# left on a box — makes sudo refuse the command. For the OTA path that meant a
+# brick. The grant below is argv-independent and frozen; what support can do as
+# root evolves inside the audited root-owned wrapper, never here.
+#
+# Security scope:
+#   - Pinned to a SINGLE absolute path outside the OTA-writable /opt/nexus tree,
+#     so neither a compromised engine nor a support session can swap the wrapper.
+#   - The trailing `*` matches the subcommand and its arguments. sudo's `*` does
+#     NOT cross `/`, so no path can be smuggled through, and the wrapper
+#     charset-validates every argument before it reaches a command's argv.
+#   - The wrapper refuses unknown subcommands, bounds packet capture in duration
+#     and size, reads no secrets, and writes no configuration. This grant
+#     therefore confers NO general apt, systemctl, tcpdump, rm or editor power.
+#   - Every invocation is logged to authpriv before it runs. Native sessions are
+#     not recorded (ADR-005), so that log is the only trail of what was done as
+#     root — which is a better audit story than general sudo would have given.
+#
+# Install (installer path):
+#   sudo install -m 0440 -o root -g root deploy/sudoers.d/nexus-diag \
+#       /etc/sudoers.d/nexus-diag
+#   sudo visudo -cf /etc/sudoers.d/nexus-diag   # validate
+#
+# On an already-deployed box this file arrives with the release and is installed
+# by nexus-apply-release during `ssh-ca-install`, so it appears only where an
+# operator has actually enabled remote access.
+nexus-remote ALL=(root) NOPASSWD: /usr/local/sbin/nexus-diag *

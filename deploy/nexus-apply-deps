@@ -102,6 +102,11 @@ is_allowed() {
         va-driver-all | vainfo | libnice10 | \
         openssh-server | \
         mesa-va-drivers | intel-media-va-driver-non-free) return 0 ;;
+        # Remote-support diagnostics (ADR-066). Read-only inspection tools the
+        # `nexus-remote` login and the nexus-diag wrapper need on a minimized
+        # image. None of them is a driver or a kernel package.
+        tcpdump | lsof | strace | smartmontools | \
+        lm-sensors | pciutils | usbutils)           return 0 ;;
         *)                                          return 1 ;;
     esac
 }

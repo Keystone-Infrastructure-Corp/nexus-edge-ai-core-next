@@ -111,9 +111,18 @@ if [[ -e /etc/sudoers.d/nexus-update ]]; then
     rm -f /etc/sudoers.d/nexus-update
 fi
 
+# --- Remove the remote-support sudoers grant (ADR-066) ------------------------
+# Written by nexus-apply-release during ssh-ca-install, not by the installer,
+# so it has to be cleaned up explicitly here too.
+
+if [[ -e /etc/sudoers.d/nexus-diag ]]; then
+    log "removing /etc/sudoers.d/nexus-diag"
+    rm -f /etc/sudoers.d/nexus-diag
+fi
+
 # --- Remove the root-owned OTA wrappers (outside $NEXUS_PREFIX) ----------------
 
-for w in /usr/local/sbin/nexus-apply-release /usr/local/sbin/nexus-apply-deps; do
+for w in /usr/local/sbin/nexus-apply-release /usr/local/sbin/nexus-apply-deps /usr/local/sbin/nexus-diag; do
     if [[ -e "$w" ]]; then
         log "removing $w"
         rm -f "$w"

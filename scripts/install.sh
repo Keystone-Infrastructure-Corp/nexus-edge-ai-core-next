@@ -433,6 +433,15 @@ install_apply_deps_wrapper "$RELEASE_DIR"
 
 install_apply_release_wrapper "$RELEASE_DIR"
 
+# --- Remote-support diagnostic wrapper (ADR-066) ------------------------------
+# Root-owned wrapper (/usr/local/sbin/nexus-diag) — the ONE command the support
+# login may run as root, and only on boxes where remote access is enabled. The
+# matching sudoers grant is written by nexus-apply-release during ssh-ca-install
+# rather than here, so it reaches already-deployed boxes over the air.
+
+install_diag_wrapper "$RELEASE_DIR"
+install_diag_sudoers "$RELEASE_DIR"
+
 # --- Atomic swap --------------------------------------------------------------
 
 previous="$(swap_current_symlink "$VERSION")"

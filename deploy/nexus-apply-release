@@ -120,10 +120,22 @@ ssh_principals_dir="/etc/ssh/nexus_principals"
 # The dedicated, unprivileged login the session certificates map onto. It is
 # deliberately NOT in `sudo`: a cloud-brokered session must not silently confer
 # root. It gets `nexus` (read engine state), `adm` + `systemd-journal` (read
-# logs) so support can actually diagnose. Escalation stays a human decision
-# made with a real password at the console.
+# logs), and `video` + `render` (see the accelerators) so support can actually
+# diagnose. The accelerator groups are the same device access the engine itself
+# already holds via the unit's `SupplementaryGroups=`; without them the one
+# account we hand to support is the only identity on a video appliance that
+# cannot open /dev/dri, /dev/accel or /dev/hailo. Root stays out of reach except
+# through the pinned nexus-diag wrapper (ADR-066).
 ssh_account="nexus-remote"
-ssh_account_groups="nexus,adm,systemd-journal"
+ssh_account_groups="nexus,adm,systemd-journal,video,render"
+
+# The support login's ONE privileged command (ADR-066). The grant ships in the
+# release under etc-templates/sudoers.d/nexus-diag, exactly like the OTA grant,
+# and is installed by ensure_diag_sudoers below during ssh-ca-install — so it
+# reaches already-deployed boxes over the air and appears only where an operator
+# has enabled remote access.
+diag_wrapper="/usr/local/sbin/nexus-diag"
+diag_sudoers="/etc/sudoers.d/nexus-diag"
 
 # Strict validation of the release version. sudo's `*` never matches `/`, but
 # defence-in-depth: a version is a bounded token of the release-tag charset,
@@ -243,7 +255,7 @@ run_on_host_mounts() {
 # rename swaps in a new inode and leaves ours intact until exit.
 refresh_appliers() {
     local src dst tmp name
-    for name in nexus-apply-release nexus-apply-deps; do
+    for name in nexus-apply-release nexus-apply-deps nexus-diag; do
         src="$release_path/scripts/$name"
         dst="/usr/local/sbin/$name"
         [[ -r "$src" ]] || continue
@@ -576,6 +588,62 @@ EOF
         die "sshd -t rejected the config; removed $ssh_dropin and left sshd untouched"
     fi
     sshd_reload
+    ensure_diag_sudoers
+}
+
+# Grant the support login its single privileged command (ADR-066).
+#
+# The grant is a reviewable file in the repo (deploy/sudoers.d/nexus-diag),
+# shipped in the release under etc-templates/ exactly like the OTA grant, and
+# installed from there. Applying it HERE rather than only in scripts/install.sh
+# is what lets it reach already-deployed boxes: the installer runs once per
+# site, `ssh-ca-install` runs on every engine start that has remote access
+# enabled. It also means the grant appears only where an operator turned remote
+# access on, because that is the only condition under which the engine invokes
+# this mode.
+#
+# Reading the file from the release rather than generating it was a deliberate
+# reversal. An earlier draft emitted a fixed heredoc so that "no release payload
+# can author sudoers" — which sounds stronger and is not, because the payload
+# already supplies THIS script, which runs as root. Anything able to forge a
+# release could replace the applier outright; the signature check upstream is
+# the boundary, not the file format. Shipping a real file instead makes the
+# grant diffable in review, keeps it consistent with nexus-update, and removes
+# the drift risk of the same line existing in two places.
+#
+# `visudo -c` gates the install and a rejected file is discarded without ever
+# being moved into place: a malformed drop-in in /etc/sudoers.d breaks sudo for
+# EVERY user on the box, including the OTA path, which is precisely the brick
+# this repo has already been bitten by.
+ensure_diag_sudoers() {
+    local src="$current_link/etc-templates/sudoers.d/nexus-diag"
+    if [[ ! -r "$src" ]]; then
+        warn "no $src in this release — support keeps read-only access"
+        return 0
+    fi
+    if ! command -v visudo >/dev/null 2>&1; then
+        warn "no visudo on PATH — refusing to install $diag_sudoers (cannot validate)"
+        return 0
+    fi
+    if cmp -s "$src" "$diag_sudoers" 2>/dev/null; then
+        log "$diag_sudoers already current"
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp)" || {
+        warn "could not stage $diag_sudoers; support keeps read-only access"
+        return 0
+    }
+    install -o root -g root -m 0440 "$src" "$tmp"
+    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        die "visudo rejected $src — refusing to install $diag_sudoers"
+    fi
+    install -o root -g root -m 0440 "$tmp" "$diag_sudoers"
+    rm -f "$tmp"
+    log "granted $ssh_account its single diagnostic command -> $diag_sudoers"
+    [[ -x "$diag_wrapper" ]] \
+        || warn "$diag_wrapper is not installed yet; the grant is inert until the next release applies"
 }
 
 do_ssh_principals_sync() {
