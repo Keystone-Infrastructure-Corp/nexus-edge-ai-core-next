@@ -48,6 +48,7 @@ fn intel_igpu_n150() {
     );
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["gpu", "cpu"]);
+    assert_eq!(c.reid.ep_priority, vec!["gpu", "cpu"]);
     assert_eq!(c.inference.workers, 1);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 4);
@@ -75,6 +76,9 @@ fn intel_npu_lunar_lake() {
     );
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["npu", "cpu"]);
+    // Detector owns the NPU, so the DINOv2 ViT takes the Arc EUs instead of
+    // contending for it.
+    assert_eq!(c.reid.ep_priority, vec!["gpu", "cpu"]);
     assert_eq!(c.inference.workers, 2);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 8);
@@ -102,6 +106,7 @@ fn discrete_arc_falls_back_to_igpu_class() {
     );
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["gpu", "cpu"]);
+    assert_eq!(c.reid.ep_priority, vec!["gpu", "cpu"]);
     assert_eq!(c.inference.workers, 1);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 12);
@@ -127,6 +132,9 @@ fn hailo_eqr7_with_amd_decode() {
     );
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["hailo", "cpu"]);
+    // The decode-only iGPU is excluded from the detector chain but IS the
+    // only device that can host the ONNX ViT — Hailo runs HEFs only.
+    assert_eq!(c.reid.ep_priority, vec!["vulkan", "cpu"]);
     assert_eq!(c.inference.workers, 1);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 16);
@@ -151,6 +159,7 @@ fn amd_vulkan_igpu() {
     );
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["vulkan", "cpu"]);
+    assert_eq!(c.reid.ep_priority, vec!["vulkan", "cpu"]);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }
@@ -172,6 +181,7 @@ fn amd_rocm_discrete() {
     );
     let c = config_for(&m);
     assert_eq!(c.inference.ep_priority, vec!["rocm", "cpu"]);
+    assert_eq!(c.reid.ep_priority, vec!["rocm", "cpu"]);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
     assert_eq!(c.bus.capacity, 4096);
 }

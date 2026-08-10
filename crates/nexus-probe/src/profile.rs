@@ -135,6 +135,17 @@ pub struct HardwareProfile {
     /// Ranked inference fallback chain, best first, always ending in
     /// [`InferenceDevice::Cpu`].
     pub inference: Vec<InferenceDevice>,
+    /// Device the re-id extractor (DINOv2-S, an ONNX ViT) should run on.
+    ///
+    /// Separate from [`Self::inference`] because the detector's device is
+    /// not always able to run the extractor: Hailo executes compiled HEFs
+    /// only, so a Hailo box has to place the ViT on whatever
+    /// general-purpose silicon it also has. Never
+    /// [`InferenceDevice::Hailo`] by construction. Defaults to
+    /// [`InferenceDevice::Cpu`] when deserializing a profile captured
+    /// before this field existed.
+    #[serde(default = "cpu_device")]
+    pub reid: InferenceDevice,
     /// Whether hardware-accelerated decode is available.
     pub decode: DecodeCapability,
     /// Total VRAM of the discrete inference GPU in MiB, when it could be
@@ -166,11 +177,20 @@ impl HardwareProfile {
             },
             None => rank_inference(&m.accelerators),
         };
+        // A forced profile pins the *detector*. Hailo can't host the ONNX
+        // ViT, so forcing it still leaves re-id to the detected silicon;
+        // forcing anything else pins re-id to that device too.
+        let reid = match forced {
+            Some(ForcedProfile::Cpu) => InferenceDevice::Cpu,
+            Some(ForcedProfile::Hailo) | None => rank_reid(&m.accelerators),
+            Some(f) => f.inference_device().unwrap_or(InferenceDevice::Cpu),
+        };
         HardwareProfile {
             cpu_physical: m.cpu.physical_cores,
             cpu_logical: m.cpu.logical_cores,
             ram_bytes: m.memory.total_kib.saturating_mul(1024),
             inference,
+            reid,
             decode: decode_capability(&m.accelerators),
             vram_mib: m.accelerators.nvidia_vram_mib,
         }
@@ -214,6 +234,43 @@ fn rank_inference(acc: &Accelerators) -> Vec<InferenceDevice> {
     match best {
         Some(dev) => vec![dev, InferenceDevice::Cpu],
         None => vec![InferenceDevice::Cpu],
+    }
+}
+
+/// Serde fallback for [`HardwareProfile::reid`] on profiles captured
+/// before the field existed.
+fn cpu_device() -> InferenceDevice {
+    InferenceDevice::Cpu
+}
+
+/// Pick the device that runs the re-id extractor.
+///
+/// Differs from [`rank_inference`] in two ways, both forced by DINOv2-S
+/// being a general-purpose ONNX graph:
+///
+/// * **Hailo is excluded.** HailoRT executes precompiled HEFs; there is no
+///   HEF for the ViT. On a Hailo box the extractor lands on the iGPU that
+///   [`rank_inference`] deliberately leaves out of the detector chain
+///   (Beelink EQR7: detector on Hailo, extractor on the Radeon 680M).
+/// * **The Intel iGPU outranks the Intel NPU.** On Lunar Lake the detector
+///   already owns the NPU; putting the ViT there too makes the two
+///   contend, while the Arc EUs are otherwise idle (decode runs on the
+///   separate media block).
+fn rank_reid(acc: &Accelerators) -> InferenceDevice {
+    if acc.intel_igpu || acc.intel_arc_140v {
+        InferenceDevice::IntelGpu
+    } else if acc.intel_npu {
+        InferenceDevice::IntelNpu
+    } else if acc.amd_igpu {
+        if acc.amd_rocm_capable {
+            InferenceDevice::AmdRocm
+        } else {
+            InferenceDevice::AmdVulkan
+        }
+    } else if acc.nvidia_gpu {
+        InferenceDevice::Nvidia
+    } else {
+        InferenceDevice::Cpu
     }
 }
 
@@ -522,5 +579,82 @@ mod tests {
         );
         assert_eq!(ForcedProfile::from_str("cpu").unwrap(), ForcedProfile::Cpu);
         assert!(ForcedProfile::from_str("quantum").is_err());
+    }
+
+    /// The re-id device is never Hailo (no HEF for the ViT) and falls
+    /// through to whatever general-purpose silicon the box also carries.
+    #[test]
+    fn reid_device_skips_hailo_and_lands_on_the_igpu() {
+        let m = manifest_with(
+            CpuInfo::default(),
+            MemoryInfo::default(),
+            Accelerators {
+                hailo: true,
+                amd_igpu: true,
+                amd_rocm_capable: false,
+                ..Default::default()
+            },
+        );
+        let p = HardwareProfile::from_manifest(&m);
+        assert_eq!(p.primary_inference(), InferenceDevice::Hailo);
+        assert_eq!(p.reid, InferenceDevice::AmdVulkan);
+    }
+
+    /// Hailo with nothing else to fall back to: CPU, and honestly so.
+    #[test]
+    fn reid_device_is_cpu_on_a_bare_hailo_box() {
+        let m = manifest_with(
+            CpuInfo::default(),
+            MemoryInfo::default(),
+            Accelerators {
+                hailo: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            HardwareProfile::from_manifest(&m).reid,
+            InferenceDevice::Cpu
+        );
+    }
+
+    /// Lunar Lake: detector takes the NPU, so the extractor takes the Arc
+    /// EUs rather than contending for the same NPU.
+    #[test]
+    fn reid_device_prefers_the_igpu_over_the_npu() {
+        let m = manifest_with(
+            CpuInfo::default(),
+            MemoryInfo::default(),
+            Accelerators {
+                intel_npu: true,
+                intel_arc_140v: true,
+                intel_igpu: true,
+                ..Default::default()
+            },
+        );
+        let p = HardwareProfile::from_manifest(&m);
+        assert_eq!(p.primary_inference(), InferenceDevice::IntelNpu);
+        assert_eq!(p.reid, InferenceDevice::IntelGpu);
+    }
+
+    /// `--force-profile hailo` pins only the detector; re-id still resolves
+    /// against detected silicon. `--force-profile cpu` pins both.
+    #[test]
+    fn forced_profile_pins_reid_except_for_hailo() {
+        let acc = Accelerators {
+            amd_igpu: true,
+            amd_rocm_capable: false,
+            ..Default::default()
+        };
+        let m = manifest_with(CpuInfo::default(), MemoryInfo::default(), acc);
+
+        let forced_hailo = HardwareProfile::from_manifest_forced(&m, Some(ForcedProfile::Hailo));
+        assert_eq!(forced_hailo.primary_inference(), InferenceDevice::Hailo);
+        assert_eq!(forced_hailo.reid, InferenceDevice::AmdVulkan);
+
+        let forced_cpu = HardwareProfile::from_manifest_forced(&m, Some(ForcedProfile::Cpu));
+        assert_eq!(forced_cpu.reid, InferenceDevice::Cpu);
+
+        let forced_igpu = HardwareProfile::from_manifest_forced(&m, Some(ForcedProfile::IntelIgpu));
+        assert_eq!(forced_igpu.reid, InferenceDevice::IntelGpu);
     }
 }
