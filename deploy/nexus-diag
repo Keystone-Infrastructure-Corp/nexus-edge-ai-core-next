@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# nexus-diag — pinned, root-owned remote-support diagnostic wrapper.
+#
+# Installed by scripts/install.sh to /usr/local/sbin/nexus-diag (root:root
+# 0755), refreshed from each verified release by nexus-apply-release. It is the
+# SINGLE command the `nexus-diag` sudoers rule lets `nexus-remote` run as root:
+#
+#   nexus-remote ALL=(root) NOPASSWD: /usr/local/sbin/nexus-diag *
+#
+# WHY THIS EXISTS (ADR-066).
+# --------------------------
+# A support engineer in a cloud-brokered session needs to restart the engine,
+# capture camera traffic, read SMART/thermal state and look inside the engine
+# process. None of that is possible as an unprivileged login, and the blunt
+# alternative — general sudo for `nexus-remote` — would make a time-boxed,
+# org-approved grant silently equal to root on a customer's appliance.
+#
+# So the privileged surface is fixed, enumerable and audited here instead. The
+# sudoers grant is an argv-independent wildcard on this one absolute path, the
+# same shape the OTA grant uses, so what support can do as root evolves in this
+# reviewed script and never in sudoers.
+#
+# HARD RULES FOR ANYTHING ADDED BELOW.
+# ------------------------------------
+#   1. No caller-supplied string ever reaches a shell, a path, or a command's
+#      argv unvalidated. Every argument is matched against a fixed charset or a
+#      fixed set of literals BEFORE use.
+#   2. No subcommand reads secrets. The admin secret, sshd host keys and
+#      enrollment key material stay unreadable to support — that is the point of
+#      a pseudonymous, revocable session.
+#   3. No subcommand writes configuration. Diagnosis is read-plus-restart;
+#      changing nexus.toml stays an operator action at the console.
+#   4. Every invocation is logged before it runs. Native sessions are not
+#      recorded (ADR-005), so this log is the only trail of what was done as
+#      root — it is load-bearing, not decoration.
+#
+# MODES
+#   restart-engine        Restart nexus-engine.service. The single most common
+#                         remediation, and the reason most support calls happen.
+#   capture <iface> <secs> Bounded tcpdump to a fixed root-owned path. Named
+#                         interface, bounded duration and packet count. No
+#                         caller-supplied filter — a filter expression is an
+#                         argv injection surface and the whole point is to see
+#                         camera traffic, which is what the default captures.
+#   hw-report             One-shot hardware/thermal/storage report to stdout.
+#   engine-proc           Engine process introspection: status, fd count, memory
+#                         maps summary, thread count. Support cannot ptrace a
+#                         process owned by `nexus`, so this stands in for it.
+#
+# Exit codes: 0 success, non-zero on refusal or failure.
+
+set -euo pipefail
+
+log()  { printf 'nexus-diag: %s\n' "$*"; }
+warn() { printf 'nexus-diag: WARN: %s\n' "$*" >&2; }
+die()  { printf 'nexus-diag: ERROR: %s\n' "$*" >&2; exit 1; }
+
+mode="${1:-}"
+arg1="${2:-}"
+arg2="${3:-}"
+
+engine_unit="nexus-engine"
+capture_dir="/var/log/nexus-diag"
+# Ceilings, not defaults: a support session is time-boxed and a capture that
+# outlives it is a packet dump nobody is watching accumulating on a customer's
+# disk.
+capture_max_secs=300
+capture_max_packets=200000
+
+# Record who ran what before doing it. SUDO_USER survives the sudo transition
+# and is the session's login; journald timestamps it and the operator can read
+# it back afterwards even for an unrecorded native session.
+audit() {
+    local who="${SUDO_USER:-unknown}"
+    log "invoked by='${who}' mode='${mode}' args='${arg1} ${arg2}'"
+    command -v logger >/dev/null 2>&1 \
+        && logger -t nexus-diag -p authpriv.notice \
+            "invoked by=${who} mode=${mode} args=${arg1} ${arg2}" \
+        || true
+}
+
+# A network interface name, not a path and not an option. Rejects anything
+# outside the kernel's own charset, and requires the interface to actually
+# exist so a typo fails loudly instead of capturing nothing for five minutes.
+validate_iface() {
+    [[ -n "$arg1" ]] || die "usage: nexus-diag capture <iface> <secs>"
+    [[ "$arg1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$ ]] \
+        || die "invalid interface '$arg1' (charset)"
+    [[ -e "/sys/class/net/$arg1" ]] \
+        || die "no such interface '$arg1' (see: ls /sys/class/net)"
+}
+
+validate_secs() {
+    [[ "$arg2" =~ ^[0-9]{1,3}$ ]] || die "invalid duration '$arg2' (1-${capture_max_secs}s)"
+    (( arg2 >= 1 )) || die "duration must be at least 1s"
+    (( arg2 <= capture_max_secs )) \
+        || die "duration ${arg2}s exceeds the ${capture_max_secs}s ceiling"
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 \
+        || die "$1 is not installed (declared in apt-requirements.txt; run an OTA or install.sh)"
+}
+
+do_restart_engine() {
+    command -v systemctl >/dev/null 2>&1 || die "no systemctl on PATH"
+    systemctl restart "$engine_unit" || die "failed to restart $engine_unit"
+    log "restarted $engine_unit"
+    systemctl --no-pager --lines=0 status "$engine_unit" || true
+}
+
+# Bounded capture. Both -G/-W (rotate once at N seconds, keep one file) and -c
+# bound it, so neither a clock problem nor a flood can leave it running.
+do_capture() {
+    require_cmd tcpdump
+    validate_iface
+    validate_secs
+    install -d -o root -g root -m 0750 "$capture_dir"
+    local out
+    out="$capture_dir/capture-$(date -u +%Y%m%dT%H%M%SZ).pcap"
+    log "capturing on '$arg1' for ${arg2}s (max ${capture_max_packets} packets) -> $out"
+    # `-Z root` keeps tcpdump from dropping to a user that cannot write $out.
+    tcpdump -i "$arg1" -nn -s 256 -c "$capture_max_packets" \
+            -G "$arg2" -W 1 -Z root -w "$out" 2>&1 || true
+    chmod 0640 "$out" 2>/dev/null || true
+    log "capture complete: $out"
+    log "NOTE: a capture can contain camera credentials — treat it as a secret."
+    ls -l "$out"
+}
+
+do_hw_report() {
+    echo "=== uname ===";        uname -a
+    echo "=== uptime ===";       uptime
+    echo "=== kernel ring ===";  dmesg --level=err,warn --ctime 2>/dev/null | tail -n 60 || true
+    echo "=== pci ===";          command -v lspci >/dev/null 2>&1 && lspci -nn || echo "(pciutils absent)"
+    echo "=== accelerators ==="; ls -l /dev/dri /dev/accel 2>/dev/null || echo "(none)"
+    echo "=== thermal ===";      command -v sensors >/dev/null 2>&1 && sensors || echo "(lm-sensors absent)"
+    echo "=== disks ===";        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null || true
+    echo "=== filesystem ===";   df -h
+    echo "=== smart ==="
+    if command -v smartctl >/dev/null 2>&1; then
+        local d
+        for d in /dev/sd? /dev/nvme?n?; do
+            [[ -b "$d" ]] || continue
+            echo "--- $d ---"
+            smartctl -H "$d" 2>&1 | sed -n '1,12p' || true
+        done
+    else
+        echo "(smartmontools absent)"
+    fi
+}
+
+do_engine_proc() {
+    local pid
+    pid="$(systemctl show -p MainPID --value "$engine_unit" 2>/dev/null || true)"
+    [[ -n "$pid" && "$pid" != "0" ]] || die "$engine_unit is not running (MainPID=0)"
+    echo "=== pid ==="; echo "$pid"
+    echo "=== status ==="
+    sed -n '/^Name:/p;/^State:/p;/^Threads:/p;/^VmRSS:/p;/^VmSize:/p' "/proc/$pid/status" 2>/dev/null || true
+    echo "=== open fds ==="
+    local n
+    n="$(find "/proc/$pid/fd" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+    echo "count: $n"
+    echo "=== fd targets (top 20 by kind) ==="
+    find "/proc/$pid/fd" -mindepth 1 -exec readlink {} \; 2>/dev/null \
+        | sed 's/[0-9]\{2,\}/N/g' | sort | uniq -c | sort -rn | head -n 20 || true
+    echo "=== accelerator libs loaded ==="
+    grep -ohE '/[^ ]*(onnxruntime|openvino|nvidia|hailo|va|drm)[^ ]*\.so[^ ]*' \
+        "/proc/$pid/maps" 2>/dev/null | sort -u | head -n 20 || true
+    echo "=== listening sockets ==="
+    command -v ss >/dev/null 2>&1 && ss -tlnp 2>/dev/null | head -n 20 || true
+}
+
+[[ -n "$mode" ]] || die "usage: nexus-diag {restart-engine|capture <iface> <secs>|hw-report|engine-proc}"
+audit
+
+case "$mode" in
+    restart-engine) do_restart_engine ;;
+    capture)        do_capture ;;
+    hw-report)      do_hw_report ;;
+    engine-proc)    do_engine_proc ;;
+    *) die "unknown mode '$mode' (allowed: restart-engine, capture, hw-report, engine-proc)" ;;
+esac

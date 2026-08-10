@@ -541,6 +541,11 @@ jobs:
           # scripts/install.sh to /etc/sudoers.d/nexus-update (0440 root).
           cp deploy/sudoers.d/nexus-update \
              "$R/etc-templates/sudoers.d/nexus-update"
+          # ADR-066 — the remote-support grant. Installed by scripts/install.sh
+          # on a fresh install and by nexus-apply-release (ssh-ca-install) on an
+          # already-deployed box, so it reaches the fleet over the air.
+          cp deploy/sudoers.d/nexus-diag \
+             "$R/etc-templates/sudoers.d/nexus-diag"
 
           cp scripts/install.sh   "$R/scripts/"
           cp scripts/uninstall.sh "$R/scripts/"
@@ -558,9 +563,15 @@ jobs:
           # applier the nexus-update sudoers rule grants; scripts/install.sh
           # copies it to /usr/local/sbin/nexus-apply-release (root:root 0755).
           cp deploy/nexus-apply-release  "$R/scripts/nexus-apply-release"
+          # ADR-066 — the pinned remote-support diagnostic wrapper, the ONE
+          # command the nexus-diag sudoers rule grants the `nexus-remote`
+          # login; scripts/install.sh copies it to /usr/local/sbin/nexus-diag
+          # and nexus-apply-release refreshes it from each release.
+          cp deploy/nexus-diag           "$R/scripts/nexus-diag"
           chmod +x "$R/scripts/install.sh" "$R/scripts/uninstall.sh" \
                    "$R/scripts/nexus-apply-deps" \
-                   "$R/scripts/nexus-apply-release"
+                   "$R/scripts/nexus-apply-release" \
+                   "$R/scripts/nexus-diag"
 
           echo "$TAG" > "$R/VERSION"
 
