@@ -104,7 +104,71 @@ def diff(before: dict, after: dict) -> None:
         print(f"    vsize={vsz:>9} kB   count {dn:+}   (~{dn * vsz // 1024:+} MB reserved)")
 
 
+def classify(buf: bytes) -> str:
+    """Guess what a retained mapping holds, from a sample of its bytes."""
+    if not buf:
+        return "unreadable"
+    zeros = buf.count(0)
+    if zeros == len(buf):
+        return "all-zero (untouched reservation)"
+    tags = []
+    if zeros * 100 // len(buf) > 80:
+        tags.append(f"{zeros * 100 // len(buf)}% zero")
+    if b"\x00\x00\x00\x01" in buf or b"\x00\x00\x01" in buf[:512]:
+        tags.append("h264-start-codes")
+    distinct = len(set(buf))
+    # Decoded RGB is dense but locally smooth: most adjacent bytes differ a
+    # little. Compressed bitstream and encrypted data look uniformly random.
+    deltas = [abs(buf[i + 1] - buf[i]) for i in range(min(len(buf), 4096) - 1)]
+    smooth = sum(1 for d in deltas if d < 16) * 100 // max(len(deltas), 1)
+    tags.append(f"distinct={distinct}")
+    tags.append(f"smooth={smooth}%")
+    if distinct > 200 and smooth > 60:
+        tags.append("<= looks like raw pixel data")
+    elif distinct > 240 and smooth < 30:
+        tags.append("<= looks like compressed/random")
+    return " ".join(tags)
+
+
+def sample(pid: str, want_kb: int, limit: int) -> None:
+    """Hexdump and classify the anonymous mappings of a given virtual size."""
+    maps = []
+    cur = None
+    with open(f"/proc/{pid}/smaps", encoding="utf-8") as fh:
+        for line in fh:
+            m = MAP_RE.match(line)
+            if m:
+                start, end, perms, name = m.groups()
+                vsz = (int(end, 16) - int(start, 16)) // 1024
+                cur = (
+                    (int(start, 16), vsz, perms)
+                    if (not name.strip() and vsz == want_kb)
+                    else None
+                )
+                continue
+            if cur and line.startswith("Rss:"):
+                maps.append((*cur, int(line.split()[1])))
+                cur = None
+    print(f"=== {len(maps)} anonymous mappings of {want_kb} kB (showing {limit}) ===")
+    with open(f"/proc/{pid}/mem", "rb", buffering=0) as mem:
+        for start, vsz, perms, rss in maps[:limit]:
+            try:
+                mem.seek(start)
+                buf = mem.read(8192)
+            except OSError as exc:
+                buf = b""
+                print(f"  read failed: {exc}")
+            print(
+                f"  @{start:#x} {perms} rss={rss} kB/{vsz} kB  {classify(buf)}\n"
+                f"    {buf[:32].hex(' ')}"
+            )
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["--sample"]:
+        sample(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]) if len(sys.argv) > 4 else 8)
+        return 0
+
     if sys.argv[1:2] == ["--diff"]:
         with open(sys.argv[2], encoding="utf-8") as fh:
             before = json.load(fh)

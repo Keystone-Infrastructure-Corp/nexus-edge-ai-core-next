@@ -14,6 +14,12 @@ API="http://127.0.0.1:8089/api/v1"
 RIG=/tmp/nexus-perf-bench
 N=${N:-4}
 CYCLES=${CYCLES:-6}
+# Seconds to simply run the cameras before tearing them down. CYCLES=0 with a
+# SOAK equal to a flap run's duration is the control arm: same cameras, same
+# inference volume, same wall time, but zero source teardowns. If that retains
+# as much as the flap does, the retention is a steady-state high-water mark
+# that is never returned, not something teardown leaks.
+SOAK=${SOAK:-0}
 OUT=/tmp/bug036-flap.log
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT"; }
@@ -99,6 +105,12 @@ for c in $(seq 1 "$CYCLES"); do
   sleep 20
   log "cycle $c: after-kill rss_mb=$down_rss threads=$down_thr | after-restart rss_mb=$(rss_mb) threads=$(threads)"
 done
+
+if (( SOAK > 0 )); then
+  log "soaking ${SOAK}s with no teardowns"
+  sleep "$SOAK"
+  log "after soak: rss_mb=$(rss_mb) threads=$(threads) (publishers=$(pubs_up))"
+fi
 
 pubs_kill
 for id in $(bench_ids); do api DELETE "/admin/cameras/$id" >/dev/null; done
