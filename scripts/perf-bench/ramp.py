@@ -319,19 +319,32 @@ def cmd_run(args: argparse.Namespace) -> int:
         # A rung counts only if the cameras kept up on it. Judge on the last
         # half of the samples so a slow ramp-in doesn't fail an otherwise
         # healthy step.
+        #
+        # Cameras falling behind is the failure. Source teardowns are judged on
+        # rate, not presence: a camera reconnecting once in a minute is normal
+        # operation, while more than one teardown per camera per minute is the
+        # thrash spiral (saturation -> teardown -> respawn -> more load), which
+        # is what collapse actually looks like.
         tail = step_rows[len(step_rows) // 2 :]
-        bad = [r for r in tail if r["stalled"] + r["nodata"] > 0 or r["datastream_errs"] > 0]
+        thrash = max(actual, 1)
+        bad = [
+            r
+            for r in tail
+            if r["stalled"] + r["nodata"] > 0 or r["datastream_errs"] > thrash
+        ]
         if bad:
             worst = max(tail, key=lambda r: r["stalled"] + r["nodata"])
             print(
                 f"--- FAILED at {actual} cameras: "
                 f"stalled={worst['stalled']} nodata={worst['nodata']} "
-                f"datastream_errs={worst['datastream_errs']}",
+                f"datastream_errs={worst['datastream_errs']} (thrash>{thrash})",
                 flush=True,
             )
             knee = actual
             break
-        print(f"--- PASSED at {actual} cameras", flush=True)
+        warn = max(r["datastream_errs"] for r in tail)
+        note = f" (warning: {warn} source teardowns/min)" if warn else ""
+        print(f"--- PASSED at {actual} cameras{note}", flush=True)
 
     _write_csv(csv_path, rows)
     print(f"\nwrote {csv_path} ({len(rows)} samples)", flush=True)
