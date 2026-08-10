@@ -136,11 +136,34 @@ The wedge plan that drives the next three phases of work is
 
 ## Commands
 
-- Install: pnpm install
-- Dev: pnpm dev
-- Test: pnpm test
-- Lint: pnpm lint && pnpm tsc --noEmit
-- Build: pnpm build
+The repo root is a Cargo workspace; the local admin console is a separate npm
+project under [ui/](ui/). **`ui` uses npm and `package-lock.json`, not pnpm.**
+CI runs `npm ci` on Node 22 (`.github/workflows/ci.yml`); running `pnpm install`
+there replaces `node_modules` with a pnpm-resolved tree that does not match the
+lockfile.
+
+Rust, from the repo root:
+
+- Format: `cargo fmt --all -- --check`
+- Lint: `cargo clippy --workspace --all-targets -- -D warnings`
+- Test: `cargo test --workspace`
+- Model licences: `cargo xtask check-models`
+- Generated TS bindings: `cargo test -p nexus-types --features ts`, then confirm
+  `ui/src/api/types/` has no diff — CI fails on drift
+
+UI, from `ui/`:
+
+- Install: `npm ci`
+- Dev: `npm run dev`
+- Unit tests: `npm test` (Vitest)
+- Lint: `npm run lint`
+- Typecheck: `npm run typecheck`
+- Build: `npm run build`
+- End-to-end: `npm run e2e` (Playwright; `npm run e2e:install` once)
+
+Note that CI's `ui` job runs only `typecheck` and `build` — `lint`, `npm test`,
+and Playwright are local gates, so a lint or unit-test regression will not be
+caught for you.
 
 ## Conventions
 
@@ -238,9 +261,12 @@ implementation notes, do cross-link ADR/SPEC/BUG records that relate to each oth
    common — open companion PRs.
 2. Branch + PR per logical change. Title: `[<crate>] <verb> <object>` for engine-only;
    `[Phase N · Step M] <verb> <object>` for wedge work that maps to a phase number.
-3. CI gates that must be green: `cargo fmt --check`, `cargo clippy --workspace
-   --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny check`,
-   `cargo xtask check-models`. The GStreamer + ORT integration jobs run on Linux.
+3. CI gates that must be green: `cargo fmt --check`, `cargo check` + `cargo clippy
+   --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
+   `cargo xtask check-models`, and the `nexus-types` TS-binding drift check. The
+   GStreamer + ORT integration jobs run on Linux. There is **no `cargo deny`
+   gate here** — this repo has no `deny.toml`; licence discipline (Rule 1) is
+   enforced by review, unlike the cloud repo where `cargo deny check` is CI.
 4. macOS-local clippy does NOT catch every Linux-only clippy issue (`#[cfg(target_os
    = "linux")]` gates, `nix` integer width). If your change touches a Linux-gated
    block, expect at least one CI round-trip.
