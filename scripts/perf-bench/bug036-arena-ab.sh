@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# BUG-036: does MALLOC_ARENA_MAX=2 cost throughput?
+# BUG-036: do the glibc allocator tunables cost throughput?
 #
-# Capping glibc arenas recovered ~2.7 GB of retained RSS, and the mapping
-# histogram confirms ~1.5 GB of a 4.7 GB retention sits in 64 MiB per-thread
-# arenas. That makes the cap worth shipping in the systemd unit -- but a
-# 16-thread engine funnelled through two arenas can trade memory for allocator
-# contention, and the flap harness measures no throughput at all. This runs the
-# same steady-state workload with and without the cap and reports frames/s and
-# CPU alongside retained RSS, so the trade is a measurement rather than a guess.
+# Pinning MALLOC_MMAP_THRESHOLD_ and capping MALLOC_ARENA_MAX cut retained RSS
+# after a four-camera workload from 4487 MB to 320 MB. Neither is free by
+# construction: a pinned threshold means an mmap/munmap syscall pair per frame
+# buffer instead of an arena hit, and a 16-thread engine funnelled through two
+# arenas can trade memory for allocator contention. The soak harness measures no
+# throughput at all, so this runs the same steady-state workload tuned and
+# untuned and reports frames/s and CPU alongside retained RSS.
 #
 # Run under sudo. Removes its drop-in and restarts the engine on exit.
 set -uo pipefail
@@ -89,11 +89,14 @@ pubs_start() {
 }
 
 arm() {
-  local label=$1 arena=$2
-  log "=== arm: $label (MALLOC_ARENA_MAX=${arena:-unset}) ==="
+  local label=$1 envs=$2
+  log "=== arm: $label (${envs:-no tuning}) ==="
   mkdir -p "$(dirname "$DROPIN")"
-  if [[ -n $arena ]]; then
-    printf '[Service]\nEnvironment=MALLOC_ARENA_MAX=%s\n' "$arena" >"$DROPIN"
+  if [[ -n $envs ]]; then
+    {
+      echo '[Service]'
+      for kv in $envs; do echo "Environment=$kv"; done
+    } >"$DROPIN"
   else
     rm -f "$DROPIN"
   fi
@@ -129,8 +132,8 @@ arm() {
 }
 
 : > "$OUT"
-log "=== arena A/B on $(readlink -f /opt/nexus/current), N=$N ==="
-arm uncapped ""
-arm arena-max-2 "2"
+log "=== allocator throughput A/B on $(readlink -f /opt/nexus/current), N=$N ==="
+arm untuned ""
+arm tuned "${TUNED:-MALLOC_MMAP_THRESHOLD_=131072 MALLOC_ARENA_MAX=2}"
 log "=== summary ==="
 grep -E 'fps=' "$OUT"
