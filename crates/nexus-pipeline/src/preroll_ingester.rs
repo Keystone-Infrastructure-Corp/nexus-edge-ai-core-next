@@ -900,7 +900,8 @@ async fn run_session(
                         if session_uses_legacy_vaapipostproc_cb
                             && !avoid_legacy_vaapipostproc_cb.load(Ordering::Acquire)
                         {
-                            let trips = vaapipostproc_loop_trips_cb.fetch_add(1, Ordering::AcqRel) + 1;
+                            let trips =
+                                vaapipostproc_loop_trips_cb.fetch_add(1, Ordering::AcqRel) + 1;
                             if trips >= VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT {
                                 avoid_legacy_vaapipostproc_cb.store(true, Ordering::Release);
                                 error!(
