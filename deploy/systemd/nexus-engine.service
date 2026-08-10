@@ -48,6 +48,31 @@ Environment=ORT_DYLIB_PATH=/opt/nexus/current/lib/onnxruntime/libonnxruntime.so
 Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime
 Environment=RUST_LOG=info,nexus=info
 
+# glibc allocator tuning (BUG-036). Together these cut retained RSS after a
+# four-camera workload from 4487 MB to 320 MB, and steady-state footprint while
+# those cameras run from 4925 MB to 837 MB. Neither does it alone (arena cap
+# only: 2857 MB; threshold only: 2072 MB) because they address different halves
+# of the same problem.
+#
+# MALLOC_MMAP_THRESHOLD_ pins the mmap threshold low. The RGB tap allocates a
+# frame-sized buffer per sample -- ~1.8 MB, tens of times a second per camera.
+# glibc serves the first of those with mmap, but on free it RAISES the threshold
+# to that size (up to 32 MB) and trim_threshold to twice it, after which the same
+# allocations come from the arenas and are only returned if the arena top holds a
+# contiguous free run bigger than trim_threshold -- which, interleaved with
+# everything else, it never does. Pinning it keeps frame buffers on mmap so each
+# one is munmapped on free. Note the trailing underscore: the variable really is
+# MALLOC_MMAP_THRESHOLD_.
+#
+# MALLOC_ARENA_MAX caps the per-thread arenas. The engine runs 140+ threads and
+# glibc will stand up an arena per contending thread, each reserving 64 MiB and
+# never handing it back; mapping-level attribution found ~1.5 GB sitting in them.
+#
+# Measured for throughput as well as memory (scripts/perf-bench/bug036-arena-ab.sh)
+# so this is not a memory win bought with an unmeasured latency cost.
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_ARENA_MAX=2
+
 # XDG_RUNTIME_DIR for the AMD legacy `vaapipostproc` GPU post-proc element.
 # On AMD (Mesa radeonsi) the decode chain uses `vaapih26Xdec ! vaapipostproc`
 # for GPU colour-convert/scale, because the new `va` plugin's `vapostproc`
