@@ -981,6 +981,139 @@ mod tests {
         );
     }
 
+    /// Everything the runtime escalation keys off `legacy_vaapipostproc`, so
+    /// a stray `true` on any other tier would silently arm the escalation for
+    /// hardware that has no `vaapipostproc` problem.
+    #[test]
+    fn legacy_vaapipostproc_flag_marks_that_tier_and_no_other() {
+        let amd_legacy = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
+        assert!(select_decode_chain("h264", DecodeMode::Auto, &amd_legacy).legacy_vaapipostproc);
+        assert!(
+            select_decode_chain("h265", DecodeMode::Auto, &{
+                probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"])
+            })
+            .legacy_vaapipostproc
+        );
+
+        for c in [
+            // Intel / other non-AMD VA device.
+            select_decode_chain("h264", DecodeMode::Auto, &va_full()),
+            // AMD system-memory NV12 + CPU-convert fallback.
+            select_decode_chain(
+                "h264",
+                DecodeMode::Auto,
+                &probe_amd(&["vah264dec", "vapostproc"]),
+            ),
+            // MSDK (Intel), NVDEC (CUDA), software.
+            select_decode_chain(
+                "h264",
+                DecodeMode::Msdk,
+                &probe(&["msdkh264dec", "msdkvpp"]),
+            ),
+            select_decode_chain("h264", DecodeMode::Nvdec, &probe(&["nvh264dec"])),
+            select_decode_chain("h264", DecodeMode::Software, &va_full()),
+        ] {
+            assert!(
+                !c.legacy_vaapipostproc,
+                "non-legacy tier wrongly flagged: {}",
+                c.label
+            );
+        }
+    }
+
+    /// The escalation target: same box, same probe, only the wrapper differs.
+    /// GPU decode must survive (`hwaccel` stays true and the chain still
+    /// starts with a hardware decoder) — this is a post-process demotion, not
+    /// a fall to software.
+    #[test]
+    fn avoid_legacy_vaapipostproc_drops_to_sysmem_cpu_convert_tier() {
+        // h265 mirrors the field box (all 53 cameras selected
+        // `vaapih265dec+vaapipostproc`).
+        let p = probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"]);
+        let before = select_decode_chain("h265", DecodeMode::Auto, &p);
+        assert!(before.legacy_vaapipostproc);
+
+        let after = select_decode_chain("h265", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
+        assert_eq!(after.backend, DecodeBackend::Va);
+        assert!(after.hwaccel);
+        assert!(!after.legacy_vaapipostproc);
+        assert!(!after.elements.contains("vaapipostproc"));
+        assert!(!after.elements.contains("vapostproc"));
+        assert_eq!(
+            after.elements,
+            "vah265dec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+        );
+    }
+
+    #[test]
+    fn avoid_legacy_vaapipostproc_drops_to_sysmem_cpu_convert_tier_h264() {
+        let p = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
+        let after = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
+        assert!(after.hwaccel);
+        assert_eq!(
+            after.elements,
+            "vah264dec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+        );
+    }
+
+    /// Intel keeps GPU post-process. `vapostproc` is a different plugin from
+    /// the shadowed legacy `vaapipostproc`, and an Intel box never latches the
+    /// escalation anyway — but if it ever did, nothing may move.
+    #[test]
+    fn avoid_legacy_vaapipostproc_leaves_intel_untouched() {
+        let p = va_full();
+        for mode in [DecodeMode::Auto, DecodeMode::Va] {
+            let c = select_decode_chain("h264", mode, &AvoidLegacyVaapiPostproc(&p));
+            assert_eq!(c.backend, DecodeBackend::Va);
+            assert_eq!(
+                c.elements,
+                "vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate"
+            );
+        }
+    }
+
+    #[test]
+    fn avoid_legacy_vaapipostproc_leaves_msdk_and_nvdec_untouched() {
+        let msdk = probe(&["msdkh264dec", "msdkvpp", "vah264dec", "vapostproc"]);
+        assert_eq!(
+            select_decode_chain("h264", DecodeMode::Msdk, &AvoidLegacyVaapiPostproc(&msdk)).backend,
+            DecodeBackend::Msdk
+        );
+
+        let nv = probe(&["nvh264dec", "nvh265dec"]);
+        for (codec, mode) in [("h264", DecodeMode::Nvdec), ("h265", DecodeMode::Auto)] {
+            let c = select_decode_chain(codec, mode, &AvoidLegacyVaapiPostproc(&nv));
+            assert_eq!(c.backend, DecodeBackend::Nvdec);
+            assert!(c.hwaccel);
+        }
+    }
+
+    /// The wrapper must not invent capabilities either: with no VA plugin at
+    /// all it still lands on software rather than emitting a chain whose
+    /// elements are not registered.
+    #[test]
+    fn avoid_legacy_vaapipostproc_still_falls_to_software_when_nothing_present() {
+        let p = none();
+        let c = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
+        assert_eq!(c.backend, DecodeBackend::Software);
+        assert!(!c.hwaccel);
+    }
+
+    /// A box that has ONLY the legacy vaapi plugin (no `va` plugin) can never
+    /// reach the legacy tier in the first place, so escalating there must not
+    /// produce a chain referencing absent `vah26Xdec`.
+    #[test]
+    fn avoid_legacy_vaapipostproc_legacy_only_box_lands_on_software() {
+        let p = probe_amd(&["vaapih264dec", "vaapipostproc"]);
+        assert_eq!(
+            select_decode_chain("h264", DecodeMode::Auto, &p).backend,
+            DecodeBackend::Software,
+            "legacy-only box never selects the legacy tier (va_available gates it)"
+        );
+        let c = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
+        assert_eq!(c.backend, DecodeBackend::Software);
+    }
+
     #[test]
     fn auto_falls_back_to_software_without_va() {
         let c = select_decode_chain("h264", DecodeMode::Auto, &none());
