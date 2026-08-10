@@ -76,10 +76,25 @@ above deliberately omits one. Sustained stream count depends on
 resolution, codec, frame rate, motion duty-cycle, model preset, and how
 many streams are concurrently active — size it empirically per box
 rather than reading a count off a table. As a real-world anchor, an
-`intel-npu` Lunar Lake box comfortably sustains ~21 cameras at this
-baseline. If your cameras don't fit this profile (4K, sub-stream only,
-sub-1 fps, JPEG snapshot mode), document it in the per-camera config and
-validate with a short pilot.
+`intel-npu` Lunar Lake box with 16 GB RAM comfortably sustains **29
+cameras** at this baseline (measured 2026-08). If your cameras don't fit
+this profile (4K, sub-stream only, sub-1 fps, JPEG snapshot mode),
+document it in the per-camera config and validate with a short pilot.
+
+Two budgets move independently and should be sized separately:
+
+- **Decode is continuous** — every stream, every frame, regardless of
+  activity. It scales purely with camera count and is the harder ceiling.
+- **Inference is motion-gated.** `MotionGate` sits between the source and
+  the detector pool and drops the bulk of frames, so inference load is
+  camera count × motion duty cycle. Size it for the **concurrent-motion
+  burst** (dawn, weather, shift change), not the average — the burst can
+  be an order of magnitude above steady state.
+
+Keeping decode and inference on separate silicon is what makes high
+camera counts work. Hailo-8 and the Intel NPU never decode; the host iGPU
+does. On `amd-vulkan` the same Radeon does both, which is precisely the
+gap a Hailo-8 fills on that chassis.
 
 ## What the generator decides
 
