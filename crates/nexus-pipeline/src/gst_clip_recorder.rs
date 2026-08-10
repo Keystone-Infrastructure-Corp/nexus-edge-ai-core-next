@@ -1137,17 +1137,22 @@ impl ClipRecorder for GstClipRecorder {
     }
 
     fn remove_camera_ingester(&self, camera_id: CameraId) {
-        if let Some(ing) = self.ingesters.write().remove(&camera_id) {
-            // Synchronously stop the supervisor + null the
-            // GStreamer pipeline regardless of how many other
-            // `Arc<PreRollIngester>` clones exist (a per-camera
-            // supervisor's `SharedRtspSource`, an in-flight clip's
-            // snapshot Arc). Without this, those clones would keep
-            // the struct alive past the map removal, the supervisor
-            // task we're about to lose track of would keep
-            // reconnecting forever, and a misconfigured camera
-            // that was added then deleted would leak GstPipelines
-            // at the reconnect-backoff rate until process exit.
+        // Bind through a `let` statement, not an `if let` scrutinee: under
+        // edition 2021 the latter holds the write guard for the whole body,
+        // which would block every reader behind this teardown.
+        let removed = self.ingesters.write().remove(&camera_id);
+        if let Some(ing) = removed {
+            // Stop the supervisor + hand the GStreamer pipeline to
+            // the detached teardown pool regardless of how many
+            // other `Arc<PreRollIngester>` clones exist (a
+            // per-camera supervisor's `SharedRtspSource`, an
+            // in-flight clip's snapshot Arc). Without this, those
+            // clones would keep the struct alive past the map
+            // removal, the supervisor task we're about to lose
+            // track of would keep reconnecting forever, and a
+            // misconfigured camera that was added then deleted
+            // would leak GstPipelines at the reconnect-backoff rate
+            // until process exit.
             ing.shutdown();
             info!(camera_id, "pre-roll ingester removed (hot-remove)");
         }
