@@ -161,9 +161,14 @@ cmd_setup() {
     if pgrep -f "$WORKDIR/mediamtx" >/dev/null 2>&1; then
         log "mediamtx already running"
     else
-        # setsid + </dev/null, not `nohup &`: a plain background job dies with
-        # the ssh session that started it.
-        ( cd "$WORKDIR" && setsid ./mediamtx mediamtx.yml < /dev/null > mediamtx.log 2>&1 & )
+        # Absolute paths on the command line, not `cd && ./mediamtx`: every
+        # pgrep/pkill in this script keys off the work directory appearing in
+        # the cmdline, and a relative invocation silently defeats all of them
+        # (leaving an orphan holding the RTSP port through the next run).
+        ss -ltn 2>/dev/null | grep -q ":${RTSP_PORT} " \
+            && die "port ${RTSP_PORT} is already bound; stop the owner or set NEXUS_PERF_RTSP_PORT"
+        setsid "$WORKDIR/mediamtx" "$WORKDIR/mediamtx.yml" \
+            < /dev/null > "$WORKDIR/mediamtx.log" 2>&1 &
         sleep 2
         pgrep -f "$WORKDIR/mediamtx" >/dev/null 2>&1 \
             || { tail -5 "$WORKDIR/mediamtx.log" >&2; die "mediamtx failed to start"; }

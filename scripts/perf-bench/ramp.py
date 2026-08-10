@@ -38,8 +38,13 @@ SECRET_PATH = os.environ.get("NEXUS_PERF_SECRET", "/var/lib/nexus/state/admin-se
 RTSP_PORT = int(os.environ.get("NEXUS_PERF_RTSP_PORT", "9554"))
 CAM_PREFIX = os.environ.get("NEXUS_PERF_CAM_PREFIX", "perfbench-")
 
-# A camera whose newest frame is older than this is not keeping up.
-STALE_MS = 10_000
+# Last `frames_emitted` seen per camera id. Health is judged on the delta:
+# the engine keys frame stats by camera id, never purges them on delete, and
+# hands out small reusable integer ids — so a freshly created bench camera
+# inherits the counters of whatever camera last held its id. Trusting
+# `last_frame_age_ms` therefore reports a working camera as stale (or, worse,
+# a dead one as healthy) depending on what the id used to be.
+_prev_frames: dict[int, int] = {}
 
 
 # --------------------------------------------------------------------------
@@ -200,22 +205,28 @@ def source_errors(window: str = "-1 min") -> tuple[int, int]:
 
 
 def camera_health() -> tuple[int, int, int]:
-    """(fresh, stale, nostats) across the bench's cameras."""
-    fresh = stale = nostats = 0
+    """(fresh, stalled, nodata) — fresh means the frame counter moved."""
+    fresh = stalled = nodata = 0
     for cam in bench_cameras():
+        cid = cam["id"]
         try:
-            stats = api(f"/cameras/{cam['id']}/stats", timeout=10)
+            stats = api(f"/cameras/{cid}/stats", timeout=10)
         except Exception:
-            nostats += 1
+            stats = None
+        if not stats:
+            nodata += 1
+            _prev_frames.pop(cid, None)
             continue
-        age = (stats or {}).get("last_frame_age_ms")
-        if age is None:
-            nostats += 1
-        elif age > STALE_MS:
-            stale += 1
-        else:
+        emitted = int(stats.get("frames_emitted") or 0)
+        previous = _prev_frames.get(cid)
+        _prev_frames[cid] = emitted
+        if previous is None:
+            nodata += 1  # first observation of this id: no delta to judge yet
+        elif emitted > previous:
             fresh += 1
-    return fresh, stale, nostats
+        else:
+            stalled += 1
+    return fresh, stalled, nodata
 
 
 def sample(n: int) -> dict:
@@ -224,7 +235,7 @@ def sample(n: int) -> dict:
     gpu = metrics.get("gpu") or {}
     rss_kb, threads = engine_rss_kb_and_threads()
     repeats, dserr = source_errors()
-    fresh, stale, nostats = camera_health()
+    fresh, stalled, nodata = camera_health()
     stat = os.statvfs("/")
     return {
         "cameras": n,
@@ -241,8 +252,8 @@ def sample(n: int) -> dict:
         "psi_io": psi("io"),
         "psi_mem": psi("memory"),
         "fresh": fresh,
-        "stale": stale,
-        "nostats": nostats,
+        "stalled": stalled,
+        "nodata": nodata,
         "repeat_warns": repeats,
         "datastream_errs": dserr,
         "free_gb": round(stat.f_bavail * stat.f_frsize / 1e9, 1),
@@ -295,12 +306,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         # half of the samples so a slow ramp-in doesn't fail an otherwise
         # healthy step.
         tail = step_rows[len(step_rows) // 2 :]
-        bad = [r for r in tail if r["stale"] + r["nostats"] > 0 or r["datastream_errs"] > 0]
+        bad = [r for r in tail if r["stalled"] + r["nodata"] > 0 or r["datastream_errs"] > 0]
         if bad:
-            worst = max(tail, key=lambda r: r["stale"] + r["nostats"])
+            worst = max(tail, key=lambda r: r["stalled"] + r["nodata"])
             print(
                 f"--- FAILED at {actual} cameras: "
-                f"stale={worst['stale']} nostats={worst['nostats']} "
+                f"stalled={worst['stalled']} nodata={worst['nodata']} "
                 f"datastream_errs={worst['datastream_errs']}",
                 flush=True,
             )
@@ -312,11 +323,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"\nwrote {csv_path} ({len(rows)} samples)", flush=True)
     if knee is None:
         print(f"RESULT: sustained all {steps[-1]} cameras; raise --steps to find the knee")
-    else:
-        passed = [s for s in steps if s < knee]
-        last_good = passed[-1] if passed else 0
-        print(f"RESULT: sustained {last_good} cameras; failed at {knee}")
-    return 0
+        return 0
+    passed = [s for s in steps if s < knee]
+    last_good = passed[-1] if passed else 0
+    print(f"RESULT: sustained {last_good} cameras; failed at {knee}")
+    return 2
 
 
 def _write_csv(path: str, rows: list[dict]) -> None:
