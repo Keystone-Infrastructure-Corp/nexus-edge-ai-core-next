@@ -185,12 +185,19 @@ def engine_rss_kb_and_threads() -> tuple[int, int]:
         return -1, -1
 
 
-def source_errors(window: str = "-1 min") -> tuple[int, int]:
-    """Count the two failures that mean the bench is lying to itself.
+def source_errors(window: str = "-1 min") -> tuple[int, int, int, int]:
+    """Count the failures that mean the bench is lying to itself, plus the
+    alert-clip encode load.
 
     A repeating-frame-cycle warning means the source clip lost its per-frame
     entropy; a data-stream error means the engine tore the source down. Either
     invalidates the rung.
+
+    Alert-clip encodes are counted separately because they are a CPU libx264
+    re-encode with burned-in boxes, running on the same cores as everything
+    else. A box that saturates while its accelerator sits idle is usually
+    clip-encode bound, not detection bound, and that distinction changes the
+    remedy entirely.
     """
     try:
         out = subprocess.run(
@@ -199,9 +206,14 @@ def source_errors(window: str = "-1 min") -> tuple[int, int]:
             text=True,
             timeout=20,
         ).stdout
-        return out.count("repeating on a fixed cycle"), out.count("Internal data stream error")
+        return (
+            out.count("repeating on a fixed cycle"),
+            out.count("Internal data stream error"),
+            out.count("alert-clip encode"),
+            out.count("exceeded 45s deadline"),
+        )
     except Exception:
-        return -1, -1
+        return -1, -1, -1, -1
 
 
 def camera_health() -> tuple[int, int, int]:
@@ -234,7 +246,7 @@ def sample(n: int) -> dict:
     hailo = metrics.get("hailo") or {}
     gpu = metrics.get("gpu") or {}
     rss_kb, threads = engine_rss_kb_and_threads()
-    repeats, dserr = source_errors()
+    repeats, dserr, clip_encodes, clip_deadline_misses = source_errors()
     fresh, stalled, nodata = camera_health()
     stat = os.statvfs("/")
     return {
@@ -256,6 +268,8 @@ def sample(n: int) -> dict:
         "nodata": nodata,
         "repeat_warns": repeats,
         "datastream_errs": dserr,
+        "clip_encodes": clip_encodes,
+        "clip_deadline_misses": clip_deadline_misses,
         "free_gb": round(stat.f_bavail * stat.f_frsize / 1e9, 1),
     }
 
