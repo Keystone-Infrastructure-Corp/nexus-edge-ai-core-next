@@ -39,6 +39,9 @@ pub mod gst_clip_recorder;
 pub mod preroll_ingester;
 
 #[cfg(feature = "gstreamer")]
+pub mod teardown;
+
+#[cfg(feature = "gstreamer")]
 pub mod thumbnail;
 
 #[cfg(feature = "gstreamer-webrtc")]
@@ -77,6 +80,9 @@ pub use decode::GstFactoryProbe;
 
 #[cfg(feature = "gstreamer")]
 pub use preroll_ingester::PreRollIngester;
+
+#[cfg(feature = "gstreamer")]
+pub use teardown::{null_pipeline_detached, TeardownStats};
 
 #[cfg(feature = "gstreamer")]
 pub use source::RtspSource;

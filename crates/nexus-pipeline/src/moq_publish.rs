@@ -175,7 +175,11 @@ impl MoqSession {
 impl Drop for MoqSession {
     fn drop(&mut self) {
         self.feed.abort();
-        let _ = self.pipeline.set_state(gst::State::Null);
+        crate::teardown::null_pipeline_detached(
+            self.pipeline.clone(),
+            "moq_publish::MoqSession::drop",
+            Some(self.camera_id),
+        );
         debug!(session_id = %self.session_id, camera_id = self.camera_id, "moq publisher stopped");
     }
 }

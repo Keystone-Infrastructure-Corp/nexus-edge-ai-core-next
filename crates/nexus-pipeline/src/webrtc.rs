@@ -601,7 +601,14 @@ impl Drop for WebRtcSession {
         if let Some(cc) = &self.cc {
             cc.abort();
         }
-        let _ = self.pipeline.set_state(gst::State::Null);
+        // Sessions are dropped by the manager-side reaper on a tokio
+        // worker, and `webrtcbin` can sit in NULL for as long as the
+        // ICE/DTLS transport takes to unwind.
+        crate::teardown::null_pipeline_detached(
+            self.pipeline.clone(),
+            "webrtc::WebRtcSession::drop",
+            Some(self.camera_id),
+        );
     }
 }
 

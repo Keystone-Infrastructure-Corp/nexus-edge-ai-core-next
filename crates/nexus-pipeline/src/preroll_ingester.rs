@@ -418,9 +418,14 @@ impl PreRollIngester {
         g.gop_count() >= 1 && g.sample_count() >= 1
     }
 
-    /// Synchronously tear down the always-on supervisor: flip the
-    /// shutdown flag, transition the active GStreamer pipeline to
-    /// NULL, and abort the background tokio task. Idempotent — a
+    /// Tear down the always-on supervisor: flip the shutdown flag,
+    /// hand the active GStreamer pipeline to the detached teardown
+    /// pool, and abort the background tokio task. Returns
+    /// immediately — the NULL transition on a source parked in a
+    /// dead network read is unbounded, and this is called from the
+    /// reconcile task that owns every camera's lifecycle. The pool
+    /// keeps the pipeline's strong reference until NULL lands, so
+    /// nothing is disposed while still PLAYING. Idempotent — a
     /// second call is a no-op because both `Mutex<Option<_>>`
     /// slots use `take()`. Drop calls this too, but holders that
     /// know an ingester should stop right now (the recorder's
@@ -432,8 +437,13 @@ impl PreRollIngester {
     /// retry loop from stopping.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Some(pipeline) = self.active_pipeline.lock().take() {
-            let _ = pipeline.set_state(gst::State::Null);
+        let active = self.active_pipeline.lock().take();
+        if let Some(pipeline) = active {
+            crate::teardown::null_pipeline_detached(
+                pipeline,
+                "preroll_ingester::shutdown",
+                Some(self.camera_id),
+            );
         }
         if let Some(handle) = self.task.lock().take() {
             handle.abort();
@@ -973,7 +983,11 @@ async fn run_session(
     // Pipeline is going down — deregister BEFORE nulling so Drop
     // doesn't race with us.
     *active_pipeline.lock() = None;
-    let _ = pipeline_for_bus.set_state(gst::State::Null);
+    crate::teardown::null_pipeline_detached(
+        pipeline_for_bus,
+        "preroll_ingester::run_session",
+        Some(camera_id),
+    );
     if let Err(e) = result {
         error!(camera_id, error = %e, "preroll ingester session error");
         return Err(e);

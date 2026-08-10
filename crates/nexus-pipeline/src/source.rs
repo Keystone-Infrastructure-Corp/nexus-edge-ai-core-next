@@ -723,8 +723,14 @@ impl RtspSource {
         // Null the pipeline regardless of which branch won. This unblocks
         // any in-flight bus dispatch on the (now-detached) blocking thread,
         // which will then observe `shutdown=true` on its next poll and exit
-        // within ≤100 ms — no thread leak, no Drop hang.
-        let _ = pipeline.set_state(gst::State::Null);
+        // within ≤100 ms — no thread leak, no Drop hang. Detached because
+        // we are on a tokio worker and `rtspsrc` parked in a read on a dead
+        // camera makes the transition unbounded.
+        crate::teardown::null_pipeline_detached(
+            pipeline,
+            "source::RtspSource::run",
+            Some(camera_id),
+        );
         bus_result
     }
 }
