@@ -129,6 +129,13 @@ pub struct DecodeChain {
     pub hwaccel: bool,
     /// Short human label for the boot log, e.g. `va (vah264dec+vapostproc)`.
     pub label: String,
+    /// `true` iff this chain is the AMD legacy-`gstreamer1.0-vaapi`
+    /// `vaapipostproc` GPU-convert tier. Lets the ingester's runtime
+    /// frame-loop guard tell whether a repeating-frame trip happened on the
+    /// tier it can escalate away from (see
+    /// [`VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`]) without string-matching
+    /// `label`.
+    pub legacy_vaapipostproc: bool,
 }
 
 impl DecodeChain {
@@ -188,6 +195,7 @@ fn software_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Software,
         hwaccel: false,
         label: format!("software ({dec})"),
+        legacy_vaapipostproc: false,
     }
 }
 
@@ -203,6 +211,7 @@ fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> Dec
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
+            legacy_vaapipostproc: false,
         };
     }
 
@@ -226,6 +235,7 @@ fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> Dec
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vaapipostproc, gpu convert)"),
+            legacy_vaapipostproc: true,
         };
     }
 
@@ -246,6 +256,7 @@ fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> Dec
         backend: DecodeBackend::Va,
         hwaccel: true,
         label: format!("va ({dec}, sysmem NV12 + cpu convert)"),
+        legacy_vaapipostproc: false,
     }
 }
 
@@ -259,6 +270,47 @@ fn va_chain_for(codec_base: &str, probe: &impl FactoryProbe) -> DecodeChain {
     va_chain(codec_base, bypass, amd_vaapi_gpu)
 }
 
+/// Number of runtime frame-loop-guard trips (see [`FrameLoopDetector`]) a
+/// camera may accumulate on the AMD legacy-`vaapipostproc` GPU-convert tier
+/// before the ingester stops trusting that tier for the rest of this
+/// camera's session lifetime and re-selects with
+/// [`AvoidLegacyVaapiPostproc`], landing on the system-memory NV12 +
+/// CPU-convert tier instead (GPU decode is kept; only the buggy GPU
+/// post-process is dropped).
+///
+/// A plain session rebuild is not a fix here: `vaapipostproc`'s surface pool
+/// recycling that the loop guard catches is a property of this box's
+/// concurrent camera count against the driver's surface allocator, not a
+/// one-off — observed in the field to retrip within minutes of every
+/// rebuild on the same camera. The limit is kept above 1 so a single
+/// coincidental trip (the guard's own bar is already ~2s of provably stale
+/// video within a 90-frame window) doesn't move a camera off GPU
+/// post-process on a fluke.
+pub const VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT: u32 = 3;
+
+/// Wraps a [`FactoryProbe`] and reports the legacy `gstreamer1.0-vaapi`
+/// decoder + `vaapipostproc` elements as unregistered regardless of what is
+/// actually installed, forcing [`va_chain_for`] past the AMD GPU-convert
+/// tier onto the system-memory NV12 + CPU-convert fallback. Element
+/// presence alone can't capture "registered but its surface pool recycles
+/// under load on this box", so this is how the runtime loop guard
+/// (see [`VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`]) expresses that verdict
+/// back into chain selection on the next session rebuild.
+pub struct AvoidLegacyVaapiPostproc<'a, P>(pub &'a P);
+
+impl<P: FactoryProbe> FactoryProbe for AvoidLegacyVaapiPostproc<'_, P> {
+    fn has(&self, factory_name: &str) -> bool {
+        match factory_name {
+            "vaapih264dec" | "vaapih265dec" | "vaapipostproc" => false,
+            _ => self.0.has(factory_name),
+        }
+    }
+
+    fn va_bypass_postproc(&self) -> bool {
+        self.0.va_bypass_postproc()
+    }
+}
+
 fn msdk_chain(codec_base: &str) -> DecodeChain {
     let dec = msdk_decoder(codec_base);
     DecodeChain {
@@ -266,6 +318,7 @@ fn msdk_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Msdk,
         hwaccel: true,
         label: format!("msdk ({dec}+msdkvpp)"),
+        legacy_vaapipostproc: false,
     }
 }
 
@@ -290,6 +343,7 @@ fn nvdec_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Nvdec,
         hwaccel: true,
         label: format!("nvdec ({dec}, sysmem NV12 + cpu convert)"),
+        legacy_vaapipostproc: false,
     }
 }
 
