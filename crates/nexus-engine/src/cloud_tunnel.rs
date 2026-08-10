@@ -1089,6 +1089,27 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     debug!(core_id = %core_id, "inbound channel closed; dispatch pump exiting");
 }
 
+/// The heartbeat `caps` tags this engine advertises.
+///
+/// Dual-transport live view: the always-on LBR pump (`live_view`) plus the
+/// per-core configured HD transport (`hd_sfu` / `hd_moq`), so the cloud routes
+/// an expanding operator to the matching client adapter. No back-compat — the
+/// old single `webrtc` tag is gone. Additive on wire `v=1`.
+///
+/// `talkdown_webrtc` is deliberately **not** advertised. It used to be pushed
+/// whenever `feature = "gstreamer-webrtc"` was on, but that feature gates the
+/// HD *publish* bridge ([`crate::webrtc_bridge`]); this engine has no
+/// receive-side talk-down sub-pipeline at all, so the tag claimed a capability
+/// nothing implements. Nothing cloud-side routes on it today, which is the only
+/// reason that was latent rather than an operator holding a dead mic. Restore
+/// it in the same change that lands the sub-pipeline (webrtcbin recvonly →
+/// Opus decode → PCMU/PCMA → the camera's RTSP backchannel, whose URL and codec
+/// [`nexus_types::CameraTalkDown`] already discovers), gated on the camera
+/// actually having one.
+fn heartbeat_caps(hd_transport: nexus_types::HdTransport) -> Vec<String> {
+    vec!["live_view".to_string(), hd_transport.cap_tag().to_string()]
+}
+
 async fn pump_heartbeats<H: TunnelHandle>(
     handle: &H,
     _core_id: &str,
@@ -1141,23 +1162,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
             body: EnvelopeBody::Heartbeat(HeartbeatPayload {
                 edge_ts_unix_ms: Some(now_unix_ms()),
                 name,
-                // Dual-transport live view — advertise the always-on LBR pump
-                // (`live_view`) plus the per-core configured HD transport
-                // (`hd_sfu` / `hd_moq`) so the cloud routes an expanding
-                // operator to the matching client adapter. `talkdown_webrtc`
-                // is advertised whenever the WebRTC/Opus talk-down
-                // sub-pipeline is compiled in. No back-compat: the old single
-                // `webrtc` tag is gone. Additive on wire `v=1`.
-                caps: Some({
-                    // `mut` is only exercised when the talk-down sub-pipeline
-                    // is compiled in; suppress the unused-mut lint otherwise.
-                    #[cfg_attr(not(feature = "gstreamer-webrtc"), allow(unused_mut))]
-                    let mut caps =
-                        vec!["live_view".to_string(), hd_transport.cap_tag().to_string()];
-                    #[cfg(feature = "gstreamer-webrtc")]
-                    caps.push("talkdown_webrtc".to_string());
-                    caps
-                }),
+                caps: Some(heartbeat_caps(hd_transport)),
                 online_cameras: 0,
                 queued_alerts: 0,
                 release,
@@ -1243,6 +1248,25 @@ fn truncate_detail(s: &str) -> String {
 #[cfg(test)]
 mod health_tests {
     use super::*;
+
+    /// The engine must not advertise a capability it cannot perform. Talk-down
+    /// audio has no receive-side pipeline here, so no transport may leak the
+    /// `talkdown_webrtc` tag onto the heartbeat — a cloud that routed an
+    /// operator on it would hand them a mic wired to nothing.
+    #[test]
+    fn no_transport_advertises_talk_down() {
+        for t in nexus_types::HdTransport::all() {
+            let caps = heartbeat_caps(t);
+            assert!(
+                caps.contains(&"live_view".to_string()),
+                "{t} must still advertise the LBR pump: {caps:?}"
+            );
+            assert!(
+                !caps.iter().any(|c| c.contains("talkdown")),
+                "{t} advertised talk-down with no sub-pipeline behind it: {caps:?}"
+            );
+        }
+    }
 
     #[test]
     fn short_detail_is_passed_through_unchanged() {
