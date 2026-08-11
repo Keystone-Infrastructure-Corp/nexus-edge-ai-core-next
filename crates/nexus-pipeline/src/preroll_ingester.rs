@@ -62,7 +62,7 @@
 //! [`BROADCAST_CAPACITY`]) to keep a slow recorder from blocking
 //! the streaming thread.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,9 +79,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::decode::{
-    frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, DecodeMode,
-    FrameLoopDetector, GstFactoryProbe, DECODE_VALIDATION_FRAMES, FRAME_LOOP_EVAL_WINDOW,
-    FRAME_LOOP_TRIP,
+    frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, AvoidLegacyVaapiPostproc,
+    DecodeMode, FrameLoopDetector, GstFactoryProbe, DECODE_VALIDATION_FRAMES,
+    FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP, VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT,
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
@@ -298,6 +298,16 @@ impl PreRollIngester {
         // guard when a hardware decoder renders only degenerate frames on this
         // GPU, so the supervisor rebuilds the session on the software chain.
         let task_force_software = Arc::new(AtomicBool::new(false));
+        // Runtime decode-health latch, one tier gentler than the above:
+        // flipped once the frame-loop guard has tripped
+        // `VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT` times on the AMD legacy
+        // `vaapipostproc` GPU-convert tier, so the supervisor rebuilds with
+        // that tier's elements reported absent (GPU decode is kept; only
+        // the buggy GPU post-process is dropped). Persists across session
+        // rebuilds like `force_software` — the trips it counts happen one
+        // per rebuilt session.
+        let task_avoid_legacy_vaapipostproc = Arc::new(AtomicBool::new(false));
+        let task_vaapipostproc_loop_trips = Arc::new(AtomicU32::new(0));
         let task = tokio::spawn(async move {
             run_supervisor(
                 camera_id,
@@ -310,6 +320,8 @@ impl PreRollIngester {
                 task_pipeline,
                 task_shutdown,
                 task_force_software,
+                task_avoid_legacy_vaapipostproc,
+                task_vaapipostproc_loop_trips,
             )
             .await;
         });
@@ -463,6 +475,8 @@ async fn run_supervisor(
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
     force_software: Arc<AtomicBool>,
+    avoid_legacy_vaapipostproc: Arc<AtomicBool>,
+    vaapipostproc_loop_trips: Arc<AtomicU32>,
 ) {
     info!(
         camera_id,
@@ -495,6 +509,8 @@ async fn run_supervisor(
             active_pipeline.clone(),
             shutdown.clone(),
             force_software.clone(),
+            avoid_legacy_vaapipostproc.clone(),
+            vaapipostproc_loop_trips.clone(),
         )
         .await
         {
@@ -531,7 +547,25 @@ async fn run_session(
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
     force_software: Arc<AtomicBool>,
+    avoid_legacy_vaapipostproc: Arc<AtomicBool>,
+    vaapipostproc_loop_trips: Arc<AtomicU32>,
 ) -> Result<(), IngesterError> {
+    // Once latched, report the AMD legacy-vaapipostproc GPU-convert tier's
+    // elements as absent so `select_decode_chain` falls to the
+    // system-memory NV12 + CPU-convert tier instead — see
+    // `VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`.
+    let avoid_vaapipostproc_this_session = avoid_legacy_vaapipostproc.load(Ordering::Acquire);
+    let pick_chain = |codec_base: &str| {
+        if avoid_vaapipostproc_this_session {
+            select_decode_chain(
+                codec_base,
+                decode_mode,
+                &AvoidLegacyVaapiPostproc(&GstFactoryProbe),
+            )
+        } else {
+            select_decode_chain(codec_base, decode_mode, &GstFactoryProbe)
+        }
+    };
     let url_safe = url.replace('"', "");
     // Codec-specific element names: rtp{depay}, {parse}, video/x-{base}.
     // The decode chain for the optional RGB tap branch is chosen
@@ -551,7 +585,7 @@ async fn run_session(
     // match arm builds, rather than threading the value out of the match.
     let rgb_hwaccel = frame_tap
         .as_ref()
-        .map(|_| select_decode_chain(codec.base(), decode_mode, &GstFactoryProbe).hwaccel)
+        .map(|_| pick_chain(codec.base()).hwaccel)
         .unwrap_or(false);
     // protocols=tcp (NOT tcp+udp) so rtspsrc never falls back to UDP.
     // UDP packet loss on a contended link (WiFi / busy switch / bursty
@@ -580,6 +614,11 @@ async fn run_session(
     //              is lossless and `rgb` queue is `leaky=downstream`
     //              so a slow detector drops the oldest decoded frame
     //              instead of stalling the shared upstream parser.
+    // Captured out of the `Some` arm below so the rgb-tap health guard
+    // (further down) knows whether THIS session picked the AMD legacy
+    // `vaapipostproc` GPU-convert tier and can count loop-guard trips
+    // against it specifically.
+    let mut session_uses_legacy_vaapipostproc = false;
     let desc = match &frame_tap {
         None => format!(
             "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
@@ -604,7 +643,8 @@ async fn run_session(
             // `videoconvert ! videoscale ! videorate` so the RGB
             // caps below always negotiate regardless of vapostproc's
             // native output format.
-            let chain = select_decode_chain(codec.base(), decode_mode, &GstFactoryProbe);
+            let chain = pick_chain(codec.base());
+            session_uses_legacy_vaapipostproc = chain.legacy_vaapipostproc;
             if chain.downgraded_from(decode_mode) {
                 warn!(
                     camera_id,
@@ -735,6 +775,12 @@ async fn run_session(
         // start out perfectly healthy and only begin recycling surfaces
         // hours later.
         let loop_detector_cb = Arc::new(parking_lot::Mutex::new(FrameLoopDetector::new()));
+        // Escalation state for the AMD legacy-vaapipostproc GPU-convert
+        // tier (see `VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`). Only meaningful
+        // when this session actually picked that tier.
+        let avoid_legacy_vaapipostproc_cb = avoid_legacy_vaapipostproc.clone();
+        let vaapipostproc_loop_trips_cb = vaapipostproc_loop_trips.clone();
+        let session_uses_legacy_vaapipostproc_cb = session_uses_legacy_vaapipostproc;
         rgb_sink.set_callbacks(
             AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -839,11 +885,35 @@ async fn run_session(
                     // seconds old. Ending the session gets the supervisor
                     // to rebuild the pipeline (fresh pool) on the same
                     // chain; we deliberately do NOT latch
-                    // `force_software`, because a rebuild usually clears
-                    // it and dropping every camera on the box to CPU
-                    // decode is far more damaging than one reconnect.
+                    // `force_software` here, because dropping every camera
+                    // on the box to CPU decode over one loop is far more
+                    // damaging than a reconnect. But when this session was
+                    // on the AMD legacy-vaapipostproc GPU-convert tier, a
+                    // bare rebuild has been observed in the field to retrip
+                    // within minutes on the same camera — that tier's
+                    // surface pool recycling is a property of this box's
+                    // load, not a one-off — so repeated trips there latch
+                    // the one-tier-gentler `avoid_legacy_vaapipostproc`
+                    // instead (see `VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`).
                     if let Some(period) = loop_detector_cb.lock().observe(frame_fingerprint(&data))
                     {
+                        if session_uses_legacy_vaapipostproc_cb
+                            && !avoid_legacy_vaapipostproc_cb.load(Ordering::Acquire)
+                        {
+                            let trips =
+                                vaapipostproc_loop_trips_cb.fetch_add(1, Ordering::AcqRel) + 1;
+                            if trips >= VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT {
+                                avoid_legacy_vaapipostproc_cb.store(true, Ordering::Release);
+                                error!(
+                                    camera_id,
+                                    trips,
+                                    "AMD legacy-vaapipostproc GPU-convert tier tripped the \
+                                     frame-loop guard repeatedly; falling back to \
+                                     system-memory NV12 + CPU convert (GPU decode kept) \
+                                     and rebuilding the camera session"
+                                );
+                            }
+                        }
                         error!(
                             camera_id,
                             period,

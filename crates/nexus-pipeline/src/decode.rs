@@ -129,6 +129,13 @@ pub struct DecodeChain {
     pub hwaccel: bool,
     /// Short human label for the boot log, e.g. `va (vah264dec+vapostproc)`.
     pub label: String,
+    /// `true` iff this chain is the AMD legacy-`gstreamer1.0-vaapi`
+    /// `vaapipostproc` GPU-convert tier. Lets the ingester's runtime
+    /// frame-loop guard tell whether a repeating-frame trip happened on the
+    /// tier it can escalate away from (see
+    /// [`VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`]) without string-matching
+    /// `label`.
+    pub legacy_vaapipostproc: bool,
 }
 
 impl DecodeChain {
@@ -188,6 +195,7 @@ fn software_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Software,
         hwaccel: false,
         label: format!("software ({dec})"),
+        legacy_vaapipostproc: false,
     }
 }
 
@@ -203,6 +211,7 @@ fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> Dec
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
+            legacy_vaapipostproc: false,
         };
     }
 
@@ -226,6 +235,7 @@ fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> Dec
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vaapipostproc, gpu convert)"),
+            legacy_vaapipostproc: true,
         };
     }
 
@@ -246,6 +256,7 @@ fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> Dec
         backend: DecodeBackend::Va,
         hwaccel: true,
         label: format!("va ({dec}, sysmem NV12 + cpu convert)"),
+        legacy_vaapipostproc: false,
     }
 }
 
@@ -259,6 +270,47 @@ fn va_chain_for(codec_base: &str, probe: &impl FactoryProbe) -> DecodeChain {
     va_chain(codec_base, bypass, amd_vaapi_gpu)
 }
 
+/// Number of runtime frame-loop-guard trips (see [`FrameLoopDetector`]) a
+/// camera may accumulate on the AMD legacy-`vaapipostproc` GPU-convert tier
+/// before the ingester stops trusting that tier for the rest of this
+/// camera's session lifetime and re-selects with
+/// [`AvoidLegacyVaapiPostproc`], landing on the system-memory NV12 +
+/// CPU-convert tier instead (GPU decode is kept; only the buggy GPU
+/// post-process is dropped).
+///
+/// A plain session rebuild is not a fix here: `vaapipostproc`'s surface pool
+/// recycling that the loop guard catches is a property of this box's
+/// concurrent camera count against the driver's surface allocator, not a
+/// one-off — observed in the field to retrip within minutes of every
+/// rebuild on the same camera. The limit is kept above 1 so a single
+/// coincidental trip (the guard's own bar is already ~2s of provably stale
+/// video within a 90-frame window) doesn't move a camera off GPU
+/// post-process on a fluke.
+pub const VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT: u32 = 3;
+
+/// Wraps a [`FactoryProbe`] and reports the legacy `gstreamer1.0-vaapi`
+/// decoder + `vaapipostproc` elements as unregistered regardless of what is
+/// actually installed, forcing [`va_chain_for`] past the AMD GPU-convert
+/// tier onto the system-memory NV12 + CPU-convert fallback. Element
+/// presence alone can't capture "registered but its surface pool recycles
+/// under load on this box", so this is how the runtime loop guard
+/// (see [`VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`]) expresses that verdict
+/// back into chain selection on the next session rebuild.
+pub struct AvoidLegacyVaapiPostproc<'a, P>(pub &'a P);
+
+impl<P: FactoryProbe> FactoryProbe for AvoidLegacyVaapiPostproc<'_, P> {
+    fn has(&self, factory_name: &str) -> bool {
+        match factory_name {
+            "vaapih264dec" | "vaapih265dec" | "vaapipostproc" => false,
+            _ => self.0.has(factory_name),
+        }
+    }
+
+    fn va_bypass_postproc(&self) -> bool {
+        self.0.va_bypass_postproc()
+    }
+}
+
 fn msdk_chain(codec_base: &str) -> DecodeChain {
     let dec = msdk_decoder(codec_base);
     DecodeChain {
@@ -266,6 +318,7 @@ fn msdk_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Msdk,
         hwaccel: true,
         label: format!("msdk ({dec}+msdkvpp)"),
+        legacy_vaapipostproc: false,
     }
 }
 
@@ -290,6 +343,7 @@ fn nvdec_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Nvdec,
         hwaccel: true,
         label: format!("nvdec ({dec}, sysmem NV12 + cpu convert)"),
+        legacy_vaapipostproc: false,
     }
 }
 
@@ -925,6 +979,139 @@ mod tests {
             c.elements,
             "vaapih265dec ! vaapipostproc ! videoconvert ! videorate"
         );
+    }
+
+    /// Everything the runtime escalation keys off `legacy_vaapipostproc`, so
+    /// a stray `true` on any other tier would silently arm the escalation for
+    /// hardware that has no `vaapipostproc` problem.
+    #[test]
+    fn legacy_vaapipostproc_flag_marks_that_tier_and_no_other() {
+        let amd_legacy = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
+        assert!(select_decode_chain("h264", DecodeMode::Auto, &amd_legacy).legacy_vaapipostproc);
+        assert!(
+            select_decode_chain("h265", DecodeMode::Auto, &{
+                probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"])
+            })
+            .legacy_vaapipostproc
+        );
+
+        for c in [
+            // Intel / other non-AMD VA device.
+            select_decode_chain("h264", DecodeMode::Auto, &va_full()),
+            // AMD system-memory NV12 + CPU-convert fallback.
+            select_decode_chain(
+                "h264",
+                DecodeMode::Auto,
+                &probe_amd(&["vah264dec", "vapostproc"]),
+            ),
+            // MSDK (Intel), NVDEC (CUDA), software.
+            select_decode_chain(
+                "h264",
+                DecodeMode::Msdk,
+                &probe(&["msdkh264dec", "msdkvpp"]),
+            ),
+            select_decode_chain("h264", DecodeMode::Nvdec, &probe(&["nvh264dec"])),
+            select_decode_chain("h264", DecodeMode::Software, &va_full()),
+        ] {
+            assert!(
+                !c.legacy_vaapipostproc,
+                "non-legacy tier wrongly flagged: {}",
+                c.label
+            );
+        }
+    }
+
+    /// The escalation target: same box, same probe, only the wrapper differs.
+    /// GPU decode must survive (`hwaccel` stays true and the chain still
+    /// starts with a hardware decoder) — this is a post-process demotion, not
+    /// a fall to software.
+    #[test]
+    fn avoid_legacy_vaapipostproc_drops_to_sysmem_cpu_convert_tier() {
+        // h265 mirrors the field box (all 53 cameras selected
+        // `vaapih265dec+vaapipostproc`).
+        let p = probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"]);
+        let before = select_decode_chain("h265", DecodeMode::Auto, &p);
+        assert!(before.legacy_vaapipostproc);
+
+        let after = select_decode_chain("h265", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
+        assert_eq!(after.backend, DecodeBackend::Va);
+        assert!(after.hwaccel);
+        assert!(!after.legacy_vaapipostproc);
+        assert!(!after.elements.contains("vaapipostproc"));
+        assert!(!after.elements.contains("vapostproc"));
+        assert_eq!(
+            after.elements,
+            "vah265dec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+        );
+    }
+
+    #[test]
+    fn avoid_legacy_vaapipostproc_drops_to_sysmem_cpu_convert_tier_h264() {
+        let p = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
+        let after = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
+        assert!(after.hwaccel);
+        assert_eq!(
+            after.elements,
+            "vah264dec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+        );
+    }
+
+    /// Intel keeps GPU post-process. `vapostproc` is a different plugin from
+    /// the shadowed legacy `vaapipostproc`, and an Intel box never latches the
+    /// escalation anyway — but if it ever did, nothing may move.
+    #[test]
+    fn avoid_legacy_vaapipostproc_leaves_intel_untouched() {
+        let p = va_full();
+        for mode in [DecodeMode::Auto, DecodeMode::Va] {
+            let c = select_decode_chain("h264", mode, &AvoidLegacyVaapiPostproc(&p));
+            assert_eq!(c.backend, DecodeBackend::Va);
+            assert_eq!(
+                c.elements,
+                "vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate"
+            );
+        }
+    }
+
+    #[test]
+    fn avoid_legacy_vaapipostproc_leaves_msdk_and_nvdec_untouched() {
+        let msdk = probe(&["msdkh264dec", "msdkvpp", "vah264dec", "vapostproc"]);
+        assert_eq!(
+            select_decode_chain("h264", DecodeMode::Msdk, &AvoidLegacyVaapiPostproc(&msdk)).backend,
+            DecodeBackend::Msdk
+        );
+
+        let nv = probe(&["nvh264dec", "nvh265dec"]);
+        for (codec, mode) in [("h264", DecodeMode::Nvdec), ("h265", DecodeMode::Auto)] {
+            let c = select_decode_chain(codec, mode, &AvoidLegacyVaapiPostproc(&nv));
+            assert_eq!(c.backend, DecodeBackend::Nvdec);
+            assert!(c.hwaccel);
+        }
+    }
+
+    /// The wrapper must not invent capabilities either: with no VA plugin at
+    /// all it still lands on software rather than emitting a chain whose
+    /// elements are not registered.
+    #[test]
+    fn avoid_legacy_vaapipostproc_still_falls_to_software_when_nothing_present() {
+        let p = none();
+        let c = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
+        assert_eq!(c.backend, DecodeBackend::Software);
+        assert!(!c.hwaccel);
+    }
+
+    /// A box that has ONLY the legacy vaapi plugin (no `va` plugin) can never
+    /// reach the legacy tier in the first place, so escalating there must not
+    /// produce a chain referencing absent `vah26Xdec`.
+    #[test]
+    fn avoid_legacy_vaapipostproc_legacy_only_box_lands_on_software() {
+        let p = probe_amd(&["vaapih264dec", "vaapipostproc"]);
+        assert_eq!(
+            select_decode_chain("h264", DecodeMode::Auto, &p).backend,
+            DecodeBackend::Software,
+            "legacy-only box never selects the legacy tier (va_available gates it)"
+        );
+        let c = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
+        assert_eq!(c.backend, DecodeBackend::Software);
     }
 
     #[test]
