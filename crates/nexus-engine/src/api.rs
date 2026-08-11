@@ -173,6 +173,12 @@ pub struct ApiState {
     /// (so the UI doesn't appear to forget a freshly-added sink
     /// just because no alerts have fired yet).
     pub sink_registry: Arc<nexus_sinks::SinkRegistry>,
+    /// BUG-048 — liveness counters for the sink dispatcher's drain
+    /// loop, written by the dispatcher task and read by
+    /// `GET /api/v1/admin/sinks/health`. The per-sink delivery counts
+    /// alone cannot distinguish "no alerts fired" from "the drain loop
+    /// is wedged"; this can.
+    pub dispatcher_health: Arc<nexus_sinks::dispatcher::DispatcherHealth>,
     /// File-defined sinks (`nexus.toml` `[[sinks]]`), snapshot at
     /// boot. The `GET /v1/admin/sinks` handler merges these with the
     /// runtime `alert_sinks` db rows so the console can show which
@@ -4676,6 +4682,32 @@ struct SinksHealthResp {
     /// for an orphan from a deleted sink (so operators can
     /// reconcile).
     sinks: Vec<SinkHealthRow>,
+    /// Liveness of the drain loop itself. Per-sink counts cannot show
+    /// this: during BUG-048 every window read zero deliveries, which is
+    /// indistinguishable from "quiet night" unless you can also see
+    /// that the dispatcher stopped completing ticks.
+    dispatcher: DispatcherHealthResp,
+}
+
+/// Drain-loop liveness. See [`nexus_sinks::dispatcher::DispatcherHealth`].
+#[derive(serde::Serialize)]
+struct DispatcherHealthResp {
+    /// False when no tick has completed within [`DISPATCHER_STALL_AFTER`]
+    /// — including before the very first tick completes.
+    live: bool,
+    /// Milliseconds since the last completed tick; `null` before the
+    /// first one.
+    last_tick_age_ms: Option<i64>,
+    last_tick_completed_ms: Option<i64>,
+    last_tick_started_ms: Option<i64>,
+    ticks_completed: u64,
+    rows_processed: u64,
+    /// Rows in the most recent batch. Sustained equality with the
+    /// dispatcher's batch size means the backlog is outgrowing the drain.
+    last_batch_rows: u64,
+    /// The threshold `live` is computed against, so the UI can label it
+    /// without hardcoding a duplicate constant.
+    stall_after_ms: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -4696,6 +4728,14 @@ struct SinkHealthRow {
 }
 
 const HEALTH_WINDOWS: &[(&str, i64)] = &[("1h", 3_600), ("24h", 86_400)];
+
+/// How stale the last completed dispatcher tick may get before the
+/// endpoint reports the drain loop as not live.
+///
+/// The loop ticks every second, so this is a wide margin — it is meant
+/// to catch a wedged loop, not a slow batch. A single tick can
+/// legitimately run long when a sink is mid-delivery.
+const DISPATCHER_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 async fn get_admin_sinks_health(
     State(s): State<ApiState>,
@@ -4759,7 +4799,23 @@ async fn get_admin_sinks_health(
         .map(|(label, secs)| SinksHealthWindow { label, secs: *secs })
         .collect();
 
-    Ok(Json(SinksHealthResp { windows, sinks }))
+    let h = &s.dispatcher_health;
+    let dispatcher = DispatcherHealthResp {
+        live: h.is_live(now, DISPATCHER_STALL_AFTER),
+        last_tick_age_ms: h.age_ms(now),
+        last_tick_completed_ms: h.last_tick_completed_ms(),
+        last_tick_started_ms: h.last_tick_started_ms(),
+        ticks_completed: h.ticks_completed(),
+        rows_processed: h.rows_processed(),
+        last_batch_rows: h.last_batch_rows(),
+        stall_after_ms: DISPATCHER_STALL_AFTER.as_millis() as u64,
+    };
+
+    Ok(Json(SinksHealthResp {
+        windows,
+        sinks,
+        dispatcher,
+    }))
 }
 
 // ===========================================================================
@@ -6517,6 +6573,10 @@ mod tests {
             // `build_test_router_full` to grab the returned handle and
             // `insert_reserved` before issuing the request.
             sink_registry: sink_registry.clone(),
+            // BUG-048 — fresh counters per test router. Reads as "not
+            // live" until a tick completes, which is the correct
+            // default: no dispatcher runs in these tests.
+            dispatcher_health: Arc::new(nexus_sinks::dispatcher::DispatcherHealth::default()),
             // M7 cloud-managed sinks — no file sinks in tests.
             file_sinks: Arc::new(Vec::new()),
             // M6 — default LockoutConfig is fine for every test
@@ -8192,6 +8252,45 @@ mod tests {
         assert_eq!(windows[0]["label"], "1h");
         assert_eq!(windows[1]["label"], "24h");
         assert_eq!(v["sinks"].as_array().unwrap().len(), 0);
+    }
+
+    /// BUG-048 — the sinks-health response must carry drain-loop
+    /// liveness, not just per-sink counts. An all-zero counts grid is
+    /// ambiguous (quiet night vs. wedged dispatcher); `dispatcher.live`
+    /// resolves it. No dispatcher runs in the test router, so this must
+    /// report not-live rather than defaulting to healthy.
+    #[tokio::test]
+    async fn sinks_health_reports_dispatcher_liveness() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-sinks-health-dispatcher-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/sinks/health")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let d = &v["dispatcher"];
+        assert!(d.is_object(), "response must carry a dispatcher block");
+        assert_eq!(
+            d["live"], false,
+            "a dispatcher that never ticked must not read as live",
+        );
+        assert!(d["last_tick_age_ms"].is_null());
+        assert!(d["last_tick_completed_ms"].is_null());
+        assert_eq!(d["ticks_completed"], 0);
+        assert_eq!(d["rows_processed"], 0);
+        assert_eq!(
+            d["stall_after_ms"],
+            crate::api::DISPATCHER_STALL_AFTER.as_millis() as u64,
+        );
     }
 
     /// Minimal reserved-sink double for the sinks-health test: any id,

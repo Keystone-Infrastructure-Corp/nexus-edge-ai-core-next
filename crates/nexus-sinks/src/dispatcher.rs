@@ -1,9 +1,11 @@
 //! M7 Phase 1 Step 3 — alert-sink dispatcher.
 //!
 //! Single background task that drains `alert_sink_outbox`. One per
-//! engine process; serializes outbound HTTP traffic to keep per-
-//! sink retry queues coherent (no thundering herd when a flapping
-//! endpoint comes back online).
+//! engine process. Rows are grouped by sink and the groups run
+//! concurrently, while rows *within* one sink stay strictly sequential
+//! — that keeps each sink's retry queue coherent (no thundering herd
+//! when a flapping endpoint comes back online) without letting one slow
+//! sink hold up every other sink's deliveries (BUG-048).
 //!
 //! State machine — for every pending row:
 //!
@@ -37,6 +39,8 @@
 //! need a live `Store`, a tempdir, and a tokio runtime, so they
 //! belong in `tests/`, not `mod tests {}`).
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,6 +201,97 @@ impl Default for SinkDispatcherConfig {
     }
 }
 
+/// Liveness + throughput counters for the dispatcher loop.
+///
+/// BUG-048 left every sink wedged for 17.7h while the engine looked
+/// perfectly healthy: it logged, served the API, and reported its sinks
+/// as registered, because nothing anywhere reported whether the drain
+/// loop was still *completing*. These counters make a stalled tick
+/// externally visible (see the admin sinks-health endpoint).
+///
+/// Deliberately cheap and lock-free: the tick updates these on every
+/// pass, so they must never be a source of contention.
+#[derive(Debug, Default)]
+pub struct DispatcherHealth {
+    /// Unix millis at which the most recent tick *finished*. `0` means
+    /// no tick has completed yet. The gap between this and now is the
+    /// signal that matters: it grows without bound iff the loop is
+    /// wedged, which is precisely what was unobservable during BUG-048.
+    last_tick_completed_ms: AtomicI64,
+    /// Unix millis at which the most recent tick *started*. With
+    /// `last_tick_completed_ms` this distinguishes "loop is stuck
+    /// mid-tick" from "loop is not being scheduled at all".
+    last_tick_started_ms: AtomicI64,
+    ticks_completed: AtomicU64,
+    rows_processed: AtomicU64,
+    /// Rows in the most recent batch. Sustained equality with
+    /// `batch_size` means the backlog is growing faster than the drain.
+    last_batch_rows: AtomicU64,
+}
+
+impl DispatcherHealth {
+    fn mark_tick_started(&self) {
+        self.last_tick_started_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+    }
+
+    fn mark_tick_completed(&self, rows: u64) {
+        self.last_batch_rows.store(rows, Ordering::Relaxed);
+        self.rows_processed.fetch_add(rows, Ordering::Relaxed);
+        self.ticks_completed.fetch_add(1, Ordering::Relaxed);
+        // Stored last so an observer that sees a fresh timestamp is
+        // guaranteed to also see the counters that go with it.
+        self.last_tick_completed_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Release);
+    }
+
+    /// Unix millis of the last completed tick, or `None` before the
+    /// first one finishes.
+    pub fn last_tick_completed_ms(&self) -> Option<i64> {
+        match self.last_tick_completed_ms.load(Ordering::Acquire) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Unix millis of the last started tick, or `None` before the first.
+    pub fn last_tick_started_ms(&self) -> Option<i64> {
+        match self.last_tick_started_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Milliseconds since the last completed tick. `None` before the
+    /// first tick completes.
+    pub fn age_ms(&self, now: chrono::DateTime<Utc>) -> Option<i64> {
+        self.last_tick_completed_ms()
+            .map(|ms| now.timestamp_millis().saturating_sub(ms))
+    }
+
+    pub fn ticks_completed(&self) -> u64 {
+        self.ticks_completed.load(Ordering::Relaxed)
+    }
+
+    pub fn rows_processed(&self) -> u64 {
+        self.rows_processed.load(Ordering::Relaxed)
+    }
+
+    pub fn last_batch_rows(&self) -> u64 {
+        self.last_batch_rows.load(Ordering::Relaxed)
+    }
+
+    /// True when a tick has completed within `stall_after`.
+    ///
+    /// Before the first tick completes this reports the loop as *not*
+    /// live: a dispatcher that never finished a single pass is exactly
+    /// the failure being guarded against.
+    pub fn is_live(&self, now: chrono::DateTime<Utc>, stall_after: Duration) -> bool {
+        self.age_ms(now)
+            .is_some_and(|age| age <= stall_after.as_millis() as i64)
+    }
+}
+
 /// Run the dispatcher loop until `shutdown` resolves.
 ///
 /// Shape mirrors `cold_replicator::run_cold_replicator` — a
@@ -209,6 +304,7 @@ pub async fn run_dispatcher(
     store: Arc<Store>,
     registry: Arc<SinkRegistry>,
     policy: Arc<dyn DeliveryPolicy>,
+    health: Arc<DispatcherHealth>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     info!(
@@ -225,7 +321,7 @@ pub async fn run_dispatcher(
     interval.tick().await;
 
     // Boot kick — one tick before entering the select loop.
-    tick(&cfg, &store, &registry, &*policy).await;
+    tick(&cfg, &store, &registry, &policy, &health).await;
 
     tokio::pin!(shutdown);
 
@@ -237,43 +333,87 @@ pub async fn run_dispatcher(
                 return;
             }
             _ = interval.tick() => {
-                tick(&cfg, &store, &registry, &*policy).await;
+                tick(&cfg, &store, &registry, &policy, &health).await;
             }
         }
     }
 }
 
-/// One drain attempt. Returns nothing — the helper updates the
-/// outbox row directly and any error is logged. Each row is
-/// independent; we keep ticking even after a malformed row so a
-/// single poison-pill can't wedge the queue.
+/// One drain attempt.
+///
+/// Rows are grouped by `sink_id` and each group runs as its own task, so
+/// a sink that blocks (a slow SMTP relay, a wedged tunnel) delays only
+/// its own queue. Within a group, rows stay sequential and in `id`
+/// order, preserving per-sink retry ordering.
+///
+/// Each row is independent; we keep ticking even after a malformed row
+/// so a single poison-pill can't wedge the queue. A panicking sink task
+/// is caught at the join and logged rather than taking down the loop.
 async fn tick(
     cfg: &SinkDispatcherConfig,
     store: &Arc<Store>,
     registry: &Arc<SinkRegistry>,
-    policy: &dyn DeliveryPolicy,
+    policy: &Arc<dyn DeliveryPolicy>,
+    health: &Arc<DispatcherHealth>,
 ) {
+    health.mark_tick_started();
+
     let rows = match store.outbox_pending(cfg.batch_size).await {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "sink dispatcher: outbox_pending failed");
+            // Not a completed drain — leave the liveness clock alone so a
+            // persistently failing query still reads as a stall.
             return;
         }
     };
 
-    debug!(n = rows.len(), "sink dispatcher: draining batch");
+    let n_rows = rows.len();
 
+    // BTreeMap keeps the per-sink spawn order deterministic, which keeps
+    // test output stable; ordering across sinks is not otherwise
+    // meaningful since they run concurrently.
+    let mut by_sink: BTreeMap<String, Vec<OutboxRow>> = BTreeMap::new();
     for row in rows {
-        process_row(
-            store,
-            registry,
-            policy,
-            cfg.clips_dir.as_deref(),
-            cfg.snapshots_dir.as_deref(),
-            row,
-        )
-        .await;
+        by_sink.entry(row.sink_id.clone()).or_default().push(row);
     }
+
+    debug!(
+        n = n_rows,
+        sinks = by_sink.len(),
+        "sink dispatcher: draining batch"
+    );
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (sink_id, sink_rows) in by_sink {
+        let store = Arc::clone(store);
+        let registry = Arc::clone(registry);
+        let policy = Arc::clone(policy);
+        let clips_dir = cfg.clips_dir.clone();
+        let snapshots_dir = cfg.snapshots_dir.clone();
+        tasks.spawn(async move {
+            for row in sink_rows {
+                process_row(
+                    &store,
+                    &registry,
+                    &*policy,
+                    clips_dir.as_deref(),
+                    snapshots_dir.as_deref(),
+                    row,
+                )
+                .await;
+            }
+            sink_id
+        });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(e) = joined {
+            warn!(error = %e, "sink dispatcher: sink task failed");
+        }
+    }
+
+    health.mark_tick_completed(n_rows as u64);
 }
 
 /// Reclaim the shared alert snapshot once every sink for this event has

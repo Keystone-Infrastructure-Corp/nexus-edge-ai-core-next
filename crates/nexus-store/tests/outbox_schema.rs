@@ -95,6 +95,77 @@ async fn outbox_migration_registers() {
     assert_eq!(row.0, "0006_alert_sink_outbox");
 }
 
+/// BUG-048 regression. The dispatcher's drain query must be an indexed
+/// walk of the pending rows, never a scan of the whole delivery ledger.
+///
+/// Asserts the *plan* rather than a wall-clock time so it stays
+/// deterministic in CI. The query pins the index with `INDEXED BY`,
+/// because left to its own cost model SQLite picks a rowid-order table
+/// scan on some builds (Linux CI did, macOS did not) — the index is on
+/// the rowid alias, so the two paths look equivalent without stats.
+///
+/// Fails if the index is dropped or renamed, or if `outbox_pending`'s
+/// WHERE/ORDER BY drifts into a shape the index cannot serve — which is
+/// exactly how the original regression shipped: 0006 added an index for
+/// this query that the planner could never actually use.
+#[tokio::test]
+async fn outbox_drain_query_is_index_driven_not_a_table_scan() {
+    let (store, _tmp) = fresh_store().await;
+
+    let indexes: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master
+          WHERE type = 'index' AND tbl_name = 'alert_sink_outbox'
+          ORDER BY name",
+    )
+    .fetch_all(store.pool())
+    .await
+    .expect("list indexes");
+    let names = indexes
+        .iter()
+        .map(|r| r.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(
+        names.contains("idx_alert_sink_outbox_drain"),
+        "migration 0034 must create the drain index; found: {names}",
+    );
+
+    // Must stay character-for-character in step with `Store::outbox_pending`.
+    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN
+         SELECT id, event_id, sink_id, status, attempts, next_attempt_at,
+                last_error, suppression_reason, created_at, delivered_at
+           FROM alert_sink_outbox INDEXED BY idx_alert_sink_outbox_drain
+          WHERE status = 'pending'
+            AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+          ORDER BY id ASC
+          LIMIT ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(64_i64)
+    .fetch_all(store.pool())
+    .await
+    .expect("explain query plan");
+
+    let detail = plan
+        .iter()
+        .map(|r| r.3.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    assert!(
+        detail.contains("idx_alert_sink_outbox_drain"),
+        "drain query must use idx_alert_sink_outbox_drain, got plan: {detail}",
+    );
+    // A sort would mean the index no longer satisfies ORDER BY id, so the
+    // LIMIT could not short-circuit and the cost would scale with the
+    // pending set instead of the batch.
+    assert!(
+        !detail.contains("USE TEMP B-TREE"),
+        "drain query must not sort; the index should already be in id order: {detail}",
+    );
+}
+
 #[tokio::test]
 async fn record_event_and_enqueue_inserts_event_and_outbox_rows() {
     let (store, _tmp) = fresh_store().await;
