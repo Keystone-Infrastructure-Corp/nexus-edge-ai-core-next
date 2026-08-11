@@ -245,7 +245,29 @@ impl Store {
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .foreign_keys(true);
 
-        let pool = SqlitePoolOptions::new()
+        let pool = Self::build_pool(opts.clone()).await?;
+
+        // A connection that was already open when a migration ran `CREATE
+        // INDEX` keeps planning queries as if the index did not exist — it
+        // never re-plans against the new schema. That silently defeats an
+        // index on the exact boot that introduces it (verified: the
+        // migrating process full-scans `alert_sink_outbox`, every later
+        // boot uses `idx_alert_sink_outbox_drain`), and it only heals when
+        // the connection is recycled up to an hour later by `max_lifetime`.
+        // Rebuilding the pool guarantees every connection post-dates the
+        // schema it will be planning against.
+        let pool = if Self::apply_schema(&pool).await? {
+            pool.close().await;
+            Self::build_pool(opts).await?
+        } else {
+            pool
+        };
+
+        Ok(Self { pool })
+    }
+
+    async fn build_pool(opts: SqliteConnectOptions) -> Result<SqlitePool, StoreError> {
+        Ok(SqlitePoolOptions::new()
             .max_connections(8)
             // Fail fast when the pool is saturated so callers can log/drop
             // work instead of waiting forever and cascading backpressure.
@@ -255,14 +277,12 @@ impl Store {
             .idle_timeout(std::time::Duration::from_secs(300))
             .max_lifetime(std::time::Duration::from_secs(3600))
             .connect_with(opts)
-            .await?;
-
-        Self::apply_schema(&pool).await?;
-
-        Ok(Self { pool })
+            .await?)
     }
 
-    async fn apply_schema(pool: &SqlitePool) -> Result<(), StoreError> {
+    /// Returns `true` when at least one migration was applied, meaning the
+    /// schema changed underneath any connection that is already open.
+    async fn apply_schema(pool: &SqlitePool) -> Result<bool, StoreError> {
         // Bootstrap the migrations table itself. Idempotent.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -286,6 +306,7 @@ impl Store {
                 .await?;
         }
 
+        let mut applied_any = false;
         for (id, sql) in MIGRATIONS {
             if Self::migration_applied(pool, id).await? {
                 continue;
@@ -346,8 +367,9 @@ impl Store {
                 tx.commit().await?;
             }
             info!(migration = %id, "applied schema migration");
+            applied_any = true;
         }
-        Ok(())
+        Ok(applied_any)
     }
 
     async fn migration_applied(pool: &SqlitePool, id: &str) -> Result<bool, StoreError> {
