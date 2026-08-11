@@ -80,8 +80,8 @@ use uuid::Uuid;
 
 use crate::decode::{
     frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, AvoidLegacyVaapiPostproc,
-    DecodeMode, FrameLoopDetector, GstFactoryProbe, DECODE_VALIDATION_FRAMES,
-    FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP, VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT,
+    DecodeMode, FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, FLAT_FRAME_EVAL_WINDOW,
+    FLAT_FRAME_TRIP, FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP, VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT,
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
@@ -766,11 +766,10 @@ async fn run_session(
         let logged_first = Arc::new(AtomicBool::new(false));
         let logged_first_cb = logged_first.clone();
         // Per-session decode-health guard state (see `force_software`).
-        let flat_streak_cb = Arc::new(parking_lot::Mutex::new(0u32));
-        let validation_done_cb = Arc::new(AtomicBool::new(false));
+        let flat_detector_cb = Arc::new(parking_lot::Mutex::new(FlatFrameDetector::new()));
         let force_software_cb = force_software.clone();
         let guard_hwaccel = rgb_hwaccel;
-        // Per-session frame-loop guard state. Unlike the flat-frame guard
+        // Per-session frame-loop guard state. Like the flat-frame guard
         // above this stays armed for the whole session: a decode path can
         // start out perfectly healthy and only begin recycling surfaces
         // hours later.
@@ -844,36 +843,34 @@ async fn run_session(
 
                     // Runtime decode-health guard. A decoder is chosen on
                     // element *presence*, not on whether it renders correctly
-                    // on this GPU/driver (some, e.g. radeonsi `vapostproc`,
-                    // emit only all-green frames). If the first
-                    // `DECODE_VALIDATION_FRAMES` frames off a hardware chain
-                    // are all near-constant colour, latch the software
-                    // fallback and end the session so the supervisor rebuilds
-                    // on `avdec_*`. One real (varied) frame disarms the check
-                    // for the rest of the session.
-                    if guard_hwaccel && !validation_done_cb.load(Ordering::Relaxed) {
-                        if rgb_frame_looks_degenerate(&data) {
-                            let hit = {
-                                let mut streak = flat_streak_cb.lock();
-                                *streak += 1;
-                                *streak >= DECODE_VALIDATION_FRAMES
-                            };
-                            if hit {
-                                validation_done_cb.store(true, Ordering::Relaxed);
-                                force_software_cb.store(true, Ordering::Release);
-                                error!(
-                                    camera_id,
-                                    frames = DECODE_VALIDATION_FRAMES,
-                                    "hardware decoder rendered only degenerate \
-                                     (near-constant colour) frames on this GPU; \
-                                     falling back to software decode and \
-                                     rebuilding the camera session"
-                                );
-                                return Err(gst::FlowError::Error);
-                            }
-                        } else {
-                            validation_done_cb.store(true, Ordering::Relaxed);
-                        }
+                    // on this GPU/driver, and a VA surface pool that was
+                    // rendering fine can start handing back slots it never
+                    // wrote — an all-zero NV12 buffer, i.e. a solid green
+                    // picture — once the box is under enough concurrent
+                    // camera load. So this stays armed for the whole session
+                    // and counts flat frames within a rolling window: an
+                    // earlier version disarmed permanently on the first
+                    // non-flat frame, which made it a startup check that a
+                    // camera turning green minutes later sailed straight
+                    // past. The frame-loop guard below cannot cover for it,
+                    // because a frozen green picture repeats at distance 1
+                    // and is excluded there by design.
+                    if guard_hwaccel
+                        && flat_detector_cb
+                            .lock()
+                            .observe(rgb_frame_looks_degenerate(&data))
+                    {
+                        force_software_cb.store(true, Ordering::Release);
+                        error!(
+                            camera_id,
+                            frames = FLAT_FRAME_TRIP,
+                            window = FLAT_FRAME_EVAL_WINDOW,
+                            "hardware decoder is rendering degenerate \
+                             (near-constant colour) frames on this GPU; \
+                             falling back to software decode and \
+                             rebuilding the camera session"
+                        );
+                        return Err(gst::FlowError::Error);
                     }
 
                     // Frame-loop guard. A recycled decoder surface pool

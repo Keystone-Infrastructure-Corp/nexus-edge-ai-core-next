@@ -437,15 +437,6 @@ pub fn select_decode_chain(
     }
 }
 
-/// Number of consecutive decoded frames a hardware chain may emit that all
-/// look degenerate (near-constant colour) before the ingest runtime guard
-/// concludes the selected GPU decoder is not rendering correctly on this
-/// hardware and falls the camera back to software decode. At the 15 fps
-/// supervisor cap this is ~2 s — long enough that a working camera has shown
-/// at least one real (non-flat) frame, short enough that a broken backend
-/// self-heals almost immediately.
-pub const DECODE_VALIDATION_FRAMES: u32 = 30;
-
 /// Per-channel spread (max − min over sampled pixels) at or below which a
 /// frame is considered "flat". A real sensor — even pointed at a dark or
 /// blank wall — carries noise well above this; a broken decoder that emits a
@@ -486,6 +477,88 @@ pub fn rgb_frame_looks_degenerate(rgb: &[u8]) -> bool {
     rmax - rmin <= FLAT_CHANNEL_DELTA
         && gmax - gmin <= FLAT_CHANNEL_DELTA
         && bmax - bmin <= FLAT_CHANNEL_DELTA
+}
+
+/// How many recent frames [`FlatFrameDetector`] evaluates its trip decision
+/// over. Matches [`FRAME_LOOP_EVAL_WINDOW`] — ~6 s at the 15 fps supervisor
+/// cap — so the two runtime decode-health guards report on the same
+/// timescale.
+pub const FLAT_FRAME_EVAL_WINDOW: usize = 90;
+
+/// Degenerate frames within [`FLAT_FRAME_EVAL_WINDOW`] before
+/// [`FlatFrameDetector`] trips. At the 15 fps supervisor cap 30 flat frames
+/// is ~2 s of provably wrong picture, and a chain that is broken from its
+/// very first frame still trips on exactly the evidence the superseded
+/// consecutive-run check needed — 30 flat frames in a row is also 30 flat
+/// frames within 90.
+pub const FLAT_FRAME_TRIP: u32 = 30;
+
+/// Detects a hardware decode path that is emitting degenerate
+/// (near-constant colour) frames — the all-zero NV12 surface an AMD VA pool
+/// hands back when it recycles a slot it never wrote, which renders as a
+/// solid green picture.
+///
+/// Counts flat frames *within a rolling window* rather than requiring an
+/// unbroken run, and never disarms. Both properties are load-bearing, and
+/// the guard this replaces had neither:
+///
+/// * The previous check stopped evaluating for the rest of the session the
+///   moment it saw one non-flat frame. Since practically every session
+///   renders correctly for at least a frame or two before a pool goes bad,
+///   that made it a *startup validation*, not a runtime guard — a camera
+///   that turned green minutes later was never re-examined and stayed green
+///   indefinitely.
+/// * The frame-loop guard cannot cover the gap either: a frozen green
+///   picture repeats at distance 1, which [`FrameLoopDetector`] excludes by
+///   design so that static night scenes and `videorate` padding do not tear
+///   down healthy sessions.
+///
+/// Measured on a 53-camera Radeon 680M box: two cameras sat at 100% flat
+/// frames indefinitely and a third flickered at ~8%, while both guards
+/// reported nothing at all.
+#[derive(Debug, Default)]
+pub struct FlatFrameDetector {
+    /// Per-observation flat/not-flat outcomes over the trip window.
+    outcomes: std::collections::VecDeque<bool>,
+    hits: u32,
+    observed: u64,
+    flat: u64,
+}
+
+impl FlatFrameDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Frames observed and, of those, how many looked degenerate. Reported
+    /// even when the detector never trips, so a flat rate below
+    /// [`FLAT_FRAME_TRIP`] is still visible to telemetry instead of silent.
+    #[must_use]
+    pub fn stats(&self) -> (u64, u64) {
+        (self.observed, self.flat)
+    }
+
+    /// Record one frame. Returns `true` once [`FLAT_FRAME_TRIP`] of the last
+    /// [`FLAT_FRAME_EVAL_WINDOW`] frames looked degenerate, then resets so a
+    /// caller that chooses not to act still gets a bounded log rate.
+    pub fn observe(&mut self, flat: bool) -> bool {
+        self.observed = self.observed.saturating_add(1);
+        if flat {
+            self.flat = self.flat.saturating_add(1);
+            self.hits += 1;
+        }
+        self.outcomes.push_back(flat);
+        if self.outcomes.len() > FLAT_FRAME_EVAL_WINDOW && self.outcomes.pop_front() == Some(true) {
+            self.hits = self.hits.saturating_sub(1);
+        }
+
+        if self.hits >= FLAT_FRAME_TRIP {
+            self.hits = 0;
+            self.outcomes.clear();
+            return true;
+        }
+        false
+    }
 }
 
 /// How many recent frame fingerprints [`FrameLoopDetector`] keeps. Must
@@ -1261,6 +1334,89 @@ mod tests {
     fn degenerate_detector_ignores_empty_or_subpixel() {
         assert!(!rgb_frame_looks_degenerate(&[]));
         assert!(!rgb_frame_looks_degenerate(&[1, 2]));
+    }
+
+    /// The regression that matters: the superseded guard disarmed for the
+    /// rest of the session on its first non-flat frame, so a decode path
+    /// that started healthy and went green later was never re-examined.
+    /// Field evidence: two cameras sat at 100% flat frames indefinitely
+    /// while the guard reported nothing.
+    #[test]
+    fn flat_detector_still_trips_long_after_a_healthy_start() {
+        let mut d = FlatFrameDetector::new();
+        for _ in 0..5_000 {
+            assert!(!d.observe(false), "healthy video must never trip");
+        }
+        let trips = (0..FLAT_FRAME_TRIP).any(|_| d.observe(true));
+        assert!(trips, "must trip once the picture goes flat, however late");
+    }
+
+    #[test]
+    fn flat_detector_trips_on_a_broken_from_boot_chain() {
+        let mut d = FlatFrameDetector::new();
+        let at = (1..=FLAT_FRAME_TRIP).position(|_| d.observe(true));
+        assert_eq!(
+            at,
+            Some(FLAT_FRAME_TRIP as usize - 1),
+            "a chain flat from frame 1 must trip on exactly FLAT_FRAME_TRIP frames"
+        );
+    }
+
+    /// An intermittently-recycled pool lets real frames through between the
+    /// unwritten ones. Under the old consecutive-run rule any single good
+    /// frame reset the count to zero and the fault ran forever.
+    #[test]
+    fn flat_detector_trips_on_an_intermittent_fault() {
+        let mut d = FlatFrameDetector::new();
+        let mut tripped = false;
+        // 2 flat : 1 good — well inside the window's 30-in-90 bar, and never
+        // more than two flat frames in a row.
+        for i in 0..FLAT_FRAME_EVAL_WINDOW {
+            if d.observe(i % 3 != 2) {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(tripped, "intermittent flat frames must still trip");
+    }
+
+    /// The counterweight: a sparse flat rate must not tear down a working
+    /// session, or a dark scene costs the camera its hardware decoder.
+    #[test]
+    fn flat_detector_ignores_a_sparse_flat_rate() {
+        let mut d = FlatFrameDetector::new();
+        for i in 0..10_000 {
+            assert!(
+                !d.observe(i % 5 == 0),
+                "20% flat is under the {FLAT_FRAME_TRIP}-in-{FLAT_FRAME_EVAL_WINDOW} bar"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_detector_reports_stats_even_without_tripping() {
+        let mut d = FlatFrameDetector::new();
+        for i in 0..100 {
+            d.observe(i % 10 == 0);
+        }
+        assert_eq!(d.stats(), (100, 10));
+    }
+
+    /// Trips reset, so a caller that declines to act gets a bounded log
+    /// rate rather than one error per frame.
+    #[test]
+    fn flat_detector_resets_after_tripping() {
+        let mut d = FlatFrameDetector::new();
+        let mut trips = 0;
+        for _ in 0..(FLAT_FRAME_TRIP * 3) {
+            if d.observe(true) {
+                trips += 1;
+            }
+        }
+        assert_eq!(
+            trips, 3,
+            "one trip per FLAT_FRAME_TRIP flat frames, not per frame"
+        );
     }
 
     #[test]
