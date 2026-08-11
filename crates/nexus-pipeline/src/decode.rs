@@ -79,6 +79,11 @@
 //! abstraction so it is unit-testable on macOS without the `gstreamer`
 //! feature or any real plugins.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+
 pub use nexus_config::DecodeMode;
 
 /// Which backend [`select_decode_chain`] actually chose after probing and
@@ -513,6 +518,62 @@ pub const FRAME_LOOP_EVAL_WINDOW: usize = 90;
 /// while still being slack enough that a short coincidental burst cannot
 /// tear down a working session.
 pub const FRAME_LOOP_TRIP: u32 = 30;
+
+/// Minimum interval between two frame-loop-guard session rebuilds on one
+/// camera.
+///
+/// The guard's remedy is a full teardown + rebuild, which reallocates the
+/// camera's VA decoder and its surface pool. On a VRAM-constrained box that
+/// reallocation is itself the thing that produces an unwritten (solid green)
+/// surface — and a green frame is pixel-identical to its predecessor, so it
+/// reads as a duplicate and trips the guard again. Field-measured on a
+/// 53-camera Radeon 680M at 90% VRAM: 1523 trips and 1523 rebuilds in 25
+/// minutes, ~61 rebuilds a minute across the fleet, indefinitely.
+///
+/// Throttling the remedy breaks that loop without blinding the detector: a
+/// genuinely wedged decoder is still rebuilt, just at most once per window,
+/// and the trips in between are reported rather than acted on.
+pub const FRAME_LOOP_REBUILD_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Per-camera rate limiter for the frame-loop guard's rebuild remedy.
+///
+/// Lives outside the session (like `vaapipostproc_loop_trips`) because the
+/// thing being limited is how often sessions are torn down — state that a
+/// per-session detector cannot hold, since the rebuild is what destroys it.
+#[derive(Debug, Default)]
+pub struct LoopRebuildThrottle {
+    last_rebuild: Mutex<Option<Instant>>,
+    suppressed: AtomicU32,
+}
+
+impl LoopRebuildThrottle {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a rebuild may proceed at `now`. Records the rebuild when it
+    /// returns `true`; counts the trip as suppressed when it returns `false`.
+    pub fn allow_rebuild_at(&self, now: Instant) -> bool {
+        let mut last = self.last_rebuild.lock();
+        match *last {
+            Some(prev) if now.duration_since(prev) < FRAME_LOOP_REBUILD_COOLDOWN => {
+                self.suppressed.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+
+    /// Trips observed while inside the cooldown, for the suppression log.
+    #[must_use]
+    pub fn suppressed(&self) -> u32 {
+        self.suppressed.load(Ordering::Relaxed)
+    }
+}
 
 /// Byte stride at which [`frame_fingerprint`] samples the frame. Prime, so
 /// consecutive samples rotate through the R/G/B channels instead of reading
@@ -1275,6 +1336,55 @@ mod tests {
             }
         }
         assert_eq!(tripped, Some(6));
+    }
+
+    /// The regression this throttle exists for: on a VRAM-constrained box
+    /// the guard's rebuild is what manufactures the unwritten (green)
+    /// surface, the green frame reads as a duplicate, and the guard trips
+    /// again — 1523 trips and 1523 rebuilds in 25 minutes were measured in
+    /// the field. The remedy must be rate-limited even when the detector
+    /// keeps firing.
+    #[test]
+    fn rebuild_throttle_allows_one_rebuild_per_cooldown() {
+        let t = LoopRebuildThrottle::new();
+        let t0 = Instant::now();
+
+        assert!(t.allow_rebuild_at(t0), "first trip must be allowed to act");
+        assert!(
+            !t.allow_rebuild_at(t0 + Duration::from_secs(1)),
+            "a trip one second later must not tear the session down again"
+        );
+        assert!(
+            !t.allow_rebuild_at(t0 + FRAME_LOOP_REBUILD_COOLDOWN - Duration::from_millis(1)),
+            "still inside the cooldown"
+        );
+        assert!(
+            t.allow_rebuild_at(t0 + FRAME_LOOP_REBUILD_COOLDOWN),
+            "a genuinely wedged decoder must still be rebuilt once the window passes"
+        );
+        assert_eq!(t.suppressed(), 2, "suppressed trips are counted, not lost");
+    }
+
+    /// A storm at the field-measured rate collapses to the cooldown rate.
+    #[test]
+    fn rebuild_throttle_collapses_a_field_rate_storm() {
+        let t = LoopRebuildThrottle::new();
+        let t0 = Instant::now();
+        // One camera tripped roughly every 52 s for 25 minutes.
+        let mut rebuilds = 0;
+        for i in 0..29 {
+            if t.allow_rebuild_at(t0 + Duration::from_secs(i * 52)) {
+                rebuilds += 1;
+            }
+        }
+        // Each grant restarts the window from the granting trip, so grants
+        // land on the first trip at or past +300 s: t = 0, 312, 624, 936,
+        // 1248. Five rebuilds where the guard asked for 29.
+        assert_eq!(
+            rebuilds, 5,
+            "25 min of trips must collapse to one rebuild per cooldown, not 29"
+        );
+        assert_eq!(t.suppressed(), 24, "the other 24 trips are counted");
     }
 
     #[test]

@@ -14,6 +14,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `labeled` is load-bearing: the `system-libs` job below opts in via a
+    # `system-libs` PR label. The default types (opened/synchronize/reopened)
+    # do NOT include `labeled`, so applying the label produced no new run and
+    # the job stayed `skipping` until someone happened to push again — i.e. the
+    # documented opt-in silently did nothing on the PR that needed it.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref. Keeps the queue honest.

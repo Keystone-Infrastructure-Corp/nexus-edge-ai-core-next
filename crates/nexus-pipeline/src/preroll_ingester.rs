@@ -64,7 +64,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gstreamer as gst;
@@ -80,8 +80,9 @@ use uuid::Uuid;
 
 use crate::decode::{
     frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, AvoidLegacyVaapiPostproc,
-    DecodeMode, FrameLoopDetector, GstFactoryProbe, DECODE_VALIDATION_FRAMES,
-    FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP, VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT,
+    DecodeMode, FrameLoopDetector, GstFactoryProbe, LoopRebuildThrottle, DECODE_VALIDATION_FRAMES,
+    FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_REBUILD_COOLDOWN, FRAME_LOOP_TRIP,
+    VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT,
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
@@ -308,6 +309,9 @@ impl PreRollIngester {
         // per rebuilt session.
         let task_avoid_legacy_vaapipostproc = Arc::new(AtomicBool::new(false));
         let task_vaapipostproc_loop_trips = Arc::new(AtomicU32::new(0));
+        // Rate limiter for the frame-loop guard's rebuild remedy. Outside the
+        // session because the rebuild is what destroys per-session state.
+        let task_loop_rebuilds = Arc::new(LoopRebuildThrottle::new());
         let task = tokio::spawn(async move {
             run_supervisor(
                 camera_id,
@@ -322,6 +326,7 @@ impl PreRollIngester {
                 task_force_software,
                 task_avoid_legacy_vaapipostproc,
                 task_vaapipostproc_loop_trips,
+                task_loop_rebuilds,
             )
             .await;
         });
@@ -477,6 +482,7 @@ async fn run_supervisor(
     force_software: Arc<AtomicBool>,
     avoid_legacy_vaapipostproc: Arc<AtomicBool>,
     vaapipostproc_loop_trips: Arc<AtomicU32>,
+    loop_rebuilds: Arc<LoopRebuildThrottle>,
 ) {
     info!(
         camera_id,
@@ -511,6 +517,7 @@ async fn run_supervisor(
             force_software.clone(),
             avoid_legacy_vaapipostproc.clone(),
             vaapipostproc_loop_trips.clone(),
+            loop_rebuilds.clone(),
         )
         .await
         {
@@ -549,6 +556,7 @@ async fn run_session(
     force_software: Arc<AtomicBool>,
     avoid_legacy_vaapipostproc: Arc<AtomicBool>,
     vaapipostproc_loop_trips: Arc<AtomicU32>,
+    loop_rebuilds: Arc<LoopRebuildThrottle>,
 ) -> Result<(), IngesterError> {
     // Once latched, report the AMD legacy-vaapipostproc GPU-convert tier's
     // elements as absent so `select_decode_chain` falls to the
@@ -775,6 +783,7 @@ async fn run_session(
         // start out perfectly healthy and only begin recycling surfaces
         // hours later.
         let loop_detector_cb = Arc::new(parking_lot::Mutex::new(FrameLoopDetector::new()));
+        let loop_rebuilds_cb = loop_rebuilds.clone();
         // Escalation state for the AMD legacy-vaapipostproc GPU-convert
         // tier (see `VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`). Only meaningful
         // when this session actually picked that tier.
@@ -914,18 +923,35 @@ async fn run_session(
                                 );
                             }
                         }
-                        error!(
+                        if loop_rebuilds_cb.allow_rebuild_at(Instant::now()) {
+                            error!(
+                                camera_id,
+                                period,
+                                frames = FRAME_LOOP_TRIP,
+                                window = FRAME_LOOP_EVAL_WINDOW,
+                                "decoded frames are repeating on a fixed cycle \
+                                 (stale video with advancing frame ids); \
+                                 rebuilding the camera session"
+                            );
+                            return Err(gst::FlowError::Error);
+                        }
+                        // Inside the cooldown: report and fall through. The
+                        // rebuild is what churns the VA surface pool, and on
+                        // a VRAM-tight box that churn is what produces the
+                        // unwritten green surface the guard then reads as
+                        // another duplicate. Falling through — rather than
+                        // returning early — keeps this frame flowing to the
+                        // tap; a suppressed trip must not blind the camera.
+                        warn!(
                             camera_id,
                             period,
-                            frames = FRAME_LOOP_TRIP,
-                            window = FRAME_LOOP_EVAL_WINDOW,
-                            "decoded frames are repeating on a fixed cycle \
-                             (stale video with advancing frame ids); \
-                             rebuilding the camera session"
+                            suppressed = loop_rebuilds_cb.suppressed(),
+                            cooldown_s = FRAME_LOOP_REBUILD_COOLDOWN.as_secs(),
+                            "frame-loop guard tripped again inside the rebuild cooldown; \
+                             leaving the session up (rebuilding this often churns the \
+                             decoder's surface pool and manufactures green frames)"
                         );
-                        return Err(gst::FlowError::Error);
                     }
-
                     // Duplicate-rate telemetry. The guard above only speaks
                     // when it tears a session down, so a loop that stays
                     // under the trip ratio is otherwise invisible and its
