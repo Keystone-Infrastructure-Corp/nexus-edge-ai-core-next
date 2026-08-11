@@ -27,7 +27,7 @@
 //!   in this crate; testing uses a locally-trusted CA instead.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -135,7 +135,24 @@ pub enum TunnelError {
     /// tunnel reconnect will send a fresh heartbeat.
     #[error("tunnel send channel closed")]
     SendChannelClosed,
+    /// The writer task did not free queue capacity within
+    /// [`ENQUEUE_TIMEOUT`]. Distinct from [`Self::Disconnected`]: the
+    /// socket still looks established, but the peer has stopped
+    /// draining it. Transient — callers backed by the durable outbox
+    /// should retry.
+    #[error("tunnel send queue full for {0:?}; writer not draining")]
+    SendTimeout(Duration),
 }
+
+/// How long an uplink enqueue waits for queue capacity before giving up.
+///
+/// A half-open socket parks the writer inside `writer.send()` forever, so
+/// without this the queue fills and every caller parks with it — the
+/// writer owns the receiver, so the channel never closes and the park
+/// never resolves. Reconnecting does not help: a caller already parked on
+/// the old connection's queue stays there. Sized above a normal flush so
+/// ordinary bursts still block-and-drain rather than erroring.
+pub const ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Phase 1.8 tunnel client. Holds the resolved `wss://gateway/v1/tunnel`
 /// URL + the mTLS identity. [`Self::connect`] performs the WSS+mTLS
@@ -417,21 +434,15 @@ impl Connection {
 #[async_trait]
 impl TunnelHandle for Connection {
     async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
-        // Route by tier. Control and alert frames are never dropped: they
-        // await queue capacity (each queue is 64 deep). Bulk frames are
+        // Route by tier. Control and alert frames are not dropped on a
+        // transient burst: they await queue capacity (each queue is 64
+        // deep) up to `ENQUEUE_TIMEOUT`, after which a stalled writer is
+        // reported rather than waited on forever. Bulk frames are
         // best-effort — a full bulk queue drops the frame rather than
         // blocking the caller (and, transitively, the writer).
         match tier_of(&envelope.body) {
-            Tier::Control => self
-                .ctl_tx
-                .send(envelope)
-                .await
-                .map_err(|_| TunnelError::SendChannelClosed),
-            Tier::Alert => self
-                .alert_tx
-                .send(envelope)
-                .await
-                .map_err(|_| TunnelError::SendChannelClosed),
+            Tier::Control => enqueue_bounded(&self.ctl_tx, envelope).await,
+            Tier::Alert => enqueue_bounded(&self.alert_tx, envelope).await,
             Tier::Bulk => match self.out_tx.try_send(envelope) {
                 Ok(()) => Ok(()),
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -444,11 +455,30 @@ impl TunnelHandle for Connection {
     }
 }
 
+/// Enqueue onto a never-drop uplink tier, bounded by [`ENQUEUE_TIMEOUT`].
+///
+/// `mpsc::Sender::send` only resolves on capacity or channel close, and a
+/// writer parked in `writer.send()` on a half-open socket delivers
+/// neither — so an unbounded await here is what turns one stalled socket
+/// into a permanently wedged dispatcher.
+async fn enqueue_bounded<T>(tx: &mpsc::Sender<T>, item: T) -> Result<(), TunnelError> {
+    match tokio::time::timeout(ENQUEUE_TIMEOUT, tx.send(item)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(TunnelError::SendChannelClosed),
+        Err(_elapsed) => {
+            warn!(
+                timeout = ?ENQUEUE_TIMEOUT,
+                "tunnel uplink queue full; writer not draining",
+            );
+            Err(TunnelError::SendTimeout(ENQUEUE_TIMEOUT))
+        }
+    }
+}
+
 /// Blanket impl so engine code that holds an `Arc<Connection>` can
 /// hand it to anything that wants `Arc<dyn TunnelHandle>` (or to a
 /// generic bound `T: TunnelHandle`) without an extra adapter type.
-///
-/// Phase 2 \u00b7 Step 2.8 \u2014 [`crate::TunnelOutbox::set_handle`] stores
+////// Phase 2 \u00b7 Step 2.8 \u2014 [`crate::TunnelOutbox::set_handle`] stores
 /// an `Arc<Connection>` cloned per-reconnect; the outbox publishes
 /// through that handle via this impl.
 #[async_trait]
@@ -576,5 +606,52 @@ mod tests {
             .connect_side_channel("wss://gateway.example:8443/v1/shell/abc")
             .await
             .is_err());
+    }
+
+    /// BUG-048 regression. A writer that has stopped draining must not
+    /// park the caller forever. Before the fix this awaited capacity that
+    /// never came: the receiver is alive (so the channel never closes)
+    /// but nothing reads it, which is exactly the half-open-socket shape
+    /// that wedged every alert sink for 17.7h.
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_times_out_when_the_writer_stops_draining() {
+        // Receiver held but never polled — the stalled-writer shape.
+        let (tx, _rx) = mpsc::channel::<u8>(1);
+        tx.send(1).await.expect("fills capacity");
+
+        let err = enqueue_bounded(&tx, 2)
+            .await
+            .expect_err("a full queue with a stalled writer must not block forever");
+
+        assert!(
+            matches!(err, TunnelError::SendTimeout(d) if d == ENQUEUE_TIMEOUT),
+            "expected SendTimeout, got {err:?}",
+        );
+    }
+
+    /// The timeout must not fire on a queue that still has capacity —
+    /// the common path stays a plain non-erroring enqueue.
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_succeeds_while_capacity_remains() {
+        let (tx, mut rx) = mpsc::channel::<u8>(1);
+        enqueue_bounded(&tx, 7)
+            .await
+            .expect("capacity is available");
+        assert_eq!(rx.try_recv().ok(), Some(7), "frame should be queued");
+    }
+
+    /// A closed channel is still reported as closed, not as a timeout —
+    /// callers distinguish "reconnecting" from "peer wedged".
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_reports_a_closed_channel_distinctly() {
+        let (tx, rx) = mpsc::channel::<u8>(1);
+        drop(rx);
+        let err = enqueue_bounded(&tx, 1)
+            .await
+            .expect_err("closed channel must error");
+        assert!(
+            matches!(err, TunnelError::SendChannelClosed),
+            "expected SendChannelClosed, got {err:?}",
+        );
     }
 }

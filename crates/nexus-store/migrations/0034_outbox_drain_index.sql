@@ -1,0 +1,54 @@
+-- 0034_outbox_drain_index.sql
+--
+-- BUG-048 — make the M7 dispatcher's drain query O(pending) instead of
+-- O(table).
+--
+-- The dispatcher runs this every tick (`Store::outbox_pending`):
+--
+--   SELECT ... FROM alert_sink_outbox
+--    WHERE status = 'pending'
+--      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+--    ORDER BY id ASC
+--    LIMIT ?
+--
+-- 0006 added `idx_alert_sink_outbox_pending (next_attempt_at, id)
+-- WHERE status='pending'` for exactly this query, but SQLite cannot
+-- use it:
+--
+--   * the `IS NULL OR <= ?` disjunction is not a sargable range over
+--     the leading column, so there is no seekable prefix; and
+--   * with `next_attempt_at` leading, the index order does not satisfy
+--     `ORDER BY id`, so serving the LIMIT from it would still require
+--     a sort of the whole partial index.
+--
+-- So the planner falls back to a full table scan of `alert_sink_outbox`
+-- — including every terminal ('sent'/'dead'/'suppressed') row — on
+-- every tick. The outbox is an append-mostly delivery ledger trimmed
+-- only by `retention.alert_sink_outbox_days` (and `0` means "keep
+-- forever", which compliance-minded deployments do set), so that scan
+-- grows without bound relative to the work actually available.
+--
+-- Leading with `id` fixes both problems at once: the index is a
+-- covering ordered walk of just the pending rows, so the planner reads
+-- them in `id` order, applies the `next_attempt_at` filter as it goes,
+-- and stops at LIMIT.
+--
+-- Measured on a 1,000,200-row fixture with 200 pending rows, production
+-- schema + both 0006 indexes, same query text:
+--
+--   before:  SCAN alert_sink_outbox                            269 ms
+--   after:   SCAN alert_sink_outbox USING INDEX ..._drain         5 ms
+--
+-- 54x, with no change to the query itself.
+--
+-- NOTE: this makes `idx_alert_sink_outbox_pending` redundant —
+-- `outbox_pending` is its only consumer (verified across the tree) and
+-- it is not used even there. It is left in place deliberately: dropping
+-- it is a separable change with its own risk, and forward-only
+-- migrations make an un-drop expensive. Remove it in a later migration
+-- once this index has soaked in the field.
+--
+-- Forward-only + idempotent via the `schema_migrations` ledger.
+CREATE INDEX IF NOT EXISTS idx_alert_sink_outbox_drain
+    ON alert_sink_outbox (id)
+    WHERE status = 'pending';

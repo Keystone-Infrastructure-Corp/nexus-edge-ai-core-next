@@ -193,6 +193,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0033_fleet_marker_apply_mode",
         include_str!("../migrations/0033_fleet_marker_apply_mode.sql"),
     ),
+    (
+        "0034_outbox_drain_index",
+        include_str!("../migrations/0034_outbox_drain_index.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

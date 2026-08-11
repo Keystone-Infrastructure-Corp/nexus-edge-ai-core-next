@@ -1202,10 +1202,14 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         file_sinks.clone(),
     );
     let (dispatcher_shutdown_tx, dispatcher_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Liveness counters for the drain loop, shared with the admin API so
+    // a wedged dispatcher is externally visible (BUG-048).
+    let dispatcher_health = Arc::new(nexus_sinks::dispatcher::DispatcherHealth::default());
     let dispatcher_handle = {
         let store = store.clone();
         let sink_registry = sink_registry.clone();
         let policy = delivery_policy.clone();
+        let health = dispatcher_health.clone();
         let dispatcher_cfg = nexus_sinks::dispatcher::SinkDispatcherConfig {
             clips_dir: Some(clips_dir.clone()),
             snapshots_dir: Some(snapshots_dir.clone()),
@@ -1217,6 +1221,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
                 store,
                 sink_registry,
                 policy,
+                health,
                 async {
                     let _ = dispatcher_shutdown_rx.await;
                 },
@@ -1504,6 +1509,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // `/api/v1/admin/sinks/health` can list configured sinks
         // even if they've never produced an outbox row.
         sink_registry: sink_registry.clone(),
+        dispatcher_health: dispatcher_health.clone(),
         // M7 cloud-managed sinks — boot snapshot of `nexus.toml`
         // `[[sinks]]` so `GET /v1/admin/sinks` can mark which sinks
         // are file-pinned (read-only) vs cloud-managed (editable).

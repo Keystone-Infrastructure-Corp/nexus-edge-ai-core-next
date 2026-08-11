@@ -1112,9 +1112,32 @@ export interface SinkHealthEntry {
   counts: Record<string, OutboxSinkCounts>;
 }
 
+/**
+ * Liveness of the engine's alert-sink drain loop.
+ *
+ * Per-sink counts alone cannot tell "no alerts fired" apart from "the
+ * dispatcher is wedged" — both read as zero deliveries. `live` is the
+ * signal that distinguishes them.
+ */
+export interface DispatcherHealth {
+  live: boolean;
+  /** Milliseconds since the last completed tick; null before the first. */
+  last_tick_age_ms: number | null;
+  last_tick_completed_ms: number | null;
+  last_tick_started_ms: number | null;
+  ticks_completed: number;
+  rows_processed: number;
+  /** Rows in the most recent batch. Sustained at the batch size means
+   *  the backlog is growing faster than the drain. */
+  last_batch_rows: number;
+  /** Threshold `live` is computed against, so the UI need not duplicate it. */
+  stall_after_ms: number;
+}
+
 export interface SinksHealthResp {
   windows: Array<{ label: string; secs: number }>;
   sinks: SinkHealthEntry[];
+  dispatcher: DispatcherHealth;
 }
 
 // ---------------------------------------------------------------------------

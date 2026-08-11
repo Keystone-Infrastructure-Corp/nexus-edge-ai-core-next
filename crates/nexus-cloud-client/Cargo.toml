@@ -49,5 +49,8 @@ futures-util = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# `test-util` gives the paused clock the enqueue-timeout regression
+# tests need — otherwise each would burn a real ENQUEUE_TIMEOUT.
+# Mirrors nexus-storage-cloud's dev-dependency shape.
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
