@@ -789,25 +789,58 @@ mod tests {
 
     #[tokio::test]
     async fn full_queue_does_not_block_submitter() {
-        // Capacity=1 so the second submit fills the queue. The
-        // worker is held off by a slow extractor (we use a real
-        // MockExtractor but submit 5 in a row before yielding).
+        // `submit()` runs the D2 crop+resize inline before the channel
+        // hand-off, so a submit is never free — several ms on a slow box.
+        // The invariant here is narrower than "fast": a *full* queue must
+        // cost no more than a queue with room, i.e. submit() drops via
+        // try_send instead of waiting. Comparing the two cases keeps that
+        // honest without a hardcoded wall-clock budget, which the crop cost
+        // silently outgrew — the old 200 ms cap measured fixture allocation
+        // plus 50 crops and failed at ~249 ms.
+        const N: u64 = 48;
+
         let extractor: Arc<dyn Extractor> = Arc::new(MockExtractor::new());
         let outbox = Arc::new(TunnelOutbox::new());
         let stats = Arc::new(ReidStatsRegistry::new());
-        let hook = CloudEntitySightingHook::spawn(extractor, outbox, 1, stats, 0, 0);
-        // First two get into the channel (sender slot + receiver
-        // slot); the next three should hit TrySendError::Full and
-        // be dropped without blocking. Test guard: this loop must
-        // complete in milliseconds. If submit() were awaiting, this
-        // would hang well past any reasonable test timeout.
-        let start = std::time::Instant::now();
-        for i in 0..50 {
-            hook.submit(dummy_snapshot(1, i));
+
+        // Built up front: dummy_snapshot allocates a 1.5 MB frame, which is
+        // not what either measurement is about.
+        let roomy_snaps: Vec<_> = (0..N).map(|i| dummy_snapshot(1, i)).collect();
+        let full_snaps: Vec<_> = (0..N).map(|i| dummy_snapshot(2, i)).collect();
+
+        // Baseline: capacity exceeds the submit count, so every try_send lands.
+        let roomy = CloudEntitySightingHook::spawn(
+            extractor.clone(),
+            outbox.clone(),
+            (N * 2) as usize,
+            stats.clone(),
+            0,
+            0,
+        );
+        let t0 = std::time::Instant::now();
+        for snap in roomy_snaps {
+            roomy.submit(snap);
         }
+        let with_capacity = t0.elapsed() / N as u32;
+
+        // Capacity=1 and primed. `#[tokio::test]` is a current-thread runtime
+        // and submit() never awaits, so the worker cannot drain between the
+        // sync calls below — the queue stays genuinely full for all of them.
+        let full = CloudEntitySightingHook::spawn(extractor, outbox, 1, stats, 0, 0);
+        full.submit(dummy_snapshot(2, 900));
+        full.submit(dummy_snapshot(2, 901));
+        let t1 = std::time::Instant::now();
+        for snap in full_snaps {
+            full.submit(snap);
+        }
+        let when_full = t1.elapsed() / N as u32;
+
+        // A blocking_send here would deadlock outright on this runtime; an
+        // .await'd send would stall unboundedly. Either dwarfs 4x baseline.
         assert!(
-            start.elapsed() < std::time::Duration::from_millis(200),
-            "submit must be non-blocking even when the queue is full"
+            when_full < with_capacity * 4 + std::time::Duration::from_millis(1),
+            "submit must not block when the queue is full \
+             (full queue: {when_full:?}/call, queue with room: {with_capacity:?}/call)"
         );
     }
 
