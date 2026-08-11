@@ -112,6 +112,9 @@ jobs:
         run: cargo test --locked -p nexus-types --features ts
       - name: verify no drift in generated bindings
         run: |
+          # intent-to-add first: `git diff` alone cannot see untracked files, so a
+          # brand-new binding for a newly-derived type slipped through this gate.
+          git add --intent-to-add -- ui/src/api/types/
           if ! git diff --exit-code -- ui/src/api/types/; then
             echo "::error::ts-rs bindings drifted from Rust derives in nexus-types."
             echo "Run: cargo test -p nexus-types --features ts && git add ui/src/api/types/"
