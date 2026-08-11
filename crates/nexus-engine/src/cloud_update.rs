@@ -403,6 +403,7 @@ async fn apply_assignment(store: &Store, outbox: &TunnelOutbox, payload: &Update
         // reporting the real running version.
         state.current_version = state.previous_good.clone();
         state.last_phase = Some(phase::FAILED.to_string());
+        discard_staged_tarball();
         fail(store, outbox, &mut state, id, code).await;
         return;
     }
@@ -528,6 +529,11 @@ pub async fn finalize_pending_update(
     if state.last_phase.as_deref() != Some(phase::RESTARTING) {
         return;
     }
+    // The applier has already extracted it, so whatever this attempt ends up
+    // deciding, the staged tarball is dead weight from here on. Rollback does
+    // not need it either — `reflip` points `current` at an already-extracted
+    // release tree.
+    discard_staged_tarball();
     let running = env!("NEXUS_BUILD_VERSION");
     let assignment_id = state
         .active_assignment_id
@@ -638,6 +644,59 @@ pub async fn finalize_pending_update(
 // Privileged install steps — Linux only.
 // ---------------------------------------------------------------------
 
+/// Delete the staged tarball if it is there.
+///
+/// Nobody else does: the applier only reads the path, so before BUG-043 a
+/// half-gigabyte release image sat in `/opt/nexus/staging` from one update to
+/// the next, on the same filesystem the storage-safety loop is trying to keep
+/// above its panic threshold.
+#[cfg(target_os = "linux")]
+fn discard_staged_tarball() {
+    if let Err(e) = std::fs::remove_file(STAGED_TARBALL) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(error = %e, path = STAGED_TARBALL, "update: staged tarball discard failed");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn discard_staged_tarball() {}
+
+/// Write `bytes` to `path`, replacing whatever is already there.
+///
+/// Deliberately **not** `cfg`-gated on Linux even though its only caller is:
+/// the staging bug this exists to prevent (BUG-043) could not be regression-
+/// tested at all while it lived inside a Linux-only function, because a
+/// macOS `cargo check` never compiles that branch.
+///
+/// Unlink-then-write-then-rename, in that order, for two separate reasons:
+/// `File::create` is `O_TRUNC` on an existing inode rather than a replace, so
+/// without the unlink a leftover owned by another user (the applier runs as
+/// root) fails `EACCES` forever on this fixed path; and the applier `tar
+/// -xzf`s whatever it finds, so publishing by rename is what stops it ever
+/// seeing a half-written archive.
+// Only Linux calls it outside tests; the point of hoisting it out of the
+// Linux-gated `install_release` is that everyone else still compiles it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stage_tarball(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let part = path.with_extension("part");
+    let _ = std::fs::remove_file(&part);
+    let mut f = std::fs::File::create(&part)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&part, path)
+}
+
 /// Stage the verified tarball, then hand the entire privileged apply
 /// sequence to the single root-owned applier.
 ///
@@ -650,22 +709,14 @@ pub async fn finalize_pending_update(
 /// `RELEASES_DIR/<version>/`, exactly where it then points `current`.
 #[cfg(target_os = "linux")]
 async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str> {
-    use std::io::Write as _;
-    // Stage the tarball at the pinned path the applier reads.
-    if let Some(parent) = std::path::Path::new(STAGED_TARBALL).parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!(error = %e, dir = %parent.display(), "update: staging dir create failed");
-        }
-    }
-    let mut f = std::fs::File::create(STAGED_TARBALL).map_err(|e| {
-        warn!(error = %e, path = STAGED_TARBALL, "update: staged tarball create failed");
-        "artifact_unavailable"
+    // `staging_failed`, not `artifact_unavailable`: the bytes are already
+    // downloaded and digest-verified by this point, so reusing the download
+    // code here sends whoever reads the failure to the wrong side of the
+    // tunnel entirely. That misdirection is half of BUG-043.
+    stage_tarball(std::path::Path::new(STAGED_TARBALL), bytes).map_err(|e| {
+        warn!(error = %e, path = STAGED_TARBALL, "update: staging the release tarball failed");
+        "staging_failed"
     })?;
-    f.write_all(bytes).map_err(|e| {
-        warn!(error = %e, path = STAGED_TARBALL, "update: staged tarball write failed");
-        "artifact_unavailable"
-    })?;
-    drop(f);
 
     // Hand the whole privileged sequence to the single applier. It extracts,
     // applies the release's declared apt deps + journald cap (best-effort,
@@ -936,6 +987,61 @@ mod tests {
         assert_eq!(
             apply_release_argv("prune", "0.1.170"),
             ["/usr/local/sbin/nexus-apply-release", "prune", "0.1.170"]
+        );
+    }
+
+    /// BUG-043. A staged tarball left behind by a previous update is owned by
+    /// whoever wrote it — and the applier runs as root, so that is not always
+    /// the `nexus` user the engine runs as. `File::create` opens the existing
+    /// inode (`O_TRUNC`) instead of replacing it, so before the fix this
+    /// failed `EACCES` on a fixed path, forever, and reported it as
+    /// `artifact_unavailable`.
+    ///
+    /// Mode `0o444` stands in for "not writable by this process". It does not
+    /// constrain root, so a root test runner cannot set the scenario up at all
+    /// and the test bails out rather than passing for the wrong reason.
+    #[cfg(unix)]
+    #[test]
+    fn stage_tarball_replaces_a_target_this_process_cannot_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Control: confirm the mode really does block a plain create for this
+        // runner, so a green result below means the unlink did the work.
+        let decoy = dir.path().join("decoy");
+        std::fs::write(&decoy, b"x").unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::File::create(&decoy).is_ok() {
+            return; // running as root; 0o444 does not deny us anything
+        }
+
+        let target = dir.path().join("update.tar.gz");
+        std::fs::write(&target, b"stale release from the last update").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        stage_tarball(&target, b"the new release").expect("staging must replace the leftover");
+        assert_eq!(std::fs::read(&target).unwrap(), b"the new release");
+    }
+
+    /// The applier `tar -xzf`s whatever sits at the pinned path, so staging
+    /// must never leave its scratch file behind for a later run to trip over.
+    #[test]
+    fn stage_tarball_creates_the_parent_and_leaves_no_scratch_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("staging").join("update.tar.gz");
+
+        stage_tarball(&target, b"release bytes").expect("staging into a fresh dir must work");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"release bytes");
+        let leftovers: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "update.tar.gz")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "scratch files left behind: {leftovers:?}"
         );
     }
 }

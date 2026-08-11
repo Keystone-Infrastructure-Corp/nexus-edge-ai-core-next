@@ -140,11 +140,19 @@ def start_publisher(path: str, offset: int) -> None:
 
     ``-ss`` staggers each camera into a different part of the clip so the box
     is not decoding 60 identical frame sequences in lockstep.
+
+    ``-loglevel error``, not ``warning``: stream-copying a looped file makes
+    ffmpeg emit a "Non-monotonic DTS" warning per packet at every loop wrap,
+    which measured 5.7 MB of log for a single publisher over one earlier run.
+    Multiplied by a 60-camera rung that is hundreds of MB written to the same
+    filesystem this bench reports `free_gb` for — the load generator
+    perturbing the measurement. Truncating (`wb`) keeps reruns from
+    accumulating on top of each other.
     """
-    log = open(os.path.join(WORKDIR, f"pub-{path}.log"), "ab")
+    log = open(os.path.join(WORKDIR, f"pub-{path}.log"), "wb")
     subprocess.Popen(
         [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-re", "-stream_loop", "-1", "-ss", str(offset),
             "-i", os.path.join(WORKDIR, "source.mp4"),
             "-c", "copy", "-f", "rtsp",
@@ -279,24 +287,68 @@ def sample(n: int) -> dict:
 # --------------------------------------------------------------------------
 
 
+def stop_publisher(path: str) -> None:
+    out = subprocess.run(
+        ["pgrep", "-f", f"rtsp://127.0.0.1:{RTSP_PORT}/{path}"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    for pid in (int(p) for p in out.split()):
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+
+def reconcile_to(target: int) -> int:
+    """Bring the bench camera count to exactly ``target``. Returns what we got.
+
+    Both directions, deliberately. The ramp used to only ever add — it seeded
+    from ``len(bench_cameras())`` and ran ``range(existing, target)`` — so a run
+    launched while a previous run's cameras were still up created nothing and
+    measured them instead. A ``--steps 5,6,7`` invocation against 8 leftover
+    cameras sampled 8 cameras three times and labelled the rungs 5, 6 and 7.
+    """
+    doomed = sorted(bench_cameras(), key=lambda c: str(c.get("name", "")))[target:]
+    for cam in doomed:
+        name = str(cam.get("name", ""))
+        try:
+            api(f"/admin/cameras/{cam['id']}", "DELETE")
+        except Exception as exc:
+            print(f"delete {name} failed: {exc}", flush=True)
+        stop_publisher(name)
+    if doomed:
+        time.sleep(5)  # let the reconciler finish tearing the pipelines down
+
+    have = {str(c.get("name", "")) for c in bench_cameras()}
+    for i in range(target):
+        path = f"{CAM_PREFIX}{i:03d}"
+        if path in have:
+            continue
+        start_publisher(path, offset=(i * 7) % 240)
+        time.sleep(0.3)
+        try:
+            create_camera(path, path)
+        except urllib.error.HTTPError as exc:
+            print(f"camera {path} rejected: {exc.read().decode()[:200]}", flush=True)
+    return len(bench_cameras())
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     steps = [int(s) for s in args.steps.split(",")]
     csv_path = os.path.join(WORKDIR, "ramp.csv")
     rows: list[dict] = []
     knee: int | None = None
+    last_good = 0
 
-    existing = len(bench_cameras())
     for target in steps:
-        for i in range(existing, target):
-            path = f"{CAM_PREFIX}{i:03d}"
-            start_publisher(path, offset=(i * 7) % 240)
-            time.sleep(0.3)
-            try:
-                create_camera(path, path)
-            except urllib.error.HTTPError as exc:
-                print(f"camera {path} rejected: {exc.read().decode()[:200]}", flush=True)
-        existing = max(existing, target)
-        actual = len(bench_cameras())
+        actual = reconcile_to(target)
+        if actual != target:
+            print(
+                f"WARNING: asked for {target} cameras, the engine has {actual}; "
+                f"this rung is reported as {actual}",
+                flush=True,
+            )
         print(
             f"=== step target={target} cameras={actual} publishers={len(publisher_pids())} "
             f"settling {args.settle}s ===",
@@ -345,14 +397,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         warn = max(r["datastream_errs"] for r in tail)
         note = f" (warning: {warn} source teardowns/min)" if warn else ""
         print(f"--- PASSED at {actual} cameras{note}", flush=True)
+        last_good = actual
 
     _write_csv(csv_path, rows)
     print(f"\nwrote {csv_path} ({len(rows)} samples)", flush=True)
     if knee is None:
-        print(f"RESULT: sustained all {steps[-1]} cameras; raise --steps to find the knee")
+        print(f"RESULT: sustained all {last_good} cameras; raise --steps to find the knee")
         return 0
-    passed = [s for s in steps if s < knee]
-    last_good = passed[-1] if passed else 0
     print(f"RESULT: sustained {last_good} cameras; failed at {knee}")
     return 2
 

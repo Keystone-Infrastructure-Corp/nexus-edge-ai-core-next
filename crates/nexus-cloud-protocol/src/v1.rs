@@ -740,7 +740,7 @@ pub struct UpdateCancelPayload {
 pub struct UpdateProgressPayload {
     /// Echoes the `update_assignment.assignment_id`. Binds this progress event to the open update_history row.
     pub assignment_id: Uuid,
-    /// Required when phase=failed. Format `failed:<code>` where code ∈ signature_invalid | digest_mismatch | recording_in_progress | artifact_unavailable | health_check_failed | rollback_also_failed. Surfaced verbatim in the console update history.
+    /// Required when phase=failed. Format `failed:<code>` where code ∈ signature_invalid | digest_mismatch | recording_in_progress | artifact_unavailable | staging_failed | health_check_failed | rollback_also_failed. Surfaced verbatim in the console update history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Optional coarse progress percentage, primarily meaningful during `fetching_artifact`. Omitted for instantaneous phases.
