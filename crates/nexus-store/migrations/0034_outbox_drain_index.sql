@@ -33,6 +33,10 @@
 -- them in `id` order, applies the `next_attempt_at` filter as it goes,
 -- and stops at LIMIT.
 --
+-- `outbox_pending` names this index with `INDEXED BY`: `id` is the
+-- rowid alias, so without stats SQLite costs the partial index and a
+-- plain rowid-order table scan the same and the choice varies by build.
+--
 -- Measured on a 1,000,200-row fixture with 200 pending rows, production
 -- schema + both 0006 indexes, same query text:
 --

@@ -99,9 +99,10 @@ async fn outbox_migration_registers() {
 /// walk of the pending rows, never a scan of the whole delivery ledger.
 ///
 /// Asserts the *plan* rather than a wall-clock time so it stays
-/// deterministic in CI. SQLite picks this index even on an empty table
-/// and with no `ANALYZE` stats (verified), so the assertion does not
-/// depend on fixture size.
+/// deterministic in CI. The query pins the index with `INDEXED BY`,
+/// because left to its own cost model SQLite picks a rowid-order table
+/// scan on some builds (Linux CI did, macOS did not) — the index is on
+/// the rowid alias, so the two paths look equivalent without stats.
 ///
 /// Fails if the index is dropped or renamed, or if `outbox_pending`'s
 /// WHERE/ORDER BY drifts into a shape the index cannot serve — which is
@@ -134,7 +135,7 @@ async fn outbox_drain_query_is_index_driven_not_a_table_scan() {
         "EXPLAIN QUERY PLAN
          SELECT id, event_id, sink_id, status, attempts, next_attempt_at,
                 last_error, suppression_reason, created_at, delivered_at
-           FROM alert_sink_outbox
+           FROM alert_sink_outbox INDEXED BY idx_alert_sink_outbox_drain
           WHERE status = 'pending'
             AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
           ORDER BY id ASC

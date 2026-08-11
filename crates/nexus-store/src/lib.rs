@@ -963,10 +963,13 @@ impl Store {
     /// oldest enqueued row goes first.
     pub async fn outbox_pending(&self, limit: i64) -> Result<Vec<OutboxRow>, StoreError> {
         let now = Utc::now().to_rfc3339();
+        // INDEXED BY pins the plan: without it the planner's choice between
+        // the partial drain index and a rowid-order table scan varies by
+        // SQLite build, and the scan reads every terminal row on every tick.
         let rows = sqlx::query(
             "SELECT id, event_id, sink_id, status, attempts, next_attempt_at,
                     last_error, suppression_reason, created_at, delivered_at
-               FROM alert_sink_outbox
+               FROM alert_sink_outbox INDEXED BY idx_alert_sink_outbox_drain
               WHERE status = 'pending'
                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
               ORDER BY id ASC
