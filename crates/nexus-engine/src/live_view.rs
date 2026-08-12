@@ -146,6 +146,33 @@ impl LbrBudget {
     }
 }
 
+/// Whether this tick should encode and send.
+///
+/// The shared budget governs **motion bursts only**; the 1 fps keepalive
+/// bypasses it. A single bucket shared across `N` cameras cannot satisfy `N`
+/// keepalives once `N` exceeds [`DEFAULT_BUDGET_PER_SEC`], and because
+/// [`LbrBudget::try_acquire`] is first-come-first-served rather than
+/// round-robin — each pump sleeps a fixed `sample_interval`, so tick phases
+/// are stable — the cells that lose the race lose it permanently rather than
+/// degrading evenly. A 53-camera wall against a budget of 24 therefore leaves
+/// ~29 cells frozen indefinitely.
+///
+/// Bypassing is bounded: the keepalive is at most one encode per camera per
+/// second, so worst-case load is `N + max_per_sec` encodes/sec, and an encode
+/// is a small-tile resize + JPEG, not a decode.
+fn should_emit(
+    new_frame: bool,
+    scene_changed: bool,
+    keepalive_due: bool,
+    stale_dup: bool,
+    budget: &LbrBudget,
+) -> bool {
+    if !new_frame || stale_dup || !(scene_changed || keepalive_due) {
+        return false;
+    }
+    keepalive_due || budget.try_acquire()
+}
+
 /// Live-tunable per-camera pump parameters. A re-`lbr_subscribe` (sent by
 /// the cloud when the tile size or fps tier changes) updates these in place
 /// so the running pump retargets without a restart / frame gap.
@@ -374,13 +401,11 @@ fn spawn_pump(
                 let stale_dup = cycle.is_some() && !keepalive_due;
 
                 // Encode only when there is a NEW frame to send and either
-                // the scene changed or a keepalive is due — and the shared
-                // budget has a token to spare (else skip this tick).
-                if new_frame
-                    && (scene_changed || keepalive_due)
-                    && !stale_dup
-                    && budget.try_acquire()
-                {
+                // the scene changed or a keepalive is due. See
+                // `should_emit`: the shared budget governs motion bursts,
+                // while the keepalive bypasses it so a wall wider than the
+                // budget cannot freeze the cells that lose the token race.
+                if should_emit(new_frame, scene_changed, keepalive_due, stale_dup, &budget) {
                     match encode_lbr(entry.frame.as_ref(), tile_w) {
                         Ok(jpeg) => {
                             let env = build_lbr_frame_envelope(
@@ -564,6 +589,45 @@ mod tests {
         assert!(b.try_acquire());
         assert!(b.try_acquire());
         assert!(!b.try_acquire()); // 4th in the same window is denied
+    }
+
+    /// The live-wall starvation this bypass exists for: 53 engaged cameras
+    /// against the default budget of 24. Every cell must still get its 1 fps
+    /// keepalive, or ~29 of them sit frozen on whatever they last sent.
+    #[test]
+    fn keepalive_survives_a_wall_wider_than_the_budget() {
+        let b = LbrBudget::new(DEFAULT_BUDGET_PER_SEC);
+        let emitted = (0..53)
+            .filter(|_| should_emit(true, false, true, false, &b))
+            .count();
+        assert_eq!(
+            emitted, 53,
+            "every engaged camera keeps its cell alive regardless of budget"
+        );
+    }
+
+    /// The budget must still bite on motion, which is what protects
+    /// inference — the bypass is for the keepalive floor only.
+    #[test]
+    fn motion_bursts_still_yield_to_the_budget() {
+        let b = LbrBudget::new(24);
+        let emitted = (0..53)
+            .filter(|_| should_emit(true, true, false, false, &b))
+            .count();
+        assert_eq!(emitted, 24, "motion-driven encodes stay capped");
+    }
+
+    #[test]
+    fn a_stale_duplicate_is_never_emitted() {
+        let b = LbrBudget::new(24);
+        assert!(!should_emit(true, true, true, true, &b));
+        assert!(b.try_acquire(), "and it spent no token doing so");
+    }
+
+    #[test]
+    fn no_new_frame_means_no_send() {
+        let b = LbrBudget::new(24);
+        assert!(!should_emit(false, true, true, false, &b));
     }
 
     fn rgb_frame(w: u32, h: u32) -> Frame {
