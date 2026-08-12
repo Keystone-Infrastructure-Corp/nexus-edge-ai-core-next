@@ -315,34 +315,6 @@ fn apply_amd_tiling_workaround(cfg: &Config) {
     std::env::set_var("AMD_DEBUG", "notiling");
 }
 
-#[cfg(test)]
-mod main_tests {
-    use super::*;
-
-    #[test]
-    fn notiling_wanted_when_inference_is_off_the_igpu() {
-        let eps = vec!["hailo".to_string(), "cpu".to_string()];
-        assert!(wants_amd_notiling(&eps));
-    }
-
-    #[test]
-    fn notiling_skipped_when_an_ep_shares_the_igpu() {
-        let eps = vec!["webgpu".to_string(), "cpu".to_string()];
-        assert!(!wants_amd_notiling(&eps));
-    }
-
-    #[test]
-    fn ep_match_is_case_insensitive() {
-        let eps = vec!["ROCm".to_string()];
-        assert!(!wants_amd_notiling(&eps));
-    }
-
-    #[test]
-    fn an_empty_ep_list_still_wants_the_workaround() {
-        assert!(wants_amd_notiling(&[]));
-    }
-}
-
 fn build_runtime(cfg: &nexus_config::RuntimeConfig) -> Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
@@ -2567,5 +2539,33 @@ async fn idle_bump_drain(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn notiling_wanted_when_inference_is_off_the_igpu() {
+        let eps = vec!["hailo".to_string(), "cpu".to_string()];
+        assert!(wants_amd_notiling(&eps));
+    }
+
+    #[test]
+    fn notiling_skipped_when_an_ep_shares_the_igpu() {
+        let eps = vec!["webgpu".to_string(), "cpu".to_string()];
+        assert!(!wants_amd_notiling(&eps));
+    }
+
+    #[test]
+    fn ep_match_is_case_insensitive() {
+        let eps = vec!["ROCm".to_string()];
+        assert!(!wants_amd_notiling(&eps));
+    }
+
+    #[test]
+    fn an_empty_ep_list_still_wants_the_workaround() {
+        assert!(wants_amd_notiling(&[]));
     }
 }
