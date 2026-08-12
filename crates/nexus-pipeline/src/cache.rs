@@ -80,4 +80,26 @@ mod tests {
         let got = cache.get(7).unwrap();
         assert!(Arc::ptr_eq(&got.frame, &f));
     }
+
+    /// A stopped camera must not keep serving its last frame. Both the admin
+    /// frame API and the Phase 10 LBR pump read this cache, so a surviving
+    /// entry paints the cloud wall with a dead camera's final image under a
+    /// "LIVE" badge — and a camera that went green just before it stalled
+    /// stays green on the wall indefinitely. Measured on San Marcos 1: after
+    /// disabling 26 cameras, every one still returned a full JPEG frozen at
+    /// the moment of teardown.
+    #[test]
+    fn clear_stops_a_stopped_camera_serving_a_stale_frame() {
+        let cache = LatestFrameCache::new();
+        cache.put(7, frame(7), Arc::new(vec![]));
+        assert!(cache.get(7).is_some());
+
+        cache.clear(7);
+
+        assert!(
+            cache.get(7).is_none(),
+            "a stopped camera must not serve its last frame"
+        );
+        assert!(!cache.cameras().contains(&7));
+    }
 }
