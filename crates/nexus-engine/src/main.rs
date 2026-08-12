@@ -200,6 +200,10 @@ fn main() -> Result<()> {
         cfg.inference.model.kind = "mock".into();
     }
 
+    // Must precede any Mesa initialisation (gst::init, ORT GPU init): radeonsi
+    // reads AMD_DEBUG once, at driver load.
+    apply_amd_tiling_workaround(&cfg);
+
     // Raise the per-process file-descriptor cap BEFORE tokio spins
     // up any I/O. The LAN discovery sweep can open 100s of sockets
     // in parallel; the macOS default `ulimit -n` of 256 caused
@@ -264,6 +268,51 @@ fn register_bundled_gst_plugins() {
         _ => dir,
     };
     std::env::set_var("GST_PLUGIN_PATH", combined);
+}
+
+/// Execution providers that would put inference on the same AMD iGPU the
+/// decoder uses. `AMD_DEBUG` is process-global, so the tiling workaround is
+/// skipped when one of these is configured rather than silently taxing
+/// inference bandwidth.
+const IGPU_BOUND_EPS: [&str; 4] = ["webgpu", "rocm", "migraphx", "vulkan"];
+
+/// Whether the AMD linear-surface workaround is wanted for this EP set.
+fn wants_amd_notiling(ep_priority: &[String]) -> bool {
+    !ep_priority
+        .iter()
+        .any(|ep| IGPU_BOUND_EPS.contains(&ep.to_ascii_lowercase().as_str()))
+}
+
+/// Whether an AMD GPU (PCI vendor `0x1002`) is present.
+fn amd_gpu_present() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        std::fs::read_to_string(e.path().join("device/vendor")).is_ok_and(|v| v.trim() == "0x1002")
+    })
+}
+
+/// Force Mesa `radeonsi` to allocate linear (untiled) surfaces.
+///
+/// Field-measured on a 53-camera Radeon 680M (BUG-065): with tiling on, the box
+/// settled at 7.76 green cameras and ~121 decode-guard trips per sample; with
+/// `AMD_DEBUG=notiling`, the same box under the same load settled at 1.80 green
+/// and ~24 trips. Every camera escalates off the legacy-`vaapipostproc` tier
+/// within minutes onto `vah26Xdec`, whose output surfaces *are* tiled, and
+/// radeonsi hands some of them back unwritten once enough decode sessions run
+/// concurrently — which is the all-green frame.
+///
+/// Set here rather than in the systemd unit because the unit is only written by
+/// a fresh `install.sh`, never re-applied over an OTA.
+fn apply_amd_tiling_workaround(cfg: &Config) {
+    if std::env::var_os("AMD_DEBUG").is_some() || !amd_gpu_present() {
+        return;
+    }
+    if !wants_amd_notiling(&cfg.inference.ep_priority) {
+        return;
+    }
+    std::env::set_var("AMD_DEBUG", "notiling");
 }
 
 fn build_runtime(cfg: &nexus_config::RuntimeConfig) -> Result<tokio::runtime::Runtime> {
@@ -2490,5 +2539,33 @@ async fn idle_bump_drain(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn notiling_wanted_when_inference_is_off_the_igpu() {
+        let eps = vec!["hailo".to_string(), "cpu".to_string()];
+        assert!(wants_amd_notiling(&eps));
+    }
+
+    #[test]
+    fn notiling_skipped_when_an_ep_shares_the_igpu() {
+        let eps = vec!["webgpu".to_string(), "cpu".to_string()];
+        assert!(!wants_amd_notiling(&eps));
+    }
+
+    #[test]
+    fn ep_match_is_case_insensitive() {
+        let eps = vec!["ROCm".to_string()];
+        assert!(!wants_amd_notiling(&eps));
+    }
+
+    #[test]
+    fn an_empty_ep_list_still_wants_the_workaround() {
+        assert!(wants_amd_notiling(&[]));
     }
 }
