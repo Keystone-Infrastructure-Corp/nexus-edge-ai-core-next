@@ -80,6 +80,7 @@
 //! feature or any real plugins.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -646,6 +647,141 @@ impl LoopRebuildThrottle {
     pub fn suppressed(&self) -> u32 {
         self.suppressed.load(Ordering::Relaxed)
     }
+}
+
+/// Guard-driven rebuilds one camera may spend on a single decode tier before
+/// that tier is judged wrong *for that camera*.
+///
+/// [`LoopRebuildThrottle`] bounds how *often* the rebuild remedy runs; it does
+/// not give the remedy anywhere to go. Field-measured on a 53-camera Radeon
+/// 680M: twelve cameras each tripped exactly once per
+/// [`FRAME_LOOP_REBUILD_COOLDOWN`] for the whole observation window — every
+/// permitted rebuild was spent and every one of them came back green. Two
+/// strikes is deliberately small because a rebuild that was going to help
+/// helps immediately; a third is just another 5 minutes of green wall.
+pub const DECODE_ESCALATION_LIMIT: u32 = 2;
+
+/// Trip-free interval after which a camera's escalation strikes lapse.
+///
+/// Without this a camera accumulates a strike every few hours and eventually
+/// escalates itself onto software decode over nothing but uptime.
+pub const DECODE_ESCALATION_FORGIVE: Duration = Duration::from_secs(1800);
+
+/// Per-camera striker that decides when a decode tier has had its chance.
+///
+/// Lives outside the session for the same reason [`LoopRebuildThrottle`] does:
+/// the rebuild it is counting is the thing that destroys per-session state.
+#[derive(Debug, Default)]
+pub struct DecodeEscalation {
+    state: Mutex<EscalationState>,
+}
+
+#[derive(Debug, Default)]
+struct EscalationState {
+    strikes: u32,
+    last_trip: Option<Instant>,
+}
+
+impl DecodeEscalation {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a guard-driven rebuild at `now`. Returns `true` when this tier
+    /// has burned its allowance and the caller should step down one rung.
+    ///
+    /// Resets on escalation so the next tier down starts with a full
+    /// allowance rather than escalating again on its first trip.
+    pub fn record_rebuild_at(&self, now: Instant) -> bool {
+        let mut st = self.state.lock();
+        if let Some(prev) = st.last_trip {
+            if now.duration_since(prev) >= DECODE_ESCALATION_FORGIVE {
+                st.strikes = 0;
+            }
+        }
+        st.last_trip = Some(now);
+        st.strikes += 1;
+        if st.strikes >= DECODE_ESCALATION_LIMIT {
+            st.strikes = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Strikes accumulated against the current tier, for logging.
+    #[must_use]
+    pub fn strikes(&self) -> u32 {
+        self.state.lock().strikes
+    }
+}
+
+/// Host-wide ceiling on how many cameras may sit on software decode at once.
+///
+/// Escalating a broken camera to CPU decode is correct; escalating an
+/// unbounded number of them is how a box dies. The ceiling is keyed on CPU
+/// cores rather than fleet size because cores are the thing being spent: a
+/// 1080p15 software H.265 decode costs roughly half a core, and the same
+/// Radeon 680M box that motivated this already runs the engine at ~11 of 16
+/// cores with every camera doing CPU colour-convert. A camera refused the
+/// budget stops rebuilding and is reported degraded instead — an honest
+/// degraded camera is worth more than a green one that also eats the cores
+/// the healthy cameras need.
+#[derive(Debug)]
+pub struct SoftwareFallbackBudget {
+    cap: u32,
+    claimed: AtomicU32,
+}
+
+impl SoftwareFallbackBudget {
+    #[must_use]
+    pub fn new(cap: u32) -> Self {
+        Self {
+            cap,
+            claimed: AtomicU32::new(0),
+        }
+    }
+
+    /// Budget for a host with `cores` CPUs: a quarter of them, always at
+    /// least one so a small box can still fall back.
+    #[must_use]
+    pub fn for_cores(cores: usize) -> Self {
+        let cap = u32::try_from(cores / 4).unwrap_or(u32::MAX);
+        Self::new(cap.max(1))
+    }
+
+    /// Claims one software-decode slot. `false` means the host is already at
+    /// its ceiling and the caller must not latch software decode.
+    pub fn try_claim(&self) -> bool {
+        self.claimed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                (c < self.cap).then_some(c + 1)
+            })
+            .is_ok()
+    }
+
+    #[must_use]
+    pub fn claimed(&self) -> u32 {
+        self.claimed.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+}
+
+/// Process-wide software-decode budget, sized from the host's CPU count.
+pub fn software_fallback_budget() -> &'static SoftwareFallbackBudget {
+    static BUDGET: OnceLock<SoftwareFallbackBudget> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        SoftwareFallbackBudget::for_cores(
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(4),
+        )
+    })
 }
 
 /// Byte stride at which [`frame_fingerprint`] samples the frame. Prime, so
@@ -1504,6 +1640,105 @@ mod tests {
         }
         assert_eq!(trips, 150, "a fully-green camera trips ~every 2 s");
         assert_eq!(rebuilds, 1, "but the cooldown lets exactly one through");
+    }
+
+    /// The field failure this ladder exists for. Measured on San Marcos 1
+    /// (`0.1.192`): twelve cameras each tripped exactly once per
+    /// `FRAME_LOOP_REBUILD_COOLDOWN` for the whole window and stayed green
+    /// throughout — every permitted rebuild was spent on a tier that had
+    /// already proved it could not render. Throttling alone turns an
+    /// unbounded rebuild storm into a bounded rebuild *loop*, which still
+    /// never converges. The ladder must step down instead.
+    #[test]
+    fn escalation_stops_a_camera_rebuilding_the_same_tier_forever() {
+        let esc = DecodeEscalation::new();
+        let throttle = LoopRebuildThrottle::new();
+        let start = Instant::now();
+        let mut rebuilds = 0u32;
+        let mut step_downs = 0u32;
+        // 25 minutes of a camera that re-trips the moment the cooldown ends.
+        for minute in 0..25u64 {
+            let now = start + Duration::from_secs(minute * 60);
+            if throttle.allow_rebuild_at(now) {
+                rebuilds += 1;
+                if esc.record_rebuild_at(now) {
+                    step_downs += 1;
+                }
+            }
+        }
+        assert_eq!(
+            rebuilds, 5,
+            "one rebuild per 5-minute cooldown, as measured"
+        );
+        assert_eq!(
+            step_downs, 2,
+            "the camera steps down a tier instead of spending every rebuild on \
+             one that has already failed"
+        );
+    }
+
+    #[test]
+    fn escalation_gives_each_tier_a_full_allowance() {
+        let esc = DecodeEscalation::new();
+        let start = Instant::now();
+        let mut tick = 0u64;
+        for tier in 0..3 {
+            for _ in 1..DECODE_ESCALATION_LIMIT {
+                tick += 60;
+                assert!(
+                    !esc.record_rebuild_at(start + Duration::from_secs(tick)),
+                    "tier {tier} escalated before spending its allowance"
+                );
+            }
+            tick += 60;
+            assert!(
+                esc.record_rebuild_at(start + Duration::from_secs(tick)),
+                "tier {tier} never escalated"
+            );
+        }
+    }
+
+    /// Without lapsing, a camera that trips once every few hours escalates
+    /// itself onto software decode over nothing but uptime.
+    #[test]
+    fn escalation_strikes_lapse_after_a_trip_free_window() {
+        let esc = DecodeEscalation::new();
+        let t0 = Instant::now();
+        assert!(!esc.record_rebuild_at(t0), "one strike must not escalate");
+        assert_eq!(esc.strikes(), 1);
+        let later = t0 + DECODE_ESCALATION_FORGIVE + Duration::from_secs(1);
+        assert!(
+            !esc.record_rebuild_at(later),
+            "a camera that behaved for the whole window starts clean"
+        );
+        assert_eq!(esc.strikes(), 1, "the lapsed strike is not still counted");
+    }
+
+    /// The box this was measured on runs the engine at ~11 of 16 cores with
+    /// every camera already doing CPU colour-convert. Letting all twelve
+    /// chronic cameras latch software H.265 would take cores that do not
+    /// exist and drag the healthy cameras down too.
+    #[test]
+    fn software_budget_caps_how_much_of_the_host_goes_to_cpu() {
+        let b = SoftwareFallbackBudget::for_cores(16);
+        assert_eq!(b.cap(), 4, "a quarter of the cores");
+        for _ in 0..4 {
+            assert!(b.try_claim());
+        }
+        assert!(
+            !b.try_claim(),
+            "the next camera stays on hardware and is reported degraded \
+             rather than taking cores the box does not have"
+        );
+        assert_eq!(b.claimed(), 4);
+    }
+
+    #[test]
+    fn software_budget_always_lets_one_camera_fall_back() {
+        let b = SoftwareFallbackBudget::for_cores(2);
+        assert_eq!(b.cap(), 1, "a small box can still fall back");
+        assert!(b.try_claim());
+        assert!(!b.try_claim());
     }
 
     #[test]
