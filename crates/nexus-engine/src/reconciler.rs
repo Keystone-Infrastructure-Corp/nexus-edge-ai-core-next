@@ -293,6 +293,11 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
         info!(camera_id = cam_id, "camera reconciler: aborted supervisor");
     }
     args.recorder.remove_camera_ingester(cam_id);
+    // Drop the last decoded frame. Without this the admin frame API and the
+    // Phase 10 LBR pump keep serving a stopped camera's final image forever —
+    // the cloud wall renders it under a "LIVE" badge, and a camera that went
+    // green just before it stalled stays green on the wall indefinitely.
+    args.cache.clear(cam_id);
     // Reset per-camera frame stats so the next spawn starts from a
     // clean slate (no stale fps_ema or counters from the previous
     // session).
