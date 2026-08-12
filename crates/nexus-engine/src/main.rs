@@ -293,26 +293,38 @@ fn amd_gpu_present() -> bool {
     })
 }
 
+/// What [`apply_amd_tiling_workaround`] decided, recorded rather than logged
+/// because it runs before the tracing subscriber exists. Emitted by [`run`]
+/// once telemetry is up.
+static AMD_TILING_DECISION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
 /// Force Mesa `radeonsi` to allocate linear (untiled) surfaces.
 ///
-/// Field-measured on a 53-camera Radeon 680M (BUG-065): with tiling on, the box
-/// settled at 7.76 green cameras and ~121 decode-guard trips per sample; with
-/// `AMD_DEBUG=notiling`, the same box under the same load settled at 1.80 green
-/// and ~24 trips. Every camera escalates off the legacy-`vaapipostproc` tier
-/// within minutes onto `vah26Xdec`, whose output surfaces *are* tiled, and
-/// radeonsi hands some of them back unwritten once enough decode sessions run
-/// concurrently — which is the all-green frame.
+/// Field-measured on a 53-camera Radeon 680M (BUG-065): tiling on, the box
+/// settled at 9.27 green cameras and ~141 decode-guard trips per sample; with
+/// `AMD_DEBUG=notiling`, the same box under the same load settled at 6.30 green
+/// and ~89 trips over 829 samples. Every camera escalates off the
+/// legacy-`vaapipostproc` tier within minutes onto `vah26Xdec`, whose output
+/// surfaces *are* tiled, and radeonsi hands some of them back unwritten once
+/// enough decode sessions run concurrently — which is the all-green frame.
+///
+/// It also unlocks the GPU-convert decode rung: `select_decode_chain` prefers
+/// the modern `vapostproc` on AMD only when this flag is in the environment.
 ///
 /// Set here rather than in the systemd unit because the unit is only written by
 /// a fresh `install.sh`, never re-applied over an OTA.
 fn apply_amd_tiling_workaround(cfg: &Config) {
-    if std::env::var_os("AMD_DEBUG").is_some() || !amd_gpu_present() {
-        return;
-    }
-    if !wants_amd_notiling(&cfg.inference.ep_priority) {
-        return;
-    }
-    std::env::set_var("AMD_DEBUG", "notiling");
+    let decision = if std::env::var_os("AMD_DEBUG").is_some() {
+        "skipped: AMD_DEBUG already set by the operator"
+    } else if !amd_gpu_present() {
+        "skipped: no AMD GPU (PCI vendor 0x1002) present"
+    } else if !wants_amd_notiling(&cfg.inference.ep_priority) {
+        "skipped: an inference execution provider is bound to the same iGPU"
+    } else {
+        std::env::set_var("AMD_DEBUG", "notiling");
+        "applied AMD_DEBUG=notiling"
+    };
+    let _ = AMD_TILING_DECISION.set(decision);
 }
 
 fn build_runtime(cfg: &nexus_config::RuntimeConfig) -> Result<tokio::runtime::Runtime> {
@@ -366,6 +378,15 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         version = env!("NEXUS_BUILD_VERSION"),
         "nexus-engine starting"
     );
+    // Decided before the subscriber existed; report it now. Which decode rung
+    // the AMD path can reach depends on this, so a silent skip would be
+    // invisible in the one place an operator looks.
+    if let Some(d) = AMD_TILING_DECISION.get() {
+        info!(
+            amd_debug = %std::env::var("AMD_DEBUG").unwrap_or_else(|_| "<unset>".into()),
+            "AMD surface-tiling workaround: {d}"
+        );
+    }
 
     let store = Arc::new(Store::open(&cfg.store).await?);
     if cfg.store.seed_from_config {
