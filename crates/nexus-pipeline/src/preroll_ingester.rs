@@ -79,11 +79,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::decode::{
-    frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, software_fallback_budget,
-    AvoidLegacyVaapiPostproc, DecodeEscalation, DecodeMode, FlatFrameDetector, FrameLoopDetector,
-    GstFactoryProbe, LoopRebuildThrottle, DECODE_ESCALATION_LIMIT, FLAT_FRAME_EVAL_WINDOW,
-    FLAT_FRAME_TRIP, FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_REBUILD_COOLDOWN, FRAME_LOOP_TRIP,
-    VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT,
+    frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, AvoidLegacyVaapiPostproc,
+    DecodeMode, FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, LoopRebuildThrottle,
+    FLAT_FRAME_EVAL_WINDOW, FLAT_FRAME_TRIP, FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_REBUILD_COOLDOWN,
+    FRAME_LOOP_TRIP, VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT,
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
@@ -313,10 +312,6 @@ impl PreRollIngester {
         // Rate limiter for the frame-loop guard's rebuild remedy. Outside the
         // session because the rebuild is what destroys per-session state.
         let task_loop_rebuilds = Arc::new(LoopRebuildThrottle::new());
-        // Counts rebuilds this camera has spent on its current decode tier, so
-        // a tier that never recovers is stepped down instead of rebuilt
-        // forever. Outside the session for the same reason as the throttle.
-        let task_escalation = Arc::new(DecodeEscalation::new());
         let task = tokio::spawn(async move {
             run_supervisor(
                 camera_id,
@@ -332,7 +327,6 @@ impl PreRollIngester {
                 task_avoid_legacy_vaapipostproc,
                 task_vaapipostproc_loop_trips,
                 task_loop_rebuilds,
-                task_escalation,
             )
             .await;
         });
@@ -474,51 +468,6 @@ impl PreRollIngester {
     }
 }
 
-/// Steps one camera one rung down the decode ladder after its current tier
-/// has spent its rebuild allowance without ever rendering a clean frame.
-///
-/// [`LoopRebuildThrottle`] bounds how often the rebuild remedy runs but gives
-/// it nowhere to go, so a camera whose tier cannot render rebuilds that same
-/// tier forever — measured in the field as one rebuild per cooldown,
-/// indefinitely, on twelve cameras at once. The rungs are
-/// legacy-`vaapipostproc` → system-memory NV12 + CPU convert → software.
-fn step_down_decode_tier(
-    camera_id: CameraId,
-    session_uses_legacy_vaapipostproc: bool,
-    avoid_legacy_vaapipostproc: &AtomicBool,
-    force_software: &AtomicBool,
-) {
-    if session_uses_legacy_vaapipostproc && !avoid_legacy_vaapipostproc.load(Ordering::Acquire) {
-        avoid_legacy_vaapipostproc.store(true, Ordering::Release);
-        error!(
-            camera_id,
-            rebuilds = DECODE_ESCALATION_LIMIT,
-            "decode tier spent its rebuild allowance without recovering; \
-             escalating to system-memory NV12 + CPU convert (GPU decode kept)"
-        );
-    } else if !force_software.load(Ordering::Acquire) {
-        let budget = software_fallback_budget();
-        if budget.try_claim() {
-            force_software.store(true, Ordering::Release);
-            error!(
-                camera_id,
-                rebuilds = DECODE_ESCALATION_LIMIT,
-                claimed = budget.claimed(),
-                cap = budget.cap(),
-                "hardware decode tiers exhausted; escalating to software decode"
-            );
-        } else {
-            warn!(
-                camera_id,
-                cap = budget.cap(),
-                "hardware decode tiers exhausted but the host software-decode \
-                 budget is full; leaving this camera on hardware rather than \
-                 taking cores the healthy cameras need"
-            );
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     camera_id: CameraId,
@@ -534,7 +483,6 @@ async fn run_supervisor(
     avoid_legacy_vaapipostproc: Arc<AtomicBool>,
     vaapipostproc_loop_trips: Arc<AtomicU32>,
     loop_rebuilds: Arc<LoopRebuildThrottle>,
-    escalation: Arc<DecodeEscalation>,
 ) {
     info!(
         camera_id,
@@ -570,7 +518,6 @@ async fn run_supervisor(
             avoid_legacy_vaapipostproc.clone(),
             vaapipostproc_loop_trips.clone(),
             loop_rebuilds.clone(),
-            escalation.clone(),
         )
         .await
         {
@@ -610,7 +557,6 @@ async fn run_session(
     avoid_legacy_vaapipostproc: Arc<AtomicBool>,
     vaapipostproc_loop_trips: Arc<AtomicU32>,
     loop_rebuilds: Arc<LoopRebuildThrottle>,
-    escalation: Arc<DecodeEscalation>,
 ) -> Result<(), IngesterError> {
     // Once latched, report the AMD legacy-vaapipostproc GPU-convert tier's
     // elements as absent so `select_decode_chain` falls to the
@@ -844,8 +790,6 @@ async fn run_session(
         let avoid_legacy_vaapipostproc_cb = avoid_legacy_vaapipostproc.clone();
         let vaapipostproc_loop_trips_cb = vaapipostproc_loop_trips.clone();
         let session_uses_legacy_vaapipostproc_cb = session_uses_legacy_vaapipostproc;
-        // Cross-session strike count for the tier this camera is currently on.
-        let escalation_cb = escalation.clone();
         rgb_sink.set_callbacks(
             AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -951,14 +895,6 @@ async fn run_session(
                                 return Err(gst::FlowError::Error);
                             }
                             if loop_rebuilds_cb.allow_rebuild_at(Instant::now()) {
-                                if escalation_cb.record_rebuild_at(Instant::now()) {
-                                    step_down_decode_tier(
-                                        camera_id,
-                                        session_uses_legacy_vaapipostproc_cb,
-                                        &avoid_legacy_vaapipostproc_cb,
-                                        &force_software_cb,
-                                    );
-                                }
                                 error!(
                                     camera_id,
                                     frames = FLAT_FRAME_TRIP,
@@ -1024,14 +960,6 @@ async fn run_session(
                             }
                         }
                         if loop_rebuilds_cb.allow_rebuild_at(Instant::now()) {
-                            if escalation_cb.record_rebuild_at(Instant::now()) {
-                                step_down_decode_tier(
-                                    camera_id,
-                                    session_uses_legacy_vaapipostproc_cb,
-                                    &avoid_legacy_vaapipostproc_cb,
-                                    &force_software_cb,
-                                );
-                            }
                             error!(
                                 camera_id,
                                 period,
