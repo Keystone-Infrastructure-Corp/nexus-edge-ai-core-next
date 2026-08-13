@@ -643,7 +643,7 @@ async fn run_session(
                 ! appsink name=tap emit-signals=true sync=false \
                     max-buffers=200 drop=false \
              {rgb_branch}",
-                rgb_branch = crate::decode::rgb_tap_branch(&chain.elements, rgb_w, rgb_h, fr),
+                rgb_branch = crate::decode::rgb_tap_branch(&chain.elements, *rgb_w, *rgb_h, fr),
             )
         }
     };
