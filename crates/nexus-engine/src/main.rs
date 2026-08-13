@@ -303,13 +303,14 @@ static AMD_TILING_DECISION: std::sync::OnceLock<&'static str> = std::sync::OnceL
 /// Field-measured on a 53-camera Radeon 680M (BUG-065): tiling on, the box
 /// settled at 9.27 green cameras and ~141 decode-guard trips per sample; with
 /// `AMD_DEBUG=notiling`, the same box under the same load settled at 6.30 green
-/// and ~89 trips over 829 samples. Every camera escalates off the
-/// legacy-`vaapipostproc` tier within minutes onto `vah26Xdec`, whose output
-/// surfaces *are* tiled, and radeonsi hands some of them back unwritten once
-/// enough decode sessions run concurrently — which is the all-green frame.
-///
-/// It also unlocks the GPU-convert decode rung: `select_decode_chain` prefers
-/// the modern `vapostproc` on AMD only when this flag is in the environment.
+/// and ~89 trips over 829 samples. That arm ran while the decode-health
+/// escalation ladder still existed, so every camera had already moved onto
+/// `vah26Xdec`, whose output surfaces *are* tiled, and radeonsi hands some of
+/// them back unwritten once enough decode sessions run concurrently — which is
+/// the all-green frame. The ladder is gone (reverted in `v0.1.195`); the flag
+/// is not, because it also unlocks the GPU-convert decode rung:
+/// `select_decode_chain` prefers the modern `vapostproc` on AMD only when this
+/// flag is in the environment, and `0.1.197` selects it for all 53 cameras.
 ///
 /// Set here rather than in the systemd unit because the unit is only written by
 /// a fresh `install.sh`, never re-applied over an OTA.
@@ -662,6 +663,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // layer (reader: `GET /v1/cameras/:id/stats` and the merged
     // health column on `GET /api/v1/cameras`).
     let frame_stats = Arc::new(FrameStatsRegistry::new());
+    // BUG-071: per-camera decode health, written by each pre-roll ingester's
+    // GStreamer threads on either side of the decoder. Separate from
+    // `frame_stats` because that one is written by the supervisor, downstream
+    // of the RGB appsink's own drops — which is exactly why it cannot say
+    // whether a frame was lost before the decoder or after it.
+    let decode_health = Arc::new(nexus_pipeline::DecodeHealthRegistry::new());
 
     // Recorder is a per-process singleton: the watermark sampler
     // (storage_safety) and every per-camera supervisor share the
@@ -742,6 +749,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cfg.runtime.clips.alert_clips.clone(),
         cold_kick.clone(),
         alert_clip_gate.clone(),
+        decode_health.clone(),
     )
     .await?;
     info!(
@@ -772,6 +780,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // the active handle into this slot post-enrollment; the cold
     // replicator + the sighting hook both read it.
     let cloud_outbox = std::sync::Arc::new(nexus_cloud_client::TunnelOutbox::new());
+    // Phase 10 Live View — the LBR pump manager. Constructed once here so it
+    // persists across tunnel reconnects; the supervisor drives it from the
+    // inbound lbr_subscribe / lbr_unsubscribe envelopes, and the reconciler
+    // reaps a camera's pump when that camera stops.
+    let live_view_manager = live_view::LiveViewManager::new(cache.clone(), cloud_outbox.clone());
 
     // Cloud entitlement cache — populated from inbound `entitlement_update`
     // envelopes by the cloud-tunnel supervisor, read by the M7
@@ -1330,6 +1343,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         sink_router: sink_router.clone(),
         alert_clip_schedule_gate: alert_clip_schedule_gate.clone(),
         handles: running.clone(),
+        live_view: live_view_manager.clone(),
     });
 
     // Phase 5.6 · R4 — periodic `entity_local_state` sweeper. Keeps
@@ -1469,10 +1483,6 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             .admin_secret()
             .map(|s| std::sync::Arc::new(s.to_string()))
     };
-    // Phase 10 Live View — the LBR pump manager. Constructed once here so it
-    // persists across tunnel reconnects; the supervisor drives it from the
-    // inbound lbr_subscribe / lbr_unsubscribe envelopes.
-    let live_view_manager = live_view::LiveViewManager::new(cache.clone(), cloud_outbox.clone());
     // Go-dark insurance. One shared signal, two independent consumers:
     // the OTA success gate below, and the watchdog further down. See
     // `cloud_liveness` for why an unreachable-but-working appliance is
@@ -1488,7 +1498,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         entitlement_cache.clone(),
         pending_acks.clone(),
         snapshot_uploader_slot.clone(),
-        live_view_manager,
+        live_view_manager.clone(),
         webrtc_bridge,
         Some(trace_rx),
         loopback_admin_base.clone(),
@@ -1564,6 +1574,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         evaluator: evaluator.clone(),
         cache: cache.clone(),
         frame_stats: frame_stats.clone(),
+        decode_health: decode_health.clone(),
         pool: pool.clone(),
         ui_root: cfg.server.ui_root.clone(),
         recorder: recorder.clone(),
@@ -1580,6 +1591,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // even if they've never produced an outbox row.
         sink_registry: sink_registry.clone(),
         dispatcher_health: dispatcher_health.clone(),
+        live_view: live_view_manager.clone(),
         // M7 cloud-managed sinks — boot snapshot of `nexus.toml`
         // `[[sinks]]` so `GET /v1/admin/sinks` can mark which sinks
         // are file-pinned (read-only) vs cloud-managed (editable).
@@ -2277,6 +2289,7 @@ async fn build_recorder(
     alert_clips: nexus_config::AlertClipsConfig,
     cold_kick: Arc<tokio::sync::Notify>,
     alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
+    decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2304,6 +2317,7 @@ async fn build_recorder(
                 alert_clips,
                 cold_kick,
                 alert_clip_gate,
+                decode_health,
             )
             .await
         }
@@ -2325,6 +2339,7 @@ async fn build_gst_recorder(
     alert_clips: nexus_config::AlertClipsConfig,
     cold_kick: Arc<tokio::sync::Notify>,
     alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
+    decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2400,6 +2415,7 @@ async fn build_gst_recorder(
             cam.ingest.max_fps,
             rgb_w,
             rgb_h,
+            Some(decode_health.clone()),
         ) {
             Ok(ing) => {
                 tracing::info!(
@@ -2436,6 +2452,7 @@ async fn build_gst_recorder(
         .with_bus(bus)
         .with_usb(usb_resolver, preferred_usb_label)
         .with_decode_mode(decode_mode)
+        .with_decode_health(decode_health)
         .with_alert_clips(alert_clips)
         .with_alert_cold_kick(cold_kick)
         .with_alert_clip_delivery_gate(alert_clip_gate);
@@ -2457,6 +2474,7 @@ async fn build_gst_recorder(
     _alert_clips: nexus_config::AlertClipsConfig,
     _cold_kick: Arc<tokio::sync::Notify>,
     _alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
+    _decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,

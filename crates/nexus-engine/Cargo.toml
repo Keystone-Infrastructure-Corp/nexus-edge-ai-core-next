@@ -304,6 +304,10 @@ libc = "0.2"# Linux-only: `network::apply` stages netplan YAML into a tempfile
 [dev-dependencies]
 tempfile = { workspace = true }
 base64 = { workspace = true }
+# BUG-057 — `test-util` (not part of tokio's `full`) gives the tests a
+# pausable clock, so the LBR pump's stall detector is driven against the
+# real pump task instead of a re-implementation of its timing.
+tokio = { workspace = true, features = ["test-util"] }
 # Phase 9 (M_OTA) — Ed25519 test-key generation for the
 # `cloud_update` manifest-signature round-trip tests.
 rand = { workspace = true }

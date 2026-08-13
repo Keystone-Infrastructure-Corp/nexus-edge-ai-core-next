@@ -17,6 +17,7 @@
 //! * `GET  /api/v1/stream/metadata`                  — SSE
 //! * `GET  /api/v1/stream/events`                    — SSE
 //! * `GET  /api/v1/backends`                         — DetectorPool slot status (OPS-1)
+//! * `GET  /api/v1/admin/live/status`                — per-camera LBR pump state (BUG-057)
 //!
 //! Everything else is served from the UI directory via [`tower_http::services::ServeDir`].
 
@@ -90,6 +91,7 @@ pub struct ApiState {
     /// Read by `GET /v1/cameras/:id/stats` and surfaced on the
     /// merged camera list response.
     pub frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
+    pub decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     pub pool: Option<Arc<DetectorPool>>,
     pub ui_root: PathBuf,
     /// Shared with the per-camera supervisors + the storage_safety
@@ -179,6 +181,11 @@ pub struct ApiState {
     /// alone cannot distinguish "no alerts fired" from "the drain loop
     /// is wedged"; this can.
     pub dispatcher_health: Arc<nexus_sinks::dispatcher::DispatcherHealth>,
+    /// BUG-057 — Phase 10 LBR pump manager, read by
+    /// `GET /api/v1/admin/live/status`. The pump's failure mode is silence,
+    /// so without a read surface the only way to tell a stalled source from
+    /// a quiet scene was to attach to a live box.
+    pub live_view: Arc<crate::live_view::LiveViewManager>,
     /// File-defined sinks (`nexus.toml` `[[sinks]]`), snapshot at
     /// boot. The `GET /v1/admin/sinks` handler merges these with the
     /// runtime `alert_sinks` db rows so the console can show which
@@ -344,6 +351,10 @@ pub fn router(state: ApiState) -> Router {
         // over a 1h + 24h window, plus the registry list so
         // configured-but-quiet sinks still get a card.
         .route("/v1/admin/sinks/health", get(get_admin_sinks_health))
+        // BUG-057 — per-camera LBR pump state. Answers "is this cell frozen
+        // because the scene is static, or because the source died?" in one
+        // curl instead of a live-box investigation.
+        .route("/v1/admin/live/status", get(get_admin_live_status))
         // M7 cloud-managed sinks — runtime CRUD over the
         // alert-delivery sink set. `GET /v1/admin/sinks` lists the
         // effective set (file ∪ db, secrets redacted, source +
@@ -2391,6 +2402,24 @@ struct CameraFrameStatsView {
     /// Cumulative wall-clock ms spent inside `run_tile_inference`.
     /// Divide by `tile_invocations` for mean per-cascade latency.
     tile_inference_ms_total: u64,
+    /// BUG-071 — compressed access units the RGB branch's decoder-input
+    /// queue leaked, i.e. frames damaged *before* the decoder saw them.
+    /// Sustained non-zero means the decoder cannot keep up with the camera
+    /// and the picture is being corrupted to make room; the visible symptom
+    /// is smeared motion and blocky residue until the next keyframe, not a
+    /// dropped frame. Distinct from `frames_dropped`, which counts whole
+    /// decoded frames the motion gate discarded on purpose.
+    decoder_input_drops: u64,
+    /// Frames the decode-loop guard has fingerprinted this session.
+    decoded_frames: u64,
+    /// Of `decoded_frames`, how many re-served a picture seen 2–12 frames
+    /// earlier — the decoder handing back a surface it had already given
+    /// us. Repeats at distance 1 (static scene, `videorate` padding) are
+    /// excluded and never counted.
+    duplicate_frames: u64,
+    /// `duplicate_frames` per thousand `decoded_frames`, precomputed so a
+    /// dashboard doesn't have to guard the divide.
+    duplicate_per_mille: u64,
 }
 
 async fn get_camera_stats(
@@ -2402,6 +2431,10 @@ async fn get_camera_stats(
         .snapshot(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
     let now = chrono::Utc::now();
+    // Absent (camera has no RGB tap, or none of its frames have reached the
+    // loop guard yet) reads as all-zero rather than 404 — the caller asked
+    // for stats, and "no decode health recorded" is a zero, not an error.
+    let decode = s.decode_health.snapshot(id).unwrap_or_default();
     Ok(Json(CameraFrameStatsView {
         camera_id: id,
         last_frame_at: snap.last_frame_at,
@@ -2414,6 +2447,10 @@ async fn get_camera_stats(
         tile_invocations: snap.tile_invocations,
         tile_detections_added: snap.tile_detections_added,
         tile_inference_ms_total: snap.tile_inference_ms_total,
+        decoder_input_drops: decode.decoder_input_drops,
+        decoded_frames: decode.decoded_frames,
+        duplicate_frames: decode.duplicate_frames,
+        duplicate_per_mille: decode.duplicate_per_mille(),
     }))
 }
 
@@ -4737,6 +4774,25 @@ const HEALTH_WINDOWS: &[(&str, i64)] = &[("1h", 3_600), ("24h", 86_400)];
 /// legitimately run long when a sink is mid-delivery.
 const DISPATCHER_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[derive(serde::Serialize)]
+struct LiveStatusResp {
+    /// Seconds of silence after which a pump reports its source stalled.
+    stall_after_s: u64,
+    cameras: Vec<crate::live_view::LivePumpStatus>,
+}
+
+/// `GET /api/v1/admin/live/status` — per-camera LBR pump state.
+///
+/// Only subscribed cameras appear: the cloud `LiveHub` sends one
+/// `lbr_subscribe` per watched `(core, camera)`, so an empty list means
+/// nobody has the wall open, not that every camera is broken.
+async fn get_admin_live_status(State(s): State<ApiState>) -> Json<LiveStatusResp> {
+    Json(LiveStatusResp {
+        stall_after_s: crate::live_view::STALL_AFTER.as_secs(),
+        cameras: s.live_view.status(),
+    })
+}
+
 async fn get_admin_sinks_health(
     State(s): State<ApiState>,
 ) -> Result<Json<SinksHealthResp>, ApiError> {
@@ -6547,6 +6603,7 @@ mod tests {
             evaluator,
             cache,
             frame_stats: Arc::new(nexus_pipeline::FrameStatsRegistry::new()),
+            decode_health: Arc::new(nexus_pipeline::DecodeHealthRegistry::new()),
             pool: None,
             ui_root: dir.path().join("ui-unused"),
             recorder,
@@ -6577,6 +6634,10 @@ mod tests {
             // live" until a tick completes, which is the correct
             // default: no dispatcher runs in these tests.
             dispatcher_health: Arc::new(nexus_sinks::dispatcher::DispatcherHealth::default()),
+            live_view: crate::live_view::LiveViewManager::new(
+                Arc::new(nexus_pipeline::LatestFrameCache::new()),
+                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            ),
             // M7 cloud-managed sinks — no file sinks in tests.
             file_sinks: Arc::new(Vec::new()),
             // M6 — default LockoutConfig is fine for every test
@@ -8252,6 +8313,31 @@ mod tests {
         assert_eq!(windows[0]["label"], "1h");
         assert_eq!(windows[1]["label"], "24h");
         assert_eq!(v["sinks"].as_array().unwrap().len(), 0);
+    }
+
+    /// BUG-057 — the live-status endpoint exists and is authenticated. With
+    /// no subscribed cameras it returns an empty list plus the stall
+    /// threshold, so an operator can tell "nobody is watching" from "every
+    /// source is dead" without reading engine source.
+    #[tokio::test]
+    async fn live_status_reports_the_stall_threshold_and_no_pumps() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"bug057-live-status-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/live/status")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["stall_after_s"], 5);
+        assert_eq!(v["cameras"].as_array().expect("cameras array").len(), 0);
     }
 
     /// BUG-048 — the sinks-health response must carry drain-loop
