@@ -135,7 +135,10 @@ fn hailo_eqr7_with_amd_decode() {
     // The decode-only iGPU is excluded from the detector chain but IS the
     // only device that can host the ONNX ViT — Hailo runs HEFs only.
     assert_eq!(c.reid.ep_priority, vec!["vulkan", "cpu"]);
-    assert_eq!(c.inference.workers, 1);
+    // Four detector workers, not one: a single worker serialises the whole
+    // camera fleet behind one thread and caps the box near 165 inferences/s
+    // (BUG-070).
+    assert_eq!(c.inference.workers, 4);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 16);
     assert_eq!(c.runtime.blocking_threads, 16);
