@@ -27,27 +27,44 @@
 //! copy-based readback and is unaffected — so this is specific to
 //! `vapostproc`'s output surface, not to VA readback in general.
 //!
-//! `AMD_DEBUG=notiling` is **not** shipped as a workaround: it is a
-//! process-global Mesa flag that makes every surface linear, and the engine
-//! runs ORT inference on the same iGPU. Nor is this waiting on a GStreamer
-//! bump — GStreamer 1.26.6 / plugins-bad 1.26.5 was staged against the same
-//! Mesa and its `vapostproc` is byte-identically broken. So on an AMD VA
-//! device we never use `vapostproc`. Instead, in preference order:
+//! `AMD_DEBUG=notiling` **is** now shipped, but by the engine rather than by
+//! this module: `apply_amd_tiling_workaround` in `nexus-engine`'s `main.rs`
+//! sets it before Mesa loads, gated on an AMD GPU being present and no
+//! inference execution provider bound to that same iGPU (a Hailo-8 or NPU box
+//! pays nothing for linear surfaces). Field-measured on a 53-camera Radeon
+//! 680M, it cut green cameras 32% (9.27 → 6.30 mean over 829 samples). Nor is
+//! this waiting on a GStreamer bump — GStreamer 1.26.6 / plugins-bad 1.26.5
+//! was staged against the same Mesa and its `vapostproc` is byte-identically
+//! broken *while tiled*. So on an AMD VA device, in preference order:
 //!
-//! 1. **Legacy `gstreamer1.0-vaapi` GPU path** — if `vaapih26Xdec` +
+//! 1. **Modern `vapostproc` GPU path, when surfaces are linear** — if
+//!    `AMD_DEBUG=notiling` is in the environment (see
+//!    [`FactoryProbe::amd_linear_surfaces`]): `vah26Xdec ! vapostproc !
+//!    videoconvert ! videorate`. The tiling bug above is the *only* thing
+//!    wrong with `vapostproc` here; with linear surfaces it is pixel-accurate,
+//!    verified by capturing 490 consecutive frames through this exact chain on
+//!    the Radeon 680M / Mesa 25.2.8 and finding real imagery throughout
+//!    (per-channel spread 250–255) where the tiled configuration yields one
+//!    flat colour. Preferred over the legacy tier below because it does not
+//!    depend on the `gstreamer1.0-vaapi` plugin being installed at all, and
+//!    because that legacy tier was field-measured tripping the frame-loop
+//!    guard on every one of 53 cameras within minutes, pushing the whole fleet
+//!    onto the CPU-convert fallback. `videoscale` is OMITTED for the same
+//!    reason as the legacy tier: keep the scale on the GPU.
+//! 2. **Legacy `gstreamer1.0-vaapi` GPU path** — if `vaapih26Xdec` +
 //!    `vaapipostproc` are registered: `vaapih26Xdec ! vaapipostproc !
 //!    videoconvert ! videorate`. The OLD `vaapipostproc` does the NV12→RGB
 //!    convert + downscale correctly on the GPU on the same Radeon 680M /
-//!    Mesa 25.2 where the new `vapostproc` fails (verified with a live
-//!    pipeline). `videoscale` is deliberately OMITTED so caps negotiation is
-//!    forced to put the scale on `vaapipostproc` (the GPU) rather than let a
-//!    downstream CPU `videoscale` claim it; the lone `videoconvert` is then
-//!    only a cheap small-frame format bridge (the GPU has already downscaled
-//!    to the target width/height). Keeps BOTH decode and convert/scale on
-//!    the GPU. `vaapipostproc` runs a GBM/GL probe that needs
-//!    `XDG_RUNTIME_DIR` set — the systemd unit provides it via
+//!    Mesa 25.2 where the new `vapostproc` fails *while tiled* (verified with
+//!    a live pipeline). `videoscale` is deliberately OMITTED so caps
+//!    negotiation is forced to put the scale on `vaapipostproc` (the GPU)
+//!    rather than let a downstream CPU `videoscale` claim it; the lone
+//!    `videoconvert` is then only a cheap small-frame format bridge (the GPU
+//!    has already downscaled to the target width/height). Keeps BOTH decode
+//!    and convert/scale on the GPU. `vaapipostproc` runs a GBM/GL probe that
+//!    needs `XDG_RUNTIME_DIR` set — the systemd unit provides it via
 //!    `RuntimeDirectory=nexus`.
-//! 2. **System-memory CPU-convert fallback** — otherwise `vah26Xdec !
+//! 3. **System-memory CPU-convert fallback** — otherwise `vah26Xdec !
 //!    video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert`. The
 //!    `video/x-raw,format=NV12` carries no `memory:VAMemory`/`memory:DMABuf`
 //!    feature, so the decoder downloads each frame to system memory and the
@@ -56,10 +73,13 @@
 //!    NV12), survivors are scaled while still subsampled NV12 (12 bpp,
 //!    cheaper than RGB), and the costly NV12→RGB convert runs LAST — on the
 //!    already-downscaled, rate-limited stream instead of at full resolution
-//!    and full frame rate.
+//!    and full frame rate. This tier is where the whole fleet ended up before
+//!    rung 1 existed, and its CPU convert is the bulk of the ~40% system time
+//!    measured on the 53-camera box.
 //!
-//! GPU decode (the expensive part) is preserved in both. The split is keyed
-//! on the DRM vendor via [`FactoryProbe::va_bypass_postproc`].
+//! GPU decode (the expensive part) is preserved in all three. The split is
+//! keyed on the DRM vendor via [`FactoryProbe::va_bypass_postproc`] and, for
+//! rung 1, on [`FactoryProbe::amd_linear_surfaces`].
 //!
 //! Because a decoder is chosen on element *presence*, not on whether it
 //! actually renders, the ingest path pairs this with a runtime guard
@@ -116,6 +136,20 @@ pub trait FactoryProbe {
     /// Intel and in the pure unit tests).
     fn va_bypass_postproc(&self) -> bool {
         false
+    }
+
+    /// Whether Mesa is allocating **linear** (untiled) surfaces this process,
+    /// i.e. `AMD_DEBUG=notiling` is in the environment.
+    ///
+    /// The `vapostproc` breakage this module documents is a *tiling* bug: the
+    /// VPP output surface is allocated tiled and read back as linear. With
+    /// linear surfaces the element is pixel-accurate — verified on the same
+    /// Radeon 680M / Mesa 25.2.8 that motivated the bypass, capturing 490
+    /// consecutive frames through `vah265dec ! vapostproc` and finding real
+    /// imagery throughout (per-channel spread 250–255), where the tiled
+    /// configuration yields a single flat colour.
+    fn amd_linear_surfaces(&self) -> bool {
+        std::env::var("AMD_DEBUG").is_ok_and(|v| v.split(',').any(|tok| tok.trim() == "notiling"))
     }
 }
 
@@ -204,7 +238,12 @@ fn software_chain(codec_base: &str) -> DecodeChain {
     }
 }
 
-fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> DecodeChain {
+fn va_chain(
+    codec_base: &str,
+    bypass_postproc: bool,
+    amd_vaapi_gpu: bool,
+    amd_linear_surfaces: bool,
+) -> DecodeChain {
     if !bypass_postproc {
         // Intel (and any other non-AMD VA device): `vapostproc` does GPU
         // colour-convert + scale correctly, so keep it. The trailing
@@ -221,8 +260,26 @@ fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> Dec
     }
 
     // AMD radeonsi: the new `vapostproc` renders all-green frames regardless
-    // of its output caps (verified on a Radeon 680M / gfx1035, Mesa 25.2), so
-    // it is never used below.
+    // of its output caps (verified on a Radeon 680M / gfx1035, Mesa 25.2) --
+    // but only while surfaces are TILED. Under `AMD_DEBUG=notiling` the same
+    // element is pixel-accurate, so prefer it: it keeps convert + downscale on
+    // the GPU without depending on the legacy `gstreamer1.0-vaapi` plugin,
+    // whose `vaapipostproc` tier was field-measured tripping the frame-loop
+    // guard on every camera within minutes and pushing the whole fleet onto
+    // the CPU-convert fallback below. `videoscale` is omitted so caps
+    // negotiation puts the scale on `vapostproc` (GPU) rather than a
+    // downstream CPU `videoscale`.
+    if amd_linear_surfaces {
+        let dec = va_decoder(codec_base);
+        return DecodeChain {
+            elements: format!("{dec} ! vapostproc ! videoconvert ! videorate"),
+            backend: DecodeBackend::Va,
+            hwaccel: true,
+            label: format!("va ({dec}+vapostproc, gpu convert, linear surfaces)"),
+            legacy_vaapipostproc: false,
+        };
+    }
+
     if amd_vaapi_gpu {
         // Preferred AMD path: the LEGACY `gstreamer1.0-vaapi` plugin's
         // `vaapipostproc` does GPU convert + downscale correctly on the same
@@ -272,7 +329,12 @@ fn va_chain(codec_base: &str, bypass_postproc: bool, amd_vaapi_gpu: bool) -> Dec
 fn va_chain_for(codec_base: &str, probe: &impl FactoryProbe) -> DecodeChain {
     let bypass = probe.va_bypass_postproc();
     let amd_vaapi_gpu = bypass && amd_vaapi_gpu_available(probe, codec_base);
-    va_chain(codec_base, bypass, amd_vaapi_gpu)
+    va_chain(
+        codec_base,
+        bypass,
+        amd_vaapi_gpu,
+        bypass && probe.amd_linear_surfaces(),
+    )
 }
 
 /// Number of runtime frame-loop-guard trips (see [`FrameLoopDetector`]) a
@@ -970,10 +1032,12 @@ mod tests {
     use std::collections::HashSet;
 
     /// Test probe: reports a fixed set of "registered" factories plus a
-    /// controllable `va_bypass_postproc` (AMD-radeonsi) flag.
+    /// controllable `va_bypass_postproc` (AMD-radeonsi) flag and an explicit
+    /// linear-surfaces flag, so no test ever reads the ambient `AMD_DEBUG`.
     struct SetProbe {
         factories: HashSet<&'static str>,
         bypass_postproc: bool,
+        linear_surfaces: bool,
     }
 
     impl FactoryProbe for SetProbe {
@@ -983,12 +1047,16 @@ mod tests {
         fn va_bypass_postproc(&self) -> bool {
             self.bypass_postproc
         }
+        fn amd_linear_surfaces(&self) -> bool {
+            self.linear_surfaces
+        }
     }
 
     fn probe(names: &[&'static str]) -> SetProbe {
         SetProbe {
             factories: names.iter().copied().collect(),
             bypass_postproc: false,
+            linear_surfaces: false,
         }
     }
 
@@ -998,6 +1066,17 @@ mod tests {
         SetProbe {
             factories: names.iter().copied().collect(),
             bypass_postproc: true,
+            linear_surfaces: false,
+        }
+    }
+
+    /// An AMD radeonsi device running with `AMD_DEBUG=notiling`, where the
+    /// modern `vapostproc` is pixel-accurate.
+    fn probe_amd_linear(names: &[&'static str]) -> SetProbe {
+        SetProbe {
+            factories: names.iter().copied().collect(),
+            bypass_postproc: true,
+            linear_surfaces: true,
         }
     }
 
@@ -1115,7 +1194,54 @@ mod tests {
         );
     }
 
-    /// Everything the runtime escalation keys off `legacy_vaapipostproc`, so
+    /// The tiling bug is the only thing wrong with `vapostproc` on AMD, so
+    /// with `AMD_DEBUG=notiling` it is preferred over the legacy tier — which
+    /// was field-measured tripping the frame-loop guard on all 53 cameras and
+    /// pushing the fleet onto CPU convert. Verified against real hardware by
+    /// capturing 490 frames through this chain (spread 250–255 throughout).
+    #[test]
+    fn amd_with_linear_surfaces_prefers_modern_vapostproc() {
+        let p = probe_amd_linear(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"]);
+        let c = select_decode_chain("h265", DecodeMode::Auto, &p);
+        assert_eq!(
+            c.elements,
+            "vah265dec ! vapostproc ! videoconvert ! videorate"
+        );
+        assert!(c.hwaccel);
+        assert!(
+            !c.legacy_vaapipostproc,
+            "this is not the legacy tier, so the vaapipostproc escalation must stay disarmed"
+        );
+        assert!(
+            !c.elements.contains("videoscale"),
+            "videoscale is omitted so the GPU keeps the downscale"
+        );
+    }
+
+    /// Without the flag the tiled `vapostproc` really is broken, so AMD must
+    /// still fall to the legacy tier rather than rendering all-green.
+    #[test]
+    fn amd_without_linear_surfaces_still_avoids_modern_vapostproc() {
+        let p = probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"]);
+        let c = select_decode_chain("h265", DecodeMode::Auto, &p);
+        assert!(
+            !c.elements.contains("! vapostproc"),
+            "tiled vapostproc emits all-green and must not be selected: {}",
+            c.elements
+        );
+        assert!(c.legacy_vaapipostproc);
+    }
+
+    /// Intel is unaffected by the AMD-only rung.
+    #[test]
+    fn intel_keeps_its_vapostproc_chain_regardless_of_linear_surfaces() {
+        let c = select_decode_chain("h264", DecodeMode::Auto, &va_full());
+        assert_eq!(
+            c.elements,
+            "vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate"
+        );
+    }
+
     /// a stray `true` on any other tier would silently arm the escalation for
     /// hardware that has no `vaapipostproc` problem.
     #[test]
