@@ -1578,6 +1578,7 @@ mod amd {
     use std::time::Duration;
 
     use super::{read_sysfs_string, GpuInfo};
+    use crate::system_metrics::GpuEngineUtil;
 
     /// Background sampler cadence. `gpu_busy_percent` on AMD APUs is a
     /// coarse 0/100 instantaneous gauge, so we poll it far faster than
