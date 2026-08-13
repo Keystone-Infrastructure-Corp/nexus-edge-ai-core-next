@@ -233,6 +233,92 @@ impl FrameStatsRegistry {
     }
 }
 
+/// Per-camera decode-health counters, written by the pre-roll ingester's
+/// GStreamer threads.
+///
+/// Deliberately a separate registry from [`FrameStatsRegistry`] rather than
+/// more columns on it. That one is written by the supervisor task, *after*
+/// the RGB appsink's own `drop=true max-buffers=4` and after any broadcast
+/// lag — which is exactly why its `fps_ema` cannot answer "did we lose this
+/// frame before the decoder or after it?". These counters are written by the
+/// ingester, on either side of the decoder, and answering that question is
+/// their whole purpose (BUG-071).
+#[derive(Debug, Default)]
+pub struct DecodeHealthRegistry {
+    inner: RwLock<HashMap<CameraId, DecodeHealth>>,
+}
+
+/// Snapshot of one camera's decode health. Cheap to clone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeHealth {
+    /// Compressed access units the RGB branch's `leaky=downstream` queue
+    /// dropped **ahead of** the decoder.
+    ///
+    /// That queue sits between `h26Xparse` and the decode chain, so its
+    /// buffers are H.26x access units (`alignment=au`), not frames. Losing
+    /// one mid-GOP corrupts every picture until the next IDR — smeared
+    /// motion and blocky residue, not a dropped frame. Anything above zero
+    /// on a sustained basis means the decoder cannot keep up with the
+    /// camera and the picture is being damaged to make room.
+    pub decoder_input_drops: u64,
+    /// Frames the loop guard has fingerprinted this session.
+    pub decoded_frames: u64,
+    /// Of [`Self::decoded_frames`], how many repeated a picture seen 2–12
+    /// frames earlier, i.e. the decoder re-served a surface it had already
+    /// handed over. Repeats at distance 1 (static scene, `videorate`
+    /// padding) are excluded by the detector and never counted here.
+    ///
+    /// The guard only logs once it crosses `FRAME_LOOP_TRIP` within
+    /// `FRAME_LOOP_EVAL_WINDOW`, so a loop that stays under that bar was
+    /// previously invisible in production. This is the raw rate.
+    pub duplicate_frames: u64,
+}
+
+impl DecodeHealth {
+    /// Duplicate frames per thousand decoded. Zero when nothing decoded yet.
+    #[must_use]
+    pub fn duplicate_per_mille(&self) -> u64 {
+        self.duplicate_frames
+            .saturating_mul(1000)
+            .checked_div(self.decoded_frames)
+            .unwrap_or(0)
+    }
+}
+
+impl DecodeHealthRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one leaked access unit on the RGB branch's decoder-input queue.
+    pub fn observe_decoder_input_drop(&self, camera_id: CameraId) {
+        let mut guard = self.inner.write();
+        let e = guard.entry(camera_id).or_default();
+        e.decoder_input_drops = e.decoder_input_drops.saturating_add(1);
+    }
+
+    /// Publish the loop detector's running totals. Absolute, not deltas, so
+    /// a session rebuild resets them rather than double-counting.
+    pub fn observe_loop_stats(&self, camera_id: CameraId, decoded: u64, duplicates: u64) {
+        let mut guard = self.inner.write();
+        let e = guard.entry(camera_id).or_default();
+        e.decoded_frames = decoded;
+        e.duplicate_frames = duplicates;
+    }
+
+    /// Reset one camera. Called when a supervisor stops so the next spawn
+    /// starts clean, mirroring [`FrameStatsRegistry::clear`].
+    pub fn clear(&self, camera_id: CameraId) {
+        self.inner.write().remove(&camera_id);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self, camera_id: CameraId) -> Option<DecodeHealth> {
+        self.inner.read().get(&camera_id).copied()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +421,73 @@ mod tests {
         assert_eq!(s.tile_invocations, 0);
         assert_eq!(s.tile_detections_added, 0);
         assert_eq!(s.tile_inference_ms_total, 0);
+    }
+
+    /// Each `overrun` on the decoder-input queue is one leaked access unit,
+    /// and the count is per camera — a busy camera's leaks must not be
+    /// attributed to a quiet one sharing the box.
+    #[test]
+    fn decoder_input_drops_accumulate_per_camera() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_decoder_input_drop(1);
+        reg.observe_decoder_input_drop(1);
+        reg.observe_decoder_input_drop(2);
+        assert_eq!(reg.snapshot(1).unwrap().decoder_input_drops, 2);
+        assert_eq!(reg.snapshot(2).unwrap().decoder_input_drops, 1);
+        assert!(reg.snapshot(3).is_none());
+    }
+
+    /// `FrameLoopDetector::stats()` returns running totals for the *current
+    /// session*, so publishing them must overwrite, not add. Adding would
+    /// make every session rebuild double-count and the duplicate rate climb
+    /// on its own, which is precisely the kind of self-confirming metric
+    /// this instrumentation exists to avoid (BUG-071).
+    #[test]
+    fn loop_stats_overwrite_rather_than_accumulate() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_loop_stats(1, 90, 30);
+        reg.observe_loop_stats(1, 180, 44);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.decoded_frames, 180);
+        assert_eq!(s.duplicate_frames, 44);
+    }
+
+    /// A leak counter and a loop counter for the same camera are independent
+    /// writers — the ingester calls them from different callbacks — so
+    /// neither may clobber the other's field.
+    #[test]
+    fn leak_and_loop_counters_are_independent() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_decoder_input_drop(4);
+        reg.observe_loop_stats(4, 100, 5);
+        reg.observe_decoder_input_drop(4);
+        let s = reg.snapshot(4).unwrap();
+        assert_eq!(s.decoder_input_drops, 2);
+        assert_eq!(s.decoded_frames, 100);
+        assert_eq!(s.duplicate_frames, 5);
+    }
+
+    /// The API serves this on every stats request, including for a camera
+    /// whose tap has not produced a frame yet. A naive divide would panic.
+    #[test]
+    fn duplicate_per_mille_handles_a_zero_denominator() {
+        assert_eq!(DecodeHealth::default().duplicate_per_mille(), 0);
+        let one_in_three = DecodeHealth {
+            decoder_input_drops: 0,
+            decoded_frames: 90,
+            duplicate_frames: 30,
+        };
+        assert_eq!(one_in_three.duplicate_per_mille(), 333);
+    }
+
+    #[test]
+    fn clearing_decode_health_resets_only_that_camera() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_decoder_input_drop(1);
+        reg.observe_decoder_input_drop(2);
+        reg.clear(1);
+        assert!(reg.snapshot(1).is_none());
+        assert_eq!(reg.snapshot(2).unwrap().decoder_input_drops, 1);
     }
 
     #[test]

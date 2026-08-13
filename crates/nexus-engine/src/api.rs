@@ -91,6 +91,7 @@ pub struct ApiState {
     /// Read by `GET /v1/cameras/:id/stats` and surfaced on the
     /// merged camera list response.
     pub frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
+    pub decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     pub pool: Option<Arc<DetectorPool>>,
     pub ui_root: PathBuf,
     /// Shared with the per-camera supervisors + the storage_safety
@@ -2401,6 +2402,24 @@ struct CameraFrameStatsView {
     /// Cumulative wall-clock ms spent inside `run_tile_inference`.
     /// Divide by `tile_invocations` for mean per-cascade latency.
     tile_inference_ms_total: u64,
+    /// BUG-071 — compressed access units the RGB branch's decoder-input
+    /// queue leaked, i.e. frames damaged *before* the decoder saw them.
+    /// Sustained non-zero means the decoder cannot keep up with the camera
+    /// and the picture is being corrupted to make room; the visible symptom
+    /// is smeared motion and blocky residue until the next keyframe, not a
+    /// dropped frame. Distinct from `frames_dropped`, which counts whole
+    /// decoded frames the motion gate discarded on purpose.
+    decoder_input_drops: u64,
+    /// Frames the decode-loop guard has fingerprinted this session.
+    decoded_frames: u64,
+    /// Of `decoded_frames`, how many re-served a picture seen 2–12 frames
+    /// earlier — the decoder handing back a surface it had already given
+    /// us. Repeats at distance 1 (static scene, `videorate` padding) are
+    /// excluded and never counted.
+    duplicate_frames: u64,
+    /// `duplicate_frames` per thousand `decoded_frames`, precomputed so a
+    /// dashboard doesn't have to guard the divide.
+    duplicate_per_mille: u64,
 }
 
 async fn get_camera_stats(
@@ -2412,6 +2431,10 @@ async fn get_camera_stats(
         .snapshot(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
     let now = chrono::Utc::now();
+    // Absent (camera has no RGB tap, or none of its frames have reached the
+    // loop guard yet) reads as all-zero rather than 404 — the caller asked
+    // for stats, and "no decode health recorded" is a zero, not an error.
+    let decode = s.decode_health.snapshot(id).unwrap_or_default();
     Ok(Json(CameraFrameStatsView {
         camera_id: id,
         last_frame_at: snap.last_frame_at,
@@ -2424,6 +2447,10 @@ async fn get_camera_stats(
         tile_invocations: snap.tile_invocations,
         tile_detections_added: snap.tile_detections_added,
         tile_inference_ms_total: snap.tile_inference_ms_total,
+        decoder_input_drops: decode.decoder_input_drops,
+        decoded_frames: decode.decoded_frames,
+        duplicate_frames: decode.duplicate_frames,
+        duplicate_per_mille: decode.duplicate_per_mille(),
     }))
 }
 
@@ -6576,6 +6603,7 @@ mod tests {
             evaluator,
             cache,
             frame_stats: Arc::new(nexus_pipeline::FrameStatsRegistry::new()),
+            decode_health: Arc::new(nexus_pipeline::DecodeHealthRegistry::new()),
             pool: None,
             ui_root: dir.path().join("ui-unused"),
             recorder,

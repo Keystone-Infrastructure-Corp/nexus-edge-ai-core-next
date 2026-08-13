@@ -85,6 +85,7 @@ use crate::decode::{
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
+use crate::stats::DecodeHealthRegistry;
 
 /// How often the per-camera duplicate-frame rate is logged, in frames.
 /// ~30 s at the 15 fps supervisor cap.
@@ -217,6 +218,7 @@ impl PreRollIngester {
             codec,
             DecodeMode::default(),
             None,
+            None,
         )
     }
 
@@ -249,6 +251,7 @@ impl PreRollIngester {
         max_fps: u32,
         rgb_w: u32,
         rgb_h: u32,
+        decode_health: Option<Arc<DecodeHealthRegistry>>,
     ) -> Result<Arc<Self>, IngesterError> {
         Self::build(
             camera_id,
@@ -257,6 +260,7 @@ impl PreRollIngester {
             codec,
             decode_mode,
             Some((max_fps, rgb_w, rgb_h)),
+            decode_health,
         )
     }
 
@@ -267,6 +271,7 @@ impl PreRollIngester {
         codec: CodecKind,
         decode_mode: DecodeMode,
         rgb_params: Option<(u32, u32, u32)>,
+        decode_health: Option<Arc<DecodeHealthRegistry>>,
     ) -> Result<Arc<Self>, IngesterError> {
         gst_init::ensure().map_err(|e| IngesterError::GstInit(e.to_string()))?;
         let url = url.into();
@@ -301,6 +306,7 @@ impl PreRollIngester {
         // has never rendered a real frame, which is a wrong-chain verdict
         // rather than a reaction to load (BUG-070).
         let task_force_software = Arc::new(AtomicBool::new(false));
+        let task_decode_health = decode_health;
         let task = tokio::spawn(async move {
             run_supervisor(
                 camera_id,
@@ -313,6 +319,7 @@ impl PreRollIngester {
                 task_pipeline,
                 task_shutdown,
                 task_force_software,
+                task_decode_health,
             )
             .await;
         });
@@ -466,6 +473,7 @@ async fn run_supervisor(
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
     force_software: Arc<AtomicBool>,
+    decode_health: Option<Arc<DecodeHealthRegistry>>,
 ) {
     info!(
         camera_id,
@@ -498,6 +506,7 @@ async fn run_supervisor(
             active_pipeline.clone(),
             shutdown.clone(),
             force_software.clone(),
+            decode_health.clone(),
         )
         .await
         {
@@ -534,6 +543,7 @@ async fn run_session(
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
     force_software: Arc<AtomicBool>,
+    decode_health: Option<Arc<DecodeHealthRegistry>>,
 ) -> Result<(), IngesterError> {
     let pick_chain =
         |codec_base: &str| select_decode_chain(codec_base, decode_mode, &GstFactoryProbe);
@@ -632,14 +642,8 @@ async fn run_session(
              t. ! queue max-size-buffers=200 max-size-bytes=0 max-size-time=0 \
                 ! appsink name=tap emit-signals=true sync=false \
                     max-buffers=200 drop=false \
-             t. ! queue leaky=downstream max-size-buffers=8 max-size-bytes=0 max-size-time=0 \
-                ! {decode_chain} \
-                ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
-                ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4",
-                decode_chain = chain.elements,
-                w = rgb_w,
-                h = rgb_h,
-                fr = fr,
+             {rgb_branch}",
+                rgb_branch = crate::decode::rgb_tap_branch(&chain.elements, rgb_w, rgb_h, fr),
             )
         }
     };
@@ -652,6 +656,25 @@ async fn run_session(
     // per-camera one. Must be installed before the first state change
     // so the sync handler sees `need-context`.
     crate::decode::install_shared_display_context(&pipeline);
+
+    // Decoder-input leak counter. `rgbq` sits between the parser and the
+    // decode chain, so its buffers are compressed access units, not frames:
+    // a leak there corrupts every picture until the next IDR instead of
+    // costing one frame. `queue` emits `overrun` once per leak cycle and
+    // drops exactly one buffer per cycle (`gst_queue_chain_buffer_or_list`
+    // signals, then leaks, then rechecks), so the signal count is the
+    // dropped-AU count. Signals are live because `queue`'s `silent`
+    // property defaults to false.
+    if let (Some(health), Some(rgbq)) = (
+        decode_health.clone(),
+        pipeline.by_name(crate::decode::RGB_TAP_QUEUE_NAME),
+    ) {
+        let camera = camera_id;
+        rgbq.connect("overrun", false, move |_| {
+            health.observe_decoder_input_drop(camera);
+            None
+        });
+    }
 
     let sink = pipeline
         .by_name("tap")
@@ -740,6 +763,7 @@ async fn run_session(
         // start out perfectly healthy and only begin recycling surfaces
         // hours later.
         let loop_detector_cb = Arc::new(parking_lot::Mutex::new(FrameLoopDetector::new()));
+        let decode_health_cb = decode_health.clone();
         rgb_sink.set_callbacks(
             AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -887,13 +911,16 @@ async fn run_session(
                         );
                     }
                     // Duplicate-rate telemetry. The guard above only speaks
-                    // when it tears a session down, so a loop that stays
-                    // under the trip ratio is otherwise invisible and its
-                    // real magnitude unmeasurable — sampling the admin frame
-                    // API from outside is far too coarse to see a cycle that
-                    // is only a handful of frames deep.
+                    // when it trips, so a loop that stays under the trip
+                    // ratio is otherwise invisible and its real magnitude
+                    // unmeasurable — sampling the admin frame API from
+                    // outside is far too coarse to see a cycle that is only
+                    // a handful of frames deep.
                     {
                         let (observed, duplicates) = loop_detector_cb.lock().stats();
+                        if let Some(health) = decode_health_cb.as_ref() {
+                            health.observe_loop_stats(camera_id, observed, duplicates);
+                        }
                         if observed % FRAME_LOOP_STATS_INTERVAL == 0 && duplicates > 0 {
                             debug!(
                                 camera_id,

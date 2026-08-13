@@ -48,8 +48,9 @@
 //!    flat colour. Preferred over the legacy tier below because it does not
 //!    depend on the `gstreamer1.0-vaapi` plugin being installed at all, and
 //!    because that legacy tier was field-measured tripping the frame-loop
-//!    guard on every one of 53 cameras within minutes, pushing the whole fleet
-//!    onto the CPU-convert fallback. `videoscale` is OMITTED for the same
+//!    guard on every one of 53 cameras within minutes — which, while the
+//!    escalation ladder still existed, pushed the whole fleet onto the
+//!    CPU-convert fallback below. `videoscale` is OMITTED for the same
 //!    reason as the legacy tier: keep the scale on the GPU.
 //! 2. **Legacy `gstreamer1.0-vaapi` GPU path** — if `vaapih26Xdec` +
 //!    `vaapipostproc` are registered: `vaapih26Xdec ! vaapipostproc !
@@ -82,10 +83,27 @@
 //! rung 1, on [`FactoryProbe::amd_linear_surfaces`].
 //!
 //! Because a decoder is chosen on element *presence*, not on whether it
-//! actually renders, the ingest path pairs this with a runtime guard
-//! ([`rgb_frame_looks_degenerate`] plus `preroll_ingester`'s first-frames
-//! check) that falls the camera back to the software chain if any hardware
-//! decoder still renders garbage on the box.
+//! actually renders, `preroll_ingester` arms two runtime guards on the RGB
+//! tap. They differ in what they are allowed to do, and only one of them
+//! acts:
+//!
+//! * [`FlatFrameDetector`] over [`rgb_frame_looks_degenerate`] — latches
+//!   `force_software` and rebuilds **only** for a chain that has never once
+//!   rendered a real frame, i.e. one that is simply wrong for this GPU. A
+//!   chain that rendered fine and went flat later is reported and left up.
+//! * [`FrameLoopDetector`] over [`frame_fingerprint`] — **reports only**.
+//!
+//! There is deliberately no escalation ladder off a bad decode rung. One
+//! existed (`v0.1.189`–`v0.1.194`) and was reverted wholesale in `v0.1.195`:
+//! its only remedy was a session rebuild, a rebuild reallocates the VA
+//! surface pool, and on a VRAM-constrained box that reallocation is itself
+//! what manufactures an unwritten (green) surface — which reads as a
+//! duplicate and re-trips the guard. Field-measured at 1523 trips and 1523
+//! rebuilds in 25 minutes; rate-limiting it to one rebuild per 5 minutes only
+//! converted the storm into a stable limit cycle that never converged. Do not
+//! re-introduce a rebuild-based remedy without new evidence that the pool
+//! churn has stopped being the dominant cost. See BUG-039, BUG-065 and
+//! BUG-071 in the engineering vault.
 //!
 //! Selection is **fail-open**: if a requested hardware backend's elements are
 //! not registered, it degrades to software (the caller logs the downgrade)
@@ -98,11 +116,6 @@
 //! The selection logic is pure string-building over a [`FactoryProbe`]
 //! abstraction so it is unit-testable on macOS without the `gstreamer`
 //! feature or any real plugins.
-
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
-
-use parking_lot::Mutex;
 
 pub use nexus_config::DecodeMode;
 
@@ -168,13 +181,6 @@ pub struct DecodeChain {
     pub hwaccel: bool,
     /// Short human label for the boot log, e.g. `va (vah264dec+vapostproc)`.
     pub label: String,
-    /// `true` iff this chain is the AMD legacy-`gstreamer1.0-vaapi`
-    /// `vaapipostproc` GPU-convert tier. Lets the ingester's runtime
-    /// frame-loop guard tell whether a repeating-frame trip happened on the
-    /// tier it can escalate away from (see
-    /// [`VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`]) without string-matching
-    /// `label`.
-    pub legacy_vaapipostproc: bool,
 }
 
 impl DecodeChain {
@@ -234,7 +240,6 @@ fn software_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Software,
         hwaccel: false,
         label: format!("software ({dec})"),
-        legacy_vaapipostproc: false,
     }
 }
 
@@ -255,7 +260,6 @@ fn va_chain(
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
-            legacy_vaapipostproc: false,
         };
     }
 
@@ -276,7 +280,6 @@ fn va_chain(
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc, gpu convert, linear surfaces)"),
-            legacy_vaapipostproc: false,
         };
     }
 
@@ -297,7 +300,6 @@ fn va_chain(
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vaapipostproc, gpu convert)"),
-            legacy_vaapipostproc: true,
         };
     }
 
@@ -318,7 +320,6 @@ fn va_chain(
         backend: DecodeBackend::Va,
         hwaccel: true,
         label: format!("va ({dec}, sysmem NV12 + cpu convert)"),
-        legacy_vaapipostproc: false,
     }
 }
 
@@ -337,45 +338,34 @@ fn va_chain_for(codec_base: &str, probe: &impl FactoryProbe) -> DecodeChain {
     )
 }
 
-/// Number of runtime frame-loop-guard trips (see [`FrameLoopDetector`]) a
-/// camera may accumulate on the AMD legacy-`vaapipostproc` GPU-convert tier
-/// before the ingester stops trusting that tier for the rest of this
-/// camera's session lifetime and re-selects with
-/// [`AvoidLegacyVaapiPostproc`], landing on the system-memory NV12 +
-/// CPU-convert tier instead (GPU decode is kept; only the buggy GPU
-/// post-process is dropped).
+/// Element name of the RGB tap's decoder-input queue.
 ///
-/// A plain session rebuild is not a fix here: `vaapipostproc`'s surface pool
-/// recycling that the loop guard catches is a property of this box's
-/// concurrent camera count against the driver's surface allocator, not a
-/// one-off — observed in the field to retrip within minutes of every
-/// rebuild on the same camera. The limit is kept above 1 so a single
-/// coincidental trip (the guard's own bar is already ~2s of provably stale
-/// video within a 90-frame window) doesn't move a camera off GPU
-/// post-process on a fluke.
-pub const VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT: u32 = 3;
+/// The ingester looks this element up to count its `overrun` signal, one
+/// emission per leaked buffer. Because the queue sits between the parser and
+/// the decode chain, its buffers are compressed access units — so a leak here
+/// is a *bitstream* loss, not a dropped frame: the decoder never sees that
+/// access unit and every picture until the next IDR carries the damage. The
+/// counter is the only evidence that is happening, so [`rgb_tap_branch`] and
+/// the lookup share this constant rather than two string literals.
+pub const RGB_TAP_QUEUE_NAME: &str = "rgbq";
 
-/// Wraps a [`FactoryProbe`] and reports the legacy `gstreamer1.0-vaapi`
-/// decoder + `vaapipostproc` elements as unregistered regardless of what is
-/// actually installed, forcing [`va_chain_for`] past the AMD GPU-convert
-/// tier onto the system-memory NV12 + CPU-convert fallback. Element
-/// presence alone can't capture "registered but its surface pool recycles
-/// under load on this box", so this is how the runtime loop guard
-/// (see [`VAAPIPOSTPROC_LOOP_ESCALATION_LIMIT`]) expresses that verdict
-/// back into chain selection on the next session rebuild.
-pub struct AvoidLegacyVaapiPostproc<'a, P>(pub &'a P);
-
-impl<P: FactoryProbe> FactoryProbe for AvoidLegacyVaapiPostproc<'_, P> {
-    fn has(&self, factory_name: &str) -> bool {
-        match factory_name {
-            "vaapih264dec" | "vaapih265dec" | "vaapipostproc" => false,
-            _ => self.0.has(factory_name),
-        }
-    }
-
-    fn va_bypass_postproc(&self) -> bool {
-        self.0.va_bypass_postproc()
-    }
+/// The RGB tap branch of the pre-roll ingest pipeline, from the `tee` to the
+/// appsink.
+///
+/// `queue` is `leaky=downstream` so a slow decoder drops the oldest queued
+/// access unit instead of stalling the shared upstream parser — which would
+/// also stall the recorder's lossless branch off the same tee. The appsink
+/// then drops *decoded* frames (`drop=true max-buffers=4`) when the
+/// supervisor is the slow one; that drop is harmless, the queue's is not.
+#[must_use]
+pub fn rgb_tap_branch(decode_chain: &str, width: u32, height: u32, framerate: u32) -> String {
+    format!(
+        "t. ! queue name={RGB_TAP_QUEUE_NAME} leaky=downstream max-size-buffers=8 \
+            max-size-bytes=0 max-size-time=0 \
+         ! {decode_chain} \
+         ! video/x-raw,format=RGB,width={width},height={height},framerate={framerate}/1 \
+         ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4"
+    )
 }
 
 fn msdk_chain(codec_base: &str) -> DecodeChain {
@@ -385,7 +375,6 @@ fn msdk_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Msdk,
         hwaccel: true,
         label: format!("msdk ({dec}+msdkvpp)"),
-        legacy_vaapipostproc: false,
     }
 }
 
@@ -410,7 +399,6 @@ fn nvdec_chain(codec_base: &str) -> DecodeChain {
         backend: DecodeBackend::Nvdec,
         hwaccel: true,
         label: format!("nvdec ({dec}, sysmem NV12 + cpu convert)"),
-        legacy_vaapipostproc: false,
     }
 }
 
@@ -653,62 +641,6 @@ pub const FRAME_LOOP_EVAL_WINDOW: usize = 90;
 /// while still being slack enough that a short coincidental burst cannot
 /// tear down a working session.
 pub const FRAME_LOOP_TRIP: u32 = 30;
-
-/// Minimum interval between two frame-loop-guard session rebuilds on one
-/// camera.
-///
-/// The guard's remedy is a full teardown + rebuild, which reallocates the
-/// camera's VA decoder and its surface pool. On a VRAM-constrained box that
-/// reallocation is itself the thing that produces an unwritten (solid green)
-/// surface — and a green frame is pixel-identical to its predecessor, so it
-/// reads as a duplicate and trips the guard again. Field-measured on a
-/// 53-camera Radeon 680M at 90% VRAM: 1523 trips and 1523 rebuilds in 25
-/// minutes, ~61 rebuilds a minute across the fleet, indefinitely.
-///
-/// Throttling the remedy breaks that loop without blinding the detector: a
-/// genuinely wedged decoder is still rebuilt, just at most once per window,
-/// and the trips in between are reported rather than acted on.
-pub const FRAME_LOOP_REBUILD_COOLDOWN: Duration = Duration::from_secs(300);
-
-/// Per-camera rate limiter for the frame-loop guard's rebuild remedy.
-///
-/// Lives outside the session (like `vaapipostproc_loop_trips`) because the
-/// thing being limited is how often sessions are torn down — state that a
-/// per-session detector cannot hold, since the rebuild is what destroys it.
-#[derive(Debug, Default)]
-pub struct LoopRebuildThrottle {
-    last_rebuild: Mutex<Option<Instant>>,
-    suppressed: AtomicU32,
-}
-
-impl LoopRebuildThrottle {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether a rebuild may proceed at `now`. Records the rebuild when it
-    /// returns `true`; counts the trip as suppressed when it returns `false`.
-    pub fn allow_rebuild_at(&self, now: Instant) -> bool {
-        let mut last = self.last_rebuild.lock();
-        match *last {
-            Some(prev) if now.duration_since(prev) < FRAME_LOOP_REBUILD_COOLDOWN => {
-                self.suppressed.fetch_add(1, Ordering::Relaxed);
-                false
-            }
-            _ => {
-                *last = Some(now);
-                true
-            }
-        }
-    }
-
-    /// Trips observed while inside the cooldown, for the suppression log.
-    #[must_use]
-    pub fn suppressed(&self) -> u32 {
-        self.suppressed.load(Ordering::Relaxed)
-    }
-}
 
 /// Byte stride at which [`frame_fingerprint`] samples the frame. Prime, so
 /// consecutive samples rotate through the R/G/B channels instead of reading
@@ -1209,10 +1141,6 @@ mod tests {
         );
         assert!(c.hwaccel);
         assert!(
-            !c.legacy_vaapipostproc,
-            "this is not the legacy tier, so the vaapipostproc escalation must stay disarmed"
-        );
-        assert!(
             !c.elements.contains("videoscale"),
             "videoscale is omitted so the GPU keeps the downscale"
         );
@@ -1229,7 +1157,7 @@ mod tests {
             "tiled vapostproc emits all-green and must not be selected: {}",
             c.elements
         );
-        assert!(c.legacy_vaapipostproc);
+        assert!(c.elements.contains("vaapipostproc"));
     }
 
     /// Intel is unaffected by the AMD-only rung.
@@ -1242,136 +1170,58 @@ mod tests {
         );
     }
 
-    /// a stray `true` on any other tier would silently arm the escalation for
-    /// hardware that has no `vaapipostproc` problem.
+    /// The leak counter finds its queue with [`RGB_TAP_QUEUE_NAME`], so the
+    /// branch must actually name it. A `queue` with no `name=` is invisible
+    /// to `by_name` and the counter silently reads zero forever — which is
+    /// indistinguishable from a healthy decoder, and is exactly the blindness
+    /// BUG-071 was opened against.
     #[test]
-    fn legacy_vaapipostproc_flag_marks_that_tier_and_no_other() {
-        let amd_legacy = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
-        assert!(select_decode_chain("h264", DecodeMode::Auto, &amd_legacy).legacy_vaapipostproc);
+    fn rgb_tap_branch_names_the_queue_the_leak_counter_looks_up() {
+        let d = rgb_tap_branch(
+            "vah265dec ! vapostproc ! videoconvert ! videorate",
+            512,
+            288,
+            15,
+        );
         assert!(
-            select_decode_chain("h265", DecodeMode::Auto, &{
-                probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"])
-            })
-            .legacy_vaapipostproc
-        );
-
-        for c in [
-            // Intel / other non-AMD VA device.
-            select_decode_chain("h264", DecodeMode::Auto, &va_full()),
-            // AMD system-memory NV12 + CPU-convert fallback.
-            select_decode_chain(
-                "h264",
-                DecodeMode::Auto,
-                &probe_amd(&["vah264dec", "vapostproc"]),
-            ),
-            // MSDK (Intel), NVDEC (CUDA), software.
-            select_decode_chain(
-                "h264",
-                DecodeMode::Msdk,
-                &probe(&["msdkh264dec", "msdkvpp"]),
-            ),
-            select_decode_chain("h264", DecodeMode::Nvdec, &probe(&["nvh264dec"])),
-            select_decode_chain("h264", DecodeMode::Software, &va_full()),
-        ] {
-            assert!(
-                !c.legacy_vaapipostproc,
-                "non-legacy tier wrongly flagged: {}",
-                c.label
-            );
-        }
-    }
-
-    /// The escalation target: same box, same probe, only the wrapper differs.
-    /// GPU decode must survive (`hwaccel` stays true and the chain still
-    /// starts with a hardware decoder) — this is a post-process demotion, not
-    /// a fall to software.
-    #[test]
-    fn avoid_legacy_vaapipostproc_drops_to_sysmem_cpu_convert_tier() {
-        // h265 mirrors the field box (all 53 cameras selected
-        // `vaapih265dec+vaapipostproc`).
-        let p = probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"]);
-        let before = select_decode_chain("h265", DecodeMode::Auto, &p);
-        assert!(before.legacy_vaapipostproc);
-
-        let after = select_decode_chain("h265", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
-        assert_eq!(after.backend, DecodeBackend::Va);
-        assert!(after.hwaccel);
-        assert!(!after.legacy_vaapipostproc);
-        assert!(!after.elements.contains("vaapipostproc"));
-        assert!(!after.elements.contains("vapostproc"));
-        assert_eq!(
-            after.elements,
-            "vah265dec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+            d.contains(&format!("queue name={RGB_TAP_QUEUE_NAME} ")),
+            "decoder-input queue must be named for by_name lookup: {d}"
         );
     }
 
+    /// `decoder_input_drops` only means "compressed access units lost" while
+    /// the queue is upstream of the decoder. Move it downstream and the same
+    /// counter starts reporting harmless decoded-frame drops under a field
+    /// name that says otherwise.
     #[test]
-    fn avoid_legacy_vaapipostproc_drops_to_sysmem_cpu_convert_tier_h264() {
-        let p = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
-        let after = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
-        assert!(after.hwaccel);
-        assert_eq!(
-            after.elements,
-            "vah264dec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+    fn rgb_tap_branch_keeps_the_counted_queue_ahead_of_the_decoder() {
+        let chain = "vah265dec ! vapostproc ! videoconvert ! videorate";
+        let d = rgb_tap_branch(chain, 512, 288, 15);
+        let queue_at = d.find("queue name=").expect("named queue present");
+        let decoder_at = d.find(chain).expect("decode chain present");
+        assert!(
+            queue_at < decoder_at,
+            "the counted queue must sit between the parser and the decoder: {d}"
         );
     }
 
-    /// Intel keeps GPU post-process. `vapostproc` is a different plugin from
-    /// the shadowed legacy `vaapipostproc`, and an Intel box never latches the
-    /// escalation anyway — but if it ever did, nothing may move.
+    /// A non-leaky queue never emits `overrun`, so the counter would read
+    /// zero while the tee blocked instead — a different failure with the
+    /// same silent telemetry.
     #[test]
-    fn avoid_legacy_vaapipostproc_leaves_intel_untouched() {
-        let p = va_full();
-        for mode in [DecodeMode::Auto, DecodeMode::Va] {
-            let c = select_decode_chain("h264", mode, &AvoidLegacyVaapiPostproc(&p));
-            assert_eq!(c.backend, DecodeBackend::Va);
-            assert_eq!(
-                c.elements,
-                "vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate"
-            );
-        }
-    }
-
-    #[test]
-    fn avoid_legacy_vaapipostproc_leaves_msdk_and_nvdec_untouched() {
-        let msdk = probe(&["msdkh264dec", "msdkvpp", "vah264dec", "vapostproc"]);
-        assert_eq!(
-            select_decode_chain("h264", DecodeMode::Msdk, &AvoidLegacyVaapiPostproc(&msdk)).backend,
-            DecodeBackend::Msdk
+    fn rgb_tap_branch_leaks_downstream() {
+        let d = rgb_tap_branch(
+            "avdec_h265 ! videoconvert ! videoscale ! videorate",
+            1024,
+            576,
+            8,
         );
-
-        let nv = probe(&["nvh264dec", "nvh265dec"]);
-        for (codec, mode) in [("h264", DecodeMode::Nvdec), ("h265", DecodeMode::Auto)] {
-            let c = select_decode_chain(codec, mode, &AvoidLegacyVaapiPostproc(&nv));
-            assert_eq!(c.backend, DecodeBackend::Nvdec);
-            assert!(c.hwaccel);
-        }
-    }
-
-    /// The wrapper must not invent capabilities either: with no VA plugin at
-    /// all it still lands on software rather than emitting a chain whose
-    /// elements are not registered.
-    #[test]
-    fn avoid_legacy_vaapipostproc_still_falls_to_software_when_nothing_present() {
-        let p = none();
-        let c = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
-        assert_eq!(c.backend, DecodeBackend::Software);
-        assert!(!c.hwaccel);
-    }
-
-    /// A box that has ONLY the legacy vaapi plugin (no `va` plugin) can never
-    /// reach the legacy tier in the first place, so escalating there must not
-    /// produce a chain referencing absent `vah26Xdec`.
-    #[test]
-    fn avoid_legacy_vaapipostproc_legacy_only_box_lands_on_software() {
-        let p = probe_amd(&["vaapih264dec", "vaapipostproc"]);
-        assert_eq!(
-            select_decode_chain("h264", DecodeMode::Auto, &p).backend,
-            DecodeBackend::Software,
-            "legacy-only box never selects the legacy tier (va_available gates it)"
+        assert!(d.contains("leaky=downstream"), "{d}");
+        assert!(
+            d.contains("video/x-raw,format=RGB,width=1024,height=576,framerate=8/1"),
+            "{d}"
         );
-        let c = select_decode_chain("h264", DecodeMode::Auto, &AvoidLegacyVaapiPostproc(&p));
-        assert_eq!(c.backend, DecodeBackend::Software);
+        assert!(d.starts_with("t. !"), "branch must hang off the tee: {d}");
     }
 
     #[test]
@@ -1606,32 +1456,6 @@ mod tests {
         );
     }
 
-    /// A permanently-green camera trips the flat guard every
-    /// `FLAT_FRAME_TRIP` frames forever. Sharing the loop guard's throttle
-    /// is what keeps that from becoming the very rebuild storm BUG-039
-    /// fixed: at 15 fps a 100%-flat camera trips every ~2 s, which without
-    /// the cooldown is ~150 rebuilds per camera per 5 minutes.
-    #[test]
-    fn flat_detector_trip_rate_is_survivable_only_with_the_throttle() {
-        let mut d = FlatFrameDetector::new();
-        let throttle = LoopRebuildThrottle::new();
-        let start = Instant::now();
-        let mut trips = 0u32;
-        let mut rebuilds = 0u32;
-        // 5 minutes of a 100%-flat camera at the 15 fps supervisor cap.
-        for frame in 0..(15 * 300) {
-            if d.observe(true) {
-                trips += 1;
-                let now = start + Duration::from_millis(frame * 1000 / 15);
-                if throttle.allow_rebuild_at(now) {
-                    rebuilds += 1;
-                }
-            }
-        }
-        assert_eq!(trips, 150, "a fully-green camera trips ~every 2 s");
-        assert_eq!(rebuilds, 1, "but the cooldown lets exactly one through");
-    }
-
     #[test]
     fn loop_detector_trips_on_a_fixed_cycle() {
         let mut d = FrameLoopDetector::new();
@@ -1644,55 +1468,6 @@ mod tests {
             }
         }
         assert_eq!(tripped, Some(6));
-    }
-
-    /// The regression this throttle exists for: on a VRAM-constrained box
-    /// the guard's rebuild is what manufactures the unwritten (green)
-    /// surface, the green frame reads as a duplicate, and the guard trips
-    /// again — 1523 trips and 1523 rebuilds in 25 minutes were measured in
-    /// the field. The remedy must be rate-limited even when the detector
-    /// keeps firing.
-    #[test]
-    fn rebuild_throttle_allows_one_rebuild_per_cooldown() {
-        let t = LoopRebuildThrottle::new();
-        let t0 = Instant::now();
-
-        assert!(t.allow_rebuild_at(t0), "first trip must be allowed to act");
-        assert!(
-            !t.allow_rebuild_at(t0 + Duration::from_secs(1)),
-            "a trip one second later must not tear the session down again"
-        );
-        assert!(
-            !t.allow_rebuild_at(t0 + FRAME_LOOP_REBUILD_COOLDOWN - Duration::from_millis(1)),
-            "still inside the cooldown"
-        );
-        assert!(
-            t.allow_rebuild_at(t0 + FRAME_LOOP_REBUILD_COOLDOWN),
-            "a genuinely wedged decoder must still be rebuilt once the window passes"
-        );
-        assert_eq!(t.suppressed(), 2, "suppressed trips are counted, not lost");
-    }
-
-    /// A storm at the field-measured rate collapses to the cooldown rate.
-    #[test]
-    fn rebuild_throttle_collapses_a_field_rate_storm() {
-        let t = LoopRebuildThrottle::new();
-        let t0 = Instant::now();
-        // One camera tripped roughly every 52 s for 25 minutes.
-        let mut rebuilds = 0;
-        for i in 0..29 {
-            if t.allow_rebuild_at(t0 + Duration::from_secs(i * 52)) {
-                rebuilds += 1;
-            }
-        }
-        // Each grant restarts the window from the granting trip, so grants
-        // land on the first trip at or past +300 s: t = 0, 312, 624, 936,
-        // 1248. Five rebuilds where the guard asked for 29.
-        assert_eq!(
-            rebuilds, 5,
-            "25 min of trips must collapse to one rebuild per cooldown, not 29"
-        );
-        assert_eq!(t.suppressed(), 24, "the other 24 trips are counted");
     }
 
     #[test]

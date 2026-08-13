@@ -207,6 +207,11 @@ pub struct GstClipRecorder {
     /// capability switch; updated by the engine on
     /// `delivery.settings.changed`.
     alert_clip_delivery_gate: Option<Arc<AtomicBool>>,
+    /// Decode-health counters for every RGB tap this recorder builds
+    /// (`add_camera_ingester` / `resize_camera_rgb_tap`). Shared with the
+    /// admin API, which serves them on `GET /v1/cameras/:id/stats`. `None`
+    /// in tests and on the no-engine path leaves the ingester uninstrumented.
+    decode_health: Option<Arc<crate::stats::DecodeHealthRegistry>>,
 }
 
 struct OpenState {
@@ -309,6 +314,7 @@ impl GstClipRecorder {
             alert_inflight: Arc::new(PlMutex::new(HashMap::new())),
             alert_cold_kick: None,
             alert_clip_delivery_gate: None,
+            decode_health: None,
         })
     }
 
@@ -317,6 +323,14 @@ impl GstClipRecorder {
     /// existing callsites that don't yet pass a bus keep working.
     pub fn with_bus(mut self, bus: Arc<dyn nexus_bus::Bus>) -> Self {
         self.bus = Some(bus);
+        self
+    }
+
+    /// Instrument every RGB tap this recorder builds with per-camera decode
+    /// health (BUG-071). The engine shares one registry between here and the
+    /// admin API.
+    pub fn with_decode_health(mut self, registry: Arc<crate::stats::DecodeHealthRegistry>) -> Self {
+        self.decode_health = Some(registry);
         self
     }
 
@@ -1114,6 +1128,7 @@ impl ClipRecorder for GstClipRecorder {
             max_fps,
             rgb_w,
             rgb_h,
+            self.decode_health.clone(),
         )
         .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
         // Insert under the exclusive lock; dropping the previous
@@ -1230,6 +1245,7 @@ impl ClipRecorder for GstClipRecorder {
             max_fps,
             new_rgb_w,
             new_rgb_h,
+            self.decode_health.clone(),
         )
         .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
         let prev = self.ingesters.write().insert(camera_id, new_ing);
