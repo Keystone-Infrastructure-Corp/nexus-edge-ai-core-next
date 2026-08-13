@@ -772,6 +772,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // the active handle into this slot post-enrollment; the cold
     // replicator + the sighting hook both read it.
     let cloud_outbox = std::sync::Arc::new(nexus_cloud_client::TunnelOutbox::new());
+    // Phase 10 Live View — the LBR pump manager. Constructed once here so it
+    // persists across tunnel reconnects; the supervisor drives it from the
+    // inbound lbr_subscribe / lbr_unsubscribe envelopes, and the reconciler
+    // reaps a camera's pump when that camera stops.
+    let live_view_manager = live_view::LiveViewManager::new(cache.clone(), cloud_outbox.clone());
 
     // Cloud entitlement cache — populated from inbound `entitlement_update`
     // envelopes by the cloud-tunnel supervisor, read by the M7
@@ -1330,6 +1335,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         sink_router: sink_router.clone(),
         alert_clip_schedule_gate: alert_clip_schedule_gate.clone(),
         handles: running.clone(),
+        live_view: live_view_manager.clone(),
     });
 
     // Phase 5.6 · R4 — periodic `entity_local_state` sweeper. Keeps
@@ -1469,10 +1475,6 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             .admin_secret()
             .map(|s| std::sync::Arc::new(s.to_string()))
     };
-    // Phase 10 Live View — the LBR pump manager. Constructed once here so it
-    // persists across tunnel reconnects; the supervisor drives it from the
-    // inbound lbr_subscribe / lbr_unsubscribe envelopes.
-    let live_view_manager = live_view::LiveViewManager::new(cache.clone(), cloud_outbox.clone());
     // Go-dark insurance. One shared signal, two independent consumers:
     // the OTA success gate below, and the watchdog further down. See
     // `cloud_liveness` for why an unreachable-but-working appliance is
@@ -1488,7 +1490,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         entitlement_cache.clone(),
         pending_acks.clone(),
         snapshot_uploader_slot.clone(),
-        live_view_manager,
+        live_view_manager.clone(),
         webrtc_bridge,
         Some(trace_rx),
         loopback_admin_base.clone(),
@@ -1580,6 +1582,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // even if they've never produced an outbox row.
         sink_registry: sink_registry.clone(),
         dispatcher_health: dispatcher_health.clone(),
+        live_view: live_view_manager.clone(),
         // M7 cloud-managed sinks — boot snapshot of `nexus.toml`
         // `[[sinks]]` so `GET /v1/admin/sinks` can mark which sinks
         // are file-pinned (read-only) vs cloud-managed (editable).

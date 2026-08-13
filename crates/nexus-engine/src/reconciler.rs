@@ -145,6 +145,11 @@ pub struct ReconcilerArgs {
     /// schedule as the boot-time ones.
     pub alert_clip_schedule_gate: Arc<dyn nexus_pipeline::AlertClipScheduleGate>,
     pub handles: HandleMap,
+    /// Phase 10 Live View — so stopping a camera also reaps its LBR pump.
+    /// Without this the pump is reaped only by an `lbr_unsubscribe` from the
+    /// cloud or a tunnel drop, and a stopped camera leaves a task polling a
+    /// cache entry that will never be refilled again.
+    pub live_view: Arc<crate::live_view::LiveViewManager>,
 }
 
 /// Spawn the reconciler task. Returns its `JoinHandle` so the main
@@ -223,6 +228,16 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     for id in current.keys().copied().collect::<Vec<_>>() {
         if !live_enabled.contains(&id) {
             stop_camera(args, id);
+            // Reap the LBR pump here and *only* here. A camera that is gone
+            // or disabled has no frames to pump, so its encode task would
+            // poll a cache entry that will never be refilled. The restart
+            // path below deliberately leaves the pump running: the cloud
+            // `LiveHub` only re-sends `lbr_subscribe` on viewer or tier
+            // changes, so killing it on a URL edit would blank the wall cell
+            // until an operator happened to re-focus the tile. Across a
+            // restart the pump reports `stalled` for the gap and clears
+            // itself when frames resume.
+            args.live_view.stop(id);
         }
     }
 

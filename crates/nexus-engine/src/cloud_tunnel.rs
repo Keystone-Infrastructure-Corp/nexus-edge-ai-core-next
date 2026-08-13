@@ -633,7 +633,7 @@ async fn run(
                 cloud_outbox.set_handle(Some(
                     conn.clone() as Arc<dyn nexus_cloud_client::TunnelHandle>
                 ));
-                let pump = pump_heartbeats(&*conn, &core_id, store.clone(), &liveness);
+                let pump = pump_heartbeats(&*conn, &core_id, store.clone(), &liveness, &live_view);
                 let dispatch = pump_rpc_dispatch(
                     &*conn,
                     inbound,
@@ -1115,6 +1115,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
     _core_id: &str,
     store: Arc<Store>,
     liveness: &crate::cloud_liveness::TunnelLiveness,
+    live_view: &crate::live_view::LiveViewManager,
 ) {
     // Reaching this function at all means the WSS handshake and the mTLS
     // client-certificate check both succeeded.
@@ -1149,7 +1150,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
         // green core and an operator sees only silence, which is
         // indistinguishable from a genuinely quiet site. Recomputed each
         // tick so a repaired detector clears within one heartbeat.
-        let health = Some(edge_health());
+        let health = Some(edge_health(&live_view.stalled_cameras()));
         let env = Envelope {
             meta: EnvelopeMeta {
                 id: uuid::Uuid::now_v7().to_string(),
@@ -1209,21 +1210,42 @@ const HEALTH_DETAIL_MAX: usize = 512;
 const HEALTH_ISSUES_MAX: usize = 16;
 
 /// Build the heartbeat's health roll-up from the process-wide degradation
-/// registry.
+/// registry, plus any live-view sources that have stopped producing frames.
 ///
 /// `status` is `degraded` iff at least one issue is open, matching the
-/// schema's stated invariant. Only `detector` conditions exist today; new
-/// subsystems append here and the cloud renders unknown `code`s verbatim.
-fn edge_health() -> EdgeHealth {
-    let issues: Vec<EdgeDegradation> = nexus_inference::health::degradations()
+/// schema's stated invariant. The cloud renders unknown `code`s verbatim, so
+/// new subsystems append here without a wire change.
+///
+/// Live-view coverage is limited to *subscribed* cameras by construction —
+/// only a camera someone is watching has a pump — but that is exactly the
+/// population whose staleness an operator can see, and the case BUG-057 was
+/// filed against.
+fn edge_health(stalled_cameras: &[nexus_types::CameraId]) -> EdgeHealth {
+    let mut issues: Vec<EdgeDegradation> = nexus_inference::health::degradations()
         .into_iter()
-        .take(HEALTH_ISSUES_MAX)
         .map(|d| EdgeDegradation {
             component: "detector".to_string(),
             code: "detector_unavailable".to_string(),
             detail: truncate_detail(&format!("{}: {}", d.kind, d.reason)),
         })
         .collect();
+    if !stalled_cameras.is_empty() {
+        let ids = stalled_cameras
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        issues.push(EdgeDegradation {
+            component: "live_view".to_string(),
+            code: "camera_source_stalled".to_string(),
+            detail: truncate_detail(&format!(
+                "{} subscribed camera(s) have produced no new frame for >{}s: {ids}",
+                stalled_cameras.len(),
+                crate::live_view::STALL_AFTER.as_secs(),
+            )),
+        });
+    }
+    issues.truncate(HEALTH_ISSUES_MAX);
     EdgeHealth {
         status: if issues.is_empty() { "ok" } else { "degraded" }.to_string(),
         issues: Some(issues),
@@ -1299,7 +1321,7 @@ mod health_tests {
         let kind = "cloud_tunnel_health_test";
         nexus_inference::health::record_degraded(kind, "model pack has no 640x640 export");
 
-        let health = edge_health();
+        let health = edge_health(&[]);
         assert_eq!(health.status, "degraded");
         let issue = health
             .issues
@@ -1313,5 +1335,22 @@ mod health_tests {
         assert!(issue.detail.contains("no 640x640 export"));
 
         nexus_inference::health::clear_degraded(kind);
+    }
+
+    /// BUG-057 — a stalled live-view source must reach the cloud. It rides
+    /// the existing `EdgeHealth.issues` shape, so no wire bump is needed.
+    #[test]
+    fn stalled_live_view_sources_become_a_wire_issue() {
+        let health = edge_health(&[4, 11]);
+        assert_eq!(health.status, "degraded");
+        let issue = health
+            .issues
+            .as_ref()
+            .expect("issues present when degraded")
+            .iter()
+            .find(|i| i.component == "live_view")
+            .expect("the stall is on the wire");
+        assert_eq!(issue.code, "camera_source_stalled");
+        assert!(issue.detail.contains("4,11"), "detail: {}", issue.detail);
     }
 }

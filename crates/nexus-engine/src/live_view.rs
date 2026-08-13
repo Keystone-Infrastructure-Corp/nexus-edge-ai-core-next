@@ -60,6 +60,11 @@ const LBR_JPEG_QUALITY: u8 = 72;
 /// stale-frame detection stays simple.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// A subscribed camera that has produced no new `frame_id` for this long is
+/// reported as stalled. Generous relative to the slowest tier (`GRID_FPS`)
+/// so a merely slow detector never trips it; a genuinely dead pipeline is
+/// silent for minutes, not seconds.
+pub(crate) const STALL_AFTER: Duration = Duration::from_secs(5);
 /// Adaptive-fps ceiling for a normal grid cell.
 const GRID_FPS: u32 = 4;
 /// Adaptive-fps ceiling for the hovered / selected ("focus") cell — a
@@ -188,7 +193,35 @@ struct PumpParams {
 
 struct PumpEntry {
     params: Arc<Mutex<PumpParams>>,
+    state: Arc<Mutex<PumpState>>,
     task: JoinHandle<()>,
+}
+
+/// What a running pump is currently doing. Written by the pump task, read by
+/// the admin `live/status` surface and the heartbeat health roll-up.
+///
+/// This exists because the pump's normal failure mode is *silence*: it only
+/// emits on a new `frame_id`, so a stalled source produces no frames, no
+/// keepalive, and no log after the first one. Silence is indistinguishable
+/// from a quiet scene, which is why BUG-057 took a live box to diagnose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PumpState {
+    /// No new `frame_id` for at least [`STALL_AFTER`] — the source is dead
+    /// or wedged, and whatever the wall is showing for this cell is stale.
+    stalled: bool,
+    /// Decoded frames are repeating on a fixed cycle, so sends are being
+    /// suppressed. See the loop guard in [`spawn_pump`].
+    suppressed: bool,
+}
+
+/// One camera's pump state, flattened for the admin surface.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct LivePumpStatus {
+    pub camera_id: CameraId,
+    pub ceiling_fps: u32,
+    pub tile_w: Option<u32>,
+    pub stalled: bool,
+    pub suppressed: bool,
 }
 
 /// Owns every running LBR pump. Constructed once at engine boot and shared
@@ -240,6 +273,7 @@ impl LiveViewManager {
             return;
         }
         let shared = Arc::new(Mutex::new(params));
+        let state = Arc::new(Mutex::new(PumpState::default()));
         let task = spawn_pump(
             camera_id,
             payload.camera_id,
@@ -247,11 +281,13 @@ impl LiveViewManager {
             self.outbox.clone(),
             self.budget.clone(),
             shared.clone(),
+            state.clone(),
         );
         pumps.insert(
             camera_id,
             PumpEntry {
                 params: shared,
+                state,
                 task,
             },
         );
@@ -264,6 +300,14 @@ impl LiveViewManager {
         let Ok(camera_id) = CameraId::try_from(payload.camera_id) else {
             return;
         };
+        self.stop(camera_id);
+    }
+
+    /// Stop one camera's pump, whatever the reason. Called from
+    /// [`Self::on_unsubscribe`] and from the camera lifecycle: a camera that
+    /// has been stopped or deleted has no frames to pump, and leaving the
+    /// task running just polls a cache entry that will never be refilled.
+    pub fn stop(&self, camera_id: CameraId) {
         if let Some(entry) = self.pumps.lock().remove(&camera_id) {
             entry.task.abort();
             debug!(camera_id, "LBR pump stopped");
@@ -285,13 +329,48 @@ impl LiveViewManager {
         }
     }
 
-    /// Number of cameras currently being pumped. Test-only for now; a
-    /// diagnostics surface (e.g. an admin `live/status` endpoint) can
-    /// un-gate it when Phase C/D wires one.
-    #[cfg(test)]
+    /// Number of cameras currently being pumped.
     #[must_use]
     pub fn active_pump_count(&self) -> usize {
         self.pumps.lock().len()
+    }
+
+    /// Per-camera pump state for `GET /api/v1/admin/live/status`, sorted by
+    /// camera so the output is stable between polls.
+    #[must_use]
+    pub fn status(&self) -> Vec<LivePumpStatus> {
+        let mut out: Vec<LivePumpStatus> = self
+            .pumps
+            .lock()
+            .iter()
+            .map(|(&camera_id, entry)| {
+                let params = *entry.params.lock();
+                let state = *entry.state.lock();
+                LivePumpStatus {
+                    camera_id,
+                    ceiling_fps: params.ceiling_fps,
+                    tile_w: params.tile_w,
+                    stalled: state.stalled,
+                    suppressed: state.suppressed,
+                }
+            })
+            .collect();
+        out.sort_unstable_by_key(|s| s.camera_id);
+        out
+    }
+
+    /// Cameras whose source has stalled, for the heartbeat health roll-up.
+    #[must_use]
+    pub fn stalled_cameras(&self) -> Vec<CameraId> {
+        let mut out: Vec<CameraId> = self
+            .pumps
+            .lock()
+            .iter()
+            .filter(|(_, entry)| entry.state.lock().stalled)
+            .map(|(&camera_id, _)| camera_id)
+            .collect();
+        out.sort_unstable();
+        out
     }
 }
 
@@ -306,8 +385,13 @@ fn spawn_pump(
     outbox: Arc<TunnelOutbox>,
     budget: Arc<LbrBudget>,
     params: Arc<Mutex<PumpParams>>,
+    state: Arc<Mutex<PumpState>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // The runtime's clock, not the OS clock, so `tokio::time::pause()`
+        // can drive the stall detector in tests without real waiting.
+        use tokio::time::Instant;
+
         let mut last_frame_id: Option<u64> = None;
         let mut last_sig: u64 = 0;
         // Rolling window of recent frame content hashes + the current
@@ -316,6 +400,11 @@ fn spawn_pump(
         let mut loop_outcomes: VecDeque<bool> = VecDeque::with_capacity(LOOP_EVAL_WINDOW);
         let mut loop_hits: u32 = 0;
         let mut loop_logged = false;
+        // Stall clock. Advanced on every new `frame_id`; drives the stalled
+        // flag when it goes quiet. Starts now so a camera that never
+        // produces a first frame still trips after STALL_AFTER.
+        let mut last_new_frame = Instant::now();
+        let mut stalled = false;
         // Force the first available frame to emit immediately so a fresh
         // cell paints without waiting for motion or the keepalive tick.
         let mut last_emit = Instant::now()
@@ -333,6 +422,9 @@ fn spawn_pump(
                 let new_frame = last_frame_id != Some(frame_id);
                 let sig = objects_signature(entry.objects.as_slice());
                 let now = Instant::now();
+                if new_frame {
+                    last_new_frame = now;
+                }
                 let scene_changed = new_frame && sig != last_sig;
                 let keepalive_due = now.duration_since(last_emit) >= KEEPALIVE_INTERVAL;
 
@@ -394,8 +486,10 @@ fn spawn_pump(
                     // Only declare the episode over once the whole
                     // evaluation window has drained of cycle hits. Clearing
                     // on the first fresh frame re-armed the log on every
-                    // gap in an ongoing loop.
-                    debug!(camera_id, "live view: frame cycle cleared");
+                    // gap in an ongoing loop. Closes at WARN because it
+                    // opened at WARN — an episode that only ever announces
+                    // its start reads as still-running forever.
+                    warn!(camera_id, "live view: frame cycle cleared");
                     loop_logged = false;
                 }
                 let stale_dup = cycle.is_some() && !keepalive_due;
@@ -423,6 +517,32 @@ fn spawn_pump(
                 }
                 last_frame_id = Some(frame_id);
                 last_sig = sig;
+            }
+
+            // Report the stall rather than falling silent. `should_emit`
+            // bails on `!new_frame`, and the arm above does nothing at all
+            // when the cache has no entry, so a dead source produces no
+            // frames, no keepalive and no further log — the cloud goes on
+            // rendering the last tile it received under a LIVE badge. This
+            // is the only place that notices (BUG-057).
+            let quiet_for = last_new_frame.elapsed();
+            if (quiet_for >= STALL_AFTER) != stalled {
+                stalled = !stalled;
+                if stalled {
+                    warn!(
+                        camera_id,
+                        quiet_for_s = quiet_for.as_secs(),
+                        "live view: source has stopped producing frames; this camera's \
+                         wall cell is stale"
+                    );
+                } else {
+                    warn!(camera_id, "live view: source is producing frames again");
+                }
+            }
+            {
+                let mut s = state.lock();
+                s.stalled = stalled;
+                s.suppressed = loop_logged;
             }
 
             tokio::time::sleep(sample_interval).await;
@@ -687,5 +807,156 @@ mod tests {
 
         mgr.on_unsubscribe(&LbrUnsubscribePayload { camera_id: 1 });
         assert_eq!(mgr.active_pump_count(), 0);
+    }
+
+    fn test_frame(camera_id: CameraId, frame_id: u64) -> Arc<Frame> {
+        frame_with_fill(camera_id, frame_id, 0)
+    }
+
+    fn frame_with_fill(camera_id: CameraId, frame_id: u64, fill: u8) -> Arc<Frame> {
+        Arc::new(Frame {
+            camera_id,
+            frame_id,
+            captured_at: chrono::Utc::now(),
+            width: 16,
+            height: 16,
+            format: PixelFormat::Rgb24,
+            data: Arc::new(vec![fill; 16 * 16 * 3]),
+            trace_id: "t".into(),
+        })
+    }
+
+    fn subscribe(mgr: &LiveViewManager, camera_id: u64) {
+        mgr.on_subscribe(&LbrSubscribePayload {
+            camera_id,
+            tile_w: Some(320),
+            tile_h: Some(180),
+            fps_tier: Some("grid".to_string()),
+        });
+    }
+
+    /// The BUG-057 invariant: a source that stops producing frames must be
+    /// *reported*, not silently ignored. `should_emit` bails on `!new_frame`,
+    /// so without this the pump emits nothing and nothing says why.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_that_stops_producing_frames_is_reported_as_stalled() {
+        let cache = Arc::new(LatestFrameCache::new());
+        let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
+        cache.put(7, test_frame(7, 1), Arc::new(vec![]));
+        subscribe(&mgr, 7);
+
+        tokio::time::sleep(STALL_AFTER / 2).await;
+        assert!(!mgr.status()[0].stalled, "not stalled before STALL_AFTER");
+        assert!(mgr.stalled_cameras().is_empty());
+
+        // frame_id never advances again.
+        tokio::time::sleep(STALL_AFTER).await;
+        assert!(
+            mgr.status()[0].stalled,
+            "stalled once the source goes quiet"
+        );
+        assert_eq!(mgr.stalled_cameras(), vec![7]);
+    }
+
+    /// A camera with no cache entry at all takes the same path — the pump's
+    /// `if let Some(entry)` arm never runs, which used to mean the tick did
+    /// nothing and left no trace.
+    #[tokio::test(start_paused = true)]
+    async fn a_camera_that_never_produced_a_frame_is_reported_as_stalled() {
+        let cache = Arc::new(LatestFrameCache::new());
+        let mgr = LiveViewManager::new(cache, Arc::new(TunnelOutbox::new()));
+        subscribe(&mgr, 9);
+
+        tokio::time::sleep(STALL_AFTER * 2).await;
+        assert_eq!(mgr.stalled_cameras(), vec![9]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recovered_source_clears_the_stall() {
+        let cache = Arc::new(LatestFrameCache::new());
+        let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
+        cache.put(3, test_frame(3, 1), Arc::new(vec![]));
+        subscribe(&mgr, 3);
+
+        tokio::time::sleep(STALL_AFTER * 2).await;
+        assert_eq!(mgr.stalled_cameras(), vec![3]);
+
+        cache.put(3, test_frame(3, 2), Arc::new(vec![]));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            mgr.stalled_cameras().is_empty(),
+            "a fresh frame_id clears the stall"
+        );
+    }
+
+    /// The lifecycle gap: stopping or deleting a camera must reap its pump.
+    /// Previously only `lbr_unsubscribe` or a tunnel drop could, so a stopped
+    /// camera left a task polling a cache entry that would never be refilled.
+    #[tokio::test]
+    async fn stopping_a_camera_reaps_its_pump() {
+        let mgr = LiveViewManager::new(
+            Arc::new(LatestFrameCache::new()),
+            Arc::new(TunnelOutbox::new()),
+        );
+        subscribe(&mgr, 4);
+        assert_eq!(mgr.active_pump_count(), 1);
+
+        mgr.stop(4);
+        assert_eq!(mgr.active_pump_count(), 0);
+        assert!(mgr.status().is_empty());
+    }
+
+    /// A decoder re-serving already-delivered surfaces produces a rotating
+    /// cycle of pixel-identical frames while `frame_id` keeps advancing. The
+    /// pump suppresses those sends; without a read surface, "suppressing"
+    /// and "healthy but static" looked identical from outside the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_looping_decoder_is_reported_as_suppressed() {
+        let cache = Arc::new(LatestFrameCache::new());
+        let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
+        cache.put(6, frame_with_fill(6, 1, 10), Arc::new(vec![]));
+        subscribe(&mgr, 6);
+
+        // Period-3 content cycle: distinct fills repeating at distance 3, so
+        // every hit lands at the >= 2 distance the guard treats as impossible
+        // for live video. Drive past LOOP_LOG_TRIP.
+        let fills = [10u8, 20, 30];
+        for i in 0..(u64::from(LOOP_LOG_TRIP) + 6) {
+            let fill = fills[(i as usize) % fills.len()];
+            cache.put(6, frame_with_fill(6, i + 2, fill), Arc::new(vec![]));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let s = mgr.status();
+        assert!(s[0].suppressed, "a fixed content cycle is reported");
+        assert!(
+            !s[0].stalled,
+            "frame_id is advancing, so this is not a stall"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_is_sorted_and_carries_the_current_tier() {
+        let mgr = LiveViewManager::new(
+            Arc::new(LatestFrameCache::new()),
+            Arc::new(TunnelOutbox::new()),
+        );
+        subscribe(&mgr, 5);
+        subscribe(&mgr, 2);
+        mgr.on_subscribe(&LbrSubscribePayload {
+            camera_id: 2,
+            tile_w: Some(640),
+            tile_h: Some(360),
+            fps_tier: Some("focus".to_string()),
+        });
+
+        let s = mgr.status();
+        assert_eq!(
+            s.iter().map(|p| p.camera_id).collect::<Vec<_>>(),
+            vec![2, 5]
+        );
+        assert_eq!(s[0].ceiling_fps, FOCUS_FPS);
+        assert_eq!(s[0].tile_w, Some(640));
+        assert_eq!(s[1].ceiling_fps, GRID_FPS);
     }
 }
