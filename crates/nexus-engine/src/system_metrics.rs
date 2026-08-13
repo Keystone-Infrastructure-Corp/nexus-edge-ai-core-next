@@ -115,7 +115,7 @@ pub struct MemoryInfo {
 /// `GpuInfo::utilization_pct` aggregate can look misleadingly idle.
 /// This per-class breakdown surfaces where the work actually is.
 ///
-/// Populated by two backends:
+/// Populated by three backends:
 /// - Intel sysfs/PMU (both the i915 driver on Alder Lake / Raptor
 ///   Lake and the xe driver on Lunar Lake / Battlemage), which
 ///   reports the full engine set.
@@ -123,8 +123,13 @@ pub struct MemoryInfo {
 ///   `"video-encode"` (NVENC). NVML exposes no render/compute
 ///   split, so those classes are absent there — the headline
 ///   `utilization_pct` already covers the SM.
+/// - AMD amdgpu sysfs, which reports `"video-decode"` from
+///   `vcn_busy_percent`. This one is load-bearing rather than
+///   decorative: `gpu_busy_percent` measures only the GFX pipeline,
+///   so a camera appliance that renders nothing reads ~0% there
+///   while VCN sits pinned at 100% and drops frames.
 ///
-/// Empty on AMD and Apple.
+/// Empty on Apple.
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuEngineUtil {
     /// Stable engine class: `"render"`, `"video-decode"`,
@@ -146,12 +151,13 @@ pub struct GpuInfo {
     pub utilization_pct: Option<f32>,
     pub temp_c: Option<f32>,
     /// Per-engine-class utilization breakdown. Intel iGPUs report
-    /// the full engine set; NVIDIA reports NVDEC/NVENC. Empty on
-    /// AMD and Apple, and while the Intel PMU baseline is warming
-    /// up. The aggregate `utilization_pct` above is unchanged when
-    /// this is populated, so consumers that only read the headline
-    /// number — including the existing Alder Lake path — keep
-    /// working untouched.
+    /// the full engine set; NVIDIA reports NVDEC/NVENC; AMD reports
+    /// video-decode. Empty on Apple, and while the Intel PMU
+    /// baseline is warming up. The aggregate `utilization_pct` above
+    /// is unchanged when this is populated, so consumers that only
+    /// read the headline number keep working untouched — but on a
+    /// decode-only box that headline number is the wrong one to
+    /// read, because it covers GFX and not the video engine.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub engines: Vec<GpuEngineUtil>,
     /// Board power draw in watts. NVIDIA (NVML) only; `None` on

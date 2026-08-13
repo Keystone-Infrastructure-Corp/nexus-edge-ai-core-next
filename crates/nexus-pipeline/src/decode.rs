@@ -236,7 +236,7 @@ fn sw_decoder(codec_base: &str) -> &'static str {
 fn software_chain(codec_base: &str) -> DecodeChain {
     let dec = sw_decoder(codec_base);
     DecodeChain {
-        elements: format!("{dec} ! videoconvert ! videoscale ! videorate"),
+        elements: format!("{dec} name={DECODER_NAME} ! videoconvert ! videoscale ! videorate"),
         backend: DecodeBackend::Software,
         hwaccel: false,
         label: format!("software ({dec})"),
@@ -256,7 +256,9 @@ fn va_chain(
         // the requested RGB caps and a CPU safety net otherwise.
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!("{dec} ! vapostproc ! videoconvert ! videoscale ! videorate"),
+            elements: format!(
+                "{dec} name={DECODER_NAME} ! vapostproc ! videoconvert ! videoscale ! videorate"
+            ),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
@@ -276,7 +278,7 @@ fn va_chain(
     if amd_linear_surfaces {
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!("{dec} ! vapostproc ! videoconvert ! videorate"),
+            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! videoconvert ! videorate"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc, gpu convert, linear surfaces)"),
@@ -296,7 +298,9 @@ fn va_chain(
         // provides it via `RuntimeDirectory=nexus`.)
         let dec = vaapi_decoder(codec_base);
         return DecodeChain {
-            elements: format!("{dec} ! vaapipostproc ! videoconvert ! videorate"),
+            elements: format!(
+                "{dec} name={DECODER_NAME} ! vaapipostproc ! videoconvert ! videorate"
+            ),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vaapipostproc, gpu convert)"),
@@ -315,7 +319,7 @@ fn va_chain(
     let dec = va_decoder(codec_base);
     DecodeChain {
         elements: format!(
-            "{dec} ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+            "{dec} name={DECODER_NAME} ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
         ),
         backend: DecodeBackend::Va,
         hwaccel: true,
@@ -337,6 +341,16 @@ fn va_chain_for(codec_base: &str, probe: &impl FactoryProbe) -> DecodeChain {
         bypass && probe.amd_linear_surfaces(),
     )
 }
+
+/// Element name of the decoder, first element of every chain.
+///
+/// The ingester probes this element's src pad to count what the decoder
+/// actually produced. That number cannot be recovered further downstream:
+/// every chain ends in a `videorate` that pads a starved decoder back up to
+/// the requested framerate by duplicating buffers, so a count taken at the
+/// appsink reads a flat nominal rate no matter how little the hardware
+/// managed (BUG-071).
+pub const DECODER_NAME: &str = "vdec";
 
 /// Element name of the RGB tap's decoder-input queue.
 ///
@@ -371,7 +385,9 @@ pub fn rgb_tap_branch(decode_chain: &str, width: u32, height: u32, framerate: u3
 fn msdk_chain(codec_base: &str) -> DecodeChain {
     let dec = msdk_decoder(codec_base);
     DecodeChain {
-        elements: format!("{dec} ! msdkvpp ! videoconvert ! videoscale ! videorate"),
+        elements: format!(
+            "{dec} name={DECODER_NAME} ! msdkvpp ! videoconvert ! videoscale ! videorate"
+        ),
         backend: DecodeBackend::Msdk,
         hwaccel: true,
         label: format!("msdk ({dec}+msdkvpp)"),
@@ -395,7 +411,7 @@ fn msdk_chain(codec_base: &str) -> DecodeChain {
 fn nvdec_chain(codec_base: &str) -> DecodeChain {
     let dec = nvdec_decoder(codec_base);
     DecodeChain {
-        elements: format!("{dec} ! videoconvert ! videoscale ! videorate"),
+        elements: format!("{dec} name={DECODER_NAME} ! videoconvert ! videoscale ! videorate"),
         backend: DecodeBackend::Nvdec,
         hwaccel: true,
         label: format!("nvdec ({dec}, sysmem NV12 + cpu convert)"),
@@ -1027,7 +1043,7 @@ mod tests {
         assert!(!c.hwaccel);
         assert_eq!(
             c.elements,
-            "avdec_h264 ! videoconvert ! videoscale ! videorate"
+            "avdec_h264 name=vdec ! videoconvert ! videoscale ! videorate"
         );
         assert!(!c.downgraded_from(DecodeMode::Software));
     }
@@ -1035,7 +1051,7 @@ mod tests {
     #[test]
     fn software_mode_h265() {
         let c = select_decode_chain("h265", DecodeMode::Software, &va_full());
-        assert!(c.elements.starts_with("avdec_h265 !"));
+        assert!(c.elements.starts_with("avdec_h265 name=vdec !"));
     }
 
     #[test]
@@ -1046,7 +1062,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate"
+            "vah264dec name=vdec ! vapostproc ! videoconvert ! videoscale ! videorate"
         );
     }
 
@@ -1054,7 +1070,7 @@ mod tests {
     fn auto_picks_va_h265() {
         let c = select_decode_chain("h265", DecodeMode::Auto, &va_full());
         assert_eq!(c.backend, DecodeBackend::Va);
-        assert!(c.elements.starts_with("vah265dec ! vapostproc !"));
+        assert!(c.elements.starts_with("vah265dec name=vdec ! vapostproc !"));
     }
 
     #[test]
@@ -1075,7 +1091,7 @@ mod tests {
         assert!(!c.elements.contains("vapostproc"));
         assert_eq!(
             c.elements,
-            "vah264dec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
+            "vah264dec name=vdec ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
         );
     }
 
@@ -1089,7 +1105,7 @@ mod tests {
         assert_eq!(c.backend, DecodeBackend::Va);
         assert!(c
             .elements
-            .starts_with("vah265dec ! video/x-raw,format=NV12 !"));
+            .starts_with("vah265dec name=vdec ! video/x-raw,format=NV12 !"));
     }
 
     #[test]
@@ -1108,7 +1124,7 @@ mod tests {
         assert!(!c.elements.contains("videoscale"));
         assert_eq!(
             c.elements,
-            "vaapih264dec ! vaapipostproc ! videoconvert ! videorate"
+            "vaapih264dec name=vdec ! vaapipostproc ! videoconvert ! videorate"
         );
     }
 
@@ -1122,7 +1138,7 @@ mod tests {
         assert_eq!(c.backend, DecodeBackend::Va);
         assert_eq!(
             c.elements,
-            "vaapih265dec ! vaapipostproc ! videoconvert ! videorate"
+            "vaapih265dec name=vdec ! vaapipostproc ! videoconvert ! videorate"
         );
     }
 
@@ -1137,7 +1153,7 @@ mod tests {
         let c = select_decode_chain("h265", DecodeMode::Auto, &p);
         assert_eq!(
             c.elements,
-            "vah265dec ! vapostproc ! videoconvert ! videorate"
+            "vah265dec name=vdec ! vapostproc ! videoconvert ! videorate"
         );
         assert!(c.hwaccel);
         assert!(
@@ -1166,7 +1182,7 @@ mod tests {
         let c = select_decode_chain("h264", DecodeMode::Auto, &va_full());
         assert_eq!(
             c.elements,
-            "vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate"
+            "vah264dec name=vdec ! vapostproc ! videoconvert ! videoscale ! videorate"
         );
     }
 
@@ -1178,7 +1194,7 @@ mod tests {
     #[test]
     fn rgb_tap_branch_names_the_queue_the_leak_counter_looks_up() {
         let d = rgb_tap_branch(
-            "vah265dec ! vapostproc ! videoconvert ! videorate",
+            "vah265dec name=vdec ! vapostproc ! videoconvert ! videorate",
             512,
             288,
             15,
@@ -1211,7 +1227,7 @@ mod tests {
     #[test]
     fn rgb_tap_branch_leaks_downstream() {
         let d = rgb_tap_branch(
-            "avdec_h265 ! videoconvert ! videoscale ! videorate",
+            "avdec_h265 name=vdec ! videoconvert ! videoscale ! videorate",
             1024,
             576,
             8,
@@ -1222,6 +1238,52 @@ mod tests {
             "{d}"
         );
         assert!(d.starts_with("t. !"), "branch must hang off the tee: {d}");
+    }
+
+    /// The decoder-output probe finds its element with [`DECODER_NAME`], so
+    /// every chain has to name it. Without the name the probe silently never
+    /// attaches and decode throughput reads zero, which is indistinguishable
+    /// from a dead camera.
+    #[test]
+    fn every_chain_names_the_decoder_for_the_output_probe() {
+        let probes: Vec<DecodeChain> = vec![
+            select_decode_chain("h264", DecodeMode::Software, &none()),
+            select_decode_chain("h265", DecodeMode::Auto, &va_full()),
+            select_decode_chain(
+                "h265",
+                DecodeMode::Auto,
+                &probe_amd_linear(&["vah265dec", "vapostproc"]),
+            ),
+            select_decode_chain(
+                "h265",
+                DecodeMode::Auto,
+                &probe_amd(&["vah265dec", "vapostproc", "vaapih265dec", "vaapipostproc"]),
+            ),
+            select_decode_chain(
+                "h265",
+                DecodeMode::Auto,
+                &probe_amd(&["vah265dec", "vapostproc"]),
+            ),
+            select_decode_chain(
+                "h264",
+                DecodeMode::Msdk,
+                &probe(&["msdkh264dec", "msdkvpp"]),
+            ),
+            select_decode_chain("h264", DecodeMode::Nvdec, &probe(&["nvh264dec"])),
+        ];
+        for c in probes {
+            assert!(
+                c.elements.contains(&format!("name={DECODER_NAME} ")),
+                "chain must name its decoder: {}",
+                c.elements
+            );
+            assert!(
+                c.elements
+                    .starts_with(&c.elements[..c.elements.find(' ').unwrap_or(0)]),
+                "decoder must lead the chain: {}",
+                c.elements
+            );
+        }
     }
 
     #[test]
@@ -1247,7 +1309,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "nvh264dec ! videoconvert ! videoscale ! videorate"
+            "nvh264dec name=vdec ! videoconvert ! videoscale ! videorate"
         );
         assert!(!c.downgraded_from(DecodeMode::Nvdec));
     }
@@ -1258,7 +1320,7 @@ mod tests {
         assert_eq!(c.backend, DecodeBackend::Nvdec);
         assert_eq!(
             c.elements,
-            "nvh265dec ! videoconvert ! videoscale ! videorate"
+            "nvh265dec name=vdec ! videoconvert ! videoscale ! videorate"
         );
     }
 
@@ -1323,7 +1385,7 @@ mod tests {
     #[test]
     fn unknown_codec_base_treated_as_h264() {
         let c = select_decode_chain("av1", DecodeMode::Software, &none());
-        assert!(c.elements.starts_with("avdec_h264 !"));
+        assert!(c.elements.starts_with("avdec_h264 name=vdec !"));
     }
 
     #[test]

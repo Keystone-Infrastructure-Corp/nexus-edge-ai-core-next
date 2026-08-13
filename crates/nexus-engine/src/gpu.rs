@@ -1541,11 +1541,21 @@ drm-total-cycles-ccs:\t8077280786690
 //
 //   * `vendor`               — must be `0x1002` (AMD/ATI)
 //   * `device`               — PCI device ID → friendly name
-//   * `gpu_busy_percent`     — integer 0..100 GPU activity (the same
+//   * `gpu_busy_percent`     — integer 0..100 **GFX** activity (the same
 //                              counter `rocm-smi --showuse` reads)
+//   * `vcn_busy_percent`     — integer 0..100 **video-decode/encode**
+//                              (VCN) activity, where present
 //   * `mem_info_vram_total`  — VRAM (or APU carve-out) total bytes
 //   * `mem_info_vram_used`   — VRAM bytes currently allocated
 //   * `hwmon/hwmon*/temp1_input` — edge temperature in millidegrees C
+//
+// **`gpu_busy_percent` is not "the GPU".** It measures the graphics /
+// compute pipeline only. Video decode runs on VCN, a physically separate
+// fixed-function block with its own counter. On a headless camera
+// appliance nothing renders, so GFX reads ~0 forever while VCN can be
+// pinned at 100% — which is exactly what a 53-camera Radeon 680M shows.
+// Reporting only the GFX number makes a saturated decoder look idle, so
+// VCN is sampled too and surfaced as a `video-decode` engine entry.
 //
 // All of these are readable by the unprivileged `nexus` user, so no
 // CAP_PERFMON / sudo is required and there is no PMU baseline to warm
@@ -1568,6 +1578,7 @@ mod amd {
     use std::time::Duration;
 
     use super::{read_sysfs_string, GpuInfo};
+    use crate::system_metrics::GpuEngineUtil;
 
     /// Background sampler cadence. `gpu_busy_percent` on AMD APUs is a
     /// coarse 0/100 instantaneous gauge, so we poll it far faster than
@@ -1592,6 +1603,9 @@ mod amd {
         // are lock-free so `snapshot()` never blocks. When `None` we
         // fall back to a single direct read of `busy_path`.
         busy_avg_centi: Option<Arc<AtomicU32>>,
+        // Same treatment for the VCN (video decode/encode) block. `None`
+        // on kernels or parts that expose no `vcn_busy_percent`.
+        vcn_avg_centi: Option<Arc<AtomicU32>>,
     }
 
     /// Continuously sample `gpu_busy_percent` and publish a rolling
@@ -1645,6 +1659,7 @@ mod amd {
                 p.exists().then_some(p)
             };
             let busy_path = exists("gpu_busy_percent");
+            let vcn_path = exists("vcn_busy_percent");
             let vram_total_path = exists("mem_info_vram_total");
             let vram_used_path = exists("mem_info_vram_used");
             let temp_path = find_hwmon_temp(&base);
@@ -1664,10 +1679,21 @@ mod amd {
                     .ok()
                     .map(|_| cell)
             });
+            let vcn_avg_centi = vcn_path.as_ref().and_then(|p| {
+                let cell = Arc::new(AtomicU32::new(0));
+                let writer = Arc::clone(&cell);
+                let path = p.clone();
+                std::thread::Builder::new()
+                    .name("amd-vcn-busy-sampler".to_string())
+                    .spawn(move || sample_busy_loop(path, writer))
+                    .ok()
+                    .map(|_| cell)
+            });
 
             tracing::info!(
                 name = %name,
                 busy = busy_path.is_some(),
+                vcn = vcn_path.is_some(),
                 vram = vram_total_path.is_some(),
                 temp = temp_path.is_some(),
                 averaged = busy_avg_centi.is_some(),
@@ -1680,6 +1706,7 @@ mod amd {
                 vram_used_path,
                 temp_path,
                 busy_avg_centi,
+                vcn_avg_centi,
             });
         }
         None
@@ -1741,6 +1768,21 @@ mod amd {
                 None
             };
 
+            // `utilization_pct` above is GFX only. On a decode-only
+            // appliance that reads ~0 while VCN is saturated, so the
+            // video engine has to be reported separately or the box
+            // looks idle while it is dropping frames.
+            let engines = self
+                .vcn_avg_centi
+                .as_ref()
+                .map(|cell| {
+                    vec![GpuEngineUtil {
+                        class: "video-decode".to_string(),
+                        utilization_pct: cell.load(Ordering::Relaxed) as f32 / 100.0,
+                    }]
+                })
+                .unwrap_or_default();
+
             GpuInfo {
                 kind: "amd".to_string(),
                 name: self.name.clone(),
@@ -1748,7 +1790,7 @@ mod amd {
                 mem_used_bytes: read_u64(&self.vram_used_path),
                 utilization_pct,
                 temp_c,
-                engines: Vec::new(),
+                engines,
                 utilization_status,
                 // amdgpu sysfs does expose power/clock nodes, but this
                 // backend does not read them yet.
