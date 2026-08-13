@@ -1086,7 +1086,8 @@ async fn build_snapshot(
                     "source_width": st.source_width,
                     "source_height": st.source_height,
                     "decoder_input_drops": dh.decoder_input_drops,
-                    "decoded_frames": dh.decoded_frames,
+                    "decoder_output_frames": dh.decoder_output_frames,
+                    "sampled_frames": dh.sampled_frames,
                     "duplicate_frames": dh.duplicate_frames,
                     "duplicate_per_mille": dh.duplicate_per_mille(),
                 })

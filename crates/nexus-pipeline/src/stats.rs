@@ -261,9 +261,23 @@ pub struct DecodeHealth {
     /// on a sustained basis means the decoder cannot keep up with the
     /// camera and the picture is being damaged to make room.
     pub decoder_input_drops: u64,
-    /// Frames the loop guard has fingerprinted this session.
-    pub decoded_frames: u64,
-    /// Of [`Self::decoded_frames`], how many repeated a picture seen 2–12
+    /// Frames the decoder actually produced, counted on its src pad.
+    ///
+    /// This is the only honest measure of what the video engine managed.
+    /// Every chain ends in a `videorate` that pads a starved decoder back
+    /// up to the requested framerate by duplicating buffers, so anything
+    /// counted downstream reads a flat nominal rate regardless of how
+    /// little the hardware delivered. Compare against
+    /// [`Self::sampled_frames`]: a large gap means the picture reaching
+    /// the engine is mostly duplicated padding.
+    pub decoder_output_frames: u64,
+    /// Frames delivered to the RGB appsink, i.e. what the engine actually
+    /// consumed — **after** `videorate` padding, so this counts duplicates
+    /// as real frames. It is the correct denominator for
+    /// [`Self::duplicate_frames`] (which is detected here) and the wrong
+    /// one for decode throughput.
+    pub sampled_frames: u64,
+    /// Of [`Self::sampled_frames`], how many repeated a picture seen 2–12
     /// frames earlier, i.e. the decoder re-served a surface it had already
     /// handed over. Repeats at distance 1 (static scene, `videorate`
     /// padding) are excluded by the detector and never counted here.
@@ -275,12 +289,12 @@ pub struct DecodeHealth {
 }
 
 impl DecodeHealth {
-    /// Duplicate frames per thousand decoded. Zero when nothing decoded yet.
+    /// Duplicate frames per thousand sampled. Zero when nothing sampled yet.
     #[must_use]
     pub fn duplicate_per_mille(&self) -> u64 {
         self.duplicate_frames
             .saturating_mul(1000)
-            .checked_div(self.decoded_frames)
+            .checked_div(self.sampled_frames)
             .unwrap_or(0)
     }
 }
@@ -298,12 +312,19 @@ impl DecodeHealthRegistry {
         e.decoder_input_drops = e.decoder_input_drops.saturating_add(1);
     }
 
-    /// Publish the loop detector's running totals. Absolute, not deltas, so
-    /// a session rebuild resets them rather than double-counting.
-    pub fn observe_loop_stats(&self, camera_id: CameraId, decoded: u64, duplicates: u64) {
+    /// Record one frame emitted by the decoder itself (src-pad probe).
+    pub fn observe_decoder_output(&self, camera_id: CameraId) {
         let mut guard = self.inner.write();
         let e = guard.entry(camera_id).or_default();
-        e.decoded_frames = decoded;
+        e.decoder_output_frames = e.decoder_output_frames.saturating_add(1);
+    }
+
+    /// Publish the loop detector's running totals. Absolute, not deltas, so
+    /// a session rebuild resets them rather than double-counting.
+    pub fn observe_loop_stats(&self, camera_id: CameraId, sampled: u64, duplicates: u64) {
+        let mut guard = self.inner.write();
+        let e = guard.entry(camera_id).or_default();
+        e.sampled_frames = sampled;
         e.duplicate_frames = duplicates;
     }
 
@@ -448,7 +469,7 @@ mod tests {
         reg.observe_loop_stats(1, 90, 30);
         reg.observe_loop_stats(1, 180, 44);
         let s = reg.snapshot(1).unwrap();
-        assert_eq!(s.decoded_frames, 180);
+        assert_eq!(s.sampled_frames, 180);
         assert_eq!(s.duplicate_frames, 44);
     }
 
@@ -461,10 +482,30 @@ mod tests {
         reg.observe_decoder_input_drop(4);
         reg.observe_loop_stats(4, 100, 5);
         reg.observe_decoder_input_drop(4);
+        reg.observe_decoder_output(4);
         let s = reg.snapshot(4).unwrap();
         assert_eq!(s.decoder_input_drops, 2);
-        assert_eq!(s.decoded_frames, 100);
+        assert_eq!(s.decoder_output_frames, 1);
+        assert_eq!(s.sampled_frames, 100);
         assert_eq!(s.duplicate_frames, 5);
+    }
+
+    /// The gap between what the decoder produced and what the appsink saw is
+    /// the whole point of separating these: `videorate` pads a starved
+    /// decoder back up to the requested framerate, so a count taken at the
+    /// appsink reads nominal no matter how little the hardware managed.
+    /// Measured on the 53-camera box: ~7 fps out of the decoder presented as
+    /// a flat 15.1 fps at the appsink.
+    #[test]
+    fn decoder_output_is_counted_separately_from_appsink_deliveries() {
+        let reg = DecodeHealthRegistry::new();
+        for _ in 0..7 {
+            reg.observe_decoder_output(9);
+        }
+        reg.observe_loop_stats(9, 15, 0);
+        let s = reg.snapshot(9).unwrap();
+        assert_eq!(s.decoder_output_frames, 7, "true decode rate");
+        assert_eq!(s.sampled_frames, 15, "post-videorate delivery rate");
     }
 
     /// The API serves this on every stats request, including for a camera
@@ -474,7 +515,8 @@ mod tests {
         assert_eq!(DecodeHealth::default().duplicate_per_mille(), 0);
         let one_in_three = DecodeHealth {
             decoder_input_drops: 0,
-            decoded_frames: 90,
+            decoder_output_frames: 0,
+            sampled_frames: 90,
             duplicate_frames: 30,
         };
         assert_eq!(one_in_three.duplicate_per_mille(), 333);

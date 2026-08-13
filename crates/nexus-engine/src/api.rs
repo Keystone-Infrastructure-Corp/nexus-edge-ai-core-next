@@ -2410,14 +2410,23 @@ struct CameraFrameStatsView {
     /// dropped frame. Distinct from `frames_dropped`, which counts whole
     /// decoded frames the motion gate discarded on purpose.
     decoder_input_drops: u64,
-    /// Frames the decode-loop guard has fingerprinted this session.
-    decoded_frames: u64,
-    /// Of `decoded_frames`, how many re-served a picture seen 2–12 frames
+    /// BUG-071 — frames the decoder actually produced, counted on its src
+    /// pad. The only honest decode-throughput number: every chain ends in a
+    /// `videorate` that pads a starved decoder back to the requested rate
+    /// by duplicating buffers, so `sampled_frames` below reads a flat
+    /// nominal figure however little the hardware managed. A large gap
+    /// between the two means the picture is mostly duplicated padding.
+    decoder_output_frames: u64,
+    /// Frames delivered to the RGB appsink — **after** `videorate` padding,
+    /// so duplicates count as real frames. Correct denominator for
+    /// `duplicate_frames`; wrong one for decode throughput.
+    sampled_frames: u64,
+    /// Of `sampled_frames`, how many re-served a picture seen 2–12 frames
     /// earlier — the decoder handing back a surface it had already given
     /// us. Repeats at distance 1 (static scene, `videorate` padding) are
     /// excluded and never counted.
     duplicate_frames: u64,
-    /// `duplicate_frames` per thousand `decoded_frames`, precomputed so a
+    /// `duplicate_frames` per thousand `sampled_frames`, precomputed so a
     /// dashboard doesn't have to guard the divide.
     duplicate_per_mille: u64,
 }
@@ -2448,7 +2457,8 @@ async fn get_camera_stats(
         tile_detections_added: snap.tile_detections_added,
         tile_inference_ms_total: snap.tile_inference_ms_total,
         decoder_input_drops: decode.decoder_input_drops,
-        decoded_frames: decode.decoded_frames,
+        decoder_output_frames: decode.decoder_output_frames,
+        sampled_frames: decode.sampled_frames,
         duplicate_frames: decode.duplicate_frames,
         duplicate_per_mille: decode.duplicate_per_mille(),
     }))

@@ -676,6 +676,24 @@ async fn run_session(
         });
     }
 
+    // True decode rate, counted on the decoder's own src pad. It cannot be
+    // recovered downstream: every chain ends in a `videorate` that pads a
+    // starved decoder back up to the requested framerate by duplicating
+    // buffers, so the appsink sees a flat nominal rate however little the
+    // hardware actually managed.
+    if let (Some(health), Some(dec)) = (
+        decode_health.clone(),
+        pipeline.by_name(crate::decode::DECODER_NAME),
+    ) {
+        if let Some(src) = dec.static_pad("src") {
+            let camera = camera_id;
+            src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                health.observe_decoder_output(camera);
+                gst::PadProbeReturn::Ok
+            });
+        }
+    }
+
     let sink = pipeline
         .by_name("tap")
         .ok_or_else(|| IngesterError::AppSink("appsink 'tap' not found".into()))?
