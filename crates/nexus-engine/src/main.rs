@@ -1332,6 +1332,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         bus: bus.clone(),
         cache: cache.clone(),
         frame_stats: frame_stats.clone(),
+        decode_health: decode_health.clone(),
         static_clear: static_clear.clone(),
         pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
         default_detector_width: cfg.inference.model.input_width,

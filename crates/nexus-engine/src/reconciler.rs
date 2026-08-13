@@ -38,7 +38,8 @@ use nexus_config::TrackerConfig;
 use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
 use nexus_inference::InferenceRouter;
 use nexus_pipeline::{
-    spawn_camera, ClipRecorder, FrameStatsRegistry, LatestFrameCache, StaticAnchorClearRegistry,
+    spawn_camera, ClipRecorder, DecodeHealthRegistry, FrameStatsRegistry, LatestFrameCache,
+    StaticAnchorClearRegistry,
 };
 use nexus_rules::RuleEvaluator;
 use nexus_store::Store;
@@ -102,6 +103,7 @@ pub struct ReconcilerArgs {
     pub bus: Arc<dyn Bus>,
     pub cache: Arc<LatestFrameCache>,
     pub frame_stats: Arc<FrameStatsRegistry>,
+    pub decode_health: Arc<DecodeHealthRegistry>,
     pub static_clear: Arc<StaticAnchorClearRegistry>,
     pub pre_roll_secs: u32,
     /// Fallback detector input width when a camera's
@@ -317,6 +319,7 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     // clean slate (no stale fps_ema or counters from the previous
     // session).
     args.frame_stats.clear(cam_id);
+    args.decode_health.clear(cam_id);
 }
 
 async fn start_camera(
