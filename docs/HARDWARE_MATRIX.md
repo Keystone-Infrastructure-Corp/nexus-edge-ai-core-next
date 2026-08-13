@@ -91,10 +91,40 @@ Two budgets move independently and should be sized separately:
   burst** (dawn, weather, shift change), not the average — the burst can
   be an order of magnitude above steady state.
 
+### Decode is a pixel-rate budget, and it fails silently
+
+Measure decode capacity in **pixels per second**, not cameras. A measured
+anchor on `amd-vulkan` (Radeon 680M / gfx1035, Mesa `radeonsi`,
+2026-08-13): the VCN video block sustains roughly **0.79 Gpixel/s ≈ 382
+fps of 1080p**. Budget a fleet as
+`Σ (width × height × fps) ≤ ceiling`, then leave headroom.
+
+Two traps this profile has already fallen into in the field:
+
+- **Framerate has less range than resolution.** 53 × 1080p cameras demand
+  1009 fps against that 382 fps ceiling; forcing every camera to 15 fps
+  still leaves 795 fps, **2.1× over**. Analysing the camera's ~640×360
+  substream is ~9× fewer pixels and is the only lever with enough range.
+  Recording is compressed passthrough and keeps full resolution either way.
+- **Oversubscription corrupts video rather than slowing it down.** Past
+  the ceiling the pipeline discards *compressed access units* ahead of the
+  decoder; an access unit lost mid-GOP damages every picture until the
+  next IDR, so the symptom is smeared, blocky, backwards-in-time video
+  rather than a clean framerate drop.
+
+**Do not read `gpu_busy_percent` to check decode load on AMD.** It tracks
+the GFX block only, which idles near zero on an appliance that renders
+nothing; the box above read ~5% GFX while `vcn_busy_percent` — in the same
+sysfs directory — sat at 99%. The engine samples and publishes VCN as a
+`video-decode` engine entry; the consoles' per-engine panel is the number
+to read.
+
 Keeping decode and inference on separate silicon is what makes high
 camera counts work. Hailo-8 and the Intel NPU never decode; the host iGPU
 does. On `amd-vulkan` the same Radeon does both, which is precisely the
-gap a Hailo-8 fills on that chassis.
+gap a Hailo-8 fills on that chassis — but note the Hailo relieves only
+the **inference** half; decode stays on the Radeon's VCN and remains the
+binding constraint at high camera counts.
 
 ## What the generator decides
 
