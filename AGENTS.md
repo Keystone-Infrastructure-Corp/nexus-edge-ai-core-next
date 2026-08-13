@@ -127,6 +127,37 @@ The wedge plan that drives the next three phases of work is
    confers general `apt`, `tar`, `ln`, `systemctl`, or `rm`. See
    [REPO_BOUNDARY R8](../nexus-cloud-console/docs/REPO_BOUNDARY.md#r8-edge-runs-as-a-single-nexus-engine-process-privileged-work-is-sudoers-gated).
 
+## Coding principles
+
+Adapted from the [Karpathy-inspired guidelines](https://github.com/multica-ai/andrej-karpathy-skills).
+They bias toward caution over speed — for a typo or an obvious one-liner, use judgment.
+
+1. **Think before coding.** Don't assume, don't hide confusion, surface tradeoffs. State
+   assumptions explicitly. Where a requirement has more than one reading, present the
+   readings instead of silently picking one. If a simpler approach exists, say so and push
+   back. If something is genuinely unclear and the answer changes the design, stop and ask
+   — the exception is an autonomous run under the `implement-loop` skill (in the cloud
+   repo), which records the assumption and keeps going rather than yielding.
+2. **Simplicity first.** The minimum code that solves the problem, nothing speculative. No
+   features beyond what was asked, no abstraction for single-use code, no configurability
+   nobody requested, no error handling for states that cannot occur. If 200 lines could be
+   50, rewrite it. The test: would a senior engineer call this overcomplicated? This
+   compounds on an edge binary — every speculative abstraction is size and startup cost on
+   an appliance.
+3. **Surgical changes.** Touch only what you must; clean up only your own mess. Don't
+   "improve" adjacent code, comments, or formatting; don't refactor what isn't broken;
+   match the surrounding style even where you'd write it differently. Unrelated dead code
+   gets mentioned, not deleted — particularly under `#[cfg(...)]` hardware gates you cannot
+   compile locally. Imports and bindings that *your* change orphaned do get removed. The
+   test: every changed line traces directly to the request.
+4. **Goal-driven execution.** Define success criteria, then loop until they verify.
+   Turn imperative tasks into verifiable goals — "fix the bug" becomes "write a test that
+   reproduces it, then make it pass". For multi-step work state the plan as `step → verify:`
+   pairs, where each verify names a real gate (`cargo test --workspace`, `cargo clippy
+   --workspace --all-targets -- -D warnings`, `cargo xtask check-models`, the `nexus-types`
+   TS-binding drift check) rather than "make it work". Remember macOS-local clippy does not
+   cover the Linux-gated paths — a green local run is a weaker verify than CI.
+
 ## Context Budget
 
 - Search for the relevant symbol or route before opening a full file
