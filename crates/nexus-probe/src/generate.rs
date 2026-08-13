@@ -189,6 +189,13 @@ const DEFAULT_PRESET: (u32, u32) = (512, 288);
 /// under-provision) because we have no reliable capacity signal for it.
 fn workers_for(device: InferenceDevice, vram_mib: Option<u64>) -> usize {
     match device {
+        // The Hailo-8 runs compiled HEFs on-device, so a worker costs one host
+        // thread and a little I/O, not a model's worth of memory. One worker
+        // serialises the whole fleet behind a single thread: measured on a
+        // 53-camera box, that thread sat at 63.5% serving ~106 inferences/s,
+        // i.e. a ~165/s ceiling, while the motion gate's 8 fps band asks for
+        // 424/s. Four workers spread the same load to ~15.5% each. See BUG-070.
+        InferenceDevice::Hailo => 4,
         InferenceDevice::IntelNpu => 2,
         InferenceDevice::Nvidia => nvidia_sizing(vram_mib),
         _ => 1,
@@ -396,9 +403,26 @@ mod tests {
         let c = generate_config(&p);
         assert_eq!(c.inference.ep_priority, vec!["hailo", "cpu"]);
         assert_eq!(c.runtime.worker_threads, 16);
-        assert_eq!(c.inference.workers, 1);
+        assert_eq!(c.inference.workers, 4);
         assert_eq!(c.bus.capacity, 2048);
         assert_eq!(c.runtime.decode.mode, DecodeMode::Va);
+    }
+
+    /// Regression lock on BUG-070. Hailo used to fall through `workers_for`'s
+    /// catch-all to a single worker, so every camera on the box serialised
+    /// behind one thread — a ~165 inference/s ceiling against the 424/s that
+    /// 53 cameras ask for at the motion gate's 8 fps band. It must never be
+    /// sized below the Intel NPU, which is the weaker accelerator.
+    #[test]
+    fn hailo_is_not_sized_by_the_catch_all() {
+        assert_eq!(workers_for(InferenceDevice::Hailo, None), 4);
+        assert!(
+            workers_for(InferenceDevice::Hailo, None)
+                > workers_for(InferenceDevice::IntelNpu, None),
+            "the Hailo-8 must not get fewer workers than an Intel NPU"
+        );
+        // The catch-all is still one worker for devices with no pool sizing.
+        assert_eq!(workers_for(InferenceDevice::Cpu, None), 1);
     }
 
     #[test]
