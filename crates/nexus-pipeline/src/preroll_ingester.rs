@@ -80,8 +80,8 @@ use uuid::Uuid;
 
 use crate::decode::{
     frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, DecodeMode,
-    FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, FLAT_FRAME_EVAL_WINDOW,
-    FLAT_FRAME_TRIP, FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP,
+    FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, FLAT_FRAME_EVAL_WINDOW, FLAT_FRAME_TRIP,
+    FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP,
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;

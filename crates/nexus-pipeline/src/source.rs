@@ -12,6 +12,17 @@ use chrono::Utc;
 use nexus_types::CodecKind;
 use nexus_types::{CameraId, Frame, PixelFormat};
 use thiserror::Error;
+
+/// True while `session_gen` is the generation the source is currently running.
+///
+/// Teardown is detached, so a superseded pipeline can still be PLAYING while
+/// holding a clone of the live `tx`. Publishing from it interleaves two
+/// independent `frame_id` sequences into one channel and stamps fresh
+/// `captured_at` onto older pictures. See BUG-070.
+#[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
+fn is_current_session(generation: &AtomicU64, session_gen: u64) -> bool {
+    generation.load(Ordering::Acquire) == session_gen
+}
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -609,7 +620,7 @@ impl RtspSource {
                     // would interleave its own `frame_id` sequence and stamp
                     // fresh `captured_at` on older pictures, which is what put
                     // the wall out of order and ran its OSD clock backwards.
-                    if gen_cb.load(Ordering::Acquire) == session_gen {
+                    if is_current_session(&gen_cb, session_gen) {
                         let _ = tx_cb.try_send(frame);
                     }
                     Ok(gst::FlowSuccess::Ok)
@@ -751,5 +762,66 @@ impl RtspSource {
             Some(camera_id),
         );
         bus_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression lock on BUG-070. `set_state(Null)` is detached, so the
+    /// pipeline a reconnect abandons may still be PLAYING — and it holds a
+    /// clone of the same `tx` its replacement writes to. Two live producers
+    /// on one channel interleave independent `frame_id` sequences and stamp
+    /// fresh `captured_at` onto older pictures, which is what put the wall
+    /// out of order and ran its burned-in OSD clock backwards.
+    #[test]
+    fn only_the_current_session_may_publish() {
+        let generation = AtomicU64::new(0);
+
+        let first = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        assert!(
+            is_current_session(&generation, first),
+            "the session that just started owns the channel"
+        );
+
+        // The reconnect loop starts a replacement while the old pipeline is
+        // still draining on a teardown thread.
+        let second = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        assert!(
+            !is_current_session(&generation, first),
+            "a superseded session must be fenced off the shared channel"
+        );
+        assert!(
+            is_current_session(&generation, second),
+            "the replacement session publishes"
+        );
+    }
+
+    #[test]
+    fn generations_never_repeat_across_reconnects() {
+        let generation = AtomicU64::new(0);
+        let seen: Vec<u64> = (0..64)
+            .map(|_| generation.fetch_add(1, Ordering::AcqRel) + 1)
+            .collect();
+
+        // A repeated generation would un-fence a zombie whose value came
+        // back around, so the counter must be strictly increasing.
+        assert!(
+            seen.windows(2).all(|w| w[1] > w[0]),
+            "session generations must be strictly increasing"
+        );
+
+        let (current, superseded) = seen.split_last().expect("64 generations");
+        assert!(
+            superseded
+                .iter()
+                .all(|g| !is_current_session(&generation, *g)),
+            "every superseded session stays fenced, however many reconnects ran"
+        );
+        assert!(
+            is_current_session(&generation, *current),
+            "the newest session is the one that publishes"
+        );
     }
 }
