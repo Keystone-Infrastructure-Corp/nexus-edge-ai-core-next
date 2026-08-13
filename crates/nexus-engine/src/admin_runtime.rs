@@ -920,6 +920,12 @@ struct DiagnosticsSnapshot {
     motion_events_json: String,
     storage_backends_json: String,
     build_info_json: String,
+    /// Per-camera frame throughput and decode health. The host metrics
+    /// above are box-wide, so before this the bundle could not answer the
+    /// first question a stale-video report raises: which cameras, and is
+    /// the picture being damaged before the decoder or recycled after it
+    /// (BUG-071).
+    camera_stats_json: String,
     /// Recent engine journal (`journalctl -u nexus-engine`), URL
     /// credentials redacted, size-capped. Always present — on a read
     /// failure it holds a short explanatory note instead of log lines.
@@ -1059,6 +1065,36 @@ async fn build_snapshot(
         serde_json::to_string_pretty(&view).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
     };
 
+    // Per-camera throughput + decode health, sorted by camera id so two
+    // bundles from the same box diff cleanly. Counters only — no URL, name
+    // or credential — so this needs no redaction pass.
+    let camera_stats_json = {
+        let mut rows: Vec<(nexus_types::CameraId, nexus_pipeline::CameraFrameStats)> =
+            s.frame_stats.snapshot_all().into_iter().collect();
+        rows.sort_by_key(|(id, _)| *id);
+        let view: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(id, st)| {
+                let dh = s.decode_health.snapshot(id).unwrap_or_default();
+                serde_json::json!({
+                    "camera_id": id,
+                    "last_frame_at": st.last_frame_at,
+                    "last_frame_age_ms": st.last_frame_age_ms(now),
+                    "fps_ema": st.fps_ema,
+                    "frames_emitted": st.frames_emitted,
+                    "frames_dropped": st.frames_dropped,
+                    "source_width": st.source_width,
+                    "source_height": st.source_height,
+                    "decoder_input_drops": dh.decoder_input_drops,
+                    "decoded_frames": dh.decoded_frames,
+                    "duplicate_frames": dh.duplicate_frames,
+                    "duplicate_per_mille": dh.duplicate_per_mille(),
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&view).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+    };
+
     let build_info_json = serde_json::to_string_pretty(&serde_json::json!({
         // See `build.rs` — release-tag at CI build-time, falls back
         // to `CARGO_PKG_VERSION` for local dev builds.
@@ -1105,6 +1141,7 @@ async fn build_snapshot(
         journal_status,
         sqlite_bytes,
         sqlite_status,
+        camera_stats_json,
         audit_count,
         motion_count,
         generated_at: now,
@@ -1333,6 +1370,7 @@ fn write_tar_entries<W: Write>(
         mtime,
     )?;
     write_entry(tar, "build-info.json", &snap.build_info_json, mtime)?;
+    write_entry(tar, "camera-stats.json", &snap.camera_stats_json, mtime)?;
     write_entry(tar, "nexus-engine.log", &snap.journal_log, mtime)?;
     if let Some(bytes) = &snap.sqlite_bytes {
         write_entry_bytes(tar, "state/nexus-state.sqlite", bytes, mtime)?;
@@ -2682,6 +2720,7 @@ mod tests {
         let snap = DiagnosticsSnapshot {
             redacted_config_toml: "cfg".into(),
             system_metrics_json: "{}".into(),
+            camera_stats_json: "[]".into(),
             audit_json: "[]".into(),
             motion_events_json: "[]".into(),
             storage_backends_json: "[]".into(),
@@ -2712,6 +2751,13 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "nexus-engine.log"),
             "engine log missing from bundle: {names:?}"
+        );
+        // The host metrics in this bundle are box-wide; without the
+        // per-camera file a stale-video report cannot be triaged from the
+        // bundle alone (BUG-071).
+        assert!(
+            names.iter().any(|n| n == "camera-stats.json"),
+            "per-camera decode health missing from bundle: {names:?}"
         );
         // sqlite omitted → snapshot entry must not appear.
         assert!(
