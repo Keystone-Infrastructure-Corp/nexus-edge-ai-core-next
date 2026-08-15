@@ -158,6 +158,32 @@ They bias toward caution over speed — for a typo or an obvious one-liner, use 
    TS-binding drift check) rather than "make it work". Remember macOS-local clippy does not
    cover the Linux-gated paths — a green local run is a weaker verify than CI.
 
+### Debugging and review
+
+Two disciplines the four principles above assume but never state. The long form lives in
+`.agents/skills/systematic-debugging/`, `.agents/skills/requesting-code-review/`, and
+`.agents/skills/receiving-code-review/` — the same three skills the cloud repo carries;
+what follows binds even when no skill fires.
+
+- **No fix without a root cause.** Before proposing any fix for a bug, test failure, or
+  unexpected behaviour: read the error in full, reproduce it, and check what changed.
+  Across a multi-stage path (camera → GStreamer pipeline → inference → tracker → rules →
+  sinks, or engine → tunnel → cloud) instrument each boundary *once* to establish which
+  stage breaks before investigating why — a hypothesis about the wrong stage costs more
+  than the instrumentation would have. Then state one hypothesis, test it with the
+  smallest change that could disprove it, and write the failing test before the fix. A
+  symptom fix is a failure even when the symptom goes away. **Three failed fixes means
+  the design is wrong, not the fix** — stop, say what the attempts had in common, and
+  question the approach rather than trying a fourth. When a bug is root-caused, ask once
+  whether siblings exist elsewhere in the pipeline before closing it.
+- **Review is not self-review.** Before a PR is ready, dispatch a fresh reviewer subagent
+  given the base/head SHAs and the requirements — never this session's history. Grading
+  your own diff with the reasoning that produced it still in context is the weakest check
+  available. Handle what comes back on technical merit: verify each finding against the
+  codebase before implementing it, push back with reasoning where it is wrong, and
+  clarify every unclear item before implementing any of them — items are usually related,
+  so partial understanding produces a wrong fix. No performative agreement.
+
 ## Context Budget
 
 - Search for the relevant symbol or route before opening a full file
