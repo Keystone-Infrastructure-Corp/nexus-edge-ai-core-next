@@ -143,16 +143,23 @@ jobs:
 
       - name: Summarise
         if: always()
+        # Through `env:`, not `${{ }}` in the script. Interpolation happens
+        # before the shell parses anything, so an unvalidated `reason` spelled
+        # `$(curl evil)` would otherwise execute here.
+        env:
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.actor }}
         run: |
           {
             echo "### Release channel promotion"
             echo
             echo "| field | value |"
             echo "| --- | --- |"
-            echo "| tag | \`${{ inputs.tag }}\` |"
-            echo "| channel | \`${{ inputs.channel }}\` |"
-            echo "| reason | ${{ inputs.reason }} |"
-            echo "| requested by | @${{ github.actor }} |"
+            echo "| tag | \`${TAG}\` |"
+            echo "| channel | \`${CHANNEL}\` |"
+            # Backticked so a reason containing a pipe cannot break the table.
+            echo "| reason | \`${REASON}\` |"
+            echo "| requested by | @${ACTOR} |"
             echo
             echo "The artifact was re-registered, not rebuilt. Halt and rollback remain console actions."
           } >> "$GITHUB_STEP_SUMMARY"
