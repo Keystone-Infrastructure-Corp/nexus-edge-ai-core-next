@@ -1,0 +1,158 @@
+# promote-release-channel.yml — SPEC-068 Phase 6 / ADR-071.
+#
+# Moves an ALREADY PUBLISHED release to another channel by re-registering the
+# existing GitHub Release asset against that channel. Nothing is rebuilt and
+# nothing is re-uploaded: the tarball, its digest, and its `MANIFEST.json.sig`
+# are the same bytes cores have been running on the previous channel.
+#
+# Why this cannot be a tag operation, or a database update:
+#
+#   `channel` is inside the Ed25519-signed canonical bytes
+#   (`ReleaseManifest::canonical_bytes` in the cloud's
+#   update-orchestrator-svc), and the edge re-verifies that signature against
+#   the key baked into its enrollment bundle. So the same artifact on a
+#   different channel is a DIFFERENT signed manifest, and only
+#   update-orchestrator-svc holds the signing key. Promotion therefore has to
+#   round-trip through `POST /v1/releases`, which re-signs.
+#
+# Why it is here rather than in the console: promotion is the reviewed half of
+# ADR-071. The run — who asked, who approved, which build, which channel — is
+# the audit trail. Retreat (halt, rollback) stays in the console with no
+# reviewer, because a killswitch that needs approval is not a killswitch.
+#
+# OPERATOR SETUP (one-time): the `release-promotion` GitHub environment must
+# carry required reviewers. It is named for the gate it imposes, not for a
+# place. GitHub creates an environment unprotected on first reference, so
+# until the reviewers are attached this workflow is merely a convenience.
+
+name: promote release channel
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of the already-published release to promote (e.g. v0.1.10)."
+        required: true
+        type: string
+      channel:
+        description: "Channel to register this build on."
+        required: true
+        type: choice
+        options:
+          - beta
+          - stable
+      reason:
+        description: "Why this build is ready for that channel. Recorded in the run."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: promote-release-channel
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: re-register existing artifact on the next channel
+    runs-on: ubuntu-latest
+    environment: release-promotion
+    env:
+      TAG: ${{ inputs.tag }}
+      CHANNEL: ${{ inputs.channel }}
+      RELEASES_URL: ${{ vars.NEXUS_CLOUD_RELEASES_URL }}
+      RELEASES_AUD: ${{ vars.NEXUS_CLOUD_RELEASES_AUD || 'api://nexus-cloud/releases' }}
+    steps:
+      - name: Re-register the existing asset on ${{ inputs.channel }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${RELEASES_URL:-}" ]]; then
+            echo "::error::NEXUS_CLOUD_RELEASES_URL is not set"
+            exit 1
+          fi
+
+          name="nexus-edge-${TAG}-linux-x86_64"
+          version="${TAG#v}"
+
+          # The asset must already exist. Promotion that could publish a new
+          # artifact would be a build with a review attached, which is a
+          # different and much weaker thing than promoting a known one.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::no GitHub Release for tag ${TAG}"
+            exit 1
+          fi
+
+          # Same digest the original registration used — read back off the
+          # published sidecar rather than recomputed, so a mismatch between
+          # what was signed and what is being promoted is impossible.
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "${name}.tar.gz.sha256" \
+            --dir /tmp \
+            --clobber
+          artifact_sha256="$(awk '{print $1; exit}' "/tmp/${name}.tar.gz.sha256")"
+          if [[ ! "$artifact_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::could not parse a 64-hex sha256 from ${name}.tar.gz.sha256"
+            exit 1
+          fi
+
+          artifact_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}/${name}.tar.gz"
+
+          oidc="$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${RELEASES_AUD}" \
+            | jq -r '.value')"
+          if [[ -z "$oidc" || "$oidc" == "null" ]]; then
+            echo "::error::failed to mint GitHub OIDC token"
+            exit 1
+          fi
+
+          body="$(jq -nc \
+            --arg channel "$CHANNEL" \
+            --arg version "$version" \
+            --arg url "$artifact_url" \
+            --arg sha "$artifact_sha256" \
+            '{channel: $channel, version: $version, artifact_url: $url, artifact_sha256: $sha, min_wire_v: 1, max_wire_v: 1}')"
+
+          echo "Promoting ${version} to ${CHANNEL} (digest ${artifact_sha256:0:12}…)"
+
+          http_code="$(curl -sS -o /tmp/cloud-resp.json -w '%{http_code}' \
+            -X POST "$RELEASES_URL" \
+            -H "Authorization: Bearer ${oidc}" \
+            -H 'Content-Type: application/json' \
+            --data "$body")"
+
+          # `POST /v1/releases` is idempotent on (channel, version,
+          # artifact_sha256): re-running returns 200, and a 409 means the same
+          # channel+version already points at DIFFERENT bytes — which is a real
+          # problem, not a retryable one.
+          if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+            echo "cloud accepted the promotion (HTTP ${http_code})"
+            jq -r '"  id=\(.id // "?") signing_key_id=\(.signing_key_id // "?")"' \
+              /tmp/cloud-resp.json 2>/dev/null || true
+          else
+            echo "::error::cloud rejected the promotion (HTTP ${http_code})"
+            head -c 2000 /tmp/cloud-resp.json || true
+            exit 1
+          fi
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Release channel promotion"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| tag | \`${{ inputs.tag }}\` |"
+            echo "| channel | \`${{ inputs.channel }}\` |"
+            echo "| reason | ${{ inputs.reason }} |"
+            echo "| requested by | @${{ github.actor }} |"
+            echo
+            echo "The artifact was re-registered, not rebuilt. Halt and rollback remain console actions."
+          } >> "$GITHUB_STEP_SUMMARY"
