@@ -54,6 +54,16 @@ on:
         description: "Tag to (re-)publish (e.g. v0.1.10). The GitHub Release with this tag must already exist."
         required: true
         type: string
+      channel:
+        description: "Channel to publish this run on. `auto` keeps the default mapping (prerelease -> beta, full release -> stable) and honours the NEXUS_CLOUD_RELEASE_CHANNEL repo variable. Anything else applies to THIS RUN ONLY."
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - dev
+          - beta
+          - stable
 
 permissions:
   contents: write
@@ -773,7 +783,14 @@ jobs:
       RELEASES_AUD: ${{ vars.NEXUS_CLOUD_RELEASES_AUD || 'api://nexus-cloud/releases' }}
       # Channel override. Default: prereleases land on `beta`, full releases
       # on `stable`. `dev` is published out-of-band (never from a GH release).
+      #
+      # SPEC-068 Phase 6 — `NEXUS_CLOUD_RELEASE_CHANNEL` is a repo variable, so
+      # it applies to every run at once: setting it to `dev` to get one build
+      # onto engineering's cores also redirects the next real release, and
+      # forgetting to unset it is silent. The dispatch input below overrides it
+      # for a single run and cannot be left switched on.
       CHANNEL_OVERRIDE: ${{ vars.NEXUS_CLOUD_RELEASE_CHANNEL }}
+      CHANNEL_INPUT: ${{ github.event.inputs.channel }}
       IS_PRERELEASE: ${{ github.event.release.prerelease }}
     steps:
       - name: post release manifest to cloud
@@ -788,10 +805,13 @@ jobs:
           # semver (v0.6.0 -> 0.6.0). Everything after is passed verbatim.
           version="${TAG#v}"
 
-          # channel: explicit override wins; otherwise map prerelease->beta,
-          # full release->stable. workflow_dispatch re-publishes have no
-          # release object, so IS_PRERELEASE is '' -> treated as stable.
-          if [[ -n "${CHANNEL_OVERRIDE:-}" ]]; then
+          # channel: the per-run dispatch input wins over the repo-wide
+          # variable, which in turn wins over the prerelease mapping.
+          # `auto` (and the empty value a `release` event produces) means
+          # "no per-run opinion".
+          if [[ -n "${CHANNEL_INPUT:-}" && "${CHANNEL_INPUT}" != "auto" ]]; then
+            channel="$CHANNEL_INPUT"
+          elif [[ -n "${CHANNEL_OVERRIDE:-}" ]]; then
             channel="$CHANNEL_OVERRIDE"
           elif [[ "${IS_PRERELEASE:-}" == "true" ]]; then
             channel="beta"
