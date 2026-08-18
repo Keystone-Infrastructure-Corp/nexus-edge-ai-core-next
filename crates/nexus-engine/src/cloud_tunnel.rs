@@ -107,6 +107,7 @@ pub fn spawn_tunnel(
     pending_acks: Arc<crate::cloud_alert_sink::PendingAckRegistry>,
     snapshot_uploader_slot: crate::cloud_alert_sink::SnapshotUploaderSlot,
     live_view: Arc<crate::live_view::LiveViewManager>,
+    frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
@@ -193,6 +194,7 @@ pub fn spawn_tunnel(
             entitlement_cache,
             pending_acks,
             live_view,
+            frame_stats,
             webrtc,
             store,
             remote_access,
@@ -560,6 +562,7 @@ async fn run(
     entitlement_cache: Arc<nexus_cloud_client::entitlements::EntitlementCache>,
     pending_acks: Arc<crate::cloud_alert_sink::PendingAckRegistry>,
     live_view: Arc<crate::live_view::LiveViewManager>,
+    frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
     remote_access: nexus_config::RemoteAccessConfig,
@@ -633,7 +636,14 @@ async fn run(
                 cloud_outbox.set_handle(Some(
                     conn.clone() as Arc<dyn nexus_cloud_client::TunnelHandle>
                 ));
-                let pump = pump_heartbeats(&*conn, &core_id, store.clone(), &liveness, &live_view);
+                let pump = pump_heartbeats(
+                    &*conn,
+                    &core_id,
+                    store.clone(),
+                    &liveness,
+                    &live_view,
+                    &frame_stats,
+                );
                 let dispatch = pump_rpc_dispatch(
                     &*conn,
                     inbound,
@@ -1116,6 +1126,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
     store: Arc<Store>,
     liveness: &crate::cloud_liveness::TunnelLiveness,
     live_view: &crate::live_view::LiveViewManager,
+    frame_stats: &nexus_pipeline::FrameStatsRegistry,
 ) {
     // Reaching this function at all means the WSS handshake and the mTLS
     // client-certificate check both succeeded.
@@ -1151,6 +1162,30 @@ async fn pump_heartbeats<H: TunnelHandle>(
         // indistinguishable from a genuinely quiet site. Recomputed each
         // tick so a repaired detector clears within one heartbeat.
         let health = Some(edge_health(&live_view.stalled_cameras()));
+        // Camera-liveness rollup — same `FrameStatsRegistry` source of
+        // truth as `roster::build_envelope`'s per-camera `online` field,
+        // so the two can never disagree. Deliberately NOT
+        // `live_view.stalled_cameras()`: that registry only tracks
+        // cameras with an active live-view subscriber, which would
+        // misreport every unwatched camera as offline. Cheap: an
+        // in-memory map read, safe at the 30s heartbeat cadence.
+        let now = chrono::Utc::now();
+        let online_cameras = frame_stats
+            .snapshot_all()
+            .values()
+            .filter(|s| s.is_online(now))
+            .count() as u64;
+        // Durable outbox depth — rows still pending delivery, not the
+        // count ever enqueued. A query failure is logged and reported
+        // as 0 rather than blocking the heartbeat; a transient DB hiccup
+        // should not stall the tunnel's only liveness signal.
+        let queued_alerts = match store.outbox_queued_count().await {
+            Ok(n) => n.try_into().unwrap_or(0),
+            Err(e) => {
+                warn!(error = %e, "heartbeat: outbox queued-count query failed");
+                0
+            }
+        };
         let env = Envelope {
             meta: EnvelopeMeta {
                 id: uuid::Uuid::now_v7().to_string(),
@@ -1164,8 +1199,8 @@ async fn pump_heartbeats<H: TunnelHandle>(
                 edge_ts_unix_ms: Some(now_unix_ms()),
                 name,
                 caps: Some(heartbeat_caps(hd_transport)),
-                online_cameras: 0,
-                queued_alerts: 0,
+                online_cameras,
+                queued_alerts,
                 release,
                 health,
                 // Optional cloud-side capability diagnostic (wire `v=1`,
