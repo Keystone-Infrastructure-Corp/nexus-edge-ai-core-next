@@ -1287,17 +1287,15 @@ async fn pump_heartbeats<H: TunnelHandle>(
 /// lazily and never errs in practice, but fail-open here rather than
 /// panic: no more storage updates this connection, next reconnect retries).
 async fn pump_storage_events<H: TunnelHandle>(handle: &H, watermark: &StorageWatermarkHandle) {
-    let env = storage_watermark_envelope(
-        watermark.signal.level(),
-        watermark.signal.free_pct(),
-        watermark.low_watermark_pct,
-        watermark.panic_watermark_pct,
-    );
-    if let Err(e) = handle.send(env).await {
-        warn!(error = %e, "storage watermark republish failed; pump exiting");
-        return;
-    }
-
+    // Subscribe *before* reading the current level. `BroadcastBus` only
+    // delivers messages published after a subscription is installed, so if
+    // we read-then-subscribed, a transition landing in the gap would be
+    // missed for the rest of this connection (the whole point of Tier 2's
+    // sticky-republish guarantee). Subscribing first means any transition
+    // is captured either by the immediate snapshot below (if it already
+    // happened) or by the bus stream (if it happens afterward) — the two
+    // can race and double-publish, which is fine because duplicate
+    // publishes of the same level are harmless on the cloud side.
     let mut events = match watermark
         .bus
         .subscribe::<crate::storage_safety::StoragePanicEvent>(topic::STORAGE_PANIC)
@@ -1310,6 +1308,17 @@ async fn pump_storage_events<H: TunnelHandle>(handle: &H, watermark: &StorageWat
             return;
         }
     };
+
+    let env = storage_watermark_envelope(
+        watermark.signal.level(),
+        watermark.signal.free_pct(),
+        watermark.low_watermark_pct,
+        watermark.panic_watermark_pct,
+    );
+    if let Err(e) = handle.send(env).await {
+        warn!(error = %e, "storage watermark republish failed; pump exiting");
+        return;
+    }
 
     while let Some(msg) = events.next().await {
         match msg {
