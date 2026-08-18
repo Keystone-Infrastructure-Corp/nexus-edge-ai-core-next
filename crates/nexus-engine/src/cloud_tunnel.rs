@@ -24,6 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::VerifyingKey;
+use futures::StreamExt;
+use nexus_bus::{topic, Bus, BusExt};
 use nexus_cloud_client::trace_uploader::{
     Span, TraceUploader, TraceUploaderConfig, DEFAULT_BATCH_SIZE, DEFAULT_FLUSH_INTERVAL,
     DEFAULT_QUEUE_CAPACITY,
@@ -33,7 +35,8 @@ use nexus_cloud_client::{
     TunnelHandle, VerifiedActor, VerifierBuilder,
 };
 use nexus_cloud_protocol::v1::{
-    EdgeDegradation, EdgeHealth, Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload,
+    BusEventPayload, EdgeDegradation, EdgeHealth, Envelope, EnvelopeBody, EnvelopeMeta,
+    HeartbeatPayload, StorageWatermarkPayload,
 };
 use nexus_storage::Registry;
 use nexus_storage_cloud::{AzureBlobBackend, GatewaySasIssuer};
@@ -46,6 +49,7 @@ use uuid::Uuid;
 use crate::engine_rpc::{
     build_rpc_response_envelope, engine_rpc_response, EngineAuditSink, EngineRpcHandler,
 };
+use crate::storage_safety::WatermarkSignal;
 
 /// Heartbeat cadence. Matches the cloud edge-gateway's `liveness_timeout / 2`
 /// expectation.
@@ -53,6 +57,22 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// ADR-075 Tier 2 — everything [`pump_storage_events`] needs to publish the
+/// edge's storage watermark level over the new `bus_event` kind.
+///
+/// Deliberately NOT a bespoke rate limiter or backoff: `bus_event` rides the
+/// existing `nexus_cloud_client::tunnel::tier_of()` default (`Tier::Control`)
+/// backpressure classification like any other low-volume kind (WIRE_PROTOCOL
+/// §6) — the edge's own `WatermarkController` FSM (5-point hysteresis) is
+/// already the anti-flap control, so no second one is layered on top here.
+#[derive(Clone)]
+pub struct StorageWatermarkHandle {
+    pub signal: WatermarkSignal,
+    pub bus: Arc<dyn Bus>,
+    pub low_watermark_pct: u8,
+    pub panic_watermark_pct: u8,
+}
 
 /// Spawn the tunnel supervisor. The task probes
 /// `cloud_enrollment`; if the row is missing it parks on
@@ -114,6 +134,7 @@ pub fn spawn_tunnel(
     admin_secret: Option<Arc<String>>,
     remote_access: nexus_config::RemoteAccessConfig,
     liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
+    watermark: StorageWatermarkHandle,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -199,6 +220,7 @@ pub fn spawn_tunnel(
             store,
             remote_access,
             liveness,
+            watermark,
             rx,
         )
         .await;
@@ -567,6 +589,7 @@ async fn run(
     store: Arc<Store>,
     remote_access: nexus_config::RemoteAccessConfig,
     liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
+    watermark: StorageWatermarkHandle,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let client = TunnelClient::new(
@@ -657,6 +680,7 @@ async fn run(
                     &webrtc,
                     &remote_shell,
                 );
+                let storage_events = pump_storage_events(&*conn, &watermark);
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
@@ -671,6 +695,12 @@ async fn run(
                     _ = dispatch => {
                         // Inbound channel closed (reader task ended) -> tunnel down.
                         warn!(core_id = %core_id, "cloud tunnel inbound dispatch ended; will reconnect");
+                    }
+                    _ = storage_events => {
+                        // ADR-075 Tier 2 — send failure means the tunnel is
+                        // down; reconnect (the initial republish on the new
+                        // connection is what recovers the sticky level).
+                        warn!(core_id = %core_id, "cloud tunnel storage watermark pump exited; will reconnect");
                     }
                 }
                 cloud_outbox.set_handle(None);
@@ -1226,6 +1256,129 @@ async fn pump_heartbeats<H: TunnelHandle>(
     }
 }
 
+/// ADR-075 Tier 2 — publish the edge's storage watermark level over the new
+/// `bus_event` kind.
+///
+/// # Stickiness / reconnect self-heal
+/// Sends the CURRENT level immediately on entry — i.e. on every fresh
+/// connection, not only on a threshold crossing. This is the property that
+/// makes Tier 2 acceptable for a lossy tunnel per ADR-075: `TunnelOutbox`
+/// does not persist envelopes, so anything in flight during a disconnect is
+/// gone, but because the level is a sticky STATE rather than a one-shot
+/// EDGE, the very next publish (this one, right after reconnect) always
+/// carries the box's true current level regardless of what was lost. A
+/// duplicate publish of the same level the cloud already knows about is
+/// harmless by construction — the cloud does not key anything off
+/// occurrence count, only the level value (see `edge-gateway::bus_event`'s
+/// module doc for the cloud-side idempotency argument).
+///
+/// After the initial publish, subscribes fresh to `topic::STORAGE_PANIC`
+/// and forwards every subsequent transition for the life of this
+/// connection. `BroadcastBus` subscribers only see FUTURE messages — a
+/// transition that happened while this pump wasn't running (i.e. while
+/// disconnected) is NOT replayed by the bus itself; it is instead covered
+/// by the initial `signal`-read publish on the NEXT connection, which is
+/// exactly the reconnect-recovers-a-dropped-transition property this
+/// function exists to provide.
+///
+/// Returns (letting the supervisor reconnect) on send failure, exactly like
+/// [`pump_heartbeats`], or if the `storage.panic` subscription itself
+/// fails (extremely unlikely — the in-process bus channel is created
+/// lazily and never errs in practice, but fail-open here rather than
+/// panic: no more storage updates this connection, next reconnect retries).
+async fn pump_storage_events<H: TunnelHandle>(handle: &H, watermark: &StorageWatermarkHandle) {
+    // Subscribe *before* reading the current level. `BroadcastBus` only
+    // delivers messages published after a subscription is installed, so if
+    // we read-then-subscribed, a transition landing in the gap would be
+    // missed for the rest of this connection (the whole point of Tier 2's
+    // sticky-republish guarantee). Subscribing first means any transition
+    // is captured either by the immediate snapshot below (if it already
+    // happened) or by the bus stream (if it happens afterward) — the two
+    // can race and double-publish, which is fine because duplicate
+    // publishes of the same level are harmless on the cloud side.
+    let mut events = match watermark
+        .bus
+        .subscribe::<crate::storage_safety::StoragePanicEvent>(topic::STORAGE_PANIC)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "failed to subscribe to storage.panic; no further watermark updates will be sent on this connection");
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+
+    let env = storage_watermark_envelope(
+        watermark.signal.level(),
+        watermark.signal.free_pct(),
+        watermark.low_watermark_pct,
+        watermark.panic_watermark_pct,
+    );
+    if let Err(e) = handle.send(env).await {
+        warn!(error = %e, "storage watermark republish failed; pump exiting");
+        return;
+    }
+
+    while let Some(msg) = events.next().await {
+        match msg {
+            Ok(event) => {
+                let env = storage_watermark_envelope(
+                    event.level,
+                    event.free_pct,
+                    event.low_pct,
+                    event.panic_pct,
+                );
+                if let Err(e) = handle.send(env).await {
+                    warn!(error = %e, "storage watermark send failed; pump exiting");
+                    return;
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "storage.panic bus stream error; skipping this message");
+            }
+        }
+    }
+    // Stream ended (bus dropped, which happens only on process shutdown) —
+    // park so the outer `select!` keeps waiting on the other pumps instead
+    // of spinning.
+    std::future::pending::<()>().await;
+}
+
+fn storage_watermark_envelope(
+    level: crate::storage_safety::WatermarkLevel,
+    free_pct: f32,
+    low_watermark_pct: u8,
+    panic_watermark_pct: u8,
+) -> Envelope {
+    use crate::storage_safety::WatermarkLevel;
+    let level_str = match level {
+        WatermarkLevel::Ok => "ok",
+        WatermarkLevel::Low => "low",
+        WatermarkLevel::Panic => "panic",
+    };
+    Envelope {
+        meta: EnvelopeMeta {
+            id: uuid::Uuid::now_v7().to_string(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+            ts: chrono::Utc::now().to_rfc3339(),
+            v: 1,
+        },
+        body: EnvelopeBody::BusEvent(BusEventPayload {
+            topic: "storage.watermark".to_string(),
+            core_id: None,
+            payload: serde_json::json!(StorageWatermarkPayload {
+                level: level_str.to_string(),
+                free_pct: free_pct as f64,
+                low_watermark_pct: u64::from(low_watermark_pct),
+                panic_watermark_pct: u64::from(panic_watermark_pct),
+            }),
+        }),
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1387,5 +1540,230 @@ mod health_tests {
             .expect("the stall is on the wire");
         assert_eq!(issue.code, "camera_source_stalled");
         assert!(issue.detail.contains("4,11"), "detail: {}", issue.detail);
+    }
+}
+
+#[cfg(test)]
+mod storage_watermark_tests {
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use nexus_bus::{topic, BroadcastBus, BusExt};
+    use nexus_cloud_client::tunnel::{TunnelError, TunnelHandle};
+    use nexus_cloud_protocol::v1::EnvelopeBody;
+
+    use super::*;
+    use crate::storage_safety::{StoragePanicEvent, WatermarkLevel};
+
+    /// Captures every envelope handed to `send` into a shared list. Mirrors
+    /// the `CapturingTunnel` convention used by `cloud_sighting.rs` /
+    /// `outbox.rs` tests. `fail_after` optionally makes the Nth-and-later
+    /// send fail with `TunnelError::Disconnected`, simulating the tunnel
+    /// going down mid-pump so the reconnect-republish path can be exercised.
+    struct CapturingTunnel {
+        sent: parking_lot::Mutex<Vec<Envelope>>,
+        fail_after: Option<usize>,
+    }
+
+    impl CapturingTunnel {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                sent: parking_lot::Mutex::new(Vec::new()),
+                fail_after: None,
+            })
+        }
+
+        fn failing_after(n: usize) -> Arc<Self> {
+            Arc::new(Self {
+                sent: parking_lot::Mutex::new(Vec::new()),
+                fail_after: Some(n),
+            })
+        }
+
+        fn watermark_payloads(&self) -> Vec<StorageWatermarkPayload> {
+            self.sent
+                .lock()
+                .iter()
+                .filter_map(|env| match &env.body {
+                    EnvelopeBody::BusEvent(p) => {
+                        serde_json::from_value::<StorageWatermarkPayload>(p.payload.clone()).ok()
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl TunnelHandle for CapturingTunnel {
+        async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
+            let mut sent = self.sent.lock();
+            if let Some(n) = self.fail_after {
+                if sent.len() >= n {
+                    return Err(TunnelError::Disconnected);
+                }
+            }
+            sent.push(envelope);
+            Ok(())
+        }
+    }
+
+    fn handle_with(signal: WatermarkSignal, bus: Arc<dyn Bus>) -> StorageWatermarkHandle {
+        StorageWatermarkHandle {
+            signal,
+            bus,
+            low_watermark_pct: 15,
+            panic_watermark_pct: 5,
+        }
+    }
+
+    /// Core stickiness property: connecting (or reconnecting) sends the
+    /// CURRENT level immediately, before any bus transition arrives. This
+    /// is what makes a dropped transition self-heal on the very next
+    /// publish per ADR-075's Tier 2 durability argument.
+    #[tokio::test]
+    async fn publishes_current_state_immediately_on_entry() {
+        let signal = WatermarkSignal::new();
+        signal.set(WatermarkLevel::Low);
+        signal.set_free_pct(12.5);
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(16));
+        let watermark = handle_with(signal, bus);
+        let tunnel = CapturingTunnel::failing_after(1);
+
+        // pump_storage_events never returns on its own once the initial
+        // send succeeds (it then awaits the bus stream), so race it
+        // against a short timeout: by the time the timeout fires the
+        // initial republish must already be captured.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            pump_storage_events(&*tunnel, &watermark),
+        )
+        .await;
+
+        let payloads = tunnel.watermark_payloads();
+        assert_eq!(payloads.len(), 1, "exactly the initial republish, no more");
+        assert_eq!(payloads[0].level, "low");
+        assert!((payloads[0].free_pct - 12.5).abs() < 1e-3);
+        assert_eq!(payloads[0].low_watermark_pct, 15);
+        assert_eq!(payloads[0].panic_watermark_pct, 5);
+    }
+
+    /// The regression this whole feature exists to prevent: a transition
+    /// that occurs while the tunnel is down (no pump running to observe the
+    /// bus) is NOT lost — it is recovered because the NEXT connection's
+    /// pump reads the CURRENT signal state on entry, not just future bus
+    /// messages (which `BroadcastBus` never replays anyway).
+    #[tokio::test]
+    async fn reconnect_recovers_a_transition_missed_while_disconnected() {
+        let signal = WatermarkSignal::new();
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(16));
+
+        // "Connection 1": starts Ok. Race the pump against a short timeout
+        // so we observe the initial republish without hanging forever on
+        // the (never-arriving, in this test) bus subscription.
+        let watermark1 = handle_with(signal.clone(), bus.clone());
+        let tunnel1 = CapturingTunnel::new();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            pump_storage_events(&*tunnel1, &watermark1),
+        )
+        .await;
+        assert_eq!(tunnel1.watermark_payloads()[0].level, "ok");
+
+        // Tunnel drops. While it is down, the FSM crosses to Panic — but
+        // there is no pump running to see it on `topic::STORAGE_PANIC`,
+        // exactly like a real disconnect. Only the shared signal is
+        // updated (as `run_storage_safety` does on every tick regardless
+        // of tunnel state).
+        signal.set(WatermarkLevel::Panic);
+        signal.set_free_pct(2.0);
+
+        // "Reconnect": a fresh pump on a fresh connection must publish the
+        // CURRENT level (Panic) immediately, recovering the missed
+        // transition from the signal alone.
+        let watermark2 = handle_with(signal.clone(), bus.clone());
+        let tunnel2 = CapturingTunnel::new();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            pump_storage_events(&*tunnel2, &watermark2),
+        )
+        .await;
+        let payloads2 = tunnel2.watermark_payloads();
+        assert_eq!(payloads2.len(), 1);
+        assert_eq!(payloads2[0].level, "panic");
+        assert!((payloads2[0].free_pct - 2.0).abs() < 1e-3);
+    }
+
+    /// Publishing the same level twice in a row (e.g. two consecutive
+    /// reconnects with no real change in between) must be harmless — the
+    /// edge never suppresses the republish, and the resulting envelopes
+    /// are structurally identical modulo `meta.id`/`meta.ts`, which is what
+    /// makes the cloud side's duplicate-tolerant handling ("nothing keyed
+    /// off occurrence count") safe.
+    #[tokio::test]
+    async fn duplicate_republish_of_the_same_level_is_harmless() {
+        let signal = WatermarkSignal::new();
+        signal.set(WatermarkLevel::Low);
+        signal.set_free_pct(11.0);
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(16));
+
+        for _ in 0..2 {
+            let watermark = handle_with(signal.clone(), bus.clone());
+            let tunnel = CapturingTunnel::new();
+            let _ = tokio::time::timeout(
+                Duration::from_millis(50),
+                pump_storage_events(&*tunnel, &watermark),
+            )
+            .await;
+            let payloads = tunnel.watermark_payloads();
+            assert_eq!(payloads.len(), 1);
+            assert_eq!(payloads[0].level, "low");
+            assert!((payloads[0].free_pct - 11.0).abs() < 1e-3);
+        }
+    }
+
+    /// A live transition published on `topic::STORAGE_PANIC` while the
+    /// pump is connected must be forwarded (not just the initial
+    /// republish), proving the second half of `pump_storage_events` — the
+    /// bus-forwarding loop — actually works end-to-end.
+    #[tokio::test]
+    async fn live_transition_on_the_bus_is_forwarded_while_connected() {
+        let signal = WatermarkSignal::new();
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(16));
+        let watermark = handle_with(signal, bus.clone());
+        let tunnel = CapturingTunnel::new();
+
+        let pump = tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(200),
+                pump_storage_events(&*tunnel, &watermark),
+            )
+            .await;
+            tunnel
+        });
+        // Give the pump time to send its initial republish and subscribe.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        bus.publish(
+            topic::STORAGE_PANIC,
+            &StoragePanicEvent {
+                level: WatermarkLevel::Panic,
+                free_pct: 1.0,
+                low_pct: 15,
+                panic_pct: 5,
+                clips_dir: std::path::PathBuf::from("/clips"),
+            },
+        )
+        .await
+        .expect("publish storage.panic");
+
+        let tunnel = pump.await.expect("pump task join");
+        let payloads = tunnel.watermark_payloads();
+        assert_eq!(
+            payloads.len(),
+            2,
+            "initial republish + forwarded transition"
+        );
+        assert_eq!(payloads[0].level, "ok");
+        assert_eq!(payloads[1].level, "panic");
     }
 }

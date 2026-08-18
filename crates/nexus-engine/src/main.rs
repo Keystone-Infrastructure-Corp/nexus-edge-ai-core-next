@@ -1508,6 +1508,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cloud_passthrough_admin_secret,
         cfg.remote_access.clone(),
         tunnel_liveness.clone(),
+        cloud_tunnel::StorageWatermarkHandle {
+            signal: watermark_signal.clone(),
+            bus: bus.clone(),
+            low_watermark_pct: effective_low_pct,
+            panic_watermark_pct: effective_panic_pct,
+        },
     );
 
     // Phase 9 (M_OTA) — boot-time finalize of any update that was
