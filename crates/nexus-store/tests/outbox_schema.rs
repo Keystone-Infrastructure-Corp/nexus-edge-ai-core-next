@@ -578,6 +578,82 @@ async fn outbox_pending_limit_and_ordering() {
 }
 
 #[tokio::test]
+async fn outbox_queued_count_matches_pending_rows() {
+    // BUG-101: `HeartbeatPayload.queued_alerts` reads this count. It must
+    // reflect durable outbox depth — rows still awaiting delivery, not the
+    // number ever enqueued.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    let alert = sample_alert(1, "rule.queued");
+    store
+        .record_event_and_enqueue(
+            &alert,
+            &[
+                "webhook:sent",
+                "webhook:failed",
+                "webhook:dead",
+                "webhook:supp",
+                "webhook:pending",
+            ],
+        )
+        .await
+        .unwrap();
+
+    let rows = store
+        .outbox_for_event(&alert.event_id.to_string())
+        .await
+        .unwrap();
+    let by_sink = |s: &str| -> i64 {
+        rows.iter()
+            .find(|r| r.sink_id == s)
+            .map(|r| r.id)
+            .unwrap_or_else(|| panic!("no row for {s}"))
+    };
+
+    // Before any transition: 5 rows, all pending.
+    assert_eq!(store.outbox_queued_count().await.unwrap(), 5);
+
+    store
+        .outbox_mark_sent(by_sink("webhook:sent"))
+        .await
+        .unwrap();
+    store
+        .outbox_mark_dead(by_sink("webhook:dead"), "permanent: 400 bad payload")
+        .await
+        .unwrap();
+    store
+        .outbox_mark_suppressed(by_sink("webhook:supp"), SuppressionReason::RuleDisabled)
+        .await
+        .unwrap();
+    store
+        .outbox_mark_failed(
+            by_sink("webhook:failed"),
+            "transient: 503",
+            Utc::now() + Duration::seconds(30),
+        )
+        .await
+        .unwrap();
+    // `mark_failed` bounces the row back to `pending` immediately, so
+    // exercise the literal `failed` status directly — it is a legal,
+    // still-outstanding state per the CHECK constraint and must count.
+    sqlx::query("UPDATE alert_sink_outbox SET status = 'failed' WHERE id = ?")
+        .bind(by_sink("webhook:pending"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.outbox_queued_count().await.unwrap(),
+        2,
+        "webhook:failed (back to pending) and webhook:pending (now literal 'failed') \
+         both remain outstanding; sent/dead/suppressed do not"
+    );
+}
+
+#[tokio::test]
 async fn outbox_suppressed_row_check_constraint() {
     // The migration's paired CHECK guarantees suppression_reason
     // NULL ⇔ status NOT 'suppressed'. Verify both halves bite.

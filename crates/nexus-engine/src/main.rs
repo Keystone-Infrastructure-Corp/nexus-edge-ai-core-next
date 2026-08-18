@@ -1429,6 +1429,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         bus.clone(),
         cloud_outbox.clone(),
         cfg.inference.model.kind.clone(),
+        frame_stats.clone(),
     );
 
     // Phase 7.5.5 — fleet-state-hash publisher. Subscribes to
@@ -1500,6 +1501,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         pending_acks.clone(),
         snapshot_uploader_slot.clone(),
         live_view_manager.clone(),
+        frame_stats.clone(),
         webrtc_bridge,
         Some(trace_rx),
         loopback_admin_base.clone(),

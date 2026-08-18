@@ -33,6 +33,15 @@ const FPS_WINDOW: Duration = Duration::from_secs(2);
 /// already past the detector cadence we care about.
 const FPS_WINDOW_MAX_SAMPLES: usize = 240;
 
+/// A camera with no observed frame within this window is reported
+/// offline. This is the frame-source liveness signal — distinct from
+/// `live_view::STALL_AFTER`, which only judges cameras with an active
+/// live-view subscriber and would misreport every unwatched camera.
+/// Generous relative to the 30s cloud heartbeat cadence so a single
+/// slow tick or brief reconnect never flaps the fleet view; a source
+/// that is actually gone stays silent far longer than this.
+pub const CAMERA_OFFLINE_AFTER_MS: i64 = 90_000;
+
 /// Snapshot returned to API callers. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct CameraFrameStats {
@@ -76,6 +85,16 @@ impl CameraFrameStats {
     pub fn last_frame_age_ms(&self, now: DateTime<Utc>) -> Option<i64> {
         self.last_frame_at
             .map(|t| (now - t).num_milliseconds().max(0))
+    }
+
+    /// Edge-observed liveness in the last frame-source pass: `true` only
+    /// when a frame has actually arrived within [`CAMERA_OFFLINE_AFTER_MS`].
+    /// A camera that has never produced a frame (never spawned, or spawned
+    /// but not yet decoding) is offline, not unknown — the whole point of
+    /// this signal is to say something real instead of a placeholder.
+    pub fn is_online(&self, now: DateTime<Utc>) -> bool {
+        self.last_frame_age_ms(now)
+            .is_some_and(|age_ms| age_ms <= CAMERA_OFFLINE_AFTER_MS)
     }
 }
 
@@ -562,5 +581,41 @@ mod tests {
         assert_eq!(s.tile_invocations, 0);
         assert_eq!(s.tile_detections_added, 0);
         assert_eq!(s.tile_inference_ms_total, 0);
+    }
+
+    /// Frame-source liveness (`CameraFrameStats::is_online`) must not depend
+    /// on any live-view subscriber — this is the signal that also covers a
+    /// camera nobody is currently watching, unlike `live_view::stalled_cameras`.
+    #[test]
+    fn camera_with_recent_frame_is_online_with_no_live_view_subscriber() {
+        let reg = FrameStatsRegistry::new();
+        let now = Utc::now();
+        reg.observe_frame(1, now, 960, 540);
+        let s = reg.snapshot(1).unwrap();
+        assert!(s.is_online(now));
+    }
+
+    /// A camera that stops producing frames must flip to offline once its
+    /// last frame ages past [`CAMERA_OFFLINE_AFTER_MS`].
+    #[test]
+    fn camera_flips_offline_after_frames_stop() {
+        let reg = FrameStatsRegistry::new();
+        let last_frame = Utc::now();
+        reg.observe_frame(1, last_frame, 960, 540);
+        let s = reg.snapshot(1).unwrap();
+        assert!(s.is_online(last_frame), "just observed a frame");
+        let long_after = last_frame + chrono::Duration::milliseconds(CAMERA_OFFLINE_AFTER_MS + 1);
+        assert!(
+            !s.is_online(long_after),
+            "no frame in over CAMERA_OFFLINE_AFTER_MS must report offline"
+        );
+    }
+
+    /// A camera that has never produced a frame (never spawned, or spawned
+    /// but not yet decoding) is offline, not merely absent from the map.
+    #[test]
+    fn camera_never_seen_is_offline() {
+        let reg = FrameStatsRegistry::new();
+        assert!(reg.snapshot(99).is_none());
     }
 }
