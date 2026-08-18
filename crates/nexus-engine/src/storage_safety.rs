@@ -189,6 +189,12 @@ pub struct WatermarkSignal {
 struct WatermarkSignalInner {
     level: std::sync::atomic::AtomicU8,
     pressure: tokio::sync::Notify,
+    /// Free-space percentage as milli-percent (`free_pct * 1000`,
+    /// rounded) so it fits an `AtomicU32` without a lock. ADR-075 Tier
+    /// 2 — the cloud tunnel publisher reads this alongside `level()`
+    /// to build the `bus_event` payload; the cold-read cache never
+    /// touches it.
+    free_pct_millis: std::sync::atomic::AtomicU32,
 }
 
 impl WatermarkSignal {
@@ -229,6 +235,29 @@ impl WatermarkSignal {
             // steady state and shouldn't re-wake.
             self.inner.pressure.notify_waiters();
         }
+    }
+
+    /// Current free-space percentage, milli-percent-rounded (see
+    /// [`Self::set_free_pct`]). ADR-075 Tier 2's `pump_storage_events`
+    /// reads this — alongside [`Self::level`] — on every (re)connect so
+    /// the published watermark state is never stale-by-construction.
+    pub fn free_pct(&self) -> f32 {
+        self.inner
+            .free_pct_millis
+            .load(std::sync::atomic::Ordering::Relaxed) as f32
+            / 1000.0
+    }
+
+    /// Record the latest observed free-space percentage. Called
+    /// alongside [`Self::set`] from [`run_storage_safety`]'s sample
+    /// loop — every tick, not only on transitions, so
+    /// [`Self::free_pct`] is never more than one `sample_interval`
+    /// stale.
+    pub fn set_free_pct(&self, free_pct: f32) {
+        let millis = (free_pct * 1000.0).round().clamp(0.0, u32::MAX as f32) as u32;
+        self.inner
+            .free_pct_millis
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -409,7 +438,10 @@ pub async fn run_storage_safety(
         // Mirror the new level into the shared signal for the cold-
         // read cache. Cheap atomic store; only wakes pressure
         // waiters on Ok→Low / Ok→Panic / Low→Panic transitions.
+        // ADR-075 Tier 2: also mirror free_pct so pump_storage_events
+        // can republish current state on reconnect without a probe.
         signal.set(controller.level());
+        signal.set_free_pct(free_pct);
 
         match trans {
             Transition::Entered(WatermarkLevel::Panic) => {
@@ -478,6 +510,7 @@ pub async fn run_storage_safety(
                     if let Ok(p) = probe.free_pct().await {
                         let lvl = controller.observe(p);
                         signal.set(controller.level());
+                        signal.set_free_pct(p);
                         if matches!(lvl, Transition::Exited(WatermarkLevel::Ok)) {
                             recorder.set_panic(false);
                             info!(free_pct = p, "storage recovered to Ok during reclaim batch");
