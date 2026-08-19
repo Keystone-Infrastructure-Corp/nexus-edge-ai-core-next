@@ -40,7 +40,7 @@
 //! 1. **Modern `vapostproc` GPU path, when surfaces are linear** — if
 //!    `AMD_DEBUG=notiling` is in the environment (see
 //!    [`FactoryProbe::amd_linear_surfaces`]): `vah26Xdec ! vapostproc !
-//!    videoconvert ! videorate`. The tiling bug above is the *only* thing
+//!    videorate ! videoconvert`. The tiling bug above is the *only* thing
 //!    wrong with `vapostproc` here; with linear surfaces it is pixel-accurate,
 //!    verified by capturing 490 consecutive frames through this exact chain on
 //!    the Radeon 680M / Mesa 25.2.8 and finding real imagery throughout
@@ -54,7 +54,7 @@
 //!    reason as the legacy tier: keep the scale on the GPU.
 //! 2. **Legacy `gstreamer1.0-vaapi` GPU path** — if `vaapih26Xdec` +
 //!    `vaapipostproc` are registered: `vaapih26Xdec ! vaapipostproc !
-//!    videoconvert ! videorate`. The OLD `vaapipostproc` does the NV12→RGB
+//!    videorate ! videoconvert`. The OLD `vaapipostproc` does the NV12→RGB
 //!    convert + downscale correctly on the GPU on the same Radeon 680M /
 //!    Mesa 25.2 where the new `vapostproc` fails *while tiled* (verified with
 //!    a live pipeline). `videoscale` is deliberately OMITTED so caps
@@ -171,7 +171,7 @@ pub trait FactoryProbe {
 pub struct DecodeChain {
     /// GStreamer element fragment from the decoder through the
     /// convert/scale/rate tail, e.g.
-    /// `vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate`.
+    /// `vah264dec ! vapostproc ! videorate ! videoscale ! videoconvert`.
     /// The caller appends
     /// `! video/x-raw,format=RGB,width=..,height=..,framerate=../1 ! appsink`.
     pub elements: String,
@@ -236,7 +236,7 @@ fn sw_decoder(codec_base: &str) -> &'static str {
 fn software_chain(codec_base: &str) -> DecodeChain {
     let dec = sw_decoder(codec_base);
     DecodeChain {
-        elements: format!("{dec} name={DECODER_NAME} ! videoconvert ! videoscale ! videorate"),
+        elements: format!("{dec} name={DECODER_NAME} ! {CPU_TAIL}"),
         backend: DecodeBackend::Software,
         hwaccel: false,
         label: format!("software ({dec})"),
@@ -256,9 +256,7 @@ fn va_chain(
         // the requested RGB caps and a CPU safety net otherwise.
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!(
-                "{dec} name={DECODER_NAME} ! vapostproc ! videoconvert ! videoscale ! videorate"
-            ),
+            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {CPU_TAIL}"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
@@ -278,7 +276,7 @@ fn va_chain(
     if amd_linear_surfaces {
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! videoconvert ! videorate"),
+            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {GPU_SCALED_TAIL}"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc, gpu convert, linear surfaces)"),
@@ -298,9 +296,7 @@ fn va_chain(
         // provides it via `RuntimeDirectory=nexus`.)
         let dec = vaapi_decoder(codec_base);
         return DecodeChain {
-            elements: format!(
-                "{dec} name={DECODER_NAME} ! vaapipostproc ! videoconvert ! videorate"
-            ),
+            elements: format!("{dec} name={DECODER_NAME} ! vaapipostproc ! {GPU_SCALED_TAIL}"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vaapipostproc, gpu convert)"),
@@ -318,9 +314,7 @@ fn va_chain(
     // full frame rate. GPU decode (the expensive part) is preserved.
     let dec = va_decoder(codec_base);
     DecodeChain {
-        elements: format!(
-            "{dec} name={DECODER_NAME} ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
-        ),
+        elements: format!("{dec} name={DECODER_NAME} ! video/x-raw,format=NV12 ! {CPU_TAIL}"),
         backend: DecodeBackend::Va,
         hwaccel: true,
         label: format!("va ({dec}, sysmem NV12 + cpu convert)"),
@@ -351,6 +345,24 @@ fn va_chain_for(codec_base: &str, probe: &impl FactoryProbe) -> DecodeChain {
 /// appsink reads a flat nominal rate no matter how little the hardware
 /// managed (BUG-071).
 pub const DECODER_NAME: &str = "vdec";
+
+/// CPU tail for every chain that hands the supervisor a system-memory frame.
+///
+/// Ordered drop → scale → convert on purpose: `videorate` sheds frames while
+/// they are still cheap, `videoscale` shrinks them while still subsampled
+/// (12 bpp), and the per-pixel colour conversion runs last, on the
+/// already-downscaled and rate-limited stream. Converting first — the shape
+/// five of these six chains shipped with — costs `source_px / supervisor_px`
+/// times more work per frame (6.25× at 1280×720 → 512×288) and allocates
+/// full-size RGB buffers the kernel then has to zero. See BUG-109.
+pub(crate) const CPU_TAIL: &str = "videorate ! videoscale ! videoconvert";
+
+/// Tail for chains whose GPU post-processor has already scaled to the target
+/// size. `videoscale` is deliberately absent so caps negotiation cannot pull
+/// the downscale back onto the CPU; the trailing `videoconvert` is only a
+/// small-frame format bridge. Rate-limiting still leads, so even that bridge
+/// runs on the reduced frame rate.
+const GPU_SCALED_TAIL: &str = "videorate ! videoconvert";
 
 /// Element name of the RGB tap's decoder-input queue.
 ///
@@ -385,9 +397,7 @@ pub fn rgb_tap_branch(decode_chain: &str, width: u32, height: u32, framerate: u3
 fn msdk_chain(codec_base: &str) -> DecodeChain {
     let dec = msdk_decoder(codec_base);
     DecodeChain {
-        elements: format!(
-            "{dec} name={DECODER_NAME} ! msdkvpp ! videoconvert ! videoscale ! videorate"
-        ),
+        elements: format!("{dec} name={DECODER_NAME} ! msdkvpp ! {CPU_TAIL}"),
         backend: DecodeBackend::Msdk,
         hwaccel: true,
         label: format!("msdk ({dec}+msdkvpp)"),
@@ -411,7 +421,7 @@ fn msdk_chain(codec_base: &str) -> DecodeChain {
 fn nvdec_chain(codec_base: &str) -> DecodeChain {
     let dec = nvdec_decoder(codec_base);
     DecodeChain {
-        elements: format!("{dec} name={DECODER_NAME} ! videoconvert ! videoscale ! videorate"),
+        elements: format!("{dec} name={DECODER_NAME} ! {CPU_TAIL}"),
         backend: DecodeBackend::Nvdec,
         hwaccel: true,
         label: format!("nvdec ({dec}, sysmem NV12 + cpu convert)"),
@@ -1043,7 +1053,7 @@ mod tests {
         assert!(!c.hwaccel);
         assert_eq!(
             c.elements,
-            "avdec_h264 name=vdec ! videoconvert ! videoscale ! videorate"
+            "avdec_h264 name=vdec ! videorate ! videoscale ! videoconvert"
         );
         assert!(!c.downgraded_from(DecodeMode::Software));
     }
@@ -1062,7 +1072,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videoconvert ! videoscale ! videorate"
+            "vah264dec name=vdec ! vapostproc ! videorate ! videoscale ! videoconvert"
         );
     }
 
@@ -1124,7 +1134,7 @@ mod tests {
         assert!(!c.elements.contains("videoscale"));
         assert_eq!(
             c.elements,
-            "vaapih264dec name=vdec ! vaapipostproc ! videoconvert ! videorate"
+            "vaapih264dec name=vdec ! vaapipostproc ! videorate ! videoconvert"
         );
     }
 
@@ -1138,7 +1148,7 @@ mod tests {
         assert_eq!(c.backend, DecodeBackend::Va);
         assert_eq!(
             c.elements,
-            "vaapih265dec name=vdec ! vaapipostproc ! videoconvert ! videorate"
+            "vaapih265dec name=vdec ! vaapipostproc ! videorate ! videoconvert"
         );
     }
 
@@ -1153,7 +1163,7 @@ mod tests {
         let c = select_decode_chain("h265", DecodeMode::Auto, &p);
         assert_eq!(
             c.elements,
-            "vah265dec name=vdec ! vapostproc ! videoconvert ! videorate"
+            "vah265dec name=vdec ! vapostproc ! videorate ! videoconvert"
         );
         assert!(c.hwaccel);
         assert!(
@@ -1182,8 +1192,52 @@ mod tests {
         let c = select_decode_chain("h264", DecodeMode::Auto, &va_full());
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videoconvert ! videoscale ! videorate"
+            "vah264dec name=vdec ! vapostproc ! videorate ! videoscale ! videoconvert"
         );
+    }
+
+    /// Colour conversion is the costliest element in every tail, so it must run
+    /// LAST — after `videorate` has shed frames and `videoscale` has shrunk the
+    /// survivors while they are still subsampled. Five of the six chains shipped
+    /// the opposite order and converted at full source resolution, which on a
+    /// 1280x720 source feeding a 512x288 supervisor frame is 6.25x the pixel
+    /// work per frame and measured ~35% of all CPU on a J3455 (BUG-109).
+    ///
+    /// Asserted across every tier at once, so a newly added chain cannot
+    /// reintroduce it in just one arm the way this defect originally spread.
+    #[test]
+    fn every_chain_converts_last() {
+        let amd_sysmem = probe_amd(&["vah264dec", "vapostproc"]);
+        let amd_legacy = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
+        let amd_linear = probe_amd_linear(&["vah264dec", "vapostproc"]);
+        let nvdec_only = probe(&["nvh264dec"]);
+        let msdk_only = probe(&["msdkh264dec", "msdkvpp"]);
+
+        let chains = [
+            select_decode_chain("h264", DecodeMode::Software, &none()),
+            select_decode_chain("h264", DecodeMode::Auto, &va_full()),
+            select_decode_chain("h264", DecodeMode::Auto, &amd_sysmem),
+            select_decode_chain("h264", DecodeMode::Auto, &amd_legacy),
+            select_decode_chain("h264", DecodeMode::Auto, &amd_linear),
+            select_decode_chain("h264", DecodeMode::Nvdec, &nvdec_only),
+            select_decode_chain("h264", DecodeMode::Msdk, &msdk_only),
+        ];
+
+        for c in chains {
+            let convert_at = c
+                .elements
+                .find("videoconvert")
+                .unwrap_or_else(|| panic!("no videoconvert in {}", c.elements));
+            for cheaper in ["videorate", "videoscale"] {
+                if let Some(at) = c.elements.find(cheaper) {
+                    assert!(
+                        at < convert_at,
+                        "{cheaper} must precede videoconvert in {}",
+                        c.elements
+                    );
+                }
+            }
+        }
     }
 
     /// The leak counter finds its queue with [`RGB_TAP_QUEUE_NAME`], so the
@@ -1309,7 +1363,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "nvh264dec name=vdec ! videoconvert ! videoscale ! videorate"
+            "nvh264dec name=vdec ! videorate ! videoscale ! videoconvert"
         );
         assert!(!c.downgraded_from(DecodeMode::Nvdec));
     }
@@ -1320,7 +1374,7 @@ mod tests {
         assert_eq!(c.backend, DecodeBackend::Nvdec);
         assert_eq!(
             c.elements,
-            "nvh265dec name=vdec ! videoconvert ! videoscale ! videorate"
+            "nvh265dec name=vdec ! videorate ! videoscale ! videoconvert"
         );
     }
 
