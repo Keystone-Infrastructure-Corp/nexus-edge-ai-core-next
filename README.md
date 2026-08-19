@@ -125,8 +125,11 @@ crates/
 └── nexus-probe/        One-shot host probe → device-manifest.json
 
 ui/                     TypeScript SPA (Vite). Types come from Rust via ts-rs.
-                        Built into engine container under /usr/share/nexus/ui.
-deploy/                 ONE Dockerfile (multi-stage rust+node→runtime) + compose
+                        Built into the release tarball under share/ui/
+                        (served from /opt/nexus/current/share/ui on install).
+deploy/                 Bare-metal install surface: systemd unit, apt deps,
+                        udev rules, sudoers.d, OTA appliers (no Dockerfile —
+                        Docker/GHCR publishing was removed, see docs/INSTALL.md)
 config/                 Example TOML configs
 docs/                   ARCHITECTURE, ROADMAP, COMPARISON
 tools/                  youtube-rtsp-bridge (dev), eval-labeler (prompt QA)
@@ -139,9 +142,10 @@ tools/                  youtube-rtsp-bridge (dev), eval-labeler (prompt QA)
 cargo build --release
 (cd ui && npm install && npm run build)
 
-# Container (recommended — no system dep hunt)
-docker compose -f deploy/docker-compose.yml build
-docker compose -f deploy/docker-compose.yml up
+# Bare-metal release tarball (recommended — no system dep hunt)
+# Download a release from GitHub Releases, then:
+./install.sh
+# See docs/INSTALL.md for the full guide.
 ```
 
 ## Run
@@ -163,7 +167,8 @@ the same SPA. Python sidecars are gone.
 
 Beta. Cores **M0–M4** + **M-Install Checkpoints 1–2** + **M-Admin Phases 0–6**
 all shipped. Full workspace compile + tests pass on macOS (`brew install
-gstreamer onnxruntime node@22`) and on the Docker reference image. Production
+gstreamer onnxruntime node@22`) and via the bare-metal release tarball
+(`scripts/install.sh`, see docs/INSTALL.md). Production
 deployment is still blocked on **M7** (alert delivery — webhook + SureView)
 and **M8** (first customer trial). See
 [`../nexus-cloud-console/docs/product/ROADMAP.md`](../nexus-cloud-console/docs/product/ROADMAP.md)
