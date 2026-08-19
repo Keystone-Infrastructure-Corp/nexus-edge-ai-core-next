@@ -12,7 +12,6 @@ use chrono::Utc;
 use nexus_types::CodecKind;
 use nexus_types::{CameraId, Frame, PixelFormat};
 use thiserror::Error;
-
 /// True while `session_gen` is the generation the source is currently running.
 ///
 /// Teardown is detached, so a superseded pipeline can still be PLAYING while
@@ -176,7 +175,7 @@ impl FrameSource for FailingSource {
 // Pipeline:
 //   rtspsrc location=URL latency=200 protocols=tcp+udp
 //   ! decodebin force-sw-decoders=true
-//   ! videoconvert ! videoscale ! videorate
+//   ! videorate ! videoscale ! videoconvert
 //   ! video/x-raw,format=RGB,width=960,height=540,framerate=N/1
 //   ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4
 //
@@ -420,9 +419,10 @@ impl RtspSource {
         let desc = format!(
             "rtspsrc name=src location=\"{url_safe}\" latency=500 protocols=tcp \
              ! decodebin force-sw-decoders={force_sw} \
-             ! videoconvert ! videoscale ! videorate \
+             ! {tail} \
              ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
              ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4",
+            tail = crate::decode::CPU_TAIL,
             w = self.frame_width,
             h = self.frame_height,
         );
