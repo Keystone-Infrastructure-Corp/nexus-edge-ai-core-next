@@ -593,7 +593,8 @@ async fn run_session(
     //              opens its own RTSP connection. Queues sit at
     //              both branch heads (mandatory for `tee`); `tap` queue
     //              is lossless and `rgb` queue is `leaky=downstream`
-    //              so a slow detector drops the oldest decoded frame
+    //              so a slow decoder drops the oldest queued *access
+    //              unit* — compressed bitstream, not a decoded frame —
     //              instead of stalling the shared upstream parser.
     let desc = match &frame_tap {
         None => format!(
