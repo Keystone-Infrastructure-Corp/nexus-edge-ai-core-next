@@ -375,6 +375,14 @@ const GPU_SCALED_TAIL: &str = "videorate ! videoconvert";
 /// the lookup share this constant rather than two string literals.
 pub const RGB_TAP_QUEUE_NAME: &str = "rgbq";
 
+/// Time cap on the decoder-input queue, in nanoseconds.
+///
+/// Bounds how far the analysis branch's wall clock can drift behind the
+/// recorder branch off the same tee. Must stay under the smallest alert-clip
+/// pre-roll (`alert_clip.pre_secs`, default 3 s) or clips are cut past the
+/// event they describe.
+pub const RGB_TAP_QUEUE_MAX_TIME_NS: u64 = 2_000_000_000;
+
 /// The RGB tap branch of the pre-roll ingest pipeline, from the `tee` to the
 /// appsink.
 ///
@@ -383,11 +391,30 @@ pub const RGB_TAP_QUEUE_NAME: &str = "rgbq";
 /// also stall the recorder's lossless branch off the same tee. The appsink
 /// then drops *decoded* frames (`drop=true max-buffers=4`) when the
 /// supervisor is the slow one; that drop is harmless, the queue's is not.
+///
+/// Depth is sized so ordinary jitter never reaches that leak. At 8 buffers it
+/// did, and the leak was not survivable: `vah264dec`/`vapostproc` answer a
+/// gapped bitstream with surfaces they never write, so six of ten cameras on an
+/// Apollo Lake box served all-zero frames while the GPU stayed fully idle
+/// (BUG-119). A full queue still leaks by design — the counter on
+/// [`RGB_TAP_QUEUE_NAME`] is what reports it.
+///
+/// The binding cap is `max-size-time`, not the buffer count, because this queue
+/// sits *upstream* of the decoder while `videorate` sits downstream in the tail:
+/// it therefore fills at the camera's native rate, not the supervisor cap, so a
+/// count means a different duration on every camera. Duration is what has to be
+/// bounded, because [`crate::preroll_ingester`] stamps `Frame::captured_at` at
+/// appsink delivery — queue latency lands in the analysis branch's wall clock
+/// while the recorder branch off the same tee keeps stream time. Let that skew
+/// exceed the alert clip's pre-roll and clips are cut past the event with boxes
+/// drawn on unrelated frames. Two seconds keeps it inside both the 3 s
+/// `alert_clip.pre_secs` and the 5 s `pre_roll_secs` default; the buffer count
+/// is only a backstop for pathological frame rates.
 #[must_use]
 pub fn rgb_tap_branch(decode_chain: &str, width: u32, height: u32, framerate: u32) -> String {
     format!(
-        "t. ! queue name={RGB_TAP_QUEUE_NAME} leaky=downstream max-size-buffers=8 \
-            max-size-bytes=0 max-size-time=0 \
+        "t. ! queue name={RGB_TAP_QUEUE_NAME} leaky=downstream max-size-buffers=200 \
+            max-size-bytes=0 max-size-time={RGB_TAP_QUEUE_MAX_TIME_NS} \
          ! {decode_chain} \
          ! video/x-raw,format=RGB,width={width},height={height},framerate={framerate}/1 \
          ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4"
@@ -644,8 +671,10 @@ impl FlatFrameDetector {
 
 /// How many recent frame fingerprints [`FrameLoopDetector`] keeps. Must
 /// exceed the deepest surface/buffer pool we expect to cycle through;
-/// observed depths in the field were 4–6, and the RGB branch itself only
-/// carries `queue max-size-buffers=8` + `appsink max-buffers=4`.
+/// observed depths in the field were 4–6, and the RGB branch's decoded side
+/// only carries `appsink max-buffers=4`. The decoder-input queue ahead of it
+/// holds compressed access units, not surfaces, so its depth does not bound
+/// this window.
 pub const FRAME_LOOP_WINDOW: usize = 12;
 
 /// How many recent observations the trip decision is evaluated over.
@@ -1292,6 +1321,64 @@ mod tests {
             "{d}"
         );
         assert!(d.starts_with("t. !"), "branch must hang off the tee: {d}");
+    }
+
+    /// The depth of the counted queue is not a tuning knob. At 8 buffers it
+    /// leaked under ordinary jitter, and a leaked access unit is not a dropped
+    /// frame — `vah264dec`/`vapostproc` answer the resulting gap with surfaces
+    /// they never write, so the tap serves all-zero frames while the GPU sits
+    /// idle and every log still reports `hwaccel=true` (BUG-119).
+    #[test]
+    fn rgb_tap_branch_queue_is_deep_enough_that_jitter_does_not_leak() {
+        let d = rgb_tap_branch(
+            "vah264dec name=vdec ! vapostproc ! videoconvert",
+            512,
+            288,
+            15,
+        );
+        let depth: usize = d
+            .split("max-size-buffers=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("decoder-input queue must declare max-size-buffers");
+        assert!(
+            depth >= 64,
+            "decoder-input queue carries compressed access units; a shallow \
+             leaky queue corrupts every picture to the next IDR: {d}"
+        );
+    }
+
+    /// Count is the backstop; duration is the real bound. The queue fills at
+    /// the camera's native rate (`videorate` is downstream of the decoder), and
+    /// its latency lands in `Frame::captured_at`, which is stamped at appsink
+    /// delivery. The recorder branch off the same tee keeps stream time, so
+    /// this queue's depth *is* the skew between them — and a skew past the
+    /// alert clip's pre-roll cuts clips on footage that postdates the event,
+    /// with boxes drawn on unrelated frames.
+    #[test]
+    fn rgb_tap_branch_queue_latency_stays_inside_the_alert_pre_roll() {
+        let d = rgb_tap_branch(
+            "vah264dec name=vdec ! vapostproc ! videoconvert",
+            512,
+            288,
+            15,
+        );
+        assert!(
+            d.contains(&format!("max-size-time={RGB_TAP_QUEUE_MAX_TIME_NS}")),
+            "decoder-input queue must be time-bounded, not count-bounded: {d}"
+        );
+        let ns: u64 = d
+            .split("max-size-time=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("decoder-input queue must declare max-size-time");
+        assert!(
+            ns > 0 && ns < 3_000_000_000,
+            "queue latency is the analysis/recorder branch skew and must stay \
+             under the 3s alert_clip.pre_secs default: {d}"
+        );
     }
 
     /// The decoder-output probe finds its element with [`DECODER_NAME`], so
