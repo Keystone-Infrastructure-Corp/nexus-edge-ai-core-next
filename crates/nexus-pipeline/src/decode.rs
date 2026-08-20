@@ -40,7 +40,7 @@
 //! 1. **Modern `vapostproc` GPU path, when surfaces are linear** — if
 //!    `AMD_DEBUG=notiling` is in the environment (see
 //!    [`FactoryProbe::amd_linear_surfaces`]): `vah26Xdec ! vapostproc !
-//!    videoconvert ! videorate`. The tiling bug above is the *only* thing
+//!    videorate ! videoconvert`. The tiling bug above is the *only* thing
 //!    wrong with `vapostproc` here; with linear surfaces it is pixel-accurate,
 //!    verified by capturing 490 consecutive frames through this exact chain on
 //!    the Radeon 680M / Mesa 25.2.8 and finding real imagery throughout
@@ -54,7 +54,7 @@
 //!    reason as the legacy tier: keep the scale on the GPU.
 //! 2. **Legacy `gstreamer1.0-vaapi` GPU path** — if `vaapih26Xdec` +
 //!    `vaapipostproc` are registered: `vaapih26Xdec ! vaapipostproc !
-//!    videoconvert ! videorate`. The OLD `vaapipostproc` does the NV12→RGB
+//!    videorate ! videoconvert`. The OLD `vaapipostproc` does the NV12→RGB
 //!    convert + downscale correctly on the GPU on the same Radeon 680M /
 //!    Mesa 25.2 where the new `vapostproc` fails *while tiled* (verified with
 //!    a live pipeline). `videoscale` is deliberately OMITTED so caps
@@ -171,7 +171,7 @@ pub trait FactoryProbe {
 pub struct DecodeChain {
     /// GStreamer element fragment from the decoder through the
     /// convert/scale/rate tail, e.g.
-    /// `vah264dec ! vapostproc ! videoconvert ! videoscale ! videorate`.
+    /// `vah264dec ! vapostproc ! videorate ! videoscale ! videoconvert`.
     /// The caller appends
     /// `! video/x-raw,format=RGB,width=..,height=..,framerate=../1 ! appsink`.
     pub elements: String,
@@ -236,7 +236,7 @@ fn sw_decoder(codec_base: &str) -> &'static str {
 fn software_chain(codec_base: &str) -> DecodeChain {
     let dec = sw_decoder(codec_base);
     DecodeChain {
-        elements: format!("{dec} name={DECODER_NAME} ! videoconvert ! videoscale ! videorate"),
+        elements: format!("{dec} name={DECODER_NAME} ! {CPU_TAIL}"),
         backend: DecodeBackend::Software,
         hwaccel: false,
         label: format!("software ({dec})"),
@@ -256,9 +256,7 @@ fn va_chain(
         // the requested RGB caps and a CPU safety net otherwise.
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!(
-                "{dec} name={DECODER_NAME} ! vapostproc ! videoconvert ! videoscale ! videorate"
-            ),
+            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {CPU_TAIL}"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
@@ -278,7 +276,7 @@ fn va_chain(
     if amd_linear_surfaces {
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! videoconvert ! videorate"),
+            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {GPU_SCALED_TAIL}"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc, gpu convert, linear surfaces)"),
@@ -298,9 +296,7 @@ fn va_chain(
         // provides it via `RuntimeDirectory=nexus`.)
         let dec = vaapi_decoder(codec_base);
         return DecodeChain {
-            elements: format!(
-                "{dec} name={DECODER_NAME} ! vaapipostproc ! videoconvert ! videorate"
-            ),
+            elements: format!("{dec} name={DECODER_NAME} ! vaapipostproc ! {GPU_SCALED_TAIL}"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vaapipostproc, gpu convert)"),
@@ -318,9 +314,7 @@ fn va_chain(
     // full frame rate. GPU decode (the expensive part) is preserved.
     let dec = va_decoder(codec_base);
     DecodeChain {
-        elements: format!(
-            "{dec} name={DECODER_NAME} ! video/x-raw,format=NV12 ! videorate ! videoscale ! videoconvert"
-        ),
+        elements: format!("{dec} name={DECODER_NAME} ! video/x-raw,format=NV12 ! {CPU_TAIL}"),
         backend: DecodeBackend::Va,
         hwaccel: true,
         label: format!("va ({dec}, sysmem NV12 + cpu convert)"),
@@ -352,6 +346,24 @@ fn va_chain_for(codec_base: &str, probe: &impl FactoryProbe) -> DecodeChain {
 /// managed (BUG-071).
 pub const DECODER_NAME: &str = "vdec";
 
+/// CPU tail for every chain that hands the supervisor a system-memory frame.
+///
+/// Ordered drop → scale → convert on purpose: `videorate` sheds frames while
+/// they are still cheap, `videoscale` shrinks them while still subsampled
+/// (12 bpp), and the per-pixel colour conversion runs last, on the
+/// already-downscaled and rate-limited stream. Converting first — the shape
+/// five of these six chains shipped with — costs `source_px / supervisor_px`
+/// times more work per frame (6.25× at 1280×720 → 512×288) and allocates
+/// full-size RGB buffers the kernel then has to zero. See BUG-109.
+pub(crate) const CPU_TAIL: &str = "videorate ! videoscale ! videoconvert";
+
+/// Tail for chains whose GPU post-processor has already scaled to the target
+/// size. `videoscale` is deliberately absent so caps negotiation cannot pull
+/// the downscale back onto the CPU; the trailing `videoconvert` is only a
+/// small-frame format bridge. Rate-limiting still leads, so even that bridge
+/// runs on the reduced frame rate.
+const GPU_SCALED_TAIL: &str = "videorate ! videoconvert";
+
 /// Element name of the RGB tap's decoder-input queue.
 ///
 /// The ingester looks this element up to count its `overrun` signal, one
@@ -363,6 +375,14 @@ pub const DECODER_NAME: &str = "vdec";
 /// the lookup share this constant rather than two string literals.
 pub const RGB_TAP_QUEUE_NAME: &str = "rgbq";
 
+/// Time cap on the decoder-input queue, in nanoseconds.
+///
+/// Bounds how far the analysis branch's wall clock can drift behind the
+/// recorder branch off the same tee. Must stay under the smallest alert-clip
+/// pre-roll (`alert_clip.pre_secs`, default 3 s) or clips are cut past the
+/// event they describe.
+pub const RGB_TAP_QUEUE_MAX_TIME_NS: u64 = 2_000_000_000;
+
 /// The RGB tap branch of the pre-roll ingest pipeline, from the `tee` to the
 /// appsink.
 ///
@@ -371,11 +391,30 @@ pub const RGB_TAP_QUEUE_NAME: &str = "rgbq";
 /// also stall the recorder's lossless branch off the same tee. The appsink
 /// then drops *decoded* frames (`drop=true max-buffers=4`) when the
 /// supervisor is the slow one; that drop is harmless, the queue's is not.
+///
+/// Depth is sized so ordinary jitter never reaches that leak. At 8 buffers it
+/// did, and the leak was not survivable: `vah264dec`/`vapostproc` answer a
+/// gapped bitstream with surfaces they never write, so six of ten cameras on an
+/// Apollo Lake box served all-zero frames while the GPU stayed fully idle
+/// (BUG-119). A full queue still leaks by design — the counter on
+/// [`RGB_TAP_QUEUE_NAME`] is what reports it.
+///
+/// The binding cap is `max-size-time`, not the buffer count, because this queue
+/// sits *upstream* of the decoder while `videorate` sits downstream in the tail:
+/// it therefore fills at the camera's native rate, not the supervisor cap, so a
+/// count means a different duration on every camera. Duration is what has to be
+/// bounded, because [`crate::preroll_ingester`] stamps `Frame::captured_at` at
+/// appsink delivery — queue latency lands in the analysis branch's wall clock
+/// while the recorder branch off the same tee keeps stream time. Let that skew
+/// exceed the alert clip's pre-roll and clips are cut past the event with boxes
+/// drawn on unrelated frames. Two seconds keeps it inside both the 3 s
+/// `alert_clip.pre_secs` and the 5 s `pre_roll_secs` default; the buffer count
+/// is only a backstop for pathological frame rates.
 #[must_use]
 pub fn rgb_tap_branch(decode_chain: &str, width: u32, height: u32, framerate: u32) -> String {
     format!(
-        "t. ! queue name={RGB_TAP_QUEUE_NAME} leaky=downstream max-size-buffers=8 \
-            max-size-bytes=0 max-size-time=0 \
+        "t. ! queue name={RGB_TAP_QUEUE_NAME} leaky=downstream max-size-buffers=200 \
+            max-size-bytes=0 max-size-time={RGB_TAP_QUEUE_MAX_TIME_NS} \
          ! {decode_chain} \
          ! video/x-raw,format=RGB,width={width},height={height},framerate={framerate}/1 \
          ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4"
@@ -385,9 +424,7 @@ pub fn rgb_tap_branch(decode_chain: &str, width: u32, height: u32, framerate: u3
 fn msdk_chain(codec_base: &str) -> DecodeChain {
     let dec = msdk_decoder(codec_base);
     DecodeChain {
-        elements: format!(
-            "{dec} name={DECODER_NAME} ! msdkvpp ! videoconvert ! videoscale ! videorate"
-        ),
+        elements: format!("{dec} name={DECODER_NAME} ! msdkvpp ! {CPU_TAIL}"),
         backend: DecodeBackend::Msdk,
         hwaccel: true,
         label: format!("msdk ({dec}+msdkvpp)"),
@@ -411,7 +448,7 @@ fn msdk_chain(codec_base: &str) -> DecodeChain {
 fn nvdec_chain(codec_base: &str) -> DecodeChain {
     let dec = nvdec_decoder(codec_base);
     DecodeChain {
-        elements: format!("{dec} name={DECODER_NAME} ! videoconvert ! videoscale ! videorate"),
+        elements: format!("{dec} name={DECODER_NAME} ! {CPU_TAIL}"),
         backend: DecodeBackend::Nvdec,
         hwaccel: true,
         label: format!("nvdec ({dec}, sysmem NV12 + cpu convert)"),
@@ -634,8 +671,10 @@ impl FlatFrameDetector {
 
 /// How many recent frame fingerprints [`FrameLoopDetector`] keeps. Must
 /// exceed the deepest surface/buffer pool we expect to cycle through;
-/// observed depths in the field were 4–6, and the RGB branch itself only
-/// carries `queue max-size-buffers=8` + `appsink max-buffers=4`.
+/// observed depths in the field were 4–6, and the RGB branch's decoded side
+/// only carries `appsink max-buffers=4`. The decoder-input queue ahead of it
+/// holds compressed access units, not surfaces, so its depth does not bound
+/// this window.
 pub const FRAME_LOOP_WINDOW: usize = 12;
 
 /// How many recent observations the trip decision is evaluated over.
@@ -1043,7 +1082,7 @@ mod tests {
         assert!(!c.hwaccel);
         assert_eq!(
             c.elements,
-            "avdec_h264 name=vdec ! videoconvert ! videoscale ! videorate"
+            "avdec_h264 name=vdec ! videorate ! videoscale ! videoconvert"
         );
         assert!(!c.downgraded_from(DecodeMode::Software));
     }
@@ -1062,7 +1101,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videoconvert ! videoscale ! videorate"
+            "vah264dec name=vdec ! vapostproc ! videorate ! videoscale ! videoconvert"
         );
     }
 
@@ -1124,7 +1163,7 @@ mod tests {
         assert!(!c.elements.contains("videoscale"));
         assert_eq!(
             c.elements,
-            "vaapih264dec name=vdec ! vaapipostproc ! videoconvert ! videorate"
+            "vaapih264dec name=vdec ! vaapipostproc ! videorate ! videoconvert"
         );
     }
 
@@ -1138,7 +1177,7 @@ mod tests {
         assert_eq!(c.backend, DecodeBackend::Va);
         assert_eq!(
             c.elements,
-            "vaapih265dec name=vdec ! vaapipostproc ! videoconvert ! videorate"
+            "vaapih265dec name=vdec ! vaapipostproc ! videorate ! videoconvert"
         );
     }
 
@@ -1153,7 +1192,7 @@ mod tests {
         let c = select_decode_chain("h265", DecodeMode::Auto, &p);
         assert_eq!(
             c.elements,
-            "vah265dec name=vdec ! vapostproc ! videoconvert ! videorate"
+            "vah265dec name=vdec ! vapostproc ! videorate ! videoconvert"
         );
         assert!(c.hwaccel);
         assert!(
@@ -1182,8 +1221,52 @@ mod tests {
         let c = select_decode_chain("h264", DecodeMode::Auto, &va_full());
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videoconvert ! videoscale ! videorate"
+            "vah264dec name=vdec ! vapostproc ! videorate ! videoscale ! videoconvert"
         );
+    }
+
+    /// Colour conversion is the costliest element in every tail, so it must run
+    /// LAST — after `videorate` has shed frames and `videoscale` has shrunk the
+    /// survivors while they are still subsampled. Five of the six chains shipped
+    /// the opposite order and converted at full source resolution, which on a
+    /// 1280x720 source feeding a 512x288 supervisor frame is 6.25x the pixel
+    /// work per frame and measured ~35% of all CPU on a J3455 (BUG-109).
+    ///
+    /// Asserted across every tier at once, so a newly added chain cannot
+    /// reintroduce it in just one arm the way this defect originally spread.
+    #[test]
+    fn every_chain_converts_last() {
+        let amd_sysmem = probe_amd(&["vah264dec", "vapostproc"]);
+        let amd_legacy = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
+        let amd_linear = probe_amd_linear(&["vah264dec", "vapostproc"]);
+        let nvdec_only = probe(&["nvh264dec"]);
+        let msdk_only = probe(&["msdkh264dec", "msdkvpp"]);
+
+        let chains = [
+            select_decode_chain("h264", DecodeMode::Software, &none()),
+            select_decode_chain("h264", DecodeMode::Auto, &va_full()),
+            select_decode_chain("h264", DecodeMode::Auto, &amd_sysmem),
+            select_decode_chain("h264", DecodeMode::Auto, &amd_legacy),
+            select_decode_chain("h264", DecodeMode::Auto, &amd_linear),
+            select_decode_chain("h264", DecodeMode::Nvdec, &nvdec_only),
+            select_decode_chain("h264", DecodeMode::Msdk, &msdk_only),
+        ];
+
+        for c in chains {
+            let convert_at = c
+                .elements
+                .find("videoconvert")
+                .unwrap_or_else(|| panic!("no videoconvert in {}", c.elements));
+            for cheaper in ["videorate", "videoscale"] {
+                if let Some(at) = c.elements.find(cheaper) {
+                    assert!(
+                        at < convert_at,
+                        "{cheaper} must precede videoconvert in {}",
+                        c.elements
+                    );
+                }
+            }
+        }
     }
 
     /// The leak counter finds its queue with [`RGB_TAP_QUEUE_NAME`], so the
@@ -1238,6 +1321,64 @@ mod tests {
             "{d}"
         );
         assert!(d.starts_with("t. !"), "branch must hang off the tee: {d}");
+    }
+
+    /// The depth of the counted queue is not a tuning knob. At 8 buffers it
+    /// leaked under ordinary jitter, and a leaked access unit is not a dropped
+    /// frame — `vah264dec`/`vapostproc` answer the resulting gap with surfaces
+    /// they never write, so the tap serves all-zero frames while the GPU sits
+    /// idle and every log still reports `hwaccel=true` (BUG-119).
+    #[test]
+    fn rgb_tap_branch_queue_is_deep_enough_that_jitter_does_not_leak() {
+        let d = rgb_tap_branch(
+            "vah264dec name=vdec ! vapostproc ! videoconvert",
+            512,
+            288,
+            15,
+        );
+        let depth: usize = d
+            .split("max-size-buffers=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("decoder-input queue must declare max-size-buffers");
+        assert!(
+            depth >= 64,
+            "decoder-input queue carries compressed access units; a shallow \
+             leaky queue corrupts every picture to the next IDR: {d}"
+        );
+    }
+
+    /// Count is the backstop; duration is the real bound. The queue fills at
+    /// the camera's native rate (`videorate` is downstream of the decoder), and
+    /// its latency lands in `Frame::captured_at`, which is stamped at appsink
+    /// delivery. The recorder branch off the same tee keeps stream time, so
+    /// this queue's depth *is* the skew between them — and a skew past the
+    /// alert clip's pre-roll cuts clips on footage that postdates the event,
+    /// with boxes drawn on unrelated frames.
+    #[test]
+    fn rgb_tap_branch_queue_latency_stays_inside_the_alert_pre_roll() {
+        let d = rgb_tap_branch(
+            "vah264dec name=vdec ! vapostproc ! videoconvert",
+            512,
+            288,
+            15,
+        );
+        assert!(
+            d.contains(&format!("max-size-time={RGB_TAP_QUEUE_MAX_TIME_NS}")),
+            "decoder-input queue must be time-bounded, not count-bounded: {d}"
+        );
+        let ns: u64 = d
+            .split("max-size-time=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("decoder-input queue must declare max-size-time");
+        assert!(
+            ns > 0 && ns < 3_000_000_000,
+            "queue latency is the analysis/recorder branch skew and must stay \
+             under the 3s alert_clip.pre_secs default: {d}"
+        );
     }
 
     /// The decoder-output probe finds its element with [`DECODER_NAME`], so
@@ -1309,7 +1450,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "nvh264dec name=vdec ! videoconvert ! videoscale ! videorate"
+            "nvh264dec name=vdec ! videorate ! videoscale ! videoconvert"
         );
         assert!(!c.downgraded_from(DecodeMode::Nvdec));
     }
@@ -1320,7 +1461,7 @@ mod tests {
         assert_eq!(c.backend, DecodeBackend::Nvdec);
         assert_eq!(
             c.elements,
-            "nvh265dec name=vdec ! videoconvert ! videoscale ! videorate"
+            "nvh265dec name=vdec ! videorate ! videoscale ! videoconvert"
         );
     }
 

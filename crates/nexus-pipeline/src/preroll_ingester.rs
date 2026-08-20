@@ -593,7 +593,8 @@ async fn run_session(
     //              opens its own RTSP connection. Queues sit at
     //              both branch heads (mandatory for `tee`); `tap` queue
     //              is lossless and `rgb` queue is `leaky=downstream`
-    //              so a slow detector drops the oldest decoded frame
+    //              so a slow decoder drops the oldest queued *access
+    //              unit* — compressed bitstream, not a decoded frame —
     //              instead of stalling the shared upstream parser.
     let desc = match &frame_tap {
         None => format!(
@@ -615,10 +616,9 @@ async fn run_session(
             // present, software `avdec_*` otherwise. Fail-open — a
             // missing VA plugin downgrades to software rather than
             // failing the launch (caller's runtime fail-open is the
-            // last net). The chain already ends with
-            // `videoconvert ! videoscale ! videorate` so the RGB
-            // caps below always negotiate regardless of vapostproc's
-            // native output format.
+            // last net). The chain already ends with a `videoconvert`
+            // so the RGB caps below always negotiate regardless of
+            // vapostproc's native output format.
             let chain = pick_chain(codec.base());
             if chain.downgraded_from(decode_mode) {
                 warn!(
