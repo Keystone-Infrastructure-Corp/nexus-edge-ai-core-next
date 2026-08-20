@@ -25,6 +25,9 @@ pub struct ActorTokenClaims {
     pub org_id: Uuid,
     /// Exact match against rpc_call.payload.path.
     pub path: String,
+    /// Phase P3 (SPEC-071 BUG-095, additive). Permission catalog key that authorized minting this token (e.g. `fleet.apply`). Optional so an edge build that predates this claim still verifies successfully; `role` is retained unchanged and remains the field the edge enforces on today. A future phase may make this required once every edge build understands it — see WIRE_PROTOCOL.md §11.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perm: Option<String>,
     pub role: String,
     /// User UUID, or `system:<svc-name>`.
     pub sub: String,
