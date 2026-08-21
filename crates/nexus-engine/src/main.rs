@@ -204,6 +204,9 @@ fn main() -> Result<()> {
     // reads AMD_DEBUG once, at driver load.
     apply_amd_tiling_workaround(&cfg);
 
+    // Same ordering constraint: libva resolves the driver once, at load.
+    select_intel_gen9_va_driver();
+
     // Raise the per-process file-descriptor cap BEFORE tokio spins
     // up any I/O. The LAN discovery sweep can open 100s of sockets
     // in parallel; the macOS default `ulimit -n` of 256 caused
@@ -298,6 +301,52 @@ fn amd_gpu_present() -> bool {
 /// once telemetry is up.
 static AMD_TILING_DECISION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
+/// Whether the GPU is Intel Gen9 LP — Broxton / Apollo Lake / Gemini Lake.
+fn intel_gen9lp_present() -> bool {
+    const GEN9LP_DEVICE_IDS: [&str; 6] = [
+        "0x5a84", "0x5a85", // Apollo Lake
+        "0x1a84", "0x1a85", // Broxton
+        "0x3184", "0x3185", // Gemini Lake
+    ];
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        let dev = e.path().join("device");
+        std::fs::read_to_string(dev.join("vendor")).is_ok_and(|v| v.trim() == "0x8086")
+            && std::fs::read_to_string(dev.join("device"))
+                .is_ok_and(|d| GEN9LP_DEVICE_IDS.contains(&d.trim()))
+    })
+}
+
+/// What [`select_intel_gen9_va_driver`] decided. Same deferred-logging reason
+/// as [`AMD_TILING_DECISION`].
+static VA_DRIVER_DECISION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Pin Gen9 LP to the `i965` VA driver.
+///
+/// iHD lists Apollo Lake as supported and does run the video engine, but hands
+/// back unwritten surfaces: measured on `colmc-tx3604cedarspringsrd-1`, 6 of 10
+/// cameras rendered byte-identical 4661-byte blank frames under iHD and 10 of
+/// 10 rendered real frames under i965 (BUG-119). libva picks iHD by default on
+/// this silicon, so the choice has to be made before any `gst::init()`.
+///
+/// Set here rather than in the systemd unit for the same reason as
+/// [`apply_amd_tiling_workaround`]: the unit is only written by a fresh
+/// `install.sh` and is never re-applied over an OTA, so a unit-only fix would
+/// never reach the cores already in the field.
+fn select_intel_gen9_va_driver() {
+    let decision = if std::env::var_os("LIBVA_DRIVER_NAME").is_some() {
+        "skipped: LIBVA_DRIVER_NAME already set by the operator"
+    } else if !intel_gen9lp_present() {
+        "skipped: no Intel Gen9 LP GPU present"
+    } else {
+        std::env::set_var("LIBVA_DRIVER_NAME", "i965");
+        "applied LIBVA_DRIVER_NAME=i965"
+    };
+    let _ = VA_DRIVER_DECISION.set(decision);
+}
+
 /// Force Mesa `radeonsi` to allocate linear (untiled) surfaces.
 ///
 /// Field-measured on a 53-camera Radeon 680M (BUG-065): tiling on, the box
@@ -386,6 +435,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         info!(
             amd_debug = %std::env::var("AMD_DEBUG").unwrap_or_else(|_| "<unset>".into()),
             "AMD surface-tiling workaround: {d}"
+        );
+    }
+    if let Some(d) = VA_DRIVER_DECISION.get() {
+        info!(
+            libva_driver = %std::env::var("LIBVA_DRIVER_NAME").unwrap_or_else(|_| "<unset>".into()),
+            "VA driver selection: {d}"
         );
     }
 

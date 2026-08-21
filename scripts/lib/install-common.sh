@@ -1110,7 +1110,124 @@ _all_dpkg_installed() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Intel Gen9 LP (Broxton / Apollo Lake / Gemini Lake) — legacy graphics stack
+# ---------------------------------------------------------------------------
+# Intel split these platforms off the mainline graphics stack in both halves:
+#
+#   * COMPUTE — every current intel/compute-runtime release says "If you are
+#     using legacy platform, follow latest 24.35 release procedure instead".
+#     Mainline NEO (26.x) does not enumerate the device at all; the Ubuntu
+#     archive's 23.43 enumerates it, compiles kernels, then hangs the render
+#     ring. Only the `-legacy1` packages work.  (BUG-120)
+#   * MEDIA — iHD lists Apollo Lake as supported and *does* run the video
+#     engine, but returns unwritten surfaces: 6 of 10 cameras render
+#     byte-identical blank frames. The archived i965 driver renders all 10.
+#     (BUG-119)
+#
+# The `-legacy1` packages are GitHub release artefacts, not apt packages, so
+# they are fetched by pinned URL + pinned SHA-256. Everything here is a no-op
+# on non-Gen9 hardware.
+_INTEL_GEN9LP_PCI_RE='8086:(5a8[45]|1a8[45]|318[45])'
+
+_INTEL_GEN9_NEO_TAG='24.35.30872.36'
+_INTEL_GEN9_IGC_TAG='1.0.17537.24'
+_INTEL_GEN9_NEO_URL="https://github.com/intel/compute-runtime/releases/download/${_INTEL_GEN9_NEO_TAG}"
+_INTEL_GEN9_IGC_URL="https://github.com/intel/intel-graphics-compiler/releases/download/igc-${_INTEL_GEN9_IGC_TAG}"
+
+# file<TAB>sha256 — sums for the compute-runtime pair are Intel's published
+# ww35.sum values; the IGC pair were computed from the same published
+# artefacts. A mismatch aborts the install rather than running unverified
+# binaries as root.
+_intel_gen9_manifest() {
+    cat <<EOF
+${_INTEL_GEN9_NEO_URL}/intel-opencl-icd-legacy1_${_INTEL_GEN9_NEO_TAG}_amd64.deb bbe71e4f414259e06a10cde72c29a2bd78d41b2bb2f6f8463b1806797fe66e85
+${_INTEL_GEN9_NEO_URL}/intel-level-zero-gpu-legacy1_1.5.30872.36_amd64.deb 40dfbd15ab62de036a00824b304a2aa1fa2d81ad60ef83da09cfe3c5a80c429f
+${_INTEL_GEN9_IGC_URL}/intel-igc-core_${_INTEL_GEN9_IGC_TAG}_amd64.deb c1e1ecdfe2064c047c552651cfdcdafc504f2033afafba65654338b880048b67
+${_INTEL_GEN9_IGC_URL}/intel-igc-opencl_${_INTEL_GEN9_IGC_TAG}_amd64.deb dd016400f87fa2b6a9fa9fbcca7eb4a2629174a29de679709f9bec5cede88b0e
+EOF
+}
+
+_is_intel_gen9_lp() {
+    command -v lspci >/dev/null 2>&1 || return 1
+    lspci -nn 2>/dev/null | grep -Eq "\[${_INTEL_GEN9LP_PCI_RE}\]"
+}
+
+# Stop unattended-upgrades replacing the legacy stack with mainline packages
+# that do not support this silicon. Mirrors the cuDNN-legacy pin convention.
+_intel_gen9_pin() {
+    local pin=/etc/apt/preferences.d/nexus-intel-gen9
+    cat > "$pin" <<'PIN'
+# Nexus: Intel Gen9 LP (Broxton / Apollo Lake / Gemini Lake).
+# Mainline NEO does not support this silicon — installing it removes the
+# -legacy1 stack (they conflict on libigc) and leaves the core with no GPU
+# compute at all. Block it outright; the legacy packages are pinned by
+# `apt-mark hold` alongside this file.
+Package: intel-opencl-icd libze-intel-gpu1
+Pin: release *
+Pin-Priority: -1
+PIN
+    log "pinned mainline Intel NEO out on Gen9 LP ($pin)"
+}
+
+_drivers_intel_gen9_legacy() {
+    log "Intel Gen9 LP detected — installing Intel's legacy graphics stack"
+
+    # Media half: i965 renders correctly where iHD emits unwritten surfaces.
+    # -shaders carries the VPP kernels `vapostproc` needs for GPU convert.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        i965-va-driver i965-va-driver-shaders vainfo \
+        || warn "i965 media driver install failed; VA decode may emit blank frames"
+
+    # Compute half: pinned URL + pinned SHA-256, verified before dpkg runs.
+    local tmp
+    tmp="$(mktemp -d)" || return 0
+    local ok=1 url sum file
+    while read -r url sum; do
+        [[ -n "$url" ]] || continue
+        file="$tmp/$(basename "$url")"
+        if ! curl -fsSL -o "$file" "$url"; then
+            warn "download failed: $url"; ok=0; break
+        fi
+        if ! printf '%s  %s\n' "$sum" "$file" | sha256sum -c --status -; then
+            warn "SHA-256 mismatch for $(basename "$url") — refusing to install"; ok=0; break
+        fi
+    done < <(_intel_gen9_manifest)
+
+    if (( ok )); then
+        if dpkg -i "$tmp"/*.deb >/dev/null 2>&1 || apt-get -f install -y -qq; then
+            apt-mark hold intel-opencl-icd-legacy1 intel-level-zero-gpu-legacy1 \
+                intel-igc-core intel-igc-opencl i965-va-driver i965-va-driver-shaders \
+                >/dev/null 2>&1 \
+                || warn "apt-mark hold failed; an upgrade could replace the legacy stack"
+            log "Intel legacy compute stack installed and held (NEO ${_INTEL_GEN9_NEO_TAG}, IGC ${_INTEL_GEN9_IGC_TAG})"
+        else
+            warn "legacy NEO install failed; engine will fall back to the CPU EP"
+        fi
+    fi
+    rm -rf "$tmp"
+
+    _intel_gen9_pin
+
+    # `mode = "auto"` selects VA decode; without this the engine picks iHD and
+    # the cameras go blind. Engine-scoped, not system-wide.
+    local dropin=/etc/systemd/system/nexus-engine.service.d
+    mkdir -p "$dropin"
+    printf '[Service]\nEnvironment=LIBVA_DRIVER_NAME=i965\n' > "$dropin/10-i965.conf"
+    systemctl daemon-reload 2>/dev/null || true
+    log "pinned the engine to the i965 VA driver ($dropin/10-i965.conf)"
+    return 0
+}
+
 _drivers_intel_graphics() {
+    # Gen9 LP takes a different stack entirely — mainline NEO cannot drive it
+    # and iHD renders blank frames. Handle it before the mainline path so the
+    # two never both land on the box.
+    if _is_intel_gen9_lp; then
+        _drivers_intel_gen9_legacy
+        return 0
+    fi
+
     # libze1 (oneAPI Level Zero loader) is required by both the
     # OpenVINO NPU and GPU plugins to enumerate devices. Ensure it
     # before the package-set early-return so a partially-installed

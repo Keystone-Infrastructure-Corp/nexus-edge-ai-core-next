@@ -171,7 +171,7 @@ pub trait FactoryProbe {
 pub struct DecodeChain {
     /// GStreamer element fragment from the decoder through the
     /// convert/scale/rate tail, e.g.
-    /// `vah264dec ! vapostproc ! videorate ! videoscale ! videoconvert`.
+    /// `vah264dec ! vapostproc ! videorate ! videoconvert`.
     /// The caller appends
     /// `! video/x-raw,format=RGB,width=..,height=..,framerate=../1 ! appsink`.
     pub elements: String,
@@ -251,12 +251,15 @@ fn va_chain(
 ) -> DecodeChain {
     if !bypass_postproc {
         // Intel (and any other non-AMD VA device): `vapostproc` does GPU
-        // colour-convert + scale correctly, so keep it. The trailing
-        // videoconvert/videoscale are cheap no-ops when it already lands on
-        // the requested RGB caps and a CPU safety net otherwise.
+        // colour-convert + scale correctly, so keep it. `videoscale` is
+        // omitted for the same reason as the AMD tiers — with it present,
+        // negotiation lets a CPU `videoscale`/`videoconvert` claim the
+        // convert+downscale instead of pushing them onto `vapostproc`, and
+        // liborc then burns the box doing in software what the VPP block
+        // does for free (BUG-122).
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {CPU_TAIL}"),
+            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {GPU_SCALED_TAIL}"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
@@ -1163,7 +1166,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videorate ! videoscale ! videoconvert"
+            "vah264dec name=vdec ! vapostproc ! videorate ! videoconvert"
         );
     }
 
@@ -1283,8 +1286,30 @@ mod tests {
         let c = select_decode_chain("h264", DecodeMode::Auto, &va_full());
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videorate ! videoscale ! videoconvert"
+            "vah264dec name=vdec ! vapostproc ! videorate ! videoconvert"
         );
+    }
+
+    /// With `videoscale` present, caps negotiation let a CPU
+    /// `videoscale`/`videoconvert` pair claim the convert+downscale instead
+    /// of `vapostproc`, and liborc burned ~90% of the box doing in software
+    /// what the VPP block does for free. The element's absence is the fix,
+    /// so pin the absence (BUG-122).
+    #[test]
+    fn intel_va_chain_leaves_no_videoscale_for_the_cpu_to_claim() {
+        for codec in ["h264", "h265"] {
+            let c = select_decode_chain(codec, DecodeMode::Auto, &va_full());
+            assert!(
+                c.elements.contains("vapostproc"),
+                "expected the GPU post-processor in {}",
+                c.elements
+            );
+            assert!(
+                !c.elements.contains("videoscale"),
+                "videoscale lets the CPU claim the downscale off vapostproc: {}",
+                c.elements
+            );
+        }
     }
 
     /// Colour conversion is the costliest element in every tail, so it must run
