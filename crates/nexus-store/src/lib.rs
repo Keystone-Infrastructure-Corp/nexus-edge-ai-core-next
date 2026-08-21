@@ -1005,6 +1005,21 @@ impl Store {
         rows.into_iter().map(outbox_row_from_sql).collect()
     }
 
+    /// Durable outbox depth: rows still awaiting delivery (`pending`,
+    /// plus `failed` — the one non-terminal state besides `pending`,
+    /// per the state machine in `outbox.rs`), not the count of rows
+    /// ever enqueued. Mirrors the same `('pending', 'failed')` filter
+    /// `Store::alert_clip_pending_deliveries` already uses to decide a
+    /// clip has outstanding work.
+    pub async fn outbox_queued_count(&self) -> Result<i64, StoreError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) FROM alert_sink_outbox WHERE status IN ('pending', 'failed')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>(0))
+    }
+
     /// Every outbox row for a given event — powers the per-event
     /// delivery badge view in the admin UI.
     pub async fn outbox_for_event(&self, event_id: &str) -> Result<Vec<OutboxRow>, StoreError> {

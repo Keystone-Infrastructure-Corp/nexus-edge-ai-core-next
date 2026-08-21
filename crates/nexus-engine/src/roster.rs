@@ -33,6 +33,7 @@ use nexus_cloud_client::TunnelOutbox;
 use nexus_cloud_protocol::v1::{
     CameraRosterEntry, CameraRosterPayload, Envelope, EnvelopeBody, EnvelopeMeta,
 };
+use nexus_pipeline::FrameStatsRegistry;
 use nexus_store::Store;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -72,9 +73,11 @@ async fn build_envelope(
     store: &Store,
     revision: u64,
     default_model_kind: &str,
+    frame_stats: &FrameStatsRegistry,
 ) -> anyhow::Result<Envelope> {
     let cams = store.list_cameras().await?;
-    let snapshot_ts = Utc::now().to_rfc3339();
+    let now = Utc::now();
+    let snapshot_ts = now.to_rfc3339();
     let entries: Vec<CameraRosterEntry> = cams
         .into_iter()
         .map(|c| {
@@ -112,7 +115,13 @@ async fn build_envelope(
                 resolution: None,
                 codec,
                 model_kind,
-                online: None,
+                // Edge-observed liveness in the last frame-source pass —
+                // derived from the same `FrameStatsRegistry` the pipeline
+                // supervisor writes on every decoded frame, so a camera
+                // nobody is watching in the live-view grid is still
+                // reported correctly (unlike `live_view::stalled_cameras`,
+                // which only tracks cameras with a live-view subscriber).
+                online: Some(frame_stats.snapshot(c.id).is_some_and(|s| s.is_online(now))),
                 // Phase A: per-camera revision == snapshot revision.
                 // Phase D will introduce real per-row tracking when
                 // cloud-side mutations need optimistic-concurrency.
@@ -144,12 +153,13 @@ async fn try_publish(
     outbox: &TunnelOutbox,
     revision_counter: &AtomicU64,
     default_model_kind: &str,
+    frame_stats: &FrameStatsRegistry,
 ) -> bool {
     if !outbox.is_connected() {
         return false;
     }
     let revision = revision_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let env = match build_envelope(store, revision, default_model_kind).await {
+    let env = match build_envelope(store, revision, default_model_kind, frame_stats).await {
         Ok(e) => e,
         Err(e) => {
             warn!(error = %e, "roster publisher: snapshot build failed");
@@ -192,6 +202,7 @@ pub fn spawn(
     bus: Arc<dyn Bus>,
     outbox: Arc<TunnelOutbox>,
     default_model_kind: String,
+    frame_stats: Arc<FrameStatsRegistry>,
 ) -> JoinHandle<()> {
     let revision_counter = Arc::new(AtomicU64::new(seed_revision()));
     let dirty = Arc::new(AtomicBool::new(true));
@@ -231,7 +242,7 @@ pub fn spawn(
                                 .is_none_or(|k| k == "camera");
                             if is_camera_event {
                                 dirty.store(true, Ordering::Relaxed);
-                                if try_publish(&store, &outbox, &revision_counter, &default_model_kind).await {
+                                if try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats).await {
                                     dirty.store(false, Ordering::Relaxed);
                                 }
                             }
@@ -247,7 +258,7 @@ pub fn spawn(
                 }
                 () = tokio::time::sleep(RETRY_TICK) => {
                     if dirty.load(Ordering::Relaxed)
-                        && try_publish(&store, &outbox, &revision_counter, &default_model_kind).await
+                        && try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats).await
                     {
                         dirty.store(false, Ordering::Relaxed);
                     }
@@ -351,7 +362,7 @@ mod tests {
             .await
             .unwrap();
 
-        let env = build_envelope(&store, 42, "yolo")
+        let env = build_envelope(&store, 42, "yolo", &FrameStatsRegistry::new())
             .await
             .expect("build envelope");
         let json = serde_json::to_string(&env).expect("serialize envelope");
@@ -431,7 +442,7 @@ mod tests {
             .await
             .unwrap();
 
-        let env = build_envelope(&store, 7, "yolo_world")
+        let env = build_envelope(&store, 7, "yolo_world", &FrameStatsRegistry::new())
             .await
             .expect("build envelope");
         let EnvelopeBody::CameraRoster(payload) = env.body else {
@@ -449,5 +460,86 @@ mod tests {
         };
         assert_eq!(kind_of(1).as_deref(), Some("yolo_world"));
         assert_eq!(kind_of(2).as_deref(), Some("yoloe"));
+    }
+
+    /// `CameraRosterEntry.online` is "Edge-observed liveness in the last
+    /// frame-source pass" — derived from `FrameStatsRegistry`, which every
+    /// spawned camera writes to regardless of live-view subscribers. This
+    /// is the regression that would catch a mistaken switch to
+    /// `live_view::stalled_cameras()`, which only tracks watched cameras
+    /// and would misreport an unwatched-but-live camera as not online.
+    #[tokio::test]
+    async fn camera_roster_online_reflects_frame_stats_not_live_view() {
+        use nexus_config::{
+            CameraBehavior, CameraConfig, CameraDetector, CameraIngest, CameraOnvif,
+            CameraTalkDown, StoreConfig,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nexus.db");
+        let store = Store::open(&StoreConfig {
+            url: format!("sqlite://{}?mode=rwc", db_path.display()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+
+        let cam = |id: i64, name: &str| CameraConfig {
+            id,
+            name: name.into(),
+            ingest: CameraIngest {
+                url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                enabled: true,
+                max_fps: 0,
+                codec: None,
+            },
+            detector: CameraDetector {
+                prompts: vec![],
+                visual_prompts: vec![],
+                model_override: None,
+            },
+            behavior: CameraBehavior::default(),
+            onvif: CameraOnvif::default(),
+            talk_down: CameraTalkDown::default(),
+            zones: vec![],
+        };
+
+        // Camera 1 produces frames but has no live-view subscriber at all
+        // (nothing ever calls into `live_view` here). Camera 2 has never
+        // produced a frame (e.g. still connecting).
+        store
+            .upsert_camera(&cam(1, "unwatched-live"))
+            .await
+            .unwrap();
+        store.upsert_camera(&cam(2, "never-started")).await.unwrap();
+
+        let frame_stats = FrameStatsRegistry::new();
+        frame_stats.observe_frame(1, Utc::now(), 960, 540);
+
+        let env = build_envelope(&store, 1, "yolo", &frame_stats)
+            .await
+            .expect("build envelope");
+        let EnvelopeBody::CameraRoster(payload) = env.body else {
+            panic!("expected a camera_roster body");
+        };
+
+        let online_of = |id: u64| {
+            payload
+                .cameras
+                .iter()
+                .find(|c| c.edge_camera_id == id)
+                .unwrap_or_else(|| panic!("camera {id} missing from roster"))
+                .online
+        };
+        assert_eq!(
+            online_of(1),
+            Some(true),
+            "camera producing frames with no live-view subscriber must still report online"
+        );
+        assert_eq!(
+            online_of(2),
+            Some(false),
+            "camera with no observed frame must report offline, not unknown"
+        );
     }
 }

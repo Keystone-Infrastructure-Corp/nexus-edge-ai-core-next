@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop, live_hd_bitrate. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop, live_hd_bitrate, bus_event. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +86,19 @@ pub struct AlertPayload {
     /// Phase 8.2 (additive). Edge fires `candidate`; cloud verifier overwrites. Omitted by N-1 edges → treated as `verified`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_state: Option<VerificationState>,
+}
+
+/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines exactly one topic: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusEventPayload {
+    /// Optional. Defense-in-depth echo of the sender's own core id — never the source of scope. MUST equal the mTLS-derived core id when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_id: Option<Uuid>,
+    /// Topic-specific body. For `topic = "storage.watermark"`, deserializes as `StorageWatermarkPayload`. The gateway also enforces a byte-size ceiling on this object independent of the 256 KiB envelope limit.
+    pub payload: serde_json::Value,
+    /// Bus topic name, mirroring the edge's `nexus_bus::topic` constants (`storage.panic` publishes under topic `storage.watermark` here — the wire name is the durable contract, not the in-process bus topic string). Unknown values are rejected by the gateway without disturbing the tunnel.
+    pub topic: String,
 }
 
 /// Cloud → Edge. Reply to a camera_roster. `permanent_failure` tells the edge to stop retrying this revision (e.g. malformed metadata). `accepted_revision` is echoed back so the edge can drop the outbox entry and advance its high-water-mark.
@@ -677,6 +690,20 @@ pub struct ShellSessionOpenPayload {
     pub side_channel_url: String,
 }
 
+/// The shape of `BusEventPayload.payload` when `topic = "storage.watermark"`. Mirrors the edge's `storage_safety::StoragePanicEvent` (minus the local `clips_dir` path, which never leaves the box) — the edge's hysteretic watermark FSM (`storage_safety::WatermarkController`, already anti-flap: 5-point hysteresis) is the sole producer. ADR-075's sticky-level argument is what makes Tier 2 acceptable for this event and no other: the edge republishes its CURRENT `level` on every threshold crossing AND on every tunnel (re)connect, not only on crossings, so an envelope dropped by the lossy tunnel is recovered by the very next publish rather than lost. A duplicate publish of the same level is harmless by construction — nothing downstream keys off occurrence count, only the level value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageWatermarkPayload {
+    /// Free-space percentage at the sample that produced this level.
+    pub free_pct: f64,
+    /// Mirrors `storage_safety::WatermarkLevel`.
+    pub level: String,
+    /// Configured low-watermark threshold (context for the level, not itself alertable).
+    pub low_watermark_pct: u64,
+    /// Configured panic-watermark threshold.
+    pub panic_watermark_pct: u64,
+}
+
 pub type Timestamp = String;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -828,6 +855,7 @@ pub enum EnvelopeBody {
     LiveHdPublishing(LiveHdPublishingPayload),
     LiveHdStop(LiveHdStopPayload),
     LiveHdBitrate(LiveHdBitratePayload),
+    BusEvent(BusEventPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.
