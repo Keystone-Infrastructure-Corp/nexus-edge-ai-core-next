@@ -105,13 +105,24 @@
 //! churn has stopped being the dominant cost. See BUG-039, BUG-065 and
 //! BUG-071 in the engineering vault.
 //!
+//! [`TerminalRung`] is the one exception, and it is bounded to stay inside
+//! that rule rather than reopen it. The reverted ladder rebuilt on *rebuild
+//! allowance exhausted*, which a busy box reaches constantly — 1523 rebuilds
+//! in 25 minutes. This one fires once per camera, only on a session that
+//! already rendered real video, and only after [`FLAT_FRAME_TERMINAL_TRIPS`]
+//! sustained trips (~60 s continuously blank). The evidence it rests on is
+//! not that churn stopped mattering but that the opposite failure is worse:
+//! a camera that rendered one good frame and then went blank for two days
+//! while every liveness signal read healthy (BUG-121).
+//!
 //! Selection is **fail-open**: if a requested hardware backend's elements are
 //! not registered, it degrades to software (the caller logs the downgrade)
 //! rather than failing the pipeline. Every chain ends with some ordering of
-//! `videoconvert` / `videoscale` / `videorate` (the AMD legacy-`vaapipostproc`
-//! chain omits `videoscale` on purpose — see above) so the downstream
-//! `video/x-raw,format=RGB,width=..,height=..,framerate=../1` caps always
-//! resolve.
+//! `videoconvert` / `videoscale` / `videorate`; the three GPU-post-processed
+//! chains (Intel `vapostproc`, AMD linear-surface `vapostproc`, AMD legacy
+//! `vaapipostproc`) omit `videoscale` on purpose — see above — so the
+//! downstream `video/x-raw,format=RGB,width=..,height=..,framerate=../1` caps
+//! land on the GPU post-processor rather than a CPU element.
 //!
 //! The selection logic is pure string-building over a [`FactoryProbe`]
 //! abstraction so it is unit-testable on macOS without the `gstreamer`
@@ -171,7 +182,7 @@ pub trait FactoryProbe {
 pub struct DecodeChain {
     /// GStreamer element fragment from the decoder through the
     /// convert/scale/rate tail, e.g.
-    /// `vah264dec ! vapostproc ! videorate ! videoscale ! videoconvert`.
+    /// `vah264dec ! vapostproc ! videorate ! videoconvert`.
     /// The caller appends
     /// `! video/x-raw,format=RGB,width=..,height=..,framerate=../1 ! appsink`.
     pub elements: String,
@@ -251,12 +262,15 @@ fn va_chain(
 ) -> DecodeChain {
     if !bypass_postproc {
         // Intel (and any other non-AMD VA device): `vapostproc` does GPU
-        // colour-convert + scale correctly, so keep it. The trailing
-        // videoconvert/videoscale are cheap no-ops when it already lands on
-        // the requested RGB caps and a CPU safety net otherwise.
+        // colour-convert + scale correctly, so keep it. `videoscale` is
+        // omitted for the same reason as the AMD tiers — with it present,
+        // negotiation lets a CPU `videoscale`/`videoconvert` claim the
+        // convert+downscale instead of pushing them onto `vapostproc`, and
+        // liborc then burns the box doing in software what the VPP block
+        // does for free (BUG-122).
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {CPU_TAIL}"),
+            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {GPU_SCALED_TAIL}"),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
@@ -666,6 +680,75 @@ impl FlatFrameDetector {
             return true;
         }
         false
+    }
+}
+
+/// Guard trips a session that has *already* rendered real video may
+/// take before the ladder escalates it to software decode regardless.
+///
+/// Each trip is [`FLAT_FRAME_TRIP`] flat frames inside
+/// [`FLAT_FRAME_EVAL_WINDOW`] and the detector resets after every one. At the
+/// 15 fps supervisor cap that is ~2 s of continuously wrong picture per trip,
+/// so 30 trips is ~60 s sustained — and 30 s even in the slowest case where
+/// each trip takes the full 90-frame window. BUG-065 and BUG-070 both
+/// concluded that rebuilding inside the transient band recovers nothing and
+/// manufactures green frames, so the budget has to clear it by a wide margin.
+pub const FLAT_FRAME_TERMINAL_TRIPS: u32 = 30;
+
+/// The last rung of the decode-health ladder.
+///
+/// [`FlatFrameDetector`] answers "is this session flat *right now*".
+/// This answers the different question "has it been flat long enough
+/// that leaving it up is worse than rebuilding it", and the two have
+/// different costs: reporting is free, rebuilding churns the decoder's
+/// surface pool. That asymmetry is why a validated session is left
+/// alone at first — rebuilding a working chain under load manufactured
+/// green frames and recovered nothing (BUG-065).
+///
+/// Leaving it alone *forever* is the opposite failure, and the more
+/// expensive one: a camera that rendered one good frame at startup and
+/// then went blank could never reach the software-decode remedy, and
+/// stayed blind for two days while every liveness signal read healthy
+/// (BUG-121). A ladder needs a last rung, not a dead end.
+///
+/// The rung is terminal because the caller stops arming it once the
+/// camera-level software latch is set — not because software decode is
+/// assumed to render. It sometimes does not: BUG-065 measured cameras
+/// still serving degenerate frames on `avdec_h265` after escalating.
+/// Since this counter is per session and the latch outlives it, a
+/// session that stays flat on the software chain would otherwise re-arm
+/// the rung on every rebuild and churn the decoder forever — the exact
+/// BUG-065 loop.
+#[derive(Debug, Default)]
+pub struct TerminalRung {
+    trips: u32,
+}
+
+impl TerminalRung {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one guard trip against an already-validated session.
+    ///
+    /// Returns `true` exactly once — on the trip that exhausts
+    /// [`FLAT_FRAME_TERMINAL_TRIPS`] — so the caller escalates and logs
+    /// a single time no matter how long the session lingers afterwards.
+    ///
+    /// `software_already_forced` is the camera-level latch.
+    ///
+    /// It is defence in depth, not a live path: the caller's guard block is
+    /// gated on `hwaccel`, which is recomputed per session and is already
+    /// false once the latch has moved the camera to software decode, so the
+    /// rung is not armed at all on those sessions. The parameter exists so
+    /// that a future caller which *does* run the guard on a software session
+    /// cannot rebuild it every 60 s forever — the BUG-065 churn loop.
+    pub fn trip(&mut self, software_already_forced: bool) -> bool {
+        if software_already_forced {
+            return false;
+        }
+        self.trips = self.trips.saturating_add(1);
+        self.trips == FLAT_FRAME_TERMINAL_TRIPS
     }
 }
 
@@ -1101,7 +1184,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videorate ! videoscale ! videoconvert"
+            "vah264dec name=vdec ! vapostproc ! videorate ! videoconvert"
         );
     }
 
@@ -1221,8 +1304,30 @@ mod tests {
         let c = select_decode_chain("h264", DecodeMode::Auto, &va_full());
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videorate ! videoscale ! videoconvert"
+            "vah264dec name=vdec ! vapostproc ! videorate ! videoconvert"
         );
+    }
+
+    /// With `videoscale` present, caps negotiation let a CPU
+    /// `videoscale`/`videoconvert` pair claim the convert+downscale instead
+    /// of `vapostproc`, and liborc burned ~90% of the box doing in software
+    /// what the VPP block does for free. The element's absence is the fix,
+    /// so pin the absence (BUG-122).
+    #[test]
+    fn intel_va_chain_leaves_no_videoscale_for_the_cpu_to_claim() {
+        for codec in ["h264", "h265"] {
+            let c = select_decode_chain(codec, DecodeMode::Auto, &va_full());
+            assert!(
+                c.elements.contains("vapostproc"),
+                "expected the GPU post-processor in {}",
+                c.elements
+            );
+            assert!(
+                !c.elements.contains("videoscale"),
+                "videoscale lets the CPU claim the downscale off vapostproc: {}",
+                c.elements
+            );
+        }
     }
 
     /// Colour conversion is the costliest element in every tail, so it must run
@@ -1527,6 +1632,49 @@ mod tests {
     fn unknown_codec_base_treated_as_h264() {
         let c = select_decode_chain("av1", DecodeMode::Software, &none());
         assert!(c.elements.starts_with("avdec_h264 name=vdec !"));
+    }
+
+    #[test]
+    fn terminal_rung_holds_until_the_blankness_is_sustained() {
+        let mut rung = TerminalRung::new();
+        for trip in 1..FLAT_FRAME_TERMINAL_TRIPS {
+            assert!(
+                !rung.trip(false),
+                "escalated on trip {trip}, before the session had been flat long enough"
+            );
+        }
+        assert!(
+            rung.trip(false),
+            "never escalated, so a validated session that goes blank stays blank forever"
+        );
+    }
+
+    #[test]
+    fn terminal_rung_escalates_exactly_once() {
+        let mut rung = TerminalRung::new();
+        for _ in 1..FLAT_FRAME_TERMINAL_TRIPS {
+            rung.trip(false);
+        }
+        assert!(rung.trip(false), "expected the escalating trip");
+        for _ in 0..10 {
+            assert!(!rung.trip(false), "escalated more than once");
+        }
+    }
+
+    /// The session-level counter resets on every rebuild while the
+    /// camera-level software latch does not, so a session that stays
+    /// flat on the software chain would re-arm a fresh rung and rebuild
+    /// the decoder every time — the BUG-065 churn loop this rung is
+    /// supposed to terminate.
+    #[test]
+    fn terminal_rung_never_re_arms_once_software_is_forced() {
+        let mut rung = TerminalRung::new();
+        for _ in 0..FLAT_FRAME_TERMINAL_TRIPS * 3 {
+            assert!(
+                !rung.trip(true),
+                "escalated a session that is already on software decode, which rebuilds it forever"
+            );
+        }
     }
 
     #[test]

@@ -48,6 +48,19 @@ gstreamer1.0-nice
 va-driver-all
 vainfo
 
+# Intel Gen9 LP (Broxton / Apollo Lake / Gemini Lake) media driver. iHD lists
+# these parts as supported and does run the video engine, but returns unwritten
+# surfaces - 6 of 10 cameras rendered byte-identical blank frames under iHD and
+# 10 of 10 under i965 (BUG-119). Harmless on every other platform: the engine
+# only selects i965 when it sees a Gen9 LP PCI id, so elsewhere this is inert
+# bytes on disk.
+#
+# ONLY the base package. `i965-va-driver-shaders` Conflicts/Replaces it - both
+# ship i965_drv_video.so - so listing both makes this whole transaction
+# unsatisfiable, and apply_apt_deps installs the entire set in ONE apt-get call.
+# It is also multiverse, which is not enabled everywhere.
+i965-va-driver
+
 # openssh-server — the local sshd the remote-shell feature pipes to, and,
 # independently of that feature, the LAN-local recovery path when a box has
 # lost its cloud tunnel. Listening only on the customer's own LAN; the
