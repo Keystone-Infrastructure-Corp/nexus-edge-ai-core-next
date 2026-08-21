@@ -47,6 +47,7 @@
 #![cfg(feature = "ort")]
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ort::session::{builder::GraphOptimizationLevel, Session};
@@ -57,40 +58,67 @@ use crate::execution_providers;
 /// How long an accelerator-backed session build may run before the
 /// chain is abandoned and rebuilt on the CPU EP.
 ///
-/// A provider that cannot serve the graph is expected to *fail*, and a
-/// healthy one compiles in seconds. Neither needs this long; the budget
-/// exists only so a provider that never returns cannot hold the engine
-/// at startup forever. Observed in the field: OpenVINO's GPU plugin on
-/// Intel Gen9 LP hangs `commit_from_file` indefinitely, and because the
-/// whole chain is handed to ORT as one provider list, the trailing
-/// `"cpu"` entry is never reached (BUG-120).
-pub const ACCELERATED_BUILD_TIMEOUT: Duration = Duration::from_secs(90);
+/// Sized against the slowest *legitimate* build, not the fastest. A cold
+/// TensorRT engine build for a detector graph runs into minutes on a
+/// modest GPU — we register `TensorRTExecutionProvider::default()` with
+/// no engine cache, so every process start pays it — and `tensorrt` is in
+/// `default_ep_priority()`. A budget tuned to OpenVINO's "compiles in
+/// seconds" would abandon working NVIDIA boxes and pin them to the CPU
+/// EP, which is this bug's own failure mode inverted.
+///
+/// The budget only has to be shorter than *forever*: OpenVINO's GPU
+/// plugin on Intel Gen9 LP hangs `commit_from_file` indefinitely, and
+/// because the whole chain is handed to ORT as one provider list, the
+/// trailing `"cpu"` entry is never reached (BUG-120).
+pub const ACCELERATED_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Set once an accelerator chain has wedged in this process.
+///
+/// A process builds several sessions serially — one per detector worker,
+/// one more for the `fail_soft` fallback, one per model layer, one for
+/// re-ID — and every one of them would otherwise pay the budget again.
+/// One wedge is enough evidence for the whole process, so the worst-case
+/// startup delay is one budget rather than a multiple of it.
+static ACCELERATOR_WEDGED: AtomicBool = AtomicBool::new(false);
 
 /// True iff the chain asks for anything other than the CPU EP.
 fn requests_accelerator(ep_priority: &[String]) -> bool {
     ep_priority.iter().any(|e| !e.starts_with("cpu"))
 }
 
-/// Run `f` on a throwaway thread, yielding `None` if it has not
-/// finished within `timeout`.
+/// Run `f` on a throwaway thread, giving up after `timeout`.
 ///
 /// The thread is **abandoned, not cancelled**. A provider wedged inside
 /// an FFI call cannot be interrupted, so the choice is between leaking
 /// one parked thread for the life of the process and never starting the
 /// engine at all.
-fn run_with_deadline<T, F>(timeout: Duration, f: F) -> Option<T>
+///
+/// The three ways this fails are reported separately because the whole
+/// point of the fix is that a stuck build says so.
+fn run_with_deadline<T, F>(timeout: Duration, f: F) -> Result<T, &'static str>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
+    if std::thread::Builder::new()
         .name("ort-session-build".to_owned())
         .spawn(move || {
+            // Buffered, so an abandoned thread completes and exits
+            // rather than parking forever on a dropped receiver.
             let _ = tx.send(f());
         })
-        .ok()?;
-    rx.recv_timeout(timeout).ok()
+        .is_err()
+    {
+        return Err("could not spawn a thread to build the session");
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(v) => Ok(v),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("execution provider never returned"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("session build panicked without returning")
+        }
+    }
 }
 
 /// Intra-op pool size for a session that got a real accelerator EP.
@@ -199,6 +227,7 @@ pub fn build_session(
         model_path,
         ep_priority,
         ACCELERATED_BUILD_TIMEOUT,
+        &ACCELERATOR_WEDGED,
         move |chain| commit(&path, &chain, &cfg),
     )
 }
@@ -208,45 +237,55 @@ pub fn build_session(
 ///
 /// Generic over the build step so the demotion policy is exercisable
 /// without ORT — the failure this exists for cannot be reproduced from
-/// a test on any hardware we own.
+/// a test on any hardware we own. `wedged` is passed in rather than read
+/// from the global for the same reason.
 ///
-/// A build that *fails* is returned as-is, not demoted: an EP that says
-/// no has already let ORT resolve the rest of the chain. Only silence
-/// is treated as a wedge.
+/// A build that *returns* an error is passed through, not demoted: an EP
+/// that says no has already let ORT resolve the rest of the chain. A
+/// build that never returns — or dies without returning — is demoted,
+/// and latches `wedged` so later sessions skip the accelerator entirely.
 fn build_or_demote_to_cpu<T, F>(
     model_path: &Path,
     ep_priority: &[String],
     timeout: Duration,
+    wedged: &AtomicBool,
     build: F,
 ) -> Result<T, String>
 where
     T: Send + 'static,
     F: Fn(Vec<String>) -> Result<T, String> + Send + Sync + 'static,
 {
+    let cpu_only = vec!["cpu".to_owned()];
     if !requests_accelerator(ep_priority) {
         return build(ep_priority.to_vec());
+    }
+    if wedged.load(Ordering::Relaxed) {
+        // An earlier session in this process already paid the budget.
+        return build(cpu_only);
     }
 
     let build = std::sync::Arc::new(build);
     let requested = ep_priority.to_vec();
     let attempt = std::sync::Arc::clone(&build);
-    if let Some(res) = run_with_deadline(timeout, move || attempt(requested)) {
-        return res;
-    }
+    let why = match run_with_deadline(timeout, move || attempt(requested)) {
+        Ok(res) => return res,
+        Err(why) => why,
+    };
 
+    wedged.store(true, Ordering::Relaxed);
     error!(
         model = %model_path.display(),
         ep_priority = ?ep_priority,
         timeout_secs = timeout.as_secs(),
-        "execution provider never returned while building the session; abandoning that \
-         thread and rebuilding on the CPU EP"
+        reason = why,
+        "abandoning the accelerator session build and rebuilding on the CPU EP; \
+         every later session in this process goes straight to the CPU EP"
     );
     // Bounded too: the abandoned thread may still hold ORT-internal state.
-    run_with_deadline(timeout, move || build(vec!["cpu".to_owned()])).unwrap_or_else(|| {
+    run_with_deadline(timeout, move || build(cpu_only)).unwrap_or_else(|cpu_why| {
         Err(format!(
-            "load {}: accelerator EP timed out and the CPU fallback did not return within {}s",
-            model_path.display(),
-            timeout.as_secs()
+            "load {}: accelerator EP {why} and the CPU fallback {cpu_why}",
+            model_path.display()
         ))
     })
 }
@@ -322,6 +361,7 @@ mod tests {
             Path::new("/models/detector.onnx"),
             &["gpu".to_owned(), "cpu".to_owned()],
             Duration::from_millis(150),
+            &AtomicBool::new(false),
             move |chain| {
                 seen.lock().expect("attempt log").push(chain.join(","));
                 if chain.iter().any(|e| e == "gpu") {
@@ -343,36 +383,72 @@ mod tests {
             "took {:?}, so the build is not bounded",
             started.elapsed()
         );
+        let attempts = attempts.lock().expect("attempt log");
+        assert_eq!(attempts.len(), 2, "exactly one retry, got {attempts:?}");
         assert_eq!(
-            *attempts.lock().expect("attempt log"),
-            vec!["gpu,cpu".to_owned(), "cpu".to_owned()],
+            attempts.last().map(String::as_str),
+            Some("cpu"),
             "the retry must drop the accelerator, not re-offer the same chain"
         );
     }
 
-    /// A provider that *fails* has already let ORT resolve the rest of
-    /// the chain, so the error is the answer. Widening the demotion to
-    /// cover errors would silently mask a broken accelerator.
+    /// Once one session has wedged, the rest of the process must not pay
+    /// the budget again — several sessions are built serially at startup.
     #[test]
-    fn a_provider_that_fails_fast_is_not_demoted() {
+    fn a_wedge_demotes_every_later_session_in_the_process() {
+        let wedged = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+
+        let built = build_or_demote_to_cpu(
+            Path::new("/models/detector.onnx"),
+            &["gpu".to_owned(), "cpu".to_owned()],
+            Duration::from_secs(600),
+            &wedged,
+            |chain| {
+                assert!(
+                    !chain.iter().any(|e| e == "gpu"),
+                    "a process that already wedged must not retry the accelerator"
+                );
+                Ok(chain.join(","))
+            },
+        );
+
+        assert_eq!(built, Ok("cpu".to_owned()));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the budget was paid a second time"
+        );
+    }
+
+    /// A build that *returns* an error has already let ORT resolve the
+    /// rest of the chain, so the error is the answer. Widening the
+    /// demotion to cover errors would silently mask a broken accelerator.
+    #[test]
+    fn a_provider_that_returns_an_error_is_not_demoted() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = std::sync::Arc::clone(&calls);
+        let wedged = AtomicBool::new(false);
 
         let built: Result<String, String> = build_or_demote_to_cpu(
             Path::new("/models/detector.onnx"),
             &["gpu".to_owned(), "cpu".to_owned()],
             Duration::from_secs(30),
+            &wedged,
             move |_| {
-                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                counted.fetch_add(1, Ordering::Relaxed);
                 Err("EP register: no device".to_owned())
             },
         );
 
         assert_eq!(built, Err("EP register: no device".to_owned()));
         assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
+            calls.load(Ordering::Relaxed),
             1,
-            "a failure is not a wedge and must not trigger a second build"
+            "a returned error is not a wedge and must not trigger a second build"
+        );
+        assert!(
+            !wedged.load(Ordering::Relaxed),
+            "a returned error must not demote the rest of the process"
         );
     }
 
@@ -383,6 +459,7 @@ mod tests {
             Path::new("/models/detector.onnx"),
             &["cpu".to_owned()],
             Duration::from_millis(1),
+            &AtomicBool::new(false),
             move |_| Ok(std::thread::current().id()),
         );
         assert_eq!(
@@ -399,8 +476,9 @@ mod tests {
             std::thread::sleep(Duration::from_secs(60));
             "never delivered"
         });
-        assert!(
-            got.is_none(),
+        assert_eq!(
+            got,
+            Err("execution provider never returned"),
             "a wedged build must not be waited on forever"
         );
         assert!(
@@ -414,8 +492,20 @@ mod tests {
     fn a_build_that_finishes_returns_its_value() {
         assert_eq!(
             run_with_deadline(Duration::from_secs(30), || 7u8),
-            Some(7),
+            Ok(7),
             "a healthy build must pass its result through unchanged"
+        );
+    }
+
+    /// A panicking provider must be reported as a panic, not as a
+    /// provider that is still running — the diagnostic is the point.
+    #[test]
+    fn a_build_that_panics_is_not_reported_as_a_wedge() {
+        assert_eq!(
+            run_with_deadline(Duration::from_secs(30), || -> u8 {
+                panic!("plugin exploded")
+            }),
+            Err("session build panicked without returning"),
         );
     }
 

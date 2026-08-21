@@ -232,6 +232,10 @@ jobs:
           cargo check --locked -p nexus-pipeline  --features gstreamer
           cargo check --locked -p nexus-pipeline  --features gstreamer-webrtc
           cargo check --locked -p nexus-inference --features ort,ep-cpu
+          # The workspace `cargo test` job runs with default features, so
+          # everything behind `#![cfg(feature = "ort")]` is invisible to it.
+          # This is the only job that can execute those tests.
+          cargo test  --locked -p nexus-inference --features ort,ep-cpu --lib
           # CUDA execution provider: compile-only. No GitHub-hosted runner
           # has an NVIDIA GPU, and the CUDA provider is dlopen'd at session
           # open, so this gates the ep-cuda code path (CUDAExecutionProvider

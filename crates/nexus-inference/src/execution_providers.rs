@@ -701,12 +701,16 @@ mod tests {
     /// without an Intel iGPU verify the OpenVINO code path. The
     /// `=skip` variant lets engineers on Intel boxes verify the
     /// CPU-fallback path.
+    ///
+    /// Both mutate one process-global variable, so they serialize on a
+    /// mutex like the Vulkan pair below. Save-and-restore alone does not
+    /// make them safe: cargo runs them on separate threads, so `skip`
+    /// can land between `force`'s write and its read.
+    static OPENVINO_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn env_override_force_returns_true() {
-        // Use a unique-ish env-var dance so we don't fight other tests.
-        // SAFETY: setting env vars in tests is process-global, but this
-        // helper's reads-and-restores the prior value to keep parallel
-        // tests well-behaved. The only state we mutate is one variable.
+        let _guard = OPENVINO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("NEXUS_OPENVINO_DEVICE").ok();
         std::env::set_var("NEXUS_OPENVINO_DEVICE", "force");
         let v = openvino_runtime_available();
@@ -719,6 +723,7 @@ mod tests {
 
     #[test]
     fn env_override_skip_returns_false() {
+        let _guard = OPENVINO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("NEXUS_OPENVINO_DEVICE").ok();
         std::env::set_var("NEXUS_OPENVINO_DEVICE", "skip");
         let v = openvino_runtime_available();
