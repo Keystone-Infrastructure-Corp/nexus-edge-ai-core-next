@@ -47,11 +47,78 @@
 #![cfg(feature = "ort")]
 
 use std::path::Path;
-
-use ort::session::{builder::GraphOptimizationLevel, Session};
-use tracing::debug;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::execution_providers;
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use tracing::{debug, error};
+
+/// How long an accelerator-backed session build may run before the
+/// chain is abandoned and rebuilt on the CPU EP.
+///
+/// Sized against the slowest *legitimate* build, not the fastest. A cold
+/// TensorRT engine build for a detector graph runs into minutes on a
+/// modest GPU — we register `TensorRTExecutionProvider::default()` with
+/// no engine cache, so every process start pays it — and `tensorrt` is in
+/// `default_ep_priority()`. A budget tuned to OpenVINO's "compiles in
+/// seconds" would abandon working NVIDIA boxes and pin them to the CPU
+/// EP, which is this bug's own failure mode inverted.
+///
+/// The budget only has to be shorter than *forever*: OpenVINO's GPU
+/// plugin on Intel Gen9 LP hangs `commit_from_file` indefinitely, and
+/// because the whole chain is handed to ORT as one provider list, the
+/// trailing `"cpu"` entry is never reached (BUG-120).
+pub const ACCELERATED_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Set once an accelerator chain has wedged in this process.
+///
+/// A process builds several sessions serially — one per detector worker,
+/// one more for the `fail_soft` fallback, one per model layer, one for
+/// re-ID — and every one of them would otherwise pay the budget again.
+/// One wedge is enough evidence for the whole process, so the worst-case
+/// startup delay is one budget rather than a multiple of it.
+static ACCELERATOR_WEDGED: AtomicBool = AtomicBool::new(false);
+
+/// True iff the chain asks for anything other than the CPU EP.
+fn requests_accelerator(ep_priority: &[String]) -> bool {
+    ep_priority.iter().any(|e| !e.starts_with("cpu"))
+}
+
+/// Run `f` on a throwaway thread, giving up after `timeout`.
+///
+/// The thread is **abandoned, not cancelled**. A provider wedged inside
+/// an FFI call cannot be interrupted, so the choice is between leaking
+/// one parked thread for the life of the process and never starting the
+/// engine at all.
+///
+/// The three ways this fails are reported separately because the whole
+/// point of the fix is that a stuck build says so.
+fn run_with_deadline<T, F>(timeout: Duration, f: F) -> Result<T, &'static str>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("ort-session-build".to_owned())
+        .spawn(move || {
+            // Buffered, so an abandoned thread completes and exits
+            // rather than parking forever on a dropped receiver.
+            let _ = tx.send(f());
+        })
+        .is_err()
+    {
+        return Err("could not spawn a thread to build the session");
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(v) => Ok(v),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("execution provider never returned"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("session build panicked without returning")
+        }
+    }
+}
 
 /// Intra-op pool size for a session that got a real accelerator EP.
 ///
@@ -143,7 +210,112 @@ pub struct BuiltSession {
 /// threading policy is applied uniformly. Errors are returned as
 /// `String` because callers wrap them in their own crate-local error
 /// types (`InferenceError::ModelLoad`, `ExtractorError::ModelLoad`).
+///
+/// A chain that names an accelerator is built under
+/// [`ACCELERATED_BUILD_TIMEOUT`] and demoted to the CPU EP if the
+/// provider never returns, so a wedged provider degrades the box
+/// instead of bricking it (BUG-120).
 pub fn build_session(
+    model_path: &Path,
+    ep_priority: &[String],
+    tuning: &SessionTuning,
+) -> Result<BuiltSession, String> {
+    let path = model_path.to_path_buf();
+    let cfg = *tuning;
+    build_or_demote_to_cpu(
+        model_path,
+        ep_priority,
+        ACCELERATED_BUILD_TIMEOUT,
+        &ACCELERATOR_WEDGED,
+        move |chain| commit(&path, &chain, &cfg),
+    )
+}
+
+/// Run `build` against `ep_priority` under `timeout`, retrying on the
+/// CPU EP alone if it never returns.
+///
+/// Generic over the build step so the demotion policy is exercisable
+/// without ORT — the failure this exists for cannot be reproduced from
+/// a test on any hardware we own. `wedged` is passed in rather than read
+/// from the global for the same reason.
+///
+/// A build that *returns* an error is passed through, not demoted: an EP
+/// that says no has already let ORT resolve the rest of the chain. A
+/// build that never returns — or dies without returning — is demoted,
+/// and latches `wedged` so later sessions skip the accelerator entirely.
+fn build_or_demote_to_cpu<T, F>(
+    model_path: &Path,
+    ep_priority: &[String],
+    timeout: Duration,
+    wedged: &AtomicBool,
+    build: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: Fn(Vec<String>) -> Result<T, String> + Send + Sync + 'static,
+{
+    let cpu_only = vec!["cpu".to_owned()];
+    if !requests_accelerator(ep_priority) {
+        return build(ep_priority.to_vec());
+    }
+    if wedged.load(Ordering::Relaxed) {
+        debug!(
+            model = %model_path.display(),
+            "an earlier session in this process wedged; building on the CPU EP directly"
+        );
+        // Still bounded. The thread abandoned by the earlier wedge is
+        // parked in the provider's FFI to this day, so if it holds an
+        // ORT process-global lock this build is *more* exposed than the
+        // first demotion was, not less.
+        return bounded_cpu_build(model_path, timeout, build, "an earlier session wedged");
+    }
+
+    let build = std::sync::Arc::new(build);
+    let requested = ep_priority.to_vec();
+    let attempt = std::sync::Arc::clone(&build);
+    let why = match run_with_deadline(timeout, move || attempt(requested)) {
+        Ok(res) => return res,
+        Err(why) => why,
+    };
+
+    wedged.store(true, Ordering::Relaxed);
+    error!(
+        model = %model_path.display(),
+        ep_priority = ?ep_priority,
+        timeout_secs = timeout.as_secs(),
+        reason = why,
+        "abandoning the accelerator session build and rebuilding on the CPU EP; \
+         every later session in this process goes straight to the CPU EP"
+    );
+    bounded_cpu_build(model_path, timeout, move |c| build(c), why)
+}
+
+/// Build on the CPU EP alone, under `timeout`.
+///
+/// `after` says what led here, so the error an operator sees names the
+/// original cause rather than only the fallback's failure.
+fn bounded_cpu_build<T, F>(
+    model_path: &Path,
+    timeout: Duration,
+    build: F,
+    after: &str,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(Vec<String>) -> Result<T, String> + Send + 'static,
+{
+    run_with_deadline(timeout, move || build(vec!["cpu".to_owned()])).unwrap_or_else(|why| {
+        Err(format!(
+            "load {}: {after}, and the CPU fallback then {why} within {}s",
+            model_path.display(),
+            timeout.as_secs()
+        ))
+    })
+}
+
+/// Configure and commit one session against `ep_priority`, with no
+/// time bound of its own.
+fn commit(
     model_path: &Path,
     ep_priority: &[String],
     tuning: &SessionTuning,
@@ -199,6 +371,184 @@ pub fn build_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defect BUG-120 was filed for: a provider that never returns
+    /// must still leave the caller with a CPU-backed session.
+    #[test]
+    fn a_wedged_accelerator_still_yields_a_cpu_backed_session() {
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&attempts);
+        let started = std::time::Instant::now();
+
+        let built = build_or_demote_to_cpu(
+            Path::new("/models/detector.onnx"),
+            &["gpu".to_owned(), "cpu".to_owned()],
+            Duration::from_millis(150),
+            &AtomicBool::new(false),
+            move |chain| {
+                seen.lock().expect("attempt log").push(chain.join(","));
+                if chain.iter().any(|e| e == "gpu") {
+                    // Stands in for OpenVINO's GPU plugin wedging inside
+                    // `commit_from_file` — it never returns at all.
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+                Ok(chain.join(","))
+            },
+        );
+
+        assert_eq!(
+            built,
+            Ok("cpu".to_owned()),
+            "a wedged accelerator must still produce a CPU-backed session"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}, so the build is not bounded",
+            started.elapsed()
+        );
+        let attempts = attempts.lock().expect("attempt log");
+        assert_eq!(attempts.len(), 2, "exactly one retry, got {attempts:?}");
+        assert_eq!(
+            attempts.last().map(String::as_str),
+            Some("cpu"),
+            "the retry must drop the accelerator, not re-offer the same chain"
+        );
+    }
+
+    /// Once one session has wedged, the rest of the process must not pay
+    /// the budget again — several sessions are built serially at startup.
+    ///
+    /// The call counter is what makes this load-bearing. Asserting only
+    /// on the returned value passes even with the short-circuit deleted,
+    /// because the accelerator attempt would then panic on the assert
+    /// below, latch, and retry on the CPU EP with the same result.
+    #[test]
+    fn a_wedge_demotes_every_later_session_in_the_process() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&calls);
+        let wedged = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+
+        let built = build_or_demote_to_cpu(
+            Path::new("/models/detector.onnx"),
+            &["gpu".to_owned(), "cpu".to_owned()],
+            Duration::from_secs(600),
+            &wedged,
+            move |chain| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(chain.join(","))
+            },
+        );
+
+        assert_eq!(built, Ok("cpu".to_owned()));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "a process that already wedged must go straight to the CPU EP, \
+             not attempt the accelerator and fall back"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the budget was paid a second time"
+        );
+    }
+
+    /// A build that *returns* an error has already let ORT resolve the
+    /// rest of the chain, so the error is the answer. Widening the
+    /// demotion to cover errors would silently mask a broken accelerator.
+    #[test]
+    fn a_provider_that_returns_an_error_is_not_demoted() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&calls);
+        let wedged = AtomicBool::new(false);
+
+        let built: Result<String, String> = build_or_demote_to_cpu(
+            Path::new("/models/detector.onnx"),
+            &["gpu".to_owned(), "cpu".to_owned()],
+            Duration::from_secs(30),
+            &wedged,
+            move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err("EP register: no device".to_owned())
+            },
+        );
+
+        assert_eq!(built, Err("EP register: no device".to_owned()));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "a returned error is not a wedge and must not trigger a second build"
+        );
+        assert!(
+            !wedged.load(Ordering::Relaxed),
+            "a returned error must not demote the rest of the process"
+        );
+    }
+
+    #[test]
+    fn a_cpu_only_chain_is_built_on_the_calling_thread() {
+        let on = std::thread::current().id();
+        let built = build_or_demote_to_cpu(
+            Path::new("/models/detector.onnx"),
+            &["cpu".to_owned()],
+            Duration::from_millis(1),
+            &AtomicBool::new(false),
+            move |_| Ok(std::thread::current().id()),
+        );
+        assert_eq!(
+            built,
+            Ok(on),
+            "a chain with no accelerator must not pay for a thread or a deadline"
+        );
+    }
+
+    #[test]
+    fn a_build_that_never_returns_is_abandoned_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let got = run_with_deadline(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(60));
+            "never delivered"
+        });
+        assert_eq!(
+            got,
+            Err("execution provider never returned"),
+            "a wedged build must not be waited on forever"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gave up after {:?}, so the deadline is not bounding the wait",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_build_that_finishes_returns_its_value() {
+        assert_eq!(
+            run_with_deadline(Duration::from_secs(30), || 7u8),
+            Ok(7),
+            "a healthy build must pass its result through unchanged"
+        );
+    }
+
+    /// A panicking provider must be reported as a panic, not as a
+    /// provider that is still running — the diagnostic is the point.
+    #[test]
+    fn a_build_that_panics_is_not_reported_as_a_wedge() {
+        assert_eq!(
+            run_with_deadline(Duration::from_secs(30), || -> u8 {
+                panic!("plugin exploded")
+            }),
+            Err("session build panicked without returning"),
+        );
+    }
+
+    #[test]
+    fn only_chains_naming_an_accelerator_are_time_bounded() {
+        assert!(!requests_accelerator(&["cpu".into()]));
+        assert!(requests_accelerator(&["gpu".into(), "cpu".into()]));
+        assert!(requests_accelerator(&["npu".into(), "cpu".into()]));
+        assert!(requests_accelerator(&["hailo".into(), "cpu".into()]));
+    }
 
     #[test]
     fn accelerator_detection_ignores_cpu_entries() {
