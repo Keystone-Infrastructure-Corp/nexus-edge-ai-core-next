@@ -893,9 +893,12 @@ async fn run_session(
                             // camera. The exception is the terminal rung: a
                             // session this far gone is already blank, so
                             // ending it costs nothing and is the only way it
-                            // ever reaches software decode (BUG-111).
+                            // ever reaches software decode (BUG-121).
                             let (observed, flat_seen) = flat_detector_cb.lock().stats();
-                            if terminal_rung_cb.lock().trip() {
+                            if terminal_rung_cb
+                                .lock()
+                                .trip(force_software_cb.load(Ordering::Acquire))
+                            {
                                 force_software_cb.store(true, Ordering::Release);
                                 error!(
                                     camera_id,
