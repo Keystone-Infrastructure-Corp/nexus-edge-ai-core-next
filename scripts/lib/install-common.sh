@@ -1128,7 +1128,7 @@ _all_dpkg_installed() {
 # The `-legacy1` packages are GitHub release artefacts, not apt packages, so
 # they are fetched by pinned URL + pinned SHA-256. Everything here is a no-op
 # on non-Gen9 hardware.
-_INTEL_GEN9LP_PCI_RE='8086:(5a8[45]|1a8[45]|318[45])'
+_INTEL_GEN9LP_PCI_RE='8086:(0a84|5a8[45]|1a8[45]|318[45])'
 
 _INTEL_GEN9_NEO_TAG='24.35.30872.36'
 _INTEL_GEN9_IGC_TAG='1.0.17537.24'
@@ -1174,9 +1174,19 @@ _drivers_intel_gen9_legacy() {
     log "Intel Gen9 LP detected — installing Intel's legacy graphics stack"
 
     # Media half: i965 renders correctly where iHD emits unwritten surfaces.
-    # -shaders carries the VPP kernels `vapostproc` needs for GPU convert.
+    # Base package ONLY — `i965-va-driver-shaders` Conflicts/Replaces it (both
+    # ship i965_drv_video.so) so asking for both is unsatisfiable, and it lives
+    # in multiverse, which is not enabled everywhere.
+    #
+    # The rest is the shared Intel userspace minus the mainline compute
+    # packages (`intel-opencl-icd`, `libze-intel-gpu1`) that cannot drive this
+    # silicon. `libze1` is the Level Zero *loader* and is still required —
+    # intel-level-zero-gpu-legacy1 links against it — and `clinfo` /
+    # `libva-glx2` / `va-driver-all` are what `verify_accelerators` checks for,
+    # so omitting them ends every Gen9 install on a spurious FAIL banner.
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        i965-va-driver i965-va-driver-shaders vainfo \
+        i965-va-driver vainfo clinfo libze1 libva-glx2 va-driver-all \
+        intel-gpu-tools \
         || warn "i965 media driver install failed; VA decode may emit blank frames"
 
     # Compute half: pinned URL + pinned SHA-256, verified before dpkg runs.
@@ -1195,19 +1205,29 @@ _drivers_intel_gen9_legacy() {
     done < <(_intel_gen9_manifest)
 
     if (( ok )); then
-        if dpkg -i "$tmp"/*.deb >/dev/null 2>&1 || apt-get -f install -y -qq; then
+        dpkg -i "$tmp"/*.deb >/dev/null 2>&1 || apt-get -f install -y -qq >/dev/null 2>&1 || true
+        # Verify installed state, not the exit code of the repair command:
+        # `apt-get -f install` exits 0 when it finds nothing broken, which is
+        # exactly what happens when `dpkg -i` bailed on the mainline
+        # intel-opencl-icd conflict. Reporting success there would be the log
+        # an operator uses to decide the box is fixed.
+        if _all_dpkg_installed intel-opencl-icd-legacy1 intel-level-zero-gpu-legacy1 \
+            intel-igc-core intel-igc-opencl; then
             apt-mark hold intel-opencl-icd-legacy1 intel-level-zero-gpu-legacy1 \
-                intel-igc-core intel-igc-opencl i965-va-driver i965-va-driver-shaders \
-                >/dev/null 2>&1 \
+                intel-igc-core intel-igc-opencl >/dev/null 2>&1 \
                 || warn "apt-mark hold failed; an upgrade could replace the legacy stack"
+            # Only pin mainline NEO out once the legacy stack is actually on the
+            # box. Pinning after a failed install leaves the core with neither
+            # stack and no way to install one.
+            _intel_gen9_pin
             log "Intel legacy compute stack installed and held (NEO ${_INTEL_GEN9_NEO_TAG}, IGC ${_INTEL_GEN9_IGC_TAG})"
         else
-            warn "legacy NEO install failed; engine will fall back to the CPU EP"
+            warn "legacy NEO not fully installed (mainline intel-opencl-icd may be holding the conflict); engine will fall back to the CPU EP"
         fi
     fi
     rm -rf "$tmp"
 
-    _intel_gen9_pin
+    apt-mark hold i965-va-driver >/dev/null 2>&1 || true
 
     # `mode = "auto"` selects VA decode; without this the engine picks iHD and
     # the cameras go blind. Engine-scoped, not system-wide.

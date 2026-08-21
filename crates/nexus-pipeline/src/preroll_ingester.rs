@@ -863,7 +863,8 @@ async fn run_session(
                     // has never once rendered a real frame is wrong for
                     // this GPU, so it latches software decode. A chain that
                     // rendered fine and only went flat later demonstrably
-                    // works, so it is only reported: rebuilding a working
+                    // works, so it is reported and left up until the terminal
+                    // rung fires: rebuilding a working
                     // session churns the decoder's surface pool, and that
                     // churn is itself what manufactures green frames.
                     // Measured at load 3.03 on an unsaturated box, the

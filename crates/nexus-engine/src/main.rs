@@ -303,9 +303,9 @@ static AMD_TILING_DECISION: std::sync::OnceLock<&'static str> = std::sync::OnceL
 
 /// Whether the GPU is Intel Gen9 LP — Broxton / Apollo Lake / Gemini Lake.
 fn intel_gen9lp_present() -> bool {
-    const GEN9LP_DEVICE_IDS: [&str; 6] = [
+    const GEN9LP_DEVICE_IDS: [&str; 7] = [
         "0x5a84", "0x5a85", // Apollo Lake
-        "0x1a84", "0x1a85", // Broxton
+        "0x0a84", "0x1a84", "0x1a85", // Broxton (kernel INTEL_BXT_IDS)
         "0x3184", "0x3185", // Gemini Lake
     ];
     let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {

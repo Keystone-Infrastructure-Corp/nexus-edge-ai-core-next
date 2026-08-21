@@ -105,13 +105,24 @@
 //! churn has stopped being the dominant cost. See BUG-039, BUG-065 and
 //! BUG-071 in the engineering vault.
 //!
+//! [`TerminalRung`] is the one exception, and it is bounded to stay inside
+//! that rule rather than reopen it. The reverted ladder rebuilt on *rebuild
+//! allowance exhausted*, which a busy box reaches constantly — 1523 rebuilds
+//! in 25 minutes. This one fires once per camera, only on a session that
+//! already rendered real video, and only after [`FLAT_FRAME_TERMINAL_TRIPS`]
+//! sustained trips (~60 s continuously blank). The evidence it rests on is
+//! not that churn stopped mattering but that the opposite failure is worse:
+//! a camera that rendered one good frame and then went blank for two days
+//! while every liveness signal read healthy (BUG-121).
+//!
 //! Selection is **fail-open**: if a requested hardware backend's elements are
 //! not registered, it degrades to software (the caller logs the downgrade)
 //! rather than failing the pipeline. Every chain ends with some ordering of
-//! `videoconvert` / `videoscale` / `videorate` (the AMD legacy-`vaapipostproc`
-//! chain omits `videoscale` on purpose — see above) so the downstream
-//! `video/x-raw,format=RGB,width=..,height=..,framerate=../1` caps always
-//! resolve.
+//! `videoconvert` / `videoscale` / `videorate`; the three GPU-post-processed
+//! chains (Intel `vapostproc`, AMD linear-surface `vapostproc`, AMD legacy
+//! `vaapipostproc`) omit `videoscale` on purpose — see above — so the
+//! downstream `video/x-raw,format=RGB,width=..,height=..,framerate=../1` caps
+//! land on the GPU post-processor rather than a CPU element.
 //!
 //! The selection logic is pure string-building over a [`FactoryProbe`]
 //! abstraction so it is unit-testable on macOS without the `gstreamer`
@@ -676,10 +687,13 @@ impl FlatFrameDetector {
 /// take before the ladder escalates it to software decode regardless.
 ///
 /// Each trip is [`FLAT_FRAME_TRIP`] flat frames inside
-/// [`FLAT_FRAME_EVAL_WINDOW`] and the detector resets after every one,
-/// so five of them is roughly a minute of continuously wrong picture —
-/// far past anything a transient surface-pool hiccup produces.
-pub const FLAT_FRAME_TERMINAL_TRIPS: u32 = 5;
+/// [`FLAT_FRAME_EVAL_WINDOW`] and the detector resets after every one. At the
+/// 15 fps supervisor cap that is ~2 s of continuously wrong picture per trip,
+/// so 30 trips is ~60 s sustained — and 30 s even in the slowest case where
+/// each trip takes the full 90-frame window. BUG-065 and BUG-070 both
+/// concluded that rebuilding inside the transient band recovers nothing and
+/// manufactures green frames, so the budget has to clear it by a wide margin.
+pub const FLAT_FRAME_TERMINAL_TRIPS: u32 = 30;
 
 /// The last rung of the decode-health ladder.
 ///
@@ -721,10 +735,14 @@ impl TerminalRung {
     /// [`FLAT_FRAME_TERMINAL_TRIPS`] — so the caller escalates and logs
     /// a single time no matter how long the session lingers afterwards.
     ///
-    /// `software_already_forced` is the camera-level latch. A session
-    /// that is still flat *after* escalating has nowhere left to go, so
-    /// re-escalating only rebuilds a decoder that is already on its last
-    /// rung.
+    /// `software_already_forced` is the camera-level latch.
+    ///
+    /// It is defence in depth, not a live path: the caller's guard block is
+    /// gated on `hwaccel`, which is recomputed per session and is already
+    /// false once the latch has moved the camera to software decode, so the
+    /// rung is not armed at all on those sessions. The parameter exists so
+    /// that a future caller which *does* run the guard on a software session
+    /// cannot rebuild it every 60 s forever — the BUG-065 churn loop.
     pub fn trip(&mut self, software_already_forced: bool) -> bool {
         if software_already_forced {
             return false;

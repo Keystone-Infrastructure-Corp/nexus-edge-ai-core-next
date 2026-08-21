@@ -101,7 +101,7 @@ is_allowed() {
         gstreamer1.0-*)                             return 0 ;;
         va-driver-all | vainfo | libnice10 | \
         openssh-server | \
-        i965-va-driver | i965-va-driver-shaders | \
+        i965-va-driver | \
         mesa-va-drivers | intel-media-va-driver-non-free) return 0 ;;
         # Remote-support diagnostics (ADR-066). Read-only inspection tools the
         # `nexus-remote` login and the nexus-diag wrapper need on a minimized
