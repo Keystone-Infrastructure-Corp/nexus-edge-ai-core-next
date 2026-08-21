@@ -47,11 +47,51 @@
 #![cfg(feature = "ort")]
 
 use std::path::Path;
+use std::time::Duration;
 
 use ort::session::{builder::GraphOptimizationLevel, Session};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::execution_providers;
+
+/// How long an accelerator-backed session build may run before the
+/// chain is abandoned and rebuilt on the CPU EP.
+///
+/// A provider that cannot serve the graph is expected to *fail*, and a
+/// healthy one compiles in seconds. Neither needs this long; the budget
+/// exists only so a provider that never returns cannot hold the engine
+/// at startup forever. Observed in the field: OpenVINO's GPU plugin on
+/// Intel Gen9 LP hangs `commit_from_file` indefinitely, and because the
+/// whole chain is handed to ORT as one provider list, the trailing
+/// `"cpu"` entry is never reached (BUG-110).
+pub const ACCELERATED_BUILD_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// True iff the chain asks for anything other than the CPU EP.
+fn requests_accelerator(ep_priority: &[String]) -> bool {
+    ep_priority.iter().any(|e| !e.starts_with("cpu"))
+}
+
+/// Run `f` on a throwaway thread, yielding `None` if it has not
+/// finished within `timeout`.
+///
+/// The thread is **abandoned, not cancelled**. A provider wedged inside
+/// an FFI call cannot be interrupted, so the choice is between leaking
+/// one parked thread for the life of the process and never starting the
+/// engine at all.
+fn run_with_deadline<T, F>(timeout: Duration, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("ort-session-build".to_owned())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .ok()?;
+    rx.recv_timeout(timeout).ok()
+}
 
 /// Intra-op pool size for a session that got a real accelerator EP.
 ///
@@ -143,7 +183,57 @@ pub struct BuiltSession {
 /// threading policy is applied uniformly. Errors are returned as
 /// `String` because callers wrap them in their own crate-local error
 /// types (`InferenceError::ModelLoad`, `ExtractorError::ModelLoad`).
+///
+/// A chain that names an accelerator is built under
+/// [`ACCELERATED_BUILD_TIMEOUT`] and demoted to the CPU EP if the
+/// provider never returns, so a wedged provider degrades the box
+/// instead of bricking it (BUG-110).
 pub fn build_session(
+    model_path: &Path,
+    ep_priority: &[String],
+    tuning: &SessionTuning,
+) -> Result<BuiltSession, String> {
+    if !requests_accelerator(ep_priority) {
+        return commit(model_path, ep_priority, tuning);
+    }
+
+    let accel = {
+        let path = model_path.to_path_buf();
+        let chain = ep_priority.to_vec();
+        let cfg = *tuning;
+        run_with_deadline(ACCELERATED_BUILD_TIMEOUT, move || {
+            commit(&path, &chain, &cfg)
+        })
+    };
+    if let Some(res) = accel {
+        return res;
+    }
+
+    error!(
+        model = %model_path.display(),
+        ep_priority = ?ep_priority,
+        timeout_secs = ACCELERATED_BUILD_TIMEOUT.as_secs(),
+        "execution provider never returned while building the session; abandoning that \
+         thread and rebuilding on the CPU EP"
+    );
+    let path = model_path.to_path_buf();
+    let cfg = *tuning;
+    // Bounded too: the abandoned thread may still hold ORT-internal state.
+    run_with_deadline(ACCELERATED_BUILD_TIMEOUT, move || {
+        commit(&path, &["cpu".to_owned()], &cfg)
+    })
+    .unwrap_or_else(|| {
+        Err(format!(
+            "load {}: accelerator EP timed out and the CPU fallback did not return within {}s",
+            model_path.display(),
+            ACCELERATED_BUILD_TIMEOUT.as_secs()
+        ))
+    })
+}
+
+/// Configure and commit one session against `ep_priority`, with no
+/// time bound of its own.
+fn commit(
     model_path: &Path,
     ep_priority: &[String],
     tuning: &SessionTuning,
@@ -199,6 +289,38 @@ pub fn build_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_that_never_returns_is_abandoned_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let got = run_with_deadline(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(60));
+            "never delivered"
+        });
+        assert!(got.is_none(), "a wedged build must not be waited on forever");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gave up after {:?}, so the deadline is not bounding the wait",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_build_that_finishes_returns_its_value() {
+        assert_eq!(
+            run_with_deadline(Duration::from_secs(30), || 7u8),
+            Some(7),
+            "a healthy build must pass its result through unchanged"
+        );
+    }
+
+    #[test]
+    fn only_chains_naming_an_accelerator_are_time_bounded() {
+        assert!(!requests_accelerator(&["cpu".into()]));
+        assert!(requests_accelerator(&["gpu".into(), "cpu".into()]));
+        assert!(requests_accelerator(&["npu".into(), "cpu".into()]));
+        assert!(requests_accelerator(&["hailo".into(), "cpu".into()]));
+    }
 
     #[test]
     fn accelerator_detection_ignores_cpu_entries() {
