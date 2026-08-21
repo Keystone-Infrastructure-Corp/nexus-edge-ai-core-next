@@ -82,6 +82,15 @@ jobs:
       - name: cargo test (workspace)
         run: cargo test --locked --workspace --no-fail-fast
 
+      # `session_tuning` is behind `#![cfg(feature = "ort")]`, so the run
+      # above cannot see it. These tests exercise the EP demotion policy
+      # only — no session is ever created — and `ort` is a `load-dynamic`
+      # dependency, so they link and pass with no ONNX Runtime present.
+      # That keeps them on every PR instead of only the label-gated
+      # `system-libs` job below.
+      - name: cargo test (EP demotion policy, ort feature)
+        run: cargo test --locked -p nexus-inference --features ort,ep-cpu --lib session_tuning
+
       # Enforces AGENTS.md rule 2: no face-recognition models in `models/`,
       # no non-commercial / research-only license values on any entry.
       # See [xtask/README.md](../../xtask/README.md). Runs without
@@ -227,14 +236,15 @@ jobs:
           echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
           echo "ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so"   >> $GITHUB_ENV
 
-      - name: cargo check (gstreamer + ort)
+      - name: cargo check + test (gstreamer + ort)
         run: |
           cargo check --locked -p nexus-pipeline  --features gstreamer
           cargo check --locked -p nexus-pipeline  --features gstreamer-webrtc
           cargo check --locked -p nexus-inference --features ort,ep-cpu
           # The workspace `cargo test` job runs with default features, so
           # everything behind `#![cfg(feature = "ort")]` is invisible to it.
-          # This is the only job that can execute those tests.
+          # The always-on job covers `session_tuning`; this is the only job
+          # that can execute the rest, which needs the real runtime.
           cargo test  --locked -p nexus-inference --features ort,ep-cpu --lib
           # CUDA execution provider: compile-only. No GitHub-hosted runner
           # has an NVIDIA GPU, and the CUDA provider is dlopen'd at session

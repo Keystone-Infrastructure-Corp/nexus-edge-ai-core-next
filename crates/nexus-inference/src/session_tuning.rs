@@ -50,10 +50,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::execution_providers;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use tracing::{debug, error};
-
-use crate::execution_providers;
 
 /// How long an accelerator-backed session build may run before the
 /// chain is abandoned and rebuilt on the CPU EP.
@@ -260,8 +259,15 @@ where
         return build(ep_priority.to_vec());
     }
     if wedged.load(Ordering::Relaxed) {
-        // An earlier session in this process already paid the budget.
-        return build(cpu_only);
+        debug!(
+            model = %model_path.display(),
+            "an earlier session in this process wedged; building on the CPU EP directly"
+        );
+        // Still bounded. The thread abandoned by the earlier wedge is
+        // parked in the provider's FFI to this day, so if it holds an
+        // ORT process-global lock this build is *more* exposed than the
+        // first demotion was, not less.
+        return bounded_cpu_build(model_path, timeout, build, "an earlier session wedged");
     }
 
     let build = std::sync::Arc::new(build);
@@ -281,11 +287,28 @@ where
         "abandoning the accelerator session build and rebuilding on the CPU EP; \
          every later session in this process goes straight to the CPU EP"
     );
-    // Bounded too: the abandoned thread may still hold ORT-internal state.
-    run_with_deadline(timeout, move || build(cpu_only)).unwrap_or_else(|cpu_why| {
+    bounded_cpu_build(model_path, timeout, move |c| build(c), why)
+}
+
+/// Build on the CPU EP alone, under `timeout`.
+///
+/// `after` says what led here, so the error an operator sees names the
+/// original cause rather than only the fallback's failure.
+fn bounded_cpu_build<T, F>(
+    model_path: &Path,
+    timeout: Duration,
+    build: F,
+    after: &str,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(Vec<String>) -> Result<T, String> + Send + 'static,
+{
+    run_with_deadline(timeout, move || build(vec!["cpu".to_owned()])).unwrap_or_else(|why| {
         Err(format!(
-            "load {}: accelerator EP {why} and the CPU fallback {cpu_why}",
-            model_path.display()
+            "load {}: {after}, and the CPU fallback then {why} within {}s",
+            model_path.display(),
+            timeout.as_secs()
         ))
     })
 }
@@ -394,8 +417,15 @@ mod tests {
 
     /// Once one session has wedged, the rest of the process must not pay
     /// the budget again — several sessions are built serially at startup.
+    ///
+    /// The call counter is what makes this load-bearing. Asserting only
+    /// on the returned value passes even with the short-circuit deleted,
+    /// because the accelerator attempt would then panic on the assert
+    /// below, latch, and retry on the CPU EP with the same result.
     #[test]
     fn a_wedge_demotes_every_later_session_in_the_process() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&calls);
         let wedged = AtomicBool::new(true);
         let started = std::time::Instant::now();
 
@@ -404,16 +434,19 @@ mod tests {
             &["gpu".to_owned(), "cpu".to_owned()],
             Duration::from_secs(600),
             &wedged,
-            |chain| {
-                assert!(
-                    !chain.iter().any(|e| e == "gpu"),
-                    "a process that already wedged must not retry the accelerator"
-                );
+            move |chain| {
+                counted.fetch_add(1, Ordering::Relaxed);
                 Ok(chain.join(","))
             },
         );
 
         assert_eq!(built, Ok("cpu".to_owned()));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "a process that already wedged must go straight to the CPU EP, \
+             not attempt the accelerator and fall back"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the budget was paid a second time"
