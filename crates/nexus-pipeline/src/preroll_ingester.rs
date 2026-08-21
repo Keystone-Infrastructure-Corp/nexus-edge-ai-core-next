@@ -80,8 +80,8 @@ use uuid::Uuid;
 
 use crate::decode::{
     frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, DecodeMode,
-    FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, FLAT_FRAME_EVAL_WINDOW, FLAT_FRAME_TRIP,
-    FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP,
+    FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, TerminalRung, FLAT_FRAME_EVAL_WINDOW,
+    FLAT_FRAME_TERMINAL_TRIPS, FLAT_FRAME_TRIP, FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP,
 };
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
@@ -774,6 +774,7 @@ async fn run_session(
         // Per-session decode-health guard state (see `force_software`).
         let flat_detector_cb = Arc::new(parking_lot::Mutex::new(FlatFrameDetector::new()));
         let validation_done_cb = Arc::new(AtomicBool::new(false));
+        let terminal_rung_cb = Arc::new(parking_lot::Mutex::new(TerminalRung::new()));
         let force_software_cb = force_software.clone();
         let guard_hwaccel = rgb_hwaccel;
         // Per-session frame-loop guard state. Like the flat-frame guard
@@ -889,8 +890,24 @@ async fn run_session(
                             }
                             // Report and FALL THROUGH — an early return here
                             // would skip the frame push below and blank the
-                            // camera.
+                            // camera. The exception is the terminal rung: a
+                            // session this far gone is already blank, so
+                            // ending it costs nothing and is the only way it
+                            // ever reaches software decode (BUG-111).
                             let (observed, flat_seen) = flat_detector_cb.lock().stats();
+                            if terminal_rung_cb.lock().trip() {
+                                force_software_cb.store(true, Ordering::Release);
+                                error!(
+                                    camera_id,
+                                    observed,
+                                    flat_seen,
+                                    trips = FLAT_FRAME_TERMINAL_TRIPS,
+                                    "decoder that was rendering correctly has stayed degenerate \
+                                     across every trip since; falling back to software decode and \
+                                     rebuilding the camera session"
+                                );
+                                return Err(gst::FlowError::Error);
+                            }
                             warn!(
                                 camera_id,
                                 observed,

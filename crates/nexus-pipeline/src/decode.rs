@@ -669,6 +669,54 @@ impl FlatFrameDetector {
     }
 }
 
+/// Guard trips a session that has *already* rendered real video may
+/// take before the ladder escalates it to software decode regardless.
+///
+/// Each trip is [`FLAT_FRAME_TRIP`] flat frames inside
+/// [`FLAT_FRAME_EVAL_WINDOW`] and the detector resets after every one,
+/// so five of them is roughly a minute of continuously wrong picture —
+/// far past anything a transient surface-pool hiccup produces.
+pub const FLAT_FRAME_TERMINAL_TRIPS: u32 = 5;
+
+/// The last rung of the decode-health ladder.
+///
+/// [`FlatFrameDetector`] answers "is this session flat *right now*".
+/// This answers the different question "has it been flat long enough
+/// that leaving it up is worse than rebuilding it", and the two have
+/// different costs: reporting is free, rebuilding churns the decoder's
+/// surface pool. That asymmetry is why a validated session is left
+/// alone at first — rebuilding a working chain under load manufactured
+/// green frames and recovered nothing (BUG-065).
+///
+/// Leaving it alone *forever* is the opposite failure, and the more
+/// expensive one: a camera that rendered one good frame at startup and
+/// then went blank could never reach the software-decode remedy, and
+/// stayed blind for two days while every liveness signal read healthy
+/// (BUG-111). A ladder needs a last rung, not a dead end. Escalating to
+/// software decode is a one-way exit rather than a churn loop — the
+/// software chain has no VA surface pool to recycle — so it terminates
+/// where the BUG-065 rebuild loop did not.
+#[derive(Debug, Default)]
+pub struct TerminalRung {
+    trips: u32,
+}
+
+impl TerminalRung {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one guard trip against an already-validated session.
+    ///
+    /// Returns `true` exactly once — on the trip that exhausts
+    /// [`FLAT_FRAME_TERMINAL_TRIPS`] — so the caller escalates and logs
+    /// a single time no matter how long the session lingers afterwards.
+    pub fn trip(&mut self) -> bool {
+        self.trips = self.trips.saturating_add(1);
+        self.trips == FLAT_FRAME_TERMINAL_TRIPS
+    }
+}
+
 /// How many recent frame fingerprints [`FrameLoopDetector`] keeps. Must
 /// exceed the deepest surface/buffer pool we expect to cycle through;
 /// observed depths in the field were 4–6, and the RGB branch's decoded side
@@ -1527,6 +1575,33 @@ mod tests {
     fn unknown_codec_base_treated_as_h264() {
         let c = select_decode_chain("av1", DecodeMode::Software, &none());
         assert!(c.elements.starts_with("avdec_h264 name=vdec !"));
+    }
+
+    #[test]
+    fn terminal_rung_holds_until_the_blankness_is_sustained() {
+        let mut rung = TerminalRung::new();
+        for trip in 1..FLAT_FRAME_TERMINAL_TRIPS {
+            assert!(
+                !rung.trip(),
+                "escalated on trip {trip}, before the session had been flat long enough"
+            );
+        }
+        assert!(
+            rung.trip(),
+            "never escalated, so a validated session that goes blank stays blank forever"
+        );
+    }
+
+    #[test]
+    fn terminal_rung_escalates_exactly_once() {
+        let mut rung = TerminalRung::new();
+        for _ in 1..FLAT_FRAME_TERMINAL_TRIPS {
+            rung.trip();
+        }
+        assert!(rung.trip(), "expected the escalating trip");
+        for _ in 0..10 {
+            assert!(!rung.trip(), "escalated more than once");
+        }
     }
 
     #[test]
