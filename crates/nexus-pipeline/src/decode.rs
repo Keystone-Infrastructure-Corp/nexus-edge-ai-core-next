@@ -182,7 +182,7 @@ pub trait FactoryProbe {
 pub struct DecodeChain {
     /// GStreamer element fragment from the decoder through the
     /// convert/scale/rate tail, e.g.
-    /// `vah264dec ! vapostproc ! videorate ! videoconvert`.
+    /// `vah264dec ! vapostproc ! video/x-raw,format=BGRx ! videorate ! videoconvert`.
     /// The caller appends
     /// `! video/x-raw,format=RGB,width=..,height=..,framerate=../1 ! appsink`.
     pub elements: String,
@@ -263,14 +263,15 @@ fn va_chain(
     if !bypass_postproc {
         // Intel (and any other non-AMD VA device): `vapostproc` does GPU
         // colour-convert + scale correctly, so keep it. `videoscale` is
-        // omitted for the same reason as the AMD tiers — with it present,
-        // negotiation lets a CPU `videoscale`/`videoconvert` claim the
-        // convert+downscale instead of pushing them onto `vapostproc`, and
-        // liborc then burns the box doing in software what the VPP block
-        // does for free (BUG-122).
+        // omitted so negotiation cannot pull the downscale back onto a CPU
+        // `videoscale`, and the output format is pinned to BGRx so the
+        // colour-space conversion lands on the VPP block rather than in
+        // liborc (BUG-123).
         let dec = va_decoder(codec_base);
         return DecodeChain {
-            elements: format!("{dec} name={DECODER_NAME} ! vapostproc ! {GPU_SCALED_TAIL}"),
+            elements: format!(
+                "{dec} name={DECODER_NAME} ! vapostproc ! {VA_GPU_CONVERT_CAPS} ! {GPU_SCALED_TAIL}"
+            ),
             backend: DecodeBackend::Va,
             hwaccel: true,
             label: format!("va ({dec}+vapostproc)"),
@@ -377,6 +378,23 @@ pub(crate) const CPU_TAIL: &str = "videorate ! videoscale ! videoconvert";
 /// small-frame format bridge. Rate-limiting still leads, so even that bridge
 /// runs on the reduced frame rate.
 const GPU_SCALED_TAIL: &str = "videorate ! videoconvert";
+
+/// Output format pinned on a GPU post-processor so the colour-space
+/// conversion happens on the VPP block instead of in liborc.
+///
+/// Left unconstrained, `vapostproc` negotiates its preferred NV12 and the
+/// downstream `videoconvert` performs the whole NV12→RGB conversion in
+/// software. `BGRx` is the cheapest format the VPP can emit that the tail can
+/// then pack to RGB: 32-bit, so no subsampling, and packed RGB is not offered
+/// on this path at all — `vapostproc`'s system-memory caps advertise
+/// `{ … RGBx, BGRx … }` but no 24-bit `RGB`, so asking for RGB here fails
+/// negotiation outright.
+///
+/// Measured on Apollo Lake / i965, ten live cameras, 150 buffers each:
+/// 259.97 s CPU and 65.6 s wall without it, 10.73 s and 11.3 s with — 24x less
+/// CPU, and the difference between 6.5x slower than realtime and realtime
+/// (BUG-123).
+const VA_GPU_CONVERT_CAPS: &str = "video/x-raw,format=BGRx";
 
 /// Element name of the RGB tap's decoder-input queue.
 ///
@@ -1184,7 +1202,7 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videorate ! videoconvert"
+            "vah264dec name=vdec ! vapostproc ! video/x-raw,format=BGRx ! videorate ! videoconvert"
         );
     }
 
@@ -1304,8 +1322,41 @@ mod tests {
         let c = select_decode_chain("h264", DecodeMode::Auto, &va_full());
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! videorate ! videoconvert"
+            "vah264dec name=vdec ! vapostproc ! video/x-raw,format=BGRx ! videorate ! videoconvert"
         );
+    }
+
+    /// Left unconstrained, `vapostproc` emits NV12 and the trailing
+    /// `videoconvert` does the whole NV12→RGB conversion in liborc: ten live
+    /// cameras cost 259.97 s CPU / 65.6 s wall per 150 buffers, versus
+    /// 10.73 s / 11.3 s once the VPP output is pinned to BGRx. Removing
+    /// `videoscale` alone (BUG-122) moved neither number. Pin the caps, and
+    /// pin that they reach ONLY the tier measured — every AMD tier has its own
+    /// green-frame history (BUG-039/046/071) and none of them was measured
+    /// here (BUG-123).
+    #[test]
+    fn intel_va_chain_pins_gpu_colour_conversion_and_amd_is_untouched() {
+        for codec in ["h264", "h265"] {
+            let c = select_decode_chain(codec, DecodeMode::Auto, &va_full());
+            assert!(
+                c.elements
+                    .contains("vapostproc ! video/x-raw,format=BGRx !"),
+                "unconstrained vapostproc leaves the NV12→RGB convert in liborc: {}",
+                c.elements
+            );
+        }
+
+        let amd_sysmem = probe_amd(&["vah264dec", "vapostproc"]);
+        let amd_legacy = probe_amd(&["vah264dec", "vapostproc", "vaapih264dec", "vaapipostproc"]);
+        let amd_linear = probe_amd_linear(&["vah264dec", "vapostproc"]);
+        for p in [&amd_sysmem, &amd_legacy, &amd_linear] {
+            let c = select_decode_chain("h264", DecodeMode::Auto, p);
+            assert!(
+                !c.elements.contains("BGRx"),
+                "BGRx was never measured on AMD VPP: {}",
+                c.elements
+            );
+        }
     }
 
     /// With `videoscale` present, caps negotiation let a CPU
