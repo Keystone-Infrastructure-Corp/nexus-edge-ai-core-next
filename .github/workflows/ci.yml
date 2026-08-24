@@ -176,18 +176,25 @@ jobs:
   # 10–20 min of wall clock because Azure's apt mirrors are sometimes
   # painfully slow; everything past `apt install` only takes ~10 s.
   #
-  # Package list is intentionally MINIMAL — dev headers only:
+  # Package list has TWO tiers — `-dev` headers for the compile, runtime
+  # plugins for the tests this job executes:
   #   * pkg-config: gstreamer-rs invokes pkg-config at build time.
   #   * libgstreamer1.0-dev, libgstreamer-plugins-base1.0-dev: gstreamer
   #     core + base .pc files & headers. These transitively pull every
   #     library gstreamer-rs links to (gstreamer-1.0, gstreamer-base-1.0,
   #     gstreamer-sdp-1.0, glib-2.0, gobject-2.0).
   #   * libgstreamer-plugins-bad1.0-dev: gstreamer-webrtc-1.0 .pc + headers
-  #     for the `gstreamer-webrtc` feature (Phase 10 HD sub-pipeline). DEV
-  #     headers only — enough for `cargo check`, no runtime webrtcbin.
-  # NOT installed (would be runtime-only / not exercised by `cargo check`):
-  #   * gstreamer1.0-plugins-good / -bad / -libav + libnice (runtime plugins
-  #     the webrtcbin element needs at execution time, not compile time).
+  #     for the `gstreamer-webrtc` feature (Phase 10 HD sub-pipeline).
+  #   * gstreamer1.0-plugins-{base,good,bad,ugly} + gstreamer1.0-libav: the
+  #     ELEMENTS, not headers. `alert_clip::gst_tests` launches real
+  #     pipelines, and `gen_h264_nals` unwraps `parse::launch`, so a missing
+  #     element is a panic rather than a skip. Covers videotestsrc /
+  #     videoconvert / videoscale (base), qtdemux + mp4mux (good),
+  #     h26Xparse (bad), x264enc (ugly), avdec_h26X (libav).
+  # NOT installed (would be runtime-only / not exercised by this job):
+  #   * libnice / gstreamer1.0-nice — webrtcbin's ICE backend. The
+  #     `gstreamer-webrtc` tests assert launch STRINGS and never instantiate
+  #     an element, so nothing here needs a live webrtcbin.
   #   * libssl-dev (workspace uses rustls everywhere; Cargo.lock has no
   #     openssl / openssl-sys / native-tls — re-verify if that changes).
   #   * libunwind-dev (was needed only on ubuntu-22.04; 24.04 resolves
@@ -208,12 +215,16 @@ jobs:
         with:
           shared-key: workspace-system-libs
 
-      - name: install gstreamer dev headers (cached)
+      - name: install gstreamer dev headers + runtime plugins (cached)
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           # Keyed by package list; bumping `version` invalidates the cache.
-          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
-          version: 2
+          # The -dev packages only provide headers. The `gst_tests` below
+          # launch real pipelines, so the element plugins have to be present
+          # too: videotestsrc/videoconvert (base), qtdemux+mp4mux (good),
+          # h26Xparse (bad), x264enc (ugly), avdec_h26X (libav).
+          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+          version: 3
 
       - name: cache onnxruntime tarball
         id: ort-cache
@@ -240,6 +251,13 @@ jobs:
         run: |
           cargo check --locked -p nexus-pipeline  --features gstreamer
           cargo check --locked -p nexus-pipeline  --features gstreamer-webrtc
+          # Same blind spot as the ort tests below: the workspace `cargo test`
+          # job runs with default features, so `alert_clip::gst_tests` — which
+          # encodes a real MP4 and asserts it decodes to EOS — never executes
+          # there. This is the only job with a GStreamer runtime to run it.
+          # `gstreamer-webrtc` implies `gstreamer`, so this one invocation also
+          # covers webrtc.rs's launch-string assertions at no extra cost.
+          cargo test  --locked -p nexus-pipeline  --features gstreamer-webrtc --lib
           cargo check --locked -p nexus-inference --features ort,ep-cpu
           # The workspace `cargo test` job runs with default features, so
           # everything behind `#![cfg(feature = "ort")]` is invisible to it.
