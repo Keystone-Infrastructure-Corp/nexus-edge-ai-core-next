@@ -236,7 +236,9 @@ jobs:
       - name: install libav's alternatives-managed BLAS runtime
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libblas3 liblapack3
+          # --reinstall: the cache step may leave the package looking present
+          # to dpkg, and a skipped install is a skipped postinst.
+          sudo apt-get install -y --reinstall --no-install-recommends libblas3 liblapack3
           test -e /usr/lib/x86_64-linux-gnu/libblas.so.3
 
       - name: cache onnxruntime tarball
