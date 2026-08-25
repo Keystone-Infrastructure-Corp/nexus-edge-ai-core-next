@@ -1119,8 +1119,18 @@ fn configure_fec(webrtc: &gst::Element, camera_id: CameraId) {
 /// encoder target only has to track the trend.
 const BITRATE_RETARGET_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Minimum relative change worth paying an IDR for, in percent.
-const BITRATE_RETARGET_MIN_DELTA_PCT: u32 = 15;
+/// Minimum relative *rise* worth paying an IDR for, in percent.
+const BITRATE_RETARGET_MIN_RISE_PCT: u32 = 15;
+
+/// Minimum relative *fall* worth paying an IDR for, in percent.
+///
+/// Deliberately lower than the rise threshold. Holding a stale *high* target
+/// overshoots the link and grows the pacer's queue, which shows up as latency;
+/// holding a stale *low* one only costs picture quality. Congestion control is
+/// conventionally asymmetric for that reason. A smaller fall threshold cannot
+/// reintroduce the keyframe storm, because [`BITRATE_RETARGET_MIN_INTERVAL`]
+/// bounds the write rate regardless of which threshold applies.
+const BITRATE_RETARGET_MIN_FALL_PCT: u32 = 5;
 
 /// Whether a new GCC estimate justifies reconfiguring the encoder. Pure.
 fn should_retarget_bitrate(current_kbps: u32, new_kbps: u32, since_last: Option<Duration>) -> bool {
@@ -1130,7 +1140,12 @@ fn should_retarget_bitrate(current_kbps: u32, new_kbps: u32, since_last: Option<
     if current_kbps == 0 {
         return new_kbps != 0;
     }
-    current_kbps.abs_diff(new_kbps) * 100 >= current_kbps * BITRATE_RETARGET_MIN_DELTA_PCT
+    let min_pct = if new_kbps < current_kbps {
+        BITRATE_RETARGET_MIN_FALL_PCT
+    } else {
+        BITRATE_RETARGET_MIN_RISE_PCT
+    };
+    current_kbps.abs_diff(new_kbps) * 100 >= current_kbps * min_pct
 }
 
 /// Wire `rtpgccbwe` as webrtcbin's aux-sender for the transcode path. The
@@ -1567,8 +1582,11 @@ mod tests {
     /// jitter and asserts the retarget rate stays bounded.
     #[test]
     fn gcc_jitter_does_not_retarget_the_encoder_on_every_estimate() {
-        // ~7 estimates/second for 10 s, wobbling around 1.2 Mbps with no trend.
-        let jitter = [1180u32, 1240, 1205, 1260, 1190, 1230, 1215];
+        // ~7 estimates/second for 10 s. The swing deliberately straddles both
+        // thresholds, so the *delta* gate never binds and the count is bounded
+        // by BITRATE_RETARGET_MIN_INTERVAL alone — zeroing that interval must
+        // fail this test.
+        let jitter = [1900u32, 700, 1800, 650, 2000, 720, 1750];
         let tick = Duration::from_millis(1000 / 7);
 
         let mut current = 1200u32;
@@ -1586,9 +1604,13 @@ mod tests {
         }
 
         assert!(
+            retargets >= 4,
+            "fixture is vacuous: swings this large must produce retargets, got {retargets}"
+        );
+        assert!(
             retargets <= 6,
-            "10 s of ordinary GCC jitter produced {retargets} encoder retargets, \
-             i.e. {retargets} forced IDRs; each restarts the GOP and blows the CBR budget"
+            "10 s of GCC churn produced {retargets} encoder retargets, i.e. {retargets} \
+             forced IDRs; the 2 s interval should cap this near 5"
         );
     }
 
@@ -1607,6 +1629,15 @@ mod tests {
         );
         // First estimate of a session has no previous write to debounce against.
         assert!(should_retarget_bitrate(1000, 2000, None));
+        // Falls are damped less than rises: 8% down lands, 8% up does not.
+        assert!(
+            should_retarget_bitrate(1000, 920, None),
+            "an 8% fall must land"
+        );
+        assert!(
+            !should_retarget_bitrate(1000, 1080, None),
+            "an 8% rise is not worth an IDR"
+        );
     }
 
     #[test]

@@ -207,7 +207,7 @@ fn main() -> Result<()> {
     // Same ordering constraint: libva resolves the driver once, at load.
     select_intel_gen9_va_driver();
 
-    // Depends on the VA driver decision above: Gen9 LP is already passthrough.
+    // Independent of the VA driver choice above; both feed transcode_allowed().
     apply_live_view_transport(&cfg);
 
     // Raise the per-process file-descriptor cap BEFORE tokio spins
