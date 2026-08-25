@@ -1360,6 +1360,15 @@ impl ClipRecorder for GstClipRecorder {
         let window_start = alert_ts
             - chrono::Duration::from_std(pre_span)
                 .unwrap_or_else(|_| chrono::Duration::seconds(i64::from(cfg.pre_secs)));
+        // `pre_span` stamps `window_start`, so a span that disagrees with the
+        // sample count is what mis-dates a clip against its own alert.
+        info!(
+            camera_id,
+            pre_samples = pre.len(),
+            pre_span_ms = pre_span.as_millis() as u64,
+            pre_secs = cfg.pre_secs,
+            "alert clip pre-roll window"
+        );
         let rel = alert_clip_rel_path(camera_id, window_start);
         let alert_clip_id = match self
             .store
@@ -2004,6 +2013,7 @@ async fn run_alert_clip_builder(
     let hard_cap_ms =
         Utc::now().timestamp_millis() + i64::from(cfg.build_timeout_secs.max(1)) * 1000;
     let mut post: Vec<NalSample> = Vec::new();
+    let mut deduped: usize = 0;
     loop {
         let now = Utc::now().timestamp_millis();
         let dl = deadline.load(Ordering::Acquire).min(hard_cap_ms);
@@ -2015,6 +2025,7 @@ async fn run_alert_clip_builder(
             Ok(Ok(sample)) => {
                 if let (Some(sp), Some(tp)) = (sample.pts, pre_tail_pts) {
                     if sp <= tp {
+                        deduped += 1;
                         continue;
                     }
                 }
@@ -2031,6 +2042,16 @@ async fn run_alert_clip_builder(
     }
 
     // Splice pre + post into one keyframe-first window.
+    // `deduped` separates "the post window collected nothing" from "it was
+    // collected and then discarded against a stale pre-roll tail PTS".
+    info!(
+        camera_id,
+        alert_clip_id,
+        pre_samples = pre.len(),
+        post_samples = post.len(),
+        deduped,
+        "alert clip window collected"
+    );
     let mut window = pre;
     window.extend(post);
 
