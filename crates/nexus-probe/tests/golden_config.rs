@@ -34,7 +34,7 @@ fn config_for(m: &Manifest) -> nexus_config::Config {
 }
 
 /// Intel UHD N150 iGPU (the `.100` box). Golden knobs:
-/// `ep_priority = ["gpu","cpu"]`, preset 512x288, workers 1, 4/4 threads.
+/// `ep_priority = ["gpu","cpu"]`, preset 512x288, workers 1, 4 worker threads.
 #[test]
 fn intel_igpu_n150() {
     let m = manifest(
@@ -52,14 +52,14 @@ fn intel_igpu_n150() {
     assert_eq!(c.inference.workers, 1);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 4);
-    assert_eq!(c.runtime.blocking_threads, 4);
+    assert_eq!(c.runtime.blocking_threads, 64);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
     // Generator improvement over the N150 box's literal 256: RAM-bucketed headroom.
     assert_eq!(c.bus.capacity, 2048);
 }
 
 /// Intel Lunar Lake (Arc 140V iGPU + NPU). Golden knobs:
-/// `ep_priority = ["npu","cpu"]`, preset 512x288, workers 2, 8/8 threads.
+/// `ep_priority = ["npu","cpu"]`, preset 512x288, workers 2, 8 worker threads.
 /// NPU wins inference; decode stays VA via the Arc media engine.
 #[test]
 fn intel_npu_lunar_lake() {
@@ -115,7 +115,7 @@ fn discrete_arc_falls_back_to_igpu_class() {
 
 /// Beelink EQR7: Hailo-8 inference, AMD Radeon 680M decode-only (not on
 /// the ROCm allowlist). Golden knobs: `ep_priority = ["hailo","cpu"]`,
-/// preset 512x288, workers 1, 16/16 threads, bus 2048. The decode-only AMD
+/// preset 512x288, workers 1, 16 worker threads, bus 2048. The decode-only AMD
 /// iGPU must NOT enter the inference chain.
 #[test]
 fn hailo_eqr7_with_amd_decode() {
@@ -141,7 +141,7 @@ fn hailo_eqr7_with_amd_decode() {
     assert_eq!(c.inference.workers, 4);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 16);
-    assert_eq!(c.runtime.blocking_threads, 16);
+    assert_eq!(c.runtime.blocking_threads, 64);
     assert_eq!(c.bus.capacity, 2048);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }

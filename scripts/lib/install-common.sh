@@ -3031,7 +3031,7 @@ verify_signature() {
 # `nexus-probe emit-config`, replacing the old per-box template copy and
 # path-rewrite step. nexus-probe
 # builds a real, fully-defaulted `nexus_config::Config` from the box's
-# capabilities (inference EP order, decode mode, worker/blocking
+# capabilities (inference EP order, decode mode, worker
 # threads, inference workers, model preset, bus capacity) and writes
 # the bare-metal pack_path/ui_root directly — so the old sed
 # path-rewrites and the Hailo ep_priority override are gone, decided in
