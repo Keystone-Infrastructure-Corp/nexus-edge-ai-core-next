@@ -1203,7 +1203,19 @@ fn spawn_congestion_control(
 /// Name of an available hardware H.264 **encoder** for the transcode path, or
 /// `None` on boxes without one (e.g. macOS dev), where the caller falls back
 /// to passthrough. Pure aside from the plugin registry lookup.
+///
+/// Returns `None` under the `i965` driver whatever the registry says. The free
+/// `i965-va-driver` build advertises `VAProfileH264*: VAEntrypointEncSlice` but
+/// ships none of the encode kernels (they are the non-free `-shaders` payload),
+/// so `intel_enc_hw_context_init` finds a NULL `mfc_context` and `assert()`s —
+/// killing the whole engine, every camera, the moment one viewer opens Live HD.
+/// Element registration reflects that false claim, and the caller's fallback
+/// only catches `parse::launch` errors, so nothing downstream can save us from
+/// an `abort()` (BUG-124).
 fn hw_h264_encoder() -> Option<&'static str> {
+    if std::env::var("LIBVA_DRIVER_NAME").as_deref() == Ok("i965") {
+        return None;
+    }
     ["vah264enc", "vaapih264enc"]
         .into_iter()
         .find(|name| gst::ElementFactory::find(name).is_some())
@@ -1420,6 +1432,26 @@ fn turn_url_for(raw: &str, username: Option<&str>, credential: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under `i965` the VA encoders abort the process rather than failing, so
+    /// no registry entry may be trusted: `vah264enc` and `vaapih264enc` both
+    /// exit 134 on `intel_enc_hw_context_init`, measured on Apollo Lake. The
+    /// caller reads `None` as "no hardware encoder" and takes the passthrough
+    /// path, which is the only encoder-free route (BUG-124).
+    #[test]
+    fn i965_never_yields_a_hardware_encoder() {
+        let prev = std::env::var("LIBVA_DRIVER_NAME").ok();
+        std::env::set_var("LIBVA_DRIVER_NAME", "i965");
+        let got = hw_h264_encoder();
+        match prev {
+            Some(v) => std::env::set_var("LIBVA_DRIVER_NAME", v),
+            None => std::env::remove_var("LIBVA_DRIVER_NAME"),
+        }
+        assert_eq!(
+            got, None,
+            "i965 advertises H.264 EncSlice it cannot honour; selecting it aborts the engine"
+        );
+    }
 
     #[test]
     fn passthrough_desc_h264() {
