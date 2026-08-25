@@ -21,7 +21,9 @@
 [runtime]
 # 0 = use available_parallelism().
 worker_threads = 0
-blocking_threads = 8
+# Scales with concurrent blocking ops (camera-scaled appsrc pushes, sqlx),
+# not with cores — see default_blocking_threads().
+blocking_threads = 64
 # M3.1 — where the engine writes uploaded YOLOE visual-prompt
 # reference images. Each upload to POST /v1/admin/visual-prompts
 # is content-addressed (SHA256 over the bytes) and stored as

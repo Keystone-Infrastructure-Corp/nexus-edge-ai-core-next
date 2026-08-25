@@ -72,9 +72,8 @@ pub fn generate_config(profile: &HardwareProfile) -> Config {
     // A probe that fails to read core count (0) falls back to a safe 4.
     //
     // `blocking_threads` is deliberately NOT set here: its tasks park rather
-    // than compute, so it scales with concurrent blocking ops (cameras x
-    // sinks), not cores. Core-sizing starved a 4-core/10-camera box (BUG-129);
-    // `default_blocking_threads()` is the sized value.
+    // than compute, so it scales with concurrent blocking ops, not cores.
+    // Core-sizing starved a 4-core/10-camera box (BUG-129).
     let threads = if profile.cpu_logical == 0 {
         4
     } else {
