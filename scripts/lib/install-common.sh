@@ -191,6 +191,7 @@ system_prep() {
     local install_deps="${NEXUS_PREP_DEPS:-1}"
     local install_swap="${NEXUS_PREP_SWAP:-1}"
     local install_firewall="${NEXUS_PREP_FIREWALL:-1}"
+    local install_nics="${NEXUS_PREP_NICS:-1}"
     local install_autoupdates="${NEXUS_PREP_AUTO_UPDATES:-0}"
 
     log "preparing host (idempotent — pass --skip-system-prep to bypass)"
@@ -199,6 +200,13 @@ system_prep() {
         _system_prep_apt
     else
         log "skipping apt prereqs (NEXUS_PREP_DEPS=0)"
+    fi
+
+    # After apt so the PCI audit has pciutils to work with.
+    if (( install_nics )); then
+        _system_prep_nics
+    else
+        log "skipping NIC bring-up (NEXUS_PREP_NICS=0)"
     fi
 
     if (( install_swap )); then
@@ -349,6 +357,30 @@ EOF
             's#^//\?\s*Unattended-Upgrade::Automatic-Reboot\s.*#Unattended-Upgrade::Automatic-Reboot "false";#' \
             /etc/apt/apt.conf.d/50unattended-upgrades
     fi
+}
+
+# Bring any wired NIC that no renderer owns into service with DHCP.
+#
+# Ubuntu's installer writes netplan for the one port that was cabled at
+# install time, so a second NIC stays unmanaged and address-less -- and
+# an address-less NIC is invisible to the engine's interface list, which
+# enumerates from if_addrs (one entry per bound address). Running here,
+# before emit_config, means camera/internet role detection sees every
+# port on first boot rather than only the one the installer cabled.
+#
+# Never an install blocker: the helper refuses to touch the NIC holding
+# the default route, and its own auto-revert restores the previous
+# config if the primary loses connectivity.
+_system_prep_nics() {
+    local helper
+    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/enable-nics.sh"
+    # Absent when an older release tarball is applied over OTA.
+    if [[ ! -f "$helper" ]]; then
+        log "enable-nics.sh not in this release; skipping NIC bring-up"
+        return 0
+    fi
+    log "bringing up unmanaged wired NICs (pass --no-nics to skip)"
+    bash "$helper" || warn "NIC bring-up reported a problem (install continues)"
 }
 
 # --- Hardware detection + driver install --------------------------------------
