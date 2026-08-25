@@ -52,7 +52,7 @@ fn intel_igpu_n150() {
     assert_eq!(c.inference.workers, 1);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 4);
-    assert_eq!(c.runtime.blocking_threads, 4);
+    assert_eq!(c.runtime.blocking_threads, 64);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
     // Generator improvement over the N150 box's literal 256: RAM-bucketed headroom.
     assert_eq!(c.bus.capacity, 2048);
@@ -141,7 +141,7 @@ fn hailo_eqr7_with_amd_decode() {
     assert_eq!(c.inference.workers, 4);
     assert_eq!(c.inference.model.preset, "512x288");
     assert_eq!(c.runtime.worker_threads, 16);
-    assert_eq!(c.runtime.blocking_threads, 16);
+    assert_eq!(c.runtime.blocking_threads, 64);
     assert_eq!(c.bus.capacity, 2048);
     assert_eq!(c.runtime.decode.mode, nexus_config::DecodeMode::Va);
 }

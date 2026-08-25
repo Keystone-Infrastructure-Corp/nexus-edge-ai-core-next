@@ -23,7 +23,7 @@
 //!
 //! | Knob | Source |
 //! |---|---|
-//! | `runtime.worker_threads` / `blocking_threads` | CPU logical cores |
+//! | `runtime.worker_threads` | CPU logical cores |
 //! | `runtime.decode.mode` | [`DecodeCapability`] (VA / NVDEC / software) |
 //! | `inference.ep_priority` | primary [`InferenceDevice`] |
 //! | `inference.workers` | primary [`InferenceDevice`] |
@@ -67,16 +67,20 @@ pub fn generate_config(profile: &HardwareProfile) -> Config {
     let mut cfg = Config::default();
 
     // --- runtime --------------------------------------------------------
-    // Thread pools scale with logical cores (matches every shipped box class:
+    // Async workers scale with logical cores (matches every shipped box class:
     // N150 4T -> 4, Lunar Lake 8T -> 8, Arc box 12T -> 12, Ryzen 16T -> 16).
     // A probe that fails to read core count (0) falls back to a safe 4.
+    //
+    // `blocking_threads` is deliberately NOT set here: its tasks park rather
+    // than compute, so it scales with concurrent blocking ops (cameras x
+    // sinks), not cores. Core-sizing starved a 4-core/10-camera box (BUG-129);
+    // `default_blocking_threads()` is the sized value.
     let threads = if profile.cpu_logical == 0 {
         4
     } else {
         profile.cpu_logical
     };
     cfg.runtime.worker_threads = threads;
-    cfg.runtime.blocking_threads = threads;
 
     // Real H.264-passthrough clip recording (default is `Stub`, which
     // writes 0-byte placeholder files). Requires the engine built with
@@ -363,7 +367,7 @@ mod tests {
         assert_eq!(c.inference.ep_priority, vec!["gpu", "cpu"]);
         assert_eq!(c.runtime.decode.mode, DecodeMode::Va);
         assert_eq!(c.runtime.worker_threads, 4);
-        assert_eq!(c.runtime.blocking_threads, 4);
+        assert_eq!(c.runtime.blocking_threads, 64);
         assert_eq!(c.inference.workers, 1);
         assert_eq!(c.inference.model.preset, "512x288");
         assert_eq!(c.inference.model.input_width, 512);
@@ -535,7 +539,8 @@ mod tests {
         let p = profile(0, 8, vec![InferenceDevice::Cpu], DecodeCapability::Software);
         let c = generate_config(&p);
         assert_eq!(c.runtime.worker_threads, 4);
-        assert_eq!(c.runtime.blocking_threads, 4);
+        // Never core-derived — the blocking pool keeps its sized default.
+        assert_eq!(c.runtime.blocking_threads, 64);
     }
 
     #[test]
