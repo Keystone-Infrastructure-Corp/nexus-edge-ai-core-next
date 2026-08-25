@@ -1211,7 +1211,7 @@ fn spawn_congestion_control(
 /// killing the whole engine, every camera, the moment one viewer opens Live HD.
 /// Element registration reflects that false claim, and the caller's fallback
 /// only catches `parse::launch` errors, so nothing downstream can save us from
-/// an `abort()` (BUG-124).
+/// an `abort()` (BUG-128).
 fn hw_h264_encoder() -> Option<&'static str> {
     if std::env::var("LIBVA_DRIVER_NAME").as_deref() == Ok("i965") {
         return None;
@@ -1437,7 +1437,7 @@ mod tests {
     /// no registry entry may be trusted: `vah264enc` and `vaapih264enc` both
     /// exit 134 on `intel_enc_hw_context_init`, measured on Apollo Lake. The
     /// caller reads `None` as "no hardware encoder" and takes the passthrough
-    /// path, which is the only encoder-free route (BUG-124).
+    /// path, which is the only encoder-free route (BUG-128).
     #[test]
     fn i965_never_yields_a_hardware_encoder() {
         let prev = std::env::var("LIBVA_DRIVER_NAME").ok();
