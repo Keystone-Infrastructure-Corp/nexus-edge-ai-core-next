@@ -223,14 +223,21 @@ jobs:
           # launch real pipelines, so the element plugins have to be present
           # too: videotestsrc/videoconvert (base), qtdemux+mp4mux (good),
           # h26Xparse (bad), x264enc (ugly), avdec_h26X (libav).
-          #
-          # libblas3 is listed explicitly even though it is only a transitive
-          # of gstreamer1.0-libav: this action caches the files apt installed
-          # at cache-creation time, so a runner image that later stops
-          # pre-installing it leaves `libgstlibav.so` unloadable and every
-          # `avdec_h264` test failing.
-          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav libblas3
-          version: 4
+          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+          version: 5
+
+      # NOT in the cached list above, deliberately. `libgstlibav.so` links
+      # `libblas.so.3`, which on Debian/Ubuntu is an update-alternatives
+      # symlink created by the package's postinst — the caching action
+      # restores package *files* and never runs maintainer scripts, so the
+      # symlink is absent and the plugin fails to load, taking every
+      # `avdec_*` element (and both alert-clip tests) with it. apt runs
+      # postinst, so this one has to come from apt.
+      - name: install libav's alternatives-managed BLAS runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libblas3 liblapack3
+          test -e /usr/lib/x86_64-linux-gnu/libblas.so.3
 
       - name: cache onnxruntime tarball
         id: ort-cache
