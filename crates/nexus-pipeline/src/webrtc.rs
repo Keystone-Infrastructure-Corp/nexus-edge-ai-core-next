@@ -1103,12 +1103,58 @@ fn configure_fec(webrtc: &gst::Element, camera_id: CameraId) {
     );
 }
 
+/// Minimum spacing between encoder bitrate retargets.
+///
+/// `vah264enc` accepts `bitrate` while PLAYING, but it reads `key-int-max` at
+/// *configure* time — so every write reconfigures the encoder and restarts the
+/// GOP with a fresh IDR. `rtpgccbwe` is a per-packet-group estimator that
+/// re-estimates several times a second, so retargeting on each notify emitted
+/// **6-7 IDR/s** (measured on an Alder Lake-N core against the browser's
+/// `keyFramesDecoded`). At 1080p that is ~4.3 Mbps out of an encoder pinned to
+/// `bitrate=1000` CBR: it saturated the uplink, collapsed the GCC estimate, and
+/// drove the stream to 0 fps — the operator-visible "HD live view drops".
+///
+/// Damping costs nothing in responsiveness: `rtpgccbwe` still *paces* the send
+/// path continuously, so short-term congestion is absorbed by the pacer. The
+/// encoder target only has to track the trend.
+const BITRATE_RETARGET_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Minimum relative *rise* worth paying an IDR for, in percent.
+const BITRATE_RETARGET_MIN_RISE_PCT: u32 = 15;
+
+/// Minimum relative *fall* worth paying an IDR for, in percent.
+///
+/// Deliberately lower than the rise threshold. Holding a stale *high* target
+/// overshoots the link and grows the pacer's queue, which shows up as latency;
+/// holding a stale *low* one only costs picture quality. Congestion control is
+/// conventionally asymmetric for that reason. A smaller fall threshold cannot
+/// reintroduce the keyframe storm, because [`BITRATE_RETARGET_MIN_INTERVAL`]
+/// bounds the write rate regardless of which threshold applies.
+const BITRATE_RETARGET_MIN_FALL_PCT: u32 = 5;
+
+/// Whether a new GCC estimate justifies reconfiguring the encoder. Pure.
+fn should_retarget_bitrate(current_kbps: u32, new_kbps: u32, since_last: Option<Duration>) -> bool {
+    if since_last.is_some_and(|d| d < BITRATE_RETARGET_MIN_INTERVAL) {
+        return false;
+    }
+    if current_kbps == 0 {
+        return new_kbps != 0;
+    }
+    let min_pct = if new_kbps < current_kbps {
+        BITRATE_RETARGET_MIN_FALL_PCT
+    } else {
+        BITRATE_RETARGET_MIN_RISE_PCT
+    };
+    current_kbps.abs_diff(new_kbps) * 100 >= current_kbps * min_pct
+}
+
 /// Wire `rtpgccbwe` as webrtcbin's aux-sender for the transcode path. The
 /// element paces the outbound RTP and produces a delay-based bandwidth
-/// estimate; on each `estimated-bitrate` change we retarget the `vah264enc`
-/// `bitrate` (kbps = bits/1000). This is the proactive replacement for the
-/// reactive [`spawn_congestion_control`] AIMD loop and is only wired when the
-/// bundled `libgstrsrtp.so` plugin registered `rtpgccbwe`.
+/// estimate; we retarget the `vah264enc` `bitrate` (kbps = bits/1000) when that
+/// estimate moves materially, subject to [`should_retarget_bitrate`] — never on
+/// every notify, because each write costs an IDR. This is the proactive
+/// replacement for the reactive [`spawn_congestion_control`] AIMD loop and is
+/// only wired when the bundled `libgstrsrtp.so` plugin registered `rtpgccbwe`.
 fn wire_gcc_congestion_control(
     webrtc: &gst::Element,
     enc: &gst::Element,
@@ -1129,16 +1175,25 @@ fn wire_gcc_congestion_control(
         // `max-bitrate` at runtime to the slowest viewer's real downlink.
         *gcc_slot.lock() = Some(cc.downgrade());
         let enc_weak = enc_weak.clone();
+        // Per-session; `request-aux-sender` can fire again on renegotiation.
+        let last_retarget: parking_lot::Mutex<Option<std::time::Instant>> =
+            parking_lot::Mutex::new(None);
         cc.connect_notify(Some("estimated-bitrate"), move |bwe, _pspec| {
             let bits: u32 = bwe.property("estimated-bitrate");
             let kbps = (bits / 1000).max(GCC_MIN_BPS / 1000);
-            if let Some(enc) = enc_weak.upgrade() {
-                let current: u32 = enc.property("bitrate");
-                if current != kbps {
-                    enc.set_property("bitrate", kbps);
-                    debug!(camera_id, kbps, "rtpgccbwe adjusted encoder bitrate");
-                }
+            let Some(enc) = enc_weak.upgrade() else {
+                return;
+            };
+            let current: u32 = enc.property("bitrate");
+            let now = std::time::Instant::now();
+            let mut last = last_retarget.lock();
+            if !should_retarget_bitrate(current, kbps, last.map(|t| now.duration_since(t))) {
+                return;
             }
+            *last = Some(now);
+            drop(last);
+            enc.set_property("bitrate", kbps);
+            debug!(camera_id, kbps, "rtpgccbwe adjusted encoder bitrate");
         });
         Some(cc.to_value())
     });
@@ -1200,20 +1255,49 @@ fn spawn_congestion_control(
     })
 }
 
+/// Operator override forcing every HD session onto the passthrough pipeline.
+///
+/// Process-wide because it is a per-box policy, not a per-session one — the
+/// same shape as the `LIBVA_DRIVER_NAME` / `AMD_DEBUG` decisions the engine
+/// already applies once at startup. Set from `[runtime.live_view]
+/// force_passthrough` via [`set_force_passthrough`].
+static FORCE_PASSTHROUGH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Apply `[runtime.live_view] force_passthrough`. Called once at startup.
+pub fn set_force_passthrough(force: bool) {
+    FORCE_PASSTHROUGH.store(force, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the hardware transcode path may be used at all.
+///
+/// Precedence, highest first:
+/// 1. the operator's `force_passthrough` override;
+/// 2. the `i965` driver, which is Gen9 LP's default and must never transcode
+///    (BUG-128 — its encoder `assert()`s and kills the engine);
+/// 3. otherwise yes, subject to what the registry actually offers.
+///
+/// Pure, and deliberately separate from the registry lookup so the policy is
+/// testable without a GStreamer runtime.
+fn transcode_allowed(force_passthrough: bool, libva_driver: Option<&str>) -> bool {
+    !force_passthrough && libva_driver != Some("i965")
+}
+
 /// Name of an available hardware H.264 **encoder** for the transcode path, or
 /// `None` on boxes without one (e.g. macOS dev), where the caller falls back
 /// to passthrough. Pure aside from the plugin registry lookup.
 ///
-/// Returns `None` under the `i965` driver whatever the registry says. The free
-/// `i965-va-driver` build advertises `VAProfileH264*: VAEntrypointEncSlice` but
-/// ships none of the encode kernels (they are the non-free `-shaders` payload),
-/// so `intel_enc_hw_context_init` finds a NULL `mfc_context` and `assert()`s —
-/// killing the whole engine, every camera, the moment one viewer opens Live HD.
-/// Element registration reflects that false claim, and the caller's fallback
-/// only catches `parse::launch` errors, so nothing downstream can save us from
-/// an `abort()` (BUG-128).
+/// Returns `None` whenever [`transcode_allowed`] says so, whatever the registry
+/// claims. The free `i965-va-driver` build advertises `VAProfileH264*:
+/// VAEntrypointEncSlice` but ships none of the encode kernels (they are the
+/// non-free `-shaders` payload), so `intel_enc_hw_context_init` finds a NULL
+/// `mfc_context` and `assert()`s — killing the whole engine, every camera, the
+/// moment one viewer opens Live HD. Element registration reflects that false
+/// claim, and the caller's fallback only catches `parse::launch` errors, so
+/// nothing downstream can save us from an `abort()` (BUG-128).
 fn hw_h264_encoder() -> Option<&'static str> {
-    if std::env::var("LIBVA_DRIVER_NAME").as_deref() == Ok("i965") {
+    let forced = FORCE_PASSTHROUGH.load(std::sync::atomic::Ordering::Relaxed);
+    let driver = std::env::var("LIBVA_DRIVER_NAME").ok();
+    if !transcode_allowed(forced, driver.as_deref()) {
         return None;
     }
     ["vah264enc", "vaapih264enc"]
@@ -1450,6 +1534,109 @@ mod tests {
         assert_eq!(
             got, None,
             "i965 advertises H.264 EncSlice it cannot honour; selecting it aborts the engine"
+        );
+    }
+
+    /// The full precedence table for choosing transcode vs passthrough. The
+    /// Apollo Lake (`i965`) leg must default to passthrough with no operator
+    /// action, and the override must win over an otherwise-capable box.
+    #[test]
+    fn transcode_allowed_precedence() {
+        // Apollo Lake / Gen9 LP: passthrough is the DEFAULT, unconfigured.
+        assert!(
+            !transcode_allowed(false, Some("i965")),
+            "i965 must default to passthrough — its encoder aborts the engine (BUG-128)"
+        );
+        // The operator override forces passthrough on an otherwise-capable box.
+        assert!(!transcode_allowed(true, Some("iHD")));
+        assert!(!transcode_allowed(true, None));
+        // Left alone, a capable box still transcodes.
+        assert!(transcode_allowed(false, Some("iHD")));
+        assert!(transcode_allowed(false, Some("radeonsi")));
+        assert!(transcode_allowed(false, None));
+        // The override cannot be used to force transcode back ON for i965.
+        assert!(!transcode_allowed(false, Some("i965")));
+    }
+
+    /// The config knob is only worth anything if it reaches the decision. This
+    /// exercises the real global rather than the pure helper, so a broken
+    /// `set_force_passthrough` wiring fails here instead of in the field.
+    /// Asserting `None` is safe under test parallelism: no other test asserts
+    /// this function returns `Some`.
+    #[test]
+    fn set_force_passthrough_reaches_the_encoder_choice() {
+        set_force_passthrough(true);
+        assert_eq!(
+            hw_h264_encoder(),
+            None,
+            "[runtime.live_view] force_passthrough must suppress the hardware encoder"
+        );
+        set_force_passthrough(false);
+    }
+
+    /// `rtpgccbwe` re-estimates several times a second, and `vah264enc` reads
+    /// `key-int-max` at configure time — so every `bitrate` write restarts the
+    /// GOP with a fresh IDR. Retargeting on each notify was measured at 6-7
+    /// IDR/s, which drove a 1000 kbps CBR encoder to 4.3 Mbps, saturated the
+    /// uplink and collapsed the stream to 0 fps. Replays ordinary estimator
+    /// jitter and asserts the retarget rate stays bounded.
+    #[test]
+    fn gcc_jitter_does_not_retarget_the_encoder_on_every_estimate() {
+        // ~7 estimates/second for 10 s. The swing deliberately straddles both
+        // thresholds, so the *delta* gate never binds and the count is bounded
+        // by BITRATE_RETARGET_MIN_INTERVAL alone — zeroing that interval must
+        // fail this test.
+        let jitter = [1900u32, 700, 1800, 650, 2000, 720, 1750];
+        let tick = Duration::from_millis(1000 / 7);
+
+        let mut current = 1200u32;
+        let mut since_last: Option<Duration> = None;
+        let mut retargets = 0usize;
+        for i in 0..70 {
+            let candidate = jitter[i % jitter.len()];
+            if should_retarget_bitrate(current, candidate, since_last) {
+                current = candidate;
+                since_last = Some(Duration::ZERO);
+                retargets += 1;
+            } else {
+                since_last = Some(since_last.map_or(tick, |d| d + tick));
+            }
+        }
+
+        assert!(
+            retargets >= 4,
+            "fixture is vacuous: swings this large must produce retargets, got {retargets}"
+        );
+        assert!(
+            retargets <= 6,
+            "10 s of GCC churn produced {retargets} encoder retargets, i.e. {retargets} \
+             forced IDRs; the 2 s interval should cap this near 5"
+        );
+    }
+
+    /// The damping must not swallow a genuine collapse: when the estimate falls
+    /// hard the encoder still has to follow, or we keep sending far more than
+    /// the link can carry.
+    #[test]
+    fn a_large_bitrate_drop_still_retargets_once_the_interval_has_passed() {
+        assert!(
+            should_retarget_bitrate(2000, 500, Some(BITRATE_RETARGET_MIN_INTERVAL)),
+            "a 75% collapse in the estimate must reach the encoder"
+        );
+        assert!(
+            !should_retarget_bitrate(2000, 500, Some(Duration::from_millis(100))),
+            "but not more often than the minimum interval"
+        );
+        // First estimate of a session has no previous write to debounce against.
+        assert!(should_retarget_bitrate(1000, 2000, None));
+        // Falls are damped less than rises: 8% down lands, 8% up does not.
+        assert!(
+            should_retarget_bitrate(1000, 920, None),
+            "an 8% fall must land"
+        );
+        assert!(
+            !should_retarget_bitrate(1000, 1080, None),
+            "an 8% rise is not worth an IDR"
         );
     }
 

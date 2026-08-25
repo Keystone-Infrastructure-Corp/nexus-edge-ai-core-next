@@ -56,6 +56,20 @@ blocking_threads = 64
 # Omit this whole section to get "auto" (zero-migration upgrade).
 mode = "auto"
 
+[runtime.live_view]
+# Force every HD (solo) live-view session onto the passthrough
+# pipeline, which forwards the camera's own H.264 stream instead of
+# hardware-transcoding it. Passthrough builds no encoder at all, so
+# it cannot suffer encoder-side faults — at the cost of the camera's
+# own (often multi-second) GOP, so recovery after loss is slower.
+#   false — (default) transcode wherever a VA H.264 encoder exists.
+#   true  — always passthrough.
+# Intel Gen9 LP (Apollo Lake / Gemini Lake) already gets passthrough
+# without this knob: the engine pins it to the i965 driver, which
+# advertises H.264 encode it cannot perform (BUG-128).
+# Omit this whole section to get the default.
+force_passthrough = false
+
 [runtime.clips]
 # Which recorder backend writes the mp4 files.
 #   "gstreamer" — real H.264-passthrough fragmented mp4 via the shared

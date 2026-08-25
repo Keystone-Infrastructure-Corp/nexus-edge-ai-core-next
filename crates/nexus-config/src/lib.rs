@@ -333,6 +333,11 @@ pub struct RuntimeConfig {
     /// configs that predate the knob.
     #[serde(default)]
     pub delivery: RuntimeDeliveryConfig,
+    /// Phase 10 HD live-view transport knobs. Defaults preserve the
+    /// hardware-driven behaviour, so configs predating this section
+    /// boot unchanged.
+    #[serde(default)]
+    pub live_view: RuntimeLiveViewConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -347,8 +352,26 @@ impl Default for RuntimeConfig {
             auth: RuntimeAuthConfig::default(),
             audit: RuntimeAuditConfig::default(),
             delivery: RuntimeDeliveryConfig::default(),
+            live_view: RuntimeLiveViewConfig::default(),
         }
     }
+}
+
+/// `[runtime.live_view]` section. Kept as a struct so further HD transport
+/// tuning lands as an additive field rather than a breaking reshape.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLiveViewConfig {
+    /// Force every HD session onto the passthrough pipeline, even where a
+    /// hardware H.264 encoder is available.
+    ///
+    /// Passthrough forwards the camera's own stream, so it never builds an
+    /// encoder and never pays the reconfiguration cost that a transcode
+    /// session does. This is the operator escape hatch for a box whose
+    /// hardware encoder misbehaves, and it is what Gen9 LP (`i965`) already
+    /// gets automatically — see `nexus_pipeline::webrtc::transcode_allowed`.
+    #[serde(default)]
+    pub force_passthrough: bool,
 }
 
 // ---------------------------------------------------------------------------

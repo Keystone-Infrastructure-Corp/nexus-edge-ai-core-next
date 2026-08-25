@@ -207,6 +207,9 @@ fn main() -> Result<()> {
     // Same ordering constraint: libva resolves the driver once, at load.
     select_intel_gen9_va_driver();
 
+    // Independent of the VA driver choice above; both feed transcode_allowed().
+    apply_live_view_transport(&cfg);
+
     // Raise the per-process file-descriptor cap BEFORE tokio spins
     // up any I/O. The LAN discovery sweep can open 100s of sockets
     // in parallel; the macOS default `ulimit -n` of 256 caused
@@ -347,6 +350,30 @@ fn select_intel_gen9_va_driver() {
     let _ = VA_DRIVER_DECISION.set(decision);
 }
 
+/// What [`apply_live_view_transport`] decided, recorded rather than logged
+/// because tracing is not up yet at this point in startup.
+static LIVE_VIEW_DECISION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Apply `[runtime.live_view] force_passthrough` to the HD live-view pipeline.
+///
+/// Gen9 LP already reaches passthrough on its own, because
+/// [`select_intel_gen9_va_driver`] pins it to `i965` and that driver can't
+/// encode (BUG-128). This is the operator override for every other box —
+/// notably one whose hardware encoder misbehaves under load.
+fn apply_live_view_transport(cfg: &Config) {
+    let force = cfg.runtime.live_view.force_passthrough;
+    #[cfg(feature = "gstreamer-webrtc")]
+    nexus_pipeline::webrtc::set_force_passthrough(force);
+    let decision = if !force {
+        "hardware-driven (transcode wherever a VA encoder is available)"
+    } else if cfg!(feature = "gstreamer-webrtc") {
+        "forced passthrough by [runtime.live_view] force_passthrough"
+    } else {
+        "force_passthrough set, but this engine has no gstreamer-webrtc feature"
+    };
+    let _ = LIVE_VIEW_DECISION.set(decision);
+}
+
 /// Force Mesa `radeonsi` to allocate linear (untiled) surfaces.
 ///
 /// Field-measured on a 53-camera Radeon 680M (BUG-065): tiling on, the box
@@ -442,6 +469,9 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             libva_driver = %std::env::var("LIBVA_DRIVER_NAME").unwrap_or_else(|_| "<unset>".into()),
             "VA driver selection: {d}"
         );
+    }
+    if let Some(d) = LIVE_VIEW_DECISION.get() {
+        info!("HD live-view transport: {d}");
     }
 
     let store = Arc::new(Store::open(&cfg.store).await?);
