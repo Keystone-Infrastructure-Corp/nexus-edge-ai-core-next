@@ -679,6 +679,7 @@ async fn run(
                     &live_view,
                     &webrtc,
                     &remote_shell,
+                    &liveness,
                 );
                 let storage_events = pump_storage_events(&*conn, &watermark);
                 tokio::select! {
@@ -694,6 +695,8 @@ async fn run(
                     }
                     _ = dispatch => {
                         // Inbound channel closed (reader task ended) -> tunnel down.
+                        // A peer that vanishes without a reset reaches this arm via
+                        // the socket's TCP_USER_TIMEOUT (BUG-133), not on its own.
                         warn!(core_id = %core_id, "cloud tunnel inbound dispatch ended; will reconnect");
                     }
                     _ = storage_events => {
@@ -798,6 +801,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     live_view: &Arc<crate::live_view::LiveViewManager>,
     webrtc: &Arc<crate::webrtc_bridge::WebRtcBridge>,
     remote_shell: &Arc<crate::remote_shell::RemoteShellManager>,
+    liveness: &crate::cloud_liveness::TunnelLiveness,
 ) {
     let Some(mut rx) = inbound else {
         debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
@@ -973,6 +977,10 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             }
             other => {
                 if let EnvelopeBody::HeartbeatAck(ack) = other {
+                    // The only proof the cloud is still on the other end of
+                    // this socket. Everything else the engine can observe
+                    // stays healthy across a half-open connection.
+                    liveness.mark_ack();
                     outbox.update_caps(ack.cloud_capabilities.as_deref());
                     debug!(
                         core_id = %core_id,
@@ -1249,10 +1257,10 @@ async fn pump_heartbeats<H: TunnelHandle>(
             warn!(error = %e, "heartbeat send failed; pump exiting");
             return;
         }
-        // Go-dark signal. Measured from process start, not wall-clock, so
-        // an NTP step on a freshly-booted appliance cannot fabricate hours
-        // of apparent silence.
-        liveness.mark_heartbeat(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        // Deliberately no liveness update here. `send` resolving means the
+        // uplink queue accepted the frame, which a half-open socket does
+        // forever; only an inbound `heartbeat_ack` proves the cloud is
+        // there, and `pump_rpc_dispatch` records that (BUG-133).
     }
 }
 
@@ -1765,5 +1773,191 @@ mod storage_watermark_tests {
         );
         assert_eq!(payloads[0].level, "ok");
         assert_eq!(payloads[1].level, "panic");
+    }
+}
+
+/// BUG-133 — a half-open tunnel accepts heartbeats forever, so "the send
+/// succeeded" cannot stand in for "the cloud is still there".
+#[cfg(test)]
+mod heartbeat_ack_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use nexus_cloud_client::tunnel::{TunnelError, TunnelHandle};
+    use nexus_cloud_client::TunnelOutbox;
+    use nexus_config::StoreConfig;
+    use nexus_pipeline::{FrameStatsRegistry, LatestFrameCache};
+
+    use super::*;
+    use crate::cloud_liveness::TunnelLiveness;
+    use crate::live_view::LiveViewManager;
+
+    /// Accepts every frame and never fails — what the engine sees when the
+    /// peer is gone but the kernel still holds the socket open. The box
+    /// that prompted BUG-133 sat here for 29 minutes with 29 KB queued.
+    #[derive(Default)]
+    struct HalfOpenTunnel {
+        sent: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TunnelHandle for HalfOpenTunnel {
+        async fn send(&self, _envelope: Envelope) -> Result<(), TunnelError> {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    async fn test_store() -> (Arc<Store>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("nexus.db");
+        let store = Store::open(&StoreConfig {
+            url: format!("sqlite://{}?mode=rwc", db_path.display()),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        (Arc::new(store), dir)
+    }
+
+    fn live_view_manager() -> Arc<LiveViewManager> {
+        LiveViewManager::new(
+            Arc::new(LatestFrameCache::new()),
+            Arc::new(TunnelOutbox::new()),
+        )
+    }
+
+    /// The go-dark watchdog reflips an appliance to its previous release
+    /// on this signal. Enqueueing a heartbeat onto a local channel proves
+    /// the channel had room, not that the cloud is reachable — a half-open
+    /// socket accepts every one of them.
+    ///
+    /// Real clock, not a paused one: the pump reads SQLite every tick and
+    /// a virtual clock races sqlx's own acquire timeout. One heartbeat is
+    /// enough, and `tokio::interval` fires its first tick immediately.
+    #[tokio::test]
+    async fn sending_a_heartbeat_is_not_proof_the_cloud_received_it() {
+        let (store, _dir) = test_store().await;
+        let live_view = live_view_manager();
+        let frame_stats = FrameStatsRegistry::new();
+        let liveness = TunnelLiveness::new();
+        let tunnel = HalfOpenTunnel::default();
+
+        let pump = pump_heartbeats(
+            &tunnel,
+            "core-1",
+            store,
+            &liveness,
+            &live_view,
+            &frame_stats,
+        );
+        tokio::pin!(pump);
+        // Poll for the condition rather than paying a fixed wait: the pump
+        // never returns on its own, which is the point.
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    () = &mut pump => return,
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if tunnel.sent.load(Ordering::Relaxed) > 0 {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(observed.is_ok(), "fixture never sent a heartbeat");
+        assert!(tunnel.sent.load(Ordering::Relaxed) > 0);
+        assert!(
+            !liveness.heartbeat_since_boot(),
+            "no heartbeat was ever acknowledged, so nothing proved this \
+             binary can reach the cloud",
+        );
+    }
+
+    /// The other half of the same invariant, and the line everything now
+    /// depends on: the OTA success gate and the go-dark watchdog both read
+    /// this signal, and after this change the *only* thing that sets it is
+    /// an inbound `heartbeat_ack`. Without this test that call site could
+    /// be deleted and the suite would stay green — more emphatically, in
+    /// fact, since the sibling test asserts the signal stays unset.
+    #[tokio::test]
+    async fn an_inbound_heartbeat_ack_is_what_records_cloud_liveness() {
+        use nexus_cloud_protocol::v1::HeartbeatAckPayload;
+
+        let (store, _dir) = test_store().await;
+        let live_view = live_view_manager();
+        let outbox = Arc::new(TunnelOutbox::new());
+        let liveness = TunnelLiveness::new();
+        // The supervisor marks this on connect; the round trip is the part
+        // under test.
+        liveness.mark_authenticated();
+        let tunnel = HalfOpenTunnel::default();
+
+        let (tx, rx) = mpsc::channel::<Envelope>(4);
+        tx.send(Envelope {
+            meta: EnvelopeMeta {
+                id: uuid::Uuid::now_v7().to_string(),
+                in_reply_to: None,
+                seq: None,
+                trace: None,
+                ts: chrono::Utc::now().to_rfc3339(),
+                v: 1,
+            },
+            body: EnvelopeBody::HeartbeatAck(HeartbeatAckPayload {
+                cert_rotate: None,
+                cloud_capabilities: None,
+                server_ts: chrono::Utc::now().to_rfc3339(),
+            }),
+        })
+        .await
+        .expect("queue the ack");
+        // Closing the sender lets the pump drain and return.
+        drop(tx);
+
+        assert!(
+            !liveness.heartbeat_since_boot(),
+            "nothing has been acknowledged yet",
+        );
+
+        let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
+        let remote_shell = Arc::new(crate::remote_shell::RemoteShellManager::new(
+            nexus_config::RemoteAccessConfig::default(),
+            nexus_cloud_client::tunnel::TunnelClient::new(
+                "wss://cloud.invalid/v1/tunnel",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            None,
+            Arc::clone(&outbox),
+        ));
+        let entitlements = Arc::new(nexus_cloud_client::entitlements::EntitlementCache::new());
+        let pending_acks = Arc::new(crate::cloud_alert_sink::PendingAckRegistry::new());
+
+        pump_rpc_dispatch(
+            &tunnel,
+            Some(rx),
+            None,
+            "core-1",
+            &outbox,
+            &entitlements,
+            &pending_acks,
+            &store,
+            &live_view,
+            &webrtc,
+            &remote_shell,
+            &liveness,
+        )
+        .await;
+
+        assert!(
+            liveness.heartbeat_since_boot(),
+            "an acknowledged heartbeat is the only proof the cloud is on the \
+             other end of this socket",
+        );
     }
 }

@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nexus_store::Store;
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 /// How often the watchdog wakes up. Small relative to the window it is
@@ -63,11 +64,23 @@ const WATCHDOG_GRACE: Duration = Duration::from_secs(15 * 60);
 /// Deliberately not a `watch` channel: every consumer here is a poller on
 /// a minutes-scale cadence, and the producer is on the heartbeat path
 /// where an extra wakeup per 30 s tick buys nothing.
-#[derive(Debug, Default)]
+///
+/// The signal owns its clock. It used to take the elapsed time from the
+/// caller, and the two callers disagreed about the origin: the heartbeat
+/// pump measured from the current *connection*, the watchdog from process
+/// start. A long-lived process that reconnected late therefore looked dark
+/// for the age of the process and could reflip a perfectly healthy
+/// appliance (BUG-133).
+#[derive(Debug)]
 pub struct TunnelLiveness {
-    /// Monotonic milliseconds since process start at the last heartbeat
-    /// the tunnel accepted for send. Zero means "never".
-    last_heartbeat_ms: AtomicU64,
+    /// Origin for every duration below. `tokio::time::Instant` so tests
+    /// can drive the watchdog on a virtual clock, and monotonic so an NTP
+    /// step on a freshly-booted appliance cannot fabricate hours of
+    /// apparent silence.
+    created: Instant,
+    /// Milliseconds since [`Self::created`] at the last acknowledged
+    /// heartbeat. Zero means "never".
+    last_ack_ms: AtomicU64,
     /// Set once the tunnel has authenticated at least once in this
     /// process. Never cleared — its question is "did this binary ever
     /// work", not "is it working right now".
@@ -76,11 +89,22 @@ pub struct TunnelLiveness {
     reflipped: AtomicBool,
 }
 
+impl Default for TunnelLiveness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TunnelLiveness {
     /// Fresh signal for a process that has not connected yet.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            created: Instant::now(),
+            last_ack_ms: AtomicU64::new(0),
+            authenticated: AtomicBool::new(false),
+            reflipped: AtomicBool::new(false),
+        }
     }
 
     /// Record that the tunnel authenticated. Called by the supervisor on
@@ -89,33 +113,36 @@ impl TunnelLiveness {
         self.authenticated.store(true, Ordering::Relaxed);
     }
 
-    /// Record a heartbeat the tunnel accepted for send.
+    /// Record that the cloud **answered** a heartbeat.
     ///
-    /// `elapsed_ms` is milliseconds since process start, which the caller
-    /// already has. Wall-clock is deliberately avoided: an NTP step on a
-    /// freshly-booted appliance is common, and it must not be able to make
-    /// the watchdog believe hours have passed.
-    pub fn mark_heartbeat(&self, elapsed_ms: u64) {
-        self.last_heartbeat_ms.store(elapsed_ms, Ordering::Relaxed);
+    /// Called only from the inbound `heartbeat_ack` path. A send that the
+    /// tunnel accepted proves the local channel had room, not that anyone
+    /// received it: a half-open socket accepts writes indefinitely.
+    pub fn mark_ack(&self) {
+        let elapsed = u64::try_from(self.created.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Floor at 1 ms: zero is the "never acknowledged" sentinel, so an
+        // ack inside the opening millisecond must not read as never.
+        self.last_ack_ms.store(elapsed.max(1), Ordering::Relaxed);
     }
 
     /// Has this process ever completed an authenticated connect *and* a
-    /// heartbeat? This is the OTA success gate.
+    /// heartbeat round-trip? This is the OTA success gate.
     #[must_use]
     pub fn heartbeat_since_boot(&self) -> bool {
-        self.authenticated.load(Ordering::Relaxed)
-            && self.last_heartbeat_ms.load(Ordering::Relaxed) > 0
+        self.authenticated.load(Ordering::Relaxed) && self.last_ack_ms.load(Ordering::Relaxed) > 0
     }
 
-    /// Milliseconds since the last accepted heartbeat, or `None` if there
-    /// has never been one.
+    /// Milliseconds since the cloud last answered — or since this signal
+    /// was created, if it never has. Never having connected counts against
+    /// us from boot, otherwise a release that cannot authenticate at all —
+    /// the worst case — is the one case the watchdog ignores.
     #[must_use]
-    pub fn idle_ms(&self, now_elapsed_ms: u64) -> Option<u64> {
-        let last = self.last_heartbeat_ms.load(Ordering::Relaxed);
-        if last == 0 {
-            return None;
+    pub fn dark_ms(&self) -> u64 {
+        let now = u64::try_from(self.created.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match self.last_ack_ms.load(Ordering::Relaxed) {
+            0 => now,
+            last => now.saturating_sub(last),
         }
-        Some(now_elapsed_ms.saturating_sub(last))
     }
 }
 
@@ -164,12 +191,8 @@ pub async fn run_cloud_liveness_watchdog(
             }
         }
 
-        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
-        // Never having connected counts against us from boot, otherwise a
-        // release that cannot authenticate at all — the worst case — is
-        // the one case the watchdog ignores.
-        let dark_ms = liveness.idle_ms(elapsed_ms).unwrap_or(elapsed_ms);
+        let dark_ms = liveness.dark_ms();
         if dark_ms < window_ms {
             continue;
         }
@@ -206,32 +229,51 @@ pub async fn run_cloud_liveness_watchdog(
 mod tests {
     use super::TunnelLiveness;
 
-    #[test]
-    fn a_fresh_signal_has_not_proved_anything() {
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_signal_has_not_proved_anything() {
         let l = TunnelLiveness::new();
         assert!(!l.heartbeat_since_boot());
-        assert_eq!(l.idle_ms(10_000), None);
     }
 
-    #[test]
-    fn authentication_alone_is_not_enough() {
+    #[tokio::test(start_paused = true)]
+    async fn authentication_alone_is_not_enough() {
         let l = TunnelLiveness::new();
         l.mark_authenticated();
         assert!(
             !l.heartbeat_since_boot(),
             "connecting proves the socket opened, not that the cloud answered"
         );
-        l.mark_heartbeat(5_000);
+        l.mark_ack();
         assert!(l.heartbeat_since_boot());
     }
 
-    #[test]
-    fn idle_is_measured_from_the_last_heartbeat() {
+    /// BUG-133 — the whole point of the signal. A half-open socket accepts
+    /// every heartbeat, so darkness has to be measured from the last reply
+    /// the cloud actually sent.
+    #[tokio::test(start_paused = true)]
+    async fn dark_time_is_measured_from_the_last_acknowledgement() {
         let l = TunnelLiveness::new();
-        l.mark_heartbeat(60_000);
-        assert_eq!(l.idle_ms(90_000), Some(30_000));
-        // A clock that appears to go backwards saturates rather than
-        // wrapping into a huge idle time and firing the watchdog.
-        assert_eq!(l.idle_ms(10_000), Some(0));
+        l.mark_ack();
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        // Not exactly 30_000: an ack in the opening millisecond is floored
+        // to 1 ms so it cannot read as "never acknowledged".
+        let dark = l.dark_ms();
+        assert!((29_000..31_000).contains(&dark), "{dark}");
+
+        l.mark_ack();
+        assert!(l.dark_ms() < 1_000, "a fresh ack resets the dark clock");
+    }
+
+    /// A binary that never completes a round-trip is the worst case, so it
+    /// must count as dark from boot rather than being exempt.
+    #[tokio::test(start_paused = true)]
+    async fn never_acknowledged_counts_as_dark_from_creation() {
+        let l = TunnelLiveness::new();
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        assert!(
+            l.dark_ms() >= 600_000,
+            "never having been answered must count against us: {}",
+            l.dark_ms()
+        );
     }
 }

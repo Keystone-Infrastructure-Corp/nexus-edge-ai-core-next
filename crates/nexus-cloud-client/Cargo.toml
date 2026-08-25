@@ -45,6 +45,13 @@ rustls-pki-types = { workspace = true }
 webpki-roots = "0.26"
 futures-util = { workspace = true }
 
+# BUG-133 — TCP_USER_TIMEOUT on the tunnel socket. Linux-only option, and
+# the edge appliances are Linux; already in the tree transitively via tokio.
+# `all` is socket2's feature gate for the extended sockopts, which is where
+# `set_tcp_user_timeout` lives.
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { workspace = true, features = ["all"] }
+
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }

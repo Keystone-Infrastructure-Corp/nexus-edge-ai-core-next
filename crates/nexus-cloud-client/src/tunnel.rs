@@ -240,6 +240,13 @@ impl TunnelClient {
     /// into an outbound pivot, and the operator's firewall exception was
     /// only ever granted for one destination.
     ///
+    /// Deliberately not armed with [`DEAD_PEER_TIMEOUT`]: a shell session
+    /// already has its own `max_session_secs` deadline, and the control
+    /// tunnel's reconnect path calls `close_all()` on every session, so a
+    /// black-holed shell socket is bounded by the control tunnel's timeout
+    /// rather than living forever. If that `close_all()` ever goes away,
+    /// this needs arming too.
+    ///
     /// # Errors
     ///
     /// * [`TunnelError::Handshake`] — `url` names a different authority
@@ -289,6 +296,8 @@ impl TunnelClient {
         )
         .await
         .map_err(|e| TunnelError::Handshake(e.to_string()))?;
+
+        arm_dead_peer_timeout(ws_stream.get_ref());
 
         info!(url = %self.gateway_url, "cloud tunnel connected");
 
@@ -419,6 +428,66 @@ impl TunnelClient {
         })
     }
 }
+
+/// How long the kernel may keep retransmitting unacknowledged tunnel data
+/// before it gives up on the socket (BUG-133).
+///
+/// Two heartbeat intervals, chosen so recovery beats the cloud's own
+/// verdict. Worst case: the peer vanishes just after an acknowledged
+/// heartbeat, the next one is queued up to 30 s later, the socket dies
+/// ~60 s after that, and the reconnect costs `BACKOFF_MIN` plus a
+/// handshake — so the gateway sees a fresh heartbeat by ~95 s, inside its
+/// 120 s `OFFLINE_AFTER` sweep. At 90 s that arithmetic reaches ~125 s and
+/// races the sweep, flapping the core offline and alerting somebody about
+/// an outage that had already healed. The test below pins the budget.
+#[cfg(target_os = "linux")]
+const DEAD_PEER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bound how long this socket will retransmit into a black hole.
+///
+/// A peer that disappears without sending a reset leaves TCP retransmitting
+/// forever: the connection stays `ESTABLISHED`, `Connection::send` keeps
+/// succeeding because the frame only has to reach the local queue, the
+/// reader never errors, and no close frame ever arrives — so nothing above
+/// this layer can tell the difference between a healthy tunnel and a dead
+/// one. Observed in the field at 29 minutes with 29 KB unacknowledged and an
+/// RTO of 120 s, on a box whose ordinary HTTPS to the same host was fine.
+///
+/// `TCP_USER_TIMEOUT` makes the kernel fail the socket with `ETIMEDOUT`
+/// instead. That surfaces as a read/write error on the existing WSS pump,
+/// which breaks, closes the inbound channel, and lets the supervisor's
+/// existing reconnect path run — no new liveness state, and nothing that a
+/// slow database or a busy dispatch loop can mistake for a dead network.
+///
+/// Deliberately not TCP keepalive: keepalive probes only fire on an *idle*
+/// connection, and a tunnel with a heartbeat queued is not idle. That is
+/// precisely why the field case retransmitted for 29 minutes rather than
+/// being reaped.
+#[cfg(target_os = "linux")]
+fn arm_dead_peer_timeout(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) {
+    use tokio_tungstenite::MaybeTlsStream;
+
+    let tcp = match stream {
+        MaybeTlsStream::Plain(tcp) => tcp,
+        MaybeTlsStream::Rustls(tls) => tls.get_ref().0,
+        // `MaybeTlsStream` is `#[non_exhaustive]`. We only ever build the
+        // two variants above; anything else means the TLS backend changed
+        // and this needs revisiting rather than silently guessing.
+        _ => {
+            warn!("unrecognised tunnel stream type; TCP_USER_TIMEOUT not set");
+            return;
+        }
+    };
+    if let Err(e) = socket2::SockRef::from(tcp).set_tcp_user_timeout(Some(DEAD_PEER_TIMEOUT)) {
+        // Not fatal: the tunnel still works, it just loses the bounded
+        // detection of a vanished peer.
+        warn!(error = %e, "could not set TCP_USER_TIMEOUT on the tunnel socket");
+    }
+}
+
+/// Non-Linux builds (developer workstations) have no `TCP_USER_TIMEOUT`.
+#[cfg(not(target_os = "linux"))]
+fn arm_dead_peer_timeout(_stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) {}
 
 impl Connection {
     /// Take ownership of the inbound envelope receiver. Returns
@@ -652,6 +721,52 @@ mod tests {
         assert!(
             matches!(err, TunnelError::SendChannelClosed),
             "expected SendChannelClosed, got {err:?}",
+        );
+    }
+
+    /// BUG-133 — without this the kernel retransmits into a black hole
+    /// indefinitely, the socket stays `ESTABLISHED`, and every layer above
+    /// it reports a healthy tunnel.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_tunnel_socket_gives_up_on_a_vanished_peer() {
+        use tokio_tungstenite::MaybeTlsStream;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let _server = accept.await.expect("join").expect("accept");
+
+        let stream = MaybeTlsStream::Plain(client);
+        arm_dead_peer_timeout(&stream);
+
+        let MaybeTlsStream::Plain(tcp) = &stream else {
+            panic!("fixture must be the plain variant");
+        };
+        let armed = socket2::SockRef::from(tcp)
+            .tcp_user_timeout()
+            .expect("read back TCP_USER_TIMEOUT");
+        assert_eq!(
+            armed,
+            Some(DEAD_PEER_TIMEOUT),
+            "the socket would retransmit into a black hole forever",
+        );
+
+        // The constant is only defensible if recovery beats the cloud's
+        // offline sweep; otherwise a core flaps offline and alerts somebody
+        // about an outage that has already healed. Mirrored values, not
+        // imports — the repo boundary forbids depending on the cloud crate.
+        const GATEWAY_OFFLINE_AFTER_SECS: u64 = 120; // edge-gateway liveness.rs
+        const HEARTBEAT_INTERVAL_SECS: u64 = 30; // worst-case delay before the
+                                                 // first unacked heartbeat
+        const RECONNECT_BUDGET_SECS: u64 = 2 + 3; // BACKOFF_MIN + handshake
+        assert!(
+            DEAD_PEER_TIMEOUT.as_secs() + HEARTBEAT_INTERVAL_SECS + RECONNECT_BUDGET_SECS
+                < GATEWAY_OFFLINE_AFTER_SECS,
+            "recovery must complete before the gateway's offline sweep",
         );
     }
 }
