@@ -66,6 +66,7 @@ SKIP_SYSTEM_PREP=0
 export NEXUS_PREP_DEPS="${NEXUS_PREP_DEPS:-1}"
 export NEXUS_PREP_SWAP="${NEXUS_PREP_SWAP:-1}"
 export NEXUS_PREP_FIREWALL="${NEXUS_PREP_FIREWALL:-1}"
+export NEXUS_PREP_NICS="${NEXUS_PREP_NICS:-1}"
 export NEXUS_PREP_AUTO_UPDATES="${NEXUS_PREP_AUTO_UPDATES:-0}"
 export NEXUS_INSTALL_DRIVERS="${NEXUS_INSTALL_DRIVERS:-1}"
 
@@ -129,6 +130,14 @@ Host-preparation flags (all ON by default — opt out per-step):
   --no-swap                       Don't create /swapfile if no swap exists.
   --no-firewall                   Don't add ufw allow rules for 80 + 8089
                                   (only relevant when ufw is already active).
+  --no-nics                       Don't bring up wired NICs that no renderer
+                                  owns. By default install.sh enables every
+                                  such port with DHCP (netplan
+                                  60-nexus-<iface>.yaml, optional: true, a
+                                  route-metric above the primary) so a
+                                  second NIC is addressable and visible in
+                                  the console. The port holding the default
+                                  route is never touched.
   --enable-auto-updates           Install + enable unattended-upgrades for
                                   security patches (off by default; auto-
                                   reboots are disabled either way).
@@ -184,6 +193,7 @@ while [[ $# -gt 0 ]]; do
         --no-deps)            export NEXUS_PREP_DEPS=0; shift ;;
         --no-swap)            export NEXUS_PREP_SWAP=0; shift ;;
         --no-firewall)        export NEXUS_PREP_FIREWALL=0; shift ;;
+        --no-nics)            export NEXUS_PREP_NICS=0; shift ;;
         --enable-auto-updates) export NEXUS_PREP_AUTO_UPDATES=1; shift ;;
         --no-drivers)         export NEXUS_INSTALL_DRIVERS=0; shift ;;
         --hailo-deb-url)      export NEXUS_HAILO_DEB_URL="$2"; shift 2 ;;
