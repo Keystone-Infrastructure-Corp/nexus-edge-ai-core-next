@@ -234,12 +234,19 @@ fn build_detector(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceE
 ///
 /// The fallback is what serves when the pool's workers cannot, so building it
 /// on their execution provider makes it fail with them — which is how a wedged
-/// iGPU cost 36 minutes of detections (BUG-133). A chain that never asked for a
-/// CPU EP keeps the one it configured: on Hailo there is no CPU path to fall
-/// back to, because the model is a HEF the CPU cannot execute.
+/// iGPU cost 36 minutes of detections (BUG-133).
+///
+/// Hailo is the one chain left alone: its model is a HEF, and `yolo.rs` selects
+/// that path by finding `hailo` in `ep_priority`. Every other chain resolves
+/// through ORT, which always has a CPU path — `selected_for_priority` appends
+/// `cpu(fallback)` even when the operator never wrote one.
 fn fail_soft_cfg(cfg: &InferenceConfig) -> InferenceConfig {
     let mut cfg = cfg.clone();
-    if cfg.ep_priority.iter().any(|ep| ep.starts_with("cpu")) {
+    let hailo = cfg
+        .ep_priority
+        .iter()
+        .any(|ep| ep.trim().eq_ignore_ascii_case("hailo"));
+    if !hailo {
         cfg.ep_priority = vec!["cpu".to_owned()];
     }
     cfg
@@ -497,16 +504,53 @@ mod tests {
         assert_eq!(fail_soft_cfg(&cfg).ep_priority, vec!["cpu".to_owned()]);
     }
 
-    /// A chain with no CPU entry has nowhere to fall back to — a Hailo model is
-    /// a HEF the CPU cannot execute, so rewriting it to `["cpu"]` would turn a
-    /// working fallback into one that cannot build at all.
+    /// A Hailo chain is the one left alone: `yolo.rs` selects the HEF path by
+    /// finding `hailo` in `ep_priority`, and every shipped Hailo config is
+    /// `["hailo", "cpu"]`, so a rule keyed on "contains cpu" would rewrite the
+    /// one chain it was meant to protect.
     #[test]
-    fn fail_soft_fallback_keeps_a_chain_with_no_cpu_entry() {
+    fn fail_soft_fallback_keeps_a_hailo_chain() {
         let cfg = InferenceConfig {
-            ep_priority: vec!["hailo".to_owned()],
+            ep_priority: vec!["hailo".to_owned(), "cpu".to_owned()],
             ..InferenceConfig::default()
         };
-        assert_eq!(fail_soft_cfg(&cfg).ep_priority, vec!["hailo".to_owned()]);
+        assert_eq!(
+            fail_soft_cfg(&cfg).ep_priority,
+            vec!["hailo".to_owned(), "cpu".to_owned()]
+        );
+    }
+
+    /// Operator input is normalised with `trim().to_ascii_lowercase()` before
+    /// the EP chain resolves, so the rewrite has to match the same way. A
+    /// case-sensitive test here silently left `["GPU", "CPU"]` boxes unfixed.
+    #[test]
+    fn fail_soft_fallback_matches_the_chain_case_insensitively() {
+        let cfg = InferenceConfig {
+            ep_priority: vec!["GPU".to_owned(), " CPU ".to_owned()],
+            ..InferenceConfig::default()
+        };
+        assert_eq!(fail_soft_cfg(&cfg).ep_priority, vec!["cpu".to_owned()]);
+
+        let hailo = InferenceConfig {
+            ep_priority: vec![" Hailo ".to_owned()],
+            ..InferenceConfig::default()
+        };
+        assert_eq!(
+            fail_soft_cfg(&hailo).ep_priority,
+            vec![" Hailo ".to_owned()]
+        );
+    }
+
+    /// A chain with no explicit CPU entry still resolves one —
+    /// `selected_for_priority` appends `cpu(fallback)` — so it must be
+    /// rewritten too, or the fallback stays on the accelerator that failed.
+    #[test]
+    fn fail_soft_fallback_rewrites_a_chain_with_no_explicit_cpu_entry() {
+        let cfg = InferenceConfig {
+            ep_priority: vec!["gpu".to_owned()],
+            ..InferenceConfig::default()
+        };
+        assert_eq!(fail_soft_cfg(&cfg).ep_priority, vec!["cpu".to_owned()]);
     }
 
     /// Everything except the provider chain must survive the rewrite.

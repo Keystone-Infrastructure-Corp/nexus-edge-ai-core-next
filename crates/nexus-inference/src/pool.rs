@@ -220,9 +220,11 @@ mod tests {
         }
     }
 
-    /// The other half of BUG-133: demoting the slot is only useful if the pool
-    /// then serves from the fallback instead. `detect` panics if the pool picks
-    /// the failed slot, so this fails loudly rather than silently.
+    /// Pins the behaviour the BUG-133 demotion depends on. The pool itself was
+    /// never wrong — it was told the slot was healthy — so this passes before
+    /// and after that fix; it exists so a change to `pick_ready` cannot quietly
+    /// remove the property the fix rests on. `detect` panics rather than
+    /// returning, so a wrong route fails loudly.
     #[tokio::test]
     async fn pool_routes_past_a_failed_worker_to_the_fallback() {
         let workers: Vec<Arc<dyn DetectorBackend>> = vec![Arc::new(FailedBackend)];
