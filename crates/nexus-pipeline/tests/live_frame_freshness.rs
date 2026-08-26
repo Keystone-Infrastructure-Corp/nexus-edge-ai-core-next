@@ -21,10 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nexus_bus::{Bus, BroadcastBus};
-use nexus_config::{
-    CameraConfig, ClipsConfig, RulesConfig, StoreConfig, TrackerConfig,
-};
+use nexus_bus::{BroadcastBus, Bus};
+use nexus_config::{CameraConfig, ClipsConfig, RulesConfig, StoreConfig, TrackerConfig};
 use nexus_inference::{Detector, InferenceError};
 use nexus_pipeline::cache::LatestFrameCache;
 use nexus_pipeline::supervisor::spawn_camera;
@@ -65,9 +63,8 @@ async fn the_wall_keeps_painting_while_inference_never_completes() {
     let tracker_cfg = TrackerConfig::default();
     let tracker: Arc<dyn nexus_tracker::Tracker> =
         Arc::from(nexus_tracker::build_tracker(&tracker_cfg));
-    let evaluator = Arc::new(
-        RuleEvaluator::new(&RulesConfig::default(), &[]).expect("compile empty rule set"),
-    );
+    let evaluator =
+        Arc::new(RuleEvaluator::new(&RulesConfig::default(), &[]).expect("compile empty rule set"));
 
     let dir = tempfile::tempdir().expect("tmpdir");
     let db_path = dir.path().join("nexus.db");
