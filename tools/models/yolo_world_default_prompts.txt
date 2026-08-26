@@ -62,3 +62,51 @@ wheelbarrow
 traffic cone
 jersey barrier
 scaffolding
+
+# --- SPEC-035 Pass A: harm-taxonomy actors & objects (per-frame hot
+#     path). Acts, objects, and conditions only — never a category of
+#     person (ADR-042); `balaclava` is admitted for being behaviourally
+#     specific while a generic `mask` is prohibited by HARM_TAXONOMY §9.
+#     Appended so existing class indices are preserved. The manifest
+#     `prompts` list and sha256 refresh when `gen_yolo_world.py
+#     --all-static` is re-run against these lines (deferred model cut).
+bolt cutter
+angle grinder
+pry bar
+sledgehammer
+screwdriver
+jack
+gas can
+lighter
+broken glass
+graffiti
+syringe
+glass pipe
+tent
+tarp
+sleeping bag
+mattress
+machete
+baseball bat
+balaclava
+
+# --- SPEC-035 Pass B: scene fixtures for the slow-cadence fixture pass
+#     (scene-map anchors, not the per-frame detector). Appended for the
+#     same reproducible re-export.
+door
+roll-up door
+gate
+fence
+window
+security camera
+light fixture
+dumpster
+pallet
+HVAC unit
+ATM
+cash register
+safe
+vending machine
+bike rack
+charging station
+parking stall

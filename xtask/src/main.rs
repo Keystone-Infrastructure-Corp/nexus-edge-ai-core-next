@@ -111,6 +111,24 @@ const LICENSE_DENYLIST: &[&str] = &[
     "proprietary",
 ];
 
+/// SPEC-035 / ADR-042 — person-category and generic-face-covering terms
+/// that must never appear as an open-vocab prompt. Mirrors
+/// `HARM_TAXONOMY.md` §9 (and the cloud `check-taxonomy` PROHIBITED_TERMS)
+/// so the edge manifest is held to the same rule the cloud catalogue is:
+/// a prompt names an act, condition, or object, never a category of
+/// person. `balaclava` is behaviourally specific and is *not* on the list,
+/// so it passes while a generic `mask` / `face covering` fails.
+const PROHIBITED_PROMPT_TERMS: &[&str] = &[
+    "addict",
+    "homeless",
+    "vagrant",
+    "gang member",
+    "suspicious person",
+    "loiterer",
+    "mask",
+    "face covering",
+];
+
 /// Subset of `models-manifest.json` that the check needs to inspect.
 /// All other fields (artifacts, presets, prompts, thresholds, etc.)
 /// are intentionally `serde(flatten)`-ignored.
@@ -128,6 +146,11 @@ struct ManifestModel {
     weights_dataset_license: Option<String>,
     #[serde(default)]
     artifacts: Vec<ManifestArtifact>,
+    /// Open-vocabulary prompt terms baked into this model's graph at
+    /// export. Empty for closed-vocab detectors. Scanned by the
+    /// SPEC-035 term-list lint (ADR-042).
+    #[serde(default)]
+    prompts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +301,40 @@ fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
             ));
         }
     }
+
+    // SPEC-035 / ADR-042: no open-vocab prompt names a category of
+    // person or a generic face covering. `balaclava` is permitted.
+    for prompt in &model.prompts {
+        if let Some(term) = prohibited_prompt_hit(prompt) {
+            report.error(format!(
+                "model '{}' prompt '{}' contains prohibited §9 term '{}' — Sentinel classifies acts and conditions, never categories of person (ADR-042)",
+                model.id, prompt, term
+            ));
+        }
+    }
+}
+
+/// Word-boundary, case-insensitive scan for a §9 prohibited prompt term.
+/// Word-boundary matching is what lets `balaclava` pass while a bare
+/// `mask` fails, and stops `mask` from tripping on an unrelated compound.
+fn prohibited_prompt_hit(prompt: &str) -> Option<&'static str> {
+    let lower = prompt.to_lowercase();
+    let bytes = lower.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for term in PROHIBITED_PROMPT_TERMS {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(term) {
+            let start = from + rel;
+            let end = start + term.len();
+            let before_ok = start == 0 || !is_word(bytes[start - 1]);
+            let after_ok = end == bytes.len() || !is_word(bytes[end]);
+            if before_ok && after_ok {
+                return Some(term);
+            }
+            from = start + 1;
+        }
+    }
+    None
 }
 
 fn license_denylist_hit(value: &str) -> Option<&'static str> {
@@ -423,6 +480,69 @@ mod tests {
         let r = audit_manifest(&parse(r#"{"models":[{"id":"x","artifacts":[]}]}"#));
         assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
         assert_eq!(r.warnings.len(), 2);
+    }
+
+    #[test]
+    fn generic_mask_prompt_is_rejected_but_balaclava_is_accepted() {
+        // SPEC-035 / ADR-042: the term-list lint fed both a generic
+        // `mask` and the behaviourally-specific `balaclava` must reject
+        // the first and accept the second.
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"yolo_world_v2_s",
+                "license":"AGPL-3.0",
+                "weights_dataset_license":"COCO:CC-BY-4.0",
+                "artifacts":[],
+                "prompts":["mask","balaclava"]
+            }]}"#,
+        ));
+        assert!(
+            r.errors.iter().any(|e| e.contains("prompt 'mask'")),
+            "generic mask must be rejected; errors: {:?}",
+            r.errors
+        );
+        assert!(
+            !r.errors.iter().any(|e| e.contains("balaclava")),
+            "balaclava must be accepted; errors: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn person_category_prompts_are_rejected() {
+        for term in [
+            "addict",
+            "homeless person",
+            "suspicious person",
+            "gang member",
+            "face covering",
+        ] {
+            let json = format!(
+                r#"{{"models":[{{"id":"m","license":"AGPL-3.0","weights_dataset_license":"COCO:CC-BY-4.0","artifacts":[],"prompts":["{term}"]}}]}}"#
+            );
+            let r = audit_manifest(&parse(&json));
+            assert!(
+                r.errors.iter().any(|e| e.contains("prohibited §9 term")),
+                "prompt '{term}' must be rejected; errors: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn benign_object_prompts_pass_the_term_lint() {
+        // Every Pass A / Pass B term SPEC-035 adds names an act, object,
+        // or fixture — none is a person category — so the lint is clean.
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"yolo_world_v2_s",
+                "license":"AGPL-3.0",
+                "weights_dataset_license":"COCO:CC-BY-4.0",
+                "artifacts":[],
+                "prompts":["bolt cutter","angle grinder","balaclava","gas can","tent","door","dumpster","ATM"]
+            }]}"#,
+        ));
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
     }
 
     #[test]

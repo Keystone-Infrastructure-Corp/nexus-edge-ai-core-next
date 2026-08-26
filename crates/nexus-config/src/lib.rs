@@ -1222,6 +1222,14 @@ pub struct InferenceConfig {
     /// Concrete model (open-vocab, ensemble, …).
     #[serde(default)]
     pub model: ModelConfig,
+    /// SPEC-036 — the dedicated fire/smoke head. `false` (default) means
+    /// no extra ORT session and behaviour identical to before Sentinel
+    /// (flags-off equivalence). When enabled, the head opens one more
+    /// session, so [`InferenceConfig::ort_session_count`] counts it and
+    /// every session still sizes its intra-op pool as
+    /// `cores / ort_session_count()`.
+    #[serde(default)]
+    pub fire_smoke_head_enabled: bool,
 }
 
 impl InferenceConfig {
@@ -1237,14 +1245,19 @@ impl InferenceConfig {
     /// `pool_worker_kind = "process"` is excluded: those detectors are
     /// built inside the child `nexus-inference-worker` processes, each
     /// of which sees a single session.
+    ///
+    /// SPEC-036: the fire/smoke head, when enabled, is one additional
+    /// in-process ORT session, added here so the intra-op auto-sizing
+    /// does not over-allocate and thrash.
     pub fn ort_session_count(&self) -> usize {
-        match self.backend {
+        let base = match self.backend {
             InferenceBackendKind::InProcess => 1,
             InferenceBackendKind::Pool => match self.pool_worker_kind {
                 PoolWorkerKind::Process => 1,
                 PoolWorkerKind::Thread => self.workers.max(1) + usize::from(self.fail_soft),
             },
-        }
+        };
+        base + usize::from(self.fire_smoke_head_enabled)
     }
 }
 
@@ -1260,6 +1273,7 @@ impl Default for InferenceConfig {
             ort_intra_threads: None,
             ort_allow_spinning: false,
             model: ModelConfig::default(),
+            fire_smoke_head_enabled: false,
         }
     }
 }
@@ -1713,6 +1727,68 @@ pub struct AnnotatorConfig {
     /// half-perimeter) for `motion.tool_in_proximity_*`. Default 1.0.
     #[serde(default = "default_annotator_tool_proximity_radius_box_multiplier")]
     pub tool_proximity_radius_box_multiplier: f32,
+    /// SPEC-039 — the M8 interaction-token FSM. Default is
+    /// [`InteractionFsmConfig::enabled`] = `false`, so a core whose org
+    /// has not been enabled for Sentinel emits no tokens and behaves
+    /// exactly as before (flags-off equivalence). The FSM derives tokens
+    /// only from attributes this annotator already stamps.
+    #[serde(default)]
+    pub interaction: InteractionFsmConfig,
+}
+
+/// SPEC-039 — thresholds and the gate for the per-track interaction-token
+/// FSM. All timings are integer seconds to match the annotator's existing
+/// `motion.dwell_seconds` / `motion.near_static_vehicle_seconds` grain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionFsmConfig {
+    /// Master gate. `false` (default) emits no tokens — flags-off
+    /// equivalence. The cloud enables this per-org through fleet-apply
+    /// only after the Sentinel entitlement and flag are on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `motion.dwell_seconds` at or above which `loiter` fires while the
+    /// track is stationary or walking. Default 30.
+    #[serde(default = "default_interaction_loiter_dwell_seconds")]
+    pub loiter_dwell_seconds: i64,
+    /// `motion.near_static_vehicle_seconds` at or above which `casing`
+    /// fires while the track is still moving (walking) near a fixture.
+    /// Default 10.
+    #[serde(default = "default_interaction_casing_near_seconds")]
+    pub casing_near_seconds: i64,
+    /// `motion.near_static_vehicle_seconds` at or above which a
+    /// now-stationary track near a fixture emits `reach_in`. Default 2.
+    #[serde(default = "default_interaction_reach_in_min_near_seconds")]
+    pub reach_in_min_near_seconds: i64,
+    /// `group.size` (count of *other* same-label tracks) at or above
+    /// which `group_form` fires; a downward crossing after a form emits
+    /// the matching `group_disperse`. Default 2.
+    #[serde(default = "default_interaction_group_form_size")]
+    pub group_form_size: u32,
+}
+
+impl Default for InteractionFsmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            loiter_dwell_seconds: default_interaction_loiter_dwell_seconds(),
+            casing_near_seconds: default_interaction_casing_near_seconds(),
+            reach_in_min_near_seconds: default_interaction_reach_in_min_near_seconds(),
+            group_form_size: default_interaction_group_form_size(),
+        }
+    }
+}
+
+fn default_interaction_loiter_dwell_seconds() -> i64 {
+    30
+}
+fn default_interaction_casing_near_seconds() -> i64 {
+    10
+}
+fn default_interaction_reach_in_min_near_seconds() -> i64 {
+    2
+}
+fn default_interaction_group_form_size() -> u32 {
+    2
 }
 
 impl Default for AnnotatorConfig {
@@ -1734,6 +1810,7 @@ impl Default for AnnotatorConfig {
             proximity_radius_box_multiplier: default_annotator_proximity_radius_box_multiplier(),
             tool_proximity_radius_box_multiplier:
                 default_annotator_tool_proximity_radius_box_multiplier(),
+            interaction: InteractionFsmConfig::default(),
         }
     }
 }
@@ -3485,6 +3562,44 @@ fn default_reid_min_crop_h_px() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fire_smoke_head_disabled_by_default_leaves_session_count_unchanged() {
+        // SPEC-036 / flags-off equivalence: a core whose org has not been
+        // enabled must open exactly the same number of ORT sessions as it
+        // did before Sentinel. The default config keeps the head off.
+        let base = InferenceConfig::default();
+        assert!(!base.fire_smoke_head_enabled, "head is off by default");
+        let baseline = base.ort_session_count();
+
+        let enabled = InferenceConfig {
+            fire_smoke_head_enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            enabled.ort_session_count(),
+            baseline + 1,
+            "enabling the head adds exactly one ORT session"
+        );
+        // And with the head off the count is identical to a struct that
+        // never knew the field existed.
+        assert_eq!(base.ort_session_count(), baseline);
+    }
+
+    #[test]
+    fn fire_smoke_head_adds_one_session_in_thread_pool_mode() {
+        let mut cfg = InferenceConfig {
+            backend: InferenceBackendKind::Pool,
+            pool_worker_kind: PoolWorkerKind::Thread,
+            workers: 3,
+            fail_soft: true,
+            ..InferenceConfig::default()
+        };
+        let without = cfg.ort_session_count();
+        assert_eq!(without, 4, "3 workers + fail-soft");
+        cfg.fire_smoke_head_enabled = true;
+        assert_eq!(cfg.ort_session_count(), 5, "+1 for the head");
+    }
 
     /// Minimal valid generic-email sink, mutated per assertion below.
     fn email_sink_cfg() -> EmailSinkConfig {

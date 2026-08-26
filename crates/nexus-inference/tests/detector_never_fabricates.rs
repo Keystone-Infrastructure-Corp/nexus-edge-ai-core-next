@@ -51,6 +51,7 @@ fn cfg_with_kind(kind: &str) -> InferenceConfig {
         ep_priority: vec!["cpu".into()],
         ort_intra_threads: None,
         ort_allow_spinning: false,
+        fire_smoke_head_enabled: false,
         model: ModelConfig {
             kind: kind.into(),
             ..Default::default()

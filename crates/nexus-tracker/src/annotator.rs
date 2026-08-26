@@ -25,8 +25,8 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use nexus_config::{AnnotatorConfig, ZoneConfig, ZoneKind};
-use nexus_types::{Frame, TrackId, TrackedObject};
+use nexus_config::{AnnotatorConfig, InteractionFsmConfig, ZoneConfig, ZoneKind};
+use nexus_types::{Frame, InteractionToken, InteractionTokenEvent, TrackId, TrackedObject};
 use serde_json::json;
 
 use crate::static_object::StaticAnchor;
@@ -56,6 +56,140 @@ struct PerTrackState {
     /// Phase 8.1 — first wall-clock at which the track entered the
     /// current anchor's proximity. Drives near_static_vehicle_seconds.
     near_anchor_since: Option<DateTime<Utc>>,
+    /// SPEC-039 — per-token "currently in condition" latches for the
+    /// interaction-token FSM. Edge-triggered: a token fires on the
+    /// false→true transition of its condition and re-arms when the
+    /// condition clears, so a sustained state emits exactly once.
+    fsm: InteractionFsmState,
+}
+
+/// SPEC-039 — the edge-trigger latches for one track's interaction tokens.
+/// Every field is a "was the condition satisfied on the previous frame"
+/// flag; the FSM emits a token when a condition flips from `false` to
+/// `true`. `group_formed` additionally gates `group_disperse` so a
+/// disperse is only ever emitted as the matched half of a prior form.
+#[derive(Debug, Default, Clone)]
+struct InteractionFsmState {
+    loiter: bool,
+    casing: bool,
+    reach_in: bool,
+    grab: bool,
+    tamper: bool,
+    remove_anchor: bool,
+    tool_proximity: bool,
+    group_formed: bool,
+}
+
+impl InteractionFsmState {
+    /// Advance the FSM by one frame against the attributes already
+    /// stamped on the track, returning the tokens that fired this frame.
+    ///
+    /// Every token is edge-triggered: a latch flips `false→true` when its
+    /// condition is first satisfied (emit) and re-arms when the condition
+    /// clears, so a held condition emits exactly once. `group_disperse`
+    /// is only emitted as the matched half of a prior `group_form`, so an
+    /// unmatched `group_form` at track end never leaks a phantom disperse.
+    fn step(
+        &mut self,
+        attrs: &serde_json::Map<String, serde_json::Value>,
+        cfg: &InteractionFsmConfig,
+    ) -> Vec<InteractionToken> {
+        let speed = attrs
+            .get("motion.speed_class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stationary");
+        let dwell = attrs
+            .get("motion.dwell_seconds")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let near_id = attrs.get("motion.near_static_vehicle_id").is_some();
+        let near_secs = attrs
+            .get("motion.near_static_vehicle_seconds")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let tool = attrs.get("motion.tool_in_proximity_label").is_some();
+        let group = attrs
+            .get("group.size")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let removed = attrs
+            .get("motion.removed_anchor_ids")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
+        let carrying = attrs.get("motion.carrying_anchor_label").is_some();
+
+        // Conditions, each derived only from the attributes above.
+        let loiter_c =
+            dwell >= cfg.loiter_dwell_seconds && matches!(speed, "stationary" | "walking");
+        let casing_c = near_id && near_secs >= cfg.casing_near_seconds && speed == "walking";
+        let reach_in_c =
+            near_id && speed == "stationary" && near_secs >= cfg.reach_in_min_near_seconds;
+        let grab_c = near_id && carrying;
+        let tamper_c = near_id && tool;
+        let remove_anchor_c = near_id && removed;
+        let tool_c = tool;
+        let group_c = group >= cfg.group_form_size;
+
+        let mut out = Vec::new();
+        edge(
+            &mut self.loiter,
+            loiter_c,
+            InteractionToken::Loiter,
+            &mut out,
+        );
+        edge(
+            &mut self.casing,
+            casing_c,
+            InteractionToken::Casing,
+            &mut out,
+        );
+        edge(
+            &mut self.reach_in,
+            reach_in_c,
+            InteractionToken::ReachIn,
+            &mut out,
+        );
+        edge(&mut self.grab, grab_c, InteractionToken::Grab, &mut out);
+        // tool_proximity is the precursor to tamper, so emit it first.
+        edge(
+            &mut self.tool_proximity,
+            tool_c,
+            InteractionToken::ToolProximity,
+            &mut out,
+        );
+        edge(
+            &mut self.tamper,
+            tamper_c,
+            InteractionToken::Tamper,
+            &mut out,
+        );
+        edge(
+            &mut self.remove_anchor,
+            remove_anchor_c,
+            InteractionToken::RemoveAnchor,
+            &mut out,
+        );
+
+        // group_form / group_disperse are a matched pair off one latch.
+        if group_c && !self.group_formed {
+            self.group_formed = true;
+            out.push(InteractionToken::GroupForm);
+        } else if !group_c && self.group_formed {
+            self.group_formed = false;
+            out.push(InteractionToken::GroupDisperse);
+        }
+
+        out
+    }
+}
+
+/// Edge-trigger helper: emit `token` on the `false→true` transition of
+/// `cond`, and re-arm the latch when `cond` clears.
+fn edge(latch: &mut bool, cond: bool, token: InteractionToken, out: &mut Vec<InteractionToken>) {
+    if cond && !*latch {
+        out.push(token);
+    }
+    *latch = cond;
 }
 
 pub struct TrackAnnotator {
@@ -65,6 +199,10 @@ pub struct TrackAnnotator {
     /// Phase 8.1 — anchor ids seen on the previous frame, so removal
     /// (anchor present last frame, absent now) can be reported.
     prev_anchor_ids: Vec<String>,
+    /// SPEC-039 — interaction tokens emitted since the last drain. Filled
+    /// only when `cfg.interaction.enabled`; the supervisor drains it each
+    /// frame via [`TrackAnnotator::drain_interaction_tokens`].
+    emitted_tokens: Vec<InteractionTokenEvent>,
 }
 
 impl TrackAnnotator {
@@ -74,6 +212,7 @@ impl TrackAnnotator {
             state_by_track: HashMap::new(),
             frame_tick: 0,
             prev_anchor_ids: Vec::new(),
+            emitted_tokens: Vec::new(),
         }
     }
 
@@ -434,7 +573,46 @@ impl TrackAnnotator {
         }
         self.prev_anchor_ids = anchor_ids;
 
+        // ---- SPEC-039 interaction-token FSM ----
+        // Runs after every attribute (including the frame-global
+        // removed/carrying stamps above) is on the object, so the FSM
+        // reads exactly what a rule would. Tokens are *computed*
+        // unconditionally when the gate is on — the tunnel has no say
+        // here; only the sink suppresses emission while disconnected.
+        if self.cfg.interaction.enabled {
+            let emitted_unix_ms = frame.captured_at.timestamp_millis();
+            for o in objects.iter() {
+                let Some(state) = self.state_by_track.get_mut(&o.track_id) else {
+                    continue;
+                };
+                let entity_local_id = o
+                    .attributes
+                    .get("identity.entity_local_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                for token in state.fsm.step(&o.attributes, &self.cfg.interaction) {
+                    self.emitted_tokens.push(InteractionTokenEvent {
+                        track_id: o.track_id,
+                        entity_local_id: entity_local_id.clone(),
+                        token,
+                        emitted_unix_ms,
+                    });
+                }
+            }
+        }
+
         self.gc_stale();
+    }
+
+    /// SPEC-039 — take the interaction tokens emitted since the last
+    /// drain. The supervisor calls this each frame after `annotate` and
+    /// hands the batch to the cloud sink (which is the layer that decides
+    /// whether to publish, dropping the bulk-tier envelope when the
+    /// outbox is saturated or the tunnel is down). Returns empty when the
+    /// FSM gate is off.
+    #[must_use]
+    pub fn drain_interaction_tokens(&mut self) -> Vec<InteractionTokenEvent> {
+        std::mem::take(&mut self.emitted_tokens)
     }
 
     fn gc_stale(&mut self) {
@@ -922,5 +1100,236 @@ mod tests {
         for (n, z) in objects_naive.iter().zip(objects_zero.iter()) {
             assert_eq!(n.attributes["group.size"], z.attributes["group.size"]);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // SPEC-039 — interaction-token FSM
+    // -----------------------------------------------------------------
+
+    /// Build a stamped-attribute map from `(key, json-value)` pairs, the
+    /// same `motion.*` / `group.*` keys the annotator writes.
+    fn attrs(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .cloned()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    }
+
+    fn tokens(seq: &[serde_json::Map<String, serde_json::Value>]) -> Vec<Vec<InteractionToken>> {
+        let cfg = InteractionFsmConfig::default();
+        let mut fsm = InteractionFsmState::default();
+        seq.iter().map(|a| fsm.step(a, &cfg)).collect()
+    }
+
+    #[test]
+    fn loiter_fires_once_on_entry_and_never_again_while_held() {
+        // dwell rises through the 30s threshold while stationary, then
+        // holds — the token must fire exactly once (edge-triggered).
+        let seq = [
+            attrs(&[
+                ("motion.speed_class", json!("stationary")),
+                ("motion.dwell_seconds", json!(10)),
+            ]),
+            attrs(&[
+                ("motion.speed_class", json!("stationary")),
+                ("motion.dwell_seconds", json!(30)),
+            ]),
+            attrs(&[
+                ("motion.speed_class", json!("stationary")),
+                ("motion.dwell_seconds", json!(45)),
+            ]),
+        ];
+        let out = tokens(&seq);
+        assert_eq!(out[0], vec![]);
+        assert_eq!(out[1], vec![InteractionToken::Loiter]);
+        assert_eq!(out[2], vec![], "held loiter must not re-emit");
+    }
+
+    #[test]
+    fn loiter_rearms_after_condition_clears() {
+        let seq = [
+            attrs(&[
+                ("motion.speed_class", json!("stationary")),
+                ("motion.dwell_seconds", json!(31)),
+            ]),
+            // ran off — no longer stationary/walking, latch re-arms
+            attrs(&[
+                ("motion.speed_class", json!("running")),
+                ("motion.dwell_seconds", json!(40)),
+            ]),
+            attrs(&[
+                ("motion.speed_class", json!("walking")),
+                ("motion.dwell_seconds", json!(50)),
+            ]),
+        ];
+        let out = tokens(&seq);
+        assert_eq!(out[0], vec![InteractionToken::Loiter]);
+        assert_eq!(out[1], vec![]);
+        assert_eq!(
+            out[2],
+            vec![InteractionToken::Loiter],
+            "must re-fire after clearing"
+        );
+    }
+
+    #[test]
+    fn casing_reach_in_grab_tamper_tool_remove_each_fire_from_their_attributes() {
+        // A single scripted track that walks around a fixture (casing),
+        // stops at it (reach_in), a tool arrives (tool_proximity +
+        // tamper), an anchor is removed while carrying (grab +
+        // remove_anchor). Each token asserted at its exact frame.
+        let near = |secs: i64| json!(secs);
+        let seq = [
+            // f0: walking near a fixture 10s → casing + tool? no tool.
+            attrs(&[
+                ("motion.speed_class", json!("walking")),
+                ("motion.near_static_vehicle_id", json!("vehicle.car@10x10")),
+                ("motion.near_static_vehicle_seconds", near(10)),
+            ]),
+            // f1: stopped at the fixture, 12s near → reach_in.
+            attrs(&[
+                ("motion.speed_class", json!("stationary")),
+                ("motion.near_static_vehicle_id", json!("vehicle.car@10x10")),
+                ("motion.near_static_vehicle_seconds", near(12)),
+            ]),
+            // f2: a tool appears in proximity → tool_proximity + tamper.
+            attrs(&[
+                ("motion.speed_class", json!("stationary")),
+                ("motion.near_static_vehicle_id", json!("vehicle.car@10x10")),
+                ("motion.near_static_vehicle_seconds", near(14)),
+                ("motion.tool_in_proximity_label", json!("bolt cutter")),
+            ]),
+            // f3: anchor removed while carrying → grab + remove_anchor.
+            attrs(&[
+                ("motion.speed_class", json!("stationary")),
+                ("motion.near_static_vehicle_id", json!("vehicle.car@10x10")),
+                ("motion.near_static_vehicle_seconds", near(16)),
+                ("motion.tool_in_proximity_label", json!("bolt cutter")),
+                ("motion.removed_anchor_ids", json!(["vehicle.car@10x10"])),
+                ("motion.carrying_anchor_label", json!("vehicle.car")),
+            ]),
+        ];
+        let out = tokens(&seq);
+        assert_eq!(out[0], vec![InteractionToken::Casing]);
+        assert_eq!(out[1], vec![InteractionToken::ReachIn]);
+        assert_eq!(
+            out[2],
+            vec![InteractionToken::ToolProximity, InteractionToken::Tamper]
+        );
+        assert_eq!(
+            out[3],
+            vec![InteractionToken::Grab, InteractionToken::RemoveAnchor]
+        );
+    }
+
+    #[test]
+    fn group_form_and_disperse_are_a_matched_pair() {
+        let seq = [
+            attrs(&[("group.size", json!(0))]),
+            attrs(&[("group.size", json!(2))]), // up-cross → form
+            attrs(&[("group.size", json!(3))]), // held → nothing
+            attrs(&[("group.size", json!(1))]), // down-cross → disperse
+        ];
+        let out = tokens(&seq);
+        assert_eq!(out[0], vec![]);
+        assert_eq!(out[1], vec![InteractionToken::GroupForm]);
+        assert_eq!(out[2], vec![]);
+        assert_eq!(out[3], vec![InteractionToken::GroupDisperse]);
+    }
+
+    #[test]
+    fn unmatched_group_form_at_track_end_leaks_no_disperse() {
+        // A track that forms a group and then simply ends (state evicted)
+        // never emits a disperse — the FSM only emits it on a real
+        // down-cross. Replaying a form-only sequence yields exactly one
+        // form and nothing else.
+        let seq = [
+            attrs(&[("group.size", json!(0))]),
+            attrs(&[("group.size", json!(4))]),
+        ];
+        let out = tokens(&seq);
+        assert_eq!(out[0], vec![]);
+        assert_eq!(out[1], vec![InteractionToken::GroupForm]);
+        let flat: Vec<_> = out.into_iter().flatten().collect();
+        assert!(
+            !flat.contains(&InteractionToken::GroupDisperse),
+            "no phantom disperse"
+        );
+    }
+
+    #[test]
+    fn gate_off_emits_no_tokens_flags_off_equivalence() {
+        // With the default (disabled) FSM config, annotate must emit no
+        // interaction tokens and leave observable attributes exactly as
+        // they were before SPEC-039 — proven by draining an empty batch
+        // after a dwell that would otherwise loiter.
+        let mut a = TrackAnnotator::new(AnnotatorConfig::default());
+        let mut o0 = vec![obj(1, "person", 0.5, 0.5)];
+        a.annotate(&frame_at(0, 1280, 720), &[], &[], &mut o0);
+        let mut o1 = vec![obj(1, "person", 0.5, 0.5)];
+        a.annotate(&frame_at(60, 1280, 720), &[], &[], &mut o1);
+        assert!(
+            a.drain_interaction_tokens().is_empty(),
+            "gate off → no tokens"
+        );
+    }
+
+    #[test]
+    fn gate_on_emits_loiter_through_annotate_and_carries_entity_id() {
+        // End-to-end through annotate(): a stationary track that dwells
+        // past the loiter window emits one loiter, drained by the caller,
+        // carrying the pseudonymous entity_local_id when present.
+        let cfg = AnnotatorConfig {
+            interaction: InteractionFsmConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut a = TrackAnnotator::new(cfg);
+        let mut o0 = vec![obj(7, "person", 0.5, 0.5)];
+        o0[0]
+            .attributes
+            .insert("identity.entity_local_id".into(), json!("ent-abc"));
+        a.annotate(&frame_at(0, 1280, 720), &[], &[], &mut o0);
+        assert!(a.drain_interaction_tokens().is_empty(), "no loiter at t=0");
+
+        let mut o1 = vec![obj(7, "person", 0.5, 0.5)];
+        o1[0]
+            .attributes
+            .insert("identity.entity_local_id".into(), json!("ent-abc"));
+        a.annotate(&frame_at(31, 1280, 720), &[], &[], &mut o1);
+        let drained = a.drain_interaction_tokens();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].token, InteractionToken::Loiter);
+        assert_eq!(drained[0].track_id, 7);
+        assert_eq!(drained[0].entity_local_id.as_deref(), Some("ent-abc"));
+    }
+
+    #[test]
+    fn tokens_are_computed_regardless_of_connection_state() {
+        // The annotator has no tunnel awareness: token computation is
+        // unconditional when the gate is on. This is the edge half of
+        // "tokens are still computed when the tunnel is down; only
+        // emission is suppressed" — suppression lives in the sink.
+        let cfg = AnnotatorConfig {
+            interaction: InteractionFsmConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut a = TrackAnnotator::new(cfg);
+        let mut o0 = vec![obj(9, "person", 0.5, 0.5)];
+        a.annotate(&frame_at(0, 1280, 720), &[], &[], &mut o0);
+        let _ = a.drain_interaction_tokens();
+        let mut o1 = vec![obj(9, "person", 0.5, 0.5)];
+        a.annotate(&frame_at(40, 1280, 720), &[], &[], &mut o1);
+        assert_eq!(
+            a.drain_interaction_tokens().len(),
+            1,
+            "computed with no connection"
+        );
     }
 }

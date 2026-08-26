@@ -517,21 +517,7 @@ pub(crate) fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
 /// Keep in sync with `models/labels.taxonomy.json` (and the v1 table); if
 /// you change one, change both.
 pub(crate) fn map_coco_to_domain_label(class_id: i32) -> Option<&'static str> {
-    Some(match class_id {
-        0 => "person",
-        1 => "vehicle.bicycle",
-        2 => "vehicle.car",
-        3 => "vehicle.motorcycle",
-        5 => "vehicle.bus",
-        7 => "vehicle.truck",
-        14 => "animal.bird",
-        15 => "animal.cat",
-        16 => "animal.dog",
-        24 => "carried.backpack",
-        26 => "carried.handbag",
-        28 => "carried.suitcase",
-        _ => return None,
-    })
+    crate::coco_labels::map_coco_to_domain_label(class_id)
 }
 
 /// Holds an `Arc<dyn Detector>` so the `build` path can swap freely

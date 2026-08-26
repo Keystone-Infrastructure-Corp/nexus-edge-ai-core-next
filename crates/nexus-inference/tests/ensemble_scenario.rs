@@ -38,6 +38,7 @@ fn cfg_for_ensemble(members: Vec<ModelConfig>) -> InferenceConfig {
         ep_priority: vec!["cpu".into()],
         ort_intra_threads: None,
         ort_allow_spinning: false,
+        fire_smoke_head_enabled: false,
         model: ModelConfig {
             kind: "ensemble".into(),
             members,

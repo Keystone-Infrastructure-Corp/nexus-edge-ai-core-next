@@ -54,3 +54,46 @@ wheelbarrow
 traffic cone
 jersey barrier
 scaffolding
+
+# --- SPEC-035 Pass A: harm-taxonomy actors & objects. Mirrors
+#     yolo_world_default_prompts.txt (ADR-042: acts/objects/conditions
+#     only; `balaclava` yes, generic `mask` no). Manifest `prompts` +
+#     sha256 refresh on the next `gen_yoloe.py` run (deferred model cut).
+bolt cutter
+angle grinder
+pry bar
+sledgehammer
+screwdriver
+jack
+gas can
+lighter
+broken glass
+graffiti
+syringe
+glass pipe
+tent
+tarp
+sleeping bag
+mattress
+machete
+baseball bat
+balaclava
+
+# --- SPEC-035 Pass B: scene fixtures (slow-cadence fixture pass).
+door
+roll-up door
+gate
+fence
+window
+security camera
+light fixture
+dumpster
+pallet
+HVAC unit
+ATM
+cash register
+safe
+vending machine
+bike rack
+charging station
+parking stall

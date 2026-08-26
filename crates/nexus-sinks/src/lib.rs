@@ -42,6 +42,9 @@ pub mod backoff;
 pub mod dispatcher;
 #[cfg(feature = "email")]
 pub mod email;
+/// SPEC-037 — edge-local emergency (Tier-0) alerting policy, registry,
+/// and rate limiter. Pure, cloud-independent decision logic.
+pub mod emergency;
 /// Best-effort artifact attachment reader shared by the SMTP sinks.
 #[cfg(any(feature = "email", feature = "sureview-email"))]
 mod mail_attach;

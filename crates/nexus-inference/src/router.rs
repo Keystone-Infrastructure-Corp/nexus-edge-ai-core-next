@@ -342,6 +342,7 @@ mod tests {
                 kind: kind.into(),
                 ..Default::default()
             },
+            fire_smoke_head_enabled: false,
         }
     }
 

@@ -18,18 +18,22 @@
 
 pub mod backends;
 pub mod caps;
+pub mod coco_labels;
 pub mod detectors;
 #[cfg(feature = "ort")]
 pub mod encoder;
 pub mod ensemble;
 #[cfg(feature = "ort")]
 pub mod execution_providers;
+pub mod fire_smoke;
 pub mod health;
+pub mod label_space;
 pub mod nms;
 pub mod pool;
 pub mod router;
 #[cfg(feature = "ort")]
 pub mod session_tuning;
+pub mod tamper;
 pub mod visual_prompts;
 pub mod visual_store_sqlite;
 pub mod worker_proto;

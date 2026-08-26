@@ -285,9 +285,229 @@ pub struct TrackedObject {
 }
 
 // ---------------------------------------------------------------------------
+// M8 interaction tokens (SPEC-039)
+// ---------------------------------------------------------------------------
+//
+// A small, discrete per-track token stream the cloud can reason over.
+// Every token names an *act*, never a person, per ADR-042. Tokens are
+// derived exclusively from attributes the annotator already produces —
+// no new model, no pose estimator, no new per-frame inference pass — so
+// they carry no name, face crop, plate, or any other personal
+// identifier; the only identity a token references is the pseudonymous
+// per-core `entity_local_id` (when reid has assigned one) and the track.
+
+/// One discrete interaction act emitted by the per-track FSM in
+/// `nexus-tracker::annotator`. Serde/TS representation is the snake_case
+/// token string the wire and cloud reason over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionToken {
+    /// Dwelling in place beyond the loiter window.
+    Loiter,
+    /// Lingering around a fixture while still moving — attention to a target.
+    Casing,
+    /// Became stationary within a fixture's proximity — a reach.
+    ReachIn,
+    /// Left a fixture's proximity carrying an anchor that was there.
+    Grab,
+    /// Manipulating a fixture with a tool in proximity.
+    Tamper,
+    /// An anchor the track was near disappeared — removal.
+    RemoveAnchor,
+    /// A tool entered the track's proximity.
+    ToolProximity,
+    /// The track's same-label group crossed the grouping threshold upward.
+    GroupForm,
+    /// The track's same-label group crossed the grouping threshold downward.
+    GroupDisperse,
+}
+
+impl InteractionToken {
+    /// The snake_case wire spelling, spelled once so a call site never
+    /// re-derives it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loiter => "loiter",
+            Self::Casing => "casing",
+            Self::ReachIn => "reach_in",
+            Self::Grab => "grab",
+            Self::Tamper => "tamper",
+            Self::RemoveAnchor => "remove_anchor",
+            Self::ToolProximity => "tool_proximity",
+            Self::GroupForm => "group_form",
+            Self::GroupDisperse => "group_disperse",
+        }
+    }
+}
+
+/// A single emitted interaction token, keyed to a track (and, when reid
+/// has assigned one, the pseudonymous per-core `entity_local_id`). The
+/// payload carries **no** personal identifier per ADR-042 / R7.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub struct InteractionTokenEvent {
+    /// The tracker's per-camera track id the token was derived from.
+    pub track_id: TrackId,
+    /// Pseudonymous per-core entity id, when reid has assigned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub entity_local_id: Option<String>,
+    /// The act this token names.
+    pub token: InteractionToken,
+    /// Wall-clock (ms since UNIX epoch) at which the FSM emitted it.
+    pub emitted_unix_ms: i64,
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-036 fire & smoke head output
+// ---------------------------------------------------------------------------
+//
+// A dedicated fire/smoke head emits a **region/texture confidence
+// signal**, not a class-plus-box detection. The output type is distinct
+// from [`Detection`] so the two can never be conflated downstream: fire is
+// texture, colour signature, flicker, and region growth — a detector that
+// fires on a bounding box would fire on sunset glare and miss a
+// smouldering pallet. The signal feeds the Tier-0 emergency path
+// (SPEC-037) and is never routed to a Sentinel decision (ADR-043).
+
+/// Which life-safety phenomenon a fire/smoke signal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+#[serde(rename_all = "lowercase")]
+pub enum FireSmokeKind {
+    Fire,
+    Smoke,
+}
+
+/// A persisted fire or smoke signal from the dedicated head. Carries a
+/// bounding **region** (where the texture/flicker was seen) and a
+/// confidence, not a labelled object. Emitted only after the head's
+/// persistence window has been satisfied (fire ≥ 2 s; smoke ≥ 5 s with a
+/// growing region), so a single-frame flicker never produces one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub struct FireSmokeSignal {
+    pub camera_id: CameraId,
+    pub kind: FireSmokeKind,
+    /// The region the confidence map peaked in.
+    pub region: BBox,
+    /// Peak confidence over the persistence window, 0..1.
+    pub confidence: f32,
+    /// Wall-clock (ms since UNIX epoch) the candidate was first nominated.
+    pub first_seen_unix_ms: i64,
+    /// Wall-clock (ms since UNIX epoch) the persistence window was met and
+    /// the signal emitted.
+    pub emitted_unix_ms: i64,
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-038 camera tamper / scene-change signal
+// ---------------------------------------------------------------------------
+//
+// A tampered camera has no tracked entity to attach to — nobody carries a
+// "tamper" object — so the signal is **place-keyed** (ADR-051): it names a
+// camera and a region and carries **no** entity identifier. It also feeds
+// the never-benign floor (ADR-056): `never_benign` is hard-coded `true` and
+// no amount of repetition can learn a benign explanation for it.
+
+/// The five observable modes of camera interference (HARM_TAXONOMY §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TamperMode {
+    /// Lens covered by an opaque object.
+    Obscuration,
+    /// Lens turned out of focus or smeared.
+    Defocus,
+    /// Camera physically repointed at a new scene.
+    Reframe,
+    /// Paint or foam applied to the lens.
+    Spray,
+    /// Site lights killed — the scene goes uniformly dark.
+    IlluminationCollapse,
+}
+
+/// A place-keyed tamper signal. Carries a camera and a region and **no
+/// entity** — there is no track to attribute a tampered camera to. Always
+/// `never_benign`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub struct TamperSignal {
+    pub camera_id: CameraId,
+    /// The affected region (the whole FOV for a full-lens tamper).
+    pub region: BBox,
+    pub mode: TamperMode,
+    /// Always `true`: tamper feeds the unlearnable never-benign floor.
+    pub never_benign: bool,
+    /// A monotonically rising assessment for this camera. Repeated tamper
+    /// **raises** it; it never decays on a tamper event.
+    pub assessment: u32,
+    /// Wall-clock (ms since UNIX epoch) the signal was emitted.
+    pub emitted_unix_ms: i64,
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-040 resolved label-space report
+// ---------------------------------------------------------------------------
+//
+// The edge reports the label space its **resolved, baked** model actually
+// carries so the cloud stops inferring capability from hand-synced mirrors
+// (ADR-054, ADR-055). This is the payload the edge computes; the wire kind
+// that carries it is an additive `v=1` message owned by the cloud repo's
+// `proto/v1.json` (R3). Sent on connect and again on any model change.
+
+/// Per-camera resolved label space. Reports what is **baked**, not the
+/// configured prompt subset (which may name terms the graph does not
+/// carry — a silent no-op per ADR-055).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub struct LabelSpaceReport {
+    pub camera_id: CameraId,
+    /// The resolved model identifier (the concrete graph in use).
+    pub model_id: String,
+    /// The autonomy-ladder rung the resolved model sits at (its input
+    /// shape, e.g. `1024x576`).
+    pub ladder_rung: String,
+    /// Open-vocab terms actually baked into the resolved graph, sorted and
+    /// de-duplicated for a stable, idempotent report.
+    pub baked_open_vocab: Vec<String>,
+    /// Closed-vocab namespaced labels the resolved graph emits, sorted.
+    pub closed_vocab: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Alerts
 // ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "ts",
