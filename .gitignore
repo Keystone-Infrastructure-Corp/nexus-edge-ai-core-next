@@ -66,3 +66,6 @@ otel.log
 
 # Personal VS Code workspace file (machine-local paths).
 /nexus-edge-ai-core-next.code-workspace
+
+# Scratch state for the implement-loop skill.
+/.implement-loop/

@@ -191,4 +191,44 @@ mod tests {
         let pool = DetectorPool::new(vec![], Some(fallback));
         assert!(!pool.detect(&frame(), &[]).await.unwrap().is_empty());
     }
+
+    /// A worker that is present but not `Ready` — the shape a slot takes once
+    /// its device wedges and it demotes itself (BUG-133).
+    struct FailedBackend;
+
+    #[async_trait]
+    impl DetectorBackend for FailedBackend {
+        async fn detect(
+            &self,
+            _f: &Frame,
+            _p: &[String],
+        ) -> Result<Vec<Detection>, InferenceError> {
+            panic!("the pool routed a frame to a Failed slot")
+        }
+        fn slot(&self) -> i32 {
+            0
+        }
+        fn state(&self) -> BackendState {
+            BackendState::Failed
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+        async fn push_camera_config(&self, _u: &CameraConfigUpdate) {}
+        fn name(&self) -> &'static str {
+            "failed_backend"
+        }
+    }
+
+    /// The other half of BUG-133: demoting the slot is only useful if the pool
+    /// then serves from the fallback instead. `detect` panics if the pool picks
+    /// the failed slot, so this fails loudly rather than silently.
+    #[tokio::test]
+    async fn pool_routes_past_a_failed_worker_to_the_fallback() {
+        let workers: Vec<Arc<dyn DetectorBackend>> = vec![Arc::new(FailedBackend)];
+        let fallback: Arc<dyn DetectorBackend> =
+            Arc::new(InProcessBackend::new(-1, Arc::new(MockDetector::new())));
+        let pool = DetectorPool::new(workers, Some(fallback));
+        assert!(!pool.detect(&frame(), &[]).await.unwrap().is_empty());
+    }
 }
