@@ -22,11 +22,24 @@ use parking_lot::RwLock;
 pub struct LatestEntry {
     pub frame: Arc<Frame>,
     pub objects: Arc<Vec<TrackedObject>>,
+    /// `frame_id` the objects were computed on, or `None` when no inference
+    /// has completed yet. The frame is published at decode rate and the
+    /// objects at inference rate (BUG-136), so the two routinely describe
+    /// different frames and callers that pair them must check.
+    pub objects_frame_id: Option<u64>,
+}
+
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<CameraId, LatestEntry>,
+    /// Bumped by `begin_session` and `clear`. A writer holding an older
+    /// epoch has been superseded and its writes are dropped.
+    epochs: HashMap<CameraId, u64>,
 }
 
 #[derive(Default)]
 pub struct LatestFrameCache {
-    inner: RwLock<HashMap<CameraId, LatestEntry>>,
+    inner: RwLock<Inner>,
 }
 
 impl LatestFrameCache {
@@ -34,22 +47,81 @@ impl LatestFrameCache {
         Self::default()
     }
 
-    pub fn put(&self, camera_id: CameraId, frame: Arc<Frame>, objects: Arc<Vec<TrackedObject>>) {
-        self.inner
-            .write()
-            .insert(camera_id, LatestEntry { frame, objects });
+    /// Claim the camera for a new pipeline session.
+    ///
+    /// `abort()` is asynchronous, so a stopped camera's writers can still be
+    /// mid-flight when the next session starts. Writes carry the epoch they
+    /// were issued under and lose the race deterministically rather than by
+    /// timing — the same shape as `is_current_session` (BUG-070).
+    pub fn begin_session(&self, camera_id: CameraId) -> u64 {
+        let mut g = self.inner.write();
+        let e = g.epochs.entry(camera_id).or_insert(0);
+        *e += 1;
+        *e
+    }
+
+    fn is_current(inner: &Inner, camera_id: CameraId, epoch: u64) -> bool {
+        inner.epochs.get(&camera_id).copied().unwrap_or(0) == epoch
+    }
+
+    /// Publish a decoded frame, leaving any cached objects in place.
+    pub fn put_frame(&self, camera_id: CameraId, epoch: u64, frame: Arc<Frame>) {
+        let mut g = self.inner.write();
+        if !Self::is_current(&g, camera_id, epoch) {
+            return;
+        }
+        match g.entries.get_mut(&camera_id) {
+            Some(entry) => entry.frame = frame,
+            None => {
+                g.entries.insert(
+                    camera_id,
+                    LatestEntry {
+                        frame,
+                        objects: Arc::new(Vec::new()),
+                        objects_frame_id: None,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn put(
+        &self,
+        camera_id: CameraId,
+        epoch: u64,
+        frame: Arc<Frame>,
+        objects: Arc<Vec<TrackedObject>>,
+    ) {
+        let mut g = self.inner.write();
+        if !Self::is_current(&g, camera_id, epoch) {
+            return;
+        }
+        let objects_frame_id = Some(frame.frame_id);
+        g.entries.insert(
+            camera_id,
+            LatestEntry {
+                frame,
+                objects,
+                objects_frame_id,
+            },
+        );
     }
 
     pub fn get(&self, camera_id: CameraId) -> Option<LatestEntry> {
-        self.inner.read().get(&camera_id).cloned()
+        self.inner.read().entries.get(&camera_id).cloned()
     }
 
+    /// Drop the camera's entry and retire its epoch, so a writer still
+    /// draining cannot repopulate it.
     pub fn clear(&self, camera_id: CameraId) {
-        self.inner.write().remove(&camera_id);
+        let mut g = self.inner.write();
+        g.entries.remove(&camera_id);
+        let e = g.epochs.entry(camera_id).or_insert(0);
+        *e += 1;
     }
 
     pub fn cameras(&self) -> Vec<CameraId> {
-        self.inner.read().keys().copied().collect()
+        self.inner.read().entries.keys().copied().collect()
     }
 }
 
@@ -75,8 +147,9 @@ mod tests {
     #[test]
     fn put_then_get_returns_same_arc() {
         let cache = LatestFrameCache::new();
+        let epoch = cache.begin_session(7);
         let f = frame(7);
-        cache.put(7, f.clone(), Arc::new(vec![]));
+        cache.put(7, epoch, f.clone(), Arc::new(vec![]));
         let got = cache.get(7).unwrap();
         assert!(Arc::ptr_eq(&got.frame, &f));
     }
@@ -91,7 +164,8 @@ mod tests {
     #[test]
     fn clear_stops_a_stopped_camera_serving_a_stale_frame() {
         let cache = LatestFrameCache::new();
-        cache.put(7, frame(7), Arc::new(vec![]));
+        let epoch = cache.begin_session(7);
+        cache.put(7, epoch, frame(7), Arc::new(vec![]));
         assert!(cache.get(7).is_some());
 
         cache.clear(7);
@@ -101,5 +175,88 @@ mod tests {
             "a stopped camera must not serve its last frame"
         );
         assert!(!cache.cameras().contains(&7));
+    }
+
+    /// The decode-rate tap runs in its own task, and `abort()` is
+    /// asynchronous — so it can still be holding a frame when `stop_camera`
+    /// clears the cache. Without the epoch that write lands *after* the
+    /// clear and the wall streams a live feed of a camera the operator just
+    /// disabled, which is strictly worse than the frozen frame the test
+    /// above locks (BUG-136).
+    #[test]
+    fn a_write_from_a_retired_session_cannot_repopulate_a_cleared_camera() {
+        let cache = LatestFrameCache::new();
+        let epoch = cache.begin_session(7);
+        cache.put(7, epoch, frame(7), Arc::new(vec![]));
+
+        cache.clear(7);
+        cache.put_frame(7, epoch, frame(7));
+
+        assert!(
+            cache.get(7).is_none(),
+            "a retired session repopulated a cleared camera"
+        );
+    }
+
+    /// A camera edit stops and restarts the pipeline while deliberately
+    /// leaving the LBR pump running. The old session's tap must not
+    /// interleave its own `frame_id` sequence into the new session's cell.
+    #[test]
+    fn a_previous_session_cannot_write_over_the_current_one() {
+        let cache = LatestFrameCache::new();
+        let old = cache.begin_session(7);
+        let new = cache.begin_session(7);
+        assert_ne!(old, new);
+
+        let current = frame(7);
+        cache.put_frame(7, new, current.clone());
+        cache.put_frame(7, old, frame(7));
+
+        let got = cache.get(7).unwrap();
+        assert!(
+            Arc::ptr_eq(&got.frame, &current),
+            "a superseded session overwrote the live frame"
+        );
+    }
+
+    /// "No inference has completed yet" and "the detector found nothing" are
+    /// different answers, and the frame API reports them to an operator.
+    #[test]
+    fn a_frame_published_before_any_inference_reports_no_objects_frame_id() {
+        let cache = LatestFrameCache::new();
+        let epoch = cache.begin_session(7);
+        cache.put_frame(7, epoch, frame(7));
+
+        let got = cache.get(7).unwrap();
+        assert_eq!(
+            got.objects_frame_id, None,
+            "a never-inferred camera must not claim its empty objects belong to a frame"
+        );
+
+        cache.put(7, epoch, frame(7), Arc::new(vec![]));
+        assert_eq!(cache.get(7).unwrap().objects_frame_id, Some(1));
+    }
+
+    /// The tap publishes at decode rate and leaves objects alone, so the
+    /// wall keeps painting while inference is still working on an older
+    /// frame.
+    #[test]
+    fn put_frame_advances_the_frame_without_disturbing_objects() {
+        let cache = LatestFrameCache::new();
+        let epoch = cache.begin_session(7);
+        let objects = Arc::new(vec![]);
+        cache.put(7, epoch, frame(7), objects.clone());
+
+        let mut newer = (*frame(7)).clone();
+        newer.frame_id = 99;
+        cache.put_frame(7, epoch, Arc::new(newer));
+
+        let got = cache.get(7).unwrap();
+        assert_eq!(got.frame.frame_id, 99, "the frame did not advance");
+        assert_eq!(
+            got.objects_frame_id,
+            Some(1),
+            "objects must still name the frame they were computed on"
+        );
     }
 }

@@ -22,7 +22,7 @@ use nexus_types::{
     BBox, CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState, PipelineStatus,
     PixelFormat, TrackLite, TrackedObject,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
@@ -181,6 +181,21 @@ impl Default for SightingSchedulerConfig {
 pub struct CameraHandle {
     pub camera_id: CameraId,
     pub task: JoinHandle<()>,
+}
+
+/// Aborts its task on drop.
+///
+/// Every `FrameSource` learns the camera is gone from `tx.closed()`, which
+/// only resolves once the matching `Receiver` is dropped. The live-view tap
+/// holds that receiver, so it has to die with the supervisor task — dropping
+/// a bare `JoinHandle` detaches it instead, leaving the source decoding at
+/// full rate forever (BUG-136).
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Build and launch one camera pipeline. Returns a join handle. If the source
@@ -470,7 +485,7 @@ async fn run_camera(
         info!(camera_id = cfg.id, "pipeline running");
 
         'outer: loop {
-        let (tx, mut rx) = mpsc::channel::<Frame>(8);
+        let (tx, mut raw_rx) = mpsc::channel::<Frame>(8);
         let source = build_source(
             &cfg,
             &recorder,
@@ -483,6 +498,31 @@ async fn run_camera(
                 warn!(camera_id = cam_id, "frame source ended: {e}");
             }
         });
+
+        // Live-view tap (BUG-136). Publishes every decoded frame to the
+        // cache so the cloud wall runs at decode rate instead of inheriting
+        // inference throughput, and forwards latest-wins to the analysis
+        // loop below. The forward MUST NOT be a second FIFO: `mpsc` +
+        // `try_send` drops the newest frame, so a full 8-slot queue hands
+        // the loop a frame eight consumer-cycles old — a minute or more on
+        // a saturated box, which also mis-stamps everything keyed on
+        // `frame.captured_at`.
+        let epoch = cache.begin_session(cam_id);
+        let (latest_tx, mut latest_rx) = watch::channel::<Option<Frame>>(None);
+        let tap_cache = cache.clone();
+        let tap_stats = stats.clone();
+        let _tap_task = AbortOnDrop(tokio::spawn(async move {
+            while let Some(frame) = raw_rx.recv().await {
+                // The true "received from the source" point, which is what
+                // `observe_frame` is documented to measure; inside the
+                // analysis loop it measured inference rate instead.
+                tap_stats.observe_frame(cam_id, frame.captured_at, frame.width, frame.height);
+                tap_cache.put_frame(cam_id, epoch, Arc::new(frame.clone()));
+                if latest_tx.send(Some(frame)).is_err() {
+                    break;
+                }
+            }
+        }));
         // M_PERF_CROWD Phase E2 — set true when the per-frame body
         // requests an RGB-tap rebuild (the recorder's pre-roll
         // ingester has been replaced at new dims; the old source's
@@ -491,13 +531,12 @@ async fn run_camera(
         // new RGB dims.
         let mut rebuild_source = false;
 
-        while let Some(frame) = rx.recv().await {
+        while latest_rx.changed().await.is_ok() {
+            let frame = match latest_rx.borrow_and_update().clone() {
+                Some(f) => f,
+                None => continue,
+            };
             decoded += 1;
-            // M-Admin Phase 0 closeout: keep per-camera fps EMA +
-            // last-frame timestamp + source dims up to date so the
-            // UI can render a live health column without polling
-            // the bus PIPELINE_STATUS topic on every frame.
-            stats.observe_frame(cfg.id, frame.captured_at, frame.width, frame.height);
 
             // Honour any operator-initiated anchor wipe issued via
             // `DELETE /api/v1/cameras/{id}/static-anchors` since the
@@ -983,7 +1022,7 @@ async fn run_camera(
 
                 // L7 cache update — see ARCHITECTURE.md.
                 let frame_arc = Arc::new(frame.clone());
-                cache.put(cfg.id, frame_arc.clone(), tracked_arc.clone());
+                cache.put(cfg.id, epoch, frame_arc.clone(), tracked_arc.clone());
 
                 // Lightweight metadata onto the bus. `objects` is
                 // `Arc<Vec<TrackedObject>>` (M_PERF_CROWD D1) so we

@@ -842,7 +842,8 @@ mod tests {
     async fn a_source_that_stops_producing_frames_is_reported_as_stalled() {
         let cache = Arc::new(LatestFrameCache::new());
         let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
-        cache.put(7, test_frame(7, 1), Arc::new(vec![]));
+        let epoch = cache.begin_session(7);
+        cache.put(7, epoch, test_frame(7, 1), Arc::new(vec![]));
         subscribe(&mgr, 7);
 
         tokio::time::sleep(STALL_AFTER / 2).await;
@@ -875,13 +876,14 @@ mod tests {
     async fn a_recovered_source_clears_the_stall() {
         let cache = Arc::new(LatestFrameCache::new());
         let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
-        cache.put(3, test_frame(3, 1), Arc::new(vec![]));
+        let epoch = cache.begin_session(3);
+        cache.put(3, epoch, test_frame(3, 1), Arc::new(vec![]));
         subscribe(&mgr, 3);
 
         tokio::time::sleep(STALL_AFTER * 2).await;
         assert_eq!(mgr.stalled_cameras(), vec![3]);
 
-        cache.put(3, test_frame(3, 2), Arc::new(vec![]));
+        cache.put(3, epoch, test_frame(3, 2), Arc::new(vec![]));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
             mgr.stalled_cameras().is_empty(),
@@ -914,7 +916,8 @@ mod tests {
     async fn a_looping_decoder_is_reported_as_suppressed() {
         let cache = Arc::new(LatestFrameCache::new());
         let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
-        cache.put(6, frame_with_fill(6, 1, 10), Arc::new(vec![]));
+        let epoch = cache.begin_session(6);
+        cache.put(6, epoch, frame_with_fill(6, 1, 10), Arc::new(vec![]));
         subscribe(&mgr, 6);
 
         // Period-3 content cycle: distinct fills repeating at distance 3, so
@@ -923,7 +926,7 @@ mod tests {
         let fills = [10u8, 20, 30];
         for i in 0..(u64::from(LOOP_LOG_TRIP) + 6) {
             let fill = fills[(i as usize) % fills.len()];
-            cache.put(6, frame_with_fill(6, i + 2, fill), Arc::new(vec![]));
+            cache.put(6, epoch, frame_with_fill(6, i + 2, fill), Arc::new(vec![]));
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
