@@ -193,8 +193,13 @@ jobs:
   #     h26Xparse (bad), x264enc (ugly), avdec_h26X (libav).
   # NOT installed (would be runtime-only / not exercised by this job):
   #   * libnice / gstreamer1.0-nice — webrtcbin's ICE backend. The
-  #     `gstreamer-webrtc` tests assert launch STRINGS and never instantiate
-  #     an element, so nothing here needs a live webrtcbin.
+  #     `gstreamer-webrtc` tests mostly assert launch STRINGS, and the one
+  #     that does instantiate an element
+  #     (`negotiation_wiring_does_not_leak_the_webrtcbin`) builds a BARE
+  #     `webrtcbin` and never negotiates, so it needs no ICE agent. That test
+  #     does make `gstreamer1.0-plugins-bad` (installed above) load-bearing:
+  #     it `return`s early when `webrtcbin` will not build, so dropping that
+  #     package turns a leak regression into a silent pass.
   #   * libssl-dev (workspace uses rustls everywhere; Cargo.lock has no
   #     openssl / openssl-sys / native-tls — re-verify if that changes).
   #   * libunwind-dev (was needed only on ubuntu-22.04; 24.04 resolves
