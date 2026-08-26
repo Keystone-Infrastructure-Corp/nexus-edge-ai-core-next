@@ -434,45 +434,12 @@ impl WebRtcSession {
     fn wire_offerer(&self) {
         let codec_label = self.codec.base();
 
-        // create-offer → set-local → emit once gathered.
-        let webrtc_neg = self.webrtc.clone();
-        let events_neg = self.events.clone();
-        let session_neg = self.session_id.clone();
-        let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.webrtc
-            .connect("on-negotiation-needed", false, move |_vals| {
-                let webrtc = webrtc_neg.clone();
-                let events = events_neg.clone();
-                let session = session_neg.clone();
-                let emitted = std::sync::Arc::clone(&emitted);
-                let webrtc_for_local = webrtc.clone();
-                let offer_promise = gst::Promise::with_change_func(move |reply| {
-                    let offer = reply
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.get::<gst_webrtc::WebRTCSessionDescription>("offer").ok());
-                    let Some(offer) = offer else {
-                        let _ = events.send(WebRtcEvent::Failed(
-                            "create-offer: no offer in reply".to_string(),
-                        ));
-                        return;
-                    };
-                    webrtc_for_local.emit_by_name::<()>(
-                        "set-local-description",
-                        &[&offer, &None::<gst::Promise>],
-                    );
-                    emit_offer_when_gathered(
-                        &webrtc_for_local,
-                        &events,
-                        &session,
-                        codec_label,
-                        &emitted,
-                    );
-                });
-                webrtc
-                    .emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &offer_promise]);
-                None
-            });
+        connect_negotiation_needed(
+            &self.webrtc,
+            self.events.clone(),
+            self.session_id.clone(),
+            codec_label,
+        );
 
         // connection established → Connected (publishing).
         let events_conn = self.events.clone();
@@ -825,6 +792,51 @@ fn emit_offer_when_gathered(
         if st == gst_webrtc::WebRTCICEGatheringState::Complete {
             emit_local_offer(&wb, &events, &session, codec, &emitted);
         }
+        None
+    });
+}
+
+/// Wire `on-negotiation-needed` → `create-offer` → `set-local-description` →
+/// emit [`WebRtcEvent::Offer`] once ICE gathering completes.
+///
+/// A free function rather than a method so the no-self-reference invariant is
+/// testable without standing up a whole session — see
+/// `negotiation_wiring_does_not_leak_the_webrtcbin`.
+///
+/// The emitting `webrtcbin` is taken from the signal's first argument and must
+/// never be captured instead: a GObject owns its signal closures, so a captured
+/// strong ref makes the element own itself and it is never finalized — not even
+/// after the pipeline reaches NULL. That leaked one `webrtcbin`, with its ICE
+/// agent, DTLS transport and RTP session, per HD session (BUG-136).
+fn connect_negotiation_needed(
+    webrtc: &gst::Element,
+    events: mpsc::UnboundedSender<WebRtcEvent>,
+    session_id: String,
+    codec_label: &'static str,
+) {
+    let emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    webrtc.connect("on-negotiation-needed", false, move |vals| {
+        let webrtc = vals.first().and_then(|v| v.get::<gst::Element>().ok())?;
+        let events = events.clone();
+        let session = session_id.clone();
+        let emitted = std::sync::Arc::clone(&emitted);
+        let webrtc_for_local = webrtc.clone();
+        let offer_promise = gst::Promise::with_change_func(move |reply| {
+            let offer = reply
+                .ok()
+                .flatten()
+                .and_then(|s| s.get::<gst_webrtc::WebRTCSessionDescription>("offer").ok());
+            let Some(offer) = offer else {
+                let _ = events.send(WebRtcEvent::Failed(
+                    "create-offer: no offer in reply".to_string(),
+                ));
+                return;
+            };
+            webrtc_for_local
+                .emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
+            emit_offer_when_gathered(&webrtc_for_local, &events, &session, codec_label, &emitted);
+        });
+        webrtc.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &offer_promise]);
         None
     });
 }
@@ -1516,6 +1528,38 @@ fn turn_url_for(raw: &str, username: Option<&str>, credential: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `webrtcbin` must be finalized once its last owner drops. It is not if
+    /// any signal closure captures the element itself: a GObject owns its
+    /// handlers, so the element ends up owning a strong reference to itself and
+    /// its `webrtc:pc` / `webrtc:ice` threads run for the life of the process.
+    ///
+    /// This leaked one `webrtcbin` per HD live-view session. Measured on an
+    /// Alder Lake-N core: 41 leaked instances after a night of expand/collapse,
+    /// with `pc`/`ice` thread counts rising on every open and never falling on
+    /// close, until new HD sessions could no longer sustain media (BUG-136).
+    #[test]
+    fn negotiation_wiring_does_not_leak_the_webrtcbin() {
+        if gst::init().is_err() {
+            return;
+        }
+        let Ok(webrtc) = gst::ElementFactory::make("webrtcbin").build() else {
+            // `gst-plugins-bad` absent (macOS dev boxes); covered by the
+            // `system-libs` CI job, which builds the webrtc feature.
+            return;
+        };
+        let weak = webrtc.downgrade();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        connect_negotiation_needed(&webrtc, tx, "session-under-test".to_string(), "H264");
+
+        drop(webrtc);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "webrtcbin outlived its last owner: a signal closure holds a strong \
+             reference to the element it is connected to",
+        );
+    }
 
     /// Under `i965` the VA encoders abort the process rather than failing, so
     /// no registry entry may be trusted: `vah264enc` and `vaapih264enc` both
