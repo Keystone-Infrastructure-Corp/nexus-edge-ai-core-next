@@ -2365,6 +2365,11 @@ async fn get_latest_frame_meta(
         .get(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no frame for camera".into()))?;
     let f = &entry.frame;
+    // `objects` trail `frame`: the frame is published at decode rate and the
+    // objects at inference rate (BUG-136), so `objects_frame_id` names the
+    // frame they were actually computed on. They are reported anyway — the
+    // local viewer draws every bbox from this route, and a blank overlay is
+    // worse than one that lags the video.
     Ok(Json(FrameMetadata {
         camera_id: f.camera_id,
         frame_id: f.frame_id,

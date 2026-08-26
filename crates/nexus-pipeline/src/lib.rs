@@ -5,11 +5,16 @@
 //! upstream stays decoupled.
 //!
 //! ```text
-//!   FrameSource → MotionGate → DetectorPool → Tracker → RuleEvaluator
-//!                                  │                          │
-//!                                  ▼                          ▼
-//!                         LatestFrameCache (L7)        EventStore + Bus
+//!   FrameSource ──→ MotionGate ──→ DetectorPool ──→ Tracker ──→ RuleEvaluator
+//!        │                                             │              │
+//!        │ frame                               objects │              ▼
+//!        └────────→ LatestFrameCache (L7) ◀────────────┘      EventStore + Bus
 //! ```
+//!
+//! The cache is fed at **two** rates (BUG-136). Its frame is tapped straight
+//! off the source, so the live-view wall never inherits inference
+//! throughput; its objects come from the far end of the DAG and therefore
+//! run at whatever rate the gate passes.
 
 #![forbid(unsafe_code)]
 

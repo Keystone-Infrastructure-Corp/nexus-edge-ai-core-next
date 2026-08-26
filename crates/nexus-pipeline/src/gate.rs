@@ -1,15 +1,18 @@
 //! Cheap motion gate — the low-bitrate (LBR) rate limiter.
 //!
 //! The gate is the cheapest layer that can drop work, and it is the single
-//! place that decides a camera's *effective* frame rate. Everything
-//! downstream of it — detector, tracker, `LatestFrameCache`, and therefore
-//! the cloud live-view wall — runs at whatever rate this gate passes.
+//! place that decides a camera's *analysis* frame rate. Everything
+//! downstream of it — detector, tracker, rules — runs at whatever rate this
+//! gate passes. The `LatestFrameCache` frame, and therefore the cloud
+//! live-view wall, does **not**: a tap upstream of the gate publishes every
+//! decoded frame, so the wall stays current even when inference is starved
+//! (BUG-136). Only the cache's *objects* run at the gate's rate.
 //!
 //! Two hard rate bounds bracket the motion decision:
 //!
 //! * [`BASELINE_GAP_MS`] — the floor. Even on a perfectly static scene the
-//!   gate passes a frame this often, so a 4×4 video wall keeps painting and
-//!   the tracker's TTLs keep refreshing.
+//!   gate passes a frame this often, so the tracker's TTLs keep refreshing
+//!   and a wall tile's boxes keep updating.
 //! * [`MOTION_GAP_MS`] — the ceiling. Once motion is present the gate still
 //!   refuses to pass faster than this. That cap is the whole point of LBR:
 //!   a 16-tile wall cannot show 15 fps × 16 streams, and inference on frames

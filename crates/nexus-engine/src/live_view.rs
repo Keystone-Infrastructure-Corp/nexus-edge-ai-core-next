@@ -88,10 +88,11 @@ const LOOP_WINDOW: usize = 8;
 /// run: one genuinely fresh frame slipping through a recycled pool used to
 /// reset the counter, which kept a persistent loop permanently unreported.
 ///
-/// Note the window counts *new-frame* observations, not pump ticks, so it
-/// spans `LOOP_EVAL_WINDOW / cache_update_rate` seconds — roughly 25 s at
-/// the gate's 2 fps LBR baseline, not the 12 s a naive read against
-/// [`GRID_FPS`] would suggest.
+/// Note the window counts *new-frame* observations, not pump ticks. Since
+/// BUG-136 the cache's frame advances at decode rate, so those observations
+/// arrive as fast as the pump can take them and the window spans roughly
+/// `LOOP_EVAL_WINDOW / GRID_FPS` — about 12 s, not the ~25 s it spanned
+/// when the cache was only written once per completed inference.
 const LOOP_EVAL_WINDOW: usize = 48;
 
 /// Cycle hits within [`LOOP_EVAL_WINDOW`] before the pump logs. Keeps an
@@ -842,7 +843,8 @@ mod tests {
     async fn a_source_that_stops_producing_frames_is_reported_as_stalled() {
         let cache = Arc::new(LatestFrameCache::new());
         let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
-        cache.put(7, test_frame(7, 1), Arc::new(vec![]));
+        let epoch = cache.begin_session(7);
+        cache.put_frame(7, epoch, test_frame(7, 1));
         subscribe(&mgr, 7);
 
         tokio::time::sleep(STALL_AFTER / 2).await;
@@ -875,13 +877,14 @@ mod tests {
     async fn a_recovered_source_clears_the_stall() {
         let cache = Arc::new(LatestFrameCache::new());
         let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
-        cache.put(3, test_frame(3, 1), Arc::new(vec![]));
+        let epoch = cache.begin_session(3);
+        cache.put_frame(3, epoch, test_frame(3, 1));
         subscribe(&mgr, 3);
 
         tokio::time::sleep(STALL_AFTER * 2).await;
         assert_eq!(mgr.stalled_cameras(), vec![3]);
 
-        cache.put(3, test_frame(3, 2), Arc::new(vec![]));
+        cache.put_frame(3, epoch, test_frame(3, 2));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
             mgr.stalled_cameras().is_empty(),
@@ -914,7 +917,8 @@ mod tests {
     async fn a_looping_decoder_is_reported_as_suppressed() {
         let cache = Arc::new(LatestFrameCache::new());
         let mgr = LiveViewManager::new(cache.clone(), Arc::new(TunnelOutbox::new()));
-        cache.put(6, frame_with_fill(6, 1, 10), Arc::new(vec![]));
+        let epoch = cache.begin_session(6);
+        cache.put_frame(6, epoch, frame_with_fill(6, 1, 10));
         subscribe(&mgr, 6);
 
         // Period-3 content cycle: distinct fills repeating at distance 3, so
@@ -923,7 +927,7 @@ mod tests {
         let fills = [10u8, 20, 30];
         for i in 0..(u64::from(LOOP_LOG_TRIP) + 6) {
             let fill = fills[(i as usize) % fills.len()];
-            cache.put(6, frame_with_fill(6, i + 2, fill), Arc::new(vec![]));
+            cache.put_frame(6, epoch, frame_with_fill(6, i + 2, fill));
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
 
