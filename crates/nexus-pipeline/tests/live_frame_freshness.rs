@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,11 +39,18 @@ use url::Url;
 /// detector-error path, which returns before the post-inference cache write
 /// and so produced zero cache updates for a camera whose detector was
 /// failing.
-struct NeverReturnsDetector;
+///
+/// `calls` is what keeps this test honest about the *other* half of the
+/// fix: the tap could publish perfectly while silently never forwarding to
+/// the analysis loop, and every cache assertion below would still pass.
+struct NeverReturnsDetector {
+    calls: Arc<AtomicUsize>,
+}
 
 #[async_trait]
 impl Detector for NeverReturnsDetector {
     async fn detect(&self, _f: &Frame, _p: &[String]) -> Result<Vec<Detection>, InferenceError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         std::future::pending().await
     }
 
@@ -106,10 +114,13 @@ async fn the_wall_keeps_painting_while_inference_never_completes() {
     let recorder: Arc<dyn ClipRecorder> =
         Arc::new(StubClipRecorder::new(store.clone(), clips_dir.clone()));
     let cache = Arc::new(LatestFrameCache::new());
+    let detect_calls = Arc::new(AtomicUsize::new(0));
 
     let handle = spawn_camera(
         cam,
-        Arc::new(NeverReturnsDetector),
+        Arc::new(NeverReturnsDetector {
+            calls: detect_calls.clone(),
+        }),
         None,
         tracker,
         tracker_cfg.annotator.clone(),
@@ -158,5 +169,14 @@ async fn the_wall_keeps_painting_while_inference_never_completes() {
     assert_eq!(
         entry.objects_frame_id, None,
         "objects claimed a frame the detector never ran on"
+    );
+
+    // Publishing at decode rate is only half the fix; the analysis loop
+    // still has to receive frames through the latest-wins forward. Without
+    // this the tap could be the pipeline's only consumer and every
+    // assertion above would still pass.
+    assert!(
+        detect_calls.load(Ordering::Relaxed) >= 1,
+        "the analysis loop never got a frame: the tap's forward to it is broken"
     );
 }

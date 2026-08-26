@@ -53,8 +53,22 @@ impl LatestFrameCache {
     /// mid-flight when the next session starts. Writes carry the epoch they
     /// were issued under and lose the race deterministically rather than by
     /// timing — the same shape as `is_current_session` (BUG-070).
+    ///
+    /// The last frame is kept — a restarting camera should not blank the
+    /// wall — but the objects are dropped. They describe the *previous*
+    /// session, and the tap republishes at decode rate the moment the new
+    /// source starts, so keeping them would ride stale boxes on a brand-new
+    /// frame. That matters most on the supervisor-dims rebuild, which
+    /// re-enters the source loop without a `clear` and would otherwise pair
+    /// new-dims frames with old-dims coordinates; and `frame_id` restarts at
+    /// 1 per source, so a retained `objects_frame_id` can collide with a
+    /// live id and claim a match that never happened.
     pub fn begin_session(&self, camera_id: CameraId) -> u64 {
         let mut g = self.inner.write();
+        if let Some(entry) = g.entries.get_mut(&camera_id) {
+            entry.objects = Arc::new(Vec::new());
+            entry.objects_frame_id = None;
+        }
         let e = g.epochs.entry(camera_id).or_insert(0);
         *e += 1;
         *e
@@ -134,7 +148,7 @@ impl LatestFrameCache {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use nexus_types::PixelFormat;
+    use nexus_types::{BBox, PixelFormat};
 
     fn frame(id: CameraId) -> Arc<Frame> {
         Arc::new(Frame {
@@ -147,6 +161,24 @@ mod tests {
             data: Arc::new(vec![0u8; 16 * 16 * 3]),
             trace_id: "t".into(),
         })
+    }
+
+    fn track(track_id: u64) -> TrackedObject {
+        TrackedObject {
+            track_id,
+            label: "person".into(),
+            confidence: 0.9,
+            bbox: BBox {
+                x1: 1.0,
+                y1: 1.0,
+                x2: 2.0,
+                y2: 2.0,
+            },
+            detection_bbox: None,
+            age_frames: 1,
+            age_ms: 100,
+            attributes: Default::default(),
+        }
     }
 
     #[test]
@@ -266,6 +298,30 @@ mod tests {
             "a completed inference rewound the live frame"
         );
         assert_eq!(got.objects_frame_id, Some(12));
+    }
+
+    /// A restart keeps the last frame so the wall does not blank, but the
+    /// previous session's boxes do not describe the new session's frames —
+    /// and since `frame_id` restarts at 1 per source, a retained
+    /// `objects_frame_id` could collide with a live id and claim a match
+    /// that never happened.
+    #[test]
+    fn a_new_session_does_not_inherit_the_previous_sessions_objects() {
+        let cache = LatestFrameCache::new();
+        let epoch = cache.begin_session(7);
+        cache.put_frame(7, epoch, frame(7));
+        cache.put_objects(7, epoch, 1, Arc::new(vec![track(7)]));
+        assert_eq!(cache.get(7).unwrap().objects.len(), 1);
+
+        cache.begin_session(7);
+
+        let got = cache.get(7).unwrap();
+        assert_eq!(got.frame.frame_id, 1, "a restart blanked the wall");
+        assert!(got.objects.is_empty(), "stale boxes survived a restart");
+        assert_eq!(
+            got.objects_frame_id, None,
+            "a restarted camera claimed inference results it has not produced"
+        );
     }
 
     /// Objects with no frame to hang on are not useful to any reader.

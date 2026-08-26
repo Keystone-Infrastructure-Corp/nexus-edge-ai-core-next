@@ -88,10 +88,11 @@ const LOOP_WINDOW: usize = 8;
 /// run: one genuinely fresh frame slipping through a recycled pool used to
 /// reset the counter, which kept a persistent loop permanently unreported.
 ///
-/// Note the window counts *new-frame* observations, not pump ticks, so it
-/// spans `LOOP_EVAL_WINDOW / cache_update_rate` seconds — roughly 25 s at
-/// the gate's 2 fps LBR baseline, not the 12 s a naive read against
-/// [`GRID_FPS`] would suggest.
+/// Note the window counts *new-frame* observations, not pump ticks. Since
+/// BUG-136 the cache's frame advances at decode rate, so those observations
+/// arrive as fast as the pump can take them and the window spans roughly
+/// `LOOP_EVAL_WINDOW / GRID_FPS` — about 12 s, not the ~25 s it spanned
+/// when the cache was only written once per completed inference.
 const LOOP_EVAL_WINDOW: usize = 48;
 
 /// Cycle hits within [`LOOP_EVAL_WINDOW`] before the pump logs. Keeps an

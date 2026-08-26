@@ -54,9 +54,14 @@ pub struct CameraFrameStats {
     /// EMA-derived. Zero until two frames have been seen.
     pub fps_ema: f64,
     /// Total frames received from the source since this camera was
-    /// last (re)spawned. Includes frames that the gate later dropped.
+    /// last (re)spawned. Counted at the live-view tap, i.e. the real
+    /// decode rate — not the rate the analysis loop consumes at.
     pub frames_emitted: u64,
-    /// Frames the motion gate (or any later stage) discarded.
+    /// Frames the motion gate (or any later stage) discarded. This is
+    /// **not** `frames_emitted` minus the analysed count: since
+    /// BUG-136 the analysis loop takes frames latest-wins off a
+    /// `watch`, so frames coalesced away before the gate ever saw them
+    /// are in neither total.
     pub frames_dropped: u64,
     /// Width of the most recent frame, in pixels. For RTSP this is
     /// the detector frame dimension (currently 960), NOT the camera
