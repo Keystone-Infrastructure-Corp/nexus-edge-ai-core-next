@@ -807,7 +807,7 @@ fn emit_offer_when_gathered(
 /// never be captured instead: a GObject owns its signal closures, so a captured
 /// strong ref makes the element own itself and it is never finalized — not even
 /// after the pipeline reaches NULL. That leaked one `webrtcbin`, with its ICE
-/// agent, DTLS transport and RTP session, per HD session (BUG-135).
+/// agent, DTLS transport and RTP session, per HD session (BUG-136).
 fn connect_negotiation_needed(
     webrtc: &gst::Element,
     events: mpsc::UnboundedSender<WebRtcEvent>,
@@ -1537,7 +1537,7 @@ mod tests {
     /// This leaked one `webrtcbin` per HD live-view session. Measured on an
     /// Alder Lake-N core: 41 leaked instances after a night of expand/collapse,
     /// with `pc`/`ice` thread counts rising on every open and never falling on
-    /// close, until new HD sessions could no longer sustain media (BUG-135).
+    /// close, until new HD sessions could no longer sustain media (BUG-136).
     #[test]
     fn negotiation_wiring_does_not_leak_the_webrtcbin() {
         if gst::init().is_err() {
