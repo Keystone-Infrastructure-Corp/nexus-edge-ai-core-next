@@ -13,9 +13,9 @@
 //! know which slots are healthy. Backends never decide pool policy —
 //! they only run the work and report state.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use crossbeam_channel as channel;
@@ -167,12 +167,32 @@ enum WorkerCmd {
     Shutdown,
 }
 
+/// Consecutive `detect` failures that demote a slot to `Failed`.
+///
+/// Paired with [`DEVICE_FAILURE_WINDOW`]: both must be satisfied. A frame count
+/// alone means something different on every deployment — one worker serving ten
+/// cameras reaches 32 in well under a second, a single low-fps camera takes
+/// half a minute.
+const DEVICE_FAILURE_STREAK: u32 = 32;
+
+/// How long the failures must also have been going on.
+///
+/// Demotion is permanent until the process restarts, so the evidence has to
+/// outlast a recoverable hang. The i915 reset that preceded BUG-133 recovered
+/// on its own; a count-only rule would have demoted a healthy accelerator for
+/// the life of the process over it.
+const DEVICE_FAILURE_WINDOW: Duration = Duration::from_secs(15);
+
 pub struct ThreadIsolatedBackend {
     slot: i32,
     common: Arc<BackendCommon>,
     cmd_tx: parking_lot::Mutex<channel::Sender<WorkerCmd>>,
     detector_factory: Arc<dyn Fn() -> Result<Arc<dyn Detector>, InferenceError> + Send + Sync>,
     restart_backoff: Duration,
+    /// Consecutive `detect` failures; the first success clears it.
+    error_streak: AtomicU32,
+    /// When the current streak began, set as it goes 0 -> 1.
+    streak_started: parking_lot::Mutex<Option<Instant>>,
 }
 
 impl ThreadIsolatedBackend {
@@ -214,6 +234,8 @@ impl ThreadIsolatedBackend {
             cmd_tx: parking_lot::Mutex::new(tx),
             detector_factory: factory,
             restart_backoff,
+            error_streak: AtomicU32::new(0),
+            streak_started: parking_lot::Mutex::new(None),
         })
     }
 
@@ -322,11 +344,42 @@ impl DetectorBackend for ThreadIsolatedBackend {
             .await
             .map_err(|e| InferenceError::Failed(format!("join: {e}")))?
             .map_err(|e| InferenceError::Failed(format!("worker reply: {e}")))?;
-        if res.is_err() {
-            warn!(
-                slot = self.slot,
-                "worker returned error; not yet restarting"
-            );
+        match &res {
+            Ok(_) => {
+                self.error_streak.store(0, Ordering::Relaxed);
+            }
+            Err(e) => {
+                let streak = self.error_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                if streak == 1 {
+                    *self.streak_started.lock() = Some(Instant::now());
+                }
+                let sustained = streak >= DEVICE_FAILURE_STREAK
+                    && self
+                        .streak_started
+                        .lock()
+                        .is_some_and(|t| t.elapsed() >= DEVICE_FAILURE_WINDOW);
+                if sustained {
+                    // Cleared so a slot that is restored one day can demote
+                    // again; `>=` alone would latch past the threshold forever.
+                    self.error_streak.store(0, Ordering::Relaxed);
+                    if self.common.state() != BackendState::Failed {
+                        // The worker thread is alive, so nothing else demotes
+                        // it; without this the pool keeps picking a slot whose
+                        // device is gone and never reaches the fallback.
+                        self.common.set_state(BackendState::Failed);
+                        error!(
+                            slot = self.slot,
+                            streak,
+                            error = %e,
+                            "detector has failed every frame for {}s; marking the slot Failed \
+                             so the pool routes to the fail-soft fallback",
+                            DEVICE_FAILURE_WINDOW.as_secs()
+                        );
+                    }
+                } else {
+                    warn!(slot = self.slot, streak, error = %e, "detector returned an error");
+                }
+            }
         }
         res
     }
@@ -729,5 +782,142 @@ mod tests {
         let res = backend.detect(&frame, &[]).await;
         assert!(res.is_ok(), "detect returned {res:?}");
         assert!(res.unwrap().is_empty());
+    }
+
+    /// Detector standing in for a session whose device is gone: the thread is
+    /// healthy, every frame fails. `fail` flips so a test can interleave a
+    /// success.
+    struct WedgedDeviceProbe {
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Detector for WedgedDeviceProbe {
+        async fn detect(
+            &self,
+            _f: &Frame,
+            _p: &[String],
+        ) -> Result<Vec<Detection>, InferenceError> {
+            if self.fail.load(Ordering::Relaxed) {
+                Err(InferenceError::Failed("CL_OUT_OF_RESOURCES".into()))
+            } else {
+                Ok(vec![])
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "wedged_device_probe"
+        }
+    }
+
+    async fn ready_backend(fail: Arc<std::sync::atomic::AtomicBool>) -> ThreadIsolatedBackend {
+        let cfg = InferenceConfig::default();
+        let detector: Arc<dyn Detector> = Arc::new(WedgedDeviceProbe { fail });
+        let backend = ThreadIsolatedBackend::start(0, detector, &cfg).expect("worker spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while backend.state() != BackendState::Ready && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.state(), BackendState::Ready);
+        backend
+    }
+
+    /// Regression for BUG-133.
+    ///
+    /// A wedged accelerator leaves the worker *thread* healthy, so the only
+    /// thing that used to set `Failed` — a closed command channel — never
+    /// fires. The slot stayed `Ready`, `DetectorPool::pick_ready` kept handing
+    /// it every frame, and the fail-soft fallback was never consulted: 36
+    /// minutes of zero detections until systemd restarted the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_persistently_failing_slot_demotes_itself() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let backend = ready_backend(fail).await;
+        let frame = tiny_frame();
+
+        // The first failure starts the clock; backdate it so this test spends
+        // its time on the count rather than on DEVICE_FAILURE_WINDOW.
+        assert!(backend.detect(&frame, &[]).await.is_err());
+        backdate_streak(&backend);
+
+        for i in 2..DEVICE_FAILURE_STREAK {
+            assert!(backend.detect(&frame, &[]).await.is_err());
+            assert_eq!(
+                backend.state(),
+                BackendState::Ready,
+                "demoted after only {i} failures"
+            );
+        }
+
+        assert!(backend.detect(&frame, &[]).await.is_err());
+        assert_eq!(
+            backend.state(),
+            BackendState::Failed,
+            "a slot that failed {DEVICE_FAILURE_STREAK} frames in a row over \
+             {}s is still being offered to the pool",
+            DEVICE_FAILURE_WINDOW.as_secs()
+        );
+    }
+
+    /// Demotion is permanent until the process restarts, so a hang the driver
+    /// recovers from must not trigger it. The i915 reset before BUG-133 did
+    /// recover; with one worker serving ten cameras, 32 frames is under a
+    /// second, so a count-only rule would have demoted a healthy accelerator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recoverable_hang_does_not_demote() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let backend = ready_backend(fail.clone()).await;
+        let frame = tiny_frame();
+
+        for _ in 0..DEVICE_FAILURE_STREAK * 3 {
+            assert!(backend.detect(&frame, &[]).await.is_err());
+        }
+
+        assert_eq!(
+            backend.state(),
+            BackendState::Ready,
+            "failures well inside DEVICE_FAILURE_WINDOW permanently demoted the accelerator"
+        );
+    }
+
+    /// The streak must measure *consecutive* failures. Without the reset the
+    /// threshold would just be a lifetime error budget, and any long-running
+    /// box would eventually demote its accelerator over unrelated hiccups.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_success_clears_the_error_streak() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let backend = ready_backend(fail.clone()).await;
+        let frame = tiny_frame();
+
+        assert!(backend.detect(&frame, &[]).await.is_err());
+        backdate_streak(&backend);
+        for _ in 2..DEVICE_FAILURE_STREAK {
+            assert!(backend.detect(&frame, &[]).await.is_err());
+        }
+        assert_eq!(backend.state(), BackendState::Ready);
+
+        fail.store(false, Ordering::Relaxed);
+        assert!(backend.detect(&frame, &[]).await.is_ok());
+        fail.store(true, Ordering::Relaxed);
+
+        // Backdated again, so only the count can decide. If the success did
+        // not clear it, the very first failure here lands on 32 and demotes.
+        assert!(backend.detect(&frame, &[]).await.is_err());
+        backdate_streak(&backend);
+        for _ in 2..DEVICE_FAILURE_STREAK {
+            assert!(backend.detect(&frame, &[]).await.is_err());
+            assert_eq!(
+                backend.state(),
+                BackendState::Ready,
+                "the success did not clear the streak"
+            );
+        }
+    }
+
+    /// Push the current streak's start further into the past than the window,
+    /// so a test can exercise the count without sleeping.
+    fn backdate_streak(backend: &ThreadIsolatedBackend) {
+        *backend.streak_started.lock() =
+            Some(Instant::now() - DEVICE_FAILURE_WINDOW - Duration::from_secs(1));
     }
 }

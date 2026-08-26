@@ -212,7 +212,7 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
                 backends.push(backend);
             }
             let fallback = if cfg.fail_soft {
-                let det = build_detector(cfg)?;
+                let det = build_detector(&fail_soft_cfg(cfg))?;
                 Some(Arc::new(InProcessBackend::new(-1, det)) as Arc<dyn DetectorBackend>)
             } else {
                 None
@@ -228,6 +228,28 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
 
 fn build_detector(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceError> {
     build_detector_with_context(cfg, &BuildContext::default())
+}
+
+/// Config for the pool's fail-soft fallback.
+///
+/// The fallback is what serves when the pool's workers cannot, so building it
+/// on their execution provider makes it fail with them — which is how a wedged
+/// iGPU cost 36 minutes of detections (BUG-133).
+///
+/// Hailo is the one chain left alone: its model is a HEF, and `yolo.rs` selects
+/// that path by finding `hailo` in `ep_priority`. Every other chain resolves
+/// through ORT, which always has a CPU path — `selected_for_priority` appends
+/// `cpu(fallback)` even when the operator never wrote one.
+fn fail_soft_cfg(cfg: &InferenceConfig) -> InferenceConfig {
+    let mut cfg = cfg.clone();
+    let hailo = cfg
+        .ep_priority
+        .iter()
+        .any(|ep| ep.trim().eq_ignore_ascii_case("hailo"));
+    if !hailo {
+        cfg.ep_priority = vec!["cpu".to_owned()];
+    }
+    cfg
 }
 
 /// Context plumbed through detector construction for kinds that need
@@ -459,5 +481,90 @@ fn build_detector_kind(
                  yoloe, yoloe_visual, yoloe_promptfree, classifier_ensemble, ensemble, mock"
             ),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for BUG-133: the fail-soft fallback must not be built on the
+    /// execution provider it exists to survive. A wedged iGPU took detections
+    /// down for 36 minutes with `fail_soft = true`, because the fallback was
+    /// built from the same `ep_priority` as the workers.
+    #[test]
+    fn fail_soft_fallback_leaves_the_accelerator_behind() {
+        let mut cfg = InferenceConfig {
+            ep_priority: vec!["gpu".to_owned(), "cpu".to_owned()],
+            ..InferenceConfig::default()
+        };
+        assert_eq!(fail_soft_cfg(&cfg).ep_priority, vec!["cpu".to_owned()]);
+
+        cfg.ep_priority = vec!["openvino".to_owned(), "cuda".to_owned(), "cpu".to_owned()];
+        assert_eq!(fail_soft_cfg(&cfg).ep_priority, vec!["cpu".to_owned()]);
+    }
+
+    /// A Hailo chain is the one left alone: `yolo.rs` selects the HEF path by
+    /// finding `hailo` in `ep_priority`, and every shipped Hailo config is
+    /// `["hailo", "cpu"]`, so a rule keyed on "contains cpu" would rewrite the
+    /// one chain it was meant to protect.
+    #[test]
+    fn fail_soft_fallback_keeps_a_hailo_chain() {
+        let cfg = InferenceConfig {
+            ep_priority: vec!["hailo".to_owned(), "cpu".to_owned()],
+            ..InferenceConfig::default()
+        };
+        assert_eq!(
+            fail_soft_cfg(&cfg).ep_priority,
+            vec!["hailo".to_owned(), "cpu".to_owned()]
+        );
+    }
+
+    /// Operator input is normalised with `trim().to_ascii_lowercase()` before
+    /// the EP chain resolves, so the rewrite has to match the same way. A
+    /// case-sensitive test here silently left `["GPU", "CPU"]` boxes unfixed.
+    #[test]
+    fn fail_soft_fallback_matches_the_chain_case_insensitively() {
+        let cfg = InferenceConfig {
+            ep_priority: vec!["GPU".to_owned(), " CPU ".to_owned()],
+            ..InferenceConfig::default()
+        };
+        assert_eq!(fail_soft_cfg(&cfg).ep_priority, vec!["cpu".to_owned()]);
+
+        let hailo = InferenceConfig {
+            ep_priority: vec![" Hailo ".to_owned()],
+            ..InferenceConfig::default()
+        };
+        assert_eq!(
+            fail_soft_cfg(&hailo).ep_priority,
+            vec![" Hailo ".to_owned()]
+        );
+    }
+
+    /// A chain with no explicit CPU entry still resolves one —
+    /// `selected_for_priority` appends `cpu(fallback)` — so it must be
+    /// rewritten too, or the fallback stays on the accelerator that failed.
+    #[test]
+    fn fail_soft_fallback_rewrites_a_chain_with_no_explicit_cpu_entry() {
+        let cfg = InferenceConfig {
+            ep_priority: vec!["gpu".to_owned()],
+            ..InferenceConfig::default()
+        };
+        assert_eq!(fail_soft_cfg(&cfg).ep_priority, vec!["cpu".to_owned()]);
+    }
+
+    /// Everything except the provider chain must survive the rewrite.
+    #[test]
+    fn fail_soft_fallback_changes_nothing_but_the_chain() {
+        let cfg = InferenceConfig {
+            ep_priority: vec!["gpu".to_owned(), "cpu".to_owned()],
+            workers: 7,
+            fail_soft: true,
+            ..InferenceConfig::default()
+        };
+        let fallback = fail_soft_cfg(&cfg);
+        assert_eq!(fallback.workers, cfg.workers);
+        assert_eq!(fallback.model.kind, cfg.model.kind);
+        assert_eq!(fallback.restart_backoff_ms, cfg.restart_backoff_ms);
     }
 }

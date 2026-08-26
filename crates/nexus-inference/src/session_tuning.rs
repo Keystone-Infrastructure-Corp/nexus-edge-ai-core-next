@@ -255,9 +255,10 @@ where
     F: Fn(Vec<String>) -> Result<T, String> + Send + Sync + 'static,
 {
     let cpu_only = vec!["cpu".to_owned()];
-    if !requests_accelerator(ep_priority) {
-        return build(ep_priority.to_vec());
-    }
+    // Checked before the CPU-only short-circuit below. Once anything in this
+    // process has wedged, even a `["cpu"]` chain needs the bound: the thread
+    // abandoned by that wedge may hold an ORT process-global lock, so the
+    // unbounded path would hang startup outright rather than fail (BUG-133).
     if wedged.load(Ordering::Relaxed) {
         debug!(
             model = %model_path.display(),
@@ -268,6 +269,9 @@ where
         // ORT process-global lock this build is *more* exposed than the
         // first demotion was, not less.
         return bounded_cpu_build(model_path, timeout, build, "an earlier session wedged");
+    }
+    if !requests_accelerator(ep_priority) {
+        return build(ep_priority.to_vec());
     }
 
     let build = std::sync::Arc::new(build);
@@ -499,6 +503,34 @@ mod tests {
             built,
             Ok(on),
             "a chain with no accelerator must not pay for a thread or a deadline"
+        );
+    }
+
+    /// Once anything in the process has wedged, even a CPU-only chain needs the
+    /// deadline: the abandoned thread may hold an ORT process-global lock, so
+    /// the unbounded path hangs startup outright instead of failing. Reachable
+    /// because the fail-soft fallback is built with `["cpu"]` (BUG-133).
+    #[test]
+    fn a_cpu_only_chain_is_still_bounded_once_the_process_has_wedged() {
+        let started = std::time::Instant::now();
+        let built = build_or_demote_to_cpu(
+            Path::new("/models/detector.onnx"),
+            &["cpu".to_owned()],
+            Duration::from_millis(100),
+            &AtomicBool::new(true),
+            move |_| {
+                std::thread::sleep(Duration::from_secs(60));
+                Ok("never delivered")
+            },
+        );
+        assert!(
+            built.is_err(),
+            "a wedged process built a CPU-only chain without a bound"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not apply; took {:?}",
+            started.elapsed()
         );
     }
 

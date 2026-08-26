@@ -191,4 +191,46 @@ mod tests {
         let pool = DetectorPool::new(vec![], Some(fallback));
         assert!(!pool.detect(&frame(), &[]).await.unwrap().is_empty());
     }
+
+    /// A worker that is present but not `Ready` — the shape a slot takes once
+    /// its device wedges and it demotes itself (BUG-133).
+    struct FailedBackend;
+
+    #[async_trait]
+    impl DetectorBackend for FailedBackend {
+        async fn detect(
+            &self,
+            _f: &Frame,
+            _p: &[String],
+        ) -> Result<Vec<Detection>, InferenceError> {
+            panic!("the pool routed a frame to a Failed slot")
+        }
+        fn slot(&self) -> i32 {
+            0
+        }
+        fn state(&self) -> BackendState {
+            BackendState::Failed
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+        async fn push_camera_config(&self, _u: &CameraConfigUpdate) {}
+        fn name(&self) -> &'static str {
+            "failed_backend"
+        }
+    }
+
+    /// Pins the behaviour the BUG-133 demotion depends on. The pool itself was
+    /// never wrong — it was told the slot was healthy — so this passes before
+    /// and after that fix; it exists so a change to `pick_ready` cannot quietly
+    /// remove the property the fix rests on. `detect` panics rather than
+    /// returning, so a wrong route fails loudly.
+    #[tokio::test]
+    async fn pool_routes_past_a_failed_worker_to_the_fallback() {
+        let workers: Vec<Arc<dyn DetectorBackend>> = vec![Arc::new(FailedBackend)];
+        let fallback: Arc<dyn DetectorBackend> =
+            Arc::new(InProcessBackend::new(-1, Arc::new(MockDetector::new())));
+        let pool = DetectorPool::new(workers, Some(fallback));
+        assert!(!pool.detect(&frame(), &[]).await.unwrap().is_empty());
+    }
 }
