@@ -1566,7 +1566,12 @@ mod tests {
         };
         let weak = webrtc.downgrade();
         let (tx, _rx) = mpsc::unbounded_channel();
-        connect_negotiation_needed(&webrtc, tx.clone(), "session-under-test".to_string(), "H264");
+        connect_negotiation_needed(
+            &webrtc,
+            tx.clone(),
+            "session-under-test".to_string(),
+            "H264",
+        );
         connect_connection_state(&webrtc, tx, "session-under-test".to_string());
 
         drop(webrtc);
