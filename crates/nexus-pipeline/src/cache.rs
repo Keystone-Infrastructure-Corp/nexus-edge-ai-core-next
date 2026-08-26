@@ -261,7 +261,10 @@ mod tests {
         cache.put_objects(7, epoch, 12, Arc::new(vec![]));
 
         let got = cache.get(7).unwrap();
-        assert_eq!(got.frame.frame_id, 50, "a completed inference rewound the live frame");
+        assert_eq!(
+            got.frame.frame_id, 50,
+            "a completed inference rewound the live frame"
+        );
         assert_eq!(got.objects_frame_id, Some(12));
     }
 
