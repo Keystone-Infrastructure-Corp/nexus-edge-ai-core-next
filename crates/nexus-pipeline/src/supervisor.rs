@@ -1022,7 +1022,7 @@ async fn run_camera(
 
                 // L7 cache update — see ARCHITECTURE.md.
                 let frame_arc = Arc::new(frame.clone());
-                cache.put(cfg.id, epoch, frame_arc.clone(), tracked_arc.clone());
+                cache.put_objects(cfg.id, epoch, frame_arc.frame_id, tracked_arc.clone());
 
                 // Lightweight metadata onto the bus. `objects` is
                 // `Arc<Vec<TrackedObject>>` (M_PERF_CROWD D1) so we

@@ -2365,17 +2365,11 @@ async fn get_latest_frame_meta(
         .get(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no frame for camera".into()))?;
     let f = &entry.frame;
-    // The frame is published at decode rate and the objects at inference
-    // rate (BUG-136), so they usually describe different frames. Reporting
-    // them together would attach boxes to a `frame_id`/`trace_id` the
-    // detector never ran on — and after a supervisor-dims change the boxes
-    // would be in the old coordinate space while `width`/`height` report the
-    // new one.
-    let objects = if entry.objects_frame_id == Some(f.frame_id) {
-        entry.objects.clone()
-    } else {
-        Arc::new(Vec::new())
-    };
+    // `objects` trail `frame`: the frame is published at decode rate and the
+    // objects at inference rate (BUG-136), so `objects_frame_id` names the
+    // frame they were actually computed on. They are reported anyway — the
+    // local viewer draws every bbox from this route, and a blank overlay is
+    // worse than one that lags the video.
     Ok(Json(FrameMetadata {
         camera_id: f.camera_id,
         frame_id: f.frame_id,
@@ -2383,7 +2377,7 @@ async fn get_latest_frame_meta(
         width: f.width,
         height: f.height,
         trace_id: f.trace_id.clone(),
-        objects,
+        objects: entry.objects.clone(),
     }))
 }
 

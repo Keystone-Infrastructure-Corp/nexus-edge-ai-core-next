@@ -85,26 +85,31 @@ impl LatestFrameCache {
         }
     }
 
-    pub fn put(
+    /// Publish inference results for a frame.
+    ///
+    /// Deliberately never touches `frame`. The analysed frame is always older
+    /// than whatever the tap last published, so writing it back would rewind
+    /// the cached `frame_id` and `captured_at` on every completed inference —
+    /// which the LBR pump reads as a brand-new frame and as its own content
+    /// re-appearing after others, i.e. a manufactured decoder loop.
+    ///
+    /// No entry means no frame has been published yet; objects without a
+    /// frame are not useful to any reader, so they are dropped.
+    pub fn put_objects(
         &self,
         camera_id: CameraId,
         epoch: u64,
-        frame: Arc<Frame>,
+        frame_id: u64,
         objects: Arc<Vec<TrackedObject>>,
     ) {
         let mut g = self.inner.write();
         if !Self::is_current(&g, camera_id, epoch) {
             return;
         }
-        let objects_frame_id = Some(frame.frame_id);
-        g.entries.insert(
-            camera_id,
-            LatestEntry {
-                frame,
-                objects,
-                objects_frame_id,
-            },
-        );
+        if let Some(entry) = g.entries.get_mut(&camera_id) {
+            entry.objects = objects;
+            entry.objects_frame_id = Some(frame_id);
+        }
     }
 
     pub fn get(&self, camera_id: CameraId) -> Option<LatestEntry> {
@@ -149,7 +154,7 @@ mod tests {
         let cache = LatestFrameCache::new();
         let epoch = cache.begin_session(7);
         let f = frame(7);
-        cache.put(7, epoch, f.clone(), Arc::new(vec![]));
+        cache.put_frame(7, epoch, f.clone());
         let got = cache.get(7).unwrap();
         assert!(Arc::ptr_eq(&got.frame, &f));
     }
@@ -165,7 +170,7 @@ mod tests {
     fn clear_stops_a_stopped_camera_serving_a_stale_frame() {
         let cache = LatestFrameCache::new();
         let epoch = cache.begin_session(7);
-        cache.put(7, epoch, frame(7), Arc::new(vec![]));
+        cache.put_frame(7, epoch, frame(7));
         assert!(cache.get(7).is_some());
 
         cache.clear(7);
@@ -187,7 +192,7 @@ mod tests {
     fn a_write_from_a_retired_session_cannot_repopulate_a_cleared_camera() {
         let cache = LatestFrameCache::new();
         let epoch = cache.begin_session(7);
-        cache.put(7, epoch, frame(7), Arc::new(vec![]));
+        cache.put_frame(7, epoch, frame(7));
 
         cache.clear(7);
         cache.put_frame(7, epoch, frame(7));
@@ -233,8 +238,40 @@ mod tests {
             "a never-inferred camera must not claim its empty objects belong to a frame"
         );
 
-        cache.put(7, epoch, frame(7), Arc::new(vec![]));
+        cache.put_objects(7, epoch, 1, Arc::new(vec![]));
         assert_eq!(cache.get(7).unwrap().objects_frame_id, Some(1));
+    }
+
+    /// The analysed frame is always older than the one the tap last
+    /// published, so writing it back would rewind `frame_id` on every
+    /// completed inference. The LBR pump reads a backwards id as a brand-new
+    /// frame, and reads its own already-sent content re-appearing as a
+    /// decoder loop — so it would start suppressing sends on a healthy
+    /// camera.
+    #[test]
+    fn inference_results_never_rewind_the_published_frame() {
+        let cache = LatestFrameCache::new();
+        let epoch = cache.begin_session(7);
+
+        let mut newest = (*frame(7)).clone();
+        newest.frame_id = 50;
+        cache.put_frame(7, epoch, Arc::new(newest));
+
+        // Inference finishes on a much older frame.
+        cache.put_objects(7, epoch, 12, Arc::new(vec![]));
+
+        let got = cache.get(7).unwrap();
+        assert_eq!(got.frame.frame_id, 50, "a completed inference rewound the live frame");
+        assert_eq!(got.objects_frame_id, Some(12));
+    }
+
+    /// Objects with no frame to hang on are not useful to any reader.
+    #[test]
+    fn objects_for_a_camera_with_no_published_frame_are_dropped() {
+        let cache = LatestFrameCache::new();
+        let epoch = cache.begin_session(7);
+        cache.put_objects(7, epoch, 1, Arc::new(vec![]));
+        assert!(cache.get(7).is_none());
     }
 
     /// The tap publishes at decode rate and leaves objects alone, so the
@@ -245,7 +282,8 @@ mod tests {
         let cache = LatestFrameCache::new();
         let epoch = cache.begin_session(7);
         let objects = Arc::new(vec![]);
-        cache.put(7, epoch, frame(7), objects.clone());
+        cache.put_frame(7, epoch, frame(7));
+        cache.put_objects(7, epoch, 1, objects.clone());
 
         let mut newer = (*frame(7)).clone();
         newer.frame_id = 99;
