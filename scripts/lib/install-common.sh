@@ -3376,6 +3376,28 @@ _proc_has_fd_to() {
     return 1
 }
 
+# EPs that ENABLED components in the generated config actually ask ORT
+# for, lowercased and space-joined. Sections without an `enabled` key
+# (e.g. [inference]) count as enabled.
+_config_requested_eps() {
+    local cfg="$NEXUS_CONFIG_DIR/nexus.toml"
+    [[ -r "$cfg" ]] || return 1
+    python3 - "$cfg" <<'PY'
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as fh:
+        cfg = tomllib.load(fh)
+except Exception:
+    sys.exit(1)
+eps = set()
+for name in ("inference", "reid"):
+    section = cfg.get(name) or {}
+    if section.get("enabled", True):
+        eps.update(str(ep).lower() for ep in section.get("ep_priority", []))
+print(" ".join(sorted(eps)))
+PY
+}
+
 # Once the engine is up, prove via /proc/$PID/maps that the
 # OpenVINO accelerator plugin .so actually loaded \u2014 i.e. that ORT
 # successfully attached the OpenVINO EP to the GPU/NPU and not just
@@ -3404,6 +3426,20 @@ verify_engine_runtime_eps() {
             intel-npu)                 has_npu=1 ;;
         esac
     done <<<"$tags"
+
+    # Hardware presence says what the box HAS; only the config says what
+    # the engine will ASK FOR. An intel-npu-profile box still has an
+    # iGPU, so probing for the GPU plugin there fails on a plugin that
+    # was never meant to load.
+    local requested_eps
+    if requested_eps="$(_config_requested_eps 2>/dev/null)"; then
+        [[ " $requested_eps " == *" gpu "* ]] || { has_igpu=0; has_arc=0; }
+        [[ " $requested_eps " == *" npu "* ]] || has_npu=0
+        if (( ! has_igpu && ! has_arc && ! has_npu )); then
+            log "engine runtime EP probe: config requests no accelerator EP (${requested_eps:-none}); skipping"
+            return 0
+        fi
+    fi
 
     local pid
     pid="$(systemctl show -p MainPID --value nexus-engine 2>/dev/null)"
