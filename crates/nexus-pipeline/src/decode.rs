@@ -264,13 +264,13 @@ fn va_chain(
         // Intel (and any other non-AMD VA device): `vapostproc` does GPU
         // colour-convert + scale correctly, so keep it. `videoscale` is
         // omitted so negotiation cannot pull the downscale back onto a CPU
-        // `videoscale`, and the output format is pinned to BGRx so the
-        // colour-space conversion lands on the VPP block rather than in
-        // liborc (BUG-123).
+        // `videoscale`, and the output format is pinned per VA driver — the
+        // two drivers want opposite formats, see `va_gpu_convert_caps`.
         let dec = va_decoder(codec_base);
+        let convert_caps = va_gpu_convert_caps(std::env::var("LIBVA_DRIVER_NAME").ok().as_deref());
         return DecodeChain {
             elements: format!(
-                "{dec} name={DECODER_NAME} ! vapostproc ! {VA_GPU_CONVERT_CAPS} ! {GPU_SCALED_TAIL}"
+                "{dec} name={DECODER_NAME} ! vapostproc ! {convert_caps} ! {GPU_SCALED_TAIL}"
             ),
             backend: DecodeBackend::Va,
             hwaccel: true,
@@ -379,22 +379,46 @@ pub(crate) const CPU_TAIL: &str = "videorate ! videoscale ! videoconvert";
 /// runs on the reduced frame rate.
 const GPU_SCALED_TAIL: &str = "videorate ! videoconvert";
 
-/// Output format pinned on a GPU post-processor so the colour-space
-/// conversion happens on the VPP block instead of in liborc.
+/// Output format pinned on a GPU post-processor, chosen by VA driver.
 ///
-/// Left unconstrained, `vapostproc` negotiates its preferred NV12 and the
-/// downstream `videoconvert` performs the whole NV12→RGB conversion in
-/// software. `BGRx` is the cheapest format the VPP can emit that the tail can
-/// then pack to RGB: 32-bit, so no subsampling, and packed RGB is not offered
-/// on this path at all — `vapostproc`'s system-memory caps advertise
-/// `{ … RGBx, BGRx … }` but no 24-bit `RGB`, so asking for RGB here fails
-/// negotiation outright.
+/// The two drivers want opposite things, and picking either one globally breaks
+/// the other box.
 ///
-/// Measured on Apollo Lake / i965, ten live cameras, 150 buffers each:
-/// 259.97 s CPU and 65.6 s wall without it, 10.73 s and 11.3 s with — 24x less
-/// CPU, and the difference between 6.5x slower than realtime and realtime
-/// (BUG-123).
-const VA_GPU_CONVERT_CAPS: &str = "video/x-raw,format=BGRx";
+/// **`i965` (Apollo Lake) wants BGRx.** Left unconstrained, `vapostproc`
+/// negotiates its preferred NV12 and the downstream `videoconvert` performs the
+/// whole NV12→RGB conversion in software. Measured on Apollo Lake / i965, ten
+/// live cameras, 150 buffers each: 259.97 s CPU and 65.6 s wall without the pin,
+/// 10.73 s and 11.3 s with — 24x less CPU, and the difference between 6.5x slower
+/// than realtime and realtime (BUG-123).
+///
+/// **`iHD` (Gen12+/Arc) wants NV12.** iHD cannot derive a BGRx surface, so every
+/// buffer map is serviced by `vaGetImage` — a copying, format-converting GPU→CPU
+/// readback with a heap allocation per call inside the driver. Measured on Arrow
+/// Lake / iHD against one recorded clip, same output caps, only this format
+/// varying: BGRx 3.38 s user + 1.00 s sys over 6.84 s wall; NV12 0.74 s + 0.15 s
+/// over 3.13 s — 4.9x the CPU, and slower than realtime. Both paths produced 560
+/// frames whose JPEG size distributions matched within 0.1%, so NV12 is not a
+/// cheap-but-degenerate path.
+///
+/// That readback is what took a 53-camera Arrow Lake box blind: it saturates the
+/// tap's streaming thread, which keeps the decoder-input queue permanently full,
+/// which evicts an access unit per arriving frame, which starves the decoder
+/// until it submits nothing at all (BUG-121).
+const VA_GPU_CONVERT_CAPS_I965: &str = "video/x-raw,format=BGRx";
+const VA_GPU_CONVERT_CAPS_IHD: &str = "video/x-raw,format=NV12";
+
+/// Pick the VPP output format for the VA driver in use.
+///
+/// `i965` is named explicitly and everything else defaults to NV12, because the
+/// installer only writes `LIBVA_DRIVER_NAME=i965` on the boxes that need it
+/// (`scripts/lib/install-common.sh`) — the same signal `transcode_allowed` reads
+/// for BUG-128. An unset variable therefore means "not Apollo Lake".
+fn va_gpu_convert_caps(libva_driver: Option<&str>) -> &'static str {
+    match libva_driver {
+        Some("i965") => VA_GPU_CONVERT_CAPS_I965,
+        _ => VA_GPU_CONVERT_CAPS_IHD,
+    }
+}
 
 /// Element name of the RGB tap's decoder-input queue.
 ///
@@ -1202,7 +1226,10 @@ mod tests {
         assert!(c.hwaccel);
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! video/x-raw,format=BGRx ! videorate ! videoconvert"
+            format!(
+                "vah264dec name=vdec ! vapostproc ! {} ! videorate ! videoconvert",
+                va_gpu_convert_caps(std::env::var("LIBVA_DRIVER_NAME").ok().as_deref())
+            )
         );
     }
 
@@ -1322,26 +1349,28 @@ mod tests {
         let c = select_decode_chain("h264", DecodeMode::Auto, &va_full());
         assert_eq!(
             c.elements,
-            "vah264dec name=vdec ! vapostproc ! video/x-raw,format=BGRx ! videorate ! videoconvert"
+            format!(
+                "vah264dec name=vdec ! vapostproc ! {} ! videorate ! videoconvert",
+                va_gpu_convert_caps(std::env::var("LIBVA_DRIVER_NAME").ok().as_deref())
+            )
         );
     }
 
-    /// Left unconstrained, `vapostproc` emits NV12 and the trailing
-    /// `videoconvert` does the whole NV12→RGB conversion in liborc: ten live
-    /// cameras cost 259.97 s CPU / 65.6 s wall per 150 buffers, versus
-    /// 10.73 s / 11.3 s once the VPP output is pinned to BGRx. Removing
-    /// `videoscale` alone (BUG-122) moved neither number. Pin the caps, and
-    /// pin that they reach ONLY the tier measured — every AMD tier has its own
-    /// green-frame history (BUG-039/046/071) and none of them was measured
-    /// here (BUG-123).
+    /// The VPP output format must be pinned — left unconstrained the trailing
+    /// `videoconvert` does the whole conversion in liborc — and it must reach
+    /// ONLY the Intel tier. Which format is pinned is the driver's business
+    /// (`va_gpu_convert_caps`): BGRx on i965 (BUG-123), NV12 on iHD, where BGRx
+    /// instead forces a copying `vaGetImage` readback (BUG-121). Every AMD tier
+    /// has its own green-frame history (BUG-039/046/071) and none of them was
+    /// measured here.
     #[test]
     fn intel_va_chain_pins_gpu_colour_conversion_and_amd_is_untouched() {
+        let expected = va_gpu_convert_caps(std::env::var("LIBVA_DRIVER_NAME").ok().as_deref());
         for codec in ["h264", "h265"] {
             let c = select_decode_chain(codec, DecodeMode::Auto, &va_full());
             assert!(
-                c.elements
-                    .contains("vapostproc ! video/x-raw,format=BGRx !"),
-                "unconstrained vapostproc leaves the NV12→RGB convert in liborc: {}",
+                c.elements.contains(&format!("vapostproc ! {expected} !")),
+                "unconstrained vapostproc leaves the colour convert in liborc: {}",
                 c.elements
             );
         }
@@ -1697,6 +1726,36 @@ mod tests {
         assert!(
             rung.trip(false),
             "never escalated, so a validated session that goes blank stays blank forever"
+        );
+    }
+
+    /// The two drivers want opposite formats and each one's fix is the other's
+    /// regression, so both legs are pinned rather than one being "the" default.
+    #[test]
+    fn i965_keeps_the_bgrx_pin_that_fixed_apollo_lake() {
+        assert_eq!(
+            va_gpu_convert_caps(Some("i965")),
+            "video/x-raw,format=BGRx",
+            "BGRx is what moved the NV12->RGB convert off liborc on Gen9 LP (BUG-123); \
+             dropping it there costs 24x the CPU"
+        );
+    }
+
+    /// iHD cannot derive a BGRx surface, so the pin turns every buffer map into
+    /// a copying `vaGetImage` readback — 4.9x the CPU, and slower than realtime.
+    #[test]
+    fn ihd_uses_nv12_because_bgrx_forces_a_vagetimage_readback() {
+        assert_eq!(va_gpu_convert_caps(Some("iHD")), "video/x-raw,format=NV12");
+    }
+
+    /// The installer writes `LIBVA_DRIVER_NAME=i965` only on the boxes that need
+    /// it, so absence means "not Apollo Lake" and must not inherit its pin.
+    #[test]
+    fn an_unset_driver_is_not_treated_as_apollo_lake() {
+        assert_eq!(va_gpu_convert_caps(None), "video/x-raw,format=NV12");
+        assert_eq!(
+            va_gpu_convert_caps(Some("radeonsi")),
+            "video/x-raw,format=NV12"
         );
     }
 
