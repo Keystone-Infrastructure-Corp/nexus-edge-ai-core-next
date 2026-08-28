@@ -422,7 +422,7 @@ pub fn frame_to_rgb_borrowed_or_owned(frame: &Frame) -> Result<RgbBuf<'_>, Extra
                 });
             }
             let mut out = vec![0u8; got];
-            for (i, ch) in frame.data.chunks_exact(3).enumerate() {
+            for (i, ch) in frame.data.as_chunks::<3>().0.iter().enumerate() {
                 let off = i * 3;
                 out[off] = ch[2];
                 out[off + 1] = ch[1];
@@ -650,7 +650,7 @@ mod tests {
 
     fn solid_rgb(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
         let mut out = vec![0u8; (width as usize) * (height as usize) * 3];
-        for px in out.chunks_exact_mut(3) {
+        for px in out.as_chunks_mut::<3>().0 {
             px.copy_from_slice(&color);
         }
         out
@@ -693,7 +693,7 @@ mod tests {
         let rgb = solid_rgb(20, 20, [100, 150, 200]);
         let cropped = crop_and_resize(&rgb, 20, 20, &bbox(2.0, 2.0, 18.0, 18.0), 8, 8).unwrap();
         assert_eq!(cropped.len(), 8 * 8 * 3);
-        for px in cropped.chunks_exact(3) {
+        for px in cropped.as_chunks::<3>().0 {
             assert_eq!(px, &[100, 150, 200], "uniform color must survive resize");
         }
     }
@@ -712,7 +712,7 @@ mod tests {
         let rgb = solid_rgb(20, 20, [42, 84, 126]);
         let cropped = crop_and_resize(&rgb, 20, 20, &bbox(10.0, 10.0, 50.0, 50.0), 8, 8).unwrap();
         assert_eq!(cropped.len(), 8 * 8 * 3);
-        for px in cropped.chunks_exact(3) {
+        for px in cropped.as_chunks::<3>().0 {
             assert_eq!(px, &[42, 84, 126]);
         }
     }
@@ -886,8 +886,8 @@ mod tests {
         assert_eq!(bytes.len(), dim * 2);
         // Cross-check that every pair of bytes encodes a sane f16 by
         // decoding back and bounding the drift.
-        for (i, chunk) in bytes.chunks_exact(2).enumerate() {
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        for (i, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
+            let bits = u16::from_le_bytes(*chunk);
             let sign = ((bits >> 15) & 0x1) as u32;
             let exp = ((bits >> 10) & 0x1f) as u32;
             let mant = (bits & 0x3ff) as u32;

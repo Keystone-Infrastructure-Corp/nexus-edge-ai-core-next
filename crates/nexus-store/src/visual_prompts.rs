@@ -363,10 +363,8 @@ fn decode_embedding(blob: &[u8], dim: i64) -> Result<Vec<f32>, VisualPromptError
         });
     }
     let mut out = Vec::with_capacity(dim as usize);
-    for chunk in blob.chunks_exact(4) {
-        // chunks_exact guarantees the slice length on each iteration.
-        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact yields 4 bytes");
-        out.push(f32::from_le_bytes(arr));
+    for chunk in blob.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }
