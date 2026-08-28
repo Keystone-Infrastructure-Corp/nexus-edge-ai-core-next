@@ -127,7 +127,15 @@ jobs:
     # into Cargo.toml's `version` or build an engine tarball. Without this
     # guard, publishing `models-vN` fails the run at the version stamp
     # ("unexpected character 'm' while parsing major version number").
-    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') }}
+    #
+    # `stable`/`beta`/`dev` are excluded for the same reason: they are the
+    # floating channel pointers this workflow publishes (ADR-080), and the
+    # version stamp would write `version = "stable"` into Cargo.toml without
+    # erroring, failing later somewhere far less obvious. Creating a pointer
+    # cannot re-enter this workflow — GitHub does not start runs from events
+    # its own GITHUB_TOKEN raised — but `workflow_dispatch` is exempt from
+    # that rule and takes `tag` as free text, so the guard is reachable.
+    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') && !contains(fromJSON('["stable", "beta", "dev"]'), github.event.release.tag_name || github.event.inputs.tag) }}
     steps:
       - uses: dtolnay/rust-toolchain@stable
 
@@ -173,14 +181,88 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
+  # -------------------------------------------------------------------------
+  # resolve-channel — the one place this run's channel is decided.
+  #
+  # Two consumers need the same answer: the `tarball` job's channel-pointer
+  # step (which decides what a brand-new box installs) and
+  # `publish-release-manifest` (which tells the cloud orchestrator what an
+  # already-enrolled fleet may update to). Computing it twice lets them
+  # drift, and drift here means a box that installed "stable" is not on the
+  # channel the cloud believes it is on.
+  #
+  # Precedence: per-run dispatch input > NEXUS_CLOUD_RELEASE_CHANNEL repo
+  # variable > GitHub's own prerelease flag.
+  # -------------------------------------------------------------------------
+  resolve-channel:
+    name: resolve release channel
+    runs-on: ubuntu-22.04
+    # Engine releases only — see the rtp-plugin guard above.
+    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') && !contains(fromJSON('["stable", "beta", "dev"]'), github.event.release.tag_name || github.event.inputs.tag) }}
+    permissions:
+      contents: read
+    outputs:
+      channel: ${{ steps.resolve.outputs.channel }}
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      # SPEC-068 Phase 6 — `NEXUS_CLOUD_RELEASE_CHANNEL` is a repo variable, so
+      # it applies to every run at once: setting it to `dev` to get one build
+      # onto engineering's cores also redirects the next real release, and
+      # forgetting to unset it is silent. The dispatch input below overrides it
+      # for a single run and cannot be left switched on.
+      CHANNEL_OVERRIDE: ${{ vars.NEXUS_CLOUD_RELEASE_CHANNEL }}
+      CHANNEL_INPUT: ${{ github.event.inputs.channel }}
+      IS_PRERELEASE: ${{ github.event.release.prerelease }}
+    steps:
+      - name: resolve
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # A workflow_dispatch re-publish carries no release payload, so ask
+          # the API rather than letting an empty flag default a prerelease
+          # onto `stable`.
+          is_prerelease="${IS_PRERELEASE:-}"
+          if [[ -z "$is_prerelease" ]]; then
+            is_prerelease="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json isPrerelease --jq '.isPrerelease')"
+          fi
+
+          # `auto` (and the empty value a `release` event produces) means
+          # "no per-run opinion".
+          if [[ -n "${CHANNEL_INPUT:-}" && "${CHANNEL_INPUT}" != "auto" ]]; then
+            channel="$CHANNEL_INPUT"
+          elif [[ -n "${CHANNEL_OVERRIDE:-}" ]]; then
+            channel="$CHANNEL_OVERRIDE"
+          elif [[ "$is_prerelease" == "true" ]]; then
+            channel="beta"
+          else
+            channel="stable"
+          fi
+
+          # The repo variable is free-form text and this value now names a
+          # release tag, so anything off the allowlist stops the run.
+          case "$channel" in
+            dev | beta | stable) ;;
+            *)
+              echo "::error::unsupported channel '${channel}' (expected dev, beta, or stable)"
+              exit 1
+              ;;
+          esac
+
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "$TAG resolves to the '$channel' channel (prerelease=$is_prerelease)"
+
   tarball:
     name: build + attach bare-metal tarball
     runs-on: ubuntu-22.04
-    needs: rtp-plugin
+    needs: [rtp-plugin, resolve-channel]
     # Engine releases only — skip data-only `models-*` model-pack tags (the
     # `register release with cloud orchestrator` job `needs: tarball`, so it
     # skips too). See the rtp-plugin guard above for the rationale.
-    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') }}
+    if: ${{ !startsWith(github.event.release.tag_name || github.event.inputs.tag, 'models-') && !contains(fromJSON('["stable", "beta", "dev"]'), github.event.release.tag_name || github.event.inputs.tag) }}
     env:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       ORT_VERSION: "1.24.1"
@@ -734,6 +816,43 @@ jobs:
           # The model files are still embedded in the tarball at
           # share/models/ for self-contained `install.sh` runs.
 
+      # ----------------------------------------------------------------
+      # Re-point the floating channel release (`stable` / `beta` / `dev`)
+      # at this build. `bootstrap.sh` with no `--version` reads the
+      # channel's VERSION asset, so this step is the moment a build
+      # becomes what every new box installs.
+      #
+      # The pointer carries only VERSION + bootstrap.sh — the tarball
+      # itself is downloaded from the version tag it names, so there is
+      # no second copy of a ~400 MB asset to keep in sync.
+      #
+      # Deliberately NOT derived from GitHub's own "Latest" release:
+      # that tracks the prerelease flag alone, so a full release routed
+      # to `beta` by the dispatch input or NEXUS_CLOUD_RELEASE_CHANNEL
+      # would still be served to new installs as stable.
+      # ----------------------------------------------------------------
+      - name: re-point channel pointer release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAG" > VERSION
+          # `--prerelease` keeps the pointer off GitHub's "Latest" badge,
+          # which must keep meaning "newest real version tag".
+          gh release view "$CHANNEL" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$CHANNEL" \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --title "$CHANNEL channel pointer" \
+              --notes "Floating pointer maintained by .github/workflows/release.yml — not a release in its own right. Its VERSION asset names the build currently on the \`$CHANNEL\` channel, and scripts/bootstrap.sh reads it to resolve an install. To install an exact build instead, pass \`--version vX.Y.Z\`."
+          gh release upload "$CHANNEL" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            VERSION \
+            "scripts/bootstrap.sh"
+          echo "channel '$CHANNEL' now points at $TAG"
+
   # -------------------------------------------------------------------------
   # publish-release-manifest — Phase 9 (OTA) cloud registration.
   #
@@ -759,7 +878,7 @@ jobs:
   # -------------------------------------------------------------------------
   publish-release-manifest:
     name: register release with cloud orchestrator
-    needs: tarball
+    needs: [tarball, resolve-channel]
     runs-on: ubuntu-22.04
     # Only run when the cloud endpoint is configured. Skipping here keeps
     # tarball-only releases (pre-cloud, or airgapped forks) green.
@@ -783,17 +902,10 @@ jobs:
       # NEXUS_CLOUD_RELEASES_AUD variable if the api-gateway is configured
       # with a different `aud`.
       RELEASES_AUD: ${{ vars.NEXUS_CLOUD_RELEASES_AUD || 'api://nexus-cloud/releases' }}
-      # Channel override. Default: prereleases land on `beta`, full releases
-      # on `stable`. `dev` is published out-of-band (never from a GH release).
-      #
-      # SPEC-068 Phase 6 — `NEXUS_CLOUD_RELEASE_CHANNEL` is a repo variable, so
-      # it applies to every run at once: setting it to `dev` to get one build
-      # onto engineering's cores also redirects the next real release, and
-      # forgetting to unset it is silent. The dispatch input below overrides it
-      # for a single run and cannot be left switched on.
-      CHANNEL_OVERRIDE: ${{ vars.NEXUS_CLOUD_RELEASE_CHANNEL }}
-      CHANNEL_INPUT: ${{ github.event.inputs.channel }}
-      IS_PRERELEASE: ${{ github.event.release.prerelease }}
+      # Resolved once in `resolve-channel` so the channel this build is
+      # registered under and the channel pointer new installs read cannot
+      # disagree.
+      CHANNEL: ${{ needs.resolve-channel.outputs.channel }}
     steps:
       - name: post release manifest to cloud
         env:
@@ -806,20 +918,6 @@ jobs:
           # version: strip a single leading 'v' so the cloud stores plain
           # semver (v0.6.0 -> 0.6.0). Everything after is passed verbatim.
           version="${TAG#v}"
-
-          # channel: the per-run dispatch input wins over the repo-wide
-          # variable, which in turn wins over the prerelease mapping.
-          # `auto` (and the empty value a `release` event produces) means
-          # "no per-run opinion".
-          if [[ -n "${CHANNEL_INPUT:-}" && "${CHANNEL_INPUT}" != "auto" ]]; then
-            channel="$CHANNEL_INPUT"
-          elif [[ -n "${CHANNEL_OVERRIDE:-}" ]]; then
-            channel="$CHANNEL_OVERRIDE"
-          elif [[ "${IS_PRERELEASE:-}" == "true" ]]; then
-            channel="beta"
-          else
-            channel="stable"
-          fi
 
           # artifact_url: the public GitHub Release asset download URL for
           # the linux-x86_64 tarball (attached by the `tarball` job).
@@ -849,13 +947,13 @@ jobs:
           fi
 
           body="$(jq -nc \
-            --arg channel "$channel" \
+            --arg channel "$CHANNEL" \
             --arg version "$version" \
             --arg url "$artifact_url" \
             --arg sha "$artifact_sha256" \
             '{channel: $channel, version: $version, artifact_url: $url, artifact_sha256: $sha, min_wire_v: 1, max_wire_v: 1}')"
 
-          echo "Registering ${channel}/${version} -> ${artifact_url}"
+          echo "Registering ${CHANNEL}/${version} -> ${artifact_url}"
 
           # POST and capture status + body separately so a non-2xx fails the
           # job with a readable message (and never dumps the OIDC token).
