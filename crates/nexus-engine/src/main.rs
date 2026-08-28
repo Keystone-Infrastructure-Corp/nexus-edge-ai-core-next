@@ -1028,7 +1028,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         }
         let cam_id = cam.id;
         let cam_url = cam.ingest.url.to_string();
-        let cam_analysis_url = cam.ingest.analysis_url.as_ref().map(ToString::to_string);
+        let cam_analysis_url = cam
+            .ingest
+            .analysis_url
+            .as_ref()
+            .filter(|_| recorder.has_analysis_ingester(cam.id))
+            .map(ToString::to_string);
         let configured_codec = cam.ingest.codec;
         let detector = router.detector_for_camera(&cam);
         let detector_low_res = router.detector_for_camera_low_res(&cam);

@@ -235,6 +235,20 @@ pub trait ClipRecorder: Send + Sync {
         Ok(())
     }
 
+    /// Is a SPEC-069 analysis session currently registered for this
+    /// camera?
+    ///
+    /// Boot seeds the reconciler's per-camera entry from this rather than
+    /// from config: an entry that claims a session which was never
+    /// registered matches the reconciler's no-change guard and strands the
+    /// camera on the main stream forever. Default impl reports `false`,
+    /// which is correct for recorders that no-op
+    /// [`Self::set_camera_analysis_ingester`].
+    #[allow(unused_variables)]
+    fn has_analysis_ingester(&self, camera_id: CameraId) -> bool {
+        false
+    }
+
     /// Hot-resize the RGB tap of an existing camera ingester to
     /// `new_rgb_w × new_rgb_h`. Used by the supervisor's
     /// M_PERF_CROWD E2 hysteresis to swap between a high-res and

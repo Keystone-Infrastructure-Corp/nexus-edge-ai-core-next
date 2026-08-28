@@ -1246,6 +1246,7 @@ async fn reprobe_apply(
     // read-modify-write race with any concurrent camera edit.
     let mut cams = s.store.list_cameras().await?;
     let mut out = Vec::with_capacity(probed.len());
+    let mut applied_any = false;
     for (proposal, resolved) in probed {
         if let Some(url) = resolved {
             if let Some(cam) = cams.iter_mut().find(|c| c.id == proposal.camera_id) {
@@ -1274,9 +1275,23 @@ async fn reprobe_apply(
                 )
                 .await?;
                 nexus_store::Store::commit_tx(tx).await?;
+                applied_any = true;
             }
         }
         out.push(proposal);
+    }
+    // The reconciler is the only thing that starts an analysis session on a
+    // live engine, and it is driven purely by this event. Without the
+    // publish the rows change, the console reports "applied", and not one
+    // camera actually switches until the appliance is restarted.
+    if applied_any {
+        let _ = s
+            .bus
+            .publish(
+                topic::CONFIG_CHANGED,
+                &serde_json::json!({ "kind": "camera", "action": "upsert" }),
+            )
+            .await;
     }
     Ok(Json(out))
 }
@@ -1332,24 +1347,45 @@ async fn run_reprobe(
     Ok(out)
 }
 
-/// Serialise a camera for an audit payload with every RTSP credential
-/// stripped.
+/// Strip `user:pass@` userinfo from a URL in place.
+fn strip_userinfo(u: &mut url::Url) {
+    if !u.username().is_empty() || u.password().is_some() {
+        let _ = u.set_password(None);
+        let _ = u.set_username("");
+    }
+}
+
+/// Serialise a camera for an audit payload with every secret stripped.
 ///
 /// Audit rows are not a private store. They ship verbatim in the
 /// diagnostics bundle — both as `audit-log.json` and inside the
-/// "secret-scrubbed" SQLite snapshot, whose `SECRET_COLUMNS` net does not
+/// "secret-scrubbed" SQLite snapshot, whose `SECRET_COLUMNS` net did not
 /// match `before_json` / `after_json` — and the `/admin/*` proxy serves
-/// them to the cloud console. A plaintext `user:pass@` in here therefore
+/// them to the cloud console. A plaintext secret in here therefore
 /// crosses the line REPO_BOUNDARY R5b exists to hold.
 ///
-/// Scrubbing the serialised blob rather than named fields is deliberate:
-/// wholesale serialisation of the domain type is what let `analysis_url`
-/// inherit this leak the moment it was added, so the scrub has to cover
-/// URL-bearing fields nobody has written yet.
+/// Redaction is **structural**, not a string scrub over the serialised
+/// blob. `redact_url_credentials` tokenises an authority on a delimiter
+/// set that includes `,`, `(`, `)` and `'` — none of which the `url`
+/// crate percent-encodes in userinfo — so a password containing one of
+/// them survives it. It also cannot see `onvif.password`, which is not a
+/// URL at all. Cloning and clearing the fields has neither blind spot.
 fn camera_audit_json(cam: &CameraConfig) -> Option<String> {
-    serde_json::to_string(cam)
-        .ok()
-        .map(|s| crate::admin_runtime::redact_url_credentials(&s))
+    let mut safe = cam.clone();
+    strip_userinfo(&mut safe.ingest.url);
+    if let Some(a) = safe.ingest.analysis_url.as_mut() {
+        strip_userinfo(a);
+    }
+    if safe.onvif.password.is_some() {
+        safe.onvif.password = Some("[redacted]".to_string());
+    }
+    if let Some(b) = safe.talk_down.backchannel_url.as_mut() {
+        if let Ok(mut parsed) = url::Url::parse(b) {
+            strip_userinfo(&mut parsed);
+            *b = parsed.to_string();
+        }
+    }
+    serde_json::to_string(&safe).ok()
 }
 
 async fn upsert_camera(

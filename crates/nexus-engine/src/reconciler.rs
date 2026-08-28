@@ -354,7 +354,7 @@ pub(crate) async fn apply_analysis_session(
     cam: &CameraConfig,
     main_codec: CodecKind,
     supervisor_dims: (u32, u32),
-) {
+) -> bool {
     let cam_id = cam.id;
     let (sup_w, sup_h) = supervisor_dims;
     let Some(analysis_url) = cam.ingest.analysis_url.as_ref() else {
@@ -368,7 +368,7 @@ pub(crate) async fn apply_analysis_session(
         ) {
             error!(camera_id = cam_id, error = %e, "analysis session teardown failed");
         }
-        return;
+        return false;
     };
     // The substream carries its own codec — an H.265 main stream with an
     // H.264 substream is the common case, so the main stream's codec is
@@ -379,7 +379,7 @@ pub(crate) async fn apply_analysis_session(
             .unwrap_or(main_codec),
         _ => main_codec,
     };
-    if let Err(e) = recorder.set_camera_analysis_ingester(
+    match recorder.set_camera_analysis_ingester(
         cam_id,
         Some(analysis_url.as_str()),
         cam.ingest.max_fps,
@@ -387,11 +387,15 @@ pub(crate) async fn apply_analysis_session(
         sup_h,
         a_codec,
     ) {
-        error!(
-            camera_id = cam_id,
-            error = %e,
-            "analysis substream session failed to start; analysis stays on the main stream"
-        );
+        Ok(()) => true,
+        Err(e) => {
+            error!(
+                camera_id = cam_id,
+                error = %e,
+                "analysis substream session failed to start; analysis stays on the main stream"
+            );
+            false
+        }
     }
 }
 
@@ -460,9 +464,15 @@ async fn start_camera(
 
     // SPEC-069 — the analysis session, when the camera has one. Shared
     // with the boot path so the two can never disagree about whether a
-    // converted camera actually got its second session.
-    let cam_analysis_url = cam.ingest.analysis_url.as_ref().map(ToString::to_string);
-    apply_analysis_session(args.recorder.as_ref(), &cam, codec, (sup_w, sup_h)).await;
+    // converted camera actually got its second session. The entry records
+    // what was REGISTERED, not what was configured: recording `Some` after
+    // a failed registration would match reconcile()'s no-change guard and
+    // strand the camera on the main stream with no retry.
+    let registered =
+        apply_analysis_session(args.recorder.as_ref(), &cam, codec, (sup_w, sup_h)).await;
+    let cam_analysis_url = registered
+        .then(|| cam.ingest.analysis_url.as_ref().map(ToString::to_string))
+        .flatten();
 
     let detector = args.router.detector_for_camera(&cam);
     let detector_low_res = args.router.detector_for_camera_low_res(&cam);

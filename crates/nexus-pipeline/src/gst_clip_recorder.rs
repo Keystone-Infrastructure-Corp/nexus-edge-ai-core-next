@@ -1225,6 +1225,13 @@ impl ClipRecorder for GstClipRecorder {
         Ok(())
     }
 
+    fn has_analysis_ingester(&self, camera_id: CameraId) -> bool {
+        self.analysis_ingesters
+            .read()
+            .get(&camera_id)
+            .is_some_and(|a| !a.is_shutdown())
+    }
+
     fn shared_frame_source(
         &self,
         camera_id: CameraId,

@@ -82,16 +82,37 @@ fn parse_resolution(s: &str) -> Option<(u32, u32)> {
 
 /// Is this profile the camera's main stream?
 ///
-/// Compared on host, port and path: the configured URL carries
-/// `user:pass@` userinfo and the ONVIF-reported URI does not, so a
-/// string comparison would never match and every camera would offer
-/// its own main stream as an analysis candidate.
-fn is_same_stream(main_url: &url::Url, uri: &str) -> bool {
-    let Ok(probed) = url::Url::parse(uri) else {
-        // Unparseable: treat it as the main stream so it is excluded.
-        // Letting it through risks returning it as the analysis pick,
-        // which would open a second session on the stream we are trying
-        // to stop decoding twice.
+/// Host, port and path first: the configured URL carries `user:pass@`
+/// userinfo and the ONVIF-reported URI does not, so a string comparison
+/// would never match and every camera would offer its own main stream as
+/// an analysis candidate.
+///
+/// Same path is where it gets interesting. Dahua and Amcrest put the
+/// profile selector in the query (`?channel=1&subtype=0` main vs
+/// `subtype=1` sub) on a byte-identical path, so path equality alone
+/// classifies the whole vendor family's substream as its own main stream.
+/// But the query cannot decide it either, in *either* direction:
+///
+/// - `GetStreamUri` commonly returns more params than the configured
+///   short form (`&unicast=true&proto=Onvif`), so string-comparing
+///   queries lets the main profile through as a candidate — and since it
+///   is the only one clearing the supervisor-pixel bar, it gets picked,
+///   doubling decode instead of halving it.
+/// - An operator may configure the short form with no query at all, in
+///   which case both probed profiles differ from it and *both* get
+///   excluded — "this camera offers no second stream" about a camera that
+///   plainly has one.
+///
+/// So resolution is the disambiguator: on a shared path, the profile
+/// matching the main stream's resolution IS the main stream. A candidate
+/// at main resolution is useless for analysis anyway — there is no decode
+/// saving in it — so excluding it costs nothing even when the guess is
+/// wrong.
+fn is_same_stream(main_url: &url::Url, main_resolution: (u32, u32), s: &MediaStream) -> bool {
+    let Ok(probed) = url::Url::parse(&s.uri) else {
+        // Unparseable: exclude. Letting it through risks returning it as
+        // the analysis pick, opening a second session on the very stream
+        // we are trying to stop decoding twice.
         return true;
     };
     if main_url.host_str() != probed.host_str()
@@ -100,15 +121,14 @@ fn is_same_stream(main_url: &url::Url, uri: &str) -> bool {
     {
         return false;
     }
-    // Dahua and Amcrest put the profile selector in the query
-    // (`?channel=1&subtype=0` main vs `subtype=1` sub) on an identical
-    // path, so path equality alone classifies the whole vendor family's
-    // substream as its own main stream. Compare queries only when both
-    // sides carry one: a transport hint an operator appended to the
-    // configured URL must not stop the main profile being excluded.
-    match (main_url.query(), probed.query()) {
-        (Some(a), Some(b)) => a == b,
-        _ => true,
+    match s.resolution.as_deref().and_then(parse_resolution) {
+        Some(res) => res == main_resolution,
+        // No resolution to compare: fall back to the query, treating a
+        // missing one on either side as "same".
+        None => match (main_url.query(), probed.query()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        },
     }
 }
 
@@ -142,7 +162,7 @@ pub fn pick_analysis_stream(
 
     let candidates: Vec<&MediaStream> = profiles
         .iter()
-        .filter(|s| !is_same_stream(main_url, &s.uri))
+        .filter(|s| !is_same_stream(main_url, main_resolution, s))
         .collect();
     if candidates.is_empty() {
         return Err(NoAnalysisStream::OnlyMain);
@@ -346,6 +366,79 @@ mod tests {
         .expect("the substream is a valid analysis pick");
         assert_eq!(pick.stream.token, "sub");
         assert!(!pick.below_detector_input);
+    }
+
+    /// Dahua's `GetStreamUri` commonly returns MORE params than the
+    /// documented short form an operator configures. Comparing query
+    /// strings then lets the main profile through as a candidate — and
+    /// because it is the only one clearing the supervisor-pixel bar, it
+    /// wins, opening a second session on the main stream and doubling
+    /// decode instead of halving it.
+    #[test]
+    fn a_probed_main_profile_with_extra_query_params_is_still_excluded() {
+        let main =
+            url::Url::parse("rtsp://admin:secret@10.0.0.5:554/cam/realmonitor?channel=1&subtype=0")
+                .unwrap();
+        let profiles = [
+            stream(
+                "main",
+                "rtsp://10.0.0.5:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif",
+                "H264",
+                "1920x1080",
+            ),
+            stream(
+                "sub",
+                "rtsp://10.0.0.5:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif",
+                "H264",
+                "640x360",
+            ),
+        ];
+        // Supervisor at the 1024x576 rung: 640x360 is BELOW it, so if the
+        // main profile survived exclusion it would be the only candidate
+        // at or above the bar and would be picked.
+        let pick = pick_analysis_stream(
+            &profiles,
+            &main,
+            (1920, 1080),
+            Some(CodecKind::H264),
+            1024 * 576,
+        )
+        .expect("the substream is still the pick");
+        assert_eq!(pick.stream.token, "sub");
+        assert!(pick.below_detector_input);
+    }
+
+    /// The mirror image: an operator configures the short form with no
+    /// query at all (Dahua firmware accepts it and defaults to subtype=0).
+    /// Both probed profiles then differ from the configured URL, and a
+    /// query-only rule excludes BOTH — reporting "no second stream" about
+    /// a camera that plainly has one.
+    #[test]
+    fn a_configured_url_without_a_query_still_finds_the_dahua_substream() {
+        let main = url::Url::parse("rtsp://admin:secret@10.0.0.5:554/cam/realmonitor").unwrap();
+        let profiles = [
+            stream(
+                "main",
+                "rtsp://10.0.0.5:554/cam/realmonitor?channel=1&subtype=0",
+                "H264",
+                "1920x1080",
+            ),
+            stream(
+                "sub",
+                "rtsp://10.0.0.5:554/cam/realmonitor?channel=1&subtype=1",
+                "H264",
+                "640x360",
+            ),
+        ];
+        let pick = pick_analysis_stream(
+            &profiles,
+            &main,
+            (1920, 1080),
+            Some(CodecKind::H264),
+            SUPERVISOR_512X288,
+        )
+        .expect("the substream is a valid analysis pick");
+        assert_eq!(pick.stream.token, "sub");
     }
 
     /// A transport hint on the configured URL must not stop the main
