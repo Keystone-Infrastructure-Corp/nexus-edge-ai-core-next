@@ -431,6 +431,11 @@ fn va_gpu_convert_caps(libva_driver: Option<&str>) -> &'static str {
 /// the lookup share this constant rather than two string literals.
 pub const RGB_TAP_QUEUE_NAME: &str = "rgbq";
 
+/// The valve gating the RGB tap's decode chain, looked up by name so the
+/// ingester can open or close it on a playing pipeline. Closed while a
+/// camera analyses its substream through a second session (SPEC-069).
+pub const RGB_TAP_VALVE_NAME: &str = "rgbvalve";
+
 /// Time cap on the decoder-input queue, in nanoseconds.
 ///
 /// Bounds how far the analysis branch's wall clock can drift behind the
@@ -467,10 +472,25 @@ pub const RGB_TAP_QUEUE_MAX_TIME_NS: u64 = 2_000_000_000;
 /// `alert_clip.pre_secs` and the 5 s `pre_roll_secs` default; the buffer count
 /// is only a backstop for pathological frame rates.
 #[must_use]
-pub fn rgb_tap_branch(decode_chain: &str, width: u32, height: u32, framerate: u32) -> String {
+pub fn rgb_tap_branch(
+    decode_chain: &str,
+    width: u32,
+    height: u32,
+    framerate: u32,
+    valve_closed: bool,
+) -> String {
+    // The valve sits ahead of the decoder so a closed one discards
+    // access units before any pixel work — that is what makes
+    // substream analysis (SPEC-069) a real saving rather than a
+    // second decode. Its `drop` property is settable on a playing
+    // pipeline, so falling back to main-stream analysis costs a
+    // property set instead of a rebuild that would interrupt
+    // recording on the branch beside it.
+    let drop = if valve_closed { "true" } else { "false" };
     format!(
         "t. ! queue name={RGB_TAP_QUEUE_NAME} leaky=downstream max-size-buffers=200 \
             max-size-bytes=0 max-size-time={RGB_TAP_QUEUE_MAX_TIME_NS} \
+         ! valve name={RGB_TAP_VALVE_NAME} drop={drop} \
          ! {decode_chain} \
          ! video/x-raw,format=RGB,width={width},height={height},framerate={framerate}/1 \
          ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4"
@@ -1466,6 +1486,7 @@ mod tests {
             512,
             288,
             15,
+            false,
         );
         assert!(
             d.contains(&format!("queue name={RGB_TAP_QUEUE_NAME} ")),
@@ -1480,7 +1501,7 @@ mod tests {
     #[test]
     fn rgb_tap_branch_keeps_the_counted_queue_ahead_of_the_decoder() {
         let chain = "vah265dec ! vapostproc ! videoconvert ! videorate";
-        let d = rgb_tap_branch(chain, 512, 288, 15);
+        let d = rgb_tap_branch(chain, 512, 288, 15, false);
         let queue_at = d.find("queue name=").expect("named queue present");
         let decoder_at = d.find(chain).expect("decode chain present");
         assert!(
@@ -1499,6 +1520,7 @@ mod tests {
             1024,
             576,
             8,
+            false,
         );
         assert!(d.contains("leaky=downstream"), "{d}");
         assert!(
@@ -1506,6 +1528,38 @@ mod tests {
             "{d}"
         );
         assert!(d.starts_with("t. !"), "branch must hang off the tee: {d}");
+    }
+
+    /// A closed valve has to sit *ahead* of the decode chain, or substream
+    /// analysis saves nothing: the point of SPEC-069 is that the main
+    /// stream's access units are discarded before any pixel work, not that
+    /// its decoded frames are thrown away afterwards.
+    #[test]
+    fn rgb_tap_valve_sits_ahead_of_the_decoder() {
+        let chain = "vah264dec name=vdec ! vapostproc ! videoconvert";
+        let d = rgb_tap_branch(chain, 512, 288, 15, true);
+        let valve_at = d
+            .find(&format!("valve name={RGB_TAP_VALVE_NAME}"))
+            .expect("valve must be named for by_name lookup");
+        let decoder_at = d.find(chain).expect("decode chain present");
+        assert!(valve_at < decoder_at, "valve must precede the decoder: {d}");
+    }
+
+    /// The valve's initial state is rebuilt from the ingester's stored flag on
+    /// every reconnect. If a rebuild ignored it, a camera on substream
+    /// analysis would silently resume decoding its main stream after the
+    /// first RTSP blip — the whole saving gone, with nothing in the logs.
+    #[test]
+    fn rgb_tap_valve_initial_state_follows_the_caller() {
+        let chain = "vah264dec ! vapostproc ! videoconvert";
+        assert!(
+            rgb_tap_branch(chain, 512, 288, 15, true).contains("drop=true"),
+            "a closed valve must be built closed"
+        );
+        assert!(
+            rgb_tap_branch(chain, 512, 288, 15, false).contains("drop=false"),
+            "an open valve must be built open"
+        );
     }
 
     /// The depth of the counted queue is not a tuning knob. At 8 buffers it
@@ -1520,6 +1574,7 @@ mod tests {
             512,
             288,
             15,
+            false,
         );
         let depth: usize = d
             .split("max-size-buffers=")
@@ -1548,6 +1603,7 @@ mod tests {
             512,
             288,
             15,
+            false,
         );
         assert!(
             d.contains(&format!("max-size-time={RGB_TAP_QUEUE_MAX_TIME_NS}")),

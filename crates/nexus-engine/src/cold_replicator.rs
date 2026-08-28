@@ -1105,6 +1105,7 @@ mod tests {
                 name: "cam1".into(),
                 ingest: nexus_config::CameraIngest {
                     url: Url::parse("rtsp://127.0.0.1/stream1").unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,

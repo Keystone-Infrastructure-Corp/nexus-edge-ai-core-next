@@ -259,6 +259,92 @@ pub struct RtspSource {
 // `broadcast::Sender` lives in the ingester struct, not the pipeline.
 // ---------------------------------------------------------------------------
 
+/// Why analysis stopped using the camera's substream and reverted to
+/// the main stream. Reported per camera so an operator sees which of
+/// the three happened rather than a bare "unavailable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// The second session never came up — refused, unauthorised, or
+    /// unreachable.
+    Refused,
+    /// The session connected but produced no decoded frame inside the
+    /// grace window.
+    NoFrames,
+    /// Frames arrived, then the rate collapsed below half of what the
+    /// substream advertised.
+    Unhealthy,
+}
+
+/// Verdict on the analysis session, recomputed on a timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisVerdict {
+    /// Too early to judge — inside the grace window with no frames yet.
+    Measuring,
+    /// Delivering frames at an acceptable rate.
+    Healthy,
+    /// Revert to the main stream for the stated reason.
+    FallBack(FallbackReason),
+}
+
+/// What the source can actually observe about the analysis session.
+#[derive(Debug, Clone, Copy)]
+pub struct AnalysisObservation {
+    /// Frames received **in the current window**, not since the session
+    /// started. A cumulative count would make this verdict useless: a
+    /// substream that ran healthy for ten hours and then died needs
+    /// another ten hours of silence before its lifetime average falls
+    /// below the threshold.
+    pub frames: u64,
+    /// Wall time the current window has been open.
+    pub elapsed: std::time::Duration,
+    /// Whether the ingester currently has a live RTSP session. Tells a
+    /// refused connection apart from one that connected and went quiet.
+    pub session_live: bool,
+    /// Frames per second the substream was configured to deliver.
+    pub expected_fps: u32,
+}
+
+/// How long a fresh analysis session gets to produce its first frame.
+/// Generous because the ingester's own reconnect backoff doubles from
+/// 500 ms, so a camera that refuses the second session burns several
+/// retries before anyone should conclude anything from the silence.
+pub const ANALYSIS_FIRST_FRAME_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long frames must flow before their rate is judged. Below this a
+/// slow start would read as a collapse.
+pub const ANALYSIS_RATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Decide whether analysis should stay on the substream (SPEC-069).
+///
+/// Pure, so the policy is testable without a camera, a GPU or
+/// GStreamer. The wiring around it is none of those things, and this
+/// is the part that decides whether a site's analysis quietly stops.
+#[must_use]
+pub fn analysis_verdict(obs: &AnalysisObservation) -> AnalysisVerdict {
+    if obs.frames == 0 {
+        if obs.elapsed < ANALYSIS_FIRST_FRAME_GRACE {
+            return AnalysisVerdict::Measuring;
+        }
+        return AnalysisVerdict::FallBack(if obs.session_live {
+            FallbackReason::NoFrames
+        } else {
+            FallbackReason::Refused
+        });
+    }
+    if obs.elapsed < ANALYSIS_RATE_SETTLE {
+        return AnalysisVerdict::Healthy;
+    }
+    let expected = if obs.expected_fps == 0 {
+        15
+    } else {
+        obs.expected_fps
+    };
+    if obs.frames as f64 / obs.elapsed.as_secs_f64() < f64::from(expected) / 2.0 {
+        return AnalysisVerdict::FallBack(FallbackReason::Unhealthy);
+    }
+    AnalysisVerdict::Healthy
+}
+
 #[cfg(feature = "gstreamer")]
 pub struct SharedRtspSource {
     pub camera_id: CameraId,
@@ -268,6 +354,15 @@ pub struct SharedRtspSource {
     /// internal `ingesters` map drops its reference (e.g. a
     /// reconciler tearing down the camera mid-shutdown).
     pub ingester: std::sync::Arc<crate::preroll_ingester::PreRollIngester>,
+    /// Second session on the camera's `analysis_url`, when one is
+    /// configured (SPEC-069 Phase 2). When present its RGB tap is
+    /// what the supervisor reads and [`Self::ingester`]'s tap is
+    /// valved off; when it fails any of the triggers in
+    /// [`analysis_verdict`] we open the main valve and read from
+    /// there instead. The main session is never torn down or
+    /// rebuilt by any of this — recording and HD live view are not
+    /// collateral (SPEC-069 invariants I2\u2013I5).
+    pub analysis: Option<std::sync::Arc<crate::preroll_ingester::PreRollIngester>>,
 }
 
 #[cfg(feature = "gstreamer")]
@@ -275,13 +370,37 @@ pub struct SharedRtspSource {
 impl FrameSource for SharedRtspSource {
     async fn run(self: Box<Self>, tx: mpsc::Sender<Frame>) -> Result<(), FrameSourceError> {
         use tokio::sync::broadcast::error::RecvError;
-        let mut rx = self.ingester.subscribe_frames().ok_or_else(|| {
-            FrameSourceError::Backend(
-                "shared rtsp source: ingester has no RGB tap (built via \
-                 PreRollIngester::new instead of new_with_rgb)"
-                    .into(),
-            )
-        })?;
+        // Which session are we reading? The analysis one while it is
+        // healthy, the main one otherwise. Switching between them
+        // never touches the main pipeline's NAL branch, so recording
+        // and HD live view are unaffected either way.
+        let mut reading_analysis = self.analysis.is_some();
+        if self.analysis.is_some() {
+            // Main stops decoding for analysis; the substream takes over.
+            self.ingester.set_rgb_valve_closed(true);
+            tracing::info!(
+                camera_id = self.camera_id,
+                "analysis reading the camera substream; main-stream rgb tap valved off"
+            );
+        }
+        let mut rx = self.frames_from(reading_analysis)?;
+        let expected_fps = self
+            .analysis
+            .as_ref()
+            .and_then(|a| a.rgb_tap_fps())
+            .unwrap_or(0);
+        let started = std::time::Instant::now();
+        let mut frames: u64 = 0;
+        // Rate is judged over a rolling window, not the session's
+        // lifetime — see `AnalysisObservation::frames`. `window_start`
+        // and `window_frames` reset each time a window closes; `frames`
+        // and `started` stay cumulative so the first-frame grace check
+        // still measures from session start.
+        let mut window_start = started;
+        let mut window_frames: u64 = 0;
+        let mut health_tick =
+            tokio::time::interval(std::time::Duration::from_secs(ANALYSIS_HEALTH_TICK_SECS));
+        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tracing::info!(
             camera_id = self.camera_id,
             "shared rtsp source subscribed to ingester rgb tap"
@@ -290,32 +409,104 @@ impl FrameSource for SharedRtspSource {
             if tx.is_closed() {
                 return Err(FrameSourceError::Closed);
             }
-            match rx.recv().await {
-                Ok(frame) => {
-                    // Same drop policy as RtspSource: try_send so a
-                    // slow downstream gate/pool drops at the edge
-                    // instead of stalling the broadcast (which would
-                    // cause Lagged on the NEXT recv).
-                    let _ = tx.try_send(frame);
+            tokio::select! {
+                _ = health_tick.tick(), if reading_analysis => {
+                    // Before the first frame, judge against the session's
+                    // age (the grace window); afterwards, against the
+                    // rolling window so a collapse is caught while it is
+                    // happening rather than averaged away.
+                    let (obs_frames, obs_elapsed) = if frames == 0 {
+                        (0, started.elapsed())
+                    } else {
+                        (window_frames, window_start.elapsed())
+                    };
+                    let verdict = analysis_verdict(&AnalysisObservation {
+                        frames: obs_frames,
+                        elapsed: obs_elapsed,
+                        session_live: self
+                            .analysis
+                            .as_ref()
+                            .is_some_and(|a| a.is_buffering()),
+                        expected_fps,
+                    });
+                    if obs_elapsed >= ANALYSIS_RATE_SETTLE {
+                        window_start = std::time::Instant::now();
+                        window_frames = 0;
+                    }
+                    if let AnalysisVerdict::FallBack(reason) = verdict {
+                        tracing::warn!(
+                            camera_id = self.camera_id,
+                            ?reason,
+                            frames,
+                            elapsed_s = started.elapsed().as_secs(),
+                            "analysis substream unusable; reverting to the main stream \
+                             (recording and HD live view are unaffected)"
+                        );
+                        self.ingester.set_rgb_valve_closed(false);
+                        // Stop the substream session outright. Leaving it
+                        // reconnecting with no subscriber would turn one
+                        // decode into two for the life of the camera —
+                        // the precise cost this phase exists to remove.
+                        if let Some(a) = self.analysis.as_ref() {
+                            a.shutdown();
+                        }
+                        reading_analysis = false;
+                        rx = self.frames_from(false)?;
+                    }
                 }
-                Err(RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        camera_id = self.camera_id,
-                        dropped = n,
-                        "shared rtsp source lagged \
-                         (downstream too slow; gate/pool should be dropping at the edge)"
-                    );
-                }
-                Err(RecvError::Closed) => {
-                    // The Sender lives in the PreRollIngester
-                    // struct. Closed means the ingester was
-                    // dropped — typically only happens during
-                    // engine shutdown. Return Closed so the
-                    // supervisor sees the source ended.
-                    return Err(FrameSourceError::Closed);
-                }
+                recv = rx.recv() => match recv {
+                    Ok(frame) => {
+                        frames += 1;
+                        window_frames += 1;
+                        // Same drop policy as RtspSource: try_send so a
+                        // slow downstream gate/pool drops at the edge
+                        // instead of stalling the broadcast (which would
+                        // cause Lagged on the NEXT recv).
+                        let _ = tx.try_send(frame);
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            camera_id = self.camera_id,
+                            dropped = n,
+                            "shared rtsp source lagged \
+                             (downstream too slow; gate/pool should be dropping at the edge)"
+                        );
+                    }
+                    Err(RecvError::Closed) => {
+                        // The Sender lives in the PreRollIngester
+                        // struct. Closed means the ingester was
+                        // dropped — typically only happens during
+                        // engine shutdown. Return Closed so the
+                        // supervisor sees the source ended.
+                        return Err(FrameSourceError::Closed);
+                    }
+                },
             }
         }
+    }
+}
+
+/// How often the analysis session's health is re-judged.
+pub const ANALYSIS_HEALTH_TICK_SECS: u64 = 5;
+
+#[cfg(feature = "gstreamer")]
+impl SharedRtspSource {
+    fn frames_from(
+        &self,
+        analysis: bool,
+    ) -> Result<tokio::sync::broadcast::Receiver<Frame>, FrameSourceError> {
+        let ing = if analysis {
+            self.analysis.as_ref().unwrap_or(&self.ingester)
+        } else {
+            &self.ingester
+        };
+        ing.subscribe_frames().ok_or_else(|| {
+            FrameSourceError::Backend(
+                "shared rtsp source: ingester has no RGB tap (built via \
+                 PreRollIngester::new instead of new_with_rgb)"
+                    .into(),
+            )
+        })
     }
 }
 
@@ -768,6 +959,101 @@ impl RtspSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn obs(frames: u64, secs: u64, session_live: bool) -> AnalysisObservation {
+        AnalysisObservation {
+            frames,
+            elapsed: std::time::Duration::from_secs(secs),
+            session_live,
+            expected_fps: 15,
+        }
+    }
+
+    /// A camera that is simply slow to hand over its first substream
+    /// frame must not be written off. The ingester's own reconnect
+    /// backoff doubles from 500 ms, so several seconds of silence is
+    /// ordinary rather than diagnostic.
+    #[test]
+    fn silence_inside_the_grace_window_is_not_a_verdict() {
+        assert_eq!(
+            analysis_verdict(&obs(0, 5, true)),
+            AnalysisVerdict::Measuring
+        );
+    }
+
+    /// A refused second session and one that connected then went quiet
+    /// need different words in front of an operator: the first is a
+    /// firmware session cap, the second is a camera problem.
+    #[test]
+    fn a_refused_session_is_distinguished_from_a_silent_one() {
+        assert_eq!(
+            analysis_verdict(&obs(0, 30, false)),
+            AnalysisVerdict::FallBack(FallbackReason::Refused)
+        );
+        assert_eq!(
+            analysis_verdict(&obs(0, 30, true)),
+            AnalysisVerdict::FallBack(FallbackReason::NoFrames)
+        );
+    }
+
+    /// Frames flowing at the advertised rate is the whole point.
+    #[test]
+    fn a_substream_delivering_its_rate_is_healthy() {
+        assert_eq!(
+            analysis_verdict(&obs(15 * 120, 120, true)),
+            AnalysisVerdict::Healthy
+        );
+    }
+
+    /// A substream that streams healthily for hours and then dies must
+    /// be caught. Judged on a lifetime average it never would be — ten
+    /// healthy hours need ten silent ones to drag the mean under the
+    /// threshold — which is why the caller feeds this a rolling window.
+    #[test]
+    fn a_long_healthy_run_followed_by_silence_still_falls_back() {
+        // One window's worth of total silence, which is what the caller
+        // passes once the window has rolled.
+        assert_eq!(
+            analysis_verdict(&obs(0, 90, true)),
+            AnalysisVerdict::FallBack(FallbackReason::NoFrames)
+        );
+    }
+
+    /// Below half the advertised rate the substream is worse than the
+    /// main stream it displaced, so revert.
+    #[test]
+    fn a_collapsed_rate_falls_back() {
+        // 3 fps against an advertised 15.
+        assert_eq!(
+            analysis_verdict(&obs(3 * 120, 120, true)),
+            AnalysisVerdict::FallBack(FallbackReason::Unhealthy)
+        );
+    }
+
+    /// Rate is not judged before it has had time to settle, or every
+    /// camera would fall back during its first seconds of streaming.
+    #[test]
+    fn rate_is_not_judged_before_it_settles() {
+        assert_eq!(
+            analysis_verdict(&obs(1, 10, true)),
+            AnalysisVerdict::Healthy
+        );
+    }
+
+    /// `max_fps = 0` means "unbounded" everywhere else in the engine and
+    /// the ingester substitutes 15. If this function did not make the
+    /// same substitution it would divide by zero and call every healthy
+    /// camera unhealthy.
+    #[test]
+    fn an_unbounded_fps_falls_back_to_the_same_default_the_ingester_uses() {
+        let o = AnalysisObservation {
+            frames: 15 * 120,
+            elapsed: std::time::Duration::from_secs(120),
+            session_live: true,
+            expected_fps: 0,
+        };
+        assert_eq!(analysis_verdict(&o), AnalysisVerdict::Healthy);
+    }
 
     /// Regression lock on BUG-070. `set_state(Null)` is detached, so the
     /// pipeline a reconnect abandons may still be PLAYING — and it holds a

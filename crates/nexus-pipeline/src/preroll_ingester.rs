@@ -179,6 +179,12 @@ pub struct PreRollIngester {
     /// Set iff the pipeline was built with the RGB tap. See
     /// [`FrameTap`] for the why.
     frame_tap: Option<FrameTap>,
+    /// Whether the RGB tap's `valve` is dropping. Held here rather than
+    /// read off the live pipeline because the supervisor rebuilds the
+    /// pipeline on every reconnect and has to restore the state — a
+    /// rebuild that reopened the valve would silently put a
+    /// substream-analysing camera back on main-stream decode.
+    rgb_valve_closed: Arc<AtomicBool>,
     /// Active GStreamer pipeline, populated by the supervisor each
     /// time it (re)builds a session. Drop sets it to NULL
     /// synchronously so the GObject ref cycle teardown doesn't
@@ -307,6 +313,8 @@ impl PreRollIngester {
         // rather than a reaction to load (BUG-070).
         let task_force_software = Arc::new(AtomicBool::new(false));
         let task_decode_health = decode_health;
+        let rgb_valve_closed = Arc::new(AtomicBool::new(false));
+        let task_rgb_valve_closed = rgb_valve_closed.clone();
         let task = tokio::spawn(async move {
             run_supervisor(
                 camera_id,
@@ -320,6 +328,7 @@ impl PreRollIngester {
                 task_shutdown,
                 task_force_software,
                 task_decode_health,
+                task_rgb_valve_closed,
             )
             .await;
         });
@@ -332,6 +341,7 @@ impl PreRollIngester {
             ring,
             live_tx,
             frame_tap,
+            rgb_valve_closed,
             active_pipeline,
             shutdown,
             task: Mutex::new(Some(task)),
@@ -401,6 +411,38 @@ impl PreRollIngester {
     /// the per-camera supervisor task).
     pub fn subscribe_frames(&self) -> Option<broadcast::Receiver<Frame>> {
         self.frame_tap.as_ref().map(|t| t.tx.subscribe())
+    }
+
+    /// Open or close the RGB tap's valve (SPEC-069). Closing it stops
+    /// this session decoding for analysis without touching the NAL
+    /// branch beside it, so recording, pre-roll and HD live view are
+    /// unaffected; opening it restores main-stream analysis when a
+    /// substream session falls back.
+    ///
+    /// Applies to the running pipeline when there is one and records
+    /// the state so the supervisor's next rebuild starts the same way.
+    /// A no-op on an ingester built without the RGB tap.
+    pub fn set_rgb_valve_closed(&self, closed: bool) {
+        self.rgb_valve_closed.store(closed, Ordering::Release);
+        let guard = self.active_pipeline.lock();
+        if let Some(valve) = guard
+            .as_ref()
+            .and_then(|p| p.by_name(crate::decode::RGB_TAP_VALVE_NAME))
+        {
+            valve.set_property("drop", closed);
+        }
+    }
+
+    /// Whether the RGB tap is currently valved off, i.e. this session
+    /// is not decoding for analysis.
+    pub fn rgb_valve_is_closed(&self) -> bool {
+        self.rgb_valve_closed.load(Ordering::Acquire)
+    }
+
+    /// Frames per second this session's RGB tap was configured for.
+    /// `None` when built without the tap.
+    pub fn rgb_tap_fps(&self) -> Option<u32> {
+        self.frame_tap.as_ref().map(|t| t.max_fps)
     }
 
     /// True iff this ingester was built with the shared RGB tap
@@ -474,6 +516,7 @@ async fn run_supervisor(
     shutdown: Arc<AtomicBool>,
     force_software: Arc<AtomicBool>,
     decode_health: Option<Arc<DecodeHealthRegistry>>,
+    rgb_valve_closed: Arc<AtomicBool>,
 ) {
     info!(
         camera_id,
@@ -507,6 +550,7 @@ async fn run_supervisor(
             shutdown.clone(),
             force_software.clone(),
             decode_health.clone(),
+            rgb_valve_closed.clone(),
         )
         .await
         {
@@ -544,6 +588,7 @@ async fn run_session(
     shutdown: Arc<AtomicBool>,
     force_software: Arc<AtomicBool>,
     decode_health: Option<Arc<DecodeHealthRegistry>>,
+    rgb_valve_closed: Arc<AtomicBool>,
 ) -> Result<(), IngesterError> {
     let pick_chain =
         |codec_base: &str| select_decode_chain(codec_base, decode_mode, &GstFactoryProbe);
@@ -643,7 +688,13 @@ async fn run_session(
                 ! appsink name=tap emit-signals=true sync=false \
                     max-buffers=200 drop=false \
              {rgb_branch}",
-                rgb_branch = crate::decode::rgb_tap_branch(&chain.elements, *rgb_w, *rgb_h, fr),
+                rgb_branch = crate::decode::rgb_tap_branch(
+                    &chain.elements,
+                    *rgb_w,
+                    *rgb_h,
+                    fr,
+                    rgb_valve_closed.load(Ordering::Acquire),
+                ),
             )
         }
     };
@@ -1013,7 +1064,23 @@ async fn run_session(
     // leave us hung in the bus iter), and BEFORE the long-blocking
     // bus iter below so a Drop happening during the first second
     // of the session still finds the pipeline.
-    *active_pipeline.lock() = Some(pipeline.clone());
+    {
+        let mut guard = active_pipeline.lock();
+        *guard = Some(pipeline.clone());
+        // Re-apply the valve under the same lock that publishes the
+        // pipeline. `set_rgb_valve_closed` landing between the `desc`
+        // being built above and this line would otherwise store its
+        // flag, find no active pipeline to act on, and leave the live
+        // valve at the stale value it was built with. The dangerous
+        // direction is a lost *open*: the source has already switched
+        // to main-stream frames and disabled its health tick, so a
+        // valve stuck shut delivers zero frames to the detector
+        // forever, with nothing in the logs.
+        if let Some(valve) = pipeline.by_name(crate::decode::RGB_TAP_VALVE_NAME) {
+            valve.set_property("drop", rgb_valve_closed.load(Ordering::Acquire));
+        }
+        drop(guard);
+    }
 
     // Drive the bus on a dedicated OS thread (NOT tokio's blocking
     // pool) so we observe Errors / EOS and propagate them up to the

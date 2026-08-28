@@ -1202,7 +1202,7 @@ fn auth_mode_str(m: AuthMode) -> &'static str {
 /// whitespace / quote / delimiter — mirroring how a URL parser tokenises
 /// it — so a stray `@` inside a query string (`?to=a@b`) is never
 /// mistaken for userinfo.
-fn redact_url_credentials(input: &str) -> String {
+pub(crate) fn redact_url_credentials(input: &str) -> String {
     const MARKER: &str = "://";
     let mut out = String::with_capacity(input.len());
     let mut rest = input;

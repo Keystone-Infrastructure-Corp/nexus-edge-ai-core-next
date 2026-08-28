@@ -87,6 +87,7 @@ async fn the_wall_keeps_painting_while_inference_never_completes() {
         name: "virtual-freshness".into(),
         ingest: nexus_config::CameraIngest {
             url: Url::parse("virtual://local").unwrap(),
+            analysis_url: None,
             enabled: true,
             max_fps: 10,
             codec: None,

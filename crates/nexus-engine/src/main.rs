@@ -25,6 +25,7 @@ mod api;
 mod audit_retention;
 mod auth;
 mod auth_bootstrap;
+mod camera_reprobe;
 mod cloud_alert_sink;
 mod cloud_audit;
 mod cloud_enroll;
@@ -1027,6 +1028,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         }
         let cam_id = cam.id;
         let cam_url = cam.ingest.url.to_string();
+        let cam_analysis_url = cam.ingest.analysis_url.as_ref().map(ToString::to_string);
         let configured_codec = cam.ingest.codec;
         let detector = router.detector_for_camera(&cam);
         let detector_low_res = router.detector_for_camera_low_res(&cam);
@@ -1101,6 +1103,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
                 url: cam_url,
                 supervisor_dims: (sup_w, sup_h),
                 codec: configured_codec,
+                analysis_url: cam_analysis_url,
             },
         );
     }

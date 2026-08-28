@@ -35,6 +35,7 @@ fn cam(id: i64, override_kind: Option<&str>, top_k: Option<usize>) -> CameraConf
         name: format!("cam-{id}"),
         ingest: CameraIngest {
             url: Url::parse("virtual://test").unwrap(),
+            analysis_url: None,
             enabled: true,
             max_fps: 0,
             codec: None,

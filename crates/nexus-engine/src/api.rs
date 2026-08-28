@@ -546,6 +546,14 @@ pub fn router(state: ApiState) -> Router {
         // routes — no behaviour fork.
         .route("/v1/admin/cameras", get(list_cameras).post(create_camera))
         .route(
+            "/v1/admin/cameras/reprobe",
+            axum::routing::post(reprobe_cameras),
+        )
+        .route(
+            "/v1/admin/cameras/reprobe/apply",
+            axum::routing::post(reprobe_apply),
+        )
+        .route(
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
         )
@@ -1183,6 +1191,116 @@ async fn get_auth_info(State(s): State<ApiState>) -> Json<serde_json::Value> {
 
 async fn list_cameras(State(s): State<ApiState>) -> Result<Json<Vec<CameraConfig>>, ApiError> {
     Ok(Json(s.store.list_cameras().await?))
+}
+
+/// Body for `POST /v1/admin/cameras/reprobe`. An absent list means
+/// every enabled camera.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ReprobeRequest {
+    #[serde(default)]
+    camera_ids: Option<Vec<CameraId>>,
+}
+
+/// `POST /v1/admin/cameras/reprobe` — SPEC-069 Phase 2.
+///
+/// Probes each camera's ONVIF profiles and returns what `analysis_url`
+/// *would* become. Writes nothing. Safe to run over a whole site as an
+/// inspection.
+///
+/// The resolved URL carries the camera's credentials and therefore
+/// never appears in the response (REPO_BOUNDARY R5b) — `reprobe_apply`
+/// re-derives it on the appliance from the camera ids the operator
+/// approved.
+async fn reprobe_cameras(
+    State(s): State<ApiState>,
+    body: Option<Json<ReprobeRequest>>,
+) -> Result<Json<Vec<crate::camera_reprobe::ReprobeProposal>>, ApiError> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(
+        run_reprobe(&s, req.camera_ids.as_deref())
+            .await?
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect(),
+    ))
+}
+
+/// `POST /v1/admin/cameras/reprobe/apply` — commit approved proposals.
+///
+/// Takes camera ids, not URLs: the appliance re-probes and re-derives
+/// each URL itself, so no credential makes the round trip through the
+/// console. Only cameras whose fresh probe still yields a `Set`
+/// proposal are written; anything that changed underneath the operator
+/// is reported rather than forced.
+async fn reprobe_apply(
+    State(s): State<ApiState>,
+    Json(req): Json<ReprobeRequest>,
+) -> Result<Json<Vec<crate::camera_reprobe::ReprobeProposal>>, ApiError> {
+    let ids = req.camera_ids.unwrap_or_default();
+    let probed = run_reprobe(&s, Some(&ids)).await?;
+    let mut out = Vec::with_capacity(probed.len());
+    for (proposal, resolved) in probed {
+        if let Some(url) = resolved {
+            let mut cams = s.store.list_cameras().await?;
+            if let Some(cam) = cams.iter_mut().find(|c| c.id == proposal.camera_id) {
+                cam.ingest.analysis_url = Some(url);
+                s.store.upsert_camera(cam).await?;
+            }
+        }
+        out.push(proposal);
+    }
+    Ok(Json(out))
+}
+
+/// Shared probe pass behind both reprobe routes. Returns each proposal
+/// beside the credential-bearing URL it resolved to; the URL stays on
+/// the appliance.
+async fn run_reprobe(
+    s: &ApiState,
+    only: Option<&[CameraId]>,
+) -> Result<Vec<(crate::camera_reprobe::ReprobeProposal, Option<url::Url>)>, ApiError> {
+    let cameras: Vec<CameraConfig> = s
+        .store
+        .list_cameras()
+        .await?
+        .into_iter()
+        .filter(|c| match only {
+            Some(ids) => ids.contains(&c.id),
+            None => c.ingest.enabled,
+        })
+        .collect();
+
+    // Bounded concurrency: one unreachable camera on a 53-camera site
+    // must not stall the batch, and 53 simultaneous ONVIF probes must
+    // not stall the appliance.
+    const MAX_INFLIGHT: usize = 8;
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let out = futures::stream::iter(cameras.into_iter().map(|cam| async move {
+        let probed = match (
+            &cam.onvif.endpoint,
+            &cam.onvif.username,
+            &cam.onvif.password,
+        ) {
+            (Some(xaddr), Some(user), Some(pass)) => tokio::time::timeout(
+                PROBE_TIMEOUT,
+                crate::discovery::onvif_media::query_streams(xaddr, user, pass),
+            )
+            .await
+            .unwrap_or_else(|_| Err("timed out".to_string())),
+            _ => Err("no ONVIF endpoint or credentials configured for this camera".to_string()),
+        };
+        let sup = crate::camera_reprobe::supervisor_pixels_for(&cam);
+        crate::camera_reprobe::propose_for_camera(&cam, probed, sup, |u| {
+            crate::admin_runtime::redact_url_credentials(u)
+        })
+    }))
+    .buffer_unordered(MAX_INFLIGHT)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut out = out;
+    out.sort_by_key(|(p, _)| p.camera_id);
+    Ok(out)
 }
 
 async fn upsert_camera(
@@ -6070,6 +6188,7 @@ mod tests {
                 name: "front".into(),
                 ingest: nexus_config::CameraIngest {
                     url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,
@@ -6336,6 +6455,7 @@ mod tests {
                 name: "cam3".into(),
                 ingest: nexus_config::CameraIngest {
                     url: Url::parse("rtsp://127.0.0.1/stream3").unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,
@@ -6842,6 +6962,7 @@ mod tests {
             name: format!("cam-{id}"),
             ingest: nexus_config::CameraIngest {
                 url: "rtsp://127.0.0.1/stream".parse().unwrap(),
+                analysis_url: None,
                 enabled: true,
                 max_fps: 0,
                 codec: None,
@@ -7291,6 +7412,7 @@ mod tests {
             name: "cam-21".into(),
             ingest: nexus_config::CameraIngest {
                 url: "rtsp://192.168.50.50:554/stream".parse().unwrap(),
+                analysis_url: None,
                 enabled: true,
                 max_fps: 0,
                 codec: None,
@@ -8245,6 +8367,7 @@ mod tests {
                 name: "front".into(),
                 ingest: nexus_config::CameraIngest {
                     url: url::Url::parse("rtsp://127.0.0.1/s").unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,
@@ -8810,6 +8933,7 @@ mod tests {
             name: name.into(),
             ingest: nexus_config::CameraIngest {
                 url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                analysis_url: None,
                 enabled: true,
                 max_fps: 0,
                 codec: None,

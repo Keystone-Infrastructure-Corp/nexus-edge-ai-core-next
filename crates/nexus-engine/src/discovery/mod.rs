@@ -24,6 +24,7 @@
 //! (reject `< /22` unconditionally, require `confirm: true` for
 //! `/22`), and the audit-log contract.
 
+pub mod analysis_pick;
 pub mod onvif;
 pub mod onvif_device;
 pub mod onvif_deviceio;
@@ -271,6 +272,24 @@ pub struct ProbeOnvifResult {
     /// name when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub osd_name: Option<String>,
+    /// Profile token to record from — always the largest, so a camera
+    /// added through discovery records its evidence at full resolution
+    /// regardless of what analysis does (BUG-073).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_main_token: Option<String>,
+    /// Profile token to analyse, when the camera offers a usable one
+    /// (SPEC-069). Computed here rather than in each console so both
+    /// consoles rank profiles identically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_analysis_token: Option<String>,
+    /// Why there is no analysis recommendation, in operator-facing
+    /// words. Present iff `recommended_analysis_token` is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_note: Option<String>,
+    /// The recommended analysis profile is smaller than the detector
+    /// input — applicable, but the operator is told.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub analysis_below_detector_input: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -766,10 +785,33 @@ pub async fn post_probe_onvif(
             } else {
                 None
             };
+            // Both profiles the camera should be committed with, ranked
+            // by the one shared policy (SPEC-069). Recording is always
+            // the largest profile; analysis is the pick against it.
+            // Ranked against the default preset's supervisor frame — a
+            // camera being discovered has no per-camera override yet.
+            let (sup_w, sup_h) = nexus_pipeline::supervisor_frame_for(512);
+            let rec = analysis_pick::recommend_for_discovery(
+                &streams,
+                u64::from(sup_w) * u64::from(sup_h),
+            );
+            let (recommended_analysis_token, analysis_note, analysis_below_detector_input) =
+                match &rec.analysis {
+                    Ok(pick) => (
+                        Some(pick.stream.token.clone()),
+                        None,
+                        pick.below_detector_input,
+                    ),
+                    Err(e) => (None, Some(analysis_pick::describe(*e).to_string()), false),
+                };
             Ok(Json(ProbeOnvifResult {
                 ok,
                 streams,
                 osd_name,
+                recommended_main_token: rec.main.map(|m| m.token),
+                recommended_analysis_token,
+                analysis_note,
+                analysis_below_detector_input,
                 error: None,
             }))
         }
@@ -777,6 +819,10 @@ pub async fn post_probe_onvif(
             ok: false,
             streams: Vec::new(),
             osd_name: None,
+            recommended_main_token: None,
+            recommended_analysis_token: None,
+            analysis_note: None,
+            analysis_below_detector_input: false,
             error: Some(err),
         })),
     }

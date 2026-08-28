@@ -80,6 +80,13 @@ pub struct RunningCameraEntry {
     /// fresh ingester rather than continuing to decode with the
     /// previous depayloader/decoder chain.
     pub codec: Option<CodecKind>,
+    /// Configured analysis substream URL (SPEC-069), or `None` when
+    /// analysis reads the main stream. Compared on each reconcile pass
+    /// — without it, applying a reprobe proposal writes the camera row,
+    /// the reconciler decides nothing changed, and the second session
+    /// is never started. The console would then show a camera set to
+    /// analyse its substream that is doing no such thing.
+    pub analysis_url: Option<String>,
 }
 
 /// Bundle of every dependency `spawn_camera()` needs. Constructed
@@ -247,6 +254,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     for cam in live.into_iter().filter(|c| c.ingest.enabled) {
         let cam_id = cam.id;
         let url = cam.ingest.url.to_string();
+        let analysis_url_str = cam.ingest.analysis_url.as_ref().map(ToString::to_string);
         let det_w = cam
             .detector
             .model_override
@@ -261,7 +269,8 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             Some(entry)
                 if entry.url == url
                     && entry.supervisor_dims == want_dims
-                    && entry.codec == cam.ingest.codec =>
+                    && entry.codec == cam.ingest.codec
+                    && entry.analysis_url == analysis_url_str =>
             {
                 // No change — supervisor still alive, URL still the
                 // same, supervisor dims still match, ingest codec
@@ -285,12 +294,17 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         new_h = want_dims.1,
                         "camera reconciler: detector input size changed; restarting supervisor"
                     );
-                } else {
+                } else if entry.codec != cam.ingest.codec {
                     info!(
                         camera_id = cam_id,
                         prev_codec = ?entry.codec,
                         new_codec = ?cam.ingest.codec,
                         "camera reconciler: ingest codec changed; restarting supervisor"
+                    );
+                } else {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: analysis stream changed; restarting supervisor"
                     );
                 }
                 stop_camera(args, cam_id);
@@ -310,6 +324,12 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
         info!(camera_id = cam_id, "camera reconciler: aborted supervisor");
     }
     args.recorder.remove_camera_ingester(cam_id);
+    // The substream session lives in a separate map and would otherwise
+    // keep its RTSP connection and decode chain alive with no
+    // subscriber — a deleted camera has to give its capacity back.
+    let _ = args
+        .recorder
+        .set_camera_analysis_ingester(cam_id, None, 0, 0, 0, CodecKind::H264);
     // Drop the last decoded frame. Without this the admin frame API and the
     // Phase 10 LBR pump keep serving a stopped camera's final image forever —
     // the cloud wall renders it under a "LIVE" badge, and a camera that went
@@ -383,6 +403,44 @@ async fn start_camera(
             error = %e,
             "camera reconciler: ingester hot-add failed; clips will be refused for this camera"
         );
+    }
+
+    // SPEC-069 — the analysis session, when the camera has one. Its
+    // codec is autodetected separately: an H.265 main stream with an
+    // H.264 substream is the common case. A failure here is not fatal;
+    // analysis stays on the main stream.
+    let analysis_url = cam.ingest.analysis_url.as_ref().map(ToString::to_string);
+    let cam_analysis_url = analysis_url.clone();
+    if let Some(a_url) = analysis_url.as_deref() {
+        let a_codec = crate::discovery::rtsp_probe::probe_codec_for_url(
+            cam.ingest.analysis_url.as_ref().expect("checked above"),
+        )
+        .await
+        .unwrap_or(codec);
+        if let Err(e) = args.recorder.set_camera_analysis_ingester(
+            cam_id,
+            Some(a_url),
+            cam.ingest.max_fps,
+            sup_w,
+            sup_h,
+            a_codec,
+        ) {
+            error!(
+                camera_id = cam_id,
+                error = %e,
+                "camera reconciler: analysis substream session failed to start; \
+                 analysis stays on the main stream"
+            );
+        }
+    } else if let Err(e) = args.recorder.set_camera_analysis_ingester(
+        cam_id,
+        None,
+        cam.ingest.max_fps,
+        sup_w,
+        sup_h,
+        codec,
+    ) {
+        error!(camera_id = cam_id, error = %e, "camera reconciler: analysis session teardown failed");
     }
 
     let detector = args.router.detector_for_camera(&cam);
@@ -466,6 +524,7 @@ async fn start_camera(
             url: url.to_string(),
             supervisor_dims,
             codec: configured_codec,
+            analysis_url: cam_analysis_url,
         },
     );
     info!(
