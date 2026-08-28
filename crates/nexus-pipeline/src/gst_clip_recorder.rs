@@ -1194,6 +1194,14 @@ impl ClipRecorder for GstClipRecorder {
         let Some(url) = analysis_url else {
             if let Some(prev) = self.analysis_ingesters.write().remove(&camera_id) {
                 prev.shutdown();
+                // Decode health is keyed per camera and tracks whichever
+                // session currently feeds analysis. Handing it back to the
+                // main stream without resetting leaves the substream's
+                // cumulative counters attributed to a different geometry,
+                // and Phase 1 multiplies those by width x height.
+                if let Some(h) = self.decode_health.as_ref() {
+                    h.clear(camera_id);
+                }
                 info!(camera_id, "analysis substream session removed");
             }
             return Ok(());
@@ -1220,6 +1228,12 @@ impl ClipRecorder for GstClipRecorder {
         .map_err(|e| RecorderError::Io(std::io::Error::other(format!("analysis ingester: {e}"))))?;
         if let Some(prev) = self.analysis_ingesters.write().insert(camera_id, new_ing) {
             prev.shutdown();
+        }
+        // Analysis moves to a different stream at a different resolution, so
+        // the camera's cumulative decode counters no longer describe one
+        // geometry. Reset rather than blend.
+        if let Some(h) = self.decode_health.as_ref() {
+            h.clear(camera_id);
         }
         info!(camera_id, %url, codec = %codec, "analysis substream session started");
         Ok(())
@@ -2789,5 +2803,69 @@ mod tests {
              otherwise the camera never returns to substream analysis"
         );
         assert!(!second.is_shutdown(), "the rebuilt session must be live");
+    }
+
+    /// Decode health is keyed per camera, and BOTH sessions write to that one
+    /// key — `observe_decoder_output` accumulates. Moving analysis between the
+    /// main stream and the substream changes the geometry those counters
+    /// describe, and Phase 1's capacity model multiplies them by width x
+    /// height. Blended counters therefore produce a wrong per-camera verdict
+    /// (`losing_frames` / `padded`) on a camera that is behaving correctly.
+    #[tokio::test]
+    async fn attaching_or_detaching_analysis_resets_the_cameras_decode_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let health = std::sync::Arc::new(crate::stats::DecodeHealthRegistry::default());
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new())
+            .unwrap()
+            .with_decode_health(health.clone());
+
+        // Main-stream decode has been running for a while.
+        for _ in 0..40 {
+            health.observe_decoder_output(7);
+        }
+        assert_eq!(health.snapshot(7).unwrap().decoder_output_frames, 40);
+
+        rec.set_camera_analysis_ingester(
+            7,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .expect("analysis session registers");
+        assert_eq!(
+            health
+                .snapshot(7)
+                .map(|h| h.decoder_output_frames)
+                .unwrap_or(0),
+            0,
+            "attaching the substream must not leave main-stream frames counted \
+             against the substream's geometry"
+        );
+
+        // ...and the same on the way back, which is the fallback path.
+        for _ in 0..25 {
+            health.observe_decoder_output(7);
+        }
+        rec.set_camera_analysis_ingester(7, None, 15, 512, 288, CodecKind::H264)
+            .expect("analysis session detaches");
+        assert_eq!(
+            health
+                .snapshot(7)
+                .map(|h| h.decoder_output_frames)
+                .unwrap_or(0),
+            0,
+            "falling back to the main stream must not carry the substream's \
+             counters onto a different geometry"
+        );
     }
 }
