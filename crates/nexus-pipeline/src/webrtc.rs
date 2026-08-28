@@ -440,31 +440,7 @@ impl WebRtcSession {
             self.session_id.clone(),
             codec_label,
         );
-
-        // connection established → Connected (publishing).
-        let events_conn = self.events.clone();
-        let session_conn = self.session_id.clone();
-        let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.webrtc
-            .connect("notify::connection-state", false, move |vals| {
-                let wb = vals.first().and_then(|v| v.get::<gst::Element>().ok())?;
-                let state =
-                    wb.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
-                match state {
-                    gst_webrtc::WebRTCPeerConnectionState::Connected
-                        if !signalled.swap(true, std::sync::atomic::Ordering::SeqCst) =>
-                    {
-                        debug!(session = %session_conn, "webrtc publisher connected");
-                        let _ = events_conn.send(WebRtcEvent::Connected);
-                    }
-                    gst_webrtc::WebRTCPeerConnectionState::Failed => {
-                        let _ = events_conn
-                            .send(WebRtcEvent::Failed("peer connection failed".to_string()));
-                    }
-                    _ => {}
-                }
-                None
-            });
+        connect_connection_state(&self.webrtc, self.events.clone(), self.session_id.clone());
     }
 
     /// Apply the SFU's SDP **answer** (publisher role). Media starts flowing
@@ -837,6 +813,37 @@ fn connect_negotiation_needed(
             emit_offer_when_gathered(&webrtc_for_local, &events, &session, codec_label, &emitted);
         });
         webrtc.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &offer_promise]);
+        None
+    });
+}
+
+/// Emit [`WebRtcEvent::Connected`] once the peer connection is up, and
+/// [`WebRtcEvent::Failed`] if it fails.
+///
+/// Free function for the same reason as [`connect_negotiation_needed`]: it is a
+/// signal connected *on* the `webrtcbin`, so it shares that function's
+/// self-reference hazard and is covered by the same test.
+fn connect_connection_state(
+    webrtc: &gst::Element,
+    events: mpsc::UnboundedSender<WebRtcEvent>,
+    session_id: String,
+) {
+    let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    webrtc.connect("notify::connection-state", false, move |vals| {
+        let wb = vals.first().and_then(|v| v.get::<gst::Element>().ok())?;
+        let state = wb.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+        match state {
+            gst_webrtc::WebRTCPeerConnectionState::Connected
+                if !signalled.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+            {
+                debug!(session = %session_id, "webrtc publisher connected");
+                let _ = events.send(WebRtcEvent::Connected);
+            }
+            gst_webrtc::WebRTCPeerConnectionState::Failed => {
+                let _ = events.send(WebRtcEvent::Failed("peer connection failed".to_string()));
+            }
+            _ => {}
+        }
         None
     });
 }
@@ -1538,6 +1545,15 @@ mod tests {
     /// Alder Lake-N core: 41 leaked instances after a night of expand/collapse,
     /// with `pc`/`ice` thread counts rising on every open and never falling on
     /// close, until new HD sessions could no longer sustain media (BUG-136).
+    ///
+    /// Wires everything [`WebRtcSession::wire_offerer`] wires, not just the one
+    /// handler that regressed — the hazard belongs to the shape (`connect` on
+    /// the element) rather than to any single call site, so anything added to
+    /// `wire_offerer` must be added here too.
+    ///
+    /// Note this only gates a PR carrying the `system-libs` label: `webrtc.rs`
+    /// compiles solely under `--features gstreamer-webrtc`, which no other CI
+    /// job builds. On an unlabeled PR it is a post-merge gate on `main`.
     #[test]
     fn negotiation_wiring_does_not_leak_the_webrtcbin() {
         if gst::init().is_err() {
@@ -1550,14 +1566,21 @@ mod tests {
         };
         let weak = webrtc.downgrade();
         let (tx, _rx) = mpsc::unbounded_channel();
-        connect_negotiation_needed(&webrtc, tx, "session-under-test".to_string(), "H264");
+        connect_negotiation_needed(
+            &webrtc,
+            tx.clone(),
+            "session-under-test".to_string(),
+            "H264",
+        );
+        connect_connection_state(&webrtc, tx, "session-under-test".to_string());
 
         drop(webrtc);
 
         assert!(
             weak.upgrade().is_none(),
-            "webrtcbin outlived its last owner: a signal closure holds a strong \
-             reference to the element it is connected to",
+            "webrtcbin outlived its last owner: something still holds a strong \
+             reference, most likely a signal closure that captured the element \
+             it is connected to",
         );
     }
 
