@@ -82,17 +82,34 @@ fn parse_resolution(s: &str) -> Option<(u32, u32)> {
 
 /// Is this profile the camera's main stream?
 ///
-/// Compared on host, port and path only: the configured URL carries
+/// Compared on host, port and path: the configured URL carries
 /// `user:pass@` userinfo and the ONVIF-reported URI does not, so a
 /// string comparison would never match and every camera would offer
 /// its own main stream as an analysis candidate.
 fn is_same_stream(main_url: &url::Url, uri: &str) -> bool {
     let Ok(probed) = url::Url::parse(uri) else {
-        return false;
+        // Unparseable: treat it as the main stream so it is excluded.
+        // Letting it through risks returning it as the analysis pick,
+        // which would open a second session on the stream we are trying
+        // to stop decoding twice.
+        return true;
     };
-    main_url.host_str() == probed.host_str()
-        && main_url.port_or_known_default() == probed.port_or_known_default()
-        && main_url.path() == probed.path()
+    if main_url.host_str() != probed.host_str()
+        || main_url.port_or_known_default() != probed.port_or_known_default()
+        || main_url.path() != probed.path()
+    {
+        return false;
+    }
+    // Dahua and Amcrest put the profile selector in the query
+    // (`?channel=1&subtype=0` main vs `subtype=1` sub) on an identical
+    // path, so path equality alone classifies the whole vendor family's
+    // substream as its own main stream. Compare queries only when both
+    // sides carry one: a transport hint an operator appended to the
+    // configured URL must not stop the main profile being excluded.
+    match (main_url.query(), probed.query()) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
 }
 
 fn is_jpeg(s: &MediaStream) -> bool {
@@ -284,6 +301,84 @@ mod tests {
             "H265",
             "3840x2160",
         )];
+        assert_eq!(
+            pick_analysis_stream(
+                &profiles,
+                &main_url(),
+                (3840, 2160),
+                Some(CodecKind::H265),
+                SUPERVISOR_512X288
+            ),
+            Err(NoAnalysisStream::OnlyMain)
+        );
+    }
+
+    #[test]
+    fn the_substream_is_picked_on_a_typical_dahua_pair() {
+        // Dahua/Amcrest differentiate profiles entirely in the query —
+        // the path is byte-identical — so a host+port+path comparison
+        // classifies the substream as the main stream and the whole
+        // vendor family silently reports "no second stream".
+        let main =
+            url::Url::parse("rtsp://admin:secret@10.0.0.5:554/cam/realmonitor?channel=1&subtype=0")
+                .unwrap();
+        let profiles = [
+            stream(
+                "main",
+                "rtsp://10.0.0.5:554/cam/realmonitor?channel=1&subtype=0",
+                "H264",
+                "1920x1080",
+            ),
+            stream(
+                "sub",
+                "rtsp://10.0.0.5:554/cam/realmonitor?channel=1&subtype=1",
+                "H264",
+                "640x360",
+            ),
+        ];
+        let pick = pick_analysis_stream(
+            &profiles,
+            &main,
+            (1920, 1080),
+            Some(CodecKind::H264),
+            SUPERVISOR_512X288,
+        )
+        .expect("the substream is a valid analysis pick");
+        assert_eq!(pick.stream.token, "sub");
+        assert!(!pick.below_detector_input);
+    }
+
+    /// A transport hint on the configured URL must not stop the main
+    /// profile being excluded — otherwise the camera offers its own main
+    /// stream as an analysis candidate and we open a second session on it.
+    #[test]
+    fn a_query_only_on_the_configured_url_still_excludes_the_main_profile() {
+        let main =
+            url::Url::parse("rtsp://admin:secret@10.0.0.5:554/Streaming/Channels/101?tcp").unwrap();
+        let profiles = [stream(
+            "main",
+            "rtsp://10.0.0.5:554/Streaming/Channels/101",
+            "H265",
+            "3840x2160",
+        )];
+        assert_eq!(
+            pick_analysis_stream(
+                &profiles,
+                &main,
+                (3840, 2160),
+                Some(CodecKind::H265),
+                SUPERVISOR_512X288
+            ),
+            Err(NoAnalysisStream::OnlyMain)
+        );
+    }
+
+    /// An unparseable candidate must be excluded, never returned as the
+    /// pick: a second session on the main stream doubles decode instead
+    /// of halving it.
+    #[test]
+    fn an_unparseable_candidate_is_never_returned_as_the_analysis_pick() {
+        let profiles = [stream("junk", "not a url", "H264", "640x360")];
         assert_eq!(
             pick_analysis_stream(
                 &profiles,

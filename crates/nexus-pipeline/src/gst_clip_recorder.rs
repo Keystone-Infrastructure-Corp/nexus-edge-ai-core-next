@@ -1199,7 +1199,7 @@ impl ClipRecorder for GstClipRecorder {
             return Ok(());
         };
         if let Some(existing) = self.analysis_ingesters.read().get(&camera_id) {
-            if existing.url() == url && existing.codec() == codec {
+            if existing.url() == url && existing.codec() == codec && !existing.is_shutdown() {
                 return Ok(());
             }
         }
@@ -1242,7 +1242,17 @@ impl ClipRecorder for GstClipRecorder {
         Some(Box::new(crate::source::SharedRtspSource {
             camera_id,
             ingester: ing.clone(),
-            analysis: self.analysis_ingesters.read().get(&camera_id).cloned(),
+            // A session the SPEC-069 fallback already shut down must not be
+            // handed to a new source: `subscribe_frames` would still return
+            // a receiver, the main RGB valve would be closed for it, and the
+            // camera would analyse nothing until the grace window expired —
+            // once per supervisor restart, forever.
+            analysis: self
+                .analysis_ingesters
+                .read()
+                .get(&camera_id)
+                .filter(|a| !a.is_shutdown())
+                .cloned(),
         }))
     }
 
@@ -2730,5 +2740,47 @@ mod tests {
         rec.set_camera_analysis_ingester(99, None, 15, 512, 288, CodecKind::H264)
             .expect("analysis session detaches");
         assert!(rec.analysis_ingesters.read().is_empty());
+    }
+
+    /// SPEC-069 fallback hygiene. When the analysis fallback shuts the
+    /// substream session down, the Arc stays in `analysis_ingesters` —
+    /// every other holder still has it. If `set_camera_analysis_ingester`
+    /// early-returns on a URL/codec match it will never rebuild that dead
+    /// session, so the camera can never return to substream analysis: not
+    /// on a reconcile, not on a restart, not ever. That contradicts
+    /// "retry on the long backoff already used for session rebuilds".
+    #[tokio::test]
+    async fn a_shut_down_analysis_session_is_rebuilt_rather_than_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new()).unwrap();
+        const SUB: &str = "rtsp://127.0.0.1:1/substream";
+
+        rec.set_camera_analysis_ingester(99, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session registers");
+        let first = rec.analysis_ingesters.read().get(&99).cloned().unwrap();
+
+        // What the fallback does on an unusable substream.
+        first.shutdown();
+        assert!(first.is_shutdown());
+
+        // Same URL, same codec — the early-return path.
+        rec.set_camera_analysis_ingester(99, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session re-registers");
+        let second = rec.analysis_ingesters.read().get(&99).cloned().unwrap();
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &second),
+            "a shut-down analysis session must be rebuilt, not handed back — \
+             otherwise the camera never returns to substream analysis"
+        );
+        assert!(!second.is_shutdown(), "the rebuilt session must be live");
     }
 }

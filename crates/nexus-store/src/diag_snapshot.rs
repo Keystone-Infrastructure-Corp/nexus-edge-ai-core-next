@@ -81,6 +81,14 @@ const KEEP_TABLES: &[&str] = &[
 /// secrets.
 const SECRET_COLUMNS: &[(&str, &str)] = &[
     ("alert_sinks", "config_json"),
+    // Audit payloads are wholesale serialisations of the mutated domain
+    // object, so a camera row carries `url` / `analysis_url` with their
+    // `user:pass@` intact. New rows are scrubbed at write time by
+    // `api::camera_audit_json`, but rows already at rest in a deployed
+    // appliance's DB are not — and this snapshot is what carries them off
+    // the box. Neither column name matches SECRET_MARKERS.
+    ("audit_log", "before_json"),
+    ("audit_log", "after_json"),
     ("cameras", "url"),
     ("cameras", "config_json"),
     ("cloud_enrollment", "cert_pem"),

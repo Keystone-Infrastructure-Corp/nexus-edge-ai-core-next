@@ -1234,17 +1234,46 @@ async fn reprobe_cameras(
 /// is reported rather than forced.
 async fn reprobe_apply(
     State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
     Json(req): Json<ReprobeRequest>,
 ) -> Result<Json<Vec<crate::camera_reprobe::ReprobeProposal>>, ApiError> {
     let ids = req.camera_ids.unwrap_or_default();
     let probed = run_reprobe(&s, Some(&ids)).await?;
+    // One read for the whole batch. Re-reading inside the loop made this
+    // 53 full table scans on a 53-camera core, and opened a
+    // read-modify-write race with any concurrent camera edit.
+    let mut cams = s.store.list_cameras().await?;
     let mut out = Vec::with_capacity(probed.len());
     for (proposal, resolved) in probed {
         if let Some(url) = resolved {
-            let mut cams = s.store.list_cameras().await?;
             if let Some(cam) = cams.iter_mut().find(|c| c.id == proposal.camera_id) {
+                let before_str = camera_audit_json(cam);
                 cam.ingest.analysis_url = Some(url);
-                s.store.upsert_camera(cam).await?;
+                let after_str = camera_audit_json(cam);
+                let resource_id = cam.id.to_string();
+                // Same tx-merge as `upsert_camera`: the mutation and its
+                // audit row commit together, so the log can never be
+                // missing a row for a change that landed. A bulk action
+                // that alters what up to 53 cameras analyse is exactly the
+                // kind of change someone asks about six months later.
+                let mut tx = s.store.begin_tx().await?;
+                s.store.upsert_camera_tx(&mut tx, cam).await?;
+                crate::auth::admin_audit::audit_admin_action_in_tx(
+                    &s.store,
+                    &mut tx,
+                    session.as_ref(),
+                    &headers,
+                    peer.ip(),
+                    "camera.reprobe.apply",
+                    "camera",
+                    Some(resource_id.as_str()),
+                    before_str.as_deref(),
+                    after_str.as_deref(),
+                )
+                .await?;
+                nexus_store::Store::commit_tx(tx).await?;
             }
         }
         out.push(proposal);
@@ -1303,6 +1332,26 @@ async fn run_reprobe(
     Ok(out)
 }
 
+/// Serialise a camera for an audit payload with every RTSP credential
+/// stripped.
+///
+/// Audit rows are not a private store. They ship verbatim in the
+/// diagnostics bundle — both as `audit-log.json` and inside the
+/// "secret-scrubbed" SQLite snapshot, whose `SECRET_COLUMNS` net does not
+/// match `before_json` / `after_json` — and the `/admin/*` proxy serves
+/// them to the cloud console. A plaintext `user:pass@` in here therefore
+/// crosses the line REPO_BOUNDARY R5b exists to hold.
+///
+/// Scrubbing the serialised blob rather than named fields is deliberate:
+/// wholesale serialisation of the domain type is what let `analysis_url`
+/// inherit this leak the moment it was added, so the scrub has to cover
+/// URL-bearing fields nobody has written yet.
+fn camera_audit_json(cam: &CameraConfig) -> Option<String> {
+    serde_json::to_string(cam)
+        .ok()
+        .map(|s| crate::admin_runtime::redact_url_credentials(&s))
+}
+
 async fn upsert_camera(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -1323,8 +1372,8 @@ async fn upsert_camera(
         .await
         .ok()
         .and_then(|all| all.into_iter().find(|c| c.id == id));
-    let after_str = serde_json::to_string(&cam).ok();
-    let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
+    let after_str = camera_audit_json(&cam);
+    let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
     // M6 Phase 4 Step 4.1 (tx-merge) — the domain mutation
     // and the success audit row commit together in one SQLite
@@ -1435,7 +1484,7 @@ async fn create_camera(
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
         s.store.create_camera_tx(&mut tx, &mut cam).await?;
-        let after_str = serde_json::to_string(&cam).ok();
+        let after_str = camera_audit_json(&cam);
         let resource_id = cam.id.to_string();
         crate::auth::admin_audit::audit_admin_action_in_tx(
             &s.store,
@@ -1459,7 +1508,7 @@ async fn create_camera(
         // for the same pattern. `before` is unconditionally
         // `None` on a create, so we just record the attempted
         // payload as the failed "after".
-        let attempted_str = serde_json::to_string(&cam).ok();
+        let attempted_str = camera_audit_json(&cam);
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             session.as_ref(),
@@ -1502,7 +1551,7 @@ async fn delete_camera(
         .await
         .ok()
         .and_then(|all| all.into_iter().find(|c| c.id == id));
-    let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
+    let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
     // M6 Phase 4 Step 4.1 (tx-merge) — see upsert_camera.
     let tx_res: Result<(), nexus_store::StoreError> = async {
@@ -6056,6 +6105,60 @@ fn is_valid_handle(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::parse_byte_range;
+
+    /// REPO_BOUNDARY R5b. The audit row records *that* a camera's stream
+    /// changed, never the secret it changed to — audit rows leave the
+    /// appliance in the diagnostics bundle and through the `/admin/*`
+    /// proxy to the cloud console. Both URLs must be scrubbed, and the
+    /// host must survive so the row still identifies the camera.
+    #[test]
+    fn camera_audit_payload_carries_no_rtsp_credential() {
+        use nexus_config::{
+            CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown,
+        };
+        let cam = nexus_config::CameraConfig {
+            id: 1,
+            name: "lot-1".into(),
+            ingest: CameraIngest {
+                url: url::Url::parse("rtsp://admin:hunter2@10.0.0.5:554/Streaming/Channels/101")
+                    .unwrap(),
+                analysis_url: Some(
+                    url::Url::parse("rtsp://admin:hunter2@10.0.0.5:554/Streaming/Channels/102")
+                        .unwrap(),
+                ),
+                enabled: true,
+                max_fps: 15,
+                codec: Some(nexus_types::CodecKind::H265),
+            },
+            detector: CameraDetector {
+                prompts: vec![],
+                visual_prompts: vec![],
+                model_override: None,
+            },
+            behavior: CameraBehavior::default(),
+            onvif: CameraOnvif::default(),
+            talk_down: CameraTalkDown::default(),
+            zones: vec![],
+        };
+
+        let json = super::camera_audit_json(&cam).expect("camera serialises");
+        assert!(
+            !json.contains("hunter2"),
+            "the camera password reached the audit payload: {json}"
+        );
+        assert!(
+            !json.contains("admin:hunter2"),
+            "the camera userinfo reached the audit payload: {json}"
+        );
+        assert!(
+            json.contains("10.0.0.5"),
+            "the host must survive the scrub or the audit row no longer says which camera: {json}"
+        );
+        assert!(
+            json.contains("Channels/102"),
+            "analysis_url must still be recorded, minus its credential: {json}"
+        );
+    }
 
     #[test]
     fn parse_simple_range() {

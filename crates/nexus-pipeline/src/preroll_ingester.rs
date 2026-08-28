@@ -501,6 +501,18 @@ impl PreRollIngester {
             handle.abort();
         }
     }
+
+    /// Has [`Self::shutdown`] been called?
+    ///
+    /// `subscribe_frames` keeps returning `Some` on a shut-down ingester
+    /// — the tap sender is a plain struct field — so a caller holding a
+    /// dead Arc waits forever on a receiver that will never yield. The
+    /// SPEC-069 analysis fallback shuts its substream session down but
+    /// other holders (the recorder's `analysis_ingesters` map) still have
+    /// the Arc, so they have to be able to ask.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

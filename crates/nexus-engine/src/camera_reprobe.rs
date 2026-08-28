@@ -3,9 +3,10 @@
 //! Answers "which of these cameras could analyse a substream, and what
 //! would change?" for a fleet that was commissioned before
 //! `analysis_url` existed. It **proposes only** — nothing here writes a
-//! camera. Applying a proposal goes through the ordinary camera-update
-//! path so `analysis_url` cannot be set by a route that skips the
-//! validation the editor performs.
+//! camera. Applying a proposal writes through `upsert_camera_tx` with an
+//! audit row committed in the same transaction, exactly as the camera
+//! editor does, so a bulk change to what a site analyses is as traceable
+//! as a single-camera edit.
 //!
 //! The probe runs on the appliance because that is where the
 //! credentials are: RTSP userinfo is edge-resident (REPO_BOUNDARY R5b),
