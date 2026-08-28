@@ -963,4 +963,105 @@ mod tests {
         assert_eq!(s[0].tile_w, Some(640));
         assert_eq!(s[1].ceiling_fps, GRID_FPS);
     }
+
+    /// The pump is the only thing that turns a cached frame into a wire
+    /// envelope. `encode_native_produces_jpeg` above calls the encoder
+    /// directly, so it would still pass if the pump stopped emitting
+    /// altogether — which is the failure an operator actually sees.
+    #[tokio::test]
+    async fn a_subscribed_camera_pumps_a_decodable_jpeg_onto_the_tunnel() {
+        use nexus_cloud_client::{TunnelError, TunnelHandle};
+        use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody};
+
+        #[derive(Default)]
+        struct CapturingTunnel {
+            sent: Mutex<Vec<Envelope>>,
+        }
+        #[async_trait::async_trait]
+        impl TunnelHandle for CapturingTunnel {
+            async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
+                self.sent.lock().push(envelope);
+                Ok(())
+            }
+        }
+
+        let tunnel = Arc::new(CapturingTunnel::default());
+        let cache = Arc::new(LatestFrameCache::new());
+        let outbox = Arc::new(TunnelOutbox::new());
+        outbox.set_handle(Some(tunnel.clone()));
+
+        let mgr = LiveViewManager::new(cache.clone(), outbox);
+        mgr.on_subscribe(&LbrSubscribePayload {
+            camera_id: 1,
+            tile_w: Some(320),
+            tile_h: Some(180),
+            fps_tier: Some("grid".to_string()),
+        });
+
+        // 640x360 against a 320-wide tile so the pump takes the DOWNSCALE
+        // branch, which is the one production always takes: `target_size`
+        // only resizes when `tile_w < src_w`, and the shared `frame_with_fill`
+        // is deliberately 16x16 for the cheap stall tests, which would land on
+        // the native branch instead.
+        let mut data = vec![0u8; 640 * 360 * 3];
+        for (i, px) in data.iter_mut().enumerate() {
+            *px = (i % 251) as u8;
+        }
+        let epoch = cache.begin_session(1);
+        cache.put_frame(
+            1,
+            epoch,
+            Arc::new(Frame {
+                camera_id: 1,
+                frame_id: 1,
+                captured_at: chrono::Utc::now(),
+                width: 640,
+                height: 360,
+                format: PixelFormat::Rgb24,
+                data: Arc::new(data),
+                trace_id: "t".into(),
+            }),
+        );
+
+        // One frame is enough: the pump primes `last_emit` to one full
+        // KEEPALIVE_INTERVAL in the past, so the first iteration that observes
+        // this frame is already keepalive-due and emits.
+        // Poll for the condition rather than sleeping a guessed duration: the
+        // keepalive cadence is KEEPALIVE_INTERVAL, and a fixed sleep would be
+        // the one machine-speed-dependent assertion in this file.
+        let jpeg = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let found = {
+                    let sent = tunnel.sent.lock();
+                    sent.iter().find_map(|e| match &e.body {
+                        EnvelopeBody::LbrFrame(p) if p.camera_id == 1 => {
+                            Some(B64.decode(&p.jpeg_b64).expect("jpeg_b64 must be base64"))
+                        }
+                        _ => None,
+                    })
+                };
+                if let Some(jpeg) = found {
+                    return jpeg;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a subscribed camera with a fresh frame must emit an lbr_frame");
+
+        assert!(jpeg.len() > 4, "payload too short: {} bytes", jpeg.len());
+        assert_eq!(jpeg[..2], [0xFF, 0xD8], "payload is not JPEG (missing SOI)");
+        assert_eq!(
+            jpeg[jpeg.len() - 2..],
+            [0xFF, 0xD9],
+            "JPEG is truncated (missing EOI)"
+        );
+        let img =
+            image::load_from_memory(&jpeg).expect("pump emitted bytes no decoder will accept");
+        assert_eq!(
+            (img.width(), img.height()),
+            (320, 180),
+            "pump must downscale the 640x360 frame to the subscribed 320-wide tile"
+        );
+    }
 }
