@@ -2841,6 +2841,19 @@ impl EmailSinkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraIngest {
     pub url: Url,
+    /// Lower-resolution stream the *analysis* tap decodes, when the
+    /// camera offers one. `None` means analysis shares the main
+    /// session, which is the pre-SPEC-069 behaviour and stays the
+    /// fallback whenever a second session cannot be established.
+    ///
+    /// Never an alternate source for [`Self::url`]: recording, the
+    /// pre-roll ring and HD live view read the main stream and only
+    /// the main stream (SPEC-069 invariants I1–I5). Carries
+    /// credentials exactly like `url` and is redacted in every place
+    /// `url` is — the roster envelope, the support bundle, the audit
+    /// log (REPO_BOUNDARY R5b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_url: Option<Url>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Per-camera FPS cap. 0 = unbounded.
@@ -4244,6 +4257,49 @@ url = "rtsp://example/cam"
 "#;
         let cam: CameraConfig = toml::from_str(src).unwrap();
         assert!(cam.detector.visual_prompts.is_empty());
+    }
+
+    /// SPEC-069 Phase 2 — `analysis_url` is additive. Every config
+    /// written before it existed must still load, and a camera that
+    /// never uses it must serialise byte-identically to how it did
+    /// before, or an OTA silently rewrites every appliance's config.
+    #[test]
+    fn analysis_url_is_absent_from_a_camera_that_does_not_use_it() {
+        let src = r#"
+id = 1
+name = "front_door"
+url = "rtsp://example/cam"
+"#;
+        let cam: CameraConfig = toml::from_str(src).unwrap();
+        assert!(cam.ingest.analysis_url.is_none());
+
+        let obj = serde_json::to_value(&cam).unwrap();
+        assert!(
+            !obj.as_object().unwrap().contains_key("analysis_url"),
+            "an unset analysis_url must not appear on the wire"
+        );
+    }
+
+    /// And when it *is* set it survives the round trip flat, beside
+    /// `url` — the admin API and the cloud both address it by that name.
+    #[test]
+    fn analysis_url_round_trips_flat_beside_url() {
+        let src = r#"
+id = 1
+name = "front_door"
+url = "rtsp://example/Streaming/Channels/101"
+analysis_url = "rtsp://example/Streaming/Channels/102"
+"#;
+        let cam: CameraConfig = toml::from_str(src).unwrap();
+        assert_eq!(
+            cam.ingest.analysis_url.as_ref().map(Url::as_str),
+            Some("rtsp://example/Streaming/Channels/102")
+        );
+
+        let v = serde_json::to_value(&cam).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("analysis_url"));
+        assert!(!obj.contains_key("ingest"));
     }
 
     /// Phase 7.6.1 — ONVIF endpoint + credentials round-trip through the

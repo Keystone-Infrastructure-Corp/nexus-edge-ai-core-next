@@ -25,6 +25,7 @@ mod api;
 mod audit_retention;
 mod auth;
 mod auth_bootstrap;
+mod camera_reprobe;
 mod cloud_alert_sink;
 mod cloud_audit;
 mod cloud_enroll;
@@ -1027,6 +1028,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         }
         let cam_id = cam.id;
         let cam_url = cam.ingest.url.to_string();
+        let cam_analysis_url = cam
+            .ingest
+            .analysis_url
+            .as_ref()
+            .filter(|_| recorder.has_analysis_ingester(cam.id))
+            .map(ToString::to_string);
         let configured_codec = cam.ingest.codec;
         let detector = router.detector_for_camera(&cam);
         let detector_low_res = router.detector_for_camera_low_res(&cam);
@@ -1101,6 +1108,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
                 url: cam_url,
                 supervisor_dims: (sup_w, sup_h),
                 codec: configured_codec,
+                analysis_url: cam_analysis_url,
             },
         );
     }
@@ -2449,6 +2457,10 @@ async fn build_gst_recorder(
     // path (e.g. InSight 192.168.1.66).
     let mut ingesters: std::collections::HashMap<i64, Arc<nexus_pipeline::PreRollIngester>> =
         std::collections::HashMap::new();
+    // Cameras that also need a SPEC-069 analysis session, with the codec
+    // and supervisor dims already resolved by the loop below so the
+    // registration pass does not recompute them.
+    let mut analysis_pending: Vec<(&CameraConfig, nexus_types::CodecKind, (u32, u32))> = Vec::new();
     for cam in cameras {
         if !cam.ingest.enabled {
             continue;
@@ -2521,6 +2533,9 @@ async fn build_gst_recorder(
                     "pre-roll ingester started (with shared rgb tap)"
                 );
                 ingesters.insert(cam.id, ing);
+                if cam.ingest.analysis_url.is_some() {
+                    analysis_pending.push((cam, codec, (rgb_w, rgb_h)));
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -2550,6 +2565,14 @@ async fn build_gst_recorder(
         .with_alert_clips(alert_clips)
         .with_alert_cold_kick(cold_kick)
         .with_alert_clip_delivery_gate(alert_clip_gate);
+    // SPEC-069 — the analysis substream sessions. `start_camera` registers
+    // these on hot-add and on every reconcile-triggered restart; boot has
+    // to do the same or a converted camera silently analyses its main
+    // stream until someone edits it, because the reconciler's no-change
+    // guard compares against the configured URL and skips.
+    for (cam, codec, dims) in analysis_pending {
+        crate::reconciler::apply_analysis_session(&rec, cam, codec, dims).await;
+    }
     Ok((Arc::new(rec), webrtc))
 }
 

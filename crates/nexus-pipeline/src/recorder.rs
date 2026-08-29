@@ -213,6 +213,42 @@ pub trait ClipRecorder: Send + Sync {
     #[allow(unused_variables)]
     fn remove_camera_ingester(&self, camera_id: CameraId) {}
 
+    /// Attach or detach a camera's second, substream-only session
+    /// (SPEC-069). `Some(url)` starts one and points analysis at it;
+    /// `None` tears it down and returns analysis to the main stream.
+    ///
+    /// This session feeds the RGB tap and nothing else — clips,
+    /// pre-roll and HD live view keep reading the main stream's NAL
+    /// broadcast, which is why recording quality cannot be affected by
+    /// any of it (invariants I1–I5). Default impl is a no-op.
+    #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
+    fn set_camera_analysis_ingester(
+        &self,
+        camera_id: CameraId,
+        analysis_url: Option<&str>,
+        max_fps: u32,
+        rgb_w: u32,
+        rgb_h: u32,
+        codec: CodecKind,
+    ) -> Result<(), RecorderError> {
+        Ok(())
+    }
+
+    /// Is a SPEC-069 analysis session currently registered for this
+    /// camera?
+    ///
+    /// Boot seeds the reconciler's per-camera entry from this rather than
+    /// from config: an entry that claims a session which was never
+    /// registered matches the reconciler's no-change guard and strands the
+    /// camera on the main stream forever. Default impl reports `false`,
+    /// which is correct for recorders that no-op
+    /// [`Self::set_camera_analysis_ingester`].
+    #[allow(unused_variables)]
+    fn has_analysis_ingester(&self, camera_id: CameraId) -> bool {
+        false
+    }
+
     /// Hot-resize the RGB tap of an existing camera ingester to
     /// `new_rgb_w × new_rgb_h`. Used by the supervisor's
     /// M_PERF_CROWD E2 hysteresis to swap between a high-res and
@@ -850,6 +886,7 @@ mod tests {
                 name: "front".into(),
                 ingest: nexus_config::CameraIngest {
                     url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,

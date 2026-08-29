@@ -351,6 +351,7 @@ mod tests {
             name: format!("cam{id}"),
             ingest: nexus_config::CameraIngest {
                 url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                analysis_url: None,
                 enabled: true,
                 max_fps: 0,
                 codec: None,

@@ -331,12 +331,21 @@ mod tests {
         let secret_user = "onvif-admin";
         let secret_pass = "sup3r-secret-onvif-pw";
         let secret_backchannel = "rtsp://127.0.0.1/talk-backchannel-secret";
+        let secret_analysis_pw = "sup3r-secret-substream-pw";
         store
             .upsert_camera(&CameraConfig {
                 id: 1,
                 name: "ptz-cam".into(),
                 ingest: CameraIngest {
                     url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    // SPEC-069 — the analysis stream carries credentials
+                    // exactly like `url`, so it is redacted exactly like it.
+                    analysis_url: Some(
+                        Url::parse(&format!(
+                            "rtsp://admin:{secret_analysis_pw}@127.0.0.1/substream"
+                        ))
+                        .unwrap(),
+                    ),
                     enabled: true,
                     max_fps: 0,
                     codec: None,
@@ -389,6 +398,10 @@ mod tests {
             !json.contains(secret_backchannel),
             "camera_roster envelope leaked the talk-down backchannel URL"
         );
+        assert!(
+            !json.contains(secret_analysis_pw) && !json.contains("analysis_url"),
+            "camera_roster envelope leaked the analysis stream URL: {json}"
+        );
     }
 
     /// The wire field is "active detector kind on this camera", so a
@@ -416,6 +429,7 @@ mod tests {
             name: name.into(),
             ingest: CameraIngest {
                 url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                analysis_url: None,
                 enabled: true,
                 max_fps: 0,
                 codec: None,
@@ -489,6 +503,7 @@ mod tests {
             name: name.into(),
             ingest: CameraIngest {
                 url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                analysis_url: None,
                 enabled: true,
                 max_fps: 0,
                 codec: None,

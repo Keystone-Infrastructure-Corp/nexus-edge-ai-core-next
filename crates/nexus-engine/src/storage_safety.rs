@@ -1026,6 +1026,7 @@ mod tests {
                 name: "front".into(),
                 ingest: nexus_config::CameraIngest {
                     url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,
@@ -1206,6 +1207,7 @@ mod tests {
                     name: format!("cam{cam_id}"),
                     ingest: nexus_config::CameraIngest {
                         url: Url::parse(&format!("rtsp://127.0.0.1/stream{cam_id}")).unwrap(),
+                        analysis_url: None,
                         enabled: true,
                         max_fps: 0,
                         codec: None,
@@ -1605,6 +1607,7 @@ mod tests {
                 name: format!("cam{cam}"),
                 ingest: nexus_config::CameraIngest {
                     url: Url::parse(&format!("rtsp://127.0.0.1/stream{cam}")).unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,

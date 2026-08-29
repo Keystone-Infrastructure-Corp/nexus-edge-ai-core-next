@@ -351,6 +351,7 @@ mod tests {
             name: format!("cam-{id}"),
             ingest: nexus_config::CameraIngest {
                 url: Url::parse("virtual://test").unwrap(),
+                analysis_url: None,
                 enabled: true,
                 max_fps: 0,
                 codec: None,
@@ -521,6 +522,7 @@ mod tests {
                 name: "default-cam".into(),
                 ingest: nexus_config::CameraIngest {
                     url: Url::parse("virtual://test").unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,

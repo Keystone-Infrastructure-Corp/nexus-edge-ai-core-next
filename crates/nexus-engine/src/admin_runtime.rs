@@ -1016,7 +1016,10 @@ async fn build_snapshot(
             let n = rows.len();
             let body = serde_json::to_string_pretty(&rows)
                 .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
-            (body, n)
+            // Audit payloads are wholesale serialisations of the mutated
+            // object, so pre-fix camera rows still at rest carry
+            // `user:pass@`. Same scrub every log line already gets.
+            (redact_url_credentials(&body), n)
         }
         Err(e) => (format!("{{\"error\":\"{e}\"}}"), 0),
     };
@@ -1202,7 +1205,7 @@ fn auth_mode_str(m: AuthMode) -> &'static str {
 /// whitespace / quote / delimiter — mirroring how a URL parser tokenises
 /// it — so a stray `@` inside a query string (`?to=a@b`) is never
 /// mistaken for userinfo.
-fn redact_url_credentials(input: &str) -> String {
+pub(crate) fn redact_url_credentials(input: &str) -> String {
     const MARKER: &str = "://";
     let mut out = String::with_capacity(input.len());
     let mut rest = input;

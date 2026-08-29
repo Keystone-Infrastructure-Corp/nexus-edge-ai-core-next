@@ -46,6 +46,7 @@ fn sample_camera(id: i64, name: &str) -> CameraConfig {
         name: name.into(),
         ingest: nexus_config::CameraIngest {
             url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+            analysis_url: None,
             enabled: true,
             max_fps: 0,
             codec: None,

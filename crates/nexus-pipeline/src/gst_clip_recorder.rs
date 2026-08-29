@@ -152,6 +152,14 @@ pub struct GstClipRecorder {
     /// times per minute per camera and the reconciler only writes
     /// on admin actions.
     ingesters: PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>,
+    /// Second, substream-only sessions keyed by camera (SPEC-069).
+    /// Read by `shared_frame_source` and by nothing else — in
+    /// particular never by the clip path, which resolves its ingester
+    /// from [`Self::ingesters`] so a clip is always cut from the main
+    /// stream's NAL broadcast (invariants I1–I4). Kept as a separate
+    /// map rather than a field on the main ingester precisely so the
+    /// clip path cannot reach one by accident.
+    analysis_ingesters: PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>,
     panic: PlMutex<bool>,
     /// Per-clip GStreamer + pump state. Held under a tokio Mutex
     /// because the close path awaits on the pump shutdown and the
@@ -303,6 +311,7 @@ impl GstClipRecorder {
             store,
             clips_dir: clips_dir.as_ref().to_path_buf(),
             ingesters: PlRwLock::new(ingesters),
+            analysis_ingesters: PlRwLock::new(HashMap::new()),
             panic: PlMutex::new(false),
             open: Mutex::new(HashMap::new()),
             bus: None,
@@ -1173,6 +1182,70 @@ impl ClipRecorder for GstClipRecorder {
         }
     }
 
+    fn set_camera_analysis_ingester(
+        &self,
+        camera_id: CameraId,
+        analysis_url: Option<&str>,
+        max_fps: u32,
+        rgb_w: u32,
+        rgb_h: u32,
+        codec: CodecKind,
+    ) -> Result<(), RecorderError> {
+        let Some(url) = analysis_url else {
+            if let Some(prev) = self.analysis_ingesters.write().remove(&camera_id) {
+                prev.shutdown();
+                // Decode health is keyed per camera and tracks whichever
+                // session currently feeds analysis. Handing it back to the
+                // main stream without resetting leaves the substream's
+                // cumulative counters attributed to a different geometry,
+                // and Phase 1 multiplies those by width x height.
+                if let Some(h) = self.decode_health.as_ref() {
+                    h.clear(camera_id);
+                }
+                info!(camera_id, "analysis substream session removed");
+            }
+            return Ok(());
+        };
+        if let Some(existing) = self.analysis_ingesters.read().get(&camera_id) {
+            if existing.url() == url && existing.codec() == codec && !existing.is_shutdown() {
+                return Ok(());
+            }
+        }
+        // pre_roll_secs = 0: this session exists only to decode. Its
+        // ring never accumulates and nothing subscribes to its NAL
+        // broadcast — clips come from the main session's.
+        let new_ing = PreRollIngester::new_with_rgb(
+            camera_id,
+            url.to_string(),
+            0,
+            codec,
+            self.decode_mode,
+            max_fps,
+            rgb_w,
+            rgb_h,
+            self.decode_health.clone(),
+        )
+        .map_err(|e| RecorderError::Io(std::io::Error::other(format!("analysis ingester: {e}"))))?;
+        if let Some(prev) = self.analysis_ingesters.write().insert(camera_id, new_ing) {
+            prev.shutdown();
+        }
+        // Analysis moves to a different stream at a different resolution, so
+        // the camera's cumulative decode counters no longer describe one
+        // geometry. Reset rather than blend.
+        if let Some(h) = self.decode_health.as_ref() {
+            h.clear(camera_id);
+        }
+        info!(camera_id, %url, codec = %codec, "analysis substream session started");
+        Ok(())
+    }
+
+    fn has_analysis_ingester(&self, camera_id: CameraId) -> bool {
+        self.analysis_ingesters
+            .read()
+            .get(&camera_id)
+            .is_some_and(|a| !a.is_shutdown())
+    }
+
     fn shared_frame_source(
         &self,
         camera_id: CameraId,
@@ -1190,6 +1263,17 @@ impl ClipRecorder for GstClipRecorder {
         Some(Box::new(crate::source::SharedRtspSource {
             camera_id,
             ingester: ing.clone(),
+            // A session the SPEC-069 fallback already shut down must not be
+            // handed to a new source: `subscribe_frames` would still return
+            // a receiver, the main RGB valve would be closed for it, and the
+            // camera would analyse nothing until the grace window expired —
+            // once per supervisor restart, forever.
+            analysis: self
+                .analysis_ingesters
+                .read()
+                .get(&camera_id)
+                .filter(|a| !a.is_shutdown())
+                .cloned(),
         }))
     }
 
@@ -2401,6 +2485,7 @@ mod tests {
                 name: "front".into(),
                 ingest: nexus_config::CameraIngest {
                     url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    analysis_url: None,
                     enabled: true,
                     max_fps: 0,
                     codec: None,
@@ -2596,6 +2681,11 @@ mod tests {
     /// encoder into the pipeline and the recorder is no longer
     /// passthrough — that's a CPU-cost regression and a quality
     /// regression and needs a deliberate decision.
+    ///
+    /// SPEC-069 invariant I1 leans on this too: `analysis_url` gives a
+    /// camera a second, lower-resolution session, and the guarantee
+    /// that no clip is ever cut from it starts here — a recorder that
+    /// cannot decode cannot record an analysis stream.
     #[test]
     fn pipeline_string_is_codec_passthrough() {
         let desc = GstClipRecorder::pipeline_desc(
@@ -2622,5 +2712,160 @@ mod tests {
                 "recorder pipeline must be codec-passthrough but contains `{forbidden}`: {desc}"
             );
         }
+    }
+
+    /// SPEC-069 invariants I2 and I4. A camera that somehow has only an
+    /// analysis session — no main ingester — must produce no frame
+    /// source at all, rather than quietly analysing (and, if the maps
+    /// were ever confused, recording) the substream. The clip path
+    /// resolves from `ingesters`; `analysis_ingesters` is reachable
+    /// only from `shared_frame_source`, and this asserts the two never
+    /// stand in for each other.
+    #[tokio::test]
+    async fn an_analysis_only_camera_gets_no_frame_source_and_no_clip_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new()).unwrap();
+
+        rec.set_camera_analysis_ingester(
+            99,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .expect("analysis session registers");
+
+        assert!(
+            rec.analysis_ingesters.read().contains_key(&99),
+            "the analysis session should have been registered"
+        );
+        assert!(
+            rec.shared_frame_source(99).is_none(),
+            "a camera with no main session must get no frame source — analysis \
+             alone must never stand in for the stream that clips are cut from"
+        );
+        assert!(
+            !rec.ingesters.read().contains_key(&99),
+            "registering an analysis session must never populate the clip path's map"
+        );
+
+        rec.set_camera_analysis_ingester(99, None, 15, 512, 288, CodecKind::H264)
+            .expect("analysis session detaches");
+        assert!(rec.analysis_ingesters.read().is_empty());
+    }
+
+    /// SPEC-069 fallback hygiene. When the analysis fallback shuts the
+    /// substream session down, the Arc stays in `analysis_ingesters` —
+    /// every other holder still has it. If `set_camera_analysis_ingester`
+    /// early-returns on a URL/codec match it will never rebuild that dead
+    /// session, so the camera can never return to substream analysis: not
+    /// on a reconcile, not on a restart, not ever. That contradicts
+    /// "retry on the long backoff already used for session rebuilds".
+    #[tokio::test]
+    async fn a_shut_down_analysis_session_is_rebuilt_rather_than_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new()).unwrap();
+        const SUB: &str = "rtsp://127.0.0.1:1/substream";
+
+        rec.set_camera_analysis_ingester(99, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session registers");
+        let first = rec.analysis_ingesters.read().get(&99).cloned().unwrap();
+
+        // What the fallback does on an unusable substream.
+        first.shutdown();
+        assert!(first.is_shutdown());
+
+        // Same URL, same codec — the early-return path.
+        rec.set_camera_analysis_ingester(99, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session re-registers");
+        let second = rec.analysis_ingesters.read().get(&99).cloned().unwrap();
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &second),
+            "a shut-down analysis session must be rebuilt, not handed back — \
+             otherwise the camera never returns to substream analysis"
+        );
+        assert!(!second.is_shutdown(), "the rebuilt session must be live");
+    }
+
+    /// Decode health is keyed per camera, and BOTH sessions write to that one
+    /// key — `observe_decoder_output` accumulates. Moving analysis between the
+    /// main stream and the substream changes the geometry those counters
+    /// describe, and Phase 1's capacity model multiplies them by width x
+    /// height. Blended counters therefore produce a wrong per-camera verdict
+    /// (`losing_frames` / `padded`) on a camera that is behaving correctly.
+    #[tokio::test]
+    async fn attaching_or_detaching_analysis_resets_the_cameras_decode_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let health = std::sync::Arc::new(crate::stats::DecodeHealthRegistry::default());
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new())
+            .unwrap()
+            .with_decode_health(health.clone());
+
+        // Main-stream decode has been running for a while.
+        for _ in 0..40 {
+            health.observe_decoder_output(7);
+        }
+        assert_eq!(health.snapshot(7).unwrap().decoder_output_frames, 40);
+
+        rec.set_camera_analysis_ingester(
+            7,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .expect("analysis session registers");
+        assert_eq!(
+            health
+                .snapshot(7)
+                .map(|h| h.decoder_output_frames)
+                .unwrap_or(0),
+            0,
+            "attaching the substream must not leave main-stream frames counted \
+             against the substream's geometry"
+        );
+
+        // ...and the same on the way back, which is the fallback path.
+        for _ in 0..25 {
+            health.observe_decoder_output(7);
+        }
+        rec.set_camera_analysis_ingester(7, None, 15, 512, 288, CodecKind::H264)
+            .expect("analysis session detaches");
+        assert_eq!(
+            health
+                .snapshot(7)
+                .map(|h| h.decoder_output_frames)
+                .unwrap_or(0),
+            0,
+            "falling back to the main stream must not carry the substream's \
+             counters onto a different geometry"
+        );
     }
 }

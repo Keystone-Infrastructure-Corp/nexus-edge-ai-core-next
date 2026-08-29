@@ -108,6 +108,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         name: "virtual-smoke".into(),
         ingest: nexus_config::CameraIngest {
             url: Url::parse("virtual://local").unwrap(),
+            analysis_url: None,
             enabled: true,
             max_fps: 5,
             codec: None,
