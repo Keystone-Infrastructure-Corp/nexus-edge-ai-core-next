@@ -4,18 +4,21 @@
 # /opt/nexus/releases/<version>/, and hands off to the in-tarball
 # scripts/install.sh.
 #
-# Operator-facing surface:
+# Operator-facing surface. With no flags this installs whatever is
+# currently on the `stable` channel:
 #
-#     curl -fsSL https://raw.githubusercontent.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/main/scripts/bootstrap.sh \
-#         | sudo bash -s -- --version v0.2.0
-#
-# Or, against a release that's already cut:
-#
-#     curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/bootstrap.sh \
+#     curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
 #         | sudo bash -s --
 #
-# (The release workflow uploads this file as `bootstrap.sh` alongside
-# the tarball so the second URL works without specifying --version.)
+# `--channel beta` opts a box into the pre-release channel. `--version
+# vX.Y.Z` pins one exact build and skips channel resolution entirely.
+#
+# Channel resolution reads the VERSION asset off the floating `stable` /
+# `beta` / `dev` release, which .github/workflows/release.yml re-points
+# using the same channel it registers the build under with the cloud
+# orchestrator. It deliberately does NOT use GitHub's own "latest"
+# release: that tracks the prerelease flag alone, so a full release the
+# workflow routed to `beta` would still be served here as stable.
 #
 # bootstrap.sh stays tiny and parameter-driven on purpose so that the
 # verifier and config-generation logic live in install.sh +
@@ -33,6 +36,7 @@ NEXUS_PREFIX="${NEXUS_PREFIX:-/opt/nexus}"
 FORCE_PROFILE=""
 KEEP_CONFIG=0
 VERSION=""
+CHANNEL=""
 EXTRA_ARGS=()
 
 usage() {
@@ -40,7 +44,11 @@ usage() {
 Usage: bootstrap.sh [options] [-- <install.sh args>]
 
 Options:
-  --version <vX.Y.Z>       Release tag to install (default: latest).
+  --channel <name>         Release channel to install from: stable
+                           (default), beta, or dev.
+  --version <vX.Y.Z>       Install this exact release tag instead of
+                           whatever the channel currently points at.
+                           Mutually exclusive with --channel.
   --force-profile <name>   Pin the inference profile (intel-igpu|intel-npu|
                            amd-vulkan|amd-rocm|hailo|nvidia|cpu); forwarded
                            to install.sh. Omit to auto-detect.
@@ -56,6 +64,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --channel)        CHANNEL="$2"; shift 2 ;;
         --version)        VERSION="$2"; shift 2 ;;
         --force-profile)  FORCE_PROFILE="$2"; shift 2 ;;
         --keep-config)    KEEP_CONFIG=1; shift ;;
@@ -64,6 +73,11 @@ while [[ $# -gt 0 ]]; do
         *)                echo "bootstrap.sh: unknown arg: $1" >&2; usage; exit 2 ;;
     esac
 done
+
+if [[ -n "$VERSION" && -n "$CHANNEL" ]]; then
+    echo "bootstrap.sh: --version and --channel are mutually exclusive" >&2
+    exit 2
+fi
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "bootstrap.sh: must run as root (sudo)" >&2
@@ -77,13 +91,30 @@ for cmd in curl tar sha256sum; do
         || { echo "bootstrap.sh: missing required command: $cmd" >&2; exit 1; }
 done
 
-# Resolve "latest" to a concrete tag so the URLs we build are stable
-# and the version is logged for the audit trail.
+# Resolve the channel to a concrete tag so that from here down both
+# modes take the identical, version-pinned download path — and so the
+# version that got installed is logged for the audit trail.
 if [[ -z "$VERSION" ]]; then
-    echo "[nexus] resolving latest release tag"
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-                | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])')"
-    [[ -n "$VERSION" ]] || { echo "bootstrap.sh: could not resolve latest tag" >&2; exit 1; }
+    CHANNEL="${CHANNEL:-stable}"
+    case "$CHANNEL" in
+        dev|beta|stable) ;;
+        *) echo "bootstrap.sh: unknown channel: $CHANNEL (expected dev, beta, or stable)" >&2; exit 2 ;;
+    esac
+    echo "[nexus] resolving the '$CHANNEL' channel"
+    channel_url="https://github.com/${REPO}/releases/download/${CHANNEL}/VERSION"
+    # Without this, an unreachable pointer surfaces as a bare
+    # `curl: (56) ... 404` with nothing saying what to do about it.
+    if ! VERSION="$(curl -fsSL --retry 3 "$channel_url")"; then
+        echo "bootstrap.sh: could not read the '$CHANNEL' channel pointer at $channel_url" >&2
+        echo "bootstrap.sh: the channel may not have published a release yet; pass --version vX.Y.Z to install a specific one" >&2
+        exit 1
+    fi
+    VERSION="$(printf '%s' "$VERSION" | tr -d '[:space:]')"
+    # This is about to be interpolated into a download URL, and an empty
+    # or HTML body would otherwise fail much later as a 404.
+    [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] \
+        || { echo "bootstrap.sh: '$CHANNEL' channel returned an unusable version: '$VERSION'" >&2; exit 1; }
+    echo "[nexus] '$CHANNEL' channel is $VERSION"
 fi
 
 TARBALL_NAME="nexus-edge-${VERSION}-linux-x86_64.tar.gz"

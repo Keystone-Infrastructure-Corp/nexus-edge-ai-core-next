@@ -47,7 +47,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 concurrency:
@@ -140,6 +140,45 @@ jobs:
             head -c 2000 /tmp/cloud-resp.json || true
             exit 1
           fi
+
+      # Registering with the cloud only moves the fleet. New boxes resolve
+      # their version from the channel pointer, so a promotion that stops at
+      # the line above leaves every fresh install on the previous build —
+      # see ADR-080.
+      - name: Re-point the ${{ inputs.channel }} channel pointer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAG" > VERSION
+
+          # Taken from the release being promoted rather than from a checkout,
+          # so the pointer serves the script that shipped with the build it
+          # names. Every release this pipeline cuts attaches one; a release
+          # that does not is old enough that pointing new installs at it
+          # deserves a human, because the documented one-liner curls
+          # bootstrap.sh from this pointer and would 404 without it.
+          if ! gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'bootstrap.sh' \
+            --dir . --clobber; then
+            echo "::error::${TAG} has no bootstrap.sh asset, so the ${CHANNEL} pointer would not serve one"
+            exit 1
+          fi
+
+          gh release view "$CHANNEL" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$CHANNEL" \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --title "$CHANNEL channel pointer" \
+              --notes "Floating pointer maintained by .github/workflows/ — not a release in its own right. Its VERSION asset names the build currently on the \`$CHANNEL\` channel, and scripts/bootstrap.sh reads it to resolve an install. To install an exact build instead, pass \`--version vX.Y.Z\`."
+
+          gh release upload "$CHANNEL" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            VERSION \
+            bootstrap.sh
+          echo "channel '$CHANNEL' now points at $TAG"
 
       - name: Summarise
         if: always()

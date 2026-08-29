@@ -889,7 +889,7 @@ Hailo-8 — install with **`--force-profile amd-vulkan`**, which generates a
 config with `ep_priority = ["vulkan", "cpu"]`:
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
   | sudo bash -s -- --force-profile amd-vulkan
 ```
 
@@ -957,13 +957,14 @@ unsupported iGPU.
 ### 6.1 One-liner from GitHub Releases
 
 Same command does first install **and** every subsequent upgrade —
-it's idempotent. On first install the script runs `nexus-probe
+it's idempotent. With no flags it installs whatever is currently on the
+**`stable` channel**. On first install the script runs `nexus-probe
 emit-config` from the staged release and **generates** the matching
 config from §1's detected hardware, so the minimum invocation is zero
 flags:
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
   | sudo bash
 ```
 
@@ -987,7 +988,8 @@ Useful flag combinations:
 | `--no-swap`                                | Box already has a swap partition / dedicated swap LVM volume.                         |
 | `--no-deps`                                | Apt prereqs already baked into the golden image.                                      |
 | `--rollback`                               | Flip `/opt/nexus/current` back to the previous good release.                          |
-| `--version vX.Y.Z`                         | Pin a specific version (instead of `latest`).                                         |
+| `--channel beta`                           | Track the pre-release channel instead of `stable`.                                    |
+| `--version vX.Y.Z`                         | Pin one exact release, bypassing channel resolution. Mutually exclusive with `--channel`. |
 | `--no-start`                               | Install everything but don't enable / start the systemd unit (useful for image bake). |
 
 Expected runtime on a Hailo-class box: ~90 s end-to-end on a clean
@@ -999,7 +1001,13 @@ above are also available as environment variables (`NEXUS_PREP_DEPS=0`,
 
 The bootstrap script:
 
-1. Resolves the release tag (or pins to `--version vX.Y.Z`).
+1. Resolves the channel to a release tag (or pins to `--version vX.Y.Z`).
+   Channel resolution reads the `VERSION` asset off the floating
+   `stable` / `beta` / `dev` release, which the release workflow
+   re-points using the same channel it registers the build under with
+   the cloud orchestrator. It is **not** GitHub's own "latest" release,
+   which tracks the prerelease flag alone and would serve a build routed
+   to `beta` as if it were stable.
 2. Downloads `nexus-edge-...-linux-x86_64.tar.gz` + its `.sha256` sidecar.
 3. Hands off to the in-tarball `scripts/install.sh`, which:
    - Re-verifies the sha256 sidecar.
@@ -1258,11 +1266,11 @@ client_id = "nexus-engine"
 
 ### 6.7 Upgrades + rollback
 
-**Upgrade to latest** — same one-liner, just rerun. The existing
-`/etc/nexus/nexus.toml` is preserved:
+**Upgrade to the current `stable` release** — same one-liner, just
+rerun. The existing `/etc/nexus/nexus.toml` is preserved:
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
   | sudo bash -s --
 ```
 
@@ -1688,7 +1696,7 @@ sudo reboot
 #   - adds `nexus` to render + video groups
 #   - downloads + verifies the release tarball
 #   - generates config (emit-config), installs systemd unit, starts engine
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
   | sudo bash
 
 # (Optional) verify the iGPU stack came up cleanly.
@@ -1747,7 +1755,7 @@ sudo reboot
 # without the required >=6.10 kernel, apt-installs
 # linux-generic-hwe-24.04, and exits with a REBOOT REQUIRED banner.
 # Re-running the same one-liner after reboot does the rest.
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
   | sudo bash -s -- --force-profile intel-npu
 
 sudo reboot
@@ -1762,7 +1770,7 @@ uname -r                       # expect 6.10.x or newer
 #   - downloads + installs the NPU driver v1.32.1 (4 .deb files)
 #   - creates the `nexus` user, dirs, group memberships
 #   - generates config (emit-config), installs systemd unit, starts engine
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
   | sudo bash -s -- --force-profile intel-npu
 
 # (Optional) verify both accelerators came up.
