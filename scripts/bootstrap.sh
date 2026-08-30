@@ -7,8 +7,14 @@
 # Operator-facing surface. With no flags this installs whatever is
 # currently on the `stable` channel:
 #
-#     curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
+#     curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
 #         | sudo bash -s --
+#
+# That URL is where the SCRIPT comes from, and is deliberately not a
+# channel pointer: a pointer only exists once a release has been routed
+# to that channel, so `releases/download/stable/bootstrap.sh` 404s until
+# something ships on stable. Which build gets INSTALLED is decided below,
+# by `--channel`, independently of where this file was fetched from.
 #
 # `--channel beta` opts a box into the pre-release channel. `--version
 # vX.Y.Z` pins one exact build and skips channel resolution entirely.

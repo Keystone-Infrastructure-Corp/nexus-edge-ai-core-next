@@ -102,9 +102,9 @@ fn the_channel_pointer_carries_bootstrap_itself() {
         );
         assert!(
             args.contains("bootstrap.sh"),
-            "{wf} uploads to the channel pointer without bootstrap.sh. Every \
-             documented install one-liner curls it from the pointer, so the \
-             pointer would resolve a version nobody can reach."
+            "{wf} uploads to the channel pointer without bootstrap.sh, so \
+             `releases/download/<channel>/bootstrap.sh` would resolve a version \
+             but serve no installer to fetch it with."
         );
     }
 }
@@ -124,11 +124,21 @@ fn bootstrap_defaults_to_the_stable_channel() {
         "bootstrap.sh must default to the stable channel when neither --channel \
          nor --version is given"
     );
+
+    // Comments are excluded deliberately: the header cites
+    // `releases/latest/download/bootstrap.sh` as where to FETCH this script,
+    // which is a different question from which build it installs (BUG-143).
+    let code: Vec<&str> = bootstrap
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| l.contains("releases/latest") || l.contains("api.github.com"))
+        .collect();
     assert!(
-        !bootstrap.contains("releases/latest"),
+        code.is_empty(),
         "bootstrap.sh must not resolve a version through GitHub's \
          /releases/latest — it reports the prerelease flag, not the channel \
-         the release was published on (ADR-080)"
+         the release was published on (ADR-080):\n  {}",
+        code.join("\n  ")
     );
 }
 
@@ -177,5 +187,35 @@ fn the_release_pipeline_skips_channel_pointer_tags() {
          also skip the `stable`/`beta`/`dev` channel pointers. A job guarded \
          against one and not the other will try to build a release out of a \
          pointer tag."
+    );
+}
+
+/// The documented one-liner must fetch the script from a URL that always exists.
+///
+/// A channel pointer is created only when a release is routed to that channel,
+/// so `releases/download/stable/bootstrap.sh` 404s until something ships on
+/// stable — which is how the documented install command shipped broken once
+/// already. `releases/latest/download/` resolves for as long as any full
+/// release exists. Where the script is FETCHED from and which build it INSTALLS
+/// are independent; only the latter is a channel decision.
+#[test]
+fn documented_install_urls_do_not_depend_on_a_channel_pointer() {
+    let doc = read("docs/INSTALL.md");
+    let offenders: Vec<&str> = doc
+        .lines()
+        .filter(|l| {
+            ["stable", "beta", "dev"]
+                .iter()
+                .any(|c| l.contains(&format!("releases/download/{c}/bootstrap.sh")))
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "docs/INSTALL.md fetches bootstrap.sh from a channel pointer, which does \
+         not exist until a release is routed to that channel:\n  {}\n\
+         Use releases/latest/download/bootstrap.sh — the channel is chosen by \
+         --channel, not by where the script was downloaded from.",
+        offenders.join("\n  ")
     );
 }
