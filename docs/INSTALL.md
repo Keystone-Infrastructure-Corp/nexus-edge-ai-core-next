@@ -889,7 +889,7 @@ Hailo-8 — install with **`--force-profile amd-vulkan`**, which generates a
 config with `ep_priority = ["vulkan", "cpu"]`:
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s -- --force-profile amd-vulkan
 ```
 
@@ -964,7 +964,7 @@ config from §1's detected hardware, so the minimum invocation is zero
 flags:
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash
 ```
 
@@ -1270,7 +1270,7 @@ client_id = "nexus-engine"
 rerun. The existing `/etc/nexus/nexus.toml` is preserved:
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s --
 ```
 
@@ -1696,7 +1696,7 @@ sudo reboot
 #   - adds `nexus` to render + video groups
 #   - downloads + verifies the release tarball
 #   - generates config (emit-config), installs systemd unit, starts engine
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash
 
 # (Optional) verify the iGPU stack came up cleanly.
@@ -1755,7 +1755,7 @@ sudo reboot
 # without the required >=6.10 kernel, apt-installs
 # linux-generic-hwe-24.04, and exits with a REBOOT REQUIRED banner.
 # Re-running the same one-liner after reboot does the rest.
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s -- --force-profile intel-npu
 
 sudo reboot
@@ -1770,7 +1770,7 @@ uname -r                       # expect 6.10.x or newer
 #   - downloads + installs the NPU driver v1.32.1 (4 .deb files)
 #   - creates the `nexus` user, dirs, group memberships
 #   - generates config (emit-config), installs systemd unit, starts engine
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/stable/bootstrap.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s -- --force-profile intel-npu
 
 # (Optional) verify both accelerators came up.
