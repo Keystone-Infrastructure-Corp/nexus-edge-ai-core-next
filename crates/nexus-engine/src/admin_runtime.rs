@@ -1234,8 +1234,13 @@ pub(crate) fn redact_url_credentials(input: &str) -> String {
             })
             .unwrap_or(tail.len());
         let authority = &tail[..authority_end];
-        match authority.find('@') {
-            // Userinfo present → keep only the host after '@'.
+        // Gap G4: use the LAST '@' as the userinfo/host boundary, per RFC
+        // 3986 (`userinfo = *( unreserved / pct-encoded / sub-delims / ":" )`,
+        // where `@` is itself a legal — if unusual — password character).
+        // Splitting on the FIRST '@' instead would treat a password like
+        // `p@ss` as if `ss@host` were the host, leaking the tail.
+        match authority.rfind('@') {
+            // Userinfo present → keep only the host after the last '@'.
             Some(at) => {
                 out.push_str("<redacted>@");
                 out.push_str(&authority[at + 1..]);
@@ -2695,6 +2700,18 @@ mod tests {
         );
         // Nothing URL-shaped → identity.
         assert_eq!(redact_url_credentials("plain log line"), "plain log line");
+        // Gap G4: a password containing '@' must not leave a credential
+        // tail after the redaction. The authority's LAST '@' is the
+        // userinfo/host boundary (RFC 3986) — splitting on the FIRST '@'
+        // instead treats everything after it, up to the real boundary, as
+        // part of the host and leaks it verbatim. Built with `format!`
+        // rather than a literal so the '@'-in-password shape survives
+        // copy/paste tooling that likes to mangle credential-looking URLs.
+        let leaky = format!("rtsp://admin:s3cret{at}more@10.0.0.5:554/stream", at = '@');
+        assert_eq!(
+            redact_url_credentials(&leaky),
+            "rtsp://<redacted>@10.0.0.5:554/stream"
+        );
     }
 
     #[test]

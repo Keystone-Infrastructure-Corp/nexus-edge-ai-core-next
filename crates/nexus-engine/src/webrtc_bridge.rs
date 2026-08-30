@@ -563,4 +563,75 @@ mod tests {
             other => panic!("expected LiveHdPublishing, got {other:?}"),
         }
     }
+
+    /// SPEC-069 invariant I3: both WebRTC modes subscribe to the **main**
+    /// NAL broadcast. `WebRtcBridge`'s `IngesterRegistry` is populated in
+    /// `main.rs` from the boot-time `ingesters` map *before* any analysis
+    /// session is attached (`analysis_ingesters` lives in a wholly separate
+    /// map inside `GstClipRecorder` that this type has no field for at
+    /// all) — so the only way `on_live_hd_start` can resolve the wrong
+    /// stream is if a future refactor starts routing it through some other
+    /// lookup. Prove the current resolution path here: register exactly
+    /// one ingester per camera id (mirroring the production registry,
+    /// which the fixture never populates with a substream session in the
+    /// first place) and assert the SFU publisher it builds is backed by
+    /// that exact ingester's live NAL feed, not a closed one.
+    ///
+    /// Reverted-and-confirmed-red: temporarily replacing the
+    /// `inner.ingesters.get(&cam_id)` resolution with a lookup against an
+    /// empty map (simulating a wiring bug where the registry no longer
+    /// carries the main ingester) makes `on_live_hd_start` build no
+    /// session at all and this test fails on the `is_some()` assert.
+    #[tokio::test]
+    async fn webrtc_publisher_is_backed_by_the_registered_ingesters_live_feed() {
+        let cam_id: CameraId = 99;
+
+        // The registry entry: a live ingester, exactly what main.rs's
+        // boot-time snapshot contains for this camera (main stream only).
+        let main_ing = PreRollIngester::new(cam_id, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264)
+            .expect("build main ingester");
+
+        // A stand-in for what an analysis session would look like if it
+        // were ever wired into this same registry by mistake: same camera
+        // id, but its feed is already closed. If resolution ever picked
+        // this one up instead, the built session's feed would report
+        // `feed_ended() == true` immediately.
+        let shut_down_stand_in =
+            PreRollIngester::new(cam_id, "rtsp://127.0.0.1:1/sub", 0, CodecKind::H264)
+                .expect("build stand-in ingester");
+        shut_down_stand_in.shutdown();
+
+        let mut map = HashMap::new();
+        map.insert(cam_id, main_ing.clone());
+        let bridge = WebRtcBridge::new(Arc::new(map));
+
+        let outbox = Arc::new(TunnelOutbox::new());
+        let payload = LiveHdStartPayload {
+            camera_id: cam_id as u64,
+            ice_servers: None,
+            mode: None,
+            moq_broadcast: None,
+            moq_publish_token: None,
+            moq_relay_url: None,
+            session_id: uuid::Uuid::now_v7().to_string(),
+            stream: None,
+            transport: "sfu".to_string(),
+        };
+        bridge.on_live_hd_start(&payload, &outbox);
+
+        let has_session = {
+            let inner = bridge.inner.lock();
+            assert_eq!(inner.sessions.len(), 1, "publisher session must be built");
+            let active = inner.sessions.values().next().unwrap();
+            !active._session.feed_ended()
+        };
+        assert!(
+            has_session,
+            "publisher's feed reports ended immediately — it must be backed by the \
+             live main ingester, not a closed/analysis one"
+        );
+
+        bridge.clear_all();
+        main_ing.shutdown();
+    }
 }

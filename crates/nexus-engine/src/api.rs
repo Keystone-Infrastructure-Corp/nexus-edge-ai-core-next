@@ -1396,6 +1396,43 @@ fn camera_audit_json(cam: &CameraConfig) -> Option<String> {
     serde_json::to_string(&safe).ok()
 }
 
+/// Gap G1 — `analysis_url` had no validation at all: a hand-set substream
+/// on the wrong scheme, or one that's a byte-for-byte copy of `url`, was
+/// accepted and would silently shift every detection zone at spawn time
+/// (SPEC-069 invariant I6 tolerates a *measured* aspect-ratio drift; it
+/// says nothing about an operator typo).
+///
+/// This is deliberately the network-free half of the check only.
+/// `analysis_url` must share a scheme family with `url` (rtsp/rtsps,
+/// matching the codec-autodetect precedent below) and must not be
+/// identical to `url` — both are static, in-payload checks. A true
+/// aspect-ratio mismatch check (comparing the substream's actual
+/// resolution against the main stream's) needs a live probe of both URLs,
+/// and `CameraIngest` stores no resolution today; that half stays blocked
+/// on the same class of missing test/probe infrastructure as the
+/// ONVIF-mock items, and is not attempted here.
+fn validate_analysis_url(ingest: &nexus_config::CameraIngest) -> Result<(), ApiError> {
+    let Some(analysis) = ingest.analysis_url.as_ref() else {
+        return Ok(());
+    };
+    let scheme = analysis.scheme();
+    if scheme != "rtsp" && scheme != "rtsps" {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("analysis_url scheme must be rtsp or rtsps, got {scheme:?}"),
+        ));
+    }
+    if analysis == &ingest.url {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "analysis_url must differ from url — a substream tap can't be \
+             the same stream as the main session (SPEC-069 I1–I5)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn upsert_camera(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -1405,6 +1442,7 @@ async fn upsert_camera(
     Json(mut cam): Json<CameraConfig>,
 ) -> Result<Json<CameraConfig>, ApiError> {
     cam.id = id;
+    validate_analysis_url(&cam.ingest)?;
     // M6 Phase 4 Step 4.1 — capture pre-state for the audit row so
     // operators can diff before/after on the per-resource history
     // panel. `None` on a create; `Some(prev)` on update. The list
@@ -1497,6 +1535,7 @@ async fn create_camera(
     // regardless, but zeroing here keeps the placeholder JSON
     // honest before the post-insert rewrite.
     cam.id = 0;
+    validate_analysis_url(&cam.ingest)?;
     // Codec autodetect: if the operator didn't specify a codec
     // and the source is rtsp/rtsps, run one RTSP DESCRIBE probe
     // against the URL and stamp the result. Best-effort — if
@@ -6289,6 +6328,58 @@ mod tests {
             json.contains("Channels/102"),
             "analysis_url must still be recorded, minus its credential: {json}"
         );
+    }
+
+    // Gap G1 — `upsert_camera`/`create_camera` had no validation on
+    // `analysis_url` at all: a hand-set substream on the wrong scheme, or
+    // one identical to `url`, was silently accepted and would shift every
+    // detection zone at spawn time. These three cases cover the
+    // network-free half of the check (see `validate_analysis_url`'s doc
+    // comment for why the aspect-ratio half stays out of reach here).
+    #[test]
+    fn analysis_url_with_a_non_rtsp_scheme_is_rejected() {
+        use nexus_config::CameraIngest;
+        let ingest = CameraIngest {
+            url: url::Url::parse("rtsp://10.0.0.5:554/Streaming/Channels/101").unwrap(),
+            analysis_url: Some(url::Url::parse("http://10.0.0.5/Channels/102").unwrap()),
+            enabled: true,
+            max_fps: 15,
+            codec: None,
+        };
+        let err = super::validate_analysis_url(&ingest)
+            .expect_err("a non-rtsp analysis_url scheme must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn analysis_url_identical_to_url_is_rejected() {
+        use nexus_config::CameraIngest;
+        let same = url::Url::parse("rtsp://10.0.0.5:554/Streaming/Channels/101").unwrap();
+        let ingest = CameraIngest {
+            url: same.clone(),
+            analysis_url: Some(same),
+            enabled: true,
+            max_fps: 15,
+            codec: None,
+        };
+        let err = super::validate_analysis_url(&ingest)
+            .expect_err("analysis_url identical to url must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_distinct_rtsp_analysis_url_is_accepted() {
+        use nexus_config::CameraIngest;
+        let ingest = CameraIngest {
+            url: url::Url::parse("rtsp://10.0.0.5:554/Streaming/Channels/101").unwrap(),
+            analysis_url: Some(
+                url::Url::parse("rtsps://10.0.0.5:554/Streaming/Channels/102").unwrap(),
+            ),
+            enabled: true,
+            max_fps: 15,
+            codec: None,
+        };
+        super::validate_analysis_url(&ingest).expect("a distinct rtsps substream is valid");
     }
 
     #[test]

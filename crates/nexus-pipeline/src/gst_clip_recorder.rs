@@ -2886,4 +2886,71 @@ mod tests {
              counters onto a different geometry"
         );
     }
+
+    /// SPEC-069 invariant I2, the other half of the fixture already covering
+    /// I2/I4 for an analysis-only camera: when a camera has BOTH a main
+    /// ingester and an analysis ingester registered — the normal converted-
+    /// camera case, not the edge case — `open()` must still resolve the
+    /// **main** session. It never even looks at `analysis_ingesters`
+    /// (`shared_frame_source` is the only reader of that map, and it only
+    /// feeds the detector's `SharedRtspSource`, not clips), so registering
+    /// an analysis session at a different codec must not change what gets
+    /// recorded.
+    ///
+    /// Reverted-and-confirmed-red: temporarily making `open()` resolve
+    /// `self.analysis_ingesters` instead of (or in preference to)
+    /// `self.ingesters` flips the recorded `ClipMeta.codec` from `h264` to
+    /// `h265` and this test fails on the codec assert.
+    #[tokio::test]
+    async fn a_camera_with_both_sessions_records_from_the_main_ingester_only() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+
+        rec.add_camera_ingester(
+            1,
+            "rtsp://127.0.0.1:1/main",
+            5,
+            15,
+            960,
+            540,
+            CodecKind::H264,
+        )
+        .expect("main ingester registers");
+        rec.set_camera_analysis_ingester(
+            1,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H265,
+        )
+        .expect("analysis session registers");
+
+        let handle = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at: Utc::now(),
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .expect(
+                "open() must resolve the main ingester even though an \
+                     analysis session is also registered for this camera",
+            );
+        let meta = rec
+            .close(
+                handle,
+                ClipFinal {
+                    ended_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("close() succeeds");
+        assert_eq!(
+            meta.codec, "h264",
+            "the clip must be cut from the main session's codec (h264), not \
+             the analysis session's (h265) — got {meta:?}"
+        );
+    }
 }
