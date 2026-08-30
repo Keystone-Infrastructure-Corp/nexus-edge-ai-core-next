@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop, live_hd_bitrate. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch, interaction_event, label_space_report, diag_collect, diag_ready, core_state_hashes, model_catalog, update_assignment, update_cancel, update_rollback, update_progress, lbr_subscribe, lbr_frame, lbr_unsubscribe, live_hd_start, live_hd_offer, live_hd_answer, live_hd_publishing, live_hd_stop, live_hd_bitrate. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -425,6 +425,48 @@ pub struct IceServer {
     pub username: Option<String>,
 }
 
+/// Edge → Cloud. Phase 13 / SPEC-039 (additive on `v=1`, no ack). Discrete interaction token emitted by the engine's per-track FSM (`nexus-tracker/src/annotator.rs`), derived only from attributes the annotator already computes — no new model, no pose, no PII. `entity_local_id` ties the token to the same track as its `entity_sighting`. Classified `Bulk` uplink tier on the edge (`nexus-cloud-client::tunnel::tier_of`): dropped by a saturated outbox rather than blocking heartbeats/alerts. An older cloud that predates this kind never receives it (the edge suppresses emission while disconnected and a pre-Phase-13 cloud simply never advertises support); an edge that predates it never sends one, and `v` stays `1` either way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionEventPayload {
+    /// The fixture/anchor label involved, when the token is anchor-derived (grab, tamper, remove_anchor, tool_proximity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_label: Option<String>,
+    /// Per-core integer id (matches cameras.edge_camera_id), so the gateway resolves org the same way it does for entity_sighting.
+    pub camera_id: u64,
+    /// Seconds the track has dwelt in its current zone/proximity at emission time, when the token is dwell-derived (loiter, casing, reach_in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dwell_seconds: Option<f64>,
+    /// The same per-track id carried on this track's `entity_sighting` envelopes.
+    pub entity_local_id: String,
+    /// The track's same-label group size at emission time, present for group_form / group_disperse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_size: Option<u64>,
+    /// Edge wall-clock the track was first observed. Optional — omitted edges still validate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ts: Option<Timestamp>,
+    /// The discrete act named by nexus-types::InteractionToken.
+    pub token: String,
+    /// Edge wall-clock at which the FSM emitted this token.
+    pub ts: Timestamp,
+}
+
+/// Edge → Cloud. Phase 13 / SPEC-040 (additive on `v=1`, no ack). Reports one camera's resolved model label space — what is actually baked into the resolved graph, never the configured prompt subset (ADR-054, ADR-055). Sent on connect and again on any model change (OTA swap, detector-kind change, prompt-subset change); idempotent, so replaying an unchanged report is a no-op cloud-side. Classified `Control` uplink tier on the edge: never dropped, because a stale/missing report is read by the cloud as `unknown coverage`, not as a capability claim, so the report must arrive to ever leave that state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelSpaceReportPayload {
+    /// Open-vocab terms actually baked into the resolved graph, sorted + de-duplicated by the edge for a stable, idempotent report.
+    pub baked_open_vocab: Vec<String>,
+    /// Per-core integer id (matches cameras.edge_camera_id).
+    pub camera_id: u64,
+    /// Closed-vocab namespaced labels the resolved graph emits, sorted.
+    pub closed_vocab: Vec<String>,
+    /// The autonomy-ladder rung the resolved model sits at (its input shape, e.g. `1024x576`).
+    pub ladder_rung: String,
+    /// The resolved model identifier — the concrete graph in use.
+    pub model_id: String,
+}
+
 /// Edge → Cloud. Phase 10 (additive on v=1). One adaptive-fps JPEG snapshot for a subscribed camera. Fire-and-forget: the cloud LiveHub fans it out to every subscribed browser, and it is the FIRST payload dropped under backpressure (a dropped frame is invisible — the next snapshot supersedes it). The frame is the CLEAN supervisor frame (no detection overlays), resized to the subscriber's tile size, JPEG q70–75. Emitted at ~0.5–1 fps when the scene is static (keepalive) and bursts up to the fps_tier ceiling on motion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -808,6 +850,8 @@ pub enum EnvelopeBody {
     CameraRosterAck(CameraRosterAckPayload),
     EntitySighting(EntitySightingPayload),
     EntitySightingBatch(EntitySightingBatchPayload),
+    InteractionEvent(InteractionEventPayload),
+    LabelSpaceReport(LabelSpaceReportPayload),
     DiagCollect(DiagCollectPayload),
     DiagReady(DiagReadyPayload),
     ShellSessionOpen(ShellSessionOpenPayload),

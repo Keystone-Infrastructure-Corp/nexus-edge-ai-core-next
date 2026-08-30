@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nexus_cloud_protocol::v1::{
     AlertPayload, ClipReplicatedPayload, DiagReadyPayload, EntitySightingBatchPayload,
-    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta, LbrFramePayload, TraceContext,
-    VerificationState,
+    EntitySightingPayload, Envelope, EnvelopeBody, EnvelopeMeta, InteractionEventPayload,
+    LabelSpaceReportPayload, LbrFramePayload, TraceContext, VerificationState,
 };
 use uuid::Uuid;
 
@@ -141,6 +141,59 @@ impl CloudConsoleSink {
         sighting: EntitySightingProjection,
     ) -> Result<(), TunnelError> {
         let envelope = build_entity_sighting_envelope(sighting);
+        self.tunnel.send(envelope).await
+    }
+
+    /// Publish one interaction token from the per-track FSM
+    /// (SPEC-039, `nexus-tracker::annotator`). Mirrors
+    /// [`Self::publish_entity_sighting`]'s shape — a projection type
+    /// plus a `build_*_envelope` builder — rather than a second
+    /// publish pattern.
+    ///
+    /// Classified `Bulk` uplink tier
+    /// (`crate::tunnel::tier_of`): a saturated outbox drops this
+    /// envelope rather than blocking heartbeats or alerts. Tokens are
+    /// still computed while the tunnel is down; only emission is
+    /// suppressed — callers gate on [`crate::TunnelOutbox::is_connected`]
+    /// before calling this (see SPEC-039 acceptance criteria).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TunnelError`] from the underlying handle, most
+    /// commonly `Disconnected` when the tunnel is down or
+    /// `SendChannelClosed`/queue-full when the Bulk channel is
+    /// saturated — the caller logs and moves on; this is best-effort
+    /// telemetry with no wire ack.
+    pub async fn publish_interaction_event(
+        &self,
+        event: InteractionEventProjection,
+    ) -> Result<(), TunnelError> {
+        let envelope = build_interaction_event_envelope(event);
+        self.tunnel.send(envelope).await
+    }
+
+    /// Publish one camera's resolved label space (SPEC-040,
+    /// `nexus-inference::label_space::LabelSpaceReporter`). Sent on
+    /// connect and again on any model change; idempotent (an
+    /// unchanged resolved space is not re-reported by the caller).
+    ///
+    /// Classified `Control` uplink tier
+    /// (`crate::tunnel::tier_of`): never dropped — a missing report
+    /// is read by the cloud as "unknown coverage", never as a
+    /// capability claim, so unlike sightings/interaction tokens this
+    /// kind cannot be silently shed under backpressure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TunnelError`] from the underlying handle (most
+    /// commonly `Disconnected` when the tunnel is down — the caller's
+    /// on-connect / on-change trigger re-fires the report once the
+    /// tunnel reconnects).
+    pub async fn publish_label_space_report(
+        &self,
+        report: nexus_types::LabelSpaceReport,
+    ) -> Result<(), TunnelError> {
+        let envelope = build_label_space_report_envelope(report);
         self.tunnel.send(envelope).await
     }
 }
@@ -515,6 +568,91 @@ pub fn build_entity_sighting_batch_envelope(
     }
 }
 
+/// Edge-side projection of one interaction token (SPEC-039). Wire-only
+/// fields the sink needs to build an `InteractionEventPayload`; the
+/// richer `nexus_types::InteractionTokenEvent` the annotator emits
+/// carries `entity_local_id` as optional (reid may not have assigned
+/// one to the track yet) — callers only project into this struct once
+/// an id exists, since the wire schema requires it (matching
+/// `entity_sighting`'s same requirement).
+#[derive(Debug, Clone)]
+pub struct InteractionEventProjection {
+    /// Per-core integer id (matches `cameras.edge_camera_id`).
+    pub camera_id: u64,
+    /// The same per-track id carried on this track's `entity_sighting`
+    /// envelopes.
+    pub entity_local_id: String,
+    /// The discrete act this token names.
+    pub token: nexus_types::InteractionToken,
+    /// Edge wall-clock at which the FSM emitted this token.
+    pub ts: DateTime<Utc>,
+    /// Edge wall-clock the track was first observed.
+    pub started_ts: Option<DateTime<Utc>>,
+    /// Seconds dwelt at emission time, for dwell-derived tokens.
+    pub dwell_seconds: Option<f64>,
+    /// Same-label group size at emission time, for `group_form` /
+    /// `group_disperse`.
+    pub group_size: Option<u64>,
+    /// The fixture/anchor label involved, for anchor-derived tokens.
+    pub anchor_label: Option<String>,
+}
+
+/// Pure-function projection. Public so engine tests can construct
+/// reference envelopes without instantiating a sink.
+#[must_use]
+pub fn build_interaction_event_envelope(event: InteractionEventProjection) -> Envelope {
+    let payload = InteractionEventPayload {
+        camera_id: event.camera_id,
+        entity_local_id: event.entity_local_id,
+        token: event.token.as_str().to_string(),
+        ts: event.ts.to_rfc3339(),
+        started_ts: event.started_ts.map(|ts| ts.to_rfc3339()),
+        dwell_seconds: event.dwell_seconds,
+        group_size: event.group_size,
+        anchor_label: event.anchor_label,
+    };
+    Envelope {
+        meta: EnvelopeMeta {
+            v: 1,
+            id: Uuid::now_v7().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+        },
+        body: EnvelopeBody::InteractionEvent(payload),
+    }
+}
+
+/// Pure-function projection from the edge's already-computed
+/// [`nexus_types::LabelSpaceReport`] (SPEC-040,
+/// `nexus_inference::label_space::compute_report`) straight onto the
+/// wire payload — no separate projection type needed, since every
+/// field the wire carries is already exactly what the report computes
+/// (ADR-055: report what is baked, never a configured subset).
+#[must_use]
+pub fn build_label_space_report_envelope(report: nexus_types::LabelSpaceReport) -> Envelope {
+    let camera_id = u64::try_from(report.camera_id).unwrap_or(0);
+    let payload = LabelSpaceReportPayload {
+        camera_id,
+        model_id: report.model_id,
+        ladder_rung: report.ladder_rung,
+        baked_open_vocab: report.baked_open_vocab,
+        closed_vocab: report.closed_vocab,
+    };
+    Envelope {
+        meta: EnvelopeMeta {
+            v: 1,
+            id: Uuid::now_v7().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+        },
+        body: EnvelopeBody::LabelSpaceReport(payload),
+    }
+}
+
 fn build_entity_sighting_payload(
     sighting: EntitySightingProjection,
     use_f16: bool,
@@ -735,6 +873,70 @@ mod tests {
                 }
             }
             other => panic!("expected EntitySighting, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_interaction_event_builds_v1_envelope() {
+        let tunnel = Arc::new(CapturingTunnel {
+            last: parking_lot::Mutex::new(None),
+        });
+        let sink = CloudConsoleSink::new(tunnel.clone());
+        let ts = Utc::now();
+        sink.publish_interaction_event(InteractionEventProjection {
+            camera_id: 3,
+            entity_local_id: "0192d3c2-7c4f-7000-8000-000000000001".into(),
+            token: nexus_types::InteractionToken::Loiter,
+            ts,
+            started_ts: Some(ts),
+            dwell_seconds: Some(12.5),
+            group_size: None,
+            anchor_label: None,
+        })
+        .await
+        .expect("send");
+        let captured = tunnel.last.lock().clone().expect("captured envelope");
+        assert_eq!(captured.meta.v, 1);
+        match captured.body {
+            EnvelopeBody::InteractionEvent(p) => {
+                assert_eq!(p.camera_id, 3);
+                assert_eq!(p.entity_local_id, "0192d3c2-7c4f-7000-8000-000000000001");
+                assert_eq!(p.token, "loiter");
+                assert!((p.dwell_seconds.expect("dwell") - 12.5).abs() < 1e-9);
+                assert!(p.started_ts.is_some());
+                assert!(p.group_size.is_none());
+                assert!(p.anchor_label.is_none());
+            }
+            other => panic!("expected InteractionEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_label_space_report_builds_v1_envelope() {
+        let tunnel = Arc::new(CapturingTunnel {
+            last: parking_lot::Mutex::new(None),
+        });
+        let sink = CloudConsoleSink::new(tunnel.clone());
+        sink.publish_label_space_report(nexus_types::LabelSpaceReport {
+            camera_id: 3,
+            model_id: "yolo-v9-open-vocab".into(),
+            ladder_rung: "1024x576".into(),
+            baked_open_vocab: vec!["forklift".into()],
+            closed_vocab: vec!["safety.person".into()],
+        })
+        .await
+        .expect("send");
+        let captured = tunnel.last.lock().clone().expect("captured envelope");
+        assert_eq!(captured.meta.v, 1);
+        match captured.body {
+            EnvelopeBody::LabelSpaceReport(p) => {
+                assert_eq!(p.camera_id, 3);
+                assert_eq!(p.model_id, "yolo-v9-open-vocab");
+                assert_eq!(p.ladder_rung, "1024x576");
+                assert_eq!(p.baked_open_vocab, vec!["forklift".to_string()]);
+                assert_eq!(p.closed_vocab, vec!["safety.person".to_string()]);
+            }
+            other => panic!("expected LabelSpaceReport, got {other:?}"),
         }
     }
 

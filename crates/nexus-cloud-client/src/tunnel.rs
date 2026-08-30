@@ -79,12 +79,26 @@ pub(crate) enum Tier {
 /// high-volume kinds are `Bulk`; alerts + clip receipts are `Alert`;
 /// **everything else defaults to `Control`** so a new low-volume kind
 /// is never accidentally droppable.
+///
+/// SPEC-039 / SPEC-040: `InteractionEvent` and `LabelSpaceReport` each
+/// get an **explicit** arm rather than resting on the `_ => Control`
+/// fallthrough. Letting a new kind's tier come from the catch-all is
+/// exactly the bug an earlier pass shipped and a reviewer caught: the
+/// fallthrough exists so an *unclassified* kind defaults safe (never
+/// dropped), not so a kind we've deliberately reasoned about inherits
+/// a tier nobody chose for it. `InteractionEvent` is best-effort
+/// per-track telemetry (same shape as `EntitySighting`) — `Bulk`.
+/// `LabelSpaceReport` is a coverage-affecting capability claim whose
+/// absence cloud-side reads as "unknown coverage" — it must arrive,
+/// so `Control`.
 pub(crate) fn tier_of(body: &EnvelopeBody) -> Tier {
     match body {
         EnvelopeBody::EntitySighting(_)
         | EnvelopeBody::EntitySightingBatch(_)
+        | EnvelopeBody::InteractionEvent(_)
         | EnvelopeBody::LbrFrame(_) => Tier::Bulk,
         EnvelopeBody::Alert(_) | EnvelopeBody::ClipReplicated(_) => Tier::Alert,
+        EnvelopeBody::LabelSpaceReport(_) => Tier::Control,
         _ => Tier::Control,
     }
 }
@@ -587,6 +601,39 @@ mod tests {
             Some("gateway.example"),
         );
         assert_eq!(authority_of("not-a-url"), None);
+    }
+
+    /// SPEC-039 / SPEC-040: assert the explicit classification directly,
+    /// so a future refactor that collapses these arms back into the
+    /// `_ => Control` fallthrough fails a test instead of silently
+    /// reclassifying `interaction_event` as never-dropped.
+    #[test]
+    fn interaction_event_is_bulk_tier() {
+        use nexus_cloud_protocol::v1::{EnvelopeBody, InteractionEventPayload};
+        let body = EnvelopeBody::InteractionEvent(InteractionEventPayload {
+            anchor_label: None,
+            camera_id: 1,
+            dwell_seconds: None,
+            entity_local_id: "trk-1".to_string(),
+            group_size: None,
+            started_ts: None,
+            token: "loiter".to_string(),
+            ts: "2024-01-01T00:00:00Z".to_string(),
+        });
+        assert_eq!(tier_of(&body), Tier::Bulk);
+    }
+
+    #[test]
+    fn label_space_report_is_control_tier() {
+        use nexus_cloud_protocol::v1::{EnvelopeBody, LabelSpaceReportPayload};
+        let body = EnvelopeBody::LabelSpaceReport(LabelSpaceReportPayload {
+            baked_open_vocab: vec![],
+            camera_id: 1,
+            closed_vocab: vec![],
+            ladder_rung: "1024x576".to_string(),
+            model_id: "m".to_string(),
+        });
+        assert_eq!(tier_of(&body), Tier::Control);
     }
 
     #[tokio::test]
