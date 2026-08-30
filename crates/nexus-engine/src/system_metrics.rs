@@ -41,6 +41,13 @@ pub struct SystemMetrics {
     pub cpu: CpuInfo,
     pub memory: MemoryInfo,
     pub gpu: Option<GpuInfo>,
+    /// SPEC-069 Phase 1 — system-wide decode capacity signal, derived
+    /// from `gpu.engines`. `None` when the GPU backend reports no
+    /// per-engine breakdown at all (Apple, or a PMU baseline still
+    /// warming up), which is absence of data, not a healthy-by-default
+    /// 0%. See [`DecodeCapacity`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub decode_capacity: Option<DecodeCapacity>,
     /// Intel NPU telemetry when an `intel_vpu`-bound device is
     /// visible via `/sys/class/accel/`. `None` on macOS, on Linux
     /// without the `intel_vpu` driver, and on non-Intel hosts.
@@ -202,6 +209,61 @@ pub struct GpuInfo {
     /// instead of a generic "not available" hint.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub utilization_status: Option<String>,
+}
+
+/// Utilization threshold above which the binding fixed-function engine is
+/// considered oversubscribed. Chosen well below 100 because GStreamer's
+/// decode-input queue starts leaking access units before the hardware
+/// engine literally reads 100% busy.
+pub const OVERSUBSCRIBED_PCT: f32 = 90.0;
+
+/// SPEC-069 Phase 1 — system-wide decode capacity signal.
+///
+/// **Binding amendment:** an Intel iHD box can sit at 3.8% `video-decode` /
+/// 99.1% `video-enhance` (VECS, the scale/composite block) while 53
+/// cameras starve — a decode-only signal would report "healthy" in that
+/// exact state. This is built from EVERY fixed-function video engine
+/// [`GpuEngineUtil`] reports, saturating on `max()`, not on `video-decode`
+/// alone.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodeCapacity {
+    /// Fixed-function engine class currently closest to saturation, e.g.
+    /// `"video-enhance"`. Carried explicitly (rather than left for a
+    /// caller to re-derive) so a verdict string can name it.
+    pub binding_engine: String,
+    /// That engine's utilization, 0–100, over the sampling window.
+    pub binding_engine_pct: f32,
+    /// `true` once `binding_engine_pct` crosses [`OVERSUBSCRIBED_PCT`].
+    pub oversubscribed: bool,
+}
+
+/// Fixed-function video engine classes considered when picking the
+/// binding engine — decode, encode, and (Intel VECS) enhance/scale.
+/// Deliberately excludes `render`/`copy`/`compute`: those are the
+/// programmable 3D/compute pipeline, which a headless video appliance
+/// barely touches, so an idle render engine must not dilute a saturated
+/// fixed-function one when picking the max.
+const FIXED_FUNCTION_ENGINE_PREFIX: &str = "video-";
+
+/// Pick the fixed-function video engine closest to saturation. `None`
+/// when the engine list is empty — no per-engine breakdown at all (Apple,
+/// or a PMU baseline still warming up) — which is absence of data, not a
+/// healthy-by-default 0%.
+#[must_use]
+pub fn decode_capacity_from_engines(engines: &[GpuEngineUtil]) -> Option<DecodeCapacity> {
+    engines
+        .iter()
+        .filter(|e| e.class.starts_with(FIXED_FUNCTION_ENGINE_PREFIX))
+        .max_by(|a, b| {
+            a.utilization_pct
+                .partial_cmp(&b.utilization_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|e| DecodeCapacity {
+            binding_engine: e.class.clone(),
+            binding_engine_pct: e.utilization_pct,
+            oversubscribed: e.utilization_pct >= OVERSUBSCRIBED_PCT,
+        })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -413,12 +475,18 @@ fn render() -> Arc<SystemMetrics> {
             threads: Vec::new(),
         });
 
+    let gpu = crate::gpu::snapshot();
+    let decode_capacity = gpu
+        .as_ref()
+        .and_then(|g| decode_capacity_from_engines(&g.engines));
+
     let response = SystemMetrics {
         uptime_secs: process.run_time_secs,
         host,
         cpu,
         memory,
-        gpu: crate::gpu::snapshot(),
+        gpu,
+        decode_capacity,
         npu: crate::npu::snapshot(),
         hailo: crate::hailo::snapshot(),
         disks,
@@ -670,5 +738,62 @@ mod tests {
         assert_eq!(query(None, Some(1)).resolve().1, 5);
         assert_eq!(query(None, Some(0)).resolve().1, 5);
         assert_eq!(query(None, Some(-7)).resolve().1, 5);
+    }
+
+    fn engine(class: &str, pct: f32) -> GpuEngineUtil {
+        GpuEngineUtil {
+            class: class.to_string(),
+            utilization_pct: pct,
+        }
+    }
+
+    /// The binding amendment's whole point: an Intel iHD box can read
+    /// 3.8% `video-decode` while `video-enhance` (VECS) sits at 99.1% —
+    /// the max, not `video-decode` specifically, must win and must be
+    /// named.
+    #[test]
+    fn decode_capacity_saturates_on_max_not_on_video_decode_specifically() {
+        let engines = [
+            engine("render", 0.2),
+            engine("video-decode", 3.8),
+            engine("video-enhance", 99.1),
+        ];
+        let cap = decode_capacity_from_engines(&engines).expect("engines present");
+        assert_eq!(cap.binding_engine, "video-enhance");
+        assert!((cap.binding_engine_pct - 99.1).abs() < 0.01);
+        assert!(cap.oversubscribed, "99.1% must cross OVERSUBSCRIBED_PCT");
+    }
+
+    #[test]
+    fn decode_capacity_ignores_render_copy_compute() {
+        let engines = [
+            engine("render", 95.0),
+            engine("copy", 90.0),
+            engine("compute", 92.0),
+        ];
+        assert!(
+            decode_capacity_from_engines(&engines).is_none(),
+            "no fixed-function video engine present, so no capacity signal"
+        );
+    }
+
+    #[test]
+    fn decode_capacity_is_none_for_an_empty_engine_list() {
+        assert!(decode_capacity_from_engines(&[]).is_none());
+    }
+
+    #[test]
+    fn decode_capacity_below_threshold_is_not_oversubscribed() {
+        let engines = [engine("video-decode", 45.0)];
+        let cap = decode_capacity_from_engines(&engines).unwrap();
+        assert!(!cap.oversubscribed);
+    }
+
+    /// Exactly at the threshold counts as oversubscribed — `>=`, not `>`.
+    #[test]
+    fn decode_capacity_at_exact_threshold_is_oversubscribed() {
+        let engines = [engine("video-decode", OVERSUBSCRIBED_PCT)];
+        let cap = decode_capacity_from_engines(&engines).unwrap();
+        assert!(cap.oversubscribed);
     }
 }

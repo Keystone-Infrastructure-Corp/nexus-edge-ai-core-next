@@ -275,6 +275,19 @@ pub enum FallbackReason {
     Unhealthy,
 }
 
+impl FallbackReason {
+    /// Stable machine-readable string for the `reason` field of
+    /// `analysis_stream` (SPEC-069 Phase 1, P3).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::NoFrames => "no_frames",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+}
+
 /// Verdict on the analysis session, recomputed on a timer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisVerdict {
@@ -363,6 +376,10 @@ pub struct SharedRtspSource {
     /// rebuilt by any of this — recording and HD live view are not
     /// collateral (SPEC-069 invariants I2\u2013I5).
     pub analysis: Option<std::sync::Arc<crate::preroll_ingester::PreRollIngester>>,
+    /// SPEC-069 Phase 1 (P3) — where the analysis-stream status this
+    /// source observes gets published for `GET /v1/cameras/{id}/stats`.
+    /// `None` in tests/callers that don't care to observe it.
+    pub analysis_stream: Option<std::sync::Arc<crate::stats::AnalysisStreamRegistry>>,
 }
 
 #[cfg(feature = "gstreamer")]
@@ -382,6 +399,13 @@ impl FrameSource for SharedRtspSource {
                 camera_id = self.camera_id,
                 "analysis reading the camera substream; main-stream rgb tap valved off"
             );
+            if let Some(reg) = self.analysis_stream.as_ref() {
+                reg.observe_probing(self.camera_id);
+            }
+        } else if let Some(reg) = self.analysis_stream.as_ref() {
+            // No substream configured — this is the intended,
+            // healthy state, not a fallback.
+            reg.observe_mainstream_by_design(self.camera_id);
         }
         let mut rx = self.frames_from(reading_analysis)?;
         let expected_fps = self
@@ -398,6 +422,9 @@ impl FrameSource for SharedRtspSource {
         // still measures from session start.
         let mut window_start = started;
         let mut window_frames: u64 = 0;
+        // Geometry of the last frame delivered, for `analysis_stream`'s
+        // width/height (P3). Whichever session is active at the time.
+        let mut last_frame_dims: (u32, u32) = (0, 0);
         let mut health_tick =
             tokio::time::interval(std::time::Duration::from_secs(ANALYSIS_HEALTH_TICK_SECS));
         health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -429,6 +456,17 @@ impl FrameSource for SharedRtspSource {
                             .is_some_and(|a| a.is_buffering()),
                         expected_fps,
                     });
+                    if let (AnalysisVerdict::Healthy, Some(reg)) =
+                        (verdict, self.analysis_stream.as_ref())
+                    {
+                        let fps = if obs_elapsed.as_secs_f32() > 0.0 {
+                            obs_frames as f32 / obs_elapsed.as_secs_f32()
+                        } else {
+                            0.0
+                        };
+                        let (w, h) = last_frame_dims;
+                        reg.observe_active(self.camera_id, w, h, fps);
+                    }
                     if obs_elapsed >= ANALYSIS_RATE_SETTLE {
                         window_start = std::time::Instant::now();
                         window_frames = 0;
@@ -450,6 +488,9 @@ impl FrameSource for SharedRtspSource {
                         if let Some(a) = self.analysis.as_ref() {
                             a.shutdown();
                         }
+                        if let Some(reg) = self.analysis_stream.as_ref() {
+                            reg.observe_unavailable(self.camera_id, reason.as_str());
+                        }
                         reading_analysis = false;
                         rx = self.frames_from(false)?;
                     }
@@ -458,6 +499,7 @@ impl FrameSource for SharedRtspSource {
                     Ok(frame) => {
                         frames += 1;
                         window_frames += 1;
+                        last_frame_dims = (frame.width, frame.height);
                         // Same drop policy as RtspSource: try_send so a
                         // slow downstream gate/pool drops at the edge
                         // instead of stalling the broadcast (which would

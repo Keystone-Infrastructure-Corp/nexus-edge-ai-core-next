@@ -220,6 +220,11 @@ pub struct GstClipRecorder {
     /// admin API, which serves them on `GET /v1/cameras/:id/stats`. `None`
     /// in tests and on the no-engine path leaves the ingester uninstrumented.
     decode_health: Option<Arc<crate::stats::DecodeHealthRegistry>>,
+    /// SPEC-069 Phase 1 (P3) — analysis-stream status for every camera
+    /// this recorder builds a `SharedRtspSource` for. Shared with the
+    /// admin API, which serves it on `GET /v1/cameras/:id/stats` as
+    /// `analysis_stream`. `None` in tests and on the no-engine path.
+    analysis_stream: Option<Arc<crate::stats::AnalysisStreamRegistry>>,
 }
 
 struct OpenState {
@@ -324,6 +329,7 @@ impl GstClipRecorder {
             alert_cold_kick: None,
             alert_clip_delivery_gate: None,
             decode_health: None,
+            analysis_stream: None,
         })
     }
 
@@ -340,6 +346,17 @@ impl GstClipRecorder {
     /// admin API.
     pub fn with_decode_health(mut self, registry: Arc<crate::stats::DecodeHealthRegistry>) -> Self {
         self.decode_health = Some(registry);
+        self
+    }
+
+    /// Publish [`crate::stats::AnalysisStreamStatus`] for every camera's
+    /// `SharedRtspSource` (SPEC-069 Phase 1, P3). The engine shares one
+    /// registry between here and the admin API.
+    pub fn with_analysis_stream(
+        mut self,
+        registry: Arc<crate::stats::AnalysisStreamRegistry>,
+    ) -> Self {
+        self.analysis_stream = Some(registry);
         self
     }
 
@@ -1274,6 +1291,7 @@ impl ClipRecorder for GstClipRecorder {
                 .get(&camera_id)
                 .filter(|a| !a.is_shutdown())
                 .cloned(),
+            analysis_stream: self.analysis_stream.clone(),
         }))
     }
 

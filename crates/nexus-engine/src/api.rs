@@ -92,6 +92,11 @@ pub struct ApiState {
     /// merged camera list response.
     pub frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
     pub decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
+    /// SPEC-069 Phase 1 (P3) — which URL each camera's analysis pipeline
+    /// is actually reading right now, written by `SharedRtspSource::run`.
+    /// Read by `GET /v1/cameras/:id/stats` and the batch stats endpoint
+    /// as `analysis_stream`.
+    pub analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
     pub pool: Option<Arc<DetectorPool>>,
     pub ui_root: PathBuf,
     /// Shared with the per-camera supervisors + the storage_safety
@@ -846,6 +851,9 @@ pub fn router(state: ApiState) -> Router {
         // (fps EMA, last_frame_age_ms, frames_emitted/dropped,
         // source dims). Used by the dashboard health column.
         .route("/v1/cameras/{id}/stats", get(get_camera_stats))
+        // SPEC-069 Phase 1 (P2) — fleet-wide batch counterpart, one
+        // request instead of one per camera.
+        .route("/v1/cameras/stats", get(get_all_camera_stats))
         // Static-object map for the live viewer overlay. Reads
         // the on-disk per-camera anchor registry written by the
         // `StaticObjectFilter` running inside each supervisor.
@@ -2637,6 +2645,40 @@ struct CameraFrameStatsView {
     /// `duplicate_frames` per thousand `sampled_frames`, precomputed so a
     /// dashboard doesn't have to guard the divide.
     duplicate_per_mille: u64,
+    /// SPEC-069 Phase 1 (P2) — windowed (5s trailing) output rate off the
+    /// decoder's own src pad. This is the throughput number ceiling
+    /// calibration is calculated from; `sampled_fps` below can read a flat
+    /// nominal rate even while this one is starved.
+    decoder_output_fps: f32,
+    /// SPEC-069 Phase 1 (P2) — delta-based rate of `sampled_frames`
+    /// between consecutive polls, i.e. what the RGB appsink is actually
+    /// being fed post-padding.
+    sampled_fps: f32,
+    /// SPEC-069 Phase 1 (P2) — geometry read off the decoder's src pad
+    /// caps, i.e. the true decoded resolution (not whatever a downstream
+    /// `videoscale` produces). Zero until the first frame lands.
+    decoder_width: u32,
+    decoder_height: u32,
+    /// SPEC-069 Phase 1 — one word an operator can act on:
+    /// `unknown` | `healthy` | `near` | `over` | `substream_unavailable`.
+    /// See `decode_verdict::compute_decode_verdict` for the precedence
+    /// rules that pick it.
+    decode_verdict: &'static str,
+    /// Human-readable expansion of `decode_verdict`, naming the specific
+    /// fixed-function GPU engine that is binding (per the P2 amendment,
+    /// this is whichever `video-*` engine class is saturating, not
+    /// necessarily decode).
+    decode_summary: String,
+    /// SPEC-069 Phase 1 (P2) — rough fps ceiling for this camera's decode
+    /// path, extrapolated from `decoder_output_fps` at the binding
+    /// engine's current utilization. `null` when the engine has never
+    /// been observed doing meaningful work (never-saturated fallback —
+    /// extrapolating from a near-zero divisor would fabricate a number).
+    decode_ceiling_fps: Option<f32>,
+    /// SPEC-069 Phase 1 (P3) — which stream analysis is actually reading
+    /// right now (substream vs. mainstream fallback) and at what geometry
+    /// / rate. `null` if this camera has no supervisor spawned yet.
+    analysis_stream: Option<nexus_pipeline::AnalysisStreamStatus>,
 }
 
 async fn get_camera_stats(
@@ -2648,11 +2690,39 @@ async fn get_camera_stats(
         .snapshot(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
     let now = chrono::Utc::now();
+    Ok(Json(build_camera_stats_view(&s, id, &snap, now)))
+}
+
+/// Shared by `GET /v1/cameras/:id/stats` and the batch
+/// `GET /v1/cameras/stats` so the two endpoints can never disagree about
+/// how a `decode_verdict` is derived.
+fn build_camera_stats_view(
+    s: &ApiState,
+    id: CameraId,
+    snap: &nexus_pipeline::CameraFrameStats,
+    now: chrono::DateTime<chrono::Utc>,
+) -> CameraFrameStatsView {
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
     // for stats, and "no decode health recorded" is a zero, not an error.
     let decode = s.decode_health.snapshot(id).unwrap_or_default();
-    Ok(Json(CameraFrameStatsView {
+    let analysis = s.analysis_stream.snapshot(id);
+    // Decode capacity is a per-core sample (one GPU, shared by every
+    // camera on this box), not per-camera — read it fresh on every call
+    // rather than caching, so a verdict never lags the box's real state.
+    let capacity = crate::system_metrics::snapshot().decode_capacity.clone();
+    let (verdict, summary) = crate::decode_verdict::compute_decode_verdict(
+        capacity.as_ref(),
+        &decode,
+        analysis.as_ref(),
+    );
+    let decode_ceiling_fps = capacity.as_ref().and_then(|c| {
+        crate::decode_verdict::estimate_decode_ceiling_fps(
+            c.binding_engine_pct,
+            decode.decoder_output_fps,
+        )
+    });
+    CameraFrameStatsView {
         camera_id: id,
         last_frame_at: snap.last_frame_at,
         last_frame_age_ms: snap.last_frame_age_ms(now),
@@ -2669,7 +2739,32 @@ async fn get_camera_stats(
         sampled_frames: decode.sampled_frames,
         duplicate_frames: decode.duplicate_frames,
         duplicate_per_mille: decode.duplicate_per_mille(),
-    }))
+        decoder_output_fps: decode.decoder_output_fps,
+        sampled_fps: decode.sampled_fps,
+        decoder_width: decode.decoder_width,
+        decoder_height: decode.decoder_height,
+        decode_verdict: verdict.as_str(),
+        decode_summary: summary,
+        decode_ceiling_fps,
+        analysis_stream: analysis,
+    }
+}
+
+/// SPEC-069 Phase 1 (P2) — batch counterpart to `GET /v1/cameras/:id/stats`.
+/// Returns every camera the frame-stats registry has ever seen a frame
+/// from, in the same shape, so a fleet-wide decode-capacity dashboard
+/// doesn't have to make one request per camera.
+async fn get_all_camera_stats(
+    State(s): State<ApiState>,
+) -> Result<Json<Vec<CameraFrameStatsView>>, ApiError> {
+    let now = chrono::Utc::now();
+    let views = s
+        .frame_stats
+        .snapshot_all()
+        .into_iter()
+        .map(|(id, snap)| build_camera_stats_view(&s, id, &snap, now))
+        .collect();
+    Ok(Json(views))
 }
 
 /// On-disk shape of `<state_dir>/static_objects/cam-<id>.json` —
@@ -6878,6 +6973,7 @@ mod tests {
             cache,
             frame_stats: Arc::new(nexus_pipeline::FrameStatsRegistry::new()),
             decode_health: Arc::new(nexus_pipeline::DecodeHealthRegistry::new()),
+            analysis_stream: Arc::new(nexus_pipeline::AnalysisStreamRegistry::new()),
             pool: None,
             ui_root: dir.path().join("ui-unused"),
             recorder,
