@@ -558,6 +558,25 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/reprobe/apply",
             axum::routing::post(reprobe_apply),
         )
+        // SPEC-069 Phase 1 — decode capacity, decode verdict and
+        // analysis-stream state, mirrored under the admin gate for the
+        // same reason `/v1/admin/storage` is: the cloud console reaches
+        // a core ONLY through `admin_proxy`, which rewrites to
+        // `/admin/{tail}` and nothing else, so the un-gated
+        // `/v1/cameras/…/stats` copies below are unreachable from it.
+        // Without these two aliases the Decode column, the Decode row
+        // and the camera-detail Analysis card render an em dash forever
+        // — the instrument this spec exists to build would be invisible
+        // to the only surface meant to display it. Same handlers as the
+        // local-UI routes, read-only, no behaviour fork.
+        //
+        // The batch route is declared before the `{camera_id}` form so
+        // the static `stats` segment is unambiguous, matching the
+        // `reprobe` precedent directly above. The param is spelled
+        // `{camera_id}` because every continuation under `cameras/{…}/`
+        // in this router shares one param name or matchit rejects it.
+        .route("/v1/admin/cameras/stats", get(get_all_camera_stats))
+        .route("/v1/admin/cameras/{camera_id}/stats", get(get_camera_stats))
         .route(
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
@@ -8302,6 +8321,86 @@ mod tests {
             res.status(),
             StatusCode::UNAUTHORIZED,
             "POST /api/v1/admin/cameras without bearer must 401, not bypass the admin gate"
+        );
+    }
+
+    /// SPEC-069 Phase 1 — the decode/analysis telemetry is only useful
+    /// if the cloud console can actually fetch it, and the console
+    /// reaches a core ONLY via `admin_proxy`'s `/admin/{tail}` rewrite.
+    /// These two routes were originally mounted in the un-gated `api`
+    /// sub-router, where the console could never reach them: the Decode
+    /// column and Analysis card would have rendered an em dash forever.
+    ///
+    /// Asserts both halves of the fix: the admin-gated paths EXIST (not
+    /// 404/405), and they sit INSIDE the gate (401 without a bearer)
+    /// rather than beside it. A route that answered without the gate
+    /// would be worse than a missing one — see BUG-138, where un-gated
+    /// camera routes let any LAN host read RTSP credentials.
+    #[tokio::test]
+    async fn admin_camera_stats_routes_exist_and_are_gated() {
+        const ADMIN_SECRET: &[u8] = b"admin-camera-stats-gate-secret";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+
+        for uri in [
+            "/api/v1/admin/cameras/stats",
+            "/api/v1/admin/cameras/1/stats",
+        ] {
+            // No Authorization header, non-loopback peer — the gate
+            // must answer before the handler does.
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(remote_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "GET {uri} must 401 at the admin gate, not bypass it"
+            );
+
+            // With a valid bearer the route must resolve to a handler.
+            // 404 here would mean "no such route" (the original defect);
+            // the batch route returns 200 and the per-camera one returns
+            // 404 only because camera 1 has no stats in a fresh store,
+            // so assert on "not 405/501" plus a non-404 for the batch.
+            let token = sign_admin_jwt(ADMIN_SECRET);
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_ne!(
+                res.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "GET {uri} must be routed, not 405"
+            );
+            assert_ne!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "GET {uri} must accept a valid admin bearer"
+            );
+        }
+
+        // The batch route in particular must return a real body, since
+        // the roster-wide Decode column depends on exactly this call.
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/cameras/stats")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "GET /api/v1/admin/cameras/stats must serve the batch roster"
         );
     }
 
