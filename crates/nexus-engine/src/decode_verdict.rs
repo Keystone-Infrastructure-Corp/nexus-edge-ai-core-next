@@ -257,6 +257,37 @@ mod tests {
         assert!(msg.contains("no_frames"));
     }
 
+    /// The top of the precedence ladder, pinned against the rung directly
+    /// below it. `substream_unavailable_takes_precedence_over_a_healthy_gpu`
+    /// passes a `DecodeHealth::default()` (no drops), so on its own it only
+    /// proves the analysis check outranks the plain capacity thresholds —
+    /// moving the analysis block below the input-drop block would leave it
+    /// green. A fallen-back substream is the actionable root cause even when
+    /// the decoder is also shedding input, so it must still win here.
+    #[test]
+    fn substream_unavailable_outranks_input_drops() {
+        let c = cap("video-decode", 95.0);
+        let unavailable = AnalysisStreamStatus {
+            mode: "mainstream".to_string(),
+            state: "unavailable".to_string(),
+            reason: Some("no_frames".to_string()),
+            width: 0,
+            height: 0,
+            fps: 0.0,
+        };
+        let health = DecodeHealth {
+            decoder_input_drops: 7,
+            decoder_output_frames: 100,
+            sampled_frames: 100,
+            duplicate_frames: 80,
+            ..Default::default()
+        };
+        let (v, msg) = compute_decode_verdict(Some(&c), &health, Some(&unavailable));
+        assert_eq!(v, DecodeVerdict::SubstreamUnavailable);
+        assert!(msg.contains("no_frames"));
+        assert!(!msg.contains("losing compressed input"));
+    }
+
     #[test]
     fn active_substream_does_not_trigger_substream_unavailable() {
         let c = cap("video-decode", 5.0);
