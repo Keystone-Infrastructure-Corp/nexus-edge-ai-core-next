@@ -146,6 +146,15 @@ pub async fn get_cloud_enrollment(
     }))
 }
 
+/// Operator-facing detail for a failed enrollment.
+///
+/// The cloud's status and error envelope sit in the error's source chain,
+/// beneath the fixed `POST /v1/enroll failed` context this path adds, so only
+/// the chain-walking form carries a reason a human can act on (BUG-144).
+fn enrollment_failure_detail(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
 /// `POST /v1/admin/cloud/enroll` — runs the same enrollment flow as
 /// the `nexus-engine enroll` CLI subcommand and persists the result
 /// into the local `cloud_enrollment` row.
@@ -231,8 +240,12 @@ pub async fn post_cloud_enroll(
         // distinguish "bad code" (400 from enrollment-svc) from "DNS
         // failure" (transport). The cloud-side enrollment-svc returns
         // a JSON error envelope; we wrap it in our own envelope.
-        tracing::warn!(error = %e, "cloud enrollment failed");
-        ApiError(StatusCode::BAD_GATEWAY, format!("enrollment failed: {e}"))
+        let detail = enrollment_failure_detail(&e);
+        tracing::warn!(error = %detail, "cloud enrollment failed");
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            format!("enrollment failed: {detail}"),
+        )
     })?;
 
     // ---- audit (fire-and-forget by design — the enrollment is
@@ -356,4 +369,33 @@ pub async fn delete_cloud_enrollment(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context as _;
+    use nexus_cloud_client::EnrollmentError;
+
+    /// BUG-144 — the operator has to be told WHY the cloud refused. The
+    /// status and error envelope live in the source chain, so a formatter
+    /// that prints only the outermost context reduces every refusal to the
+    /// same uninformative `POST /v1/enroll failed`.
+    #[test]
+    fn failure_detail_preserves_the_clouds_rejection_reason() {
+        let err = Err::<(), _>(EnrollmentError::BadStatus {
+            status: 403,
+            body: r#"{"error":"organization_suspended","message":"organization is suspended"}"#
+                .to_string(),
+        })
+        .context("POST /v1/enroll failed")
+        .unwrap_err();
+
+        let detail = super::enrollment_failure_detail(&err);
+
+        assert!(detail.contains("403"), "status missing from {detail:?}");
+        assert!(
+            detail.contains("organization_suspended"),
+            "cloud reason missing from {detail:?}"
+        );
+    }
 }
