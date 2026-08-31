@@ -35,6 +35,7 @@ mod cloud_tunnel;
 mod cloud_update;
 mod cold_read_cache;
 mod cold_replicator;
+mod decode_verdict;
 mod delivery_reload;
 mod device_control;
 mod diag_collect;
@@ -755,6 +756,10 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // of the RGB appsink's own drops — which is exactly why it cannot say
     // whether a frame was lost before the decoder or after it.
     let decode_health = Arc::new(nexus_pipeline::DecodeHealthRegistry::new());
+    // SPEC-069 Phase 1 (P3): which URL each camera's analysis pipeline is
+    // actually reading right now, written by `SharedRtspSource::run` and
+    // served on `GET /v1/cameras/:id/stats` as `analysis_stream`.
+    let analysis_stream = Arc::new(nexus_pipeline::AnalysisStreamRegistry::new());
 
     // Recorder is a per-process singleton: the watermark sampler
     // (storage_safety) and every per-camera supervisor share the
@@ -836,6 +841,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cold_kick.clone(),
         alert_clip_gate.clone(),
         decode_health.clone(),
+        analysis_stream.clone(),
     )
     .await?;
     info!(
@@ -1426,6 +1432,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cache: cache.clone(),
         frame_stats: frame_stats.clone(),
         decode_health: decode_health.clone(),
+        analysis_stream: analysis_stream.clone(),
         static_clear: static_clear.clone(),
         pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
         default_detector_width: cfg.inference.model.input_width,
@@ -1677,6 +1684,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         cache: cache.clone(),
         frame_stats: frame_stats.clone(),
         decode_health: decode_health.clone(),
+        analysis_stream: analysis_stream.clone(),
         pool: pool.clone(),
         ui_root: cfg.server.ui_root.clone(),
         recorder: recorder.clone(),
@@ -2392,6 +2400,7 @@ async fn build_recorder(
     cold_kick: Arc<tokio::sync::Notify>,
     alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
+    analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2420,6 +2429,7 @@ async fn build_recorder(
                 cold_kick,
                 alert_clip_gate,
                 decode_health,
+                analysis_stream,
             )
             .await
         }
@@ -2442,6 +2452,7 @@ async fn build_gst_recorder(
     cold_kick: Arc<tokio::sync::Notify>,
     alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
+    analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
@@ -2546,25 +2557,28 @@ async fn build_gst_recorder(
             }
         }
     }
-    // Phase F — snapshot the camera→ingester registry for the WebRTC bridge
-    // before the map is moved into the recorder (values are Arcs, so this
-    // clones only refcounts). Camera rebuilds at new dims aren't hot-reflected
-    // in v1 — a fresh HD expand picks up the current ingester.
-    #[cfg(feature = "gstreamer-webrtc")]
-    let webrtc = crate::webrtc_bridge::WebRtcBridge::new(std::sync::Arc::new(ingesters.clone()));
-    #[cfg(feature = "gstreamer-webrtc")]
-    webrtc.spawn_reaper();
-    #[cfg(not(feature = "gstreamer-webrtc"))]
-    let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
     let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, ingesters)
         .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?
         .with_bus(bus)
         .with_usb(usb_resolver, preferred_usb_label)
         .with_decode_mode(decode_mode)
         .with_decode_health(decode_health)
+        .with_analysis_stream(analysis_stream)
         .with_alert_clips(alert_clips)
         .with_alert_cold_kick(cold_kick)
         .with_alert_clip_delivery_gate(alert_clip_gate);
+    // Phase F — the WebRTC bridge shares the recorder's live camera→ingester
+    // map rather than a snapshot of it. The reconciler drops and rebuilds an
+    // ingester on every restart (URL, detector dims, codec, or `analysis_url`
+    // change), and `remove_camera_ingester` shuts the old one down for every
+    // Arc holder — so a snapshot leaves HD subscribed to a dead broadcast for
+    // the life of the process, which is BUG-144.
+    #[cfg(feature = "gstreamer-webrtc")]
+    let webrtc = crate::webrtc_bridge::WebRtcBridge::new(rec.ingester_registry());
+    #[cfg(feature = "gstreamer-webrtc")]
+    webrtc.spawn_reaper();
+    #[cfg(not(feature = "gstreamer-webrtc"))]
+    let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
     // SPEC-069 — the analysis substream sessions. `start_camera` registers
     // these on hot-add and on every reconcile-triggered restart; boot has
     // to do the same or a converted camera silently analyses its main
@@ -2592,6 +2606,7 @@ async fn build_gst_recorder(
     _cold_kick: Arc<tokio::sync::Notify>,
     _alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
     _decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
+    _analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,

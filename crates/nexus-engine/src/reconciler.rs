@@ -111,6 +111,10 @@ pub struct ReconcilerArgs {
     pub cache: Arc<LatestFrameCache>,
     pub frame_stats: Arc<FrameStatsRegistry>,
     pub decode_health: Arc<DecodeHealthRegistry>,
+    /// SPEC-069 Phase 1 (P3) — cleared on camera removal alongside
+    /// `decode_health` so a stale `analysis_stream` entry never survives
+    /// a delete/rebuild.
+    pub analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
     pub static_clear: Arc<StaticAnchorClearRegistry>,
     pub pre_roll_secs: u32,
     /// Fallback detector input width when a camera's
@@ -340,6 +344,7 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     // session).
     args.frame_stats.clear(cam_id);
     args.decode_health.clear(cam_id);
+    args.analysis_stream.clear(cam_id);
 }
 
 /// Attach or detach a camera's SPEC-069 analysis substream session.

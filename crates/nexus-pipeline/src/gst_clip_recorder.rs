@@ -151,7 +151,12 @@ pub struct GstClipRecorder {
     /// Contention is negligible: clip opens fire at most a few
     /// times per minute per camera and the reconciler only writes
     /// on admin actions.
-    ingesters: PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>,
+    ///
+    /// Shared by `Arc` with the engine's WebRTC bridge (see
+    /// [`Self::ingester_registry`]) so HD live view resolves the same
+    /// map the reconciler mutates. It previously held its own snapshot
+    /// and went stale on every restart — see BUG-144.
+    ingesters: IngesterRegistry,
     /// Second, substream-only sessions keyed by camera (SPEC-069).
     /// Read by `shared_frame_source` and by nothing else — in
     /// particular never by the clip path, which resolves its ingester
@@ -220,6 +225,11 @@ pub struct GstClipRecorder {
     /// admin API, which serves them on `GET /v1/cameras/:id/stats`. `None`
     /// in tests and on the no-engine path leaves the ingester uninstrumented.
     decode_health: Option<Arc<crate::stats::DecodeHealthRegistry>>,
+    /// SPEC-069 Phase 1 (P3) — analysis-stream status for every camera
+    /// this recorder builds a `SharedRtspSource` for. Shared with the
+    /// admin API, which serves it on `GET /v1/cameras/:id/stats` as
+    /// `analysis_stream`. `None` in tests and on the no-engine path.
+    analysis_stream: Option<Arc<crate::stats::AnalysisStreamRegistry>>,
 }
 
 struct OpenState {
@@ -299,6 +309,16 @@ struct AlertInflight {
     deadline: Arc<AtomicI64>,
 }
 
+/// The live camera → main-stream ingester map, shared by `Arc` between the
+/// clip recorder that mutates it and every other reader of it.
+///
+/// Holding the `Arc` rather than a cloned `HashMap` is load-bearing: the
+/// reconciler tears an ingester down and builds a new one on every restart
+/// (URL, detector dims, codec, or `analysis_url` change), so any reader
+/// caching its own copy resolves a shut-down session forever after. That is
+/// BUG-144.
+pub type IngesterRegistry = Arc<PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>>;
+
 impl GstClipRecorder {
     pub fn new(
         store: Arc<Store>,
@@ -310,7 +330,7 @@ impl GstClipRecorder {
         Ok(Self {
             store,
             clips_dir: clips_dir.as_ref().to_path_buf(),
-            ingesters: PlRwLock::new(ingesters),
+            ingesters: Arc::new(PlRwLock::new(ingesters)),
             analysis_ingesters: PlRwLock::new(HashMap::new()),
             panic: PlMutex::new(false),
             open: Mutex::new(HashMap::new()),
@@ -324,6 +344,7 @@ impl GstClipRecorder {
             alert_cold_kick: None,
             alert_clip_delivery_gate: None,
             decode_health: None,
+            analysis_stream: None,
         })
     }
 
@@ -341,6 +362,26 @@ impl GstClipRecorder {
     pub fn with_decode_health(mut self, registry: Arc<crate::stats::DecodeHealthRegistry>) -> Self {
         self.decode_health = Some(registry);
         self
+    }
+
+    /// Publish [`crate::stats::AnalysisStreamStatus`] for every camera's
+    /// `SharedRtspSource` (SPEC-069 Phase 1, P3). The engine shares one
+    /// registry between here and the admin API.
+    pub fn with_analysis_stream(
+        mut self,
+        registry: Arc<crate::stats::AnalysisStreamRegistry>,
+    ) -> Self {
+        self.analysis_stream = Some(registry);
+        self
+    }
+
+    /// The live main-stream ingester map, for readers outside this crate
+    /// (the engine's WebRTC bridge). Returns the shared handle, never a
+    /// copy — a copy is exactly the BUG-144 defect. Only `analysis_url`
+    /// sessions are withheld: they live in a separate map this never
+    /// exposes, which is what keeps invariants I2/I3 structural.
+    pub fn ingester_registry(&self) -> IngesterRegistry {
+        Arc::clone(&self.ingesters)
     }
 
     /// M2.2 Phase 3: attach a USB resolver + preferred label so
@@ -1274,6 +1315,7 @@ impl ClipRecorder for GstClipRecorder {
                 .get(&camera_id)
                 .filter(|a| !a.is_shutdown())
                 .cloned(),
+            analysis_stream: self.analysis_stream.clone(),
         }))
     }
 
@@ -2866,6 +2908,73 @@ mod tests {
             0,
             "falling back to the main stream must not carry the substream's \
              counters onto a different geometry"
+        );
+    }
+
+    /// SPEC-069 invariant I2, the other half of the fixture already covering
+    /// I2/I4 for an analysis-only camera: when a camera has BOTH a main
+    /// ingester and an analysis ingester registered — the normal converted-
+    /// camera case, not the edge case — `open()` must still resolve the
+    /// **main** session. It never even looks at `analysis_ingesters`
+    /// (`shared_frame_source` is the only reader of that map, and it only
+    /// feeds the detector's `SharedRtspSource`, not clips), so registering
+    /// an analysis session at a different codec must not change what gets
+    /// recorded.
+    ///
+    /// Reverted-and-confirmed-red: temporarily making `open()` resolve
+    /// `self.analysis_ingesters` instead of (or in preference to)
+    /// `self.ingesters` flips the recorded `ClipMeta.codec` from `h264` to
+    /// `h265` and this test fails on the codec assert.
+    #[tokio::test]
+    async fn a_camera_with_both_sessions_records_from_the_main_ingester_only() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+
+        rec.add_camera_ingester(
+            1,
+            "rtsp://127.0.0.1:1/main",
+            5,
+            15,
+            960,
+            540,
+            CodecKind::H264,
+        )
+        .expect("main ingester registers");
+        rec.set_camera_analysis_ingester(
+            1,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H265,
+        )
+        .expect("analysis session registers");
+
+        let handle = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at: Utc::now(),
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .expect(
+                "open() must resolve the main ingester even though an \
+                     analysis session is also registered for this camera",
+            );
+        let meta = rec
+            .close(
+                handle,
+                ClipFinal {
+                    ended_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("close() succeeds");
+        assert_eq!(
+            meta.codec, "h264",
+            "the clip must be cut from the main session's codec (h264), not \
+             the analysis session's (h265) — got {meta:?}"
         );
     }
 }

@@ -92,6 +92,11 @@ pub struct ApiState {
     /// merged camera list response.
     pub frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
     pub decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
+    /// SPEC-069 Phase 1 (P3) — which URL each camera's analysis pipeline
+    /// is actually reading right now, written by `SharedRtspSource::run`.
+    /// Read by `GET /v1/cameras/:id/stats` and the batch stats endpoint
+    /// as `analysis_stream`.
+    pub analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
     pub pool: Option<Arc<DetectorPool>>,
     pub ui_root: PathBuf,
     /// Shared with the per-camera supervisors + the storage_safety
@@ -553,6 +558,25 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/reprobe/apply",
             axum::routing::post(reprobe_apply),
         )
+        // SPEC-069 Phase 1 — decode capacity, decode verdict and
+        // analysis-stream state, mirrored under the admin gate for the
+        // same reason `/v1/admin/storage` is: the cloud console reaches
+        // a core ONLY through `admin_proxy`, which rewrites to
+        // `/admin/{tail}` and nothing else, so the un-gated
+        // `/v1/cameras/…/stats` copies below are unreachable from it.
+        // Without these two aliases the Decode column, the Decode row
+        // and the camera-detail Analysis card render an em dash forever
+        // — the instrument this spec exists to build would be invisible
+        // to the only surface meant to display it. Same handlers as the
+        // local-UI routes, read-only, no behaviour fork.
+        //
+        // The batch route is declared before the `{camera_id}` form so
+        // the static `stats` segment is unambiguous, matching the
+        // `reprobe` precedent directly above. The param is spelled
+        // `{camera_id}` because every continuation under `cameras/{…}/`
+        // in this router shares one param name or matchit rejects it.
+        .route("/v1/admin/cameras/stats", get(get_all_camera_stats))
+        .route("/v1/admin/cameras/{camera_id}/stats", get(get_camera_stats))
         .route(
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
@@ -846,6 +870,9 @@ pub fn router(state: ApiState) -> Router {
         // (fps EMA, last_frame_age_ms, frames_emitted/dropped,
         // source dims). Used by the dashboard health column.
         .route("/v1/cameras/{id}/stats", get(get_camera_stats))
+        // SPEC-069 Phase 1 (P2) — fleet-wide batch counterpart, one
+        // request instead of one per camera.
+        .route("/v1/cameras/stats", get(get_all_camera_stats))
         // Static-object map for the live viewer overlay. Reads
         // the on-disk per-camera anchor registry written by the
         // `StaticObjectFilter` running inside each supervisor.
@@ -1388,6 +1415,43 @@ fn camera_audit_json(cam: &CameraConfig) -> Option<String> {
     serde_json::to_string(&safe).ok()
 }
 
+/// Gap G1 — `analysis_url` had no validation at all: a hand-set substream
+/// on the wrong scheme, or one that's a byte-for-byte copy of `url`, was
+/// accepted and would silently shift every detection zone at spawn time
+/// (SPEC-069 invariant I6 tolerates a *measured* aspect-ratio drift; it
+/// says nothing about an operator typo).
+///
+/// This is deliberately the network-free half of the check only.
+/// `analysis_url` must share a scheme family with `url` (rtsp/rtsps,
+/// matching the codec-autodetect precedent below) and must not be
+/// identical to `url` — both are static, in-payload checks. A true
+/// aspect-ratio mismatch check (comparing the substream's actual
+/// resolution against the main stream's) needs a live probe of both URLs,
+/// and `CameraIngest` stores no resolution today; that half stays blocked
+/// on the same class of missing test/probe infrastructure as the
+/// ONVIF-mock items, and is not attempted here.
+fn validate_analysis_url(ingest: &nexus_config::CameraIngest) -> Result<(), ApiError> {
+    let Some(analysis) = ingest.analysis_url.as_ref() else {
+        return Ok(());
+    };
+    let scheme = analysis.scheme();
+    if scheme != "rtsp" && scheme != "rtsps" {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("analysis_url scheme must be rtsp or rtsps, got {scheme:?}"),
+        ));
+    }
+    if analysis == &ingest.url {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "analysis_url must differ from url — a substream tap can't be \
+             the same stream as the main session (SPEC-069 I1–I5)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn upsert_camera(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -1397,6 +1461,7 @@ async fn upsert_camera(
     Json(mut cam): Json<CameraConfig>,
 ) -> Result<Json<CameraConfig>, ApiError> {
     cam.id = id;
+    validate_analysis_url(&cam.ingest)?;
     // M6 Phase 4 Step 4.1 — capture pre-state for the audit row so
     // operators can diff before/after on the per-resource history
     // panel. `None` on a create; `Some(prev)` on update. The list
@@ -1489,6 +1554,7 @@ async fn create_camera(
     // regardless, but zeroing here keeps the placeholder JSON
     // honest before the post-insert rewrite.
     cam.id = 0;
+    validate_analysis_url(&cam.ingest)?;
     // Codec autodetect: if the operator didn't specify a codec
     // and the source is rtsp/rtsps, run one RTSP DESCRIBE probe
     // against the URL and stamp the result. Best-effort — if
@@ -2637,6 +2703,40 @@ struct CameraFrameStatsView {
     /// `duplicate_frames` per thousand `sampled_frames`, precomputed so a
     /// dashboard doesn't have to guard the divide.
     duplicate_per_mille: u64,
+    /// SPEC-069 Phase 1 (P2) — windowed (5s trailing) output rate off the
+    /// decoder's own src pad. This is the throughput number ceiling
+    /// calibration is calculated from; `sampled_fps` below can read a flat
+    /// nominal rate even while this one is starved.
+    decoder_output_fps: f32,
+    /// SPEC-069 Phase 1 (P2) — delta-based rate of `sampled_frames`
+    /// between consecutive polls, i.e. what the RGB appsink is actually
+    /// being fed post-padding.
+    sampled_fps: f32,
+    /// SPEC-069 Phase 1 (P2) — geometry read off the decoder's src pad
+    /// caps, i.e. the true decoded resolution (not whatever a downstream
+    /// `videoscale` produces). Zero until the first frame lands.
+    decoder_width: u32,
+    decoder_height: u32,
+    /// SPEC-069 Phase 1 — one word an operator can act on:
+    /// `unknown` | `healthy` | `near` | `over` | `substream_unavailable`.
+    /// See `decode_verdict::compute_decode_verdict` for the precedence
+    /// rules that pick it.
+    decode_verdict: &'static str,
+    /// Human-readable expansion of `decode_verdict`, naming the specific
+    /// fixed-function GPU engine that is binding (per the P2 amendment,
+    /// this is whichever `video-*` engine class is saturating, not
+    /// necessarily decode).
+    decode_summary: String,
+    /// SPEC-069 Phase 1 (P2) — rough fps ceiling for this camera's decode
+    /// path, extrapolated from `decoder_output_fps` at the binding
+    /// engine's current utilization. `null` when the engine has never
+    /// been observed doing meaningful work (never-saturated fallback —
+    /// extrapolating from a near-zero divisor would fabricate a number).
+    decode_ceiling_fps: Option<f32>,
+    /// SPEC-069 Phase 1 (P3) — which stream analysis is actually reading
+    /// right now (substream vs. mainstream fallback) and at what geometry
+    /// / rate. `null` if this camera has no supervisor spawned yet.
+    analysis_stream: Option<nexus_pipeline::AnalysisStreamStatus>,
 }
 
 async fn get_camera_stats(
@@ -2648,11 +2748,39 @@ async fn get_camera_stats(
         .snapshot(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
     let now = chrono::Utc::now();
+    Ok(Json(build_camera_stats_view(&s, id, &snap, now)))
+}
+
+/// Shared by `GET /v1/cameras/:id/stats` and the batch
+/// `GET /v1/cameras/stats` so the two endpoints can never disagree about
+/// how a `decode_verdict` is derived.
+fn build_camera_stats_view(
+    s: &ApiState,
+    id: CameraId,
+    snap: &nexus_pipeline::CameraFrameStats,
+    now: chrono::DateTime<chrono::Utc>,
+) -> CameraFrameStatsView {
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
     // for stats, and "no decode health recorded" is a zero, not an error.
     let decode = s.decode_health.snapshot(id).unwrap_or_default();
-    Ok(Json(CameraFrameStatsView {
+    let analysis = s.analysis_stream.snapshot(id);
+    // Decode capacity is a per-core sample (one GPU, shared by every
+    // camera on this box), not per-camera — read it fresh on every call
+    // rather than caching, so a verdict never lags the box's real state.
+    let capacity = crate::system_metrics::snapshot().decode_capacity.clone();
+    let (verdict, summary) = crate::decode_verdict::compute_decode_verdict(
+        capacity.as_ref(),
+        &decode,
+        analysis.as_ref(),
+    );
+    let decode_ceiling_fps = capacity.as_ref().and_then(|c| {
+        crate::decode_verdict::estimate_decode_ceiling_fps(
+            c.binding_engine_pct,
+            decode.decoder_output_fps,
+        )
+    });
+    CameraFrameStatsView {
         camera_id: id,
         last_frame_at: snap.last_frame_at,
         last_frame_age_ms: snap.last_frame_age_ms(now),
@@ -2669,7 +2797,32 @@ async fn get_camera_stats(
         sampled_frames: decode.sampled_frames,
         duplicate_frames: decode.duplicate_frames,
         duplicate_per_mille: decode.duplicate_per_mille(),
-    }))
+        decoder_output_fps: decode.decoder_output_fps,
+        sampled_fps: decode.sampled_fps,
+        decoder_width: decode.decoder_width,
+        decoder_height: decode.decoder_height,
+        decode_verdict: verdict.as_str(),
+        decode_summary: summary,
+        decode_ceiling_fps,
+        analysis_stream: analysis,
+    }
+}
+
+/// SPEC-069 Phase 1 (P2) — batch counterpart to `GET /v1/cameras/:id/stats`.
+/// Returns every camera the frame-stats registry has ever seen a frame
+/// from, in the same shape, so a fleet-wide decode-capacity dashboard
+/// doesn't have to make one request per camera.
+async fn get_all_camera_stats(
+    State(s): State<ApiState>,
+) -> Result<Json<Vec<CameraFrameStatsView>>, ApiError> {
+    let now = chrono::Utc::now();
+    let views = s
+        .frame_stats
+        .snapshot_all()
+        .into_iter()
+        .map(|(id, snap)| build_camera_stats_view(&s, id, &snap, now))
+        .collect();
+    Ok(Json(views))
 }
 
 /// On-disk shape of `<state_dir>/static_objects/cam-<id>.json` —
@@ -6196,6 +6349,58 @@ mod tests {
         );
     }
 
+    // Gap G1 — `upsert_camera`/`create_camera` had no validation on
+    // `analysis_url` at all: a hand-set substream on the wrong scheme, or
+    // one identical to `url`, was silently accepted and would shift every
+    // detection zone at spawn time. These three cases cover the
+    // network-free half of the check (see `validate_analysis_url`'s doc
+    // comment for why the aspect-ratio half stays out of reach here).
+    #[test]
+    fn analysis_url_with_a_non_rtsp_scheme_is_rejected() {
+        use nexus_config::CameraIngest;
+        let ingest = CameraIngest {
+            url: url::Url::parse("rtsp://10.0.0.5:554/Streaming/Channels/101").unwrap(),
+            analysis_url: Some(url::Url::parse("http://10.0.0.5/Channels/102").unwrap()),
+            enabled: true,
+            max_fps: 15,
+            codec: None,
+        };
+        let err = super::validate_analysis_url(&ingest)
+            .expect_err("a non-rtsp analysis_url scheme must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn analysis_url_identical_to_url_is_rejected() {
+        use nexus_config::CameraIngest;
+        let same = url::Url::parse("rtsp://10.0.0.5:554/Streaming/Channels/101").unwrap();
+        let ingest = CameraIngest {
+            url: same.clone(),
+            analysis_url: Some(same),
+            enabled: true,
+            max_fps: 15,
+            codec: None,
+        };
+        let err = super::validate_analysis_url(&ingest)
+            .expect_err("analysis_url identical to url must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_distinct_rtsp_analysis_url_is_accepted() {
+        use nexus_config::CameraIngest;
+        let ingest = CameraIngest {
+            url: url::Url::parse("rtsp://10.0.0.5:554/Streaming/Channels/101").unwrap(),
+            analysis_url: Some(
+                url::Url::parse("rtsps://10.0.0.5:554/Streaming/Channels/102").unwrap(),
+            ),
+            enabled: true,
+            max_fps: 15,
+            codec: None,
+        };
+        super::validate_analysis_url(&ingest).expect("a distinct rtsps substream is valid");
+    }
+
     #[test]
     fn parse_simple_range() {
         assert_eq!(parse_byte_range("bytes=0-499", 1000), Some((0, 499)));
@@ -6878,6 +7083,7 @@ mod tests {
             cache,
             frame_stats: Arc::new(nexus_pipeline::FrameStatsRegistry::new()),
             decode_health: Arc::new(nexus_pipeline::DecodeHealthRegistry::new()),
+            analysis_stream: Arc::new(nexus_pipeline::AnalysisStreamRegistry::new()),
             pool: None,
             ui_root: dir.path().join("ui-unused"),
             recorder,
@@ -8115,6 +8321,86 @@ mod tests {
             res.status(),
             StatusCode::UNAUTHORIZED,
             "POST /api/v1/admin/cameras without bearer must 401, not bypass the admin gate"
+        );
+    }
+
+    /// SPEC-069 Phase 1 — the decode/analysis telemetry is only useful
+    /// if the cloud console can actually fetch it, and the console
+    /// reaches a core ONLY via `admin_proxy`'s `/admin/{tail}` rewrite.
+    /// These two routes were originally mounted in the un-gated `api`
+    /// sub-router, where the console could never reach them: the Decode
+    /// column and Analysis card would have rendered an em dash forever.
+    ///
+    /// Asserts both halves of the fix: the admin-gated paths EXIST (not
+    /// 404/405), and they sit INSIDE the gate (401 without a bearer)
+    /// rather than beside it. A route that answered without the gate
+    /// would be worse than a missing one — see BUG-138, where un-gated
+    /// camera routes let any LAN host read RTSP credentials.
+    #[tokio::test]
+    async fn admin_camera_stats_routes_exist_and_are_gated() {
+        const ADMIN_SECRET: &[u8] = b"admin-camera-stats-gate-secret";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+
+        for uri in [
+            "/api/v1/admin/cameras/stats",
+            "/api/v1/admin/cameras/1/stats",
+        ] {
+            // No Authorization header, non-loopback peer — the gate
+            // must answer before the handler does.
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(remote_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "GET {uri} must 401 at the admin gate, not bypass it"
+            );
+
+            // With a valid bearer the route must resolve to a handler.
+            // 404 here would mean "no such route" (the original defect);
+            // the batch route returns 200 and the per-camera one returns
+            // 404 only because camera 1 has no stats in a fresh store,
+            // so assert on "not 405/501" plus a non-404 for the batch.
+            let token = sign_admin_jwt(ADMIN_SECRET);
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_ne!(
+                res.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "GET {uri} must be routed, not 405"
+            );
+            assert_ne!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "GET {uri} must accept a valid admin bearer"
+            );
+        }
+
+        // The batch route in particular must return a real body, since
+        // the roster-wide Decode column depends on exactly this call.
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/cameras/stats")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "GET /api/v1/admin/cameras/stats must serve the batch roster"
         );
     }
 

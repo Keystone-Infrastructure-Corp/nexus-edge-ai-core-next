@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use nexus_types::CameraId;
 use parking_lot::RwLock;
+use serde::Serialize;
 
 /// Sliding window over which `fps_ema` is averaged. Two seconds is
 /// long enough to smooth typical source jitter (camera frame timing,
@@ -270,10 +271,15 @@ impl FrameStatsRegistry {
 #[derive(Debug, Default)]
 pub struct DecodeHealthRegistry {
     inner: RwLock<HashMap<CameraId, DecodeHealth>>,
+    /// SPEC-069 Phase 1 — windowed-rate side-state, one [`RateState`] per
+    /// camera. Kept in its own map (rather than inline on `DecodeHealth`)
+    /// because it holds `Instant`s, which are neither serializable nor
+    /// `Copy`-cheap to carry through the public snapshot type.
+    rates: RwLock<HashMap<CameraId, RateState>>,
 }
 
 /// Snapshot of one camera's decode health. Cheap to clone.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct DecodeHealth {
     /// Compressed access units the RGB branch's `leaky=downstream` queue
     /// dropped **ahead of** the decoder.
@@ -310,6 +316,24 @@ pub struct DecodeHealth {
     /// `FRAME_LOOP_EVAL_WINDOW`, so a loop that stays under that bar was
     /// previously invisible in production. This is the raw rate.
     pub duplicate_frames: u64,
+    /// SPEC-069 Phase 1 — `decoder_output_frames` per second, over a
+    /// trailing window (see `RATE_WINDOW`). The cumulative counter above
+    /// answers "how much has this camera decoded since the supervisor
+    /// started"; this answers "how much is it decoding right now", which
+    /// is the number decode-capacity ceiling calibration needs. Zero
+    /// until at least two src-pad buffers have landed inside one window.
+    pub decoder_output_fps: f32,
+    /// SPEC-069 Phase 1 — `sampled_frames` per second, over the interval
+    /// between consecutive `observe_loop_stats` calls. Includes
+    /// `videorate` padding (same caveat as the cumulative counter), so
+    /// compare against `decoder_output_fps` to see how much of the
+    /// output is duplicated rather than decoded.
+    pub sampled_fps: f32,
+    /// SPEC-069 Phase 1 — width/height negotiated on the decoder's own
+    /// src pad (not the appsink's, which can differ when a `videoscale`
+    /// sits downstream). Zero until the first buffer with caps arrives.
+    pub decoder_width: u32,
+    pub decoder_height: u32,
 }
 
 impl DecodeHealth {
@@ -321,6 +345,58 @@ impl DecodeHealth {
             .checked_div(self.sampled_frames)
             .unwrap_or(0)
     }
+}
+
+/// Trailing window used to turn discrete `observe_*` calls into a
+/// per-second rate. 5s balances responsiveness (a stalled decoder should
+/// show up quickly) against noise from one slow frame.
+const RATE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Rolling event-timestamp window → events/sec.
+#[derive(Debug, Default)]
+struct RateWindow {
+    timestamps: VecDeque<Instant>,
+}
+
+impl RateWindow {
+    /// Record one event `now` and return the rate (events/sec) over the
+    /// trailing [`RATE_WINDOW`]. Needs at least two timestamps in the
+    /// window to produce a rate; a single event has no span to divide by.
+    fn record(&mut self, now: Instant) -> f32 {
+        self.timestamps.push_back(now);
+        while let Some(&front) = self.timestamps.front() {
+            if now.duration_since(front) > RATE_WINDOW {
+                self.timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+        let n = self.timestamps.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let span = self
+            .timestamps
+            .back()
+            .unwrap()
+            .duration_since(*self.timestamps.front().unwrap())
+            .as_secs_f32();
+        if span <= 0.0 {
+            return 0.0;
+        }
+        (n - 1) as f32 / span
+    }
+}
+
+/// Rate-tracking side-state for one camera, kept out of the public,
+/// `Copy` [`DecodeHealth`] snapshot: `Instant` isn't serializable and
+/// doesn't need to cross the API boundary, only the fps it produces does.
+#[derive(Debug, Default)]
+struct RateState {
+    decoder_output: RateWindow,
+    /// Last `(observed_at, sampled_frames)` from `observe_loop_stats`,
+    /// used to turn its cumulative counter into a rate between calls.
+    last_sampled: Option<(Instant, u64)>,
 }
 
 impl DecodeHealthRegistry {
@@ -338,29 +414,194 @@ impl DecodeHealthRegistry {
 
     /// Record one frame emitted by the decoder itself (src-pad probe).
     pub fn observe_decoder_output(&self, camera_id: CameraId) {
+        let now = Instant::now();
+        let fps = self
+            .rates
+            .write()
+            .entry(camera_id)
+            .or_default()
+            .decoder_output
+            .record(now);
         let mut guard = self.inner.write();
         let e = guard.entry(camera_id).or_default();
         e.decoder_output_frames = e.decoder_output_frames.saturating_add(1);
+        e.decoder_output_fps = fps;
+    }
+
+    /// Record the width/height negotiated on the decoder's src pad.
+    pub fn observe_decoder_geometry(&self, camera_id: CameraId, width: u32, height: u32) {
+        let mut guard = self.inner.write();
+        let e = guard.entry(camera_id).or_default();
+        e.decoder_width = width;
+        e.decoder_height = height;
     }
 
     /// Publish the loop detector's running totals. Absolute, not deltas, so
     /// a session rebuild resets them rather than double-counting.
     pub fn observe_loop_stats(&self, camera_id: CameraId, sampled: u64, duplicates: u64) {
+        let now = Instant::now();
+        let fps = {
+            let mut rates = self.rates.write();
+            let state = rates.entry(camera_id).or_default();
+            let fps = match state.last_sampled {
+                Some((last_t, last_n)) if sampled >= last_n => {
+                    let dt = now.duration_since(last_t).as_secs_f32();
+                    if dt > 0.0 {
+                        (sampled - last_n) as f32 / dt
+                    } else {
+                        0.0
+                    }
+                }
+                // Counter went backwards (session rebuild) or this is the
+                // first observation — no delta to rate yet.
+                _ => 0.0,
+            };
+            state.last_sampled = Some((now, sampled));
+            fps
+        };
         let mut guard = self.inner.write();
         let e = guard.entry(camera_id).or_default();
         e.sampled_frames = sampled;
         e.duplicate_frames = duplicates;
+        e.sampled_fps = fps;
     }
 
     /// Reset one camera. Called when a supervisor stops so the next spawn
     /// starts clean, mirroring [`FrameStatsRegistry::clear`].
     pub fn clear(&self, camera_id: CameraId) {
         self.inner.write().remove(&camera_id);
+        self.rates.write().remove(&camera_id);
     }
 
     #[must_use]
     pub fn snapshot(&self, camera_id: CameraId) -> Option<DecodeHealth> {
         self.inner.read().get(&camera_id).copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-069 Phase 1 (P3) — analysis-stream status.
+// ---------------------------------------------------------------------------
+
+/// Which URL the analysis pipeline is actually reading right now, and how
+/// healthy that choice is. Published on the stats endpoints as
+/// `analysis_stream` — `{mode, state, reason, width, height, fps}` — so a
+/// column/verdict can explain WHY decode capacity looks the way it does: a
+/// camera stuck analysing its 1080p mainstream (because the substream never
+/// negotiated, or fell back) consumes far more decode than one analysing a
+/// healthy 360p substream, and that's invisible from decode-capacity
+/// numbers alone.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisStreamStatus {
+    /// `"substream"` or `"mainstream"` — which URL analysis is reading.
+    pub mode: String,
+    /// `"active"` (delivering frames at an acceptable rate), `"probing"`
+    /// (inside the substream's first-frame grace window, verdict not
+    /// judged yet), or `"unavailable"` (a configured substream was tried
+    /// and rejected; analysis fell back to the main stream).
+    pub state: String,
+    /// Present only when `state == "unavailable"`: `"refused"`,
+    /// `"no_frames"`, or `"unhealthy"` — see [`crate::source::FallbackReason`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
+    /// Geometry of the currently-active stream (from the frame source
+    /// actually being read, not necessarily the substream). Zero until
+    /// the first frame arrives.
+    pub width: u32,
+    pub height: u32,
+    /// Frames per second observed over the last health window. Zero
+    /// while `state == "probing"`.
+    pub fps: f32,
+}
+
+/// Registry of per-camera [`AnalysisStreamStatus`]. Separate from
+/// [`DecodeHealthRegistry`] because it is written from a different call
+/// site (`SharedRtspSource::run`'s health tick, not the decoder's src-pad
+/// probe) and answers a different question: not "how much is the decoder
+/// managing" but "which stream is it managing".
+#[derive(Debug, Default)]
+pub struct AnalysisStreamRegistry {
+    inner: RwLock<HashMap<CameraId, AnalysisStreamStatus>>,
+}
+
+impl AnalysisStreamRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A camera with no substream configured at all reads `mainstream` /
+    /// `active` from the start — this is the intended, healthy state, NOT
+    /// a fallback, so it must never be confused with `unavailable`.
+    pub fn observe_mainstream_by_design(&self, camera_id: CameraId) {
+        self.inner.write().insert(
+            camera_id,
+            AnalysisStreamStatus {
+                mode: "mainstream".to_string(),
+                state: "active".to_string(),
+                reason: None,
+                width: 0,
+                height: 0,
+                fps: 0.0,
+            },
+        );
+    }
+
+    /// A substream session exists but hasn't cleared its first-frame grace
+    /// window yet — too early to call it healthy or unavailable.
+    pub fn observe_probing(&self, camera_id: CameraId) {
+        self.inner.write().insert(
+            camera_id,
+            AnalysisStreamStatus {
+                mode: "substream".to_string(),
+                state: "probing".to_string(),
+                reason: None,
+                width: 0,
+                height: 0,
+                fps: 0.0,
+            },
+        );
+    }
+
+    /// Substream delivering frames at an acceptable rate.
+    pub fn observe_active(&self, camera_id: CameraId, width: u32, height: u32, fps: f32) {
+        self.inner.write().insert(
+            camera_id,
+            AnalysisStreamStatus {
+                mode: "substream".to_string(),
+                state: "active".to_string(),
+                reason: None,
+                width,
+                height,
+                fps,
+            },
+        );
+    }
+
+    /// A configured substream was tried and rejected; analysis fell back
+    /// to the main stream. `reason` is one of `"refused"`, `"no_frames"`,
+    /// `"unhealthy"`.
+    pub fn observe_unavailable(&self, camera_id: CameraId, reason: &str) {
+        self.inner.write().insert(
+            camera_id,
+            AnalysisStreamStatus {
+                mode: "mainstream".to_string(),
+                state: "unavailable".to_string(),
+                reason: Some(reason.to_string()),
+                width: 0,
+                height: 0,
+                fps: 0.0,
+            },
+        );
+    }
+
+    pub fn clear(&self, camera_id: CameraId) {
+        self.inner.write().remove(&camera_id);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self, camera_id: CameraId) -> Option<AnalysisStreamStatus> {
+        self.inner.read().get(&camera_id).cloned()
     }
 }
 
@@ -532,6 +773,89 @@ mod tests {
         assert_eq!(s.sampled_frames, 15, "post-videorate delivery rate");
     }
 
+    /// SPEC-069 Phase 1 — a single decoder-output event has no span to
+    /// divide by, so the windowed rate must stay 0 rather than divide by
+    /// zero or report a bogus instantaneous spike.
+    #[test]
+    fn decoder_output_fps_is_zero_after_one_sample() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_decoder_output(1);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.decoder_output_fps, 0.0);
+    }
+
+    /// Two decoder-output events ~50ms apart should read close to 20fps —
+    /// this is the "how much is it decoding *right now*" number ceiling
+    /// calibration needs, as opposed to the cumulative
+    /// `decoder_output_frames` counter (which only answers "since the
+    /// supervisor started").
+    #[test]
+    fn decoder_output_fps_tracks_recent_arrival_rate() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_decoder_output(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        reg.observe_decoder_output(1);
+        let s = reg.snapshot(1).unwrap();
+        assert!(
+            s.decoder_output_fps > 5.0 && s.decoder_output_fps < 60.0,
+            "expected roughly 20fps, got {}",
+            s.decoder_output_fps
+        );
+    }
+
+    /// `observe_loop_stats` publishes a cumulative counter, so `sampled_fps`
+    /// has to be derived from the *delta* between two calls, not a naive
+    /// re-read of the counter itself.
+    #[test]
+    fn sampled_fps_is_the_delta_between_loop_stats_calls() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_loop_stats(1, 0, 0);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reg.observe_loop_stats(1, 10, 0);
+        let s = reg.snapshot(1).unwrap();
+        // 10 frames over ~100ms => roughly 100fps.
+        assert!(
+            s.sampled_fps > 40.0 && s.sampled_fps < 400.0,
+            "expected roughly 100fps, got {}",
+            s.sampled_fps
+        );
+    }
+
+    /// A session rebuild can restart `observe_loop_stats` from a lower
+    /// cumulative total than the previous session ended on. That must not
+    /// underflow (`sampled - last_n` on `u64`) or report a nonsensical fps.
+    #[test]
+    fn sampled_fps_handles_a_counter_that_goes_backwards() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_loop_stats(1, 500, 10);
+        reg.observe_loop_stats(1, 20, 1); // session rebuilt, counter reset
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.sampled_fps, 0.0);
+        assert_eq!(s.sampled_frames, 20);
+    }
+
+    /// SPEC-069 Phase 1 — geometry read off the decoder's own src pad.
+    #[test]
+    fn decoder_geometry_is_recorded_per_camera() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_decoder_geometry(1, 1920, 1080);
+        reg.observe_decoder_geometry(2, 640, 360);
+        assert_eq!(
+            (
+                reg.snapshot(1).unwrap().decoder_width,
+                reg.snapshot(1).unwrap().decoder_height
+            ),
+            (1920, 1080)
+        );
+        assert_eq!(
+            (
+                reg.snapshot(2).unwrap().decoder_width,
+                reg.snapshot(2).unwrap().decoder_height
+            ),
+            (640, 360)
+        );
+    }
+
     /// The API serves this on every stats request, including for a camera
     /// whose tap has not produced a frame yet. A naive divide would panic.
     #[test]
@@ -542,6 +866,7 @@ mod tests {
             decoder_output_frames: 0,
             sampled_frames: 90,
             duplicate_frames: 30,
+            ..Default::default()
         };
         assert_eq!(one_in_three.duplicate_per_mille(), 333);
     }
@@ -554,6 +879,63 @@ mod tests {
         reg.clear(1);
         assert!(reg.snapshot(1).is_none());
         assert_eq!(reg.snapshot(2).unwrap().decoder_input_drops, 1);
+    }
+
+    /// SPEC-069 Phase 1 (P3) — a camera with no substream configured must
+    /// read `mainstream`/`active` by design, never `unavailable`: absence
+    /// of a substream is normal, not a failure.
+    #[test]
+    fn mainstream_by_design_is_active_not_unavailable() {
+        let reg = AnalysisStreamRegistry::new();
+        reg.observe_mainstream_by_design(1);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.mode, "mainstream");
+        assert_eq!(s.state, "active");
+        assert!(s.reason.is_none());
+    }
+
+    #[test]
+    fn probing_reports_substream_with_no_verdict_yet() {
+        let reg = AnalysisStreamRegistry::new();
+        reg.observe_probing(1);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.mode, "substream");
+        assert_eq!(s.state, "probing");
+    }
+
+    #[test]
+    fn active_substream_carries_geometry_and_fps() {
+        let reg = AnalysisStreamRegistry::new();
+        reg.observe_active(1, 640, 360, 14.8);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.mode, "substream");
+        assert_eq!(s.state, "active");
+        assert_eq!((s.width, s.height), (640, 360));
+        assert!((s.fps - 14.8).abs() < 0.01);
+    }
+
+    /// A fallback must fall through to `mainstream` (that's what the
+    /// source actually reads afterwards) with `unavailable` + a reason —
+    /// this is the state `decode_verdict`'s `substream_unavailable` derives
+    /// from.
+    #[test]
+    fn unavailable_falls_back_to_mainstream_with_a_reason() {
+        let reg = AnalysisStreamRegistry::new();
+        reg.observe_unavailable(1, "unhealthy");
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.mode, "mainstream");
+        assert_eq!(s.state, "unavailable");
+        assert_eq!(s.reason.as_deref(), Some("unhealthy"));
+    }
+
+    #[test]
+    fn analysis_stream_clear_resets_only_that_camera() {
+        let reg = AnalysisStreamRegistry::new();
+        reg.observe_active(1, 640, 360, 15.0);
+        reg.observe_active(2, 640, 360, 15.0);
+        reg.clear(1);
+        assert!(reg.snapshot(1).is_none());
+        assert!(reg.snapshot(2).is_some());
     }
 
     #[test]

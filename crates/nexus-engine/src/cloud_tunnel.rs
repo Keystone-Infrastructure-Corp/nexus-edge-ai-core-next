@@ -1199,7 +1199,10 @@ async fn pump_heartbeats<H: TunnelHandle>(
         // green core and an operator sees only silence, which is
         // indistinguishable from a genuinely quiet site. Recomputed each
         // tick so a repaired detector clears within one heartbeat.
-        let health = Some(edge_health(&live_view.stalled_cameras()));
+        let health = Some(edge_health(
+            &live_view.stalled_cameras(),
+            crate::system_metrics::snapshot().decode_capacity.as_ref(),
+        ));
         // Camera-liveness rollup — same `FrameStatsRegistry` source of
         // truth as `roster::build_envelope`'s per-camera `online` field,
         // so the two can never disagree. Deliberately NOT
@@ -1416,7 +1419,10 @@ const HEALTH_ISSUES_MAX: usize = 16;
 /// only a camera someone is watching has a pump — but that is exactly the
 /// population whose staleness an operator can see, and the case BUG-057 was
 /// filed against.
-fn edge_health(stalled_cameras: &[nexus_types::CameraId]) -> EdgeHealth {
+fn edge_health(
+    stalled_cameras: &[nexus_types::CameraId],
+    decode_capacity: Option<&crate::system_metrics::DecodeCapacity>,
+) -> EdgeHealth {
     let mut issues: Vec<EdgeDegradation> = nexus_inference::health::degradations()
         .into_iter()
         .map(|d| EdgeDegradation {
@@ -1440,6 +1446,25 @@ fn edge_health(stalled_cameras: &[nexus_types::CameraId]) -> EdgeHealth {
                 crate::live_view::STALL_AFTER.as_secs(),
             )),
         });
+    }
+    // SPEC-069 Phase 1 — a fixed-function video engine oversubscribed is a
+    // fleet-visible degradation in its own right: it explains a core that
+    // looks otherwise healthy (still recording, still streaming) but is
+    // quietly dropping/duplicating frames across every camera sharing that
+    // engine, which is exactly the state a 53-camera Radeon 680M / Intel
+    // iHD box is in before this instrumentation existed.
+    if let Some(cap) = decode_capacity {
+        if cap.oversubscribed {
+            issues.push(EdgeDegradation {
+                component: "decode".to_string(),
+                code: "decode_oversubscribed".to_string(),
+                detail: truncate_detail(&format!(
+                    "{} at {:.1}% \u{2014} this fixed-function video engine is oversubscribed \
+                     and shared by every camera decoding on it",
+                    cap.binding_engine, cap.binding_engine_pct,
+                )),
+            });
+        }
     }
     issues.truncate(HEALTH_ISSUES_MAX);
     EdgeHealth {
@@ -1517,7 +1542,7 @@ mod health_tests {
         let kind = "cloud_tunnel_health_test";
         nexus_inference::health::record_degraded(kind, "model pack has no 640x640 export");
 
-        let health = edge_health(&[]);
+        let health = edge_health(&[], None);
         assert_eq!(health.status, "degraded");
         let issue = health
             .issues
@@ -1537,7 +1562,7 @@ mod health_tests {
     /// the existing `EdgeHealth.issues` shape, so no wire bump is needed.
     #[test]
     fn stalled_live_view_sources_become_a_wire_issue() {
-        let health = edge_health(&[4, 11]);
+        let health = edge_health(&[4, 11], None);
         assert_eq!(health.status, "degraded");
         let issue = health
             .issues
@@ -1548,6 +1573,43 @@ mod health_tests {
             .expect("the stall is on the wire");
         assert_eq!(issue.code, "camera_source_stalled");
         assert!(issue.detail.contains("4,11"), "detail: {}", issue.detail);
+    }
+
+    /// SPEC-069 Phase 1 — a fixed-function engine oversubscribed must
+    /// surface as its own wire issue, naming the binding engine.
+    #[test]
+    fn oversubscribed_decode_capacity_becomes_a_wire_issue() {
+        let cap = crate::system_metrics::DecodeCapacity {
+            binding_engine: "video-enhance".to_string(),
+            binding_engine_pct: 99.1,
+            oversubscribed: true,
+        };
+        let health = edge_health(&[], Some(&cap));
+        assert_eq!(health.status, "degraded");
+        let issue = health
+            .issues
+            .as_ref()
+            .expect("issues present when degraded")
+            .iter()
+            .find(|i| i.component == "decode")
+            .expect("oversubscription is on the wire");
+        assert_eq!(issue.code, "decode_oversubscribed");
+        assert!(issue.detail.contains("video-enhance"), "{}", issue.detail);
+        assert!(issue.detail.contains("99.1"), "{}", issue.detail);
+    }
+
+    /// A binding engine below the threshold must not raise an issue —
+    /// otherwise every core with any GPU decode load at all would read
+    /// permanently degraded.
+    #[test]
+    fn healthy_decode_capacity_does_not_raise_an_issue() {
+        let cap = crate::system_metrics::DecodeCapacity {
+            binding_engine: "video-decode".to_string(),
+            binding_engine_pct: 12.0,
+            oversubscribed: false,
+        };
+        let health = edge_health(&[], Some(&cap));
+        assert_eq!(health.status, "ok");
     }
 }
 

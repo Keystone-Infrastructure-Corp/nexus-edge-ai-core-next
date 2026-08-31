@@ -750,8 +750,20 @@ async fn run_session(
     ) {
         if let Some(src) = dec.static_pad("src") {
             let camera = camera_id;
-            src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            src.add_probe(gst::PadProbeType::BUFFER, move |pad, _| {
                 health.observe_decoder_output(camera);
+                // SPEC-069 Phase 1 — geometry off the decoder's own src
+                // pad, not the appsink's. The appsink sees post-scale
+                // dimensions when a `videoscale` sits between decode
+                // and the RGB tap; the decoder's negotiated caps are
+                // what the fixed-function engine is actually decoding,
+                // which is the number decode-capacity ceiling
+                // calibration needs.
+                if let Some(caps) = pad.current_caps() {
+                    if let Ok(info) = VideoInfo::from_caps(&caps) {
+                        health.observe_decoder_geometry(camera, info.width(), info.height());
+                    }
+                }
                 gst::PadProbeReturn::Ok
             });
         }

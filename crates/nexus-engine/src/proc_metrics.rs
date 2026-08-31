@@ -155,7 +155,19 @@ static SAMPLER: LazyLock<Mutex<Sampler>> = LazyLock::new(|| Mutex::new(Sampler::
 /// calls made less than [`MIN_SAMPLE_INTERVAL`] apart, and on every
 /// non-Linux platform.
 pub(crate) fn sample() -> ProcSample {
-    let mut guard = SAMPLER.lock();
+    sample_into(&mut SAMPLER.lock())
+}
+
+/// The body of [`sample`], operating on a caller-supplied [`Sampler`]
+/// rather than the process-wide `SAMPLER` global.
+///
+/// Split out so the baselining behaviour can be tested against a local
+/// `Sampler`. Asserting it through `sample()` instead would make the test
+/// depend on winning a race for the global: any other test in this binary
+/// that reaches `sample()` — `system_metrics::snapshot()` does, and the
+/// camera-stats API handlers call that — would baseline it first, and the
+/// "first" call would then legitimately return rates.
+fn sample_into(guard: &mut Sampler) -> ProcSample {
     let now = Instant::now();
 
     let disks_now = read_diskstats();
@@ -460,15 +472,25 @@ mod tests {
 
     #[test]
     fn sample_is_infallible_and_baselines_first() {
+        // Drive a LOCAL `Sampler`, not the `SAMPLER` global. This assertion
+        // is about what the *first* sample of a given sampler returns, and
+        // through `sample()` that would be a claim about global process
+        // history — which any other test in this binary can invalidate by
+        // reaching `system_metrics::snapshot()` first (the camera-stats
+        // handlers do). That made this test lose a race intermittently on
+        // Linux, where `disk_io` is actually populated; macOS never caught
+        // it because `read_diskstats` returns empty there regardless.
+        let mut sampler = Sampler::default();
+
         // First call establishes the baseline and reports no rates.
-        let first = sample();
+        let first = sample_into(&mut sampler);
         assert!(
             first.disk_io.is_empty(),
             "first sample cannot produce a rate"
         );
 
         std::thread::sleep(MIN_SAMPLE_INTERVAL + std::time::Duration::from_millis(50));
-        let second = sample();
+        let second = sample_into(&mut sampler);
         // Rates are only asserted on Linux; macOS dev boxes return empty.
         if cfg!(target_os = "linux") {
             assert!(second.thread_count > 0, "process has at least one thread");
@@ -476,6 +498,22 @@ mod tests {
                 second.process_cpu_pct.is_some(),
                 "second sample computes process CPU"
             );
+        }
+    }
+
+    /// The global `sample()` wrapper must stay wired to the same logic the
+    /// test above exercises locally — otherwise that test could pass while
+    /// the real entry point diverged. Deliberately asserts nothing about
+    /// *rates*: whether this call is the first in the process is not
+    /// knowable here, which is the whole reason the test above uses a local
+    /// sampler. Reaching the end without panicking is the claim.
+    #[test]
+    fn global_sample_is_infallible() {
+        let s = sample();
+        // thread_count is read fresh every call and never differenced, so
+        // it is the one field that is meaningful regardless of baseline.
+        if cfg!(target_os = "linux") {
+            assert!(s.thread_count > 0, "process has at least one thread");
         }
     }
 

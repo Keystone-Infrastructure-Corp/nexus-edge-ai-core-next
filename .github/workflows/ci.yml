@@ -268,6 +268,29 @@ jobs:
           echo "ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so"   >> $GITHUB_ENV
 
       - name: cargo check + test (gstreamer + ort)
+        # `GIO_USE_PROXY_RESOLVER=dummy`: forces GIO to pick its no-op proxy
+        # resolver extension instead of auto-probing for `gnome` (provided
+        # by `glib-networking`, which this runner image ships even though
+        # nothing above installs it). SPEC-069's P8 invariant tests are the
+        # first in this suite to build TWO concurrent real `rtspsrc`
+        # sessions for one camera (`a_camera_with_both_sessions_records_
+        # from_the_main_ingester_only`, `nexus-pipeline`'s `gst_clip_
+        # recorder.rs`) — that's what newly reaches the connection-attempt
+        # code path that lazily constructs GIO's default proxy resolver.
+        # `GProxyResolverGnome`'s constructor calls `g_settings_new
+        # ("org.gnome.system.proxy")`, which is `g_error` (fatal, aborts
+        # the process with SIGTRAP) when `gsettings-desktop-schemas` isn't
+        # installed — true here, since this is a headless CI image, not a
+        # GNOME desktop. Confirmed CI-only: this workflow's apt package
+        # list is unchanged by SPEC-069, the same tests pass unmodified on
+        # macOS (no `gnome` GIO proxy backend to probe there), and no
+        # production code path calls proxy-resolution APIs — the camera
+        # URLs here are deliberately-unroutable test fixtures
+        # (`rtsp://127.0.0.1:1/...`), not real traffic. This only changes
+        # what `cargo test` sees; a deployed core still uses the host's
+        # real resolver.
+        env:
+          GIO_USE_PROXY_RESOLVER: dummy
         run: |
           cargo check --locked -p nexus-pipeline  --features gstreamer
           cargo check --locked -p nexus-pipeline  --features gstreamer-webrtc
