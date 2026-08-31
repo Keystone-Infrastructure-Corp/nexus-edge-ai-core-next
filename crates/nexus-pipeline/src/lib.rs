@@ -79,7 +79,7 @@ pub use stats::{
 pub use supervisor::{spawn_camera, CameraHandle};
 
 #[cfg(feature = "gstreamer")]
-pub use gst_clip_recorder::GstClipRecorder;
+pub use gst_clip_recorder::{GstClipRecorder, IngesterRegistry};
 
 #[cfg(feature = "gstreamer")]
 pub use decode::install_shared_display_context;

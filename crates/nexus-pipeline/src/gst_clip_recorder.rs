@@ -151,7 +151,12 @@ pub struct GstClipRecorder {
     /// Contention is negligible: clip opens fire at most a few
     /// times per minute per camera and the reconciler only writes
     /// on admin actions.
-    ingesters: PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>,
+    ///
+    /// Shared by `Arc` with the engine's WebRTC bridge (see
+    /// [`Self::ingester_registry`]) so HD live view resolves the same
+    /// map the reconciler mutates. It previously held its own snapshot
+    /// and went stale on every restart — see BUG-144.
+    ingesters: IngesterRegistry,
     /// Second, substream-only sessions keyed by camera (SPEC-069).
     /// Read by `shared_frame_source` and by nothing else — in
     /// particular never by the clip path, which resolves its ingester
@@ -304,6 +309,16 @@ struct AlertInflight {
     deadline: Arc<AtomicI64>,
 }
 
+/// The live camera → main-stream ingester map, shared by `Arc` between the
+/// clip recorder that mutates it and every other reader of it.
+///
+/// Holding the `Arc` rather than a cloned `HashMap` is load-bearing: the
+/// reconciler tears an ingester down and builds a new one on every restart
+/// (URL, detector dims, codec, or `analysis_url` change), so any reader
+/// caching its own copy resolves a shut-down session forever after. That is
+/// BUG-144.
+pub type IngesterRegistry = Arc<PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>>;
+
 impl GstClipRecorder {
     pub fn new(
         store: Arc<Store>,
@@ -315,7 +330,7 @@ impl GstClipRecorder {
         Ok(Self {
             store,
             clips_dir: clips_dir.as_ref().to_path_buf(),
-            ingesters: PlRwLock::new(ingesters),
+            ingesters: Arc::new(PlRwLock::new(ingesters)),
             analysis_ingesters: PlRwLock::new(HashMap::new()),
             panic: PlMutex::new(false),
             open: Mutex::new(HashMap::new()),
@@ -358,6 +373,15 @@ impl GstClipRecorder {
     ) -> Self {
         self.analysis_stream = Some(registry);
         self
+    }
+
+    /// The live main-stream ingester map, for readers outside this crate
+    /// (the engine's WebRTC bridge). Returns the shared handle, never a
+    /// copy — a copy is exactly the BUG-144 defect. Only `analysis_url`
+    /// sessions are withheld: they live in a separate map this never
+    /// exposes, which is what keeps invariants I2/I3 structural.
+    pub fn ingester_registry(&self) -> IngesterRegistry {
+        Arc::clone(&self.ingesters)
     }
 
     /// M2.2 Phase 3: attach a USB resolver + preferred label so

@@ -32,7 +32,7 @@ use nexus_cloud_protocol::v1::{
     Envelope, EnvelopeBody, EnvelopeMeta, LiveHdOfferPayload, LiveHdPublishingPayload,
 };
 #[cfg(feature = "gstreamer-webrtc")]
-use nexus_pipeline::{NalSample, PreRollIngester};
+use nexus_pipeline::NalSample;
 #[cfg(feature = "gstreamer-webrtc")]
 use nexus_types::{CameraId, CodecKind};
 #[cfg(feature = "gstreamer-webrtc")]
@@ -42,10 +42,12 @@ use tokio::sync::broadcast;
 #[cfg(feature = "gstreamer-webrtc")]
 use tracing::warn;
 
-/// Boot-time snapshot of the camera → ingester registry (the compressed-NAL
-/// sources) the bridge builds passthrough sessions from.
+/// The live camera → ingester registry (the compressed-NAL sources) the
+/// bridge builds passthrough sessions from. Shared by `Arc` with the clip
+/// recorder that mutates it, so an HD expand after a camera restart resolves
+/// the session that is actually running (BUG-144).
 #[cfg(feature = "gstreamer-webrtc")]
-pub type IngesterRegistry = Arc<HashMap<CameraId, Arc<PreRollIngester>>>;
+pub use nexus_pipeline::IngesterRegistry;
 
 /// Owns every live edge WebRTC session and the seam to the camera ingesters.
 pub struct WebRtcBridge {
@@ -107,7 +109,7 @@ impl WebRtcBridge {
         Arc::new(Self {
             #[cfg(feature = "gstreamer-webrtc")]
             inner: parking_lot::Mutex::new(Inner {
-                ingesters: Arc::new(HashMap::new()),
+                ingesters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
                 sessions: HashMap::new(),
             }),
         })
@@ -253,7 +255,7 @@ impl WebRtcBridge {
                 }
             }
         }
-        let Some(ingester) = inner.ingesters.get(&cam_id).cloned() else {
+        let Some(ingester) = inner.ingesters.read().get(&cam_id).cloned() else {
             warn!(
                 camera_id = cam_id,
                 session_id = %payload.session_id,
@@ -537,6 +539,8 @@ fn base_meta() -> EnvelopeMeta {
 #[cfg(all(test, feature = "gstreamer-webrtc"))]
 mod tests {
     use super::*;
+    #[cfg(feature = "gstreamer-webrtc")]
+    use nexus_pipeline::PreRollIngester;
 
     #[test]
     fn offer_envelope_shape() {
@@ -565,51 +569,60 @@ mod tests {
     }
 
     /// SPEC-069 invariant I3: both WebRTC modes subscribe to the **main**
-    /// NAL broadcast. `WebRtcBridge`'s `IngesterRegistry` is populated in
-    /// `main.rs` from the boot-time `ingesters` map *before* any analysis
-    /// session is attached (`analysis_ingesters` lives in a wholly separate
-    /// map inside `GstClipRecorder` that this type has no field for at
-    /// all) — so the only way `on_live_hd_start` can resolve the wrong
-    /// stream is if a future refactor starts routing it through some other
-    /// lookup. Prove the current resolution path here: register exactly
-    /// one ingester per camera id (mirroring the production registry,
-    /// which the fixture never populates with a substream session in the
-    /// first place) and assert the SFU publisher it builds is backed by
-    /// that exact ingester's live NAL feed, not a closed one.
+    /// NAL broadcast, and they subscribe to the one that is *currently
+    /// running*.
     ///
-    /// Reverted-and-confirmed-red: temporarily replacing the
-    /// `inner.ingesters.get(&cam_id)` resolution with a lookup against an
-    /// empty map (simulating a wiring bug where the registry no longer
-    /// carries the main ingester) makes `on_live_hd_start` build no
-    /// session at all and this test fails on the `is_some()` assert.
-    #[tokio::test]
-    async fn webrtc_publisher_is_backed_by_the_registered_ingesters_live_feed() {
+    /// The second half is what BUG-144 turned out to be. The bridge holds
+    /// the recorder's live registry by `Arc`, and the reconciler drops and
+    /// rebuilds a camera's ingester on every restart — including the
+    /// `analysis_url` change that rolling out substream analysis performs on
+    /// every camera at once. `remove_camera_ingester` calls `shutdown()` on
+    /// the outgoing session regardless of how many `Arc` clones exist, so a
+    /// bridge holding its own snapshot resolves a dead broadcast forever
+    /// after: `webrtcbin` still builds and ICE still runs, but no NAL ever
+    /// arrives and HD never negotiates.
+    ///
+    /// So this drives a real restart through the shared map and asserts the
+    /// publisher is backed by the *replacement* feed. `mode` is parameterised
+    /// because the transcode pipeline is the one with a decoder in it and was
+    /// previously unexercised.
+    ///
+    /// Reverted-and-confirmed-red: reintroducing the snapshot inside
+    /// `WebRtcBridge::new` (`Arc::new(RwLock::new(ingesters.read().clone()))`)
+    /// fails both cases on the `is_shutdown` assert.
+    ///
+    /// The probe is deliberately **not** `feed_ended()`. A publisher whose
+    /// ingester was torn down subscribes to a broadcast whose sender is a
+    /// plain struct field that `shutdown()` never drops, so its pump task
+    /// blocks forever rather than finishing — `feed_ended()` stays `false`
+    /// on exactly the failure this guards. That silent pass is why the
+    /// defect shipped; see `PreRollIngester::is_shutdown`'s doc comment.
+    #[cfg(feature = "gstreamer-webrtc")]
+    async fn hd_resolves_the_running_ingester_after_a_camera_restart(mode: Option<&str>) {
         let cam_id: CameraId = 99;
 
-        // The registry entry: a live ingester, exactly what main.rs's
-        // boot-time snapshot contains for this camera (main stream only).
-        let main_ing = PreRollIngester::new(cam_id, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264)
-            .expect("build main ingester");
+        // The live map the recorder owns and the reconciler mutates.
+        let registry: nexus_pipeline::IngesterRegistry =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let boot_ing = PreRollIngester::new(cam_id, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264)
+            .expect("build boot ingester");
+        registry.write().insert(cam_id, boot_ing.clone());
 
-        // A stand-in for what an analysis session would look like if it
-        // were ever wired into this same registry by mistake: same camera
-        // id, but its feed is already closed. If resolution ever picked
-        // this one up instead, the built session's feed would report
-        // `feed_ended() == true` immediately.
-        let shut_down_stand_in =
-            PreRollIngester::new(cam_id, "rtsp://127.0.0.1:1/sub", 0, CodecKind::H264)
-                .expect("build stand-in ingester");
-        shut_down_stand_in.shutdown();
+        let bridge = WebRtcBridge::new(Arc::clone(&registry));
 
-        let mut map = HashMap::new();
-        map.insert(cam_id, main_ing.clone());
-        let bridge = WebRtcBridge::new(Arc::new(map));
+        // What the reconciler does on an `analysis_url` change: shut the
+        // running session down and put a fresh one in its place.
+        boot_ing.shutdown();
+        let restarted_ing =
+            PreRollIngester::new(cam_id, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264)
+                .expect("build restarted ingester");
+        registry.write().insert(cam_id, restarted_ing.clone());
 
         let outbox = Arc::new(TunnelOutbox::new());
         let payload = LiveHdStartPayload {
             camera_id: cam_id as u64,
             ice_servers: None,
-            mode: None,
+            mode: mode.map(str::to_string),
             moq_broadcast: None,
             moq_publish_token: None,
             moq_relay_url: None,
@@ -619,19 +632,71 @@ mod tests {
         };
         bridge.on_live_hd_start(&payload, &outbox);
 
-        let has_session = {
+        {
             let inner = bridge.inner.lock();
-            assert_eq!(inner.sessions.len(), 1, "publisher session must be built");
-            let active = inner.sessions.values().next().unwrap();
-            !active._session.feed_ended()
-        };
-        assert!(
-            has_session,
-            "publisher's feed reports ended immediately — it must be backed by the \
-             live main ingester, not a closed/analysis one"
-        );
+            let resolved = inner
+                .ingesters
+                .read()
+                .get(&cam_id)
+                .cloned()
+                .expect("camera present in the registry");
+            assert!(
+                !resolved.is_shutdown(),
+                "the bridge resolves a torn-down ingester: its NAL broadcast \
+                 never yields, so HD negotiates ICE and then hangs forever \
+                 (BUG-144). mode {mode:?}"
+            );
+            assert!(
+                Arc::ptr_eq(&resolved, &restarted_ing),
+                "the bridge must resolve the ingester currently running for \
+                 this camera, not the one it saw at construction. mode {mode:?}"
+            );
+            assert_eq!(
+                inner.sessions.len(),
+                1,
+                "publisher session must be built (mode {mode:?})"
+            );
+        }
 
         bridge.clear_all();
+        restarted_ing.shutdown();
+    }
+
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test]
+    async fn webrtc_passthrough_resolves_the_running_ingester_after_a_restart() {
+        hd_resolves_the_running_ingester_after_a_camera_restart(None).await;
+    }
+
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test]
+    async fn webrtc_transcode_resolves_the_running_ingester_after_a_restart() {
+        hd_resolves_the_running_ingester_after_a_camera_restart(Some("transcode")).await;
+    }
+
+    /// The analysis substream session lives in the recorder's separate
+    /// `analysis_ingesters` map, which `ingester_registry()` does not expose.
+    /// This is the structural half of I3: there is no key the bridge could
+    /// look up that would reach a substream session, whatever the camera's
+    /// `analysis_url` is set to.
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test]
+    async fn webrtc_registry_cannot_reach_an_analysis_session() {
+        let cam_id: CameraId = 99;
+        let registry: nexus_pipeline::IngesterRegistry =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let main_ing = PreRollIngester::new(cam_id, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264)
+            .expect("build main ingester");
+        registry.write().insert(cam_id, main_ing.clone());
+
+        let resolved = registry.read().get(&cam_id).cloned().expect("main present");
+        assert_eq!(
+            resolved.codec(),
+            CodecKind::H264,
+            "the only session reachable through the WebRTC registry is the \
+             main one; substream sessions are held in a map this never sees"
+        );
+
         main_ing.shutdown();
     }
 }

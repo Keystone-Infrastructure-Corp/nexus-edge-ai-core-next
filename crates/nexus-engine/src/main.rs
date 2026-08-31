@@ -2557,16 +2557,6 @@ async fn build_gst_recorder(
             }
         }
     }
-    // Phase F — snapshot the camera→ingester registry for the WebRTC bridge
-    // before the map is moved into the recorder (values are Arcs, so this
-    // clones only refcounts). Camera rebuilds at new dims aren't hot-reflected
-    // in v1 — a fresh HD expand picks up the current ingester.
-    #[cfg(feature = "gstreamer-webrtc")]
-    let webrtc = crate::webrtc_bridge::WebRtcBridge::new(std::sync::Arc::new(ingesters.clone()));
-    #[cfg(feature = "gstreamer-webrtc")]
-    webrtc.spawn_reaper();
-    #[cfg(not(feature = "gstreamer-webrtc"))]
-    let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
     let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, ingesters)
         .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?
         .with_bus(bus)
@@ -2577,6 +2567,18 @@ async fn build_gst_recorder(
         .with_alert_clips(alert_clips)
         .with_alert_cold_kick(cold_kick)
         .with_alert_clip_delivery_gate(alert_clip_gate);
+    // Phase F — the WebRTC bridge shares the recorder's live camera→ingester
+    // map rather than a snapshot of it. The reconciler drops and rebuilds an
+    // ingester on every restart (URL, detector dims, codec, or `analysis_url`
+    // change), and `remove_camera_ingester` shuts the old one down for every
+    // Arc holder — so a snapshot leaves HD subscribed to a dead broadcast for
+    // the life of the process, which is BUG-144.
+    #[cfg(feature = "gstreamer-webrtc")]
+    let webrtc = crate::webrtc_bridge::WebRtcBridge::new(rec.ingester_registry());
+    #[cfg(feature = "gstreamer-webrtc")]
+    webrtc.spawn_reaper();
+    #[cfg(not(feature = "gstreamer-webrtc"))]
+    let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
     // SPEC-069 — the analysis substream sessions. `start_camera` registers
     // these on hot-add and on every reconcile-triggered restart; boot has
     // to do the same or a converted camera silently analyses its main
