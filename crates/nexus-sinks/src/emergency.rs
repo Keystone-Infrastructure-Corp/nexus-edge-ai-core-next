@@ -275,10 +275,67 @@ impl EmergencyRateLimiter {
     }
 }
 
+/// A Tier-0 delivery record — what happened, when, and (optionally, much
+/// later) which Sentinel episode it was attached to for advisory context.
+///
+/// `delivered_at` and `outcome` are set exactly once, at [`Self::deliver`],
+/// which is the emergency path's own act of delivering the alert. Nothing
+/// after that point — in particular [`Self::attach_episode`] — can touch
+/// them: Sentinel's episode is advisory and always arrives after the fact,
+/// so it must not be able to re-time or re-decide a delivery that has
+/// already happened (SPEC-037: "attaching an episode changes neither the
+/// delivery outcome nor its timing").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyDelivery {
+    pub camera_id: u64,
+    pub class: Tier0Class,
+    pub outcome: EmergencyOutcome,
+    pub delivered_at: DateTime<Utc>,
+    /// `None` until Sentinel has an episode to offer, which is always
+    /// strictly after delivery — Sentinel is advisory and never gates or
+    /// precedes the emergency path.
+    pub episode_id: Option<u64>,
+}
+
+impl EmergencyDelivery {
+    /// Record a delivery. This is the only place `delivered_at` and
+    /// `outcome` are ever set.
+    #[must_use]
+    pub fn deliver(
+        camera_id: u64,
+        class: Tier0Class,
+        outcome: EmergencyOutcome,
+        delivered_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            camera_id,
+            class,
+            outcome,
+            delivered_at,
+            episode_id: None,
+        }
+    }
+
+    /// Attach a Sentinel episode to an already-delivered Tier-0 event, after
+    /// the fact. The only field this can change is `episode_id`:
+    /// `delivered_at` and `outcome` are carried through untouched, by
+    /// construction, so an episode arriving late — or never — can neither
+    /// delay nor alter the delivery that already happened.
+    #[must_use]
+    pub fn attach_episode(self, episode_id: u64) -> Self {
+        Self {
+            episode_id: Some(episode_id),
+            ..self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     fn t(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
@@ -399,6 +456,96 @@ mod tests {
         assert!(
             rl.allow(1, Tier0Class::Fire, t(1)),
             "no state → always deliver"
+        );
+    }
+
+    /// SPEC-037 — "Sentinel may attach an episode to a Tier-0 event after
+    /// the fact, and a test asserts that attaching one changes neither the
+    /// delivery outcome nor its timing."
+    ///
+    /// The episode arrives long after delivery (a much later timestamp
+    /// stands in for "after the fact" here — `attach_episode` takes no
+    /// clock at all, which is the point: it cannot re-time anything).
+    #[test]
+    fn attaching_an_episode_after_the_fact_changes_neither_the_delivery_outcome_nor_its_timing() {
+        let delivered_at = t(1_000);
+        let delivery =
+            EmergencyDelivery::deliver(7, Tier0Class::Fire, EmergencyOutcome::Alarm, delivered_at);
+        assert_eq!(
+            delivery.episode_id, None,
+            "the delivery was already complete before any episode existed"
+        );
+
+        // Sentinel's episode shows up long after delivery.
+        let attached = delivery.clone().attach_episode(42);
+
+        assert_eq!(
+            attached.delivered_at, delivered_at,
+            "attaching an episode altered the delivery timing"
+        );
+        assert_eq!(
+            attached.outcome,
+            EmergencyOutcome::Alarm,
+            "attaching an episode altered the delivery outcome"
+        );
+        assert_eq!(attached.camera_id, delivery.camera_id);
+        assert_eq!(attached.class, delivery.class);
+        assert_eq!(attached.episode_id, Some(42));
+    }
+
+    /// SPEC-037 — "Detection, recording, and rule evaluation are unaffected
+    /// by the emergency path — a Tier-0 fire does not stall the pipeline,
+    /// and the alert emission cannot block a frame."
+    ///
+    /// This crate has no production caller wiring `EmergencyPolicy`,
+    /// `EmergencyRateLimiter`, or `EmergencyDelivery` into the pipeline yet
+    /// (SPEC-036's detectors are what would call `decide`/`allow`, and they
+    /// do not exist in this repo) — that wiring gap is named in the vault
+    /// record, not hidden here. What IS buildable and tested here is the
+    /// timing property the AC actually names: a full emergency decision +
+    /// rate-limit + episode-attach cycle completes so far under a single
+    /// frame's budget (33 ms at 30 fps) that it structurally cannot be what
+    /// stalls a detection/recording/rule-evaluation loop sharing the same
+    /// thread. A regression that made any of these take a lock, sleep, or
+    /// perform I/O would blow this budget and fail this test for exactly
+    /// that reason.
+    #[test]
+    fn emergency_decision_rate_limit_and_episode_attach_complete_far_under_one_frame_budget() {
+        const FRAME_BUDGET: Duration = Duration::from_millis(33);
+        const ITERATIONS: u64 = 2_000;
+
+        let policy = EmergencyPolicy::default();
+        let mut rl = EmergencyRateLimiter::new(Duration::from_millis(1));
+        let sig = EmergencySignal {
+            class: Tier0Class::Fire,
+            persistence: Duration::from_millis(600),
+            brandish_confirmed: None,
+        };
+
+        let worst_single_call = Arc::new(AtomicU64::new(0));
+
+        for i in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+
+            let outcome = policy.decide(&sig, true);
+            let _delivered = rl.allow(1, Tier0Class::Fire, t(i as i64));
+            let delivery = EmergencyDelivery::deliver(1, Tier0Class::Fire, outcome, t(i as i64));
+            let _attached = delivery.attach_episode(i);
+
+            let elapsed = start.elapsed();
+            worst_single_call.fetch_max(elapsed.as_nanos() as u64, Ordering::Relaxed);
+            assert!(
+                elapsed < FRAME_BUDGET,
+                "one emergency decision cycle took {elapsed:?}, over the {FRAME_BUDGET:?} \
+                 single-frame budget — the alert emission would block a frame"
+            );
+        }
+
+        let worst = Duration::from_nanos(worst_single_call.load(Ordering::Relaxed));
+        assert!(
+            worst < FRAME_BUDGET,
+            "the worst single emergency decision cycle took {worst:?}, at or over the \
+             {FRAME_BUDGET:?} frame budget"
         );
     }
 }
