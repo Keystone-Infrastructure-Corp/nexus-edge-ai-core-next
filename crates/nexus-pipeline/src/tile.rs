@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(crop.height, 100);
         assert_eq!(crop.data.len(), 100 * 100 * 3);
         // Every pixel should be the bottom-right colour [100, 110, 120].
-        for px in crop.data.chunks_exact(3) {
+        for px in crop.data.as_chunks::<3>().0 {
             assert_eq!(px, &[100, 110, 120], "wrong quadrant data");
         }
     }

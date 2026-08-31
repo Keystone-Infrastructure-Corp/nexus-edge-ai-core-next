@@ -449,6 +449,11 @@ pub(crate) fn snapshot() -> Arc<SystemMetrics> {
 /// this. We deliberately do NOT require admin: operators and
 /// viewers need to see system health to do their jobs, and the
 /// surface is read-only host telemetry (no secrets).
+// `result_large_err` fires on `Result<Response, Response>`, which is the axum
+// handler idiom used throughout this crate: the error arm IS a response, so it
+// is necessarily as large as one. Boxing it would stop it satisfying axum's
+// `IntoResponse` for a handler return type, so the lint is not actionable here.
+#[allow(clippy::result_large_err)]
 pub async fn get_system_metrics(session: SessionContext) -> Result<Response, Response> {
     session
         .require(Role::Viewer)

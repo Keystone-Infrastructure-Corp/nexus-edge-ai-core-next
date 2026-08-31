@@ -622,7 +622,7 @@ fn objects_signature(objects: &[TrackedObject]) -> u64 {
 /// snapshot helper in `api.rs`.
 fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.chunks_exact(3).enumerate() {
+    for (i, chunk) in buf.as_chunks::<3>().0.iter().enumerate() {
         let off = i * 3;
         out[off] = chunk[2];
         out[off + 1] = chunk[1];

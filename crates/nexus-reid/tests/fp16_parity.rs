@@ -53,7 +53,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 fn solid_rgb(w: u32, h: u32, color: [u8; 3]) -> Vec<u8> {
     let mut out = vec![0u8; (w as usize) * (h as usize) * 3];
-    for px in out.chunks_exact_mut(3) {
+    for px in out.as_chunks_mut::<3>().0 {
         px.copy_from_slice(&color);
     }
     out
@@ -76,7 +76,9 @@ fn roundtrip(emb: &Embedding) -> Vec<f32> {
     let bytes = emb.to_f16_le_bytes();
     assert_eq!(bytes.len(), emb.vec.len() * 2);
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect()
 }

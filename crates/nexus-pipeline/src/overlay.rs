@@ -364,13 +364,15 @@ mod tests {
         let mut buf = vec![255u8; (w * h * 3) as usize];
         draw_label_chip_rgb24(&mut buf, w, h, 6, 48, "hi 0.90", 18.0);
         // Some cyan (chip background) present.
-        let cyan = buf.chunks_exact(3).any(|p| p == ALERT_RGB);
+        let cyan = buf.as_chunks::<3>().0.iter().any(|p| p == &ALERT_RGB);
         assert!(cyan, "chip must paint its cyan background");
         // Anti-aliased dark text darkens some chip pixels below cyan's
         // green/blue channels (the exact colour varies with coverage).
         let text = buf
-            .chunks_exact(3)
-            .any(|p| p != ALERT_RGB && p[1] < ALERT_RGB[1] && p[2] < ALERT_RGB[2]);
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .any(|p| p != &ALERT_RGB && p[1] < ALERT_RGB[1] && p[2] < ALERT_RGB[2]);
         assert!(text, "chip must paint darkened (blended) text pixels");
     }
 
