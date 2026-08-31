@@ -40,9 +40,12 @@ import {
   upsertCamera,
 } from "@/api/config";
 import {
+  getCameraStats,
   getStaticObjectDefaults,
   latestFrameJpegUrl,
+  listCameraStats,
   listCameras,
+  type CameraFrameStats,
 } from "@/api/system";
 import type {
   CameraConfig,
@@ -57,6 +60,7 @@ import type {
   ZoneConfig,
   ZoneKind,
 } from "@/api/types";
+import { DecodeVerdictChip } from "@/components/DecodeVerdictChip";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -73,6 +77,11 @@ import {
   shapeKey,
   shapesForKind,
 } from "@/lib/model-sizes";
+import {
+  analysisStreamLabel,
+  decodeSummaryText,
+  decodeVerdictPresentation,
+} from "@/lib/decodeCapacity";
 
 const EMPTY_CAMERA: CameraConfig = {
   // 0 is the sentinel for "no server-assigned id yet". The
@@ -104,6 +113,19 @@ export function CamerasPage() {
     queryFn: listCameras,
     staleTime: 10_000,
   });
+  // One batch call for the whole table (SPEC-069 Phase 1) rather than one
+  // per row. `isSuccess` is passed down so a pending or failed read renders
+  // "Not read" instead of an all-clear.
+  const statsQuery = useQuery({
+    queryKey: ["cameras", "stats", "all"],
+    queryFn: listCameraStats,
+    refetchInterval: 5_000,
+  });
+  const statsById = useMemo(() => {
+    const m = new Map<number, CameraFrameStats>();
+    for (const s of statsQuery.data ?? []) m.set(s.camera_id, s);
+    return m;
+  }, [statsQuery.data]);
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<CameraConfig | null>(null);
@@ -259,6 +281,7 @@ export function CamerasPage() {
                     <th className="px-3 py-2 text-left">Name</th>
                     <th className="px-3 py-2 text-left">URL</th>
                     <th className="px-3 py-2 text-left">Model</th>
+                    <th className="px-3 py-2 text-left">Decode</th>
                     <th className="px-3 py-2 text-left">Status</th>
                     <th className="px-3 py-2 text-right">Actions</th>
                   </tr>
@@ -268,6 +291,8 @@ export function CamerasPage() {
                     <CameraRow
                       key={String(cam.id)}
                       camera={cam}
+                      stats={statsById.get(Number(cam.id))}
+                      statsRead={statsQuery.isSuccess}
                       onEdit={() => openExisting(cam)}
                     />
                   ))}
@@ -303,9 +328,13 @@ export function CamerasPage() {
 
 function CameraRow({
   camera,
+  stats,
+  statsRead,
   onEdit,
 }: {
   camera: CameraConfig;
+  stats: CameraFrameStats | undefined;
+  statsRead: boolean;
   onEdit: () => void;
 }) {
   const qc = useQueryClient();
@@ -321,6 +350,10 @@ function CameraRow({
     camera.model_override && typeof camera.model_override === "object"
       ? ((camera.model_override as { kind?: unknown }).kind as string | undefined) ?? "—"
       : "—";
+  // A row the batch read covers but has no entry for is a camera the
+  // supervisor has not produced a frame for yet — distinct from an
+  // unread list, and still not an all-clear.
+  const analysis = analysisStreamLabel(stats?.analysis_stream);
 
   return (
     <tr className="border-t border-border/40">
@@ -333,6 +366,20 @@ function CameraRow({
       </td>
       <td className="px-3 py-2">
         <Badge variant="outline">{modelKind}</Badge>
+      </td>
+      <td className="px-3 py-2">
+        <div className="flex flex-col items-start gap-1">
+          <DecodeVerdictChip
+            verdict={stats?.decode_verdict}
+            read={statsRead && stats !== undefined}
+            title={decodeSummaryText(stats?.decode_summary, statsRead && stats !== undefined)}
+          />
+          {analysis ? (
+            <span className="text-[11px] text-muted-foreground">
+              Analysis: {analysis}
+            </span>
+          ) : null}
+        </div>
       </td>
       <td className="px-3 py-2">
         {enabled ? (
@@ -369,6 +416,100 @@ function CameraRow({
 // ---------------------------------------------------------------------------
 // Camera editor sheet.
 // ---------------------------------------------------------------------------
+
+/**
+ * SPEC-069 Phase 1 — decode verdict for one camera, with the raw counters
+ * behind a disclosure so the sheet stays readable for the operators who do
+ * not need them.
+ *
+ * Every branch below distinguishes "not read yet" from a real answer: a
+ * pending or failed stats request says so rather than rendering Healthy.
+ */
+function CameraDecodeSection({ cameraId }: { cameraId: number }) {
+  const [showCounters, setShowCounters] = useState(false);
+  const q = useQuery({
+    queryKey: ["cameras", "stats", cameraId],
+    queryFn: () => getCameraStats(cameraId),
+    refetchInterval: 5_000,
+  });
+  const read = q.isSuccess;
+  const s = q.data;
+  const p = decodeVerdictPresentation(s?.decode_verdict, read);
+  const analysis = analysisStreamLabel(s?.analysis_stream);
+
+  return (
+    <div className="border-b border-border/50 px-5 py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Decode
+        </span>
+        <DecodeVerdictChip verdict={s?.decode_verdict} read={read} />
+        {analysis ? (
+          <Badge variant="outline" className="font-normal">
+            Analysis: {analysis}
+          </Badge>
+        ) : null}
+        <button
+          type="button"
+          className="ml-auto text-xs text-muted-foreground underline-offset-2 hover:underline"
+          onClick={() => setShowCounters((v) => !v)}
+        >
+          {showCounters ? "Hide decode counters" : "Show decode counters"}
+        </button>
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground" data-testid="decode-summary">
+        {decodeSummaryText(s?.decode_summary, read)}
+      </p>
+      {p.verdict === "substream_unavailable" && s?.analysis_stream?.reason ? (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Substream rejected: {s.analysis_stream.reason}.
+        </p>
+      ) : null}
+      {showCounters ? (
+        <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 text-xs sm:grid-cols-3">
+          <Counter label="Decoder input drops" value={s?.decoder_input_drops} read={read} />
+          <Counter label="Decoder output frames" value={s?.decoder_output_frames} read={read} />
+          <Counter label="Sampled frames" value={s?.sampled_frames} read={read} />
+          <Counter label="Duplicate frames" value={s?.duplicate_frames} read={read} />
+          <Counter label="Decoder output fps" value={s?.decoder_output_fps} read={read} />
+          <Counter label="Sampled fps" value={s?.sampled_fps} read={read} />
+          <Counter
+            label="Decoded geometry"
+            value={
+              s?.decoder_width && s?.decoder_height
+                ? `${s.decoder_width}×${s.decoder_height}`
+                : undefined
+            }
+            read={read}
+          />
+        </dl>
+      ) : null}
+    </div>
+  );
+}
+
+function Counter({
+  label,
+  value,
+  read,
+}: {
+  label: string;
+  value: number | string | undefined;
+  read: boolean;
+}) {
+  return (
+    <div>
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="tabular-nums">
+        {!read ? "not read" : value === undefined ? "—" : typeof value === "number" ? round2(value) : value}
+      </dd>
+    </div>
+  );
+}
+
+function round2(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
 
 /**
  * Derive the conventional ONVIF device-service URL from an RTSP URL's host —
@@ -563,6 +704,8 @@ function CameraEditor({
             {error}
           </div>
         ) : null}
+
+        {isNew ? null : <CameraDecodeSection cameraId={draft.id} />}
 
         {restartRequired ? (
           <div className="flex items-start gap-2 border-b border-warning/40 bg-warning/10 px-5 py-3 text-xs">

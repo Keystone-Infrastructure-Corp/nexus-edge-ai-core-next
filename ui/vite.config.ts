@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
@@ -72,5 +73,11 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+  },
+  // Vitest owns `src/`; Playwright owns `e2e/` and runs under `npm run e2e`.
+  // Without this bound, `vitest run` globs the Playwright specs and fails on
+  // all of them, which buries any real unit failure.
+  test: {
+    include: ["src/**/*.test.{ts,tsx}"],
   },
 });

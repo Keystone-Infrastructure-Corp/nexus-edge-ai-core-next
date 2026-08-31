@@ -66,12 +66,51 @@ export interface CameraFrameStats {
   frames_dropped: number;
   source_width: number;
   source_height: number;
+  // SPEC-069 Phase 1 decode counters and verdict. Optional so an older
+  // engine (or a core that has not produced a frame yet) parses cleanly.
+  decoder_input_drops?: number;
+  decoder_output_frames?: number;
+  sampled_frames?: number;
+  duplicate_frames?: number;
+  duplicate_per_mille?: number;
+  decoder_output_fps?: number;
+  sampled_fps?: number;
+  decoder_width?: number;
+  decoder_height?: number;
+  /** `healthy` | `losing_frames` | `padded` | `substream_unavailable` | `measuring`. */
+  decode_verdict?: string;
+  /** The operator sentence the engine computed; thresholds live only there. */
+  decode_summary?: string;
+  decode_ceiling_fps?: number | null;
+  analysis_stream?: AnalysisStreamStatus | null;
+}
+
+/**
+ * Which stream the analysis tap is reading, per camera (SPEC-069 Phase 2).
+ *
+ * Note the shipped string values, which differ from the spec's prose:
+ * `mode` is `mainstream`/`substream`, and `state` is
+ * `active`/`probing`/`unavailable` — a degraded substream reverts to the
+ * main stream rather than lingering, so there is no `degraded` state.
+ */
+export interface AnalysisStreamStatus {
+  mode: string;
+  state: string;
+  reason?: string;
+  width: number;
+  height: number;
+  fps: number;
 }
 
 export function getCameraStats(cameraId: string | number): Promise<CameraFrameStats> {
   return api.get<CameraFrameStats>(
     `/cameras/${encodeURIComponent(String(cameraId))}/stats`,
   );
+}
+
+/** Every camera's stats in one call, so an N-camera list costs one request. */
+export function listCameraStats(): Promise<CameraFrameStats[]> {
+  return api.get<CameraFrameStats[]>("/cameras/stats");
 }
 
 // Per-camera static-object map — anchor centroids for every

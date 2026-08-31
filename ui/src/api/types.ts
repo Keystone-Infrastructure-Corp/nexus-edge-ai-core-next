@@ -527,7 +527,25 @@ export interface SystemMetrics {
   process: SystemProcessInfo;
   /// Absent on non-Linux hosts and on kernels without `CONFIG_PSI`.
   pressure?: SystemPressureInfo;
+  /// SPEC-069 Phase 1 — which fixed-function video engine is the binding
+  /// constraint, and whether it is saturated. Absent when the host reports
+  /// no per-engine utilisation. Mirrors `DecodeCapacity`
+  /// (`crates/nexus-engine/src/system_metrics.rs`); this file is
+  /// hand-mirrored, not generated, so keep it in sync by hand.
+  decode_capacity?: DecodeCapacity | null;
   captured_at: string;
+}
+
+/**
+ * The saturation signal, keyed on whichever video engine is busiest rather
+ * than on the decoder specifically — on Intel iHD the decoder can sit near
+ * idle while post-processing is the ceiling.
+ */
+export interface DecodeCapacity {
+  /// Engine class, e.g. `"video-decode"` or `"video-enhance"`.
+  binding_engine: string;
+  binding_engine_pct: number;
+  oversubscribed: boolean;
 }
 
 export interface SystemHostInfo {

@@ -12,7 +12,9 @@ import {
   Zap,
 } from "lucide-react";
 
-import { getSystemMetrics } from "@/api/system";
+import { getSystemMetrics, listCameraStats } from "@/api/system";
+import type { SystemMetrics } from "@/api/types";
+import { VerdictIcon } from "@/components/DecodeVerdictChip";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -22,6 +24,10 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  capacityHeadline,
+  countCamerasLosingFrames,
+} from "@/lib/decodeCapacity";
 import { formatBytes, formatDuration } from "@/lib/format";
 import { PageHeader } from "@/pages/placeholder";
 
@@ -31,6 +37,18 @@ export function SystemPage() {
     queryFn: getSystemMetrics,
     refetchInterval: 2_000,
   });
+  // Feeds the "N cameras are losing frames" clause. Kept separate from the
+  // metrics query so a stats failure degrades that clause to absent rather
+  // than blanking the whole card.
+  const statsQ = useQuery({
+    queryKey: ["cameras", "stats", "all"],
+    queryFn: listCameraStats,
+    refetchInterval: 5_000,
+  });
+  const camerasLosingFrames = countCamerasLosingFrames(
+    statsQ.data,
+    statsQ.isSuccess,
+  );
 
   if (q.isLoading) {
     return (
@@ -197,6 +215,10 @@ export function SystemPage() {
               ) : null}
               {m.gpu.engines && m.gpu.engines.length > 0 ? (
                 <div className="space-y-2 rounded-lg border border-border/50 bg-muted/20 p-3">
+                  <DecodeCapacityLine
+                    capacity={m.decode_capacity}
+                    camerasLosingFrames={camerasLosingFrames}
+                  />
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                       Per-engine utilization
@@ -613,4 +635,31 @@ const ENGINE_LABELS: Record<string, string> = {
 
 function engineLabel(cls: string): string {
   return ENGINE_LABELS[cls] ?? cls;
+}
+
+/**
+ * SPEC-069 Phase 1 — the capacity verdict, as a state plus one sentence
+ * directly above the per-engine bars it explains. Not a chart and not a
+ * second gauge: the bars below already carry the numbers.
+ */
+function DecodeCapacityLine({
+  capacity,
+  camerasLosingFrames,
+}: {
+  capacity: SystemMetrics["decode_capacity"];
+  camerasLosingFrames: number | null;
+}) {
+  const h = capacityHeadline(capacity, camerasLosingFrames);
+  return (
+    <div className="flex gap-2 border-b border-border/50 pb-2" data-testid="decode-capacity-line">
+      <VerdictIcon
+        presentation={{ verdict: "unknown", label: h.title, icon: h.icon, tone: h.tone }}
+        className="mt-0.5 h-4 w-4"
+      />
+      <div className="space-y-0.5">
+        <div className="text-sm font-medium">{h.title}</div>
+        <p className="text-xs text-muted-foreground">{h.detail}</p>
+      </div>
+    </div>
+  );
 }
