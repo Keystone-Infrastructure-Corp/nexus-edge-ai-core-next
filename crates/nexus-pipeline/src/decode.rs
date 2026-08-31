@@ -486,6 +486,11 @@ pub fn rgb_tap_branch(
     // pipeline, so falling back to main-stream analysis costs a
     // property set instead of a rebuild that would interrupt
     // recording on the branch beside it.
+    //
+    // `async=false` on the sink below is load-bearing: a closed valve leaves
+    // it with no buffer to preroll on, and a sink that gates the async state
+    // change would hold the pipeline in PAUSED, starving the NAL `tap` on the
+    // sibling tee branch — clips, alert clips and HD live view all die with it.
     let drop = if valve_closed { "true" } else { "false" };
     format!(
         "t. ! queue name={RGB_TAP_QUEUE_NAME} leaky=downstream max-size-buffers=200 \
@@ -493,7 +498,7 @@ pub fn rgb_tap_branch(
          ! valve name={RGB_TAP_VALVE_NAME} drop={drop} \
          ! {decode_chain} \
          ! video/x-raw,format=RGB,width={width},height={height},framerate={framerate}/1 \
-         ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4"
+         ! appsink name=rgb emit-signals=true sync=false async=false drop=true max-buffers=4"
     )
 }
 
@@ -1543,6 +1548,27 @@ mod tests {
             .expect("valve must be named for by_name lookup");
         let decoder_at = d.find(chain).expect("decode chain present");
         assert!(valve_at < decoder_at, "valve must precede the decoder: {d}");
+    }
+
+    /// A closed valve leaves the RGB appsink with no buffer to preroll on, and
+    /// a sink that takes part in the async state change never completes it —
+    /// so the pipeline stays in PAUSED and starves the *sibling* NAL `tap`
+    /// branch hanging off the same tee. Measured on an InSight main stream:
+    /// 731 tap buffers in 15 s with the valve open, 1 with it closed, 730 once
+    /// the sink stops gating. Field effect of the stall was an empty pre-roll
+    /// ring on every camera running substream analysis — `preroll_samples=0`,
+    /// 663-byte clips with no video track, no alert clips, and HD live view
+    /// that never negotiated (SPEC-069 invariants I1-I5 claim the opposite).
+    #[test]
+    fn rgb_tap_appsink_never_gates_the_pipeline_state_change() {
+        let chain = "vah264dec ! vapostproc ! videoconvert";
+        for valve_closed in [true, false] {
+            let d = rgb_tap_branch(chain, 512, 288, 15, valve_closed);
+            assert!(
+                d.contains("async=false"),
+                "rgb appsink must not gate preroll (valve_closed={valve_closed}): {d}"
+            );
+        }
     }
 
     /// The valve's initial state is rebuilt from the ingester's stored flag on
