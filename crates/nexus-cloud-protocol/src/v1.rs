@@ -25,6 +25,9 @@ pub struct ActorTokenClaims {
     pub org_id: Uuid,
     /// Exact match against rpc_call.payload.path.
     pub path: String,
+    /// Phase P3 (SPEC-071 BUG-095). Permission catalog key that authorized minting this token (e.g. `fleet.apply`). Optional, and genuinely omitted when the internal caller supplied none. NOT free to start emitting: ActorTokenClaims is `deny_unknown_fields`, so an engine build that predates this claim REJECTS any token carrying it as MalformedClaims and refuses every state-mutating rpc_call. The engine build that understands `perm` MUST reach the whole fleet before the cloud is deployed with a signer that emits it — see WIRE_PROTOCOL.md §11.2. `role` is unchanged and remains the only claim the edge enforces on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perm: Option<String>,
     pub role: String,
     /// User UUID, or `system:<svc-name>`.
     pub sub: String,

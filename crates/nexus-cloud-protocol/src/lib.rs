@@ -13,7 +13,10 @@
 //! [`src/v1.rs`](src/v1.rs), kept byte-identical to the cloud's
 //! generated source via the cloud-console `cargo xtask
 //! sync-cloud-protocol --core <path>` command, which also writes a
-//! companion `v1.CHECKSUM` file that CI verifies on every build.
+//! companion `v1.CHECKSUM` recording the SHA-256 of the cloud schema
+//! that produced them. No CI job compares that value against the cloud
+//! repo today — it is a sync marker for review, not a gate. Regenerate
+//! rather than hand-edit, and expect nothing to stop you if you don't.
 //! Per REPO_BOUNDARY R1, neither repo imports a `nexus-*` crate from
 //! the other — both consume the schema independently.
 
