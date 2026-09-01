@@ -91,7 +91,7 @@ pub struct AlertPayload {
     pub verification_state: Option<VerificationState>,
 }
 
-/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines exactly one topic: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
+/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines two topics: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`, and `storage.eviction.aggressive`, whose `payload` deserializes as `StorageEvictionAggressivePayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BusEventPayload {
@@ -691,6 +691,20 @@ pub struct ShellSessionOpenPayload {
     pub session_id: Uuid,
     /// `wss://<host>/v1/shell/edge/<session_id>`, where `<host>` is the control tunnel's own authority — the URL is derived cloud-side from the edge-gateway replica holding this core's tunnel, so it cannot name anything else (SPEC-032). The engine MUST still verify the host equals its control tunnel's before dialling — no second DNS name, no second port, no new outbound firewall rule. A mismatch is rejected with `close_reason = bad_side_channel_host`.
     pub side_channel_url: String,
+}
+
+/// The shape of `BusEventPayload.payload` when `topic = "storage.eviction.aggressive"`. Feeds the `storage.eviction.aggressive` platform-event type (Core-scoped, one-shot, warning). The edge — not the cloud — decides when eviction is "aggressive", because the threshold is defined by the engine's own reclaim cadence (`storage_safety::MAX_RECLAIM_STEPS_PER_TICK`, one bounded batch per watermark sample tick) which the cloud has no visibility into; the same division of labour as `storage.watermark`, where the edge's FSM decides the level. One eviction, or one full batch, is normal operation under disk pressure; this topic is published only when evictions sustained across multiple ticks exceed one batch's worth inside the reporting window, i.e. eviction is outrunning retention. Deliberately counts and durations only: no clip ids, no camera ids, and above all no `cold_path`/`hot_path`, which are local filesystem paths that can embed customer naming. Unlike `storage.watermark` this is a one-shot EDGE, not a sticky STATE, so an envelope lost to the tunnel is simply lost — acceptable because the condition re-detects on the next window while pressure persists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageEvictionAggressivePayload {
+    /// Total clips evicted in the window (soft + hard).
+    pub evictions: u64,
+    /// Bytes reclaimed by those evictions.
+    pub freed_bytes: u64,
+    /// Subset of `evictions` that had no cold copy and were therefore permanently lost, not merely tiered out of the hot store. Never exceeds `evictions`.
+    pub hard_evictions: u64,
+    /// Length of the rolling window the counts below were accumulated over.
+    pub window_secs: u64,
 }
 
 /// The shape of `BusEventPayload.payload` when `topic = "storage.watermark"`. Mirrors the edge's `storage_safety::StoragePanicEvent` (minus the local `clips_dir` path, which never leaves the box) — the edge's hysteretic watermark FSM (`storage_safety::WatermarkController`, already anti-flap: 5-point hysteresis) is the sole producer. ADR-075's sticky-level argument is what makes Tier 2 acceptable for this event and no other: the edge republishes its CURRENT `level` on every threshold crossing AND on every tunnel (re)connect, not only on crossings, so an envelope dropped by the lossy tunnel is recovered by the very next publish rather than lost. A duplicate publish of the same level is harmless by construction — nothing downstream keys off occurrence count, only the level value.

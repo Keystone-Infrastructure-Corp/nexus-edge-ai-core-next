@@ -19,7 +19,7 @@
 //! that reuses the same cert / key / CA chain as the tunnel itself.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ed25519_dalek::pkcs8::DecodePublicKey;
@@ -36,7 +36,7 @@ use nexus_cloud_client::{
 };
 use nexus_cloud_protocol::v1::{
     BusEventPayload, EdgeDegradation, EdgeHealth, Envelope, EnvelopeBody, EnvelopeMeta,
-    HeartbeatPayload, StorageWatermarkPayload,
+    HeartbeatPayload, StorageEvictionAggressivePayload, StorageWatermarkPayload,
 };
 use nexus_storage::Registry;
 use nexus_storage_cloud::{AzureBlobBackend, GatewaySasIssuer};
@@ -682,6 +682,7 @@ async fn run(
                     &liveness,
                 );
                 let storage_events = pump_storage_events(&*conn, &watermark);
+                let eviction_events = pump_eviction_events(&*conn, &watermark.bus);
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
@@ -704,6 +705,9 @@ async fn run(
                         // down; reconnect (the initial republish on the new
                         // connection is what recovers the sticky level).
                         warn!(core_id = %core_id, "cloud tunnel storage watermark pump exited; will reconnect");
+                    }
+                    _ = eviction_events => {
+                        warn!(core_id = %core_id, "cloud tunnel eviction pump exited; will reconnect");
                     }
                 }
                 cloud_outbox.set_handle(None);
@@ -1390,6 +1394,158 @@ fn storage_watermark_envelope(
     }
 }
 
+/// Rolling window the eviction counts below are accumulated over.
+const EVICTION_WINDOW: Duration = Duration::from_secs(300);
+
+/// Evictions inside one [`EVICTION_WINDOW`] above which eviction counts as
+/// "aggressive". One pressure batch is bounded at
+/// [`MAX_RECLAIM_STEPS_PER_TICK`](crate::storage_safety::MAX_RECLAIM_STEPS_PER_TICK)
+/// evictions per watermark sample tick, so a single burst — the normal
+/// response to one big ingest — must NOT trip this. More than one batch's
+/// worth inside the window means the ladder is running tick after tick, i.e.
+/// eviction is outrunning retention rather than absorbing a spike.
+const EVICTION_AGGRESSIVE_THRESHOLD: u64 = crate::storage_safety::MAX_RECLAIM_STEPS_PER_TICK as u64;
+
+/// Rolling count of evictions used to decide the "aggressive" verdict.
+///
+/// The window advances lazily, on event arrival rather than on a timer: a
+/// quiet period costs nothing and the first eviction after it finds the
+/// window stale and resets. Reporting also resets, so a core sends at most
+/// one envelope per window no matter how hard the ladder is running.
+#[derive(Debug)]
+struct EvictionWindow {
+    started_at: Instant,
+    evictions: u64,
+    hard_evictions: u64,
+    freed_bytes: u64,
+}
+
+impl EvictionWindow {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            evictions: 0,
+            hard_evictions: 0,
+            freed_bytes: 0,
+        }
+    }
+
+    /// Fold one eviction in; returns a payload iff this one tipped the
+    /// window over [`EVICTION_AGGRESSIVE_THRESHOLD`].
+    fn observe(
+        &mut self,
+        event: &serde_json::Value,
+        is_hard: bool,
+    ) -> Option<StorageEvictionAggressivePayload> {
+        let now = Instant::now();
+        if now.duration_since(self.started_at) >= EVICTION_WINDOW {
+            self.reset(now);
+        }
+        self.evictions += 1;
+        if is_hard {
+            self.hard_evictions += 1;
+        }
+        // Only `freed_bytes` is read off the bus payload: the sibling fields
+        // (`clip_id`, `camera_id`, `cold_handle`, and above all `cold_path`,
+        // a local filesystem path) stay on the box.
+        self.freed_bytes += event
+            .get("freed_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if self.evictions <= EVICTION_AGGRESSIVE_THRESHOLD {
+            return None;
+        }
+        let payload = StorageEvictionAggressivePayload {
+            window_secs: EVICTION_WINDOW.as_secs(),
+            evictions: self.evictions,
+            hard_evictions: self.hard_evictions,
+            freed_bytes: self.freed_bytes,
+        };
+        self.reset(now);
+        Some(payload)
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.started_at = now;
+        self.evictions = 0;
+        self.hard_evictions = 0;
+        self.freed_bytes = 0;
+    }
+}
+
+/// ADR-075 Tier 2 — publish `storage.eviction.aggressive` when the reclaim
+/// ladder is deleting footage faster than retention can absorb.
+///
+/// Unlike [`pump_storage_events`] this carries a one-shot EDGE, not a sticky
+/// STATE, so there is deliberately no republish-on-entry: there is no
+/// "current value" to resync, and an envelope lost to the tunnel is simply
+/// lost. That is acceptable because the condition re-detects on the next
+/// window for as long as the pressure lasts — and the catalogue types it
+/// `is_stateful = false`, so the cloud never leaves a condition open on the
+/// strength of one that got dropped.
+///
+/// Best-effort like every other pump: returns on send failure so the
+/// supervisor reconnects, and parks (rather than spinning) if either
+/// subscription fails.
+async fn pump_eviction_events<H: TunnelHandle>(handle: &H, bus: &Arc<dyn Bus>) {
+    let (mut hot, mut hard) = match (
+        bus.subscribe::<serde_json::Value>(topic::CLIP_HOT_EVICTED)
+            .await,
+        bus.subscribe::<serde_json::Value>(topic::CLIP_HARD_EVICTED)
+            .await,
+    ) {
+        (Ok(hot), Ok(hard)) => (hot, hard),
+        _ => {
+            warn!("failed to subscribe to clip eviction topics; no aggressive-eviction reports on this connection");
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+
+    let mut window = EvictionWindow::new();
+    loop {
+        let (msg, is_hard) = tokio::select! {
+            Some(msg) = hot.next() => (msg, false),
+            Some(msg) = hard.next() => (msg, true),
+            else => break,
+        };
+        let event = match msg {
+            Ok(event) => event,
+            Err(e) => {
+                debug!(error = %e, "clip eviction bus stream error; skipping this message");
+                continue;
+            }
+        };
+        if let Some(payload) = window.observe(&event, is_hard) {
+            if let Err(e) = handle.send(eviction_aggressive_envelope(&payload)).await {
+                warn!(error = %e, "aggressive eviction send failed; pump exiting");
+                return;
+            }
+        }
+    }
+    // Both streams ended (bus dropped, i.e. process shutdown) — park so the
+    // outer `select!` keeps waiting on the other pumps instead of spinning.
+    std::future::pending::<()>().await;
+}
+
+fn eviction_aggressive_envelope(payload: &StorageEvictionAggressivePayload) -> Envelope {
+    Envelope {
+        meta: EnvelopeMeta {
+            id: uuid::Uuid::now_v7().to_string(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+            ts: chrono::Utc::now().to_rfc3339(),
+            v: 1,
+        },
+        body: EnvelopeBody::BusEvent(BusEventPayload {
+            topic: "storage.eviction.aggressive".to_string(),
+            core_id: None,
+            payload: serde_json::json!(payload),
+        }),
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1601,6 +1757,12 @@ mod health_tests {
     /// A binding engine below the threshold must not raise an issue —
     /// otherwise every core with any GPU decode load at all would read
     /// permanently degraded.
+    ///
+    /// Asserts the absence of a `decode` issue rather than
+    /// `status == "ok"`: status folds in the process-global detector
+    /// registry, which a sibling test in this binary writes and never
+    /// clears, so the stronger assertion only passed by winning a race
+    /// (BUG-155).
     #[test]
     fn healthy_decode_capacity_does_not_raise_an_issue() {
         let cap = crate::system_metrics::DecodeCapacity {
@@ -1609,7 +1771,14 @@ mod health_tests {
             oversubscribed: false,
         };
         let health = edge_health(&[], Some(&cap));
-        assert_eq!(health.status, "ok");
+        assert!(
+            !health
+                .issues
+                .unwrap_or_default()
+                .iter()
+                .any(|i| i.component == "decode"),
+            "an under-threshold binding engine must not be reported",
+        );
     }
 }
 
@@ -1658,6 +1827,20 @@ mod storage_watermark_tests {
                     EnvelopeBody::BusEvent(p) => {
                         serde_json::from_value::<StorageWatermarkPayload>(p.payload.clone()).ok()
                     }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Every `bus_event` envelope under `topic`, with its inner payload
+        /// still typed — so a test can assert on the WIRE topic name, not
+        /// just on a shape that happens to deserialize.
+        fn bus_events_on(&self, topic: &str) -> Vec<serde_json::Value> {
+            self.sent
+                .lock()
+                .iter()
+                .filter_map(|env| match &env.body {
+                    EnvelopeBody::BusEvent(p) if p.topic == topic => Some(p.payload.clone()),
                     _ => None,
                 })
                 .collect()
@@ -1835,6 +2018,104 @@ mod storage_watermark_tests {
         );
         assert_eq!(payloads[0].level, "ok");
         assert_eq!(payloads[1].level, "panic");
+    }
+
+    /// Publish `n` evictions on `topic` and wait for the pump to drain them.
+    async fn publish_evictions(bus: &Arc<dyn Bus>, topic: &str, n: u64, freed_bytes: u64) {
+        for _ in 0..n {
+            bus.publish(
+                topic,
+                &serde_json::json!({
+                    "clip_id": 1,
+                    "camera_id": 1,
+                    "cold_path": "usb/NEXUS_ACME_HQ/cam1/clip.mp4",
+                    "freed_bytes": freed_bytes,
+                }),
+            )
+            .await
+            .expect("publish");
+        }
+    }
+
+    /// One pressure batch is normal operation, not an alert. The reclaim
+    /// ladder is bounded at `MAX_RECLAIM_STEPS_PER_TICK` evictions per
+    /// watermark sample tick, so exactly that many must NOT report.
+    #[tokio::test]
+    async fn one_reclaim_batch_is_not_aggressive() {
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(256));
+        let tunnel = CapturingTunnel::new();
+        let pump = pump_eviction_events(&*tunnel, &bus);
+        let drive = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            publish_evictions(
+                &bus,
+                topic::CLIP_HOT_EVICTED,
+                EVICTION_AGGRESSIVE_THRESHOLD,
+                1,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        tokio::select! {
+            () = pump => {}
+            () = drive => {}
+        }
+
+        assert!(
+            tunnel
+                .bus_events_on("storage.eviction.aggressive")
+                .is_empty(),
+            "a single bounded reclaim batch must not report as aggressive",
+        );
+    }
+
+    /// More than one batch's worth inside the window means eviction is
+    /// running tick after tick — that is the condition, and it must reach
+    /// the cloud as a `bus_event` on the wire topic the gateway allow-lists.
+    #[tokio::test]
+    async fn sustained_eviction_reports_on_the_wire_topic() {
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(256));
+        let tunnel = CapturingTunnel::new();
+        let pump = pump_eviction_events(&*tunnel, &bus);
+        let drive = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            publish_evictions(
+                &bus,
+                topic::CLIP_HOT_EVICTED,
+                EVICTION_AGGRESSIVE_THRESHOLD,
+                1024,
+            )
+            .await;
+            // The one that tips it over, and the only hard eviction.
+            publish_evictions(&bus, topic::CLIP_HARD_EVICTED, 1, 2048).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        tokio::select! {
+            () = pump => {}
+            () = drive => {}
+        }
+
+        let sent = tunnel.bus_events_on("storage.eviction.aggressive");
+        assert_eq!(
+            sent.len(),
+            1,
+            "the window resets on report, so sustained pressure sends once per window",
+        );
+        let ev: StorageEvictionAggressivePayload =
+            serde_json::from_value(sent[0].clone()).expect("payload matches the wire schema");
+        assert_eq!(ev.evictions, EVICTION_AGGRESSIVE_THRESHOLD + 1);
+        assert_eq!(ev.hard_evictions, 1);
+        assert_eq!(ev.freed_bytes, EVICTION_AGGRESSIVE_THRESHOLD * 1024 + 2048);
+        assert_eq!(ev.window_secs, EVICTION_WINDOW.as_secs());
+
+        // AGENTS.md payload hygiene: the bus payload carries `cold_path`, a
+        // local filesystem path that can embed a customer's name. It must
+        // not survive the bridge.
+        let serialized = serde_json::to_string(&sent[0]).expect("serialize");
+        assert!(
+            !serialized.contains("cold_path") && !serialized.contains("NEXUS_ACME_HQ"),
+            "no filesystem paths on the wire, got {serialized}",
+        );
     }
 }
 
