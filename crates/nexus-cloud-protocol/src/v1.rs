@@ -91,7 +91,7 @@ pub struct AlertPayload {
     pub verification_state: Option<VerificationState>,
 }
 
-/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines two topics: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`, and `storage.eviction.aggressive`, whose `payload` deserializes as `StorageEvictionAggressivePayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
+/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines three topics: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`, `storage.eviction.aggressive`, whose `payload` deserializes as `StorageEvictionAggressivePayload`, and `sink.delivery.health`, whose `payload` deserializes as `SinkDeliveryHealthPayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BusEventPayload {
@@ -691,6 +691,32 @@ pub struct ShellSessionOpenPayload {
     pub session_id: Uuid,
     /// `wss://<host>/v1/shell/edge/<session_id>`, where `<host>` is the control tunnel's own authority — the URL is derived cloud-side from the edge-gateway replica holding this core's tunnel, so it cannot name anything else (SPEC-032). The engine MUST still verify the host equals its control tunnel's before dialling — no second DNS name, no second port, no new outbound firewall rule. A mismatch is rejected with `close_reason = bad_side_channel_host`.
     pub side_channel_url: String,
+}
+
+/// One sink's delivery counters inside a `SinkDeliveryHealthPayload` window. Identifiers and counts only — the sink's URL, mailbox or SureView endpoint never leaves the edge (REPO_BOUNDARY R5b), and neither does `alert_sink_outbox.last_error`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkDeliveryCounts {
+    /// Rows dead-lettered to this sink inside the window — retries exhausted, the alert will never be delivered.
+    pub dead: u64,
+    /// Outbox rows whose FIRST delivery attempt failed during the window. Deliberately not every failed attempt: the retry schedule allows 8 per row, so a per-attempt count would report one outage eight times.
+    pub first_failures: u64,
+    /// The operator-assigned sink identifier (`nexus_sinks::SinkId`). An id, never an endpoint.
+    pub sink_id: String,
+}
+
+/// The shape of `BusEventPayload.payload` when `topic = "sink.delivery.health"`. One periodic sample of the edge's alert-delivery outbox, feeding three platform-event types at once: `sink.outbox.backlogged` (stateful — open while `queued > queue_threshold`, resolve below it), `sink.delivery.dead` (stateful, per sink — open while that sink's `dead` is non-zero, resolve at zero) and `sink.delivery.failed` (one-shot, per sink — appended when `first_failures` is non-zero). The edge sets `queue_threshold` because it is the dispatcher's own drain cadence (`nexus_sinks::dispatcher::BATCH_SIZE`, one bounded sweep per tick), which the cloud has no visibility into — the same division of labour as `storage.watermark`. Sticky like `storage.watermark`, not one-shot: the sample is re-sent on every reconnect and whenever the picture changes, so a lost envelope cannot strand an open condition. Deliberately ids, counts and durations only — never `alert_sink_outbox.last_error` (free-form remote text) and never a sink's URL, mailbox or endpoint, which stay edge-resident per REPO_BOUNDARY R5b.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkDeliveryHealthPayload {
+    /// Depth above which the edge considers the outbox backlogged. One dispatcher sweep's worth of rows: at or below it the queue is under a single tick's work.
+    pub queue_threshold: u64,
+    /// Outbox rows still awaiting delivery at sample time (the same depth `HeartbeatPayload.queued_alerts` reports).
+    pub queued: u64,
+    /// One entry per sink seen in the outbox during the window, INCLUDING sinks with all-zero counters — an absent-vs-zero distinction the cloud needs to resolve a condition rather than leave it open forever. Bounded so the sample cannot approach the gateway's per-payload ceiling.
+    pub sinks: Vec<SinkDeliveryCounts>,
+    /// Length of the sampling window the per-sink counters below were accumulated over.
+    pub window_secs: u64,
 }
 
 /// The shape of `BusEventPayload.payload` when `topic = "storage.eviction.aggressive"`. Feeds the `storage.eviction.aggressive` platform-event type (Core-scoped, one-shot, warning). The edge — not the cloud — decides when eviction is "aggressive", because the threshold is defined by the engine's own reclaim cadence (`storage_safety::MAX_RECLAIM_STEPS_PER_TICK`, one bounded batch per watermark sample tick) which the cloud has no visibility into; the same division of labour as `storage.watermark`, where the edge's FSM decides the level. One eviction, or one full batch, is normal operation under disk pressure; this topic is published only when evictions sustained across multiple ticks exceed one batch's worth inside the reporting window, i.e. eviction is outrunning retention. Deliberately counts and durations only: no clip ids, no camera ids, and above all no `cold_path`/`hot_path`, which are local filesystem paths that can embed customer naming. Unlike `storage.watermark` this is a one-shot EDGE, not a sticky STATE, so an envelope lost to the tunnel is simply lost — acceptable because the condition re-detects on the next window while pressure persists.

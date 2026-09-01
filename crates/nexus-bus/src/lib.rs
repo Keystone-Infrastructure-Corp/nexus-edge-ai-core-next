@@ -134,6 +134,17 @@ pub mod topic {
     /// subscriber that drops an intermediate signal still converges
     /// on the next signal.
     pub const SINK_CONFIG_CHANGED: &str = "sink.config.changed";
+
+    /// An outbox row reached a delivery outcome the cloud needs to
+    /// hear about. Payload is
+    /// `nexus_sinks::dispatcher::SinkDeliveryOutcomeEvent { sink_id,
+    /// outcome }` — an id and an enum, never the row's `last_error`
+    /// or the sink's endpoint. Published on the two transitions the
+    /// outbox table cannot be sampled for: a row's FIRST failed
+    /// delivery attempt (a retrying row is written back as `pending`,
+    /// so only `attempts` distinguishes it, and it sits in first
+    /// retry for 500 ms) and dead-lettering.
+    pub const SINK_DELIVERY_OUTCOME: &str = "sink.delivery.outcome";
 }
 
 // ---------------------------------------------------------------------------

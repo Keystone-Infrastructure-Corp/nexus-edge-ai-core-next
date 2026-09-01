@@ -29,6 +29,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use nexus_bus::{topic, BroadcastBus, Bus, BusExt};
 use nexus_config::{CameraConfig, StoreConfig};
 use nexus_sinks::backoff::MAX_ATTEMPTS;
 use nexus_sinks::dispatcher::{self, AllowAllPolicy, DeliveryPolicy, DeliveryVerdict};
@@ -216,7 +218,16 @@ async fn delivers_pending_row_marks_sent() {
     registry.replace(vec![sink.clone()]);
 
     let (_alert, row) = enqueue_one(&store, 1, "rule.ok", id.as_str()).await;
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     assert_eq!(sink.calls(), 1);
     let after = store
@@ -249,7 +260,16 @@ async fn permanent_error_marks_dead() {
     registry.replace(vec![sink.clone()]);
 
     let (_alert, row) = enqueue_one(&store, 1, "rule.p", id.as_str()).await;
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     assert_eq!(sink.calls(), 1);
     let after = store
@@ -284,7 +304,16 @@ async fn transient_error_schedules_retry() {
 
     let (_alert, row) = enqueue_one(&store, 1, "rule.t", id.as_str()).await;
     let before = Utc::now();
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     assert_eq!(sink.calls(), 1);
     let after = store
@@ -349,6 +378,7 @@ async fn exhausted_retries_become_dead() {
         &AllowAllPolicy,
         None,
         None,
+        None,
         row_after_backdate,
     )
     .await;
@@ -385,6 +415,7 @@ async fn suppressed_by_policy_marks_suppressed() {
         &SuppressOnlyPolicy,
         None,
         None,
+        None,
         row.clone(),
     )
     .await;
@@ -418,7 +449,16 @@ async fn missing_sink_marks_dead() {
 
     let registry = Arc::new(SinkRegistry::new()); // EMPTY
     let (_alert, row) = enqueue_one(&store, 1, "rule.miss", "webhook:gone").await;
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     let after = store
         .outbox_for_event(&row.event_id)
@@ -480,7 +520,16 @@ async fn missing_event_marks_dead() {
             .unwrap();
     }
 
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     assert_eq!(sink.calls(), 0, "deliver() must not be called");
     let after = store
@@ -521,7 +570,16 @@ async fn malformed_sink_id_marks_dead() {
         .next()
         .unwrap();
 
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     let after = store
         .outbox_for_event(&row.event_id)
@@ -559,7 +617,16 @@ async fn no_clip_linked_within_grace_schedules_retry() {
     // sample_alert's captured_at is Utc::now() → inside the grace.
     let (_alert, row) = enqueue_one(&store, 1, "rule.clip", id.as_str()).await;
     let before = Utc::now();
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     assert_eq!(sink.calls(), 0, "must not deliver while clip link pending");
     let after = store
@@ -614,7 +681,16 @@ async fn no_clip_linked_after_grace_delivers() {
         .next()
         .unwrap();
 
-    dispatcher::process_row(&store, &registry, &AllowAllPolicy, None, None, row.clone()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        row.clone(),
+    )
+    .await;
 
     assert_eq!(sink.calls(), 1, "delivers clip-less after grace elapses");
     let after = store
@@ -720,6 +796,7 @@ async fn clip_hot_file_present_delivers_with_clip() {
         &AllowAllPolicy,
         Some(clips_dir.path()),
         None,
+        None,
         row.clone(),
     )
     .await;
@@ -761,6 +838,7 @@ async fn clip_hot_file_missing_within_grace_retries() {
         &registry,
         &AllowAllPolicy,
         Some(clips_dir.path()),
+        None,
         None,
         row.clone(),
     )
@@ -806,6 +884,7 @@ async fn clip_soft_evicted_within_grace_retries() {
         &registry,
         &AllowAllPolicy,
         Some(clips_dir.path()),
+        None,
         None,
         row.clone(),
     )
@@ -864,6 +943,7 @@ async fn clip_soft_evicted_after_grace_delivers_clipless() {
         &AllowAllPolicy,
         Some(clips_dir.path()),
         None,
+        None,
         row.clone(),
     )
     .await;
@@ -920,6 +1000,7 @@ async fn alert_clip_building_within_grace_retries() {
         &registry,
         &AllowAllPolicy,
         Some(clips_dir.path()),
+        None,
         None,
         row.clone(),
     )
@@ -992,6 +1073,7 @@ async fn alert_clip_wait_does_not_consume_retry_budget() {
             &registry,
             &AllowAllPolicy,
             Some(clips_dir.path()),
+            None,
             None,
             row.clone(),
         )
@@ -1068,6 +1150,7 @@ async fn future_dated_event_does_not_wait_forever() {
         &AllowAllPolicy,
         Some(clips_dir.path()),
         None,
+        None,
         row.clone(),
     )
     .await;
@@ -1132,6 +1215,7 @@ async fn alert_clip_ready_delivers_with_clip() {
         &AllowAllPolicy,
         Some(clips_dir.path()),
         None,
+        None,
         row.clone(),
     )
     .await;
@@ -1183,6 +1267,7 @@ async fn alert_clip_failed_delivers_clipless() {
         &AllowAllPolicy,
         Some(clips_dir.path()),
         None,
+        None,
         row.clone(),
     )
     .await;
@@ -1196,4 +1281,76 @@ async fn alert_clip_failed_delivers_clipless() {
         .next()
         .unwrap();
     assert_eq!(after.status, OutboxStatus::Sent);
+}
+
+/// The delivery-outcome bridge carries an id and an enum, and nothing
+/// else. The endpoint's own error text is the thing most likely to leak
+/// a URL, a mailbox or a token, and `alert_sink_outbox.last_error` keeps
+/// it verbatim — so the assertion is on the published payload, taken
+/// from a failure whose message contains all three.
+#[tokio::test]
+async fn a_delivery_outcome_publishes_an_id_and_an_enum_only() {
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    let id = SinkId::new("webhook", "leaky").unwrap();
+    let sink = Arc::new(ScriptedSink::new(
+        id.clone(),
+        vec![Err(SinkError::Transient(
+            "POST https://hook.example/t/abc123 failed for ops@example.com".into(),
+        ))],
+    ));
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(16));
+    let mut outcomes = bus
+        .subscribe::<serde_json::Value>(topic::SINK_DELIVERY_OUTCOME)
+        .await
+        .expect("subscribe");
+
+    let (_alert, row) = enqueue_one(&store, 1, "rule.leak", id.as_str()).await;
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        Some(&bus),
+        row.clone(),
+    )
+    .await;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), outcomes.next())
+        .await
+        .expect("an outcome is published")
+        .expect("stream open")
+        .expect("well-formed");
+    assert_eq!(event["sink_id"], "webhook:leaky");
+    assert_eq!(event["outcome"], "first_failure");
+
+    let serialized = serde_json::to_string(&event).unwrap();
+    for forbidden in ["https", "hook.example", "abc123", "@", "last_error"] {
+        assert!(
+            !serialized.contains(forbidden),
+            "{forbidden:?} must not reach the delivery-outcome bridge, got {serialized}",
+        );
+    }
+    // The row still records the error locally — the boundary is the bus,
+    // not the outbox.
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(after
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("hook.example"));
 }

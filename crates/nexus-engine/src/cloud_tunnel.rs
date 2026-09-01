@@ -36,7 +36,8 @@ use nexus_cloud_client::{
 };
 use nexus_cloud_protocol::v1::{
     BusEventPayload, EdgeDegradation, EdgeHealth, Envelope, EnvelopeBody, EnvelopeMeta,
-    HeartbeatPayload, StorageEvictionAggressivePayload, StorageWatermarkPayload,
+    HeartbeatPayload, SinkDeliveryCounts, SinkDeliveryHealthPayload,
+    StorageEvictionAggressivePayload, StorageWatermarkPayload,
 };
 use nexus_storage::Registry;
 use nexus_storage_cloud::{AzureBlobBackend, GatewaySasIssuer};
@@ -683,6 +684,7 @@ async fn run(
                 );
                 let storage_events = pump_storage_events(&*conn, &watermark);
                 let eviction_events = pump_eviction_events(&*conn, &watermark.bus);
+                let sink_health = pump_sink_delivery_health(&*conn, &watermark.bus, &store);
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
@@ -708,6 +710,9 @@ async fn run(
                     }
                     _ = eviction_events => {
                         warn!(core_id = %core_id, "cloud tunnel eviction pump exited; will reconnect");
+                    }
+                    _ = sink_health => {
+                        warn!(core_id = %core_id, "cloud tunnel sink delivery-health pump exited; will reconnect");
                     }
                 }
                 cloud_outbox.set_handle(None);
@@ -1546,6 +1551,168 @@ fn eviction_aggressive_envelope(payload: &StorageEvictionAggressivePayload) -> E
     }
 }
 
+/// How often the delivery-health sample below is taken and sent.
+const SINK_HEALTH_WINDOW: Duration = Duration::from_secs(60);
+
+/// Most sinks reported in one sample. `BusEventPayload.payload` is capped
+/// at 4 KiB by the gateway and the schema caps `sinks` at 32; a site with
+/// more configured sinks than this reports the busiest ones and drops the
+/// tail rather than having the whole envelope rejected.
+const SINK_HEALTH_MAX_SINKS: usize = 32;
+
+/// Rolling per-sink delivery counters between two samples.
+#[derive(Debug, Default)]
+struct SinkHealthWindow {
+    /// `sink_id` → (first failures, dead-letters) since the last send.
+    counts: std::collections::BTreeMap<String, (u64, u64)>,
+}
+
+impl SinkHealthWindow {
+    fn observe(&mut self, event: &nexus_sinks::dispatcher::SinkDeliveryOutcomeEvent) {
+        let entry = self.counts.entry(event.sink_id.clone()).or_default();
+        match event.outcome {
+            nexus_sinks::dispatcher::SinkDeliveryOutcome::FirstFailure => entry.0 += 1,
+            nexus_sinks::dispatcher::SinkDeliveryOutcome::Dead => entry.1 += 1,
+        }
+    }
+
+    /// Drain the window into a wire payload. Sinks are ordered busiest
+    /// first so the `SINK_HEALTH_MAX_SINKS` truncation drops the quietest.
+    fn drain(&mut self, queued: u64) -> SinkDeliveryHealthPayload {
+        let mut sinks: Vec<SinkDeliveryCounts> = std::mem::take(&mut self.counts)
+            .into_iter()
+            .map(|(sink_id, (first_failures, dead))| SinkDeliveryCounts {
+                sink_id,
+                first_failures,
+                dead,
+            })
+            .collect();
+        sinks.sort_by_key(|s| std::cmp::Reverse(s.first_failures + s.dead));
+        sinks.truncate(SINK_HEALTH_MAX_SINKS);
+        SinkDeliveryHealthPayload {
+            window_secs: SINK_HEALTH_WINDOW.as_secs(),
+            queued,
+            queue_threshold: nexus_sinks::dispatcher::BATCH_SIZE.max(1) as u64,
+            sinks,
+        }
+    }
+}
+
+/// True when a sample says nothing an operator would act on: the queue is
+/// under one sweep's worth and no sink failed or dead-lettered.
+fn sink_health_is_quiet(p: &SinkDeliveryHealthPayload) -> bool {
+    p.queued <= p.queue_threshold && p.sinks.iter().all(|s| s.first_failures == 0 && s.dead == 0)
+}
+
+/// ADR-075 Tier 2 — publish a periodic sample of the alert-delivery
+/// outbox, feeding `sink.outbox.backlogged`, `sink.delivery.dead` and
+/// `sink.delivery.failed`.
+///
+/// Sticky like [`pump_storage_events`], not one-shot like
+/// [`pump_eviction_events`]: two of the three types it feeds are
+/// `is_stateful`, so an envelope lost to the tunnel must not be able to
+/// strand an open condition. Two mechanisms guarantee the resolve is
+/// always reachable — the first sample on every connection is sent
+/// unconditionally (a reconnect resyncs the picture), and afterwards a
+/// clean sample is still sent whenever the previous one was not, which is
+/// the transition back to healthy.
+///
+/// The counters come off the bus rather than out of `alert_sink_outbox`
+/// because neither transition survives sampling: `outbox_mark_failed`
+/// writes a retrying row back as `pending`, and `outbox_counts_since`
+/// buckets on `created_at` rather than on when a row died. `queued` is a
+/// point-in-time gauge, so it is read from the store at each sample.
+///
+/// Best-effort like every other pump: returns on send failure so the
+/// supervisor reconnects, and parks (rather than spinning) if the
+/// subscription fails.
+async fn pump_sink_delivery_health<H: TunnelHandle>(
+    handle: &H,
+    bus: &Arc<dyn Bus>,
+    store: &Arc<Store>,
+) {
+    let mut outcomes = match bus
+        .subscribe::<nexus_sinks::dispatcher::SinkDeliveryOutcomeEvent>(
+            topic::SINK_DELIVERY_OUTCOME,
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "failed to subscribe to sink delivery outcomes; no delivery-health reports on this connection");
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+
+    let mut window = SinkHealthWindow::default();
+    let mut ticker = tokio::time::interval(SINK_HEALTH_WINDOW);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick (tokio fires `interval` at t=0). A
+    // sample taken before any outcome has been observed would report a
+    // clean window and resolve conditions that are still true — a
+    // reconnect must not be able to clear a real one.
+    ticker.tick().await;
+    // Starts `false` so the first real sample always goes out, however
+    // healthy: that is this connection's resync of the sticky state.
+    let mut last_was_quiet = false;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let queued = match store.outbox_queued_count().await {
+                    Ok(n) => u64::try_from(n).unwrap_or(0),
+                    Err(e) => {
+                        warn!(error = %e, "sink delivery health: outbox depth query failed; skipping this sample");
+                        continue;
+                    }
+                };
+                let payload = window.drain(queued);
+                let quiet = sink_health_is_quiet(&payload);
+                if quiet && last_was_quiet {
+                    continue;
+                }
+                last_was_quiet = quiet;
+                if let Err(e) = handle.send(sink_delivery_health_envelope(&payload)).await {
+                    warn!(error = %e, "sink delivery health send failed; pump exiting");
+                    return;
+                }
+            }
+            msg = outcomes.next() => {
+                match msg {
+                    Some(Ok(event)) => window.observe(&event),
+                    Some(Err(e)) => {
+                        debug!(error = %e, "sink delivery outcome bus stream error; skipping this message");
+                    }
+                    // Stream ended (bus dropped, i.e. process shutdown) — park
+                    // so the outer `select!` keeps waiting on the other pumps.
+                    None => {
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sink_delivery_health_envelope(payload: &SinkDeliveryHealthPayload) -> Envelope {
+    Envelope {
+        meta: EnvelopeMeta {
+            id: uuid::Uuid::now_v7().to_string(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+            ts: chrono::Utc::now().to_rfc3339(),
+            v: 1,
+        },
+        body: EnvelopeBody::BusEvent(BusEventPayload {
+            topic: "sink.delivery.health".to_string(),
+            core_id: None,
+            payload: serde_json::json!(payload),
+        }),
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2116,6 +2283,110 @@ mod storage_watermark_tests {
             !serialized.contains("cold_path") && !serialized.contains("NEXUS_ACME_HQ"),
             "no filesystem paths on the wire, got {serialized}",
         );
+    }
+
+    /// One sample's worth of outcomes is reported once each, under the
+    /// sink's id — the counters the cloud turns into `sink.delivery.failed`
+    /// and `sink.delivery.dead`.
+    #[test]
+    fn a_window_reports_each_outcome_once_per_sink() {
+        let mut window = SinkHealthWindow::default();
+        for outcome in [
+            nexus_sinks::dispatcher::SinkDeliveryOutcome::FirstFailure,
+            nexus_sinks::dispatcher::SinkDeliveryOutcome::FirstFailure,
+            nexus_sinks::dispatcher::SinkDeliveryOutcome::Dead,
+        ] {
+            window.observe(&nexus_sinks::dispatcher::SinkDeliveryOutcomeEvent {
+                sink_id: "webhook:primary".to_string(),
+                outcome,
+            });
+        }
+        window.observe(&nexus_sinks::dispatcher::SinkDeliveryOutcomeEvent {
+            sink_id: "sureview:b".to_string(),
+            outcome: nexus_sinks::dispatcher::SinkDeliveryOutcome::Dead,
+        });
+
+        let payload = window.drain(0);
+        assert_eq!(payload.sinks.len(), 2, "one entry per sink");
+        let primary = payload
+            .sinks
+            .iter()
+            .find(|s| s.sink_id == "webhook:primary")
+            .expect("the busy sink is reported");
+        assert_eq!(primary.first_failures, 2);
+        assert_eq!(primary.dead, 1);
+
+        // Draining is what bounds the report: the next window starts empty,
+        // so one outage is not re-reported every minute for as long as it
+        // lasts.
+        assert!(
+            window.drain(0).sinks.is_empty(),
+            "the window resets on drain"
+        );
+    }
+
+    /// The edge, not the cloud, decides what "backlogged" means, because
+    /// the threshold is the dispatcher's own sweep size.
+    #[test]
+    fn the_queue_threshold_is_the_dispatcher_batch_size() {
+        let payload = SinkHealthWindow::default().drain(0);
+        assert_eq!(
+            payload.queue_threshold,
+            nexus_sinks::dispatcher::BATCH_SIZE as u64,
+        );
+        assert_eq!(payload.window_secs, SINK_HEALTH_WINDOW.as_secs());
+    }
+
+    /// `sink_health_is_quiet` is what stops a healthy core sending a sample
+    /// a minute forever — and, paired with the pump's `last_was_quiet`,
+    /// what guarantees the ONE sample that resolves a stateful condition
+    /// still goes out. A depth exactly at the threshold is under one
+    /// sweep's work and must not count as backlogged.
+    #[test]
+    fn quiet_means_nothing_failed_and_the_queue_is_within_one_sweep() {
+        let threshold = SinkHealthWindow::default().drain(0).queue_threshold;
+        assert!(sink_health_is_quiet(
+            &SinkHealthWindow::default().drain(threshold)
+        ));
+        assert!(!sink_health_is_quiet(
+            &SinkHealthWindow::default().drain(threshold + 1)
+        ));
+
+        let mut window = SinkHealthWindow::default();
+        window.observe(&nexus_sinks::dispatcher::SinkDeliveryOutcomeEvent {
+            sink_id: "webhook:primary".to_string(),
+            outcome: nexus_sinks::dispatcher::SinkDeliveryOutcome::Dead,
+        });
+        assert!(
+            !sink_health_is_quiet(&window.drain(0)),
+            "a dead-lettering sink is never quiet, however short the queue",
+        );
+    }
+
+    /// The bridge is only useful if the cloud recognises the topic, and the
+    /// payload must carry ids and counts — never the sink's endpoint.
+    #[test]
+    fn the_sample_rides_its_own_wire_topic_and_carries_ids_only() {
+        let mut window = SinkHealthWindow::default();
+        window.observe(&nexus_sinks::dispatcher::SinkDeliveryOutcomeEvent {
+            sink_id: "webhook:primary".to_string(),
+            outcome: nexus_sinks::dispatcher::SinkDeliveryOutcome::Dead,
+        });
+        let env = sink_delivery_health_envelope(&window.drain(9));
+        let EnvelopeBody::BusEvent(body) = &env.body else {
+            panic!("expected a bus_event envelope, got {:?}", env.body);
+        };
+        assert_eq!(body.topic, "sink.delivery.health");
+        assert_eq!(body.core_id, None, "scope comes from the cert, not here");
+        assert_eq!(body.payload["sinks"][0]["sink_id"], "webhook:primary");
+
+        let serialized = serde_json::to_string(&env).expect("serialize");
+        for forbidden in ["last_error", "http", "@"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "{forbidden:?} must not reach the wire, got {serialized}",
+            );
+        }
     }
 }
 
