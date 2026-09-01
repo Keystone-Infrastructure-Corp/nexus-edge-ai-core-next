@@ -88,10 +88,24 @@ pub struct SinkDeliveryOutcomeEvent {
 /// Best-effort publish of one delivery outcome. A bus with no
 /// subscriber (no cloud tunnel) is the normal single-site case, so a
 /// publish error is debug-level and never affects the row's fate.
+///
+/// `sink_id` arrives as the raw `alert_sink_outbox.sink_id` column, so it
+/// is re-parsed here rather than trusted: the dead-letter path that fires
+/// on an unparseable id would otherwise publish across the tunnel exactly
+/// the value it just rejected as malformed. A row whose id will not parse
+/// cannot be attributed to a sink, so there is nothing to report about it
+/// and it is dropped. One choke point covers both call sites.
 async fn publish_outcome(bus: Option<&Arc<dyn Bus>>, sink_id: &str, outcome: SinkDeliveryOutcome) {
     let Some(bus) = bus else { return };
+    let Some(parsed) = SinkId::parse(sink_id) else {
+        debug!(
+            sink_id,
+            "sink dispatcher: unparseable sink_id, not publishing a delivery outcome for it"
+        );
+        return;
+    };
     let event = SinkDeliveryOutcomeEvent {
-        sink_id: sink_id.to_string(),
+        sink_id: parsed.as_str().to_string(),
         outcome,
     };
     if let Err(e) = bus.publish(topic::SINK_DELIVERY_OUTCOME, &event).await {

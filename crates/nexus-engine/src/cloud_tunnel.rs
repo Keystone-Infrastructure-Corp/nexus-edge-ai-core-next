@@ -19,7 +19,7 @@
 //! that reuses the same cert / key / CA chain as the tunnel itself.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ed25519_dalek::pkcs8::DecodePublicKey;
@@ -641,6 +641,10 @@ async fn run(
     }
     let mut backoff = BACKOFF_MIN;
     let core_id = enrollment.core_id.clone();
+    // Outlives the connection on purpose: this is the decode-health
+    // baseline, and rebuilding it per connection would make the census sent
+    // on reconnect all-zero (see `pump_camera_decode_health`).
+    let mut decode_window = DecodeHealthWindow::default();
     loop {
         // Check for shutdown before each connect attempt.
         if shutdown.try_recv().is_ok() {
@@ -688,7 +692,8 @@ async fn run(
                 let storage_events = pump_storage_events(&*conn, &watermark);
                 let eviction_events = pump_eviction_events(&*conn, &watermark.bus);
                 let sink_health = pump_sink_delivery_health(&*conn, &watermark.bus, &store);
-                let decode_events = pump_camera_decode_health(&*conn, &decode_health);
+                let decode_events =
+                    pump_camera_decode_health(&*conn, &decode_health, &mut decode_window);
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
@@ -1409,50 +1414,67 @@ fn storage_watermark_envelope(
 /// Rolling window the eviction counts below are accumulated over.
 const EVICTION_WINDOW: Duration = Duration::from_secs(300);
 
-/// Evictions inside one [`EVICTION_WINDOW`] above which eviction counts as
-/// "aggressive". One pressure batch is bounded at
-/// [`MAX_RECLAIM_STEPS_PER_TICK`](crate::storage_safety::MAX_RECLAIM_STEPS_PER_TICK)
-/// evictions per watermark sample tick, so a single burst — the normal
-/// response to one big ingest — must NOT trip this. More than one batch's
-/// worth inside the window means the ladder is running tick after tick, i.e.
-/// eviction is outrunning retention rather than absorbing a spike.
-const EVICTION_AGGRESSIVE_THRESHOLD: u64 = crate::storage_safety::MAX_RECLAIM_STEPS_PER_TICK as u64;
-
-/// Rolling count of evictions used to decide the "aggressive" verdict.
+/// Multiple of the window's clip closures that evictions must exceed for
+/// eviction to count as "aggressive".
 ///
-/// The window advances lazily, on event arrival rather than on a timer: a
-/// quiet period costs nothing and the first eviction after it finds the
-/// window stale and resets. Reporting also resets, so a core sends at most
-/// one envelope per window no matter how hard the ladder is running.
+/// The verdict is a RATIO rather than a count, and that is the whole point.
+/// Eviction only runs at Low or Panic
+/// ([`storage_safety`](crate::storage_safety) gates the reclaim ladder on
+/// the watermark level), which is exactly where a healthy retention-limited
+/// recorder permanently lives once the disk has filled — so an absolute
+/// count of evictions per window measures how many cameras the site has,
+/// not whether anything is wrong. A 4-camera site never reaches any
+/// count-based threshold and a 32-camera site clears it continuously, and
+/// both are fine. What is *not* fine at either size is deleting footage
+/// materially faster than it is being written: at steady state a full disk
+/// evicts roughly one clip per clip closed, so a ratio above two means
+/// retention depth is collapsing rather than holding.
+const EVICTION_AGGRESSIVE_RATIO: u64 = 2;
+
+/// Evictions below which a window is too small to draw a ratio from.
+///
+/// Only the degenerate end needs suppressing: with zero clips closed *any*
+/// eviction count beats the ratio, so a near-idle box that tidied up three
+/// clips would report. One full reclaim batch
+/// ([`MAX_RECLAIM_STEPS_PER_TICK`](crate::storage_safety::MAX_RECLAIM_STEPS_PER_TICK))
+/// is the floor because it is a real statement about the mechanism — at
+/// least one tick spent its entire reclaim budget — rather than an invented
+/// number. It costs sensitivity on a small site evicting less than a batch
+/// per window, which is the right way round for a warning nobody can act on
+/// twice.
+const EVICTION_MIN_SAMPLE: u64 = crate::storage_safety::MAX_RECLAIM_STEPS_PER_TICK as u64;
+
+/// Eviction and clip-closure counts for the window currently being filled.
+///
+/// Unlike a lazily-advanced window, this one is closed by a timer (see
+/// [`pump_eviction_events`]) so that both counts cover the same interval.
+/// Judging on eviction arrival instead would compare a full reclaim batch —
+/// which lands all at once, on a watermark tick — against however few clips
+/// happened to close before it, and report a healthy site every window.
 #[derive(Debug)]
 struct EvictionWindow {
-    started_at: Instant,
     evictions: u64,
     hard_evictions: u64,
+    clips_closed: u64,
     freed_bytes: u64,
+    /// False while an episode is already being reported. One sustained
+    /// episode notifies once; a window that does not trip re-arms it.
+    armed: bool,
 }
 
 impl EvictionWindow {
     fn new() -> Self {
         Self {
-            started_at: Instant::now(),
             evictions: 0,
             hard_evictions: 0,
+            clips_closed: 0,
             freed_bytes: 0,
+            armed: true,
         }
     }
 
-    /// Fold one eviction in; returns a payload iff this one tipped the
-    /// window over [`EVICTION_AGGRESSIVE_THRESHOLD`].
-    fn observe(
-        &mut self,
-        event: &serde_json::Value,
-        is_hard: bool,
-    ) -> Option<StorageEvictionAggressivePayload> {
-        let now = Instant::now();
-        if now.duration_since(self.started_at) >= EVICTION_WINDOW {
-            self.reset(now);
-        }
+    /// Fold one eviction into the open window.
+    fn observe_eviction(&mut self, event: &serde_json::Value, is_hard: bool) {
         self.evictions += 1;
         if is_hard {
             self.hard_evictions += 1;
@@ -1464,49 +1486,70 @@ impl EvictionWindow {
             .get("freed_bytes")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        if self.evictions <= EVICTION_AGGRESSIVE_THRESHOLD {
-            return None;
-        }
-        let payload = StorageEvictionAggressivePayload {
+    }
+
+    /// Fold one finished recording into the open window — the denominator.
+    fn observe_clip_closed(&mut self) {
+        self.clips_closed += 1;
+    }
+
+    /// True when this window's counts describe eviction outrunning
+    /// recording, independent of how many cameras the site runs.
+    fn is_aggressive(&self) -> bool {
+        self.evictions >= EVICTION_MIN_SAMPLE
+            && self.evictions > EVICTION_AGGRESSIVE_RATIO.saturating_mul(self.clips_closed)
+    }
+
+    /// Close the window: return a payload iff it tripped *and* this is the
+    /// first window of the episode, then reset for the next one.
+    fn close(&mut self) -> Option<StorageEvictionAggressivePayload> {
+        let tripped = self.is_aggressive();
+        let payload = (tripped && self.armed).then(|| StorageEvictionAggressivePayload {
             window_secs: EVICTION_WINDOW.as_secs(),
             evictions: self.evictions,
             hard_evictions: self.hard_evictions,
+            clips_closed: Some(self.clips_closed),
             freed_bytes: self.freed_bytes,
-        };
-        self.reset(now);
-        Some(payload)
-    }
-
-    fn reset(&mut self, now: Instant) {
-        self.started_at = now;
+        });
+        // Re-arm only once pressure has actually let up, so a core that
+        // stays aggressive for an hour reports at the start of the episode
+        // and then stays quiet.
+        self.armed = !tripped;
         self.evictions = 0;
         self.hard_evictions = 0;
+        self.clips_closed = 0;
         self.freed_bytes = 0;
+        payload
     }
 }
 
 /// ADR-075 Tier 2 — publish `storage.eviction.aggressive` when the reclaim
-/// ladder is deleting footage faster than retention can absorb.
+/// ladder is deleting footage faster than the recorder is writing it.
 ///
 /// Unlike [`pump_storage_events`] this carries a one-shot EDGE, not a sticky
 /// STATE, so there is deliberately no republish-on-entry: there is no
 /// "current value" to resync, and an envelope lost to the tunnel is simply
-/// lost. That is acceptable because the condition re-detects on the next
-/// window for as long as the pressure lasts — and the catalogue types it
+/// lost. That is acceptable because the catalogue types it
 /// `is_stateful = false`, so the cloud never leaves a condition open on the
-/// strength of one that got dropped.
+/// strength of one that got dropped, and a still-worsening episode
+/// re-detects after the next window that does not trip.
+///
+/// Windows are closed by a timer rather than on eviction arrival so that
+/// evictions and clip closures cover the same interval — see
+/// [`EvictionWindow`] for why judging per-eviction reports healthy sites.
 ///
 /// Best-effort like every other pump: returns on send failure so the
-/// supervisor reconnects, and parks (rather than spinning) if either
+/// supervisor reconnects, and parks (rather than spinning) if any
 /// subscription fails.
 async fn pump_eviction_events<H: TunnelHandle>(handle: &H, bus: &Arc<dyn Bus>) {
-    let (mut hot, mut hard) = match (
+    let (mut hot, mut hard, mut closed) = match (
         bus.subscribe::<serde_json::Value>(topic::CLIP_HOT_EVICTED)
             .await,
         bus.subscribe::<serde_json::Value>(topic::CLIP_HARD_EVICTED)
             .await,
+        bus.subscribe::<serde_json::Value>(topic::CLIP_CLOSED).await,
     ) {
-        (Ok(hot), Ok(hard)) => (hot, hard),
+        (Ok(hot), Ok(hard), Ok(closed)) => (hot, hard, closed),
         _ => {
             warn!("failed to subscribe to clip eviction topics; no aggressive-eviction reports on this connection");
             std::future::pending::<()>().await;
@@ -1515,27 +1558,39 @@ async fn pump_eviction_events<H: TunnelHandle>(handle: &H, bus: &Arc<dyn Bus>) {
     };
 
     let mut window = EvictionWindow::new();
+    let mut ticker = tokio::time::interval(EVICTION_WINDOW);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick (tokio fires `interval` at t=0): a
+    // zero-length window holds no counts and has no ratio to judge. Unlike
+    // the two sticky pumps below there is nothing to resync here, so this
+    // costs no resolve.
+    ticker.tick().await;
     loop {
-        let (msg, is_hard) = tokio::select! {
-            Some(msg) = hot.next() => (msg, false),
-            Some(msg) = hard.next() => (msg, true),
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Some(payload) = window.close() {
+                    if let Err(e) = handle.send(eviction_aggressive_envelope(&payload)).await {
+                        warn!(error = %e, "aggressive eviction send failed; pump exiting");
+                        return;
+                    }
+                }
+            }
+            Some(msg) = hot.next() => match msg {
+                Ok(event) => window.observe_eviction(&event, false),
+                Err(e) => debug!(error = %e, "clip eviction bus stream error; skipping this message"),
+            },
+            Some(msg) = hard.next() => match msg {
+                Ok(event) => window.observe_eviction(&event, true),
+                Err(e) => debug!(error = %e, "clip eviction bus stream error; skipping this message"),
+            },
+            Some(msg) = closed.next() => match msg {
+                Ok(_) => window.observe_clip_closed(),
+                Err(e) => debug!(error = %e, "clip closed bus stream error; skipping this message"),
+            },
             else => break,
-        };
-        let event = match msg {
-            Ok(event) => event,
-            Err(e) => {
-                debug!(error = %e, "clip eviction bus stream error; skipping this message");
-                continue;
-            }
-        };
-        if let Some(payload) = window.observe(&event, is_hard) {
-            if let Err(e) = handle.send(eviction_aggressive_envelope(&payload)).await {
-                warn!(error = %e, "aggressive eviction send failed; pump exiting");
-                return;
-            }
         }
     }
-    // Both streams ended (bus dropped, i.e. process shutdown) — park so the
+    // Every stream ended (bus dropped, i.e. process shutdown) — park so the
     // outer `select!` keeps waiting on the other pumps instead of spinning.
     std::future::pending::<()>().await;
 }
@@ -1595,12 +1650,41 @@ impl SinkHealthWindow {
             })
             .collect();
         sinks.sort_by_key(|s| std::cmp::Reverse(s.first_failures + s.dead));
+        let truncated = sinks.len() > SINK_HEALTH_MAX_SINKS;
         sinks.truncate(SINK_HEALTH_MAX_SINKS);
         SinkDeliveryHealthPayload {
             window_secs: SINK_HEALTH_WINDOW.as_secs(),
             queued,
             queue_threshold: nexus_sinks::dispatcher::BATCH_SIZE.max(1) as u64,
+            // The cloud resolves `sink.delivery.dead` on a sample with no
+            // dead-lettering sink. Say so when that absence is the cap
+            // rather than health, so it can decline to.
+            truncated: truncated.then_some(true),
             sinks,
+        }
+    }
+
+    /// The gauge-only sample sent immediately on connect.
+    ///
+    /// `queued` is a live point-in-time read of the outbox and is the whole
+    /// value of this sample: it resyncs `sink.outbox.backlogged`, which
+    /// otherwise stays open on the cloud for a full window after every
+    /// reconnect — or forever, on a tunnel that keeps flapping before the
+    /// first tick lands.
+    ///
+    /// The per-sink counters deliberately ride empty and `window_secs` is
+    /// ZERO to say so. They come off a bus subscription that only exists
+    /// while connected, so at t=0 nothing has been observed — and an empty
+    /// `sinks` array read as "no sink dead-lettered" would resolve a
+    /// condition this pump has no evidence about, which is the one thing a
+    /// resync must not do.
+    fn gauge_only(queued: u64) -> SinkDeliveryHealthPayload {
+        SinkDeliveryHealthPayload {
+            window_secs: 0,
+            queued,
+            queue_threshold: nexus_sinks::dispatcher::BATCH_SIZE.max(1) as u64,
+            truncated: None,
+            sinks: Vec::new(),
         }
     }
 }
@@ -1619,10 +1703,18 @@ fn sink_health_is_quiet(p: &SinkDeliveryHealthPayload) -> bool {
 /// [`pump_eviction_events`]: two of the three types it feeds are
 /// `is_stateful`, so an envelope lost to the tunnel must not be able to
 /// strand an open condition. Two mechanisms guarantee the resolve is
-/// always reachable — the first sample on every connection is sent
-/// unconditionally (a reconnect resyncs the picture), and afterwards a
-/// clean sample is still sent whenever the previous one was not, which is
-/// the transition back to healthy.
+/// always reachable — a gauge-only sample goes out IMMEDIATELY on entry,
+/// before the first window has elapsed, and afterwards a clean sample is
+/// still sent whenever the previous one was not, which is the transition
+/// back to healthy.
+///
+/// The immediate sample matters most on a flapping tunnel, which is
+/// precisely when the cloud is out of date: a connection that dies inside
+/// 60 s used to send nothing at all, so an outbox that had already drained
+/// stayed backlogged on the console indefinitely. It carries only the
+/// `queued` gauge and says so with `window_secs = 0` — see
+/// [`SinkHealthWindow::gauge_only`] for why the counters cannot honestly
+/// ride along with it.
 ///
 /// The counters come off the bus rather than out of `alert_sink_outbox`
 /// because neither transition survives sampling: `outbox_mark_failed`
@@ -1652,13 +1744,29 @@ async fn pump_sink_delivery_health<H: TunnelHandle>(
         }
     };
 
+    // Resync the outbox depth before waiting on anything. The counters have
+    // to wait a window, but this gauge does not, and it is the one the cloud
+    // can be stale about for as long as the tunnel keeps flapping.
+    match store.outbox_queued_count().await {
+        Ok(n) => {
+            let payload = SinkHealthWindow::gauge_only(u64::try_from(n).unwrap_or(0));
+            if let Err(e) = handle.send(sink_delivery_health_envelope(&payload)).await {
+                warn!(error = %e, "sink delivery health resync failed; pump exiting");
+                return;
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "sink delivery health: outbox depth query failed; skipping the connect resync");
+        }
+    }
+
     let mut window = SinkHealthWindow::default();
     let mut ticker = tokio::time::interval(SINK_HEALTH_WINDOW);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Consume the immediate first tick (tokio fires `interval` at t=0). A
-    // sample taken before any outcome has been observed would report a
-    // clean window and resolve conditions that are still true — a
-    // reconnect must not be able to clear a real one.
+    // Consume the immediate first tick (tokio fires `interval` at t=0). The
+    // resync above has already gone out; a second sample here would report a
+    // counter window that has observed nothing and resolve conditions that
+    // are still true.
     ticker.tick().await;
     // Starts `false` so the first real sample always goes out, however
     // healthy: that is this connection's resync of the sticky state.
@@ -1778,16 +1886,19 @@ impl DecodeHealthWindow {
             .map(|(&camera_id, snap)| (camera_id, snap.decoder_input_drops))
             .collect();
         // Worst-first, so the truncation below drops the least-degraded
-        // cameras. Those fall out of the census and the cloud resolves them:
-        // on a core with more than `DECODE_HEALTH_MAX_CAMERAS` cameras this
-        // under-reports rather than strands, which is the right way round.
-        // Not truncating is the unsafe option — the census would exceed the
-        // schema's `maxItems` and be rejected whole, closing nothing.
+        // cameras. Not truncating is not an option — the census would
+        // exceed the schema's `maxItems` and be rejected whole, closing
+        // nothing — but the cloud resolves any camera a census omits, so a
+        // truncated census that stayed silent about it would assert health
+        // about cameras this core never reported on. `truncated` says the
+        // omission is the cap, and the cloud skips its resolve sweep.
         cameras.sort_by_key(|c| std::cmp::Reverse(c.input_drops));
+        let truncated = cameras.len() > DECODE_HEALTH_MAX_CAMERAS;
         cameras.truncate(DECODE_HEALTH_MAX_CAMERAS);
         CameraDecodeHealthPayload {
             window_secs: DECODE_HEALTH_WINDOW.as_secs(),
             drop_threshold: DECODE_HEALTH_DROP_THRESHOLD,
+            truncated: truncated.then_some(true),
             cameras,
         }
     }
@@ -1806,15 +1917,23 @@ fn decode_health_is_quiet(p: &CameraDecodeHealthPayload) -> bool {
 /// [`pump_eviction_events`]: the type it feeds is `is_stateful`, so an
 /// envelope lost to the tunnel must not be able to strand an open
 /// condition. The same two mechanisms guarantee the resolve is reachable —
-/// the first census on every connection is sent unconditionally, and
-/// afterwards a clean census is still sent whenever the previous one was
-/// not, which is the transition back to healthy.
+/// a census goes out IMMEDIATELY on entry, before the first window has
+/// elapsed, and afterwards a clean census is still sent whenever the
+/// previous one was not, which is the transition back to healthy.
+///
+/// The on-entry census is a real measurement, not an empty one, because
+/// `window` is owned by the supervisor and outlives the connection: its
+/// per-camera baseline is whatever the last census read, so the deltas it
+/// reports on connect cover the disconnect gap. Rebuilding the baseline per
+/// connection would make that census all-zero and resolve every degraded
+/// camera on the strength of a window nobody measured.
 ///
 /// The census is COMPLETE, not a list of offenders: every camera the
 /// registry knows rides in it, including those at zero. That is what lets
 /// the cloud resolve a camera which drops out of the registry entirely
 /// (pipeline torn down, camera removed) instead of leaving it degraded
-/// forever.
+/// forever — except when `truncated` says the census hit its cap, where
+/// absence means nothing and the cloud declines to resolve.
 ///
 /// Reads the registry directly rather than subscribing to a bus topic,
 /// unlike the two pumps above: `decoder_input_drops` is already a shared
@@ -1826,16 +1945,12 @@ fn decode_health_is_quiet(p: &CameraDecodeHealthPayload) -> bool {
 async fn pump_camera_decode_health<H: TunnelHandle>(
     handle: &H,
     health: &Arc<nexus_pipeline::DecodeHealthRegistry>,
+    window: &mut DecodeHealthWindow,
 ) {
-    let mut window = DecodeHealthWindow::default();
     let mut ticker = tokio::time::interval(DECODE_HEALTH_WINDOW);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Consume the immediate first tick (tokio fires `interval` at t=0) so
-    // the first census covers a real window and, more importantly, so the
-    // deltas it reports are measured against a baseline rather than against
-    // zero — a reconnect must not re-report drops it already reported.
-    ticker.tick().await;
-    let _ = window.census(health);
+    // The immediate first tick (tokio fires `interval` at t=0) is kept, not
+    // consumed: it IS this connection's resync.
     // Starts `false` so the first real census always goes out, however
     // healthy: that is this connection's resync of the sticky state.
     let mut last_was_quiet = false;
@@ -2346,6 +2461,15 @@ mod storage_watermark_tests {
         assert_eq!(payloads[1].level, "panic");
     }
 
+    /// Publish `n` clip closures, the denominator of the eviction ratio.
+    async fn publish_clip_closures(bus: &Arc<dyn Bus>, n: u64) {
+        for _ in 0..n {
+            bus.publish(topic::CLIP_CLOSED, &serde_json::json!({ "clip_id": 1 }))
+                .await
+                .expect("publish");
+        }
+    }
+
     /// Publish `n` evictions on `topic` and wait for the pump to drain them.
     async fn publish_evictions(bus: &Arc<dyn Bus>, topic: &str, n: u64, freed_bytes: u64) {
         for _ in 0..n {
@@ -2363,24 +2487,23 @@ mod storage_watermark_tests {
         }
     }
 
-    /// One pressure batch is normal operation, not an alert. The reclaim
-    /// ladder is bounded at `MAX_RECLAIM_STEPS_PER_TICK` evictions per
-    /// watermark sample tick, so exactly that many must NOT report.
-    #[tokio::test]
-    async fn one_reclaim_batch_is_not_aggressive() {
+    /// A full disk at steady state evicts roughly one clip per clip closed,
+    /// and that is a healthy retention-limited recorder — at four cameras or
+    /// at thirty-two. The volume here is deliberately far above any absolute
+    /// floor: if the verdict were a count rather than a ratio, this is the
+    /// site that would notify forever.
+    #[tokio::test(start_paused = true)]
+    async fn steady_state_eviction_is_not_aggressive_at_any_site_size() {
         let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(256));
         let tunnel = CapturingTunnel::new();
         let pump = pump_eviction_events(&*tunnel, &bus);
         let drive = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            publish_evictions(
-                &bus,
-                topic::CLIP_HOT_EVICTED,
-                EVICTION_AGGRESSIVE_THRESHOLD,
-                1,
-            )
-            .await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let busy = EVICTION_MIN_SAMPLE * 8;
+            publish_clip_closures(&bus, busy).await;
+            publish_evictions(&bus, topic::CLIP_HOT_EVICTED, busy, 1).await;
+            // The verdict lands on the window ticker, not on the eviction.
+            tokio::time::sleep(EVICTION_WINDOW + Duration::from_secs(1)).await;
         };
         tokio::select! {
             () = pump => {}
@@ -2391,30 +2514,30 @@ mod storage_watermark_tests {
             tunnel
                 .bus_events_on("storage.eviction.aggressive")
                 .is_empty(),
-            "a single bounded reclaim batch must not report as aggressive",
+            "evicting one clip per clip written is retention working, not failing",
         );
     }
 
-    /// More than one batch's worth inside the window means eviction is
-    /// running tick after tick — that is the condition, and it must reach
-    /// the cloud as a `bus_event` on the wire topic the gateway allow-lists.
-    #[tokio::test]
-    async fn sustained_eviction_reports_on_the_wire_topic() {
+    /// Deleting materially faster than recording IS the condition: evictions
+    /// past twice the clips closed in the same window means retention depth is
+    /// collapsing rather than holding. It must reach the cloud as a
+    /// `bus_event` on the wire topic the gateway allow-lists.
+    #[tokio::test(start_paused = true)]
+    async fn eviction_outrunning_recording_reports_on_the_wire_topic() {
         let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(256));
         let tunnel = CapturingTunnel::new();
         let pump = pump_eviction_events(&*tunnel, &bus);
         let drive = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            publish_evictions(
-                &bus,
-                topic::CLIP_HOT_EVICTED,
-                EVICTION_AGGRESSIVE_THRESHOLD,
-                1024,
-            )
-            .await;
+            // Two clips written, five deleted: past the 2x ratio and above the
+            // small-sample floor.
+            publish_clip_closures(&bus, 2).await;
+            let hot = (EVICTION_MIN_SAMPLE.max(5)) - 1;
+            publish_evictions(&bus, topic::CLIP_HOT_EVICTED, hot, 1024).await;
             // The one that tips it over, and the only hard eviction.
             publish_evictions(&bus, topic::CLIP_HARD_EVICTED, 1, 2048).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The verdict lands on the window ticker, not on the eviction.
+            tokio::time::sleep(EVICTION_WINDOW + Duration::from_secs(1)).await;
         };
         tokio::select! {
             () = pump => {}
@@ -2429,9 +2552,10 @@ mod storage_watermark_tests {
         );
         let ev: StorageEvictionAggressivePayload =
             serde_json::from_value(sent[0].clone()).expect("payload matches the wire schema");
-        assert_eq!(ev.evictions, EVICTION_AGGRESSIVE_THRESHOLD + 1);
+        let hot = (EVICTION_MIN_SAMPLE.max(5)) - 1;
+        assert_eq!(ev.evictions, hot + 1);
         assert_eq!(ev.hard_evictions, 1);
-        assert_eq!(ev.freed_bytes, EVICTION_AGGRESSIVE_THRESHOLD * 1024 + 2048);
+        assert_eq!(ev.freed_bytes, hot * 1024 + 2048);
         assert_eq!(ev.window_secs, EVICTION_WINDOW.as_secs());
 
         // AGENTS.md payload hygiene: the bus payload carries `cold_path`, a
