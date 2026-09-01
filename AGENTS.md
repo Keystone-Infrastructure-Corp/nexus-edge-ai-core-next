@@ -73,9 +73,11 @@ The wedge plan that drives the next three phases of work is
    SDK. The cloud repo MUST NOT depend on this one. The only sanctioned cross-repo
    artifact is the generated Rust view of the wire schema vendored into
    [crates/nexus-cloud-protocol/src/v1.rs](crates/nexus-cloud-protocol/src/v1.rs)
-   alongside a SHA-256 checksum (`v1.CHECKSUM`) that CI verifies against the cloud-side
-   source of truth at
-   [nexus-cloud-console/proto/v1.json](../nexus-cloud-console/proto/v1.json). The edge
+   alongside a SHA-256 checksum (`v1.CHECKSUM`) recording the cloud-side source of
+   truth at
+   [nexus-cloud-console/proto/v1.json](../nexus-cloud-console/proto/v1.json) that
+   produced it. Note the checksum is a sync marker verified by review, **not** a CI
+   gate — no job in either repo compares the two today. The edge
    itself does NOT carry a copy of `proto/v1.json` — only the generated bindings. See
    [REPO_BOUNDARY R1–R3 in the cloud repo](../nexus-cloud-console/docs/REPO_BOUNDARY.md).
 4. **Wire protocol version pinned to the cloud's `v`.** The engine speaks the version

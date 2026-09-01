@@ -71,6 +71,8 @@ struct TokenSpec {
     kid: String,
     /// Phase 11.E2 — set when the human was acting for a monitoring org.
     actor_org_id: Option<String>,
+    /// SPEC-071 P3 — the catalog permission the cloud authorized on.
+    perm: Option<String>,
 }
 
 impl TokenSpec {
@@ -88,6 +90,7 @@ impl TokenSpec {
             exp: now + 60,
             kid: kid.into(),
             actor_org_id: None,
+            perm: None,
         }
     }
 }
@@ -110,6 +113,9 @@ fn mint(sk: &SigningKey, spec: &TokenSpec) -> String {
     let mut claims = claims;
     if let Some(acting) = spec.actor_org_id.as_ref() {
         claims["actor_org_id"] = json!(acting);
+    }
+    if let Some(perm) = spec.perm.as_ref() {
+        claims["perm"] = json!(perm);
     }
     let h = b64url(serde_json::to_vec(&header).unwrap());
     let c = b64url(serde_json::to_vec(&claims).unwrap());
@@ -470,4 +476,55 @@ fn acting_org_claim_reaches_the_verified_actor() {
         )
         .expect("ordinary token verifies");
     assert_eq!(actor.actor_org_id, None);
+}
+
+/// SPEC-071 P3 / BUG-095 — the whole functional delta of the `perm` claim on
+/// this side is "a token carrying it verifies instead of being rejected as
+/// malformed".
+///
+/// That is not a free property. `ActorTokenClaims` is
+/// `#[serde(deny_unknown_fields)]`, so before this claim existed in the
+/// generated struct the first half of this test failed with
+/// `InvalidReason::MalformedClaims` — which is exactly what an engine build
+/// older than this one still does, and why the cloud must not emit `perm`
+/// until the fleet has converged (WIRE_PROTOCOL.md §11.2).
+///
+/// The absent case is asserted alongside so "claim omitted" and "claim
+/// rejected" cannot be confused, and `VerifiedActor` is checked to confirm
+/// the claim stays audit-only: `role` is still what the engine enforces on.
+#[test]
+fn permission_claim_is_accepted_and_stays_audit_only() {
+    let (sk, verifier) = build_verifier_with("k1");
+    let now = Utc::now().timestamp();
+
+    let mut spec = TokenSpec::fresh(now, "POST", "/admin/cameras", "k1");
+    spec.perm = Some("cameras.control".to_owned());
+    let token = mint(&sk, &spec);
+
+    let actor = verifier
+        .verify(
+            &token,
+            EnvelopeContext {
+                method: "POST",
+                path: "/admin/cameras",
+            },
+        )
+        .expect("a token carrying `perm` must verify on a build that knows it");
+    assert_eq!(
+        actor.role, "operator",
+        "`role` remains the claim the engine enforces on"
+    );
+
+    // A signer that supplied no permission omits the claim entirely; the
+    // same build must still accept that token.
+    let legacy = mint(&sk, &TokenSpec::fresh(now, "POST", "/admin/sites", "k1"));
+    verifier
+        .verify(
+            &legacy,
+            EnvelopeContext {
+                method: "POST",
+                path: "/admin/sites",
+            },
+        )
+        .expect("a token without `perm` must keep verifying");
 }
