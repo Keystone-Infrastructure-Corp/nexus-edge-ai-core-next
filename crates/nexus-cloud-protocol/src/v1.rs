@@ -91,7 +91,7 @@ pub struct AlertPayload {
     pub verification_state: Option<VerificationState>,
 }
 
-/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines three topics: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`, `storage.eviction.aggressive`, whose `payload` deserializes as `StorageEvictionAggressivePayload`, and `sink.delivery.health`, whose `payload` deserializes as `SinkDeliveryHealthPayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
+/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines four topics: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`, `storage.eviction.aggressive`, whose `payload` deserializes as `StorageEvictionAggressivePayload`, `sink.delivery.health`, whose `payload` deserializes as `SinkDeliveryHealthPayload`, and `camera.decode.health`, whose `payload` deserializes as `CameraDecodeHealthPayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BusEventPayload {
@@ -102,6 +102,28 @@ pub struct BusEventPayload {
     pub payload: serde_json::Value,
     /// Bus topic name, mirroring the edge's `nexus_bus::topic` constants (`storage.panic` publishes under topic `storage.watermark` here — the wire name is the durable contract, not the in-process bus topic string). Unknown values are rejected by the gateway without disturbing the tunnel.
     pub topic: String,
+}
+
+/// One camera's decode counters inside a `CameraDecodeHealthPayload` window. Identifiers and counts only — the camera's RTSP URL and ONVIF credentials never leave the edge (AGENTS.md rule 6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraDecodeCounts {
+    /// The per-core integer camera id, the same key `CameraRosterEntry.edge_camera_id` uses; the cloud maps it to a camera UUID through `cameras (core_id, edge_camera_id)`.
+    pub edge_camera_id: u64,
+    /// Compressed access units dropped ahead of the decoder DURING THIS WINDOW — a delta of the engine's cumulative `DecodeHealth::decoder_input_drops`, not the running total, so a condition that ends can be seen to end.
+    pub input_drops: u64,
+}
+
+/// The shape of `BusEventPayload.payload` when `topic = "camera.decode.health"`. One periodic sample of every camera's decode health on this core, feeding the `camera.stream.degraded` platform-event type (Camera-scoped, stateful, warning). "Degraded" here is the catalogue's own definition — decode errors above a threshold — read off `nexus_pipeline::DecodeHealth::decoder_input_drops`, the compressed access units the RGB branch's decoder-input queue leaked ahead of the decoder. That is deliberately NOT camera liveness, which is already `camera.offline` from the roster; a camera can stream perfectly and still be losing access units, and a camera that has stopped streaming is offline rather than degraded. The edge sets `drop_threshold` because the cloud cannot see the decode chain, the same division of labour as `storage.watermark`. Sticky like `sink.delivery.health`, not one-shot: the sample is re-sent on every reconnect and whenever the picture changes, so a lost envelope cannot strand an open condition. `cameras` is a COMPLETE census of the cameras this core has decode health for, so the cloud resolves the condition for any camera the sample omits. Deliberately ids, counts and durations only — never the RTSP URL, ONVIF credential or `PipelineStatus.last_error` (a free-form GStreamer string whose `debug` field embeds the source URI), all of which stay edge-resident per AGENTS.md rule 6 / REPO_BOUNDARY R5b.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraDecodeHealthPayload {
+    /// One entry per camera the core recorded decode health for during the window, INCLUDING cameras at zero drops — the absent-vs-zero distinction the cloud needs to resolve a condition rather than leave it open forever. Bounded so the sample cannot approach the gateway's per-payload ceiling.
+    pub cameras: Vec<CameraDecodeCounts>,
+    /// Access-unit drops inside one window above which the edge considers a camera's stream degraded. Zero means any loss counts, matching the engine's own shipped verdict rule (`decode_verdict::compute_decode_verdict` treats `decoder_input_drops > 0` as `over`), because one lost access unit corrupts every picture until the next IDR.
+    pub drop_threshold: u64,
+    /// Length of the sampling window the per-camera counters below were accumulated over.
+    pub window_secs: u64,
 }
 
 /// Cloud → Edge. Reply to a camera_roster. `permanent_failure` tells the edge to stop retrying this revision (e.g. malformed metadata). `accepted_revision` is echoed back so the edge can drop the outbox entry and advance its high-water-mark.

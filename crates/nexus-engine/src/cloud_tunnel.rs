@@ -35,9 +35,9 @@ use nexus_cloud_client::{
     TunnelHandle, VerifiedActor, VerifierBuilder,
 };
 use nexus_cloud_protocol::v1::{
-    BusEventPayload, EdgeDegradation, EdgeHealth, Envelope, EnvelopeBody, EnvelopeMeta,
-    HeartbeatPayload, SinkDeliveryCounts, SinkDeliveryHealthPayload,
-    StorageEvictionAggressivePayload, StorageWatermarkPayload,
+    BusEventPayload, CameraDecodeCounts, CameraDecodeHealthPayload, EdgeDegradation, EdgeHealth,
+    Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload, SinkDeliveryCounts,
+    SinkDeliveryHealthPayload, StorageEvictionAggressivePayload, StorageWatermarkPayload,
 };
 use nexus_storage::Registry;
 use nexus_storage_cloud::{AzureBlobBackend, GatewaySasIssuer};
@@ -129,6 +129,7 @@ pub fn spawn_tunnel(
     snapshot_uploader_slot: crate::cloud_alert_sink::SnapshotUploaderSlot,
     live_view: Arc<crate::live_view::LiveViewManager>,
     frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
+    decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
@@ -217,6 +218,7 @@ pub fn spawn_tunnel(
             pending_acks,
             live_view,
             frame_stats,
+            decode_health,
             webrtc,
             store,
             remote_access,
@@ -586,6 +588,7 @@ async fn run(
     pending_acks: Arc<crate::cloud_alert_sink::PendingAckRegistry>,
     live_view: Arc<crate::live_view::LiveViewManager>,
     frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
+    decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
     remote_access: nexus_config::RemoteAccessConfig,
@@ -685,6 +688,7 @@ async fn run(
                 let storage_events = pump_storage_events(&*conn, &watermark);
                 let eviction_events = pump_eviction_events(&*conn, &watermark.bus);
                 let sink_health = pump_sink_delivery_health(&*conn, &watermark.bus, &store);
+                let decode_events = pump_camera_decode_health(&*conn, &decode_health);
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
@@ -713,6 +717,9 @@ async fn run(
                     }
                     _ = sink_health => {
                         warn!(core_id = %core_id, "cloud tunnel sink delivery-health pump exited; will reconnect");
+                    }
+                    _ = decode_events => {
+                        warn!(core_id = %core_id, "cloud tunnel camera decode-health pump exited; will reconnect");
                     }
                 }
                 cloud_outbox.set_handle(None);
@@ -1713,6 +1720,158 @@ fn sink_delivery_health_envelope(payload: &SinkDeliveryHealthPayload) -> Envelop
     }
 }
 
+/// How often the decode-health census below is taken and sent.
+const DECODE_HEALTH_WINDOW: Duration = Duration::from_secs(60);
+
+/// Most cameras reported in one census. Matches the schema's `maxItems` on
+/// `CameraDecodeHealthPayload.cameras`; a core with more cameras than this
+/// reports the worst offenders and drops the tail rather than having the
+/// whole envelope rejected for size.
+const DECODE_HEALTH_MAX_CAMERAS: usize = 64;
+
+/// Access-unit drops inside one window above which a camera's stream counts
+/// as degraded. Zero (i.e. any loss at all) rather than an invented number,
+/// because [`crate::decode_verdict::compute_decode_verdict`] already treats
+/// a non-zero `decoder_input_drops` as `over`: one lost access unit corrupts
+/// every picture until the next IDR.
+const DECODE_HEALTH_DROP_THRESHOLD: u64 = 0;
+
+/// Last census's cumulative `decoder_input_drops` per camera, so the wire
+/// can carry a per-window delta. The registry's counters only ever climb,
+/// and a condition that can only climb can never be seen to end.
+#[derive(Debug, Default)]
+struct DecodeHealthWindow {
+    previous: std::collections::BTreeMap<nexus_types::CameraId, u64>,
+}
+
+impl DecodeHealthWindow {
+    /// Take one census from the registry, folding each camera's cumulative
+    /// counter into this window's delta.
+    ///
+    /// A camera whose counter went *backwards* has been cleared and
+    /// respawned (`DecodeHealthRegistry::clear`, called by the reconciler on
+    /// every camera restart), so its running total restarts from zero;
+    /// treating the new absolute value as the delta is both correct and the
+    /// only saturating-subtraction-safe reading.
+    fn census(
+        &mut self,
+        health: &nexus_pipeline::DecodeHealthRegistry,
+    ) -> CameraDecodeHealthPayload {
+        let observed = health.snapshot_all();
+        let mut cameras: Vec<CameraDecodeCounts> = observed
+            .iter()
+            // The schema's `edge_camera_id` is unsigned; a camera id that
+            // will not convert cannot be named on the wire, so it is left
+            // out of the census and the cloud resolves it rather than
+            // reporting it under someone else's id.
+            .filter_map(|(&camera_id, snap)| {
+                let edge_camera_id = u64::try_from(camera_id).ok()?;
+                let previous = self.previous.get(&camera_id).copied().unwrap_or(0);
+                Some(CameraDecodeCounts {
+                    edge_camera_id,
+                    input_drops: snap.decoder_input_drops.saturating_sub(previous),
+                })
+            })
+            .collect();
+        self.previous = observed
+            .iter()
+            .map(|(&camera_id, snap)| (camera_id, snap.decoder_input_drops))
+            .collect();
+        // Worst-first, so the truncation below drops the least-degraded
+        // cameras. Those fall out of the census and the cloud resolves them:
+        // on a core with more than `DECODE_HEALTH_MAX_CAMERAS` cameras this
+        // under-reports rather than strands, which is the right way round.
+        // Not truncating is the unsafe option — the census would exceed the
+        // schema's `maxItems` and be rejected whole, closing nothing.
+        cameras.sort_by_key(|c| std::cmp::Reverse(c.input_drops));
+        cameras.truncate(DECODE_HEALTH_MAX_CAMERAS);
+        CameraDecodeHealthPayload {
+            window_secs: DECODE_HEALTH_WINDOW.as_secs(),
+            drop_threshold: DECODE_HEALTH_DROP_THRESHOLD,
+            cameras,
+        }
+    }
+}
+
+/// True when a census says nothing an operator would act on: no camera lost
+/// an access unit inside the window.
+fn decode_health_is_quiet(p: &CameraDecodeHealthPayload) -> bool {
+    p.cameras.iter().all(|c| c.input_drops <= p.drop_threshold)
+}
+
+/// ADR-075 Tier 2 — publish a periodic census of every camera's decode
+/// health, feeding `camera.stream.degraded`.
+///
+/// Sticky like [`pump_sink_delivery_health`], not one-shot like
+/// [`pump_eviction_events`]: the type it feeds is `is_stateful`, so an
+/// envelope lost to the tunnel must not be able to strand an open
+/// condition. The same two mechanisms guarantee the resolve is reachable —
+/// the first census on every connection is sent unconditionally, and
+/// afterwards a clean census is still sent whenever the previous one was
+/// not, which is the transition back to healthy.
+///
+/// The census is COMPLETE, not a list of offenders: every camera the
+/// registry knows rides in it, including those at zero. That is what lets
+/// the cloud resolve a camera which drops out of the registry entirely
+/// (pipeline torn down, camera removed) instead of leaving it degraded
+/// forever.
+///
+/// Reads the registry directly rather than subscribing to a bus topic,
+/// unlike the two pumps above: `decoder_input_drops` is already a shared
+/// gauge written by the ingester threads, so a bus topic would only be a
+/// second copy of it.
+///
+/// Best-effort like every other pump: returns on send failure so the
+/// supervisor reconnects.
+async fn pump_camera_decode_health<H: TunnelHandle>(
+    handle: &H,
+    health: &Arc<nexus_pipeline::DecodeHealthRegistry>,
+) {
+    let mut window = DecodeHealthWindow::default();
+    let mut ticker = tokio::time::interval(DECODE_HEALTH_WINDOW);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick (tokio fires `interval` at t=0) so
+    // the first census covers a real window and, more importantly, so the
+    // deltas it reports are measured against a baseline rather than against
+    // zero — a reconnect must not re-report drops it already reported.
+    ticker.tick().await;
+    let _ = window.census(health);
+    // Starts `false` so the first real census always goes out, however
+    // healthy: that is this connection's resync of the sticky state.
+    let mut last_was_quiet = false;
+    loop {
+        ticker.tick().await;
+        let payload = window.census(health);
+        let quiet = decode_health_is_quiet(&payload);
+        if quiet && last_was_quiet {
+            continue;
+        }
+        last_was_quiet = quiet;
+        if let Err(e) = handle.send(camera_decode_health_envelope(&payload)).await {
+            warn!(error = %e, "camera decode health send failed; pump exiting");
+            return;
+        }
+    }
+}
+
+fn camera_decode_health_envelope(payload: &CameraDecodeHealthPayload) -> Envelope {
+    Envelope {
+        meta: EnvelopeMeta {
+            id: uuid::Uuid::now_v7().to_string(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+            ts: chrono::Utc::now().to_rfc3339(),
+            v: 1,
+        },
+        body: EnvelopeBody::BusEvent(BusEventPayload {
+            topic: "camera.decode.health".to_string(),
+            core_id: None,
+            payload: serde_json::json!(payload),
+        }),
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2387,6 +2546,116 @@ mod storage_watermark_tests {
                 "{forbidden:?} must not reach the wire, got {serialized}",
             );
         }
+    }
+
+    /// The registry's counters only ever climb, so the wire has to carry a
+    /// per-window delta: a cumulative total can never be seen to fall back
+    /// under the threshold, which would strand the stateful condition the
+    /// cloud opens from it.
+    #[test]
+    fn a_census_reports_the_windows_drops_not_the_running_total() {
+        let registry = nexus_pipeline::DecodeHealthRegistry::new();
+        let mut window = DecodeHealthWindow::default();
+
+        for _ in 0..3 {
+            registry.observe_decoder_input_drop(7);
+        }
+        let first = window.census(&registry);
+        assert_eq!(drops_for(&first, 7), 3, "first window sees all three");
+
+        // Two more drops on a cumulative total of five.
+        for _ in 0..2 {
+            registry.observe_decoder_input_drop(7);
+        }
+        let second = window.census(&registry);
+        assert_eq!(drops_for(&second, 7), 2, "second window sees only its own");
+
+        // A window with no new drops is what resolves the condition.
+        let third = window.census(&registry);
+        assert_eq!(drops_for(&third, 7), 0, "a clean window reports zero");
+        assert!(decode_health_is_quiet(&third));
+    }
+
+    /// The census is what makes the cloud's resolve total, so it must name
+    /// every camera the registry knows — including the healthy ones, whose
+    /// absence the cloud would otherwise be unable to tell apart from a
+    /// camera that stopped being decoded.
+    #[test]
+    fn a_census_names_healthy_cameras_too() {
+        let registry = nexus_pipeline::DecodeHealthRegistry::new();
+        registry.observe_decoder_output(1);
+        registry.observe_decoder_output(2);
+        registry.observe_decoder_input_drop(2);
+
+        let census = DecodeHealthWindow::default().census(&registry);
+        assert_eq!(census.cameras.len(), 2, "both cameras are in the census");
+        assert_eq!(drops_for(&census, 1), 0, "the healthy camera rides at zero");
+        assert_eq!(drops_for(&census, 2), 1);
+        assert!(
+            !decode_health_is_quiet(&census),
+            "one losing camera makes the whole census worth sending",
+        );
+    }
+
+    /// The threshold is the edge's call and is deliberately zero — it is the
+    /// same rule `decode_verdict` already applies, not an invented number.
+    #[test]
+    fn any_lost_access_unit_clears_the_threshold() {
+        let registry = nexus_pipeline::DecodeHealthRegistry::new();
+        registry.observe_decoder_output(4);
+        let clean = DecodeHealthWindow::default().census(&registry);
+        assert_eq!(clean.drop_threshold, 0);
+        assert_eq!(clean.window_secs, DECODE_HEALTH_WINDOW.as_secs());
+        assert!(decode_health_is_quiet(&clean));
+
+        registry.observe_decoder_input_drop(4);
+        assert!(
+            !decode_health_is_quiet(&DecodeHealthWindow::default().census(&registry)),
+            "a single dropped access unit is already damage",
+        );
+    }
+
+    /// The bridge is only useful if the cloud recognises the topic. The
+    /// hygiene half is asserted on an envelope built from a REAL registry
+    /// census rather than a hand-written payload: a test that constructs
+    /// the thing it inspects cannot catch a publisher that starts copying
+    /// a URL or an error string into it.
+    #[test]
+    fn the_census_rides_its_own_wire_topic_and_carries_counts_only() {
+        let registry = nexus_pipeline::DecodeHealthRegistry::new();
+        registry.observe_decoder_geometry(3, 1920, 1080);
+        registry.observe_decoder_input_drop(3);
+
+        let census = DecodeHealthWindow::default().census(&registry);
+        let env = camera_decode_health_envelope(&census);
+        let EnvelopeBody::BusEvent(body) = &env.body else {
+            panic!("expected a bus_event envelope, got {:?}", env.body);
+        };
+        assert_eq!(body.topic, "camera.decode.health");
+        assert_eq!(body.core_id, None, "scope comes from the cert, not here");
+        assert_eq!(body.payload["cameras"][0]["edge_camera_id"], 3);
+        assert_eq!(body.payload["cameras"][0]["input_drops"], 1);
+
+        let keys: Vec<&str> = body.payload["cameras"][0]
+            .as_object()
+            .expect("a camera entry is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["edge_camera_id", "input_drops"],
+            "a camera entry carries an id and a count, nothing else",
+        );
+    }
+
+    fn drops_for(payload: &CameraDecodeHealthPayload, edge_camera_id: u64) -> u64 {
+        payload
+            .cameras
+            .iter()
+            .find(|c| c.edge_camera_id == edge_camera_id)
+            .unwrap_or_else(|| panic!("camera {edge_camera_id} missing from the census"))
+            .input_drops
     }
 }
 

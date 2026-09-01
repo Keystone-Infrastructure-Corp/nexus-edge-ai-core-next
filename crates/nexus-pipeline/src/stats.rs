@@ -477,6 +477,15 @@ impl DecodeHealthRegistry {
     pub fn snapshot(&self, camera_id: CameraId) -> Option<DecodeHealth> {
         self.inner.read().get(&camera_id).copied()
     }
+
+    /// Every camera the registry currently holds health for. The absent-vs-
+    /// zero distinction matters to callers that report a census rather than
+    /// a lookup: a camera missing here has no live decode chain, which is
+    /// not the same as one decoding cleanly.
+    #[must_use]
+    pub fn snapshot_all(&self) -> HashMap<CameraId, DecodeHealth> {
+        self.inner.read().clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
