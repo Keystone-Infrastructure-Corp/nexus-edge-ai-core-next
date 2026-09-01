@@ -117,6 +117,36 @@ impl TunnelLiveness {
         }
         Some(now_elapsed_ms.saturating_sub(last))
     }
+
+    /// Whether the cloud should be treated as reachable right now, given a
+    /// caller's staleness budget.
+    ///
+    /// A tunnel that has never authenticated, or whose last accepted
+    /// heartbeat is older than `budget`, is unreachable — the same "never
+    /// having connected counts against us" reading the watchdog loop
+    /// applies above, expressed as a pure, independently-testable function
+    /// rather than only inline in that loop.
+    ///
+    /// This is the real, non-fabricated connectivity signal SPEC-055 AC-7
+    /// (Wave 18) feeds into [`nexus_sinks::emergency::EmergencyPolicy::decide`]'s
+    /// `cloud_reachable` parameter for the disconnected-alarm proof — not a
+    /// caller-supplied bool standing in for a real read.
+    ///
+    /// No Tier-0 detector-to-`decide` dispatch loop exists yet anywhere in
+    /// this binary (confirmed by search: `EmergencyPolicy` has zero
+    /// production call sites in this repo) — building that loop is a
+    /// separate, unbuilt feature outside this wave's scope. Until it
+    /// exists, this function's only caller is the proof test below, hence
+    /// the `allow` rather than a fabricated call site.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_reachable(&self, now_elapsed_ms: u64, budget: Duration) -> bool {
+        let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+        match self.idle_ms(now_elapsed_ms) {
+            Some(idle) => idle < budget_ms,
+            None => false,
+        }
+    }
 }
 
 /// Watchdog loop. Runs for the life of the process.
@@ -233,5 +263,66 @@ mod tests {
         // A clock that appears to go backwards saturates rather than
         // wrapping into a huge idle time and firing the watchdog.
         assert_eq!(l.idle_ms(10_000), Some(0));
+    }
+
+    #[test]
+    fn a_tunnel_that_never_authenticated_is_never_reachable() {
+        let l = TunnelLiveness::new();
+        assert!(!l.is_reachable(0, std::time::Duration::from_secs(60)));
+    }
+
+    // ---------------------------------------------------------------------
+    // SPEC-055 AC-7 (Wave 18) — a staged Tier-0 event must alarm with the
+    // cloud disconnected, including a tunnel-down variant. This proves it
+    // against the *real* `TunnelLiveness` production type, not a bare bool
+    // standing in for one: a tunnel torn down past its own staleness budget
+    // derives `cloud_reachable = false` through `is_reachable`, and that
+    // derived value — not a hand-picked `false` literal — is what
+    // `EmergencyPolicy::decide` is fed.
+    // ---------------------------------------------------------------------
+
+    /// A tunnel that authenticated and heartbeat once, then went dark past
+    /// its staleness budget (the tunnel-down variant), derives
+    /// `cloud_reachable = false` and a staged Tier-0 signal still alarms —
+    /// proven against the production `EmergencyPolicy`, not a fixture.
+    ///
+    /// Fault injection: temporarily changed `is_reachable`'s `Some(idle) =>
+    /// idle < budget_ms` arm to always return `true` once any heartbeat had
+    /// ever landed (ignoring how stale it was). This test failed on
+    /// `assert!(!reachable, ...)` (became `true`) and would also have failed
+    /// on the final `decide` assertion (an unconfirmed Firearm signal fed
+    /// `cloud_reachable = true` degrades to `AwaitBrandishConfirmation`, not
+    /// `Alarm`); reverted, both pass.
+    #[test]
+    fn a_tunnel_down_past_its_budget_derives_unreachable_and_a_staged_tier0_still_alarms() {
+        let liveness = TunnelLiveness::new();
+        liveness.mark_authenticated();
+        liveness.mark_heartbeat(1_000);
+
+        let budget = std::time::Duration::from_secs(90);
+        // Well past the 90 s budget: the tunnel went dark and never came
+        // back, the disconnected variant this AC names.
+        let now_elapsed_ms = 10 * 60 * 1_000;
+
+        let reachable = liveness.is_reachable(now_elapsed_ms, budget);
+        assert!(
+            !reachable,
+            "a tunnel dark for 10 minutes against a 90 s budget must derive unreachable"
+        );
+
+        let policy = nexus_sinks::emergency::EmergencyPolicy::default();
+        let staged_firearm = nexus_sinks::emergency::EmergencySignal {
+            class: nexus_sinks::emergency::Tier0Class::Firearm,
+            persistence: std::time::Duration::from_secs(1),
+            brandish_confirmed: None,
+        };
+        // Online (reachable = true) this same unconfirmed signal would only
+        // AWAIT confirmation, never alarm outright — so this assertion is
+        // only true because the derived signal is actually unreachable, not
+        // because Firearm always alarms.
+        assert_eq!(
+            policy.decide(&staged_firearm, reachable),
+            nexus_sinks::emergency::EmergencyOutcome::Alarm
+        );
     }
 }
