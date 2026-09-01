@@ -146,6 +146,30 @@ pub async fn get_cloud_enrollment(
     }))
 }
 
+/// Operator-facing failure for a failed enrollment.
+///
+/// The cloud's status and error envelope sit in the error's source chain,
+/// beneath the fixed `POST /v1/enroll failed` context this path adds, so only
+/// the chain-walking form carries a reason a human can act on (BUG-145).
+/// Builds the whole `ApiError` rather than just the string so the call site
+/// has nothing left to format, and the log and the response body cannot drift.
+///
+/// The body is verbatim from the cloud and unbounded, so it is capped before
+/// it reaches journald or the admin response.
+fn enrollment_failure(e: &anyhow::Error) -> ApiError {
+    const MAX_DETAIL: usize = 2048;
+    let mut detail = format!("{e:#}");
+    if detail.chars().count() > MAX_DETAIL {
+        detail = detail.chars().take(MAX_DETAIL).collect();
+        detail.push_str("… (truncated)");
+    }
+    tracing::warn!(error = %detail, "cloud enrollment failed");
+    ApiError(
+        StatusCode::BAD_GATEWAY,
+        format!("enrollment failed: {detail}"),
+    )
+}
+
 /// `POST /v1/admin/cloud/enroll` — runs the same enrollment flow as
 /// the `nexus-engine enroll` CLI subcommand and persists the result
 /// into the local `cloud_enrollment` row.
@@ -226,14 +250,7 @@ pub async fn post_cloud_enroll(
         req.history_days,
     )
     .await
-    .map_err(|e| {
-        // Bubble the upstream error message verbatim so the UI can
-        // distinguish "bad code" (400 from enrollment-svc) from "DNS
-        // failure" (transport). The cloud-side enrollment-svc returns
-        // a JSON error envelope; we wrap it in our own envelope.
-        tracing::warn!(error = %e, "cloud enrollment failed");
-        ApiError(StatusCode::BAD_GATEWAY, format!("enrollment failed: {e}"))
-    })?;
+    .map_err(|e| enrollment_failure(&e))?;
 
     // ---- audit (fire-and-forget by design — the enrollment is
     //      already persisted, and `audit_admin_action` swallows write
@@ -356,4 +373,57 @@ pub async fn delete_cloud_enrollment(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiError, StatusCode};
+    use anyhow::Context as _;
+    use nexus_cloud_client::EnrollmentError;
+
+    /// BUG-145 — the operator has to be told WHY the cloud refused. The
+    /// status and error envelope live in the source chain, so a formatter
+    /// that prints only the outermost context reduces every refusal to the
+    /// same uninformative `POST /v1/enroll failed`.
+    #[test]
+    fn failure_detail_preserves_the_clouds_rejection_reason() {
+        let err = Err::<(), _>(EnrollmentError::BadStatus {
+            status: 403,
+            body: r#"{"error":"organization_suspended","message":"organization is suspended"}"#
+                .to_string(),
+        })
+        .context("POST /v1/enroll failed")
+        .unwrap_err();
+
+        let ApiError(status, message) = super::enrollment_failure(&err);
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(message.contains("403"), "status missing from {message:?}");
+        assert!(
+            message.contains("organization_suspended"),
+            "cloud reason missing from {message:?}"
+        );
+    }
+
+    /// A cloud 5xx can carry a multi-kilobyte body (a proxy error page, or a
+    /// sqlx error's Display). It reaches journald and the admin response, so
+    /// it must be bounded.
+    #[test]
+    fn failure_detail_caps_an_oversized_cloud_body() {
+        let err = Err::<(), _>(EnrollmentError::BadStatus {
+            status: 502,
+            body: "x".repeat(64 * 1024),
+        })
+        .context("POST /v1/enroll failed")
+        .unwrap_err();
+
+        let ApiError(_, message) = super::enrollment_failure(&err);
+
+        assert!(
+            message.len() < 4096,
+            "unbounded body: {} bytes",
+            message.len()
+        );
+        assert!(message.ends_with("… (truncated)"));
+    }
 }
