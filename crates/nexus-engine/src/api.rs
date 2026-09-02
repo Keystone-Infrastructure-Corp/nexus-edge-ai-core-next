@@ -1991,6 +1991,18 @@ pub(crate) async fn reload_rules_into_evaluator(s: &ApiState, op: &str, rule_id:
             );
         }
     }
+    // Every rules mutation funnels through here, so one publish at the funnel
+    // is what stops a local edit from diverging unreported (BUG-165/BUG-163).
+    // Unconditional: the store moved even when the evaluator reload above
+    // failed, so the hash is stale either way. `kind` keeps the camera
+    // reconciler from running a pointless pass.
+    let _ = s
+        .bus
+        .publish(
+            topic::CONFIG_CHANGED,
+            &serde_json::json!({ "kind": "rules" }),
+        )
+        .await;
 }
 
 /// M-Admin Phase 5 — compile-only CEL validation endpoint.
@@ -7255,6 +7267,128 @@ mod tests {
         // carries a different `kind`, so the assertion cannot pass on a
         // bystander's event if `apply_rules` regresses.
         assert_eq!(event.get("kind").and_then(|k| k.as_str()), Some("rules"));
+    }
+
+    /// BUG-165 — a rule edited through the *local* admin API must move the
+    /// reported hash too. The three local handlers published nothing, so
+    /// `core_runtime_hashes.rules_sha256` stopped tracking the store and the
+    /// console reported "In sync" over a diverged edge — a false all-clear,
+    /// strictly worse than BUG-163's false alarm.
+    ///
+    /// The hash assertion pins that the mutation reached the store and landed
+    /// in the `rules` category specifically, so the test cannot pass on a route
+    /// that publishes but no-ops, nor on one that moves some other category.
+    #[tokio::test]
+    async fn local_rule_mutations_move_the_reported_hash() {
+        use futures::StreamExt;
+        use nexus_bus::BusExt;
+
+        let (app, store, _dir, _reg, bus) = build_test_router_full(None).await;
+        let mut changed = bus
+            .subscribe::<serde_json::Value>(nexus_bus::topic::CONFIG_CHANGED)
+            .await
+            .expect("subscribe to config.changed");
+
+        async fn rules_hash(store: &Store) -> Option<String> {
+            crate::fleet_hash::compute(store)
+                .await
+                .expect("hash the live store")
+                .rules
+        }
+
+        /// Await the publish this mutation must have made, and prove the
+        /// hash it wakes the reporter for actually differs.
+        async fn expect_republish(
+            changed: &mut (impl StreamExt<Item = Result<serde_json::Value, nexus_bus::BusError>>
+                      + Unpin),
+            store: &Store,
+            before: &Option<String>,
+            op: &str,
+        ) -> Option<String> {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), changed.next())
+                .await
+                .unwrap_or_else(|_| panic!("local rule {op} must publish config.changed"))
+                .expect("bus stream closed")
+                .expect("bus payload deserialises");
+            assert_eq!(
+                event.get("kind").and_then(|k| k.as_str()),
+                Some("rules"),
+                "{op} published a CONFIG_CHANGED that was not the rules one"
+            );
+            let after = rules_hash(store).await;
+            assert_ne!(*before, after, "rules hash did not move after {op}");
+            after
+        }
+
+        fn rule_body(name: &str, when: &str) -> Body {
+            Body::from(
+                serde_json::json!({
+                    "id": "",
+                    "name": name,
+                    "when": when,
+                    "severity": "warning"
+                })
+                .to_string(),
+            )
+        }
+
+        fn local(method: Method, uri: &str, body: Body) -> Request<Body> {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            req
+        }
+
+        let h0 = rules_hash(&store).await;
+
+        let res = app
+            .clone()
+            .oneshot(local(
+                Method::POST,
+                "/api/v1/rules",
+                rule_body("local", "object.label == 'person'"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let created: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let id = created["id"]
+            .as_str()
+            .expect("created rule has an id")
+            .to_string();
+        let h1 = expect_republish(&mut changed, &store, &h0, "create").await;
+
+        let res = app
+            .clone()
+            .oneshot(local(
+                Method::PUT,
+                &format!("/api/v1/rules/{id}"),
+                rule_body("local", "object.label == 'vehicle'"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let h2 = expect_republish(&mut changed, &store, &h1, "upsert").await;
+
+        let res = app
+            .oneshot(local(
+                Method::DELETE,
+                &format!("/api/v1/rules/{id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        expect_republish(&mut changed, &store, &h2, "delete").await;
     }
 
     fn sign_admin_jwt(secret: &[u8]) -> String {
