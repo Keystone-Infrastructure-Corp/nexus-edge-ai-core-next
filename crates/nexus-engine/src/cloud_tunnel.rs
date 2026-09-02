@@ -645,6 +645,11 @@ async fn run(
     // baseline, and rebuilding it per connection would make the census sent
     // on reconnect all-zero (see `pump_camera_decode_health`).
     let mut decode_window = DecodeHealthWindow::default();
+    // Same reason, different failure: rebuilding this per connection would
+    // reset both the counts and the window deadline, so a core reconnecting
+    // faster than `EVICTION_WINDOW` would never reach a boundary and never
+    // report (see `pump_eviction_events`).
+    let mut eviction_window = EvictionWindow::new();
     loop {
         // Check for shutdown before each connect attempt.
         if shutdown.try_recv().is_ok() {
@@ -690,7 +695,8 @@ async fn run(
                     &liveness,
                 );
                 let storage_events = pump_storage_events(&*conn, &watermark);
-                let eviction_events = pump_eviction_events(&*conn, &watermark.bus);
+                let eviction_events =
+                    pump_eviction_events(&*conn, &watermark.bus, &mut eviction_window);
                 let sink_health = pump_sink_delivery_health(&*conn, &watermark.bus, &store);
                 let decode_events =
                     pump_camera_decode_health(&*conn, &decode_health, &mut decode_window);
@@ -1460,6 +1466,12 @@ struct EvictionWindow {
     /// False while an episode is already being reported. One sustained
     /// episode notifies once; a window that does not trip re-arms it.
     armed: bool,
+    /// When the window currently being filled closes. Owned by the window
+    /// rather than by the pump because the window outlives the connection:
+    /// a core reconnecting faster than [`EVICTION_WINDOW`] — a core under
+    /// duress, which is the population this report exists for — would never
+    /// reach a boundary if the deadline restarted on every connect.
+    deadline: tokio::time::Instant,
 }
 
 impl EvictionWindow {
@@ -1470,6 +1482,7 @@ impl EvictionWindow {
             clips_closed: 0,
             freed_bytes: 0,
             armed: true,
+            deadline: tokio::time::Instant::now() + EVICTION_WINDOW,
         }
     }
 
@@ -1519,6 +1532,7 @@ impl EvictionWindow {
         self.hard_evictions = 0;
         self.clips_closed = 0;
         self.freed_bytes = 0;
+        self.deadline = tokio::time::Instant::now() + EVICTION_WINDOW;
         payload
     }
 }
@@ -1541,7 +1555,16 @@ impl EvictionWindow {
 /// Best-effort like every other pump: returns on send failure so the
 /// supervisor reconnects, and parks (rather than spinning) if any
 /// subscription fails.
-async fn pump_eviction_events<H: TunnelHandle>(handle: &H, bus: &Arc<dyn Bus>) {
+///
+/// `window` is owned by the supervisor and outlives the connection, so a
+/// tunnel that flaps inside one [`EVICTION_WINDOW`] still accumulates
+/// towards a verdict instead of resetting its counts and its deadline on
+/// every connect.
+async fn pump_eviction_events<H: TunnelHandle>(
+    handle: &H,
+    bus: &Arc<dyn Bus>,
+    window: &mut EvictionWindow,
+) {
     let (mut hot, mut hard, mut closed) = match (
         bus.subscribe::<serde_json::Value>(topic::CLIP_HOT_EVICTED)
             .await,
@@ -1557,17 +1580,12 @@ async fn pump_eviction_events<H: TunnelHandle>(handle: &H, bus: &Arc<dyn Bus>) {
         }
     };
 
-    let mut window = EvictionWindow::new();
-    let mut ticker = tokio::time::interval(EVICTION_WINDOW);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Consume the immediate first tick (tokio fires `interval` at t=0): a
-    // zero-length window holds no counts and has no ratio to judge. Unlike
-    // the two sticky pumps below there is nothing to resync here, so this
-    // costs no resolve.
-    ticker.tick().await;
     loop {
+        // Read the deadline out before the `select!` so the sleep future
+        // does not hold a borrow the observe arms need.
+        let deadline = window.deadline;
         tokio::select! {
-            _ = ticker.tick() => {
+            () = tokio::time::sleep_until(deadline) => {
                 if let Some(payload) = window.close() {
                     if let Err(e) = handle.send(eviction_aggressive_envelope(&payload)).await {
                         warn!(error = %e, "aggressive eviction send failed; pump exiting");
@@ -1587,12 +1605,8 @@ async fn pump_eviction_events<H: TunnelHandle>(handle: &H, bus: &Arc<dyn Bus>) {
                 Ok(_) => window.observe_clip_closed(),
                 Err(e) => debug!(error = %e, "clip closed bus stream error; skipping this message"),
             },
-            else => break,
         }
     }
-    // Every stream ended (bus dropped, i.e. process shutdown) — park so the
-    // outer `select!` keeps waiting on the other pumps instead of spinning.
-    std::future::pending::<()>().await;
 }
 
 fn eviction_aggressive_envelope(payload: &StorageEvictionAggressivePayload) -> Envelope {
@@ -2496,7 +2510,8 @@ mod storage_watermark_tests {
     async fn steady_state_eviction_is_not_aggressive_at_any_site_size() {
         let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(256));
         let tunnel = CapturingTunnel::new();
-        let pump = pump_eviction_events(&*tunnel, &bus);
+        let mut window = EvictionWindow::new();
+        let pump = pump_eviction_events(&*tunnel, &bus, &mut window);
         let drive = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             let busy = EVICTION_MIN_SAMPLE * 8;
@@ -2526,7 +2541,8 @@ mod storage_watermark_tests {
     async fn eviction_outrunning_recording_reports_on_the_wire_topic() {
         let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(256));
         let tunnel = CapturingTunnel::new();
-        let pump = pump_eviction_events(&*tunnel, &bus);
+        let mut window = EvictionWindow::new();
+        let pump = pump_eviction_events(&*tunnel, &bus, &mut window);
         let drive = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             // Two clips written, five deleted: past the 2x ratio and above the
@@ -2565,6 +2581,50 @@ mod storage_watermark_tests {
         assert!(
             !serialized.contains("cold_path") && !serialized.contains("NEXUS_ACME_HQ"),
             "no filesystem paths on the wire, got {serialized}",
+        );
+    }
+
+    /// A core under duress is a core whose tunnel flaps, and it is exactly
+    /// the core this report exists for. The window (counts, `armed` and the
+    /// boundary deadline) therefore has to outlive the connection: rebuilt
+    /// per connect, a core reconnecting inside one `EVICTION_WINDOW` would
+    /// restart the clock every time and never reach a boundary.
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_flapping_inside_one_window_still_reaches_a_boundary() {
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(256));
+        let tunnel = CapturingTunnel::new();
+        let mut window = EvictionWindow::new();
+        let per_connection = EVICTION_MIN_SAMPLE.max(5);
+
+        // Two connections, each barely over half a window: neither is long
+        // enough to close a window of its own.
+        for _ in 0..2 {
+            let pump = pump_eviction_events(&*tunnel, &bus, &mut window);
+            let drive = async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                publish_clip_closures(&bus, 1).await;
+                publish_evictions(&bus, topic::CLIP_HOT_EVICTED, per_connection, 512).await;
+                tokio::time::sleep(EVICTION_WINDOW / 2 + Duration::from_secs(1)).await;
+            };
+            tokio::select! {
+                () = pump => {}
+                () = drive => {}
+            }
+        }
+
+        let sent = tunnel.bus_events_on("storage.eviction.aggressive");
+        assert_eq!(
+            sent.len(),
+            1,
+            "a window that survives the reconnect reports; one rebuilt per \
+             connection never would",
+        );
+        let ev: StorageEvictionAggressivePayload =
+            serde_json::from_value(sent[0].clone()).expect("payload matches the wire schema");
+        assert_eq!(
+            ev.evictions,
+            per_connection * 2,
+            "the counts span both connections",
         );
     }
 
@@ -2672,6 +2732,53 @@ mod storage_watermark_tests {
         }
     }
 
+    /// The connect-time resync is the whole reason a flapping tunnel does
+    /// not strand `sink.outbox.backlogged` open forever, so it has to go out
+    /// BEFORE the first window elapses — and it has to say, with
+    /// `window_secs = 0`, that its empty `sinks` array is silence rather
+    /// than a clean window. A consumer that read that array as "no sink
+    /// dead-lettered" would resolve a condition on every reconnect.
+    #[tokio::test]
+    async fn the_connect_resync_is_gauge_only_and_precedes_the_first_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..nexus_config::StoreConfig::default()
+            })
+            .await
+            .expect("open store"),
+        );
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(16));
+        let tunnel = CapturingTunnel::new();
+
+        // Real clock (the pump reads SQLite), and far short of one window.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(250),
+            pump_sink_delivery_health(&*tunnel, &bus, &store),
+        )
+        .await;
+
+        let sent = tunnel.bus_events_on("sink.delivery.health");
+        assert_eq!(
+            sent.len(),
+            1,
+            "exactly one sample before the first window closes: the resync",
+        );
+        let sh: SinkDeliveryHealthPayload =
+            serde_json::from_value(sent[0].clone()).expect("payload matches the wire schema");
+        assert_eq!(
+            sh.window_secs, 0,
+            "a zero window is how the resync says its counters observed nothing",
+        );
+        assert!(
+            sh.sinks.is_empty(),
+            "the resync carries the gauge only, got {:?}",
+            sh.sinks,
+        );
+        assert!(sh.queue_threshold > 0, "the threshold must stay meaningful");
+    }
+
     /// The registry's counters only ever climb, so the wire has to carry a
     /// per-window delta: a cumulative total can never be seen to fall back
     /// under the threshold, which would strand the stateful condition the
@@ -2698,6 +2805,49 @@ mod storage_watermark_tests {
         let third = window.census(&registry);
         assert_eq!(drops_for(&third, 7), 0, "a clean window reports zero");
         assert!(decode_health_is_quiet(&third));
+    }
+
+    /// The census sent on reconnect is a real measurement of the gap, not an
+    /// empty one: the baseline is owned by the supervisor and survives the
+    /// connection. Rebuilt per connection it would report all-zero and
+    /// resolve every degraded camera on the strength of a window nobody
+    /// measured.
+    #[tokio::test]
+    async fn a_reconnect_census_reports_the_drops_taken_while_disconnected() {
+        let registry = Arc::new(nexus_pipeline::DecodeHealthRegistry::new());
+        let tunnel = CapturingTunnel::new();
+        let mut window = DecodeHealthWindow::default();
+
+        registry.observe_decoder_output(5);
+        // First connection: establishes the baseline and disconnects.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            pump_camera_decode_health(&*tunnel, &registry, &mut window),
+        )
+        .await;
+
+        // Four access units lost while the tunnel was down.
+        for _ in 0..4 {
+            registry.observe_decoder_input_drop(5);
+        }
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            pump_camera_decode_health(&*tunnel, &registry, &mut window),
+        )
+        .await;
+
+        let sent = tunnel.bus_events_on("camera.decode.health");
+        assert_eq!(sent.len(), 2, "one census per connection");
+        let first: CameraDecodeHealthPayload =
+            serde_json::from_value(sent[0].clone()).expect("payload matches the wire schema");
+        let second: CameraDecodeHealthPayload =
+            serde_json::from_value(sent[1].clone()).expect("payload matches the wire schema");
+        assert_eq!(drops_for(&first, 5), 0, "nothing lost before the baseline");
+        assert_eq!(
+            drops_for(&second, 5),
+            4,
+            "the reconnect census covers the disconnect gap",
+        );
     }
 
     /// The census is what makes the cloud's resolve total, so it must name
