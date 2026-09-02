@@ -249,6 +249,7 @@ async fn slow_sink_does_not_block_other_sinks() {
         registry.clone(),
         policy,
         health.clone(),
+        None,
         async {
             let _ = shutdown_rx.await;
         },
@@ -321,6 +322,7 @@ async fn dispatcher_health_reports_liveness() {
         registry,
         policy,
         health.clone(),
+        None,
         async {
             let _ = shutdown_rx.await;
         },

@@ -17,6 +17,11 @@ rust-version.workspace = true
 
 [dependencies]
 nexus-types = { workspace = true }
+# Delivery-outcome publish (`topic::SINK_DELIVERY_OUTCOME`). The two
+# transitions the outbox table cannot be sampled for have to be told to
+# the rest of the process the moment they happen; the engine's cloud
+# tunnel is the only subscriber today.
+nexus-bus = { workspace = true }
 # Outbox CRUD + OutboxRow types. nexus-rules already depends on
 # nexus-store, so adding it here introduces no new transitive deps
 # for any consumer of `nexus-sinks::AlertSink`.
@@ -89,6 +94,8 @@ email = ["dep:lettre"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `StreamExt::next` on the bus subscription the delivery-outcome test reads.
+futures = { workspace = true }
 sqlx = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }

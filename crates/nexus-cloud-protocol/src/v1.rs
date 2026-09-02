@@ -91,7 +91,7 @@ pub struct AlertPayload {
     pub verification_state: Option<VerificationState>,
 }
 
-/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines exactly one topic: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
+/// Edge → Cloud. ADR-075 Tier 2: edge-emitted, best-effort, over the lossy tunnel — the reservation §9 of WIRE_PROTOCOL.md made for this exact purpose ("surfacing the edge's internal event bus to cloud subscribers"); this schema entry is the first caller. Additive on `v=1`: an older gateway that has never heard of `bus_event` ignores the unknown `kind` per §3, and an older edge that never sends one is unaffected. `topic` discriminates the shape of the nested `payload` object the same way `MessageKind` discriminates the envelope itself, but stays a plain (bounded) string rather than a schema enum so a future topic can ship without a wire-schema edit — the gateway's own allow-list is the enforcement point, not this schema. v1 defines four topics: `storage.watermark`, whose `payload` deserializes as `StorageWatermarkPayload`, `storage.eviction.aggressive`, whose `payload` deserializes as `StorageEvictionAggressivePayload`, `sink.delivery.health`, whose `payload` deserializes as `SinkDeliveryHealthPayload`, and `camera.decode.health`, whose `payload` deserializes as `CameraDecodeHealthPayload`. `core_id` is optional defense-in-depth ONLY: per WIRE_PROTOCOL.md §8 and §1, scope is derived exclusively from the mTLS certificate SAN at handshake time, never from any payload field; if present here it MUST equal the cert-derived core id or the gateway rejects the envelope (logged, tunnel left intact) — a core cannot use this field to claim events on another core's behalf.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BusEventPayload {
@@ -102,6 +102,31 @@ pub struct BusEventPayload {
     pub payload: serde_json::Value,
     /// Bus topic name, mirroring the edge's `nexus_bus::topic` constants (`storage.panic` publishes under topic `storage.watermark` here — the wire name is the durable contract, not the in-process bus topic string). Unknown values are rejected by the gateway without disturbing the tunnel.
     pub topic: String,
+}
+
+/// One camera's decode counters inside a `CameraDecodeHealthPayload` window. Identifiers and counts only — the camera's RTSP URL and ONVIF credentials never leave the edge (AGENTS.md rule 6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraDecodeCounts {
+    /// The per-core integer camera id, the same key `CameraRosterEntry.edge_camera_id` uses; the cloud maps it to a camera UUID through `cameras (core_id, edge_camera_id)`.
+    pub edge_camera_id: u64,
+    /// Compressed access units dropped ahead of the decoder DURING THIS WINDOW — a delta of the engine's cumulative `DecodeHealth::decoder_input_drops`, not the running total, so a condition that ends can be seen to end.
+    pub input_drops: u64,
+}
+
+/// The shape of `BusEventPayload.payload` when `topic = "camera.decode.health"`. One periodic sample of every camera's decode health on this core, feeding the `camera.stream.degraded` platform-event type (Camera-scoped, stateful, warning). "Degraded" here is the catalogue's own definition — decode errors above a threshold — read off `nexus_pipeline::DecodeHealth::decoder_input_drops`, the compressed access units the RGB branch's decoder-input queue leaked ahead of the decoder. That is deliberately NOT camera liveness, which is already `camera.offline` from the roster; a camera can stream perfectly and still be losing access units, and a camera that has stopped streaming is offline rather than degraded. The edge sets `drop_threshold` because the cloud cannot see the decode chain, the same division of labour as `storage.watermark`. Sticky like `sink.delivery.health`, not one-shot: a census is sent immediately on every reconnect and again whenever the picture changes, so a lost envelope cannot strand an open condition. The edge carries its per-camera baseline ACROSS reconnects, so the on-connect census reports the drops accumulated while the tunnel was down rather than an empty window. `cameras` is a complete census of the cameras this core has decode health for — including cameras at zero drops — so the cloud resolves the condition for any camera the census omits, UNLESS `truncated` says the omission is the cap rather than health. Deliberately ids, counts and durations only — never the RTSP URL, ONVIF credential or `PipelineStatus.last_error` (a free-form GStreamer string whose `debug` field embeds the source URI), all of which stay edge-resident per AGENTS.md rule 6 / REPO_BOUNDARY R5b.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraDecodeHealthPayload {
+    /// One entry per camera the core recorded decode health for during the window, INCLUDING cameras at zero drops — the absent-vs-zero distinction the cloud needs to resolve a condition rather than leave it open forever. Ordered worst-first and cut to `maxItems`, which `truncated` reports; bounded so the sample cannot approach the gateway's per-payload ceiling.
+    pub cameras: Vec<CameraDecodeCounts>,
+    /// Access-unit drops inside one window above which the edge considers a camera's stream degraded. Zero means any loss counts, matching the engine's own shipped verdict rule (`decode_verdict::compute_decode_verdict` treats `decoder_input_drops > 0` as `over`), because one lost access unit corrupts every picture until the next IDR.
+    pub drop_threshold: u64,
+    /// True when `cameras` was cut to `maxItems` and one or more cameras were dropped from the census. The census is then NOT complete, so absence carries no information and a consumer MUST NOT resolve `camera.stream.degraded` for the cameras it omits — resolving on a known-incomplete census would assert health about a camera the core never reported on. Optional and absent-means-false, so an older edge that never sets it is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    /// Length of the sampling window the per-camera counters below were accumulated over.
+    pub window_secs: u64,
 }
 
 /// Cloud → Edge. Reply to a camera_roster. `permanent_failure` tells the edge to stop retrying this revision (e.g. malformed metadata). `accepted_revision` is echoed back so the edge can drop the outbox entry and advance its high-water-mark.
@@ -691,6 +716,52 @@ pub struct ShellSessionOpenPayload {
     pub session_id: Uuid,
     /// `wss://<host>/v1/shell/edge/<session_id>`, where `<host>` is the control tunnel's own authority — the URL is derived cloud-side from the edge-gateway replica holding this core's tunnel, so it cannot name anything else (SPEC-032). The engine MUST still verify the host equals its control tunnel's before dialling — no second DNS name, no second port, no new outbound firewall rule. A mismatch is rejected with `close_reason = bad_side_channel_host`.
     pub side_channel_url: String,
+}
+
+/// One sink's delivery counters inside a `SinkDeliveryHealthPayload` window. Identifiers and counts only — the sink's URL, mailbox or SureView endpoint never leaves the edge (REPO_BOUNDARY R5b), and neither does `alert_sink_outbox.last_error`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkDeliveryCounts {
+    /// Rows dead-lettered to this sink inside the window — retries exhausted, the alert will never be delivered.
+    pub dead: u64,
+    /// Outbox rows whose FIRST delivery attempt failed during the window. Deliberately not every failed attempt: the retry schedule allows 8 per row, so a per-attempt count would report one outage eight times.
+    pub first_failures: u64,
+    /// The operator-assigned sink identifier (`nexus_sinks::SinkId`). An id, never an endpoint.
+    pub sink_id: String,
+}
+
+/// The shape of `BusEventPayload.payload` when `topic = "sink.delivery.health"`. One periodic sample of the edge's alert-delivery outbox, feeding three platform-event types at once: `sink.outbox.backlogged` (stateful — open while `queued > queue_threshold`, resolve below it), `sink.delivery.dead` (stateful, ONE condition per core rather than per sink — open while any sink in the sample dead-lettered, resolved by a sample in which none did; per-sink would be unresolvable, because a sink that stops receiving alerts stops appearing at all) and `sink.delivery.failed` (one-shot, per sink — appended when `first_failures` is non-zero). The edge sets `queue_threshold` because it is the dispatcher's own drain cadence (`nexus_sinks::dispatcher::BATCH_SIZE`, one bounded sweep per tick), which the cloud has no visibility into — the same division of labour as `storage.watermark`. Sticky like `storage.watermark`, not one-shot: a sample is sent immediately on every reconnect and again whenever the picture changes, so a lost envelope cannot strand an open condition. The on-reconnect sample carries `window_secs = 0`, meaning the `queued` gauge is live but no counter window has been observed yet — see `window_secs`. Deliberately ids, counts and durations only — never `alert_sink_outbox.last_error` (free-form remote text) and never a sink's URL, mailbox or endpoint, which stay edge-resident per REPO_BOUNDARY R5b.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkDeliveryHealthPayload {
+    /// Depth above which the edge considers the outbox backlogged. One dispatcher sweep's worth of rows: at or below it the queue is under a single tick's work.
+    pub queue_threshold: u64,
+    /// Outbox rows still awaiting delivery at sample time (the same depth `HeartbeatPayload.queued_alerts` reports).
+    pub queued: u64,
+    /// One entry per sink that produced a delivery outcome during the window — a first failure or a dead-letter. This is NOT a roster: a sink that was configured but delivered cleanly (or had nothing to deliver) is ABSENT, not present with zero counters. Ordered busiest-first and cut to `maxItems`, which `truncated` reports; bounded so the sample cannot approach the gateway's per-payload ceiling.
+    pub sinks: Vec<SinkDeliveryCounts>,
+    /// True when `sinks` was cut to `maxItems` and one or more sinks with non-zero counters were dropped from it. Absence of a sink is then NOT evidence of health, so a consumer MUST NOT resolve `sink.delivery.dead` on a truncated sample. Optional and absent-means-false, so an older edge that never sets it is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    /// Length of the sampling window the per-sink counters below were accumulated over. ZERO is meaningful and means this is the gauge-only sample sent immediately on connect: `queued` is a live point-in-time read, but the per-sink counters come off a bus subscription that only exists while connected, so nothing has been observed yet. A consumer MUST drive only `sink.outbox.backlogged` from a zero-window sample and MUST NOT read the empty `sinks` array as evidence that no sink failed or dead-lettered.
+    pub window_secs: u64,
+}
+
+/// The shape of `BusEventPayload.payload` when `topic = "storage.eviction.aggressive"`. Feeds the `storage.eviction.aggressive` platform-event type (Core-scoped, one-shot, warning). The edge — not the cloud — decides when eviction is "aggressive", because the verdict needs the clip-creation rate, which the cloud has no visibility into; the same division of labour as `storage.watermark`, where the edge's FSM decides the level. The verdict is a RATIO, not a count, and that is deliberate: eviction only runs at all once the disk is at the Low or Panic watermark, which is exactly where a healthy retention-limited recorder permanently lives, so any absolute count of evictions per window is a function of how many cameras the site has rather than of whether anything is wrong. At steady state a full disk deletes roughly one clip for every clip it writes, on a 4-camera site and a 32-camera site alike; the edge publishes only when evictions exceed twice the clips closed in the same window, i.e. footage is being destroyed materially faster than it is being recorded and retention depth is actively collapsing. A floor of one full reclaim batch (`storage_safety::MAX_RECLAIM_STEPS_PER_TICK`) suppresses the degenerate small-sample case where a near-idle box evicts a handful of clips against zero closures. One sustained episode is reported ONCE — the edge re-arms only after a window that does not trip — so a core under prolonged pressure does not notify on a timer. Deliberately counts and durations only: no clip ids, no camera ids, and above all no `cold_path`/`hot_path`, which are local filesystem paths that can embed customer naming. Unlike `storage.watermark` this is a one-shot EDGE, not a sticky STATE, so an envelope lost to the tunnel is simply lost — acceptable because a still-worsening episode re-detects after the next quiet window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageEvictionAggressivePayload {
+    /// Clips the recorder finished writing in the same window — the denominator of the ratio that produced this verdict, so a consumer can show why the core reported rather than a bare eviction count that means nothing without the site's size. Optional, so an older edge that never sets it is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clips_closed: Option<u64>,
+    /// Total clips evicted in the window (soft + hard).
+    pub evictions: u64,
+    /// Bytes reclaimed by those evictions.
+    pub freed_bytes: u64,
+    /// Subset of `evictions` that had no cold copy and were therefore permanently lost, not merely tiered out of the hot store. Never exceeds `evictions`.
+    pub hard_evictions: u64,
+    /// Length of the rolling window the counts below were accumulated over.
+    pub window_secs: u64,
 }
 
 /// The shape of `BusEventPayload.payload` when `topic = "storage.watermark"`. Mirrors the edge's `storage_safety::StoragePanicEvent` (minus the local `clips_dir` path, which never leaves the box) — the edge's hysteretic watermark FSM (`storage_safety::WatermarkController`, already anti-flap: 5-point hysteresis) is the sole producer. ADR-075's sticky-level argument is what makes Tier 2 acceptable for this event and no other: the edge republishes its CURRENT `level` on every threshold crossing AND on every tunnel (re)connect, not only on crossings, so an envelope dropped by the lossy tunnel is recovered by the very next publish rather than lost. A duplicate publish of the same level is harmless by construction — nothing downstream keys off occurrence count, only the level value.

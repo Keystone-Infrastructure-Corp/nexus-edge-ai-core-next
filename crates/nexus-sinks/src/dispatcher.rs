@@ -46,11 +46,72 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use nexus_bus::{topic, Bus, BusExt};
 use nexus_store::{OutboxRow, OutboxStatus, Store, SuppressionReason};
 use nexus_types::AlertEvent;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::{backoff_for, SinkError, SinkId, SinkRegistry};
+
+/// A delivery outcome worth telling the rest of the process about.
+///
+/// Only the two transitions that cannot be recovered by sampling
+/// `alert_sink_outbox`: [`Self::FirstFailure`] because a retrying row is
+/// written back as `pending` (see [`Store::outbox_mark_failed`]) and is
+/// only distinguishable by `attempts`, for the 500 ms until its first
+/// retry; [`Self::Dead`] because `outbox_counts_since` buckets on
+/// `created_at`, not on when the row died.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkDeliveryOutcome {
+    /// The row's first `deliver()` call failed. Deliberately not every
+    /// failed attempt: the retry schedule allows 8 per row, so a
+    /// per-attempt signal reports one outage eight times.
+    FirstFailure,
+    /// The row was dead-lettered — retries exhausted, or a permanent
+    /// rejection. The alert will never be delivered.
+    Dead,
+}
+
+/// Payload of [`topic::SINK_DELIVERY_OUTCOME`].
+///
+/// An id and an enum. The row's `last_error` is free-form text from a
+/// remote endpoint and the sink's URL / mailbox is a credential-adjacent
+/// local secret; neither belongs anywhere a cloud bridge can pick it up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SinkDeliveryOutcomeEvent {
+    pub sink_id: String,
+    pub outcome: SinkDeliveryOutcome,
+}
+
+/// Best-effort publish of one delivery outcome. A bus with no
+/// subscriber (no cloud tunnel) is the normal single-site case, so a
+/// publish error is debug-level and never affects the row's fate.
+///
+/// `sink_id` arrives as the raw `alert_sink_outbox.sink_id` column, so it
+/// is re-parsed here rather than trusted: the dead-letter path that fires
+/// on an unparseable id would otherwise publish across the tunnel exactly
+/// the value it just rejected as malformed. A row whose id will not parse
+/// cannot be attributed to a sink, so there is nothing to report about it
+/// and it is dropped. One choke point covers both call sites.
+async fn publish_outcome(bus: Option<&Arc<dyn Bus>>, sink_id: &str, outcome: SinkDeliveryOutcome) {
+    let Some(bus) = bus else { return };
+    let Some(parsed) = SinkId::parse(sink_id) else {
+        debug!(
+            sink_id,
+            "sink dispatcher: unparseable sink_id, not publishing a delivery outcome for it"
+        );
+        return;
+    };
+    let event = SinkDeliveryOutcomeEvent {
+        sink_id: parsed.as_str().to_string(),
+        outcome,
+    };
+    if let Err(e) = bus.publish(topic::SINK_DELIVERY_OUTCOME, &event).await {
+        debug!(error = %e, sink_id, "sink dispatcher: outcome publish failed");
+    }
+}
 
 /// Default time between drain sweeps when the outbox is quiet. The
 /// dispatcher also wakes immediately when [`SinkDispatcher::notify`]
@@ -305,6 +366,7 @@ pub async fn run_dispatcher(
     registry: Arc<SinkRegistry>,
     policy: Arc<dyn DeliveryPolicy>,
     health: Arc<DispatcherHealth>,
+    bus: Option<Arc<dyn Bus>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     info!(
@@ -321,7 +383,7 @@ pub async fn run_dispatcher(
     interval.tick().await;
 
     // Boot kick — one tick before entering the select loop.
-    tick(&cfg, &store, &registry, &policy, &health).await;
+    tick(&cfg, &store, &registry, &policy, &health, bus.as_ref()).await;
 
     tokio::pin!(shutdown);
 
@@ -333,7 +395,7 @@ pub async fn run_dispatcher(
                 return;
             }
             _ = interval.tick() => {
-                tick(&cfg, &store, &registry, &policy, &health).await;
+                tick(&cfg, &store, &registry, &policy, &health, bus.as_ref()).await;
             }
         }
     }
@@ -355,6 +417,7 @@ async fn tick(
     registry: &Arc<SinkRegistry>,
     policy: &Arc<dyn DeliveryPolicy>,
     health: &Arc<DispatcherHealth>,
+    bus: Option<&Arc<dyn Bus>>,
 ) {
     health.mark_tick_started();
 
@@ -391,6 +454,7 @@ async fn tick(
         let policy = Arc::clone(policy);
         let clips_dir = cfg.clips_dir.clone();
         let snapshots_dir = cfg.snapshots_dir.clone();
+        let bus = bus.cloned();
         tasks.spawn(async move {
             for row in sink_rows {
                 process_row(
@@ -399,6 +463,7 @@ async fn tick(
                     &*policy,
                     clips_dir.as_deref(),
                     snapshots_dir.as_deref(),
+                    bus.as_ref(),
                     row,
                 )
                 .await;
@@ -519,6 +584,7 @@ pub async fn process_row(
     policy: &dyn DeliveryPolicy,
     clips_dir: Option<&std::path::Path>,
     snapshots_dir: Option<&std::path::Path>,
+    bus: Option<&Arc<dyn Bus>>,
     row: OutboxRow,
 ) {
     // Belt-and-suspenders: outbox_pending should already filter
@@ -542,6 +608,7 @@ pub async fn process_row(
             mark_dead(
                 store,
                 snapshots_dir,
+                bus,
                 &row,
                 format!("event {} missing (likely clip-evicted)", row.event_id),
             )
@@ -554,7 +621,14 @@ pub async fn process_row(
                 error = %e,
                 "sink dispatcher: get_event failed; will retry"
             );
-            schedule_retry(store, snapshots_dir, &row, &format!("store error: {e}")).await;
+            schedule_retry(
+                store,
+                snapshots_dir,
+                bus,
+                &row,
+                &format!("store error: {e}"),
+            )
+            .await;
             return;
         }
     };
@@ -579,6 +653,7 @@ pub async fn process_row(
             mark_dead(
                 store,
                 snapshots_dir,
+                bus,
                 &row,
                 format!("malformed sink_id: {:?}", row.sink_id),
             )
@@ -592,6 +667,7 @@ pub async fn process_row(
             mark_dead(
                 store,
                 snapshots_dir,
+                bus,
                 &row,
                 format!("no sink registered for {}", row.sink_id),
             )
@@ -674,6 +750,7 @@ pub async fn process_row(
                 schedule_retry(
                     store,
                     snapshots_dir,
+                    bus,
                     &row,
                     &format!("alert clip lookup: {e}"),
                 )
@@ -763,8 +840,14 @@ pub async fn process_row(
                         error = %e,
                         "sink dispatcher: get_clip failed; will retry"
                     );
-                    schedule_retry(store, snapshots_dir, &row, &format!("get_clip error: {e}"))
-                        .await;
+                    schedule_retry(
+                        store,
+                        snapshots_dir,
+                        bus,
+                        &row,
+                        &format!("get_clip error: {e}"),
+                    )
+                    .await;
                     return;
                 }
             },
@@ -801,6 +884,7 @@ pub async fn process_row(
                 schedule_retry(
                     store,
                     snapshots_dir,
+                    bus,
                     &row,
                     &format!("clip lookup error: {e}"),
                 )
@@ -825,17 +909,36 @@ pub async fn process_row(
         Err(SinkError::Permanent(msg)) => {
             // 4xx-class: don't burn retries on something that
             // will never succeed.
-            mark_dead(store, snapshots_dir, &row, format!("permanent: {msg}")).await;
+            report_first_failure(bus, &row).await;
+            mark_dead(store, snapshots_dir, bus, &row, format!("permanent: {msg}")).await;
         }
         Err(SinkError::Transient(msg)) => {
-            schedule_retry(store, snapshots_dir, &row, &format!("transient: {msg}")).await;
+            report_first_failure(bus, &row).await;
+            schedule_retry(
+                store,
+                snapshots_dir,
+                bus,
+                &row,
+                &format!("transient: {msg}"),
+            )
+            .await;
         }
+    }
+}
+
+/// Publish [`SinkDeliveryOutcome::FirstFailure`] iff this `deliver()` call
+/// was the row's first. `attempts` is the pre-bump value the dispatcher
+/// read with the row, so zero means nothing has been tried yet.
+async fn report_first_failure(bus: Option<&Arc<dyn Bus>>, row: &OutboxRow) {
+    if row.attempts == 0 {
+        publish_outcome(bus, &row.sink_id, SinkDeliveryOutcome::FirstFailure).await;
     }
 }
 
 async fn schedule_retry(
     store: &Arc<Store>,
     snapshots_dir: Option<&std::path::Path>,
+    bus: Option<&Arc<dyn Bus>>,
     row: &OutboxRow,
     msg: &str,
 ) {
@@ -861,6 +964,7 @@ async fn schedule_retry(
             mark_dead(
                 store,
                 snapshots_dir,
+                bus,
                 row,
                 format!("max retries exceeded ({msg})"),
             )
@@ -900,6 +1004,7 @@ async fn schedule_clip_wait(store: &Arc<Store>, row: &OutboxRow, msg: &str) {
 async fn mark_dead(
     store: &Arc<Store>,
     snapshots_dir: Option<&std::path::Path>,
+    bus: Option<&Arc<dyn Bus>>,
     row: &OutboxRow,
     msg: String,
 ) {
@@ -910,5 +1015,6 @@ async fn mark_dead(
             "sink dispatcher: outbox_mark_dead failed"
         );
     }
+    publish_outcome(bus, &row.sink_id, SinkDeliveryOutcome::Dead).await;
     reclaim_snapshot_if_drained(store, snapshots_dir, &row.event_id).await;
 }

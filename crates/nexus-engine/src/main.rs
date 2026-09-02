@@ -1392,6 +1392,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         let sink_registry = sink_registry.clone();
         let policy = delivery_policy.clone();
         let health = dispatcher_health.clone();
+        let bus = bus.clone();
         let dispatcher_cfg = nexus_sinks::dispatcher::SinkDispatcherConfig {
             clips_dir: Some(clips_dir.clone()),
             snapshots_dir: Some(snapshots_dir.clone()),
@@ -1404,6 +1405,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
                 sink_registry,
                 policy,
                 health,
+                Some(bus),
                 async {
                     let _ = dispatcher_shutdown_rx.await;
                 },
@@ -1602,6 +1604,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         snapshot_uploader_slot.clone(),
         live_view_manager.clone(),
         frame_stats.clone(),
+        decode_health.clone(),
         webrtc_bridge,
         Some(trace_rx),
         loopback_admin_base.clone(),

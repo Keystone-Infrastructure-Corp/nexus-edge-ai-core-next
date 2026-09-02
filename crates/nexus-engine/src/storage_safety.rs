@@ -65,7 +65,7 @@ const PRESSURE_RECLAIM_BATCH: i64 = 64;
 /// sample interval, so we drain a bounded batch each tick. The cap
 /// keeps one tick's work bounded; the next tick resumes if still under
 /// pressure.
-const MAX_RECLAIM_STEPS_PER_TICK: u32 = 64;
+pub(crate) const MAX_RECLAIM_STEPS_PER_TICK: u32 = 64;
 
 /// Within a reclaim batch, re-probe free space every N steps so we
 /// stop as soon as the disk recovers instead of over-evicting the full
