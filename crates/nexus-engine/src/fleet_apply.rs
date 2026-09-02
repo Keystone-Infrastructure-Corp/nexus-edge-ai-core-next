@@ -432,6 +432,16 @@ async fn apply_rules(
     nexus_store::Store::commit_tx(tx).await?;
     let reload_id: RuleId = "fleet-apply".to_string();
     crate::api::reload_rules_into_evaluator(s, "fleet-apply", &reload_id).await;
+    // Wakes the state-hash publisher; without it a rules-only apply
+    // never re-reports and the console shows drift forever (BUG-163).
+    // `kind` keeps the camera reconciler from running a pointless pass.
+    let _ = s
+        .bus
+        .publish(
+            topic::CONFIG_CHANGED,
+            &serde_json::json!({ "kind": "rules" }),
+        )
+        .await;
     Ok(AppliedCategory {
         targets: rules.len(),
         managed_keys: rules.iter().map(|r| r.id.clone()).collect(),

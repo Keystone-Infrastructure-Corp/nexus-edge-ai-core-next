@@ -7025,6 +7025,9 @@ mod tests {
     /// so tests can `insert_reserved` / register sinks before exercising
     /// the sinks-health endpoint. `build_test_router` wraps this and drops
     /// the handle (most tests never touch the registry).
+    ///
+    /// The bus is returned last so a test can subscribe before issuing a
+    /// request and assert on what a handler published.
     async fn build_test_router_full(
         admin_secret: Option<&[u8]>,
     ) -> (
@@ -7032,6 +7035,7 @@ mod tests {
         Arc<Store>,
         tempfile::TempDir,
         Arc<nexus_sinks::SinkRegistry>,
+        Arc<dyn nexus_bus::Bus>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nexus.db");
@@ -7076,7 +7080,7 @@ mod tests {
         let sink_registry = Arc::new(nexus_sinks::SinkRegistry::new());
         let state = super::ApiState {
             store: store.clone(),
-            bus,
+            bus: bus.clone(),
             current_bind: "127.0.0.1:0".into(),
             current_ui_bind: None,
             evaluator,
@@ -7192,7 +7196,7 @@ mod tests {
             reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
         };
         let app = super::router(state);
-        (app, store, dir, sink_registry)
+        (app, store, dir, sink_registry, bus)
     }
 
     /// Common wrapper over [`build_test_router_full`] that drops the
@@ -7200,8 +7204,57 @@ mod tests {
     async fn build_test_router(
         admin_secret: Option<&[u8]>,
     ) -> (axum::Router, Arc<Store>, tempfile::TempDir) {
-        let (app, store, dir, _reg) = build_test_router_full(admin_secret).await;
+        let (app, store, dir, _reg, _bus) = build_test_router_full(admin_secret).await;
         (app, store, dir)
+    }
+
+    /// BUG-163 — a rules-only fleet apply must wake the state-hash
+    /// publisher. `apply_rules` was the only handler for a category the
+    /// edge hashes that published nothing, so the core never
+    /// re-reported and the console showed configuration drift forever
+    /// even though the rules had applied.
+    #[tokio::test]
+    async fn fleet_apply_rules_publishes_config_changed() {
+        use futures::StreamExt;
+        use nexus_bus::BusExt;
+
+        let (app, _store, _dir, _reg, bus) = build_test_router_full(None).await;
+        // Subscribe before the request: BroadcastBus drops for late subscribers.
+        let mut changed = bus
+            .subscribe::<serde_json::Value>(nexus_bus::topic::CONFIG_CHANGED)
+            .await
+            .expect("subscribe to config.changed");
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/fleet/rules")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "mode": "replace",
+                    "effective": [{
+                        "id": "fleet-rule-1",
+                        "name": "person",
+                        "when": "object.label == 'person'",
+                        "severity": "warning"
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), changed.next())
+            .await
+            .expect("apply_rules must publish config.changed")
+            .expect("bus stream closed")
+            .expect("bus payload deserialises");
+        // Identifies the publisher: every other CONFIG_CHANGED on this path
+        // carries a different `kind`, so the assertion cannot pass on a
+        // bystander's event if `apply_rules` regresses.
+        assert_eq!(event.get("kind").and_then(|k| k.as_str()), Some("rules"));
     }
 
     fn sign_admin_jwt(secret: &[u8]) -> String {
@@ -8974,7 +9027,7 @@ mod tests {
     async fn sinks_health_reserved_sink_is_configured_not_orphan() {
         use axum::body::to_bytes;
         const SECRET: &[u8] = b"m7-sinks-health-reserved-secret";
-        let (app, _store, _dir, registry) = build_test_router_full(Some(SECRET)).await;
+        let (app, _store, _dir, registry, _bus) = build_test_router_full(Some(SECRET)).await;
         registry.insert_reserved(Arc::new(ReservedTestSink {
             id: nexus_sinks::SinkId::new("cloud", "console").unwrap(),
         }));
