@@ -219,6 +219,9 @@ pub struct CoreStateHashesPayload {
     /// Lower-hex SHA-256 of the canonical JSON of the per-camera attached visual prompts. Omitted when no visual prompts are attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_prompts_sha256: Option<String>,
+    /// Lower-hex SHA-256 the edge self-reports for the behavior-verifier VLM model it has loaded (SPEC-056 AC-10). Omitted when the edge has no VLM/behavior-verifier loaded (`deployBehaviorVerifier=false` is the shipped default) — a reported fact, not cloud-pushed config, so it carries no `fleet/effective` projection to compare against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlm_model_sha256: Option<String>,
 }
 
 /// One detector kind the engine knows how to build, with the prompt vocabulary it actually resolves at boot. The console renders prompt suggestions from these entries instead of a hand-maintained mirror, so closed-vocab kinds advertise the exact label set the detector emits and open-vocab kinds advertise the baked prompt vocabulary.

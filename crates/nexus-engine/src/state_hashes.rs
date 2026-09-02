@@ -62,6 +62,14 @@ fn build_envelope(hashes: &CategoryHashes) -> Envelope {
             visual_prompts_sha256: hashes.visual_prompts.clone(),
             detector_config_sha256: hashes.detector_config.clone(),
             delivery_settings_sha256: hashes.delivery_settings.clone(),
+            // No VLM/behavior-verifier model is loaded by this engine build
+            // (SPEC-056 AC-10, [[ADR-090]]): `deployBehaviorVerifier` ships
+            // `false` by default and this repo has no VLM hash computation
+            // yet. Omitted, not fabricated — the cloud's `vlm` fingerprint
+            // folds this core's `None` the same deterministic way every
+            // other never-reporting core does, so no spurious re-execution
+            // trigger results.
+            vlm_model_sha256: None,
         }),
     }
 }
