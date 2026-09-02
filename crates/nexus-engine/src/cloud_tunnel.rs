@@ -1872,9 +1872,12 @@ impl DecodeHealthWindow {
     ///
     /// A camera whose counter went *backwards* has been cleared and
     /// respawned (`DecodeHealthRegistry::clear`, called by the reconciler on
-    /// every camera restart), so its running total restarts from zero;
-    /// treating the new absolute value as the delta is both correct and the
-    /// only saturating-subtraction-safe reading.
+    /// every camera restart, REMOVES the entry so the next spawn counts up
+    /// from zero), so its running total restarts: the new absolute value IS
+    /// the window's delta. Subtracting the stale baseline would saturate to
+    /// zero and report a camera that has just been restarted *because it was
+    /// failing* as clean — resolving `camera.stream.degraded` on the strength
+    /// of a window whose drops were all discarded.
     fn census(
         &mut self,
         health: &nexus_pipeline::DecodeHealthRegistry,
@@ -1891,7 +1894,11 @@ impl DecodeHealthWindow {
                 let previous = self.previous.get(&camera_id).copied().unwrap_or(0);
                 Some(CameraDecodeCounts {
                     edge_camera_id,
-                    input_drops: snap.decoder_input_drops.saturating_sub(previous),
+                    input_drops: if snap.decoder_input_drops < previous {
+                        snap.decoder_input_drops
+                    } else {
+                        snap.decoder_input_drops - previous
+                    },
                 })
             })
             .collect();
@@ -2804,6 +2811,52 @@ mod storage_watermark_tests {
         // A window with no new drops is what resolves the condition.
         let third = window.census(&registry);
         assert_eq!(drops_for(&third, 7), 0, "a clean window reports zero");
+        assert!(decode_health_is_quiet(&third));
+    }
+
+    /// A camera restarted mid-window must report the drops it took SINCE the
+    /// restart, not zero.
+    ///
+    /// `DecodeHealthRegistry::clear` removes the entry (the reconciler calls
+    /// it on every camera teardown), so the next spawn counts up from zero
+    /// while this window still holds the pre-restart baseline. Subtracting
+    /// that baseline saturates to zero, and a zero census is exactly what
+    /// resolves `camera.stream.degraded` — so a camera restarted *because it
+    /// is failing* would report clean on the very window that proves it is
+    /// not.
+    #[test]
+    fn a_census_after_a_camera_restart_reports_the_new_totals_drops() {
+        let registry = nexus_pipeline::DecodeHealthRegistry::new();
+        let mut window = DecodeHealthWindow::default();
+
+        for _ in 0..500 {
+            registry.observe_decoder_input_drop(7);
+        }
+        let first = window.census(&registry);
+        assert_eq!(drops_for(&first, 7), 500, "baseline window sees all 500");
+
+        // The reconciler tears the camera down and respawns it; the counter
+        // restarts at zero while `window.previous` still holds 500.
+        registry.clear(7);
+        for _ in 0..30 {
+            registry.observe_decoder_input_drop(7);
+        }
+
+        let second = window.census(&registry);
+        assert_eq!(
+            drops_for(&second, 7),
+            30,
+            "the post-restart total IS the window's delta",
+        );
+        assert!(
+            !decode_health_is_quiet(&second),
+            "a camera still dropping after a restart is not healthy",
+        );
+
+        // And the new baseline is the post-restart total, not the old one:
+        // the next clean window must still resolve.
+        let third = window.census(&registry);
+        assert_eq!(drops_for(&third, 7), 0, "a clean window still reports zero");
         assert!(decode_health_is_quiet(&third));
     }
 
