@@ -101,7 +101,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,7 +115,7 @@ use nexus_store::{AlertClipId, ClipClose, ClipId, NewAlertClip, NewClip, Store};
 use nexus_types::{CameraId, CodecKind};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
-use tokio::sync::{broadcast, oneshot, Mutex, Notify};
+use tokio::sync::{broadcast, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::alert_clip::{
@@ -204,6 +204,16 @@ pub struct GstClipRecorder {
     /// an `Arc` so the spawned builder task can remove its own entry
     /// on completion.
     alert_inflight: Arc<PlMutex<HashMap<CameraId, AlertInflight>>>,
+    /// Admission control for alert-clip builds — BUG-168. Holds
+    /// [`MAX_CONCURRENT_ALERT_CLIP_BUILDS`] permits; `arm_alert_clip`
+    /// takes one with `try_acquire_owned()` and the builder drops it
+    /// when it finishes. Coalescing alerts need no permit: they join a
+    /// build that already holds one.
+    alert_build_slots: Arc<Semaphore>,
+    /// Alert clips refused because every build slot was taken
+    /// (BUG-168). Reported on the refusal log line so a degrading
+    /// feature is visible without inferring it from a restart loop.
+    alert_clips_shed: AtomicU64,
     /// Optional wake handle shared with the cold replicator
     /// (M-Alert-Clip cloud delivery). The builder fires `notify_one()`
     /// the moment an alert clip is stamped `ready`, so the replicator
@@ -309,6 +319,26 @@ struct AlertInflight {
     deadline: Arc<AtomicI64>,
 }
 
+/// How many alert-clip builds may be in flight at once, across every
+/// camera (BUG-168).
+///
+/// The coalescing in [`AlertInflight`] is not a bound: it reuses a clip
+/// only while its *collection* deadline is open, and the map entry lives
+/// until the encode finishes, so the next alert after collection closes
+/// arms a second build while the first still encodes. At 29 cameras and
+/// `post_secs = 5` that is ~6 arrivals/s against an encode rate no edge
+/// box can match, and each build holds its whole window
+/// (`Vec<NalSample>`, pre + post at native resolution) plus a software
+/// decode and an x264 encode pipeline. Unbounded, that reached ~143
+/// concurrent builds and 13.4 GB of anonymous RSS before the cgroup
+/// OOM-killed the engine.
+///
+/// Excess is shed at arm time rather than queued: a waiting builder
+/// still holds its window, so queueing is the same exhaustion with more
+/// steps. Four leaves room for a burst without letting the encoders take
+/// the cores the live pipelines need.
+const MAX_CONCURRENT_ALERT_CLIP_BUILDS: usize = 4;
+
 /// The live camera → main-stream ingester map, shared by `Arc` between the
 /// clip recorder that mutates it and every other reader of it.
 ///
@@ -341,6 +371,8 @@ impl GstClipRecorder {
             alert_clips_cfg: AlertClipsConfig::default(),
             alert_box_timelines: PlRwLock::new(HashMap::new()),
             alert_inflight: Arc::new(PlMutex::new(HashMap::new())),
+            alert_build_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ALERT_CLIP_BUILDS)),
+            alert_clips_shed: AtomicU64::new(0),
             alert_cold_kick: None,
             alert_clip_delivery_gate: None,
             decode_health: None,
@@ -1466,7 +1498,25 @@ impl ClipRecorder for GstClipRecorder {
             }
         }
 
-        // Start a fresh alert clip.
+        // Start a fresh alert clip — but only if a build slot is free
+        // (BUG-168). Taken here, after coalescing (a coalescing alert
+        // joins a build that already holds a permit) and before the
+        // pre-roll snapshot and the row insert, so a shed alert costs
+        // neither memory nor a row. `try_acquire` and not `acquire`:
+        // a builder waiting for a permit still holds its window, so
+        // queueing is the same memory exhaustion with more steps.
+        let Ok(build_slot) = self.alert_build_slots.clone().try_acquire_owned() else {
+            let shed = self.alert_clips_shed.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                camera_id,
+                max_concurrent = MAX_CONCURRENT_ALERT_CLIP_BUILDS,
+                shed_total = shed,
+                "alert clip refused: every build slot is busy; encodes are not \
+                 keeping up with alerts"
+            );
+            return None;
+        };
+
         let ingester = self.ingesters.read().get(&camera_id).cloned()?;
         let codec = ingester.codec();
         // Snapshot + trim the pre-roll ring; derive the window-start
@@ -1538,6 +1588,7 @@ impl ClipRecorder for GstClipRecorder {
             timeline,
             deadline,
             self.alert_cold_kick.clone(),
+            build_slot,
         ));
         Some(alert_clip_id)
     }
@@ -2114,6 +2165,10 @@ async fn run_live_pump(
 /// re-encode on the blocking pool, then stamps the `alert_clips` row
 /// ready (or failed). Spawned per burst by
 /// [`ClipRecorder::arm_alert_clip`].
+///
+/// `build_slot` is the caller's admission permit (BUG-168). It is held
+/// for the whole function — collection *and* encode — because the window
+/// is resident across both, and dropped when this returns.
 #[allow(clippy::too_many_arguments)]
 async fn run_alert_clip_builder(
     store: Arc<Store>,
@@ -2129,6 +2184,7 @@ async fn run_alert_clip_builder(
     timeline: Option<Arc<PlMutex<BoxTimeline>>>,
     deadline: Arc<AtomicI64>,
     cold_kick: Option<Arc<Notify>>,
+    build_slot: OwnedSemaphorePermit,
 ) {
     // Collect the post window, deduping against the pre snapshot's tail
     // PTS (a sample can straddle the snapshot/live boundary).
@@ -2286,6 +2342,11 @@ async fn run_alert_clip_builder(
     if map.get(&camera_id).map(|e| e.alert_clip_id) == Some(alert_clip_id) {
         map.remove(&camera_id);
     }
+    drop(map);
+
+    // Free the build slot last, so the ceiling covers this build's
+    // entire memory footprint (BUG-168).
+    drop(build_slot);
 }
 
 #[cfg(test)]
@@ -2611,6 +2672,53 @@ mod tests {
         let (store, _dir, clips_dir) = fixture().await;
         let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
         assert_eq!(rec.kind(), "gstreamer");
+    }
+
+    /// BUG-168: arming must be refused once every build slot is taken.
+    /// Without this ceiling the builders accumulate — 144 armed against
+    /// 1 completion on the box that OOM-killed itself — because each one
+    /// holds its whole window plus a decode and an encode pipeline.
+    #[tokio::test]
+    async fn alert_clip_arm_is_refused_when_every_build_slot_is_taken() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+        // Stand in for MAX_CONCURRENT_ALERT_CLIP_BUILDS builders that
+        // have been armed and are still encoding.
+        let held: Vec<_> = (0..MAX_CONCURRENT_ALERT_CLIP_BUILDS)
+            .map(|_| rec.alert_build_slots.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(rec.alert_build_slots.available_permits(), 0);
+
+        assert!(rec.arm_alert_clip(1, Utc::now()).await.is_none());
+        assert_eq!(
+            rec.alert_clips_shed.load(Ordering::Relaxed),
+            1,
+            "a refused alert must be counted as shed, not silently dropped"
+        );
+
+        // Freeing the slots stops the shedding: the next alert reaches
+        // the (pre-existing) no-ingester refusal instead.
+        drop(held);
+        assert!(rec.arm_alert_clip(1, Utc::now()).await.is_none());
+        assert_eq!(rec.alert_clips_shed.load(Ordering::Relaxed), 1);
+    }
+
+    /// BUG-168: every path that gives up after admission must return its
+    /// permit. A leak here is worse than no ceiling — a handful of them
+    /// disables alert clips until the process restarts.
+    #[tokio::test]
+    async fn alert_clip_arm_releases_its_build_slot_when_it_cannot_proceed() {
+        let (store, _dir, clips_dir) = fixture().await;
+        // Empty ingester map -> arm takes a permit, then bails.
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+        for _ in 0..(MAX_CONCURRENT_ALERT_CLIP_BUILDS * 2) {
+            assert!(rec.arm_alert_clip(1, Utc::now()).await.is_none());
+        }
+        assert_eq!(
+            rec.alert_build_slots.available_permits(),
+            MAX_CONCURRENT_ALERT_CLIP_BUILDS
+        );
+        assert_eq!(rec.alert_clips_shed.load(Ordering::Relaxed), 0);
     }
 
     // -----------------------------------------------------------
