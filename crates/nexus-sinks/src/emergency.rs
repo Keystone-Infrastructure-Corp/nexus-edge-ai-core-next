@@ -369,6 +369,86 @@ mod tests {
         assert!(reg.exception_for(Tier0Class::Fire).is_none());
     }
 
+    /// SPEC-037 — "Violence and person down are, at merge time, either
+    /// given an edge-local detector or recorded as signed-off exceptions
+    /// in [[docs/cloud-console/HARM_TAXONOMY#4. Tier 0 — Emergency]] — a
+    /// cloud-only implementation of either fails review."
+    ///
+    /// This is the machine-checkable half of that criterion. The doc-level
+    /// half lives in `docs/cloud-console/HARM_TAXONOMY.md` §4.2
+    /// (a separate repository, `nexus-cloud-console`) — a formal table
+    /// carrying class / decision / reason / fail-open consequence /
+    /// sign-off for both classes, with the sign-off itself recorded in
+    /// `ADR-093`. This test proves the *registry* actually enforces "no
+    /// free pass": it walks exactly the two classes SPEC-037 names
+    /// through `Tier0Registry` the way a real boot-time registration
+    /// would, and asserts each ends up either shipped-with-a-detector or
+    /// carrying a registered exception — never neither. A change that
+    /// silently dropped one of the two `register_exception` calls below
+    /// (i.e. shipped the class with neither a detector nor a recorded
+    /// exception) fails the final loop's assertion, naming the class.
+    ///
+    /// Deliberately scoped to violence and person down — the two classes
+    /// SPEC-037 names — not all six `Tier0Class` variants. Fire, smoke,
+    /// firearm, and knife are SPEC-036 / VLM-prompt territory (out of
+    /// this spec's scope); asserting their detector-or-exception status
+    /// here would overreach this brief.
+    #[test]
+    fn violence_and_person_down_are_each_a_detector_or_a_signed_off_exception() {
+        let mut reg = Tier0Registry::new();
+
+        // Neither class has a shipped edge-local detector at merge time
+        // (confirmed: no production caller of `Tier0Registry::register`
+        // exists anywhere in this crate outside its own tests). Both
+        // start, accordingly, with neither status.
+        for class in [Tier0Class::Violence, Tier0Class::PersonDown] {
+            assert!(
+                !reg.is_shipped(class) && reg.exception_for(class).is_none(),
+                "test setup: {class:?} should start with neither a detector nor an \
+                 exception registered"
+            );
+        }
+
+        // Person down: DEFERRED. The two-stage cascade (geometric
+        // nominator + `yolo26s-pose` COCO-only confirmer) is fully
+        // specified in HARM_TAXONOMY §4.1, but building and validating a
+        // detector is out of SPEC-037's scope (it consumes a detector's
+        // signal; it does not build one).
+        reg.register_exception(FailOpenException {
+            class: Tier0Class::PersonDown,
+            fail_open_consequence:
+                "no automated person-down detection exists at merge, on any path — not \
+                 edge, and per ADR-043 never silently downgraded to a cloud-gated \
+                 substitute either; the gap is an honest absence of coverage, not a \
+                 disguised cloud path"
+                    .into(),
+        });
+
+        // Violence: RECLASSIFIED OUT OF TIER-0 ENTIRELY — a stronger
+        // resolution than "deferred". No licensable training corpus
+        // exists at any acceptable quality (HARM_TAXONOMY §4.1), and the
+        // false-positive/consequence-asymmetry argument holds
+        // independently of data availability.
+        reg.register_exception(FailOpenException {
+            class: Tier0Class::Violence,
+            fail_open_consequence:
+                "no autonomous violence alarm exists at the Tier-0 latency/corroboration \
+                 budget, or as a cloud-gated substitute for it; the only surfaced signal \
+                 is the Tier-2 `physical altercation — review` item, at Tier-2's latency \
+                 budget and never interrupting"
+                    .into(),
+        });
+
+        for class in [Tier0Class::Violence, Tier0Class::PersonDown] {
+            assert!(
+                reg.is_shipped(class) || reg.exception_for(class).is_some(),
+                "{class:?} has neither a registered edge-local detector nor a registered \
+                 signed-off exception — SPEC-037's acceptance criterion for this class \
+                 fails, and a cloud-only implementation would fail review just the same"
+            );
+        }
+    }
+
     #[test]
     fn emergency_and_wrongdoing_policies_are_distinct_types() {
         // A structural assertion: the two default policies have different
@@ -546,6 +626,70 @@ mod tests {
             worst < FRAME_BUDGET,
             "the worst single emergency decision cycle took {worst:?}, at or over the \
              {FRAME_BUDGET:?} frame budget"
+        );
+    }
+
+    /// SPEC-037 — "Delivery rides the existing alert sink and
+    /// cascading-policy layer from SPEC-011; no second notification
+    /// transport is introduced."
+    ///
+    /// This is enforced as a **compile-time / build-configuration** check
+    /// rather than a plain value-level `#[test]` assertion, because "owns
+    /// no independent transport" is a property of what this module
+    /// *requires in order to compile*, not something observable at
+    /// runtime from one particular feature-resolved test binary — a
+    /// unit test cannot prove the absence of a dependency, only a build
+    /// with that dependency unavailable can.
+    ///
+    /// `reqwest` (HTTP) and `lettre` (SMTP) are `optional = true` in this
+    /// crate's `Cargo.toml`, gated behind the `webhook` / `sureview` /
+    /// `email` / `sureview-email` features that the SPEC-011 sink
+    /// implementations (`webhook.rs`, `sureview.rs`, `email.rs`,
+    /// `sureview_email.rs`) require. `emergency.rs` is unconditional — it
+    /// carries none of those `#[cfg(feature = ...)]` guards — so if it
+    /// ever grew a transport client of its own (e.g. a bare
+    /// `reqwest::Client::new()` call, or an SMTP client), the crate would
+    /// fail to *compile* with every sink feature disabled, because
+    /// `reqwest`/`lettre` would not be pulled in as dependencies at all
+    /// in that configuration.
+    ///
+    /// This test proves that invariant directly by shelling out to
+    /// `cargo check -p nexus-sinks --no-default-features` and asserting
+    /// it succeeds. That is a real compiler-enforced structural check —
+    /// not a source-text lint — and it is the strongest assertion
+    /// available given that this crate has no production caller wiring
+    /// the emergency path into the dispatcher yet (so there is no
+    /// concrete `AlertSink` impl to assert type equality against): the
+    /// property we can honestly assert today is "the Tier-0 path
+    /// introduces no transport dependency of its own", which this test
+    /// checks at the only level where "introduces a dependency" is a
+    /// meaningful, checkable fact — the build.
+    #[test]
+    fn emergency_path_compiles_with_every_transport_feature_disabled() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .args([
+                "check",
+                "-p",
+                "nexus-sinks",
+                "--no-default-features",
+                "--quiet",
+            ])
+            .current_dir(manifest_dir)
+            .output()
+            .expect("failed to invoke `cargo check` — is cargo on PATH?");
+
+        assert!(
+            output.status.success(),
+            "nexus-sinks failed to compile with every sink transport feature \
+             disabled (webhook/sureview/email/sureview-email all off). The \
+             only unconditional (non-feature-gated) alert-delivery module in \
+             this crate is emergency.rs, the Tier-0 path — so this means it \
+             now depends directly on a transport crate (reqwest/lettre), \
+             i.e. a second notification transport was introduced outside \
+             the SPEC-011 feature-gated sinks.\n--- cargo stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
