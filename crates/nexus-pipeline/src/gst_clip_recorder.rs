@@ -213,7 +213,7 @@ pub struct GstClipRecorder {
     /// Alert clips refused because every build slot was taken
     /// (BUG-168). Reported on the refusal log line so a degrading
     /// feature is visible without inferring it from a restart loop.
-    alert_clips_shed: Arc<AtomicU64>,
+    alert_clips_shed: AtomicU64,
     /// Optional wake handle shared with the cold replicator
     /// (M-Alert-Clip cloud delivery). The builder fires `notify_one()`
     /// the moment an alert clip is stamped `ready`, so the replicator
@@ -372,7 +372,7 @@ impl GstClipRecorder {
             alert_box_timelines: PlRwLock::new(HashMap::new()),
             alert_inflight: Arc::new(PlMutex::new(HashMap::new())),
             alert_build_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ALERT_CLIP_BUILDS)),
-            alert_clips_shed: Arc::new(AtomicU64::new(0)),
+            alert_clips_shed: AtomicU64::new(0),
             alert_cold_kick: None,
             alert_clip_delivery_gate: None,
             decode_health: None,
