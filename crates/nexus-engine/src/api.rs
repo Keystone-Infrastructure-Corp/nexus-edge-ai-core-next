@@ -2720,9 +2720,10 @@ struct CameraFrameStatsView {
     /// calibration is calculated from; `sampled_fps` below can read a flat
     /// nominal rate even while this one is starved.
     decoder_output_fps: f32,
-    /// SPEC-069 Phase 1 (P2) — delta-based rate of `sampled_frames`
-    /// between consecutive polls, i.e. what the RGB appsink is actually
-    /// being fed post-padding.
+    /// SPEC-069 Phase 1 (P2) — windowed (5s trailing) delivery rate at the
+    /// RGB appsink, i.e. what the engine is actually fed post-padding. Shares
+    /// its window with `decoder_output_fps` above, which is what makes the
+    /// gap between the two a legitimate measure of `videorate` padding.
     sampled_fps: f32,
     /// SPEC-069 Phase 1 (P2) — geometry read off the decoder's src pad
     /// caps, i.e. the true decoded resolution (not whatever a downstream

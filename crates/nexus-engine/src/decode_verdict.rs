@@ -28,12 +28,14 @@ use crate::system_metrics::{DecodeCapacity, OVERSUBSCRIBED_PCT};
 /// Chosen as a ruling — SPEC-069 does not specify a numeric threshold.
 pub const NEAR_PCT: f32 = 70.0;
 
-/// Duplicate-frame ratio (per mille of `sampled_frames`) above which
-/// padding alone is treated as `Over` rather than `Near`. 500‰ means "more
-/// than half of what the appsink received was a re-served duplicate" —
-/// at that point the camera is not decoding new pictures fast enough to
-/// call it a mild pressure signal. Ruling, not a spec'd number.
-pub const HEAVY_PADDING_PER_MILLE: u64 = 500;
+/// SPEC-069's `healthy` floor for the padding rung: at or above this share
+/// of appsink frames being freshly decoded, padding is not a finding.
+pub const FRESH_OUTPUT_HEALTHY_RATIO: f32 = 0.85;
+
+/// SPEC-069's `padded` bar. Below this share the camera is not decoding new
+/// pictures fast enough to call it a mild pressure signal, so it reads `Over`
+/// rather than `Near`; `[padded, healthy)` is the amber band.
+pub const FRESH_OUTPUT_PADDED_RATIO: f32 = 0.70;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeVerdict {
@@ -104,26 +106,35 @@ pub fn compute_decode_verdict(
         );
     }
 
-    if health.duplicate_frames > 0 {
-        let per_mille = health.duplicate_per_mille();
-        if per_mille >= HEAVY_PADDING_PER_MILLE {
+    // Windowed, per SPEC-069: the cumulative `duplicate_frames` total this
+    // rung used to read never falls, so one padded frame latched the camera
+    // to `Near` for the life of the supervisor (BUG-174). Both rates share
+    // one `RATE_WINDOW`, which is what makes the division meaningful.
+    // `fresh > 1` means `videorate` is dropping to hold the requested rate,
+    // not padding to reach it — nothing to report, so it falls through.
+    if health.sampled_fps > 0.0 {
+        let fresh = health.decoder_output_fps / health.sampled_fps;
+        let padded_pct = ((1.0 - fresh).clamp(0.0, 1.0)) * 100.0;
+        if fresh < FRESH_OUTPUT_PADDED_RATIO {
             return (
                 DecodeVerdict::Over,
                 format!(
-                    "{} at {:.1}% is padding most output with duplicates ({per_mille}\u{2030} of \
-                     sampled frames) — decode throughput is not keeping pace",
+                    "{} at {:.1}% is padding most output with duplicates ({padded_pct:.0}% of \
+                     frames in the last window) — decode throughput is not keeping pace",
                     cap.binding_engine, cap.binding_engine_pct
                 ),
             );
         }
-        return (
-            DecodeVerdict::Near,
-            format!(
-                "{} at {:.1}% is padding some output with duplicates ({per_mille}\u{2030} of \
-                 sampled frames)",
-                cap.binding_engine, cap.binding_engine_pct
-            ),
-        );
+        if fresh < FRESH_OUTPUT_HEALTHY_RATIO {
+            return (
+                DecodeVerdict::Near,
+                format!(
+                    "{} at {:.1}% is padding some output with duplicates ({padded_pct:.0}% of \
+                     frames in the last window)",
+                    cap.binding_engine, cap.binding_engine_pct
+                ),
+            );
+        }
     }
 
     if cap.binding_engine_pct >= OVERSUBSCRIBED_PCT {
@@ -277,9 +288,8 @@ mod tests {
         };
         let health = DecodeHealth {
             decoder_input_drops: 7,
-            decoder_output_frames: 100,
-            sampled_frames: 100,
-            duplicate_frames: 80,
+            decoder_output_fps: 2.0,
+            sampled_fps: 10.0,
             ..Default::default()
         };
         let (v, msg) = compute_decode_verdict(Some(&c), &health, Some(&unavailable));
@@ -303,9 +313,8 @@ mod tests {
         let c = cap("video-decode", 5.0);
         let health = DecodeHealth {
             decoder_input_drops: 3,
-            decoder_output_frames: 100,
-            sampled_frames: 100,
-            duplicate_frames: 80,
+            decoder_output_fps: 2.0,
+            sampled_fps: 10.0,
             ..Default::default()
         };
         let (v, msg) = compute_decode_verdict(Some(&c), &health, None);
@@ -318,30 +327,78 @@ mod tests {
     fn heavy_padding_alone_is_over() {
         let c = cap("video-decode", 5.0);
         let health = DecodeHealth {
-            decoder_input_drops: 0,
-            decoder_output_frames: 100,
-            sampled_frames: 100,
-            duplicate_frames: 60, // 600 per mille >= HEAVY_PADDING_PER_MILLE
+            decoder_output_fps: 2.0,
+            sampled_fps: 10.0, // fresh 0.20 < FRESH_OUTPUT_PADDED_RATIO
             ..Default::default()
         };
         let (v, msg) = compute_decode_verdict(Some(&c), &health, None);
         assert_eq!(v, DecodeVerdict::Over);
-        assert!(msg.contains("padding most output"));
+        assert!(msg.contains("padding most output"), "{msg}");
+        assert!(msg.contains("80%"), "{msg}");
     }
 
     #[test]
     fn light_padding_alone_is_near() {
         let c = cap("video-decode", 5.0);
         let health = DecodeHealth {
-            decoder_input_drops: 0,
-            decoder_output_frames: 100,
-            sampled_frames: 100,
-            duplicate_frames: 10, // 100 per mille < HEAVY_PADDING_PER_MILLE
+            decoder_output_fps: 7.5,
+            sampled_fps: 10.0, // fresh 0.75 — inside the amber band
             ..Default::default()
         };
         let (v, msg) = compute_decode_verdict(Some(&c), &health, None);
         assert_eq!(v, DecodeVerdict::Near);
-        assert!(msg.contains("padding some output"));
+        assert!(msg.contains("padding some output"), "{msg}");
+    }
+
+    /// BUG-174. `duplicate_frames` is cumulative since supervisor start, so
+    /// gating the padding rung on it pinned a camera to `Near` for the life
+    /// of the process over one padded frame. A camera whose *current* window
+    /// is clean reads `healthy` no matter what its lifetime total says.
+    #[test]
+    fn a_lifetime_duplicate_total_does_not_latch_near_when_the_window_is_clean() {
+        let c = cap("video-enhance", 31.9);
+        let health = DecodeHealth {
+            duplicate_frames: 1,
+            sampled_frames: 900_000,
+            decoder_output_fps: 10.0,
+            sampled_fps: 10.0,
+            ..Default::default()
+        };
+        let (v, msg) = compute_decode_verdict(Some(&c), &health, None);
+        assert_eq!(v, DecodeVerdict::Healthy);
+        assert!(msg.contains("headroom"), "{msg}");
+    }
+
+    /// No rate window yet (the first poll after a session rebuild) must fall
+    /// through to the engine-percentage rung. `decoder_output_fps` can land
+    /// before `sampled_fps` does, so the hazardous shape is a positive
+    /// numerator over a zero denominator, not 0/0.
+    #[test]
+    fn no_rate_window_yet_falls_through_to_the_percentage_rung() {
+        let c = cap("video-decode", 5.0);
+        let health = DecodeHealth {
+            decoder_output_fps: 10.0,
+            sampled_fps: 0.0,
+            ..Default::default()
+        };
+        let (v, msg) = compute_decode_verdict(Some(&c), &health, None);
+        assert_eq!(v, DecodeVerdict::Healthy);
+        assert!(msg.contains("headroom"), "{msg}");
+    }
+
+    /// `videorate` dropping to hold a `max_fps` below the camera's native
+    /// rate makes the decoder outpace the appsink. That is the opposite of
+    /// padding and must not read as a finding.
+    #[test]
+    fn a_decoder_outpacing_the_requested_rate_is_not_padding() {
+        let c = cap("video-decode", 5.0);
+        let health = DecodeHealth {
+            decoder_output_fps: 30.0,
+            sampled_fps: 15.0,
+            ..Default::default()
+        };
+        let (v, _) = compute_decode_verdict(Some(&c), &health, None);
+        assert_eq!(v, DecodeVerdict::Healthy);
     }
 
     #[test]
