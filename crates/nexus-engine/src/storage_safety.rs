@@ -37,7 +37,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use nexus_bus::{topic, Bus, BusExt};
-use nexus_pipeline::ClipRecorder;
+use nexus_pipeline::{ClipRecorder, MAX_CLIP_DURATION_MS};
 use nexus_store::Store;
 use nexus_types::CameraId;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,29 @@ use tracing::{debug, error, info, warn};
 /// panic mode. Prevents flapping when eviction frees just enough to
 /// dip back under the threshold.
 pub const HYSTERESIS_PCT: u8 = 5;
+
+/// How long past `MAX_CLIP_DURATION_MS` an un-closed clip row must sit
+/// before hard-eviction treats it as crash-abandoned rather than live.
+///
+/// The eviction ladder must never cascade-delete a clip the recorder is
+/// still writing — doing so strands the supervisor's `ClipHandle` and
+/// every subsequent `insert_motion_event` fails the `motion_events.clip_id`
+/// foreign key until the next rotation (BUG-170). But "still open" is
+/// inferred from `ended_at IS NULL`, and a hard kill mid-clip leaves that
+/// NULL forever, so an unconditional guard would make those rows
+/// permanently undeletable and could wedge a full disk.
+///
+/// The rotation bound is the discriminator. The supervisor rotates a
+/// clip once a frame arrives more than `MAX_CLIP_DURATION_MS` after it
+/// opened, so an un-closed row older than that by a wide margin has no
+/// recorder behind it. That cap lives in the frame loop rather than on a
+/// timer, so it only advances when frames do — a source that goes silent
+/// is caught separately by the RTSP stall timeout, which tears the camera
+/// task down and closes the clip on the way out. 2x is the margin for the
+/// slack that remains: a supervisor mid-close (finalise + fsync + rename
+/// on a loaded box) when the sweep samples it, or one frame iteration
+/// running long behind the SQLite writer lock.
+const ABANDONED_CLIP_GRACE_MS: i64 = 2 * MAX_CLIP_DURATION_MS;
 
 /// Under disk pressure the rolling host-metrics buffer is coarsened
 /// hard: everything older than this is dropped outright (vs the
@@ -721,6 +744,15 @@ async fn sweep_orphan_snapshots(store: &Arc<Store>, dir: &Path) -> anyhow::Resul
 /// `events` rows tear down with the clip. Emit
 /// [`topic::CLIP_HARD_EVICTED`].
 ///
+/// **In-flight clips are never hard-evicted.** Panic mode stops new
+/// clips from opening but the ones already recording keep writing, and
+/// they carry `cold_handle IS NULL` until they close — which used to
+/// make them prime hard-evict candidates and cascade-deleted the row a
+/// running supervisor still held (BUG-170). The candidate query now
+/// skips rows with `ended_at IS NULL` unless they started more than
+/// [`ABANDONED_CLIP_GRACE_MS`] ago, which keeps crash-orphaned rows
+/// reclaimable.
+///
 /// **Cold-replicated clips are undeletable.** The hard-evict
 /// candidate's `cold_handle IS NULL` guard makes this structural:
 /// once a clip lives on cold, only the soft path can touch it from
@@ -826,7 +858,13 @@ async fn evict_one(
         }
 
         // ----- Pass 2: hard-evict (cascade-delete, no cold copy) -----
-        if let Some(clip) = store.find_hard_evict_candidate(cam).await? {
+        if let Some(clip) = store
+            .find_hard_evict_candidate(
+                cam,
+                Utc::now() - chrono::Duration::milliseconds(ABANDONED_CLIP_GRACE_MS),
+            )
+            .await?
+        {
             // Metadata FIRST (M2.1 ordering preserved for hard path).
             store.cascade_delete_clip_metadata(clip.id).await?;
 
@@ -1233,7 +1271,7 @@ mod tests {
                 .unwrap();
             for i in 0..count {
                 let path_rel = format!("{cam_id}/clip_{i:04}.mp4");
-                store
+                let clip_id = store
                     .open_clip(&NewClip {
                         camera_id: cam_id,
                         // Older i = older started_at; oldest_clip_for_camera
@@ -1249,6 +1287,23 @@ mod tests {
                     .await
                     .unwrap();
                 tokio::fs::write(clips_dir.join(&path_rel), b"x")
+                    .await
+                    .unwrap();
+                // Close so `ended_at` is set. These fixtures stand in
+                // for clips the recorder has already finished; leaving
+                // them open would make them in-flight, and hard-evict
+                // deliberately skips those (BUG-170).
+                store
+                    .close_clip(
+                        clip_id,
+                        &nexus_store::ClipClose {
+                            ended_at: now,
+                            duration_ms: 1000,
+                            size_bytes: 1,
+                            hot_path: Some(path_rel.clone()),
+                            sha256: Some(format!("{cam_id:032x}{i:032x}")),
+                        },
+                    )
                     .await
                     .unwrap();
             }
@@ -1739,7 +1794,10 @@ mod tests {
 
         // The row's hot_path is now NULL.
         let clip_after = store
-            .find_hard_evict_candidate(1)
+            .find_hard_evict_candidate(
+                1,
+                Utc::now() - chrono::Duration::milliseconds(ABANDONED_CLIP_GRACE_MS),
+            )
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("the hot-only clip should still be hard-evict eligible"));
@@ -1801,6 +1859,115 @@ mod tests {
             .expect("subscriber stream returned None")
             .expect("subscriber stream returned an Err");
         assert_eq!(evt.get("camera_id").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    /// BUG-170 regression: a clip the recorder is STILL WRITING must
+    /// never be hard-evicted.
+    ///
+    /// An in-flight clip has `ended_at IS NULL`, and because the cold
+    /// replicator only uploads once `close_clip` stamps the sha256, it
+    /// also has `cold_handle IS NULL` — so it used to match the
+    /// hard-evict candidate query. On a box whose replicator is
+    /// healthy (every closed clip already cold) it was frequently the
+    /// ONLY match, so a disk-pressure episode cascade-deleted the row
+    /// out from under the running supervisor and every subsequent
+    /// `insert_motion_event` failed the `motion_events.clip_id`
+    /// foreign key until the next rotation.
+    #[tokio::test]
+    async fn evict_one_never_hard_evicts_an_in_flight_clip() {
+        // No closed clips at all — the in-flight one is the only row,
+        // which is exactly the shape that used to get evicted.
+        let (store, _dir, clips_dir) = build_store_with_mixed_clips(4, 0, 0).await;
+        let now = Utc::now();
+        let path_rel = "4/inflight.mp4".to_string();
+        store
+            .open_clip(&NewClip {
+                camera_id: 4,
+                started_at: now,
+                hot_path: path_rel.clone(),
+                codec: "stub".into(),
+                container: "mp4".into(),
+                hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .unwrap();
+        tokio::fs::write(clips_dir.join(&path_rel), b"x")
+            .await
+            .unwrap();
+
+        // The candidate query skips it while it is genuinely live.
+        assert!(
+            store
+                .find_hard_evict_candidate(
+                    4,
+                    now - chrono::Duration::milliseconds(ABANDONED_CLIP_GRACE_MS)
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "an in-flight clip must not be a hard-evict candidate"
+        );
+
+        // ...and the ladder leaves both row and file alone under pressure.
+        let bus: Arc<dyn Bus> = Arc::new(nexus_bus::BroadcastBus::new(64));
+        let mut cursor = 0usize;
+        evict_one(&store, &clips_dir, &bus, &mut cursor)
+            .await
+            .unwrap();
+
+        let count_after = store
+            .per_camera_clip_stats()
+            .await
+            .unwrap()
+            .iter()
+            .find(|s| s.camera_id == 4)
+            .map(|s| s.clip_count)
+            .unwrap_or(0);
+        assert_eq!(
+            count_after, 1,
+            "evict_one must not cascade-delete a clip that is still recording"
+        );
+        assert!(
+            clips_dir.join(&path_rel).exists(),
+            "evict_one must not unlink a clip that is still recording"
+        );
+
+        // Crash-orphaned rows must NOT leak. A row left open well past
+        // the grace cannot still have a live recorder behind it, so it
+        // becomes reclaimable again and a full disk stays recoverable.
+        // Staged as a genuinely old row measured against the *production*
+        // cutoff, rather than by shifting the cutoff into the future, so
+        // this pins ABANDONED_CLIP_GRACE_MS itself and not just the
+        // predicate: a grace widened past 20 minutes fails here.
+        let orphan_rel = "4/orphan.mp4".to_string();
+        store
+            .open_clip(&NewClip {
+                camera_id: 4,
+                started_at: now - chrono::Duration::minutes(20),
+                hot_path: orphan_rel.clone(),
+                codec: "stub".into(),
+                container: "mp4".into(),
+                hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .unwrap();
+        let orphan = store
+            .find_hard_evict_candidate(
+                4,
+                Utc::now() - chrono::Duration::milliseconds(ABANDONED_CLIP_GRACE_MS),
+            )
+            .await
+            .unwrap()
+            .expect("a clip abandoned past the grace must stay hard-evictable");
+        assert_eq!(
+            orphan.hot_path.as_deref(),
+            Some(orphan_rel.as_str()),
+            "the abandoned clip must be the candidate, never the live one"
+        );
     }
 
     /// Cold-only clips (hot pointer cleared, cold pointer set) MUST

@@ -65,6 +65,7 @@ pub use gate::MotionGate;
 pub use preroll::{NalRingBuffer, NalSample};
 pub use recorder::{
     ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError, StubClipRecorder,
+    MAX_CLIP_DURATION_MS,
 };
 pub use sink_router::{
     AlertClipScheduleGate, NoopAlertClipScheduleGate, NoopSinkRouter, SinkRouter,

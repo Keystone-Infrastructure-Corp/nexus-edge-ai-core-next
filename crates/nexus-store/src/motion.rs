@@ -1205,30 +1205,55 @@ impl Store {
         row.map(clip_row_from_row).transpose()
     }
 
-    /// Hard-evict candidate: oldest clip per camera that has NEVER
-    /// been replicated to cold. Hard-eviction goes through
+    /// Hard-evict candidate: oldest *closed* clip per camera that has
+    /// NEVER been replicated to cold. Hard-eviction goes through
     /// [`Self::cascade_delete_clip_metadata`] which removes
     /// `motion_events` + linked `events` via FK CASCADE. Replaces
     /// the M2.1 [`Self::oldest_clip_for_camera`] for the eviction
     /// loop's Pass 2.
     ///
+    /// **Never returns a clip the recorder is still writing.** An
+    /// in-flight clip has `ended_at IS NULL` and — because the cold
+    /// replicator only uploads a clip once `close_clip` has stamped
+    /// its `sha256` — also `cold_handle IS NULL`. Without the
+    /// `ended_at` guard it therefore matched this query, and on a box
+    /// whose replicator is healthy (every closed clip already cold)
+    /// it was frequently the *only* match, so disk pressure
+    /// cascade-deleted the row out from under the running supervisor.
+    /// The supervisor kept its now-dangling `ClipHandle` until the
+    /// next rotation and every `insert_motion_event` in between died
+    /// on `FOREIGN KEY constraint failed` — minutes of motion history
+    /// lost per pressure episode. See BUG-170.
+    ///
+    /// `abandoned_cutoff` keeps that guard from becoming a storage
+    /// leak: a clip whose `ended_at` is still NULL but which started
+    /// before the cutoff was orphaned by a crash (the supervisor
+    /// rotates a clip once it exceeds its max duration, so an older
+    /// still-open row has no recorder behind it), so it stays
+    /// evictable. Without this escape a single hard kill mid-clip
+    /// would leave an undeletable row per camera and a full disk could
+    /// never be reclaimed.
+    ///
     /// Returns `Ok(None)` when every clip for this camera has been
-    /// cold-replicated — at that point the eviction loop must
-    /// either fall back to soft-eviction (already failed in Pass 1
-    /// for this camera) or refuse to evict (cold-only clips are
-    /// undeletable until the operator clears cold).
+    /// cold-replicated or is still being recorded — at that point the
+    /// eviction loop must either fall back to soft-eviction (already
+    /// failed in Pass 1 for this camera) or refuse to evict (cold-only
+    /// clips are undeletable until the operator clears cold).
     pub async fn find_hard_evict_candidate(
         &self,
         camera_id: CameraId,
+        abandoned_cutoff: DateTime<Utc>,
     ) -> Result<Option<ClipRow>, StoreError> {
         let row = sqlx::query(&format!(
             "{CLIP_SELECT_COLUMNS_BASE}
               WHERE camera_id = ?
                 AND cold_handle IS NULL
+                AND (ended_at IS NOT NULL OR started_at < ?)
               ORDER BY started_at ASC
               LIMIT 1"
         ))
         .bind(camera_id)
+        .bind(abandoned_cutoff.to_rfc3339())
         .fetch_optional(&self.pool)
         .await?;
         row.map(clip_row_from_row).transpose()
