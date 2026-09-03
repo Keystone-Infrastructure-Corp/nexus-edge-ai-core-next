@@ -3291,6 +3291,67 @@ pub struct CameraConfigUpdate {
     pub generation: u64,
 }
 
+/// SPEC-035 Pass B — scene-fixture terms exported for the slow-cadence
+/// fixture pass, never the per-frame detector (see
+/// `tools/models/yoloe_default_prompts.txt` and
+/// `yolo_world_default_prompts.txt`, which stage the same 17 terms for
+/// the generator). Spelled exactly once here so the per-frame choke
+/// point ([`CameraConfigUpdate::for_per_frame_detector`]) and the
+/// future fixture pass share a single source of truth and can never
+/// disagree about what counts as a fixture.
+pub const PASS_B_FIXTURE_TERMS: &[&str] = &[
+    "door",
+    "roll-up door",
+    "gate",
+    "fence",
+    "window",
+    "security camera",
+    "light fixture",
+    "dumpster",
+    "pallet",
+    "HVAC unit",
+    "ATM",
+    "cash register",
+    "safe",
+    "vending machine",
+    "bike rack",
+    "charging station",
+    "parking stall",
+];
+
+impl CameraConfigUpdate {
+    /// The sanctioned choke point for building the per-frame detector's
+    /// resolved prompt subset from a camera's stored `[detector]`
+    /// config. Excludes every [`PASS_B_FIXTURE_TERMS`] entry by
+    /// construction, so once Pass B terms land in a camera's `prompts`
+    /// (fleet-pushed or operator-set) they still cannot leak into the
+    /// per-frame path — only the future slow-cadence fixture pass reads
+    /// them. This only affects what gets fan-pushed to detector slots;
+    /// it does not touch the stored `CameraConfig`/`CameraDetector`
+    /// that `fleet_hash` projects from, so fleet-drift hashing is
+    /// unaffected.
+    pub fn for_per_frame_detector(
+        camera_id: CameraId,
+        detector: &CameraDetector,
+        model: ModelConfig,
+        generation: u64,
+    ) -> Self {
+        let prompts = detector
+            .prompts
+            .iter()
+            .filter(|p| !PASS_B_FIXTURE_TERMS.contains(&p.as_str()))
+            .cloned()
+            .collect();
+        Self {
+            camera_id,
+            prompts,
+            visual_prompts: detector.visual_prompts.clone(),
+            model,
+            generation,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 7.6.6 — generic LAN device proxy (REPO_BOUNDARY R5c)
 // ---------------------------------------------------------------------------
@@ -4460,6 +4521,47 @@ talk_down = { speaker_present = true, backchannel_codec = "PCMU", backchannel_ur
         }"#;
         let parsed: CameraConfigUpdate = serde_json::from_str(legacy).unwrap();
         assert!(parsed.visual_prompts.is_empty());
+    }
+
+    /// SPEC-035: the Pass B fixture terms must not appear in the
+    /// per-frame detector's resolved prompt subset. Seeds a camera
+    /// whose `[detector]` prompts mix ordinary (per-frame) terms with
+    /// fixture terms, resolves via the sanctioned choke point
+    /// (`CameraConfigUpdate::for_per_frame_detector`), and asserts the
+    /// resolved subset keeps the ordinary terms and drops every
+    /// fixture term — asserted on the resolved config, not by
+    /// inspecting source text.
+    #[test]
+    fn per_frame_resolved_prompts_exclude_pass_b_fixture_terms() {
+        let detector = CameraDetector {
+            prompts: vec![
+                "person".into(),
+                "door".into(), // Pass B fixture term
+                "vehicle".into(),
+                "gate".into(), // Pass B fixture term
+                "balaclava".into(),
+            ],
+            visual_prompts: vec![],
+            model_override: None,
+        };
+        let update =
+            CameraConfigUpdate::for_per_frame_detector(7, &detector, ModelConfig::default(), 1);
+
+        assert_eq!(
+            update.prompts,
+            vec![
+                "person".to_string(),
+                "vehicle".to_string(),
+                "balaclava".to_string()
+            ],
+            "ordinary per-frame terms must survive resolution in order"
+        );
+        for fixture in PASS_B_FIXTURE_TERMS {
+            assert!(
+                !update.prompts.iter().any(|p| p == fixture),
+                "fixture term {fixture:?} leaked into the per-frame resolved prompt subset"
+            );
+        }
     }
 
     /// `VisualPromptRef` denies unknown fields — typos in admin JSON
