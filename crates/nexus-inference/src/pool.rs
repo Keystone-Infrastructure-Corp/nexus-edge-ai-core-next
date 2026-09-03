@@ -66,7 +66,14 @@ impl DetectorPool {
         out
     }
 
+    /// Fan a config change out to every worker (and the fallback).
+    ///
+    /// SPEC-035: Pass B scene-fixture terms are stripped here, at the point of
+    /// delivery, so they can never reach a per-frame detector slot no matter
+    /// how the update was constructed. Fixtures are static scenery served by
+    /// the slow-cadence fixture pass; re-detecting them every frame is waste.
     pub async fn fan_push_config(&self, update: &CameraConfigUpdate) {
+        let update = &update.stripped_of_fixture_terms();
         for w in &self.workers {
             w.push_camera_config(update).await;
         }
@@ -190,5 +197,71 @@ mod tests {
             Arc::new(InProcessBackend::new(-1, Arc::new(MockDetector::new())));
         let pool = DetectorPool::new(vec![], Some(fallback));
         assert!(!pool.detect(&frame(), &[]).await.unwrap().is_empty());
+    }
+
+    /// SPEC-035: a Pass B scene-fixture term must never reach a per-frame
+    /// detector slot, however the update was built.
+    ///
+    /// Asserted on what the slot actually *receives* — a recording backend
+    /// captures the fan-pushed update — rather than on the value the caller
+    /// passed in, because the caller is exactly the thing that cannot be
+    /// trusted to have filtered.
+    #[tokio::test]
+    async fn fixture_terms_never_reach_a_per_frame_detector_slot() {
+        #[derive(Default)]
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl DetectorBackend for Recorder {
+            async fn detect(
+                &self,
+                _f: &Frame,
+                _p: &[String],
+            ) -> Result<Vec<Detection>, InferenceError> {
+                Ok(vec![])
+            }
+            async fn push_camera_config(&self, u: &CameraConfigUpdate) {
+                *self.seen.lock().expect("poisoned") = u.prompts.clone();
+            }
+            fn slot(&self) -> i32 {
+                0
+            }
+            fn name(&self) -> &'static str {
+                "recorder"
+            }
+            fn state(&self) -> BackendState {
+                BackendState::Ready
+            }
+            fn generation(&self) -> u64 {
+                0
+            }
+        }
+
+        let rec = Arc::new(Recorder::default());
+        let pool = DetectorPool::new(vec![rec.clone() as Arc<dyn DetectorBackend>], None);
+
+        let fixture = nexus_config::PASS_B_FIXTURE_TERMS[0];
+        let update = CameraConfigUpdate {
+            camera_id: 1,
+            // Deliberately built by hand, bypassing `for_per_frame_detector`:
+            // this is the untrusted path the delivery-point strip exists for.
+            prompts: vec!["person".to_string(), fixture.to_string()],
+            visual_prompts: vec![],
+            model: nexus_config::ModelConfig::default(),
+            generation: 1,
+        };
+        pool.fan_push_config(&update).await;
+
+        let seen = rec.seen.lock().expect("poisoned").clone();
+        assert!(
+            seen.contains(&"person".to_string()),
+            "ordinary per-frame terms must survive: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&fixture.to_string()),
+            "fixture term `{fixture}` reached a per-frame detector slot: {seen:?}"
+        );
     }
 }

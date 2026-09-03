@@ -3330,6 +3330,31 @@ impl CameraConfigUpdate {
     /// it does not touch the stored `CameraConfig`/`CameraDetector`
     /// that `fleet_hash` projects from, so fleet-drift hashing is
     /// unaffected.
+    /// Return this update with every [`PASS_B_FIXTURE_TERMS`] entry removed.
+    ///
+    /// [`Self::for_per_frame_detector`] applies the same rule when an update is
+    /// *built*, but an update can also arrive already-built — deserialised from
+    /// a fan-push payload, or constructed by a call site that predates this
+    /// rule. The detector pool therefore strips fixture terms again at the
+    /// point of delivery, so the invariant binds on the value the per-frame
+    /// detector slots actually receive rather than on the discipline of every
+    /// call site. Idempotent: an update carrying no fixture term is unchanged.
+    #[must_use]
+    pub fn stripped_of_fixture_terms(&self) -> Self {
+        Self {
+            camera_id: self.camera_id,
+            prompts: self
+                .prompts
+                .iter()
+                .filter(|p| !PASS_B_FIXTURE_TERMS.contains(&p.as_str()))
+                .cloned()
+                .collect(),
+            visual_prompts: self.visual_prompts.clone(),
+            model: self.model.clone(),
+            generation: self.generation,
+        }
+    }
+
     pub fn for_per_frame_detector(
         camera_id: CameraId,
         detector: &CameraDetector,
