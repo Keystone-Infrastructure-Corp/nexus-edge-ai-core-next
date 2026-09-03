@@ -4536,20 +4536,16 @@ talk_down = { speaker_present = true, backchannel_codec = "PCMU", backchannel_ur
         let detector = CameraDetector {
             prompts: vec![
                 "person".into(),
-                "door".into(),   // Pass B fixture term
+                "door".into(), // Pass B fixture term
                 "vehicle".into(),
-                "gate".into(),   // Pass B fixture term
+                "gate".into(), // Pass B fixture term
                 "balaclava".into(),
             ],
             visual_prompts: vec![],
             model_override: None,
         };
-        let update = CameraConfigUpdate::for_per_frame_detector(
-            7,
-            &detector,
-            ModelConfig::default(),
-            1,
-        );
+        let update =
+            CameraConfigUpdate::for_per_frame_detector(7, &detector, ModelConfig::default(), 1);
 
         assert_eq!(
             update.prompts,
