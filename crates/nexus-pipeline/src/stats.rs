@@ -323,11 +323,11 @@ pub struct DecodeHealth {
     /// is the number decode-capacity ceiling calibration needs. Zero
     /// until at least two src-pad buffers have landed inside one window.
     pub decoder_output_fps: f32,
-    /// SPEC-069 Phase 1 — `sampled_frames` per second, over the interval
-    /// between consecutive `observe_loop_stats` calls. Includes
-    /// `videorate` padding (same caveat as the cumulative counter), so
-    /// compare against `decoder_output_fps` to see how much of the
-    /// output is duplicated rather than decoded.
+    /// SPEC-069 Phase 1 — `sampled_frames` per second over the same trailing
+    /// [`RATE_WINDOW`] as `decoder_output_fps`. Includes `videorate` padding
+    /// (same caveat as the cumulative counter), so the gap between the two is
+    /// how much of the output is duplicated rather than decoded — a
+    /// comparison that is only valid because they share a window.
     pub sampled_fps: f32,
     /// SPEC-069 Phase 1 — width/height negotiated on the decoder's own
     /// src pad (not the appsink's, which can differ when a `videoscale`
@@ -394,9 +394,10 @@ impl RateWindow {
 #[derive(Debug, Default)]
 struct RateState {
     decoder_output: RateWindow,
-    /// Last `(observed_at, sampled_frames)` from `observe_loop_stats`,
-    /// used to turn its cumulative counter into a rate between calls.
-    last_sampled: Option<(Instant, u64)>,
+    /// Sampled (post-`videorate`) appsink deliveries. Shares [`RATE_WINDOW`]
+    /// with `decoder_output` so the two rates can legitimately be divided —
+    /// `decode_verdict` does exactly that to size the padding gap.
+    sampled: RateWindow,
 }
 
 impl DecodeHealthRegistry {
@@ -437,28 +438,18 @@ impl DecodeHealthRegistry {
     }
 
     /// Publish the loop detector's running totals. Absolute, not deltas, so
-    /// a session rebuild resets them rather than double-counting.
+    /// a session rebuild resets them rather than double-counting. Called once
+    /// per appsink delivery, which is what makes the rate window below count
+    /// sampled frames.
     pub fn observe_loop_stats(&self, camera_id: CameraId, sampled: u64, duplicates: u64) {
         let now = Instant::now();
-        let fps = {
-            let mut rates = self.rates.write();
-            let state = rates.entry(camera_id).or_default();
-            let fps = match state.last_sampled {
-                Some((last_t, last_n)) if sampled >= last_n => {
-                    let dt = now.duration_since(last_t).as_secs_f32();
-                    if dt > 0.0 {
-                        (sampled - last_n) as f32 / dt
-                    } else {
-                        0.0
-                    }
-                }
-                // Counter went backwards (session rebuild) or this is the
-                // first observation — no delta to rate yet.
-                _ => 0.0,
-            };
-            state.last_sampled = Some((now, sampled));
-            fps
-        };
+        let fps = self
+            .rates
+            .write()
+            .entry(camera_id)
+            .or_default()
+            .sampled
+            .record(now);
         let mut guard = self.inner.write();
         let e = guard.entry(camera_id).or_default();
         e.sampled_frames = sampled;
@@ -812,34 +803,70 @@ mod tests {
         );
     }
 
-    /// `observe_loop_stats` publishes a cumulative counter, so `sampled_fps`
-    /// has to be derived from the *delta* between two calls, not a naive
-    /// re-read of the counter itself.
+    /// `observe_loop_stats` fires once per appsink delivery, so the rate is
+    /// the call rate over [`RATE_WINDOW`] — the cumulative counter it also
+    /// carries is not what the fps is derived from.
     #[test]
-    fn sampled_fps_is_the_delta_between_loop_stats_calls() {
+    fn sampled_fps_tracks_the_appsink_delivery_rate() {
         let reg = DecodeHealthRegistry::new();
-        reg.observe_loop_stats(1, 0, 0);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        reg.observe_loop_stats(1, 10, 0);
+        reg.observe_loop_stats(1, 1, 0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        reg.observe_loop_stats(1, 2, 0);
         let s = reg.snapshot(1).unwrap();
-        // 10 frames over ~100ms => roughly 100fps.
         assert!(
-            s.sampled_fps > 40.0 && s.sampled_fps < 400.0,
-            "expected roughly 100fps, got {}",
+            s.sampled_fps > 5.0 && s.sampled_fps < 60.0,
+            "expected roughly 20fps, got {}",
             s.sampled_fps
         );
     }
 
-    /// A session rebuild can restart `observe_loop_stats` from a lower
-    /// cumulative total than the previous session ended on. That must not
-    /// underflow (`sampled - last_n` on `u64`) or report a nonsensical fps.
+    /// BUG-174 — `decode_verdict` divides `decoder_output_fps` by
+    /// `sampled_fps` to size the padding gap, which is only meaningful if
+    /// both are measured over the same window. `sampled_fps` used to be
+    /// `1/Δt` for the single most recent inter-frame gap while
+    /// `decoder_output_fps` was a [`RATE_WINDOW`] mean, so one jittery
+    /// delivery moved the ratio far enough to flip the verdict. Feeding both
+    /// counters at the same cadence must leave the ratio at ~1.
     #[test]
-    fn sampled_fps_handles_a_counter_that_goes_backwards() {
+    fn sampled_and_decoder_output_rates_share_a_window_so_their_ratio_is_stable() {
+        let reg = DecodeHealthRegistry::new();
+        for i in 1..=6 {
+            reg.observe_decoder_output(1);
+            reg.observe_loop_stats(1, i, 0);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // One late delivery: the old single-interval estimator turned this
+        // into a large sampled_fps swing all on its own.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        reg.observe_decoder_output(1);
+        reg.observe_loop_stats(1, 7, 0);
+
+        let s = reg.snapshot(1).unwrap();
+        let ratio = s.decoder_output_fps / s.sampled_fps;
+        assert!(
+            (ratio - 1.0).abs() < 0.05,
+            "rates must track each other: output {} / sampled {} = {ratio}",
+            s.decoder_output_fps,
+            s.sampled_fps
+        );
+    }
+
+    /// A session rebuild restarts `observe_loop_stats` from a lower
+    /// cumulative total. The rate is a call-rate now, so a counter reset
+    /// cannot disturb it — two calls inside the window still yield a positive
+    /// rate — while the cumulative field follows the counter down.
+    #[test]
+    fn a_counter_that_goes_backwards_does_not_disturb_the_rate() {
         let reg = DecodeHealthRegistry::new();
         reg.observe_loop_stats(1, 500, 10);
+        std::thread::sleep(std::time::Duration::from_millis(20));
         reg.observe_loop_stats(1, 20, 1); // session rebuilt, counter reset
         let s = reg.snapshot(1).unwrap();
-        assert_eq!(s.sampled_fps, 0.0);
+        assert!(
+            s.sampled_fps > 0.0,
+            "a counter reset must not zero the rate, got {}",
+            s.sampled_fps
+        );
         assert_eq!(s.sampled_frames, 20);
     }
 
