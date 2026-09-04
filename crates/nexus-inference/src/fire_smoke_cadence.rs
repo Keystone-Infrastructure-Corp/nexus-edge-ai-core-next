@@ -100,12 +100,41 @@ impl CadenceDecision {
 #[derive(Debug, Clone, Copy)]
 pub struct CadencePolicy {
     persistence_window: Duration,
+    samples_required: u32,
 }
 
 impl CadencePolicy {
     #[must_use]
     pub fn new(persistence_window: Duration) -> Self {
-        Self { persistence_window }
+        Self {
+            persistence_window,
+            samples_required: MIN_SAMPLES_TO_CONFIRM_PERSISTENCE,
+        }
+    }
+
+    /// A policy whose window must be provable with `samples_required`
+    /// samples rather than the fire head's two.
+    ///
+    /// Fire needs two because *persistence* is the thing being proven:
+    /// one sample shows a flame-like frame, only a second one separated
+    /// by the window shows it lasted. A detector that classifies from a
+    /// single frame against a stored reference — SPEC-038's tamper
+    /// detector is the motivating case, since `classify` fires on the
+    /// first frame that clears its thresholds — proves its condition
+    /// with one sample, and its window is a *detection-latency* budget
+    /// rather than a persistence window. Halving the budget for such a
+    /// detector would be safe but would be reasoning that does not
+    /// apply, so the sample count is explicit rather than assumed.
+    ///
+    /// `samples_required` is clamped to at least 1: a window provable
+    /// with zero samples is not a thing, and permitting 0 would make
+    /// `max_safe_period` divide by zero.
+    #[must_use]
+    pub fn with_samples_required(window: Duration, samples_required: u32) -> Self {
+        Self {
+            persistence_window: window,
+            samples_required: samples_required.max(1),
+        }
     }
 
     /// The slowest cadence period that still guarantees the persistence
@@ -114,7 +143,7 @@ impl CadencePolicy {
     /// itself, so there is no way to call `decide` and skip the check.
     #[must_use]
     pub fn max_safe_period(&self) -> Duration {
-        self.persistence_window / MIN_SAMPLES_TO_CONFIRM_PERSISTENCE
+        self.persistence_window / self.samples_required
     }
 
     /// Decide the cadence for one ladder rung.
