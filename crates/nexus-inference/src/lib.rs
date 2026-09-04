@@ -26,6 +26,7 @@ pub mod ensemble;
 #[cfg(feature = "ort")]
 pub mod execution_providers;
 pub mod fire_smoke;
+pub mod fire_smoke_cadence;
 pub mod health;
 pub mod label_space;
 pub mod nms;
