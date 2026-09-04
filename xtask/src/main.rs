@@ -33,6 +33,18 @@
 //!    manifest entry is fully back-filled; CI runs without
 //!    `--strict` today and with `--strict` once back-fill is done.
 //!
+//! 4. **No Hailo artifact for the fire/smoke head.** Per
+//!    [`ADR-065`](../../nexus-cloud-console/.obsidian-vault/decisions/ADR-065%20New%20Detection%20Capabilities%20Target%20ONNX%20Profiles%20And%20Defer%20Hailo.md),
+//!    new detection capabilities (fire/smoke, pose) target ONNX
+//!    profiles only and explicitly defer Hailo — no HEF, no
+//!    calibration corpus, no DFC run. Any manifest entry identified
+//!    as the fire/smoke head (by the `fire`/`smoke` naming already
+//!    used in-repo — see `fire_smoke.rs`, `FireSmokeHead`) that
+//!    declares a `hef`/Hailo-backend artifact is a hard error. This
+//!    is deliberately scoped to that one head: other models (e.g.
+//!    the primary detector) legitimately ship HEF artifacts under
+//!    Hailo's continued support for existing capabilities.
+//!
 //! The check exits 0 on success, 1 on any rule violation, and
 //! prints a one-line summary at the end either way.
 
@@ -129,6 +141,22 @@ const PROHIBITED_PROMPT_TERMS: &[&str] = &[
     "face covering",
 ];
 
+/// Substrings identifying the fire/smoke detection head by model `id`.
+/// Mirrors the naming already established in-repo for this capability
+/// (`crates/nexus-inference/src/fire_smoke.rs`, `FireSmokeHead`,
+/// `InferenceConfig::fire_smoke_head_enabled`) rather than inventing a
+/// new convention. ADR-065 defers Hailo for this head — it ships
+/// ONNX-only, one artifact per ladder rung — so any manifest entry
+/// matched by this marker that declares a HEF/Hailo-backend artifact
+/// trips a hard error (see `fire_smoke_head_forbids_hailo_artifact`
+/// below). This binds the moment such an entry is added; it does not
+/// require the still-open model-cut work to land first.
+const FIRE_SMOKE_HEAD_ID_MARKERS: &[&str] = &["fire", "smoke"];
+
+/// Backend values that identify a Hailo-compiled artifact, as opposed
+/// to the ONNX artifacts every profile but `hailo` consumes.
+const HAILO_BACKEND_MARKERS: &[&str] = &["hef", "hailo"];
+
 /// Subset of `models-manifest.json` that the check needs to inspect.
 /// All other fields (artifacts, presets, prompts, thresholds, etc.)
 /// are intentionally `serde(flatten)`-ignored.
@@ -157,6 +185,8 @@ struct ManifestModel {
 struct ManifestArtifact {
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 /// Outcome of a single rule against the manifest.
@@ -310,6 +340,37 @@ fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
                 "model '{}' prompt '{}' contains prohibited §9 term '{}' — Sentinel classifies acts and conditions, never categories of person (ADR-042)",
                 model.id, prompt, term
             ));
+        }
+    }
+
+    // ADR-065 / SPEC-036: the fire/smoke head is deferred on Hailo — it
+    // ships ONNX-only, one artifact per ladder rung, with no HEF, no
+    // calibration corpus, and no DFC run. A Hailo/HEF artifact declared
+    // for a model identified as the fire/smoke head is a structural
+    // regression of that decision, not a style nit, so it is a hard
+    // error regardless of `--strict`. Scoped to this one head: other
+    // models (e.g. the primary detector) legitimately ship HEF
+    // artifacts under Hailo's continued support for existing
+    // capabilities.
+    if FIRE_SMOKE_HEAD_ID_MARKERS
+        .iter()
+        .any(|marker| id_lc.contains(marker))
+    {
+        for art in &model.artifacts {
+            let backend_lc = art.backend.as_deref().unwrap_or("").to_lowercase();
+            let path_lc = art.path.as_deref().unwrap_or("").to_lowercase();
+            let is_hailo_artifact = HAILO_BACKEND_MARKERS
+                .iter()
+                .any(|marker| backend_lc.contains(marker))
+                || path_lc.ends_with(".hef");
+            if is_hailo_artifact {
+                report.error(format!(
+                    "model '{}' (fire/smoke head) declares a Hailo artifact '{}' (backend '{}') — ADR-065 defers Hailo for new detection capabilities; the fire/smoke head ships ONNX-only, one artifact per ladder rung, with no HEF. Remove this artifact rather than adding Hailo backend work for it.",
+                    model.id,
+                    art.path.as_deref().unwrap_or("<no path>"),
+                    art.backend.as_deref().unwrap_or("<no backend>"),
+                ));
+            }
         }
     }
 }
@@ -540,6 +601,70 @@ mod tests {
                 "weights_dataset_license":"COCO:CC-BY-4.0",
                 "artifacts":[],
                 "prompts":["bolt cutter","angle grinder","balaclava","gas can","tent","door","dumpster","ATM"]
+            }]}"#,
+        ));
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn fire_smoke_head_onnx_only_passes() {
+        // ADR-065: the fire/smoke head ships ONNX-only, one artifact per
+        // ladder rung. An entry with only `onnx` artifacts must be clean.
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"fire_smoke_yolo26n",
+                "license":"AGPL-3.0",
+                "weights_dataset_license":"D-Fire:CC-BY-4.0",
+                "artifacts":[
+                    {"backend":"onnx","path":"fire_smoke_512x288.onnx"},
+                    {"backend":"onnx","path":"fire_smoke_1024x576.onnx"},
+                    {"backend":"onnx","path":"fire_smoke_1536x864.onnx"}
+                ]
+            }]}"#,
+        ));
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn fire_smoke_head_forbids_hailo_artifact() {
+        // ADR-065 defers Hailo for the fire/smoke head. A `hef` backend
+        // artifact declared for it must be a hard error naming the
+        // head, the offending artifact, and ADR-065.
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"fire_smoke_yolo26n",
+                "license":"AGPL-3.0",
+                "weights_dataset_license":"D-Fire:CC-BY-4.0",
+                "artifacts":[
+                    {"backend":"onnx","path":"fire_smoke_512x288.onnx"},
+                    {"backend":"hef","path":"fire_smoke_512x288.hef"}
+                ]
+            }]}"#,
+        ));
+        assert!(
+            r.errors.iter().any(|e| e.contains("fire_smoke_yolo26n")
+                && e.contains("fire_smoke_512x288.hef")
+                && e.contains("ADR-065")),
+            "expected a fire/smoke-head Hailo error naming the model, artifact, and ADR-065; errors: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn hailo_artifacts_on_non_fire_smoke_models_are_unaffected() {
+        // The rule must be scoped to the fire/smoke head only. Existing
+        // models (e.g. the primary detector) legitimately ship HEF
+        // artifacts under Hailo's continued support and must not trip
+        // this check.
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"yolo26n",
+                "license":"AGPL-3.0",
+                "weights_dataset_license":"COCO:CC-BY-4.0",
+                "artifacts":[
+                    {"backend":"onnx","path":"yolo26n_512x288.onnx"},
+                    {"backend":"hef","path":"yolo26n_512x288.hef"}
+                ]
             }]}"#,
         ));
         assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
