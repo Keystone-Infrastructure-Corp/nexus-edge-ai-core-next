@@ -146,6 +146,11 @@ pub struct ReconcilerArgs {
     /// spawned camera gates alert-clip arming on the same live delivery
     /// schedule as the boot-time ones.
     pub alert_clip_schedule_gate: Arc<dyn nexus_pipeline::AlertClipScheduleGate>,
+    /// SPEC-037 — Tier-0 emergency dispatch. Cloned per `start_camera`
+    /// so a hot-added camera gets the same emergency wiring (or
+    /// `NoopEmergencyDispatch` in harnesses that don't configure it) as
+    /// the boot-time cameras.
+    pub emergency_dispatch: Arc<dyn nexus_pipeline::EmergencyDispatch>,
     pub handles: HandleMap,
     /// Phase 10 Live View — so stopping a camera also reaps its LBR pump.
     /// Without this the pump is reaped only by an `lbr_unsubscribe` from the
@@ -458,6 +463,7 @@ async fn start_camera(
         effective_top_k,
         args.sink_router.clone(),
         args.alert_clip_schedule_gate.clone(),
+        args.emergency_dispatch.clone(),
     );
     args.handles.lock().insert(
         cam_id,

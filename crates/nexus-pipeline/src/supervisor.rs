@@ -28,6 +28,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::cache::LatestFrameCache;
 use crate::crowd_hysteresis::CrowdHysteresis;
+use crate::emergency_dispatch::EmergencyDispatch;
 use crate::entity_sighting::{
     EntityLocalPersist, EntityLocalSeed, SightingHook, SightingScheduler,
 };
@@ -235,6 +236,12 @@ pub fn spawn_camera(
     // `NoopAlertClipScheduleGate` always arms (pre-M-Event-Audit
     // behaviour) for harnesses that don't wire the delivery cascade.
     alert_clip_gate: Arc<dyn AlertClipScheduleGate>,
+    // SPEC-037 — Tier-0 emergency dispatch. Consulted once per frame
+    // with that frame's non-static tracked objects, from inside a
+    // spawned task (see the call site below) so the emergency path can
+    // never stall this frame. `NoopEmergencyDispatch` observes nothing
+    // for harnesses that don't wire the Tier-0 path.
+    emergency: Arc<dyn EmergencyDispatch>,
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
@@ -262,6 +269,7 @@ pub fn spawn_camera(
         effective_top_k,
         sink_router,
         alert_clip_gate,
+        emergency,
     ));
     CameraHandle { camera_id, task }
 }
@@ -292,6 +300,7 @@ async fn run_camera(
     effective_top_k: Option<usize>,
     sink_router: Arc<dyn SinkRouter>,
     alert_clip_gate: Arc<dyn AlertClipScheduleGate>,
+    emergency: Arc<dyn EmergencyDispatch>,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -1036,6 +1045,25 @@ async fn run_camera(
                 } else {
                     tracked.clone()
                 };
+
+                // SPEC-037 — Tier-0 emergency dispatch. Fed the same
+                // non-static tracked-object slice rules see, spawned as
+                // its own task so no implementation (however slow) can
+                // stall THIS frame's recording/rule-evaluation path —
+                // "the alert emission cannot block a frame" is enforced
+                // here, structurally, rather than trusted to whatever
+                // `emergency` does internally. `NoopEmergencyDispatch`
+                // makes this a cheap no-op spawn for harnesses that
+                // don't wire the Tier-0 path.
+                {
+                    let emergency = Arc::clone(&emergency);
+                    let camera_id = cfg.id;
+                    let captured_at = frame.captured_at;
+                    let snapshot = Arc::new(dynamic_tracked.clone());
+                    tokio::spawn(async move {
+                        emergency.observe(camera_id, snapshot, captured_at).await;
+                    });
+                }
 
                 // M-Alert-Clip: feed this frame's frame-aligned detection
                 // boxes into the recorder's per-camera box timeline so an
