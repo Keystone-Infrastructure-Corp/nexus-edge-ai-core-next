@@ -132,14 +132,9 @@ impl TunnelLiveness {
     /// `cloud_reachable` parameter for the disconnected-alarm proof — not a
     /// caller-supplied bool standing in for a real read.
     ///
-    /// No Tier-0 detector-to-`decide` dispatch loop exists yet anywhere in
-    /// this binary (confirmed by search: `EmergencyPolicy` has zero
-    /// production call sites in this repo) — building that loop is a
-    /// separate, unbuilt feature outside this wave's scope. Until it
-    /// exists, this function's only caller is the proof test below, hence
-    /// the `allow` rather than a fabricated call site.
+    /// SPEC-037 (Wave 26): `nexus-engine`'s `EngineEmergencyDispatch` is now
+    /// a real production caller — see `crates/nexus-engine/src/emergency_dispatch.rs`.
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_reachable(&self, now_elapsed_ms: u64, budget: Duration) -> bool {
         let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
         match self.idle_ms(now_elapsed_ms) {

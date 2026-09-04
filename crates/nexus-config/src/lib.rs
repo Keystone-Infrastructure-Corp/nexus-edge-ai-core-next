@@ -128,6 +128,12 @@ pub struct Config {
     /// of the enrollment: currently just the go-dark watchdog window.
     #[serde(default)]
     pub cloud: CloudConfig,
+    /// SPEC-037 — edge-local Tier-0 emergency alerting. Ships OFF; the
+    /// operator opts in per owner ruling ("feature-flagged, disabled by
+    /// default"). See [`EmergencyConfig`] docs for why this exists
+    /// separately from `sinks`/`rules`.
+    #[serde(default)]
+    pub emergency: EmergencyConfig,
 }
 
 /// Per-appliance cloud behaviour.
@@ -168,6 +174,67 @@ impl CloudConfig {
             Some(std::time::Duration::from_secs(
                 self.dark_window_hours * 3600,
             ))
+        }
+    }
+}
+
+/// SPEC-037 — edge-local Tier-0 emergency alerting.
+///
+/// Owner ruling: feature-flagged, disabled by default. `enabled = false`
+/// makes `nexus-engine`'s `EngineEmergencyDispatch` a pure observer that
+/// never enqueues a delivery, regardless of what the stub detector below
+/// sees in a frame's tracked objects.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmergencyConfig {
+    /// Master switch. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// SPEC-036's fire/smoke detector does not exist yet (out of this
+    /// spec's scope — it consumes a detector's signal, it does not build
+    /// one). Per owner ruling ("a stub is fine for now"), this names the
+    /// `TrackedObject.label` value `EngineEmergencyDispatch` treats as a
+    /// Tier-0 `Fire` detection — a plausible signal source wired to the
+    /// real policy/rate-limit/delivery sequence, not a scripted outcome.
+    /// Never matches ordinary detector output unless something (a test,
+    /// or an operator's visual-prompt config) deliberately produces this
+    /// exact label.
+    #[serde(default = "default_emergency_stub_fire_label")]
+    pub stub_fire_label: String,
+    /// How stale the cloud tunnel's last accepted heartbeat may be
+    /// before `EmergencyPolicy::decide`'s `cloud_reachable` is derived
+    /// `false`. Deliberately independent of `CloudConfig::dark_window_hours`
+    /// — that one gates the OTA-reflip watchdog on an hours timescale;
+    /// this one gates a sub-10-second life-safety decision and must be
+    /// far tighter. Mirrors the 90 s budget used in
+    /// `cloud_liveness`'s own disconnected-alarm proof.
+    #[serde(default = "default_emergency_cloud_reachable_budget_secs")]
+    pub cloud_reachable_budget_secs: u64,
+    /// `EmergencyRateLimiter`'s minimum spacing between deliveries for
+    /// one (camera, class).
+    #[serde(default = "default_emergency_rate_limit_window_secs")]
+    pub rate_limit_window_secs: u64,
+}
+
+const fn default_emergency_cloud_reachable_budget_secs() -> u64 {
+    90
+}
+
+const fn default_emergency_rate_limit_window_secs() -> u64 {
+    60
+}
+
+fn default_emergency_stub_fire_label() -> String {
+    "tier0_fire_stub".to_string()
+}
+
+impl Default for EmergencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stub_fire_label: default_emergency_stub_fire_label(),
+            cloud_reachable_budget_secs: default_emergency_cloud_reachable_budget_secs(),
+            rate_limit_window_secs: default_emergency_rate_limit_window_secs(),
         }
     }
 }

@@ -33,7 +33,7 @@ mod cloud_sighting;
 mod cloud_tunnel;
 mod cloud_update;
 mod cold_read_cache;
-mod cold_replicator;
+mod emergency_dispatch;mod cold_replicator;
 mod delivery_reload;
 mod device_control;
 mod diag_collect;
@@ -935,6 +935,28 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             cascading_policy.clone(),
         ));
 
+    // Go-dark insurance. One shared signal, several consumers: the OTA
+    // success gate and watchdog further below, AND (SPEC-037) the
+    // emergency dispatch's `cloud_reachable` derivation — moved up here
+    // (it used to be built just before `cloud_tunnel::spawn_tunnel`) so
+    // the boot-time camera spawn loop below can hand every supervisor
+    // the same `Arc<TunnelLiveness>` the tunnel updates. See
+    // `cloud_liveness` for why an unreachable-but-working appliance is
+    // the failure mode worth its own machinery.
+    let tunnel_liveness = std::sync::Arc::new(cloud_liveness::TunnelLiveness::new());
+
+    // SPEC-037 — Tier-0 emergency dispatch. Ships OFF by default
+    // (`cfg.emergency.enabled`); when on, drives the real
+    // `nexus_sinks::emergency` policy/rate-limit/delivery sequence off a
+    // stub fire signal (owner ruling 4 — no trained detector exists).
+    let emergency_dispatch: std::sync::Arc<dyn nexus_pipeline::EmergencyDispatch> =
+        std::sync::Arc::new(emergency_dispatch::EngineEmergencyDispatch::new(
+            cfg.emergency.clone(),
+            tunnel_liveness.clone(),
+            store.clone(),
+            sink_registry.clone(),
+        ));
+
     for cam in cameras {
         if !cam.ingest.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
@@ -1008,6 +1030,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             effective_top_k,
             sink_router.clone(),
             alert_clip_schedule_gate.clone(),
+            emergency_dispatch.clone(),
         );
         running.lock().insert(
             cam_id,
@@ -1343,6 +1366,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         sighting_hydration_window_secs: hydration_window_secs,
         sink_router: sink_router.clone(),
         alert_clip_schedule_gate: alert_clip_schedule_gate.clone(),
+        emergency_dispatch: emergency_dispatch.clone(),
         handles: running.clone(),
         live_view: live_view_manager.clone(),
     });
@@ -1484,11 +1508,9 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             .admin_secret()
             .map(|s| std::sync::Arc::new(s.to_string()))
     };
-    // Go-dark insurance. One shared signal, two independent consumers:
-    // the OTA success gate below, and the watchdog further down. See
-    // `cloud_liveness` for why an unreachable-but-working appliance is
-    // the failure mode worth its own machinery.
-    let tunnel_liveness = std::sync::Arc::new(cloud_liveness::TunnelLiveness::new());
+    // Go-dark insurance — `tunnel_liveness` is constructed earlier
+    // (before the boot-time camera spawn loop) so `EngineEmergencyDispatch`
+    // (SPEC-037) shares the exact same `Arc` the tunnel updates below.
 
     let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(
         store.clone(),

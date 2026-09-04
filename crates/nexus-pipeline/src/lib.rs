@@ -17,6 +17,7 @@ pub mod alert_clip;
 pub mod cache;
 pub mod crowd_hysteresis;
 pub mod decode;
+pub mod emergency_dispatch;
 pub mod entity_sighting;
 pub mod gate;
 pub mod overlay;
@@ -52,6 +53,7 @@ pub mod webrtc;
 
 pub use cache::{LatestEntry, LatestFrameCache};
 pub use decode::{select_decode_chain, DecodeBackend, DecodeChain, DecodeMode, FactoryProbe};
+pub use emergency_dispatch::{EmergencyDispatch, NoopEmergencyDispatch};
 pub use entity_sighting::{
     EntityLocalPersist, EntityLocalSeed, EntityLocalUpdate, NoopEntityLocalPersist,
     NoopSightingHook, SightingHook, SightingScheduler, SightingSnapshot,
