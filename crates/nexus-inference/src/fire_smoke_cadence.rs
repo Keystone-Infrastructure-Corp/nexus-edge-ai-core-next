@@ -344,15 +344,25 @@ mod tests {
         let mut runner = CadencedFireHead::new(7, cfg(ms(2000)), ms(33), ms(500))
             .expect("a 500ms cost under a 1s ceiling is runnable");
         let mut src = StubFireSource::new(0, 100_000);
+        let mut emits = 0u32;
         for f in 0..600 {
-            assert!(runner.on_frame(f * 33, &mut src).is_none());
+            if runner.on_frame(f * 33, &mut src).is_some() {
+                emits += 1;
+            }
         }
         assert_eq!(
             runner.head_invocations(),
             0,
-            "disabled must mean the head was not called at all"
+            "disabled must mean the head was NOT CALLED at all, but it ran {} times over \
+             600 frames of burning fire",
+            runner.head_invocations()
         );
-        assert_eq!(src.samples, 0, "a disabled head does not even sample frames");
+        assert_eq!(
+            src.samples, 0,
+            "a disabled head must not even sample frames, but sampled {} times",
+            src.samples
+        );
+        assert_eq!(emits, 0, "a disabled head emitted {emits} signals");
     }
 
     /// The runner must actually throttle: at a reduced cadence it may
