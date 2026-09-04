@@ -388,10 +388,14 @@ mod tests {
     /// `self.sink_registry.ids().into_iter()...collect()` WITHOUT the
     /// `.filter(|id| id.kind() != "cloud")` — i.e. routed the emergency
     /// alarm to every configured sink, cloud included. This test failed
-    /// on `assert_eq!(cloud_delivered.lock().len(), 0, ...)` (became 1):
-    /// `assertion `left == right` failed: a Tier-0 alarm must never be
-    /// routed to a cloud sink — left: 1, right: 0`. Reverted, GREEN
-    /// restored, diff clean.
+    /// with the real, observed message:
+    /// `assertion `left == right` failed: a Tier-0 alarm must enqueue
+    /// exactly one outbox row (the local sink); cloud is excluded
+    ///   left: 2
+    ///  right: 1` — because the outbox now got one row per sink (local
+    /// AND cloud) instead of just the local one. Reverted, GREEN
+    /// restored (`git checkout -- crates/nexus-engine/src/emergency_dispatch.rs`),
+    /// diff clean.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tunnel_down_seeds_a_detection_and_delivers_on_the_local_path() {
         // 1. A tunnel that never authenticated is a real "forced
@@ -566,12 +570,15 @@ mod tests {
     /// Fault injection: temporarily changed the supervisor's emergency
     /// call site (`crates/nexus-pipeline/src/supervisor.rs`) from
     /// spawning `emergency.observe(...)` in its own task to `.await`ing
-    /// it inline on the frame loop. This test failed — with a 2s sleep
-    /// per `observe()` call and a 20fps camera (50ms/frame), the ordinary
-    /// `any_person` rule-fire alert count observed within the 1200ms
-    /// window dropped from "several" to 0/1 (`assert!(alerts.len() >= 3,
-    /// ...)` failed with `left: 0`, or `1`), because every frame now
-    /// blocked on the 2s sleep. Reverted, GREEN restored, diff clean.
+    /// it inline on the frame loop. This test failed with the real,
+    /// observed message:
+    /// `rule-fired alerts must keep arriving at the camera's normal
+    /// cadence while the emergency dispatch is stuck mid-flight; got 0
+    /// within 1200ms` — because every frame now blocked on the stub's
+    /// 2s sleep, so no frame ever got far enough to record a rule-fired
+    /// alert inside the 1200ms observation window. Reverted, GREEN
+    /// restored (`git checkout -- crates/nexus-pipeline/src/supervisor.rs`),
+    /// diff clean.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn emergency_dispatch_never_blocks_detection_recording_or_rule_evaluation() {
         let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
