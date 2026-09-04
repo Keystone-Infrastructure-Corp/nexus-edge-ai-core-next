@@ -174,8 +174,7 @@ mod tests {
         assert_eq!(decision, CadenceDecision::FullRate { period: budget });
     }
 
-    /// 2. Cost over budget -> a reduced cadence is returned, and it
-    /// satisfies the window.
+    /// 2. Cost over budget -> a reduced cadence is returned, and it satisfies the window.
     #[test]
     fn cost_over_budget_returns_reduced_cadence_within_window() {
         let policy = CadencePolicy::new(ms(2000));
@@ -194,8 +193,7 @@ mod tests {
         }
     }
 
-    /// 3. The important one: across a wide range of costs and budgets,
-    /// *every* cadence the policy returns satisfies the >= 2 s window.
+    /// 3. The important one: across a wide range of costs and budgets, *every* cadence the policy returns satisfies the >= 2 s window.
     #[test]
     fn every_returned_cadence_satisfies_the_persistence_window() {
         let windows_ms = [500u64, 1000, 2000, 5000, 10_000];
@@ -254,8 +252,7 @@ mod tests {
         assert!(refused_seen);
     }
 
-    /// 4. Cost so extreme that no valid cadence exists -> the policy
-    /// refuses rather than returning a window-violating cadence.
+    /// 4. Cost so extreme that no valid cadence exists -> the policy refuses rather than returning a window-violating cadence.
     #[test]
     fn extreme_cost_refuses_instead_of_violating_the_window() {
         let policy = CadencePolicy::new(ms(2000)); // ceiling = 1000ms
