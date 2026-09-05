@@ -747,7 +747,7 @@ mod tests {
     /// A crisp, high-frequency frame: a 1px checkerboard.
     fn checkerboard(w: usize, h: usize) -> Vec<u8> {
         (0..w * h)
-            .map(|i| if ((i / w) + (i % w)) % 2 == 0 { 0 } else { 255 })
+            .map(|i| if ((i / w) + (i % w)).is_multiple_of(2) { 0 } else { 255 })
             .collect()
     }
 
