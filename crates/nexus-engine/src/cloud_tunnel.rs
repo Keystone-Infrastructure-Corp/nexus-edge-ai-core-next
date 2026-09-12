@@ -55,6 +55,12 @@ use crate::storage_safety::WatermarkSignal;
 /// Heartbeat cadence. Matches the cloud edge-gateway's `liveness_timeout / 2`
 /// expectation.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the wait-for-enrollment loop re-reads `cloud_enrollment`.
+///
+/// The timer only runs while this core is unenrolled: the loop returns on
+/// the first successful read, so an enrolled engine never polls.
+const ENROLLMENT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -3160,12 +3166,6 @@ mod heartbeat_ack_tests {
     }
 }
 
-/// How often the wait-for-enrollment loop re-reads `cloud_enrollment`.
-///
-/// The timer only runs while this core is unenrolled: the loop returns on
-/// the first successful read, so an enrolled engine never polls.
-const ENROLLMENT_POLL_INTERVAL: Duration = Duration::from_secs(15);
-
 /// Block until this core has a `cloud_enrollment` row, or until shutdown.
 ///
 /// Returns `Some(enrollment)` once a row is readable, or `None` when the
@@ -3184,6 +3184,7 @@ async fn wait_for_enrollment(
     poll_interval: Duration,
 ) -> Option<CloudEnrollment> {
     let mut idle_logged = false;
+    let mut err_logged = false;
     loop {
         match store.get_cloud_enrollment().await {
             Ok(Some(e)) => return Some(e),
@@ -3202,10 +3203,19 @@ async fn wait_for_enrollment(
                 }
             }
             Err(e) => {
-                warn!(
-                    error = %e,
-                    "could not read cloud_enrollment; will retry on the next poll or notification",
-                );
+                // Same throttle as the idle branch: a store that fails to
+                // decode (a malformed `enrolled_at`, say) fails on every
+                // poll, and WARN once per interval forever would bury the
+                // journal on a box that is already broken.
+                if err_logged {
+                    debug!(error = %e, "cloud_enrollment still unreadable; re-probing");
+                } else {
+                    warn!(
+                        error = %e,
+                        "could not read cloud_enrollment; will retry on the next poll or notification",
+                    );
+                    err_logged = true;
+                }
             }
         }
         tokio::select! {
@@ -3228,13 +3238,16 @@ mod enrollment_wait_tests {
     use nexus_config::StoreConfig;
     use tempfile::TempDir;
 
-    async fn fresh_store() -> (Arc<Store>, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let cfg = StoreConfig {
+    fn store_cfg(tmp: &TempDir) -> StoreConfig {
+        StoreConfig {
             url: format!("sqlite://{}/store.db?mode=rwc", tmp.path().display()),
             ..StoreConfig::default()
-        };
-        let store = Store::open(&cfg).await.expect("open store");
+        }
+    }
+
+    async fn fresh_store() -> (Arc<Store>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(&store_cfg(&tmp)).await.expect("open store");
         (Arc::new(store), tmp)
     }
 
@@ -3278,9 +3291,15 @@ mod enrollment_wait_tests {
             .await
         });
 
-        // Stand in for the CLI: write the row, never touch `notify`.
+        // Stand in for the CLI: a SECOND connection to the same database
+        // writes the row, and nothing ever touches `notify`. The separate
+        // Store is the point — it is what the out-of-process CLI does, and
+        // it exercises the cross-connection visibility the bug turns on.
         tokio::time::sleep(Duration::from_millis(60)).await;
-        store
+        let cli_store = Store::open(&store_cfg(&_tmp))
+            .await
+            .expect("open cli store");
+        cli_store
             .set_cloud_enrollment(&sample_enrollment())
             .await
             .expect("write enrollment");
@@ -3295,21 +3314,36 @@ mod enrollment_wait_tests {
         );
     }
 
-    /// The shutdown arm must still win while unenrolled — the poll timer
-    /// must not hold the task open past a shutdown request.
+    /// The shutdown arm must still win while unenrolled: a task parked on
+    /// the poll timer has to drop out on shutdown rather than sit on the
+    /// sleep. The shutdown is sent only AFTER the waiter has reached the
+    /// `select!`, so the timer is genuinely armed when it fires.
     #[tokio::test]
-    async fn shutdown_returns_none_while_unenrolled() {
+    async fn shutdown_interrupts_a_parked_poll() {
         let (store, _tmp) = fresh_store().await;
         let notify = Arc::new(Notify::new());
         let (tx, mut rx) = oneshot::channel::<()>();
+
+        let waiter_store = Arc::clone(&store);
+        let waiter_notify = Arc::clone(&notify);
+        let waiter = tokio::spawn(async move {
+            wait_for_enrollment(
+                &waiter_store,
+                &waiter_notify,
+                &mut rx,
+                Duration::from_secs(3600),
+            )
+            .await
+        });
+
+        // Let the waiter reach the select! and park on the 1 h timer.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send(()).expect("send shutdown");
 
-        let got = tokio::time::timeout(
-            Duration::from_secs(5),
-            wait_for_enrollment(&store, &notify, &mut rx, Duration::from_secs(3600)),
-        )
-        .await
-        .expect("shutdown arm did not fire");
+        let got = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("shutdown did not interrupt a parked poll")
+            .expect("waiter task panicked");
         assert!(got.is_none(), "shutdown must return None");
     }
 }
