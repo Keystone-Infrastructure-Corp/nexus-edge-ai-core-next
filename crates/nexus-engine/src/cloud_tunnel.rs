@@ -55,6 +55,12 @@ use crate::storage_safety::WatermarkSignal;
 /// Heartbeat cadence. Matches the cloud edge-gateway's `liveness_timeout / 2`
 /// expectation.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the wait-for-enrollment loop re-reads `cloud_enrollment`.
+///
+/// The timer only runs while this core is unenrolled: the loop returns on
+/// the first successful read, so an enrolled engine never polls.
+const ENROLLMENT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -78,9 +84,11 @@ pub struct StorageWatermarkHandle {
 /// Spawn the tunnel supervisor. The task probes
 /// `cloud_enrollment`; if the row is missing it parks on
 /// `enrollment_changed` and re-probes on every notification, so a
-/// post-boot admin enrollment (`POST /v1/admin/cloud/enroll` or the
-/// `nexus-engine enroll` CLI re-using the same store path) activates
-/// the WSS tunnel within seconds — no engine restart required. The
+/// post-boot admin enrollment (`POST /v1/admin/cloud/enroll`) activates
+/// the WSS tunnel within seconds — no engine restart required. It also
+/// re-probes on an [`ENROLLMENT_POLL_INTERVAL`] timer, because the
+/// `nexus-engine enroll` CLI writes the row from a separate process and
+/// so cannot signal an in-process `Notify` (BUG-201). The
 /// task only exits when the shutdown signal fires.
 ///
 /// Note: re-enrollment *while the tunnel is already running* still
@@ -158,33 +166,19 @@ pub fn spawn_tunnel(
         // Outer wait-for-enrollment loop. The Phase 1.8 supervisor
         // exited immediately when no row was present, forcing the
         // operator to restart the engine after enrolling. Phase 1.16:
-        // park on `enrollment_changed` so a post-boot enrollment
-        // (admin POST or CLI) hot-activates the tunnel within seconds.
-        let enrollment = loop {
-            match store.get_cloud_enrollment().await {
-                Ok(Some(e)) => break e,
-                Ok(None) => {
-                    info!(
-                        "no cloud enrollment present; cloud tunnel idle until admin enrolls (POST /v1/admin/cloud/enroll) or engine restart",
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "could not read cloud_enrollment; will retry on next enrollment notification",
-                    );
-                }
-            }
-            tokio::select! {
-                biased;
-                _ = &mut rx => {
-                    info!("cloud tunnel shutdown requested before enrollment");
-                    return;
-                }
-                _ = enrollment_changed.notified() => {
-                    info!("enrollment change notification received; re-probing cloud_enrollment");
-                }
-            }
+        // park on `enrollment_changed` so a post-boot admin POST
+        // hot-activates the tunnel within seconds. BUG-201 added the
+        // poll arm so a CLI enroll — a separate process, which cannot
+        // signal this one's Notify — hot-activates it too.
+        let Some(enrollment) = wait_for_enrollment(
+            &store,
+            &enrollment_changed,
+            &mut rx,
+            ENROLLMENT_POLL_INTERVAL,
+        )
+        .await
+        else {
+            return;
         };
         info!(
             core_id = %enrollment.core_id,
@@ -3169,5 +3163,187 @@ mod heartbeat_ack_tests {
             "an acknowledged heartbeat is the only proof the cloud is on the \
              other end of this socket",
         );
+    }
+}
+
+/// Block until this core has a `cloud_enrollment` row, or until shutdown.
+///
+/// Returns `Some(enrollment)` once a row is readable, or `None` when the
+/// shutdown signal fires first.
+///
+/// Wakes on three things: the shutdown signal, an in-process
+/// `enrollment_changed` notification (raised by the admin HTTP handlers in
+/// [`crate::admin_cloud`]), and a `poll_interval` timer. The timer is what
+/// lets a `nexus-engine enroll` CLI run take effect without an engine
+/// restart — that CLI is a separate process writing the same SQLite store,
+/// so it has no way to signal this process's `Notify` (BUG-201).
+async fn wait_for_enrollment(
+    store: &Store,
+    enrollment_changed: &Notify,
+    rx: &mut oneshot::Receiver<()>,
+    poll_interval: Duration,
+) -> Option<CloudEnrollment> {
+    let mut idle_logged = false;
+    let mut err_logged = false;
+    loop {
+        match store.get_cloud_enrollment().await {
+            Ok(Some(e)) => return Some(e),
+            Ok(None) => {
+                // INFO once, DEBUG thereafter: polling every
+                // `poll_interval` would otherwise fill the journal on a
+                // box that sits unenrolled for days.
+                if idle_logged {
+                    debug!("still no cloud enrollment; re-probing");
+                } else {
+                    info!(
+                        poll_interval_secs = poll_interval.as_secs(),
+                        "no cloud enrollment present; cloud tunnel idle until this core is enrolled (POST /v1/admin/cloud/enroll or `nexus-engine enroll`)",
+                    );
+                    idle_logged = true;
+                }
+            }
+            Err(e) => {
+                // Same throttle as the idle branch: a store that fails to
+                // decode (a malformed `enrolled_at`, say) fails on every
+                // poll, and WARN once per interval forever would bury the
+                // journal on a box that is already broken.
+                if err_logged {
+                    debug!(error = %e, "cloud_enrollment still unreadable; re-probing");
+                } else {
+                    warn!(
+                        error = %e,
+                        "could not read cloud_enrollment; will retry on the next poll or notification",
+                    );
+                    err_logged = true;
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = &mut *rx => {
+                info!("cloud tunnel shutdown requested before enrollment");
+                return None;
+            }
+            _ = enrollment_changed.notified() => {
+                info!("enrollment change notification received; re-probing cloud_enrollment");
+            }
+            _ = tokio::time::sleep(poll_interval) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod enrollment_wait_tests {
+    use super::*;
+    use nexus_config::StoreConfig;
+    use tempfile::TempDir;
+
+    fn store_cfg(tmp: &TempDir) -> StoreConfig {
+        StoreConfig {
+            url: format!("sqlite://{}/store.db?mode=rwc", tmp.path().display()),
+            ..StoreConfig::default()
+        }
+    }
+
+    async fn fresh_store() -> (Arc<Store>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(&store_cfg(&tmp)).await.expect("open store");
+        (Arc::new(store), tmp)
+    }
+
+    fn sample_enrollment() -> CloudEnrollment {
+        CloudEnrollment {
+            core_id: "11111111-2222-3333-4444-555555555555".into(),
+            gateway_url: "wss://gateway.test/v1/tunnel".into(),
+            cert_pem: "cert".into(),
+            private_key_pem: "key".into(),
+            ca_chain_pem: "ca".into(),
+            entitlement_jwt: "eyJ.fake.jwt".into(),
+            signing_key_pem: None,
+            signing_kid: None,
+            enrolled_at: chrono::Utc::now(),
+            attach_replay_after: None,
+            server_cert_pem: None,
+            server_private_key_pem: None,
+            ssh_ca_public_key: None,
+        }
+    }
+
+    /// BUG-201 — `nexus-engine enroll` runs in its OWN process, so it can
+    /// write the `cloud_enrollment` row but cannot signal this process's
+    /// `enrollment_changed` Notify. Without the poll arm the wait loop
+    /// parks forever and the core stays offline until someone restarts it.
+    #[tokio::test]
+    async fn poll_picks_up_an_enrollment_written_without_a_notification() {
+        let (store, _tmp) = fresh_store().await;
+        let notify = Arc::new(Notify::new());
+        let (_tx, mut rx) = oneshot::channel::<()>();
+
+        let waiter_store = Arc::clone(&store);
+        let waiter_notify = Arc::clone(&notify);
+        let waiter = tokio::spawn(async move {
+            wait_for_enrollment(
+                &waiter_store,
+                &waiter_notify,
+                &mut rx,
+                Duration::from_millis(25),
+            )
+            .await
+        });
+
+        // Stand in for the CLI: a SECOND connection to the same database
+        // writes the row, and nothing ever touches `notify`. The separate
+        // Store is the point — it is what the out-of-process CLI does, and
+        // it exercises the cross-connection visibility the bug turns on.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let cli_store = Store::open(&store_cfg(&_tmp))
+            .await
+            .expect("open cli store");
+        cli_store
+            .set_cloud_enrollment(&sample_enrollment())
+            .await
+            .expect("write enrollment");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("wait_for_enrollment never returned — no poll fallback")
+            .expect("waiter task panicked");
+        assert_eq!(
+            got.expect("expected an enrollment, got shutdown").core_id,
+            "11111111-2222-3333-4444-555555555555",
+        );
+    }
+
+    /// The shutdown arm must still win while unenrolled: a task parked on
+    /// the poll timer has to drop out on shutdown rather than sit on the
+    /// sleep. The shutdown is sent only AFTER the waiter has reached the
+    /// `select!`, so the timer is genuinely armed when it fires.
+    #[tokio::test]
+    async fn shutdown_interrupts_a_parked_poll() {
+        let (store, _tmp) = fresh_store().await;
+        let notify = Arc::new(Notify::new());
+        let (tx, mut rx) = oneshot::channel::<()>();
+
+        let waiter_store = Arc::clone(&store);
+        let waiter_notify = Arc::clone(&notify);
+        let waiter = tokio::spawn(async move {
+            wait_for_enrollment(
+                &waiter_store,
+                &waiter_notify,
+                &mut rx,
+                Duration::from_secs(3600),
+            )
+            .await
+        });
+
+        // Let the waiter reach the select! and park on the 1 h timer.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(()).expect("send shutdown");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("shutdown did not interrupt a parked poll")
+            .expect("waiter task panicked");
+        assert!(got.is_none(), "shutdown must return None");
     }
 }

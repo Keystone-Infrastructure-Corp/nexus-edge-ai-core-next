@@ -1545,11 +1545,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // this spawns a long-running task that maintains the WSS+mTLS
     // tunnel to `edge-gateway`, sending heartbeats every 30s. When
     // no enrollment is present, the task parks on
-    // `cloud_enrollment_changed` (Phase 1.16) — the engine continues
-    // to serve locally (fail-open per Hard Rule 5) and the admin
-    // `POST /v1/admin/cloud/enroll` handler fires the Notify after
-    // persisting the row so the tunnel activates within seconds
-    // without an engine restart.
+    // `cloud_enrollment_changed` (Phase 1.16) and a re-probe timer
+    // (BUG-201) — the engine continues to serve locally (fail-open per
+    // Hard Rule 5). The admin `POST /v1/admin/cloud/enroll` handler
+    // fires the Notify after persisting the row; an out-of-process
+    // `nexus-engine enroll` cannot, and is picked up by the timer
+    // instead. Either way the tunnel activates without a restart.
     //
     // Phase 2 Step 2.1b — also receives the shared `registry` +
     // `cold_kick` so post-enrollment it can install the cloud
