@@ -88,7 +88,7 @@ pub struct StorageWatermarkHandle {
 /// the WSS tunnel within seconds — no engine restart required. It also
 /// re-probes on an [`ENROLLMENT_POLL_INTERVAL`] timer, because the
 /// `nexus-engine enroll` CLI writes the row from a separate process and
-/// so cannot signal an in-process `Notify` (BUG-175). The
+/// so cannot signal an in-process `Notify` (BUG-201). The
 /// task only exits when the shutdown signal fires.
 ///
 /// Note: re-enrollment *while the tunnel is already running* still
@@ -167,7 +167,7 @@ pub fn spawn_tunnel(
         // exited immediately when no row was present, forcing the
         // operator to restart the engine after enrolling. Phase 1.16:
         // park on `enrollment_changed` so a post-boot admin POST
-        // hot-activates the tunnel within seconds. BUG-175 added the
+        // hot-activates the tunnel within seconds. BUG-201 added the
         // poll arm so a CLI enroll — a separate process, which cannot
         // signal this one's Notify — hot-activates it too.
         let Some(enrollment) = wait_for_enrollment(
@@ -3176,7 +3176,7 @@ mod heartbeat_ack_tests {
 /// [`crate::admin_cloud`]), and a `poll_interval` timer. The timer is what
 /// lets a `nexus-engine enroll` CLI run take effect without an engine
 /// restart — that CLI is a separate process writing the same SQLite store,
-/// so it has no way to signal this process's `Notify` (BUG-175).
+/// so it has no way to signal this process's `Notify` (BUG-201).
 async fn wait_for_enrollment(
     store: &Store,
     enrollment_changed: &Notify,
@@ -3269,7 +3269,7 @@ mod enrollment_wait_tests {
         }
     }
 
-    /// BUG-175 — `nexus-engine enroll` runs in its OWN process, so it can
+    /// BUG-201 — `nexus-engine enroll` runs in its OWN process, so it can
     /// write the `cloud_enrollment` row but cannot signal this process's
     /// `enrollment_changed` Notify. Without the poll arm the wait loop
     /// parks forever and the core stays offline until someone restarts it.

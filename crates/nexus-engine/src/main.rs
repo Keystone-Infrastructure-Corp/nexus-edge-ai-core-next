@@ -1546,7 +1546,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // tunnel to `edge-gateway`, sending heartbeats every 30s. When
     // no enrollment is present, the task parks on
     // `cloud_enrollment_changed` (Phase 1.16) and a re-probe timer
-    // (BUG-175) — the engine continues to serve locally (fail-open per
+    // (BUG-201) — the engine continues to serve locally (fail-open per
     // Hard Rule 5). The admin `POST /v1/admin/cloud/enroll` handler
     // fires the Notify after persisting the row; an out-of-process
     // `nexus-engine enroll` cannot, and is picked up by the timer
