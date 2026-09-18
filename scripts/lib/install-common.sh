@@ -1167,12 +1167,21 @@ _INTEL_GEN9_IGC_TAG='1.0.17537.24'
 _INTEL_GEN9_NEO_URL="https://github.com/intel/compute-runtime/releases/download/${_INTEL_GEN9_NEO_TAG}"
 _INTEL_GEN9_IGC_URL="https://github.com/intel/intel-graphics-compiler/releases/download/igc-${_INTEL_GEN9_IGC_TAG}"
 
-# file<TAB>sha256 — sums for the compute-runtime pair are Intel's published
-# ww35.sum values; the IGC pair were computed from the same published
-# artefacts. A mismatch aborts the install rather than running unverified
-# binaries as root.
+# file sha256 — the three compute-runtime sums are Intel's published ww35.sum
+# values; the IGC pair were computed from the IGC release's own artefacts, which
+# ship no checksum file. A mismatch aborts the install rather than running
+# unverified binaries as root.
+#
+# libigdgmm12 (>= 22.5.0) ships here rather than coming from the Ubuntu archive
+# (24.04 has 22.3.17): both -legacy1 packages depend on it, so without it dpkg
+# leaves the legacy compute stack unconfigured and the iGPU silently falls back
+# to the CPU EP on a clean box. It is held below with the rest of the stack,
+# which keeps Ubuntu's GMM updates off this box too — GMM is shared with
+# iHD/libva via va-driver-all. That is the accepted cost of holding a GMM the
+# -legacy1 binaries are ABI-matched to. (BUG-176)
 _intel_gen9_manifest() {
     cat <<EOF
+${_INTEL_GEN9_NEO_URL}/libigdgmm12_22.5.0_amd64.deb cc29d14df83cff1b3c6a66baa39257f0211b168ab43a99c2dc62a3734431bc23
 ${_INTEL_GEN9_NEO_URL}/intel-opencl-icd-legacy1_${_INTEL_GEN9_NEO_TAG}_amd64.deb bbe71e4f414259e06a10cde72c29a2bd78d41b2bb2f6f8463b1806797fe66e85
 ${_INTEL_GEN9_NEO_URL}/intel-level-zero-gpu-legacy1_1.5.30872.36_amd64.deb 40dfbd15ab62de036a00824b304a2aa1fa2d81ad60ef83da09cfe3c5a80c429f
 ${_INTEL_GEN9_IGC_URL}/intel-igc-core_${_INTEL_GEN9_IGC_TAG}_amd64.deb c1e1ecdfe2064c047c552651cfdcdafc504f2033afafba65654338b880048b67
@@ -1246,7 +1255,7 @@ _drivers_intel_gen9_legacy() {
         if _all_dpkg_installed intel-opencl-icd-legacy1 intel-level-zero-gpu-legacy1 \
             intel-igc-core intel-igc-opencl; then
             apt-mark hold intel-opencl-icd-legacy1 intel-level-zero-gpu-legacy1 \
-                intel-igc-core intel-igc-opencl >/dev/null 2>&1 \
+                intel-igc-core intel-igc-opencl libigdgmm12 >/dev/null 2>&1 \
                 || warn "apt-mark hold failed; an upgrade could replace the legacy stack"
             # Only pin mainline NEO out once the legacy stack is actually on the
             # box. Pinning after a failed install leaves the core with neither
