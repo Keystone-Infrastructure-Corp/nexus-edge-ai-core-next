@@ -47,7 +47,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 /// Delivery ceiling handed to `process_row` by these tests. Any value
 /// comfortably above a scripted sink's (instant) `deliver()`; the ceiling
 /// itself is exercised in `crates/nexus-sinks/tests/dispatcher_isolation.rs`.
-const DELIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TEST_DELIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Fixtures (kept in sync with tests/dispatcher.rs)
@@ -153,7 +153,7 @@ async fn drain(store: &Arc<Store>, registry: &Arc<SinkRegistry>, mut row: Outbox
             None,
             None,
             None,
-            DELIVER_TIMEOUT,
+            TEST_DELIVER_TIMEOUT,
             row.clone(),
         )
         .await;

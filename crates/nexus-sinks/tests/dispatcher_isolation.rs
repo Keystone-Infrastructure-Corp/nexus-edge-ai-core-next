@@ -392,14 +392,21 @@ async fn fresh_health_is_not_live() {
 /// still held. Reaching `Sent` requires a second `outbox_pending`.
 #[tokio::test(flavor = "multi_thread")]
 async fn hung_sink_does_not_wedge_later_ticks() {
+    // Every test in the tree supplies its own short ceiling, so nothing
+    // else would notice if the shipped default were changed to something
+    // that times out every production delivery.
+    assert_eq!(
+        dispatcher::SinkDispatcherConfig::default().deliver_timeout,
+        dispatcher::DELIVER_TIMEOUT,
+        "the shipped dispatcher must default to the documented ceiling",
+    );
+
     let (store, _tmp) = fresh_store().await;
     store
         .upsert_camera(&sample_camera(1, "front"))
         .await
         .unwrap();
 
-    // Same ordering invariant as the test above: the hung sink is first
-    // by outbox id and first in sink-id order.
     let hung_id = SinkId::new("webhook", "ahung").unwrap();
     let fast_id = SinkId::new("webhook", "zfast").unwrap();
     // 0 permits — parks forever, and this test never releases it.
