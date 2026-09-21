@@ -64,7 +64,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gstreamer as gst;
@@ -115,6 +115,13 @@ const FRAME_BROADCAST_CAPACITY: usize = 16;
 
 /// Max backoff between reconnect attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long a session must have run before its failure is treated as a
+/// one-off rather than as part of a flap, resetting the reconnect
+/// ladder. Comfortably longer than the worst-case connect path
+/// (`RTSP_FIRST_SAMPLE_GRACE_SECS` plus a MAX_BACKOFF wait), so a
+/// camera that only ever fails to deliver can never look "healthy".
+const HEALTHY_SESSION: Duration = Duration::from_secs(120);
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngesterError {
@@ -550,6 +557,7 @@ async fn run_supervisor(
         } else {
             decode_mode
         };
+        let session_start = std::time::Instant::now();
         match run_session(
             camera_id,
             &url,
@@ -577,6 +585,17 @@ async fn run_supervisor(
                     backoff_ms = backoff.as_millis(),
                     "preroll ingester session failed; reconnecting after backoff"
                 );
+                // A session that ran for a good while before failing is
+                // not a flapping camera, so it starts the ladder over.
+                // Without this the backoff only ever ratchets: it resets
+                // on EOS, which a failing camera never sends, so one
+                // stall every few hours walks a healthy camera up to
+                // MAX_BACKOFF and leaves it there for the life of the
+                // process. The stall watchdog (#336) makes that
+                // reachable far more often than a bus error did.
+                if session_start.elapsed() >= HEALTHY_SESSION {
+                    backoff = Duration::from_millis(500);
+                }
             }
         }
         if shutdown.load(Ordering::Acquire) {
@@ -786,6 +805,13 @@ async fn run_session(
     // assumed 33ms frame duration (~30fps). This keeps the recording
     // continuous even on cameras with flaky timestamps.
     let last_pts = std::sync::Arc::new(parking_lot::Mutex::new(None::<Duration>));
+    // Stall-watchdog clock (#336). `None` until the first NAL reaches
+    // the tap, which is what separates "this session never delivered"
+    // from "this session stopped delivering" — the two get different
+    // budgets, see `source::watch_for_stall`. Bumped on every tap sample
+    // so a normally-recording session never trips the watchdog.
+    let last_sample_at = std::sync::Arc::new(parking_lot::Mutex::new(None::<Instant>));
+    let last_sample_at_cb = last_sample_at.clone();
     sink.set_callbacks(
         AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -814,6 +840,11 @@ async fn run_session(
                     is_keyframe,
                     data: map.as_slice().to_vec(),
                 };
+                // Bump the stall watchdog before anything downstream
+                // runs: this sample DID arrive from the camera, and a
+                // slow ring or broadcast must not read as a dead
+                // upstream.
+                *last_sample_at_cb.lock() = Some(Instant::now());
                 // Push into ring first so a slow broadcast doesn't
                 // delay the buffer's persistence path. The ring is
                 // bounded by duration so pushes are O(1) amortised.
@@ -1078,6 +1109,12 @@ async fn run_session(
     pipeline
         .set_state(gst::State::Playing)
         .map_err(|e| IngesterError::Pipeline(format!("set Playing: {e}")))?;
+    // Anchor the first-sample budget. `set_state(Playing)` on an
+    // `rtspsrc` returns `Async` — DESCRIBE/SETUP/PLAY are still ahead —
+    // so everything from here to the first parsable access unit is
+    // charged against `RTSP_FIRST_SAMPLE_GRACE_SECS`, deliberately much
+    // larger than the steady-state stall timeout.
+    let session_started = Instant::now();
 
     // Register the live pipeline with the ingester struct so Drop
     // can null it synchronously (the bus iterator below blocks the
@@ -1129,13 +1166,22 @@ async fn run_session(
         .ok_or_else(|| IngesterError::Pipeline("pipeline bus missing".into()))?;
     let pipeline_for_bus = pipeline.clone();
     let bus_shutdown = shutdown;
+    // Session-scoped stop flag for the bus thread, distinct from the
+    // ingester-wide `shutdown` above. `shutdown` means "this camera is
+    // going away" and makes `run_supervisor` return without reconnecting;
+    // a stall must NOT set it, or the watchdog would turn a recoverable
+    // silence into a permanently dead camera. This one only unparks the
+    // bus thread, which is otherwise waiting on a bus that will never
+    // produce another message.
+    let bus_stop = Arc::new(AtomicBool::new(false));
+    let bus_stop_thread = bus_stop.clone();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), IngesterError>>();
     let thread_name = format!("nexus-gst-bus-cam{camera_id}");
     let spawn_res = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
             let out = loop {
-                if bus_shutdown.load(Ordering::Acquire) {
+                if bus_shutdown.load(Ordering::Acquire) || bus_stop_thread.load(Ordering::Acquire) {
                     break Ok(());
                 }
                 let timeout = gst::ClockTime::from_mseconds(250);
@@ -1163,9 +1209,55 @@ async fn run_session(
     if let Err(e) = spawn_res {
         return Err(IngesterError::Pipeline(format!("spawn bus thread: {e}")));
     }
-    let result: Result<(), IngesterError> = done_rx
-        .await
-        .unwrap_or_else(|_| Err(IngesterError::Pipeline("bus thread dropped".into())));
+    // Race the bus against the stall watchdog. The bus alone is not a
+    // liveness signal: when the upstream stops sending RTP but leaves the
+    // TCP session open, `rtspsrc` sits in PLAYING forever — no EOS, no
+    // Error, the tap callback simply goes quiet — so `done_rx` never
+    // resolves and the supervisor's reconnect backoff never runs. The
+    // camera then records nothing indefinitely while the analysis-fed
+    // heartbeat still reports it online (#336). Expiring to a
+    // `Pipeline` error turns "silent" into "errored", which
+    // `run_supervisor` already knows how to reconnect from.
+    let stall_timeout = Duration::from_secs(crate::source::RTSP_STALL_TIMEOUT_SECS);
+    let first_sample_grace = Duration::from_secs(crate::source::RTSP_FIRST_SAMPLE_GRACE_SECS);
+    let result: Result<(), IngesterError> = tokio::select! {
+        // `biased` so a real bus Error that lands in the same poll as a
+        // watchdog expiry wins: its message names the actual fault,
+        // where the watchdog's can only say "nothing arrived".
+        biased;
+        r = done_rx => {
+            r.unwrap_or_else(|_| Err(IngesterError::Pipeline("bus thread dropped".into())))
+        }
+        elapsed = crate::source::watch_for_stall(
+            session_started,
+            &last_sample_at,
+            first_sample_grace,
+            stall_timeout,
+        ) => {
+            // Unpark the bus thread; it is waiting on a bus that will
+            // never produce a message. It observes this within one
+            // 250 ms poll. Deliberately NOT the ingester-wide
+            // `shutdown` — see `bus_stop` above.
+            bus_stop.store(true, Ordering::Release);
+            // Which budget ran out is the first thing an operator needs:
+            // "never delivered" points at the camera's keyframe interval
+            // or the SDP, "stopped delivering" at the upstream going
+            // quiet mid-session. They have very different fixes.
+            let delivered = last_sample_at.lock().is_some();
+            let threshold = if delivered { stall_timeout } else { first_sample_grace };
+            warn!(
+                camera_id,
+                elapsed_ms = elapsed.as_millis() as u64,
+                threshold_ms = threshold.as_millis() as u64,
+                delivered_any_samples = delivered,
+                "recording stream stalled (no NAL samples); forcing reconnect",
+            );
+            Err(IngesterError::Pipeline(format!(
+                "stall watchdog: no NAL samples for {}s (delivered_any_samples={delivered})",
+                elapsed.as_secs()
+            )))
+        }
+    };
 
     // Pipeline is going down — deregister BEFORE nulling so Drop
     // doesn't race with us.

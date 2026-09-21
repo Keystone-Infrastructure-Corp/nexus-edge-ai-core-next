@@ -2,9 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-#[cfg(feature = "gstreamer")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -74,9 +72,12 @@ pub const fn supervisor_frame_for(width: u32) -> (u32, u32) {
     (width, h)
 }
 
-/// Hard ceiling on the gap between consecutive frames before a
-/// live RTSP session is considered stalled and the supervisor
-/// loop forces a reconnect. `rtspsrc` will sit forever in
+/// Hard ceiling on the gap between consecutive samples before an
+/// RTSP session is considered stalled and its supervisor loop
+/// forces a reconnect. Shared by the live/analysis path
+/// (`RtspSource::run`) and the recording path
+/// (`preroll_ingester::run_session`), which face the same
+/// upstream and the same failure. `rtspsrc` will sit forever in
 /// PLAYING with no EOS / no Error when the upstream silently
 /// stops sending RTP (common with: mediamtx publisher dying,
 /// the YouTube/streamlink bridge wedging mid-segment, NAT
@@ -89,8 +90,31 @@ pub const fn supervisor_frame_for(width: u32) -> (u32, u32) {
 /// reports PLAYING but no sample ever arrives in 15s the source
 /// is almost certainly negotiating endlessly against a dead
 /// publisher.
-#[cfg(feature = "gstreamer")]
-const RTSP_STALL_TIMEOUT_SECS: u64 = 15;
+#[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
+pub(crate) const RTSP_STALL_TIMEOUT_SECS: u64 = 15;
+
+/// Budget for the session's FIRST sample, which is a different question
+/// from the gap between two samples and needs a different answer.
+///
+/// `set_state(Playing)` on a pipeline containing `rtspsrc` returns
+/// `Async` — DESCRIBE/SETUP/PLAY have not happened yet — so this budget
+/// covers the whole RTSP handshake *and* the wait for the first buffer
+/// the depayloader/parser can emit. When the camera does not advertise
+/// `sprop-parameter-sets` in its SDP, `h264parse` cannot negotiate caps
+/// until it sees in-band SPS/PPS, which most cameras send only with an
+/// IDR — so that wait is bounded by the camera's keyframe interval, not
+/// by its frame rate. A long-GOP camera (Hikvision/Dahua expose I-frame
+/// intervals well past 15 s) would otherwise be torn down before its
+/// first keyframe on every attempt, which turns a working camera into a
+/// permanently dead one — strictly worse than the stall this watchdog
+/// exists to catch. 60 s clears any sane GOP while still bounding a
+/// camera that accepts the session and then sends nothing at all.
+///
+/// This does not slow down detection of an unreachable camera:
+/// `rtspsrc`'s own `tcp-timeout` (20 s by default) raises a bus error
+/// first in that case.
+#[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
+pub(crate) const RTSP_FIRST_SAMPLE_GRACE_SECS: u64 = 60;
 
 #[derive(Debug, Error)]
 pub enum FrameSourceError {
@@ -356,6 +380,55 @@ pub fn analysis_verdict(obs: &AnalysisObservation) -> AnalysisVerdict {
         return AnalysisVerdict::FallBack(FallbackReason::Unhealthy);
     }
     AnalysisVerdict::Healthy
+}
+
+/// Resolve once the session has gone quiet for longer than its budget,
+/// returning how long it had been quiet.
+///
+/// Pure — no GStreamer, no camera, no GPU — so the policy that decides
+/// whether a session has gone silent is unit-testable, for the same
+/// reason [`analysis_verdict`] is.
+///
+/// `rtspsrc` sits in PLAYING indefinitely when the upstream stops
+/// sending RTP but leaves the TCP session open: no EOS, no Error, the
+/// appsink callback simply goes quiet, so a bus poll alone never
+/// returns. Callers bump `last_sample_at` from their appsink callback
+/// and race this against their bus result — turning "silent" into
+/// "errored", which the reconnect backoff already handles.
+///
+/// Two budgets, because "this session has produced nothing yet" and
+/// "this session stopped producing" are different failures:
+/// `last_sample_at` is `None` until the first sample arrives, and until
+/// then the clock runs from `session_started` against
+/// `first_sample_grace` (see [`RTSP_FIRST_SAMPLE_GRACE_SECS`]).
+///
+/// Sleeps exactly the remaining budget rather than polling on a fixed
+/// tick, so a quiet session is caught at the threshold and a flowing one
+/// costs one wake-up per window.
+///
+/// Precondition: `session_started` must be `Instant::now()` as of the
+/// caller's last chance to observe a sample. This reads the clock before
+/// its first sleep, so a caller that anchors and *then* awaits something
+/// slow would be charged for that wait.
+#[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
+pub(crate) async fn watch_for_stall(
+    session_started: Instant,
+    last_sample_at: &parking_lot::Mutex<Option<Instant>>,
+    first_sample_grace: Duration,
+    stall_timeout: Duration,
+) -> Duration {
+    loop {
+        let (quiet_for, budget) = match *last_sample_at.lock() {
+            Some(last) => (last.elapsed(), stall_timeout),
+            None => (session_started.elapsed(), first_sample_grace),
+        };
+        if quiet_for > budget {
+            return quiet_for;
+        }
+        // `budget - quiet_for` cannot underflow: the branch above
+        // returned for every value greater than `budget`.
+        tokio::time::sleep(budget - quiet_for).await;
+    }
 }
 
 #[cfg(feature = "gstreamer")]
@@ -743,8 +816,8 @@ impl RtspSource {
         // gets killed inside `RTSP_STALL_TIMEOUT_SECS`; bumped on
         // every appsink callback so a normally-flowing session
         // never trips the watchdog.
-        let last_frame_at: Arc<parking_lot::Mutex<Instant>> =
-            Arc::new(parking_lot::Mutex::new(Instant::now()));
+        let last_frame_at: Arc<parking_lot::Mutex<Option<Instant>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         let last_frame_at_cb = last_frame_at.clone();
         let last_frame_at_w = last_frame_at.clone();
 
@@ -836,7 +909,7 @@ impl RtspSource {
                     // store on a contention-free lock) but it has
                     // to live in the callback because the bus
                     // thread can't observe sample flow directly.
-                    *last_frame_at_cb.lock() = Instant::now();
+                    *last_frame_at_cb.lock() = Some(Instant::now());
                     let frame = Frame {
                         camera_id,
                         frame_id,
@@ -864,11 +937,12 @@ impl RtspSource {
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| FrameSourceError::Backend(format!("set Playing: {e}")))?;
-        // Restart the watchdog clock from "just transitioned to
-        // PLAYING"; without this a long preroll/SDP negotiation
-        // (e.g. RTSPS handshake on a slow link) could eat into
-        // the first-frame budget below.
-        *last_frame_at.lock() = Instant::now();
+        // Anchor the first-sample budget here. `set_state(Playing)` on
+        // an `rtspsrc` returns `Async`, so SDP negotiation is still
+        // ahead of us and is charged against
+        // `RTSP_FIRST_SAMPLE_GRACE_SECS`, not against the much tighter
+        // steady-state stall timeout.
+        let session_started = Instant::now();
 
         let bus = pipeline
             .bus()
@@ -937,34 +1011,29 @@ impl RtspSource {
         // appsink callback just goes quiet. Without this branch
         // `run_session` would block on the bus poll forever and
         // the outer reconnect loop in `RtspSource::run` would
-        // never get a chance to retry. Polls the shared
-        // `last_frame_at` once a second; returns a synthetic
-        // backend error after `RTSP_STALL_TIMEOUT_SECS` so the
-        // existing exponential-backoff reconnect kicks in.
+        // never get a chance to retry. The policy lives in
+        // [`watch_for_stall`] so the recording path uses the same
+        // one (see #336) and so it is testable without a camera.
         let stall_timeout = Duration::from_secs(RTSP_STALL_TIMEOUT_SECS);
         let cam_id_for_stall = self.camera_id;
         let stall_watchdog = async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            // Skip the immediate-fire tick; otherwise we'd see
-            // elapsed < 1ms on the first poll and bail uselessly
-            // if `Instant::now()` raced the PLAYING reset.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let elapsed = last_frame_at_w.lock().elapsed();
-                if elapsed > stall_timeout {
-                    tracing::warn!(
-                        camera_id = cam_id_for_stall,
-                        elapsed_ms = elapsed.as_millis() as u64,
-                        threshold_ms = stall_timeout.as_millis() as u64,
-                        "rtsp session stalled (no frames); forcing reconnect",
-                    );
-                    return FrameSourceError::Backend(format!(
-                        "stall watchdog: no frames for {}s",
-                        elapsed.as_secs()
-                    ));
-                }
-            }
+            let elapsed = watch_for_stall(
+                session_started,
+                &last_frame_at_w,
+                Duration::from_secs(RTSP_FIRST_SAMPLE_GRACE_SECS),
+                stall_timeout,
+            )
+            .await;
+            tracing::warn!(
+                camera_id = cam_id_for_stall,
+                elapsed_ms = elapsed.as_millis() as u64,
+                threshold_ms = stall_timeout.as_millis() as u64,
+                "rtsp session stalled (no frames); forcing reconnect",
+            );
+            FrameSourceError::Backend(format!(
+                "stall watchdog: no frames for {}s",
+                elapsed.as_secs()
+            ))
         };
         tokio::pin!(stall_watchdog);
 
@@ -1151,5 +1220,149 @@ mod tests {
             is_current_session(&generation, *current),
             "the newest session is the one that publishes"
         );
+    }
+
+    // --- stall watchdog (#336) -------------------------------------
+    //
+    // The recording path had no liveness check at all: a session that
+    // stayed PLAYING with a live socket and no RTP produced no bus
+    // message, so `run_session` awaited its bus result forever and the
+    // supervisor's reconnect backoff never ran. These pin the policy
+    // that converts that silence into an error. Real time, small
+    // durations: `watch_for_stall` reads `std::time::Instant`, which
+    // `tokio::time::pause()` does not advance.
+
+    /// Threshold for the "does it fire?" tests. Small: a loaded runner
+    /// only ever makes these fire *later*, and the outer timeout is 5 s.
+    const FIRE_TIMEOUT: Duration = Duration::from_millis(100);
+
+    /// Threshold for the "does it stay quiet?" test. Deliberately 10x the
+    /// bump interval below: that test fails if a scheduling hiccup stalls
+    /// the bumper past the threshold, so the margin is what keeps it off
+    /// the flaky list on a loaded CI runner.
+    const QUIET_TIMEOUT: Duration = Duration::from_millis(500);
+    const QUIET_BUMP_EVERY: Duration = Duration::from_millis(50);
+
+    /// A grace long enough that these tests fail if the first-sample
+    /// budget is ever charged when a sample HAS arrived.
+    const LONG_GRACE: Duration = Duration::from_secs(30);
+
+    fn clock() -> std::sync::Arc<parking_lot::Mutex<Option<Instant>>> {
+        std::sync::Arc::new(parking_lot::Mutex::new(None))
+    }
+
+    #[tokio::test]
+    async fn stall_watchdog_fires_when_samples_stop() {
+        let c = clock();
+        *c.lock() = Some(Instant::now());
+        let started = Instant::now();
+        let quiet_for = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::watch_for_stall(Instant::now(), &c, LONG_GRACE, FIRE_TIMEOUT),
+        )
+        .await
+        .expect("watchdog must resolve on a clock that never gets bumped again");
+        // Wall-clock, not just the reported value: a watchdog that
+        // returned instantly would satisfy the returned-duration check
+        // on a clock that was already old.
+        assert!(
+            started.elapsed() >= FIRE_TIMEOUT,
+            "fired after only {:?}, before the {FIRE_TIMEOUT:?} threshold",
+            started.elapsed(),
+        );
+        assert!(quiet_for > FIRE_TIMEOUT, "reported {quiet_for:?}");
+    }
+
+    #[tokio::test]
+    async fn stall_watchdog_stays_quiet_while_samples_flow() {
+        let c = clock();
+        *c.lock() = Some(Instant::now());
+        let bumper = c.clone();
+        let pump = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(QUIET_BUMP_EVERY).await;
+                *bumper.lock() = Some(Instant::now());
+            }
+        });
+        let fired = tokio::time::timeout(
+            QUIET_TIMEOUT * 3,
+            super::watch_for_stall(Instant::now(), &c, LONG_GRACE, QUIET_TIMEOUT),
+        )
+        .await;
+        pump.abort();
+        assert!(
+            fired.is_err(),
+            "watchdog fired after {:?} on a session that never stopped delivering samples",
+            fired.ok(),
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_watchdog_measures_from_the_last_sample_not_the_session_start() {
+        // The field case in #336: samples arrive, then stop, with the
+        // socket still open. Asserted on wall-clock time, because the
+        // returned duration alone cannot tell the two apart.
+        let c = clock();
+        *c.lock() = Some(Instant::now());
+        let bumper = c.clone();
+        const BUMPS: u32 = 4;
+        tokio::spawn(async move {
+            for _ in 0..BUMPS {
+                tokio::time::sleep(FIRE_TIMEOUT / 2).await;
+                *bumper.lock() = Some(Instant::now());
+            }
+            // ...and then the upstream goes silent.
+        });
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            super::watch_for_stall(Instant::now(), &c, LONG_GRACE, FIRE_TIMEOUT),
+        )
+        .await
+        .expect("watchdog must still fire once a previously-flowing session goes quiet");
+        // Must outlast every bump plus a full threshold. An
+        // implementation measuring from session start would fire at
+        // roughly FIRE_TIMEOUT, well before this.
+        let floor = FIRE_TIMEOUT / 2 * BUMPS + FIRE_TIMEOUT;
+        assert!(
+            started.elapsed() >= floor,
+            "fired after {:?}, before the last sample plus a full threshold ({floor:?}) — \
+             it is measuring from the session start, not the last sample",
+            started.elapsed(),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_that_never_delivers_gets_the_first_sample_grace_not_the_stall_timeout() {
+        // `set_state(Playing)` on an rtspsrc returns Async, so the whole
+        // RTSP handshake and the wait for the first parsable access unit
+        // are charged to this budget. Tearing a long-GOP camera down at
+        // the steady-state threshold would reconnect-loop it forever —
+        // strictly worse than the stall this watchdog exists to catch.
+        let c = clock();
+        let fired = tokio::time::timeout(
+            FIRE_TIMEOUT * 4,
+            super::watch_for_stall(Instant::now(), &c, LONG_GRACE, FIRE_TIMEOUT),
+        )
+        .await;
+        assert!(
+            fired.is_err(),
+            "watchdog fired after {:?} while still inside the first-sample grace",
+            fired.ok(),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_sample_grace_still_expires() {
+        // Generous is not unbounded: a camera that accepts the session
+        // and then sends nothing at all must still be reconnected.
+        let c = clock();
+        let quiet_for = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::watch_for_stall(Instant::now(), &c, FIRE_TIMEOUT, QUIET_TIMEOUT),
+        )
+        .await
+        .expect("a session that never delivers must still expire");
+        assert!(quiet_for > FIRE_TIMEOUT, "reported {quiet_for:?}");
     }
 }
