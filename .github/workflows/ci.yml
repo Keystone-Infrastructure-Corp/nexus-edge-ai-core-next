@@ -228,8 +228,40 @@ jobs:
           # launch real pipelines, so the element plugins have to be present
           # too: videotestsrc/videoconvert (base), qtdemux+mp4mux (good),
           # h26Xparse (bad), x264enc (ugly), avdec_h26X (libav).
-          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
-          version: 5
+          # `libglib2.0-dev` is a TRANSITIVE dep of libgstreamer1.0-dev and is
+          # named explicitly on purpose. This action caches only the packages
+          # it actually installs: when the cache was built the runner image
+          # still shipped glib's dev headers, so nothing was installed for
+          # them and nothing was cached. A later `ubuntu-24.04` image dropped
+          # them, and from then on every run restored a cache with no
+          # `glib-2.0.pc` in it while reporting "Cache restored successfully"
+          # -- the job failed on `main` from 2026-09-18 with nobody alerted,
+          # because this job is not a required check. Naming the dep pins it
+          # into the cache key so an image roll cannot silently remove it.
+          packages: pkg-config libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+          # 5 -> 6 evicts the poisoned entry described above.
+          version: 6
+
+      # The caching action reports success whenever the cache *restores*,
+      # regardless of whether the packages it was supposed to provide are
+      # usable -- which is exactly how a green step shipped a toolchain with
+      # no glib for three days. Assert the post-condition the next step
+      # actually depends on, so a bad cache fails here with a clear message
+      # instead of thousands of lines into a cargo build.
+      - name: verify the gstreamer toolchain is actually usable
+        run: |
+          missing=0
+          for pc in glib-2.0 gstreamer-1.0 gstreamer-plugins-base-1.0 gstreamer-plugins-bad-1.0; do
+            if pkg-config --exists "$pc"; then
+              echo "ok: $pc $(pkg-config --modversion "$pc")"
+            else
+              echo "MISSING: $pc"; missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::apt cache restored but the gstreamer toolchain is incomplete; bump the cache-apt-pkgs-action \`version\` to evict it"
+            exit 1
+          fi
 
       # NOT in the cached list above, deliberately. `libgstlibav.so` links
       # `libblas.so.3`, which on Debian/Ubuntu is an update-alternatives
