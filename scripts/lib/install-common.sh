@@ -1178,7 +1178,7 @@ _INTEL_GEN9_IGC_URL="https://github.com/intel/intel-graphics-compiler/releases/d
 # to the CPU EP on a clean box. It is held below with the rest of the stack,
 # which keeps Ubuntu's GMM updates off this box too — GMM is shared with
 # iHD/libva via va-driver-all. That is the accepted cost of holding a GMM the
-# -legacy1 binaries are ABI-matched to. (BUG-176)
+# -legacy1 binaries are ABI-matched to. (BUG-205)
 _intel_gen9_manifest() {
     cat <<EOF
 ${_INTEL_GEN9_NEO_URL}/libigdgmm12_22.5.0_amd64.deb cc29d14df83cff1b3c6a66baa39257f0211b168ab43a99c2dc62a3734431bc23
