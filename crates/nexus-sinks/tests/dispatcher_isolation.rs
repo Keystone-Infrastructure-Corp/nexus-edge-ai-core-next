@@ -10,6 +10,7 @@
 //! | `slow_sink_does_not_block_other_sinks`        | one blocked sink stalled all  |
 //! | `dispatcher_health_reports_liveness`          | a wedged loop was invisible   |
 //! | `fresh_health_is_not_live`                    | absent ≠ healthy              |
+//! | `hung_sink_does_not_wedge_later_ticks`        | a hung sink stopped the loop  |
 //!
 //! Production shape being reproduced: an alert fans out to several
 //! sinks, and one of them (the SureView email sink, uploading multi-MB
@@ -28,7 +29,7 @@ use chrono::Utc;
 use nexus_config::{CameraConfig, StoreConfig};
 use nexus_sinks::dispatcher::{self, AllowAllPolicy, DeliveryPolicy, DispatcherHealth};
 use nexus_sinks::{AlertSink, SinkError, SinkId, SinkRegistry};
-use nexus_store::{OutboxStatus, Store};
+use nexus_store::{OutboxRow, OutboxStatus, Store};
 use nexus_types::{AlertEvent, Artifacts, Severity};
 use tempfile::TempDir;
 use url::Url;
@@ -155,7 +156,7 @@ async fn wait_until(within: Duration, mut f: impl FnMut() -> bool) -> bool {
     }
 }
 
-async fn status_of(store: &Arc<Store>, event_id: &str, sink_id: &str) -> OutboxStatus {
+async fn row_for(store: &Arc<Store>, event_id: &str, sink_id: &str) -> OutboxRow {
     store
         .outbox_for_event(event_id)
         .await
@@ -163,7 +164,10 @@ async fn status_of(store: &Arc<Store>, event_id: &str, sink_id: &str) -> OutboxS
         .into_iter()
         .find(|r| r.sink_id == sink_id)
         .expect("row for sink")
-        .status
+}
+
+async fn status_of(store: &Arc<Store>, event_id: &str, sink_id: &str) -> OutboxStatus {
+    row_for(store, event_id, sink_id).await.status
 }
 
 /// Poll until an outbox row reaches `want`, or `within` elapses.
@@ -367,4 +371,143 @@ async fn fresh_health_is_not_live() {
     assert_eq!(health.last_tick_completed_ms(), None);
     assert_eq!(health.last_tick_started_ms(), None);
     assert_eq!(health.ticks_completed(), 0);
+}
+
+/// Issue #338 regression — a sink whose `deliver()` never returns must not
+/// stop the drain loop, nor the shutdown branch with it.
+///
+/// `slow_sink_does_not_block_other_sinks` above passes against this
+/// defect, which is exactly why it shipped: it fans ONE alert out to both
+/// sinks, so both rows land in the SAME batch and the per-sink `JoinSet`
+/// gives the fast sink its concurrency *within* tick 1 — then it releases
+/// the gate before asserting anything further. But the defect is not
+/// inside a tick, it is at the batch boundary: `tick` joins every sink
+/// group before `outbox_pending` is called again, so a parked `deliver()`
+/// means there is never a tick 2, for any sink. Isolation *within* a
+/// batch and liveness *across* batches are different properties and only
+/// the first was ever asserted.
+///
+/// So the assertion here is the one that separates them: an alert
+/// enqueued AFTER the hang has begun, for the healthy sink, with the gate
+/// still held. Reaching `Sent` requires a second `outbox_pending`.
+#[tokio::test(flavor = "multi_thread")]
+async fn hung_sink_does_not_wedge_later_ticks() {
+    // Every test in the tree supplies its own short ceiling, so nothing
+    // else would notice if the shipped default were changed to something
+    // that times out every production delivery.
+    assert_eq!(
+        dispatcher::SinkDispatcherConfig::default().deliver_timeout,
+        dispatcher::DELIVER_TIMEOUT,
+        "the shipped dispatcher must default to the documented ceiling",
+    );
+
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    let hung_id = SinkId::new("webhook", "ahung").unwrap();
+    let fast_id = SinkId::new("webhook", "zfast").unwrap();
+    // 0 permits — parks forever, and this test never releases it.
+    let hung = Arc::new(GatedSink::new(hung_id.clone(), 0));
+    let fast = Arc::new(GatedSink::new(fast_id.clone(), 128));
+
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![hung.clone(), fast.clone()]);
+
+    let first = sample_alert(1, "rule.hang");
+    store
+        .record_event_and_enqueue(&first, &[hung_id.as_str(), fast_id.as_str()])
+        .await
+        .expect("enqueue");
+    let first_id = first.event_id.to_string();
+
+    // Long enough that the second alert is provably enqueued while the
+    // first tick is still parked inside `deliver()`, short enough to keep
+    // the test quick. Production uses `dispatcher::DELIVER_TIMEOUT`.
+    let cfg = dispatcher::SinkDispatcherConfig {
+        deliver_timeout: Duration::from_secs(2),
+        ..test_cfg()
+    };
+
+    let health = Arc::new(DispatcherHealth::default());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let policy: Arc<dyn DeliveryPolicy> = Arc::new(AllowAllPolicy);
+    let loop_handle = tokio::spawn(dispatcher::run_dispatcher(
+        cfg,
+        store.clone(),
+        registry.clone(),
+        policy,
+        health.clone(),
+        None,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    // Wait until the hung sink is genuinely parked inside `deliver()`, so
+    // the row enqueued below cannot have been in the batch this tick is
+    // already draining.
+    assert!(
+        wait_until(Duration::from_secs(10), {
+            let hung = hung.clone();
+            move || hung.calls() >= 1
+        })
+        .await,
+        "the hung sink should have been called at least once",
+    );
+
+    let second = sample_alert(1, "rule.after");
+    store
+        .record_event_and_enqueue(&second, &[fast_id.as_str()])
+        .await
+        .expect("enqueue");
+    let second_id = second.event_id.to_string();
+
+    // THE assertion. Pre-fix this times out: tick 1 never returns, so
+    // `outbox_pending` is never called again and this row is never seen.
+    assert!(
+        wait_for_status(
+            &store,
+            &second_id,
+            fast_id.as_str(),
+            OutboxStatus::Sent,
+            Duration::from_secs(20),
+        )
+        .await,
+        "an alert enqueued while another sink is hung must still be \
+         delivered; hung.calls={}, fast.calls={}",
+        hung.calls(),
+        fast.calls(),
+    );
+
+    // And the hung row must carry the evidence. The production signature
+    // of this bug was `attempts = 0, last_error IS NULL` on every pending
+    // row: status is written only after `deliver()` returns, so a hang
+    // left no trace in the outbox, in the logs, or anywhere else.
+    let hung_row = row_for(&store, &first_id, hung_id.as_str()).await;
+    assert!(
+        hung_row.attempts >= 1,
+        "a timed-out delivery must consume an attempt, got {}",
+        hung_row.attempts,
+    );
+    assert!(
+        hung_row
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("timed out")),
+        "a timed-out delivery must record why, got {:?}",
+        hung_row.last_error,
+    );
+
+    // Graceful shutdown was wedged by the same join: the `select!` arm
+    // that observes `shutdown` cannot be polled while `tick` is awaited.
+    let _ = shutdown_tx.send(());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), loop_handle)
+            .await
+            .is_ok(),
+        "the dispatcher must still shut down while a sink is hung",
+    );
 }

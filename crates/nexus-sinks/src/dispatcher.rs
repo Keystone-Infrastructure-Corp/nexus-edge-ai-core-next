@@ -168,6 +168,42 @@ pub const CLIP_WAIT_POLL_SECS: i64 = 1;
 /// remainder.
 pub const BATCH_SIZE: i64 = 64;
 
+/// Hard ceiling on one [`crate::AlertSink::deliver`] call.
+///
+/// A backstop against a delivery future that never resolves, not a
+/// per-sink SLA. Issue #338: an SMTP peer completed the TCP handshake and
+/// then never sent its `220` banner; lettre's async transport applies
+/// its configured `timeout` to the TCP connect only (there is no async
+/// equivalent of the blocking transport's `set_timeout`, which arms the
+/// socket's read/write deadlines), so the banner read had no deadline at
+/// all and `deliver()` parked forever. [`tick`] joins every sink group
+/// before fetching the next batch, so that one future stopped **all**
+/// alert delivery — and graceful shutdown — for fifteen days, silently.
+///
+/// Deliberately a single dispatcher-level constant rather than a
+/// function of the sink's own `timeout_secs`: the whole point is to
+/// bound the dispatcher's exposure to a sink whose configured timeout
+/// does not cover the hang, which is exactly what happened. Deriving the
+/// ceiling from the sink would let the broken party set its own bound.
+///
+/// Sized well above the slowest *legitimate* delivery, because a false
+/// elapse costs one of [`crate::backoff::MAX_ATTEMPTS`] and eight of them
+/// dead-letter an alert that was deliverable — losing an alarm is worse
+/// than delaying one. Derived from what sinks configure, not from an
+/// assumed link speed: every sink's `timeout_secs` defaults to 10–15 s
+/// (see `nexus_config`), and 300 s is twenty times the largest of them.
+/// A delivery still in flight after five minutes is a fault, not
+/// slowness. A deployment where that is wrong — a very slow uplink with
+/// clip attachments near `mail_attach::MAX_CLIP_BYTES` — raises it via
+/// [`SinkDispatcherConfig::deliver_timeout`] rather than by changing this.
+///
+/// The cost is that while a sink really is hung, every other sink's next
+/// batch waits on the per-group budget in [`tick`], which bounds a tick
+/// at two ceilings rather than one. That is a bounded delay during a
+/// fault the outbox now reports loudly, which is the trade being made.
+///
+pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Verdict from a [`DeliveryPolicy`]. The dispatcher branches on
 /// this AFTER reading the outbox row but BEFORE resolving the sink
 /// — a `Suppressed` verdict short-circuits HTTP entirely and writes
@@ -249,6 +285,10 @@ pub struct SinkDispatcherConfig {
     /// has the JPEG deleted out from under it. `None` disables
     /// reclaim (the file is simply left on disk).
     pub snapshots_dir: Option<std::path::PathBuf>,
+    /// Ceiling on a single `deliver()` call, and the per-tick budget a
+    /// sink group may spend before it stops taking new rows. See
+    /// [`DELIVER_TIMEOUT`].
+    pub deliver_timeout: Duration,
 }
 
 impl Default for SinkDispatcherConfig {
@@ -258,6 +298,7 @@ impl Default for SinkDispatcherConfig {
             batch_size: BATCH_SIZE,
             clips_dir: None,
             snapshots_dir: None,
+            deliver_timeout: DELIVER_TIMEOUT,
         }
     }
 }
@@ -296,9 +337,15 @@ impl DispatcherHealth {
             .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
     }
 
-    fn mark_tick_completed(&self, rows: u64) {
-        self.last_batch_rows.store(rows, Ordering::Relaxed);
-        self.rows_processed.fetch_add(rows, Ordering::Relaxed);
+    /// `fetched` is what `outbox_pending` returned (the backlog signal);
+    /// `processed` is how many of them a sink group actually reached.
+    /// They diverge when a group runs out of its per-tick budget, and
+    /// they must stay separate: `rows_processed` is the throughput
+    /// counter, so counting skipped rows there would show a healthy
+    /// climbing drain rate during exactly the wedge it exists to expose.
+    fn mark_tick_completed(&self, fetched: u64, processed: u64) {
+        self.last_batch_rows.store(fetched, Ordering::Relaxed);
+        self.rows_processed.fetch_add(processed, Ordering::Relaxed);
         self.ticks_completed.fetch_add(1, Ordering::Relaxed);
         // Stored last so an observer that sees a fresh timestamp is
         // guaranteed to also see the counters that go with it.
@@ -455,7 +502,31 @@ async fn tick(
         let clips_dir = cfg.clips_dir.clone();
         let snapshots_dir = cfg.snapshots_dir.clone();
         let bus = bus.cloned();
+        let deliver_timeout = cfg.deliver_timeout;
         tasks.spawn(async move {
+            // Rows in a group are strictly sequential, and `tick` joins
+            // every group before the next batch is fetched — so without a
+            // budget a sink that times out on every row costs
+            // `batch_size * deliver_timeout` (64 x 5 min) of tick wall
+            // clock, and that is every *other* sink's next batch too.
+            //
+            // The budget is checked AFTER each row, so the first row
+            // always runs (a group always makes progress) and a row that
+            // starts just under the deadline still gets its full ceiling:
+            // the real bound is two ceilings, not one. Cutting a row's
+            // own timeout short to make it exactly one would turn a slow
+            // but succeeding delivery into a retry, which is the cost
+            // `DELIVER_TIMEOUT` is deliberately sized to avoid.
+            //
+            // This bounds tick *duration*; it does not give cross-sink
+            // fairness. `outbox_pending`'s LIMIT is global, so a sink that
+            // has just wedged can still own a whole batch and keep another
+            // sink's rows out of it until its own pick up a
+            // `next_attempt_at`. Rows left behind here are untouched and
+            // still `pending`, so the next tick re-selects them and no row
+            // is ever delivered twice.
+            let budget = tokio::time::Instant::now() + deliver_timeout;
+            let mut processed = 0u64;
             for row in sink_rows {
                 process_row(
                     &store,
@@ -464,21 +535,34 @@ async fn tick(
                     clips_dir.as_deref(),
                     snapshots_dir.as_deref(),
                     bus.as_ref(),
+                    deliver_timeout,
                     row,
                 )
                 .await;
+                processed += 1;
+                if tokio::time::Instant::now() >= budget {
+                    debug!(
+                        sink_id,
+                        processed,
+                        "sink dispatcher: sink group out of tick budget; \
+                         remaining rows deferred to the next tick"
+                    );
+                    break;
+                }
             }
-            sink_id
+            processed
         });
     }
 
+    let mut processed = 0u64;
     while let Some(joined) = tasks.join_next().await {
-        if let Err(e) = joined {
-            warn!(error = %e, "sink dispatcher: sink task failed");
+        match joined {
+            Ok(n) => processed += n,
+            Err(e) => warn!(error = %e, "sink dispatcher: sink task failed"),
         }
     }
 
-    health.mark_tick_completed(n_rows as u64);
+    health.mark_tick_completed(n_rows as u64, processed);
 }
 
 /// Reclaim the shared alert snapshot once every sink for this event has
@@ -578,6 +662,7 @@ fn within_grace(event: &AlertEvent, grace_secs: i64) -> bool {
 ///      the row points at a sink the operator has since deleted,
 ///      and retrying buys nothing.
 ///   4. Actual delivery.
+#[allow(clippy::too_many_arguments)] // the dispatcher's whole per-row context
 pub async fn process_row(
     store: &Arc<Store>,
     registry: &Arc<SinkRegistry>,
@@ -585,6 +670,7 @@ pub async fn process_row(
     clips_dir: Option<&std::path::Path>,
     snapshots_dir: Option<&std::path::Path>,
     bus: Option<&Arc<dyn Bus>>,
+    deliver_timeout: Duration,
     row: OutboxRow,
 ) {
     // Belt-and-suspenders: outbox_pending should already filter
@@ -894,8 +980,38 @@ pub async fn process_row(
         }
     }
 
-    // (4) Actual delivery.
-    match sink.deliver(&event).await {
+    // (4) Actual delivery, bounded. A sink is not trusted to return:
+    // `tick` joins every sink group before fetching the next batch, so an
+    // unbounded `deliver()` future stops the whole drain loop and the
+    // graceful-shutdown branch with it (issue #338). An elapse is reported as
+    // `Transient` so the row takes the ordinary retry path below —
+    // `attempts` climbs, `last_error` is written, backoff applies, and the
+    // row eventually dead-letters. That is also the point of the bound: a
+    // hang used to leave the row at `attempts = 0, last_error IS NULL`,
+    // which is why fifteen days of outage produced no evidence anywhere.
+    //
+    // The ceiling can in principle fire after the peer has already taken
+    // ownership of the alert, duplicating it on retry. That is the
+    // pre-existing semantics of every transient failure here, and
+    // `DELIVER_TIMEOUT` is sized so it takes a genuine fault to get there.
+    let delivered = match tokio::time::timeout(deliver_timeout, sink.deliver(&event)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            warn!(
+                outbox_id = row.id,
+                sink_id = %row.sink_id,
+                timeout_ms = deliver_timeout.as_millis() as u64,
+                "sink dispatcher: deliver() exceeded the delivery ceiling; \
+                 cancelling it and retrying the row"
+            );
+            Err(SinkError::Transient(format!(
+                "deliver() timed out after {}s",
+                deliver_timeout.as_secs()
+            )))
+        }
+    };
+
+    match delivered {
         Ok(()) => {
             if let Err(e) = store.outbox_mark_sent(row.id).await {
                 warn!(

@@ -42,6 +42,11 @@ use tempfile::TempDir;
 use url::Url;
 use uuid::Uuid;
 
+/// Delivery ceiling handed to `process_row` by these tests. Any value
+/// comfortably above a scripted sink's (instant) `deliver()`; the ceiling
+/// itself is exercised in `crates/nexus-sinks/tests/dispatcher_isolation.rs`.
+const TEST_DELIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -225,6 +230,7 @@ async fn delivers_pending_row_marks_sent() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -267,6 +273,7 @@ async fn permanent_error_marks_dead() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -311,6 +318,7 @@ async fn transient_error_schedules_retry() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -379,6 +387,7 @@ async fn exhausted_retries_become_dead() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row_after_backdate,
     )
     .await;
@@ -416,6 +425,7 @@ async fn suppressed_by_policy_marks_suppressed() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -456,6 +466,7 @@ async fn missing_sink_marks_dead() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -527,6 +538,7 @@ async fn missing_event_marks_dead() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -577,6 +589,7 @@ async fn malformed_sink_id_marks_dead() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -624,6 +637,7 @@ async fn no_clip_linked_within_grace_schedules_retry() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -688,6 +702,7 @@ async fn no_clip_linked_after_grace_delivers() {
         None,
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -797,6 +812,7 @@ async fn clip_hot_file_present_delivers_with_clip() {
         Some(clips_dir.path()),
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -840,6 +856,7 @@ async fn clip_hot_file_missing_within_grace_retries() {
         Some(clips_dir.path()),
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -886,6 +903,7 @@ async fn clip_soft_evicted_within_grace_retries() {
         Some(clips_dir.path()),
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -944,6 +962,7 @@ async fn clip_soft_evicted_after_grace_delivers_clipless() {
         Some(clips_dir.path()),
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -1002,6 +1021,7 @@ async fn alert_clip_building_within_grace_retries() {
         Some(clips_dir.path()),
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -1075,6 +1095,7 @@ async fn alert_clip_wait_does_not_consume_retry_budget() {
             Some(clips_dir.path()),
             None,
             None,
+            TEST_DELIVER_TIMEOUT,
             row.clone(),
         )
         .await;
@@ -1151,6 +1172,7 @@ async fn future_dated_event_does_not_wait_forever() {
         Some(clips_dir.path()),
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -1216,6 +1238,7 @@ async fn alert_clip_ready_delivers_with_clip() {
         Some(clips_dir.path()),
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -1268,6 +1291,7 @@ async fn alert_clip_failed_delivers_clipless() {
         Some(clips_dir.path()),
         None,
         None,
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
@@ -1320,6 +1344,7 @@ async fn a_delivery_outcome_publishes_an_id_and_an_enum_only() {
         None,
         None,
         Some(&bus),
+        TEST_DELIVER_TIMEOUT,
         row.clone(),
     )
     .await;
