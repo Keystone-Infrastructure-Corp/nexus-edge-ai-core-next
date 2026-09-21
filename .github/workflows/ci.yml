@@ -220,6 +220,25 @@ jobs:
         with:
           shared-key: workspace-system-libs
 
+      # `cache-apt-pkgs-action` resolves each package to an EXACT version from
+      # the runner image's apt index, then fetches those versions. The image
+      # ships a stale index, so once Ubuntu publishes a point release and drops
+      # the superseded .deb from the pool, every fetch 404s:
+      #
+      #   E: Failed to fetch .../gstreamer1.0-plugins-good_1.24.2-1ubuntu1.5_amd64.deb  404
+      #
+      # The action then logs "Caching 0 installed packages" and EXITS 0, and the
+      # empty result is saved under the cache key -- so every later run restores
+      # a cache with nothing in it and reports "Cache restored successfully".
+      # That is how this job failed on `main` from 2026-09-18 with nobody
+      # alerted (it is not a required check). 1.24.2-1ubuntu1.5 -> 1ubuntu1.6 is
+      # the same Ubuntu point release documented in issue #337.
+      #
+      # Refreshing the index first is the actual fix: the action then pins
+      # versions that still exist in the pool.
+      - name: refresh the apt index before the cached install
+        run: sudo apt-get update -qq
+
       - name: install gstreamer dev headers + runtime plugins (cached)
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
@@ -228,8 +247,33 @@ jobs:
           # launch real pipelines, so the element plugins have to be present
           # too: videotestsrc/videoconvert (base), qtdemux+mp4mux (good),
           # h26Xparse (bad), x264enc (ugly), avdec_h26X (libav).
-          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
-          version: 5
+          # `libglib2.0-dev` is a transitive dep of libgstreamer1.0-dev, named
+          # explicitly so a runner image that stops preinstalling it cannot
+          # quietly drop `glib-2.0.pc` out of the cached set.
+          packages: pkg-config libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+          # 5 -> 7. 6 was burned by a run that cached the failed install above.
+          version: 7
+
+      # The caching action reports success whenever the cache *restores*,
+      # regardless of whether the packages it was supposed to provide are
+      # usable -- which is exactly how a green step shipped a toolchain with
+      # no glib for three days. Assert the post-condition the next step
+      # actually depends on, so a bad cache fails here with a clear message
+      # instead of thousands of lines into a cargo build.
+      - name: verify the gstreamer toolchain is actually usable
+        run: |
+          missing=0
+          for pc in glib-2.0 gstreamer-1.0 gstreamer-plugins-base-1.0 gstreamer-plugins-bad-1.0; do
+            if pkg-config --exists "$pc"; then
+              echo "ok: $pc $(pkg-config --modversion "$pc")"
+            else
+              echo "MISSING: $pc"; missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::gstreamer toolchain missing after the install step. Most likely the apt index went stale and the pinned .debs 404d, leaving an empty cache; bump the cache-apt-pkgs-action \`version\` to evict it and check the install log above."
+            exit 1
+          fi
 
       # NOT in the cached list above, deliberately. `libgstlibav.so` links
       # `libblas.so.3`, which on Debian/Ubuntu is an update-alternatives
