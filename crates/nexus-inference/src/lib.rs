@@ -371,7 +371,11 @@ fn build_detector_kind(
         // stays advertised on the wire, it just reports nothing until
         // something real backs it. See `detector_never_fabricates.rs`.
         "classifier_ensemble" | "ppe" => Ok(crate::health::degraded_detector(
-            "classifier_ensemble",
+            // The kind the operator actually configured, not the alias
+            // this arm is filed under — `d.kind` is echoed verbatim to
+            // `/health` and into the cloud heartbeat detail, so a `ppe`
+            // box must not be told `classifier_ensemble` is degraded.
+            cfg.model.kind.as_str(),
             "no detector implementation ships for this model kind",
         )),
         // M3.1 — yoloe (open-vocab text-prompt detector). Real ORT path
@@ -485,7 +489,7 @@ fn build_detector_kind(
             other,
             format!(
                 "unknown inference.model.kind {other:?}; expected one of yolo, yolo_world, \
-                 yoloe, yoloe_visual, yoloe_promptfree, classifier_ensemble, ensemble, mock"
+                 yoloe, yoloe_visual, yoloe_promptfree, ensemble, mock"
             ),
         )),
     }

@@ -110,7 +110,7 @@ fn unknown_model_kind_degrades_instead_of_mocking() {
 #[test]
 fn advertised_kinds_with_no_implementation_degrade_instead_of_mocking() {
     for kind in ["classifier_ensemble", "ppe"] {
-        health::clear_degraded("classifier_ensemble");
+        health::clear_degraded(kind);
 
         let layer = build(&cfg_with_kind(kind))
             .expect("engine must still boot so it can report the problem");
@@ -122,14 +122,13 @@ fn advertised_kinds_with_no_implementation_degrade_instead_of_mocking() {
              mock detector"
         );
         assert!(
-            health::degradations()
-                .iter()
-                .any(|d| d.kind == "classifier_ensemble"),
-            "`{kind}` must be reported degraded so /health and the cloud \
-             heartbeat stop claiming the camera is fine"
+            health::degradations().iter().any(|d| d.kind == kind),
+            "`{kind}` must be reported degraded under the kind the operator \
+             configured, so /health and the cloud heartbeat name something \
+             they can find in their own config"
         );
 
-        health::clear_degraded("classifier_ensemble");
+        health::clear_degraded(kind);
     }
 }
 
