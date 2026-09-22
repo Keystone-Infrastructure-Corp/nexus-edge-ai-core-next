@@ -122,6 +122,19 @@ pub struct AlertClipColdMark {
 }
 
 impl Store {
+    /// Every `alert_clips.path` still backed by a file, for the
+    /// orphan-file scanner. Alert clips share the motion recorder's
+    /// `clips_dir` root by design (`alert_clip_rel_path` is relative to
+    /// it), so the scanner walks them and must be told they are spoken
+    /// for. `evicted` rows are excluded — their file is already gone by
+    /// definition, and sparing them would resurrect nothing.
+    pub async fn known_alert_clip_paths(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query("SELECT path FROM alert_clips WHERE state <> 'evicted'")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
+    }
+
     /// Insert a fresh `building` alert clip and return its id. The
     /// builder later stamps it ready (or failed); alert events fired
     /// in the same motion burst link to this id via
