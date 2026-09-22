@@ -549,17 +549,25 @@ impl Store {
             .collect()
     }
 
-    /// Every `motion_clips.hot_path` currently in the DB whose
-    /// `hot_handle` is the implicit `'local'` backend. Used by the
-    /// orphan-file scanner to compute "files on disk under
-    /// `clips_dir` that have no matching row" by set difference.
-    /// Soft-evicted clips (no hot pointer) and clips whose hot
-    /// backend is not `'local'` (e.g. USB-vault) are excluded — the
-    /// scanner only owns the local `clips_dir` filesystem.
-    pub async fn known_local_clip_paths(&self) -> Result<Vec<String>, StoreError> {
+    /// Every `motion_clips.hot_path` currently in the DB, for any hot
+    /// backend. Used by the orphan-file scanner to compute "files on
+    /// disk under `clips_dir` that have no matching row" by set
+    /// difference. Soft-evicted clips (no hot pointer) are excluded —
+    /// they have no file to spare.
+    ///
+    /// Deliberately NOT filtered to `hot_handle = 'local'`. That filter
+    /// read as "the scanner only owns the local `clips_dir`
+    /// filesystem", but a USB vault mounts *inside* `clips_dir`
+    /// (`UsbResolver::lookup` returns a path relative to it, stamped
+    /// `usb-<label>`), so its files are inside the swept tree while its
+    /// rows were outside the known set — and the scanner deleted them.
+    /// `hot_path` is relative to the base `clips_dir` for every backend,
+    /// because `clip_rel_path` strips against the base rather than the
+    /// effective directory, so one join resolves them all.
+    pub async fn known_clip_paths(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query(
             "SELECT hot_path FROM motion_clips
-              WHERE hot_handle = 'local' AND hot_path IS NOT NULL",
+              WHERE hot_path IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await?;

@@ -23,10 +23,10 @@
 //! signal so a Ctrl-C between sweep ticks doesn't have to wait the
 //! full `interval`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use nexus_store::Store;
@@ -81,7 +81,7 @@ pub async fn run_retention(
         }
 
         let cutoff = Utc::now() - chrono::Duration::days(cfg.retention_days as i64);
-        match sweep_once(&store, &cfg.clips_dir, cutoff).await {
+        match sweep_once(&store, &cfg.clips_dir, cutoff, ORPHAN_MIN_AGE).await {
             Ok(SweepResult {
                 evicted,
                 orphans,
@@ -151,6 +151,7 @@ pub async fn sweep_once(
     store: &Arc<Store>,
     clips_dir: &Path,
     cutoff: DateTime<Utc>,
+    orphan_min_age: Duration,
 ) -> anyhow::Result<SweepResult> {
     let mut out = SweepResult::default();
 
@@ -187,15 +188,55 @@ pub async fn sweep_once(
     }
 
     // ---- 2. Orphan-file scan ----
-    let known: HashSet<PathBuf> = store
-        .known_local_clip_paths()
+    // The known set must cover EVERY table that puts a file under
+    // `clips_dir`, because the walk below owns the whole tree. It used
+    // to be motion clips on the `local` backend only, which silently
+    // made alert clips and the USB vault deletable (BUG-211).
+    let mut known: HashSet<PathBuf> = store
+        .known_clip_paths()
         .await?
         .into_iter()
         .map(|p| clips_dir.join(p))
         .collect();
+    // "Spared from deletion" and "expected to exist" are different
+    // sets. A `building` alert clip is spared — the file appears at the
+    // final path the moment the builder renames, before the row flips
+    // to `ready` — but it is not yet expected, so it must not be
+    // reported missing while the encoder is still working.
+    let mut expected: HashSet<PathBuf> = known.clone();
+    for (rel, state) in store.known_alert_clip_paths().await? {
+        let abs = clips_dir.join(rel);
+        if state == "ready" {
+            expected.insert(abs.clone());
+        }
+        known.insert(abs);
+    }
     let on_disk = walk_clip_files(clips_dir).await?;
+    // Files younger than this are never orphans.
+    //
+    // The case that needs it is the ALERT clip: `insert_alert_clip`
+    // registers the FINAL path while the builder writes
+    // `<name>.partial.mp4` and renames on completion, so the partial is
+    // in no known set by construction and the sweep would unlink it
+    // mid-write. Motion clips are NOT in this state — both recorders
+    // insert their row with the in-flight path (`clip_rel_path` over
+    // `inflight_clip_path`), so a motion partial was always known; its
+    // only unknown window is the few ms between the rename and
+    // `close_clip`'s UPDATE, when the unknown file is the finished one.
+    //
+    // The floor covers both, and is the backstop for the class: any
+    // future writer under `clips_dir` gets this window to register its
+    // row before the scanner may claim the file.
+    let young_cutoff = SystemTime::now() - orphan_min_age;
     for path in &on_disk {
         if !known.contains(path) {
+            if is_younger_than(path, young_cutoff).await {
+                debug!(
+                    path = %path.display(),
+                    "orphan-file scan skipped a file younger than the grace window"
+                );
+                continue;
+            }
             match tokio::fs::remove_file(path).await {
                 Ok(()) => {
                     info!(path = %path.display(), "orphan-file scan removed unreferenced file");
@@ -206,17 +247,65 @@ pub async fn sweep_once(
         }
     }
     let on_disk_set: HashSet<PathBuf> = on_disk.into_iter().collect();
-    for path in &known {
-        if !on_disk_set.contains(path) {
-            warn!(
-                path = %path.display(),
-                "DB references clip file that does not exist on disk; row LEFT in place for operator review"
-            );
-            out.missing += 1;
+    // A missing file is worth one warn line; a missing *medium* is not
+    // worth one per clip. The USB vault mounts inside `clips_dir` and is
+    // hot-pluggable by design, so a detached stick makes every one of
+    // its rows absent at once — on a 20k-clip vault that is 20k lines a
+    // sweep, drowning the signal this counter exists to carry. Skip a
+    // row whose containing directory is gone (the medium went away) and
+    // keep warning when the directory is there but the file is not
+    // (the file was removed). Directory existence is memoised because
+    // clips cluster by camera and day.
+    let mut dir_exists: HashMap<PathBuf, bool> = HashMap::new();
+    for path in &expected {
+        if on_disk_set.contains(path) {
+            continue;
         }
+        let parent = path.parent().unwrap_or(clips_dir).to_path_buf();
+        let present = match dir_exists.get(&parent) {
+            Some(v) => *v,
+            None => {
+                let v = tokio::fs::metadata(&parent)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                dir_exists.insert(parent.clone(), v);
+                v
+            }
+        };
+        if !present {
+            debug!(
+                path = %path.display(),
+                "clip row's directory is absent (detached medium?); not counted as missing"
+            );
+            continue;
+        }
+        warn!(
+            path = %path.display(),
+            "DB references clip file that does not exist on disk; row LEFT in place for operator review"
+        );
+        out.missing += 1;
     }
 
     Ok(out)
+}
+
+/// Grace window before an unreferenced file may be treated as an
+/// orphan. Sized well above the longest clip finalisation (the alert
+/// builder's own ceiling is minutes, not hours) and well below the 24 h
+/// sweep interval, so a genuine orphan is still reclaimed on the next
+/// pass rather than lingering.
+const ORPHAN_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// `true` when `path`'s mtime is newer than `cutoff`. An unreadable
+/// mtime returns `true` — fail safe, because the cost of sparing a real
+/// orphan for one more sweep is a stale file, and the cost of deleting
+/// a live one is lost footage.
+async fn is_younger_than(path: &Path, cutoff: SystemTime) -> bool {
+    match tokio::fs::metadata(path).await.and_then(|m| m.modified()) {
+        Ok(mtime) => mtime > cutoff,
+        Err(_) => true,
+    }
 }
 
 /// Recursively collect every regular-file path under `root`.
@@ -437,7 +526,9 @@ mod tests {
         .await;
 
         let cutoff = now - chrono::Duration::days(30);
-        let res = sweep_once(&store, &clips_dir, cutoff).await.unwrap();
+        let res = sweep_once(&store, &clips_dir, cutoff, Duration::ZERO)
+            .await
+            .unwrap();
         assert_eq!(res.evicted, 1);
         assert_eq!(res.orphans, 0);
         assert_eq!(res.missing, 0);
@@ -447,6 +538,284 @@ mod tests {
         assert!(recent_path.exists(), "recent file should remain");
         assert!(store.get_clip(old_id).await.unwrap().is_none());
         assert!(store.get_clip(recent_id).await.unwrap().is_some());
+    }
+
+    /// The grace window must not become a way to never collect
+    /// anything: a young orphan is spared, and the SAME file is
+    /// collected once its mtime ages past the window.
+    #[tokio::test]
+    async fn a_young_orphan_is_spared_then_collected_once_it_ages() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::days(30);
+
+        let orphan = clips_dir.join("cam1").join("fresh-orphan.mp4");
+        tokio::fs::create_dir_all(orphan.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&orphan, b"just-written").await.unwrap();
+
+        let spared = sweep_once(&store, &clips_dir, cutoff, ORPHAN_MIN_AGE)
+            .await
+            .unwrap();
+        assert_eq!(
+            spared.orphans, 0,
+            "a just-written file is not yet an orphan"
+        );
+        assert!(orphan.exists());
+
+        // Age the file itself rather than shrinking the window, so this
+        // exercises `is_younger_than` returning false under a real window.
+        let old = SystemTime::now() - (ORPHAN_MIN_AGE * 2);
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        let collected = sweep_once(&store, &clips_dir, cutoff, ORPHAN_MIN_AGE)
+            .await
+            .unwrap();
+        assert_eq!(collected.orphans, 1, "it must be reclaimed once it ages");
+        assert!(!orphan.exists());
+    }
+
+    /// A `failed` alert clip's final path never existed, and nothing
+    /// ever deletes the row -- so counting it as known would report it
+    /// missing on every sweep, forever.
+    #[tokio::test]
+    async fn a_failed_alert_clip_is_not_reported_missing() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+
+        let rel = format!(
+            "alert/2/{}/{}.mp4",
+            now.format("%Y-%m-%d"),
+            now.timestamp_millis()
+        );
+        let id = store
+            .insert_alert_clip(&nexus_store::NewAlertClip {
+                camera_id: 1,
+                started_at: now,
+                path: rel.clone(),
+            })
+            .await
+            .unwrap();
+        store.mark_alert_clip_failed(id).await.unwrap();
+
+        let cutoff = now - chrono::Duration::days(30);
+        let res = sweep_once(&store, &clips_dir, cutoff, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.missing, 0,
+            "a failed alert clip has no file by construction and must not be \
+             warned about on every sweep"
+        );
+
+        // Assert the query's own contract too. The sweep result above is
+        // also satisfied by the ready/expected split, so without this the
+        // test would pass even if `failed` rows leaked back into the
+        // spared set.
+        let spared = store.known_alert_clip_paths().await.unwrap();
+        assert!(
+            !spared.iter().any(|(p, _)| p == &rel),
+            "a failed alert clip must not be in the spared set: {spared:?}"
+        );
+    }
+
+    /// A detached USB vault makes every one of its rows absent at once.
+    /// That is one event, not one per clip.
+    #[tokio::test]
+    async fn a_detached_vault_does_not_warn_once_per_clip() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO storage_backends (handle, kind, config_json)
+             VALUES ('usb-GONE', 'usb', '{}')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        // Rows exist; the mount never does.
+        for n in 0..3 {
+            store
+                .open_clip(&NewClip {
+                    camera_id: 1,
+                    started_at: now,
+                    hot_path: format!("usb/GONE/cam1/clip{n}.mp4"),
+                    codec: "stub".into(),
+                    container: "mp4".into(),
+                    hot_handle: "usb-GONE".into(),
+                    frame_width: 960,
+                    frame_height: 540,
+                })
+                .await
+                .unwrap();
+        }
+
+        let cutoff = now - chrono::Duration::days(30);
+        let res = sweep_once(&store, &clips_dir, cutoff, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.missing, 0,
+            "a detached medium must not produce one missing warning per clip"
+        );
+    }
+
+    /// The alert builder registers the FINAL path but writes
+    /// `<name>.partial.mp4`, so the partial is in no known set by
+    /// construction. Without the grace window the sweep unlinks it
+    /// mid-write and the builder's rename then fails.
+    ///
+    /// Motion clips are deliberately not exercised here: both recorders
+    /// insert their row with the in-flight path, so a motion partial
+    /// was always in the known set.
+    #[tokio::test]
+    async fn an_in_flight_alert_partial_survives_the_orphan_sweep() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+
+        let rel = format!(
+            "alert/1/{}/{}.mp4",
+            now.format("%Y-%m-%d"),
+            now.timestamp_millis()
+        );
+        store
+            .insert_alert_clip(&nexus_store::NewAlertClip {
+                camera_id: 1,
+                started_at: now,
+                path: rel.clone(),
+            })
+            .await
+            .unwrap();
+
+        // On disk there is only the partial; the row names the final path.
+        let partial = clips_dir.join(&rel).with_extension("partial.mp4");
+        tokio::fs::create_dir_all(partial.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&partial, b"still-being-encoded")
+            .await
+            .unwrap();
+
+        let cutoff = now - chrono::Duration::days(30);
+        let res = sweep_once(&store, &clips_dir, cutoff, ORPHAN_MIN_AGE)
+            .await
+            .unwrap();
+
+        assert!(
+            partial.exists(),
+            "an in-flight alert partial was unlinked mid-write (orphans={}); \
+             the rename to the final path would then fail",
+            res.orphans
+        );
+        assert_eq!(
+            res.missing, 0,
+            "a building row whose file is still at the partial path must not \
+             be reported missing"
+        );
+    }
+
+    /// USB-vault clips live at `clips_dir/usb/<label>/...` -- inside the swept
+    /// tree -- but their rows carry `hot_handle = "usb-<label>"`, which
+    /// `known_clip_paths()` used to filter out.
+    #[tokio::test]
+    async fn a_usb_vault_clip_survives_the_orphan_sweep() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+
+        // motion_clips.hot_handle REFERENCES storage_backends(handle),
+        // so a vault clip can only exist once its backend is registered.
+        sqlx::query(
+            "INSERT INTO storage_backends (handle, kind, config_json)
+             VALUES ('usb-NEXUS_VAULT', 'usb', '{}')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let rel = "usb/NEXUS_VAULT/cam1/vaulted.mp4";
+        let abs = clips_dir.join(rel);
+        tokio::fs::create_dir_all(abs.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&abs, b"vaulted-evidence").await.unwrap();
+        store
+            .open_clip(&NewClip {
+                camera_id: 1,
+                started_at: now,
+                hot_path: rel.into(),
+                codec: "stub".into(),
+                container: "mp4".into(),
+                hot_handle: "usb-NEXUS_VAULT".into(),
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .unwrap();
+
+        let cutoff = now - chrono::Duration::days(30);
+        let res = sweep_once(&store, &clips_dir, cutoff, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(
+            abs.exists(),
+            "a USB-vault clip with a live row was deleted by the orphan sweep \
+             (orphans={}); its files are under clips_dir but its hot_handle is \
+             not 'local'",
+            res.orphans
+        );
+    }
+
+    /// DIAGNOSTIC (issue: orphan sweep vs alert clips). An alert clip
+    /// with a live `alert_clips` row must survive the sweep.
+    #[tokio::test]
+    async fn alert_clip_with_a_row_survives_the_orphan_sweep() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+
+        // A real alert clip, laid out exactly as alert_clip_rel_path does:
+        // alert/{camera_id}/{YYYY-MM-DD}/{start_unix_ms}.mp4
+        let rel = format!(
+            "alert/1/{}/{}.mp4",
+            now.format("%Y-%m-%d"),
+            now.timestamp_millis()
+        );
+        let abs = clips_dir.join(&rel);
+        tokio::fs::create_dir_all(abs.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&abs, b"alert-clip-payload").await.unwrap();
+
+        let id = store
+            .insert_alert_clip(&nexus_store::NewAlertClip {
+                camera_id: 1,
+                started_at: now,
+                path: rel.clone(),
+            })
+            .await
+            .expect("insert alert clip row");
+        assert!(id > 0, "row must exist");
+
+        let cutoff = now - chrono::Duration::days(30);
+        let res = sweep_once(&store, &clips_dir, cutoff, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(
+            abs.exists(),
+            "alert clip with a live alert_clips row was deleted by the orphan sweep \
+             (orphans={}); the known set did not include alert_clips",
+            res.orphans
+        );
     }
 
     #[tokio::test]
@@ -462,7 +831,9 @@ mod tests {
         tokio::fs::write(&orphan, b"crash-leftover").await.unwrap();
 
         let cutoff = now - chrono::Duration::days(30); // doesn't trigger retention
-        let res = sweep_once(&store, &clips_dir, cutoff).await.unwrap();
+        let res = sweep_once(&store, &clips_dir, cutoff, Duration::ZERO)
+            .await
+            .unwrap();
         assert_eq!(res.evicted, 0);
         assert_eq!(res.orphans, 1, "orphan must be unlinked");
         assert_eq!(res.missing, 0);
@@ -480,7 +851,9 @@ mod tests {
         tokio::fs::remove_file(&path).await.unwrap();
 
         let cutoff = now - chrono::Duration::days(30);
-        let res = sweep_once(&store, &clips_dir, cutoff).await.unwrap();
+        let res = sweep_once(&store, &clips_dir, cutoff, Duration::ZERO)
+            .await
+            .unwrap();
         assert_eq!(res.evicted, 0);
         assert_eq!(res.orphans, 0);
         assert_eq!(res.missing, 1, "missing-file count must increment");
