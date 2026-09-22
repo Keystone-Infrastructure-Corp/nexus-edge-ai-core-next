@@ -122,17 +122,41 @@ pub struct AlertClipColdMark {
 }
 
 impl Store {
-    /// Every `alert_clips.path` still backed by a file, for the
-    /// orphan-file scanner. Alert clips share the motion recorder's
-    /// `clips_dir` root by design (`alert_clip_rel_path` is relative to
-    /// it), so the scanner walks them and must be told they are spoken
-    /// for. `evicted` rows are excluded — their file is already gone by
-    /// definition, and sparing them would resurrect nothing.
-    pub async fn known_alert_clip_paths(&self) -> Result<Vec<String>, StoreError> {
-        let rows = sqlx::query("SELECT path FROM alert_clips WHERE state <> 'evicted'")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
+    /// Every `alert_clips.path` that may currently have a file at it,
+    /// for the orphan-file scanner. Alert clips share the motion
+    /// recorder's `clips_dir` root by design (`alert_clip_rel_path` is
+    /// relative to it), so the scanner walks them and must be told they
+    /// are spoken for.
+    ///
+    /// `building` and `ready` only, and the exclusions are not
+    /// symmetric with each other:
+    ///
+    /// * `evicted` — the evictor unlinked the file before marking the
+    ///   row, so there is nothing to spare.
+    /// * `failed` — the final path **never existed**. Every
+    ///   `mark_alert_clip_failed` call site is reached because the
+    ///   rename did not happen or the encode died with its partial
+    ///   already removed. Nothing deletes `alert_clips` rows, so
+    ///   including them would make the scanner's `missing` counter
+    ///   report every historical failure on every sweep, forever.
+    ///
+    /// `building` must stay: the file sits at the final path while the
+    /// sha256 is hashed, before the row flips to `ready`.
+    /// Returns `(path, state)` because the scanner needs two different
+    /// sets from it: everything here is spared from deletion, but only
+    /// `ready` is expected to have a file. A `building` row's final path
+    /// legitimately does not exist yet — the encoder is still writing
+    /// the partial — so counting it as "missing" would warn on every
+    /// in-flight clip.
+    pub async fn known_alert_clip_paths(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let rows =
+            sqlx::query("SELECT path, state FROM alert_clips WHERE state IN ('building', 'ready')")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .collect())
     }
 
     /// Insert a fresh `building` alert clip and return its id. The
