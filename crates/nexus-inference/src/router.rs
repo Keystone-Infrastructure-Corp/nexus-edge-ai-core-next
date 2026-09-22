@@ -405,12 +405,17 @@ mod tests {
     #[test]
     fn router_picks_override_detector_for_camera() {
         let cfg = cfg_with_kind("mock");
-        let cams = vec![cam(1, None), cam(2, Some("classifier_ensemble"))];
+        // `open_vocab` rather than `classifier_ensemble`: this test is
+        // about override routing, and `classifier_ensemble` ships no
+        // implementation so it now resolves to the degraded detector,
+        // which would make the override indistinguishable from a
+        // build failure. See `detector_never_fabricates.rs`.
+        let cams = vec![cam(1, None), cam(2, Some("open_vocab"))];
         let router = InferenceRouter::build(&cfg, &cams).unwrap();
         let d1 = router.detector_for_camera(&cams[0]);
         let d2 = router.detector_for_camera(&cams[1]);
         assert_eq!(d1.name(), "mock");
-        assert_eq!(d2.name(), "classifier_ensemble");
+        assert_eq!(d2.name(), "open_vocab");
     }
 
     /// M_PERF_CROWD Phase E3 — when a camera opts in to detector

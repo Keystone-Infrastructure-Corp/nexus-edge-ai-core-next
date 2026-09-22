@@ -271,43 +271,6 @@ impl Detector for OpenVocabDetector {
 }
 
 // ---------------------------------------------------------------------------
-// ClassifierEnsembleDetector — narrow specialists (PPE, vehicle, equipment).
-//
-// Co-exists with OpenVocabDetector; operator picks per-camera. M0 ships the
-// trait + a mock body that re-labels detections with per-camera classes.
-// ---------------------------------------------------------------------------
-
-pub struct ClassifierEnsembleDetector {
-    fallback: Arc<MockDetector>,
-}
-
-impl ClassifierEnsembleDetector {
-    pub fn new(_cfg: &InferenceConfig) -> Result<Self, InferenceError> {
-        Ok(Self {
-            fallback: Arc::new(MockDetector::new()),
-        })
-    }
-}
-
-#[async_trait]
-impl Detector for ClassifierEnsembleDetector {
-    async fn detect(
-        &self,
-        frame: &Frame,
-        prompts: &[String],
-    ) -> Result<Vec<Detection>, InferenceError> {
-        // The per-camera `prompts` whitelist is enforced uniformly
-        // for every detector kind by the pipeline supervisor (see
-        // `label_matches_any_prompt`), so no retain is needed here.
-        self.fallback.detect(frame, prompts).await
-    }
-
-    fn name(&self) -> &'static str {
-        "classifier_ensemble"
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Shared label/prompts matching used by the pipeline supervisor to enforce
 // the per-camera `prompts` whitelist uniformly for every detector kind.
 //

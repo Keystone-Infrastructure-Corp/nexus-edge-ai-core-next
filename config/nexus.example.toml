@@ -260,7 +260,9 @@ ep_priority = ["openvino", "cpu"]
 
 [inference.model]
 # yolo (default, closed-vocab; ships per-size: yolo26n_640.onnx / _960.onnx / _1280.onnx,
-# plus yolo26n.hef for Hailo-8 boxes) | open_vocab | classifier_ensemble | mock
+# plus yolo26n.hef for Hailo-8 boxes) | open_vocab | mock
+# NOT IMPLEMENTED: classifier_ensemble / ppe are accepted on the wire but ship no
+# model, so selecting one reports zero detections and marks health degraded.
 kind = "yolo"
 # Pack preset — "320" / "640" / "1280" from models-manifest.json.
 #   cpu profile → 320 (lowest latency)

@@ -101,6 +101,38 @@ fn unknown_model_kind_degrades_instead_of_mocking() {
     health::clear_degraded("definitely_not_a_real_kind");
 }
 
+/// `classifier_ensemble` / `ppe` are advertised, operator-selectable
+/// kinds (`config/nexus.example.toml`) with no ONNX implementation
+/// behind them. They must degrade like any other unloadable model
+/// rather than resolving to the synthetic mock — otherwise the flood
+/// this file exists to prevent is reachable straight from the shipped
+/// reference config.
+#[test]
+fn advertised_kinds_with_no_implementation_degrade_instead_of_mocking() {
+    for kind in ["classifier_ensemble", "ppe"] {
+        health::clear_degraded("classifier_ensemble");
+
+        let layer = build(&cfg_with_kind(kind))
+            .expect("engine must still boot so it can report the problem");
+
+        assert_eq!(
+            layer.detector.name(),
+            "unavailable",
+            "`{kind}` ships no model, so it MUST NOT resolve to the synthetic \
+             mock detector"
+        );
+        assert!(
+            health::degradations()
+                .iter()
+                .any(|d| d.kind == "classifier_ensemble"),
+            "`{kind}` must be reported degraded so /health and the cloud \
+             heartbeat stop claiming the camera is fine"
+        );
+
+        health::clear_degraded("classifier_ensemble");
+    }
+}
+
 /// Requesting the mock explicitly is still legitimate — this is how
 /// tests and bare dev boxes run without a model pack.
 #[test]
