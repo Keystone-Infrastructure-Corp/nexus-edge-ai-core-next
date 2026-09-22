@@ -1,4 +1,4 @@
-//! BUG-048 regression — per-sink isolation and drain-loop liveness.
+//! BUG-054 regression — per-sink isolation and drain-loop liveness.
 //!
 //! These boot the real [`dispatcher::run_dispatcher`] timer loop (the
 //! other dispatcher test files drive `process_row` directly), because
@@ -100,7 +100,7 @@ fn sample_alert(camera_id: i64, rule: &str) -> AlertEvent {
 
 /// An `AlertSink` whose `deliver()` parks until the test hands out a
 /// permit. Models a sink that is slow (big attachment, slow relay) or
-/// wedged (the stalled tunnel writer of BUG-048) without any sleeps, so
+/// wedged (the stalled tunnel writer of BUG-054) without any sleeps, so
 /// the test stays deterministic.
 struct GatedSink {
     id: SinkId,
@@ -303,7 +303,7 @@ async fn slow_sink_does_not_block_other_sinks() {
     let _ = tokio::time::timeout(Duration::from_secs(5), loop_handle).await;
 }
 
-/// The drain loop must publish a liveness signal. During BUG-048 the
+/// The drain loop must publish a liveness signal. During BUG-054 the
 /// engine looked healthy from every angle — it logged, served the API,
 /// and reported its sinks as configured — because nothing reported
 /// whether the loop was still completing passes.

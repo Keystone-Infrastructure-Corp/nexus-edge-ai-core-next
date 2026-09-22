@@ -5,7 +5,7 @@
 //! concurrently, while rows *within* one sink stay strictly sequential
 //! — that keeps each sink's retry queue coherent (no thundering herd
 //! when a flapping endpoint comes back online) without letting one slow
-//! sink hold up every other sink's deliveries (BUG-048).
+//! sink hold up every other sink's deliveries (BUG-054).
 //!
 //! State machine — for every pending row:
 //!
@@ -305,7 +305,7 @@ impl Default for SinkDispatcherConfig {
 
 /// Liveness + throughput counters for the dispatcher loop.
 ///
-/// BUG-048 left every sink wedged for 17.7h while the engine looked
+/// BUG-054 left every sink wedged for 17.7h while the engine looked
 /// perfectly healthy: it logged, served the API, and reported its sinks
 /// as registered, because nothing anywhere reported whether the drain
 /// loop was still *completing*. These counters make a stalled tick
@@ -318,7 +318,7 @@ pub struct DispatcherHealth {
     /// Unix millis at which the most recent tick *finished*. `0` means
     /// no tick has completed yet. The gap between this and now is the
     /// signal that matters: it grows without bound iff the loop is
-    /// wedged, which is precisely what was unobservable during BUG-048.
+    /// wedged, which is precisely what was unobservable during BUG-054.
     last_tick_completed_ms: AtomicI64,
     /// Unix millis at which the most recent tick *started*. With
     /// `last_tick_completed_ms` this distinguishes "loop is stuck
