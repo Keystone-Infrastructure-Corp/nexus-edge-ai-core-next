@@ -2676,9 +2676,10 @@ struct CameraFrameStatsView {
     fps_ema: f64,
     frames_emitted: u64,
     frames_dropped: u64,
-    /// Frames the source produced that never reached the analysis loop,
-    /// counted from `frame_id` gaps. Distinct from `frames_dropped`, which
-    /// is the motion gate doing its job.
+    /// Frames the source produced that the analysis loop never saw, counted
+    /// from `frame_id` gaps — the bounded source channel overflowing, plus
+    /// the latest-wins tap coalescing while the loop is slow or wedged.
+    /// Distinct from `frames_dropped`, which is the motion gate doing its job.
     frames_backpressure_dropped: u64,
     source_width: u32,
     source_height: u32,

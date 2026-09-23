@@ -176,13 +176,28 @@ enum WorkerCmd {
 /// the call waits forever, the streak never moves, and the camera reports
 /// Running while recording nothing.
 ///
-/// Ten seconds is ~125x the 20-80 ms a real inference takes, so it cannot fire
-/// on a merely slow box; a false demotion is worse than a slow one, because it
-/// moves a healthy accelerator to the CPU EP until the process restarts. The
-/// consequence is that a wedge on a single serial worker needs
-/// `DEVICE_FAILURE_STREAK` timeouts to demote — minutes, not seconds. Bounded
-/// where it used to be unbounded, which is the defect; tightening it is a
-/// tuning question, not a correctness one.
+/// The budget is QUEUE WAIT PLUS INFERENCE, not inference alone. A worker
+/// serves its slot serially from an unbounded queue shared by every camera
+/// routed to it, and `workers` defaults to 1, so on an N-camera slot the
+/// margin over a single 20-80 ms inference is nearer N x latency than the
+/// 125x the raw numbers suggest. Ten seconds is chosen to sit well clear of
+/// that on the boxes this ships to; it is not a large multiple of a saturated
+/// slot's worst case.
+///
+/// That matters because a timeout demotes: under sustained overload — as
+/// opposed to a wedge — every call can time out consecutively and move a
+/// healthy accelerator onto the CPU EP until the process restarts, which is
+/// worse than the state it left. The timeout also does not cancel the queued
+/// command, so the worker still runs the abandoned frame. Capping in-flight
+/// work per slot, or starting the deadline when the worker dequeues rather
+/// than when the caller enqueues, would separate "wedged" from "behind"
+/// properly; both are larger changes than this fix and want a real overloaded
+/// box to tune against.
+///
+/// A false demotion is worse than a slow one, so the constant errs long: a
+/// wedge on a single serial worker needs `DEVICE_FAILURE_STREAK` timeouts to
+/// demote, which is minutes rather than seconds. Bounded where it used to be
+/// unbounded is the defect being fixed; tightening it is a tuning question.
 const DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Consecutive `detect` failures that demote a slot to `Failed`.
@@ -999,6 +1014,43 @@ mod tests {
         assert!(
             err.to_string().contains("timed out"),
             "the failure must name the timeout so it is diagnosable, got: {err}"
+        );
+    }
+
+    /// The requirement BUG-217 exists for: a device that hangs must end up
+    /// demoted, exactly as one that fails loudly does.
+    ///
+    /// Without this, a refactor that turned the timeout into an early
+    /// `return Err(..)` — the shape of the arm immediately above it in
+    /// `detect` — would keep the test above green while restoring the bug,
+    /// because the streak block would never run.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_timeouts_demote_the_slot_like_repeated_errors() {
+        let cfg = InferenceConfig::default();
+        let detector: Arc<dyn Detector> = Arc::new(NeverRepliesProbe);
+        let backend = ThreadIsolatedBackend::start(0, detector, &cfg).expect("worker spawn");
+        let frame = tiny_frame();
+
+        assert!(backend.detect(&frame, &[]).await.is_err());
+        // The first failure starts the clock; backdate it so the test spends
+        // its time on the count rather than on DEVICE_FAILURE_WINDOW.
+        backdate_streak(&backend);
+
+        for _ in 2..DEVICE_FAILURE_STREAK {
+            assert!(backend.detect(&frame, &[]).await.is_err());
+        }
+        assert_eq!(
+            backend.state(),
+            BackendState::Ready,
+            "must not demote before the streak is reached"
+        );
+
+        assert!(backend.detect(&frame, &[]).await.is_err());
+        assert_eq!(
+            backend.state(),
+            BackendState::Failed,
+            "a slot whose detector never replies must leave rotation, or \
+             `pick_ready` keeps sending it frames forever"
         );
     }
 }

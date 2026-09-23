@@ -517,12 +517,6 @@ async fn run_camera(
                 // `observe_frame` is documented to measure; inside the
                 // analysis loop it measured inference rate instead.
                 tap_stats.observe_frame(cam_id, frame.captured_at, frame.width, frame.height);
-                // Gaps in the source's per-session `frame_id` are frames the
-                // bounded channel discarded via `try_send`. This is the only
-                // place that sees both sides of that channel, and until now
-                // those drops were counted nowhere — the one drop counter
-                // measures the motion gate, which drops by design.
-                tap_stats.observe_frame_id(cam_id, frame.frame_id);
                 tap_cache.put_frame(cam_id, epoch, Arc::new(frame.clone()));
                 if latest_tx.send(Some(frame)).is_err() {
                     break;
@@ -543,6 +537,16 @@ async fn run_camera(
                 None => continue,
             };
             decoded += 1;
+            // Count frames the source produced that this loop never saw.
+            //
+            // It has to be HERE, not in the tap above: the tap drains
+            // `raw_rx` unconditionally and cannot block, so the bounded
+            // channel only overflows under runtime starvation. The loss that
+            // matters — a slow or wedged analysis loop — happens in the
+            // latest-wins `watch` between them, which coalesces silently by
+            // design. Gaps in the source's monotonic per-session `frame_id`
+            // at this point cover both.
+            stats.observe_frame_id(cfg.id, frame.frame_id);
 
             // Honour any operator-initiated anchor wipe issued via
             // `DELETE /api/v1/cameras/{id}/static-anchors` since the

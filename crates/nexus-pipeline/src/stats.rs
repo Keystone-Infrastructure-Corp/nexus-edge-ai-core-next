@@ -64,9 +64,16 @@ pub struct CameraFrameStats {
     /// `watch`, so frames coalesced away before the gate ever saw them
     /// are in neither total.
     pub frames_dropped: u64,
-    /// Frames the SOURCE produced that never reached the supervisor —
+    /// Frames the SOURCE produced that the analysis loop never saw —
     /// counted from gaps in the per-session `frame_id` sequence, which the
     /// source assigns before its non-blocking `try_send`.
+    ///
+    /// Covers both ways a frame is lost on the way in: the bounded source
+    /// channel overflowing under runtime starvation, and the latest-wins
+    /// `watch` between the live-view tap and the analysis loop coalescing
+    /// while that loop is slow or wedged. The second is the dominant one and
+    /// is silent by design, which is why the count is taken at the analysis
+    /// loop rather than at the tap.
     ///
     /// Deliberately separate from [`frames_dropped`]. That counter measures
     /// the motion gate, which drops on purpose and is the expected steady
@@ -233,23 +240,38 @@ impl FrameStatsRegistry {
     /// any gap since the previous one as frames lost to backpressure.
     ///
     /// The source assigns `frame_id` from a monotonic per-session counter
-    /// *before* its `try_send`, so a gap is exactly the set of frames that
-    /// were produced and discarded by a full channel. A counter that goes
-    /// backwards or repeats is a new session (the source restarts the
-    /// sequence on reconfiguration) and resets the baseline rather than
-    /// inventing a drop for every id in between.
+    /// *before* its `try_send`, so a gap is exactly the set of frames the
+    /// caller never received — whether they were dropped by a full channel
+    /// or coalesced away by the latest-wins `watch` downstream of it.
+    ///
+    /// A counter that goes backwards or repeats is a new session (the source
+    /// restarts the sequence on reconfiguration) and resets the baseline
+    /// rather than inventing a drop for every id in between. So is a forward
+    /// jump beyond `MAX_PLAUSIBLE_FRAME_GAP`, which means two independent
+    /// sequences rather than one camera falling behind.
     pub fn observe_frame_id(&self, camera_id: CameraId, frame_id: u64) {
+        /// Largest gap attributable to one camera falling behind. Beyond it
+        /// the jump is two counters, not lost frames: at 30 fps this is over
+        /// two minutes of total loss, which a camera does not survive without
+        /// the decode-health ladder firing first.
+        const MAX_PLAUSIBLE_FRAME_GAP: u64 = 4096;
+
         let mut guard = self.inner.write();
         let Some(entry) = guard.get_mut(&camera_id) else {
             return;
         };
         if let Some(prev) = entry.last_frame_id {
-            if frame_id > prev {
-                let lost = frame_id - prev - 1;
-                if lost > 0 {
-                    entry.frames_backpressure_dropped =
-                        entry.frames_backpressure_dropped.saturating_add(lost);
-                }
+            let lost = frame_id.saturating_sub(prev).saturating_sub(1);
+            // A jump this large is not a camera that fell behind — it is a
+            // different counter. `SharedRtspSource` swaps the analysis
+            // substream's ingester for the main one mid-run on fallback, and
+            // each ingester owns its own sequence, so the first frame after
+            // the swap can land arbitrarily far ahead. Counting it would post
+            // a one-shot phantom spike of thousands. Treated as a reset, the
+            // same way a backwards jump already is.
+            if lost > 0 && lost <= MAX_PLAUSIBLE_FRAME_GAP {
+                entry.frames_backpressure_dropped =
+                    entry.frames_backpressure_dropped.saturating_add(lost);
             }
         }
         entry.last_frame_id = Some(frame_id);
@@ -732,6 +754,24 @@ mod tests {
             s.frames_dropped, 0,
             "a backpressure drop is NOT a gate drop — conflating them is the \
              defect: the gate drops on purpose and is the expected steady state"
+        );
+    }
+
+    #[test]
+    fn an_implausible_forward_jump_is_two_counters_not_lost_frames() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 320, 240);
+        reg.observe_frame_id(1, 10);
+        // SharedRtspSource swaps the analysis substream's ingester for the
+        // main one mid-run; each owns its own sequence, so the first frame
+        // after the swap can land arbitrarily far ahead.
+        reg.observe_frame_id(1, 900_000);
+        reg.observe_frame_id(1, 900_001);
+
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(
+            s.frames_backpressure_dropped, 0,
+            "a jump of 900k is a different counter, not 900k dropped frames"
         );
     }
 
