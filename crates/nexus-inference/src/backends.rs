@@ -1017,6 +1017,32 @@ mod tests {
         );
     }
 
+    /// Block until the worker thread publishes `Ready`.
+    ///
+    /// `ThreadIsolatedBackend::start` returns as soon as the thread is
+    /// spawned, before that thread has built its runtime and called
+    /// `set_state(Ready)`, so a test that asserts on `state()` races it.
+    /// `ready_backend` above cannot be reused under
+    /// `#[tokio::test(start_paused = true)]`: its `tokio::time::sleep`
+    /// resolves instantly against the virtual clock, so the loop spins
+    /// rather than waits. Sleeping the OS thread advances real time whatever
+    /// the runtime's clock is doing, which is what a cross-thread handshake
+    /// needs.
+    ///
+    /// CI caught this as a flake on a loaded runner; it passed 160 local
+    /// iterations, including under 3x CPU oversubscription.
+    fn wait_until_ready(backend: &ThreadIsolatedBackend) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while backend.state() != BackendState::Ready {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never reached Ready; state is {:?}",
+                backend.state()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// The requirement BUG-217 exists for: a device that hangs must end up
     /// demoted, exactly as one that fails loudly does.
     ///
@@ -1029,6 +1055,7 @@ mod tests {
         let cfg = InferenceConfig::default();
         let detector: Arc<dyn Detector> = Arc::new(NeverRepliesProbe);
         let backend = ThreadIsolatedBackend::start(0, detector, &cfg).expect("worker spawn");
+        wait_until_ready(&backend);
         let frame = tiny_frame();
 
         assert!(backend.detect(&frame, &[]).await.is_err());
