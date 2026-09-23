@@ -2,11 +2,14 @@
 //!
 //! Lives outside the `linux + feature = "linked"` gate that covers `imp`,
 //! because none of this touches HailoRT: it is byte-slice arithmetic over
-//! tensors the runtime has already dequantised. Keeping it in `imp` meant it
-//! was never compiled by CI (no job builds this crate with `linked` — the
-//! HailoRT .deb is under a EULA that prevents caching it), so the decoder
-//! shipped with zero test coverage. Moving it here is what makes the tests
-//! below possible.
+//! tensors the runtime has already dequantised.
+//!
+//! Keeping it in `imp` meant no PR-gating job ever type-checked it: `imp` is
+//! gated on `all(target_os = "linux", feature = "linked")`, and the only job
+//! that enables `linked` is the release build (`release.yml`, via
+//! `ep-hailo`), which runs at tag time. The decoder therefore shipped with
+//! zero test coverage. Moving it here is what makes the tests below possible
+//! and puts it in front of `cargo clippy`/`cargo test` on every target.
 
 use crate::Detection;
 
@@ -295,6 +298,9 @@ fn decode_yolo26_raw(
     // Score floor: anything below this is discarded before NMS to keep
     // the candidate set bounded. yolo26n's default training threshold
     // is 0.001 but per-class >0.25 is the standard inference cutoff.
+    // Compared against the SIGMOID-ACTIVATED score, so this really is a
+    // probability — see `sigmoid`. It was effectively a logit cutoff until
+    // that activation was added (BUG-219).
     const SCORE_FLOOR: f32 = 0.20;
     const IOU_THRESHOLD: f32 = 0.70;
 
@@ -329,7 +335,11 @@ fn decode_yolo26_raw(
             for gx in 0..w {
                 let cls_base = (gy * w + gx) * nc * 4;
                 // Best class for this cell.
-                let mut best_score = 0.0f32;
+                // Seeded at -inf, not 0.0: the tensor holds logits, so a cell
+                // whose classes are all negative has a real (small) maximum.
+                // Seeding at 0.0 would both hide that and, once the floor
+                // below is in probability space, report it as sigmoid(0) = 0.5.
+                let mut best_logit = f32::NEG_INFINITY;
                 let mut best_class: u16 = 0;
                 for c in 0..nc {
                     let o = cls_base + c * 4;
@@ -339,11 +349,20 @@ fn decode_yolo26_raw(
                         cls_buf[o + 2],
                         cls_buf[o + 3],
                     ]);
-                    if s > best_score {
-                        best_score = s;
+                    if s > best_logit {
+                        best_logit = s;
                         best_class = c as u16;
                     }
                 }
+                // Activate, then compare. `SCORE_FLOOR` is documented as a
+                // probability ("per-class >0.25 is the standard inference
+                // cutoff") and now is one. Flooring on the raw logit instead
+                // would make the minimum emittable confidence
+                // sigmoid(0.20) = 0.5498, which is above
+                // `bytetrack.high_confidence` (0.5) — every detection would
+                // land in ByteTrack's high bucket and its low-confidence
+                // recovery pass would never run again.
+                let best_score = sigmoid(best_logit);
                 if best_score < SCORE_FLOOR {
                     continue;
                 }
@@ -387,12 +406,9 @@ fn decode_yolo26_raw(
                     x_min: x1,
                     y_max: y2,
                     x_max: x2,
-                    // `best_score` is a raw logit: the loop seeds at 0.0 and
-                    // `SCORE_FLOOR` is compared against it, so the candidate
-                    // set is decided in logit space exactly as before. Only
-                    // the reported confidence changes — activate the winner.
-                    // Sigmoid is monotonic, so the argmax above is unaffected.
-                    score: sigmoid(best_score),
+                    // Already activated above. Sigmoid is monotonic, so the
+                    // argmax and the NMS ordering are unaffected.
+                    score: best_score,
                     class_id: best_class,
                 });
             }
@@ -506,7 +522,9 @@ mod tests {
                 "logit {logit} => {}, expected ~{expect}",
                 d[0].score
             );
-            assert!(d[0].score < 1.0, "a probability must never reach 1.0");
+            // Not asserting < 1.0 in general: f32 sigmoid rounds to exactly
+            // 1.0 for logits above ~17. These ladder values are far below that.
+            assert!(d[0].score < 0.999, "must not saturate at the ladder values");
         }
     }
 
@@ -528,23 +546,43 @@ mod tests {
         );
     }
 
-    /// The candidate set must not change. `SCORE_FLOOR` is compared against
-    /// the raw logit exactly as before, so a cell below it is still dropped —
-    /// activating before the comparison would let `sigmoid(0) = 0.5` push
-    /// every background cell through.
+    /// `SCORE_FLOOR` is documented as a probability and must behave as one.
+    /// Flooring on the raw logit instead would put the minimum emittable
+    /// confidence at sigmoid(0.20) = 0.5498 — above
+    /// `bytetrack.high_confidence` (0.5) — so every Hailo detection would
+    /// land in the high bucket and ByteTrack's low-confidence recovery pass
+    /// would never run again.
     #[test]
-    fn the_score_floor_still_cuts_in_logit_space() {
-        let (bufs, layout) = one_cell(0.1);
+    fn the_score_floor_is_a_probability_not_a_logit() {
+        // sigmoid(-2.0) = 0.119 — below a 0.20 probability floor.
+        let (bufs, layout) = one_cell(-2.0);
         assert!(
             decode_detections(&bufs, &layout, 16).is_empty(),
-            "a 0.1 logit is below SCORE_FLOOR and must not be emitted \
-             (sigmoid(0.1) = 0.525 would have passed a probability floor)"
+            "0.119 is below SCORE_FLOOR and must be dropped"
         );
-        let (bufs, layout) = one_cell(0.25);
-        assert_eq!(
-            decode_detections(&bufs, &layout, 16).len(),
-            1,
-            "a 0.25 logit is above SCORE_FLOOR and must still be emitted"
+        // sigmoid(-1.0) = 0.269 — above it, and BELOW the 0.5498 that a
+        // logit-space floor would have imposed. This is the detection a
+        // logit floor silently loses.
+        let (bufs, layout) = one_cell(-1.0);
+        let d = decode_detections(&bufs, &layout, 16);
+        assert_eq!(d.len(), 1, "0.269 clears a probability floor of 0.20");
+        assert!(
+            d[0].score < 0.5,
+            "and it must stay below bytetrack.high_confidence so the low \
+             bucket is reachable; got {}",
+            d[0].score
+        );
+    }
+
+    /// A cell whose classes are all strongly negative is background and must
+    /// be dropped. Seeding the argmax at 0.0 instead of -inf would report it
+    /// as sigmoid(0) = 0.5 and flood every frame.
+    #[test]
+    fn an_all_negative_cell_is_background_not_a_half_confidence_detection() {
+        let (bufs, layout) = one_cell(-8.0);
+        assert!(
+            decode_detections(&bufs, &layout, 16).is_empty(),
+            "sigmoid(-8) = 0.0003; a 0.0-seeded argmax would have said 0.5"
         );
     }
 
