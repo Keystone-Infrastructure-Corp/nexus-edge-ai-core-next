@@ -2676,6 +2676,10 @@ struct CameraFrameStatsView {
     fps_ema: f64,
     frames_emitted: u64,
     frames_dropped: u64,
+    /// Frames the source produced that never reached the analysis loop,
+    /// counted from `frame_id` gaps. Distinct from `frames_dropped`, which
+    /// is the motion gate doing its job.
+    frames_backpressure_dropped: u64,
     source_width: u32,
     source_height: u32,
     /// M_TILE_REINFER (G1) — number of frames on which the tile
@@ -2800,6 +2804,7 @@ fn build_camera_stats_view(
         fps_ema: snap.fps_ema,
         frames_emitted: snap.frames_emitted,
         frames_dropped: snap.frames_dropped,
+        frames_backpressure_dropped: snap.frames_backpressure_dropped,
         source_width: snap.source_width,
         source_height: snap.source_height,
         tile_invocations: snap.tile_invocations,

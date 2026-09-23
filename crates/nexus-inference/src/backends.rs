@@ -161,11 +161,29 @@ enum WorkerCmd {
     Detect {
         frame: Frame,
         prompts: Vec<String>,
-        reply: channel::Sender<Result<Vec<Detection>, InferenceError>>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<Detection>, InferenceError>>,
     },
     PushConfig(CameraConfigUpdate),
     Shutdown,
 }
+
+/// How long a single `detect` may go without a reply before the call is
+/// failed.
+///
+/// [[BUG-135 A Wedged Accelerator Keeps Its Worker Ready So Fail-Soft Never Engages]]
+/// demotes a slot on a streak of detect ERRORS. A wedged device produces none
+/// — the worker accepts the frame and never replies — so without a deadline
+/// the call waits forever, the streak never moves, and the camera reports
+/// Running while recording nothing.
+///
+/// Ten seconds is ~125x the 20-80 ms a real inference takes, so it cannot fire
+/// on a merely slow box; a false demotion is worse than a slow one, because it
+/// moves a healthy accelerator to the CPU EP until the process restarts. The
+/// consequence is that a wedge on a single serial worker needs
+/// `DEVICE_FAILURE_STREAK` timeouts to demote — minutes, not seconds. Bounded
+/// where it used to be unbounded, which is the defect; tightening it is a
+/// tuning question, not a correctness one.
+const DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Consecutive `detect` failures that demote a slot to `Failed`.
 ///
@@ -326,7 +344,7 @@ impl DetectorBackend for ThreadIsolatedBackend {
         frame: &Frame,
         prompts: &[String],
     ) -> Result<Vec<Detection>, InferenceError> {
-        let (reply_tx, reply_rx) = channel::bounded(1);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let cmd = WorkerCmd::Detect {
             frame: frame.clone(),
             prompts: prompts.to_vec(),
@@ -339,11 +357,27 @@ impl DetectorBackend for ThreadIsolatedBackend {
                 "worker channel closed: {e}"
             )));
         }
-        // Wait off-runtime for the worker to reply.
-        let res = tokio::task::spawn_blocking(move || reply_rx.recv())
-            .await
-            .map_err(|e| InferenceError::Failed(format!("join: {e}")))?
-            .map_err(|e| InferenceError::Failed(format!("worker reply: {e}")))?;
+        // Await the reply on the runtime, bounded. This used to park a
+        // tokio BLOCKING-POOL thread per in-flight inference via
+        // `spawn_blocking(|| reply_rx.recv())` — one per camera for the
+        // full 20-80 ms — which is the starvation `source.rs` documents
+        // and avoids for its own capture threads. `WorkerProcessBackend`
+        // already uses a oneshot here; this matches it.
+        //
+        // A timeout becomes an `Err` rather than an early return, so a
+        // wedged device feeds the same error-streak demotion BUG-135
+        // built for a device that fails loudly.
+        let res = match tokio::time::timeout(DETECT_TIMEOUT, reply_rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => {
+                return Err(InferenceError::Failed(format!("worker reply: {e}")));
+            }
+            Err(_) => Err(InferenceError::Failed(format!(
+                "detect timed out after {}s; the worker accepted the frame and \
+                 never replied, which is a wedged device rather than a slow one",
+                DETECT_TIMEOUT.as_secs()
+            ))),
+        };
         match &res {
             Ok(_) => {
                 self.error_streak.store(0, Ordering::Relaxed);
@@ -748,6 +782,29 @@ mod tests {
         }
     }
 
+    /// A detector that accepts the frame and never replies — the shape of
+    /// a wedged accelerator (BUG-120's OpenVINO hang, or an i915 reset that
+    /// never completes). It returns no error, so BUG-135's error-streak
+    /// demotion never sees anything to count.
+    struct NeverRepliesProbe;
+
+    #[async_trait]
+    impl Detector for NeverRepliesProbe {
+        async fn detect(
+            &self,
+            _f: &Frame,
+            _p: &[String],
+        ) -> Result<Vec<Detection>, InferenceError> {
+            // No timer: this must hang regardless of whose clock is paused.
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        fn name(&self) -> &'static str {
+            "never_replies_probe"
+        }
+    }
+
     fn tiny_frame() -> Frame {
         Frame {
             camera_id: 0,
@@ -919,5 +976,29 @@ mod tests {
     fn backdate_streak(backend: &ThreadIsolatedBackend) {
         *backend.streak_started.lock() =
             Some(Instant::now() - DEVICE_FAILURE_WINDOW - Duration::from_secs(1));
+    }
+
+    /// Regression: a detector that never replies must fail the call rather
+    /// than wedging it forever.
+    ///
+    /// [[BUG-135 A Wedged Accelerator Keeps Its Worker Ready So Fail-Soft Never Engages]]
+    /// demotes a slot after a streak of `detect` ERRORS. A hang produces no
+    /// error — `detect` simply never returns — so the streak never moves, the
+    /// slot stays `Ready`, `pick_ready` keeps routing frames to it, and the
+    /// camera reports Running while recording nothing until the process is
+    /// restarted.
+    #[tokio::test(start_paused = true)]
+    async fn detect_that_never_replies_times_out_instead_of_wedging() {
+        let cfg = InferenceConfig::default();
+        let detector: Arc<dyn Detector> = Arc::new(NeverRepliesProbe);
+        let backend = ThreadIsolatedBackend::start(0, detector, &cfg).expect("worker spawn");
+        let err = backend
+            .detect(&tiny_frame(), &[])
+            .await
+            .expect_err("a detector that never replies must not hang the caller");
+        assert!(
+            err.to_string().contains("timed out"),
+            "the failure must name the timeout so it is diagnosable, got: {err}"
+        );
     }
 }

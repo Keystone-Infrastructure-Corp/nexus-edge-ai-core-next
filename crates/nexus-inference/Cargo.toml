@@ -85,7 +85,10 @@ name = "nexus-inference-worker"
 path = "src/bin/nexus-inference-worker.rs"
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` is NOT part of tokio's `full`. It gives the tests a pausable
+# clock so the detect deadline is asserted against the real backend rather
+# than by sleeping for it. Same reason nexus-engine enables it (BUG-057).
+tokio = { workspace = true, features = ["test-util"] }
 url = { workspace = true }
 tempfile = { workspace = true }
 ndarray = { workspace = true }

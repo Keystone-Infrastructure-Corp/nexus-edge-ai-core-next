@@ -517,6 +517,12 @@ async fn run_camera(
                 // `observe_frame` is documented to measure; inside the
                 // analysis loop it measured inference rate instead.
                 tap_stats.observe_frame(cam_id, frame.captured_at, frame.width, frame.height);
+                // Gaps in the source's per-session `frame_id` are frames the
+                // bounded channel discarded via `try_send`. This is the only
+                // place that sees both sides of that channel, and until now
+                // those drops were counted nowhere — the one drop counter
+                // measures the motion gate, which drops by design.
+                tap_stats.observe_frame_id(cam_id, frame.frame_id);
                 tap_cache.put_frame(cam_id, epoch, Arc::new(frame.clone()));
                 if latest_tx.send(Some(frame)).is_err() {
                     break;
