@@ -300,7 +300,7 @@ fn decode_yolo26_raw(
     // is 0.001 but per-class >0.25 is the standard inference cutoff.
     // Compared against the SIGMOID-ACTIVATED score, so this really is a
     // probability — see `sigmoid`. It was effectively a logit cutoff until
-    // that activation was added (BUG-219).
+    // that activation was added (BUG-220).
     const SCORE_FLOOR: f32 = 0.20;
     const IOU_THRESHOLD: f32 = 0.70;
 
