@@ -721,14 +721,24 @@ async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str
     // Hand the whole privileged sequence to the single applier. It extracts,
     // applies the release's declared apt deps + journald cap (best-effort,
     // WITHOUT pruning — the rollback target must survive a failed apply),
-    // flips `current`, and restarts the unit. A non-zero exit means the
-    // version did NOT take effect; the caller rolls the persisted version back.
+    // flips `current`, and restarts the unit. Whether the version took effect
+    // is decided by `current`, not by the exit status — see `apply_outcome`.
+    // Sampled BEFORE the spawn: `current` naming the target afterwards only
+    // proves THIS run landed it if it did not already name it going in.
+    let landed_before = current_release_is(version);
     let status = std::process::Command::new("sudo")
         .arg("-n")
         .args(apply_release_argv("apply", version))
         .status();
     match status {
-        Ok(s) => apply_outcome(version, s.success(), s.code(), current_release_is(version)),
+        Ok(s) => apply_outcome(
+            version,
+            s.success(),
+            s.code(),
+            landed_before,
+            current_release_is(version),
+            "apply_failed",
+        ),
         Err(e) => {
             warn!(error = %e, "update: failed to spawn `nexus-apply-release apply`");
             Err("apply_failed")
@@ -736,48 +746,53 @@ async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str
     }
 }
 
-/// Decide whether an `apply` landed, given how the applier exited and whether
-/// `current` now names the target.
+/// Decide whether a privileged flip landed, given how the applier exited and
+/// whether `current` named the target before and after it ran.
 ///
-/// Pure so the decision is testable without spawning anything — the exit-status
-/// handling is the part that has been wrong, not the process plumbing.
+/// Shared by `apply` and `reflip` because both end in the same
+/// `flip_and_restart()` inside the applier and so carry identical exit-form
+/// ambiguity — BUG-023 fixed them as a pair and they must stay one rule.
+///
+/// Pure so the decision is testable without spawning anything: the
+/// exit-status handling is the part that has been wrong, not the plumbing.
 #[cfg(any(target_os = "linux", test))]
 fn apply_outcome(
     version: &str,
     success: bool,
     code: Option<i32>,
-    landed: bool,
+    landed_before: bool,
+    landed_after: bool,
+    failure: &'static str,
 ) -> Result<(), &'static str> {
     if success {
         info!(
             version,
-            "update: applier `apply` requested restart; awaiting SIGTERM"
+            "update: applier requested restart; awaiting SIGTERM"
         );
         return Ok(());
     }
-    // The applier's exit status is not evidence about whether the apply
-    // landed, in either direction. Its last act is flipping `current` and then
-    // restarting the unit, and it runs inside THIS unit's cgroup (we spawned
-    // it) — so systemd's stop job may SIGTERM it before it can exit 0, or the
-    // closing restart may itself return non-zero once the unit is already
-    // going down. Both happen AFTER the flip.
+    // The applier flips `current` and then restarts the unit, from inside that
+    // unit's cgroup. It may be SIGTERMed by the restart it requested, and
+    // because we spawn it through `sudo`, that signal reaches us laundered as
+    // an ordinary exit code (128+N) rather than as `code == None`. Keying the
+    // tolerance on `code.is_none()` therefore missed the common case.
     //
-    // `current` naming the target is the only ground truth available, so it
-    // decides, whatever the exit form. Narrowing this to signal-death (the
-    // original BUG-219 shape) left every non-zero exit reporting a landed
-    // apply as `apply_failed`, which also increments `crash_count` — at 3 that
-    // auto-rolls-back a core running the new version correctly.
-    if landed {
+    // `current` is the ground truth, but only about the flip — and only if it
+    // did not already name the target going in. A re-apply, an operator-flipped
+    // symlink, or a retry over a half-extracted tree all start with
+    // `landed_before == true`, and there the exit status is the only signal
+    // left, so it decides.
+    if landed_after && !landed_before {
         info!(
             version,
             code = ?code,
-            "update: applier exited non-zero but `current` already points at \
-             the target — treating as applied"
+            "update: applier exited non-zero but flipped `current` to the target \
+             during this run — treating as applied"
         );
         return Ok(());
     }
-    warn!(code = ?code, "update: `nexus-apply-release apply` exited non-zero");
-    Err("apply_failed")
+    warn!(code = ?code, landed_before, landed_after, "update: applier exited non-zero");
+    Err(failure)
 }
 
 /// True when `/opt/nexus/current` resolves to a release directory named
@@ -804,26 +819,21 @@ fn release_dir_matches(link_target: &std::path::Path, version: &str) -> bool {
 /// `reflip` mode (no tarball, no deps).
 #[cfg(target_os = "linux")]
 async fn flip_and_restart(version: &str) -> Result<(), &'static str> {
+    // Same sampling rationale as `install_release`.
+    let landed_before = current_release_is(version);
     let status = std::process::Command::new("sudo")
         .arg("-n")
         .args(apply_release_argv("reflip", version))
         .status();
     match status {
-        Ok(s) if s.success() => Ok(()),
-        // Same self-inflicted signal as the `apply` path: the reflip's own
-        // `systemctl restart` tears down the cgroup the applier runs in.
-        Ok(s) if s.code().is_none() && current_release_is(version) => {
-            info!(
-                version,
-                "update: reflip applier signalled by the restart it requested; \
-                 `current` already points at the target — treating as applied"
-            );
-            Ok(())
-        }
-        Ok(s) => {
-            warn!(code = ?s.code(), "update: `nexus-apply-release reflip` exited non-zero");
-            Err("rollback_also_failed")
-        }
+        Ok(s) => apply_outcome(
+            version,
+            s.success(),
+            s.code(),
+            landed_before,
+            current_release_is(version),
+            "rollback_also_failed",
+        ),
         Err(e) => {
             warn!(error = %e, "update: failed to spawn `nexus-apply-release reflip`");
             Err("rollback_also_failed")
@@ -916,42 +926,80 @@ mod tests {
     use ed25519_dalek::pkcs8::EncodePublicKey;
     use ed25519_dalek::{Signer, SigningKey};
 
-    /// The applier's last act is flipping `current`, then restarting the unit.
-    /// If that closing restart returns non-zero, the applier exits non-zero
-    /// AFTER the flip has landed. `current` is ground truth; the exit status is
-    /// not. Reporting failure here also increments `crash_count`, which at 3
-    /// auto-rolls-back a core that is running the new version perfectly.
+    /// The applier flips `current`, then restarts the unit from inside that
+    /// unit's cgroup. We spawn it through `sudo`, so the SIGTERM from the
+    /// restart it requested reaches us laundered as 128+N, not as
+    /// `code == None` — which is why keying the tolerance on signal-death
+    /// missed the case a production core actually hit (BUG-023).
     #[test]
-    fn a_landed_apply_is_success_even_when_the_applier_exits_non_zero() {
-        assert!(
-            apply_outcome("0.1.220", false, Some(1), true).is_ok(),
-            "current names the target, so the apply landed regardless of exit code"
-        );
+    fn a_flip_that_landed_this_run_is_success_whatever_the_exit_code() {
+        for code in [Some(1), Some(143), None] {
+            assert!(
+                apply_outcome("0.1.220", false, code, false, true, "apply_failed").is_ok(),
+                "code {code:?}: the flip landed during this run",
+            );
+        }
     }
 
-    /// The pre-existing signal-death case must keep working.
+    /// The dangerous direction. `current` already naming the target going in
+    /// means this run proves nothing: a re-apply, an operator-flipped symlink,
+    /// or a retry over a half-extracted tree all start that way. There the
+    /// exit status is the only signal left, so a failure stays a failure —
+    /// otherwise a half-written release tree gets reported as applied.
     #[test]
-    fn a_landed_apply_is_success_when_the_applier_dies_by_signal() {
-        assert!(apply_outcome("0.1.220", false, None, true).is_ok());
+    fn an_already_flipped_symlink_does_not_launder_a_failure_into_success() {
+        assert_eq!(
+            apply_outcome("0.1.220", false, Some(1), true, true, "apply_failed"),
+            Err("apply_failed")
+        );
     }
 
     /// A genuine failure is still a failure: nothing landed.
     #[test]
     fn an_apply_that_did_not_land_is_still_failed() {
         assert_eq!(
-            apply_outcome("0.1.220", false, Some(1), false),
+            apply_outcome("0.1.220", false, Some(1), false, false, "apply_failed"),
             Err("apply_failed")
         );
         assert_eq!(
-            apply_outcome("0.1.220", false, None, false),
+            apply_outcome("0.1.220", false, None, false, false, "apply_failed"),
             Err("apply_failed")
         );
     }
 
-    /// A clean exit is success without needing to consult the symlink.
+    /// The rollback path shares the rule and must keep its own error string,
+    /// which the cloud surfaces distinctly from an apply failure.
+    #[test]
+    fn the_rollback_path_shares_the_rule_but_keeps_its_own_error() {
+        assert!(apply_outcome(
+            "0.1.219",
+            false,
+            Some(143),
+            false,
+            true,
+            "rollback_also_failed"
+        )
+        .is_ok());
+        assert_eq!(
+            apply_outcome(
+                "0.1.219",
+                false,
+                Some(1),
+                true,
+                true,
+                "rollback_also_failed"
+            ),
+            Err("rollback_also_failed")
+        );
+    }
+
+    /// Exit 0 is success on its own. Unreachable against the shipped applier —
+    /// `flip_and_restart` dies if `ln` fails and the flip precedes the restart,
+    /// so it cannot exit 0 without having flipped — but pinned so a future
+    /// applier that could does not silently change the contract.
     #[test]
     fn a_clean_exit_is_success() {
-        assert!(apply_outcome("0.1.220", true, Some(0), false).is_ok());
+        assert!(apply_outcome("0.1.220", true, Some(0), false, false, "apply_failed").is_ok());
     }
 
     #[test]
