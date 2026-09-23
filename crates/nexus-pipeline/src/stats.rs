@@ -80,6 +80,13 @@ pub struct CameraFrameStats {
     /// state; this one measures the consumer failing to keep up, which is
     /// the single most important backpressure signal in the pipeline and
     /// was previously counted nowhere at all.
+    ///
+    /// It measures a loop that is BEHIND, not one that has stopped: a gap is
+    /// only banked when a frame finally arrives, so a loop wedged forever on
+    /// one frame holds this at its last value while losing everything. What
+    /// keeps that case visible is the detect deadline that fails a wedged
+    /// backend instead of waiting on it — the loop resumes, and the frames it
+    /// skipped are counted on the next one through.
     pub frames_backpressure_dropped: u64,
     /// Width of the most recent frame, in pixels. For RTSP this is
     /// the detector frame dimension (currently 960), NOT the camera
@@ -773,6 +780,19 @@ mod tests {
             s.frames_backpressure_dropped, 0,
             "a jump of 900k is a different counter, not 900k dropped frames"
         );
+
+        // A reset REBASELINES; it does not make the camera un-countable.
+        // Skipping the baseline update instead would leave `last_frame_id`
+        // pinned at 10, every later id would exceed the cap, and this
+        // camera's counter would read zero for the rest of the process —
+        // the "counted nowhere" defect, back again, with the assertion
+        // above still green.
+        reg.observe_frame_id(1, 900_005);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(
+            s.frames_backpressure_dropped, 3,
+            "the new sequence must be countable immediately after the swap"
+        );
     }
 
     #[test]
@@ -788,6 +808,16 @@ mod tests {
         assert_eq!(
             s.frames_backpressure_dropped, 0,
             "a counter that went BACKWARDS is a new session, not 899 lost frames"
+        );
+
+        // Same rebaseline requirement as the forward-jump case: without it
+        // `last_frame_id` stays at 900 and the next 898 ids all subtract to
+        // zero, silently under-reporting a whole session's loss.
+        reg.observe_frame_id(1, 5);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(
+            s.frames_backpressure_dropped, 2,
+            "the restarted sequence must be countable from its own baseline"
         );
     }
 
