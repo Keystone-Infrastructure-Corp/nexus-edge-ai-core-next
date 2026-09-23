@@ -728,36 +728,56 @@ async fn install_release(bytes: &[u8], version: &str) -> Result<(), &'static str
         .args(apply_release_argv("apply", version))
         .status();
     match status {
-        Ok(s) if s.success() => {
-            info!(
-                version,
-                "update: applier `apply` requested restart; awaiting SIGTERM"
-            );
-            Ok(())
-        }
-        // `ExitStatus::code() == None` means the applier died by signal. Its
-        // last act is `systemctl restart nexus-engine`, and the applier runs
-        // inside THIS unit's cgroup (we spawned it), so systemd's stop job
-        // routinely SIGTERMs it before it can exit 0 — a successful apply
-        // that merely could not report itself. `current` already pointing at
-        // the target is proof the flip landed.
-        Ok(s) if s.code().is_none() && current_release_is(version) => {
-            info!(
-                version,
-                "update: applier signalled by the restart it requested; \
-                 `current` already points at the target — treating as applied"
-            );
-            Ok(())
-        }
-        Ok(s) => {
-            warn!(code = ?s.code(), "update: `nexus-apply-release apply` exited non-zero");
-            Err("apply_failed")
-        }
+        Ok(s) => apply_outcome(version, s.success(), s.code(), current_release_is(version)),
         Err(e) => {
             warn!(error = %e, "update: failed to spawn `nexus-apply-release apply`");
             Err("apply_failed")
         }
     }
+}
+
+/// Decide whether an `apply` landed, given how the applier exited and whether
+/// `current` now names the target.
+///
+/// Pure so the decision is testable without spawning anything — the exit-status
+/// handling is the part that has been wrong, not the process plumbing.
+#[cfg(any(target_os = "linux", test))]
+fn apply_outcome(
+    version: &str,
+    success: bool,
+    code: Option<i32>,
+    landed: bool,
+) -> Result<(), &'static str> {
+    if success {
+        info!(
+            version,
+            "update: applier `apply` requested restart; awaiting SIGTERM"
+        );
+        return Ok(());
+    }
+    // The applier's exit status is not evidence about whether the apply
+    // landed, in either direction. Its last act is flipping `current` and then
+    // restarting the unit, and it runs inside THIS unit's cgroup (we spawned
+    // it) — so systemd's stop job may SIGTERM it before it can exit 0, or the
+    // closing restart may itself return non-zero once the unit is already
+    // going down. Both happen AFTER the flip.
+    //
+    // `current` naming the target is the only ground truth available, so it
+    // decides, whatever the exit form. Narrowing this to signal-death (the
+    // original BUG-219 shape) left every non-zero exit reporting a landed
+    // apply as `apply_failed`, which also increments `crash_count` — at 3 that
+    // auto-rolls-back a core running the new version correctly.
+    if landed {
+        info!(
+            version,
+            code = ?code,
+            "update: applier exited non-zero but `current` already points at \
+             the target — treating as applied"
+        );
+        return Ok(());
+    }
+    warn!(code = ?code, "update: `nexus-apply-release apply` exited non-zero");
+    Err("apply_failed")
 }
 
 /// True when `/opt/nexus/current` resolves to a release directory named
@@ -895,6 +915,44 @@ mod tests {
     use super::*;
     use ed25519_dalek::pkcs8::EncodePublicKey;
     use ed25519_dalek::{Signer, SigningKey};
+
+    /// The applier's last act is flipping `current`, then restarting the unit.
+    /// If that closing restart returns non-zero, the applier exits non-zero
+    /// AFTER the flip has landed. `current` is ground truth; the exit status is
+    /// not. Reporting failure here also increments `crash_count`, which at 3
+    /// auto-rolls-back a core that is running the new version perfectly.
+    #[test]
+    fn a_landed_apply_is_success_even_when_the_applier_exits_non_zero() {
+        assert!(
+            apply_outcome("0.1.220", false, Some(1), true).is_ok(),
+            "current names the target, so the apply landed regardless of exit code"
+        );
+    }
+
+    /// The pre-existing signal-death case must keep working.
+    #[test]
+    fn a_landed_apply_is_success_when_the_applier_dies_by_signal() {
+        assert!(apply_outcome("0.1.220", false, None, true).is_ok());
+    }
+
+    /// A genuine failure is still a failure: nothing landed.
+    #[test]
+    fn an_apply_that_did_not_land_is_still_failed() {
+        assert_eq!(
+            apply_outcome("0.1.220", false, Some(1), false),
+            Err("apply_failed")
+        );
+        assert_eq!(
+            apply_outcome("0.1.220", false, None, false),
+            Err("apply_failed")
+        );
+    }
+
+    /// A clean exit is success without needing to consult the symlink.
+    #[test]
+    fn a_clean_exit_is_success() {
+        assert!(apply_outcome("0.1.220", true, Some(0), false).is_ok());
+    }
 
     #[test]
     fn release_dir_matches_exact_version_component() {
