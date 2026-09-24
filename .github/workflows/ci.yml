@@ -91,6 +91,17 @@ jobs:
       - name: cargo test (EP demotion policy, ort feature)
         run: cargo test --locked -p nexus-inference --features ort,ep-cpu --lib session_tuning
 
+      # `imp.rs`, `ffi.rs` and the `nexus-hailo-probe` binary sit behind
+      # `all(target_os = "linux", feature = "linked")`, so the workspace
+      # check above compiles `stub.rs` in their place and has never
+      # type-checked the real implementation. `linked` is `dlopen`-based
+      # (no build.rs, no link attributes, no build-time HailoRT), so it
+      # compiles on a clean runner with zero Hailo artifacts present.
+      # Without this step the release job is the FIRST compile of that
+      # code, and a failure there blocks a tag cut instead of a PR.
+      - name: cargo clippy (hailo linked path)
+        run: cargo clippy --locked -p nexus-hailo-backend --features linked --all-targets -- -D warnings
+
       # Enforces AGENTS.md rule 2: no face-recognition models in `models/`,
       # no non-commercial / research-only license values on any entry.
       # See [xtask/README.md](../../xtask/README.md). Runs without

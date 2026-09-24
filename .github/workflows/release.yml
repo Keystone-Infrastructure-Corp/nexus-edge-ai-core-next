@@ -83,7 +83,10 @@ jobs:
   #   │   │                                ort,ep-cpu,ep-openvino,ep-cuda,
   #   │   │                                ep-tensorrt,ep-hailo,ep-rocm,ep-vulkan)
   #   │   ├── nexus-probe
-  #   │   └── nexus-doctor
+  #   │   ├── nexus-doctor
+  #   │   └── nexus-hailo-probe           (--features linked; dlopens
+  #   │                                    libhailort at runtime, inert
+  #   │                                    if HailoRT is not installed)
   #   ├── lib/onnxruntime/                (libonnxruntime.so + OpenVINO
   #   │                                    EP + intel CPU/GPU/NPU plugins,
   #   │                                    extracted from the wheel)
@@ -471,6 +474,15 @@ jobs:
             --features "$FEATURES" \
             --bin nexus-engine --bin nexus-doctor
           cargo build --release -p nexus-probe --bin nexus-probe
+          # Hailo field diagnostic. Separate invocation because the binary
+          # lives in `nexus-hailo-backend`, not `nexus-engine`. `linked` is
+          # safe to enable on a clean runner: it is `dlopen`-based (see that
+          # crate's [features] comment), so nothing Hailo needs to be present
+          # at build time -- the SONAME is resolved on the box at runtime.
+          # Without the feature every entry point returns `NotAvailable` and
+          # the tool would ship inert.
+          cargo build --release -p nexus-hailo-backend \
+            --features linked --bin nexus-hailo-probe
 
       - uses: actions/setup-node@v5
         with: { node-version: "22" }
@@ -567,6 +579,7 @@ jobs:
           install -m 0755 target/release/nexus-engine "$R/bin/"
           install -m 0755 target/release/nexus-probe  "$R/bin/"
           install -m 0755 target/release/nexus-doctor "$R/bin/"
+          install -m 0755 target/release/nexus-hailo-probe "$R/bin/"
 
           # Bundled gst-plugins-rs rtpgccbwe (paced congestion control),
           # built by the rtp-plugin job against gst 1.24. Optional — the
