@@ -38,6 +38,10 @@ pub mod error;
 
 pub use error::Error;
 
+/// Pure output decoding, deliberately outside the `linked` gate so it is
+/// compiled and tested on every target. See the module docs.
+mod decode;
+
 #[cfg(all(target_os = "linux", feature = "linked"))]
 mod ffi;
 #[cfg(all(target_os = "linux", feature = "linked"))]
@@ -46,16 +50,12 @@ mod imp;
 #[cfg(not(all(target_os = "linux", feature = "linked")))]
 mod stub;
 
+pub use decode::{decode_detections, OutputLayout, OutputStreamInfo, RawYolo26Scale};
+
 #[cfg(all(target_os = "linux", feature = "linked"))]
-pub use imp::{
-    decode_detections, DeviceInfo, DeviceTelemetry, InferSession, OutputLayout, OutputStreamInfo,
-    RawYolo26Scale, Telemetry,
-};
+pub use imp::{DeviceInfo, DeviceTelemetry, InferSession, Telemetry};
 #[cfg(not(all(target_os = "linux", feature = "linked")))]
-pub use stub::{
-    decode_detections, DeviceInfo, DeviceTelemetry, InferSession, OutputLayout, OutputStreamInfo,
-    RawYolo26Scale, Telemetry,
-};
+pub use stub::{DeviceInfo, DeviceTelemetry, InferSession, Telemetry};
 
 /// One detection decoded from the on-chip NMS output.
 ///
