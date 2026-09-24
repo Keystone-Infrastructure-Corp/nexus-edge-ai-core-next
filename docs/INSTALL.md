@@ -864,6 +864,17 @@ sudo -u nexus hailortcli scan
 # Same output — proves the service user can open /dev/hailo0.
 ls -l /dev/hailo*
 # Expect: crw-rw---- 1 root hailo ...   (group `hailo`, mode 0660)
+
+sudo -u nexus /opt/nexus/current/bin/nexus-hailo-probe
+# One line per device: board, serial, firmware version, PCIe id.
+# Exits 2 if the build has no HailoRT linkage, 3 if no device is found.
+
+sudo -u nexus /opt/nexus/current/bin/nexus-hailo-probe \
+  --hef /opt/nexus/current/share/models/yolo26n_512x288_hailo.hef
+# Also opens the HEF and pushes one blank frame through the real decode
+# path, printing the input/output tensor shapes and the detected output
+# layout. Use it to confirm the engine and the chip agree about the
+# model before blaming the pipeline.
 ```
 
 If `/dev/hailo0` is missing immediately after install, the DKMS
@@ -1067,7 +1078,8 @@ Each release directory contains:
 bin/
 ├── nexus-engine             # FEATURES=gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt,ep-hailo,ep-rocm
 ├── nexus-probe
-└── nexus-doctor
+├── nexus-doctor
+└── nexus-hailo-probe        # Hailo field diagnostic; inert unless HailoRT is installed
 lib/onnxruntime/             # libonnxruntime.so + OpenVINO EP + intel CPU/GPU/NPU plugins
 lib/nexus/
 └── nexus-netd               # privileged netplan helper (§6.5)
