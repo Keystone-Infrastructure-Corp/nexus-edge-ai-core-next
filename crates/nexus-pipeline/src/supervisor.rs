@@ -1096,19 +1096,22 @@ async fn run_camera(
                 // overlay subscriber's broadcast buffer no longer
                 // dominates `BusError::Lagged` under crowd load. The
                 // attributes panel still subscribes to the full topic
-                // via `?attributes=full`.
-                let meta_lite = FrameMetadataLite {
-                    camera_id: meta.camera_id,
-                    frame_id: meta.frame_id,
-                    captured_at: meta.captured_at,
-                    width: meta.width,
-                    height: meta.height,
-                    trace_id: meta.trace_id.clone(),
-                    objects: Arc::new(tracked_arc.iter().map(TrackLite::from).collect()),
-                };
-                let _ = bus
-                    .publish(topic::FRAME_METADATA_LITE, &meta_lite)
-                    .await;
+                // via `?attributes=full`. The projection is only built
+                // while a live view is subscribed.
+                if bus.has_subscribers(topic::FRAME_METADATA_LITE) {
+                    let meta_lite = FrameMetadataLite {
+                        camera_id: meta.camera_id,
+                        frame_id: meta.frame_id,
+                        captured_at: meta.captured_at,
+                        width: meta.width,
+                        height: meta.height,
+                        trace_id: meta.trace_id.clone(),
+                        objects: Arc::new(tracked_arc.iter().map(TrackLite::from).collect()),
+                    };
+                    let _ = bus
+                        .publish(topic::FRAME_METADATA_LITE, &meta_lite)
+                        .await;
+                }
 
                 // Partition: rules and the motion lifecycle only see
                 // non-static tracks. A parked car shouldn't keep firing
