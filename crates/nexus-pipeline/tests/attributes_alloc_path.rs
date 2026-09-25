@@ -18,6 +18,10 @@
 //!
 //! `cargo test -p nexus-pipeline --test attributes_alloc_path -- --nocapture`
 //! also prints a per-stage census of the whole post-inference path.
+//!
+//! The bounds count calls into the allocator, so a `cel-interpreter` or
+//! `serde_json` upgrade can legitimately move them. That is a re-baseline,
+//! not a flake; re-measure with the census before loosening a bound.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

@@ -10,6 +10,9 @@
 //! frames with M tracks. Counting is per thread (`#[global_allocator]` +
 //! thread-locals), so the numbers are deterministic.
 //! `-- --nocapture` prints the per-stage census.
+//!
+//! The bound counts calls into the allocator, so a `serde_json` upgrade can
+//! legitimately move it. That is a re-baseline, not a flake.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
