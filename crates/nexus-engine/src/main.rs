@@ -2379,7 +2379,9 @@ fn build_reid_extractor(
 /// affect everything atomically.
 ///
 /// Every branch also registers the cameras' SPEC-069 substreams, once
-/// each, and returns the URL each boot entry records.
+/// each, and returns the URL each boot entry records. The gstreamer
+/// recorder registers only the cameras whose main ingester built, so any
+/// other camera records `None` with no attempt.
 ///
 /// `Stub` is always available. `Gstreamer` requires the `gstreamer`
 /// cargo feature on `nexus-pipeline`; on a build without the feature
@@ -2450,7 +2452,9 @@ async fn build_recorder(
 /// The stub keeps the trait's no-op, which reads neither codec nor dims, so
 /// neither is resolved here: no main-stream probe and no fourth copy of the
 /// supervisor-dims formula. That would have to change if the stub ever
-/// registered sessions.
+/// registered sessions. `apply_analysis_session` still probes each RTSP
+/// substream's codec, which the no-op ignores; that probe used to run in
+/// the first restart about 30 s after boot, and is the accepted boot cost.
 async fn register_stub_analysis_sessions(
     rec: &dyn nexus_pipeline::ClipRecorder,
     cameras: &[CameraConfig],

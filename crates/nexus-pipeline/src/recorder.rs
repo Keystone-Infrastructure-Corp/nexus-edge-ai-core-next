@@ -227,13 +227,14 @@ pub trait ClipRecorder: Send + Sync {
     /// `Some(url)` means nothing to retry until the configured URL
     /// changes: a recorder with substream sessions now has one for `url`;
     /// the default no-op, for recorders without them, has nothing to
-    /// register, and that is not a failure. `Err` means nothing was
-    /// registered. The reconciler retries on each pass by restarting the
-    /// whole camera, main recording session included, until a call
-    /// succeeds, so return `Err` only for a failure a later call can cure.
-    /// For `None` nothing is retried: the engine logs a failed teardown
-    /// when it applies a camera's config, and discards the result when it
-    /// stops the camera.
+    /// register, and that is not a failure. `Err` means no new session was
+    /// registered (an earlier one may remain, but the engine tears a
+    /// camera's session down before it starts the camera again). The
+    /// reconciler retries on each pass by restarting the whole camera, main
+    /// recording session included, until a call succeeds, so return `Err`
+    /// only for a failure a later call can cure. For `None` nothing is
+    /// retried: the engine logs a failed teardown when it applies a
+    /// camera's config, and discards the result when it stops the camera.
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
     fn set_camera_analysis_ingester(
