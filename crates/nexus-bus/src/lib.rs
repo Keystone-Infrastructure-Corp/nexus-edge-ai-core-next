@@ -191,6 +191,8 @@ pub trait Bus: Send + Sync {
     /// skips serialisation when this is `false`, so a backend may return
     /// `false` only when it knows the message would be dropped anyway.
     /// The default is `true`: a backend that cannot tell pays the cost.
+    /// A consequence: with nobody listening, a payload that cannot be
+    /// serialised returns `Ok` rather than `Err(Serialize)`.
     fn has_subscribers(&self, _topic: &str) -> bool {
         true
     }

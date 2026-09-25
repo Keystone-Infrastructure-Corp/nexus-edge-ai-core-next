@@ -171,17 +171,27 @@ fn dynamic_tracks(
     }
 }
 
+/// Most alert snapshots one frame encodes at once. Each holds its own copy
+/// of the frame (~4 MB at 1536x864) and a blocking-pool thread, so a crowd
+/// scene firing many rules must not take them all at the same time.
+const ALERT_SNAPSHOT_CONCURRENCY: usize = 4;
+
 /// Write one snapshot per event and stamp its path onto
-/// `artifacts.snapshot`. The writes for one frame run concurrently (each
-/// is its own blocking-pool encode, since every snapshot burns in its own
-/// box + label) and all complete before this returns, so the caller's
-/// record/enqueue/publish still sees every path it would have serially.
+/// `artifacts.snapshot`. The writes for one frame run concurrently, up to
+/// [`ALERT_SNAPSHOT_CONCURRENCY`] at a time (each is its own blocking-pool
+/// encode, since every snapshot burns in its own box + label), and all
+/// complete before this returns, so the caller's record/enqueue/publish
+/// still sees every path it would have serially.
 async fn stamp_alert_snapshots<F, Fut>(events: &mut [AlertEvent], write: F)
 where
     F: Fn(&AlertEvent) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
-    let paths = futures::future::join_all(events.iter().map(&write)).await;
+    use futures::StreamExt;
+    let paths: Vec<_> = futures::stream::iter(events.iter().map(&write))
+        .buffered(ALERT_SNAPSHOT_CONCURRENCY)
+        .collect()
+        .await;
     for (ev, path) in events.iter_mut().zip(paths) {
         if let Some(path) = path {
             ev.artifacts.snapshot = Some(path);
@@ -1671,26 +1681,37 @@ mod tests {
         assert_eq!(ids, vec![1, 3]);
     }
 
-    /// N events on one frame must have their snapshots in flight together:
-    /// each fake write parks on an N-party barrier, so a serial loop never
-    /// gets past the first write and the timeout fails the test. No
-    /// wall-clock race — a pass means all N were concurrently pending.
+    /// A frame's snapshots must be in flight together, but never more than
+    /// the cap: each fake write parks on a cap-sized barrier, so a serial
+    /// loop never gets past the first write and the timeout fails the test,
+    /// and twice the cap in events only completes if the barrier is reached
+    /// in cap-sized waves. No wall-clock race.
     #[tokio::test]
     async fn snapshots_for_one_frame_are_written_concurrently() {
-        const N: usize = 5;
+        const N: usize = ALERT_SNAPSHOT_CONCURRENCY;
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
-        let mut events: Vec<AlertEvent> = (1..=N as u128).map(event).collect();
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut events: Vec<AlertEvent> = (1..=2 * N as u128).map(event).collect();
         let run = stamp_alert_snapshots(&mut events, |ev| {
-            let barrier = barrier.clone();
+            let (barrier, in_flight, peak) = (barrier.clone(), in_flight.clone(), peak.clone());
             let path = format!("/snap/{}.jpg", ev.event_id);
             async move {
+                use std::sync::atomic::Ordering::SeqCst;
+                peak.fetch_max(in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
                 barrier.wait().await;
+                in_flight.fetch_sub(1, SeqCst);
                 Some(path)
             }
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), run)
             .await
             .expect("snapshot writes ran serially: the barrier was never reached by all N");
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            N,
+            "snapshot writes exceeded the concurrency cap"
+        );
         for ev in &events {
             assert_eq!(
                 ev.artifacts.snapshot.as_deref(),
