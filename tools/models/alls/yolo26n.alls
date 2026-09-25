@@ -23,3 +23,11 @@ performance_param(compiler_optimization_level=max)
 quantization_param(conv64, force_range_out=[-10.0, 10.0])
 quantization_param(conv80, force_range_out=[-10.0, 10.0])
 quantization_param(conv94, force_range_out=[-10.0, 10.0])
+#
+# HAZARD: this clamp is only safe because optimization_level=2 skips Bias Correction
+# (compile logs: "Bias Correction skipped"). At level 1 the same clamp collapsed the
+# yoloe26_s class head to a constant, silently -- rc=0 and qp_zp looked perfect. If the
+# level is ever lowered, add
+#   post_quantization_optimization(bias_correction, layers=[conv64, conv80, conv94], policy=disabled)
+# and re-verify detection counts on real frames. Not added here, so this recipe stays the
+# one that built the measured HEFs. See BUG-221.

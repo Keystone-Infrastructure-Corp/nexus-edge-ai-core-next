@@ -3,3 +3,24 @@ model_optimization_config(calibration, batch_size=8, calibset_size=256)
 model_optimization_flavor(optimization_level=1, compression_level=0)
 post_quantization_optimization(adaround, policy=enabled, batch_size=8)
 performance_param(compiler_optimization_level=max)
+
+# Class-branch output range -- same defect and same fix as yolo26n.alls (BUG-221).
+# Measured on a Hailo-8 without this: the c=44 class convs quantised to
+# [-50.4,+1.8] / [-116.2,+2.3] / [-89.4,+2.5] (qp_zp 246/250/248), leaving 9 / 5 / 7
+# uint8 levels above logit 0. The decoder applies sigmoid, so clipping the negative
+# tail to -10 costs nothing observable. Layer names verified on all three shapes.
+quantization_param(conv64, force_range_out=[-10.0, 10.0])
+quantization_param(conv80, force_range_out=[-10.0, 10.0])
+quantization_param(conv94, force_range_out=[-10.0, 10.0])
+#
+# Bias correction is disabled on these three layers because, with the clamp alone, the
+# class head collapsed. Measured on a Hailo-8 (512x288, optimization_level=1): every
+# class value on the frame inspected with `nexus-hailo-probe --stats` was exactly
+# -10.0787 (q=0), and 200 COCO frames gave 0 detections (shipped HEF: 560). Adding this
+# one line -- nothing else changed -- restored 571 detections, 95.4% matched.
+# Likely mechanism (inferred, not measured): level 1 runs Bias Correction (yolo26n's
+# level 2 logs "Bias Correction skipped"), which shifts a layer's bias to match the float
+# output mean; the clamp makes the float mean unreachable, so the bias is pushed down
+# until everything saturates at the floor. Shown for 512x288; the other shapes were
+# compiled with this line from the start and verified to work, not to fail without it.
+post_quantization_optimization(bias_correction, layers=[conv64, conv80, conv94], policy=disabled)

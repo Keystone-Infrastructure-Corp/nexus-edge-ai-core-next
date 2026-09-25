@@ -5,6 +5,7 @@
 //!     nexus-hailo-probe --hef path/to/yolo26n.hef   # also open + dummy infer
 //!     nexus-hailo-probe --hef m.hef --images DIR --csv OUT.csv
 //!                                                   # run raw RGB frames, one row per detection
+//!     ... --stats                                   # also print raw output stats for the first frame
 //!
 //! Exits non-zero on any failure. Designed for `journalctl`-friendly
 //! line output rather than pretty TUI.
@@ -85,6 +86,39 @@ fn parse_flag(flag: &str) -> Option<PathBuf> {
     None
 }
 
+/// `--stats`: per-output min / max / mean / fraction-positive of the dequantised
+/// values for the first frame. Shows what the chip actually emits before the
+/// floor and NMS -- the question a zero-detection result cannot answer on its own.
+fn print_output_stats(name: &str, out_names: &[String], raw: &[Vec<u8>]) {
+    println!("stats for {name}:");
+    for (out, buf) in out_names.iter().zip(raw) {
+        let v: Vec<f32> = buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        if v.is_empty() {
+            println!("  {out:<28} n=0");
+            continue;
+        }
+        let (mut lo, mut hi, mut sum, mut pos) = (f32::MAX, f32::MIN, 0f64, 0usize);
+        for &x in &v {
+            lo = lo.min(x);
+            hi = hi.max(x);
+            sum += x as f64;
+            pos += (x > 0.0) as usize;
+        }
+        println!(
+            "  {:<28} n={:<7} min={lo:.4} max={hi:.4} mean={:.4} positive={:.3}%",
+            out,
+            v.len(),
+            sum / v.len() as f64,
+            100.0 * pos as f64 / v.len() as f64,
+        );
+    }
+}
+
 /// Run every raw frame in `dir` and print one CSV row per detection.
 ///
 /// Frames are raw interleaved RGB of exactly `input_frame_size()` bytes --
@@ -104,6 +138,11 @@ fn run_images(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
     let want = session.input_frame_size();
+    let out_names: Vec<String> = session
+        .output_infos()
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
     let mut unlisted = 0usize;
     let mut files: Vec<PathBuf> = Vec::new();
     for e in std::fs::read_dir(dir)? {
@@ -145,6 +184,9 @@ fn run_images(
                 continue;
             }
         };
+        if run == 0 && env::args().any(|a| a == "--stats") {
+            print_output_stats(&name, &out_names, raw);
+        }
         for d in nexus_hailo_backend::decode_detections(raw, layout, 200) {
             writeln!(
                 out,
