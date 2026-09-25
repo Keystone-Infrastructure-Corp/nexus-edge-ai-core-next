@@ -7,8 +7,9 @@
 //!
 //! The HTTP layer (`GET /v1/cameras/:id/stats` + the same fields
 //! merged into `GET /api/v1/cameras`) reads a cheap snapshot of the
-//! map. One writer per camera, many readers, over a
-//! `parking_lot::RwLock<HashMap>`.
+//! map. Each camera has its own lock, so one camera's per-frame update
+//! never waits on another's; the map itself is write-locked only when a
+//! camera is first seen or cleared.
 //!
 //! Why a separate registry instead of squatting on the existing bus
 //! `PIPELINE_STATUS` topic: that topic publishes only on supervisor
@@ -16,11 +17,12 @@
 //! every frame, so it can't carry a live fps EMA.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use nexus_types::CameraId;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
 /// Sliding window over which `fps_ema` is averaged. Two seconds is
@@ -187,12 +189,44 @@ impl Entry {
 
 #[derive(Default)]
 pub struct FrameStatsRegistry {
-    inner: RwLock<HashMap<CameraId, Entry>>,
+    inner: RwLock<HashMap<CameraId, Arc<Mutex<Entry>>>>,
 }
 
 impl FrameStatsRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn slot(&self, camera_id: CameraId) -> Option<Arc<Mutex<Entry>>> {
+        self.inner.read().get(&camera_id).cloned()
+    }
+
+    /// Only [`Self::observe_frame`] may bring a camera into the registry.
+    /// Every other writer goes through [`Self::slot`] and is a no-op for a
+    /// camera that has not produced a frame since it was last cleared.
+    fn slot_or_insert(&self, camera_id: CameraId) -> Arc<Mutex<Entry>> {
+        if let Some(slot) = self.slot(camera_id) {
+            return slot;
+        }
+        self.inner
+            .write()
+            .entry(camera_id)
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(Entry {
+                    last_frame_at: None,
+                    recent_instants: VecDeque::with_capacity(FPS_WINDOW_MAX_SAMPLES),
+                    frames_emitted: 0,
+                    frames_backpressure_dropped: 0,
+                    last_frame_id: None,
+                    frames_dropped: 0,
+                    source_width: 0,
+                    source_height: 0,
+                    tile_invocations: 0,
+                    tile_detections_added: 0,
+                    tile_inference_ms_total: 0,
+                }))
+            })
+            .clone()
     }
 
     /// Record one frame from the source. `captured_at` should be the
@@ -206,20 +240,9 @@ impl FrameStatsRegistry {
         height: u32,
     ) {
         let now = Instant::now();
-        let mut guard = self.inner.write();
-        let entry = guard.entry(camera_id).or_insert_with(|| Entry {
-            last_frame_at: None,
-            recent_instants: VecDeque::with_capacity(FPS_WINDOW_MAX_SAMPLES),
-            frames_emitted: 0,
-            frames_backpressure_dropped: 0,
-            last_frame_id: None,
-            frames_dropped: 0,
-            source_width: 0,
-            source_height: 0,
-            tile_invocations: 0,
-            tile_detections_added: 0,
-            tile_inference_ms_total: 0,
-        });
+        let slot = self.slot_or_insert(camera_id);
+        let mut guard = slot.lock();
+        let entry = &mut *guard;
         // Prune anything older than the window before appending so the
         // VecDeque stays bounded even at high arrival rates.
         let cutoff = now - FPS_WINDOW;
@@ -262,10 +285,10 @@ impl FrameStatsRegistry {
         /// the decode-health ladder firing first.
         const MAX_PLAUSIBLE_FRAME_GAP: u64 = 4096;
 
-        let mut guard = self.inner.write();
-        let Some(entry) = guard.get_mut(&camera_id) else {
+        let Some(slot) = self.slot(camera_id) else {
             return;
         };
+        let mut entry = slot.lock();
         if let Some(prev) = entry.last_frame_id {
             let lost = frame_id.saturating_sub(prev).saturating_sub(1);
             // A jump this large is not a camera that fell behind — it is a
@@ -284,8 +307,8 @@ impl FrameStatsRegistry {
     }
 
     pub fn observe_dropped(&self, camera_id: CameraId) {
-        let mut guard = self.inner.write();
-        if let Some(entry) = guard.get_mut(&camera_id) {
+        if let Some(slot) = self.slot(camera_id) {
+            let mut entry = slot.lock();
             entry.frames_dropped = entry.frames_dropped.saturating_add(1);
         }
     }
@@ -298,8 +321,8 @@ impl FrameStatsRegistry {
     /// the cascade always runs after `observe_frame`, so the entry is
     /// guaranteed to exist by the time this is called.
     pub fn observe_tile_invocation(&self, camera_id: CameraId, added: u64, infer_ms: u64) {
-        let mut guard = self.inner.write();
-        if let Some(entry) = guard.get_mut(&camera_id) {
+        if let Some(slot) = self.slot(camera_id) {
+            let mut entry = slot.lock();
             entry.tile_invocations = entry.tile_invocations.saturating_add(1);
             entry.tile_detections_added = entry.tile_detections_added.saturating_add(added);
             entry.tile_inference_ms_total = entry.tile_inference_ms_total.saturating_add(infer_ms);
@@ -315,15 +338,22 @@ impl FrameStatsRegistry {
 
     pub fn snapshot(&self, camera_id: CameraId) -> Option<CameraFrameStats> {
         let now = Instant::now();
-        self.inner.read().get(&camera_id).map(|e| e.snapshot(now))
+        self.slot(camera_id).map(|slot| slot.lock().snapshot(now))
     }
 
+    /// Each row is consistent within its camera; the rows are not one
+    /// cross-camera instant, which no reader needs.
     pub fn snapshot_all(&self) -> HashMap<CameraId, CameraFrameStats> {
         let now = Instant::now();
-        self.inner
+        let slots: Vec<(CameraId, Arc<Mutex<Entry>>)> = self
+            .inner
             .read()
             .iter()
-            .map(|(k, v)| (*k, v.snapshot(now)))
+            .map(|(id, slot)| (*id, slot.clone()))
+            .collect();
+        slots
+            .into_iter()
+            .map(|(id, slot)| (id, slot.lock().snapshot(now)))
             .collect()
     }
 }
@@ -338,14 +368,25 @@ impl FrameStatsRegistry {
 /// frame before the decoder or after it?". These counters are written by the
 /// ingester, on either side of the decoder, and answering that question is
 /// their whole purpose (BUG-071).
+///
+/// Every camera's streaming threads write here, several times per decoded
+/// frame, so each camera has its own lock and a probe only ever waits on its
+/// own camera. The map is write-locked only when a camera is first seen or
+/// cleared.
 #[derive(Debug, Default)]
 pub struct DecodeHealthRegistry {
-    inner: RwLock<HashMap<CameraId, DecodeHealth>>,
-    /// SPEC-069 Phase 1 — windowed-rate side-state, one [`RateState`] per
-    /// camera. Kept in its own map (rather than inline on `DecodeHealth`)
-    /// because it holds `Instant`s, which are neither serializable nor
-    /// `Copy`-cheap to carry through the public snapshot type.
-    rates: RwLock<HashMap<CameraId, RateState>>,
+    inner: RwLock<HashMap<CameraId, Arc<Mutex<DecodeSlot>>>>,
+}
+
+/// One camera's counters and the SPEC-069 Phase 1 windowed-rate side-state
+/// they are derived from, under one lock so a probe updates both in a single
+/// critical section. The [`RateState`] holds `Instant`s, which are neither
+/// serializable nor `Copy`-cheap, so it stays here and the public snapshot
+/// remains the plain [`DecodeHealth`].
+#[derive(Debug, Default)]
+struct DecodeSlot {
+    health: DecodeHealth,
+    rates: RateState,
 }
 
 /// Snapshot of one camera's decode health. Cheap to clone.
@@ -476,35 +517,41 @@ impl DecodeHealthRegistry {
         Self::default()
     }
 
+    fn slot(&self, camera_id: CameraId) -> Option<Arc<Mutex<DecodeSlot>>> {
+        self.inner.read().get(&camera_id).cloned()
+    }
+
+    /// Every probe records on first sight, so every writer comes through here.
+    fn slot_or_insert(&self, camera_id: CameraId) -> Arc<Mutex<DecodeSlot>> {
+        if let Some(slot) = self.slot(camera_id) {
+            return slot;
+        }
+        self.inner.write().entry(camera_id).or_default().clone()
+    }
+
     /// Record one leaked access unit on the RGB branch's decoder-input queue.
     pub fn observe_decoder_input_drop(&self, camera_id: CameraId) {
-        let mut guard = self.inner.write();
-        let e = guard.entry(camera_id).or_default();
-        e.decoder_input_drops = e.decoder_input_drops.saturating_add(1);
+        let slot = self.slot_or_insert(camera_id);
+        let mut s = slot.lock();
+        s.health.decoder_input_drops = s.health.decoder_input_drops.saturating_add(1);
     }
 
     /// Record one frame emitted by the decoder itself (src-pad probe).
     pub fn observe_decoder_output(&self, camera_id: CameraId) {
         let now = Instant::now();
-        let fps = self
-            .rates
-            .write()
-            .entry(camera_id)
-            .or_default()
-            .decoder_output
-            .record(now);
-        let mut guard = self.inner.write();
-        let e = guard.entry(camera_id).or_default();
-        e.decoder_output_frames = e.decoder_output_frames.saturating_add(1);
-        e.decoder_output_fps = fps;
+        let slot = self.slot_or_insert(camera_id);
+        let mut s = slot.lock();
+        let fps = s.rates.decoder_output.record(now);
+        s.health.decoder_output_frames = s.health.decoder_output_frames.saturating_add(1);
+        s.health.decoder_output_fps = fps;
     }
 
     /// Record the width/height negotiated on the decoder's src pad.
     pub fn observe_decoder_geometry(&self, camera_id: CameraId, width: u32, height: u32) {
-        let mut guard = self.inner.write();
-        let e = guard.entry(camera_id).or_default();
-        e.decoder_width = width;
-        e.decoder_height = height;
+        let slot = self.slot_or_insert(camera_id);
+        let mut s = slot.lock();
+        s.health.decoder_width = width;
+        s.health.decoder_height = height;
     }
 
     /// Publish the loop detector's running totals. Absolute, not deltas, so
@@ -513,30 +560,23 @@ impl DecodeHealthRegistry {
     /// sampled frames.
     pub fn observe_loop_stats(&self, camera_id: CameraId, sampled: u64, duplicates: u64) {
         let now = Instant::now();
-        let fps = self
-            .rates
-            .write()
-            .entry(camera_id)
-            .or_default()
-            .sampled
-            .record(now);
-        let mut guard = self.inner.write();
-        let e = guard.entry(camera_id).or_default();
-        e.sampled_frames = sampled;
-        e.duplicate_frames = duplicates;
-        e.sampled_fps = fps;
+        let slot = self.slot_or_insert(camera_id);
+        let mut s = slot.lock();
+        let fps = s.rates.sampled.record(now);
+        s.health.sampled_frames = sampled;
+        s.health.duplicate_frames = duplicates;
+        s.health.sampled_fps = fps;
     }
 
     /// Reset one camera. Called when a supervisor stops so the next spawn
     /// starts clean, mirroring [`FrameStatsRegistry::clear`].
     pub fn clear(&self, camera_id: CameraId) {
         self.inner.write().remove(&camera_id);
-        self.rates.write().remove(&camera_id);
     }
 
     #[must_use]
     pub fn snapshot(&self, camera_id: CameraId) -> Option<DecodeHealth> {
-        self.inner.read().get(&camera_id).copied()
+        self.slot(camera_id).map(|slot| slot.lock().health)
     }
 
     /// Every camera the registry currently holds health for. The absent-vs-
@@ -545,7 +585,16 @@ impl DecodeHealthRegistry {
     /// not the same as one decoding cleanly.
     #[must_use]
     pub fn snapshot_all(&self) -> HashMap<CameraId, DecodeHealth> {
-        self.inner.read().clone()
+        let slots: Vec<(CameraId, Arc<Mutex<DecodeSlot>>)> = self
+            .inner
+            .read()
+            .iter()
+            .map(|(id, slot)| (*id, slot.clone()))
+            .collect();
+        slots
+            .into_iter()
+            .map(|(id, slot)| (id, slot.lock().health))
+            .collect()
     }
 }
 
@@ -1188,5 +1237,134 @@ mod tests {
     fn camera_never_seen_is_offline() {
         let reg = FrameStatsRegistry::new();
         assert!(reg.snapshot(99).is_none());
+    }
+
+    /// Every camera's decode-rate tap writes this registry on every frame,
+    /// and its analysis loop writes the frame-id and gate-drop counters on
+    /// every analysed frame. While one lock covers every camera, camera 7's
+    /// update excludes camera 9's and a reader of camera 9 queues behind
+    /// both. A camera's stats must only ever wait on that same camera. The
+    /// check fails by timeout only on regression; on the passing path camera
+    /// 9's calls complete without waiting.
+    #[test]
+    fn a_write_for_one_camera_is_not_blocked_by_another_cameras_lock() {
+        let reg = std::sync::Arc::new(FrameStatsRegistry::new());
+        reg.observe_frame(7, Utc::now(), 960, 540);
+
+        // Camera 7's own lock, the one `observe_frame(7, ..)` holds for its
+        // critical section.
+        let held = reg.slot(7).unwrap();
+        let guard = held.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = reg.clone();
+        let worker = std::thread::spawn(move || {
+            r.observe_frame(9, Utc::now(), 960, 540);
+            r.observe_frame_id(9, 1);
+            r.observe_frame_id(9, 3);
+            r.observe_dropped(9);
+            r.observe_tile_invocation(9, 2, 5);
+            let got = r.snapshot(9).map(|s| {
+                (
+                    s.frames_emitted,
+                    s.frames_backpressure_dropped,
+                    s.frames_dropped,
+                    s.tile_invocations,
+                )
+            });
+            let _ = tx.send(got);
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(
+            got.expect("camera 9's stats write waited on camera 7's lock"),
+            Some((1, 1, 1, 1))
+        );
+    }
+
+    /// Only a frame brings a camera into the registry. `stop_camera` clears
+    /// the stats, but the stopped session's analysis loop can still be
+    /// draining; a gate drop it reports afterwards must not recreate the
+    /// camera, or the stats API keeps answering for a camera that is gone
+    /// and the next session starts with a drop already counted.
+    #[test]
+    fn a_gate_drop_after_clear_does_not_bring_the_camera_back() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 320, 240);
+        reg.clear(1);
+
+        reg.observe_dropped(1);
+
+        assert!(
+            reg.snapshot(1).is_none(),
+            "a gate drop recreated a cleared camera"
+        );
+        assert!(reg.snapshot_all().is_empty());
+    }
+
+    /// Same as the gate-drop case, for the frame-id gap counter. A stale id
+    /// banked into a recreated entry would also become the next session's
+    /// baseline and turn its first frame into a phantom backpressure gap.
+    #[test]
+    fn a_frame_id_after_clear_does_not_bring_the_camera_back() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 320, 240);
+        reg.clear(1);
+
+        reg.observe_frame_id(1, 5);
+
+        assert!(
+            reg.snapshot(1).is_none(),
+            "a frame id recreated a cleared camera"
+        );
+        reg.observe_frame(1, Utc::now(), 320, 240);
+        reg.observe_frame_id(1, 9);
+        assert_eq!(
+            reg.snapshot(1).unwrap().frames_backpressure_dropped,
+            0,
+            "the new session's first id must be its baseline, not a gap from a stale one"
+        );
+    }
+
+    /// The decode-health probes run on each camera's own GStreamer streaming
+    /// threads, several times per decoded frame. While one lock covered every
+    /// camera, camera 7's probe excluded camera 9's, and a blocked probe
+    /// stalls that camera's decode chain. The check fails by timeout only on
+    /// regression.
+    #[test]
+    fn a_decode_health_write_for_one_camera_is_not_blocked_by_another_cameras_lock() {
+        let reg = std::sync::Arc::new(DecodeHealthRegistry::new());
+        reg.observe_decoder_output(7);
+
+        // Camera 7's own lock, the one its probes take for their critical
+        // section.
+        let held = reg.slot(7).unwrap();
+        let guard = held.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = reg.clone();
+        let worker = std::thread::spawn(move || {
+            r.observe_decoder_input_drop(9);
+            r.observe_decoder_output(9);
+            r.observe_decoder_geometry(9, 640, 360);
+            r.observe_loop_stats(9, 3, 1);
+            let got = r.snapshot(9).map(|h| {
+                (
+                    h.decoder_input_drops,
+                    h.decoder_output_frames,
+                    h.decoder_width,
+                    h.decoder_height,
+                    h.sampled_frames,
+                    h.duplicate_frames,
+                )
+            });
+            let _ = tx.send(got);
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(
+            got.expect("camera 9's decode-health write waited on camera 7's lock"),
+            Some((1, 1, 640, 360, 3, 1))
+        );
     }
 }
