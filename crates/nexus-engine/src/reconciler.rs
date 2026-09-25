@@ -23,8 +23,10 @@
 //!
 //! Restart triggers today: a supervisor that exited without being
 //! stopped (nothing announces that, hence the periodic pass), ingest
-//! URL change, supervisor (analysis) frame dimension change, and
-//! ingest codec change. Detector /
+//! URL change, supervisor (analysis) frame dimension change, ingest
+//! codec change, and an analysis substream (SPEC-069) the recorder has
+//! not accepted: a changed `analysis_url`, or a registration that failed
+//! and is retried this way. Detector /
 //! threshold / rule changes do not — those still require a process
 //! restart (or a future, finer-grained hot-reload path). This
 //! matches the UX where the admin UI surfaces camera ingest edits
@@ -82,8 +84,11 @@ pub struct RunningCameraEntry {
     /// fresh ingester rather than continuing to decode with the
     /// previous depayloader/decoder chain.
     pub codec: Option<CodecKind>,
-    /// Configured analysis substream URL (SPEC-069), or `None` when
-    /// analysis reads the main stream. Compared on each reconcile pass
+    /// The analysis substream URL (SPEC-069) the recorder accepted — what
+    /// `apply_analysis_session` returned, at boot or in `start_camera` —
+    /// or `None` when the camera has none or its registration failed,
+    /// which the next pass retries by restarting the camera. Compared on
+    /// each reconcile pass
     /// — without it, applying a reprobe proposal writes the camera row,
     /// the reconciler decides nothing changed, and the second session
     /// is never started. The console would then show a camera set to
@@ -382,19 +387,23 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     args.analysis_stream.clear(cam_id);
 }
 
-/// Attach or detach a camera's SPEC-069 analysis substream session.
+/// Attach or detach a camera's SPEC-069 analysis substream session, and
+/// return what the camera's entry records: the configured URL once the
+/// recorder accepted it, or `None` for a camera with no substream or a
+/// registration that failed, which [`reconcile`]'s no-change guard then
+/// retries.
 ///
-/// Boot and hot-add MUST both call this. A camera whose analysis session
-/// is registered only on hot-add reverts to main-stream decode on the
-/// next engine restart, and [`reconcile`]'s no-change guard — which
-/// compares the *configured* `analysis_url` against the entry seeded at
-/// boot — then keeps it there with no log line and no self-heal.
+/// Both writers of [`RunningCameraEntry::analysis_url`] record this and
+/// nothing else: `start_camera`, and boot through
+/// [`register_analysis_sessions`]. Recording anything else makes the next
+/// pass restart a healthy camera, or strands a failed registration with no
+/// retry.
 pub(crate) async fn apply_analysis_session(
     recorder: &dyn ClipRecorder,
     cam: &CameraConfig,
     main_codec: CodecKind,
     supervisor_dims: (u32, u32),
-) -> bool {
+) -> Option<String> {
     let cam_id = cam.id;
     let (sup_w, sup_h) = supervisor_dims;
     let Some(analysis_url) = cam.ingest.analysis_url.as_ref() else {
@@ -408,7 +417,7 @@ pub(crate) async fn apply_analysis_session(
         ) {
             error!(camera_id = cam_id, error = %e, "analysis session teardown failed");
         }
-        return false;
+        return None;
     };
     // The substream carries its own codec — an H.265 main stream with an
     // H.264 substream is the common case, so the main stream's codec is
@@ -427,16 +436,33 @@ pub(crate) async fn apply_analysis_session(
         sup_h,
         a_codec,
     ) {
-        Ok(()) => true,
+        Ok(()) => Some(analysis_url.to_string()),
         Err(e) => {
             error!(
                 camera_id = cam_id,
                 error = %e,
                 "analysis substream session failed to start; analysis stays on the main stream"
             );
-            false
+            None
         }
     }
+}
+
+/// Boot's registration pass, run once by every `build_recorder` branch. The
+/// map holds the URL each boot entry records: the answer `start_camera`
+/// records after a restart. A second call would re-probe each RTSP
+/// substream and can rebuild a live session.
+pub(crate) async fn register_analysis_sessions(
+    recorder: &dyn ClipRecorder,
+    pending: Vec<(&CameraConfig, CodecKind, (u32, u32))>,
+) -> HashMap<CameraId, String> {
+    let mut registered = HashMap::new();
+    for (cam, codec, dims) in pending {
+        if let Some(url) = apply_analysis_session(recorder, cam, codec, dims).await {
+            registered.insert(cam.id, url);
+        }
+    }
+    registered
 }
 
 async fn start_camera(
@@ -508,11 +534,8 @@ async fn start_camera(
     // what was REGISTERED, not what was configured: recording `Some` after
     // a failed registration would match reconcile()'s no-change guard and
     // strand the camera on the main stream with no retry.
-    let registered =
+    let cam_analysis_url =
         apply_analysis_session(args.recorder.as_ref(), &cam, codec, (sup_w, sup_h)).await;
-    let cam_analysis_url = registered
-        .then(|| cam.ingest.analysis_url.as_ref().map(ToString::to_string))
-        .flatten();
 
     let detector = args.router.detector_for_camera(&cam);
     let detector_low_res = args.router.detector_for_camera_low_res(&cam);
@@ -610,8 +633,11 @@ async fn start_camera(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_config::{CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown};
+    use nexus_config::{
+        CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown, RecorderKind,
+    };
     use nexus_pipeline::{ClipFinal, ClipHandle, ClipMeta, OpenClip, RecorderError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use url::Url;
 
     /// Records every `set_camera_analysis_ingester` call so a test can assert
@@ -689,7 +715,7 @@ mod tests {
         let rec = RecordingRecorder::default();
         // http:// keeps the codec probe off the network: the substream's own
         // codec is only probed for rtsp/rtsps.
-        apply_analysis_session(
+        let recorded = apply_analysis_session(
             &rec,
             &cam(Some("http://10.0.0.5/sub")),
             CodecKind::H265,
@@ -704,6 +730,11 @@ mod tests {
             (7, Some("http://10.0.0.5/sub".to_string()), CodecKind::H265),
             "the analysis session must be registered for the camera's substream URL"
         );
+        assert_eq!(
+            recorded.as_deref(),
+            Some(SUBSTREAM),
+            "an accepted registration is recorded as the configured substream URL"
+        );
     }
 
     /// The other half of invariant I5 — there is no third arrangement. A
@@ -713,7 +744,7 @@ mod tests {
     #[tokio::test]
     async fn a_camera_without_an_analysis_url_tears_the_session_down() {
         let rec = RecordingRecorder::default();
-        apply_analysis_session(&rec, &cam(None), CodecKind::H264, (512, 288)).await;
+        let recorded = apply_analysis_session(&rec, &cam(None), CodecKind::H264, (512, 288)).await;
 
         let calls = rec.calls.lock().clone();
         assert_eq!(calls.len(), 1, "teardown is a call, not a skip");
@@ -721,22 +752,26 @@ mod tests {
             calls[0].1, None,
             "a camera with no substream must clear any registered analysis session"
         );
+        assert_eq!(
+            recorded, None,
+            "a camera with no substream records no analysis URL"
+        );
     }
 
     /// The shared helper is only half the fix — boot has to call it.
     /// `build_gst_recorder` is `#[cfg(feature = "gstreamer")]` and builds
     /// real RTSP ingesters, so it cannot be unit-constructed; this pins the
     /// wiring at the source level instead, the same audit-test shape as
-    /// `gst_clip_recorder::pipeline_string_is_codec_passthrough`.
+    /// `gst_clip_recorder::pipeline_string_is_codec_passthrough`. The needle
+    /// is the call only that function makes; the stub arms are driven for
+    /// real by `the_stub_boot_path_registers_every_enabled_substream`.
     #[test]
     fn the_boot_path_registers_analysis_sessions() {
         assert!(
-            include_str!("main.rs").contains("apply_analysis_session"),
-            "build_gst_recorder must register SPEC-069 analysis sessions at boot. \
-             Without it a converted camera reverts to main-stream decode on the \
-             first restart, and reconcile()'s no-change guard — which compares the \
-             configured analysis_url against the boot-seeded entry — keeps it there \
-             forever with no log line and no self-heal."
+            include_str!("main.rs").contains("register_analysis_sessions(&rec, analysis_pending)"),
+            "build_gst_recorder must register SPEC-069 analysis sessions at boot and return \
+             what registered. Without it every converted camera boots with no substream \
+             recorded, and the first reconcile pass restarts it, main ingester included."
         );
     }
 
@@ -1091,6 +1126,616 @@ mod tests {
             recorder.ingesters_removed(7),
             0,
             "a periodic pass tore down a healthy camera's ingester"
+        );
+    }
+
+    /// An `http://` substream keeps the codec probe off the network:
+    /// `apply_analysis_session` only probes `rtsp` / `rtsps`.
+    const SUBSTREAM: &str = "http://10.0.0.5/sub";
+
+    /// The supervisor dims `main` resolves for `cam` at boot. Boot reads
+    /// `cfg.inference.model.input_width`, which `main` also hands the
+    /// reconciler as `default_detector_width`.
+    fn boot_dims(args: &ReconcilerArgs, cam: &CameraConfig) -> (u32, u32) {
+        let det_w = cam
+            .detector
+            .model_override
+            .as_ref()
+            .map(|m| m.input_width)
+            .unwrap_or(args.default_detector_width);
+        let sup_input = cam.behavior.supervisor_width.unwrap_or(det_w).max(det_w);
+        nexus_pipeline::supervisor_frame_for(sup_input)
+    }
+
+    /// What `build_gst_recorder` hands [`register_analysis_sessions`]: each
+    /// enabled camera with a substream, at the codec and dims its main
+    /// ingester was built with. The test cameras pin their codec, so boot
+    /// would not probe.
+    fn pending_like_build_gst_recorder<'a>(
+        args: &ReconcilerArgs,
+        cams: &'a [CameraConfig],
+    ) -> Vec<(&'a CameraConfig, CodecKind, (u32, u32))> {
+        cams.iter()
+            .filter(|c| c.ingest.enabled && c.ingest.analysis_url.is_some())
+            .map(|c| {
+                let codec = c.ingest.codec.expect("test cameras pin their codec");
+                (c, codec, boot_dims(args, c))
+            })
+            .collect()
+    }
+
+    /// Seeds `handles` the way `main`'s boot loop does (`for cam in cameras`
+    /// … `running.lock().insert`): each enabled camera is spawned at its boot
+    /// dims and recorded with its configured codec and the substream URL the
+    /// recorder builder registered for it, taken from `boot_analysis` with
+    /// the lookup `main` uses. It registers nothing: `build_recorder` did
+    /// that before the loop.
+    async fn seed_like_boot(args: &ReconcilerArgs, mut boot_analysis: HashMap<CameraId, String>) {
+        for cam in args.store.list_cameras().await.expect("list cameras") {
+            if !cam.ingest.enabled {
+                continue;
+            }
+            let cam_id = cam.id;
+            let (sup_w, sup_h) = boot_dims(args, &cam);
+            let url = cam.ingest.url.to_string();
+            let configured_codec = cam.ingest.codec;
+            let detector = args.router.detector_for_camera(&cam);
+            let detector_low_res = args.router.detector_for_camera_low_res(&cam);
+            let tracker: Arc<dyn Tracker> =
+                Arc::from(nexus_tracker::build_tracker(&args.tracker_cfg));
+            let effective_top_k = cam
+                .detector
+                .model_override
+                .as_ref()
+                .and_then(|m| m.top_k)
+                .or(args.default_top_k);
+            let h = spawn_camera(
+                cam,
+                detector,
+                detector_low_res,
+                tracker,
+                args.annotator.clone(),
+                args.static_object.clone(),
+                args.clips.clone(),
+                args.state_dir.clone(),
+                args.evaluator.clone(),
+                args.store.clone(),
+                args.recorder.clone(),
+                args.bus.clone(),
+                args.cache.clone(),
+                args.frame_stats.clone(),
+                args.static_clear.clone(),
+                sup_w,
+                sup_h,
+                args.sighting_hook.clone(),
+                args.sighting_cfg,
+                Vec::new(),
+                args.sighting_persist.clone(),
+                effective_top_k,
+                args.sink_router.clone(),
+                args.alert_clip_schedule_gate.clone(),
+            );
+            args.handles.lock().insert(
+                cam_id,
+                RunningCameraEntry {
+                    task: Arc::new(h.task),
+                    url,
+                    supervisor_dims: (sup_w, sup_h),
+                    codec: configured_codec,
+                    analysis_url: boot_analysis.remove(&cam_id),
+                },
+            );
+        }
+    }
+
+    /// Runs `passes` reconcile passes — the pass each 30 s tick runs — and
+    /// reports, per pass, whether camera 7's supervisor was replaced. Every
+    /// supervisor must still be running when a pass starts, so a replacement
+    /// is never the restart of one that exited on its own, which would read
+    /// as, or hide, the restart under test. After a replacement it waits for
+    /// the new supervisor to build its frame source, so the next pass sees a
+    /// running camera and the counts have settled.
+    async fn restarts_per_pass(
+        args: &ReconcilerArgs,
+        passes: usize,
+        sources_built: impl Fn() -> usize,
+    ) -> Vec<bool> {
+        let task_of_7 = || {
+            args.handles
+                .lock()
+                .get(&7)
+                .map(|e| e.task.clone())
+                .expect("camera 7 running")
+        };
+        let mut restarted = Vec::with_capacity(passes);
+        for pass in 1..=passes {
+            for (id, entry) in args.handles.lock().iter() {
+                assert!(
+                    !entry.task.is_finished(),
+                    "camera {id}'s supervisor exited before pass {pass}: that pass would \
+                     restart it for exiting, not for the change under test"
+                );
+            }
+            let before = task_of_7();
+            let built_before = sources_built();
+            reconcile(args).await.expect("reconcile pass");
+            let replaced = !Arc::ptr_eq(&before, &task_of_7());
+            if replaced {
+                wait_until(
+                    "the restarted supervisor never built its frame source",
+                    || sources_built() > built_before,
+                )
+                .await;
+            }
+            restarted.push(replaced);
+        }
+        restarted
+    }
+
+    /// `GstClipRecorder`'s substream registration without GStreamer:
+    /// `set_camera_analysis_ingester(Some)` counts a try and returns `Err`
+    /// for the first `refuse_first` tries, then `Ok` and holds the camera's
+    /// registration; `None` drops it and returns `Ok`. Counts what each
+    /// restart asks of the main ingester and the frame source. The tests
+    /// using it have one camera, so counts are not keyed.
+    struct SubstreamRecorder {
+        refuse_first: AtomicUsize,
+        registered: Mutex<HashSet<CameraId>>,
+        registrations_tried: AtomicUsize,
+        ingesters_removed: AtomicUsize,
+        sources_built: AtomicUsize,
+    }
+
+    impl SubstreamRecorder {
+        fn new(refuse_first: usize) -> Arc<Self> {
+            Arc::new(Self {
+                refuse_first: refuse_first.into(),
+                registered: Mutex::new(HashSet::new()),
+                registrations_tried: Default::default(),
+                ingesters_removed: Default::default(),
+                sources_built: Default::default(),
+            })
+        }
+
+        /// What the SPEC-069 fallback in `SharedRtspSource` does to
+        /// `GstClipRecorder`: it shuts the camera's substream session down,
+        /// so the recorder no longer holds the registration boot recorded.
+        fn fall_back(&self, camera_id: CameraId) {
+            self.registered.lock().remove(&camera_id);
+        }
+
+        fn registrations_tried(&self) -> usize {
+            self.registrations_tried.load(Ordering::SeqCst)
+        }
+        fn ingesters_removed(&self) -> usize {
+            self.ingesters_removed.load(Ordering::SeqCst)
+        }
+        fn sources_built(&self) -> usize {
+            self.sources_built.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClipRecorder for SubstreamRecorder {
+        async fn open(&self, _args: OpenClip) -> Result<ClipHandle, RecorderError> {
+            Err(RecorderError::Refused)
+        }
+        async fn close(
+            &self,
+            _handle: ClipHandle,
+            _args: ClipFinal,
+        ) -> Result<ClipMeta, RecorderError> {
+            Err(RecorderError::Refused)
+        }
+        fn set_panic(&self, _panic: bool) {}
+        fn is_panic(&self) -> bool {
+            false
+        }
+        fn kind(&self) -> &'static str {
+            "substream"
+        }
+        fn remove_camera_ingester(&self, _camera_id: CameraId) {
+            self.ingesters_removed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn set_camera_analysis_ingester(
+            &self,
+            camera_id: CameraId,
+            analysis_url: Option<&str>,
+            _max_fps: u32,
+            _rgb_w: u32,
+            _rgb_h: u32,
+            _codec: CodecKind,
+        ) -> Result<(), RecorderError> {
+            if analysis_url.is_none() {
+                self.registered.lock().remove(&camera_id);
+                return Ok(());
+            }
+            self.registrations_tried.fetch_add(1, Ordering::SeqCst);
+            let refused = self
+                .refuse_first
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if refused {
+                return Err(RecorderError::Io(std::io::Error::other(
+                    "analysis ingester: scripted refusal",
+                )));
+            }
+            self.registered.lock().insert(camera_id);
+            Ok(())
+        }
+        fn shared_frame_source(
+            &self,
+            camera_id: CameraId,
+        ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
+            self.sources_built.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(nexus_pipeline::VirtualSource {
+                camera_id,
+                width: 512,
+                height: 288,
+                fps: 10,
+            }))
+        }
+    }
+
+    /// Boot and `start_camera` must record one answer for a camera's SPEC-069
+    /// substream: what registering it returned. Boot used to ask
+    /// `has_analysis_ingester` instead, whose default (`false`) contradicted
+    /// the setter's default (`Ok`). With a recorder that kept both defaults
+    /// — the stub — boot recorded `None` for a camera configured with a
+    /// substream, and the first periodic pass read the difference as a change
+    /// and restarted a healthy camera, main ingester included. Camera 8 has no
+    /// substream and must be left alone too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_boot_seeded_camera_with_a_substream_is_left_alone_by_periodic_passes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Overrides no analysis method, so it answers as the stub does.
+        let recorder =
+            ScriptedRecorder::new(&[(7, SourceScript::NeverEnds), (8, SourceScript::NeverEnds)]);
+        let cams = [cam(Some(SUBSTREAM)), cam_with_id(8)];
+        let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
+        // The stub's boot registration, the one `build_recorder` runs.
+        let boot_analysis =
+            crate::register_stub_analysis_sessions(args.recorder.as_ref(), &cams).await;
+        seed_like_boot(&args, boot_analysis).await;
+        wait_until(
+            "precondition: both boot supervisors should build their frame source",
+            || recorder.sources_built(7) == 1 && recorder.sources_built(8) == 1,
+        )
+        .await;
+        let booted_8 = args
+            .handles
+            .lock()
+            .get(&8)
+            .map(|e| e.task.clone())
+            .expect("camera 8 seeded");
+
+        let restarts = restarts_per_pass(&args, 3, || recorder.sources_built(7)).await;
+
+        let entry_7 = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 running");
+        let same_8 = args
+            .handles
+            .lock()
+            .get(&8)
+            .is_some_and(|e| Arc::ptr_eq(&e.task, &booted_8));
+        abort_all(&args.handles);
+        assert_eq!(
+            restarts,
+            vec![false, false, false],
+            "a periodic pass restarted camera 7, whose config never changed: boot recorded \
+             a different analysis_url from the one start_camera records"
+        );
+        assert!(same_8, "a periodic pass replaced camera 8's supervisor");
+        for id in [7, 8] {
+            assert_eq!(
+                recorder.ingesters_removed(id),
+                0,
+                "a periodic pass tore down camera {id}'s main ingester"
+            );
+            assert_eq!(
+                recorder.sources_built(id),
+                1,
+                "camera {id}'s frame source was rebuilt"
+            );
+        }
+        assert_eq!(
+            entry_7.analysis_url.as_deref(),
+            Some(SUBSTREAM),
+            "boot must record the substream the recorder accepted"
+        );
+    }
+
+    /// `main`'s `build_recorder`, with inert values for everything but the
+    /// recorder kind and the cameras. Returns the recorder and the analysis
+    /// URL each boot entry records.
+    async fn build_recorder_like_main(
+        kind: &RecorderKind,
+        dir: &std::path::Path,
+        cameras: &[CameraConfig],
+    ) -> (Arc<dyn ClipRecorder>, HashMap<CameraId, String>) {
+        let store = Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.join("recorder.db").display()),
+                ..nexus_config::StoreConfig::default()
+            })
+            .await
+            .expect("recorder store"),
+        );
+        let (recorder, _webrtc, boot_analysis) = crate::build_recorder(
+            kind,
+            store,
+            &dir.join("clips"),
+            cameras,
+            512,
+            0,
+            nexus_config::DecodeMode::default(),
+            Arc::new(nexus_bus::BroadcastBus::new(64)),
+            Arc::new(crate::usb_watch::UsbRegistry::new()),
+            nexus_pipeline::recorder::PreferredUsbLabel::default(),
+            nexus_config::AlertClipsConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Arc::new(DecodeHealthRegistry::new()),
+            Arc::new(nexus_pipeline::AnalysisStreamRegistry::new()),
+        )
+        .await
+        .expect("build_recorder");
+        (recorder, boot_analysis)
+    }
+
+    /// The stub arms of `build_recorder` run the same registration pass as
+    /// `build_gst_recorder`: each enabled camera with a substream, once, and
+    /// they return the URL each boot entry records. Camera 9 is disabled and
+    /// has a substream, so the map must leave it out. Boot seeded from that
+    /// recorder and that map must then be a no-op on every pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stub_boot_path_registers_every_enabled_substream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The stub offers no shared frame source, so each supervisor builds
+        // its own from the main URL: `virtual://` gives one that never ends on
+        // any build, where `rtsp://` without gstreamer ends at once.
+        let with = |id: CameraId, analysis: Option<&str>, enabled: bool| {
+            let mut c = cam_with_id(id);
+            c.ingest.url = Url::parse(&format!("virtual://lot-{id}")).unwrap();
+            c.ingest.analysis_url = analysis.map(|a| Url::parse(a).unwrap());
+            c.ingest.enabled = enabled;
+            c
+        };
+        let cams = [
+            with(7, Some(SUBSTREAM), true),
+            with(8, None, true),
+            with(9, Some(SUBSTREAM), false),
+        ];
+        let want = HashMap::from([(7, SUBSTREAM.to_string())]);
+
+        let (recorder, registered) =
+            build_recorder_like_main(&RecorderKind::Stub, dir.path(), &cams).await;
+        assert_eq!(
+            registered, want,
+            "the stub arm must register the substream of every enabled camera, and only those"
+        );
+
+        // Without the feature, `RecorderKind::Gstreamer` falls back to the stub.
+        #[cfg(not(feature = "gstreamer"))]
+        {
+            let fallback_dir = tempfile::tempdir().expect("tempdir");
+            let (_, registered) =
+                build_recorder_like_main(&RecorderKind::Gstreamer, fallback_dir.path(), &cams)
+                    .await;
+            assert_eq!(
+                registered, want,
+                "the non-gstreamer fallback must register the way the stub arm does"
+            );
+        }
+
+        let args = reconciler_args(recorder, dir.path(), &cams).await;
+        seed_like_boot(&args, registered).await;
+        let task_of = |id: CameraId| {
+            args.handles
+                .lock()
+                .get(&id)
+                .map(|e| e.task.clone())
+                .expect("camera running")
+        };
+        let booted = [(7, task_of(7)), (8, task_of(8))];
+        for pass in 1..=3 {
+            for (id, task) in &booted {
+                assert!(
+                    !task.is_finished(),
+                    "camera {id}'s supervisor exited before pass {pass}"
+                );
+            }
+            reconcile(&args).await.expect("reconcile pass");
+            for (id, task) in &booted {
+                assert!(
+                    Arc::ptr_eq(&task_of(*id), task),
+                    "pass {pass} restarted camera {id}, whose config never changed"
+                );
+            }
+        }
+        abort_all(&args.handles);
+    }
+
+    /// `GstClipRecorder`'s side of the rule, without GStreamer: boot's one
+    /// registration pass is the only registration, and what it returned is
+    /// what boot records, so no pass registers the substream again or
+    /// restarts the camera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_substream_registered_at_boot_is_not_registered_again_or_restarted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = SubstreamRecorder::new(0);
+        let cams = [cam(Some(SUBSTREAM))];
+        let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
+        let boot_analysis = register_analysis_sessions(
+            args.recorder.as_ref(),
+            pending_like_build_gst_recorder(&args, &cams),
+        )
+        .await;
+        seed_like_boot(&args, boot_analysis).await;
+        wait_until(
+            "precondition: the boot supervisor should build its frame source",
+            || recorder.sources_built() == 1,
+        )
+        .await;
+        let booted = args
+            .handles
+            .lock()
+            .get(&7)
+            .map(|e| e.task.clone())
+            .expect("camera 7 seeded");
+
+        let restarts = restarts_per_pass(&args, 3, || recorder.sources_built()).await;
+
+        let same_task = args
+            .handles
+            .lock()
+            .get(&7)
+            .is_some_and(|e| Arc::ptr_eq(&e.task, &booted));
+        abort_all(&args.handles);
+        assert_eq!(
+            restarts,
+            vec![false, false, false],
+            "a periodic pass restarted a camera whose substream registered at boot"
+        );
+        assert!(same_task, "camera 7's boot supervisor was replaced");
+        assert_eq!(
+            recorder.ingesters_removed(),
+            0,
+            "a periodic pass tore down the camera's main ingester"
+        );
+        assert_eq!(
+            recorder.sources_built(),
+            1,
+            "the camera's frame source was rebuilt"
+        );
+        assert_eq!(
+            recorder.registrations_tried(),
+            1,
+            "boot registers the substream once, and no pass registers it again"
+        );
+    }
+
+    /// The rule's other half: a registration that failed is recorded as
+    /// `None`, never as the configured URL, so the next pass sees the
+    /// difference and retries it — by restarting the whole camera, main
+    /// ingester included, the only retry the reconciler has. Recording the
+    /// configured URL instead would strand the camera on its main stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_substream_registration_that_failed_at_boot_is_retried_by_the_next_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = SubstreamRecorder::new(1);
+        let cams = [cam(Some(SUBSTREAM))];
+        let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
+        let boot_analysis = register_analysis_sessions(
+            args.recorder.as_ref(),
+            pending_like_build_gst_recorder(&args, &cams),
+        )
+        .await;
+        seed_like_boot(&args, boot_analysis).await;
+        wait_until(
+            "precondition: the boot supervisor should build its frame source",
+            || recorder.sources_built() == 1,
+        )
+        .await;
+
+        let restarts = restarts_per_pass(&args, 3, || recorder.sources_built()).await;
+
+        let entry_url = args
+            .handles
+            .lock()
+            .get(&7)
+            .and_then(|e| e.analysis_url.clone());
+        abort_all(&args.handles);
+        assert_eq!(
+            restarts,
+            vec![true, false, false],
+            "the first pass must retry the refused registration, and later passes leave \
+             the camera alone"
+        );
+        assert_eq!(
+            recorder.registrations_tried(),
+            2,
+            "boot's refused try, then the first pass's retry"
+        );
+        assert_eq!(
+            recorder.ingesters_removed(),
+            1,
+            "the retry is a whole-camera restart: one main-ingester teardown"
+        );
+        assert_eq!(
+            recorder.sources_built(),
+            2,
+            "boot's frame source, then the restart's"
+        );
+        assert_eq!(
+            entry_url.as_deref(),
+            Some(SUBSTREAM),
+            "the retry's registration must be recorded"
+        );
+    }
+
+    /// The guard reads the entry, never the recorder. After boot, the SPEC-069
+    /// fallback can shut a camera's substream session down, so the recorder no
+    /// longer holds the registration the entry records. That must neither
+    /// restart the camera, whose main recording session is untouched by
+    /// analysis, nor register the substream again: nothing re-registers it
+    /// until an unrelated restart, a known gap BUG-223 records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_substream_fallback_does_not_restart_the_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = SubstreamRecorder::new(0);
+        let cams = [cam(Some(SUBSTREAM))];
+        let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
+        let boot_analysis = register_analysis_sessions(
+            args.recorder.as_ref(),
+            pending_like_build_gst_recorder(&args, &cams),
+        )
+        .await;
+        seed_like_boot(&args, boot_analysis).await;
+        wait_until(
+            "precondition: the boot supervisor should build its frame source",
+            || recorder.sources_built() == 1,
+        )
+        .await;
+        assert!(
+            recorder.registered.lock().contains(&7),
+            "precondition: boot registered camera 7's substream with the recorder"
+        );
+        let booted = args
+            .handles
+            .lock()
+            .get(&7)
+            .map(|e| e.task.clone())
+            .expect("camera 7 seeded");
+
+        recorder.fall_back(7);
+        let restarts = restarts_per_pass(&args, 3, || recorder.sources_built()).await;
+
+        let same_task = args
+            .handles
+            .lock()
+            .get(&7)
+            .is_some_and(|e| Arc::ptr_eq(&e.task, &booted));
+        abort_all(&args.handles);
+        assert_eq!(
+            restarts,
+            vec![false, false, false],
+            "a periodic pass restarted a camera because its substream session fell back"
+        );
+        assert!(same_task, "camera 7's boot supervisor was replaced");
+        assert_eq!(
+            recorder.ingesters_removed(),
+            0,
+            "a substream fallback must leave the main recording ingester alone"
+        );
+        assert_eq!(
+            recorder.registrations_tried(),
+            1,
+            "no pass may register the substream again"
         );
     }
 }

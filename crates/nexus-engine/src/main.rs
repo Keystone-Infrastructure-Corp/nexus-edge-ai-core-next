@@ -826,7 +826,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             .unwrap_or(true),
     ));
 
-    let (recorder, webrtc_bridge) = build_recorder(
+    let (recorder, webrtc_bridge, mut boot_analysis) = build_recorder(
         &cfg.runtime.clips.recorder,
         store.clone(),
         &clips_dir,
@@ -1034,12 +1034,9 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         }
         let cam_id = cam.id;
         let cam_url = cam.ingest.url.to_string();
-        let cam_analysis_url = cam
-            .ingest
-            .analysis_url
-            .as_ref()
-            .filter(|_| recorder.has_analysis_ingester(cam.id))
-            .map(ToString::to_string);
+        // What build_recorder registered: the answer start_camera records after
+        // a restart, so the first reconcile pass does not read it as a change.
+        let cam_analysis_url = boot_analysis.remove(&cam_id);
         let configured_codec = cam.ingest.codec;
         let detector = router.detector_for_camera(&cam);
         let detector_low_res = router.detector_for_camera_low_res(&cam);
@@ -2381,6 +2378,9 @@ fn build_reid_extractor(
 /// per-camera supervisor share this single Arc so panic-flag flips
 /// affect everything atomically.
 ///
+/// Every branch also registers the cameras' SPEC-069 substreams, once
+/// each, and returns the URL each boot entry records.
+///
 /// `Stub` is always available. `Gstreamer` requires the `gstreamer`
 /// cargo feature on `nexus-pipeline`; on a build without the feature
 /// the engine logs an error + falls back to `Stub` so a misconfigured
@@ -2408,16 +2408,20 @@ async fn build_recorder(
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
+    std::collections::HashMap<nexus_types::CameraId, String>,
 )> {
     match kind {
-        RecorderKind::Stub => Ok((
-            Arc::new(
-                nexus_pipeline::StubClipRecorder::new(store, clips_dir)
-                    .with_bus(bus)
-                    .with_usb(usb_resolver, preferred_usb_label),
-            ),
-            crate::webrtc_bridge::WebRtcBridge::disabled(),
-        )),
+        RecorderKind::Stub => {
+            let rec = nexus_pipeline::StubClipRecorder::new(store, clips_dir)
+                .with_bus(bus)
+                .with_usb(usb_resolver, preferred_usb_label);
+            let analysis = register_stub_analysis_sessions(&rec, cameras).await;
+            Ok((
+                Arc::new(rec),
+                crate::webrtc_bridge::WebRtcBridge::disabled(),
+                analysis,
+            ))
+        }
         RecorderKind::Gstreamer => {
             build_gst_recorder(
                 store,
@@ -2440,6 +2444,28 @@ async fn build_recorder(
     }
 }
 
+/// The stub's boot registration, through the same pass as
+/// `build_gst_recorder`: every enabled camera with a substream, once.
+///
+/// The stub keeps the trait's no-op, which reads neither codec nor dims, so
+/// neither is resolved here: no main-stream probe and no fourth copy of the
+/// supervisor-dims formula. That would have to change if the stub ever
+/// registered sessions.
+async fn register_stub_analysis_sessions(
+    rec: &dyn nexus_pipeline::ClipRecorder,
+    cameras: &[CameraConfig],
+) -> std::collections::HashMap<nexus_types::CameraId, String> {
+    let pending = cameras
+        .iter()
+        .filter(|c| c.ingest.enabled && c.ingest.analysis_url.is_some())
+        .map(|c| {
+            let codec = c.ingest.codec.unwrap_or(nexus_types::CodecKind::H264);
+            (c, codec, (0, 0))
+        })
+        .collect();
+    crate::reconciler::register_analysis_sessions(rec, pending).await
+}
+
 #[cfg(feature = "gstreamer")]
 #[allow(clippy::too_many_arguments)]
 async fn build_gst_recorder(
@@ -2460,6 +2486,7 @@ async fn build_gst_recorder(
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
+    std::collections::HashMap<nexus_types::CameraId, String>,
 )> {
     // Build one always-on PreRollIngester per enabled camera. The
     // ingester holds the only RTSP connection for that camera; the
@@ -2584,14 +2611,11 @@ async fn build_gst_recorder(
     #[cfg(not(feature = "gstreamer-webrtc"))]
     let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
     // SPEC-069 — the analysis substream sessions. `start_camera` registers
-    // these on hot-add and on every reconcile-triggered restart; boot has
-    // to do the same or a converted camera silently analyses its main
-    // stream until someone edits it, because the reconciler's no-change
-    // guard compares against the configured URL and skips.
-    for (cam, codec, dims) in analysis_pending {
-        crate::reconciler::apply_analysis_session(&rec, cam, codec, dims).await;
-    }
-    Ok((Arc::new(rec), webrtc))
+    // these on hot-add and on every reconcile-triggered restart. Boot has to
+    // register them too and record what registered, or the first reconcile
+    // pass restarts every converted camera to register one.
+    let analysis = crate::reconciler::register_analysis_sessions(&rec, analysis_pending).await;
+    Ok((Arc::new(rec), webrtc, analysis))
 }
 
 #[cfg(not(feature = "gstreamer"))]
@@ -2599,7 +2623,7 @@ async fn build_gst_recorder(
 async fn build_gst_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
-    _cameras: &[CameraConfig],
+    cameras: &[CameraConfig],
     _default_detector_width: u32,
     _pre_roll_secs: u32,
     _decode_mode: nexus_config::DecodeMode,
@@ -2614,19 +2638,21 @@ async fn build_gst_recorder(
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
+    std::collections::HashMap<nexus_types::CameraId, String>,
 )> {
     tracing::error!(
         "config selected RecorderKind::Gstreamer but this build was compiled without \
          --features gstreamer; falling back to StubClipRecorder. Rebuild nexus-engine with \
          the gstreamer feature to record real video."
     );
+    let rec = nexus_pipeline::StubClipRecorder::new(store, clips_dir)
+        .with_bus(bus)
+        .with_usb(usb_resolver, preferred_usb_label);
+    let analysis = register_stub_analysis_sessions(&rec, cameras).await;
     Ok((
-        Arc::new(
-            nexus_pipeline::StubClipRecorder::new(store, clips_dir)
-                .with_bus(bus)
-                .with_usb(usb_resolver, preferred_usb_label),
-        ),
+        Arc::new(rec),
         crate::webrtc_bridge::WebRtcBridge::disabled(),
+        analysis,
     ))
 }
 
