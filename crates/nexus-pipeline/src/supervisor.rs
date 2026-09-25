@@ -341,7 +341,7 @@ async fn run_camera(
         let mut current_supervisor_w = supervisor_w;
         let mut current_supervisor_h = supervisor_h;
 
-        let gate = MotionGate::new();
+        let mut gate = MotionGate::new();
         // M_PERF_CROWD Phase E1 — adaptive detector cadence under crowd.
         // No-op (always-run) unless both
         // `behavior.detector_skip_crowded_threshold` and
