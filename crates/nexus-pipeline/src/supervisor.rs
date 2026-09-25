@@ -1543,9 +1543,12 @@ fn build_source(
         // Without the `gstreamer` feature there is no real RTSP backend.
         // Refuse to silently fall back to a 640x480 black VirtualSource —
         // surface a loud error and return a FailingSource so the
-        // supervisor's existing warn path makes the misconfiguration
-        // visible in `/api/v1/cameras` (pipeline state stays Initializing →
-        // error) instead of "running" with a fake feed.
+        // supervisor exits instead of "running" with a fake feed. What an
+        // operator sees is this ERROR, then the engine reconciler's ERROR
+        // restarting the camera each periodic pass (it fails the same way
+        // every time), and a camera whose frame stats — and the cloud
+        // roster's `online` — report it offline, since no frame ever arrives.
+        // `/api/v1/cameras` shows nothing: it returns only the stored config.
         #[cfg(not(feature = "gstreamer"))]
         "rtsp" | "rtsps" => {
             let msg = format!(
