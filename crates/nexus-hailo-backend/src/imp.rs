@@ -382,6 +382,10 @@ impl InferSession {
                 w,
                 c,
                 frame_size,
+                qp_zp: info.quant_info.qp_zp,
+                qp_scale: info.quant_info.qp_scale,
+                limvals_min: info.quant_info.limvals_min,
+                limvals_max: info.quant_info.limvals_max,
             });
         }
 
