@@ -32,7 +32,6 @@
 #![cfg(feature = "ort")]
 #![allow(unsafe_code)]
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,7 +40,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use ndarray::{s, Array2, Ix2};
 use nexus_config::{CameraConfigUpdate, InferenceConfig};
-use nexus_types::{BBox, CameraId, Detection, Frame, PixelFormat};
+use nexus_types::{BBox, CameraId, Detection, Frame};
 use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
@@ -49,7 +48,7 @@ use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
 use crate::session_tuning::{self, SessionTuning};
-use crate::yolo::preprocess_nchw;
+use crate::yolo::{frame_rgb, preprocess_nchw};
 
 /// One YOLOE ONNX session + the prompt vocabulary it was exported
 /// with + a per-camera subset filter.
@@ -256,7 +255,6 @@ impl Detector for YoloeDetector {
         let score_threshold = self.score_threshold;
         let nms_iou = self.nms_iou_threshold;
         let nms_bucket = self.nms_spatial_bucket_size_px;
-        let format = frame.format;
         let camera_id = frame.camera_id;
 
         // Decide the enabled class-id subset for this frame. The rule:
@@ -276,15 +274,9 @@ impl Detector for YoloeDetector {
                 .unwrap_or_default()
         };
 
-        // Borrow the source RGB buffer when it's already in the right
-        // pixel order; only the BGR path needs to allocate. `frame.data`
-        // is `Arc<Vec<u8>>` so the Rgb24 branch is a zero-copy borrow
-        // — saves ~1.5 MB alloc + memcpy per frame per camera.
-        let rgb: Cow<'_, [u8]> = match format {
-            PixelFormat::Rgb24 => Cow::Borrowed(&frame.data[..]),
-            PixelFormat::Bgr24 => Cow::Owned(bgr_to_rgb(&frame.data)),
-            other => return Err(InferenceError::UnsupportedFormat(other)),
-        };
+        // Borrowed for RGB24 (the supervisor contract); only BGR24 pays
+        // for a converted copy.
+        let rgb = frame_rgb(frame)?;
 
         let session_for_blocking: &Mutex<Session> = &self.session;
         let vocab = &self.vocab;
@@ -594,17 +586,6 @@ fn parse_seg_nms_rows(
         enabled = enabled.len(),
         "yoloe seg-NMS postprocess done"
     );
-    out
-}
-
-fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.chunks_exact(3).enumerate() {
-        let off = i * 3;
-        out[off] = chunk[2];
-        out[off + 1] = chunk[1];
-        out[off + 2] = chunk[0];
-    }
     out
 }
 

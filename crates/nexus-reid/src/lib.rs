@@ -45,6 +45,7 @@
 
 #![deny(unsafe_code)]
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -392,46 +393,29 @@ impl Extractor for MockExtractor {
 // ---------------------------------------------------------------------------
 
 /// Borrow the frame's RGB bytes if it's already RGB24; copy + swap
-/// if BGR24. Other formats are rejected — the upstream pipeline
-/// hands the supervisor frame to nexus-inference and nexus-reid in
-/// RGB24 already (per the per-camera supervisor frame contract).
+/// if BGR24 ([`Frame::rgb24`]). Other formats are rejected — the upstream
+/// pipeline hands the supervisor frame to nexus-inference and nexus-reid
+/// in RGB24 already (per the per-camera supervisor frame contract). The
+/// format is checked before the length, and a buffer that is not
+/// `width * height * 3` bytes is refused because the crop indexes by
+/// width and height.
 pub fn frame_to_rgb_borrowed_or_owned(frame: &Frame) -> Result<RgbBuf<'_>, ExtractorError> {
+    let rgb = frame.rgb24().map_err(ExtractorError::UnsupportedFormat)?;
     let expected = (frame.width as usize) * (frame.height as usize) * 3;
     let got = frame.data.len();
-    match frame.format {
-        PixelFormat::Rgb24 => {
-            if got != expected {
-                return Err(ExtractorError::FrameBufferSize {
-                    got,
-                    expected,
-                    width: frame.width,
-                    height: frame.height,
-                    format: frame.format,
-                });
-            }
-            Ok(RgbBuf::Borrowed(&frame.data[..]))
-        }
-        PixelFormat::Bgr24 => {
-            if got != expected {
-                return Err(ExtractorError::FrameBufferSize {
-                    got,
-                    expected,
-                    width: frame.width,
-                    height: frame.height,
-                    format: frame.format,
-                });
-            }
-            let mut out = vec![0u8; got];
-            for (i, ch) in frame.data.as_chunks::<3>().0.iter().enumerate() {
-                let off = i * 3;
-                out[off] = ch[2];
-                out[off + 1] = ch[1];
-                out[off + 2] = ch[0];
-            }
-            Ok(RgbBuf::Owned(out))
-        }
-        other => Err(ExtractorError::UnsupportedFormat(other)),
+    if got != expected {
+        return Err(ExtractorError::FrameBufferSize {
+            got,
+            expected,
+            width: frame.width,
+            height: frame.height,
+            format: frame.format,
+        });
     }
+    Ok(match rgb {
+        Cow::Borrowed(s) => RgbBuf::Borrowed(s),
+        Cow::Owned(v) => RgbBuf::Owned(v),
+    })
 }
 
 /// Holder so the RGB24 fast path stays zero-copy.
@@ -849,6 +833,23 @@ mod tests {
         assert!(matches!(
             err,
             ExtractorError::UnsupportedFormat(PixelFormat::Nv12)
+        ));
+    }
+
+    #[test]
+    fn frame_to_rgb_rejects_a_wrong_sized_bgr24_buffer() {
+        // The crop indexes by width/height, so a short BGR24 buffer must
+        // be refused rather than swapped (the swap alone zero-pads it).
+        let f = frame(2, 2, PixelFormat::Bgr24, vec![0u8; 11]);
+        assert!(matches!(
+            frame_to_rgb_borrowed_or_owned(&f).unwrap_err(),
+            ExtractorError::FrameBufferSize {
+                got: 11,
+                expected: 12,
+                width: 2,
+                height: 2,
+                format: PixelFormat::Bgr24,
+            }
         ));
     }
 

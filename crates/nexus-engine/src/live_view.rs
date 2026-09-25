@@ -46,7 +46,7 @@ use image::ImageEncoder;
 use nexus_cloud_client::{build_lbr_frame_envelope, TunnelOutbox};
 use nexus_cloud_protocol::v1::{LbrSubscribePayload, LbrUnsubscribePayload};
 use nexus_pipeline::LatestFrameCache;
-use nexus_types::{CameraId, Frame, PixelFormat, TrackedObject};
+use nexus_types::{CameraId, Frame, TrackedObject};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -554,11 +554,9 @@ fn spawn_pump(
 /// Resize (down, never up) the clean supervisor frame to the tile and
 /// JPEG-encode it.
 fn encode_lbr(frame: &Frame, tile_w: Option<u32>) -> Result<Vec<u8>, String> {
-    let rgb: std::borrow::Cow<'_, [u8]> = match frame.format {
-        PixelFormat::Rgb24 => std::borrow::Cow::Borrowed(&frame.data[..]),
-        PixelFormat::Bgr24 => std::borrow::Cow::Owned(bgr_to_rgb(frame.data.as_ref())),
-        other => return Err(format!("unsupported pixel format {other:?}")),
-    };
+    let rgb = frame
+        .rgb24()
+        .map_err(|format| format!("unsupported pixel format {format:?}"))?;
     let (tw, th) = target_size(frame.width, frame.height, tile_w);
     let mut out = Vec::new();
     if tw == frame.width && th == frame.height {
@@ -620,19 +618,6 @@ fn objects_signature(objects: &[TrackedObject]) -> u64 {
     hash
 }
 
-/// Swap B and R channels in a packed 24-bit buffer (BGR → RGB). Mirrors the
-/// snapshot helper in `api.rs`.
-fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.as_chunks::<3>().0.iter().enumerate() {
-        let off = i * 3;
-        out[off] = chunk[2];
-        out[off + 1] = chunk[1];
-        out[off + 2] = chunk[0];
-    }
-    out
-}
-
 /// Edge capture wall-clock in unix ms (diagnostics / staleness only).
 fn now_unix_ms() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
@@ -641,7 +626,7 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_types::BBox;
+    use nexus_types::{BBox, PixelFormat};
 
     fn obj(track_id: u64, cx: f32, cy: f32) -> TrackedObject {
         TrackedObject {
@@ -778,9 +763,15 @@ mod tests {
     }
 
     #[test]
-    fn bgr_to_rgb_swaps_channels() {
-        // One pixel BGR (10, 20, 30) → RGB (30, 20, 10).
-        assert_eq!(bgr_to_rgb(&[10, 20, 30]), vec![30, 20, 10]);
+    fn encode_rejects_a_planar_frame_by_format() {
+        let frame = Frame {
+            format: PixelFormat::Nv12,
+            ..rgb_frame(4, 2)
+        };
+        assert_eq!(
+            encode_lbr(&frame, None).unwrap_err(),
+            "unsupported pixel format Nv12"
+        );
     }
 
     #[tokio::test]

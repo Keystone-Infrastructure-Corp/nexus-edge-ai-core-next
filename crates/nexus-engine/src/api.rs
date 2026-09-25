@@ -42,7 +42,7 @@ use nexus_pipeline::{LatestFrameCache, StaticAnchorClearRegistry};
 use nexus_rules::{CelEngine, RuleEngine, RuleEvaluator, RulesError};
 use nexus_store::Store;
 use nexus_types::{
-    AlertEvent, CameraId, FrameMetadata, FrameMetadataLite, PixelFormat, RuleId, StaticAnchor,
+    AlertEvent, CameraId, FrameMetadata, FrameMetadataLite, RuleId, StaticAnchor,
     StaticAnchorsResponse,
 };
 use tower_http::compression::CompressionLayer;
@@ -2960,16 +2960,12 @@ pub(crate) fn latest_frame_jpeg(s: &ApiState, id: CameraId) -> Result<Vec<u8>, A
     let frame = &entry.frame;
 
     // Convert NV12/I420 → RGB on demand for the snapshot. M0 supports RGB24.
-    let rgb: std::borrow::Cow<'_, [u8]> = match frame.format {
-        PixelFormat::Rgb24 => std::borrow::Cow::Borrowed(&frame.data[..]),
-        PixelFormat::Bgr24 => std::borrow::Cow::Owned(bgr_to_rgb(frame.data.as_ref())),
-        _ => {
-            return Err(ApiError(
-                StatusCode::NOT_IMPLEMENTED,
-                format!("snapshot for {:?} not yet implemented", frame.format),
-            ));
-        }
-    };
+    let rgb = frame.rgb24().map_err(|format| {
+        ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            format!("snapshot for {format:?} not yet implemented"),
+        )
+    })?;
 
     let mut out = Vec::with_capacity(rgb.len() / 4);
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
@@ -2997,17 +2993,6 @@ async fn get_latest_frame_jpeg(
         out,
     )
         .into_response())
-}
-
-fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.as_chunks::<3>().0.iter().enumerate() {
-        let off = i * 3;
-        out[off] = chunk[2];
-        out[off + 1] = chunk[1];
-        out[off + 2] = chunk[0];
-    }
-    out
 }
 
 async fn stream_metadata(

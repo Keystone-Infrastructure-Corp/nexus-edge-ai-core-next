@@ -41,7 +41,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ndarray::{s, Array2, Array4};
 use nexus_config::InferenceConfig;
-use nexus_types::{BBox, Detection, Frame, PixelFormat};
+use nexus_types::{BBox, Detection, Frame};
 use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
@@ -519,28 +519,15 @@ pub(crate) fn preprocess_nchw(
     Ok(tensor)
 }
 
-/// The frame's pixels as RGB. RGB24 (the supervisor frame contract, so
-/// the branch every inferred frame takes) is borrowed straight from the
-/// frame's `Arc` buffer; only BGR24 pays for a converted copy. Nothing
-/// downstream needs ownership: `block_in_place` keeps the work on this
-/// thread, so the borrow outlives it.
+/// The frame's pixels as RGB ([`Frame::rgb24`]), with an unsupported
+/// format mapped to [`InferenceError::UnsupportedFormat`] for every
+/// detector. RGB24 (the supervisor frame contract, so the branch every
+/// inferred frame takes) is borrowed straight from the frame's `Arc`
+/// buffer; only BGR24 pays for a converted copy. Nothing downstream needs
+/// ownership: `block_in_place` keeps the work on this thread, so the
+/// borrow outlives it.
 pub(crate) fn frame_rgb(frame: &Frame) -> Result<Cow<'_, [u8]>, InferenceError> {
-    match frame.format {
-        PixelFormat::Rgb24 => Ok(Cow::Borrowed(&frame.data[..])),
-        PixelFormat::Bgr24 => Ok(Cow::Owned(bgr_to_rgb(&frame.data))),
-        other => Err(InferenceError::UnsupportedFormat(other)),
-    }
-}
-
-pub(crate) fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.chunks_exact(3).enumerate() {
-        let off = i * 3;
-        out[off] = chunk[2];
-        out[off + 1] = chunk[1];
-        out[off + 2] = chunk[0];
-    }
-    out
+    frame.rgb24().map_err(InferenceError::UnsupportedFormat)
 }
 
 /// COCO class id → Tier 1 domain label. Mirrors the table in
@@ -639,6 +626,7 @@ fn resolve_hailo_hef(cfg: &InferenceConfig) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_types::PixelFormat;
     use std::fs;
     use tempfile::TempDir;
 
@@ -794,19 +782,9 @@ mod tests {
     }
 
     #[test]
-    fn frame_rgb_borrows_rgb24_instead_of_copying_it() {
-        // RGB24 is the supervisor contract, so this is the branch every
-        // inferred frame takes: it must hand back the frame's own bytes.
-        let frame = frame_of(PixelFormat::Rgb24, vec![1, 2, 3, 4, 5, 6]);
-        let rgb = frame_rgb(&frame).unwrap();
-        assert!(matches!(rgb, Cow::Borrowed(_)), "RGB24 was copied");
-        assert_eq!(rgb.as_ptr(), frame.data.as_ptr());
-    }
-
-    #[test]
-    fn frame_rgb_swaps_bgr24_and_rejects_other_formats() {
-        let frame = frame_of(PixelFormat::Bgr24, vec![1, 2, 3, 4, 5, 6]);
-        assert_eq!(&*frame_rgb(&frame).unwrap(), &[3, 2, 1, 6, 5, 4]);
+    fn frame_rgb_maps_an_unsupported_format_to_inference_error() {
+        // The conversion itself is tested on `Frame::rgb24`; this pins
+        // the error every detector returns for a format it cannot read.
         let frame = frame_of(PixelFormat::Nv12, vec![0; 3]);
         assert!(matches!(
             frame_rgb(&frame),

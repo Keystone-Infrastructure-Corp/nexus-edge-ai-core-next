@@ -41,7 +41,6 @@
 #![cfg(feature = "ort")]
 #![allow(unsafe_code)]
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,7 +49,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use ndarray::{s, Array2, Array3, Ix2};
 use nexus_config::{CameraConfigUpdate, InferenceConfig};
-use nexus_types::{BBox, CameraId, Detection, Frame, PixelFormat};
+use nexus_types::{BBox, CameraId, Detection, Frame};
 use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
@@ -59,7 +58,7 @@ use tracing::{debug, info, warn};
 use crate::detectors::{Detector, InferenceError};
 use crate::session_tuning::{self, SessionTuning};
 use crate::visual_prompts::{VisualPromptBinding, VisualPromptStore};
-use crate::yolo::preprocess_nchw;
+use crate::yolo::{frame_rgb, preprocess_nchw};
 
 /// One YOLOE visual-prompt ONNX session + a per-camera binding map.
 pub struct YoloeVisualDetector {
@@ -200,15 +199,9 @@ impl Detector for YoloeVisualDetector {
         let nms_bucket = self.nms_spatial_bucket_size_px;
         let embedding_dim = self.embedding_dim;
 
-        // Borrow the source RGB buffer when it's already in the right
-        // pixel order; only the BGR path needs to allocate. `frame.data`
-        // is `Arc<Vec<u8>>` so the Rgb24 branch is a zero-copy borrow
-        // — saves ~1.5 MB alloc + memcpy per frame per camera.
-        let rgb: Cow<'_, [u8]> = match frame.format {
-            PixelFormat::Rgb24 => Cow::Borrowed(&frame.data[..]),
-            PixelFormat::Bgr24 => Cow::Owned(bgr_to_rgb(&frame.data)),
-            other => return Err(InferenceError::UnsupportedFormat(other)),
-        };
+        // Borrowed for RGB24 (the supervisor contract); only BGR24 pays
+        // for a converted copy.
+        let rgb = frame_rgb(frame)?;
 
         let session_for_blocking: &Mutex<Session> = &self.session;
         tokio::task::block_in_place(|| {
@@ -449,17 +442,6 @@ fn build_vpe_tensor(
         }
     }
     Ok(tensor)
-}
-
-fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.chunks_exact(3).enumerate() {
-        let off = i * 3;
-        out[off] = chunk[2];
-        out[off + 1] = chunk[1];
-        out[off + 2] = chunk[0];
-    }
-    out
 }
 
 /// Default IoU for class-aware NMS in visual mode. Same 0.50 as text
