@@ -139,8 +139,9 @@ fn info_for_kind(kind: &str, cfg: &nexus_config::InferenceConfig) -> DetectorPro
             prompts: vec![],
             groups: vec![],
             note: Some(
-                "PPE classifier ensemble — emits per-object attributes; \
-                 no per-class labels. Rules can match `object.attributes['ppe.helmet']`."
+                "NOT IMPLEMENTED — no model ships for this kind. Selecting it \
+                 reports zero detections and marks engine health degraded. \
+                 Kept listed so cameras that already persist it still render."
                     .into(),
             ),
             loaded: false,

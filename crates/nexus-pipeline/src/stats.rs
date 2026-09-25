@@ -64,6 +64,30 @@ pub struct CameraFrameStats {
     /// `watch`, so frames coalesced away before the gate ever saw them
     /// are in neither total.
     pub frames_dropped: u64,
+    /// Frames the SOURCE produced that the analysis loop never saw —
+    /// counted from gaps in the per-session `frame_id` sequence, which the
+    /// source assigns before its non-blocking `try_send`.
+    ///
+    /// Covers both ways a frame is lost on the way in: the bounded source
+    /// channel overflowing under runtime starvation, and the latest-wins
+    /// `watch` between the live-view tap and the analysis loop coalescing
+    /// while that loop is slow or wedged. The second is the dominant one and
+    /// is silent by design, which is why the count is taken at the analysis
+    /// loop rather than at the tap.
+    ///
+    /// Deliberately separate from [`frames_dropped`]. That counter measures
+    /// the motion gate, which drops on purpose and is the expected steady
+    /// state; this one measures the consumer failing to keep up, which is
+    /// the single most important backpressure signal in the pipeline and
+    /// was previously counted nowhere at all.
+    ///
+    /// It measures a loop that is BEHIND, not one that has stopped: a gap is
+    /// only banked when a frame finally arrives, so a loop wedged forever on
+    /// one frame holds this at its last value while losing everything. What
+    /// keeps that case visible is the detect deadline that fails a wedged
+    /// backend instead of waiting on it — the loop resumes, and the frames it
+    /// skipped are counted on the next one through.
+    pub frames_backpressure_dropped: u64,
     /// Width of the most recent frame, in pixels. For RTSP this is
     /// the detector frame dimension (currently 960), NOT the camera
     /// native resolution. The UI uses this to scale bbox overlay
@@ -115,6 +139,9 @@ struct Entry {
     recent_instants: VecDeque<Instant>,
     frames_emitted: u64,
     frames_dropped: u64,
+    frames_backpressure_dropped: u64,
+    /// Last `frame_id` seen from the source, for gap detection.
+    last_frame_id: Option<u64>,
     source_width: u32,
     source_height: u32,
     tile_invocations: u64,
@@ -149,6 +176,7 @@ impl Entry {
             fps_ema: self.fps(now),
             frames_emitted: self.frames_emitted,
             frames_dropped: self.frames_dropped,
+            frames_backpressure_dropped: self.frames_backpressure_dropped,
             source_width: self.source_width,
             source_height: self.source_height,
             tile_invocations: self.tile_invocations,
@@ -184,6 +212,8 @@ impl FrameStatsRegistry {
             last_frame_at: None,
             recent_instants: VecDeque::with_capacity(FPS_WINDOW_MAX_SAMPLES),
             frames_emitted: 0,
+            frames_backpressure_dropped: 0,
+            last_frame_id: None,
             frames_dropped: 0,
             source_width: 0,
             source_height: 0,
@@ -211,6 +241,47 @@ impl FrameStatsRegistry {
         entry.frames_emitted = entry.frames_emitted.saturating_add(1);
         entry.source_width = width;
         entry.source_height = height;
+    }
+
+    /// Record the `frame_id` of a frame that reached the consumer, counting
+    /// any gap since the previous one as frames lost to backpressure.
+    ///
+    /// The source assigns `frame_id` from a monotonic per-session counter
+    /// *before* its `try_send`, so a gap is exactly the set of frames the
+    /// caller never received — whether they were dropped by a full channel
+    /// or coalesced away by the latest-wins `watch` downstream of it.
+    ///
+    /// A counter that goes backwards or repeats is a new session (the source
+    /// restarts the sequence on reconfiguration) and resets the baseline
+    /// rather than inventing a drop for every id in between. So is a forward
+    /// jump beyond `MAX_PLAUSIBLE_FRAME_GAP`, which means two independent
+    /// sequences rather than one camera falling behind.
+    pub fn observe_frame_id(&self, camera_id: CameraId, frame_id: u64) {
+        /// Largest gap attributable to one camera falling behind. Beyond it
+        /// the jump is two counters, not lost frames: at 30 fps this is over
+        /// two minutes of total loss, which a camera does not survive without
+        /// the decode-health ladder firing first.
+        const MAX_PLAUSIBLE_FRAME_GAP: u64 = 4096;
+
+        let mut guard = self.inner.write();
+        let Some(entry) = guard.get_mut(&camera_id) else {
+            return;
+        };
+        if let Some(prev) = entry.last_frame_id {
+            let lost = frame_id.saturating_sub(prev).saturating_sub(1);
+            // A jump this large is not a camera that fell behind — it is a
+            // different counter. `SharedRtspSource` swaps the analysis
+            // substream's ingester for the main one mid-run on fallback, and
+            // each ingester owns its own sequence, so the first frame after
+            // the swap can land arbitrarily far ahead. Counting it would post
+            // a one-shot phantom spike of thousands. Treated as a reset, the
+            // same way a backwards jump already is.
+            if lost > 0 && lost <= MAX_PLAUSIBLE_FRAME_GAP {
+                entry.frames_backpressure_dropped =
+                    entry.frames_backpressure_dropped.saturating_add(lost);
+            }
+        }
+        entry.last_frame_id = Some(frame_id);
     }
 
     pub fn observe_dropped(&self, camera_id: CameraId) {
@@ -670,6 +741,84 @@ mod tests {
         let s = reg.snapshot(1).unwrap();
         assert_eq!(s.frames_emitted, 1);
         assert_eq!(s.frames_dropped, 2);
+    }
+
+    #[test]
+    fn a_gap_in_frame_ids_is_counted_as_backpressure_not_as_a_gate_drop() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 320, 240);
+
+        reg.observe_frame_id(1, 1);
+        reg.observe_frame_id(1, 2); // contiguous — nothing lost
+        reg.observe_frame_id(1, 7); // 3,4,5,6 never arrived
+
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(
+            s.frames_backpressure_dropped, 4,
+            "the four frame ids the source produced and the channel discarded"
+        );
+        assert_eq!(
+            s.frames_dropped, 0,
+            "a backpressure drop is NOT a gate drop — conflating them is the \
+             defect: the gate drops on purpose and is the expected steady state"
+        );
+    }
+
+    #[test]
+    fn an_implausible_forward_jump_is_two_counters_not_lost_frames() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 320, 240);
+        reg.observe_frame_id(1, 10);
+        // SharedRtspSource swaps the analysis substream's ingester for the
+        // main one mid-run; each owns its own sequence, so the first frame
+        // after the swap can land arbitrarily far ahead.
+        reg.observe_frame_id(1, 900_000);
+        reg.observe_frame_id(1, 900_001);
+
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(
+            s.frames_backpressure_dropped, 0,
+            "a jump of 900k is a different counter, not 900k dropped frames"
+        );
+
+        // A reset REBASELINES; it does not make the camera un-countable.
+        // Skipping the baseline update instead would leave `last_frame_id`
+        // pinned at 10, every later id would exceed the cap, and this
+        // camera's counter would read zero for the rest of the process —
+        // the "counted nowhere" defect, back again, with the assertion
+        // above still green.
+        reg.observe_frame_id(1, 900_005);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(
+            s.frames_backpressure_dropped, 3,
+            "the new sequence must be countable immediately after the swap"
+        );
+    }
+
+    #[test]
+    fn a_session_restart_resets_the_sequence_without_inventing_drops() {
+        let reg = FrameStatsRegistry::new();
+        reg.observe_frame(1, Utc::now(), 320, 240);
+        reg.observe_frame_id(1, 900);
+        // The source's per-session counter restarts at 1 on reconfiguration.
+        reg.observe_frame_id(1, 1);
+        reg.observe_frame_id(1, 2);
+
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(
+            s.frames_backpressure_dropped, 0,
+            "a counter that went BACKWARDS is a new session, not 899 lost frames"
+        );
+
+        // Same rebaseline requirement as the forward-jump case: without it
+        // `last_frame_id` stays at 900 and the next 898 ids all subtract to
+        // zero, silently under-reporting a whole session's loss.
+        reg.observe_frame_id(1, 5);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(
+            s.frames_backpressure_dropped, 2,
+            "the restarted sequence must be countable from its own baseline"
+        );
     }
 
     #[test]

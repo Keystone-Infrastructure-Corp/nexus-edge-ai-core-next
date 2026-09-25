@@ -64,6 +64,10 @@ export interface CameraFrameStats {
   fps_ema: number;
   frames_emitted: number;
   frames_dropped: number;
+  // Frames the source produced that the analysis loop never saw. Distinct
+  // from `frames_dropped`, which is the motion gate dropping on purpose and
+  // is the expected steady state. Optional so an older engine parses cleanly.
+  frames_backpressure_dropped?: number;
   source_width: number;
   source_height: number;
   // SPEC-069 Phase 1 decode counters and verdict. Optional so an older

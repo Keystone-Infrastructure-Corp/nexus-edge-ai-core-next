@@ -621,6 +621,10 @@ function CameraTile({ camera }: { camera: CameraConfig }) {
   const src = `${latestFrameJpegUrl(String(camera.id))}?t=${bust}`;
   const fps = statsQuery.data?.fps_ema ?? 0;
   const dropped = statsQuery.data?.frames_dropped ?? 0;
+  // The gate drops on purpose and is the expected steady state; frames the
+  // analysis loop never saw are the backpressure signal worth surfacing
+  // separately, and used to be counted nowhere at all (BUG-218).
+  const missed = statsQuery.data?.frames_backpressure_dropped ?? 0;
   // Engine-side detector frame dims (after videoscale). The playback
   // <img> is the same JPEG the engine just emitted, so this IS the
   // resolution the viewer is showing — not the camera's native
@@ -678,7 +682,8 @@ function CameraTile({ camera }: { camera: CameraConfig }) {
         </span>
         <span className="font-mono text-muted-foreground">
           {formatAgo(metaQuery.data?.captured_at)}
-          {dropped > 0 ? ` · ${dropped} dropped` : ""}
+          {dropped > 0 ? ` · ${dropped} gated` : ""}
+          {missed > 0 ? ` · ${missed} missed` : ""}
         </span>
       </div>
     </div>

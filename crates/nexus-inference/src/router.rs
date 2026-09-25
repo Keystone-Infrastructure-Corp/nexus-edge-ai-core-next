@@ -410,7 +410,12 @@ mod tests {
         let d1 = router.detector_for_camera(&cams[0]);
         let d2 = router.detector_for_camera(&cams[1]);
         assert_eq!(d1.name(), "mock");
-        assert_eq!(d2.name(), "classifier_ensemble");
+        // `classifier_ensemble` ships no model, so its layer degrades to
+        // `unavailable` (see `detector_never_fabricates.rs`). That is
+        // still the override's OWN layer: had the override failed to
+        // build, the camera would fall through to the default and read
+        // `mock`. Not feature-gated, so this holds with and without `ort`.
+        assert_eq!(d2.name(), "unavailable");
     }
 
     /// M_PERF_CROWD Phase E3 — when a camera opts in to detector

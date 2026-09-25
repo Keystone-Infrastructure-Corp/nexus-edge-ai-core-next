@@ -537,6 +537,16 @@ async fn run_camera(
                 None => continue,
             };
             decoded += 1;
+            // Count frames the source produced that this loop never saw.
+            //
+            // It has to be HERE, not in the tap above: the tap drains
+            // `raw_rx` unconditionally and cannot block, so the bounded
+            // channel only overflows under runtime starvation. The loss that
+            // matters — a slow or wedged analysis loop — happens in the
+            // latest-wins `watch` between them, which coalesces silently by
+            // design. Gaps in the source's monotonic per-session `frame_id`
+            // at this point cover both.
+            stats.observe_frame_id(cfg.id, frame.frame_id);
 
             // Honour any operator-initiated anchor wipe issued via
             // `DELETE /api/v1/cameras/{id}/static-anchors` since the

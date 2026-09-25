@@ -27,7 +27,7 @@ use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use nexus_inference::detectors::{Detector, MockDetector};
+use nexus_inference::detectors::{Detector, MockDetector, UnavailableDetector};
 use nexus_inference::worker_proto::{read_msg, write_msg, WorkerRequest, WorkerResponse};
 use tokio::io::{stdin, stdout};
 
@@ -129,7 +129,23 @@ async fn build_worker_detector(kind: &str) -> Arc<dyn Detector> {
             );
             Arc::new(MockDetector::new())
         }
-        _ => Arc::new(MockDetector::new()),
+        // Asking for the mock by name stays supported — that is how
+        // tests and bare dev boxes run without a model pack. It needs
+        // its own arm now that the catch-all below no longer returns it.
+        "mock" => Arc::new(MockDetector::new()),
+        // Everything else — `classifier_ensemble` / `ppe`, which ship no
+        // model, and any typo — reports nothing, matching the library's
+        // unknown-kind arm in `build_detector_kind`. Returning the mock
+        // here fabricated a `person` on every frame of every camera on a
+        // process pool; see `tests/detector_never_fabricates.rs`.
+        other => {
+            eprintln!(
+                "[nexus-inference-worker] DETECTION DISABLED: no detector implementation \
+                 for model kind {other:?}; this worker will report ZERO detections until \
+                 inference.model.kind is corrected and the engine restarted"
+            );
+            Arc::new(UnavailableDetector::new())
+        }
     }
 }
 

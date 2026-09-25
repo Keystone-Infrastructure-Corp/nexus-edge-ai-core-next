@@ -1322,8 +1322,12 @@ pub struct ModelConfig {
     /// `"yolo"` (closed-vocab YOLOv26-nano, default) | `"open_vocab"` /
     /// `"yolo_world"` | `"yoloe"` (M3.1 open-vocab text + visual prompts) |
     /// `"yoloe_visual"` | `"yoloe_promptfree"` (M3.3 open-set auto-class)
-    /// | `"classifier_ensemble"` | `"ensemble"` (M3.2 same-camera multi-
-    /// detector fan-out — see `members` below) | `"mock"`.
+    /// | `"ensemble"` (M3.2 same-camera multi-detector fan-out — see
+    /// `members` below) | `"mock"`.
+    ///
+    /// `"classifier_ensemble"` / `"ppe"` are still accepted, but no model
+    /// ships for them: they resolve to the degraded detector, report zero
+    /// detections, and mark engine health degraded.
     ///
     /// `yolo` matches the v1 ship — `models/yolo26n_<W>x<H>.onnx` on the
     /// native 16:9 ladder (512x288 … 1536x864).

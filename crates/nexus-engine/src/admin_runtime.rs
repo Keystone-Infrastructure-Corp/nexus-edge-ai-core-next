@@ -1086,6 +1086,7 @@ async fn build_snapshot(
                     "fps_ema": st.fps_ema,
                     "frames_emitted": st.frames_emitted,
                     "frames_dropped": st.frames_dropped,
+                    "frames_backpressure_dropped": st.frames_backpressure_dropped,
                     "source_width": st.source_width,
                     "source_height": st.source_height,
                     "decoder_input_drops": dh.decoder_input_drops,

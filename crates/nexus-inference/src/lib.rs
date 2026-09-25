@@ -3,7 +3,7 @@
 //! This crate owns three orthogonal axes:
 //!
 //! 1. **What runs** — the [`Detector`] trait. Implementations include
-//!    [`MockDetector`], [`OpenVocabDetector`], and [`ClassifierEnsembleDetector`].
+//!    [`MockDetector`] and [`OpenVocabDetector`].
 //! 2. **Where it runs** — the [`DetectorBackend`] trait. Implementations include
 //!    [`InProcessBackend`], [`ThreadIsolatedBackend`], and [`WorkerProcessBackend`].
 //!    Backends wrap a [`Detector`] in an isolation strategy.
@@ -54,8 +54,8 @@ pub use backends::{
 };
 pub use caps::{MinBBoxAreaDetector, TopKDetector};
 pub use detectors::{
-    label_matches_any_prompt, ClassifierEnsembleDetector, Detector, InferenceError, MockDetector,
-    OpenVocabDetector, UnavailableDetector,
+    label_matches_any_prompt, Detector, InferenceError, MockDetector, OpenVocabDetector,
+    UnavailableDetector,
 };
 #[cfg(feature = "ort")]
 pub use encoder::ImageEncoder;
@@ -365,8 +365,19 @@ fn build_detector_kind(
                 Ok(Arc::new(OpenVocabDetector::new(cfg)?))
             }
         }
-        // PPE-style attribute heads (`ppe_v1.onnx` is the v1 ship).
-        "classifier_ensemble" | "ppe" => Ok(Arc::new(ClassifierEnsembleDetector::new(cfg)?)),
+        // PPE-style attribute heads. No detector implementation ships
+        // for these yet, so they degrade like any other unloadable
+        // model rather than resolving to the synthetic mock — the kind
+        // stays advertised on the wire, it just reports nothing until
+        // something real backs it. See `detector_never_fabricates.rs`.
+        "classifier_ensemble" | "ppe" => Ok(crate::health::degraded_detector(
+            // The kind the operator actually configured, not the alias
+            // this arm is filed under — `d.kind` is echoed verbatim to
+            // `/health` and into the cloud heartbeat detail, so a `ppe`
+            // box must not be told `classifier_ensemble` is degraded.
+            cfg.model.kind.as_str(),
+            "no detector implementation ships for this model kind",
+        )),
         // M3.1 — yoloe (open-vocab text-prompt detector). Real ORT path
         // requires the `ort` feature AND inference.model.pack_path; mock
         // fallback otherwise so the engine still boots on a bare dev box.
@@ -478,7 +489,7 @@ fn build_detector_kind(
             other,
             format!(
                 "unknown inference.model.kind {other:?}; expected one of yolo, yolo_world, \
-                 yoloe, yoloe_visual, yoloe_promptfree, classifier_ensemble, ensemble, mock"
+                 yoloe, yoloe_visual, yoloe_promptfree, ensemble, mock"
             ),
         )),
     }
