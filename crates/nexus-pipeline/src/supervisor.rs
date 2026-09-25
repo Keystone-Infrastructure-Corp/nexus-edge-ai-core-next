@@ -5,6 +5,7 @@
 //! that opens child spans for `decode/gate/infer/track/rules`. That's how
 //! the `trace_id` field on [`nexus_types::Frame`] is actually backed.
 
+use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,8 +20,8 @@ use nexus_tracker::{
     MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
 };
 use nexus_types::{
-    BBox, CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState, PipelineStatus,
-    PixelFormat, TrackLite, TrackedObject,
+    AlertEvent, BBox, CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState,
+    PipelineStatus, PixelFormat, TrackLite, TrackedObject,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -146,6 +147,44 @@ async fn write_alert_snapshot(
         Err(e) => {
             warn!(event = %event_id, "alert snapshot task join failed: {e}");
             None
+        }
+    }
+}
+
+/// The non-static tracks that rules, sightings, alert-clip boxes and the
+/// motion lifecycle see. Borrows the frame's single tracked set whenever
+/// nothing is filtered out, so the common frame makes no copy of it.
+fn dynamic_tracks(
+    tracked: &[TrackedObject],
+    static_filter_active: bool,
+) -> Cow<'_, [TrackedObject]> {
+    if static_filter_active && tracked.iter().any(is_object_static) {
+        Cow::Owned(
+            tracked
+                .iter()
+                .filter(|t| !is_object_static(t))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(tracked)
+    }
+}
+
+/// Write one snapshot per event and stamp its path onto
+/// `artifacts.snapshot`. The writes for one frame run concurrently (each
+/// is its own blocking-pool encode, since every snapshot burns in its own
+/// box + label) and all complete before this returns, so the caller's
+/// record/enqueue/publish still sees every path it would have serially.
+async fn stamp_alert_snapshots<F, Fut>(events: &mut [AlertEvent], write: F)
+where
+    F: Fn(&AlertEvent) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let paths = futures::future::join_all(events.iter().map(&write)).await;
+    for (ev, path) in events.iter_mut().zip(paths) {
+        if let Some(path) = path {
+            ev.artifacts.snapshot = Some(path);
         }
     }
 }
@@ -1028,7 +1067,10 @@ async fn run_camera(
                     // them out of rule eval + the motion lifecycle.
                     sf.classify(&frame, &mut tracked);
                 }
-                let tracked_arc = Arc::new(tracked.clone());
+                // Built once: the cache, FRAME_METADATA and (via
+                // `dynamic_tracks`) the rule / sighting / motion consumers
+                // all read this one allocation.
+                let tracked_arc = Arc::new(tracked);
 
                 // L7 cache update — see ARCHITECTURE.md.
                 let frame_arc = Arc::new(frame.clone());
@@ -1062,7 +1104,7 @@ async fn run_camera(
                     width: meta.width,
                     height: meta.height,
                     trace_id: meta.trace_id.clone(),
-                    objects: Arc::new(tracked.iter().map(TrackLite::from).collect()),
+                    objects: Arc::new(tracked_arc.iter().map(TrackLite::from).collect()),
                 };
                 let _ = bus
                     .publish(topic::FRAME_METADATA_LITE, &meta_lite)
@@ -1074,17 +1116,9 @@ async fn run_camera(
                 // still appear in the L7 cache + FRAME_METADATA above
                 // so the live viewer can draw it (de-emphasised) and
                 // so the operator can see the static-suppression in
-                // action. When `static_filter` is `None`, no object can
-                // be marked static so we just clone the full slice.
-                let dynamic_tracked: Vec<TrackedObject> = if static_filter.is_some() {
-                    tracked
-                        .iter()
-                        .filter(|t| !is_object_static(t))
-                        .cloned()
-                        .collect()
-                } else {
-                    tracked.clone()
-                };
+                // action. When nothing is static this borrows the shared
+                // set instead of copying it.
+                let dynamic_tracked = dynamic_tracks(&tracked_arc, static_filter.is_some());
 
                 // M-Alert-Clip: feed this frame's frame-aligned detection
                 // boxes into the recorder's per-camera box timeline so an
@@ -1135,7 +1169,7 @@ async fn run_camera(
                     sighting_hook.as_ref(),
                 );
 
-                let events = {
+                let mut events = {
                     let _g = info_span!("frame.rules").entered();
                     evaluator.evaluate(
                         cfg.id,
@@ -1147,6 +1181,40 @@ async fn run_camera(
                         &dynamic_tracked,
                     )
                 };
+                // Alert snapshots — persist a JPEG of the frame that fired
+                // each rule at a deterministic
+                // `<state_dir>/snapshots/<event_id>.jpg` path BEFORE any
+                // outbox row is written, so the cloud-console sink (if
+                // enrolled) always finds the file when it processes the
+                // row. Best-effort: a missing thumbnail never blocks the
+                // alert. Also stamped onto `artifacts.snapshot` for bus
+                // subscribers / the local admin API. The writes for this
+                // frame run concurrently, so N simultaneous fires cost one
+                // encode's latency on the analysis loop rather than N.
+                stamp_alert_snapshots(&mut events, |ev| {
+                    let event_id = ev.event_id.to_string();
+                    let label = ev.label.clone();
+                    let bbox = ev.bbox;
+                    let snap_conf = ev
+                        .context
+                        .get("confidence")
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|f| f as f32);
+                    let snapshots_dir = &snapshots_dir;
+                    let frame_arc = &frame_arc;
+                    async move {
+                        write_alert_snapshot(
+                            snapshots_dir,
+                            &event_id,
+                            frame_arc,
+                            bbox,
+                            &label,
+                            snap_conf,
+                        )
+                        .await
+                    }
+                })
+                .await;
                 // Record + publish the events now so the row exists.
                 // We defer the events.clip_id stamp until AFTER the
                 // motion lifecycle has run for this frame, because a
@@ -1159,38 +1227,13 @@ async fn run_camera(
                 // the alert-clip arm below; an off-schedule frame logs its
                 // events + links the motion clip only.
                 let mut any_deliverable = false;
-                for mut ev in events {
+                for ev in events {
                     let event_id = ev.event_id.to_string();
                     // M-Event-Audit: does this rule-fire fall within the
                     // active delivery schedule (global + per-rule cascade)?
                     // Drives both the alert-clip arm and the `events.alerted`
                     // audit flag stamped by `record_event_and_enqueue`.
                     let alerted = alert_clip_gate.should_build(&ev.rule_id, frame.captured_at);
-                    // Alert snapshot — persist a JPEG of the frame that fired
-                    // this rule at a deterministic
-                    // `<state_dir>/snapshots/<event_id>.jpg` path BEFORE the
-                    // outbox row is written, so the cloud-console sink (if
-                    // enrolled) always finds the file when it processes the
-                    // row. Best-effort: a missing thumbnail never blocks the
-                    // alert. Also stamped onto `artifacts.snapshot` for bus
-                    // subscribers / the local admin API.
-                    let snap_conf = ev
-                        .context
-                        .get("confidence")
-                        .and_then(serde_json::Value::as_f64)
-                        .map(|f| f as f32);
-                    if let Some(path) = write_alert_snapshot(
-                        &snapshots_dir,
-                        &event_id,
-                        &frame_arc,
-                        ev.bbox,
-                        &ev.label,
-                        snap_conf,
-                    )
-                    .await
-                    {
-                        ev.artifacts.snapshot = Some(path);
-                    }
                     // M7 per-rule sink routing — resolve which configured
                     // sinks this rule delivers to, then record the event
                     // and enqueue an `alert_sink_outbox` row per sink in a
@@ -1547,4 +1590,126 @@ async fn insert_motion_decision(
         attributes_json: attrs_json,
     };
     store.insert_motion_event(&new).await.map(|_id| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(id: u64, is_static: bool) -> TrackedObject {
+        let mut attributes = serde_json::Map::new();
+        if is_static {
+            attributes.insert(
+                nexus_tracker::STATIC_ATTRIBUTE_KEY.into(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        TrackedObject {
+            track_id: id,
+            label: "person".into(),
+            confidence: 0.9,
+            bbox: BBox {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 10.0,
+                y2: 10.0,
+            },
+            detection_bbox: None,
+            age_frames: 1,
+            age_ms: 0,
+            attributes,
+        }
+    }
+
+    fn event(n: u128) -> AlertEvent {
+        AlertEvent {
+            event_id: uuid::Uuid::from_u128(n),
+            camera_id: 1,
+            rule_id: format!("rule-{n}"),
+            track_id: Some(n as u64),
+            label: "person".into(),
+            severity: nexus_types::Severity::Low,
+            bbox: None,
+            frame_id: 7,
+            captured_at: chrono::Utc::now(),
+            trace_id: "t".into(),
+            frame_w: 0,
+            frame_h: 0,
+            artifacts: Default::default(),
+            context: serde_json::Map::new(),
+        }
+    }
+
+    /// Without a static filter every track is dynamic, so the rule /
+    /// sighting / motion consumers must read the frame's one tracked set
+    /// rather than a per-frame copy of it.
+    #[test]
+    fn dynamic_tracks_borrows_when_nothing_is_filtered() {
+        let tracked = vec![track(1, false), track(2, false)];
+        let view = dynamic_tracks(&tracked, false);
+        assert!(matches!(view, Cow::Borrowed(_)), "no filter: must borrow");
+        assert!(std::ptr::eq(view.as_ptr(), tracked.as_ptr()));
+
+        // Filter active but no track is static: nothing to drop, no copy.
+        let view = dynamic_tracks(&tracked, true);
+        assert!(
+            matches!(view, Cow::Borrowed(_)),
+            "no static track: must borrow"
+        );
+    }
+
+    #[test]
+    fn dynamic_tracks_drops_static_tracks() {
+        let tracked = vec![track(1, false), track(2, true), track(3, false)];
+        let ids: Vec<u64> = dynamic_tracks(&tracked, true)
+            .iter()
+            .map(|t| t.track_id)
+            .collect();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    /// N events on one frame must have their snapshots in flight together:
+    /// each fake write parks on an N-party barrier, so a serial loop never
+    /// gets past the first write and the timeout fails the test. No
+    /// wall-clock race — a pass means all N were concurrently pending.
+    #[tokio::test]
+    async fn snapshots_for_one_frame_are_written_concurrently() {
+        const N: usize = 5;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
+        let mut events: Vec<AlertEvent> = (1..=N as u128).map(event).collect();
+        let run = stamp_alert_snapshots(&mut events, |ev| {
+            let barrier = barrier.clone();
+            let path = format!("/snap/{}.jpg", ev.event_id);
+            async move {
+                barrier.wait().await;
+                Some(path)
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("snapshot writes ran serially: the barrier was never reached by all N");
+        for ev in &events {
+            assert_eq!(
+                ev.artifacts.snapshot.as_deref(),
+                Some(format!("/snap/{}.jpg", ev.event_id).as_str()),
+                "each event keeps its own snapshot path"
+            );
+        }
+    }
+
+    /// A failed write (None) leaves that event without a snapshot and does
+    /// not disturb the others.
+    #[tokio::test]
+    async fn failed_snapshot_leaves_only_that_event_unstamped() {
+        let mut events: Vec<AlertEvent> = (1..=3).map(event).collect();
+        let fail = events[1].event_id;
+        stamp_alert_snapshots(&mut events, |ev| {
+            let out = (ev.event_id != fail).then(|| format!("/snap/{}.jpg", ev.event_id));
+            async move { out }
+        })
+        .await;
+        assert!(events[0].artifacts.snapshot.is_some());
+        assert!(events[1].artifacts.snapshot.is_none());
+        assert!(events[2].artifacts.snapshot.is_some());
+    }
 }
