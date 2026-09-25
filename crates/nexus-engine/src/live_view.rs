@@ -554,9 +554,9 @@ fn spawn_pump(
 /// Resize (down, never up) the clean supervisor frame to the tile and
 /// JPEG-encode it.
 fn encode_lbr(frame: &Frame, tile_w: Option<u32>) -> Result<Vec<u8>, String> {
-    let rgb = match frame.format {
-        PixelFormat::Rgb24 => frame.data.as_ref().clone(),
-        PixelFormat::Bgr24 => bgr_to_rgb(frame.data.as_ref()),
+    let rgb: std::borrow::Cow<'_, [u8]> = match frame.format {
+        PixelFormat::Rgb24 => std::borrow::Cow::Borrowed(&frame.data[..]),
+        PixelFormat::Bgr24 => std::borrow::Cow::Owned(bgr_to_rgb(frame.data.as_ref())),
         other => return Err(format!("unsupported pixel format {other:?}")),
     };
     let (tw, th) = target_size(frame.width, frame.height, tile_w);
@@ -571,8 +571,9 @@ fn encode_lbr(frame: &Frame, tile_w: Option<u32>) -> Result<Vec<u8>, String> {
             )
             .map_err(|e| e.to_string())?;
     } else {
-        let img = image::RgbImage::from_raw(frame.width, frame.height, rgb)
-            .ok_or_else(|| "frame buffer size mismatch".to_string())?;
+        let img =
+            image::ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(frame.width, frame.height, &rgb)
+                .ok_or_else(|| "frame buffer size mismatch".to_string())?;
         let resized = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, LBR_JPEG_QUALITY)
             .write_image(resized.as_raw(), tw, th, image::ExtendedColorType::Rgb8)

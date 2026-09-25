@@ -2960,9 +2960,9 @@ pub(crate) fn latest_frame_jpeg(s: &ApiState, id: CameraId) -> Result<Vec<u8>, A
     let frame = &entry.frame;
 
     // Convert NV12/I420 → RGB on demand for the snapshot. M0 supports RGB24.
-    let rgb = match frame.format {
-        PixelFormat::Rgb24 => frame.data.as_ref().clone(),
-        PixelFormat::Bgr24 => bgr_to_rgb(frame.data.as_ref()),
+    let rgb: std::borrow::Cow<'_, [u8]> = match frame.format {
+        PixelFormat::Rgb24 => std::borrow::Cow::Borrowed(&frame.data[..]),
+        PixelFormat::Bgr24 => std::borrow::Cow::Owned(bgr_to_rgb(frame.data.as_ref())),
         _ => {
             return Err(ApiError(
                 StatusCode::NOT_IMPLEMENTED,

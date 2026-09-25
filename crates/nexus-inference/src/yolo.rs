@@ -34,6 +34,7 @@
 #![cfg(feature = "ort")]
 #![allow(unsafe_code)]
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -279,13 +280,8 @@ impl Detector for YoloOrtDetector {
         let frame_w = frame.width;
         let frame_h = frame.height;
         let score_threshold = self.score_threshold;
-        let format = frame.format;
 
-        let rgb = match format {
-            PixelFormat::Rgb24 => frame.data.as_ref().clone(),
-            PixelFormat::Bgr24 => bgr_to_rgb(frame.data.as_ref()),
-            other => return Err(InferenceError::UnsupportedFormat(other)),
-        };
+        let rgb = frame_rgb(frame)?;
 
         // ort sessions are !Sync and `run` takes &mut self, so do the
         // work on a blocking thread and acquire the mutex there.
@@ -521,6 +517,19 @@ pub(crate) fn preprocess_nchw(
     }
 
     Ok(tensor)
+}
+
+/// The frame's pixels as RGB. RGB24 (the supervisor frame contract, so
+/// the branch every inferred frame takes) is borrowed straight from the
+/// frame's `Arc` buffer; only BGR24 pays for a converted copy. Nothing
+/// downstream needs ownership: `block_in_place` keeps the work on this
+/// thread, so the borrow outlives it.
+pub(crate) fn frame_rgb(frame: &Frame) -> Result<Cow<'_, [u8]>, InferenceError> {
+    match frame.format {
+        PixelFormat::Rgb24 => Ok(Cow::Borrowed(&frame.data[..])),
+        PixelFormat::Bgr24 => Ok(Cow::Owned(bgr_to_rgb(&frame.data))),
+        other => Err(InferenceError::UnsupportedFormat(other)),
+    }
 }
 
 pub(crate) fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
@@ -769,6 +778,40 @@ mod tests {
                 samples[samples.len() / 10]
             );
         }
+    }
+
+    fn frame_of(format: PixelFormat, data: Vec<u8>) -> Frame {
+        Frame {
+            camera_id: 1,
+            frame_id: 1,
+            captured_at: chrono::Utc::now(),
+            width: 2,
+            height: 1,
+            format,
+            data: Arc::new(data),
+            trace_id: "yolo-test".into(),
+        }
+    }
+
+    #[test]
+    fn frame_rgb_borrows_rgb24_instead_of_copying_it() {
+        // RGB24 is the supervisor contract, so this is the branch every
+        // inferred frame takes: it must hand back the frame's own bytes.
+        let frame = frame_of(PixelFormat::Rgb24, vec![1, 2, 3, 4, 5, 6]);
+        let rgb = frame_rgb(&frame).unwrap();
+        assert!(matches!(rgb, Cow::Borrowed(_)), "RGB24 was copied");
+        assert_eq!(rgb.as_ptr(), frame.data.as_ptr());
+    }
+
+    #[test]
+    fn frame_rgb_swaps_bgr24_and_rejects_other_formats() {
+        let frame = frame_of(PixelFormat::Bgr24, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(&*frame_rgb(&frame).unwrap(), &[3, 2, 1, 6, 5, 4]);
+        let frame = frame_of(PixelFormat::Nv12, vec![0; 3]);
+        assert!(matches!(
+            frame_rgb(&frame),
+            Err(InferenceError::UnsupportedFormat(PixelFormat::Nv12))
+        ));
     }
 
     #[test]
