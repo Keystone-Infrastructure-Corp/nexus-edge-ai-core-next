@@ -3,3 +3,23 @@ model_optimization_config(calibration, batch_size=8, calibset_size=256)
 model_optimization_flavor(optimization_level=2, compression_level=2)
 post_quantization_optimization(adaround, policy=enabled, batch_size=8)
 performance_param(compiler_optimization_level=max)
+
+# Class-branch output range. Without this, DFC derives limvals from the
+# calibration set, and background cells drive the minimum to -40 / -217 / -139
+# on the three FPN scales. A uint8 then spends almost all of its levels at or below logit 0
+# (95.7% / 98.8% / 97.7%) and leaves only 11 / 3 / 6 above it, so confidence above p=0.5 carries 3-11
+# distinct values and caps at 0.862 / 0.930 / 0.966 -- a rule thresholded at
+# 0.95 can never fire. Measured on a Hailo-8; see BUG-221.
+#
+# Clipping the negative tail is free: the decoder applies sigmoid, and
+# sigmoid(-217) = 5.7e-95 (exactly 0 in f32) vs sigmoid(-10) = 4.5e-5 are both orders of magnitude
+# below SCORE_FLOOR (0.20). Nothing downstream can tell them apart. [-10, +10]
+# gives 127 levels above logit 0, ~0.0197 resolution at p=0.5, max p 0.99995.
+# DFC keeps +10 exact and snaps the zero-point to an integer (128), so the realised
+# range is [-10.079, +10.000] with qp_scale 10/127 -- the asymmetry is expected.
+#
+# conv64 / conv80 / conv94 are the c=80 class convs at strides 8 / 16 / 32.
+# Verified present under these names on all three shipped shapes.
+quantization_param(conv64, force_range_out=[-10.0, 10.0])
+quantization_param(conv80, force_range_out=[-10.0, 10.0])
+quantization_param(conv94, force_range_out=[-10.0, 10.0])

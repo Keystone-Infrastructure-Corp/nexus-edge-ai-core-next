@@ -3,6 +3,8 @@
 //! Usage:
 //!     nexus-hailo-probe                            # just list devices
 //!     nexus-hailo-probe --hef path/to/yolo26n.hef   # also open + dummy infer
+//!     nexus-hailo-probe --hef m.hef --images DIR --csv OUT.csv
+//!                                                   # run raw RGB frames, one row per detection
 //!
 //! Exits non-zero on any failure. Designed for `journalctl`-friendly
 //! line output rather than pretty TUI.
@@ -56,7 +58,7 @@ fn main() -> ExitCode {
     }
 
     // --- if --hef given, open + run one dummy frame ---
-    let hef_path = parse_hef_arg();
+    let hef_path = parse_flag("--hef");
     if let Some(path) = hef_path {
         match probe_hef(&path) {
             Ok(()) => {
@@ -73,14 +75,96 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_hef_arg() -> Option<PathBuf> {
+fn parse_flag(flag: &str) -> Option<PathBuf> {
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
-        if a == "--hef" {
+        if a == flag {
             return args.next().map(PathBuf::from);
         }
     }
     None
+}
+
+/// Run every raw frame in `dir` and print one CSV row per detection.
+///
+/// Frames are raw interleaved RGB of exactly `input_frame_size()` bytes --
+/// no image decoding here, because this crate has four dependencies and
+/// decoding JPEG is not worth a fifth. Convert with any tool that can
+/// write raw bytes at the model's input resolution.
+///
+/// The point of running real frames through THIS binary rather than a
+/// separate harness is that it exercises the production decode path
+/// (`decode_detections`), so a comparison between two HEFs measures the
+/// model change and not a reimplementation.
+fn run_images(
+    session: &mut InferSession,
+    layout: &OutputLayout,
+    dir: &std::path::Path,
+    csv: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let want = session.input_frame_size();
+    let mut unlisted = 0usize;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        match e {
+            Ok(e) if e.path().is_file() => files.push(e.path()),
+            Ok(_) => {}
+            Err(_) => unlisted += 1,
+        }
+    }
+    files.sort();
+    // Rows go to their own file: stdout also carries the device/HEF preamble
+    // and the final "OK" line, and mixing them made the output unparseable.
+    let mut out = std::io::BufWriter::new(std::fs::File::create(csv)?);
+    writeln!(out, "image,class_id,score,x_min,y_min,x_max,y_max")?;
+    let (mut run, mut wrong_size, mut failed) = (0usize, 0usize, 0usize);
+    for f in &files {
+        let buf = match std::fs::read(f) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("nexus-hailo-probe: skipping {}: {e}", f.display());
+                failed += 1;
+                continue;
+            }
+        };
+        if buf.len() != want {
+            wrong_size += 1;
+            continue;
+        }
+        let name = f
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let raw = match session.infer_blocking(&buf) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("nexus-hailo-probe: inference failed on {name}: {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        for d in nexus_hailo_backend::decode_detections(raw, layout, 200) {
+            writeln!(
+                out,
+                "{name},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                d.class_id, d.score, d.x_min, d.y_min, d.x_max, d.y_max,
+            )?;
+        }
+        run += 1;
+    }
+    out.flush()?;
+    // Every frame is accounted for, so a short CSV cannot pass for a full one.
+    println!(
+        "images: {run} run, {wrong_size} wrong size (expected {want} bytes), \
+         {failed} failed, {unlisted} unlisted -> {}",
+        csv.display(),
+    );
+    if failed + unlisted > 0 {
+        return Err(format!("{} frame(s) not run", failed + unlisted).into());
+    }
+    Ok(())
 }
 
 fn probe_hef(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -150,6 +234,10 @@ fn probe_hef(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             "  [{i}] class={} score={:.3} box=({:.3},{:.3})-({:.3},{:.3})",
             d.class_id, d.score, d.x_min, d.y_min, d.x_max, d.y_max,
         );
+    }
+    if let Some(dir) = parse_flag("--images") {
+        let csv = parse_flag("--csv").ok_or("--images needs --csv <path>")?;
+        run_images(&mut session, &layout, &dir, &csv)?;
     }
     Ok(())
 }
