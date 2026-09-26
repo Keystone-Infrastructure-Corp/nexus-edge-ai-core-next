@@ -71,6 +71,17 @@ pub struct OutputStreamInfo {
     pub w: u32,
     pub c: u32,
     pub frame_size: usize,
+    /// HailoRT's affine quantisation for this stream: the device value `q`
+    /// dequantises to `qp_scale * (q - qp_zp)`. We open output vstreams as
+    /// FLOAT32 so HailoRT applies this for us, which is exactly why it was
+    /// never recorded -- and why the representable range was guesswork.
+    /// `qp_zp > 0` is what makes a NEGATIVE logit representable at all.
+    pub qp_zp: f32,
+    pub qp_scale: f32,
+    /// The value range calibration chose. Anything the network produces
+    /// outside `[limvals_min, limvals_max]` is clipped at quantisation.
+    pub limvals_min: f32,
+    pub limvals_max: f32,
 }
 
 /// One anchor-free yolo26 scale (box tensor + class tensor at a given stride).
@@ -357,11 +368,19 @@ fn decode_yolo26_raw(
                 // Activate, then compare. `SCORE_FLOOR` is documented as a
                 // probability ("per-class >0.25 is the standard inference
                 // cutoff") and now is one. Flooring on the raw logit instead
-                // would make the minimum emittable confidence
-                // sigmoid(0.20) = 0.5498, which is above
-                // `bytetrack.high_confidence` (0.5) — every detection would
-                // land in ByteTrack's high bucket and its low-confidence
-                // recovery pass would never run again.
+                // would put the minimum emittable confidence at
+                // sigmoid(0.20) = 0.5498. Two consequences, both bad and
+                // both independent of which HEF is loaded:
+                //   * `inference.score_threshold` goes inert for any value
+                //     below 0.55, and Hailo disagrees with ONNX on identical
+                //     camera config.
+                //   * 0.5498 is above `bytetrack.high_confidence` (0.5), so
+                //     every detection lands in ByteTrack's high bucket and
+                //     its low-confidence recovery pass never runs.
+                // Under this ordering the low bucket is reachable: the
+                // stride-8 tensor alone quantises to eight distinct
+                // probabilities in [0.20, 0.5). How *many* land there is a
+                // property of the HEF's calibration range -- see BUG-221.
                 let best_score = sigmoid(best_logit);
                 if best_score < SCORE_FLOOR {
                     continue;
@@ -592,5 +611,34 @@ mod tests {
     fn activation_does_not_change_the_argmax() {
         let (bufs, layout) = one_cell(2.0);
         assert_eq!(decode_detections(&bufs, &layout, 16)[0].class_id, 1);
+    }
+
+    /// Pins the decoder to three confidences actually observed in the field.
+    /// Measured on a Hailo-8 (serial `HLLWM2A234601212`, fw 4.24.0) with
+    /// `nexus-hailo-probe --hef`: the `conv80` class tensor carries
+    /// `qp_zp = 252`, `qp_scale = 0.8614314`, and HailoRT dequantises
+    /// `q -> qp_scale * (q - qp_zp)`. Those device values are reproduced here
+    /// as constants; this test does not read them back from the FFI.
+    ///
+    /// What it guards: the `q = 252` case dequantises to a logit of exactly
+    /// `0.0`, so any regression to a logit-space floor (`0.0 < SCORE_FLOOR`)
+    /// drops the detection and the length assertion fails. The other two
+    /// pin the sigmoid mapping against real hardware output rather than
+    /// against a recomputation of the same formula.
+    #[test]
+    fn the_conv80_ladder_reports_the_confidences_measured_on_hardware() {
+        const QP_ZP: f32 = 252.0;
+        const QP_SCALE: f32 = 0.8614314;
+        for (q, expected) in [(252u32, 0.5_f32), (253, 0.702_960), (254, 0.848_497)] {
+            let logit = QP_SCALE * (q as f32 - QP_ZP);
+            let (bufs, layout) = one_cell(logit);
+            let got = decode_detections(&bufs, &layout, 16);
+            assert_eq!(got.len(), 1, "q={q} should decode to one detection");
+            assert!(
+                (got[0].score - expected).abs() < 1e-5,
+                "q={q}: decoded {} but hardware reported {expected}",
+                got[0].score,
+            );
+        }
     }
 }

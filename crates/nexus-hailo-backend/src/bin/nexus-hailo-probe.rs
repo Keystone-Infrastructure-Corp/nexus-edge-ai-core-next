@@ -97,6 +97,15 @@ fn probe_hef(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             "  output: name={:<24} shape={}x{}x{}  frame_size={}",
             info.name, info.h, info.w, info.c, info.frame_size,
         );
+        // HailoRT dequantises `q -> qp_scale * (q - qp_zp)`, and derives
+        // both from `limvals` -- which is therefore the representable range,
+        // already measured and free of any assumption about the device dtype.
+        // Deriving it again from a hardcoded 0..255 would add nothing when
+        // right and be silently wrong on a non-uint8 output.
+        println!(
+            "          quant: qp_zp={} qp_scale={}  representable=[{}, {}]",
+            info.qp_zp, info.qp_scale, info.limvals_min, info.limvals_max,
+        );
     }
     match session.output_layout() {
         OutputLayout::NmsByClass {
