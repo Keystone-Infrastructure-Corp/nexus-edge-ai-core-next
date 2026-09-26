@@ -826,12 +826,19 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             .unwrap_or(true),
     ));
 
+    // Sizes both the boot RGB taps, in `build_recorder`, and every camera's
+    // supervisor and entry, through `ReconcilerArgs`. Only this one binding
+    // keeps the two equal, and no test sizes a boot tap (with or without the
+    // gstreamer feature): a tap sized apart from its supervisor misplaces
+    // burned-in alert boxes and misreports clip frame size until the camera
+    // next restarts.
+    let default_detector_width = cfg.inference.model.input_width;
     let (recorder, webrtc_bridge, mut boot_analysis) = build_recorder(
         &cfg.runtime.clips.recorder,
         store.clone(),
         &clips_dir,
         &cameras,
-        cfg.inference.model.input_width,
+        default_detector_width,
         cfg.runtime.clips.pre_roll_secs,
         cfg.runtime.decode.mode,
         bus.clone(),
@@ -1027,17 +1034,48 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             cascading_policy.clone(),
         ));
 
+    // Built before the boot loop so each boot entry comes from the
+    // `ReconcilerArgs` the reconciler's no-change guard reads. The
+    // reconciler itself is spawned further below.
+    let reconciler_args = reconciler::ReconcilerArgs {
+        router: router.clone(),
+        tracker_cfg: cfg.tracker.clone(),
+        annotator: cfg.tracker.annotator.clone(),
+        static_object: cfg.tracker.static_object.clone(),
+        clips: cfg.runtime.clips.clone(),
+        state_dir: cfg.runtime.state_dir.clone(),
+        evaluator: evaluator.clone(),
+        store: store.clone(),
+        recorder: recorder.clone(),
+        bus: bus.clone(),
+        cache: cache.clone(),
+        frame_stats: frame_stats.clone(),
+        decode_health: decode_health.clone(),
+        analysis_stream: analysis_stream.clone(),
+        static_clear: static_clear.clone(),
+        pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
+        default_detector_width,
+        default_top_k: cfg.inference.model.top_k,
+        sighting_hook: sighting_hook.clone(),
+        sighting_cfg,
+        sighting_persist: sighting_persist.clone(),
+        sighting_hydration_window_secs: hydration_window_secs,
+        sink_router: sink_router.clone(),
+        alert_clip_schedule_gate: alert_clip_schedule_gate.clone(),
+        handles: running.clone(),
+        live_view: live_view_manager.clone(),
+    };
+
     for cam in cameras {
         if !cam.ingest.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
             continue;
         }
         let cam_id = cam.id;
-        let cam_url = cam.ingest.url.to_string();
-        // What build_recorder registered: the answer start_camera records after
+        // What the reconciler's no-change guard compares, with the substream
+        // URL build_recorder registered: the answer start_camera records after
         // a restart, so the first reconcile pass does not read it as a change.
-        let cam_analysis_url = boot_analysis.remove(&cam_id);
-        let configured_codec = cam.ingest.codec;
+        let key = reconciler::EntryKey::at_boot(&reconciler_args, &cam, &mut boot_analysis);
         let detector = router.detector_for_camera(&cam);
         let detector_low_res = router.detector_for_camera_low_res(&cam);
         // Fresh per-camera tracker — see the comment on `cfg.tracker`
@@ -1048,16 +1086,8 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // lets a camera analyse at a larger native-16:9 ladder rung
         // (`behavior.supervisor_width`) so the tile grid divides the
         // frame into exact model-sized tiles. See
-        // `nexus_pipeline::supervisor_frame_for`.
-        let det_w = cam
-            .detector
-            .model_override
-            .as_ref()
-            .map(|m| m.input_width)
-            .unwrap_or(cfg.inference.model.input_width);
-        // Clamp up so the supervisor frame never drops below the model input.
-        let sup_input = cam.behavior.supervisor_width.unwrap_or(det_w).max(det_w);
-        let (sup_w, sup_h) = nexus_pipeline::supervisor_frame_for(sup_input);
+        // `reconciler::supervisor_dims_for`.
+        let (sup_w, sup_h) = key.supervisor_dims();
         // M_TILE_REINFER (G1) Phase B2.1 — effective per-camera `top_k`
         // for the post-merge cascade re-cap; matches the equivalent
         // computation in `reconciler::start_camera`.
@@ -1104,16 +1134,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             sink_router.clone(),
             alert_clip_schedule_gate.clone(),
         );
-        running.lock().insert(
-            cam_id,
-            reconciler::RunningCameraEntry {
-                task: Arc::new(h.task),
-                url: cam_url,
-                supervisor_dims: (sup_w, sup_h),
-                codec: configured_codec,
-                analysis_url: cam_analysis_url,
-            },
-        );
+        running.lock().insert(cam_id, key.spawned(h.task));
     }
 
     // Storage safety floor (M2.1 Stage A PR 4). Watermark sampler
@@ -1417,34 +1438,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // this, cameras added via the discovery UI (or `PUT /api/v1/cameras/{id}`)
     // persist to disk but never get a pipeline until the next
     // engine restart.
-    let reconciler_handle = reconciler::spawn(reconciler::ReconcilerArgs {
-        router: router.clone(),
-        tracker_cfg: cfg.tracker.clone(),
-        annotator: cfg.tracker.annotator.clone(),
-        static_object: cfg.tracker.static_object.clone(),
-        clips: cfg.runtime.clips.clone(),
-        state_dir: cfg.runtime.state_dir.clone(),
-        evaluator: evaluator.clone(),
-        store: store.clone(),
-        recorder: recorder.clone(),
-        bus: bus.clone(),
-        cache: cache.clone(),
-        frame_stats: frame_stats.clone(),
-        decode_health: decode_health.clone(),
-        analysis_stream: analysis_stream.clone(),
-        static_clear: static_clear.clone(),
-        pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
-        default_detector_width: cfg.inference.model.input_width,
-        default_top_k: cfg.inference.model.top_k,
-        sighting_hook: sighting_hook.clone(),
-        sighting_cfg,
-        sighting_persist: sighting_persist.clone(),
-        sighting_hydration_window_secs: hydration_window_secs,
-        sink_router: sink_router.clone(),
-        alert_clip_schedule_gate: alert_clip_schedule_gate.clone(),
-        handles: running.clone(),
-        live_view: live_view_manager.clone(),
-    });
+    let reconciler_handle = reconciler::spawn(reconciler_args);
 
     // Phase 5.6 · R4 — periodic `entity_local_state` sweeper. Keeps
     // the table from growing unbounded when cameras come and go.
@@ -2410,7 +2404,7 @@ async fn build_recorder(
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
-    std::collections::HashMap<nexus_types::CameraId, String>,
+    crate::reconciler::BootAnalysis,
 )> {
     match kind {
         RecorderKind::Stub => {
@@ -2450,15 +2444,15 @@ async fn build_recorder(
 /// `build_gst_recorder`: every enabled camera with a substream, once.
 ///
 /// The stub keeps the trait's no-op, which reads neither codec nor dims, so
-/// neither is resolved here: no main-stream probe and no fourth copy of the
-/// supervisor-dims formula. That would have to change if the stub ever
+/// neither is resolved here: no main-stream probe and no supervisor-dims
+/// lookup. That would have to change if the stub ever
 /// registered sessions. `apply_analysis_session` still probes each RTSP
 /// substream's codec, which the no-op ignores; that probe used to run in
 /// the first restart about 30 s after boot, and is the accepted boot cost.
 async fn register_stub_analysis_sessions(
     rec: &dyn nexus_pipeline::ClipRecorder,
     cameras: &[CameraConfig],
-) -> std::collections::HashMap<nexus_types::CameraId, String> {
+) -> crate::reconciler::BootAnalysis {
     let pending = cameras
         .iter()
         .filter(|c| c.ingest.enabled && c.ingest.analysis_url.is_some())
@@ -2490,7 +2484,7 @@ async fn build_gst_recorder(
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
-    std::collections::HashMap<nexus_types::CameraId, String>,
+    crate::reconciler::BootAnalysis,
 )> {
     // Build one always-on PreRollIngester per enabled camera. The
     // ingester holds the only RTSP connection for that camera; the
@@ -2516,14 +2510,7 @@ async fn build_gst_recorder(
         // allows a larger native-16:9 ladder rung via
         // `behavior.supervisor_width`. Matches what the engine spawn
         // site passes to `spawn_camera`.
-        let det_w = cam
-            .detector
-            .model_override
-            .as_ref()
-            .map(|m| m.input_width)
-            .unwrap_or(default_detector_width);
-        let sup_input = cam.behavior.supervisor_width.unwrap_or(det_w).max(det_w);
-        let (rgb_w, rgb_h) = nexus_pipeline::supervisor_frame_for(sup_input);
+        let (rgb_w, rgb_h) = crate::reconciler::supervisor_dims_for(cam, default_detector_width);
         // Autodetect codec for cameras stored with `codec=None`
         // (operator picked "auto", or row predates the column).
         // Mirrors what `create_camera` does at create-time; needed
@@ -2642,7 +2629,7 @@ async fn build_gst_recorder(
 ) -> Result<(
     Arc<dyn nexus_pipeline::ClipRecorder>,
     Arc<crate::webrtc_bridge::WebRtcBridge>,
-    std::collections::HashMap<nexus_types::CameraId, String>,
+    crate::reconciler::BootAnalysis,
 )> {
     tracing::error!(
         "config selected RecorderKind::Gstreamer but this build was compiled without \
