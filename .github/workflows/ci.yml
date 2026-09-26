@@ -226,7 +226,9 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: install rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-system-libs
@@ -322,6 +324,36 @@ jobs:
           echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
           echo "ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so"   >> $GITHUB_ENV
 
+      # This is the only job in this workflow that compiles the gstreamer-gated
+      # code, so it is the only place a warning there can fail CI; no clippy in
+      # the `rust` job enables `gstreamer`. It used to `cargo check` these,
+      # which prints a warning and exits 0, so a plain rebind (result left
+      # unread) or a bare-statement discard of the result of
+      # `register_analysis_sessions` in main.rs's gstreamer
+      # `build_gst_recorder` was a warning on a green job. `let _ =` and a
+      # read-then-discard rebind still pass.
+      #   * Both feature levels: gstreamer-gated code under
+      #     `cfg(not(feature = "gstreamer-webrtc"))` (e.g. main.rs's
+      #     `build_gst_recorder`) compiles only in the gstreamer-only build.
+      #   * Both crates: `-p nexus-engine` lints nexus-pipeline's lib but not
+      #     its gstreamer test modules.
+      #   * `--all-targets` lints that gated test code. It pulls in the
+      #     dev-dependency tree and is this step's extra cost over the old
+      #     checks until the rust-cache key next changes: dev-dependencies
+      #     change shared dependencies' features (e.g. nexus-engine's
+      #     `tokio/test-util` re-checks tokio, hyper, axum, sqlx and reqwest),
+      #     and rust-cache saves only on a key miss, so that re-check repeats
+      #     every run until then.
+      # The ort lines in the next step stay `cargo check`: clippy with `-p`
+      # also lints every workspace crate it depends on, and nexus-inference's
+      # `ort` build is not warning-free yet.
+      - name: cargo clippy (gstreamer, deny warnings)
+        run: |
+          cargo clippy --locked -p nexus-pipeline --features gstreamer --all-targets -- -D warnings
+          cargo clippy --locked -p nexus-pipeline --features gstreamer-webrtc --all-targets -- -D warnings
+          cargo clippy --locked -p nexus-engine --features gstreamer --all-targets -- -D warnings
+          cargo clippy --locked -p nexus-engine --features gstreamer-webrtc --all-targets -- -D warnings
+
       - name: cargo check + test (gstreamer + ort)
         # `GIO_USE_PROXY_RESOLVER=dummy`: forces GIO to pick its no-op proxy
         # resolver extension instead of auto-probing for `gnome` (provided
@@ -347,8 +379,6 @@ jobs:
         env:
           GIO_USE_PROXY_RESOLVER: dummy
         run: |
-          cargo check --locked -p nexus-pipeline  --features gstreamer
-          cargo check --locked -p nexus-pipeline  --features gstreamer-webrtc
           # Same blind spot as the ort tests below: the workspace `cargo test`
           # job runs with default features, so `alert_clip::gst_tests` — which
           # encodes a real MP4 and asserts it decodes to EOS — never executes
@@ -368,8 +398,6 @@ jobs:
           # builder API) without needing hardware. Real attachment is
           # verified manually on the reference box.
           cargo check --locked -p nexus-inference --features ort,ep-cuda
-          cargo check --locked -p nexus-engine    --features gstreamer
-          cargo check --locked -p nexus-engine    --features gstreamer-webrtc
           # ep-cpu implies `ort`, so this is the only job that compiles the
           # cfg(feature = "ort") DINOv2 extractor (nexus-reid/src/ort_dinov2.rs).
           cargo check --locked -p nexus-reid      --features ep-cpu
