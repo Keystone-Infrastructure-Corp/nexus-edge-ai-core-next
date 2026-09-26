@@ -31,8 +31,6 @@
 //! threshold. Roughly 0.3 ms per 1080p frame on a recent CPU — and it is
 //! skipped entirely for frames rejected by the ceiling.
 
-use std::sync::Mutex;
-
 use chrono::{DateTime, Utc};
 use nexus_types::{Frame, PixelFormat};
 
@@ -45,29 +43,29 @@ pub const BASELINE_GAP_MS: i64 = 500;
 pub const MOTION_GAP_MS: i64 = 125;
 
 pub struct MotionGate {
-    prev_y: Mutex<Option<Vec<u8>>>,
+    prev_y: Option<Vec<u8>>,
     delta_threshold: u8,
     pixel_pct_threshold: f32,
     baseline_gap_ms: i64,
     motion_gap_ms: i64,
-    last_pass: Mutex<Option<DateTime<Utc>>>,
+    last_pass: Option<DateTime<Utc>>,
 }
 
 impl MotionGate {
     pub fn new() -> Self {
         Self {
-            prev_y: Mutex::new(None),
+            prev_y: None,
             delta_threshold: 16,
             pixel_pct_threshold: 0.005,
             baseline_gap_ms: BASELINE_GAP_MS,
             motion_gap_ms: MOTION_GAP_MS,
-            last_pass: Mutex::new(None),
+            last_pass: None,
         }
     }
 
-    pub fn allow(&self, frame: &Frame) -> bool {
+    pub fn allow(&mut self, frame: &Frame) -> bool {
         let now = frame.captured_at;
-        let gap_ms = match *self.last_pass.lock().unwrap() {
+        let gap_ms = match self.last_pass {
             Some(prev) => (now - prev).num_milliseconds(),
             None => i64::MAX,
         };
@@ -81,7 +79,7 @@ impl MotionGate {
         }
 
         // Ceiling. The cheapest possible rejection: no downsample, no delta
-        // scan, no lock on `prev_y`.
+        // scan.
         if gap_ms < self.motion_gap_ms {
             return false;
         }
@@ -99,7 +97,7 @@ impl MotionGate {
         // what I'm showing?"), and it is the only baseline still available
         // now that ceiling-rejected frames are never downsampled.
         let y = downsample_y(frame);
-        let moved = match self.prev_y.lock().unwrap().as_ref() {
+        let moved = match self.prev_y.as_ref() {
             Some(prev_y) if prev_y.len() == y.len() => {
                 let mut changed = 0usize;
                 for (a, b) in prev_y.iter().zip(y.iter()) {
@@ -114,15 +112,15 @@ impl MotionGate {
         };
 
         if moved {
-            *self.prev_y.lock().unwrap() = Some(y);
-            *self.last_pass.lock().unwrap() = Some(now);
+            self.prev_y = Some(y);
+            self.last_pass = Some(now);
         }
         moved
     }
 
-    fn record_pass(&self, frame: &Frame, now: DateTime<Utc>) {
-        *self.prev_y.lock().unwrap() = Some(downsample_y(frame));
-        *self.last_pass.lock().unwrap() = Some(now);
+    fn record_pass(&mut self, frame: &Frame, now: DateTime<Utc>) {
+        self.prev_y = Some(downsample_y(frame));
+        self.last_pass = Some(now);
     }
 }
 
@@ -144,18 +142,20 @@ fn downsample_y(frame: &Frame) -> Vec<u8> {
     match frame.format {
         PixelFormat::Nv12 | PixelFormat::I420 => {
             for j in 0..dh {
-                let sy = (j * scale as usize).min(frame.height as usize - 1);
+                let sy = (j * scale as usize).min((frame.height as usize).saturating_sub(1));
                 for i in 0..dw {
-                    let sx = (i * scale as usize).min(frame.width as usize - 1);
-                    out.push(data[sy * stride + sx]);
+                    let sx = (i * scale as usize).min((frame.width as usize).saturating_sub(1));
+                    // Short buffer for the declared geometry: sample as
+                    // black rather than index out of bounds.
+                    out.push(data.get(sy * stride + sx).copied().unwrap_or(0));
                 }
             }
         }
         PixelFormat::Rgb24 | PixelFormat::Bgr24 => {
             for j in 0..dh {
-                let sy = (j * scale as usize).min(frame.height as usize - 1);
+                let sy = (j * scale as usize).min((frame.height as usize).saturating_sub(1));
                 for i in 0..dw {
-                    let sx = (i * scale as usize).min(frame.width as usize - 1);
+                    let sx = (i * scale as usize).min((frame.width as usize).saturating_sub(1));
                     let off = sy * stride + sx * 3;
                     if off + 2 < data.len() {
                         let r = data[off] as u32;
@@ -210,15 +210,15 @@ mod tests {
         frame_at(i, (i * 101 % 256) as u8)
     }
 
-    fn passes(gate: &MotionGate, frames: impl Iterator<Item = Frame>) -> usize {
+    fn passes(gate: &mut MotionGate, frames: impl Iterator<Item = Frame>) -> usize {
         frames.filter(|f| gate.allow(f)).count()
     }
 
     #[test]
     fn baseline_floor_passes_a_static_scene_at_about_two_fps() {
-        let gate = MotionGate::new();
+        let mut gate = MotionGate::new();
         // 10 s of a perfectly motionless camera at the 15 fps ingest cap.
-        let n = passes(&gate, (0..SOURCE_FPS * 10).map(static_frame));
+        let n = passes(&mut gate, (0..SOURCE_FPS * 10).map(static_frame));
 
         // The floor is 500 ms, but passes can only land on the 66.7 ms
         // source grid, so the realised gap is 8 frames = 533 ms = 1.875 fps.
@@ -235,8 +235,8 @@ mod tests {
     /// two seconds at a time and looked like it was replaying.
     #[test]
     fn baseline_floor_is_not_the_old_frame_counted_half_fps() {
-        let gate = MotionGate::new();
-        let n = passes(&gate, (0..SOURCE_FPS * 10).map(static_frame));
+        let mut gate = MotionGate::new();
+        let n = passes(&mut gate, (0..SOURCE_FPS * 10).map(static_frame));
 
         let old_behaviour = (SOURCE_FPS * 10) / 30; // keyframe_every = 30
         assert_eq!(old_behaviour, 5, "old rule passed 5 frames in 10 s");
@@ -248,9 +248,9 @@ mod tests {
 
     #[test]
     fn motion_ceiling_caps_a_busy_scene_below_the_source_rate() {
-        let gate = MotionGate::new();
+        let mut gate = MotionGate::new();
         // 10 s of a camera where every single frame differs.
-        let n = passes(&gate, (0..SOURCE_FPS * 10).map(moving_frame));
+        let n = passes(&mut gate, (0..SOURCE_FPS * 10).map(moving_frame));
 
         // Ceiling is 125 ms; on the 66.7 ms grid that realises as every
         // 2nd frame = 7.5 fps, i.e. 75 of the 150 frames.
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn a_backwards_source_clock_does_not_stall_the_camera() {
-        let gate = MotionGate::new();
+        let mut gate = MotionGate::new();
         assert!(gate.allow(&static_frame(1000)), "first frame always passes");
 
         // Camera reconnects and its clock restarts well behind the old
@@ -278,5 +278,46 @@ mod tests {
         );
         // ...and the new baseline is honoured from there.
         assert!(!gate.allow(&static_frame(1)), "ceiling applies after reset");
+    }
+
+    /// A frame whose buffer is shorter than its declared geometry, or whose
+    /// geometry is zero, must not panic the gate — a panic here kills the
+    /// camera's supervisor task (or, under the release profile's
+    /// `panic = "abort"`, the whole engine). The gate must keep gating
+    /// normally on the frames that follow.
+    #[test]
+    fn a_malformed_frame_does_not_panic_and_gating_resumes() {
+        let mut gate = MotionGate::new();
+        assert!(gate.allow(&static_frame(0)), "first frame always passes");
+
+        // NV12 frame claiming 64x64 but carrying 10 bytes, landing on the
+        // baseline floor so it is downsampled.
+        let mut short_nv12 = static_frame(8);
+        short_nv12.format = PixelFormat::Nv12;
+        short_nv12.data = Arc::new(vec![0u8; 10]);
+        gate.allow(&short_nv12);
+
+        // Zero-geometry RGB frame, also on the floor.
+        let mut empty = static_frame(16);
+        empty.width = 0;
+        empty.height = 0;
+        empty.data = Arc::new(Vec::new());
+        gate.allow(&empty);
+
+        // Normal frames afterwards: ceiling still rejects the very next
+        // frame, and a static scene still settles at the ~2 fps floor.
+        assert!(
+            gate.allow(&static_frame(24)),
+            "floor passes after malformed"
+        );
+        assert!(!gate.allow(&static_frame(25)), "ceiling still applies");
+        let n = (26..26 + SOURCE_FPS * 10)
+            .map(static_frame)
+            .filter(|f| gate.allow(f))
+            .count();
+        assert!(
+            (18..=20).contains(&n),
+            "static scene should settle at ~1.9 fps after a malformed frame, got {n}"
+        );
     }
 }

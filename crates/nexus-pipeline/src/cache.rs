@@ -8,15 +8,18 @@
 //! get a cheap pointer copy. The cache is documented in `ARCHITECTURE.md`
 //! as L7 — it's a first-class architectural element, not a hack.
 //!
-//! Contention model: writers are pipeline tasks (one per camera). Readers
-//! are HTTP handlers. `parking_lot::RwLock` is the right primitive here —
-//! the cache is read 100x more often than written.
+//! Contention model: writers are pipeline tasks (two per camera — the
+//! decode-rate tap and the inference loop). Readers are HTTP handlers and
+//! the per-camera LBR pump. The camera id already partitions the data, so
+//! the lock does too: each camera has its own `Mutex<Slot>`, and a write for
+//! one camera never waits on another. The outer map is only write-locked
+//! the first time a camera is seen; every hot-path call takes it shared.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use nexus_types::{CameraId, Frame, TrackedObject};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 #[derive(Clone)]
 pub struct LatestEntry {
@@ -29,22 +32,38 @@ pub struct LatestEntry {
     pub objects_frame_id: Option<u64>,
 }
 
+/// One camera's state. The entry and its epoch share one lock so the epoch
+/// check and the write it guards are atomic with respect to `begin_session`
+/// and `clear` for the same camera. A slot is never removed from the map
+/// (`clear` empties it), so every call for a camera serialises on the same
+/// mutex.
 #[derive(Default)]
-struct Inner {
-    entries: HashMap<CameraId, LatestEntry>,
+struct Slot {
+    entry: Option<LatestEntry>,
     /// Bumped by `begin_session` and `clear`. A writer holding an older
     /// epoch has been superseded and its writes are dropped.
-    epochs: HashMap<CameraId, u64>,
+    epoch: u64,
 }
 
 #[derive(Default)]
 pub struct LatestFrameCache {
-    inner: RwLock<Inner>,
+    slots: RwLock<HashMap<CameraId, Arc<Mutex<Slot>>>>,
 }
 
 impl LatestFrameCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn slot(&self, camera_id: CameraId) -> Option<Arc<Mutex<Slot>>> {
+        self.slots.read().get(&camera_id).cloned()
+    }
+
+    fn slot_or_insert(&self, camera_id: CameraId) -> Arc<Mutex<Slot>> {
+        if let Some(slot) = self.slot(camera_id) {
+            return slot;
+        }
+        self.slots.write().entry(camera_id).or_default().clone()
     }
 
     /// Claim the camera for a new pipeline session.
@@ -64,37 +83,31 @@ impl LatestFrameCache {
     /// 1 per source, so a retained `objects_frame_id` can collide with a
     /// live id and claim a match that never happened.
     pub fn begin_session(&self, camera_id: CameraId) -> u64 {
-        let mut g = self.inner.write();
-        if let Some(entry) = g.entries.get_mut(&camera_id) {
+        let slot = self.slot_or_insert(camera_id);
+        let mut g = slot.lock();
+        if let Some(entry) = g.entry.as_mut() {
             entry.objects = Arc::new(Vec::new());
             entry.objects_frame_id = None;
         }
-        let e = g.epochs.entry(camera_id).or_insert(0);
-        *e += 1;
-        *e
-    }
-
-    fn is_current(inner: &Inner, camera_id: CameraId, epoch: u64) -> bool {
-        inner.epochs.get(&camera_id).copied().unwrap_or(0) == epoch
+        g.epoch += 1;
+        g.epoch
     }
 
     /// Publish a decoded frame, leaving any cached objects in place.
     pub fn put_frame(&self, camera_id: CameraId, epoch: u64, frame: Arc<Frame>) {
-        let mut g = self.inner.write();
-        if !Self::is_current(&g, camera_id, epoch) {
+        let slot = self.slot_or_insert(camera_id);
+        let mut g = slot.lock();
+        if g.epoch != epoch {
             return;
         }
-        match g.entries.get_mut(&camera_id) {
+        match g.entry.as_mut() {
             Some(entry) => entry.frame = frame,
             None => {
-                g.entries.insert(
-                    camera_id,
-                    LatestEntry {
-                        frame,
-                        objects: Arc::new(Vec::new()),
-                        objects_frame_id: None,
-                    },
-                );
+                g.entry = Some(LatestEntry {
+                    frame,
+                    objects: Arc::new(Vec::new()),
+                    objects_frame_id: None,
+                });
             }
         }
     }
@@ -116,31 +129,39 @@ impl LatestFrameCache {
         frame_id: u64,
         objects: Arc<Vec<TrackedObject>>,
     ) {
-        let mut g = self.inner.write();
-        if !Self::is_current(&g, camera_id, epoch) {
+        let Some(slot) = self.slot(camera_id) else {
+            return;
+        };
+        let mut g = slot.lock();
+        if g.epoch != epoch {
             return;
         }
-        if let Some(entry) = g.entries.get_mut(&camera_id) {
+        if let Some(entry) = g.entry.as_mut() {
             entry.objects = objects;
             entry.objects_frame_id = Some(frame_id);
         }
     }
 
     pub fn get(&self, camera_id: CameraId) -> Option<LatestEntry> {
-        self.inner.read().entries.get(&camera_id).cloned()
+        self.slot(camera_id)?.lock().entry.clone()
     }
 
     /// Drop the camera's entry and retire its epoch, so a writer still
     /// draining cannot repopulate it.
     pub fn clear(&self, camera_id: CameraId) {
-        let mut g = self.inner.write();
-        g.entries.remove(&camera_id);
-        let e = g.epochs.entry(camera_id).or_insert(0);
-        *e += 1;
+        let slot = self.slot_or_insert(camera_id);
+        let mut g = slot.lock();
+        g.entry = None;
+        g.epoch += 1;
     }
 
     pub fn cameras(&self) -> Vec<CameraId> {
-        self.inner.read().entries.keys().copied().collect()
+        self.slots
+            .read()
+            .iter()
+            .filter(|(_, slot)| slot.lock().entry.is_some())
+            .map(|(id, _)| *id)
+            .collect()
     }
 }
 
@@ -355,5 +376,78 @@ mod tests {
             Some(1),
             "objects must still name the frame they were computed on"
         );
+    }
+
+    /// 29 cameras at 8 fps each write through this cache. When one lock
+    /// covered every camera, camera 3's write excluded camera 17's and the
+    /// readers queued behind both. A camera's writes must only ever wait on
+    /// that same camera. The check fails by timeout only on regression; on
+    /// the passing path camera 9's calls complete without waiting.
+    #[test]
+    fn a_write_for_one_camera_is_not_blocked_by_another_cameras_lock() {
+        let cache = Arc::new(LatestFrameCache::new());
+        let a = cache.begin_session(7);
+        cache.put_frame(7, a, frame(7));
+
+        let held = cache.slot_or_insert(7);
+        let guard = held.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = cache.clone();
+        let worker = std::thread::spawn(move || {
+            let b = c.begin_session(9);
+            c.put_frame(9, b, frame(9));
+            c.put_objects(9, b, 1, Arc::new(vec![]));
+            let got = c.get(9).map(|e| e.objects_frame_id);
+            let _ = tx.send(got);
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(
+            got.expect("camera 9's write waited on camera 7's lock"),
+            Some(Some(1))
+        );
+    }
+
+    /// Partitioning must not reopen BUG-136: a superseded writer racing
+    /// `begin_session` and `clear` on the same camera still loses, however
+    /// the threads interleave.
+    #[test]
+    fn superseded_writers_racing_session_changes_never_land() {
+        let cache = Arc::new(LatestFrameCache::new());
+        let old = cache.begin_session(7);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let (c, stop) = (cache.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut stale = (*frame(7)).clone();
+                    stale.frame_id = 1;
+                    let stale = Arc::new(stale);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        c.put_frame(7, old, stale.clone());
+                        c.put_objects(7, old, 1, Arc::new(vec![track(1)]));
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..1_000 {
+            let epoch = cache.begin_session(7);
+            let mut live = (*frame(7)).clone();
+            live.frame_id = 1_000;
+            cache.put_frame(7, epoch, Arc::new(live));
+            let got = cache.get(7).unwrap();
+            assert_eq!(got.frame.frame_id, 1_000, "a superseded frame landed");
+            assert_eq!(got.objects_frame_id, None, "superseded objects landed");
+
+            cache.clear(7);
+            assert!(cache.get(7).is_none(), "a retired writer repopulated");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert!(cache.get(7).is_none());
     }
 }

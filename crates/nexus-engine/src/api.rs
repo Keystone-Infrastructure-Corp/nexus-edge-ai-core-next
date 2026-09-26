@@ -42,7 +42,7 @@ use nexus_pipeline::{LatestFrameCache, StaticAnchorClearRegistry};
 use nexus_rules::{CelEngine, RuleEngine, RuleEvaluator, RulesError};
 use nexus_store::Store;
 use nexus_types::{
-    AlertEvent, CameraId, FrameMetadata, FrameMetadataLite, PixelFormat, RuleId, StaticAnchor,
+    AlertEvent, CameraId, FrameMetadata, FrameMetadataLite, RuleId, StaticAnchor,
     StaticAnchorsResponse,
 };
 use tower_http::compression::CompressionLayer;
@@ -1090,13 +1090,26 @@ impl From<nexus_store::StoreError> for ApiError {
 ///
 /// `status` is `"ok"` unless the engine is running with a known loss of
 /// function, in which case it is `"degraded"` and `issues[]` explains
-/// why. Today the only such condition is a detector that failed to build
+/// why. One such condition is a detector that failed to build
 /// (see [`nexus_inference::health`]) — the engine keeps recording and
 /// streaming, but reports zero detections, so an operator watching only
 /// the alert count would otherwise see silence and assume all is well.
-async fn health() -> Json<serde_json::Value> {
+/// The other is a stub clip recorder behind enabled cameras (see
+/// [`crate::cloud_tunnel::recorder_issue`]), which detects but keeps no
+/// video. Degraded is still HTTP 200. Computing that issue reads the store,
+/// so the probe makes one camera-list read per request.
+async fn health(State(s): State<ApiState>) -> Json<serde_json::Value> {
+    Json(health_body(
+        crate::cloud_tunnel::recorder_issue(s.recorder.kind(), &s.store).await,
+    ))
+}
+
+/// The body of [`health`], apart from the handler so a test can drive it
+/// with the recorder issue computed from the recorder that boot really
+/// builds.
+fn health_body(recorder: Option<nexus_cloud_protocol::v1::EdgeDegradation>) -> serde_json::Value {
     let degradations = nexus_inference::health::degradations();
-    let issues: Vec<serde_json::Value> = degradations
+    let mut issues: Vec<serde_json::Value> = degradations
         .iter()
         .map(|d| {
             serde_json::json!({
@@ -1107,8 +1120,15 @@ async fn health() -> Json<serde_json::Value> {
             })
         })
         .collect();
+    if let Some(i) = recorder {
+        issues.push(serde_json::json!({
+            "component": i.component,
+            "code": i.code,
+            "detail": i.detail,
+        }));
+    }
 
-    Json(serde_json::json!({
+    serde_json::json!({
         "status": if issues.is_empty() { "ok" } else { "degraded" },
         // `NEXUS_BUILD_VERSION` is computed in `build.rs` from the
         // release tag (`NEXUS_RELEASE_VERSION`, e.g. `v0.1.27` →
@@ -1116,7 +1136,7 @@ async fn health() -> Json<serde_json::Value> {
         // `CARGO_PKG_VERSION` for local dev builds.
         "version": env!("NEXUS_BUILD_VERSION"),
         "issues": issues,
-    }))
+    })
 }
 
 /// `GET /api/v1/cloud/status` — unauthenticated liveness probe for the
@@ -2960,16 +2980,12 @@ pub(crate) fn latest_frame_jpeg(s: &ApiState, id: CameraId) -> Result<Vec<u8>, A
     let frame = &entry.frame;
 
     // Convert NV12/I420 → RGB on demand for the snapshot. M0 supports RGB24.
-    let rgb = match frame.format {
-        PixelFormat::Rgb24 => frame.data.as_ref().clone(),
-        PixelFormat::Bgr24 => bgr_to_rgb(frame.data.as_ref()),
-        _ => {
-            return Err(ApiError(
-                StatusCode::NOT_IMPLEMENTED,
-                format!("snapshot for {:?} not yet implemented", frame.format),
-            ));
-        }
-    };
+    let rgb = frame.rgb24().map_err(|format| {
+        ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            format!("snapshot for {format:?} not yet implemented"),
+        )
+    })?;
 
     let mut out = Vec::with_capacity(rgb.len() / 4);
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
@@ -2997,17 +3013,6 @@ async fn get_latest_frame_jpeg(
         out,
     )
         .into_response())
-}
-
-fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.as_chunks::<3>().0.iter().enumerate() {
-        let off = i * 3;
-        out[off] = chunk[2];
-        out[off + 1] = chunk[1];
-        out[off + 2] = chunk[0];
-    }
-    out
 }
 
 async fn stream_metadata(
@@ -10006,5 +10011,80 @@ mod tests {
 
         let attached = store.list_camera_visual_prompt_ids(1).await.unwrap();
         assert_eq!(attached, vec![vp_a], "beta must be detached by replace");
+    }
+
+    /// `config/single-camera.toml` (the engine's `DEFAULT_CONFIG`) has
+    /// a `[runtime.clips]` table with no `recorder` key, so `RecorderKind`'s
+    /// `#[default] Stub` boots: an engine with an enabled camera whose clips
+    /// are 0-byte placeholders. Drives the health body with the recorder
+    /// that boot really builds and the store boot seeds, before any frame,
+    /// so a renamed `kind()` cannot silently disarm it.
+    ///
+    /// Computed as a `gstreamer` build computes it
+    /// ([`crate::cloud_tunnel::recorder_issue_in`] given `true`), so it
+    /// runs in default-feature CI; `cloud_tunnel` tests the feature gate.
+    /// Asserts on the recorder issue, never on `status == "ok"`: the
+    /// detector registry is process-global and a sibling test may have
+    /// written it (BUG-159).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_config_without_a_recorder_key_boots_the_stub_and_local_health_says_so() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cfg = nexus_config::Config::load(repo_root.join(crate::DEFAULT_CONFIG))
+            .expect("load the engine's default config");
+        assert_eq!(
+            cfg.runtime.clips.recorder,
+            nexus_config::RecorderKind::Stub,
+            "no `recorder` key must resolve to the Stub default"
+        );
+        assert!(
+            cfg.cameras.iter().any(|c| c.ingest.enabled),
+            "the default config must boot at least one enabled camera"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(
+            nexus_store::Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("f6a.db").display()),
+                ..nexus_config::StoreConfig::default()
+            })
+            .await
+            .expect("store"),
+        );
+        store
+            .seed_from_config_if_empty(&cfg)
+            .await
+            .expect("seed the store as boot does");
+        let (recorder, _webrtc, _analysis) = crate::build_recorder(
+            &cfg.runtime.clips.recorder,
+            store.clone(),
+            &dir.path().join("clips"),
+            &cfg.cameras,
+            cfg.inference.model.input_width,
+            cfg.runtime.clips.pre_roll_secs,
+            cfg.runtime.decode.mode,
+            Arc::new(nexus_bus::BroadcastBus::new(64)),
+            Arc::new(crate::usb_watch::UsbRegistry::new()),
+            nexus_pipeline::recorder::PreferredUsbLabel::default(),
+            cfg.runtime.clips.alert_clips.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Arc::new(nexus_pipeline::DecodeHealthRegistry::new()),
+            Arc::new(nexus_pipeline::AnalysisStreamRegistry::new()),
+        )
+        .await
+        .expect("build_recorder");
+        assert_eq!(recorder.kind(), "stub", "boot must construct the stub");
+
+        let body = super::health_body(
+            crate::cloud_tunnel::recorder_issue_in(true, recorder.kind(), &store).await,
+        );
+        let issue = body["issues"]
+            .as_array()
+            .and_then(|issues| issues.iter().find(|i| i["component"] == "recorder"))
+            .unwrap_or_else(|| {
+                panic!("/api/v1/health must report a stub behind an enabled camera: {body}")
+            });
+        assert_eq!(issue["code"], "recorder_stub", "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
     }
 }

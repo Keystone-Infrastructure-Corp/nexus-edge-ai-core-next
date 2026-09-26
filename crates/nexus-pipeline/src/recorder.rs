@@ -220,7 +220,21 @@ pub trait ClipRecorder: Send + Sync {
     /// This session feeds the RGB tap and nothing else — clips,
     /// pre-roll and HD live view keep reading the main stream's NAL
     /// broadcast, which is why recording quality cannot be affected by
-    /// any of it (invariants I1–I5). Default impl is a no-op.
+    /// any of it (invariants I1–I5).
+    ///
+    /// The result is the engine's only record of this call, at boot and
+    /// every time the reconciler starts the camera. `Ok(())` for
+    /// `Some(url)` means nothing to retry until the configured URL
+    /// changes: a recorder with substream sessions now has one for `url`;
+    /// the default no-op, for recorders without them, has nothing to
+    /// register, and that is not a failure. `Err` means no new session was
+    /// registered (an earlier one may remain, but the engine tears a
+    /// camera's session down before it starts the camera again). The
+    /// reconciler retries on each pass by restarting the whole camera, main
+    /// recording session included, until a call succeeds, so return `Err`
+    /// only for a failure a later call can cure. For `None` nothing is
+    /// retried: the engine logs a failed teardown when it applies a
+    /// camera's config, and discards the result when it stops the camera.
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
     fn set_camera_analysis_ingester(
@@ -233,20 +247,6 @@ pub trait ClipRecorder: Send + Sync {
         codec: CodecKind,
     ) -> Result<(), RecorderError> {
         Ok(())
-    }
-
-    /// Is a SPEC-069 analysis session currently registered for this
-    /// camera?
-    ///
-    /// Boot seeds the reconciler's per-camera entry from this rather than
-    /// from config: an entry that claims a session which was never
-    /// registered matches the reconciler's no-change guard and strands the
-    /// camera on the main stream forever. Default impl reports `false`,
-    /// which is correct for recorders that no-op
-    /// [`Self::set_camera_analysis_ingester`].
-    #[allow(unused_variables)]
-    fn has_analysis_ingester(&self, camera_id: CameraId) -> bool {
-        false
     }
 
     /// Hot-resize the RGB tap of an existing camera ingester to

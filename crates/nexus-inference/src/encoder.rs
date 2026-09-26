@@ -25,10 +25,8 @@
 //!   reactor responsive (admin upload handler does).
 //!
 //! * **Input shape == 640×640 RGB NCHW float32** — same shape as
-//!   the YOLOE detectors. Bilinear resize lives here as a copy
-//!   of `yoloe::preprocess_nchw`; deduplicating would require
-//!   making the yoloe version `pub`, which we'd rather avoid
-//!   until M3.2 stabilises the shape contract.
+//!   the YOLOE detectors, and the same bilinear resize
+//!   (`crate::yolo::preprocess_nchw`, shared by every ORT model).
 //!
 //! * **Output is a 1-D `Vec<f32>`** of length `embedding_dim`. The
 //!   YOLOE-26-S encoder ships with `embedding_dim = 512`. We
@@ -41,7 +39,6 @@
 
 use std::path::{Path, PathBuf};
 
-use ndarray::Array4;
 use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
@@ -49,6 +46,7 @@ use tracing::{debug, info};
 
 use crate::detectors::InferenceError;
 use crate::session_tuning::{self, SessionTuning};
+use crate::yolo::preprocess_nchw;
 
 /// One image-encoder ONNX session. Cheap to clone (the underlying
 /// `Session` lives behind a `Mutex` so concurrent admin uploads
@@ -199,56 +197,6 @@ impl ImageEncoder {
         );
         Ok(values)
     }
-}
-
-/// Bilinear resize RGB → NCHW float32. Duplicate of
-/// `yoloe::preprocess_nchw` (intentional — see module-level doc).
-fn preprocess_nchw(
-    rgb: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Result<Array4<f32>, InferenceError> {
-    if rgb.len() != (src_w as usize) * (src_h as usize) * 3 {
-        return Err(InferenceError::Failed(format!(
-            "rgb buffer wrong size: got {} expected {}",
-            rgb.len(),
-            (src_w as usize) * (src_h as usize) * 3
-        )));
-    }
-    let mut tensor = Array4::<f32>::zeros((1, 3, dst_h as usize, dst_w as usize));
-    let inv_255 = 1.0f32 / 255.0;
-    let sx = src_w as f32 / dst_w as f32;
-    let sy = src_h as f32 / dst_h as f32;
-    for y in 0..dst_h as usize {
-        let src_yf = ((y as f32) + 0.5) * sy - 0.5;
-        let y0 = src_yf.floor().clamp(0.0, (src_h - 1) as f32) as usize;
-        let y1 = (y0 + 1).min(src_h as usize - 1);
-        let dy = (src_yf - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..dst_w as usize {
-            let src_xf = ((x as f32) + 0.5) * sx - 0.5;
-            let x0 = src_xf.floor().clamp(0.0, (src_w - 1) as f32) as usize;
-            let x1 = (x0 + 1).min(src_w as usize - 1);
-            let dx = (src_xf - x0 as f32).clamp(0.0, 1.0);
-            let stride = src_w as usize * 3;
-            let i00 = y0 * stride + x0 * 3;
-            let i01 = y0 * stride + x1 * 3;
-            let i10 = y1 * stride + x0 * 3;
-            let i11 = y1 * stride + x1 * 3;
-            for c in 0..3 {
-                let v00 = rgb[i00 + c] as f32;
-                let v01 = rgb[i01 + c] as f32;
-                let v10 = rgb[i10 + c] as f32;
-                let v11 = rgb[i11 + c] as f32;
-                let v0 = v00 * (1.0 - dx) + v01 * dx;
-                let v1 = v10 * (1.0 - dx) + v11 * dx;
-                let v = v0 * (1.0 - dy) + v1 * dy;
-                tensor[[0, c, y, x]] = v * inv_255;
-            }
-        }
-    }
-    Ok(tensor)
 }
 
 #[cfg(test)]

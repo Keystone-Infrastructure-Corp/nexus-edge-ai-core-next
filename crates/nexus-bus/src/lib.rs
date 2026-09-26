@@ -186,6 +186,16 @@ pub trait Bus: Send + Sync {
         payload: Arc<serde_json::Value>,
     ) -> Result<(), BusError>;
     async fn subscribe_raw(&self, topic: &str) -> Result<DynStream, BusError>;
+
+    /// Whether a publish on `topic` could reach anyone. `BusExt::publish`
+    /// skips serialisation when this is `false`, so a backend may return
+    /// `false` only when it knows the message would be dropped anyway.
+    /// The default is `true`: a backend that cannot tell pays the cost.
+    /// A consequence: with nobody listening, a payload that cannot be
+    /// serialised returns `Ok` rather than `Err(Serialize)`.
+    fn has_subscribers(&self, _topic: &str) -> bool {
+        true
+    }
 }
 
 /// Typed convenience layer. Anything that implements [`Bus`] gets these for free.
@@ -196,6 +206,9 @@ pub trait BusExt: Bus {
         topic: &str,
         msg: &T,
     ) -> Result<(), BusError> {
+        if !self.has_subscribers(topic) {
+            return Ok(());
+        }
         let v = serde_json::to_value(msg)?;
         self.publish_raw(topic, Arc::new(v)).await
     }
@@ -254,6 +267,16 @@ impl Bus for BroadcastBus {
         // Allow no-subscribers; ops bus events shouldn't fail because no one's listening.
         let _ = tx.send(payload);
         Ok(())
+    }
+
+    // A receiver that subscribes between this check and the send misses
+    // the message — the same outcome as subscribing just after the send,
+    // which broadcast semantics already allow.
+    fn has_subscribers(&self, topic: &str) -> bool {
+        self.channels
+            .read()
+            .get(topic)
+            .is_some_and(|tx| tx.receiver_count() > 0)
     }
 
     async fn subscribe_raw(&self, topic: &str) -> Result<DynStream, BusError> {
@@ -339,5 +362,66 @@ mod tests {
         let va = a.next().await.unwrap().unwrap();
         let vb = b.next().await.unwrap().unwrap();
         assert!(Arc::ptr_eq(&va, &vb));
+    }
+
+    /// Counts how many times it is serialised, so a test can tell
+    /// whether `publish` paid the `to_value` cost.
+    struct CountingMsg(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Serialize for CountingMsg {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            s.serialize_u8(7)
+        }
+    }
+
+    /// Per-frame topics are published on every frame of every camera
+    /// but only subscribed to while a live view is open; with nobody
+    /// listening, `publish` must not serialise the payload at all.
+    #[tokio::test]
+    async fn publish_without_subscribers_skips_serialisation() {
+        let bus = BroadcastBus::new(8);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        bus.publish("t", &CountingMsg(calls.clone())).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A subscriber that has come and gone leaves nobody listening.
+        drop(bus.subscribe_raw("t").await.unwrap());
+        bus.publish("t", &CountingMsg(calls.clone())).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn publish_with_subscriber_serialises_and_delivers() {
+        let bus = BroadcastBus::new(8);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut rx = bus.subscribe::<u8>("t").await.unwrap();
+        bus.publish("t", &CountingMsg(calls.clone())).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rx.next().await.unwrap().unwrap(), 7);
+    }
+
+    /// A backend that does not override `has_subscribers` keeps the old
+    /// behaviour: every publish is serialised and handed to `publish_raw`.
+    #[tokio::test]
+    async fn default_has_subscribers_is_conservative() {
+        struct Forwarding(BroadcastBus);
+        #[async_trait]
+        impl Bus for Forwarding {
+            async fn publish_raw(
+                &self,
+                topic: &str,
+                payload: Arc<serde_json::Value>,
+            ) -> Result<(), BusError> {
+                self.0.publish_raw(topic, payload).await
+            }
+            async fn subscribe_raw(&self, topic: &str) -> Result<DynStream, BusError> {
+                self.0.subscribe_raw(topic).await
+            }
+        }
+        let bus = Forwarding(BroadcastBus::new(8));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        bus.publish("t", &CountingMsg(calls.clone())).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

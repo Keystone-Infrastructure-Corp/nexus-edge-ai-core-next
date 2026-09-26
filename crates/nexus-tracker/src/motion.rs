@@ -174,12 +174,13 @@ impl MotionEventEmitter {
                     // Refresh the last-known snapshot every frame so
                     // Died always carries the most-recent bbox /
                     // label / attributes, regardless of whether we
-                    // emitted an Updated this frame.
+                    // emitted an Updated this frame. Refreshed in place:
+                    // a steady-state frame reuses the snapshot's buffers.
                     let snap = state.tracks.get_mut(&t.track_id).unwrap();
                     snap.last_bbox = t.bbox;
-                    snap.last_label = t.label.clone();
+                    snap.last_label.clone_from(&t.label);
                     snap.last_confidence = t.confidence;
-                    snap.last_attributes = t.attributes.clone();
+                    assign_attributes(&mut snap.last_attributes, &t.attributes);
                     if due {
                         snap.last_emitted_at = Some(now);
                         updated.push(decision(camera_id, MotionKind::Updated, now, t));
@@ -249,6 +250,39 @@ impl MotionEventEmitter {
             .get(&camera_id)
             .map(|s| s.tracks.len())
             .unwrap_or(0)
+    }
+}
+
+/// Make `dst` equal to `src`, keeping `dst`'s keys and string / array
+/// buffers wherever they already fit.
+fn assign_attributes(
+    dst: &mut serde_json::Map<String, serde_json::Value>,
+    src: &serde_json::Map<String, serde_json::Value>,
+) {
+    dst.retain(|k, _| src.contains_key(k));
+    for (k, v) in src {
+        match dst.get_mut(k) {
+            Some(d) => assign_value(d, v),
+            None => {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+fn assign_value(dst: &mut serde_json::Value, src: &serde_json::Value) {
+    use serde_json::Value;
+    match (dst, src) {
+        (Value::String(d), Value::String(s)) => d.clone_from(s),
+        (Value::Array(d), Value::Array(s)) => {
+            d.truncate(s.len());
+            for (dv, sv) in d.iter_mut().zip(s) {
+                assign_value(dv, sv);
+            }
+            let kept = d.len();
+            d.extend_from_slice(&s[kept..]);
+        }
+        (d, s) => *d = s.clone(),
     }
 }
 
@@ -394,6 +428,36 @@ mod tests {
         assert_eq!(died[0].bbox.y2, 700.0);
         assert_eq!(died[0].label, "person");
         assert!((died[0].confidence - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn died_carries_exactly_the_last_frames_attributes() {
+        // Whatever changes between frames — keys added and dropped, strings
+        // grown and shrunk, arrays resized, a value switching JSON type —
+        // Died must carry the attributes of the last frame the track was seen.
+        let mut em = MotionEventEmitter::new(0.0);
+        let now = t0();
+        let frames = [
+            json!({"speed": "stationary", "zones": ["parking", "lot-b"], "grow": [1],
+                   "dropped": 1, "flip": "text"}),
+            json!({"speed": "running-much-longer", "zones": ["a-much-longer-zone-id"],
+                   "grow": [1, "two"], "flip": [1, 2], "added": {"n": null}}),
+            json!({"speed": "w", "zones": [], "grow": [1, "two", [3]], "flip": 7.5,
+                   "added": {"n": true}, "late": "x"}),
+        ];
+        for (i, attrs) in frames.iter().enumerate() {
+            let mut o = tobj(1, "person");
+            o.attributes = attrs.as_object().unwrap().clone();
+            em.tick(7, &[o], now + chrono::Duration::milliseconds(33 * i as i64));
+        }
+        let died = em.tick(7, &[], now + chrono::Duration::milliseconds(99));
+        assert_eq!(died.len(), 1);
+        assert_eq!(died[0].kind, MotionKind::Died);
+        assert_eq!(
+            serde_json::Value::Object(died[0].attributes.clone()),
+            json!({"added": {"n": true}, "flip": 7.5, "grow": [1, "two", [3]], "late": "x",
+                   "speed": "w", "zones": []})
+        );
     }
 
     #[test]
