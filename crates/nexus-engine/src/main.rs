@@ -1596,6 +1596,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         snapshot_uploader_slot.clone(),
         live_view_manager.clone(),
         frame_stats.clone(),
+        recorder.kind(),
         decode_health.clone(),
         webrtc_bridge,
         Some(trace_rx),
