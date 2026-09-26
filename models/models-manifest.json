@@ -1,7 +1,7 @@
 {
   "version": "v2",
-  "pack_version": "v5",
-  "_pack_version_comment": "Bumped only when ONNX/HEF bytes change OR a new artifact filename is introduced. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX (`gen_*.py --all-static`) -> compile HEFs (`gen_*_hailo.py`) -> bump this field -> commit -> `gh release create models-v5 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build. v5 (M_NATIVE_ASPECT) retires the square inputs: every detector ships the native 16:9 ladder (512x288/1024x576/1536x864) for both ONNX and Hailo-8 HEF; dinov2-s-v1 stays 224 (crop encoder). All rectangular HEFs are operator-compiled via the DFC (no public prebuilt) and ship sha256=PENDING_COMPILE + requires_compile=true until compiled. See /memories/repo/nexus-models-manifest-pending-compile.md and tools/models/README.md \u00a7'Hailo HEF compilation'.",
+  "pack_version": "v6",
+  "_pack_version_comment": "Bumped only when ONNX/HEF bytes change OR a new artifact filename is introduced. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX (`gen_*.py --all-static`) -> compile HEFs (`gen_*_hailo.py`) -> bump this field -> commit -> `gh release create models-vN --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build. v6 (BUG-221) recompiles the yolo26n and yoloe26_s HEFs with a clamped class-branch quantisation range; ONNX and all other artifacts are byte-identical to v5. v5 (M_NATIVE_ASPECT) retired the square inputs: every detector ships the native 16:9 ladder (512x288/1024x576/1536x864) for both ONNX and Hailo-8 HEF; dinov2-s-v1 stays 224 (crop encoder). All rectangular HEFs are operator-compiled via the DFC (no public prebuilt) and ship sha256=PENDING_COMPILE + requires_compile=true until compiled. See /memories/repo/nexus-models-manifest-pending-compile.md and tools/models/README.md \u00a7'Hailo HEF compilation'.",
   "_comment": "Model pack v2 manifest. See models/MODEL_PACK_V2.md for the schema reference. Paths are resolved relative to this file. sha256 is verified at engine load time when artifact verification is wired up (W-DETECT D5).",
   "_generated_by": "models/tools/generate_model_pack.py (or hand-edited at the repo root for the ship-in-tree models below)",
   "models": [
@@ -45,12 +45,14 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo26n @ 512x288 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo26n_512x288.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo26n_512x288_hailo.hef",
           "preset": "512x288-hef",
-          "sha256": "d1131deda27b7815dafa3922264808e036e321764c77997e96b6f2bbfebf3f2f",
+          "sha256": "026e6a48e27694e9940724e542c33f1ebd86256b4fb63efd0f9aed1b4ed6599d",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo26n_512x288.onnx",
             "script": "tools/models/gen_yolo26n_hailo.py --shape 512x288",
-            "calibration": "coco-val2017-1024"
+            "calibration": "coco-val2017-1024",
+            "dfc_version": "3.34.0",
+            "bug": "BUG-221 (class-branch force_range_out)"
           }
         },
         {
@@ -58,12 +60,14 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo26n @ 1024x576 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo26n_1024x576.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo26n_1024x576_hailo.hef",
           "preset": "1024x576-hef",
-          "sha256": "18f6a439edd83d3f24cfa4418c0b7fbfc9a69f1110f069992ccdf85864eeb2c3",
+          "sha256": "3ebfd1f1c7db20a29ec87ba04b2d1eb9719c6cd8311122be90c93d6797e2d70d",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo26n_1024x576.onnx",
             "script": "tools/models/gen_yolo26n_hailo.py --shape 1024x576",
-            "calibration": "coco-val2017-1024"
+            "calibration": "coco-val2017-1024",
+            "dfc_version": "3.34.0",
+            "bug": "BUG-221 (class-branch force_range_out)"
           }
         },
         {
@@ -71,12 +75,14 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yolo26n @ 1536x864 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yolo26n_1536x864.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yolo26n_1536x864_hailo.hef",
           "preset": "1536x864-hef",
-          "sha256": "1221f21cf1d32ec3365aaeaa7c7351ef2bce982e163921b7caa8edaec2fdaa74",
+          "sha256": "e9aec8a33b2e9aed7ad478eae35a1583093ecea640afb66785ed8cf562dd556a",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yolo26n_1536x864.onnx",
             "script": "tools/models/gen_yolo26n_hailo.py --shape 1536x864",
-            "calibration": "coco-val2017-1024"
+            "calibration": "coco-val2017-1024",
+            "dfc_version": "3.34.0",
+            "bug": "BUG-221 (class-branch force_range_out)"
           }
         }
       ],
@@ -323,12 +329,14 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yoloe26_s @ 512x288 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yoloe26_s_512x288.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yoloe26_s_512x288_hailo.hef",
           "preset": "512x288-hef",
-          "sha256": "10de77874ad4ea9cc97a8fe16df86018b9b8893ab95e69670a3139b84f64e8aa",
+          "sha256": "e9f9215f7741c763d7bd7222e1cc51ac6c58368d08ffe9a43db4438efd038575",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yoloe26_s_512x288.onnx",
             "script": "tools/models/gen_yoloe_hailo.py --shape 512x288",
-            "calibration": "coco-val2017-1024"
+            "calibration": "coco-val2017-1024",
+            "dfc_version": "3.34.0",
+            "bug": "BUG-221 (class-branch force_range_out; bias_correction off on class convs)"
           }
         },
         {
@@ -336,12 +344,14 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yoloe26_s @ 1024x576 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yoloe26_s_1024x576.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yoloe26_s_1024x576_hailo.hef",
           "preset": "1024x576-hef",
-          "sha256": "107c3edc7619285eb95f7016a6185e1ce2ee98649ed2ee849f0e668195236c84",
+          "sha256": "43e0b7a00dbc457ccdf62e18cfbaa8b2182866300595b765db445324609f1c4e",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yoloe26_s_1024x576.onnx",
             "script": "tools/models/gen_yoloe_hailo.py --shape 1024x576",
-            "calibration": "coco-val2017-1024"
+            "calibration": "coco-val2017-1024",
+            "dfc_version": "3.34.0",
+            "bug": "BUG-221 (class-branch force_range_out; bias_correction off on class convs)"
           }
         },
         {
@@ -349,12 +359,14 @@
           "_comment": "M_NATIVE_ASPECT \u2014 Hailo-8 compiled artifact for yoloe26_s @ 1536x864 (native 16:9). No public Model Zoo prebuilt at any rectangular shape; operator compiles from yoloe26_s_1536x864.onnx via the Hailo Dataflow Compiler. Calibration: 1024-image COCO val2017 sample (INT8 PTQ, capped by CALIB_LIMIT).",
           "path": "yoloe26_s_1536x864_hailo.hef",
           "preset": "1536x864-hef",
-          "sha256": "2e090a4f29dd4bf523dd963c9329fc1b69bcf94eb01f72357e563f68f6c53754",
+          "sha256": "987081d8da18372ff675b638e8bbb75189a8ab1056f9754f39cc1fbae1db6f53",
           "_compile": {
             "tool": "hailo-dataflow-compiler",
             "source_onnx": "yoloe26_s_1536x864.onnx",
             "script": "tools/models/gen_yoloe_hailo.py --shape 1536x864",
-            "calibration": "coco-val2017-1024"
+            "calibration": "coco-val2017-1024",
+            "dfc_version": "3.34.0",
+            "bug": "BUG-221 (class-branch force_range_out; bias_correction off on class convs)"
           }
         }
       ],
