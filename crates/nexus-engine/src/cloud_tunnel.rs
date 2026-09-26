@@ -2131,6 +2131,10 @@ fn edge_health_from(
 ///   window would clear the issue, and the cameras' return would raise it
 ///   again.
 ///
+/// So camera liveness is deliberately not an input: this takes only the
+/// recorder's kind and the store, and neither a first frame nor an outage
+/// can reach the issue.
+///
 /// Only a `gstreamer` build raises it. Release binaries always carry that
 /// feature, so it is the build where a real recorder was available and the
 /// stub is a misconfiguration. A build without it has no other recorder, and
@@ -2141,8 +2145,20 @@ fn edge_health_from(
 /// detector by name stays healthy: however the stub was chosen, behind running
 /// cameras it keeps no evidence.
 pub(crate) async fn recorder_issue(recorder_kind: &str, store: &Store) -> Option<EdgeDegradation> {
+    recorder_issue_in(cfg!(feature = "gstreamer"), recorder_kind, store).await
+}
+
+/// [`recorder_issue`] with the build's feature as an argument, so a test can
+/// run the raising branch on any build, through the same store read.
+/// Production passes `cfg!(feature = "gstreamer")`, through
+/// [`recorder_issue`] only.
+pub(crate) async fn recorder_issue_in(
+    real_recorder_available: bool,
+    recorder_kind: &str,
+    store: &Store,
+) -> Option<EdgeDegradation> {
     recorder_issue_for(
-        cfg!(feature = "gstreamer"),
+        real_recorder_available,
         recorder_kind,
         enabled_camera_count(store).await,
     )
@@ -2150,9 +2166,11 @@ pub(crate) async fn recorder_issue(recorder_kind: &str, store: &Store) -> Option
 
 /// The cameras [`recorder_issue`] counts: the store's enabled ones. A failed
 /// read is logged and counts none, like the heartbeat's other best-effort
-/// store reads. That read drops the issue, so on the heartbeat a failed read
-/// costs one resolve and re-raise of `core.health.degraded`.
-pub(crate) async fn enabled_camera_count(store: &Store) -> usize {
+/// store reads, so it drops the issue for that read. On the heartbeat that
+/// costs one resolve and re-raise of `core.health.degraded`, and only when
+/// `recorder_stub` is the only open issue: the cloud acts on status
+/// transitions, and any other open issue keeps the status degraded.
+async fn enabled_camera_count(store: &Store) -> usize {
     match store.list_cameras().await {
         Ok(cameras) => cameras.iter().filter(|c| c.ingest.enabled).count(),
         Err(e) => {
@@ -2162,10 +2180,9 @@ pub(crate) async fn enabled_camera_count(store: &Store) -> usize {
     }
 }
 
-/// [`recorder_issue`] with the build's feature as an argument, so a test can
-/// run the raising branch on any build. Production passes
-/// `cfg!(feature = "gstreamer")`, through [`recorder_issue`] only.
-pub(crate) fn recorder_issue_for(
+/// The rule [`recorder_issue_in`] applies, over the count of enabled
+/// cameras.
+fn recorder_issue_for(
     real_recorder_available: bool,
     recorder_kind: &str,
     enabled_cameras: usize,
@@ -2203,7 +2220,7 @@ fn truncate_detail(s: &str) -> String {
 #[cfg(test)]
 mod health_tests {
     use super::*;
-    use nexus_pipeline::FrameStatsRegistry;
+    use nexus_pipeline::{ClipRecorder, StubClipRecorder};
 
     /// The engine must not advertise a capability it cannot perform. Talk-down
     /// audio has no receive-side pipeline here, so no transport may leak the
@@ -2380,16 +2397,21 @@ mod health_tests {
     /// Stub`, and an enabled camera. Such a box detects and alerts but keeps
     /// no video, and this roll-up is the cloud's only view of edge health.
     /// No frame has arrived here; a population that waited for one would
-    /// report ok and then degraded one tick later on every restart.
+    /// report ok and then degraded one tick later on every restart. The kind
+    /// comes from a `StubClipRecorder`, what `build_recorder` makes for
+    /// `Stub`, so a renamed `kind()` cannot silently disarm it.
     ///
-    /// Computed as a `gstreamer` build computes it, so it runs in
-    /// default-feature CI; the feature gate has its own test. Asserts on the
-    /// recorder issue, never on `status == "ok"` (BUG-159).
+    /// Computed as a `gstreamer` build computes it ([`recorder_issue_in`]
+    /// given `true`), so it runs in default-feature CI; the feature gate has
+    /// its own test. Asserts on the recorder issue, never on
+    /// `status == "ok"` (BUG-159).
     #[tokio::test]
     async fn the_heartbeat_health_reports_a_stub_recorder() {
-        let (store, _dir) = default_config_store(true).await;
+        let (store, dir) = default_config_store(true).await;
+        let store = Arc::new(store);
+        let stub = StubClipRecorder::new(store.clone(), dir.path().join("clips"));
 
-        let recorder = recorder_issue_for(true, "stub", enabled_camera_count(&store).await);
+        let recorder = recorder_issue_in(true, stub.kind(), &store).await;
         let health = edge_health(&[], None, recorder);
         let issue = health
             .issues
@@ -2441,44 +2463,7 @@ mod health_tests {
             !store.list_cameras().await.expect("list cameras").is_empty(),
             "fixture: the disabled camera is in the store",
         );
-        assert_eq!(
-            recorder_issue_for(true, "stub", enabled_camera_count(&store).await),
-            None,
-        );
-    }
-
-    /// The recorder kind is fixed for the process, so the issue must not
-    /// follow camera liveness. A site-wide outage longer than the offline
-    /// window would otherwise resolve `core.health.degraded` and raise it
-    /// again when the cameras return — a default-on customer notification
-    /// pair for a recorder nobody fixed. The camera here is enabled and its
-    /// last frame is older than that window, so the heartbeat's
-    /// `online_cameras` counts it out; the issue counts the store instead.
-    #[tokio::test]
-    async fn a_stub_whose_only_camera_went_offline_still_raises_the_issue() {
-        let (store, _dir) = default_config_store(true).await;
-        let camera = store.list_cameras().await.expect("list cameras")[0].id;
-        let now = chrono::Utc::now();
-        let frame_stats = FrameStatsRegistry::new();
-        frame_stats.observe_frame(
-            camera,
-            now - chrono::Duration::milliseconds(
-                nexus_pipeline::stats::CAMERA_OFFLINE_AFTER_MS + 1_000,
-            ),
-            640,
-            480,
-        );
-        assert!(
-            !frame_stats
-                .snapshot(camera)
-                .expect("the camera has a frame")
-                .is_online(now),
-            "fixture: the camera must read offline",
-        );
-        assert!(
-            recorder_issue_for(true, "stub", enabled_camera_count(&store).await).is_some(),
-            "an offline camera is still an enabled one the stub is not recording",
-        );
+        assert_eq!(recorder_issue_in(true, "stub", &store).await, None);
     }
 
     /// On a list already at the wire cap, the recorder issue must not carry

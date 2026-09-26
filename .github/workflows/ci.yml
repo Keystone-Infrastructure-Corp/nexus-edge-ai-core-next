@@ -330,10 +330,16 @@ jobs:
       # which prints a warning and exits 0, so a plain rebind (result left
       # unread) or a bare-statement discard of the result of
       # `register_analysis_sessions` in main.rs's gstreamer
-      # `build_gst_recorder` was a warning on a green job. `let _ =` and a
-      # read-then-discard rebind still pass.
+      # `build_gst_recorder` was a warning on a green job; either now fails
+      # this step. Because the boot map is an opaque `BootAnalysis`, a
+      # rebind can no longer derive a doctored map from the first result,
+      # and every form that still passes is a deliberate forge: dropping or
+      # dead-reading the first result (`let _ =`, `drop`, an `_` binding, a
+      # dead branch) plus a second, empty or throwaway, registration pass,
+      # or feeding the one real pass an empty camera list.
       #   * Both feature levels: gstreamer-gated code under
-      #     `cfg(not(feature = "gstreamer-webrtc"))` (e.g. main.rs's
+      #     `cfg(not(feature = "gstreamer-webrtc"))` (e.g. the
+      #     `WebRtcBridge::disabled()` arm inside main.rs's
       #     `build_gst_recorder`) compiles only in the gstreamer-only build.
       #   * Both crates: `-p nexus-engine` lints nexus-pipeline's lib but not
       #     its gstreamer test modules.

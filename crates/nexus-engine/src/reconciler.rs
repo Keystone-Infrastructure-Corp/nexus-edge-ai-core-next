@@ -123,7 +123,11 @@ impl EntryKey {
     }
 
     /// A boot entry's key: the guard's, with the substream URL boot
-    /// registered for `cam` in place of the configured one.
+    /// registered for `cam` in place of the configured one. The call drains
+    /// that camera's entry from `boot_analysis`, so the key it returns is the
+    /// only record of it. An extra call as a bare statement fails
+    /// `clippy -D warnings` on this `#[must_use]`; `let _ =` still passes.
+    #[must_use = "this drains the camera's boot entry, which only the returned key records"]
     pub(crate) fn at_boot(
         args: &ReconcilerArgs,
         cam: &CameraConfig,
@@ -152,10 +156,12 @@ impl EntryKey {
 
 /// The substream URL each boot entry records, by camera: what boot's one
 /// registration pass returned. Only [`register_analysis_sessions`] makes
-/// one and only [`EntryKey::at_boot`] reads it, so `main` cannot build or
-/// alter the map, only obtain one from a registration pass. A deliberate
-/// forge is still possible: an empty pass, or a pass over a throwaway
-/// `StubClipRecorder`, which accepts every substream.
+/// one and only [`EntryKey::at_boot`] reads it, so `main` cannot build the
+/// map, and can change it only by draining entries through `at_boot`.
+/// Deliberate forges are still possible: an empty registration pass; a pass
+/// over a throwaway `StubClipRecorder`, which accepts every substream; and a
+/// second `at_boot` call for a camera, or one made with a doctored copy of
+/// it, which drains its entry so the real key records `None`.
 #[must_use = "each boot entry's analysis_url comes from this map, through EntryKey::at_boot"]
 pub(crate) struct BootAnalysis(HashMap<CameraId, String>);
 

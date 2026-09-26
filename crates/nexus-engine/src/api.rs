@@ -1096,7 +1096,8 @@ impl From<nexus_store::StoreError> for ApiError {
 /// the alert count would otherwise see silence and assume all is well.
 /// The other is a stub clip recorder behind enabled cameras (see
 /// [`crate::cloud_tunnel::recorder_issue`]), which detects but keeps no
-/// video. Degraded is still HTTP 200.
+/// video. Degraded is still HTTP 200. Computing that issue reads the store,
+/// so the probe makes one camera-list read per request.
 async fn health(State(s): State<ApiState>) -> Json<serde_json::Value> {
     Json(health_body(
         crate::cloud_tunnel::recorder_issue(s.recorder.kind(), &s.store).await,
@@ -1104,7 +1105,8 @@ async fn health(State(s): State<ApiState>) -> Json<serde_json::Value> {
 }
 
 /// The body of [`health`], apart from the handler so a test can drive it
-/// with the recorder that boot really builds.
+/// with the recorder issue computed from the recorder that boot really
+/// builds.
 fn health_body(recorder: Option<nexus_cloud_protocol::v1::EdgeDegradation>) -> serde_json::Value {
     let degradations = nexus_inference::health::degradations();
     let mut issues: Vec<serde_json::Value> = degradations
@@ -10019,7 +10021,7 @@ mod tests {
     /// so a renamed `kind()` cannot silently disarm it.
     ///
     /// Computed as a `gstreamer` build computes it
-    /// ([`crate::cloud_tunnel::recorder_issue_for`] given `true`), so it
+    /// ([`crate::cloud_tunnel::recorder_issue_in`] given `true`), so it
     /// runs in default-feature CI; `cloud_tunnel` tests the feature gate.
     /// Asserts on the recorder issue, never on `status == "ok"`: the
     /// detector registry is process-global and a sibling test may have
@@ -10073,11 +10075,9 @@ mod tests {
         .expect("build_recorder");
         assert_eq!(recorder.kind(), "stub", "boot must construct the stub");
 
-        let body = super::health_body(crate::cloud_tunnel::recorder_issue_for(
-            true,
-            recorder.kind(),
-            crate::cloud_tunnel::enabled_camera_count(&store).await,
-        ));
+        let body = super::health_body(
+            crate::cloud_tunnel::recorder_issue_in(true, recorder.kind(), &store).await,
+        );
         let issue = body["issues"]
             .as_array()
             .and_then(|issues| issues.iter().find(|i| i["component"] == "recorder"))
