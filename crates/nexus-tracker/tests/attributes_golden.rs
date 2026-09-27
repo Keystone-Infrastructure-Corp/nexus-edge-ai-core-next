@@ -82,7 +82,7 @@ fn detections(i: u64) -> Vec<Detection> {
     walker
         .attributes
         .insert("classifier.score".into(), json!(0.87));
-    if i % 3 == 0 {
+    if i.is_multiple_of(3) {
         walker
             .attributes
             .insert("zoné.ü".into(), json!({"b": [1, "x"], "a": null}));
