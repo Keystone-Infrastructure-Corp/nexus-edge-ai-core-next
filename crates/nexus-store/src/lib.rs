@@ -462,7 +462,7 @@ impl Store {
             .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let s: String = r.get(0);
+            let s: String = r.try_get(0)?;
             out.push(serde_json::from_str(&s)?);
         }
         Ok(out)

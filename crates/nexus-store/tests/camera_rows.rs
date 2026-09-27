@@ -1,6 +1,7 @@
 //! `Store::list_readable_cameras` returns the camera rows this build can read
 //! and the ids of those it cannot. Boot and the reconciler read with it, so a
-//! row it cannot read must be reported, never a panic that takes them down.
+//! row it cannot read must be reported, never a panic that takes them down;
+//! `list_cameras`, which needs every row, must fail on it, not panic.
 
 use std::path::PathBuf;
 
@@ -59,4 +60,17 @@ async fn a_row_this_build_cannot_read_is_reported_by_id() {
         .expect("the rows are read one by one");
     assert_eq!(readable.iter().map(|c| c.id).collect::<Vec<_>>(), vec![1]);
     assert_eq!(unreadable, vec![2, 3]);
+
+    // The reads that need every row fail on them, rather than panic the
+    // task that called them (the roster's, say).
+    sqlx::query(
+        "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'h264') WHERE id = 3",
+    )
+    .execute(store.pool())
+    .await
+    .expect("make camera 3 readable again");
+    assert!(
+        store.list_cameras().await.is_err(),
+        "list_cameras fails on the blob row"
+    );
 }
