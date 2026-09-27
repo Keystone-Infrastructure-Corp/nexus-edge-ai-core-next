@@ -2197,9 +2197,11 @@ fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegr
 
 /// The camera rows boot or the reconciler could not read
 /// ([`crate::reconciler::ReconcilerArgs::unreadable_cameras`]), as one issue.
-/// No change to such a camera applies, and no other issue names it: the read
-/// that skips its row succeeds. The console's camera list, which reads every
-/// row, fails meanwhile, so the detail names the calls that clear it.
+/// Such a camera does not run, and no other issue names it: the read that
+/// skips its row succeeds. The reads that need every row fail meanwhile (the
+/// console's camera list, the cloud roster, fleet apply and its hash, the
+/// reprobe, ONVIF device control, setup status and rule preview), so the
+/// detail names the calls that clear it.
 fn unreadable_cameras_issue(ids: &[nexus_types::CameraId]) -> Option<EdgeDegradation> {
     if ids.is_empty() {
         return None;
@@ -2213,9 +2215,10 @@ fn unreadable_cameras_issue(ids: &[nexus_types::CameraId]) -> Option<EdgeDegrada
         component: "store".to_string(),
         code: "camera_config_unreadable".to_string(),
         detail: truncate_detail(&format!(
-            "this engine build cannot read the stored configuration of {} camera(s). A camera \
-             not already running does not start, and one running keeps its last configuration, \
-             until it is saved again (PUT /api/v1/cameras/{{id}}) or deleted: {list}",
+            "this engine build cannot read the stored configuration of {} camera(s), so they \
+             do not run and nothing on them is detected, alerted on or recorded until each is \
+             deleted (DELETE /api/v1/cameras/{{id}}) or saved again with its whole configuration \
+             (PUT /api/v1/cameras/{{id}}): {list}",
             ids.len(),
         )),
     })
