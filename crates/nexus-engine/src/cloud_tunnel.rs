@@ -3116,6 +3116,7 @@ mod storage_watermark_tests {
         // The reconciler tears the camera down and respawns it; the counter
         // restarts at zero while `window.previous` still holds 500.
         registry.clear(7);
+        registry.begin_session(7);
         for _ in 0..30 {
             registry.observe_decoder_input_drop(7);
         }

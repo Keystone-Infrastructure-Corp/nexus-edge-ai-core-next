@@ -9,14 +9,14 @@
 //! merged into `GET /api/v1/cameras`) reads a cheap snapshot of the
 //! map. Each camera has its own lock, so one camera's per-frame update
 //! never waits on another's; the map itself is write-locked only when a
-//! camera is first seen or cleared.
+//! camera is first seen.
 //!
 //! Why a separate registry instead of squatting on the existing bus
 //! `PIPELINE_STATUS` topic: that topic publishes only on supervisor
 //! state transitions (Initializing → Running → Stopped), not on
 //! every frame, so it can't carry a live fps EMA.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -187,9 +187,23 @@ impl Entry {
     }
 }
 
+/// One camera's stats and the epoch that guards them, under one lock so the
+/// epoch check and the write it guards are atomic with respect to
+/// `begin_session` and `clear`. A slot is never removed from the map
+/// (`clear` empties it), so the epoch outlives the entry — the
+/// [`crate::cache::LatestFrameCache`] shape.
+#[derive(Default)]
+struct Slot {
+    /// `None` until the camera's first frame since it was last cleared.
+    entry: Option<Entry>,
+    /// Bumped by `begin_session` and `clear`. A writer holding an older
+    /// epoch has been superseded and its frames are dropped.
+    epoch: u64,
+}
+
 #[derive(Default)]
 pub struct FrameStatsRegistry {
-    inner: RwLock<HashMap<CameraId, Arc<Mutex<Entry>>>>,
+    inner: RwLock<HashMap<CameraId, Arc<Mutex<Slot>>>>,
 }
 
 impl FrameStatsRegistry {
@@ -197,52 +211,63 @@ impl FrameStatsRegistry {
         Self::default()
     }
 
-    fn slot(&self, camera_id: CameraId) -> Option<Arc<Mutex<Entry>>> {
+    fn slot(&self, camera_id: CameraId) -> Option<Arc<Mutex<Slot>>> {
         self.inner.read().get(&camera_id).cloned()
     }
 
-    /// Only [`Self::observe_frame`] may bring a camera into the registry.
-    /// Every other writer goes through [`Self::slot`] and is a no-op for a
-    /// camera that has not produced a frame since it was last cleared.
-    fn slot_or_insert(&self, camera_id: CameraId) -> Arc<Mutex<Entry>> {
-        if let Some(slot) = self.slot(camera_id) {
-            return slot;
-        }
-        self.inner
-            .write()
-            .entry(camera_id)
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(Entry {
-                    last_frame_at: None,
-                    recent_instants: VecDeque::with_capacity(FPS_WINDOW_MAX_SAMPLES),
-                    frames_emitted: 0,
-                    frames_backpressure_dropped: 0,
-                    last_frame_id: None,
-                    frames_dropped: 0,
-                    source_width: 0,
-                    source_height: 0,
-                    tile_invocations: 0,
-                    tile_detections_added: 0,
-                    tile_inference_ms_total: 0,
-                }))
-            })
-            .clone()
+    /// Claim the camera for a new source session; the returned epoch is what
+    /// that session's [`Self::observe_frame`] calls must carry.
+    ///
+    /// `stop_camera` aborts the supervisor and then clears, and abort is
+    /// asynchronous, so the stopped session's tap can still be mid-frame.
+    /// Its write loses on the epoch rather than on timing, instead of
+    /// bringing a stopped camera back as a running one.
+    pub fn begin_session(&self, camera_id: CameraId) -> u64 {
+        let slot = match self.slot(camera_id) {
+            Some(slot) => slot,
+            None => self.inner.write().entry(camera_id).or_default().clone(),
+        };
+        let mut g = slot.lock();
+        g.epoch += 1;
+        g.epoch
     }
 
     /// Record one frame from the source. `captured_at` should be the
     /// wall-clock timestamp on the `Frame` itself. `width`/`height`
     /// are the source frame dimensions.
+    ///
+    /// Only this may bring a camera into the registry, and only for the
+    /// current session: every other writer is a no-op for a camera that
+    /// has not produced a frame since it was last cleared.
     pub fn observe_frame(
         &self,
         camera_id: CameraId,
+        epoch: u64,
         captured_at: DateTime<Utc>,
         width: u32,
         height: u32,
     ) {
         let now = Instant::now();
-        let slot = self.slot_or_insert(camera_id);
+        let Some(slot) = self.slot(camera_id) else {
+            return;
+        };
         let mut guard = slot.lock();
-        let entry = &mut *guard;
+        if guard.epoch != epoch {
+            return;
+        }
+        let entry = guard.entry.get_or_insert_with(|| Entry {
+            last_frame_at: None,
+            recent_instants: VecDeque::with_capacity(FPS_WINDOW_MAX_SAMPLES),
+            frames_emitted: 0,
+            frames_backpressure_dropped: 0,
+            last_frame_id: None,
+            frames_dropped: 0,
+            source_width: 0,
+            source_height: 0,
+            tile_invocations: 0,
+            tile_detections_added: 0,
+            tile_inference_ms_total: 0,
+        });
         // Prune anything older than the window before appending so the
         // VecDeque stays bounded even at high arrival rates.
         let cutoff = now - FPS_WINDOW;
@@ -288,7 +313,10 @@ impl FrameStatsRegistry {
         let Some(slot) = self.slot(camera_id) else {
             return;
         };
-        let mut entry = slot.lock();
+        let mut guard = slot.lock();
+        let Some(entry) = guard.entry.as_mut() else {
+            return;
+        };
         if let Some(prev) = entry.last_frame_id {
             let lost = frame_id.saturating_sub(prev).saturating_sub(1);
             // A jump this large is not a camera that fell behind — it is a
@@ -308,8 +336,9 @@ impl FrameStatsRegistry {
 
     pub fn observe_dropped(&self, camera_id: CameraId) {
         if let Some(slot) = self.slot(camera_id) {
-            let mut entry = slot.lock();
-            entry.frames_dropped = entry.frames_dropped.saturating_add(1);
+            if let Some(entry) = slot.lock().entry.as_mut() {
+                entry.frames_dropped = entry.frames_dropped.saturating_add(1);
+            }
         }
     }
 
@@ -322,30 +351,39 @@ impl FrameStatsRegistry {
     /// guaranteed to exist by the time this is called.
     pub fn observe_tile_invocation(&self, camera_id: CameraId, added: u64, infer_ms: u64) {
         if let Some(slot) = self.slot(camera_id) {
-            let mut entry = slot.lock();
-            entry.tile_invocations = entry.tile_invocations.saturating_add(1);
-            entry.tile_detections_added = entry.tile_detections_added.saturating_add(added);
-            entry.tile_inference_ms_total = entry.tile_inference_ms_total.saturating_add(infer_ms);
+            if let Some(entry) = slot.lock().entry.as_mut() {
+                entry.tile_invocations = entry.tile_invocations.saturating_add(1);
+                entry.tile_detections_added = entry.tile_detections_added.saturating_add(added);
+                entry.tile_inference_ms_total =
+                    entry.tile_inference_ms_total.saturating_add(infer_ms);
+            }
         }
     }
 
     /// Reset a camera's stats — call this when a supervisor is
     /// stopped (e.g. on `disable` or URL change), so the next spawn
-    /// starts from a clean slate.
+    /// starts from a clean slate. Retires the session's epoch, so a
+    /// writer still draining cannot repopulate it.
     pub fn clear(&self, camera_id: CameraId) {
-        self.inner.write().remove(&camera_id);
+        if let Some(slot) = self.slot(camera_id) {
+            let mut g = slot.lock();
+            g.entry = None;
+            g.epoch += 1;
+        }
     }
 
     pub fn snapshot(&self, camera_id: CameraId) -> Option<CameraFrameStats> {
         let now = Instant::now();
-        self.slot(camera_id).map(|slot| slot.lock().snapshot(now))
+        let slot = self.slot(camera_id)?;
+        let g = slot.lock();
+        g.entry.as_ref().map(|e| e.snapshot(now))
     }
 
     /// Each row is consistent within its camera; the rows are not one
     /// cross-camera instant, which no reader needs.
     pub fn snapshot_all(&self) -> HashMap<CameraId, CameraFrameStats> {
         let now = Instant::now();
-        let slots: Vec<(CameraId, Arc<Mutex<Entry>>)> = self
+        let slots: Vec<(CameraId, Arc<Mutex<Slot>>)> = self
             .inner
             .read()
             .iter()
@@ -353,7 +391,7 @@ impl FrameStatsRegistry {
             .collect();
         slots
             .into_iter()
-            .map(|(id, slot)| (id, slot.lock().snapshot(now)))
+            .filter_map(|(id, slot)| Some((id, slot.lock().entry.as_ref()?.snapshot(now))))
             .collect()
     }
 }
@@ -371,11 +409,24 @@ impl FrameStatsRegistry {
 ///
 /// Every camera's streaming threads write here, several times per decoded
 /// frame, so each camera has its own lock and a probe only ever waits on its
-/// own camera. The map is write-locked only when a camera is first seen or
-/// cleared.
+/// own camera. The map is write-locked only when a camera is first seen,
+/// cleared or reset, or claimed by a new ingester.
 #[derive(Debug, Default)]
 pub struct DecodeHealthRegistry {
-    inner: RwLock<HashMap<CameraId, Arc<Mutex<DecodeSlot>>>>,
+    inner: RwLock<DecodeHealthMap>,
+}
+
+/// The per-camera slots and the cameras [`DecodeHealthRegistry::clear`] has
+/// retired, under one lock so a probe's first-sight insert cannot interleave
+/// with a clear.
+#[derive(Debug, Default)]
+struct DecodeHealthMap {
+    slots: HashMap<CameraId, Arc<Mutex<DecodeSlot>>>,
+    /// Cleared by `stop_camera` and not yet claimed by a new ingester. A
+    /// stopped ingester's pipeline goes to NULL on a detached thread, so its
+    /// probes can still fire after the clear, and each would bring the camera
+    /// back into the census as a live decode chain.
+    retired: HashSet<CameraId>,
 }
 
 /// One camera's counters and the SPEC-069 Phase 1 windowed-rate side-state
@@ -518,20 +569,33 @@ impl DecodeHealthRegistry {
     }
 
     fn slot(&self, camera_id: CameraId) -> Option<Arc<Mutex<DecodeSlot>>> {
-        self.inner.read().get(&camera_id).cloned()
+        self.inner.read().slots.get(&camera_id).cloned()
     }
 
     /// Every probe records on first sight, so every writer comes through here.
-    fn slot_or_insert(&self, camera_id: CameraId) -> Arc<Mutex<DecodeSlot>> {
+    /// `None` for a camera [`Self::clear`] retired: its probe is dropped.
+    fn slot_or_insert(&self, camera_id: CameraId) -> Option<Arc<Mutex<DecodeSlot>>> {
         if let Some(slot) = self.slot(camera_id) {
-            return slot;
+            return Some(slot);
         }
-        self.inner.write().entry(camera_id).or_default().clone()
+        let mut g = self.inner.write();
+        if g.retired.contains(&camera_id) {
+            return None;
+        }
+        Some(g.slots.entry(camera_id).or_default().clone())
+    }
+
+    /// Claim the camera for a newly built ingester, so a camera that was
+    /// cleared and started again records its new decode chain.
+    pub fn begin_session(&self, camera_id: CameraId) {
+        self.inner.write().retired.remove(&camera_id);
     }
 
     /// Record one leaked access unit on the RGB branch's decoder-input queue.
     pub fn observe_decoder_input_drop(&self, camera_id: CameraId) {
-        let slot = self.slot_or_insert(camera_id);
+        let Some(slot) = self.slot_or_insert(camera_id) else {
+            return;
+        };
         let mut s = slot.lock();
         s.health.decoder_input_drops = s.health.decoder_input_drops.saturating_add(1);
     }
@@ -539,7 +603,9 @@ impl DecodeHealthRegistry {
     /// Record one frame emitted by the decoder itself (src-pad probe).
     pub fn observe_decoder_output(&self, camera_id: CameraId) {
         let now = Instant::now();
-        let slot = self.slot_or_insert(camera_id);
+        let Some(slot) = self.slot_or_insert(camera_id) else {
+            return;
+        };
         let mut s = slot.lock();
         let fps = s.rates.decoder_output.record(now);
         s.health.decoder_output_frames = s.health.decoder_output_frames.saturating_add(1);
@@ -548,7 +614,9 @@ impl DecodeHealthRegistry {
 
     /// Record the width/height negotiated on the decoder's src pad.
     pub fn observe_decoder_geometry(&self, camera_id: CameraId, width: u32, height: u32) {
-        let slot = self.slot_or_insert(camera_id);
+        let Some(slot) = self.slot_or_insert(camera_id) else {
+            return;
+        };
         let mut s = slot.lock();
         s.health.decoder_width = width;
         s.health.decoder_height = height;
@@ -560,7 +628,9 @@ impl DecodeHealthRegistry {
     /// sampled frames.
     pub fn observe_loop_stats(&self, camera_id: CameraId, sampled: u64, duplicates: u64) {
         let now = Instant::now();
-        let slot = self.slot_or_insert(camera_id);
+        let Some(slot) = self.slot_or_insert(camera_id) else {
+            return;
+        };
         let mut s = slot.lock();
         let fps = s.rates.sampled.record(now);
         s.health.sampled_frames = sampled;
@@ -569,9 +639,20 @@ impl DecodeHealthRegistry {
     }
 
     /// Reset one camera. Called when a supervisor stops so the next spawn
-    /// starts clean, mirroring [`FrameStatsRegistry::clear`].
+    /// starts clean, mirroring [`FrameStatsRegistry::clear`]: the camera stays
+    /// retired, dropping its stopped ingester's late probes, until an
+    /// ingester calls [`Self::begin_session`] for it.
     pub fn clear(&self, camera_id: CameraId) {
-        self.inner.write().remove(&camera_id);
+        let mut g = self.inner.write();
+        g.slots.remove(&camera_id);
+        g.retired.insert(camera_id);
+    }
+
+    /// Zero one camera's counters without retiring it, so its live ingesters
+    /// keep recording. For a change of which session feeds analysis, whose
+    /// counters would otherwise blend two geometries.
+    pub fn reset(&self, camera_id: CameraId) {
+        self.inner.write().slots.remove(&camera_id);
     }
 
     #[must_use]
@@ -588,6 +669,7 @@ impl DecodeHealthRegistry {
         let slots: Vec<(CameraId, Arc<Mutex<DecodeSlot>>)> = self
             .inner
             .read()
+            .slots
             .iter()
             .map(|(id, slot)| (*id, slot.clone()))
             .collect();
@@ -731,7 +813,8 @@ mod tests {
     #[test]
     fn observe_frame_increments_counter_and_records_dims() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 960, 540);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 960, 540);
         let s = reg.snapshot(1).unwrap();
         assert_eq!(s.frames_emitted, 1);
         assert_eq!(s.source_width, 960);
@@ -743,10 +826,11 @@ mod tests {
     #[test]
     fn second_frame_seeds_fps_ema() {
         let reg = FrameStatsRegistry::new();
+        let epoch = reg.begin_session(1);
         let t = Utc::now();
-        reg.observe_frame(1, t, 960, 540);
+        reg.observe_frame(1, epoch, t, 960, 540);
         std::thread::sleep(std::time::Duration::from_millis(20));
-        reg.observe_frame(1, t, 960, 540);
+        reg.observe_frame(1, epoch, t, 960, 540);
         let s = reg.snapshot(1).unwrap();
         assert!(s.fps_ema > 0.0, "fps_ema should be positive after 2 frames");
         assert_eq!(s.frames_emitted, 2);
@@ -760,14 +844,15 @@ mod tests {
     #[test]
     fn bursty_arrivals_do_not_inflate_fps() {
         let reg = FrameStatsRegistry::new();
+        let epoch = reg.begin_session(1);
         let t = Utc::now();
         // 10 frames in <1 ms (tight loop), then sleep so the span the
         // window measures is dominated by the real wall-clock gap.
         for _ in 0..10 {
-            reg.observe_frame(1, t, 320, 240);
+            reg.observe_frame(1, epoch, t, 320, 240);
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
-        reg.observe_frame(1, t, 320, 240);
+        reg.observe_frame(1, epoch, t, 320, 240);
         let s = reg.snapshot(1).unwrap();
         // Eleven frames over ~50 ms => roughly 200 fps. The exact
         // value is timing-sensitive; what matters is that the prior
@@ -783,7 +868,8 @@ mod tests {
     #[test]
     fn dropped_frames_do_not_count_emitted() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 320, 240);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 320, 240);
         reg.observe_dropped(1);
         reg.observe_dropped(1);
         let s = reg.snapshot(1).unwrap();
@@ -794,7 +880,8 @@ mod tests {
     #[test]
     fn a_gap_in_frame_ids_is_counted_as_backpressure_not_as_a_gate_drop() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 320, 240);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 320, 240);
 
         reg.observe_frame_id(1, 1);
         reg.observe_frame_id(1, 2); // contiguous — nothing lost
@@ -815,7 +902,8 @@ mod tests {
     #[test]
     fn an_implausible_forward_jump_is_two_counters_not_lost_frames() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 320, 240);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 320, 240);
         reg.observe_frame_id(1, 10);
         // SharedRtspSource swaps the analysis substream's ingester for the
         // main one mid-run; each owns its own sequence, so the first frame
@@ -846,7 +934,8 @@ mod tests {
     #[test]
     fn a_session_restart_resets_the_sequence_without_inventing_drops() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 320, 240);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 320, 240);
         reg.observe_frame_id(1, 900);
         // The source's per-session counter restarts at 1 on reconfiguration.
         reg.observe_frame_id(1, 1);
@@ -872,16 +961,47 @@ mod tests {
     #[test]
     fn clear_resets_camera() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 640, 480);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 640, 480);
         reg.clear(1);
         assert!(reg.snapshot(1).is_none());
+    }
+
+    /// `stop_camera` aborts the supervisor and then clears, and abort is
+    /// asynchronous: the tap can still be mid-frame when the clear lands.
+    /// Its write must not bring the stopped camera back, or every reader
+    /// (heartbeat `online_cameras`, the roster's `online`, `/stats`) reports
+    /// it running.
+    #[test]
+    fn a_write_from_a_stopped_session_cannot_recreate_a_cleared_camera() {
+        let reg = FrameStatsRegistry::new();
+        let stopped = reg.begin_session(1);
+        reg.observe_frame(1, stopped, Utc::now(), 640, 480);
+
+        reg.clear(1);
+        reg.observe_frame(1, stopped, Utc::now(), 640, 480);
+
+        assert!(
+            reg.snapshot(1).is_none() && reg.snapshot_all().is_empty(),
+            "a stopped session's late frame recreated the camera it was cleared from"
+        );
+
+        // Nor may it land in the camera's next session once that has begun.
+        let next = reg.begin_session(1);
+        reg.observe_frame(1, stopped, Utc::now(), 640, 480);
+        assert!(
+            reg.snapshot(1).is_none(),
+            "a stopped session's late frame was counted as the next session's"
+        );
+        reg.observe_frame(1, next, Utc::now(), 640, 480);
+        assert_eq!(reg.snapshot(1).map(|s| s.frames_emitted), Some(1));
     }
 
     #[test]
     fn snapshot_all_returns_one_entry_per_camera() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 320, 240);
-        reg.observe_frame(2, Utc::now(), 640, 480);
+        reg.observe_frame(1, reg.begin_session(1), Utc::now(), 320, 240);
+        reg.observe_frame(2, reg.begin_session(2), Utc::now(), 640, 480);
         let all = reg.snapshot_all();
         assert_eq!(all.len(), 2);
     }
@@ -889,8 +1009,9 @@ mod tests {
     #[test]
     fn last_frame_age_ms_is_non_negative() {
         let reg = FrameStatsRegistry::new();
+        let epoch = reg.begin_session(1);
         let t = Utc::now() - chrono::Duration::milliseconds(500);
-        reg.observe_frame(1, t, 16, 16);
+        reg.observe_frame(1, epoch, t, 16, 16);
         let s = reg.snapshot(1).unwrap();
         let age = s.last_frame_age_ms(Utc::now()).unwrap();
         assert!(age >= 500);
@@ -899,7 +1020,8 @@ mod tests {
     #[test]
     fn tile_counters_default_to_zero() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 960, 540);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 960, 540);
         let s = reg.snapshot(1).unwrap();
         assert_eq!(s.tile_invocations, 0);
         assert_eq!(s.tile_detections_added, 0);
@@ -1114,6 +1236,44 @@ mod tests {
         assert_eq!(reg.snapshot(2).unwrap().decoder_input_drops, 1);
     }
 
+    /// The same race as frame stats, with GStreamer streaming threads as the
+    /// late writer: `stop_camera` shuts the ingester down and then clears,
+    /// and the pipeline's NULL transition is detached, so a probe can still
+    /// fire after the clear. The census must not report a stopped camera's
+    /// decode chain as live.
+    #[test]
+    fn a_probe_from_a_stopped_ingester_cannot_recreate_a_cleared_camera() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_decoder_output(1);
+
+        reg.clear(1);
+        reg.observe_decoder_output(1);
+
+        assert!(
+            reg.snapshot(1).is_none() && reg.snapshot_all().is_empty(),
+            "a stopped ingester's late probe recreated the camera it was cleared from"
+        );
+
+        // The camera's next ingester claims it and records from zero.
+        reg.begin_session(1);
+        reg.observe_decoder_output(1);
+        assert_eq!(reg.snapshot(1).map(|h| h.decoder_output_frames), Some(1));
+    }
+
+    /// Moving analysis between sessions resets the counters but must not
+    /// retire the camera: its ingesters are still running.
+    #[test]
+    fn a_reset_keeps_recording_the_cameras_live_ingesters() {
+        let reg = DecodeHealthRegistry::new();
+        reg.observe_decoder_output(1);
+
+        reg.reset(1);
+        assert!(reg.snapshot(1).is_none(), "reset zeroes the counters");
+        reg.observe_decoder_output(1);
+
+        assert_eq!(reg.snapshot(1).map(|h| h.decoder_output_frames), Some(1));
+    }
+
     /// SPEC-069 Phase 1 (P3) — a camera with no substream configured must
     /// read `mainstream`/`active` by design, never `unavailable`: absence
     /// of a substream is normal, not a failure.
@@ -1174,7 +1334,8 @@ mod tests {
     #[test]
     fn observe_tile_invocation_increments_counters() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 960, 540);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 960, 540);
         reg.observe_tile_invocation(1, 7, 12);
         reg.observe_tile_invocation(1, 3, 8);
         let s = reg.snapshot(1).unwrap();
@@ -1193,10 +1354,12 @@ mod tests {
     #[test]
     fn clear_resets_tile_counters() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 960, 540);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 960, 540);
         reg.observe_tile_invocation(1, 4, 6);
         reg.clear(1);
-        reg.observe_frame(1, Utc::now(), 960, 540);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 960, 540);
         let s = reg.snapshot(1).unwrap();
         assert_eq!(s.tile_invocations, 0);
         assert_eq!(s.tile_detections_added, 0);
@@ -1209,8 +1372,9 @@ mod tests {
     #[test]
     fn camera_with_recent_frame_is_online_with_no_live_view_subscriber() {
         let reg = FrameStatsRegistry::new();
+        let epoch = reg.begin_session(1);
         let now = Utc::now();
-        reg.observe_frame(1, now, 960, 540);
+        reg.observe_frame(1, epoch, now, 960, 540);
         let s = reg.snapshot(1).unwrap();
         assert!(s.is_online(now));
     }
@@ -1220,8 +1384,9 @@ mod tests {
     #[test]
     fn camera_flips_offline_after_frames_stop() {
         let reg = FrameStatsRegistry::new();
+        let epoch = reg.begin_session(1);
         let last_frame = Utc::now();
-        reg.observe_frame(1, last_frame, 960, 540);
+        reg.observe_frame(1, epoch, last_frame, 960, 540);
         let s = reg.snapshot(1).unwrap();
         assert!(s.is_online(last_frame), "just observed a frame");
         let long_after = last_frame + chrono::Duration::milliseconds(CAMERA_OFFLINE_AFTER_MS + 1);
@@ -1249,7 +1414,7 @@ mod tests {
     #[test]
     fn a_write_for_one_camera_is_not_blocked_by_another_cameras_lock() {
         let reg = std::sync::Arc::new(FrameStatsRegistry::new());
-        reg.observe_frame(7, Utc::now(), 960, 540);
+        reg.observe_frame(7, reg.begin_session(7), Utc::now(), 960, 540);
 
         // Camera 7's own lock, the one `observe_frame(7, ..)` holds for its
         // critical section.
@@ -1258,7 +1423,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let r = reg.clone();
         let worker = std::thread::spawn(move || {
-            r.observe_frame(9, Utc::now(), 960, 540);
+            r.observe_frame(9, r.begin_session(9), Utc::now(), 960, 540);
             r.observe_frame_id(9, 1);
             r.observe_frame_id(9, 3);
             r.observe_dropped(9);
@@ -1290,7 +1455,8 @@ mod tests {
     #[test]
     fn a_gate_drop_after_clear_does_not_bring_the_camera_back() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 320, 240);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 320, 240);
         reg.clear(1);
 
         reg.observe_dropped(1);
@@ -1308,7 +1474,8 @@ mod tests {
     #[test]
     fn a_frame_id_after_clear_does_not_bring_the_camera_back() {
         let reg = FrameStatsRegistry::new();
-        reg.observe_frame(1, Utc::now(), 320, 240);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 320, 240);
         reg.clear(1);
 
         reg.observe_frame_id(1, 5);
@@ -1317,7 +1484,8 @@ mod tests {
             reg.snapshot(1).is_none(),
             "a frame id recreated a cleared camera"
         );
-        reg.observe_frame(1, Utc::now(), 320, 240);
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 320, 240);
         reg.observe_frame_id(1, 9);
         assert_eq!(
             reg.snapshot(1).unwrap().frames_backpressure_dropped,

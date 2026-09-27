@@ -556,6 +556,7 @@ async fn run_camera(
         // a saturated box, which also mis-stamps everything keyed on
         // `frame.captured_at`.
         let epoch = cache.begin_session(cam_id);
+        let stats_epoch = stats.begin_session(cam_id);
         let (latest_tx, mut latest_rx) = watch::channel::<Option<Frame>>(None);
         let tap_cache = cache.clone();
         let tap_stats = stats.clone();
@@ -564,7 +565,13 @@ async fn run_camera(
                 // The true "received from the source" point, which is what
                 // `observe_frame` is documented to measure; inside the
                 // analysis loop it measured inference rate instead.
-                tap_stats.observe_frame(cam_id, frame.captured_at, frame.width, frame.height);
+                tap_stats.observe_frame(
+                    cam_id,
+                    stats_epoch,
+                    frame.captured_at,
+                    frame.width,
+                    frame.height,
+                );
                 tap_cache.put_frame(cam_id, epoch, Arc::new(frame.clone()));
                 if latest_tx.send(Some(frame)).is_err() {
                     break;

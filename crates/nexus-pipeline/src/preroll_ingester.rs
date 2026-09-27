@@ -336,6 +336,11 @@ impl PreRollIngester {
         // has never rendered a real frame, which is a wrong-chain verdict
         // rather than a reaction to load (BUG-070).
         let task_force_software = Arc::new(AtomicBool::new(false));
+        // Before the task that installs this ingester's probes: a camera that
+        // `stop_camera` cleared stays retired until its next ingester claims it.
+        if let Some(health) = decode_health.as_ref() {
+            health.begin_session(camera_id);
+        }
         let stream_codec = Arc::new(Mutex::new(codec));
         let task_stream_codec = stream_codec.clone();
         let task_decode_health = decode_health;

@@ -529,7 +529,7 @@ mod tests {
         store.upsert_camera(&cam(2, "never-started")).await.unwrap();
 
         let frame_stats = FrameStatsRegistry::new();
-        frame_stats.observe_frame(1, Utc::now(), 960, 540);
+        frame_stats.observe_frame(1, frame_stats.begin_session(1), Utc::now(), 960, 540);
 
         let env = build_envelope(&store, 1, "yolo", &frame_stats)
             .await

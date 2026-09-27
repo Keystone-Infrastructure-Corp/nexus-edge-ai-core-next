@@ -1297,7 +1297,7 @@ impl ClipRecorder for GstClipRecorder {
                 // cumulative counters attributed to a different geometry,
                 // and Phase 1 multiplies those by width x height.
                 if let Some(h) = self.decode_health.as_ref() {
-                    h.clear(camera_id);
+                    h.reset(camera_id);
                 }
                 info!(camera_id, "analysis substream session removed");
             }
@@ -1330,7 +1330,7 @@ impl ClipRecorder for GstClipRecorder {
         // the camera's cumulative decode counters no longer describe one
         // geometry. Reset rather than blend.
         if let Some(h) = self.decode_health.as_ref() {
-            h.clear(camera_id);
+            h.reset(camera_id);
         }
         info!(camera_id, %url, codec = %codec, "analysis substream session started");
         Ok(())

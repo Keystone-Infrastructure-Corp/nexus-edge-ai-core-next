@@ -1357,6 +1357,35 @@ mod tests {
         assert_supervision_survives(false).await;
     }
 
+    /// `stop_camera` aborts the supervisor and shuts the ingesters down, and
+    /// neither is synchronous: the tap can be mid-frame and a pipeline's
+    /// probes keep firing until its detached NULL lands. Writes from either
+    /// after the stop must not make a stopped camera read as running to the
+    /// heartbeat, the roster or the decode-health census (SPEC-075 F2).
+    #[tokio::test]
+    async fn a_stopped_cameras_late_writers_cannot_bring_it_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let tap = args.frame_stats.begin_session(7);
+        let now = chrono::Utc::now();
+        args.frame_stats.observe_frame(7, tap, now, 512, 288);
+        args.decode_health.observe_decoder_output(7);
+
+        stop_camera(&args, 7);
+        args.frame_stats.observe_frame(7, tap, now, 512, 288);
+        args.decode_health.observe_decoder_output(7);
+
+        assert!(
+            args.frame_stats.snapshot_all().is_empty(),
+            "the stopped session's tap brought camera 7 back into the frame stats"
+        );
+        assert!(
+            args.decode_health.snapshot_all().is_empty(),
+            "the stopped ingester's probe brought camera 7 back into the decode-health census"
+        );
+    }
+
     /// An `http://` substream keeps the codec probe off the network:
     /// `apply_analysis_session` only probes `rtsp` / `rtsps`.
     const SUBSTREAM: &str = "http://10.0.0.5/sub";
