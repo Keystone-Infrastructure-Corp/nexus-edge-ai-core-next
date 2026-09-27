@@ -997,7 +997,8 @@ async fn run_session(
                     let height = info.height() as usize;
                     let row_bytes = width * 3;
 
-                    if stride < row_bytes || plane.len() < stride * height {
+                    let Some(data) = crate::source::pack_rgb_rows(plane, stride, width, height)
+                    else {
                         error!(
                             camera_id,
                             stride,
@@ -1007,17 +1008,7 @@ async fn run_session(
                             "rgb appsink buffer geometry inconsistent with caps"
                         );
                         return Err(gst::FlowError::Error);
-                    }
-
-                    let mut data = Vec::with_capacity(row_bytes * height);
-                    if stride == row_bytes {
-                        data.extend_from_slice(&plane[..row_bytes * height]);
-                    } else {
-                        for y in 0..height {
-                            let start = y * stride;
-                            data.extend_from_slice(&plane[start..start + row_bytes]);
-                        }
-                    }
+                    };
 
                     // Runtime decode-health guard, armed for the whole
                     // session. A decoder is chosen on element *presence*,

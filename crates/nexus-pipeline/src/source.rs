@@ -645,6 +645,36 @@ pub(crate) mod gst_init {
     }
 }
 
+/// Copy one RGB plane into the packed `width * height * 3` buffer every
+/// `Frame` consumer reads (the JPEG encoders, the detectors). GStreamer
+/// pads each RGB row to a 4-byte stride, so wherever `width * 3` is not a
+/// multiple of 4 the plane is wider than the picture: a `supervisor_width`
+/// of 1366 gives 4098-byte rows in a 4100-byte stride. `None` when the
+/// plane is smaller than its stride and height say.
+#[cfg(feature = "gstreamer")]
+pub(crate) fn pack_rgb_rows(
+    plane: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
+    let row_bytes = width * 3;
+    if stride < row_bytes || plane.len() < stride * height {
+        return None;
+    }
+    let mut data = Vec::with_capacity(row_bytes * height);
+    if stride == row_bytes {
+        // Hot path: no padding, single bulk copy.
+        data.extend_from_slice(&plane[..row_bytes * height]);
+    } else {
+        for y in 0..height {
+            let start = y * stride;
+            data.extend_from_slice(&plane[start..start + row_bytes]);
+        }
+    }
+    Some(data)
+}
+
 #[cfg(feature = "gstreamer")]
 #[async_trait]
 impl FrameSource for RtspSource {
@@ -877,7 +907,7 @@ impl RtspSource {
                     let height = info.height() as usize;
                     let row_bytes = width * 3;
 
-                    if stride < row_bytes || plane.len() < stride * height {
+                    let Some(data) = pack_rgb_rows(plane, stride, width, height) else {
                         tracing::error!(
                             camera_id = camera_id,
                             stride,
@@ -887,18 +917,7 @@ impl RtspSource {
                             "rtsp appsink buffer geometry inconsistent with caps"
                         );
                         return Err(gst::FlowError::Error);
-                    }
-
-                    let mut data = Vec::with_capacity(row_bytes * height);
-                    if stride == row_bytes {
-                        // Hot path: no padding, single bulk copy.
-                        data.extend_from_slice(&plane[..row_bytes * height]);
-                    } else {
-                        for y in 0..height {
-                            let start = y * stride;
-                            data.extend_from_slice(&plane[start..start + row_bytes]);
-                        }
-                    }
+                    };
 
                     let frame_id = {
                         let mut g = counter_cb.lock();
@@ -1364,5 +1383,78 @@ mod tests {
         .await
         .expect("a session that never delivers must still expire");
         assert!(quiet_for > FIRE_TIMEOUT, "reported {quiet_for:?}");
+    }
+}
+
+#[cfg(all(test, feature = "gstreamer"))]
+mod gst_tests {
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app::AppSink;
+    use gstreamer_video::prelude::*;
+    use gstreamer_video::{VideoFrameRef, VideoInfo};
+
+    /// A real GStreamer RGB buffer at a width where `width * 3` is not a
+    /// multiple of 4 (1366, a `supervisor_width` nothing rejects) arrives
+    /// with padded rows. The frame both RGB taps build from it must be
+    /// exactly `width * height * 3`, row for row, or every JPEG encode of
+    /// it fails and every detector reads it sheared.
+    #[test]
+    fn a_padded_rgb_plane_is_packed_to_width_times_three() {
+        super::gst_init::ensure().expect("gst init");
+        let (w, h) = super::supervisor_frame_for(1366);
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=1 ! {} ! video/x-raw,format=RGB,width={w},height={h} \
+             ! appsink name=sink sync=false",
+            crate::decode::CPU_TAIL
+        ))
+        .expect("launch")
+        .downcast::<gst::Pipeline>()
+        .expect("pipeline");
+        let sink = pipeline
+            .by_name("sink")
+            .expect("sink")
+            .downcast::<AppSink>()
+            .expect("appsink");
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        let sample = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(10))
+            .expect("one sample within 10 s");
+        crate::teardown::null_pipeline_detached(pipeline, "source::gst_tests", None);
+
+        let info = VideoInfo::from_caps(sample.caps().expect("caps")).expect("info");
+        let frame =
+            VideoFrameRef::from_buffer_ref_readable(sample.buffer().expect("buffer"), &info)
+                .expect("map");
+        let plane = frame.plane_data(0).expect("plane");
+        let stride = frame.plane_stride()[0] as usize;
+        let row = w as usize * 3;
+        assert!(
+            stride > row,
+            "GStreamer did not pad a {row}-byte row: stride {stride}"
+        );
+
+        let packed = super::pack_rgb_rows(plane, stride, w as usize, h as usize).expect("pack");
+        assert_eq!(packed.len(), row * h as usize);
+        for y in 0..h as usize {
+            assert_eq!(
+                &packed[y * row..(y + 1) * row],
+                &plane[y * stride..y * stride + row],
+                "row {y}"
+            );
+        }
+        crate::jpeg::encode_rgb24(&packed, w, h, 80).expect("the packed frame encodes");
+    }
+
+    /// A stride narrower than the row, or a plane shorter than its stride
+    /// and height, is refused rather than read overlapping or out of range.
+    #[test]
+    fn a_plane_inconsistent_with_its_geometry_is_refused() {
+        assert_eq!(super::pack_rgb_rows(&[0; 24], 5, 2, 4), None);
+        assert_eq!(super::pack_rgb_rows(&[0; 20], 8, 2, 3), None);
+        assert_eq!(
+            super::pack_rgb_rows(&[0; 24], 8, 2, 3).map(|d| d.len()),
+            Some(18)
+        );
     }
 }
