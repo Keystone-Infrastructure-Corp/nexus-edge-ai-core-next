@@ -413,7 +413,8 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
 /// One reconciliation pass. Compares `store.list_readable_cameras()` to the
 /// in-memory `handles` map and:
 ///   * aborts the supervisor + removes the ingester for any camera
-///     that is missing from the DB or has `ingest.enabled = false`;
+///     that is missing from the DB, has `ingest.enabled = false`, or
+///     whose row this build cannot read;
 ///   * spawns a fresh supervisor + ingester for any enabled camera
 ///     not yet in the map;
 ///   * restarts the supervisor + ingester for any enabled camera

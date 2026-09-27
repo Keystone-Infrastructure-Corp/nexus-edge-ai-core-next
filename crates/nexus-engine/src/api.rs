@@ -1494,9 +1494,10 @@ async fn upsert_camera(
         .map_err(|why| ApiError(StatusCode::BAD_REQUEST, why))?;
     // M6 Phase 4 Step 4.1 — capture pre-state for the audit row so
     // operators can diff before/after on the per-resource history
-    // panel. `None` on a create; `Some(prev)` on update. The list
-    // walk is cheap (rules / cameras are tens of rows), but if it
-    // becomes hot we'd switch to a `get_camera(id)` shortcut.
+    // panel. `None` on a create, or when this camera's own row cannot
+    // be read; `Some(prev)` on update. The list walk is cheap (rules /
+    // cameras are tens of rows), but if it becomes hot we'd switch to a
+    // `get_camera(id)` shortcut.
     let before = s
         .store
         .list_readable_cameras()

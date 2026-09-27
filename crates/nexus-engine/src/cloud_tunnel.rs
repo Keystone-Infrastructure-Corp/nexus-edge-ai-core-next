@@ -2200,8 +2200,9 @@ fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegr
 /// Such a camera does not run, and no other issue names it: the read that
 /// skips its row succeeds. The reads that need every row fail meanwhile (the
 /// console's camera list, the cloud roster, fleet apply and its hash, the
-/// reprobe, ONVIF device control, setup status and rule preview), so the
-/// detail names the calls that clear it.
+/// reprobe, ONVIF device control, setup status and rule preview), and the
+/// LAN proxy's allowlist leaves out every configured camera, so the detail
+/// names the calls that clear it.
 fn unreadable_cameras_issue(ids: &[nexus_types::CameraId]) -> Option<EdgeDegradation> {
     if ids.is_empty() {
         return None;
