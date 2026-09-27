@@ -130,16 +130,17 @@ impl MotionEventEmitter {
     /// `now` is the frame's `captured_at`; passing wall-clock would
     /// also work but `captured_at` is what the rest of the pipeline
     /// uses so the rows line up time-wise with `events.captured_at`.
-    pub fn tick(
+    pub fn tick<'a>(
         &mut self,
         camera_id: CameraId,
-        tracked: &[TrackedObject],
+        tracked: impl IntoIterator<Item = &'a TrackedObject, IntoIter: Clone>,
         now: DateTime<Utc>,
     ) -> Vec<MotionDecision> {
+        let tracked = tracked.into_iter();
         let interval = self.update_interval();
         let state = self.cameras.entry(camera_id).or_default();
 
-        let live: HashSet<TrackId> = tracked.iter().map(|t| t.track_id).collect();
+        let live: HashSet<TrackId> = tracked.clone().map(|t| t.track_id).collect();
         let mut born = Vec::new();
         let mut updated = Vec::new();
 

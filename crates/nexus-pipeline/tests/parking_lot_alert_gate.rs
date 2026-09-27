@@ -149,20 +149,19 @@ impl Sim {
         let f = frame(self.frame_id);
         self.frame_id += 1;
 
-        let dynamic: Vec<TrackedObject> = match self.filter.as_mut() {
+        let filtering = match self.filter.as_mut() {
             Some(filter) => {
                 filter.classify(&f, &mut objects);
-                objects
-                    .iter()
-                    .filter(|t| !is_object_static(t))
-                    .cloned()
-                    .collect()
+                true
             }
-            None => objects,
+            None => false,
         };
+        let dynamic = objects
+            .iter()
+            .filter(|t| !(filtering && is_object_static(t)));
 
         self.evaluator
-            .evaluate(1, f.frame_id, &f.trace_id, FRAME_W, FRAME_H, &[], &dynamic)
+            .evaluate(1, f.frame_id, &f.trace_id, FRAME_W, FRAME_H, &[], dynamic)
     }
 
     /// Run `frames` steps with the object parked at a fixed point and

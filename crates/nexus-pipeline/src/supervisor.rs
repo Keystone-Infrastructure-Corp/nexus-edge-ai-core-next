@@ -5,7 +5,6 @@
 //! that opens child spans for `decode/gate/infer/track/rules`. That's how
 //! the `trace_id` field on [`nexus_types::Frame`] is actually backed.
 
-use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -152,23 +151,17 @@ async fn write_alert_snapshot(
 }
 
 /// The non-static tracks that rules, sightings, alert-clip boxes and the
-/// motion lifecycle see. Borrows the frame's single tracked set whenever
-/// nothing is filtered out, so the common frame makes no copy of it.
+/// motion lifecycle see, borrowed from the frame's single tracked set. The
+/// moving tracks are not contiguous in that set, whose order the cache and
+/// `FRAME_METADATA` publish, so a static track is skipped rather than the
+/// rest copied into a slice of their own.
 fn dynamic_tracks(
     tracked: &[TrackedObject],
     static_filter_active: bool,
-) -> Cow<'_, [TrackedObject]> {
-    if static_filter_active && tracked.iter().any(is_object_static) {
-        Cow::Owned(
-            tracked
-                .iter()
-                .filter(|t| !is_object_static(t))
-                .cloned()
-                .collect(),
-        )
-    } else {
-        Cow::Borrowed(tracked)
-    }
+) -> impl Iterator<Item = &TrackedObject> + Clone {
+    tracked
+        .iter()
+        .filter(move |t| !(static_filter_active && is_object_static(t)))
 }
 
 /// Most alert snapshots one frame encodes at once. Each holds its own copy
@@ -1129,8 +1122,7 @@ async fn run_camera(
                 // still appear in the L7 cache + FRAME_METADATA above
                 // so the live viewer can draw it (de-emphasised) and
                 // so the operator can see the static-suppression in
-                // action. When nothing is static this borrows the shared
-                // set instead of copying it.
+                // action. This borrows the shared set; it never copies it.
                 let dynamic_tracked = dynamic_tracks(&tracked_arc, static_filter.is_some());
 
                 // M-Alert-Clip: feed this frame's frame-aligned detection
@@ -1148,7 +1140,7 @@ async fn run_camera(
                 // overlapping survivors yields one box per physical object.
                 if alert_clips_enabled {
                     let mut boxes: Vec<crate::alert_clip::BurnBox> = dynamic_tracked
-                        .iter()
+                        .clone()
                         .filter_map(|t| {
                             let b = t.detection_bbox?;
                             Some(crate::alert_clip::BurnBox {
@@ -1177,7 +1169,7 @@ async fn run_camera(
                 // as rule eval + motion lifecycle).
                 sighting_scheduler.tick(
                     &frame_arc,
-                    &dynamic_tracked,
+                    dynamic_tracked.clone(),
                     frame.captured_at,
                     sighting_hook.as_ref(),
                 );
@@ -1191,7 +1183,7 @@ async fn run_camera(
                         frame.width,
                         frame.height,
                         &zones,
-                        &dynamic_tracked,
+                        dynamic_tracked.clone(),
                     )
                 };
                 // Alert snapshots — persist a JPEG of the frame that fired
@@ -1305,7 +1297,7 @@ async fn run_camera(
                 // across recorder/store awaits because EnteredSpan is
                 // !Send and would break tokio::spawn.
                 let decisions = info_span!("frame.motion")
-                    .in_scope(|| emitter.tick(cfg.id, &dynamic_tracked, frame.captured_at));
+                    .in_scope(|| emitter.tick(cfg.id, dynamic_tracked, frame.captured_at));
                 for d in &decisions {
                     let should_open = current_clip.is_none()
                         && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);
@@ -1662,25 +1654,35 @@ mod tests {
     #[test]
     fn dynamic_tracks_borrows_when_nothing_is_filtered() {
         let tracked = vec![track(1, false), track(2, false)];
-        let view = dynamic_tracks(&tracked, false);
-        assert!(matches!(view, Cow::Borrowed(_)), "no filter: must borrow");
-        assert!(std::ptr::eq(view.as_ptr(), tracked.as_ptr()));
+        let view: Vec<&TrackedObject> = dynamic_tracks(&tracked, false).collect();
+        assert!(
+            std::ptr::eq(view[0], &tracked[0]) && std::ptr::eq(view[1], &tracked[1]),
+            "no filter: must borrow"
+        );
 
         // Filter active but no track is static: nothing to drop, no copy.
-        let view = dynamic_tracks(&tracked, true);
+        let view: Vec<&TrackedObject> = dynamic_tracks(&tracked, true).collect();
         assert!(
-            matches!(view, Cow::Borrowed(_)),
+            std::ptr::eq(view[0], &tracked[0]) && std::ptr::eq(view[1], &tracked[1]),
             "no static track: must borrow"
         );
+    }
+
+    /// Parking-lot mode with a static track in view: the consumers must
+    /// still read the frame's own moving tracks, in order, not copies.
+    #[test]
+    fn dynamic_tracks_borrows_the_moving_tracks_when_a_static_is_filtered() {
+        let tracked = vec![track(1, false), track(2, true), track(3, false)];
+        let view: Vec<&TrackedObject> = dynamic_tracks(&tracked, true).collect();
+        assert_eq!(view.len(), 2);
+        assert!(std::ptr::eq(view[0], &tracked[0]), "track 1 was copied");
+        assert!(std::ptr::eq(view[1], &tracked[2]), "track 3 was copied");
     }
 
     #[test]
     fn dynamic_tracks_drops_static_tracks() {
         let tracked = vec![track(1, false), track(2, true), track(3, false)];
-        let ids: Vec<u64> = dynamic_tracks(&tracked, true)
-            .iter()
-            .map(|t| t.track_id)
-            .collect();
+        let ids: Vec<u64> = dynamic_tracks(&tracked, true).map(|t| t.track_id).collect();
         assert_eq!(ids, vec![1, 3]);
     }
 

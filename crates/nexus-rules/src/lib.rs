@@ -340,10 +340,14 @@ impl RuleEvaluator {
     /// camera that produced `objects`. Zones are looked up by `id`
     /// against `rule.zones` (the rule stores only ids); a rule with
     /// no `zones` set is unaffected by this argument.
+    ///
+    /// `objects` is walked once per rule, so it is any cloneable iterator:
+    /// the supervisor passes the frame's non-static tracks without copying
+    /// them, and a `&[TrackedObject]` or `&Vec` works as before.
     #[allow(clippy::too_many_arguments)] // 8 args is the natural shape: rule eval inherently needs frame
                                          // dims + zones + identifiers; bundling them would just push the
                                          // boilerplate to every caller.
-    pub fn evaluate(
+    pub fn evaluate<'a>(
         &self,
         camera_id: CameraId,
         frame_id: FrameId,
@@ -351,8 +355,9 @@ impl RuleEvaluator {
         frame_width: u32,
         frame_height: u32,
         camera_zones: &[ZoneConfig],
-        objects: &[TrackedObject],
+        objects: impl IntoIterator<Item = &'a TrackedObject, IntoIter: Clone>,
     ) -> Vec<AlertEvent> {
+        let objects = objects.into_iter();
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -371,7 +376,7 @@ impl RuleEvaluator {
         // this frame and built on first use. `now` is therefore bound once:
         // it is constant across every rule and object in this evaluation.
         let mut cel: Option<Context<'static>> = None;
-        let mut bindings: Vec<Option<CelValue>> = vec![None; objects.len()];
+        let mut bindings: Vec<Option<CelValue>> = vec![None; objects.clone().count()];
 
         for rule in rules.iter() {
             let cfg = &rule.config;
@@ -430,9 +435,9 @@ impl RuleEvaluator {
                 .entry(key.clone())
                 .or_default()
                 .static_alerts
-                .retain(|track_id, _| objects.iter().any(|o| o.track_id == *track_id));
+                .retain(|track_id, _| objects.clone().any(|o| o.track_id == *track_id));
 
-            for (idx, o) in objects.iter().enumerate() {
+            for (idx, o) in objects.clone().enumerate() {
                 // Rules fire on evidence from THIS frame only. A
                 // predicted-only ("coasting") track carries no
                 // detection on this frame — ByteTrack keeps emitting

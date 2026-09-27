@@ -281,18 +281,19 @@ impl SightingScheduler {
     /// Synchronously emits zero or more [`SightingSnapshot`]s via
     /// `hook.submit()` and returns the count of snapshots emitted
     /// (for the supervisor's frame-stats counter).
-    pub fn tick(
+    pub fn tick<'a>(
         &mut self,
         frame: &Arc<Frame>,
-        tracked: &[TrackedObject],
+        tracked: impl IntoIterator<Item = &'a TrackedObject, IntoIter: Clone>,
         now: DateTime<Utc>,
         hook: &dyn SightingHook,
     ) -> usize {
+        let tracked = tracked.into_iter();
         // M_PERF_CROWD B2 — pick the periodic re-emit cadence based
         // on the current per-camera tracked-object count. Threshold
         // 0 disables crowded mode (always use the regular interval).
         let periodic_interval = if self.crowded_track_threshold > 0
-            && tracked.len() > self.crowded_track_threshold as usize
+            && tracked.clone().count() > self.crowded_track_threshold as usize
         {
             self.crowded_emit_interval
         } else {
