@@ -30,16 +30,18 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-/** Stub `fetch`: `/health` answers with `health`, `/cloud/status` with not-enrolled. */
-function stubEngine(health: () => Promise<Response>) {
+/** Stub `fetch`: `/health` answers with `health`, `/cloud/status` with `cloud` (default: not enrolled). */
+function stubEngine(
+  health: () => Promise<Response>,
+  cloud: () => Promise<Response> = () =>
+    Promise.resolve(json({ enrolled: false, connected: false })),
+) {
   vi.stubGlobal(
     "fetch",
     vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/api/v1/health")) return health();
-      if (url.endsWith("/api/v1/cloud/status")) {
-        return Promise.resolve(json({ enrolled: false, connected: false }));
-      }
+      if (url.endsWith("/api/v1/cloud/status")) return cloud();
       return Promise.resolve(json({ error: "not stubbed" }, 404));
     }),
   );
@@ -114,5 +116,21 @@ describe("TopBar engine-health pill", () => {
     expect(
       await screen.findByText("engine unreachable", undefined, { timeout: 4_000 }),
     ).toBeTruthy();
+  });
+});
+
+describe("TopBar cloud pill", () => {
+  it("does not call the core not enrolled before the cloud status has answered", async () => {
+    stubEngine(
+      () => Promise.resolve(json({ status: "ok", version: "0.1.99", issues: [] })),
+      () => new Promise<Response>(() => {}),
+    );
+    renderTopBar();
+
+    // The health pill answering proves the render settled with the cloud
+    // query still pending.
+    expect(await screen.findByText("online • 0.1.99")).toBeTruthy();
+    expect(screen.getByText("cloud: …")).toBeTruthy();
+    expect(screen.queryByText("cloud: not enrolled")).toBeNull();
   });
 });

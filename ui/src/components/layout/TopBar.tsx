@@ -74,9 +74,10 @@ export function TopBar() {
           .join("\n")
       : undefined;
 
-  // Cloud-tunnel pill — three observable states (plus a fourth for
-  // transient errors), mapped to the same Badge variants used by
-  // the health pill so the two read as a unit.
+  // Cloud-tunnel pill — three observable states (plus one for
+  // transient errors and one for "not answered yet"), mapped to the
+  // same Badge variants used by the health pill so the two read as a
+  // unit. An unanswered query is not "not enrolled".
   const cloudVariant: "secondary" | "success" | "warning" = cloud.isError
     ? "secondary"
     : !cloud.data?.enrolled
@@ -86,11 +87,13 @@ export function TopBar() {
         : "warning";
   const cloudLabel = cloud.isError
     ? "cloud: ?"
-    : !cloud.data?.enrolled
-      ? "cloud: not enrolled"
-      : cloud.data.connected
-        ? "cloud: connected"
-        : "cloud: reconnecting\u2026";
+    : !cloud.isSuccess
+      ? "cloud: \u2026"
+      : !cloud.data?.enrolled
+        ? "cloud: not enrolled"
+        : cloud.data.connected
+          ? "cloud: connected"
+          : "cloud: reconnecting\u2026";
 
   return (
     <header className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-card px-4">
