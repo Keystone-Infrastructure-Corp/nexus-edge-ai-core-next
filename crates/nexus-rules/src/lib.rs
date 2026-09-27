@@ -430,10 +430,12 @@ impl RuleEvaluator {
                 }
             };
 
-            let key = (cfg.id.clone(), camera_id, 0u64);
-            state
-                .entry(key.clone())
-                .or_default()
+            // Cooldown + debounce are scoped per (rule, camera), not per
+            // track: the fixed `0` collapses every track on this camera
+            // onto one debounce entry so tracker ID churn can't bypass
+            // `cooldown_ms`. Looked up once per rule, not per object.
+            let entry = state.entry((cfg.id.clone(), camera_id, 0u64)).or_default();
+            entry
                 .static_alerts
                 .retain(|track_id, _| objects.clone().any(|o| o.track_id == *track_id));
 
@@ -483,11 +485,6 @@ impl RuleEvaluator {
                     }
                 };
 
-                // Cooldown + debounce are scoped per (rule, camera),
-                // not per track: the fixed `0` collapses every track on
-                // this camera onto one debounce entry so tracker ID
-                // churn can't bypass `cooldown_ms`.
-                let entry = state.entry(key.clone()).or_default();
                 let static_alert_epoch = o
                     .attributes
                     .get(STATIC_ALERT_EPOCH_ATTRIBUTE_KEY)

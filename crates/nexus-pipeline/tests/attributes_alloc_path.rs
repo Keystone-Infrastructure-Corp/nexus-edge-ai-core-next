@@ -233,7 +233,7 @@ fn rule_stage(eval: &RuleEvaluator, strip: bool) -> (u64, u64) {
 }
 
 #[test]
-fn each_extra_rule_adds_at_most_eight_allocations_per_object() {
+fn each_extra_rule_adds_at_most_six_allocations_per_object() {
     let (one, objects) = rule_stage(&never_matching(1), false);
     let (four, _) = rule_stage(&never_matching(4), false);
     let per_extra_rule = (four - one) as f64 / (3 * objects) as f64;
@@ -243,9 +243,10 @@ fn each_extra_rule_adds_at_most_eight_allocations_per_object() {
         four as f64 / objects as f64
     );
     assert!(
-        per_extra_rule <= 8.0,
+        per_extra_rule <= 6.0,
         "each extra rule costs {per_extra_rule:.2} allocations per object per frame; \
-         the object binding or the CEL Context is being rebuilt per rule"
+         the object binding, the CEL Context or the rule's debounce key is being \
+         rebuilt per object"
     );
 }
 
@@ -274,12 +275,12 @@ fn attributes_are_converted_once_per_object_not_once_per_rule() {
 /// and an `Arc` each); on an object with no attributes, what is left is the
 /// binding's maps and label plus one rule's evaluation.
 #[test]
-fn an_object_without_attributes_costs_at_most_seventeen_allocations_with_one_rule() {
+fn an_object_without_attributes_costs_at_most_sixteen_allocations_with_one_rule() {
     let (n, objects) = rule_stage(&never_matching(1), true);
     let per_object = n as f64 / objects as f64;
     println!("rules x1, attributes stripped: {per_object:.2} allocs/object/frame");
     assert!(
-        per_object <= 17.0,
+        per_object <= 16.0,
         "one rule costs {per_object:.2} allocations per bare object per frame; \
          the binding's constant keys are being allocated per object"
     );
