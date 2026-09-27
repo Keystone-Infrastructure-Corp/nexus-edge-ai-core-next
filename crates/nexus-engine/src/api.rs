@@ -10479,14 +10479,17 @@ mod tests {
 
     /// `GET /api/v1/health` must answer while the store's pool is exhausted,
     /// and answer the way an unread camera list answers: a stub is still
-    /// reported, saying the list could not be read. The answer must come
-    /// inside the installer's health probe, 2 s (`curl -m 2` in
-    /// `wait_for_health`); a pool acquire waits up to 30 s. The host-metrics
-    /// snapshot is taken once first, so the bound measures the request and
-    /// not the one-time GPU probe (`system_profiler` on macOS, 1 to 3 s).
+    /// reported, saying the list could not be read. A pool acquire waits up
+    /// to 30 s, and the installer's health probe gives the whole request,
+    /// connect included, 2 s (`curl -m 2` in `wait_for_health`). So the
+    /// answer must come inside 1.5 s: the store read's 1 s bound and half a
+    /// second to spare. A bound equal to the installer's would pass a store
+    /// read that took all of it. The host-metrics snapshot is taken once
+    /// first, so the bound measures the request and not the one-time GPU
+    /// probe (`system_profiler` on macOS, 1 to 3 s).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_health_answers_while_the_store_pool_is_exhausted() {
-        const INSTALLER_HEALTH_PROBE: std::time::Duration = std::time::Duration::from_secs(2);
+        const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_millis(1500);
         let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
         store_default_camera(&store, true).await;
         let _ = crate::system_metrics::snapshot();
@@ -10501,12 +10504,9 @@ mod tests {
             );
         }
 
-        let body = tokio::time::timeout(
-            INSTALLER_HEALTH_PROBE,
-            get_health(super::router(state), None),
-        )
-        .await
-        .expect("/api/v1/health must answer inside the installer's probe");
+        let body = tokio::time::timeout(ANSWER_WITHIN, get_health(super::router(state), None))
+            .await
+            .expect("/api/v1/health must answer with the installer's probe to spare");
         let issue = body["issues"]
             .as_array()
             .and_then(|issues| issues.iter().find(|i| i["code"] == "recorder_stub"))
