@@ -91,48 +91,8 @@ async fn write_alert_snapshot(
     let id = event_id.to_string();
     let label = label.to_string();
     let join = tokio::task::spawn_blocking(move || {
-        use image::ImageEncoder as _;
         let path = dir.join(format!("{id}.jpg"));
-        // The frame buffer is shared (Arc<Frame>); copy it so the
-        // bbox stroke doesn't mutate pixels other subscribers see.
-        let mut pixels = frame.data.to_vec();
-        if let Some(bbox) = bbox {
-            let (stroke, radius) = crate::overlay::box_metrics(frame.width, frame.height);
-            crate::overlay::draw_box_rgb24(
-                &mut pixels,
-                frame.width,
-                frame.height,
-                bbox.x1.round() as i64,
-                bbox.y1.round() as i64,
-                bbox.x2.round() as i64,
-                bbox.y2.round() as i64,
-                stroke,
-                radius,
-                crate::overlay::ALERT_RGB,
-            );
-            // Label chip ("person 0.96") anchored to the box top-left,
-            // burned into the JPEG so the email / SureView copies show
-            // it too — identical to the burned-in alert clip.
-            let chip = crate::overlay::label_text(&label, confidence);
-            crate::overlay::draw_label_chip_rgb24(
-                &mut pixels,
-                frame.width,
-                frame.height,
-                bbox.x1.round() as i64,
-                bbox.y1.round() as i64,
-                &chip,
-                crate::alert_clip::label_px(frame.width),
-            );
-        }
-        let mut out = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, SNAPSHOT_JPEG_QUALITY)
-            .write_image(
-                &pixels[..],
-                frame.width,
-                frame.height,
-                image::ExtendedColorType::Rgb8,
-            )
-            .map_err(|e| format!("jpeg encode: {e}"))?;
+        let out = alert_snapshot_jpeg(&frame, bbox, &label, confidence)?;
         std::fs::write(&path, &out).map_err(|e| format!("write {}: {e}", path.display()))?;
         Ok::<PathBuf, String>(path)
     })
@@ -148,6 +108,50 @@ async fn write_alert_snapshot(
             None
         }
     }
+}
+
+/// Burn the alert's box and label chip into a copy of `frame` and
+/// JPEG-encode it. Blocking; [`write_alert_snapshot`] runs it on the
+/// blocking pool.
+fn alert_snapshot_jpeg(
+    frame: &Frame,
+    bbox: Option<BBox>,
+    label: &str,
+    confidence: Option<f32>,
+) -> Result<Vec<u8>, String> {
+    // The frame buffer is shared (Arc<Frame>); copy it so the
+    // bbox stroke doesn't mutate pixels other subscribers see.
+    let mut pixels = frame.data.to_vec();
+    if let Some(bbox) = bbox {
+        let (stroke, radius) = crate::overlay::box_metrics(frame.width, frame.height);
+        crate::overlay::draw_box_rgb24(
+            &mut pixels,
+            frame.width,
+            frame.height,
+            bbox.x1.round() as i64,
+            bbox.y1.round() as i64,
+            bbox.x2.round() as i64,
+            bbox.y2.round() as i64,
+            stroke,
+            radius,
+            crate::overlay::ALERT_RGB,
+        );
+        // Label chip ("person 0.96") anchored to the box top-left,
+        // burned into the JPEG so the email / SureView copies show
+        // it too — identical to the burned-in alert clip.
+        let chip = crate::overlay::label_text(label, confidence);
+        crate::overlay::draw_label_chip_rgb24(
+            &mut pixels,
+            frame.width,
+            frame.height,
+            bbox.x1.round() as i64,
+            bbox.y1.round() as i64,
+            &chip,
+            crate::alert_clip::label_px(frame.width),
+        );
+    }
+    crate::jpeg::encode_rgb24(&pixels, frame.width, frame.height, SNAPSHOT_JPEG_QUALITY)
+        .map_err(|e| format!("jpeg encode: {e}"))
 }
 
 /// The non-static tracks that rules, sightings, alert-clip boxes and the
@@ -1740,5 +1744,40 @@ mod tests {
         assert!(events[0].artifacts.snapshot.is_some());
         assert!(events[1].artifacts.snapshot.is_none());
         assert!(events[2].artifacts.snapshot.is_some());
+    }
+
+    /// `image`'s `JpegEncoder` asserts that the buffer is exactly `w*h*3`,
+    /// and the release profile aborts on a panic, so a wrongly sized frame
+    /// must lose its snapshot rather than end the engine. The padded case is
+    /// GStreamer's RGB row stride at 642 px (1926 bytes of pixels in a
+    /// 1928-byte row). Called directly because on the blocking pool a panic
+    /// comes back as the same `None` an error does.
+    #[test]
+    fn a_mis_sized_frame_fails_the_snapshot_instead_of_panicking() {
+        let frame = |len: usize| Frame {
+            camera_id: 1,
+            frame_id: 1,
+            captured_at: chrono::Utc::now(),
+            width: 642,
+            height: 361,
+            format: PixelFormat::Rgb24,
+            data: Arc::new(vec![0u8; len]),
+            trace_id: String::new(),
+        };
+        let bbox = Some(BBox {
+            x1: 10.0,
+            y1: 10.0,
+            x2: 100.0,
+            y2: 100.0,
+        });
+        let jpeg = alert_snapshot_jpeg(&frame(642 * 361 * 3), bbox, "person", Some(0.9))
+            .expect("an exact-size frame encodes");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        for len in [642 * 361 * 3 - 1, 1928 * 361] {
+            assert!(
+                alert_snapshot_jpeg(&frame(len), bbox, "person", Some(0.9)).is_err(),
+                "{len} bytes"
+            );
+        }
     }
 }

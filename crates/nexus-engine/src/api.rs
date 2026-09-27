@@ -34,7 +34,6 @@ use axum::routing::{delete, get, put};
 use axum::Json;
 use axum::Router;
 use futures::stream::StreamExt;
-use image::ImageEncoder;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{CameraConfig, RuleConfig};
 use nexus_inference::{BackendStatus, DetectorPool};
@@ -2972,9 +2971,11 @@ async fn get_static_object_defaults(State(s): State<ApiState>) -> Json<StaticObj
 /// `GetSnapshotUri` with `ter:ActionNotSupported` — a very common gap on
 /// Profile-S-only devices. The frame is already in memory, so this costs
 /// one JPEG encode and never touches the camera.
-pub(crate) fn latest_frame_jpeg(s: &ApiState, id: CameraId) -> Result<Vec<u8>, ApiError> {
-    let entry = s
-        .cache
+pub(crate) fn latest_frame_jpeg(
+    cache: &LatestFrameCache,
+    id: CameraId,
+) -> Result<Vec<u8>, ApiError> {
+    let entry = cache
         .get(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no frame for camera".into()))?;
     let frame = &entry.frame;
@@ -2987,23 +2988,15 @@ pub(crate) fn latest_frame_jpeg(s: &ApiState, id: CameraId) -> Result<Vec<u8>, A
         )
     })?;
 
-    let mut out = Vec::with_capacity(rgb.len() / 4);
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
-        .write_image(
-            &rgb,
-            frame.width,
-            frame.height,
-            image::ExtendedColorType::Rgb8,
-        )
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(out)
+    nexus_pipeline::jpeg::encode_rgb24(&rgb, frame.width, frame.height, 80)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn get_latest_frame_jpeg(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
 ) -> Result<Response, ApiError> {
-    let out = latest_frame_jpeg(&s, id)?;
+    let out = latest_frame_jpeg(&s.cache, id)?;
     Ok((
         StatusCode::OK,
         [
@@ -6371,6 +6364,45 @@ mod tests {
             json.contains("Channels/102"),
             "analysis_url must still be recorded, minus its credential: {json}"
         );
+    }
+
+    /// `image`'s `JpegEncoder` asserts that the buffer is exactly `w*h*3`,
+    /// and the release profile aborts on a panic, so a wrongly sized frame
+    /// in the cache must fail this request rather than end the engine. The
+    /// padded case is GStreamer's RGB row stride at 642 px (1926 bytes of
+    /// pixels in a 1928-byte row).
+    #[test]
+    fn a_mis_sized_frame_fails_the_snapshot_instead_of_panicking() {
+        use std::sync::Arc;
+        let snapshot = |len: usize| {
+            let cache = nexus_pipeline::LatestFrameCache::new();
+            let epoch = cache.begin_session(7);
+            cache.put_frame(
+                7,
+                epoch,
+                Arc::new(nexus_types::Frame {
+                    camera_id: 7,
+                    frame_id: 1,
+                    captured_at: chrono::Utc::now(),
+                    width: 642,
+                    height: 361,
+                    format: nexus_types::PixelFormat::Rgb24,
+                    data: Arc::new(vec![0u8; len]),
+                    trace_id: String::new(),
+                }),
+            );
+            super::latest_frame_jpeg(&cache, 7)
+        };
+        let jpeg = snapshot(642 * 361 * 3).expect("an exact-size frame encodes");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        for len in [642 * 361 * 3 - 1, 1928 * 361] {
+            let err = snapshot(len).expect_err("a mis-sized frame");
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{len} bytes"
+            );
+        }
     }
 
     // Gap G1 — `upsert_camera`/`create_camera` had no validation on

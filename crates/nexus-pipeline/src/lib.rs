@@ -24,6 +24,7 @@ pub mod crowd_hysteresis;
 pub mod decode;
 pub mod entity_sighting;
 pub mod gate;
+pub mod jpeg;
 pub mod overlay;
 pub mod param_sets;
 pub mod post_roll;

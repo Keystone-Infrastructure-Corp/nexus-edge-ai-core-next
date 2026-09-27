@@ -1379,7 +1379,7 @@ pub async fn snapshot_get(
                 error = %onvif_err.1,
                 "ONVIF still unavailable; serving latest analysis frame instead",
             );
-            let bytes = crate::api::latest_frame_jpeg(&s, id).map_err(|frame_err| {
+            let bytes = crate::api::latest_frame_jpeg(&s.cache, id).map_err(|frame_err| {
                 ApiError(
                     frame_err.0,
                     format!(
