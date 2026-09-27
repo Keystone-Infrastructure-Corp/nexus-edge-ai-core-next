@@ -2292,9 +2292,10 @@ fn edge_health_from(
 /// closed. Before any read has succeeded, a stub on a build with a real
 /// recorder is reported, with a detail that says the list could not be read.
 /// After one has, a failed read reuses its count, so a read that fails on
-/// and off (a busy pool, a transient SQLite error) cannot flip the issue. A
-/// row this build cannot deserialise, as a rollback past a newer config value
-/// leaves it, fails every read from boot and so stays reported.
+/// and off (a pool held past [`HEALTH_STORE_READ_TIMEOUT`], a transient
+/// SQLite error) cannot flip the issue. Those are the failures a running
+/// engine meets. A camera row this build cannot deserialise never reaches
+/// here: `run` reads the camera list at boot and exits on it.
 ///
 /// Only a `gstreamer` build raises it ([`EngineHealth::new`]). Release
 /// binaries always carry that feature, so it is the build where a real
@@ -2641,9 +2642,10 @@ mod health_tests {
         );
     }
 
-    /// Give every stored camera a codec this build has no variant for, as
-    /// a rollback past a newer `CodecKind` leaves the row. Every
-    /// `list_cameras` read then fails to deserialise.
+    /// Give every stored camera a codec this build has no variant for, so
+    /// every `list_cameras` read fails: a real read error from a real store,
+    /// on demand. A running engine meets its read errors from a held pool or
+    /// SQLite instead; a row like this one stops `run` at boot.
     pub(super) async fn store_a_codec_this_build_cannot_read(store: &Store) {
         sqlx::query("UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1')")
             .execute(store.pool())
