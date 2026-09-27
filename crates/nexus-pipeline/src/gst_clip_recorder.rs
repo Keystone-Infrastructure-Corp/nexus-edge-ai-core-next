@@ -2747,6 +2747,29 @@ mod tests {
         assert!(matches!(res, Err(RecorderError::Refused)));
     }
 
+    /// Why the refusal above cannot strand a running camera (BUG-225).
+    /// Building an ingester fails only when GStreamer fails to initialise,
+    /// and `new` shares that one `OnceLock` result. Boot builds every enabled
+    /// camera's ingester before `new`, so if any failed, `new` fails and the
+    /// engine exits; and once a recorder exists, a hot-add cannot fail. A
+    /// fallible step added to `PreRollIngester::build` would let a camera
+    /// refuse every clip with no health issue, and turns this red.
+    #[tokio::test]
+    async fn a_running_recorder_builds_an_ingester_for_any_camera_url() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+        for (id, url, codec) in [
+            (1, "rtsp://127.0.0.1:1/main", CodecKind::H264),
+            (2, "not a url", CodecKind::H265),
+            (3, "", CodecKind::H264),
+        ] {
+            rec.add_camera_ingester(id, url, 5, 15, 512, 288, codec)
+                .unwrap_or_else(|e| panic!("camera {id} ({url:?}) got no ingester: {e}"));
+            assert!(rec.ingester_registry().read().contains_key(&id));
+            rec.remove_camera_ingester(id);
+        }
+    }
+
     #[tokio::test]
     async fn kind_reports_gstreamer() {
         let (store, _dir, clips_dir) = fixture().await;
