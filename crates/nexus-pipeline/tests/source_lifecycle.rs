@@ -4,9 +4,10 @@
 //! `task.abort()`. The source runs in a task of its own, and a bare
 //! `JoinHandle` detaches on drop, so whether the source then ends depended on
 //! the source noticing its receiver had gone. `VirtualSource` never looks,
-//! and `SharedRtspSource` parks on an ingester that a stopped camera has shut
-//! down: it holds the `Arc` that keeps that ingester's broadcast sender alive,
-//! so the receive it waits on can never close. Each restart left one behind.
+//! and a `SharedRtspSource` reading the main stream (no substream health tick
+//! to wake it) parks on an ingester that a stopped camera has shut down: it
+//! holds the `Arc` that keeps that ingester's broadcast sender alive, so the
+//! receive it waits on can never close. Each restart left one behind.
 //!
 //! The RTSP test is the other half: ending the source must still hang up the
 //! camera, not just stop polling it.
@@ -15,6 +16,7 @@
 //! `live_frame_freshness.rs`. The two GStreamer tests need no camera.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -76,10 +78,13 @@ impl ClipRecorder for HandsOutOnce {
 }
 
 /// Runs `inner` unchanged while holding `alive`, so the `Arc`'s weak count
-/// says whether the source's task still exists.
+/// says whether the source's task still exists. `started` is raised when the
+/// supervisor runs it: a source the supervisor never ran is dropped with the
+/// recorder that held it, which would pass for one that ended.
 struct Alive {
     inner: Box<dyn FrameSource + Send>,
     alive: Arc<()>,
+    started: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -88,8 +93,13 @@ impl FrameSource for Alive {
         self: Box<Self>,
         tx: tokio::sync::mpsc::Sender<Frame>,
     ) -> Result<(), FrameSourceError> {
-        let Alive { inner, alive } = *self;
+        let Alive {
+            inner,
+            alive,
+            started,
+        } = *self;
         let _alive = alive;
+        started.store(true, Ordering::SeqCst);
         inner.run(tx).await
     }
 }
@@ -189,6 +199,7 @@ async fn a_stopped_supervisor_takes_its_frame_source_with_it() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let alive = Arc::new(());
     let weak = Arc::downgrade(&alive);
+    let started = Arc::new(AtomicBool::new(false));
     let source = Box::new(Alive {
         inner: Box::new(VirtualSource {
             camera_id: 1,
@@ -197,12 +208,16 @@ async fn a_stopped_supervisor_takes_its_frame_source_with_it() {
             fps: 10,
         }),
         alive,
+        started: started.clone(),
     });
     let stats = Arc::new(FrameStatsRegistry::new());
     let handle = spawn(dir.path(), "virtual://local", Some(source), stats.clone()).await;
     assert!(
-        holds_within(Duration::from_secs(10), || stats.snapshot(1).is_some()).await,
-        "precondition: the source never delivered a frame"
+        holds_within(Duration::from_secs(10), || {
+            started.load(Ordering::SeqCst) && stats.snapshot(1).is_some()
+        })
+        .await,
+        "precondition: the supervisor never ran this source, or it delivered no frame"
     );
 
     handle.task.abort();
@@ -235,11 +250,16 @@ async fn a_stopped_supervisor_releases_the_ingester_its_source_reads() {
     )
     .expect("ingester");
     let weak = Arc::downgrade(&ingester);
-    let source = Box::new(SharedRtspSource {
-        camera_id: 1,
-        ingester: ingester.clone(),
-        analysis: None,
-        analysis_stream: None,
+    let started = Arc::new(AtomicBool::new(false));
+    let source = Box::new(Alive {
+        inner: Box::new(SharedRtspSource {
+            camera_id: 1,
+            ingester: ingester.clone(),
+            analysis: None,
+            analysis_stream: None,
+        }),
+        alive: Arc::new(()),
+        started: started.clone(),
     });
     let handle = spawn(
         dir.path(),
@@ -248,10 +268,9 @@ async fn a_stopped_supervisor_releases_the_ingester_its_source_reads() {
         Arc::new(FrameStatsRegistry::new()),
     )
     .await;
-    let source_built = || Arc::strong_count(&ingester) == 2;
     assert!(
-        holds_within(Duration::from_secs(10), source_built).await,
-        "precondition: the supervisor never built its source"
+        holds_within(Duration::from_secs(10), || started.load(Ordering::SeqCst)).await,
+        "precondition: the supervisor never ran this source"
     );
     // Let the source reach its receive.
     tokio::time::sleep(Duration::from_millis(200)).await;
