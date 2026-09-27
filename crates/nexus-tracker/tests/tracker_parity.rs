@@ -104,3 +104,21 @@ fn both_trackers_age_tracks_in_frame_time() {
         }
     }
 }
+
+/// A stamp older than the track's first frame keeps the track, and its age
+/// and IouNaive's TTL saturate at zero instead of panicking or wrapping. The
+/// trackers do not rely on the frames reaching them in stamp order.
+#[test]
+fn an_older_stamp_keeps_the_track_and_holds_its_age_at_zero() {
+    for backend in [TrackerBackendKind::IouNaive, TrackerBackendKind::Bytetrack] {
+        let t = tracker(backend);
+        let first = t.update(vec![det("person", 10.0, Map::new())], at(10));
+        let back = t.update(vec![det("person", 11.0, Map::new())], at(0));
+        assert_eq!(back.len(), 1, "{backend:?}");
+        assert_eq!(
+            back[0].track_id, first[0].track_id,
+            "{backend:?}: an older stamp dropped the track"
+        );
+        assert_eq!(back[0].age_ms, 0, "{backend:?}: age on an older stamp");
+    }
+}
