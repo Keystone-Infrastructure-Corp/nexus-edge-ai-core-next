@@ -733,6 +733,14 @@ mod tests {
         let mut o = vec![obj(1, "person", 200.0, 200.0)];
         a.annotate(&frame_at(0, 1920, 1080), &zones, &[], &mut o);
         assert_eq!(o[0].attributes["motion.zone_state"], "entering");
+
+        // Still inside on the next frame: entering is reported once.
+        let mut o = vec![obj(1, "person", 300.0, 300.0)];
+        a.annotate(&frame_at(1, 1920, 1080), &zones, &[], &mut o);
+        assert_eq!(
+            o[0].attributes["motion.zone_state"], "inside",
+            "the first sight of a zone must record that the track is inside it"
+        );
     }
 
     #[test]
