@@ -3389,7 +3389,7 @@ impl RemoteAccessConfig {
 /// `[reid]` block. Disabled by default. When `enabled = true`, the
 /// per-camera supervisor runs the configured [`nexus_reid::Extractor`]
 /// on each stable track once on first-stable and again every
-/// `emit_interval_s` of wall-clock, publishing `entity_sighting`
+/// `emit_interval_s` of capture time, publishing `entity_sighting`
 /// envelopes through the cloud tunnel. See
 /// `crates/nexus-pipeline/src/entity_sighting.rs` for the per-track
 /// FSM and `WEDGE_PLAN.md §4` for the wire contract.
