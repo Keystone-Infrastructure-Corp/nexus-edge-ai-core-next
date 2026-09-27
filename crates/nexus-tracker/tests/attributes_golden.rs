@@ -291,3 +291,18 @@ fn any_attribute_key_deserializes_and_round_trips() {
     assert_eq!(o.attributes["ключ"], json!({"k": true}));
     assert_eq!(serde_json::to_string(&o).unwrap(), text);
 }
+
+/// An empty map writes no `attributes` field at all, and a missing field
+/// reads back as an empty map. The golden scene never has an empty map.
+#[test]
+fn an_empty_attribute_map_is_not_written() {
+    let text = r#"{"track_id":1,"label":"x","confidence":0.5,"bbox":{"x1":0.0,"y1":0.0,"x2":1.0,"y2":1.0},"age_frames":0,"age_ms":0}"#;
+    let o: TrackedObject = serde_json::from_str(text).unwrap();
+    assert!(o.attributes.is_empty());
+    assert_eq!(serde_json::to_string(&o).unwrap(), text);
+
+    let text = r#"{"label":"x","confidence":0.5,"bbox":{"x1":0.0,"y1":0.0,"x2":1.0,"y2":1.0}}"#;
+    let d: Detection = serde_json::from_str(text).unwrap();
+    assert!(d.attributes.is_empty());
+    assert_eq!(serde_json::to_string(&d).unwrap(), text);
+}
