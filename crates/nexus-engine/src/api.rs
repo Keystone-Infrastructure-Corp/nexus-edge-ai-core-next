@@ -1365,6 +1365,7 @@ async fn run_reprobe(
     // not stall the appliance.
     const MAX_INFLIGHT: usize = 8;
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let default_detector_width = s.current_inference_model.input_width;
     let out = futures::stream::iter(cameras.into_iter().map(|cam| async move {
         let probed = match (
             &cam.onvif.endpoint,
@@ -1379,7 +1380,7 @@ async fn run_reprobe(
             .unwrap_or_else(|_| Err("timed out".to_string())),
             _ => Err("no ONVIF endpoint or credentials configured for this camera".to_string()),
         };
-        let sup = crate::camera_reprobe::supervisor_pixels_for(&cam);
+        let sup = crate::camera_reprobe::supervisor_pixels_for(&cam, default_detector_width);
         crate::camera_reprobe::propose_for_camera(&cam, probed, sup, |u| {
             crate::admin_runtime::redact_url_credentials(u)
         })
@@ -7093,6 +7094,22 @@ mod tests {
         Arc<nexus_sinks::SinkRegistry>,
         Arc<dyn nexus_bus::Bus>,
     ) {
+        build_test_router_with_model(admin_secret, nexus_config::ModelConfig::default()).await
+    }
+
+    /// [`build_test_router_full`] for an engine whose default inference
+    /// model is `model`, which is what a camera with no model override is
+    /// sized by.
+    async fn build_test_router_with_model(
+        admin_secret: Option<&[u8]>,
+        model: nexus_config::ModelConfig,
+    ) -> (
+        axum::Router,
+        Arc<Store>,
+        tempfile::TempDir,
+        Arc<nexus_sinks::SinkRegistry>,
+        Arc<dyn nexus_bus::Bus>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nexus.db");
         let store = Arc::new(
@@ -7209,10 +7226,7 @@ mod tests {
                 #[cfg(feature = "ort")]
                 encoder: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             },
-            // M-Admin Phase 0 follow-up — tests don't exercise
-            // the `GET /v1/admin/server/inference` endpoint;
-            // default ModelConfig is fine.
-            current_inference_model: std::sync::Arc::new(nexus_config::ModelConfig::default()),
+            current_inference_model: std::sync::Arc::new(model),
             // Static-anchors handler reads `<state_dir>/static_objects/cam-<id>.json`;
             // tests don't write that file so the endpoint returns
             // an empty anchor list, which is the documented behaviour
@@ -7554,6 +7568,135 @@ mod tests {
             zones: vec![],
         };
         store.upsert_camera(&cam).await.unwrap();
+    }
+
+    /// An ONVIF Media service with three H.264 profiles at one aspect
+    /// ratio, each streaming from `rtsp://127.0.0.1:554/<token>`. The
+    /// `stream` profile is the main stream of a camera seeded by
+    /// [`seed_onvif_camera`]. Every other request (the OSD read) fails,
+    /// which the probes tolerate.
+    async fn serve_onvif_media_stub() -> SocketAddr {
+        use axum::response::IntoResponse;
+        const PROFILES: [(&str, u32, u32); 3] = [
+            ("stream", 1920, 1080),
+            ("sub", 640, 360),
+            ("third", 1280, 720),
+        ];
+        async fn stub(body: String) -> axum::response::Response {
+            if body.contains("GetProfiles") {
+                let profiles: String = PROFILES
+                    .iter()
+                    .map(|(token, w, h)| {
+                        format!(
+                            r#"<trt:Profiles token="{token}"><tt:Name>{token}</tt:Name><tt:VideoEncoderConfiguration token="enc-{token}"><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution></tt:VideoEncoderConfiguration></trt:Profiles>"#
+                        )
+                    })
+                    .collect();
+                let soap = format!(
+                    r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><trt:GetProfilesResponse>{profiles}</trt:GetProfilesResponse></s:Body></s:Envelope>"#
+                );
+                return (StatusCode::OK, soap).into_response();
+            }
+            if let Some((token, _, _)) = PROFILES
+                .iter()
+                .find(|(t, _, _)| body.contains(&format!("ProfileToken>{t}</")))
+            {
+                let soap = format!(
+                    r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><trt:GetStreamUriResponse><trt:MediaUri><tt:Uri>rtsp://127.0.0.1:554/{token}</tt:Uri></trt:MediaUri></trt:GetStreamUriResponse></s:Body></s:Envelope>"#
+                );
+                return (StatusCode::OK, soap).into_response();
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, "unsupported").into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(stub);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        addr
+    }
+
+    /// An engine whose default detector is 1024 px wide: a camera with no
+    /// model override analyses a 1024x576 frame, which the 640x360 profile
+    /// does not cover and the 1280x720 one does.
+    fn wide_default_model() -> nexus_config::ModelConfig {
+        nexus_config::ModelConfig {
+            input_width: 1024,
+            input_height: 576,
+            ..Default::default()
+        }
+    }
+
+    /// Discovery ranks a probed camera's substreams against the frame the
+    /// camera will analyse at once created, which is the engine's default
+    /// detector width, not a fixed 512 px.
+    #[tokio::test]
+    async fn discovery_ranks_substreams_against_the_engines_default_detector_width() {
+        use axum::body::to_bytes;
+        let onvif = serve_onvif_media_stub().await;
+        let (app, _store, _dir, _reg, _bus) =
+            build_test_router_with_model(None, wide_default_model()).await;
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/admin/discovery/sessions/{}/onvif-streams",
+                uuid::Uuid::now_v7()
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "xaddr": format!("http://{onvif}/onvif/device_service"),
+                    "username": "admin",
+                    "password": "secret",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["recommended_main_token"], "stream", "{v}");
+        assert_eq!(
+            v["recommended_analysis_token"], "third",
+            "the smallest profile covering a 1024x576 frame: {v}"
+        );
+        assert_eq!(v.get("analysis_below_detector_input"), None, "{v}");
+    }
+
+    /// The reprobe ranks an existing camera's substreams the same way: a
+    /// camera with no model override against the engine's default width.
+    #[tokio::test]
+    async fn reprobe_ranks_substreams_against_the_engines_default_detector_width() {
+        use axum::body::to_bytes;
+        let onvif = serve_onvif_media_stub().await;
+        let (app, store, _dir, _reg, _bus) =
+            build_test_router_with_model(None, wide_default_model()).await;
+        seed_onvif_camera(
+            &store,
+            1,
+            Some(&format!("http://{onvif}/onvif/device_service")),
+        )
+        .await;
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras/reprobe")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let proposed = v[0]["proposed"].as_str().unwrap_or_default();
+        assert!(
+            proposed.ends_with("/third"),
+            "the smallest profile covering a 1024x576 frame: {v}"
+        );
+        assert_eq!(v[0].get("below_detector_input"), None, "{v}");
     }
 
     /// An operator may not touch the imaging surface — that's
