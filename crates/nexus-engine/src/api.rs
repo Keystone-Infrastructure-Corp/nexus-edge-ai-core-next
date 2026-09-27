@@ -1489,6 +1489,8 @@ async fn upsert_camera(
 ) -> Result<Json<CameraConfig>, ApiError> {
     cam.id = id;
     validate_analysis_url(&cam.ingest)?;
+    cam.validate_finite()
+        .map_err(|why| ApiError(StatusCode::BAD_REQUEST, why))?;
     // M6 Phase 4 Step 4.1 — capture pre-state for the audit row so
     // operators can diff before/after on the per-resource history
     // panel. `None` on a create; `Some(prev)` on update. The list
@@ -1582,6 +1584,8 @@ async fn create_camera(
     // honest before the post-insert rewrite.
     cam.id = 0;
     validate_analysis_url(&cam.ingest)?;
+    cam.validate_finite()
+        .map_err(|why| ApiError(StatusCode::BAD_REQUEST, why))?;
     // Codec autodetect: if the operator didn't specify a codec
     // and the source is rtsp/rtsps, run one RTSP DESCRIBE probe
     // against the URL and stamp the result. Best-effort — if
@@ -8864,6 +8868,68 @@ mod tests {
         );
     }
 
+    /// A camera write cannot store a number JSON has no literal for. `1e39`
+    /// is beyond f32's range, so it parses to infinity, and `serde_json`
+    /// writes that as `null`, which no later camera-list read can parse. One
+    /// such PUT used to answer 200 and leave every `list_cameras` failing.
+    /// Both writes refuse it with 400 and leave the stored camera as it was.
+    #[tokio::test]
+    async fn a_camera_write_with_a_number_json_cannot_hold_is_refused() {
+        use axum::body::to_bytes;
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let stored = store
+            .list_cameras()
+            .await
+            .expect("fixture: a readable list");
+        let before = serde_json::to_value(&stored).unwrap();
+        let mut zone_vertex = before[0].clone();
+        zone_vertex["zones"] = serde_json::json!([{
+            "id": "z1",
+            "name": "door",
+            "polygon": [[1e39, 0.5], [0.1, 0.1], [0.2, 0.9]],
+        }]);
+        let mut threshold = before[0].clone();
+        threshold["model_override"] = serde_json::json!({ "score_threshold": 1e39 });
+        // Pinned so a create that is let through does not probe the URL.
+        threshold["codec"] = serde_json::json!("h264");
+        let app = super::router(state);
+        for (method, uri, body) in [
+            (
+                Method::PUT,
+                format!("/api/v1/cameras/{}", stored[0].id),
+                zone_vertex,
+            ),
+            (Method::POST, "/api/v1/cameras".to_string(), threshold),
+        ] {
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let text = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{method} {uri} must refuse the number: {}",
+                String::from_utf8_lossy(&text),
+            );
+            let after = store
+                .list_cameras()
+                .await
+                .unwrap_or_else(|e| panic!("{method} {uri} must leave the list readable: {e}"));
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                before,
+                "{method} {uri} must not write",
+            );
+        }
+    }
+
     //
     // Each test stands up its own router so the inserted rows
     // (rules, motion_events, outbox entries) don't leak. We exercise
@@ -9944,6 +10010,30 @@ mod tests {
             .expect("model_override set");
         assert_eq!(model.kind, "yolo");
         assert_eq!(model.preset, "640");
+    }
+
+    /// The fleet's `detector_config` is written into every camera's
+    /// `model_override`, so a threshold JSON has no literal for would leave
+    /// every camera row unreadable. It is refused with 400 before any camera
+    /// is written.
+    #[tokio::test]
+    async fn fleet_apply_detector_config_refuses_a_number_json_cannot_hold() {
+        const SECRET: &[u8] = b"fleet-detector-config-non-finite-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        store
+            .upsert_camera(&fleet_test_camera(1, "front"))
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({ "kind": "yolo", "score_threshold": 1e39 });
+        let res = fleet_apply(&app, SECRET, "detector_config", body).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let cameras = store
+            .list_cameras()
+            .await
+            .expect("the camera list must stay readable");
+        assert!(cameras[0].detector.model_override.is_none());
     }
 
     /// `delivery_settings` upserts the singleton row.

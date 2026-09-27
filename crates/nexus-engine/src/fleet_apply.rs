@@ -512,6 +512,12 @@ async fn apply_detector_config(
             format!("detector_config payload: {e}"),
         )
     })?;
+    model.validate_finite().map_err(|why| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("detector_config payload: {why}"),
+        )
+    })?;
     let mut cameras = s.store.list_cameras().await?;
     let mut tx = s.store.begin_tx().await?;
     for cam in &mut cameras {
