@@ -341,9 +341,9 @@ impl RuleEvaluator {
     /// against `rule.zones` (the rule stores only ids); a rule with
     /// no `zones` set is unaffected by this argument.
     ///
-    /// `objects` is walked once per rule, so it is any cloneable iterator:
-    /// the supervisor passes the frame's non-static tracks without copying
-    /// them, and a `&[TrackedObject]` or `&Vec` works as before.
+    /// `objects` is any cloneable iterator, walked once after a clone counts
+    /// it: the supervisor passes the frame's non-static tracks without
+    /// copying them, and a `&[TrackedObject]` or `&Vec` works as before.
     #[allow(clippy::too_many_arguments)] // 8 args is the natural shape: rule eval inherently needs frame
                                          // dims + zones + identifiers; bundling them would just push the
                                          // boilerplate to every caller.
@@ -357,7 +357,6 @@ impl RuleEvaluator {
         camera_zones: &[ZoneConfig],
         objects: impl IntoIterator<Item = &'a TrackedObject, IntoIter: Clone>,
     ) -> Vec<AlertEvent> {
-        let objects = objects.into_iter();
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -375,8 +374,15 @@ impl RuleEvaluator {
         // One CEL scope, and one binding per object, shared by every rule of
         // this frame and built on first use. `now` is therefore bound once:
         // it is constant across every rule and object in this evaluation.
+        // Each binding is kept beside its object, so a rule only ever reads
+        // the binding of the object it is evaluating.
         let mut cel: Option<Context<'static>> = None;
-        let mut bindings: Vec<Option<CelValue>> = vec![None; objects.clone().count()];
+        let mut objects: Vec<(&TrackedObject, Option<CelValue>)> = {
+            let objects = objects.into_iter();
+            let mut v = Vec::with_capacity(objects.clone().count());
+            v.extend(objects.map(|o| (o, None)));
+            v
+        };
 
         for rule in rules.iter() {
             let cfg = &rule.config;
@@ -437,9 +443,10 @@ impl RuleEvaluator {
             let entry = state.entry((cfg.id.clone(), camera_id, 0u64)).or_default();
             entry
                 .static_alerts
-                .retain(|track_id, _| objects.clone().any(|o| o.track_id == *track_id));
+                .retain(|track_id, _| objects.iter().any(|(o, _)| o.track_id == *track_id));
 
-            for (idx, o) in objects.clone().enumerate() {
+            for (o, binding) in objects.iter_mut() {
+                let o: &TrackedObject = o;
                 // Rules fire on evidence from THIS frame only. A
                 // predicted-only ("coasting") track carries no
                 // detection on this frame — ByteTrack keeps emitting
@@ -474,7 +481,7 @@ impl RuleEvaluator {
                     }
                 }
 
-                let object = bindings[idx].get_or_insert_with(|| object_to_cel(o));
+                let object = binding.get_or_insert_with(|| object_to_cel(o));
                 let ctx = cel.get_or_insert_with(|| cel_context(camera_id));
                 ctx.add_variable_from_value("object", object.clone());
                 let matched = match run_program(rule, ctx) {
@@ -1261,6 +1268,75 @@ mod tests {
                 ("box".to_string(), 7),
                 ("box".to_string(), i64::MAX as u64),
             ]
+        );
+    }
+
+    /// `evaluate` takes any cloneable iterator. One whose clones do not
+    /// replay the same sequence breaks what `Clone` promises, but it must
+    /// not make a rule read another object's binding. This one yields its
+    /// objects forward or reversed, alternating with every clone.
+    #[test]
+    fn a_rule_only_reads_the_binding_of_the_object_it_is_evaluating() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Alternating<'a> {
+            objects: &'a [TrackedObject],
+            clones: Rc<Cell<u32>>,
+            reversed: bool,
+            next: usize,
+        }
+        impl Clone for Alternating<'_> {
+            fn clone(&self) -> Self {
+                self.clones.set(self.clones.get() + 1);
+                Self {
+                    objects: self.objects,
+                    clones: self.clones.clone(),
+                    reversed: self.clones.get() % 2 == 1,
+                    next: self.next,
+                }
+            }
+        }
+        impl<'a> Iterator for Alternating<'a> {
+            type Item = &'a TrackedObject;
+            fn next(&mut self) -> Option<&'a TrackedObject> {
+                let objects: &'a [TrackedObject] = self.objects;
+                let (i, n) = (self.next, objects.len());
+                self.next += 1;
+                (i < n).then(|| &objects[if self.reversed { n - 1 - i } else { i }])
+            }
+        }
+
+        let b = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+        };
+        let objects = [
+            binding_fixture(1, "a", 0.9, b, serde_json::json!({})),
+            binding_fixture(2, "b", 0.9, b, serde_json::json!({})),
+        ];
+        let rules = [
+            fire_every_match("is_a", "object.label == 'a'"),
+            fire_every_match("is_b", "object.label == 'b'"),
+        ];
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &rules).unwrap();
+        let iter = Alternating {
+            objects: &objects,
+            clones: Rc::default(),
+            reversed: false,
+            next: 0,
+        };
+        let fired: Vec<(String, u64)> = ev
+            .evaluate(3, 1, &"t".to_string(), 1000, 1000, &[], iter)
+            .into_iter()
+            .map(|e| (e.rule_id, e.track_id.unwrap()))
+            .collect();
+        assert_eq!(
+            fired,
+            vec![("is_a".to_string(), 1), ("is_b".to_string(), 2)],
+            "a rule fired on an object whose label it never matched"
         );
     }
 }
