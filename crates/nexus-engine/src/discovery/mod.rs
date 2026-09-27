@@ -790,10 +790,12 @@ pub async fn post_probe_onvif(
             // the largest profile; analysis is the pick against it.
             // Ranked against the supervisor frame the camera will analyse
             // at once created. It has no `model_override` or
-            // `supervisor_width` yet, so `reconciler::supervisor_dims_for`
-            // sizes it at the engine's default detector width.
-            let (sup_w, sup_h) =
-                nexus_pipeline::supervisor_frame_for(s.current_inference_model.input_width);
+            // `supervisor_width` yet.
+            let (sup_w, sup_h) = crate::reconciler::supervisor_dims_from(
+                None,
+                None,
+                s.current_inference_model.input_width,
+            );
             let rec = analysis_pick::recommend_for_discovery(
                 &streams,
                 u64::from(sup_w) * u64::from(sup_h),

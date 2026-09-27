@@ -193,17 +193,28 @@ impl BootAnalysis {
 /// `default_detector_width` — raised to `behavior.supervisor_width` when
 /// that is larger. The only copy of the rule: the no-change guard and the
 /// boot RGB tap in `build_gst_recorder` size from it, boot's entries record
-/// the tap's frame, and `camera_reprobe` ranks substreams against it.
+/// the tap's frame, and `camera_reprobe` and discovery rank substreams
+/// against it.
 pub(crate) fn supervisor_dims_for(cam: &CameraConfig, default_detector_width: u32) -> (u32, u32) {
-    let det_w = cam
-        .detector
-        .model_override
-        .as_ref()
-        .map(|m| m.input_width)
-        .unwrap_or(default_detector_width);
+    supervisor_dims_from(
+        cam.detector.model_override.as_ref().map(|m| m.input_width),
+        cam.behavior.supervisor_width,
+        default_detector_width,
+    )
+}
+
+/// [`supervisor_dims_for`] on the two camera fields it reads, for a caller
+/// with no `CameraConfig` yet: discovery ranks for a camera it has not
+/// created, which has neither field.
+pub(crate) fn supervisor_dims_from(
+    model_override_width: Option<u32>,
+    supervisor_width: Option<u32>,
+    default_detector_width: u32,
+) -> (u32, u32) {
+    let det_w = model_override_width.unwrap_or(default_detector_width);
     // M_NATIVE_ASPECT — supervisor width may be decoupled from the
     // detector input (clamped up so it never drops below it).
-    let sup_input = cam.behavior.supervisor_width.unwrap_or(det_w).max(det_w);
+    let sup_input = supervisor_width.unwrap_or(det_w).max(det_w);
     nexus_pipeline::supervisor_frame_for(sup_input)
 }
 
