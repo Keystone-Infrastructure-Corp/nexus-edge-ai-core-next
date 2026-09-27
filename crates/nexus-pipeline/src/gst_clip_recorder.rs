@@ -416,6 +416,105 @@ impl GstClipRecorder {
         Arc::clone(&self.ingesters)
     }
 
+    /// The camera's SPEC-069 analysis session, while it is live. A new
+    /// `SharedRtspSource` reads its frames from this session and valves the
+    /// main RGB tap off, so the crowd resize rebuilds it beside the main
+    /// tap. A session the fallback shut down is not live: the supervisor
+    /// reads the main tap again.
+    fn live_analysis_ingester(&self, camera_id: CameraId) -> Option<Arc<PreRollIngester>> {
+        self.analysis_ingesters
+            .read()
+            .get(&camera_id)
+            .filter(|a| !a.is_shutdown())
+            .cloned()
+    }
+
+    /// Rebuild one of the camera's RGB taps, the analysis session's or
+    /// the main ingester's, at `new_rgb_w x new_rgb_h`. `Ok(false)` when
+    /// there is no such tap or it already has those dims.
+    fn resize_tap(
+        &self,
+        analysis: bool,
+        camera_id: CameraId,
+        new_rgb_w: u32,
+        new_rgb_h: u32,
+    ) -> Result<bool, RecorderError> {
+        let taps: &PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>> = if analysis {
+            &self.analysis_ingesters
+        } else {
+            &self.ingesters
+        };
+        // Snapshot the existing ingester's identity + connection
+        // params under a short read lock so we can drop it before
+        // doing the slow PreRollIngester::new_with_rgb call.
+        let snapshot = {
+            let read = taps.read();
+            read.get(&camera_id).map(|ing| {
+                (
+                    ing.url().to_string(),
+                    ing.codec(),
+                    ing.pre_roll_secs(),
+                    ing.max_fps(),
+                    ing.rgb_w(),
+                    ing.rgb_h(),
+                    ing.has_rgb_tap(),
+                )
+            })
+        };
+        let Some((url, codec, pre_roll_secs, max_fps, cur_w, cur_h, had_rgb)) = snapshot else {
+            debug!(
+                camera_id,
+                new_rgb_w, new_rgb_h, "resize_camera_rgb_tap: no ingester registered"
+            );
+            return Ok(false);
+        };
+        if !had_rgb {
+            // Ingester was built via `new` (no RGB tap). Resizing it
+            // would change observable behaviour for callers that
+            // built the legacy path on purpose; refuse instead.
+            debug!(
+                camera_id,
+                "resize_camera_rgb_tap: existing ingester has no RGB tap, skipping"
+            );
+            return Ok(false);
+        }
+        if cur_w == new_rgb_w && cur_h == new_rgb_h {
+            return Ok(false);
+        }
+        let new_ing = PreRollIngester::new_with_rgb(
+            camera_id,
+            url.clone(),
+            pre_roll_secs,
+            codec,
+            self.decode_mode,
+            max_fps,
+            new_rgb_w,
+            new_rgb_h,
+            self.decode_health.clone(),
+        )
+        .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
+        let prev = taps.write().insert(camera_id, new_ing);
+        if let Some(prev_ing) = prev {
+            // Same justification as the URL-change replace path in
+            // `add_camera_ingester`: any stale `SharedRtspSource`
+            // clones must NOT keep the previous supervisor
+            // reconnecting against the old (now-superseded) RGB
+            // dims indefinitely.
+            prev_ing.shutdown();
+        }
+        info!(
+            camera_id,
+            %url,
+            prev_w = cur_w,
+            prev_h = cur_h,
+            new_w = new_rgb_w,
+            new_h = new_rgb_h,
+            analysis,
+            "pre-roll ingester RGB tap resized (crowd hysteresis)"
+        );
+        Ok(true)
+    }
+
     /// M2.2 Phase 3: attach a USB resolver + preferred label so
     /// new clips can be routed to a hot-tier USB volume. Both
     /// arguments are required together. Builder pattern so
@@ -1358,12 +1457,7 @@ impl ClipRecorder for GstClipRecorder {
             // a receiver, the main RGB valve would be closed for it, and the
             // camera would analyse nothing until the grace window expired —
             // once per supervisor restart, forever.
-            analysis: self
-                .analysis_ingesters
-                .read()
-                .get(&camera_id)
-                .filter(|a| !a.is_shutdown())
-                .cloned(),
+            analysis: self.live_analysis_ingester(camera_id),
             analysis_stream: self.analysis_stream.clone(),
         }))
     }
@@ -1374,74 +1468,16 @@ impl ClipRecorder for GstClipRecorder {
         new_rgb_w: u32,
         new_rgb_h: u32,
     ) -> Result<bool, RecorderError> {
-        // Snapshot the existing ingester's identity + connection
-        // params under a short read lock so we can drop it before
-        // doing the slow PreRollIngester::new_with_rgb call.
-        let snapshot = {
-            let read = self.ingesters.read();
-            read.get(&camera_id).map(|ing| {
-                (
-                    ing.url().to_string(),
-                    ing.codec(),
-                    ing.pre_roll_secs(),
-                    ing.max_fps(),
-                    ing.rgb_w(),
-                    ing.rgb_h(),
-                    ing.has_rgb_tap(),
-                )
-            })
-        };
-        let Some((url, codec, pre_roll_secs, max_fps, cur_w, cur_h, had_rgb)) = snapshot else {
-            debug!(
-                camera_id,
-                new_rgb_w, new_rgb_h, "resize_camera_rgb_tap: no ingester registered"
-            );
-            return Ok(false);
-        };
-        if !had_rgb {
-            // Ingester was built via `new` (no RGB tap). Resizing it
-            // would change observable behaviour for callers that
-            // built the legacy path on purpose; refuse instead.
-            debug!(
-                camera_id,
-                "resize_camera_rgb_tap: existing ingester has no RGB tap, skipping"
-            );
-            return Ok(false);
-        }
-        if cur_w == new_rgb_w && cur_h == new_rgb_h {
-            return Ok(false);
-        }
-        let new_ing = PreRollIngester::new_with_rgb(
-            camera_id,
-            url.clone(),
-            pre_roll_secs,
-            codec,
-            self.decode_mode,
-            max_fps,
-            new_rgb_w,
-            new_rgb_h,
-            self.decode_health.clone(),
-        )
-        .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
-        let prev = self.ingesters.write().insert(camera_id, new_ing);
-        if let Some(prev_ing) = prev {
-            // Same justification as the URL-change replace path in
-            // `add_camera_ingester`: any stale `SharedRtspSource`
-            // clones must NOT keep the previous supervisor
-            // reconnecting against the old (now-superseded) RGB
-            // dims indefinitely.
-            prev_ing.shutdown();
-        }
-        info!(
-            camera_id,
-            %url,
-            prev_w = cur_w,
-            prev_h = cur_h,
-            new_w = new_rgb_w,
-            new_h = new_rgb_h,
-            "pre-roll ingester RGB tap resized (crowd hysteresis)"
-        );
-        Ok(true)
+        // Boot and `start_camera` build a camera's main and analysis taps at
+        // one frame, the supervisor's, and `SharedRtspSource` falls back from
+        // the analysis session to the main tap without telling the
+        // supervisor. So both taps move: the main one alone leaves the
+        // supervisor reading analysis frames of the old size, and the
+        // analysis one alone leaves a fallback reading main frames of it.
+        let main = self.resize_tap(false, camera_id, new_rgb_w, new_rgb_h)?;
+        let analysis = self.live_analysis_ingester(camera_id).is_some()
+            && self.resize_tap(true, camera_id, new_rgb_w, new_rgb_h)?;
+        Ok(main || analysis)
     }
 
     fn push_alert_boxes(
@@ -3128,6 +3164,126 @@ mod tests {
             "the clip must be cut from the main session's codec (h264), not \
              the analysis session's (h265) — got {meta:?}"
         );
+    }
+
+    /// M_PERF_CROWD E2 under SPEC-069. While a camera's analysis session is
+    /// live, the supervisor reads its frames from that session, with the
+    /// main RGB tap valved off, and `SharedRtspSource` falls back to the
+    /// main tap without telling the supervisor. The crowd resize has to move
+    /// both taps to the new frame: without the analysis one the supervisor
+    /// keeps getting frames at the old size while it believes they are
+    /// downscaled, and without the main one a fallback does the same.
+    #[tokio::test]
+    async fn a_crowd_resize_moves_both_taps_while_an_analysis_session_is_live() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+        rec.add_camera_ingester(
+            1,
+            "rtsp://127.0.0.1:1/main",
+            5,
+            15,
+            1024,
+            576,
+            CodecKind::H264,
+        )
+        .expect("main ingester registers");
+        rec.set_camera_analysis_ingester(
+            1,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            1024,
+            576,
+            CodecKind::H265,
+        )
+        .expect("analysis session registers");
+        let analysis_before = rec.analysis_ingesters.read().get(&1).cloned().unwrap();
+
+        assert!(
+            rec.resize_camera_rgb_tap(1, 512, 288).expect("resize"),
+            "the supervisor must be told to rebuild its source"
+        );
+
+        let analysis_after = rec.analysis_ingesters.read().get(&1).cloned().unwrap();
+        assert_eq!(
+            (analysis_after.rgb_w(), analysis_after.rgb_h()),
+            (512, 288),
+            "the analysis session is the tap the supervisor reads, so it takes the new dims"
+        );
+        assert!(
+            !analysis_after.is_shutdown(),
+            "the rebuilt session must be live"
+        );
+        assert!(
+            analysis_before.is_shutdown(),
+            "the old session must be shut down"
+        );
+        assert_eq!(analysis_after.url(), "rtsp://127.0.0.1:1/substream");
+        assert_eq!(analysis_after.codec(), CodecKind::H265);
+        assert_eq!(analysis_after.max_fps(), 15);
+        assert_eq!(analysis_after.pre_roll_secs(), 0);
+        let main_after = rec.ingesters.read().get(&1).cloned().unwrap();
+        assert_eq!(
+            (main_after.rgb_w(), main_after.rgb_h()),
+            (512, 288),
+            "the main tap is what a fallback reads, so it takes the new dims too"
+        );
+        assert_eq!(main_after.pre_roll_secs(), 5);
+    }
+
+    /// The other side of the rule above: with no analysis session, or one
+    /// the SPEC-069 fallback shut down, the supervisor reads the main tap,
+    /// so that is the tap the crowd resize rebuilds, and a dead analysis
+    /// session is left as it is.
+    #[tokio::test]
+    async fn a_crowd_resize_rebuilds_the_main_tap_when_no_live_analysis_session_feeds_the_supervisor(
+    ) {
+        for fallen_back in [false, true] {
+            let (store, _dir, clips_dir) = fixture().await;
+            let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+            rec.add_camera_ingester(
+                1,
+                "rtsp://127.0.0.1:1/main",
+                5,
+                15,
+                1024,
+                576,
+                CodecKind::H264,
+            )
+            .expect("main ingester registers");
+            if fallen_back {
+                rec.set_camera_analysis_ingester(
+                    1,
+                    Some("rtsp://127.0.0.1:1/substream"),
+                    15,
+                    1024,
+                    576,
+                    CodecKind::H265,
+                )
+                .expect("analysis session registers");
+                // What the fallback does to an unusable substream.
+                rec.analysis_ingesters.read().get(&1).unwrap().shutdown();
+            }
+            let analysis_before = rec.analysis_ingesters.read().get(&1).cloned();
+
+            assert!(rec.resize_camera_rgb_tap(1, 512, 288).expect("resize"));
+
+            let main_after = rec.ingesters.read().get(&1).cloned().unwrap();
+            assert_eq!(
+                (main_after.rgb_w(), main_after.rgb_h()),
+                (512, 288),
+                "fallen_back={fallen_back}: the main tap is the one the supervisor reads"
+            );
+            assert_eq!(main_after.pre_roll_secs(), 5);
+            let analysis_after = rec.analysis_ingesters.read().get(&1).cloned();
+            assert_eq!(
+                analysis_before.map(|a| Arc::as_ptr(&a)),
+                analysis_after.as_ref().map(Arc::as_ptr),
+                "fallen_back={fallen_back}: a dead analysis session must not be rebuilt"
+            );
+            if let Some(a) = analysis_after {
+                assert_eq!((a.rgb_w(), a.rgb_h()), (1024, 576));
+            }
+        }
     }
 }
 

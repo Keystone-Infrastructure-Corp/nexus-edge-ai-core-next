@@ -255,7 +255,9 @@ pub trait ClipRecorder: Send + Sync {
     /// low-res `PreRollIngester` under sustained crowd. Implemented
     /// by the GStreamer recorder via a teardown + rebuild keyed on
     /// the existing ingester's URL/codec/max-fps/pre-roll; other
-    /// recorders are a no-op.
+    /// recorders are a no-op. It resizes every tap
+    /// [`Self::shared_frame_source`] can read from: the main ingester's,
+    /// and the camera's SPEC-069 analysis session's while that is live.
     ///
     /// Returns `Ok(true)` when a rebuild happened (and the
     /// supervisor MUST re-acquire its [`Self::shared_frame_source`]
