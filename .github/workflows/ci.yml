@@ -369,6 +369,18 @@ jobs:
           cargo clippy --locked -p nexus-engine --features gstreamer --all-targets -- -D warnings
           cargo clippy --locked -p nexus-engine --features gstreamer-webrtc --all-targets -- -D warnings
 
+      # The workspace `cargo test` job runs nexus-engine with default
+      # features, so a test whose answer depends on `gstreamer` only ever
+      # checks the non-gstreamer half there. The health roll-up's feature
+      # gate is one: `EngineHealth::new` stuck at "no real recorder" passes
+      # every default-feature test, and only
+      # `only_a_gstreamer_build_raises_the_recorder_issue` on this build
+      # fails it. The GIO override is the one the next step documents.
+      - name: cargo test (nexus-engine, gstreamer)
+        env:
+          GIO_USE_PROXY_RESOLVER: dummy
+        run: cargo test --locked -p nexus-engine --features gstreamer --bin nexus-engine
+
       - name: cargo check + test (gstreamer + ort)
         # `GIO_USE_PROXY_RESOLVER=dummy`: forces GIO to pick its no-op proxy
         # resolver extension instead of auto-probing for `gnome` (provided
