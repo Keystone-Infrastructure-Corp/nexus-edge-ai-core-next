@@ -2831,8 +2831,9 @@ mod health_tests {
 
     /// A read that fails on and off must not flip the issue. Every flip is
     /// a `core.health.degraded` open or resolve for the cloud, so a failed
-    /// read after a good one keeps the good one's answer, for a box that is
-    /// reported and for one that is not.
+    /// read after a good one keeps the good one's answer, inside
+    /// [`UNREAD_REPORTED_AFTER`], for a box that is reported and for one
+    /// that is not.
     #[tokio::test]
     async fn a_failed_read_after_a_good_one_keeps_its_answer() {
         for enabled in [true, false] {
