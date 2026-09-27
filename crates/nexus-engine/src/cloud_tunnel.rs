@@ -2080,9 +2080,19 @@ pub struct EngineHealth {
     live_view: Arc<crate::live_view::LiveViewManager>,
     /// The running supervisors, as the reconciler keeps them.
     supervisors: crate::reconciler::HandleMap,
-    /// The last enabled-camera count a store read returned, which a failed
-    /// read reuses ([`recorder_issue`]). `None` until a read succeeds.
-    enabled_cameras: parking_lot::Mutex<Option<usize>>,
+    /// What the store reads [`recorder_issue`] makes have returned.
+    last_read: parking_lot::Mutex<LastRead>,
+}
+
+/// [`recorder_issue`]'s memory of its store reads.
+#[derive(Default)]
+struct LastRead {
+    /// The last enabled-camera count a read returned, which a failed read
+    /// reuses for up to [`UNREAD_REPORTED_AFTER`]. `None` until a read
+    /// succeeds.
+    enabled: Option<usize>,
+    /// When the reads started failing, while the latest one has failed.
+    failing_since: Option<std::time::Instant>,
 }
 
 impl EngineHealth {
@@ -2097,7 +2107,7 @@ impl EngineHealth {
             store: reconciler.store.clone(),
             live_view: reconciler.live_view.clone(),
             supervisors: reconciler.handles.clone(),
-            enabled_cameras: parking_lot::Mutex::new(None),
+            last_read: parking_lot::Mutex::default(),
         }
     }
 
@@ -2118,7 +2128,7 @@ impl EngineHealth {
             store,
             live_view,
             supervisors,
-            enabled_cameras: parking_lot::Mutex::new(None),
+            last_read: parking_lot::Mutex::default(),
         }
     }
 
@@ -2291,11 +2301,12 @@ fn edge_health_from(
 /// A camera list that could not be read is not an empty one, so it fails
 /// closed. Before any read has succeeded, a stub on a build with a real
 /// recorder is reported, with a detail that says the list could not be read.
-/// After one has, a failed read reuses its count, so a read that fails on
-/// and off (a pool held past [`HEALTH_STORE_READ_TIMEOUT`], a transient
-/// SQLite error) cannot flip the issue. Those are the failures a running
-/// engine meets. A camera row this build cannot deserialise never reaches
-/// here: `run` reads the camera list at boot and exits on it.
+/// After one has, a failed read reuses its count for up to
+/// [`UNREAD_REPORTED_AFTER`], so a read that fails on and off (a pool held
+/// past [`HEALTH_STORE_READ_TIMEOUT`], a transient SQLite error) cannot flip
+/// the issue, and a list that stays unread past that is reported as unread,
+/// as before the first good read. Reads fail for good on a damaged
+/// database, and on a camera row this build cannot decode.
 ///
 /// Only a `gstreamer` build raises it ([`EngineHealth::new`]). Release
 /// binaries always carry that feature, so it is the build where a real
@@ -2315,11 +2326,21 @@ async fn recorder_issue(health: &EngineHealth) -> Option<EdgeDegradation> {
     }
     let read = enabled_camera_count(&health.store).await;
     let enabled = {
-        let mut last = health.enabled_cameras.lock();
+        let mut last = health.last_read.lock();
         if read.is_some() {
-            *last = read;
+            last.enabled = read;
+            last.failing_since = None;
+            read
+        } else if last
+            .failing_since
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+            < UNREAD_REPORTED_AFTER
+        {
+            last.enabled
+        } else {
+            None
         }
-        *last
     };
     recorder_issue_for(
         health.real_recorder_available,
@@ -2327,6 +2348,15 @@ async fn recorder_issue(health: &EngineHealth) -> Option<EdgeDegradation> {
         enabled,
     )
 }
+
+/// How long the camera-list reads [`recorder_issue`] makes may fail before it
+/// stops reusing the last good count and reports the list as unread. Two
+/// heartbeat intervals: one or two failed beats between good reads do not
+/// change the answer, and a failure that spans three consecutive beats is
+/// reported. A time, not a count of failures, because the two surfaces read
+/// at their callers' pace: the heartbeat every 30 s, and each open console
+/// tab every 10 s.
+const UNREAD_REPORTED_AFTER: Duration = Duration::from_secs(60);
 
 /// How long [`enabled_camera_count`] waits for the store. A pool acquire
 /// alone waits up to 30 s, and `GET /api/v1/health` has to answer inside
@@ -2643,9 +2673,10 @@ mod health_tests {
     }
 
     /// Give every stored camera a codec this build has no variant for, so
-    /// every `list_cameras` read fails: a real read error from a real store,
-    /// on demand. A running engine meets its read errors from a held pool or
-    /// SQLite instead; a row like this one stops `run` at boot.
+    /// every `list_cameras` read fails. A rollback past a release that wrote
+    /// a newer codec leaves such a row, and so did a camera write of a float
+    /// beyond f32's range, stored as `null`, before camera writes refused
+    /// one; `run` exits on it at boot.
     pub(super) async fn store_a_codec_this_build_cannot_read(store: &Store) {
         sqlx::query("UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1')")
             .execute(store.pool())
@@ -2654,6 +2685,88 @@ mod health_tests {
         assert!(
             store.list_cameras().await.is_err(),
             "fixture: the camera list can no longer be read",
+        );
+    }
+
+    /// Rename the camera table away, so every camera-list read fails with a
+    /// SQL error, as a read of a damaged database would, until
+    /// [`restore_the_camera_list`] puts it back.
+    async fn make_the_camera_list_unreadable(store: &Store) {
+        sqlx::query("ALTER TABLE cameras RENAME TO cameras_away")
+            .execute(store.pool())
+            .await
+            .expect("rename the camera table");
+        assert!(
+            store.list_cameras().await.is_err(),
+            "fixture: the camera list can no longer be read",
+        );
+    }
+
+    async fn restore_the_camera_list(store: &Store) {
+        sqlx::query("ALTER TABLE cameras_away RENAME TO cameras")
+            .execute(store.pool())
+            .await
+            .expect("restore the camera table");
+    }
+
+    /// The last good count must not stand in for a list that stays unread.
+    /// Once the reads have failed for [`UNREAD_REPORTED_AFTER`], the stub is
+    /// reported with the detail that says the list could not be read, even
+    /// though the last good read found no enabled camera and the box was ok.
+    /// The reconciler's own read fails the same way, so no camera change is
+    /// applied meanwhile. A good read restarts the clock.
+    #[tokio::test]
+    async fn a_camera_list_that_stays_unread_is_reported_after_the_bound() {
+        let (store, dir) = default_config_store(false).await;
+        let store = Arc::new(store);
+        let health = stub_health(store.clone(), &dir);
+        let recorder_stub = |h: EdgeHealth| {
+            h.issues
+                .into_iter()
+                .flatten()
+                .find(|i| i.code == "recorder_stub")
+        };
+        let fail_for_the_whole_bound = || {
+            let mut last = health.last_read.lock();
+            let since = last.failing_since.expect("a failed read started the clock");
+            last.failing_since = Some(
+                since
+                    .checked_sub(UNREAD_REPORTED_AFTER)
+                    .expect("the clock reaches back over the bound"),
+            );
+        };
+        assert_eq!(
+            recorder_stub(health.rollup().await),
+            None,
+            "fixture: a good read of no enabled camera",
+        );
+
+        make_the_camera_list_unreadable(&store).await;
+        assert_eq!(
+            recorder_stub(health.rollup().await),
+            None,
+            "a failed read inside the bound keeps the last good answer",
+        );
+        fail_for_the_whole_bound();
+        let issue = recorder_stub(health.rollup().await)
+            .expect("a camera list unread for the whole bound must be reported");
+        assert!(
+            issue.detail.contains("could not be read"),
+            "the detail must say the list was not read: {}",
+            issue.detail,
+        );
+
+        restore_the_camera_list(&store).await;
+        assert_eq!(
+            recorder_stub(health.rollup().await),
+            None,
+            "a good read decides the answer again",
+        );
+        make_the_camera_list_unreadable(&store).await;
+        assert_eq!(
+            recorder_stub(health.rollup().await),
+            None,
+            "the good read restarted the clock",
         );
     }
 
