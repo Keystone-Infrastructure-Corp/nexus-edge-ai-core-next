@@ -3323,9 +3323,10 @@ mod tests {
     /// SPEC-069's retry: a substream session registered while a camera's
     /// frame source already runs, after a fallback or a refused
     /// registration, is what the engine's retry produces. The source must
-    /// take it up once it delivers a frame, and valve the main stream's rgb
-    /// tap off again, without being rebuilt; a source that looks for its
-    /// substream only when it is built never analyses it again.
+    /// take it up once it delivers a frame, read it from then on, and valve
+    /// the main stream's rgb tap off again, without being rebuilt; a source
+    /// that looks for its substream only when it is built never analyses it
+    /// again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_substream_session_registered_after_its_source_started_is_taken_up_once_it_delivers()
     {
@@ -3363,6 +3364,20 @@ mod tests {
         };
         let valved = main.rgb_valve_is_closed();
         let drops = health.snapshot(7).map_or(0, |h| h.decoder_input_drops);
+        // From then on analysis reads the session: its later frames reach the
+        // source's output too, not only the one that triggered the take-up.
+        while frames.try_recv().is_ok() {}
+        for _ in 0..6 {
+            let _ = tap.send(rgb_frame());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut later = 0;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while later < 6 && frames.recv().await.is_some() {
+                later += 1;
+            }
+        })
+        .await;
         task.abort();
         session.shutdown();
         main.shutdown();
@@ -3373,6 +3388,11 @@ mod tests {
         assert!(
             valved,
             "analysis reads the substream, so the main stream's rgb tap must be valved off"
+        );
+        assert_eq!(
+            later, 6,
+            "the taken-up session delivered 6 more frames and {later} reached analysis: the \
+             source must read the session it took up"
         );
         assert_eq!(
             drops, 0,
