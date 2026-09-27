@@ -158,8 +158,7 @@ thread_local! {
     /// The attribute names this thread has bound, each built into a `Key`
     /// once. The annotator stamps the same names on every object on every
     /// frame, and each `Key::from` allocates a `String` and an `Arc`. Per
-    /// thread rather than shared: a `Key` every camera thread cloned would
-    /// put all their refcount traffic on one cache line.
+    /// thread, so reading and filling it takes no lock.
     static ATTRIBUTE_KEYS: RefCell<HashMap<String, Key>> = RefCell::new(HashMap::new());
 }
 
