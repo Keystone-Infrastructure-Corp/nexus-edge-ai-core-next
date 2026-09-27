@@ -717,6 +717,9 @@ impl SharedRtspSource {
         }
     }
 
+    /// The main session's frames or, with `analysis`, those of the session
+    /// this source started with, if any ([`Self::analysis`]); never those of
+    /// a session taken up since.
     fn frames_from(
         &self,
         analysis: bool,
