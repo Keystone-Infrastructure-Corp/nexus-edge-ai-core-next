@@ -256,6 +256,8 @@ async fn a_stopped_supervisor_releases_the_ingester_its_source_reads() {
             camera_id: 1,
             ingester: ingester.clone(),
             analysis: None,
+            analysis_sessions: Default::default(),
+            decode_health: None,
             analysis_stream: None,
         }),
         alive: Arc::new(()),
