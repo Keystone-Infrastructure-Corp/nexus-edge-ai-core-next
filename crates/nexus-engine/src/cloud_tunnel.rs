@@ -2078,11 +2078,14 @@ pub struct EngineHealth {
     recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
     store: Arc<Store>,
     live_view: Arc<crate::live_view::LiveViewManager>,
+    /// The last enabled-camera count a store read returned, which a failed
+    /// read reuses ([`recorder_issue`]). `None` until a read succeeds.
+    enabled_cameras: parking_lot::Mutex<Option<usize>>,
 }
 
 impl EngineHealth {
     /// A real recorder was available iff this is a `gstreamer` build (see
-    /// [`recorder_issue_in`]).
+    /// [`recorder_issue`]).
     pub(crate) fn new(
         recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
         store: Arc<Store>,
@@ -2104,6 +2107,7 @@ impl EngineHealth {
             recorder,
             store,
             live_view,
+            enabled_cameras: parking_lot::Mutex::new(None),
         }
     }
 
@@ -2113,19 +2117,14 @@ impl EngineHealth {
         edge_health(
             &self.live_view.stalled_cameras(),
             crate::system_metrics::snapshot().decode_capacity.as_ref(),
-            recorder_issue_in(
-                self.real_recorder_available,
-                self.recorder.kind(),
-                &self.store,
-            )
-            .await,
+            recorder_issue(self).await,
         )
     }
 }
 
 /// Build the health roll-up from the process-wide degradation registry,
 /// plus any live-view sources that have stopped producing frames and a stub
-/// recorder behind enabled cameras ([`recorder_issue_in`]).
+/// recorder behind enabled cameras ([`recorder_issue`]).
 ///
 /// `status` is `degraded` iff at least one issue is open, matching the
 /// schema's stated invariant. The cloud renders unknown `code`s verbatim, so
@@ -2230,6 +2229,14 @@ fn edge_health_from(
 /// recorder's kind and the store, and neither a first frame nor an outage
 /// can reach the issue.
 ///
+/// A camera list that could not be read is not an empty one, so it fails
+/// closed. Before any read has succeeded, a stub on a build with a real
+/// recorder is reported, with a detail that says the list could not be read.
+/// After one has, a failed read reuses its count, so a read that fails on
+/// and off (a busy pool, a transient SQLite error) cannot flip the issue. A
+/// row this build cannot deserialise, as a rollback past a newer config value
+/// leaves it, fails every read from boot and so stays reported.
+///
 /// Only a `gstreamer` build raises it ([`EngineHealth::new`]). Release
 /// binaries always carry that feature, so it is the build where a real
 /// recorder was available and the stub is a misconfiguration. A build without
@@ -2240,53 +2247,64 @@ fn edge_health_from(
 /// departs on purpose from the detector's precedent, where asking for the mock
 /// detector by name stays healthy: however the stub was chosen, behind running
 /// cameras it keeps no evidence.
-pub(crate) async fn recorder_issue_in(
-    real_recorder_available: bool,
-    recorder_kind: &str,
-    store: &Store,
-) -> Option<EdgeDegradation> {
+async fn recorder_issue(health: &EngineHealth) -> Option<EdgeDegradation> {
+    let read = enabled_camera_count(&health.store).await;
+    let enabled = {
+        let mut last = health.enabled_cameras.lock();
+        if read.is_some() {
+            *last = read;
+        }
+        *last
+    };
     recorder_issue_for(
-        real_recorder_available,
-        recorder_kind,
-        enabled_camera_count(store).await,
+        health.real_recorder_available,
+        health.recorder.kind(),
+        enabled,
     )
 }
 
-/// The cameras [`recorder_issue_in`] counts: the store's enabled ones. A failed
-/// read is logged and counts none, like the heartbeat's other best-effort
-/// store reads, so it drops the issue for that read. On the heartbeat that
-/// costs one resolve and re-raise of `core.health.degraded`, and only when
-/// `recorder_stub` is the only open issue: the cloud acts on status
-/// transitions, and any other open issue keeps the status degraded.
-async fn enabled_camera_count(store: &Store) -> usize {
+/// The cameras [`recorder_issue`] counts: the store's enabled ones, or
+/// `None` when the camera list could not be read.
+async fn enabled_camera_count(store: &Store) -> Option<usize> {
     match store.list_cameras().await {
-        Ok(cameras) => cameras.iter().filter(|c| c.ingest.enabled).count(),
+        Ok(cameras) => Some(cameras.iter().filter(|c| c.ingest.enabled).count()),
         Err(e) => {
-            warn!(error = %e, "health: camera list query failed; counting no enabled cameras");
-            0
+            warn!(error = %e, "health: camera list query failed");
+            None
         }
     }
 }
 
-/// The rule [`recorder_issue_in`] applies, over the count of enabled
-/// cameras.
+/// The rule [`recorder_issue`] applies, over the count of enabled cameras,
+/// `None` when it is not known.
 fn recorder_issue_for(
     real_recorder_available: bool,
     recorder_kind: &str,
-    enabled_cameras: usize,
+    enabled_cameras: Option<usize>,
 ) -> Option<EdgeDegradation> {
-    if !real_recorder_available || recorder_kind != "stub" || enabled_cameras == 0 {
+    if !real_recorder_available || recorder_kind != "stub" {
         return None;
     }
-    Some(EdgeDegradation {
-        component: "recorder".to_string(),
-        code: "recorder_stub".to_string(),
-        detail: truncate_detail(
+    let detail = match enabled_cameras {
+        Some(0) => return None,
+        Some(_) => {
             "the clip recorder is the stub, so running cameras are detected but nothing is \
              recorded; set [runtime.clips] recorder = \"gstreamer\" in /etc/nexus/nexus.toml \
              (or re-run install.sh without --keep-config) and restart nexus-engine. This needs \
-             shell or remote-shell access to the box.",
-        ),
+             shell or remote-shell access to the box."
+        }
+        None => {
+            "the clip recorder is the stub, which records nothing, and the camera list could \
+             not be read to tell whether any camera is enabled; set [runtime.clips] recorder = \
+             \"gstreamer\" in /etc/nexus/nexus.toml (or re-run install.sh without \
+             --keep-config) and restart nexus-engine. This needs shell or remote-shell access \
+             to the box."
+        }
+    };
+    Some(EdgeDegradation {
+        component: "recorder".to_string(),
+        code: "recorder_stub".to_string(),
+        detail: truncate_detail(detail),
     })
 }
 
@@ -2308,7 +2326,7 @@ fn truncate_detail(s: &str) -> String {
 #[cfg(test)]
 mod health_tests {
     use super::*;
-    use nexus_pipeline::{ClipRecorder, StubClipRecorder};
+    use nexus_pipeline::StubClipRecorder;
 
     /// The engine must not advertise a capability it cannot perform. Talk-down
     /// audio has no receive-side pipeline here, so no transport may leak the
@@ -2489,6 +2507,23 @@ mod health_tests {
         (store, dir)
     }
 
+    /// The roll-up a `gstreamer` build makes over `store`, for the
+    /// `StubClipRecorder` that `build_recorder` makes for `Stub`.
+    fn stub_health(store: Arc<Store>, dir: &tempfile::TempDir) -> EngineHealth {
+        EngineHealth::with_real_recorder(
+            true,
+            Arc::new(StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store,
+            crate::live_view::LiveViewManager::new(
+                Arc::new(nexus_pipeline::LatestFrameCache::new()),
+                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            ),
+        )
+    }
+
     /// A stub recorder behind an enabled camera must reach the cloud, from
     /// the first heartbeat after boot. The engine's own default config boots
     /// exactly that: no `recorder` key, so `RecorderKind`'s `#[default]
@@ -2499,18 +2534,14 @@ mod health_tests {
     /// comes from a `StubClipRecorder`, what `build_recorder` makes for
     /// `Stub`, so a renamed `kind()` cannot silently disarm it.
     ///
-    /// Computed as a `gstreamer` build computes it ([`recorder_issue_in`]
-    /// given `true`), so it runs in default-feature CI; the feature gate has
-    /// its own test. Asserts on the recorder issue, never on
-    /// `status == "ok"` (BUG-159).
+    /// Computed as a `gstreamer` build computes it
+    /// ([`EngineHealth::with_real_recorder`] given `true`), so it runs in
+    /// default-feature CI; the feature gate has its own test. Asserts on the
+    /// recorder issue, never on `status == "ok"` (BUG-159).
     #[tokio::test]
     async fn the_heartbeat_health_reports_a_stub_recorder() {
         let (store, dir) = default_config_store(true).await;
-        let store = Arc::new(store);
-        let stub = StubClipRecorder::new(store.clone(), dir.path().join("clips"));
-
-        let recorder = recorder_issue_in(true, stub.kind(), &store).await;
-        let health = edge_health(&[], None, recorder);
+        let health = stub_health(Arc::new(store), &dir).rollup().await;
         let issue = health
             .issues
             .as_ref()
@@ -2530,6 +2561,71 @@ mod health_tests {
             "the detail must name the fix and what it needs: {}",
             issue.detail,
         );
+    }
+
+    /// Give every stored camera a codec this build has no variant for, as
+    /// a rollback past a newer `CodecKind` leaves the row. Every
+    /// `list_cameras` read then fails to deserialise.
+    async fn store_a_codec_this_build_cannot_read(store: &Store) {
+        sqlx::query("UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1')")
+            .execute(store.pool())
+            .await
+            .expect("rewrite the camera rows");
+        assert!(
+            store.list_cameras().await.is_err(),
+            "fixture: the camera list can no longer be read",
+        );
+    }
+
+    /// A camera list nobody could read is not an empty one. A stub on a
+    /// build with a real recorder must stay reported when the read fails,
+    /// and the detail must say the list could not be read rather than
+    /// claim cameras it never saw.
+    #[tokio::test]
+    async fn an_unreadable_camera_list_keeps_the_stub_reported() {
+        let (store, dir) = default_config_store(true).await;
+        store_a_codec_this_build_cannot_read(&store).await;
+
+        let issue = recorder_issue(&stub_health(Arc::new(store), &dir))
+            .await
+            .expect("a stub whose camera list could not be read must be reported");
+        assert_eq!(issue.component, "recorder");
+        assert_eq!(issue.code, "recorder_stub");
+        assert!(
+            issue.detail.contains("could not be read") && !issue.detail.contains("running cameras"),
+            "the detail must say the camera list was not read, not claim cameras: {}",
+            issue.detail,
+        );
+        assert!(
+            issue.detail.contains("restart nexus-engine")
+                && issue.detail.contains("remote-shell access"),
+            "the wire clamp must not cut off the remedy: {}",
+            issue.detail,
+        );
+    }
+
+    /// A read that fails on and off must not flip the issue. Every flip is
+    /// a `core.health.degraded` open or resolve for the cloud, so a failed
+    /// read after a good one keeps the good one's answer, for a box that is
+    /// reported and for one that is not.
+    #[tokio::test]
+    async fn a_failed_read_after_a_good_one_keeps_its_answer() {
+        for enabled in [true, false] {
+            let (store, dir) = default_config_store(enabled).await;
+            let store = Arc::new(store);
+            let health = stub_health(store.clone(), &dir);
+            let read = recorder_issue(&health).await;
+            assert_eq!(read.is_some(), enabled, "fixture: the good read's answer");
+
+            store_a_codec_this_build_cannot_read(&store).await;
+            for _ in 0..3 {
+                assert_eq!(
+                    recorder_issue(&health).await,
+                    read,
+                    "a failed read must not change the answer (enabled: {enabled})",
+                );
+            }
+        }
     }
 
     /// The feature gate, stated per build: only a `gstreamer` build, where
@@ -2567,7 +2663,7 @@ mod health_tests {
     /// A real recorder behind an enabled camera is the healthy case.
     #[test]
     fn a_gstreamer_recorder_with_enabled_cameras_raises_no_recorder_issue() {
-        assert_eq!(recorder_issue_for(true, "gstreamer", 1), None);
+        assert_eq!(recorder_issue_for(true, "gstreamer", Some(1)), None);
     }
 
     /// A stub with nothing to record loses nothing: the reconciler runs no
@@ -2575,12 +2671,15 @@ mod health_tests {
     /// Playwright harness, is the empty case of the same count.
     #[tokio::test]
     async fn a_stub_with_only_disabled_cameras_raises_no_recorder_issue() {
-        let (store, _dir) = default_config_store(false).await;
+        let (store, dir) = default_config_store(false).await;
         assert!(
             !store.list_cameras().await.expect("list cameras").is_empty(),
             "fixture: the disabled camera is in the store",
         );
-        assert_eq!(recorder_issue_in(true, "stub", &store).await, None);
+        assert_eq!(
+            recorder_issue(&stub_health(Arc::new(store), &dir)).await,
+            None
+        );
     }
 
     /// On a list already at the wire cap, the recorder issue must not carry
@@ -2594,7 +2693,12 @@ mod health_tests {
                 reason: "unavailable".to_string(),
             })
             .collect();
-        let health = edge_health_from(detector, &[], None, recorder_issue_for(true, "stub", 1));
+        let health = edge_health_from(
+            detector,
+            &[],
+            None,
+            recorder_issue_for(true, "stub", Some(1)),
+        );
         let issues = health.issues.expect("issues present when degraded");
         assert!(
             issues.len() <= HEALTH_ISSUES_MAX,
