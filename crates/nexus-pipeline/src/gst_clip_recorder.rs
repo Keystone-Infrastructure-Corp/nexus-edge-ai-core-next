@@ -1415,6 +1415,14 @@ impl ClipRecorder for GstClipRecorder {
             }
             _ => false,
         };
+        // At the main tap's frame when there is one: the crowd resize moves
+        // it with the supervisor, while a retry passes the frame the camera
+        // started at, so a session rebuilt after a resize would otherwise
+        // feed the supervisor frames of a size it no longer runs at.
+        let (rgb_w, rgb_h) = match self.ingesters.read().get(&camera_id) {
+            Some(main) if main.has_rgb_tap() => (main.rgb_w(), main.rgb_h()),
+            _ => (rgb_w, rgb_h),
+        };
         // pre_roll_secs = 0: this session exists only to decode. Its
         // ring never accumulates and nothing subscribes to its NAL
         // broadcast — clips come from the main session's.
@@ -3886,6 +3894,67 @@ mod tests {
             if let Some(a) = analysis_after {
                 assert_eq!((a.rgb_w(), a.rgb_h()), (1024, 576));
             }
+        }
+    }
+
+    /// E2 under SPEC-069's retry. The crowd resize moves the main tap to the
+    /// supervisor's new frame and leaves a session the fallback shut down as
+    /// it was, and the engine's retry passes the frame the camera started
+    /// at. The session the retry builds is the one the running source takes
+    /// up next, so it must come back at the main tap's frame, the one the
+    /// supervisor runs at, whether the fallback came before the resize or
+    /// after it: at the start's frame the supervisor would read frames of
+    /// one size while it believes they are another.
+    #[tokio::test]
+    async fn a_retried_analysis_session_is_built_at_the_frame_the_crowd_resize_left() {
+        for fell_back_first in [true, false] {
+            let (store, _dir, clips_dir) = fixture().await;
+            let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+            rec.add_camera_ingester(
+                1,
+                "rtsp://127.0.0.1:1/main",
+                5,
+                15,
+                1024,
+                576,
+                CodecKind::H264,
+            )
+            .expect("main ingester registers");
+            let register = || {
+                rec.set_camera_analysis_ingester(
+                    1,
+                    Some("rtsp://127.0.0.1:1/substream"),
+                    15,
+                    1024,
+                    576,
+                    CodecKind::H265,
+                )
+            };
+            register().expect("analysis session registers");
+            // What the fallback does to an unusable substream.
+            let fall_back = || rec.analysis_ingesters.read().get(&1).unwrap().shutdown();
+            if fell_back_first {
+                fall_back();
+            }
+            assert!(rec.resize_camera_rgb_tap(1, 512, 288).expect("resize"));
+            if !fell_back_first {
+                fall_back();
+            }
+
+            // The engine's retry, at the frame the camera started at.
+            register().expect("the retry registers");
+
+            let retried = rec.analysis_ingesters.read().get(&1).cloned().unwrap();
+            assert!(
+                !retried.is_shutdown(),
+                "fell_back_first={fell_back_first}: the retry must build a live session"
+            );
+            assert_eq!(
+                (retried.rgb_w(), retried.rgb_h()),
+                (512, 288),
+                "fell_back_first={fell_back_first}: the retried session must run at the main \
+                 tap's frame, which the crowd resize moved with the supervisor"
+            );
         }
     }
 }

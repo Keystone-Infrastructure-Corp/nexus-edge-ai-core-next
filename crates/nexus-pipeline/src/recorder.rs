@@ -230,7 +230,9 @@ pub trait ClipRecorder: Send + Sync {
     /// reconcile pass while the camera runs, without restarting it:
     /// SPEC-069's retry on the long backoff. So `Ok(())` for a session that
     /// is running must be a no-op, and a call that finds the camera's
-    /// session shut down by the SPEC-069 fallback must start a new one; the
+    /// session shut down by the SPEC-069 fallback must start a new one, at
+    /// the frame the camera's taps run at now, which
+    /// [`Self::resize_camera_rgb_tap`] may have moved since the start; the
     /// running frame source takes it up once it delivers. The default no-op,
     /// for recorders without substream sessions, has nothing to register,
     /// and that is not a failure. `Err` means no new session was registered
