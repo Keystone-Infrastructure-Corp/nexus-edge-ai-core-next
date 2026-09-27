@@ -2640,7 +2640,7 @@ mod health_tests {
     /// Give every stored camera a codec this build has no variant for, as
     /// a rollback past a newer `CodecKind` leaves the row. Every
     /// `list_cameras` read then fails to deserialise.
-    async fn store_a_codec_this_build_cannot_read(store: &Store) {
+    pub(super) async fn store_a_codec_this_build_cannot_read(store: &Store) {
         sqlx::query("UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1')")
             .execute(store.pool())
             .await
@@ -3765,13 +3765,31 @@ mod heartbeat_ack_tests {
     /// The heartbeat carries the roll-up it shares with `GET /api/v1/health`,
     /// not a list of its own: a stub behind an enabled camera is on it, and a
     /// stub behind only a disabled camera is not. Fails if the pump drops the
-    /// roll-up or computes any part of it apart. Compares all but the
-    /// detector's issues, whose registry is process-global (BUG-159).
-    #[tokio::test]
+    /// roll-up or computes any part of it apart. A subscribed camera has
+    /// stalled, so the roll-up carries more than the recorder issue, and the
+    /// camera list stops reading after one good read, which the roll-up
+    /// answers from and a read of the pump's own would not. Compares all but
+    /// the detector's issues, whose registry is process-global (BUG-159).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_heartbeat_carries_the_shared_roll_up() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let cfg = nexus_config::Config::load(repo_root.join(crate::DEFAULT_CONFIG))
             .expect("load the engine's default config");
+        let live_view = live_view_manager();
+        live_view.on_subscribe(&nexus_cloud_protocol::v1::LbrSubscribePayload {
+            camera_id: 7,
+            tile_w: Some(320),
+            tile_h: Some(180),
+            fps_tier: Some("grid".to_string()),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while live_view.stalled_cameras() != vec![7] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture: the subscribed camera never stalled"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         for enabled in [true, false] {
             let (store, dir) = test_store().await;
             let mut camera = cfg.cameras[0].clone();
@@ -3787,9 +3805,15 @@ mod heartbeat_ack_tests {
                     dir.path().join("clips"),
                 )),
                 store.clone(),
-                live_view_manager(),
+                live_view.clone(),
                 crate::reconciler::HandleMap::default(),
             );
+            assert_eq!(
+                recorder_issue(&health).await.is_some(),
+                enabled,
+                "fixture: the good read's answer",
+            );
+            super::health_tests::store_a_codec_this_build_cannot_read(&store).await;
             let frame_stats = FrameStatsRegistry::new();
             let liveness = TunnelLiveness::new();
             let tunnel = CapturingTunnel::default();
@@ -3837,6 +3861,10 @@ mod heartbeat_ack_tests {
                 carried.iter().any(|i| i.code == "recorder_stub"),
                 enabled,
                 "a stub behind an enabled camera, and only then: {carried:?}",
+            );
+            assert!(
+                carried.iter().any(|i| i.code == "camera_source_stalled"),
+                "the stalled camera is on the heartbeat: {carried:?}",
             );
         }
     }
