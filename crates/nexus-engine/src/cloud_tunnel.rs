@@ -2734,8 +2734,37 @@ mod health_tests {
         }
     }
 
+    /// A recorder that is not the stub, as a release box runs the
+    /// `gstreamer` one. The roll-up reads only its kind.
+    struct RealRecorder;
+
+    #[async_trait::async_trait]
+    impl nexus_pipeline::ClipRecorder for RealRecorder {
+        async fn open(
+            &self,
+            _args: nexus_pipeline::OpenClip,
+        ) -> Result<nexus_pipeline::ClipHandle, nexus_pipeline::RecorderError> {
+            Err(nexus_pipeline::RecorderError::Refused)
+        }
+        async fn close(
+            &self,
+            _handle: nexus_pipeline::ClipHandle,
+            _args: nexus_pipeline::ClipFinal,
+        ) -> Result<nexus_pipeline::ClipMeta, nexus_pipeline::RecorderError> {
+            Err(nexus_pipeline::RecorderError::Refused)
+        }
+        fn set_panic(&self, _panic: bool) {}
+        fn is_panic(&self) -> bool {
+            false
+        }
+        fn kind(&self) -> &'static str {
+            "gstreamer"
+        }
+    }
+
     /// Only a stub on a build with a real recorder reads the store, so every
-    /// other box answers both surfaces without waiting on the pool.
+    /// other box answers both surfaces without waiting on the pool: a build
+    /// without a real recorder, and a release box running the real one.
     #[tokio::test]
     async fn a_box_that_cannot_raise_the_recorder_issue_does_not_wait_on_the_store() {
         let (store, dir) = default_config_store(true).await;
@@ -2750,27 +2779,33 @@ mod health_tests {
                     .expect("hold a pool connection"),
             );
         }
-        let health = EngineHealth::with_real_recorder(
-            false,
-            Arc::new(StubClipRecorder::new(
+        let stub: Arc<dyn nexus_pipeline::ClipRecorder> = Arc::new(StubClipRecorder::new(
+            store.clone(),
+            dir.path().join("clips"),
+        ));
+        let real: Arc<dyn nexus_pipeline::ClipRecorder> = Arc::new(RealRecorder);
+        for (real_recorder_available, recorder) in [(false, stub), (true, real)] {
+            let kind = recorder.kind();
+            let health = EngineHealth::with_real_recorder(
+                real_recorder_available,
+                recorder,
                 store.clone(),
-                dir.path().join("clips"),
-            )),
-            store,
-            crate::live_view::LiveViewManager::new(
-                Arc::new(nexus_pipeline::LatestFrameCache::new()),
-                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
-            ),
-            crate::reconciler::HandleMap::default(),
-        );
+                crate::live_view::LiveViewManager::new(
+                    Arc::new(nexus_pipeline::LatestFrameCache::new()),
+                    Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+                ),
+                crate::reconciler::HandleMap::default(),
+            );
 
-        let started = std::time::Instant::now();
-        assert_eq!(recorder_issue(&health).await, None);
-        assert!(
-            started.elapsed() < HEALTH_STORE_READ_TIMEOUT,
-            "no store read was needed, but the answer took {:?}",
-            started.elapsed(),
-        );
+            let started = std::time::Instant::now();
+            assert_eq!(recorder_issue(&health).await, None);
+            assert!(
+                started.elapsed() < HEALTH_STORE_READ_TIMEOUT,
+                "no store read was needed, but the answer took {:?} \
+                 (real recorder available: {real_recorder_available}, kind: {kind})",
+                started.elapsed(),
+            );
+        }
         drop(held);
     }
 
