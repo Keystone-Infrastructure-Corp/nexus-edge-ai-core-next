@@ -49,6 +49,9 @@ pub const CAMERA_OFFLINE_AFTER_MS: i64 = 90_000;
 pub struct CameraFrameStats {
     /// Wall-clock timestamp of the most recent frame, in UTC.
     pub last_frame_at: Option<DateTime<Utc>>,
+    /// Monotonic instant the most recent frame was observed at, which the
+    /// age and the liveness are measured from.
+    last_frame_mono: Option<Instant>,
     /// Frames-per-second computed over a fixed wall-clock window
     /// ([`FPS_WINDOW`]). Immune to burst arrivals because the divisor
     /// is the window length, not the inter-frame delta. The field is
@@ -111,11 +114,12 @@ pub struct CameraFrameStats {
 
 impl CameraFrameStats {
     /// Milliseconds since the last observed frame, computed against
-    /// the supplied wall-clock `now`. `None` if no frame has been
-    /// observed yet.
-    pub fn last_frame_age_ms(&self, now: DateTime<Utc>) -> Option<i64> {
-        self.last_frame_at
-            .map(|t| (now - t).num_milliseconds().max(0))
+    /// the supplied monotonic `now`, so a step of the wall clock does not
+    /// move it. `None` if no frame has been observed yet.
+    pub fn last_frame_age_ms(&self, now: Instant) -> Option<i64> {
+        self.last_frame_mono.map(|t| {
+            i64::try_from(now.saturating_duration_since(t).as_millis()).unwrap_or(i64::MAX)
+        })
     }
 
     /// Edge-observed liveness in the last frame-source pass: `true` only
@@ -123,7 +127,7 @@ impl CameraFrameStats {
     /// A camera that has never produced a frame (never spawned, or spawned
     /// but not yet decoding) is offline, not unknown — the whole point of
     /// this signal is to say something real instead of a placeholder.
-    pub fn is_online(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_online(&self, now: Instant) -> bool {
         self.last_frame_age_ms(now)
             .is_some_and(|age_ms| age_ms <= CAMERA_OFFLINE_AFTER_MS)
     }
@@ -134,6 +138,7 @@ impl CameraFrameStats {
 /// for fps math — operators can drift system time).
 struct Entry {
     last_frame_at: Option<DateTime<Utc>>,
+    last_frame_mono: Option<Instant>,
     /// Ring of frame arrival `Instant`s, capped at
     /// [`FPS_WINDOW_MAX_SAMPLES`]. Pruned to entries inside
     /// [`FPS_WINDOW`] on every observation.
@@ -174,6 +179,7 @@ impl Entry {
     fn snapshot(&self, now: Instant) -> CameraFrameStats {
         CameraFrameStats {
             last_frame_at: self.last_frame_at,
+            last_frame_mono: self.last_frame_mono,
             fps_ema: self.fps(now),
             frames_emitted: self.frames_emitted,
             frames_dropped: self.frames_dropped,
@@ -257,6 +263,7 @@ impl FrameStatsRegistry {
         }
         let entry = guard.entry.get_or_insert_with(|| Entry {
             last_frame_at: None,
+            last_frame_mono: None,
             recent_instants: VecDeque::with_capacity(FPS_WINDOW_MAX_SAMPLES),
             frames_emitted: 0,
             frames_backpressure_dropped: 0,
@@ -285,6 +292,7 @@ impl FrameStatsRegistry {
             entry.recent_instants.pop_front();
         }
         entry.last_frame_at = Some(captured_at);
+        entry.last_frame_mono = Some(now);
         entry.frames_emitted = entry.frames_emitted.saturating_add(1);
         entry.source_width = width;
         entry.source_height = height;
@@ -1011,11 +1019,10 @@ mod tests {
     fn last_frame_age_ms_is_non_negative() {
         let reg = FrameStatsRegistry::new();
         let epoch = reg.begin_session(1);
-        let t = Utc::now() - chrono::Duration::milliseconds(500);
-        reg.observe_frame(1, epoch, t, 16, 16);
+        let before = Instant::now();
+        reg.observe_frame(1, epoch, Utc::now(), 16, 16);
         let s = reg.snapshot(1).unwrap();
-        let age = s.last_frame_age_ms(Utc::now()).unwrap();
-        assert!(age >= 500);
+        assert_eq!(s.last_frame_age_ms(before), Some(0));
     }
 
     #[test]
@@ -1374,10 +1381,9 @@ mod tests {
     fn camera_with_recent_frame_is_online_with_no_live_view_subscriber() {
         let reg = FrameStatsRegistry::new();
         let epoch = reg.begin_session(1);
-        let now = Utc::now();
-        reg.observe_frame(1, epoch, now, 960, 540);
+        reg.observe_frame(1, epoch, Utc::now(), 960, 540);
         let s = reg.snapshot(1).unwrap();
-        assert!(s.is_online(now));
+        assert!(s.is_online(Instant::now()));
     }
 
     /// A camera that stops producing frames must flip to offline once its
@@ -1386,15 +1392,39 @@ mod tests {
     fn camera_flips_offline_after_frames_stop() {
         let reg = FrameStatsRegistry::new();
         let epoch = reg.begin_session(1);
-        let last_frame = Utc::now();
-        reg.observe_frame(1, epoch, last_frame, 960, 540);
+        reg.observe_frame(1, epoch, Utc::now(), 960, 540);
+        let last_frame = Instant::now();
         let s = reg.snapshot(1).unwrap();
         assert!(s.is_online(last_frame), "just observed a frame");
-        let long_after = last_frame + chrono::Duration::milliseconds(CAMERA_OFFLINE_AFTER_MS + 1);
+        let long_after = last_frame + Duration::from_millis(CAMERA_OFFLINE_AFTER_MS as u64 + 1);
         assert!(
             !s.is_online(long_after),
             "no frame in over CAMERA_OFFLINE_AFTER_MS must report offline"
         );
+    }
+
+    /// Liveness is measured on the monotonic clock, so a step of the wall
+    /// clock after a camera's last frame neither keeps a silent camera online
+    /// nor takes a live one offline.
+    #[test]
+    fn a_wall_clock_step_moves_no_cameras_liveness() {
+        let reg = FrameStatsRegistry::new();
+        let hour = chrono::Duration::hours(1);
+        // Each camera's last frame was stamped just before the wall clock
+        // stepped: camera 1's before a step back, camera 2's before a step
+        // forward.
+        reg.observe_frame(1, reg.begin_session(1), Utc::now() + hour, 960, 540);
+        reg.observe_frame(2, reg.begin_session(2), Utc::now() - hour, 960, 540);
+        let observed = Instant::now();
+        let silent = observed + Duration::from_millis(CAMERA_OFFLINE_AFTER_MS as u64 + 1);
+        let (one, two) = (reg.snapshot(1).unwrap(), reg.snapshot(2).unwrap());
+        assert_eq!(
+            [one.is_online(silent), two.is_online(observed)],
+            [false, true],
+            "camera 1 silent past the window, camera 2 just observed"
+        );
+        assert!(one.last_frame_age_ms(silent).unwrap() > CAMERA_OFFLINE_AFTER_MS);
+        assert!(two.last_frame_age_ms(observed).unwrap() < 1_000);
     }
 
     /// A camera that has never produced a frame (never spawned, or spawned

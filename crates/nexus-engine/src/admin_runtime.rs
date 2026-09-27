@@ -1082,7 +1082,7 @@ async fn build_snapshot(
                 serde_json::json!({
                     "camera_id": id,
                     "last_frame_at": st.last_frame_at,
-                    "last_frame_age_ms": st.last_frame_age_ms(now),
+                    "last_frame_age_ms": st.last_frame_age_ms(std::time::Instant::now()),
                     "fps_ema": st.fps_ema,
                     "frames_emitted": st.frames_emitted,
                     "frames_dropped": st.frames_dropped,

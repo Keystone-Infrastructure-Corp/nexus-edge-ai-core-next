@@ -1283,7 +1283,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
         // cameras with an active live-view subscriber, which would
         // misreport every unwatched camera as offline. Cheap: an
         // in-memory map read, safe at the 30s heartbeat cadence.
-        let now = chrono::Utc::now();
+        let now = std::time::Instant::now();
         let online_cameras = frame_stats
             .snapshot_all()
             .values()

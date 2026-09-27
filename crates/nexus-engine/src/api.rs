@@ -2785,7 +2785,7 @@ async fn get_camera_stats(
         .frame_stats
         .snapshot(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
-    let now = chrono::Utc::now();
+    let now = std::time::Instant::now();
     Ok(Json(build_camera_stats_view(&s, id, &snap, now)))
 }
 
@@ -2796,7 +2796,7 @@ fn build_camera_stats_view(
     s: &ApiState,
     id: CameraId,
     snap: &nexus_pipeline::CameraFrameStats,
-    now: chrono::DateTime<chrono::Utc>,
+    now: std::time::Instant,
 ) -> CameraFrameStatsView {
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
@@ -2854,7 +2854,7 @@ fn build_camera_stats_view(
 async fn get_all_camera_stats(
     State(s): State<ApiState>,
 ) -> Result<Json<Vec<CameraFrameStatsView>>, ApiError> {
-    let now = chrono::Utc::now();
+    let now = std::time::Instant::now();
     let views = s
         .frame_stats
         .snapshot_all()
