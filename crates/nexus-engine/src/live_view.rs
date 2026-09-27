@@ -632,7 +632,7 @@ mod tests {
             detection_bbox: None,
             age_frames: 3,
             age_ms: 100,
-            attributes: serde_json::Map::new(),
+            attributes: Default::default(),
         }
     }
 

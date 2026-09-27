@@ -290,6 +290,25 @@ fn attributes_are_converted_once_per_object_not_once_per_rule() {
     );
 }
 
+/// Every attribute name is bound to a CEL key without building one per
+/// object: the annotator stamps the same names on every object on every
+/// frame, and building each cost a `String` and an `Arc`. What is left is
+/// the map itself and the values' own strings and lists. The bound sits
+/// under the cost of one name built again on the 4 vehicles of 20 objects
+/// (0.4 per object).
+#[test]
+fn binding_an_objects_attributes_costs_at_most_thirteen_and_a_half_allocations() {
+    let (full, objects) = rule_stage(&never_matching(1), false);
+    let (bare, _) = rule_stage(&never_matching(1), true);
+    let per_object = (full as f64 - bare as f64) / objects as f64;
+    println!("attributes bound: {per_object:.2} allocs/object/frame");
+    assert!(
+        per_object <= 13.5,
+        "binding an object's attributes costs {per_object:.2} allocations per frame; \
+         an attribute name's CEL key is being built per object"
+    );
+}
+
 /// The binding's 13 constant keys (`label`, `box`, `x1`, ...) are built once
 /// and shared. Allocating them per object costs 26 allocations (a `String`
 /// and an `Arc` each); on an object with no attributes, what is left is the

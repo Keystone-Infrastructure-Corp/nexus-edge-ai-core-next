@@ -271,7 +271,6 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use nexus_types::PixelFormat;
-    use serde_json::Map;
 
     // ---- helpers -----------------------------------------------------------
 
@@ -285,7 +284,7 @@ mod tests {
                 x2: cx + 5.0,
                 y2: cy + 5.0,
             },
-            attributes: Map::new(),
+            attributes: Default::default(),
         }
     }
 
@@ -620,7 +619,7 @@ mod tests {
                 x2: 60.0,
                 y2: 80.0,
             },
-            attributes: Map::new(),
+            attributes: Default::default(),
         }];
         let mapped = map_tile_dets_to_frame(&crop_space, roi);
         assert_eq!(mapped.len(), 1);
@@ -686,7 +685,7 @@ mod tests {
                 x2: 245.0,
                 y2: 140.0,
             },
-            attributes: Map::new(),
+            attributes: Default::default(),
         }];
         let parent_dets = map_tile_dets_to_frame(&crop_dets, tile);
         assert_eq!(parent_dets.len(), 1);

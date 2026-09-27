@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use nexus_config::{TrackerBackendKind, TrackerConfig};
 use nexus_tracker::{build_tracker, Tracker};
-use nexus_types::{BBox, Detection, TrackedObject};
+use nexus_types::{Attributes, BBox, Detection, TrackedObject};
 use serde_json::{json, Map, Value};
 
 fn tracker(backend: TrackerBackendKind) -> Box<dyn Tracker> {
@@ -33,7 +33,7 @@ fn det(label: &str, x: f32, attributes: Map<String, Value>) -> Detection {
             x2: x + 40.0,
             y2: 80.0,
         },
-        attributes,
+        attributes: attributes.into_iter().map(|(k, v)| (k.into(), v)).collect(),
     }
 }
 
@@ -75,7 +75,7 @@ fn both_trackers_carry_this_frames_detection_attributes() {
                 a.attributes, d.attributes,
                 "frame {i}: iou-naive copies them"
             );
-            let detector_keys: Map<String, Value> = b
+            let detector_keys: Attributes = b
                 .attributes
                 .iter()
                 .filter(|(k, _)| !k.starts_with("tracking."))

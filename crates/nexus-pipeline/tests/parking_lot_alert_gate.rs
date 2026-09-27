@@ -124,7 +124,7 @@ fn object(track_id: u64, label: &str, cx: f32, cy: f32) -> TrackedObject {
         detection_bbox: Some(bbox),
         age_frames: 10,
         age_ms: 1000,
-        attributes: serde_json::Map::new(),
+        attributes: Default::default(),
     }
 }
 
@@ -216,7 +216,7 @@ fn rules_engine_honours_the_epoch_key_produced_by_the_tracker() {
     let mut ev = Sim::new(None, &[rule_for("vehicle.car", 0)]);
     let mut o = object(7, "vehicle.car", 500.0, 500.0);
     o.attributes
-        .insert(ALERT_EPOCH_ATTRIBUTE_KEY.to_string(), serde_json::json!(0));
+        .insert(ALERT_EPOCH_ATTRIBUTE_KEY.into(), serde_json::json!(0));
 
     let first = ev.step(vec![o.clone()]);
     let second = ev.step(vec![o]);

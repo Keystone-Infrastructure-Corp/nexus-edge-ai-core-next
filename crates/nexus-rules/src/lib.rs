@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -148,6 +149,31 @@ static OBJECT_KEYS: LazyLock<[Key; 7]> = LazyLock::new(|| {
     .map(Key::from)
 });
 
+/// Most attribute names a thread keeps a built `Key` for. The names are data,
+/// so the table stops growing here; a name past it gets a `Key` of its own
+/// per object, as every name did before.
+const ATTRIBUTE_KEYS_MAX: usize = 256;
+
+thread_local! {
+    /// The attribute names this thread has bound, each built into a `Key`
+    /// once. The annotator stamps the same names on every object on every
+    /// frame, and each `Key::from` allocates a `String` and an `Arc`. Per
+    /// thread rather than shared: a `Key` every camera thread cloned would
+    /// put all their refcount traffic on one cache line.
+    static ATTRIBUTE_KEYS: RefCell<HashMap<String, Key>> = RefCell::new(HashMap::new());
+}
+
+fn attribute_key(keys: &mut HashMap<String, Key>, name: &str) -> Key {
+    if let Some(key) = keys.get(name) {
+        return key.clone();
+    }
+    let key = Key::from(name);
+    if keys.len() < ATTRIBUTE_KEYS_MAX {
+        keys.insert(name.to_owned(), key.clone());
+    }
+    key
+}
+
 /// Bind an object for CEL straight from its typed fields. Produces exactly
 /// what the former `json!` -> `serde_json::Value` -> CEL round trip did (see
 /// the differential test), without building the intermediate tree.
@@ -164,11 +190,12 @@ fn object_to_cel(o: &TrackedObject) -> CelValue {
             f32_to_cel(b.height()),
         ],
     );
-    let attributes: HashMap<Key, CelValue> = o
-        .attributes
-        .iter()
-        .map(|(k, v)| (Key::from(k.clone()), json_to_cel(v)))
-        .collect();
+    let attributes: HashMap<Key, CelValue> = ATTRIBUTE_KEYS.with_borrow_mut(|keys| {
+        o.attributes
+            .iter()
+            .map(|(k, v)| (attribute_key(keys, k), json_to_cel(v)))
+            .collect()
+    });
     cel_map(
         &OBJECT_KEYS,
         [
@@ -1316,7 +1343,7 @@ mod tests {
             age_frames: 42,
             age_ms: 1_234,
             attributes: match attributes {
-                JsonValue::Object(m) => m,
+                JsonValue::Object(m) => m.into_iter().map(|(k, v)| (k.into(), v)).collect(),
                 other => panic!("fixture attributes must be an object, got {other}"),
             },
         }
@@ -1405,15 +1432,42 @@ mod tests {
         v
     }
 
+    /// The second pass binds every attribute name from this thread's table
+    /// of built keys rather than building it.
     #[test]
     fn direct_binding_matches_the_json_round_trip_exactly() {
-        for o in binding_fixtures() {
+        for pass in 0..2 {
+            for o in binding_fixtures() {
+                assert_same_cel(
+                    &object_to_cel(&o),
+                    &reference_object_to_cel(&o),
+                    &format!("pass {pass}: object[track {}]", o.track_id),
+                );
+            }
+        }
+    }
+
+    /// Attribute names are data, so the table of built keys is bounded. A
+    /// name past the cap still binds, with a key of its own.
+    #[test]
+    fn the_attribute_key_table_stops_growing_at_its_cap() {
+        let b = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 1.0,
+            y2: 1.0,
+        };
+        for i in 0..ATTRIBUTE_KEYS_MAX + 10 {
+            let mut attributes = serde_json::Map::new();
+            attributes.insert(format!("name-{i}"), i.into());
+            let o = binding_fixture(1, "x", 0.5, b, JsonValue::Object(attributes));
             assert_same_cel(
                 &object_to_cel(&o),
                 &reference_object_to_cel(&o),
-                &format!("object[track {}]", o.track_id),
+                &format!("name-{i}"),
             );
         }
+        assert_eq!(ATTRIBUTE_KEYS.with_borrow(HashMap::len), ATTRIBUTE_KEYS_MAX);
     }
 
     /// The 13 constant keys are shared, not built per object. CEL resolves a

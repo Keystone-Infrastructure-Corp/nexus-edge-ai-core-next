@@ -7,8 +7,8 @@
 //! reserved for diagnostics.
 //!
 //! Why MessagePack + a pipe?
-//! - `Detection.attributes` is `serde_json::Map<String, Value>` with
-//!   `#[serde(skip_serializing_if = "Map::is_empty")]`. Non-self-describing
+//! - `Detection.attributes` is a map of `serde_json::Value`s with
+//!   `#[serde(skip_serializing_if = "BTreeMap::is_empty")]`. Non-self-describing
 //!   formats (bincode) can't round-trip that field, because skipping a
 //!   field has no on-wire marker. MessagePack tags each field, so the
 //!   deserializer correctly applies `#[serde(default)]` when the field

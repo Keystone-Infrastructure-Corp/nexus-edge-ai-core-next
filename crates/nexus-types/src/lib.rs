@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -273,6 +274,17 @@ impl From<&TrackedObject> for TrackLite {
 // Detection + tracking
 // ---------------------------------------------------------------------------
 
+/// A detection's or tracked object's attributes, name to JSON value.
+///
+/// Names are `Cow<'static, str>` so the constant names the tracker, the
+/// annotator and the static filter stamp on every object on every frame are
+/// borrowed rather than allocated (`"motion.speed_class".into()` is a
+/// `Cow::Borrowed`). A name read from JSON or msgpack is owned, so any string
+/// is accepted. Held in name order, it serializes exactly as the
+/// `serde_json::Map<String, Value>` it replaced (the workspace does not enable
+/// serde_json's `preserve_order`, so that map is a `BTreeMap` too).
+pub type Attributes = BTreeMap<Cow<'static, str>, serde_json::Value>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "ts",
@@ -286,9 +298,9 @@ pub struct Detection {
     /// Optional per-detection attributes from the backend (e.g. open-vocab
     /// auxiliary scores). Kept opaque so backends can extend without
     /// schema migrations.
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[cfg_attr(feature = "ts", ts(type = "Record<string, unknown>"))]
-    pub attributes: serde_json::Map<String, serde_json::Value>,
+    pub attributes: Attributes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,9 +328,9 @@ pub struct TrackedObject {
     /// seen on, so a step of the wall clock does not move it.
     pub age_ms: u64,
     /// Tracker + annotator outputs (motion.speed_class, dwell.zone_state, …).
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[cfg_attr(feature = "ts", ts(type = "Record<string, unknown>"))]
-    pub attributes: serde_json::Map<String, serde_json::Value>,
+    pub attributes: Attributes,
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,7 +1233,7 @@ mod tests {
 
     #[test]
     fn track_lite_from_tracked_object_drops_attributes_and_derives_lifecycle() {
-        let mut attrs = serde_json::Map::new();
+        let mut attrs = Attributes::new();
         attrs.insert("motion.speed_class".into(), serde_json::json!("running"));
         attrs.insert("group.size".into(), serde_json::json!(7));
         let new_obj = TrackedObject {

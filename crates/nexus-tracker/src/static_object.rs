@@ -426,7 +426,7 @@ impl StaticObjectFilter {
         for (o, suppress) in objects.iter_mut().zip(suppress_verdict.iter().copied()) {
             if suppress {
                 o.attributes
-                    .insert(STATIC_ATTRIBUTE_KEY.to_string(), Value::Bool(true));
+                    .insert(STATIC_ATTRIBUTE_KEY.into(), Value::Bool(true));
             }
             if self.is_anchor_eligible(&o.label) {
                 if let Some(state) = self.state_by_track.get(&o.track_id) {
@@ -435,18 +435,18 @@ impl StaticObjectFilter {
                     // never be either but be defensive.
                     if let Some(n) = serde_json::Number::from_f64(state.movement_ema) {
                         o.attributes
-                            .insert(EMA_ATTRIBUTE_KEY.to_string(), Value::Number(n));
+                            .insert(EMA_ATTRIBUTE_KEY.into(), Value::Number(n));
                     }
                     o.attributes.insert(
-                        STATIC_FRAMES_ATTRIBUTE_KEY.to_string(),
+                        STATIC_FRAMES_ATTRIBUTE_KEY.into(),
                         Value::Number(state.static_frames.into()),
                     );
                     o.attributes.insert(
-                        MOVING_FRAMES_ATTRIBUTE_KEY.to_string(),
+                        MOVING_FRAMES_ATTRIBUTE_KEY.into(),
                         Value::Number(state.moving_consecutive_frames.into()),
                     );
                     o.attributes.insert(
-                        ALERT_EPOCH_ATTRIBUTE_KEY.to_string(),
+                        ALERT_EPOCH_ATTRIBUTE_KEY.into(),
                         Value::Number(state.alert_epoch.into()),
                     );
                 }
@@ -678,7 +678,7 @@ mod tests {
             detection_bbox: None,
             age_frames: 1,
             age_ms: 33,
-            attributes: serde_json::Map::new(),
+            attributes: Default::default(),
         }
     }
 
@@ -700,7 +700,7 @@ mod tests {
             detection_bbox: None,
             age_frames: 1,
             age_ms: 33,
-            attributes: serde_json::Map::new(),
+            attributes: Default::default(),
         }
     }
 

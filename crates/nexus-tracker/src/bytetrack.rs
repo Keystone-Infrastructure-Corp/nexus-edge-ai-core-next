@@ -31,7 +31,7 @@
 use std::time::Instant;
 
 use nexus_config::ByteTrackConfig;
-use nexus_types::{BBox, Detection, TrackId, TrackedObject};
+use nexus_types::{Attributes, BBox, Detection, TrackId, TrackedObject};
 use parking_lot::Mutex;
 use serde_json::json;
 
@@ -63,7 +63,7 @@ struct TrackState {
     /// The attributes of the detection this track matched on the current
     /// frame, moved into the emitted object. Empty on a predicted-only
     /// frame, like `detection_bbox`: there is no detection to describe.
-    attributes: serde_json::Map<String, serde_json::Value>,
+    attributes: Attributes,
 }
 
 struct ByteTrackState {

@@ -221,6 +221,32 @@ fn emitter_refreshes_its_snapshot_without_cloning_every_frame() {
     }
 }
 
+/// The tracker, annotator and static filter stamp compile-time-constant
+/// attribute names on every track on every frame: four `tracking.*`, six or
+/// seven `motion.*` / `group.*`, and on anchor-eligible tracks up to five
+/// `tracker.*`. The emitter copies them into each Born and Updated decision.
+/// The names are borrowed, not built. Each bound sits 0.1 above the measured
+/// cost, so one name that allocates again fails it even when only the 4
+/// vehicles of 20 tracks carry it (0.2 per track per frame), as does a
+/// decision whose names are built again (0.33).
+#[test]
+fn constant_attribute_names_cost_the_tracker_chain_no_allocation() {
+    let [track, annotate, _, emit] = run(false, &zones());
+    let [_, _, classify, _] = run(true, &zones());
+    for (stage, cost, bound) in [
+        ("track", track, 3.5),
+        ("annotate", annotate, 8.55),
+        ("classify", classify, 2.75),
+        ("emit", emit, 0.43),
+    ] {
+        assert!(
+            cost <= bound,
+            "{stage} costs {cost:.2} allocations per track per frame (bound {bound}); \
+             a constant attribute name is being allocated per object"
+        );
+    }
+}
+
 #[test]
 fn a_zone_the_object_is_not_in_costs_the_annotator_no_allocation() {
     let mut more = zones();

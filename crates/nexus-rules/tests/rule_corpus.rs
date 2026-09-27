@@ -49,7 +49,7 @@
 
 use nexus_config::{RuleConfig, RulesBackendKind, RulesConfig};
 use nexus_rules::{CelEngine, RuleEngine, RuleEvaluator};
-use nexus_types::{BBox, CameraId, TrackedObject};
+use nexus_types::{Attributes, BBox, CameraId, TrackedObject};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -260,7 +260,7 @@ struct ObjectBuilder {
     age_ms: u64,
     age_frames: u32,
     track_id: u64,
-    attributes: serde_json::Map<String, serde_json::Value>,
+    attributes: Attributes,
 }
 
 impl ObjectBuilder {
@@ -296,7 +296,7 @@ impl ObjectBuilder {
         self
     }
 
-    fn attr(mut self, key: &str, value: serde_json::Value) -> Self {
+    fn attr(mut self, key: &'static str, value: serde_json::Value) -> Self {
         self.attributes.insert(key.into(), value);
         self
     }

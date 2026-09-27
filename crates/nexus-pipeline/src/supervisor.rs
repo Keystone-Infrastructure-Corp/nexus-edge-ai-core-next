@@ -1601,7 +1601,7 @@ async fn insert_motion_decision(
         "{}".to_string()
     } else {
         serde_json::to_string(&d.attributes)
-            .expect("serde_json::Map<String, Value> is infallible to serialize")
+            .expect("string-keyed JSON attributes are infallible to serialize")
     };
     let new = NewMotionEvent {
         camera_id: d.camera_id,
@@ -1622,7 +1622,7 @@ mod tests {
     use super::*;
 
     fn track(id: u64, is_static: bool) -> TrackedObject {
-        let mut attributes = serde_json::Map::new();
+        let mut attributes = nexus_types::Attributes::new();
         if is_static {
             attributes.insert(
                 nexus_tracker::STATIC_ATTRIBUTE_KEY.into(),

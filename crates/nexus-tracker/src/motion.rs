@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use nexus_types::{BBox, CameraId, TrackId, TrackedObject};
+use nexus_types::{Attributes, BBox, CameraId, TrackId, TrackedObject};
 
 /// Lifecycle kind for a [`MotionDecision`]. Mirrors
 /// `nexus_store::MotionEventKind` deliberately so the supervisor's
@@ -60,7 +60,7 @@ pub struct MotionDecision {
     /// moment of the lifecycle event. Cloned so the supervisor's
     /// downstream mutation of the live `TrackedObject` doesn't
     /// rewrite history.
-    pub attributes: serde_json::Map<String, serde_json::Value>,
+    pub attributes: Attributes,
 }
 
 /// Per-track bookkeeping kept alive between frames so Died can carry
@@ -78,7 +78,7 @@ struct TrackSnapshot {
     last_bbox: BBox,
     last_label: String,
     last_confidence: f32,
-    last_attributes: serde_json::Map<String, serde_json::Value>,
+    last_attributes: Attributes,
 }
 
 /// Shared state for one camera's open tracks.
@@ -252,10 +252,7 @@ impl MotionEventEmitter {
 
 /// Make `dst` equal to `src`, keeping `dst`'s keys and string / array
 /// buffers wherever they already fit.
-fn assign_attributes(
-    dst: &mut serde_json::Map<String, serde_json::Value>,
-    src: &serde_json::Map<String, serde_json::Value>,
-) {
+fn assign_attributes(dst: &mut Attributes, src: &Attributes) {
     dst.retain(|k, _| src.contains_key(k));
     for (k, v) in src {
         match dst.get_mut(k) {
@@ -330,7 +327,7 @@ mod tests {
     }
 
     fn tobj(id: TrackId, label: &str) -> TrackedObject {
-        let mut attrs = serde_json::Map::new();
+        let mut attrs = Attributes::new();
         attrs.insert("tracking.hit_streak".into(), json!(3));
         TrackedObject {
             track_id: id,
@@ -471,7 +468,7 @@ mod tests {
         ];
         for (i, attrs) in frames.iter().enumerate() {
             let mut o = tobj(1, "person");
-            o.attributes = attrs.as_object().unwrap().clone();
+            o.attributes = serde_json::from_value(attrs.clone()).unwrap();
             tick_at(
                 &mut em,
                 7,
@@ -483,7 +480,7 @@ mod tests {
         assert_eq!(died.len(), 1);
         assert_eq!(died[0].kind, MotionKind::Died);
         assert_eq!(
-            serde_json::Value::Object(died[0].attributes.clone()),
+            serde_json::to_value(&died[0].attributes).unwrap(),
             json!({"added": {"n": true}, "flip": 7.5, "grow": [1, "two", [3]], "late": "x",
                    "speed": "w", "zones": []})
         );
