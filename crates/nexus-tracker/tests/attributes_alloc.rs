@@ -6,6 +6,9 @@
 //! annotator spend building it). It now refreshes the snapshot in place, so
 //! a steady-state frame costs well under two allocations per track.
 //!
+//! The annotator's per-track zone flags persist across frames the same way,
+//! so a zone the object is not in costs it no allocation per frame.
+//!
 //! Driven by the real ByteTrack -> annotator -> static-filter chain over N
 //! frames with M tracks. Counting is per thread (`#[global_allocator]` +
 //! thread-locals), so the numbers are deterministic.
@@ -148,7 +151,7 @@ fn zones() -> Vec<ZoneConfig> {
 }
 
 /// Allocations per track per frame for (track, annotate, classify, emit).
-fn run(parking_lot_mode: bool) -> [f64; 4] {
+fn run(parking_lot_mode: bool, zones: &[ZoneConfig]) -> [f64; 4] {
     let tracker = ByteTrackTracker::new(ByteTrackConfig::default());
     let mut annotator = TrackAnnotator::new(AnnotatorConfig::default());
     let mut sf = parking_lot_mode.then(|| {
@@ -162,7 +165,6 @@ fn run(parking_lot_mode: bool) -> [f64; 4] {
         )
     });
     let mut emitter = MotionEventEmitter::new(1.0);
-    let zones = zones();
     let mut stage = [0u64; 4];
     let mut tracks = 0u64;
 
@@ -174,7 +176,7 @@ fn run(parking_lot_mode: bool) -> [f64; 4] {
             .as_ref()
             .map(|s| s.anchors().to_vec())
             .unwrap_or_default();
-        let ((), b) = allocs(|| annotator.annotate(&f, &zones, &anchors, &mut tracked));
+        let ((), b) = allocs(|| annotator.annotate(&f, zones, &anchors, &mut tracked));
         let ((), c) = allocs(|| {
             if let Some(s) = sf.as_mut() {
                 s.classify(&f, &mut tracked);
@@ -192,9 +194,13 @@ fn run(parking_lot_mode: bool) -> [f64; 4] {
     }
     let per = stage.map(|s| s as f64 / tracks as f64);
     println!(
-        "parking_lot_mode={parking_lot_mode}: allocs/track/frame track {:.2} annotate {:.2} \
-         classify {:.2} emit {:.2}",
-        per[0], per[1], per[2], per[3]
+        "parking_lot_mode={parking_lot_mode} zones={}: allocs/track/frame track {:.2} \
+         annotate {:.2} classify {:.2} emit {:.2}",
+        zones.len(),
+        per[0],
+        per[1],
+        per[2],
+        per[3]
     );
     per
 }
@@ -202,11 +208,31 @@ fn run(parking_lot_mode: bool) -> [f64; 4] {
 #[test]
 fn emitter_refreshes_its_snapshot_without_cloning_every_frame() {
     for parking_lot_mode in [false, true] {
-        let emit = run(parking_lot_mode)[3];
+        let emit = run(parking_lot_mode, &zones())[3];
         assert!(
             emit <= 2.0,
             "motion emitter costs {emit:.2} allocations per track per frame \
              (parking_lot_mode={parking_lot_mode}); the per-frame snapshot is being cloned"
         );
     }
+}
+
+#[test]
+fn a_zone_the_object_is_not_in_costs_the_annotator_no_allocation() {
+    let mut more = zones();
+    for i in 0..4 {
+        more.push(ZoneConfig {
+            id: format!("offscreen-{i}"),
+            name: format!("Offscreen {i}"),
+            polygon: vec![(0.0, 2.0), (1.0, 2.0), (1.0, 3.0), (0.0, 3.0)],
+            kind: ZoneKind::Inclusion,
+            min_bbox_area_px_override: None,
+        });
+    }
+    let per_zone = (run(false, &more)[1] - run(false, &zones())[1]) / 4.0;
+    assert!(
+        per_zone <= 0.05,
+        "each zone no object is in costs the annotator {per_zone:.2} allocations per track \
+         per frame; its per-track flag is being re-keyed every frame"
+    );
 }

@@ -286,8 +286,15 @@ impl TrackAnnotator {
                     center.1 / frame_h.max(1.0),
                     &zone.polygon,
                 );
-                let inside_prev = state.inside_by_zone.get(&zone.id).copied().unwrap_or(false);
-                state.inside_by_zone.insert(zone.id.clone(), inside_now);
+                // Update the flag in place: re-inserting would allocate the
+                // zone id for every track on every frame.
+                let inside_prev = match state.inside_by_zone.get_mut(&zone.id) {
+                    Some(inside) => std::mem::replace(inside, inside_now),
+                    None => {
+                        state.inside_by_zone.insert(zone.id.clone(), inside_now);
+                        false
+                    }
+                };
 
                 if inside_now {
                     inside_zone_ids.push(zone.id.clone());
@@ -711,6 +718,21 @@ mod tests {
         let mut o = vec![obj(1, "person", 1700.0, 100.0)];
         a.annotate(&frame_at(3, 1920, 1080), &zones, &[], &mut o);
         assert_eq!(o[0].attributes["motion.zone_state"], "exiting");
+    }
+
+    #[test]
+    fn a_track_first_seen_inside_a_zone_is_entering() {
+        let mut a = TrackAnnotator::new(AnnotatorConfig::default());
+        let zones = vec![ZoneConfig {
+            id: "z1".into(),
+            name: "z1".into(),
+            polygon: vec![(0.0, 0.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5)],
+            kind: ZoneKind::Inclusion,
+            min_bbox_area_px_override: None,
+        }];
+        let mut o = vec![obj(1, "person", 200.0, 200.0)];
+        a.annotate(&frame_at(0, 1920, 1080), &zones, &[], &mut o);
+        assert_eq!(o[0].attributes["motion.zone_state"], "entering");
     }
 
     #[test]
