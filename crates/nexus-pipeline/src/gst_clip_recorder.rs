@@ -3485,6 +3485,58 @@ mod tests {
         );
     }
 
+    /// While a substream stays refused, each pass's retry is given up in turn
+    /// and the next pass registers another. A give-up must leave the source
+    /// watching the registry, so the next retry's session is read beside the
+    /// main stream and taken up once it delivers. A source that kept the
+    /// given-up session would judge the dead one on every tick and never look
+    /// again: each later retry would reconnect, or decode with no reader, for
+    /// the life of the camera, and analysis would stay on the main stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_registered_after_a_give_up_is_watched_and_taken_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, mut frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        let given_up = rec.analysis_ingesters.read()[&7].clone();
+        let gave_up = within(35.0, || given_up.is_shutdown());
+        // The next pass's retry.
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("the next retry registers");
+        let retry = rec.analysis_ingesters.read()[&7].clone();
+        let tap = retry.rgb_tap_sender().expect("rgb tap");
+        let watched = within(7.0, || tap.receiver_count() > 0);
+        let _ = tap.send(rgb_frame());
+        let delivered = tokio::time::timeout(Duration::from_millis(2500), frames.recv())
+            .await
+            .is_ok_and(|f| f.is_some());
+        let valved = main.rgb_valve_is_closed();
+
+        task.abort();
+        given_up.shutdown();
+        retry.shutdown();
+        main.shutdown();
+        assert!(
+            gave_up,
+            "precondition: the source never gave the first retry's silent session up"
+        );
+        assert!(
+            !Arc::ptr_eq(&given_up, &retry),
+            "the next retry must start a new session"
+        );
+        assert!(
+            watched,
+            "the source never watched the retry registered after it gave one up"
+        );
+        assert!(
+            delivered && valved,
+            "the next retry's session delivered, and the source did not take it up \
+             (frame delivered: {delivered}, main valve closed: {valved})"
+        );
+    }
+
     /// SPEC-069's retry from the state it exists for: a source that started
     /// on its substream session, fell back from it, and has analysed the main
     /// stream since. The session it fell back from stays in the recorder's
