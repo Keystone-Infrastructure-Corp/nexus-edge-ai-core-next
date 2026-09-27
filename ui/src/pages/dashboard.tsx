@@ -48,6 +48,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkline } from "@/components/ui/sparkline";
 import { useSSE } from "@/hooks/useSSE";
+import { engineHealth, issueCodes } from "@/lib/engineHealth";
 import { ageMs, formatAgo, formatBytes, formatDuration } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/pages/placeholder";
@@ -159,7 +160,7 @@ export function DashboardPage() {
   }, [metricsQuery.data]);
 
   const cameras = camerasQuery.data ?? [];
-  const healthOk = healthQuery.data?.status === "ok";
+  const engine = engineHealth(healthQuery);
 
   // System sparkline cards: CPU + Memory + Inference are always
   // shown; GPU and NPU are added when the host reports them. Pick a
@@ -213,13 +214,64 @@ export function DashboardPage() {
         <KpiCard
           icon={<HeartPulse className="h-4 w-4" />}
           label="Engine"
-          value={healthOk ? "OK" : healthQuery.isError ? "ERROR" : "…"}
-          hint={
-            healthQuery.data?.version ? `v${healthQuery.data.version}` : ""
+          value={
+            engine.verdict === "ok"
+              ? "OK"
+              : engine.verdict === "degraded"
+                ? "DEGRADED"
+                : engine.verdict === "unreachable"
+                  ? "ERROR"
+                  : "…"
           }
-          accent={healthOk ? "success" : healthQuery.isError ? "destructive" : "default"}
+          hint={
+            engine.verdict === "degraded"
+              ? `${issueCodes(engine.read.issues)} · v${engine.read.version}`
+              : healthQuery.data?.version
+                ? `v${healthQuery.data.version}`
+                : ""
+          }
+          accent={
+            engine.verdict === "ok"
+              ? "success"
+              : engine.verdict === "degraded"
+                ? "warning"
+                : engine.verdict === "unreachable"
+                  ? "destructive"
+                  : "default"
+          }
         />
       </div>
+
+      {engine.verdict === "degraded" ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base text-warning">
+              <AlertTriangle className="h-4 w-4" />
+              Engine degraded
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ul className="flex flex-col gap-2">
+              {engine.read.issues.map((issue, i) => (
+                <li key={`${issue.component}:${issue.code}:${i}`} className="text-sm">
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-medium">{issue.component}</span>
+                    {/* Verbatim: a code this UI has no copy for still shows. */}
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {issue.code}
+                    </span>
+                  </div>
+                  {issue.detail ? (
+                    <div className="mt-0.5 text-xs text-muted-foreground">
+                      {issue.detail}
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         {/* Cameras at a glance -------------------------------------- */}

@@ -774,9 +774,22 @@ export interface BackendsResponse {
 // Health (GET /api/v1/health).
 // ---------------------------------------------------------------------------
 
+/** One open loss-of-function condition, as `health_body` in api.rs builds it. */
+export interface HealthIssue {
+  component: string;
+  /** Stable machine-readable cause. Render unknown codes verbatim. */
+  code: string;
+  /** Detector issues only: the detector kind that failed to build. */
+  kind?: string;
+  /** Operator-facing explanation. Absent when the engine withholds it. */
+  detail?: string;
+}
+
 export interface HealthResponse {
+  /** `"ok"`, or `"degraded"` when `issues` is non-empty. */
   status: string;
   version: string;
+  issues: HealthIssue[];
 }
 
 // ---------------------------------------------------------------------------

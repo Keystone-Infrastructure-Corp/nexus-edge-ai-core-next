@@ -10,15 +10,12 @@ import { useState } from "react";
 
 import { api } from "@/api/client";
 import { authApi } from "@/api/auth";
+import { getHealth } from "@/api/system";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useAuth, useSession } from "@/lib/auth";
+import { engineHealth, issueCodes } from "@/lib/engineHealth";
 import { cn } from "@/lib/utils";
-
-interface HealthResponse {
-  status: string;
-  version?: string;
-}
 
 interface CloudStatusResponse {
   enrolled: boolean;
@@ -32,7 +29,7 @@ export function TopBar() {
 
   const health = useQuery({
     queryKey: ["health"],
-    queryFn: () => api.get<HealthResponse>("/health"),
+    queryFn: getHealth,
     refetchInterval: 10_000,
     retry: 1,
   });
@@ -53,17 +50,29 @@ export function TopBar() {
     },
   });
 
-  const isHealthy = health.data?.status === "ok" || health.data?.status === "healthy";
-  const healthVariant = health.isError
-    ? "destructive"
-    : isHealthy
-      ? "success"
-      : "warning";
-  const healthLabel = health.isError
-    ? "engine unreachable"
-    : isHealthy
-      ? `online \u2022 ${health.data?.version ?? "?"}`
-      : "starting\u2026";
+  const engine = engineHealth(health);
+  const healthVariant =
+    engine.verdict === "unreachable"
+      ? "destructive"
+      : engine.verdict === "ok"
+        ? "success"
+        : "warning";
+  const healthLabel =
+    engine.verdict === "unreachable"
+      ? "engine unreachable"
+      : engine.verdict === "unread"
+        ? "starting\u2026"
+        : engine.verdict === "ok"
+          ? `online \u2022 ${engine.read.version}`
+          : `degraded \u2022 ${issueCodes(engine.read.issues)}`;
+  // Hover text for a degraded pill: every issue, with its detail when the
+  // engine sent one.
+  const healthTitle =
+    engine.verdict === "degraded"
+      ? engine.read.issues
+          .map((i) => (i.detail ? `${i.code}: ${i.detail}` : i.code))
+          .join("\n")
+      : undefined;
 
   // Cloud-tunnel pill — three observable states (plus a fourth for
   // transient errors), mapped to the same Badge variants used by
@@ -90,7 +99,7 @@ export function TopBar() {
           <ShieldCheck className="h-4 w-4" />
         </div>
         <div className="text-sm font-semibold tracking-tight">Nexus Edge AI</div>
-        <Badge variant={healthVariant} className="ml-2">
+        <Badge variant={healthVariant} className="ml-2" title={healthTitle}>
           {healthLabel}
         </Badge>
         <Badge variant={cloudVariant} className="ml-2">
