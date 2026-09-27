@@ -104,6 +104,57 @@ test.describe("cameras", () => {
     await expect(page.getByText(/^Analysis \d/)).toHaveCount(0);
   });
 
+  // The crowd-downscale rungs are the ones below the detector input, which a
+  // camera with no model override takes from the same catalog. While it is
+  // unread, the picker still shows the camera's saved rung, not "Off".
+  test("a saved crowd-downscale rung is shown while the default model is unread", async ({
+    page,
+  }) => {
+    await page.goto("/cameras");
+    const id = await page.evaluate(async () => {
+      const s = JSON.parse(localStorage.getItem("nexus_session") ?? "{}");
+      const r = await fetch("/api/v1/cameras", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${s.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: 0,
+          name: "e2e crowd rung",
+          url: "rtsp://127.0.0.1:9/e2e",
+          codec: "h264",
+          enabled: false,
+          detector_downscale_to_width: 512,
+          detector_downscale_to_height: 288,
+        }),
+      });
+      if (!r.ok) throw new Error(`create camera: HTTP ${r.status}`);
+      return ((await r.json()) as { id: number }).id;
+    });
+    try {
+      const release = await holdPromptsCatalog(page);
+      await page.goto(`/cameras/${id}`);
+
+      await expect(page.locator("#downscale-target")).toHaveValue("512");
+      await expect(
+        page.getByText("Reading the engine's default model…"),
+      ).toBeVisible();
+
+      release();
+      await expect(page.getByText(/^Analysis 1024 × 576 · /)).toBeVisible();
+      await expect(page.locator("#downscale-target")).toHaveValue("512");
+    } finally {
+      await page.evaluate(async (camId) => {
+        const s = JSON.parse(localStorage.getItem("nexus_session") ?? "{}");
+        await fetch(`/api/v1/cameras/${camId}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${s.access_token}` },
+        });
+      }, id);
+    }
+  });
+
   test("discover sheet opens", async ({ page }) => {
     await page.goto("/cameras");
     await page.getByRole("button", { name: /discover/i }).click();
@@ -112,3 +163,4 @@ test.describe("cameras", () => {
     await page.getByRole("button", { name: /cidr scan/i }).click();
     await expect(page.getByPlaceholder(/192\.168\.1\.0\/24/i)).toBeVisible();
   });
+});

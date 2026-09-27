@@ -1193,8 +1193,12 @@ function CameraEditor({
               className="rounded-md border border-border bg-background px-2 py-1 text-sm"
             >
               <option value="">Off — always full-res</option>
-              {SHAPE_LADDER.filter(
-                (s) => modelInput && s.w < modelInput.w,
+              {/* Until the detector input is read, offer only the saved
+                  rung, so a saved value is not shown as "Off". */}
+              {SHAPE_LADDER.filter((s) =>
+                modelInput
+                  ? s.w < modelInput.w
+                  : s.w === draft.detector_downscale_to_width,
               ).map((s) => (
                 <option key={s.w} value={String(s.w)}>
                   {s.tier} — {s.w} × {s.h}
