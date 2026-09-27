@@ -1499,10 +1499,10 @@ async fn upsert_camera(
     // becomes hot we'd switch to a `get_camera(id)` shortcut.
     let before = s
         .store
-        .list_cameras()
+        .list_readable_cameras()
         .await
         .ok()
-        .and_then(|all| all.into_iter().find(|c| c.id == id));
+        .and_then(|(all, _)| all.into_iter().find(|c| c.id == id));
     let after_str = camera_audit_json(&cam);
     let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
@@ -1681,10 +1681,10 @@ async fn delete_camera(
 ) -> Result<StatusCode, ApiError> {
     let before = s
         .store
-        .list_cameras()
+        .list_readable_cameras()
         .await
         .ok()
-        .and_then(|all| all.into_iter().find(|c| c.id == id));
+        .and_then(|(all, _)| all.into_iter().find(|c| c.id == id));
     let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
     // M6 Phase 4 Step 4.1 (tx-merge) — see upsert_camera.
@@ -8867,6 +8867,73 @@ mod tests {
             "engine should have stamped a server-assigned id; got {:?}",
             cam["id"]
         );
+    }
+
+    /// While one camera's row cannot be read, an edit or a delete of another
+    /// camera still records what that camera was before. The pre-state read
+    /// needed every row, so while any one could not be read every camera
+    /// edit was audited as a create and every delete as the deletion of
+    /// nothing.
+    #[tokio::test]
+    async fn a_camera_change_keeps_its_audit_before_state_while_another_row_is_unreadable() {
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mut camera = store.list_cameras().await.expect("list cameras")[0].clone();
+        let mut other = camera.clone();
+        other.id += 1;
+        store
+            .upsert_camera(&other)
+            .await
+            .expect("store a second camera");
+        sqlx::query(
+            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = ?",
+        )
+        .bind(other.id)
+        .execute(store.pool())
+        .await
+        .expect("give the second camera a codec this build cannot read");
+        camera.name = "renamed".to_string();
+        let app = super::router(state);
+        let uri = format!("/api/v1/cameras/{}", camera.id);
+        for (method, body) in [
+            (
+                Method::PUT,
+                Body::from(serde_json::to_string(&camera).unwrap()),
+            ),
+            (Method::DELETE, Body::empty()),
+        ] {
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert!(
+                res.status().is_success(),
+                "{method} {uri}: {}",
+                res.status()
+            );
+        }
+
+        let rows = store
+            .list_audit_for_resource("camera", &camera.id.to_string(), 10)
+            .await
+            .expect("read the camera's audit rows");
+        for (action, was) in [("camera.upsert", "Virtual"), ("camera.delete", "renamed")] {
+            let before = rows
+                .iter()
+                .find(|e| e.action == action)
+                .unwrap_or_else(|| panic!("a {action} audit row: {rows:?}"))
+                .before_json
+                .as_deref()
+                .unwrap_or_default();
+            assert!(
+                before.contains(&format!("\"name\":\"{was}\"")),
+                "{action} must record the camera it changed: {before:?}",
+            );
+        }
     }
 
     /// A camera write cannot store a number JSON has no literal for. `1e39`

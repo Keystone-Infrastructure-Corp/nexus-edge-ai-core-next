@@ -471,10 +471,11 @@ impl Store {
     /// [`Store::list_cameras`], decoded row by row: the cameras this build
     /// can read, and the ids of the rows it cannot (one a newer release wrote
     /// with a value this build has no variant for, say), each logged.
-    /// `list_cameras` fails on such a row. Boot, the reconciler and the
-    /// health roll-up read with this, so that the other cameras run; a caller
-    /// that must not drop a camera keeps `list_cameras`, as the cloud roster
-    /// does, since a camera absent from it is removed cloud-side.
+    /// `list_cameras` fails on such a row. Boot, the reconciler, the health
+    /// roll-up and a camera change's audit pre-state read with this, so that
+    /// the other cameras run; a caller that must not drop a camera keeps
+    /// `list_cameras`, as the cloud roster does, since a camera absent from
+    /// it is removed cloud-side.
     pub async fn list_readable_cameras(
         &self,
     ) -> Result<(Vec<CameraConfig>, Vec<CameraId>), StoreError> {
