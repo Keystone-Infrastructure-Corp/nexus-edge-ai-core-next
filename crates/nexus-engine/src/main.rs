@@ -880,6 +880,12 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // inbound lbr_subscribe / lbr_unsubscribe envelopes, and the reconciler
     // reaps a camera's pump when that camera stops.
     let live_view_manager = live_view::LiveViewManager::new(cache.clone(), cloud_outbox.clone());
+    // One health roll-up, shared by `GET /api/v1/health` and the heartbeat.
+    let engine_health = Arc::new(cloud_tunnel::EngineHealth::new(
+        recorder.clone(),
+        store.clone(),
+        live_view_manager.clone(),
+    ));
 
     // Cloud entitlement cache — populated from inbound `entitlement_update`
     // envelopes by the cloud-tunnel supervisor, read by the M7
@@ -1549,7 +1555,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         snapshot_uploader_slot.clone(),
         live_view_manager.clone(),
         frame_stats.clone(),
-        recorder.kind(),
+        engine_health.clone(),
         decode_health.clone(),
         webrtc_bridge,
         Some(trace_rx),
@@ -1651,6 +1657,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         sink_registry: sink_registry.clone(),
         dispatcher_health: dispatcher_health.clone(),
         live_view: live_view_manager.clone(),
+        health: engine_health,
         // M7 cloud-managed sinks — boot snapshot of `nexus.toml`
         // `[[sinks]]` so `GET /v1/admin/sinks` can mark which sinks
         // are file-pinned (read-only) vs cloud-managed (editable).

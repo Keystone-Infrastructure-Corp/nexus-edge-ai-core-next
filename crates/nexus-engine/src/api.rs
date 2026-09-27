@@ -190,6 +190,9 @@ pub struct ApiState {
     /// so without a read surface the only way to tell a stalled source from
     /// a quiet scene was to attach to a live box.
     pub live_view: Arc<crate::live_view::LiveViewManager>,
+    /// The health roll-up `GET /api/v1/health` reports. The same `Arc` the
+    /// cloud tunnel's heartbeat reports, so the two cannot disagree.
+    pub health: Arc<crate::cloud_tunnel::EngineHealth>,
     /// File-defined sinks (`nexus.toml` `[[sinks]]`), snapshot at
     /// boot. The `GET /v1/admin/sinks` handler merges these with the
     /// runtime `alert_sinks` db rows so the console can show which
@@ -1089,46 +1092,33 @@ impl From<nexus_store::StoreError> for ApiError {
 ///
 /// `status` is `"ok"` unless the engine is running with a known loss of
 /// function, in which case it is `"degraded"` and `issues[]` explains
-/// why. One such condition is a detector that failed to build
-/// (see [`nexus_inference::health`]) — the engine keeps recording and
-/// streaming, but reports zero detections, so an operator watching only
-/// the alert count would otherwise see silence and assume all is well.
-/// The other is a stub clip recorder behind enabled cameras (see
-/// [`crate::cloud_tunnel::recorder_issue`]), which detects but keeps no
-/// video. Degraded is still HTTP 200. Computing that issue reads the store,
-/// so the probe makes one camera-list read per request.
+/// why. The issues are the engine's health roll-up
+/// ([`crate::cloud_tunnel::EngineHealth`]), the same set the cloud
+/// heartbeat carries: a detector that failed to build, stalled live-view
+/// sources, an oversubscribed video engine, a stub clip recorder behind
+/// enabled cameras. Degraded is still HTTP 200.
 async fn health(State(s): State<ApiState>) -> Json<serde_json::Value> {
-    Json(health_body(
-        crate::cloud_tunnel::recorder_issue(s.recorder.kind(), &s.store).await,
-    ))
+    Json(health_body(s.health.rollup().await))
 }
 
 /// The body of [`health`], apart from the handler so a test can drive it
-/// with the recorder issue computed from the recorder that boot really
-/// builds.
-fn health_body(recorder: Option<nexus_cloud_protocol::v1::EdgeDegradation>) -> serde_json::Value {
-    let degradations = nexus_inference::health::degradations();
-    let mut issues: Vec<serde_json::Value> = degradations
-        .iter()
-        .map(|d| {
+/// with the roll-up of the recorder that boot really builds.
+fn health_body(health: nexus_cloud_protocol::v1::EdgeHealth) -> serde_json::Value {
+    let issues: Vec<serde_json::Value> = health
+        .issues
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| {
             serde_json::json!({
-                "component": "detector",
-                "code": "detector_unavailable",
-                "kind": d.kind,
-                "detail": d.reason,
+                "component": i.component,
+                "code": i.code,
+                "detail": i.detail,
             })
         })
         .collect();
-    if let Some(i) = recorder {
-        issues.push(serde_json::json!({
-            "component": i.component,
-            "code": i.code,
-            "detail": i.detail,
-        }));
-    }
 
     serde_json::json!({
-        "status": if issues.is_empty() { "ok" } else { "degraded" },
+        "status": health.status,
         // `NEXUS_BUILD_VERSION` is computed in `build.rs` from the
         // release tag (`NEXUS_RELEASE_VERSION`, e.g. `v0.1.27` →
         // `0.1.27`) at CI build-time, falling back to
@@ -7112,6 +7102,22 @@ mod tests {
         Arc<nexus_sinks::SinkRegistry>,
         Arc<dyn nexus_bus::Bus>,
     ) {
+        let (mut state, store, dir, sink_registry, bus) = build_test_state(admin_secret).await;
+        state.current_inference_model = Arc::new(model);
+        (super::router(state), store, dir, sink_registry, bus)
+    }
+
+    /// The state [`build_test_router_full`] routes, for a test that must
+    /// hold one of its handles before the router takes it.
+    async fn build_test_state(
+        admin_secret: Option<&[u8]>,
+    ) -> (
+        super::ApiState,
+        Arc<Store>,
+        tempfile::TempDir,
+        Arc<nexus_sinks::SinkRegistry>,
+        Arc<dyn nexus_bus::Bus>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nexus.db");
         let store = Arc::new(
@@ -7153,6 +7159,18 @@ mod tests {
                 .expect("empty rule set always compiles"),
         );
         let sink_registry = Arc::new(nexus_sinks::SinkRegistry::new());
+        let live_view = crate::live_view::LiveViewManager::new(
+            Arc::new(nexus_pipeline::LatestFrameCache::new()),
+            Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+        );
+        // Built as a `gstreamer` build builds it, so the recorder issue's
+        // raising branch runs on every build.
+        let health = Arc::new(crate::cloud_tunnel::EngineHealth::with_real_recorder(
+            true,
+            recorder.clone(),
+            store.clone(),
+            live_view.clone(),
+        ));
         let state = super::ApiState {
             store: store.clone(),
             bus: bus.clone(),
@@ -7195,10 +7213,8 @@ mod tests {
             // live" until a tick completes, which is the correct
             // default: no dispatcher runs in these tests.
             dispatcher_health: Arc::new(nexus_sinks::dispatcher::DispatcherHealth::default()),
-            live_view: crate::live_view::LiveViewManager::new(
-                Arc::new(nexus_pipeline::LatestFrameCache::new()),
-                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
-            ),
+            health,
+            live_view,
             // M7 cloud-managed sinks — no file sinks in tests.
             file_sinks: Arc::new(Vec::new()),
             // M6 — default LockoutConfig is fine for every test
@@ -7230,7 +7246,7 @@ mod tests {
                 #[cfg(feature = "ort")]
                 encoder: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             },
-            current_inference_model: std::sync::Arc::new(model),
+            current_inference_model: std::sync::Arc::new(nexus_config::ModelConfig::default()),
             // Static-anchors handler reads `<state_dir>/static_objects/cam-<id>.json`;
             // tests don't write that file so the endpoint returns
             // an empty anchor list, which is the documented behaviour
@@ -7269,8 +7285,7 @@ mod tests {
             remote_access_enabled: false,
             reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
         };
-        let app = super::router(state);
-        (app, store, dir, sink_registry, bus)
+        (state, store, dir, sink_registry, bus)
     }
 
     /// Common wrapper over [`build_test_router_full`] that drops the
@@ -10200,8 +10215,9 @@ mod tests {
     /// so a renamed `kind()` cannot silently disarm it.
     ///
     /// Computed as a `gstreamer` build computes it
-    /// ([`crate::cloud_tunnel::recorder_issue_in`] given `true`), so it
-    /// runs in default-feature CI; `cloud_tunnel` tests the feature gate.
+    /// ([`crate::cloud_tunnel::EngineHealth::with_real_recorder`] given
+    /// `true`), so it runs in default-feature CI; `cloud_tunnel` tests the
+    /// feature gate.
     /// Asserts on the recorder issue, never on `status == "ok"`: the
     /// detector registry is process-global and a sibling test may have
     /// written it (BUG-159).
@@ -10260,9 +10276,16 @@ mod tests {
             "the stub's WebRTC bridge drops every HD start, so the heartbeat must not offer HD"
         );
 
-        let body = super::health_body(
-            crate::cloud_tunnel::recorder_issue_in(true, recorder.kind(), &store).await,
+        let health = crate::cloud_tunnel::EngineHealth::with_real_recorder(
+            true,
+            recorder,
+            store,
+            crate::live_view::LiveViewManager::new(
+                Arc::new(nexus_pipeline::LatestFrameCache::new()),
+                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            ),
         );
+        let body = super::health_body(health.rollup().await);
         let issue = body["issues"]
             .as_array()
             .and_then(|issues| issues.iter().find(|i| i["component"] == "recorder"))
@@ -10270,6 +10293,111 @@ mod tests {
                 panic!("/api/v1/health must report a stub behind an enabled camera: {body}")
             });
         assert_eq!(issue["code"], "recorder_stub", "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
+    }
+
+    /// `GET /api/v1/health` through the full router, with the caller's
+    /// bearer when there is one.
+    async fn get_health(app: axum::Router, bearer: Option<&str>) -> serde_json::Value {
+        use axum::body::to_bytes;
+        let mut req = Request::builder().method(Method::GET).uri("/api/v1/health");
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "degraded is still HTTP 200");
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The first camera of the engine's default config, stored with
+    /// `ingest.enabled` set to `enabled`.
+    async fn store_default_camera(store: &Store, enabled: bool) {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cfg = nexus_config::Config::load(repo_root.join(crate::DEFAULT_CONFIG))
+            .expect("load the engine's default config");
+        let mut camera = cfg.cameras[0].clone();
+        camera.ingest.enabled = enabled;
+        store
+            .upsert_camera(&camera)
+            .await
+            .expect("store the camera");
+    }
+
+    /// The roll-up's issues apart from the detector's. The detector
+    /// registry is process-global and a sibling test may write it between
+    /// two reads (BUG-159).
+    fn non_detector_issues(
+        health: &nexus_cloud_protocol::v1::EdgeHealth,
+    ) -> Vec<serde_json::Value> {
+        health
+            .issues
+            .iter()
+            .flatten()
+            .filter(|i| i.component != "detector")
+            .map(|i| serde_json::json!({ "component": i.component, "code": i.code, "detail": i.detail }))
+            .collect()
+    }
+
+    /// `GET /api/v1/health` reports the roll-up it shares with the
+    /// heartbeat, not a list of its own: a stub behind an enabled camera is
+    /// on it, and a stub behind only a disabled camera is not. Fails if the
+    /// handler drops the roll-up or computes any part of it apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_reports_the_shared_roll_up() {
+        for enabled in [true, false] {
+            let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+            store_default_camera(&store, enabled).await;
+            let health = state.health.clone();
+
+            let body = get_health(super::router(state), None).await;
+            let local: Vec<serde_json::Value> = body["issues"]
+                .as_array()
+                .expect("issues array")
+                .iter()
+                .filter(|i| i["component"] != "detector")
+                .cloned()
+                .collect();
+            assert_eq!(local, non_detector_issues(&health.rollup().await), "{body}");
+            assert_eq!(
+                local.iter().any(|i| i["code"] == "recorder_stub"),
+                enabled,
+                "a stub behind an enabled camera, and only then: {body}",
+            );
+        }
+    }
+
+    /// The local probe must report what the heartbeat reports. A subscribed
+    /// live-view camera whose source never produced a frame stalls after
+    /// `STALL_AFTER`, and the heartbeat carries that as
+    /// `camera_source_stalled` (`stalled_live_view_sources_become_a_wire_issue`).
+    /// Real clock, because the router reads SQLite and a paused clock races
+    /// sqlx's acquire timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_reports_a_stalled_camera_the_heartbeat_reports() {
+        let (state, _store, _dir, _reg, _bus) = build_test_state(None).await;
+        let live_view = state.live_view.clone();
+        live_view.on_subscribe(&nexus_cloud_protocol::v1::LbrSubscribePayload {
+            camera_id: 7,
+            tile_w: Some(320),
+            tile_h: Some(180),
+            fps_tier: Some("grid".to_string()),
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while live_view.stalled_cameras() != vec![7] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture: the subscribed camera never stalled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let body = get_health(super::router(state), None).await;
+        let issue = body["issues"]
+            .as_array()
+            .and_then(|issues| issues.iter().find(|i| i["code"] == "camera_source_stalled"))
+            .unwrap_or_else(|| panic!("/api/v1/health must report the stalled camera: {body}"));
+        assert_eq!(issue["component"], "live_view", "{body}");
         assert_eq!(body["status"], "degraded", "{body}");
     }
 }

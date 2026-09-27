@@ -137,7 +137,7 @@ pub fn spawn_tunnel(
     snapshot_uploader_slot: crate::cloud_alert_sink::SnapshotUploaderSlot,
     live_view: Arc<crate::live_view::LiveViewManager>,
     frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
-    recorder_kind: &'static str,
+    engine_health: Arc<EngineHealth>,
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     trace_rx: Option<mpsc::Receiver<Span>>,
@@ -213,7 +213,7 @@ pub fn spawn_tunnel(
             pending_acks,
             live_view,
             frame_stats,
-            recorder_kind,
+            engine_health,
             decode_health,
             webrtc,
             store,
@@ -584,7 +584,7 @@ async fn run(
     pending_acks: Arc<crate::cloud_alert_sink::PendingAckRegistry>,
     live_view: Arc<crate::live_view::LiveViewManager>,
     frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
-    recorder_kind: &'static str,
+    engine_health: Arc<EngineHealth>,
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
@@ -674,9 +674,8 @@ async fn run(
                     &core_id,
                     store.clone(),
                     &liveness,
-                    &live_view,
                     &frame_stats,
-                    recorder_kind,
+                    &engine_health,
                     &webrtc,
                 );
                 let dispatch = pump_rpc_dispatch(
@@ -1227,15 +1226,13 @@ fn heartbeat_caps(hd_transport: Option<nexus_types::HdTransport>) -> Vec<String>
     caps
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn pump_heartbeats<H: TunnelHandle>(
     handle: &H,
     _core_id: &str,
     store: Arc<Store>,
     liveness: &crate::cloud_liveness::TunnelLiveness,
-    live_view: &crate::live_view::LiveViewManager,
     frame_stats: &nexus_pipeline::FrameStatsRegistry,
-    recorder_kind: &'static str,
+    engine_health: &EngineHealth,
     webrtc: &crate::webrtc_bridge::WebRtcBridge,
 ) {
     // Reaching this function at all means the WSS handshake and the mTLS
@@ -1271,11 +1268,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
         // green core and an operator sees only silence, which is
         // indistinguishable from a genuinely quiet site. Recomputed each
         // tick so a repaired detector clears within one heartbeat.
-        let health = Some(edge_health(
-            &live_view.stalled_cameras(),
-            crate::system_metrics::snapshot().decode_capacity.as_ref(),
-            recorder_issue(recorder_kind, &store).await,
-        ));
+        let health = Some(engine_health.rollup().await);
         // Camera-liveness rollup — same `FrameStatsRegistry` source of
         // truth as `roster::build_envelope`'s per-camera `online` field,
         // so the two can never disagree. Deliberately NOT
@@ -2074,9 +2067,65 @@ const HEALTH_DETAIL_MAX: usize = 512;
 /// conditions cannot make the heartbeat unserialisable.
 const HEALTH_ISSUES_MAX: usize = 16;
 
-/// Build the heartbeat's health roll-up from the process-wide degradation
-/// registry, plus any live-view sources that have stopped producing frames
-/// and a stub recorder behind enabled cameras ([`recorder_issue`]).
+/// The engine's health roll-up: the one issue set both health surfaces
+/// report, the heartbeat's [`EdgeHealth`] and the local `GET /api/v1/health`.
+/// `main` builds one and hands the same `Arc` to the API state and the tunnel,
+/// so the two surfaces cannot disagree. They used to build their issue lists
+/// apart, and every source added after the detector's went into the heartbeat
+/// only.
+pub struct EngineHealth {
+    real_recorder_available: bool,
+    recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
+    store: Arc<Store>,
+    live_view: Arc<crate::live_view::LiveViewManager>,
+}
+
+impl EngineHealth {
+    /// A real recorder was available iff this is a `gstreamer` build (see
+    /// [`recorder_issue_in`]).
+    pub(crate) fn new(
+        recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
+        store: Arc<Store>,
+        live_view: Arc<crate::live_view::LiveViewManager>,
+    ) -> Self {
+        Self::with_real_recorder(cfg!(feature = "gstreamer"), recorder, store, live_view)
+    }
+
+    /// [`Self::new`] with the build's feature as an argument, so a test can
+    /// run the recorder issue's raising branch on any build.
+    pub(crate) fn with_real_recorder(
+        real_recorder_available: bool,
+        recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
+        store: Arc<Store>,
+        live_view: Arc<crate::live_view::LiveViewManager>,
+    ) -> Self {
+        Self {
+            real_recorder_available,
+            recorder,
+            store,
+            live_view,
+        }
+    }
+
+    /// The current roll-up. Recomputed on every call, so a repaired
+    /// condition clears on the next heartbeat or probe.
+    pub(crate) async fn rollup(&self) -> EdgeHealth {
+        edge_health(
+            &self.live_view.stalled_cameras(),
+            crate::system_metrics::snapshot().decode_capacity.as_ref(),
+            recorder_issue_in(
+                self.real_recorder_available,
+                self.recorder.kind(),
+                &self.store,
+            )
+            .await,
+        )
+    }
+}
+
+/// Build the health roll-up from the process-wide degradation registry,
+/// plus any live-view sources that have stopped producing frames and a stub
+/// recorder behind enabled cameras ([`recorder_issue_in`]).
 ///
 /// `status` is `degraded` iff at least one issue is open, matching the
 /// schema's stated invariant. The cloud renders unknown `code`s verbatim, so
@@ -2159,9 +2208,7 @@ fn edge_health_from(
     }
 }
 
-/// The clip recorder's contribution to both health surfaces, the heartbeat's
-/// [`edge_health`] and the local `GET /api/v1/health`. It is computed only
-/// here so the two cannot disagree on it.
+/// The clip recorder's contribution to [`EngineHealth`].
 ///
 /// Raised when the running recorder is the stub and the store has at least
 /// one enabled camera. The stub writes a 0-byte placeholder for every clip,
@@ -2183,23 +2230,16 @@ fn edge_health_from(
 /// recorder's kind and the store, and neither a first frame nor an outage
 /// can reach the issue.
 ///
-/// Only a `gstreamer` build raises it. Release binaries always carry that
-/// feature, so it is the build where a real recorder was available and the
-/// stub is a misconfiguration. A build without it has no other recorder, and
-/// an RTSP camera there already fails loudly at its source.
+/// Only a `gstreamer` build raises it ([`EngineHealth::new`]). Release
+/// binaries always carry that feature, so it is the build where a real
+/// recorder was available and the stub is a misconfiguration. A build without
+/// it has no other recorder, and an RTSP camera there already fails loudly at
+/// its source.
 ///
 /// An explicit `recorder = "stub"` on a `gstreamer` build raises it too. That
 /// departs on purpose from the detector's precedent, where asking for the mock
 /// detector by name stays healthy: however the stub was chosen, behind running
 /// cameras it keeps no evidence.
-pub(crate) async fn recorder_issue(recorder_kind: &str, store: &Store) -> Option<EdgeDegradation> {
-    recorder_issue_in(cfg!(feature = "gstreamer"), recorder_kind, store).await
-}
-
-/// [`recorder_issue`] with the build's feature as an argument, so a test can
-/// run the raising branch on any build, through the same store read.
-/// Production passes `cfg!(feature = "gstreamer")`, through
-/// [`recorder_issue`] only.
 pub(crate) async fn recorder_issue_in(
     real_recorder_available: bool,
     recorder_kind: &str,
@@ -2212,7 +2252,7 @@ pub(crate) async fn recorder_issue_in(
     )
 }
 
-/// The cameras [`recorder_issue`] counts: the store's enabled ones. A failed
+/// The cameras [`recorder_issue_in`] counts: the store's enabled ones. A failed
 /// read is logged and counts none, like the heartbeat's other best-effort
 /// store reads, so it drops the issue for that read. On the heartbeat that
 /// costs one resolve and re-raise of `core.health.degraded`, and only when
@@ -2496,9 +2536,28 @@ mod health_tests {
     /// a real recorder was available, raises the issue.
     #[tokio::test]
     async fn only_a_gstreamer_build_raises_the_recorder_issue() {
-        let (store, _dir) = default_config_store(true).await;
+        let (store, dir) = default_config_store(true).await;
+        let store = Arc::new(store);
+        let health = EngineHealth::new(
+            Arc::new(StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store,
+            crate::live_view::LiveViewManager::new(
+                Arc::new(nexus_pipeline::LatestFrameCache::new()),
+                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            ),
+        );
+        let recorder_issue = health
+            .rollup()
+            .await
+            .issues
+            .unwrap_or_default()
+            .into_iter()
+            .find(|i| i.component == "recorder");
         assert_eq!(
-            recorder_issue("stub", &store).await.is_some(),
+            recorder_issue.is_some(),
             cfg!(feature = "gstreamer"),
             "a gstreamer build must report a stub recorder behind an enabled camera, \
              and a build without the feature must not",
@@ -3361,7 +3420,7 @@ mod heartbeat_ack_tests {
         webrtc: &crate::webrtc_bridge::WebRtcBridge,
         hd_transport: nexus_types::HdTransport,
     ) -> Vec<String> {
-        let (store, _dir) = test_store().await;
+        let (store, dir) = test_store().await;
         store
             .write_runtime_setting(
                 crate::admin_runtime::KEY_HD_TRANSPORT,
@@ -3369,15 +3428,23 @@ mod heartbeat_ack_tests {
             )
             .await
             .expect("configure the HD transport");
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+        );
         let tunnel = FirstEnvelopeTunnel::default();
         pump_heartbeats(
             &tunnel,
             "core-1",
             store,
             &TunnelLiveness::new(),
-            &live_view_manager(),
             &FrameStatsRegistry::new(),
-            "gstreamer",
+            &health,
             webrtc,
         )
         .await;
@@ -3443,8 +3510,15 @@ mod heartbeat_ack_tests {
     /// enough, and `tokio::interval` fires its first tick immediately.
     #[tokio::test]
     async fn sending_a_heartbeat_is_not_proof_the_cloud_received_it() {
-        let (store, _dir) = test_store().await;
-        let live_view = live_view_manager();
+        let (store, dir) = test_store().await;
+        let health = EngineHealth::new(
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+        );
         let frame_stats = FrameStatsRegistry::new();
         let liveness = TunnelLiveness::new();
         let tunnel = HalfOpenTunnel::default();
@@ -3455,9 +3529,8 @@ mod heartbeat_ack_tests {
             "core-1",
             store,
             &liveness,
-            &live_view,
             &frame_stats,
-            "gstreamer",
+            &health,
             &webrtc,
         );
         tokio::pin!(pump);
@@ -3484,6 +3557,98 @@ mod heartbeat_ack_tests {
             "no heartbeat was ever acknowledged, so nothing proved this \
              binary can reach the cloud",
         );
+    }
+
+    /// Keeps every envelope handed to `send`.
+    #[derive(Default)]
+    struct CapturingTunnel {
+        sent: parking_lot::Mutex<Vec<Envelope>>,
+    }
+
+    #[async_trait]
+    impl TunnelHandle for CapturingTunnel {
+        async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
+            self.sent.lock().push(envelope);
+            Ok(())
+        }
+    }
+
+    /// The heartbeat carries the roll-up it shares with `GET /api/v1/health`,
+    /// not a list of its own: a stub behind an enabled camera is on it, and a
+    /// stub behind only a disabled camera is not. Fails if the pump drops the
+    /// roll-up or computes any part of it apart. Compares all but the
+    /// detector's issues, whose registry is process-global (BUG-159).
+    #[tokio::test]
+    async fn the_heartbeat_carries_the_shared_roll_up() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cfg = nexus_config::Config::load(repo_root.join(crate::DEFAULT_CONFIG))
+            .expect("load the engine's default config");
+        for enabled in [true, false] {
+            let (store, dir) = test_store().await;
+            let mut camera = cfg.cameras[0].clone();
+            camera.ingest.enabled = enabled;
+            store
+                .upsert_camera(&camera)
+                .await
+                .expect("store the camera");
+            let health = EngineHealth::with_real_recorder(
+                true,
+                Arc::new(nexus_pipeline::StubClipRecorder::new(
+                    store.clone(),
+                    dir.path().join("clips"),
+                )),
+                store.clone(),
+                live_view_manager(),
+            );
+            let frame_stats = FrameStatsRegistry::new();
+            let liveness = TunnelLiveness::new();
+            let tunnel = CapturingTunnel::default();
+            let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
+
+            let pump = pump_heartbeats(
+                &tunnel,
+                "core-1",
+                store,
+                &liveness,
+                &frame_stats,
+                &health,
+                &webrtc,
+            );
+            tokio::pin!(pump);
+            let sent = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        () = &mut pump => return,
+                        () = tokio::time::sleep(Duration::from_millis(10)) => {
+                            if !tunnel.sent.lock().is_empty() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(sent.is_ok(), "fixture never sent a heartbeat");
+
+            let EnvelopeBody::Heartbeat(beat) = tunnel.sent.lock()[0].body.clone() else {
+                panic!("the pump's first envelope is a heartbeat");
+            };
+            let without_detector = |h: &EdgeHealth| -> Vec<EdgeDegradation> {
+                h.issues
+                    .iter()
+                    .flatten()
+                    .filter(|i| i.component != "detector")
+                    .cloned()
+                    .collect()
+            };
+            let carried = without_detector(beat.health.as_ref().expect("health on the heartbeat"));
+            assert_eq!(carried, without_detector(&health.rollup().await));
+            assert_eq!(
+                carried.iter().any(|i| i.code == "recorder_stub"),
+                enabled,
+                "a stub behind an enabled camera, and only then: {carried:?}",
+            );
+        }
     }
 
     /// The other half of the same invariant, and the line everything now
