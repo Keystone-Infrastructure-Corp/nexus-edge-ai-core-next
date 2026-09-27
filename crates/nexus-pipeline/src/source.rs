@@ -455,7 +455,7 @@ pub struct SharedRtspSource {
     /// read beside the main stream until it delivers a frame, then taken
     /// up, and given up if it delivers none inside
     /// [`ANALYSIS_FIRST_FRAME_GRACE`]. Waiting on it never valves the main
-    /// stream off, so a retry that fails costs analysis nothing.
+    /// stream off, so analysis stays on the main stream while a retry fails.
     pub analysis_sessions: crate::gst_clip_recorder::IngesterRegistry,
     /// The camera's decode counters, reset when this source takes one of
     /// those sessions up, since they then describe another geometry.

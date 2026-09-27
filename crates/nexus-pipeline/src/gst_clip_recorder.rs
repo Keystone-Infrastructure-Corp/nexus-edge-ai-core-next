@@ -3216,9 +3216,14 @@ mod tests {
     }
 
     /// Camera 7's frame source, running, over a main session on a dead URL,
-    /// so every frame the source delivers came from a substream session.
+    /// so every frame the source delivers came from a session's rgb tap, which
+    /// the test feeds. With `substream_at_start`, a substream session on a
+    /// dead URL is registered before the source is built, as a camera's start
+    /// registers one. The recorder publishes decode health and analysis-stream
+    /// status.
     async fn a_running_source_over_a_silent_main_stream(
         dir: &Path,
+        substream_at_start: bool,
     ) -> (
         GstClipRecorder,
         Arc<PreRollIngester>,
@@ -3247,7 +3252,12 @@ mod tests {
         .unwrap();
         let rec = GstClipRecorder::new(store, dir, HashMap::from([(7, main.clone())]))
             .unwrap()
-            .with_decode_health(Arc::new(crate::stats::DecodeHealthRegistry::default()));
+            .with_decode_health(Arc::new(crate::stats::DecodeHealthRegistry::default()))
+            .with_analysis_stream(Arc::new(crate::stats::AnalysisStreamRegistry::new()));
+        if substream_at_start {
+            rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+                .expect("analysis session registers");
+        }
         let source = rec
             .shared_frame_source(7)
             .expect("camera 7 has a main session with an rgb tap");
@@ -3256,6 +3266,45 @@ mod tests {
             let _ = source.run(tx).await;
         });
         (rec, main, frames, task)
+    }
+
+    /// The substream URL the source tests register: dead, so every frame a
+    /// session delivers is one the test sent.
+    const SUBSTREAM: &str = "rtsp://127.0.0.1:1/substream";
+
+    /// Poll `done` every 100 ms for up to `secs` seconds, blocking this worker
+    /// while the source runs on the other; whether it came to hold.
+    fn within(secs: f64, done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs_f64(secs);
+        loop {
+            if done() {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Send a frame into `tap` every `every` from a thread, until the
+    /// returned flag is cleared.
+    fn feed(
+        tap: tokio::sync::broadcast::Sender<nexus_types::Frame>,
+        every: Duration,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let feeding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let running = feeding.clone();
+        let feeder = std::thread::spawn(move || {
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = tap.send(rgb_frame());
+                std::thread::sleep(every);
+            }
+        });
+        (feeding, feeder)
     }
 
     fn rgb_frame() -> nexus_types::Frame {
@@ -3282,7 +3331,7 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let (rec, main, mut frames, task) =
-            a_running_source_over_a_silent_main_stream(dir.path()).await;
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
 
         rec.set_camera_analysis_ingester(
             7,
@@ -3334,14 +3383,15 @@ mod tests {
 
     /// The same retry when the substream stays silent: the source must keep
     /// analysing the main stream while it waits, and give the session up
-    /// (shut it down) once the first-frame grace runs out, so a retry that
-    /// fails costs analysis nothing and does not leave a second session
-    /// reconnecting for the life of the camera.
+    /// (shut it down, and report it unavailable) once the first-frame grace
+    /// runs out, so a retry that fails leaves analysis on the main stream and
+    /// does not leave a second session reconnecting for the life of the
+    /// camera.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_silent_substream_session_is_given_up_while_the_main_stream_keeps_analysis() {
         let dir = tempfile::tempdir().unwrap();
         let (rec, main, _frames, task) =
-            a_running_source_over_a_silent_main_stream(dir.path()).await;
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
 
         rec.set_camera_analysis_ingester(
             7,
@@ -3381,12 +3431,26 @@ mod tests {
         });
         let open_after = !main.rgb_valve_is_closed();
         let drops = health.snapshot(7).map_or(0, |h| h.decoder_input_drops);
+        let status = rec
+            .analysis_stream
+            .as_ref()
+            .and_then(|r| r.snapshot(7))
+            .map(|s| (s.mode, s.state, s.reason));
         task.abort();
         session.shutdown();
         main.shutdown();
         for (what, ok) in [watched, given_up] {
             assert!(ok, "{what}");
         }
+        assert_eq!(
+            status,
+            Some((
+                "mainstream".to_string(),
+                "unavailable".to_string(),
+                Some("refused".to_string())
+            )),
+            "a given-up substream must be reported unavailable, with why"
+        );
         assert!(
             open_while_waiting,
             "waiting on a silent substream valved the main stream off: analysis sees nothing"
@@ -3398,6 +3462,171 @@ mod tests {
         assert_eq!(
             drops, 40,
             "analysis never left the main stream, so its decode counters must survive"
+        );
+    }
+
+    /// SPEC-069's retry from the state it exists for: a source that started
+    /// on its substream session, fell back from it, and has analysed the main
+    /// stream since. The session it fell back from stays in the recorder's
+    /// registry, shut down, until the engine's retry replaces it, and the
+    /// source must not read it again. The retry's session must then be taken
+    /// up in its place and judged from its own first frame: reported probing,
+    /// with the camera's decode counters reset, and a rate that counts its
+    /// frames, not the main stream's before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_after_a_fallback_is_taken_up_in_place_of_the_session_that_fell_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, _frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), true).await;
+        let status = rec.analysis_stream.clone().expect("analysis stream");
+        let health = rec.decode_health.clone().expect("decode health");
+        let fallen = rec.analysis_ingesters.read()[&7].clone();
+        let fallen_tap = fallen.rgb_tap_sender().expect("rgb tap");
+        let now = || status.snapshot(7).map(|s| (s.mode, s.state, s.reason));
+
+        // The source's own fallback: its session delivers nothing inside the
+        // first-frame grace. Then the main stream delivers, 20 frames a second.
+        let fell_back = within(35.0, || {
+            fallen.is_shutdown() && fallen_tap.receiver_count() == 0
+        });
+        let after_fallback = (main.rgb_valve_is_closed(), now());
+        let (feeding_main, main_feeder) = feed(
+            main.rgb_tap_sender().expect("rgb tap"),
+            Duration::from_millis(50),
+        );
+        // Two health ticks with only the fallen-back session in the registry.
+        let read_again = within(7.0, || fallen_tap.receiver_count() > 0);
+
+        // The engine's retry, and the main stream's decode counters it leaves.
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        let retry = rec.analysis_ingesters.read()[&7].clone();
+        let retry_tap = retry.rgb_tap_sender().expect("rgb tap");
+        for _ in 0..40 {
+            health.observe_decoder_input_drop(7);
+        }
+        let watched = within(7.0, || retry_tap.receiver_count() > 0);
+        let open_while_waiting = !main.rgb_valve_is_closed();
+        // One frame, just after the health tick that started reading the
+        // session, so the next tick is about 5 s away.
+        let _ = retry_tap.send(rgb_frame());
+        let taken_up = within(2.5, || {
+            main.rgb_valve_is_closed() && now().is_some_and(|(mode, _, _)| mode == "substream")
+        });
+        let drops = health.snapshot(7).map_or(0, |h| h.decoder_input_drops);
+        feeding_main.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Two health ticks later the rate reported is the retry's alone: one
+        // frame over at least 5 s.
+        std::thread::sleep(Duration::from_millis(10_500));
+        let judged = status.snapshot(7);
+
+        task.abort();
+        retry.shutdown();
+        main.shutdown();
+        let _ = main_feeder.join();
+        assert!(
+            fell_back,
+            "precondition: the source never fell back from its silent substream session"
+        );
+        assert_eq!(
+            after_fallback,
+            (
+                false,
+                Some((
+                    "mainstream".to_string(),
+                    "unavailable".to_string(),
+                    Some("refused".to_string())
+                ))
+            ),
+            "precondition: the fallback reopens the main valve and reports why"
+        );
+        assert!(
+            !read_again,
+            "the source read the session it fell back from again, which the fallback shut down"
+        );
+        assert!(
+            !Arc::ptr_eq(&fallen, &retry),
+            "the retry must start a new session"
+        );
+        assert!(watched, "the source never watched the retry's session");
+        assert!(
+            open_while_waiting,
+            "waiting on the retry's session valved the main stream off"
+        );
+        assert!(
+            taken_up,
+            "the retry's session delivered, and the source did not take it up at once, valve \
+             the main stream off and report it probing"
+        );
+        assert_eq!(
+            drops, 0,
+            "taking the retry's session up must reset the camera's decode counters"
+        );
+        let judged = judged.expect("status");
+        assert_eq!(
+            (judged.mode.as_str(), judged.state.as_str()),
+            ("substream", "active"),
+            "the retry's session, one frame in, is inside its rate settle"
+        );
+        assert!(
+            judged.fps < 1.0,
+            "the retry's session delivered one frame, but the source reported {} fps: it counted \
+             frames from before it took the session up",
+            judged.fps
+        );
+    }
+
+    /// A session taken up by a retry is the session analysis reads: judged at
+    /// its own advertised rate, and the one its fallback shuts down.
+    /// Registered at 30 fps and delivering about 10, it is below half its
+    /// rate, so once the rate settles the source must fall back from it and
+    /// shut it down. Judged at the default 15 fps it would pass; a fallback
+    /// that shut another session down would leave it decoding with no reader,
+    /// the double decode SPEC-069 exists to remove.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_taken_up_session_is_judged_at_its_own_rate_and_is_the_one_its_fallback_shuts_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, _frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+        let status = rec.analysis_stream.clone().expect("analysis stream");
+
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 30, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        let session = rec.analysis_ingesters.read()[&7].clone();
+        let tap = session.rgb_tap_sender().expect("rgb tap");
+        let watched = within(7.0, || tap.receiver_count() > 0);
+        let (feeding, feeder) = feed(tap, Duration::from_millis(100));
+        let taken_up = within(2.0, || main.rgb_valve_is_closed());
+        let fell_back = within(80.0, || session.is_shutdown());
+        let open_after = !main.rgb_valve_is_closed();
+        let after = status.snapshot(7).map(|s| (s.state, s.reason));
+
+        feeding.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = feeder.join();
+        task.abort();
+        session.shutdown();
+        main.shutdown();
+        assert!(
+            watched,
+            "precondition: the source never watched the session"
+        );
+        assert!(
+            taken_up,
+            "precondition: the source never took the session up"
+        );
+        assert!(
+            fell_back,
+            "the session analysis read delivered below half its advertised rate and was not \
+             shut down"
+        );
+        assert!(
+            open_after,
+            "falling back must reopen the main stream's rgb tap"
+        );
+        assert_eq!(
+            after,
+            Some(("unavailable".to_string(), Some("unhealthy".to_string()))),
+            "the fallback must report the session unhealthy"
         );
     }
 
