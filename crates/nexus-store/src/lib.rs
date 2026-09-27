@@ -485,7 +485,11 @@ impl Store {
         let mut unreadable = Vec::new();
         for r in rows {
             let id: CameraId = r.get(0);
-            match serde_json::from_str(r.get::<&str, _>(1)) {
+            let cam = r
+                .try_get::<&str, _>(1)
+                .map_err(StoreError::from)
+                .and_then(|json| serde_json::from_str(json).map_err(StoreError::from));
+            match cam {
                 Ok(cam) => readable.push(cam),
                 Err(e) => {
                     warn!(camera_id = id, error = %e, "store: this build cannot read the camera's row");
