@@ -87,6 +87,9 @@ const VEHICLES: usize = 4;
 const WARMUP: u64 = 30;
 const FRAMES: u64 = 100;
 
+static MONO0: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
 fn frame(i: u64) -> Frame {
     Frame {
         camera_id: 1,
@@ -94,7 +97,7 @@ fn frame(i: u64) -> Frame {
         captured_at: Utc
             .timestamp_millis_opt(1_700_000_000_000 + i as i64 * 33)
             .unwrap(),
-        captured_mono: std::time::Instant::now(),
+        captured_mono: *MONO0 + std::time::Duration::from_millis(i * 33),
         width: W,
         height: H,
         format: PixelFormat::Rgb24,
@@ -196,7 +199,7 @@ fn scenario() -> Vec<(Frame, Vec<TrackedObject>)> {
     let mut out = Vec::new();
     for i in 0..WARMUP + FRAMES {
         let f = frame(i);
-        let mut tracked = tracker.update(detections(i), f.captured_at);
+        let mut tracked = tracker.update(detections(i), f.captured_mono);
         annotator.annotate(&f, &zones, &[], &mut tracked);
         if i >= WARMUP {
             assert_eq!(tracked.len(), PERSONS + VEHICLES);
@@ -326,9 +329,9 @@ fn whole_path_census_with_two_rules() {
     for i in 0..WARMUP + FRAMES {
         let f = frame(i);
         let dets = detections(i);
-        let (mut tracked, a) = allocs(|| tracker.update(dets, f.captured_at));
+        let (mut tracked, a) = allocs(|| tracker.update(dets, f.captured_mono));
         let ((), b) = allocs(|| annotator.annotate(&f, &zones, &[], &mut tracked));
-        let (decisions, c) = allocs(|| emitter.tick(1, &tracked, f.captured_at));
+        let (decisions, c) = allocs(|| emitter.tick(1, &tracked, f.captured_at, f.captured_mono));
         let (events, d) = allocs(|| {
             evaluator.evaluate(
                 1,

@@ -1,10 +1,11 @@
 //! `min_track_age_ms` gates a rule on how long the camera has watched the
 //! object, so the age it compares against must be measured in frame time
-//! (`Frame::captured_at`), not in the time the engine happened to process
+//! (`Frame::captured_mono`), not in the time the engine happened to process
 //! the frames in.
 //!
-//! Every production source stamps `captured_at` from the wall clock as the
-//! frame leaves the decoder, and the analysis loop takes the latest frame, so
+//! Every production source stamps `captured_mono` (and the wall-clock
+//! `captured_at` beside it) as the frame leaves the decoder, and the
+//! analysis loop takes the latest frame, so
 //! the two clocks differ by a frame's capture-to-tracker latency: its wait for
 //! the loop plus its inference, including any wait for a detector shared with
 //! other cameras. An age read at tracking time is off by however much that
@@ -19,7 +20,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
 use futures::StreamExt;
 use nexus_bus::{topic, BroadcastBus, Bus, BusExt};
 use nexus_config::{
@@ -70,8 +73,9 @@ fn evaluator() -> RuleEvaluator {
     RuleEvaluator::new(&RulesConfig::default(), &[rule]).unwrap()
 }
 
-fn at(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(1_700_000_000_000).unwrap() + Duration::milliseconds(ms)
+fn at(ms: u64) -> Instant {
+    static T0: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    *T0 + Duration::from_millis(ms)
 }
 
 fn person(i: u64) -> Vec<Detection> {
@@ -90,13 +94,13 @@ fn person(i: u64) -> Vec<Detection> {
 }
 
 /// Track the frame and return how many alerts it fired.
-fn fire(tracker: &dyn Tracker, eval: &RuleEvaluator, i: u64, captured_at: DateTime<Utc>) -> usize {
-    let tracked = tracker.update(person(i), captured_at);
+fn fire(tracker: &dyn Tracker, eval: &RuleEvaluator, i: u64, captured_mono: Instant) -> usize {
+    let tracked = tracker.update(person(i), captured_mono);
     eval.evaluate(
         1,
         i,
-        captured_at,
-        std::time::Instant::now(),
+        Utc::now(),
+        captured_mono,
         &String::from("t"),
         W,
         H,
@@ -114,7 +118,7 @@ fn the_gate_opens_at_500_ms_of_frame_time_however_fast_the_frames_are_tracked() 
     for backend in BACKENDS {
         let t = tracker(backend);
         let eval = evaluator();
-        let first = (0..30u64).find(|&i| fire(t.as_ref(), &eval, i, at(i as i64 * 33)) > 0);
+        let first = (0..30u64).find(|&i| fire(t.as_ref(), &eval, i, at(i * 33)) > 0);
         assert_eq!(
             first,
             Some(16),
@@ -137,23 +141,6 @@ fn a_processing_delay_does_not_age_the_track() {
             fire(t.as_ref(), &eval, 1, at(33)),
             0,
             "{backend:?}: a 33 ms-old track passed the 500 ms age gate"
-        );
-    }
-}
-
-/// `captured_at` is wall-clock and can step backwards. A track first seen
-/// just before the step has been watched for no measurable frame time, so
-/// the gate must hold rather than read a negative age as a huge one.
-#[test]
-fn a_clock_stepped_back_does_not_open_the_gate() {
-    for backend in BACKENDS {
-        let t = tracker(backend);
-        let eval = evaluator();
-        assert_eq!(fire(t.as_ref(), &eval, 0, at(1000)), 0);
-        assert_eq!(
-            fire(t.as_ref(), &eval, 1, at(0)),
-            0,
-            "{backend:?}: a backward clock step opened the 500 ms age gate"
         );
     }
 }
@@ -188,9 +175,12 @@ impl Detector for SlowingDetector {
     }
 }
 
-/// The supervisor must hand the tracker each frame's capture time. A clock
+/// The supervisor must hand the tracker each frame's capture stamp. A clock
 /// read at tracking time ages the person by the 400 ms the detector slowed
 /// down, while the camera watched it for only the capture-time difference.
+/// The bus carries only the wall-clock `captured_at`, read beside the
+/// monotonic stamp the age is measured on, so the two differences may round
+/// 1 ms apart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_supervisor_ages_a_track_in_capture_time_when_inference_slows() {
     let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
@@ -288,8 +278,8 @@ async fn the_supervisor_ages_a_track_in_capture_time_when_inference_slows() {
     for &(captured_at, track_id, age_ms) in &seen[1..] {
         assert_eq!(track_id, id, "one person, one track");
         let watched = (captured_at - born).num_milliseconds() as u64;
-        assert_eq!(
-            age_ms, watched,
+        assert!(
+            age_ms.abs_diff(watched) <= 1,
             "the camera watched the person for {watched} ms of capture time, but the track \
              is {age_ms} ms old"
         );

@@ -82,7 +82,8 @@ impl CrowdHysteresis {
         }
     }
 
-    /// Feed the new tracked-object count and current monotonic time.
+    /// Feed the new tracked-object count and the frame's monotonic
+    /// capture stamp (`Frame::captured_mono`).
     /// Returns the desired downscale state for the *next* detector
     /// call. No-op (always returns `false`) when the policy is
     /// disabled.

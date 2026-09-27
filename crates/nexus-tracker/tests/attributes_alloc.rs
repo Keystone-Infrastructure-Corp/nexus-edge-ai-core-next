@@ -78,6 +78,9 @@ const VEHICLES: usize = 4;
 const WARMUP: u64 = 30;
 const FRAMES: u64 = 300;
 
+static MONO0: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
 fn frame(i: u64) -> Frame {
     Frame {
         camera_id: 1,
@@ -85,7 +88,7 @@ fn frame(i: u64) -> Frame {
         captured_at: Utc
             .timestamp_millis_opt(1_700_000_000_000 + i as i64 * 33)
             .unwrap(),
-        captured_mono: std::time::Instant::now(),
+        captured_mono: *MONO0 + std::time::Duration::from_millis(i * 33),
         width: W,
         height: H,
         format: PixelFormat::Rgb24,
@@ -172,7 +175,7 @@ fn run(parking_lot_mode: bool, zones: &[ZoneConfig]) -> [f64; 4] {
     for i in 0..WARMUP + FRAMES {
         let f = frame(i);
         let dets = detections(i);
-        let (mut tracked, a) = allocs(|| tracker.update(dets, f.captured_at));
+        let (mut tracked, a) = allocs(|| tracker.update(dets, f.captured_mono));
         let anchors: Vec<_> = sf
             .as_ref()
             .map(|s| s.anchors().to_vec())
@@ -183,7 +186,7 @@ fn run(parking_lot_mode: bool, zones: &[ZoneConfig]) -> [f64; 4] {
                 s.classify(&f, &mut tracked);
             }
         });
-        let (decisions, d) = allocs(|| emitter.tick(1, &tracked, f.captured_at));
+        let (decisions, d) = allocs(|| emitter.tick(1, &tracked, f.captured_at, f.captured_mono));
         drop(decisions);
         if i >= WARMUP {
             assert_eq!(tracked.len(), PERSONS + VEHICLES, "no track churn");

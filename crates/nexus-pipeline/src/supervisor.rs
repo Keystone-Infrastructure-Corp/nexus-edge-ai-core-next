@@ -502,12 +502,12 @@ async fn run_camera(
                 "failed to create alert snapshot dir (snapshots disabled for this camera): {e}"
             );
         }
-        // Wall-clock anchor for the currently-open clip. Used to
-        // enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
+        // Monotonic capture stamp of the frame the open clip started on.
+        // Used to enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
         // open clip exceeds 5min we force-close it and (if motion
         // is still active on this frame) the next Born will open a
         // fresh one. Reset to None on every close.
-        let mut clip_opened_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut clip_opened_at: Option<std::time::Instant> = None;
         // Byte cap on the in-flight clip. A corrupt camera H.264
         // stream can balloon a single short clip to multiple GiB
         // long before the 5-min duration cap fires, and such a clip
@@ -671,7 +671,8 @@ async fn run_camera(
                 // one.
                 let mut force_reopen_after_rotation = false;
                 if let (Some(handle), Some(opened_at)) = (current_clip, clip_opened_at) {
-                    let age_ms = (frame.captured_at - opened_at).num_milliseconds();
+                    let age_ms =
+                        frame.captured_mono.saturating_duration_since(opened_at).as_millis() as i64;
                     let duration_exceeded = age_ms >= MAX_CLIP_DURATION_MS;
 
                     // Byte-cap guard. Sampled every SIZE_STAT_INTERVAL_FRAMES
@@ -934,7 +935,7 @@ async fn run_camera(
 
                 let mut tracked = {
                     let _g = info_span!("frame.track", tracker = tracker.name()).entered();
-                    tracker.update(detections, frame.captured_at)
+                    tracker.update(detections, frame.captured_mono)
                 };
                 // M_PERF_CROWD Phase E1 — feed the post-tracker
                 // tracked-object count back into the skip policy's EMA so
@@ -947,7 +948,7 @@ async fn run_camera(
                 // current frame we already committed to a detector above.
                 // No-op when the policy is disabled.
                 detector_downscaled =
-                    crowd_hysteresis.observe(tracked.len(), std::time::Instant::now());
+                    crowd_hysteresis.observe(tracked.len(), frame.captured_mono);
                 // M_PERF_CROWD Phase E2 — sustained-crowd supervisor
                 // frame downscale. Independent hysteresis (asymmetric
                 // up/down windows) over the same tracked-object EMA. On
@@ -963,7 +964,7 @@ async fn run_camera(
                 // no RGB-tap ingester for this camera (e.g. stub
                 // recorder in tests).
                 let want_supervisor_downscale =
-                    supervisor_hysteresis.observe(tracked.len(), std::time::Instant::now());
+                    supervisor_hysteresis.observe(tracked.len(), frame.captured_mono);
                 if want_supervisor_downscale != supervisor_downscaled {
                     if let Some(downscale_w) = cfg.behavior.supervisor_downscale_to_width {
                         let (target_w, target_h) = if want_supervisor_downscale {
@@ -1312,7 +1313,7 @@ async fn run_camera(
                 // across recorder/store awaits because EnteredSpan is
                 // !Send and would break tokio::spawn.
                 let decisions = info_span!("frame.motion")
-                    .in_scope(|| emitter.tick(cfg.id, dynamic_tracked, frame.captured_at));
+                    .in_scope(|| emitter.tick(cfg.id, dynamic_tracked, frame.captured_at, frame.captured_mono));
                 for d in &decisions {
                     let should_open = current_clip.is_none()
                         && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);
@@ -1328,7 +1329,7 @@ async fn run_camera(
                         {
                             Ok(handle) => {
                                 current_clip = Some(handle);
-                                clip_opened_at = Some(d.captured_at);
+                                clip_opened_at = Some(frame.captured_mono);
                                 // One-shot — only the first decision in
                                 // this frame triggers the post-rotation
                                 // reopen.
@@ -1392,7 +1393,7 @@ async fn run_camera(
                                     "alert-triggered motion clip opened (no live motion track)"
                                 );
                                 current_clip = Some(handle);
-                                clip_opened_at = Some(frame.captured_at);
+                                clip_opened_at = Some(frame.captured_mono);
                             }
                             Err(RecorderError::Refused) => {
                                 // Watermark sampler has paused new clips
@@ -1440,7 +1441,7 @@ async fn run_camera(
                 // next frame.
                 let alert_kept_alive = record_motion_clip_on_alert && !events_to_link.is_empty();
                 let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
-                let action = post_roll.tick(frame.captured_at, has_live_motion);
+                let action = post_roll.tick(frame.captured_mono, has_live_motion);
                 if matches!(action, PostRollAction::CloseNow) {
                     if let Some(handle) = current_clip.take() {
                         if let Err(e) = recorder

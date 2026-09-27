@@ -23,8 +23,8 @@
 //! `stale_state_frames` empty observations.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
-use chrono::{DateTime, Utc};
 use nexus_config::{AnnotatorConfig, ZoneConfig, ZoneKind};
 use nexus_types::{Frame, TrackId, TrackedObject};
 use serde_json::json;
@@ -38,8 +38,8 @@ type CenterGrid = HashMap<(i32, i32), Vec<(f32, f32)>>;
 
 #[derive(Debug, Default, Clone)]
 struct PerTrackState {
-    first_seen_at: Option<DateTime<Utc>>,
-    last_seen_at: Option<DateTime<Utc>>,
+    first_seen_at: Option<Instant>,
+    last_seen_at: Option<Instant>,
     last_seen_tick: u64,
     last_center: Option<(f32, f32)>,
     /// EMA of px/frame movement magnitude. Drives speed_class and parked.
@@ -54,9 +54,9 @@ struct PerTrackState {
     /// Phase 8.1 — id of the static anchor this track is currently
     /// within proximity of (None when clear). Drives near_static_vehicle_id.
     near_anchor_id: Option<String>,
-    /// Phase 8.1 — first wall-clock at which the track entered the
+    /// Phase 8.1 — capture stamp at which the track entered the
     /// current anchor's proximity. Drives near_static_vehicle_seconds.
-    near_anchor_since: Option<DateTime<Utc>>,
+    near_anchor_since: Option<Instant>,
 }
 
 pub struct TrackAnnotator {
@@ -165,15 +165,12 @@ impl TrackAnnotator {
 
         for o in objects.iter_mut() {
             let state = self.state_by_track.entry(o.track_id).or_default();
-            let now = frame.captured_at;
+            let now = frame.captured_mono;
             let center = o.bbox.center();
             // ---- dt seconds since last observation ----
             let dt_seconds = match state.last_seen_at {
                 Some(prev) => {
-                    let delta_us = now
-                        .signed_duration_since(prev)
-                        .num_microseconds()
-                        .unwrap_or(0);
+                    let delta_us = now.saturating_duration_since(prev).as_micros();
                     if delta_us > 0 {
                         delta_us as f64 / 1_000_000.0
                     } else {
@@ -257,7 +254,7 @@ impl TrackAnnotator {
             // ---- dwell_seconds (integer seconds since first_seen_at) ----
             let dwell_ms = state
                 .first_seen_at
-                .map(|first| now.signed_duration_since(first).num_milliseconds().max(0))
+                .map(|first| now.saturating_duration_since(first).as_millis() as u64)
                 .unwrap_or(0);
             o.attributes
                 .insert("motion.dwell_seconds".into(), json!(dwell_ms / 1000));
@@ -386,7 +383,7 @@ impl TrackAnnotator {
                     }
                     let secs = state
                         .near_anchor_since
-                        .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                        .map(|t| now.saturating_duration_since(t).as_secs())
                         .unwrap_or(0);
                     o.attributes
                         .insert("motion.near_static_vehicle_id".into(), json!(id));
@@ -536,16 +533,24 @@ pub(crate) fn point_in_normalized_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
     use nexus_types::{BBox, Frame, PixelFormat};
     use std::sync::Arc;
+
+    /// The monotonic stamp read beside wall time `ms`, for a clock that was
+    /// never stepped.
+    fn mono_ms(ms: i64) -> std::time::Instant {
+        static T0: std::sync::LazyLock<std::time::Instant> =
+            std::sync::LazyLock::new(std::time::Instant::now);
+        *T0 + std::time::Duration::from_millis(ms as u64)
+    }
 
     fn frame_at(secs: i64, w: u32, h: u32) -> Frame {
         Frame {
             camera_id: 1,
             frame_id: secs as u64,
             captured_at: Utc.timestamp_opt(secs, 0).unwrap(),
-            captured_mono: std::time::Instant::now(),
+            captured_mono: mono_ms(secs * 1000),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,
@@ -559,7 +564,7 @@ mod tests {
             camera_id: 1,
             frame_id: ms as u64,
             captured_at: Utc.timestamp_millis_opt(ms).unwrap(),
-            captured_mono: std::time::Instant::now(),
+            captured_mono: mono_ms(ms),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,
@@ -613,6 +618,35 @@ mod tests {
             if i == 4 {
                 assert_eq!(o[0].attributes["motion.speed_class"], "running");
                 assert_eq!(o[0].attributes["motion.direction"], "e");
+            }
+        }
+    }
+
+    /// Dwell and speed are measured on the monotonic capture stamp, so an
+    /// hour's step of the wall clock either way moves neither: a person
+    /// walking 6 px every 100 ms stays `walking`, and dwells 100 ms a frame.
+    #[test]
+    fn a_wall_clock_step_moves_neither_dwell_nor_speed() {
+        for step_ms in [3_600_000, -3_600_000] {
+            let mut a = TrackAnnotator::new(AnnotatorConfig::default());
+            for i in 0..30i64 {
+                let mut f = frame_at_ms(i * 100, 1920, 1080);
+                if i >= 15 {
+                    f.captured_at += chrono::Duration::milliseconds(step_ms);
+                }
+                let mut o = vec![obj(1, "person", 100.0 + 6.0 * i as f32, 500.0)];
+                a.annotate(&f, &[], &[], &mut o);
+                assert_eq!(
+                    o[0].attributes["motion.dwell_seconds"],
+                    json!(i / 10),
+                    "{step_ms} ms step: frame {i}'s dwell"
+                );
+                if i >= 10 {
+                    assert_eq!(
+                        o[0].attributes["motion.speed_class"], "walking",
+                        "{step_ms} ms step: frame {i}'s speed"
+                    );
+                }
             }
         }
     }
