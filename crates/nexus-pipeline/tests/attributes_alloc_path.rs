@@ -269,6 +269,22 @@ fn attributes_are_converted_once_per_object_not_once_per_rule() {
     );
 }
 
+/// The binding's 13 constant keys (`label`, `box`, `x1`, ...) are built once
+/// and shared. Allocating them per object costs 26 allocations (a `String`
+/// and an `Arc` each); on an object with no attributes, what is left is the
+/// binding's maps and label plus one rule's evaluation.
+#[test]
+fn an_object_without_attributes_costs_at_most_seventeen_allocations_with_one_rule() {
+    let (n, objects) = rule_stage(&never_matching(1), true);
+    let per_object = n as f64 / objects as f64;
+    println!("rules x1, attributes stripped: {per_object:.2} allocs/object/frame");
+    assert!(
+        per_object <= 17.0,
+        "one rule costs {per_object:.2} allocations per bare object per frame; \
+         the binding's constant keys are being allocated per object"
+    );
+}
+
 /// Per-stage census of the whole post-inference path with two realistic
 /// rules. Printed for the record; the bounds live in the tests above.
 #[test]

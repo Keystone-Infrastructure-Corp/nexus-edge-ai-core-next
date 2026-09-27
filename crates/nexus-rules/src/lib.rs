@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -129,48 +129,65 @@ fn run_program(compiled: &CompiledRule, ctx: &Context) -> Result<bool, RulesErro
     }
 }
 
+/// The key names of the binding's two fixed maps, in the order
+/// `object_to_cel` supplies their values. Built once: `Key::from(&str)`
+/// allocates a `String` and an `Arc`, 26 allocations per object per frame,
+/// while cloning a built `Key` only bumps its refcount.
+static BOX_KEYS: LazyLock<[Key; 6]> =
+    LazyLock::new(|| ["x1", "y1", "x2", "y2", "width", "height"].map(Key::from));
+static OBJECT_KEYS: LazyLock<[Key; 7]> = LazyLock::new(|| {
+    [
+        "label",
+        "confidence",
+        "track_id",
+        "age_ms",
+        "age_frames",
+        "box",
+        "attributes",
+    ]
+    .map(Key::from)
+});
+
 /// Bind an object for CEL straight from its typed fields. Produces exactly
 /// what the former `json!` -> `serde_json::Value` -> CEL round trip did (see
 /// the differential test), without building the intermediate tree.
 fn object_to_cel(o: &TrackedObject) -> CelValue {
     let b = &o.bbox;
-    let bbox = cel_map([
-        ("x1", f32_to_cel(b.x1)),
-        ("y1", f32_to_cel(b.y1)),
-        ("x2", f32_to_cel(b.x2)),
-        ("y2", f32_to_cel(b.y2)),
-        ("width", f32_to_cel(b.width())),
-        ("height", f32_to_cel(b.height())),
-    ]);
+    let bbox = cel_map(
+        &BOX_KEYS,
+        [
+            f32_to_cel(b.x1),
+            f32_to_cel(b.y1),
+            f32_to_cel(b.x2),
+            f32_to_cel(b.y2),
+            f32_to_cel(b.width()),
+            f32_to_cel(b.height()),
+        ],
+    );
     let attributes: HashMap<Key, CelValue> = o
         .attributes
         .iter()
         .map(|(k, v)| (Key::from(k.clone()), json_to_cel(v)))
         .collect();
-    cel_map([
-        ("label", CelValue::String(Arc::new(o.label.clone()))),
-        ("confidence", f32_to_cel(o.confidence)),
-        ("track_id", u64_to_cel(o.track_id)),
-        ("age_ms", u64_to_cel(o.age_ms)),
-        ("age_frames", CelValue::Int(o.age_frames.into())),
-        ("box", bbox),
-        (
-            "attributes",
+    cel_map(
+        &OBJECT_KEYS,
+        [
+            CelValue::String(Arc::new(o.label.clone())),
+            f32_to_cel(o.confidence),
+            u64_to_cel(o.track_id),
+            u64_to_cel(o.age_ms),
+            CelValue::Int(o.age_frames.into()),
+            bbox,
             CelValue::Map(CelMap {
                 map: Arc::new(attributes),
             }),
-        ),
-    ])
+        ],
+    )
 }
 
-fn cel_map<const N: usize>(entries: [(&str, CelValue); N]) -> CelValue {
+fn cel_map<const N: usize>(keys: &[Key; N], values: [CelValue; N]) -> CelValue {
     CelValue::Map(CelMap {
-        map: Arc::new(
-            entries
-                .into_iter()
-                .map(|(k, v)| (Key::from(k), v))
-                .collect(),
-        ),
+        map: Arc::new(keys.iter().cloned().zip(values).collect()),
     })
 }
 
@@ -1162,6 +1179,27 @@ mod tests {
                 &format!("object[track {}]", o.track_id),
             );
         }
+    }
+
+    /// The 13 constant keys are shared, not built per object. CEL resolves a
+    /// member by hashing a freshly built key, so each shared key must still
+    /// resolve through CEL's own lookup, with its own value.
+    #[test]
+    fn every_constant_binding_key_resolves_through_cel() {
+        let rule = fire_every_match(
+            "all",
+            "object.label == 'person' && object.confidence > 0.89 \
+             && object.confidence < 0.91 && object.track_id == 1 \
+             && object.age_ms == 1234 && object.age_frames == 42 \
+             && object.box.x1 == 10.25 && object.box.y1 == -3.5 \
+             && object.box.x2 == 110.75 && object.box.y2 == 200.0 \
+             && object.box.width == 100.5 && object.box.height == 203.5 \
+             && size(object.attributes) == 0",
+        );
+        let eng = CelEngine::new();
+        let compiled = eng.compile(&rule).unwrap();
+        let object = &binding_fixtures()[0];
+        assert!(matches!(eng.matches(&compiled, object, 3), Ok(true)));
     }
 
     fn fire_every_match(id: &str, when: &str) -> RuleConfig {
