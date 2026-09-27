@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -133,6 +134,33 @@ impl Frame {
         match self.format {
             PixelFormat::Rgb24 | PixelFormat::Bgr24 => self.width as usize * 3,
             PixelFormat::Nv12 | PixelFormat::I420 => self.width as usize,
+        }
+    }
+
+    /// The pixels as packed RGB24: RGB24 is borrowed from the frame's
+    /// buffer, BGR24 is swapped into an owned copy, and any other format
+    /// comes back as `Err(format)` for the caller to map. The length is
+    /// not checked; a trailing partial pixel is zeroed.
+    ///
+    /// This is the one home for the conversion. It lives here, not in a
+    /// consumer, because every consumer (nexus-inference, nexus-engine,
+    /// nexus-reid) can reach this crate and CI lints it on every PR — the
+    /// seven per-crate copies it replaced were partly behind the `ort`
+    /// feature, which CI's clippy never builds.
+    pub fn rgb24(&self) -> Result<Cow<'_, [u8]>, PixelFormat> {
+        match self.format {
+            PixelFormat::Rgb24 => Ok(Cow::Borrowed(&self.data[..])),
+            PixelFormat::Bgr24 => {
+                let mut out = vec![0u8; self.data.len()];
+                for (i, px) in self.data.as_chunks::<3>().0.iter().enumerate() {
+                    let off = i * 3;
+                    out[off] = px[2];
+                    out[off + 1] = px[1];
+                    out[off + 2] = px[0];
+                }
+                Ok(Cow::Owned(out))
+            }
+            other => Err(other),
         }
     }
 }
@@ -967,6 +995,53 @@ mod tests {
         };
         assert_eq!(a.area(), 24.0);
         assert_eq!(a.center(), (2.0, 3.0));
+    }
+
+    fn frame_of(format: PixelFormat, data: Vec<u8>) -> Frame {
+        Frame {
+            camera_id: 1,
+            frame_id: 1,
+            captured_at: Utc::now(),
+            width: 2,
+            height: 1,
+            format,
+            data: Arc::new(data),
+            trace_id: "rgb24-test".into(),
+        }
+    }
+
+    #[test]
+    fn rgb24_borrows_rgb24_instead_of_copying_it() {
+        // RGB24 is the supervisor frame contract, so this is the branch
+        // every inferred and encoded frame takes: it must hand back the
+        // frame's own bytes.
+        let frame = frame_of(PixelFormat::Rgb24, vec![1, 2, 3, 4, 5, 6]);
+        let rgb = frame.rgb24().unwrap();
+        assert!(matches!(rgb, Cow::Borrowed(_)), "RGB24 was copied");
+        assert_eq!(rgb.as_ptr(), frame.data.as_ptr());
+    }
+
+    #[test]
+    fn rgb24_swaps_bgr24() {
+        let frame = frame_of(PixelFormat::Bgr24, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(&*frame.rgb24().unwrap(), &[3, 2, 1, 6, 5, 4]);
+    }
+
+    #[test]
+    fn rgb24_bgr24_partial_trailing_pixel_keeps_length_and_zeroes_it() {
+        // No length check here: callers that index by width/height
+        // validate the size themselves. A trailing partial pixel is
+        // zeroed, not copied and not dropped.
+        let frame = frame_of(PixelFormat::Bgr24, vec![1, 2, 3, 4, 5]);
+        assert_eq!(&*frame.rgb24().unwrap(), &[3, 2, 1, 0, 0]);
+    }
+
+    #[test]
+    fn rgb24_rejects_planar_formats_with_the_format() {
+        for format in [PixelFormat::Nv12, PixelFormat::I420] {
+            let frame = frame_of(format, vec![0; 3]);
+            assert_eq!(frame.rgb24().unwrap_err(), format);
+        }
     }
 
     #[test]

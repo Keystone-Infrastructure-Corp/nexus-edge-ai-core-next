@@ -30,7 +30,10 @@ future automated agents who need to skip the same potholes we already hit.
   cargo clippy --locked --workspace --all-targets -- -D warnings   # ~5 s
   cargo test   --locked --workspace --no-fail-fast    # ~4 s
   cargo test   -p nexus-types --features ts           # regenerates ui/src/api/types/
-  cargo check  --locked -p nexus-pipeline --features gstreamer
+  cargo clippy --locked -p nexus-pipeline --features gstreamer --all-targets -- -D warnings
+  cargo clippy --locked -p nexus-pipeline --features gstreamer-webrtc --all-targets -- -D warnings
+  cargo clippy --locked -p nexus-engine --features gstreamer --all-targets -- -D warnings
+  cargo clippy --locked -p nexus-engine --features gstreamer-webrtc --all-targets -- -D warnings
   cargo check  --locked -p nexus-inference --features ort,ep-cpu \
        ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib
   cargo check  --locked -p nexus-inference --features ort,ep-cuda   # compile-only

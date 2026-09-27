@@ -208,14 +208,7 @@ fn parse_wxh(s: &str) -> Option<(u32, u32)> {
 /// session at the camera's real supervisor size.
 pub fn supervisor_pixels_for(cam: &CameraConfig) -> u64 {
     const DEFAULT_DETECTOR_WIDTH: u32 = 512;
-    let det_w = cam
-        .detector
-        .model_override
-        .as_ref()
-        .map(|m| m.input_width)
-        .unwrap_or(DEFAULT_DETECTOR_WIDTH);
-    let sup_input = cam.behavior.supervisor_width.unwrap_or(det_w).max(det_w);
-    let (w, h) = nexus_pipeline::supervisor_frame_for(sup_input);
+    let (w, h) = crate::reconciler::supervisor_dims_for(cam, DEFAULT_DETECTOR_WIDTH);
     u64::from(w) * u64::from(h)
 }
 
@@ -386,5 +379,43 @@ mod tests {
         let (p, _) = propose_for_camera(&cam(None), Ok(mismatched), SUP, redact);
         assert_eq!(p.outcome, ReprobeOutcome::NoSubstream);
         assert!(p.reason.unwrap().contains("shift your zones"));
+    }
+
+    /// The floor a substream is ranked against: the camera's supervisor
+    /// frame, with the 512 px default detector width standing in for the
+    /// engine's configured one, which the admin API does not carry.
+    #[test]
+    fn the_substream_floor_is_the_supervisor_frame_at_the_512_px_default() {
+        let shaped = |shape: &dyn Fn(&mut CameraConfig)| {
+            let mut c = cam(None);
+            shape(&mut c);
+            c
+        };
+        for (what, cam, want) in [
+            ("the 512 px default", cam(None), 512 * 288),
+            (
+                "a model override",
+                shaped(&|c| {
+                    c.detector.model_override = Some(nexus_config::ModelConfig {
+                        kind: "mock".into(),
+                        input_width: 640,
+                        ..Default::default()
+                    })
+                }),
+                640 * 360,
+            ),
+            (
+                "a supervisor_width below the detector input",
+                shaped(&|c| c.behavior.supervisor_width = Some(256)),
+                512 * 288,
+            ),
+            (
+                "a supervisor_width above the detector input",
+                shaped(&|c| c.behavior.supervisor_width = Some(1024)),
+                1024 * 576,
+            ),
+        ] {
+            assert_eq!(supervisor_pixels_for(&cam), want, "{what}");
+        }
     }
 }

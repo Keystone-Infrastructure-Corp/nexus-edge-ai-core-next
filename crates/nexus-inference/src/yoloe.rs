@@ -32,16 +32,15 @@
 #![cfg(feature = "ort")]
 #![allow(unsafe_code)]
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use ndarray::{s, Array2, Array4, Ix2};
+use ndarray::{s, Array2, Ix2};
 use nexus_config::{CameraConfigUpdate, InferenceConfig};
-use nexus_types::{BBox, CameraId, Detection, Frame, PixelFormat};
+use nexus_types::{BBox, CameraId, Detection, Frame};
 use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
@@ -49,6 +48,7 @@ use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
 use crate::session_tuning::{self, SessionTuning};
+use crate::yolo::{frame_rgb, preprocess_nchw};
 
 /// One YOLOE ONNX session + the prompt vocabulary it was exported
 /// with + a per-camera subset filter.
@@ -255,7 +255,6 @@ impl Detector for YoloeDetector {
         let score_threshold = self.score_threshold;
         let nms_iou = self.nms_iou_threshold;
         let nms_bucket = self.nms_spatial_bucket_size_px;
-        let format = frame.format;
         let camera_id = frame.camera_id;
 
         // Decide the enabled class-id subset for this frame. The rule:
@@ -275,15 +274,9 @@ impl Detector for YoloeDetector {
                 .unwrap_or_default()
         };
 
-        // Borrow the source RGB buffer when it's already in the right
-        // pixel order; only the BGR path needs to allocate. `frame.data`
-        // is `Arc<Vec<u8>>` so the Rgb24 branch is a zero-copy borrow
-        // — saves ~1.5 MB alloc + memcpy per frame per camera.
-        let rgb: Cow<'_, [u8]> = match format {
-            PixelFormat::Rgb24 => Cow::Borrowed(&frame.data[..]),
-            PixelFormat::Bgr24 => Cow::Owned(bgr_to_rgb(&frame.data)),
-            other => return Err(InferenceError::UnsupportedFormat(other)),
-        };
+        // Borrowed for RGB24 (the supervisor contract); only BGR24 pays
+        // for a converted copy.
+        let rgb = frame_rgb(frame)?;
 
         let session_for_blocking: &Mutex<Session> = &self.session;
         let vocab = &self.vocab;
@@ -593,70 +586,6 @@ fn parse_seg_nms_rows(
         enabled = enabled.len(),
         "yoloe seg-NMS postprocess done"
     );
-    out
-}
-
-/// Bilinear resize RGB → NCHW float32. Same shape as the closed-vocab
-/// `crate::yolo::preprocess_nchw`; kept as a sibling rather than reused
-/// across module boundaries because the closed-vocab one is `pub(super)`
-/// only by accident — keeping them separate also lets a future YOLOE
-/// preprocess (e.g. ImageNet mean/std normalize) diverge cleanly.
-fn preprocess_nchw(
-    rgb: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Result<Array4<f32>, InferenceError> {
-    if rgb.len() != (src_w as usize) * (src_h as usize) * 3 {
-        return Err(InferenceError::Failed(format!(
-            "rgb buffer wrong size: got {} expected {}",
-            rgb.len(),
-            (src_w as usize) * (src_h as usize) * 3
-        )));
-    }
-    let mut tensor = Array4::<f32>::zeros((1, 3, dst_h as usize, dst_w as usize));
-    let inv_255 = 1.0f32 / 255.0;
-    let sx = src_w as f32 / dst_w as f32;
-    let sy = src_h as f32 / dst_h as f32;
-    for y in 0..dst_h as usize {
-        let src_yf = ((y as f32) + 0.5) * sy - 0.5;
-        let y0 = src_yf.floor().clamp(0.0, (src_h - 1) as f32) as usize;
-        let y1 = (y0 + 1).min(src_h as usize - 1);
-        let dy = (src_yf - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..dst_w as usize {
-            let src_xf = ((x as f32) + 0.5) * sx - 0.5;
-            let x0 = src_xf.floor().clamp(0.0, (src_w - 1) as f32) as usize;
-            let x1 = (x0 + 1).min(src_w as usize - 1);
-            let dx = (src_xf - x0 as f32).clamp(0.0, 1.0);
-            let stride = src_w as usize * 3;
-            let i00 = y0 * stride + x0 * 3;
-            let i01 = y0 * stride + x1 * 3;
-            let i10 = y1 * stride + x0 * 3;
-            let i11 = y1 * stride + x1 * 3;
-            for c in 0..3 {
-                let v00 = rgb[i00 + c] as f32;
-                let v01 = rgb[i01 + c] as f32;
-                let v10 = rgb[i10 + c] as f32;
-                let v11 = rgb[i11 + c] as f32;
-                let v0 = v00 * (1.0 - dx) + v01 * dx;
-                let v1 = v10 * (1.0 - dx) + v11 * dx;
-                let v = v0 * (1.0 - dy) + v1 * dy;
-                tensor[[0, c, y, x]] = v * inv_255;
-            }
-        }
-    }
-    Ok(tensor)
-}
-
-fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.chunks_exact(3).enumerate() {
-        let off = i * 3;
-        out[off] = chunk[2];
-        out[off + 1] = chunk[1];
-        out[off + 2] = chunk[0];
-    }
     out
 }
 

@@ -34,13 +34,14 @@
 #![cfg(feature = "ort")]
 #![allow(unsafe_code)]
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ndarray::{s, Array2, Array4};
 use nexus_config::InferenceConfig;
-use nexus_types::{BBox, Detection, Frame, PixelFormat};
+use nexus_types::{BBox, Detection, Frame};
 use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
@@ -279,13 +280,8 @@ impl Detector for YoloOrtDetector {
         let frame_w = frame.width;
         let frame_h = frame.height;
         let score_threshold = self.score_threshold;
-        let format = frame.format;
 
-        let rgb = match format {
-            PixelFormat::Rgb24 => frame.data.as_ref().clone(),
-            PixelFormat::Bgr24 => bgr_to_rgb(frame.data.as_ref()),
-            other => return Err(InferenceError::UnsupportedFormat(other)),
-        };
+        let rgb = frame_rgb(frame)?;
 
         // ort sessions are !Sync and `run` takes &mut self, so do the
         // work on a blocking thread and acquire the mutex there.
@@ -443,9 +439,13 @@ fn run_yolo(
     Ok(out)
 }
 
-/// Bilinear resize RGB → NCHW float32, in-place into a fresh ndarray.
-/// Hot path; do as little allocation as possible, no per-pixel allocs.
-fn preprocess_nchw(
+/// Bilinear resize RGB → NCHW float32 / 255.0. Shared by every ORT
+/// detector and the image encoder. Hot path: the per-column source
+/// offsets and weights are computed once per call, and the tensor is
+/// written through its contiguous slice rather than by 4-D indexing.
+/// Output is bit-identical to the original per-pixel form (same f32
+/// expressions in the same order; see the reference test).
+pub(crate) fn preprocess_nchw(
     rgb: &[u8],
     src_w: u32,
     src_h: u32,
@@ -460,56 +460,74 @@ fn preprocess_nchw(
         )));
     }
 
-    let mut tensor = Array4::<f32>::zeros((1, 3, dst_h as usize, dst_w as usize));
+    let (dw, dh) = (dst_w as usize, dst_h as usize);
+    let mut tensor = Array4::<f32>::zeros((1, 3, dh, dw));
     let inv_255 = 1.0f32 / 255.0;
     let sx = src_w as f32 / dst_w as f32;
     let sy = src_h as f32 / dst_h as f32;
+    let stride = src_w as usize * 3;
 
-    for y in 0..dst_h as usize {
-        // Sample center-pixel: src_y = (y + 0.5) * sy - 0.5
-        let src_yf = ((y as f32) + 0.5) * sy - 0.5;
-        let y0 = src_yf.floor().clamp(0.0, (src_h - 1) as f32) as usize;
-        let y1 = (y0 + 1).min(src_h as usize - 1);
-        let dy = (src_yf - y0 as f32).clamp(0.0, 1.0);
-
-        for x in 0..dst_w as usize {
+    // Sample center-pixel: src_x = (x + 0.5) * sx - 0.5. Byte offsets of
+    // the left/right source pixels plus the right-hand weight, per column.
+    let cols: Vec<(usize, usize, f32)> = (0..dw)
+        .map(|x| {
             let src_xf = ((x as f32) + 0.5) * sx - 0.5;
             let x0 = src_xf.floor().clamp(0.0, (src_w - 1) as f32) as usize;
             let x1 = (x0 + 1).min(src_w as usize - 1);
             let dx = (src_xf - x0 as f32).clamp(0.0, 1.0);
+            (x0 * 3, x1 * 3, dx)
+        })
+        .collect();
 
-            // Four-corner indices in the source RGB buffer.
-            let stride = src_w as usize * 3;
-            let i00 = y0 * stride + x0 * 3;
-            let i01 = y0 * stride + x1 * 3;
-            let i10 = y1 * stride + x0 * 3;
-            let i11 = y1 * stride + x1 * 3;
+    let plane = dw * dh;
+    let out = tensor
+        .as_slice_mut()
+        .expect("freshly allocated Array4 is contiguous");
+    let (r_plane, gb) = out.split_at_mut(plane);
+    let (g_plane, b_plane) = gb.split_at_mut(plane);
 
-            for c in 0..3 {
-                let v00 = rgb[i00 + c] as f32;
-                let v01 = rgb[i01 + c] as f32;
-                let v10 = rgb[i10 + c] as f32;
-                let v11 = rgb[i11 + c] as f32;
+    for y in 0..dh {
+        let src_yf = ((y as f32) + 0.5) * sy - 0.5;
+        let y0 = src_yf.floor().clamp(0.0, (src_h - 1) as f32) as usize;
+        let y1 = (y0 + 1).min(src_h as usize - 1);
+        let dy = (src_yf - y0 as f32).clamp(0.0, 1.0);
+        let row0 = &rgb[y0 * stride..(y0 + 1) * stride];
+        let row1 = &rgb[y1 * stride..(y1 + 1) * stride];
+
+        let span = y * dw..(y + 1) * dw;
+        let r_row = &mut r_plane[span.clone()];
+        let g_row = &mut g_plane[span.clone()];
+        let b_row = &mut b_plane[span];
+        let dst = r_row.iter_mut().zip(g_row).zip(b_row);
+        for (&(o0, o1, dx), ((r, g), b)) in cols.iter().zip(dst) {
+            let sample = |c: usize| {
+                let v00 = row0[o0 + c] as f32;
+                let v01 = row0[o1 + c] as f32;
+                let v10 = row1[o0 + c] as f32;
+                let v11 = row1[o1 + c] as f32;
                 let v0 = v00 * (1.0 - dx) + v01 * dx;
                 let v1 = v10 * (1.0 - dx) + v11 * dx;
                 let v = v0 * (1.0 - dy) + v1 * dy;
-                tensor[[0, c, y, x]] = v * inv_255;
-            }
+                v * inv_255
+            };
+            *r = sample(0);
+            *g = sample(1);
+            *b = sample(2);
         }
     }
 
     Ok(tensor)
 }
 
-pub(crate) fn bgr_to_rgb(buf: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; buf.len()];
-    for (i, chunk) in buf.chunks_exact(3).enumerate() {
-        let off = i * 3;
-        out[off] = chunk[2];
-        out[off + 1] = chunk[1];
-        out[off + 2] = chunk[0];
-    }
-    out
+/// The frame's pixels as RGB ([`Frame::rgb24`]), with an unsupported
+/// format mapped to [`InferenceError::UnsupportedFormat`] for every
+/// detector. RGB24 (the supervisor frame contract, so the branch every
+/// inferred frame takes) is borrowed straight from the frame's `Arc`
+/// buffer; only BGR24 pays for a converted copy. Nothing downstream needs
+/// ownership: `block_in_place` keeps the work on this thread, so the
+/// borrow outlives it.
+pub(crate) fn frame_rgb(frame: &Frame) -> Result<Cow<'_, [u8]>, InferenceError> {
+    frame.rgb24().map_err(InferenceError::UnsupportedFormat)
 }
 
 /// COCO class id → Tier 1 domain label. Mirrors the table in
@@ -608,6 +626,7 @@ fn resolve_hailo_hef(cfg: &InferenceConfig) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_types::PixelFormat;
     use std::fs;
     use tempfile::TempDir;
 
@@ -625,6 +644,152 @@ mod tests {
                 assert!(t[[0, 2, y, x]].abs() < 1e-3);
             }
         }
+    }
+
+    /// The per-pixel implementation every detector carried a copy of
+    /// before they were collapsed onto [`preprocess_nchw`]. Kept verbatim
+    /// as the reference the rewrite must match bit for bit.
+    fn reference_preprocess_nchw(
+        rgb: &[u8],
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> Array4<f32> {
+        let mut tensor = Array4::<f32>::zeros((1, 3, dst_h as usize, dst_w as usize));
+        let inv_255 = 1.0f32 / 255.0;
+        let sx = src_w as f32 / dst_w as f32;
+        let sy = src_h as f32 / dst_h as f32;
+        for y in 0..dst_h as usize {
+            let src_yf = ((y as f32) + 0.5) * sy - 0.5;
+            let y0 = src_yf.floor().clamp(0.0, (src_h - 1) as f32) as usize;
+            let y1 = (y0 + 1).min(src_h as usize - 1);
+            let dy = (src_yf - y0 as f32).clamp(0.0, 1.0);
+            for x in 0..dst_w as usize {
+                let src_xf = ((x as f32) + 0.5) * sx - 0.5;
+                let x0 = src_xf.floor().clamp(0.0, (src_w - 1) as f32) as usize;
+                let x1 = (x0 + 1).min(src_w as usize - 1);
+                let dx = (src_xf - x0 as f32).clamp(0.0, 1.0);
+                let stride = src_w as usize * 3;
+                let i00 = y0 * stride + x0 * 3;
+                let i01 = y0 * stride + x1 * 3;
+                let i10 = y1 * stride + x0 * 3;
+                let i11 = y1 * stride + x1 * 3;
+                for c in 0..3 {
+                    let v00 = rgb[i00 + c] as f32;
+                    let v01 = rgb[i01 + c] as f32;
+                    let v10 = rgb[i10 + c] as f32;
+                    let v11 = rgb[i11 + c] as f32;
+                    let v0 = v00 * (1.0 - dx) + v01 * dx;
+                    let v1 = v10 * (1.0 - dx) + v11 * dx;
+                    let v = v0 * (1.0 - dy) + v1 * dy;
+                    tensor[[0, c, y, x]] = v * inv_255;
+                }
+            }
+        }
+        tensor
+    }
+
+    /// Deterministic, non-uniform pixels so every bilinear weight matters.
+    fn noise_rgb(w: u32, h: u32) -> Vec<u8> {
+        let mut s: u32 = 0x9e37_79b9 ^ (w.wrapping_mul(31) + h);
+        (0..(w as usize * h as usize * 3))
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn preprocess_is_bit_identical_to_the_per_pixel_reference() {
+        // (src_w, src_h, dst_w, dst_h): the supervisor ladder into the
+        // square and native model inputs, identity, upscale, non-integer
+        // ratios, aspect-changing stretches, and degenerate 1-px edges.
+        let cases = [
+            (512, 288, 640, 640),
+            (1024, 576, 640, 640),
+            (1536, 864, 640, 640),
+            (1024, 576, 1024, 576),
+            (640, 640, 640, 640),
+            (960, 540, 512, 288),
+            (4, 4, 2, 2),
+            (3, 5, 7, 11),
+            (7, 3, 640, 352),
+            (1, 1, 5, 3),
+            (1, 9, 4, 4),
+            (9, 1, 4, 4),
+            (13, 17, 1, 1),
+        ];
+        for (sw, sh, dw, dh) in cases {
+            let rgb = noise_rgb(sw, sh);
+            let want = reference_preprocess_nchw(&rgb, sw, sh, dw, dh);
+            let got = preprocess_nchw(&rgb, sw, sh, dw, dh).unwrap();
+            assert_eq!(got.shape(), want.shape(), "{sw}x{sh}->{dw}x{dh}");
+            let mismatch = got
+                .iter()
+                .zip(want.iter())
+                .position(|(a, b)| a.to_bits() != b.to_bits());
+            assert_eq!(mismatch, None, "{sw}x{sh}->{dw}x{dh} differs");
+        }
+    }
+
+    /// Timing harness (no criterion in this workspace). Run with:
+    /// `cargo test --release -p nexus-inference --features ort,ep-cpu --lib
+    ///  bench_preprocess_nchw -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing harness, not a correctness gate"]
+    fn bench_preprocess_nchw() {
+        // Open-vocab / encoder models take 640x640; the closed-vocab
+        // yolo26n model is exported per ladder rung, so src == dst there.
+        let cases = [
+            (512u32, 288u32, 640u32, 640u32),
+            (1024, 576, 640, 640),
+            (1536, 864, 640, 640),
+            (1024, 576, 1024, 576),
+            (1536, 864, 1536, 864),
+        ];
+        for (sw, sh, dw, dh) in cases {
+            let rgb = noise_rgb(sw, sh);
+            let mut samples: Vec<f64> = (0..60)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let out = preprocess_nchw(&rgb, sw, sh, dw, dh).unwrap();
+                    std::hint::black_box(&out);
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "preprocess_nchw {sw}x{sh}->{dw}x{dh}: median {:.3} ms, p10 {:.3} ms",
+                samples[samples.len() / 2],
+                samples[samples.len() / 10]
+            );
+        }
+    }
+
+    fn frame_of(format: PixelFormat, data: Vec<u8>) -> Frame {
+        Frame {
+            camera_id: 1,
+            frame_id: 1,
+            captured_at: chrono::Utc::now(),
+            width: 2,
+            height: 1,
+            format,
+            data: Arc::new(data),
+            trace_id: "yolo-test".into(),
+        }
+    }
+
+    #[test]
+    fn frame_rgb_maps_an_unsupported_format_to_inference_error() {
+        // The conversion itself is tested on `Frame::rgb24`; this pins
+        // the error every detector returns for a format it cannot read.
+        let frame = frame_of(PixelFormat::Nv12, vec![0; 3]);
+        assert!(matches!(
+            frame_rgb(&frame),
+            Err(InferenceError::UnsupportedFormat(PixelFormat::Nv12))
+        ));
     }
 
     #[test]

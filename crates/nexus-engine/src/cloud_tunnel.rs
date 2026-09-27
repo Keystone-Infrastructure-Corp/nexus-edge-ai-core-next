@@ -137,6 +137,7 @@ pub fn spawn_tunnel(
     snapshot_uploader_slot: crate::cloud_alert_sink::SnapshotUploaderSlot,
     live_view: Arc<crate::live_view::LiveViewManager>,
     frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
+    recorder_kind: &'static str,
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     trace_rx: Option<mpsc::Receiver<Span>>,
@@ -212,6 +213,7 @@ pub fn spawn_tunnel(
             pending_acks,
             live_view,
             frame_stats,
+            recorder_kind,
             decode_health,
             webrtc,
             store,
@@ -582,6 +584,7 @@ async fn run(
     pending_acks: Arc<crate::cloud_alert_sink::PendingAckRegistry>,
     live_view: Arc<crate::live_view::LiveViewManager>,
     frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
+    recorder_kind: &'static str,
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
@@ -673,6 +676,7 @@ async fn run(
                     &liveness,
                     &live_view,
                     &frame_stats,
+                    recorder_kind,
                 );
                 let dispatch = pump_rpc_dispatch(
                     &*conn,
@@ -1186,6 +1190,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
     liveness: &crate::cloud_liveness::TunnelLiveness,
     live_view: &crate::live_view::LiveViewManager,
     frame_stats: &nexus_pipeline::FrameStatsRegistry,
+    recorder_kind: &'static str,
 ) {
     // Reaching this function at all means the WSS handshake and the mTLS
     // client-certificate check both succeeded.
@@ -1223,6 +1228,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
         let health = Some(edge_health(
             &live_view.stalled_cameras(),
             crate::system_metrics::snapshot().decode_capacity.as_ref(),
+            recorder_issue(recorder_kind, &store).await,
         ));
         // Camera-liveness rollup — same `FrameStatsRegistry` source of
         // truth as `roster::build_envelope`'s per-camera `online` field,
@@ -2021,7 +2027,8 @@ const HEALTH_DETAIL_MAX: usize = 512;
 const HEALTH_ISSUES_MAX: usize = 16;
 
 /// Build the heartbeat's health roll-up from the process-wide degradation
-/// registry, plus any live-view sources that have stopped producing frames.
+/// registry, plus any live-view sources that have stopped producing frames
+/// and a stub recorder behind enabled cameras ([`recorder_issue`]).
 ///
 /// `status` is `degraded` iff at least one issue is open, matching the
 /// schema's stated invariant. The cloud renders unknown `code`s verbatim, so
@@ -2034,8 +2041,26 @@ const HEALTH_ISSUES_MAX: usize = 16;
 fn edge_health(
     stalled_cameras: &[nexus_types::CameraId],
     decode_capacity: Option<&crate::system_metrics::DecodeCapacity>,
+    recorder: Option<EdgeDegradation>,
 ) -> EdgeHealth {
-    let mut issues: Vec<EdgeDegradation> = nexus_inference::health::degradations()
+    edge_health_from(
+        nexus_inference::health::degradations(),
+        stalled_cameras,
+        decode_capacity,
+        recorder,
+    )
+}
+
+/// [`edge_health`] over a given detector list, so a test can fill the issue
+/// list to [`HEALTH_ISSUES_MAX`] without writing the process-global registry
+/// that sibling tests read (BUG-159).
+fn edge_health_from(
+    detector: Vec<nexus_inference::health::DetectorDegradation>,
+    stalled_cameras: &[nexus_types::CameraId],
+    decode_capacity: Option<&crate::system_metrics::DecodeCapacity>,
+    recorder: Option<EdgeDegradation>,
+) -> EdgeHealth {
+    let mut issues: Vec<EdgeDegradation> = detector
         .into_iter()
         .map(|d| EdgeDegradation {
             component: "detector".to_string(),
@@ -2078,11 +2103,103 @@ fn edge_health(
             });
         }
     }
+    issues.extend(recorder);
     issues.truncate(HEALTH_ISSUES_MAX);
     EdgeHealth {
         status: if issues.is_empty() { "ok" } else { "degraded" }.to_string(),
         issues: Some(issues),
     }
+}
+
+/// The clip recorder's contribution to both health surfaces, the heartbeat's
+/// [`edge_health`] and the local `GET /api/v1/health`. It is computed only
+/// here so the two cannot disagree on it.
+///
+/// Raised when the running recorder is the stub and the store has at least
+/// one enabled camera. The stub writes a 0-byte placeholder for every clip,
+/// so such a box detects, alerts and streams low-bitrate live view but keeps
+/// no video, and without this issue every health surface calls it healthy.
+///
+/// The population is the store's enabled cameras, the set the reconciler
+/// runs. It exists from boot and does not move with the cameras, and it must
+/// not: every flip of this issue is a default-on `core.health.degraded`
+/// customer notification, for a recorder that was never fixed.
+/// - Not cameras that have delivered a frame. That set is empty at boot and
+///   the first heartbeat goes out on connect, so every restart or OTA would
+///   report ok and then degraded one tick later.
+/// - Not online cameras. A site-wide outage longer than the 90 s online
+///   window would clear the issue, and the cameras' return would raise it
+///   again.
+///
+/// So camera liveness is deliberately not an input: this takes only the
+/// recorder's kind and the store, and neither a first frame nor an outage
+/// can reach the issue.
+///
+/// Only a `gstreamer` build raises it. Release binaries always carry that
+/// feature, so it is the build where a real recorder was available and the
+/// stub is a misconfiguration. A build without it has no other recorder, and
+/// an RTSP camera there already fails loudly at its source.
+///
+/// An explicit `recorder = "stub"` on a `gstreamer` build raises it too. That
+/// departs on purpose from the detector's precedent, where asking for the mock
+/// detector by name stays healthy: however the stub was chosen, behind running
+/// cameras it keeps no evidence.
+pub(crate) async fn recorder_issue(recorder_kind: &str, store: &Store) -> Option<EdgeDegradation> {
+    recorder_issue_in(cfg!(feature = "gstreamer"), recorder_kind, store).await
+}
+
+/// [`recorder_issue`] with the build's feature as an argument, so a test can
+/// run the raising branch on any build, through the same store read.
+/// Production passes `cfg!(feature = "gstreamer")`, through
+/// [`recorder_issue`] only.
+pub(crate) async fn recorder_issue_in(
+    real_recorder_available: bool,
+    recorder_kind: &str,
+    store: &Store,
+) -> Option<EdgeDegradation> {
+    recorder_issue_for(
+        real_recorder_available,
+        recorder_kind,
+        enabled_camera_count(store).await,
+    )
+}
+
+/// The cameras [`recorder_issue`] counts: the store's enabled ones. A failed
+/// read is logged and counts none, like the heartbeat's other best-effort
+/// store reads, so it drops the issue for that read. On the heartbeat that
+/// costs one resolve and re-raise of `core.health.degraded`, and only when
+/// `recorder_stub` is the only open issue: the cloud acts on status
+/// transitions, and any other open issue keeps the status degraded.
+async fn enabled_camera_count(store: &Store) -> usize {
+    match store.list_cameras().await {
+        Ok(cameras) => cameras.iter().filter(|c| c.ingest.enabled).count(),
+        Err(e) => {
+            warn!(error = %e, "health: camera list query failed; counting no enabled cameras");
+            0
+        }
+    }
+}
+
+/// The rule [`recorder_issue_in`] applies, over the count of enabled
+/// cameras.
+fn recorder_issue_for(
+    real_recorder_available: bool,
+    recorder_kind: &str,
+    enabled_cameras: usize,
+) -> Option<EdgeDegradation> {
+    if !real_recorder_available || recorder_kind != "stub" || enabled_cameras == 0 {
+        return None;
+    }
+    Some(EdgeDegradation {
+        component: "recorder".to_string(),
+        code: "recorder_stub".to_string(),
+        detail: truncate_detail(
+            "the clip recorder is the stub, so running cameras are detected but nothing is \
+             recorded; set [runtime.clips] recorder = \"gstreamer\" in /etc/nexus/nexus.toml \
+             (or re-run install.sh without --keep-config) and restart nexus-engine. This needs \
+             shell or remote-shell access to the box.",
+        ),
+    })
 }
 
 /// Truncate to at most [`HEALTH_DETAIL_MAX`] **bytes** without splitting a
@@ -2103,6 +2220,7 @@ fn truncate_detail(s: &str) -> String {
 #[cfg(test)]
 mod health_tests {
     use super::*;
+    use nexus_pipeline::{ClipRecorder, StubClipRecorder};
 
     /// The engine must not advertise a capability it cannot perform. Talk-down
     /// audio has no receive-side pipeline here, so no transport may leak the
@@ -2154,7 +2272,7 @@ mod health_tests {
         let kind = "cloud_tunnel_health_test";
         nexus_inference::health::record_degraded(kind, "model pack has no 640x640 export");
 
-        let health = edge_health(&[], None);
+        let health = edge_health(&[], None, None);
         assert_eq!(health.status, "degraded");
         let issue = health
             .issues
@@ -2174,7 +2292,7 @@ mod health_tests {
     /// the existing `EdgeHealth.issues` shape, so no wire bump is needed.
     #[test]
     fn stalled_live_view_sources_become_a_wire_issue() {
-        let health = edge_health(&[4, 11], None);
+        let health = edge_health(&[4, 11], None, None);
         assert_eq!(health.status, "degraded");
         let issue = health
             .issues
@@ -2196,7 +2314,7 @@ mod health_tests {
             binding_engine_pct: 99.1,
             oversubscribed: true,
         };
-        let health = edge_health(&[], Some(&cap));
+        let health = edge_health(&[], Some(&cap), None);
         assert_eq!(health.status, "degraded");
         let issue = health
             .issues
@@ -2226,7 +2344,7 @@ mod health_tests {
             binding_engine_pct: 12.0,
             oversubscribed: false,
         };
-        let health = edge_health(&[], Some(&cap));
+        let health = edge_health(&[], Some(&cap), None);
         assert!(
             !health
                 .issues
@@ -2234,6 +2352,137 @@ mod health_tests {
                 .iter()
                 .any(|i| i.component == "decode"),
             "an under-threshold binding engine must not be reported",
+        );
+    }
+
+    /// A store seeded as boot seeds it, from the engine's default config,
+    /// with every camera's `ingest.enabled` set to `enabled`. No frame has
+    /// arrived, which is the state of the first heartbeat after a restart.
+    async fn default_config_store(enabled: bool) -> (Store, tempfile::TempDir) {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut cfg = nexus_config::Config::load(repo_root.join(crate::DEFAULT_CONFIG))
+            .expect("load the engine's default config");
+        assert_eq!(
+            cfg.runtime.clips.recorder,
+            nexus_config::RecorderKind::Stub,
+            "fixture: the default config has no `recorder` key",
+        );
+        assert!(
+            !cfg.cameras.is_empty(),
+            "fixture: the default config has a camera"
+        );
+        for camera in &mut cfg.cameras {
+            camera.ingest.enabled = enabled;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&nexus_config::StoreConfig {
+            url: format!(
+                "sqlite://{}?mode=rwc",
+                dir.path().join("nexus.db").display()
+            ),
+            ..nexus_config::StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        store
+            .seed_from_config_if_empty(&cfg)
+            .await
+            .expect("seed the store as boot does");
+        (store, dir)
+    }
+
+    /// A stub recorder behind an enabled camera must reach the cloud, from
+    /// the first heartbeat after boot. The engine's own default config boots
+    /// exactly that: no `recorder` key, so `RecorderKind`'s `#[default]
+    /// Stub`, and an enabled camera. Such a box detects and alerts but keeps
+    /// no video, and this roll-up is the cloud's only view of edge health.
+    /// No frame has arrived here; a population that waited for one would
+    /// report ok and then degraded one tick later on every restart. The kind
+    /// comes from a `StubClipRecorder`, what `build_recorder` makes for
+    /// `Stub`, so a renamed `kind()` cannot silently disarm it.
+    ///
+    /// Computed as a `gstreamer` build computes it ([`recorder_issue_in`]
+    /// given `true`), so it runs in default-feature CI; the feature gate has
+    /// its own test. Asserts on the recorder issue, never on
+    /// `status == "ok"` (BUG-159).
+    #[tokio::test]
+    async fn the_heartbeat_health_reports_a_stub_recorder() {
+        let (store, dir) = default_config_store(true).await;
+        let store = Arc::new(store);
+        let stub = StubClipRecorder::new(store.clone(), dir.path().join("clips"));
+
+        let recorder = recorder_issue_in(true, stub.kind(), &store).await;
+        let health = edge_health(&[], None, recorder);
+        let issue = health
+            .issues
+            .as_ref()
+            .and_then(|issues| issues.iter().find(|i| i.component == "recorder"))
+            .unwrap_or_else(|| {
+                panic!("a stub behind an enabled camera must be reported: {health:?}")
+            });
+        assert_eq!(health.status, "degraded");
+        assert_eq!(issue.code, "recorder_stub");
+        // The remedy is the last thing in the detail, so this also
+        // proves the wire clamp did not cut it off.
+        assert!(
+            issue.detail.contains(r#"recorder = "gstreamer""#)
+                && issue.detail.contains("/etc/nexus/nexus.toml")
+                && issue.detail.contains("restart nexus-engine")
+                && issue.detail.contains("remote-shell access"),
+            "the detail must name the fix and what it needs: {}",
+            issue.detail,
+        );
+    }
+
+    /// The feature gate, stated per build: only a `gstreamer` build, where
+    /// a real recorder was available, raises the issue.
+    #[tokio::test]
+    async fn only_a_gstreamer_build_raises_the_recorder_issue() {
+        let (store, _dir) = default_config_store(true).await;
+        assert_eq!(
+            recorder_issue("stub", &store).await.is_some(),
+            cfg!(feature = "gstreamer"),
+            "a gstreamer build must report a stub recorder behind an enabled camera, \
+             and a build without the feature must not",
+        );
+    }
+
+    /// A real recorder behind an enabled camera is the healthy case.
+    #[test]
+    fn a_gstreamer_recorder_with_enabled_cameras_raises_no_recorder_issue() {
+        assert_eq!(recorder_issue_for(true, "gstreamer", 1), None);
+    }
+
+    /// A stub with nothing to record loses nothing: the reconciler runs no
+    /// disabled camera. A box with no cameras at all, such as the
+    /// Playwright harness, is the empty case of the same count.
+    #[tokio::test]
+    async fn a_stub_with_only_disabled_cameras_raises_no_recorder_issue() {
+        let (store, _dir) = default_config_store(false).await;
+        assert!(
+            !store.list_cameras().await.expect("list cameras").is_empty(),
+            "fixture: the disabled camera is in the store",
+        );
+        assert_eq!(recorder_issue_in(true, "stub", &store).await, None);
+    }
+
+    /// On a list already at the wire cap, the recorder issue must not carry
+    /// the heartbeat past it, or the envelope is unserialisable (see
+    /// [`HEALTH_ISSUES_MAX`]).
+    #[test]
+    fn the_recorder_issue_cannot_carry_the_heartbeat_past_the_wire_cap() {
+        let detector = (0..HEALTH_ISSUES_MAX)
+            .map(|n| nexus_inference::health::DetectorDegradation {
+                kind: format!("cap_{n}"),
+                reason: "unavailable".to_string(),
+            })
+            .collect();
+        let health = edge_health_from(detector, &[], None, recorder_issue_for(true, "stub", 1));
+        let issues = health.issues.expect("issues present when degraded");
+        assert!(
+            issues.len() <= HEALTH_ISSUES_MAX,
+            "{} issues exceed the wire cap of {HEALTH_ISSUES_MAX}",
+            issues.len(),
         );
     }
 }
@@ -3055,6 +3304,7 @@ mod heartbeat_ack_tests {
             &liveness,
             &live_view,
             &frame_stats,
+            "gstreamer",
         );
         tokio::pin!(pump);
         // Poll for the condition rather than paying a fixed wait: the pump

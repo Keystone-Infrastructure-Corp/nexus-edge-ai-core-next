@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use cel_interpreter::objects::{Key, Map as CelMap};
 use cel_interpreter::{Context, Program, Value as CelValue};
 use chrono::Utc;
 use nexus_config::{RuleConfig, RulesBackendKind, RulesConfig, ZoneConfig};
@@ -95,27 +96,9 @@ impl RuleEngine for CelEngine {
         object: &TrackedObject,
         camera_id: CameraId,
     ) -> Result<bool, RulesError> {
-        let ProgramRepr::Cel(program) = &compiled.program;
-
-        let mut ctx = Context::default();
-        ctx.add_variable("object", object_to_cel(object))
-            .map_err(|e| RulesError::Evaluate(compiled.config.id.clone(), e.to_string()))?;
-        ctx.add_variable("camera", camera_to_cel(camera_id))
-            .map_err(|e| RulesError::Evaluate(compiled.config.id.clone(), e.to_string()))?;
-        ctx.add_variable("now", now_to_cel())
-            .map_err(|e| RulesError::Evaluate(compiled.config.id.clone(), e.to_string()))?;
-
-        match program.execute(&ctx) {
-            Ok(CelValue::Bool(b)) => Ok(b),
-            Ok(other) => Err(RulesError::Evaluate(
-                compiled.config.id.clone(),
-                format!("rule did not return Bool, got {:?}", other),
-            )),
-            Err(e) => Err(RulesError::Evaluate(
-                compiled.config.id.clone(),
-                e.to_string(),
-            )),
-        }
+        let mut ctx = cel_context(camera_id);
+        ctx.add_variable_from_value("object", object_to_cel(object));
+        run_program(compiled, &ctx)
     }
 
     fn kind(&self) -> RulesBackendKind {
@@ -123,21 +106,87 @@ impl RuleEngine for CelEngine {
     }
 }
 
+/// A CEL scope with `camera` and `now` bound; the caller binds `object`.
+fn cel_context(camera_id: CameraId) -> Context<'static> {
+    let mut ctx = Context::default();
+    ctx.add_variable_from_value("camera", camera_to_cel(camera_id));
+    ctx.add_variable_from_value("now", now_to_cel());
+    ctx
+}
+
+fn run_program(compiled: &CompiledRule, ctx: &Context) -> Result<bool, RulesError> {
+    let ProgramRepr::Cel(program) = &compiled.program;
+    match program.execute(ctx) {
+        Ok(CelValue::Bool(b)) => Ok(b),
+        Ok(other) => Err(RulesError::Evaluate(
+            compiled.config.id.clone(),
+            format!("rule did not return Bool, got {:?}", other),
+        )),
+        Err(e) => Err(RulesError::Evaluate(
+            compiled.config.id.clone(),
+            e.to_string(),
+        )),
+    }
+}
+
+/// Bind an object for CEL straight from its typed fields. Produces exactly
+/// what the former `json!` -> `serde_json::Value` -> CEL round trip did (see
+/// the differential test), without building the intermediate tree.
 fn object_to_cel(o: &TrackedObject) -> CelValue {
-    let v = serde_json::json!({
-        "label": o.label,
-        "confidence": o.confidence,
-        "track_id": o.track_id,
-        "age_ms": o.age_ms,
-        "age_frames": o.age_frames,
-        "box": {
-            "x1": o.bbox.x1, "y1": o.bbox.y1,
-            "x2": o.bbox.x2, "y2": o.bbox.y2,
-            "width": o.bbox.width(), "height": o.bbox.height(),
-        },
-        "attributes": o.attributes,
-    });
-    json_to_cel(&v)
+    let b = &o.bbox;
+    let bbox = cel_map([
+        ("x1", f32_to_cel(b.x1)),
+        ("y1", f32_to_cel(b.y1)),
+        ("x2", f32_to_cel(b.x2)),
+        ("y2", f32_to_cel(b.y2)),
+        ("width", f32_to_cel(b.width())),
+        ("height", f32_to_cel(b.height())),
+    ]);
+    let attributes: HashMap<Key, CelValue> = o
+        .attributes
+        .iter()
+        .map(|(k, v)| (Key::from(k.clone()), json_to_cel(v)))
+        .collect();
+    cel_map([
+        ("label", CelValue::String(Arc::new(o.label.clone()))),
+        ("confidence", f32_to_cel(o.confidence)),
+        ("track_id", u64_to_cel(o.track_id)),
+        ("age_ms", u64_to_cel(o.age_ms)),
+        ("age_frames", CelValue::Int(o.age_frames.into())),
+        ("box", bbox),
+        (
+            "attributes",
+            CelValue::Map(CelMap {
+                map: Arc::new(attributes),
+            }),
+        ),
+    ])
+}
+
+fn cel_map<const N: usize>(entries: [(&str, CelValue); N]) -> CelValue {
+    CelValue::Map(CelMap {
+        map: Arc::new(
+            entries
+                .into_iter()
+                .map(|(k, v)| (Key::from(k), v))
+                .collect(),
+        ),
+    })
+}
+
+/// serde_json widens a finite f32 to an f64 number and has no NaN/inf, which
+/// became `Null`.
+fn f32_to_cel(f: f32) -> CelValue {
+    if f.is_finite() {
+        CelValue::Float(f as f64)
+    } else {
+        CelValue::Null
+    }
+}
+
+/// A JSON number past `i64::MAX` came back as `UInt`, everything else `Int`.
+fn u64_to_cel(u: u64) -> CelValue {
+    i64::try_from(u).map_or(CelValue::UInt(u), CelValue::Int)
 }
 
 fn camera_to_cel(id: CameraId) -> CelValue {
@@ -301,6 +350,12 @@ impl RuleEvaluator {
         let fw = frame_width.max(1) as f32;
         let fh = frame_height.max(1) as f32;
 
+        // One CEL scope, and one binding per object, shared by every rule of
+        // this frame and built on first use. `now` is therefore bound once:
+        // it is constant across every rule and object in this evaluation.
+        let mut cel: Option<Context<'static>> = None;
+        let mut bindings: Vec<Option<CelValue>> = vec![None; objects.len()];
+
         for rule in rules.iter() {
             let cfg = &rule.config;
             if !cfg.enabled {
@@ -360,7 +415,7 @@ impl RuleEvaluator {
                 .static_alerts
                 .retain(|track_id, _| objects.iter().any(|o| o.track_id == *track_id));
 
-            for o in objects {
+            for (idx, o) in objects.iter().enumerate() {
                 // Rules fire on evidence from THIS frame only. A
                 // predicted-only ("coasting") track carries no
                 // detection on this frame — ByteTrack keeps emitting
@@ -395,7 +450,10 @@ impl RuleEvaluator {
                     }
                 }
 
-                let matched = match self.engine.matches(rule, o, camera_id) {
+                let object = bindings[idx].get_or_insert_with(|| object_to_cel(o));
+                let ctx = cel.get_or_insert_with(|| cel_context(camera_id));
+                ctx.add_variable_from_value("object", object.clone());
+                let matched = match run_program(rule, ctx) {
                     Ok(b) => b,
                     Err(e) => {
                         warn!(rule = %cfg.id, "rule eval failed: {e}");
@@ -900,6 +958,269 @@ mod tests {
             alerts[0].bbox,
             Some(raw),
             "event must carry the frame-aligned detection box"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // F1 — the CEL binding is built directly from `TrackedObject`, once
+    // per object per frame. The reference below is the pre-F1 conversion
+    // verbatim (typed object -> `json!` -> `serde_json::Value` -> CEL),
+    // kept here only as the oracle the direct binding must reproduce.
+    // -----------------------------------------------------------------
+
+    fn reference_json_to_cel(v: &JsonValue) -> CelValue {
+        match v {
+            JsonValue::Null => CelValue::Null,
+            JsonValue::Bool(b) => CelValue::Bool(*b),
+            JsonValue::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    CelValue::Int(i)
+                } else if let Some(u) = n.as_u64() {
+                    CelValue::UInt(u)
+                } else if let Some(f) = n.as_f64() {
+                    CelValue::Float(f)
+                } else {
+                    CelValue::Null
+                }
+            }
+            JsonValue::String(s) => CelValue::String(Arc::new(s.clone())),
+            JsonValue::Array(items) => {
+                let converted: Vec<CelValue> = items.iter().map(reference_json_to_cel).collect();
+                CelValue::from(converted)
+            }
+            JsonValue::Object(map) => {
+                let entries: HashMap<String, CelValue> = map
+                    .iter()
+                    .map(|(k, val)| (k.clone(), reference_json_to_cel(val)))
+                    .collect();
+                CelValue::from(entries)
+            }
+        }
+    }
+
+    fn reference_object_to_cel(o: &TrackedObject) -> CelValue {
+        let v = serde_json::json!({
+            "label": o.label,
+            "confidence": o.confidence,
+            "track_id": o.track_id,
+            "age_ms": o.age_ms,
+            "age_frames": o.age_frames,
+            "box": {
+                "x1": o.bbox.x1, "y1": o.bbox.y1,
+                "x2": o.bbox.x2, "y2": o.bbox.y2,
+                "width": o.bbox.width(), "height": o.bbox.height(),
+            },
+            "attributes": o.attributes,
+        });
+        reference_json_to_cel(&v)
+    }
+
+    /// `CelValue`'s own `==` treats `Int(1)`, `UInt(1)` and `Float(1.0)` as
+    /// equal, which would hide exactly the numeric-mapping drift this test
+    /// exists to catch. Compare variant-for-variant instead.
+    fn assert_same_cel(a: &CelValue, b: &CelValue, path: &str) {
+        match (a, b) {
+            (CelValue::Map(x), CelValue::Map(y)) => {
+                let mut xk: Vec<_> = x.map.keys().collect();
+                let mut yk: Vec<_> = y.map.keys().collect();
+                xk.sort();
+                yk.sort();
+                assert_eq!(xk, yk, "{path}: map keys differ");
+                for k in xk {
+                    assert_same_cel(&x.map[k], &y.map[k], &format!("{path}.{k}"));
+                }
+            }
+            (CelValue::List(x), CelValue::List(y)) => {
+                assert_eq!(x.len(), y.len(), "{path}: list lengths differ");
+                for (i, (xa, ya)) in x.iter().zip(y.iter()).enumerate() {
+                    assert_same_cel(xa, ya, &format!("{path}[{i}]"));
+                }
+            }
+            (CelValue::Int(x), CelValue::Int(y)) => assert_eq!(x, y, "{path}"),
+            (CelValue::UInt(x), CelValue::UInt(y)) => assert_eq!(x, y, "{path}"),
+            (CelValue::Float(x), CelValue::Float(y)) => {
+                assert_eq!(x.to_bits(), y.to_bits(), "{path}: {x} vs {y}")
+            }
+            (CelValue::String(x), CelValue::String(y)) => assert_eq!(x, y, "{path}"),
+            (CelValue::Bool(x), CelValue::Bool(y)) => assert_eq!(x, y, "{path}"),
+            (CelValue::Null, CelValue::Null) => {}
+            _ => panic!("{path}: variant mismatch: {a:?} vs {b:?}"),
+        }
+    }
+
+    fn binding_fixture(
+        track_id: u64,
+        label: &str,
+        confidence: f32,
+        bbox: BBox,
+        attributes: JsonValue,
+    ) -> TrackedObject {
+        TrackedObject {
+            track_id,
+            label: label.into(),
+            confidence,
+            bbox,
+            detection_bbox: Some(bbox),
+            age_frames: 42,
+            age_ms: 1_234,
+            attributes: match attributes {
+                JsonValue::Object(m) => m,
+                other => panic!("fixture attributes must be an object, got {other}"),
+            },
+        }
+    }
+
+    fn binding_fixtures() -> Vec<TrackedObject> {
+        let b = BBox {
+            x1: 10.25,
+            y1: -3.5,
+            x2: 110.75,
+            y2: 200.0,
+        };
+        let mut v = vec![
+            // Empty attributes, plain fields.
+            binding_fixture(1, "person", 0.9, b, serde_json::json!({})),
+            // What the tracker + annotator + static filter actually stamp.
+            binding_fixture(
+                7,
+                "vehicle.car",
+                0.61,
+                b,
+                serde_json::json!({
+                    "tracking.lifecycle": "confirmed",
+                    "tracking.predicted_only": false,
+                    "tracking.missed_frames": 0,
+                    "tracking.hit_streak": 31,
+                    "motion.speed_class": "stationary",
+                    "motion.direction": "none",
+                    "motion.parked_vehicle": "yes",
+                    "motion.dwell_seconds": 12,
+                    "motion.zone_state": "inside",
+                    "motion.zone_ids": ["parking", "lot-b"],
+                    "group.size": 0,
+                    "motion.near_static_vehicle_seconds": 3,
+                    "motion.tool_in_proximity_confidence": 0.8125_f32,
+                    "motion.removed_anchor_ids": [],
+                    "tracker.is_static": true,
+                    "tracker.movement_ema": 0.35,
+                    "tracker.static_frames": 150,
+                }),
+            ),
+            // Every JSON shape and numeric edge the conversion has to map.
+            binding_fixture(
+                u64::MAX,
+                "",
+                f32::NAN,
+                BBox {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: f32::INFINITY,
+                    y2: 1.0,
+                },
+                serde_json::json!({
+                    "neg": -5,
+                    "zero": 0,
+                    "big_u64": u64::MAX,
+                    "i64_max": i64::MAX,
+                    "i64_min": i64::MIN,
+                    "float_integral": 3.0,
+                    "float_frac": -0.1,
+                    "empty_string": "",
+                    "unicode": "persöna \u{1F6B6}",
+                    "null": null,
+                    "t": true,
+                    "empty_array": [],
+                    "mixed_array": [1, -2, 2.5, "x", null, false, [3, ["deep"]], {"k": "v"}],
+                    "nested": {"a": {"b": [1, 2, {"c": null}], "d": 1.5}, "e": {}},
+                }),
+            ),
+        ];
+        // Confidence at the f32 edges and a track id just past i64::MAX.
+        v.push(binding_fixture(
+            i64::MAX as u64 + 1,
+            "dog",
+            f32::NEG_INFINITY,
+            b,
+            serde_json::json!({"x": 1}),
+        ));
+        v.push(binding_fixture(
+            i64::MAX as u64,
+            "cat",
+            f32::MIN_POSITIVE,
+            b,
+            serde_json::json!({"x": 1}),
+        ));
+        v
+    }
+
+    #[test]
+    fn direct_binding_matches_the_json_round_trip_exactly() {
+        for o in binding_fixtures() {
+            assert_same_cel(
+                &object_to_cel(&o),
+                &reference_object_to_cel(&o),
+                &format!("object[track {}]", o.track_id),
+            );
+        }
+    }
+
+    fn fire_every_match(id: &str, when: &str) -> RuleConfig {
+        let mut r = rule_with_zones(None);
+        r.id = id.into();
+        r.predicate.when = when.into();
+        r.debounce = nexus_config::RuleDebounce {
+            min_track_age_ms: 0,
+            consecutive_frames: 1,
+            cooldown_ms: 0,
+        };
+        r
+    }
+
+    /// The evaluator reuses one `Context` and one binding per object across
+    /// every rule of a frame. What fires must be exactly what a fresh,
+    /// standalone `CelEngine::matches` says for each (rule, object) pair —
+    /// including rules that read attributes, rules that error on a missing
+    /// key, and objects evaluated after one that matched.
+    #[test]
+    fn evaluator_fires_exactly_what_standalone_matches_says() {
+        let rules = vec![
+            fire_every_match("label", "object.label == 'vehicle.car'"),
+            fire_every_match("attr", "object.attributes['motion.dwell_seconds'] >= 10"),
+            fire_every_match("list", "'parking' in object.attributes['motion.zone_ids']"),
+            fire_every_match("missing", "object.attributes['absent'] == 1"),
+            fire_every_match("id", "object.track_id == 1 && camera.id == 3"),
+            fire_every_match("box", "object.box.width > 100.0 && object.confidence < 0.7"),
+        ];
+        let objects = binding_fixtures();
+        let eng = CelEngine::new();
+        let mut expected: Vec<(String, u64)> = Vec::new();
+        for r in &rules {
+            let compiled = eng.compile(r).unwrap();
+            for o in &objects {
+                if matches!(eng.matches(&compiled, o, 3), Ok(true)) {
+                    expected.push((r.id.clone(), o.track_id));
+                }
+            }
+        }
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &rules).unwrap();
+        let fired: Vec<(String, u64)> = ev
+            .evaluate(3, 1, &"t".to_string(), 1000, 1000, &[], &objects)
+            .into_iter()
+            .map(|e| (e.rule_id, e.track_id.unwrap()))
+            .collect();
+        assert_eq!(fired, expected);
+        // Guard against a vacuous oracle: the fixtures must make several
+        // distinct rules fire on several distinct objects.
+        assert_eq!(
+            expected,
+            vec![
+                ("label".to_string(), 7),
+                ("attr".to_string(), 7),
+                ("list".to_string(), 7),
+                ("id".to_string(), 1),
+                ("box".to_string(), 7),
+                ("box".to_string(), i64::MAX as u64),
+            ]
         );
     }
 }

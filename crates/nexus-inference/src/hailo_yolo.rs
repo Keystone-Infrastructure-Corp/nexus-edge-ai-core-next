@@ -54,12 +54,12 @@ use nexus_config::InferenceConfig;
 use nexus_hailo_backend::{
     decode_detections, Detection as HailoDetection, InferSession, OutputLayout, Telemetry,
 };
-use nexus_types::{BBox, Detection, Frame, PixelFormat};
+use nexus_types::{BBox, Detection, Frame};
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
-use crate::yolo::{bgr_to_rgb, map_coco_to_domain_label};
+use crate::yolo::{frame_rgb, map_coco_to_domain_label};
 
 /// Process-wide cache of live HailoYoloDetector instances, keyed by
 /// canonicalized HEF path. Holds `Weak` refs so a detector drops as
@@ -155,11 +155,7 @@ impl Detector for HailoYoloDetector {
         let score_threshold = self.score_threshold;
         let output_layout = self.output_layout.clone();
 
-        let rgb = match frame.format {
-            PixelFormat::Rgb24 => frame.data.as_ref().clone(),
-            PixelFormat::Bgr24 => bgr_to_rgb(frame.data.as_ref()),
-            other => return Err(InferenceError::UnsupportedFormat(other)),
-        };
+        let rgb = frame_rgb(frame)?;
 
         let session = &self.session;
         tokio::task::block_in_place(|| {
