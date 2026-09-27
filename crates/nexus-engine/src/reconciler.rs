@@ -15,7 +15,7 @@
 //! Reconciliation model — single async task that:
 //!   1. Subscribes to `topic::CONFIG_CHANGED` once at startup.
 //!   2. On each event, and every [`SUPERVISE_INTERVAL`] with no event,
-//!      calls [`reconcile`], which re-reads `store.list_cameras()` and
+//!      calls [`reconcile`], which re-reads `store.list_readable_cameras()` and
 //!      compares it against the shared `handles` map (seeded by `main`
 //!      with the cameras it spawned at boot).
 //!   3. Adds, removes, or restarts supervisors + ingesters to make
@@ -312,6 +312,10 @@ pub struct ReconcilerArgs {
     /// schedule as the boot-time ones.
     pub alert_clip_schedule_gate: Arc<dyn nexus_pipeline::AlertClipScheduleGate>,
     pub handles: HandleMap,
+    /// The camera rows the last read of the camera list could not decode,
+    /// which therefore do not run: set by `main` from its boot read and by
+    /// every [`reconcile`] pass, and reported by the health roll-up.
+    pub unreadable_cameras: Arc<Mutex<Vec<CameraId>>>,
     /// Phase 10 Live View — so stopping a camera also reaps its LBR pump.
     /// Without this the pump is reaped only by an `lbr_unsubscribe` from the
     /// cloud or a tunnel drop, and a stopped camera leaves a task polling a
@@ -405,7 +409,7 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
     }
 }
 
-/// One reconciliation pass. Compares `store.list_cameras()` to the
+/// One reconciliation pass. Compares `store.list_readable_cameras()` to the
 /// in-memory `handles` map and:
 ///   * aborts the supervisor + removes the ingester for any camera
 ///     that is missing from the DB or has `ingest.enabled = false`;
@@ -414,7 +418,8 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
 ///   * restarts the supervisor + ingester for any enabled camera
 ///     whose ingest URL has changed, or whose supervisor has exited.
 async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
-    let live: Vec<CameraConfig> = args.store.list_cameras().await?;
+    let (live, unreadable) = args.store.list_readable_cameras().await?;
+    *args.unreadable_cameras.lock() = unreadable;
 
     // Snapshot current state under a short lock so the rest of the
     // pass can run without holding it. The clone is cheap — at most
@@ -1312,6 +1317,7 @@ mod tests {
             sink_router: Arc::new(nexus_pipeline::NoopSinkRouter),
             alert_clip_schedule_gate: Arc::new(nexus_pipeline::NoopAlertClipScheduleGate),
             handles: Arc::new(Mutex::new(HashMap::new())),
+            unreadable_cameras: Arc::default(),
             live_view: crate::live_view::LiveViewManager::new(
                 cache,
                 Arc::new(nexus_cloud_client::TunnelOutbox::new()),
@@ -3017,5 +3023,62 @@ mod tests {
             "a gstreamer build must report a stub recorder behind an enabled camera, \
              and a build without the feature must not",
         );
+    }
+
+    /// One camera row this build cannot read, such as one a newer release
+    /// wrote with a codec this build has no variant for, must not stop the
+    /// others. The pass runs every camera it can read, the health roll-up
+    /// names the one it cannot, and once the row is saved again the next
+    /// pass runs it and the issue clears. The pass used to fail at its read,
+    /// so no camera was added, removed or restarted while the row was there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_camera_row_this_build_cannot_read_is_reported_and_the_rest_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder =
+            ScriptedRecorder::new(&[(7, SourceScript::NeverEnds), (8, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam_with_id(7), cam_with_id(8)]).await;
+        sqlx::query(
+            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = 8",
+        )
+        .execute(args.store.pool())
+        .await
+        .expect("rewrite camera 8's row");
+        let health = crate::cloud_tunnel::EngineHealth::new(&args);
+        let unreadable = |h: nexus_cloud_protocol::v1::EdgeHealth| {
+            h.issues
+                .into_iter()
+                .flatten()
+                .find(|i| i.code == "camera_config_unreadable")
+        };
+        let running = || {
+            let mut ids: Vec<CameraId> = args.handles.lock().keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        };
+
+        let pass = reconcile(&args).await;
+        let running_with_the_row = running();
+        let issue = unreadable(health.rollup().await);
+        args.store
+            .upsert_camera(&cam_with_id(8))
+            .await
+            .expect("save camera 8 again");
+        reconcile(&args)
+            .await
+            .expect("the pass after the row is saved");
+        let running_after = running();
+        let after = unreadable(health.rollup().await);
+        abort_all(&args.handles);
+
+        pass.expect("a pass over a store with one unreadable row");
+        assert_eq!(running_with_the_row, vec![7], "the readable camera runs");
+        let issue = issue.expect("the unreadable row must be on the roll-up");
+        assert!(
+            issue.detail.ends_with(": 8"),
+            "names the camera: {}",
+            issue.detail
+        );
+        assert_eq!(running_after, vec![7, 8], "the saved row runs");
+        assert_eq!(after, None, "a row that reads again is not reported");
     }
 }

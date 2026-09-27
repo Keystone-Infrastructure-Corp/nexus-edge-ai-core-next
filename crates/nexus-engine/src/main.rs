@@ -707,7 +707,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
 
     let bus = build_bus(&cfg.bus);
 
-    let cameras = store.list_cameras().await?;
+    let (cameras, unreadable_cameras) = store.list_readable_cameras().await?;
 
     // Router builds one InferenceLayer per kind referenced by any
     // camera (default + each unique override). Keeping disabled cameras
@@ -1059,6 +1059,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         sink_router: sink_router.clone(),
         alert_clip_schedule_gate: alert_clip_schedule_gate.clone(),
         handles: running.clone(),
+        unreadable_cameras: Arc::new(parking_lot::Mutex::new(unreadable_cameras)),
         live_view: live_view_manager.clone(),
     };
     // One health roll-up, shared by `GET /api/v1/health` and the heartbeat.

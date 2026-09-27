@@ -1097,7 +1097,8 @@ impl From<nexus_store::StoreError> for ApiError {
 /// heartbeat carries: a detector that failed to build, stalled live-view
 /// sources, an oversubscribed video engine, a stub clip recorder behind
 /// enabled cameras, a camera whose analysis pipeline exited without being
-/// stopped. Degraded is still HTTP 200.
+/// stopped, a camera whose stored configuration this build cannot read.
+/// Degraded is still HTTP 200.
 ///
 /// Every caller gets `status` and each issue's `component` and `code`.
 /// Only a signed-in caller gets `detail`, which can say the box keeps no

@@ -2080,6 +2080,8 @@ pub struct EngineHealth {
     live_view: Arc<crate::live_view::LiveViewManager>,
     /// The running supervisors, as the reconciler keeps them.
     supervisors: crate::reconciler::HandleMap,
+    /// The camera rows the reconciler could not read.
+    unreadable_cameras: Arc<parking_lot::Mutex<Vec<nexus_types::CameraId>>>,
     /// What the store reads [`recorder_issue`] makes have returned.
     last_read: parking_lot::Mutex<LastRead>,
 }
@@ -2107,6 +2109,7 @@ impl EngineHealth {
             store: reconciler.store.clone(),
             live_view: reconciler.live_view.clone(),
             supervisors: reconciler.handles.clone(),
+            unreadable_cameras: reconciler.unreadable_cameras.clone(),
             last_read: parking_lot::Mutex::default(),
         }
     }
@@ -2128,6 +2131,7 @@ impl EngineHealth {
             store,
             live_view,
             supervisors,
+            unreadable_cameras: Arc::default(),
             last_read: parking_lot::Mutex::default(),
         }
     }
@@ -2135,13 +2139,15 @@ impl EngineHealth {
     /// The current roll-up. Recomputed on every call, so a repaired
     /// condition clears on the next heartbeat or probe.
     pub(crate) async fn rollup(&self) -> EdgeHealth {
+        let recorder = recorder_issue(self).await;
+        let unreadable = self.unreadable_cameras.lock().clone();
         edge_health(
             &self.live_view.stalled_cameras(),
             crate::system_metrics::snapshot().decode_capacity.as_ref(),
-            recorder_issue(self)
-                .await
+            recorder
                 .into_iter()
-                .chain(exited_supervisors_issue(&self.exited_supervisors())),
+                .chain(exited_supervisors_issue(&self.exited_supervisors()))
+                .chain(unreadable_cameras_issue(&unreadable)),
         )
     }
 
@@ -2189,11 +2195,34 @@ fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegr
     })
 }
 
+/// The camera rows the reconciler could not read, as one issue. Such a
+/// camera does not run, and no other issue names it: the read that skips
+/// its row succeeds.
+fn unreadable_cameras_issue(ids: &[nexus_types::CameraId]) -> Option<EdgeDegradation> {
+    if ids.is_empty() {
+        return None;
+    }
+    let list = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(EdgeDegradation {
+        component: "store".to_string(),
+        code: "camera_config_unreadable".to_string(),
+        detail: truncate_detail(&format!(
+            "this engine build cannot read the stored configuration of {} camera(s), so they \
+             do not run and nothing on them is detected, alerted on or recorded: {list}",
+            ids.len(),
+        )),
+    })
+}
+
 /// Build the health roll-up from the process-wide degradation registry,
 /// plus any live-view sources that have stopped producing frames, an
 /// oversubscribed video engine, and the issues [`EngineHealth`] derives
 /// itself (`others`: a stub recorder behind enabled cameras, exited
-/// supervisors).
+/// supervisors, unreadable camera rows).
 ///
 /// `status` is `degraded` iff at least one issue is open, matching the
 /// schema's stated invariant. The cloud renders unknown `code`s verbatim, so
@@ -2306,7 +2335,9 @@ fn edge_health_from(
 /// past [`HEALTH_STORE_READ_TIMEOUT`], a transient SQLite error) cannot flip
 /// the issue, and a list that stays unread past that is reported as unread,
 /// as before the first good read. Reads fail for good on a damaged
-/// database, and on a camera row this build cannot decode.
+/// database. A camera row this build cannot decode does not fail them: like
+/// the reconciler, the read leaves it out, since it does not run, and the
+/// roll-up reports it apart ([`unreadable_cameras_issue`]).
 ///
 /// Only a `gstreamer` build raises it ([`EngineHealth::new`]). Release
 /// binaries always carry that feature, so it is the build where a real
@@ -2363,12 +2394,12 @@ const UNREAD_REPORTED_AFTER: Duration = Duration::from_secs(60);
 /// the installer's 2 s probe (`curl -m 2` in `wait_for_health`).
 const HEALTH_STORE_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The cameras [`recorder_issue`] counts: the store's enabled ones, or
-/// `None` when the camera list could not be read in
+/// The cameras [`recorder_issue`] counts: the store's enabled ones that this
+/// build can read, or `None` when the camera list could not be read in
 /// [`HEALTH_STORE_READ_TIMEOUT`].
 async fn enabled_camera_count(store: &Store) -> Option<usize> {
-    match tokio::time::timeout(HEALTH_STORE_READ_TIMEOUT, store.list_cameras()).await {
-        Ok(Ok(cameras)) => Some(cameras.iter().filter(|c| c.ingest.enabled).count()),
+    match tokio::time::timeout(HEALTH_STORE_READ_TIMEOUT, store.list_readable_cameras()).await {
+        Ok(Ok((cameras, _))) => Some(cameras.iter().filter(|c| c.ingest.enabled).count()),
         Ok(Err(e)) => {
             warn!(error = %e, "health: camera list query failed");
             None
@@ -2672,26 +2703,27 @@ mod health_tests {
         );
     }
 
-    /// Give every stored camera a codec this build has no variant for, so
-    /// every `list_cameras` read fails. A rollback past a release that wrote
-    /// a newer codec leaves such a row, and so did a camera write of a float
-    /// beyond f32's range, stored as `null`, before camera writes refused
-    /// one; `run` exits on it at boot.
-    pub(super) async fn store_a_codec_this_build_cannot_read(store: &Store) {
-        sqlx::query("UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1')")
-            .execute(store.pool())
-            .await
-            .expect("rewrite the camera rows");
+    /// Give camera `id` a codec this build has no variant for, the row a
+    /// rollback past a release that wrote a newer codec leaves, so this
+    /// build cannot read it and `list_cameras` fails on it.
+    async fn store_a_codec_this_build_cannot_read(store: &Store, id: nexus_types::CameraId) {
+        sqlx::query(
+            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = ?",
+        )
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .expect("rewrite the camera row");
         assert!(
             store.list_cameras().await.is_err(),
-            "fixture: the camera list can no longer be read",
+            "fixture: the camera list can no longer be read in one piece",
         );
     }
 
     /// Rename the camera table away, so every camera-list read fails with a
     /// SQL error, as a read of a damaged database would, until
     /// [`restore_the_camera_list`] puts it back.
-    async fn make_the_camera_list_unreadable(store: &Store) {
+    pub(super) async fn make_the_camera_list_unreadable(store: &Store) {
         sqlx::query("ALTER TABLE cameras RENAME TO cameras_away")
             .execute(store.pool())
             .await
@@ -2777,7 +2809,7 @@ mod health_tests {
     #[tokio::test]
     async fn an_unreadable_camera_list_keeps_the_stub_reported() {
         let (store, dir) = default_config_store(true).await;
-        store_a_codec_this_build_cannot_read(&store).await;
+        make_the_camera_list_unreadable(&store).await;
 
         let issue = recorder_issue(&stub_health(Arc::new(store), &dir))
             .await
@@ -2810,7 +2842,7 @@ mod health_tests {
             let read = recorder_issue(&health).await;
             assert_eq!(read.is_some(), enabled, "fixture: the good read's answer");
 
-            store_a_codec_this_build_cannot_read(&store).await;
+            make_the_camera_list_unreadable(&store).await;
             for _ in 0..3 {
                 assert_eq!(
                     recorder_issue(&health).await,
@@ -2847,6 +2879,32 @@ mod health_tests {
                 !enabled,
             );
         }
+    }
+
+    /// The recorder issue counts the cameras the reconciler runs. A camera
+    /// row this build cannot read does not run, so it is left out of the
+    /// count rather than failing the read: the stub behind the other,
+    /// enabled camera is reported as recording nothing, not as a camera list
+    /// that could not be read.
+    #[tokio::test]
+    async fn a_camera_row_this_build_cannot_read_leaves_the_rest_counted() {
+        let (store, dir) = default_config_store(true).await;
+        let mut second = store.list_cameras().await.expect("list cameras")[0].clone();
+        second.id += 1;
+        store
+            .upsert_camera(&second)
+            .await
+            .expect("store a second camera");
+        store_a_codec_this_build_cannot_read(&store, second.id).await;
+
+        let issue = recorder_issue(&stub_health(Arc::new(store), &dir))
+            .await
+            .expect("a stub behind the readable enabled camera must be reported");
+        assert!(
+            issue.detail.contains("running cameras"),
+            "the readable camera was counted: {}",
+            issue.detail,
+        );
     }
 
     /// A recorder that is not the stub, as a release box runs the
@@ -3995,7 +4053,7 @@ mod heartbeat_ack_tests {
                 enabled,
                 "fixture: the good read's answer",
             );
-            super::health_tests::store_a_codec_this_build_cannot_read(&store).await;
+            super::health_tests::make_the_camera_list_unreadable(&store).await;
             let frame_stats = FrameStatsRegistry::new();
             let liveness = TunnelLiveness::new();
             let tunnel = CapturingTunnel::default();
