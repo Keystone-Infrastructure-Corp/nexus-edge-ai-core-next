@@ -254,7 +254,6 @@ where
     T: Send + 'static,
     F: Fn(Vec<String>) -> Result<T, String> + Send + Sync + 'static,
 {
-    let cpu_only = vec!["cpu".to_owned()];
     // Checked before the CPU-only short-circuit below. Once anything in this
     // process has wedged, even a `["cpu"]` chain needs the bound: the thread
     // abandoned by that wedge may hold an ORT process-global lock, so the
