@@ -969,9 +969,10 @@ mod tests {
 
     /// `stop_camera` aborts the supervisor and then clears, and abort is
     /// asynchronous: the tap can still be mid-frame when the clear lands.
-    /// Its write must not bring the stopped camera back, or every reader
-    /// (heartbeat `online_cameras`, the roster's `online`, `/stats`) reports
-    /// it running.
+    /// Its write must not bring the stopped camera back: the heartbeat's
+    /// `online_cameras` and the roster's `online` would count it online for
+    /// [`CAMERA_OFFLINE_AFTER_MS`], and `/stats` and the diagnostics bundle
+    /// would keep a row for it.
     #[test]
     fn a_write_from_a_stopped_session_cannot_recreate_a_cleared_camera() {
         let reg = FrameStatsRegistry::new();
