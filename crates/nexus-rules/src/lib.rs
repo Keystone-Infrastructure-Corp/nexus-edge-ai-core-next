@@ -352,8 +352,8 @@ impl RuleEvaluator {
     /// it: the supervisor passes the frame's non-static tracks without
     /// copying them, and a `&[TrackedObject]` or `&Vec` works as before.
     #[allow(clippy::too_many_arguments)] // 10 args is the natural shape: rule eval inherently needs frame
-                                         // stamps + dims + zones + identifiers; bundling them would just push
-                                         // the boilerplate to every caller.
+                                         // stamps + dims + zones + identifiers; bundling them would just
+                                         // push the boilerplate to every caller.
     pub fn evaluate<'a>(
         &self,
         camera_id: CameraId,

@@ -1312,8 +1312,9 @@ async fn run_camera(
                 // via in_scope(); we don't hold an EnteredSpan guard
                 // across recorder/store awaits because EnteredSpan is
                 // !Send and would break tokio::spawn.
-                let decisions = info_span!("frame.motion")
-                    .in_scope(|| emitter.tick(cfg.id, dynamic_tracked, frame.captured_at, frame.captured_mono));
+                let decisions = info_span!("frame.motion").in_scope(|| {
+                    emitter.tick(cfg.id, dynamic_tracked, frame.captured_at, frame.captured_mono)
+                });
                 for d in &decisions {
                     let should_open = current_clip.is_none()
                         && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);

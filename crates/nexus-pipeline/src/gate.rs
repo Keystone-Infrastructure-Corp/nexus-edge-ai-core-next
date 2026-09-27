@@ -21,10 +21,10 @@
 //! Both bounds are **time-based**, derived from `frame.captured_mono`, so a
 //! step of the wall clock moves neither. An earlier revision counted frames
 //! instead (`keyframe_every: 30`), which made the baseline silently depend
-//! on the source rate — at the default 15 fps
-//! ingest cap that yielded a 0.5 fps floor, 4× below the intended 2 fps, and
-//! it was the direct cause of the live-view wall appearing to replay one
-//! frame for seconds at a time on quiet cameras.
+//! on the source rate — at the default 15 fps ingest cap that yielded a
+//! 0.5 fps floor, 4× below the intended 2 fps, and it was the direct cause
+//! of the live-view wall appearing to replay one frame for seconds at a
+//! time on quiet cameras.
 //!
 //! Between the two bounds the motion test decides: downsample the Y plane
 //! (or RGB→Y) by 8×, count per-pixel absolute deltas against the last
