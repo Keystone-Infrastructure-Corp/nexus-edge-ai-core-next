@@ -1097,23 +1097,39 @@ impl From<nexus_store::StoreError> for ApiError {
 /// heartbeat carries: a detector that failed to build, stalled live-view
 /// sources, an oversubscribed video engine, a stub clip recorder behind
 /// enabled cameras. Degraded is still HTTP 200.
-async fn health(State(s): State<ApiState>) -> Json<serde_json::Value> {
-    Json(health_body(s.health.rollup().await))
+///
+/// Every caller gets `status` and each issue's `component` and `code`.
+/// Only a signed-in caller gets `detail`, which can say the box keeps no
+/// video and name the file to change; no unauthenticated consumer (the
+/// installer's and e2e's readiness waits, `nexus-doctor`) reads it. With no
+/// admin secret configured every caller counts as signed in, as on every
+/// session-gated route.
+async fn health(
+    State(s): State<ApiState>,
+    crate::auth::require_role::SignedIn(signed_in): crate::auth::require_role::SignedIn,
+) -> Json<serde_json::Value> {
+    Json(health_body(s.health.rollup().await, signed_in))
 }
 
 /// The body of [`health`], apart from the handler so a test can drive it
 /// with the roll-up of the recorder that boot really builds.
-fn health_body(health: nexus_cloud_protocol::v1::EdgeHealth) -> serde_json::Value {
+fn health_body(
+    health: nexus_cloud_protocol::v1::EdgeHealth,
+    with_detail: bool,
+) -> serde_json::Value {
     let issues: Vec<serde_json::Value> = health
         .issues
         .unwrap_or_default()
         .into_iter()
         .map(|i| {
-            serde_json::json!({
+            let mut issue = serde_json::json!({
                 "component": i.component,
                 "code": i.code,
-                "detail": i.detail,
-            })
+            });
+            if with_detail {
+                issue["detail"] = serde_json::Value::String(i.detail);
+            }
+            issue
         })
         .collect();
 
@@ -10287,7 +10303,7 @@ mod tests {
             ),
             crate::reconciler::HandleMap::default(),
         );
-        let body = super::health_body(health.rollup().await);
+        let body = super::health_body(health.rollup().await, true);
         let issue = body["issues"]
             .as_array()
             .and_then(|issues| issues.iter().find(|i| i["component"] == "recorder"))
@@ -10407,6 +10423,89 @@ mod tests {
             "{body}",
         );
         drop(held);
+    }
+
+    const HEALTH_SECRET: &[u8] = b"local-health-detail-secret";
+
+    /// A stub behind an enabled camera, on a router with an admin secret,
+    /// so it can tell a signed-in caller from anyone else.
+    async fn degraded_health_state() -> (super::ApiState, Arc<Store>, tempfile::TempDir) {
+        let (state, store, dir, _reg, _bus) = build_test_state(Some(HEALTH_SECRET)).await;
+        store_default_camera(&store, true).await;
+        (state, store, dir)
+    }
+
+    fn recorder_stub_issue(body: &serde_json::Value) -> serde_json::Value {
+        body["issues"]
+            .as_array()
+            .and_then(|issues| issues.iter().find(|i| i["code"] == "recorder_stub"))
+            .cloned()
+            .unwrap_or_else(|| panic!("fixture: the stub is reported: {body}"))
+    }
+
+    /// Any LAN host can call `/api/v1/health`, with no bearer or one that
+    /// does not verify. It learns that the box is degraded, and the
+    /// component and code, but not the detail, which says the box keeps no
+    /// video and names the file to change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_withholds_issue_detail_from_an_unauthenticated_caller() {
+        for bearer in [None, Some(sign_admin_jwt(b"some-other-secret"))] {
+            let (state, _store, _dir) = degraded_health_state().await;
+            let body = get_health(super::router(state), bearer.as_deref()).await;
+            assert_eq!(body["status"], "degraded", "{body}");
+            let issue = recorder_stub_issue(&body);
+            assert_eq!(issue["component"], "recorder", "{body}");
+            assert!(
+                issue.get("detail").is_none(),
+                "an unauthenticated caller must not get the detail: {body}",
+            );
+        }
+    }
+
+    /// A signed-in caller, such as the local UI, gets the detail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_gives_a_signed_in_caller_the_issue_detail() {
+        let (state, _store, _dir) = degraded_health_state().await;
+        let body = get_health(super::router(state), Some(&sign_admin_jwt(HEALTH_SECRET))).await;
+        let issue = recorder_stub_issue(&body);
+        assert!(
+            issue["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("restart nexus-engine")),
+            "a signed-in caller must get the detail: {body}",
+        );
+    }
+
+    /// The local UI polls `/api/v1/health` every 10 s from every signed-in
+    /// page. Checking the caller's session must not count as activity, or
+    /// an open tab would keep its session from ever reaching the idle
+    /// timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn polling_local_health_does_not_keep_a_session_active() {
+        let (mut state, _store, _dir) = degraded_health_state().await;
+        let (tx, mut bumps) = tokio::sync::mpsc::channel(8);
+        state.admin_auth = Arc::new(
+            AdminAuthState::from_secret_bytes(Some(HEALTH_SECRET), false).with_idle_bump_tx(tx),
+        );
+        let token = crate::auth::sessions::issue_access_token(
+            1,
+            nexus_types::Role::Viewer,
+            HEALTH_SECRET,
+            chrono::Utc::now(),
+            chrono::Duration::minutes(5),
+            Some("chain-1"),
+        )
+        .expect("mint a session token");
+
+        let body = get_health(super::router(state), Some(&token)).await;
+        assert!(
+            recorder_stub_issue(&body).get("detail").is_some(),
+            "fixture: the session verified: {body}",
+        );
+        assert!(
+            bumps.try_recv().is_err(),
+            "a health poll must not bump the session's idle clock",
+        );
     }
 
     /// The local probe must report what the heartbeat reports. A subscribed
