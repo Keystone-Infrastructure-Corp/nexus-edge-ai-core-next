@@ -2389,10 +2389,11 @@ async fn recorder_issue(health: &EngineHealth) -> Option<EdgeDegradation> {
 /// How long the camera-list reads [`recorder_issue`] makes may fail before it
 /// stops reusing the last good count and reports the list as unread. Two
 /// heartbeat intervals: one or two failed beats between good reads do not
-/// change the answer, and a failure that spans three consecutive beats is
-/// reported. A time, not a count of failures, because the two surfaces read
-/// at their callers' pace: the heartbeat every 30 s, and each open console
-/// tab every 10 s.
+/// change the answer, and a failure that lasts 60 s from the first failed
+/// read is reported by the next beat, the third or fourth failed one in a
+/// row. A time, not a count of failures, because the two surfaces read at
+/// their callers' pace: the heartbeat every 30 s, and each open console tab
+/// every 10 s.
 const UNREAD_REPORTED_AFTER: Duration = Duration::from_secs(60);
 
 /// How long [`enabled_camera_count`] waits for the store. A pool acquire
