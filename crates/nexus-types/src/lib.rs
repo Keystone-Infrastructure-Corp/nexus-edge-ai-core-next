@@ -146,7 +146,7 @@ impl Frame {
     /// consumer, because every consumer (nexus-inference, nexus-engine,
     /// nexus-reid) can reach this crate and CI lints it on every PR — the
     /// seven per-crate copies it replaced were partly behind the `ort`
-    /// feature, which CI's clippy never builds.
+    /// feature, which CI's clippy did not build.
     pub fn rgb24(&self) -> Result<Cow<'_, [u8]>, PixelFormat> {
         match self.format {
             PixelFormat::Rgb24 => Ok(Cow::Borrowed(&self.data[..])),
