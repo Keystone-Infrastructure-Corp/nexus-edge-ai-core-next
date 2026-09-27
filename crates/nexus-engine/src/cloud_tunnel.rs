@@ -2248,6 +2248,11 @@ fn edge_health_from(
 /// detector by name stays healthy: however the stub was chosen, behind running
 /// cameras it keeps no evidence.
 async fn recorder_issue(health: &EngineHealth) -> Option<EdgeDegradation> {
+    // The count cannot change the answer for a real recorder, so only a
+    // stub on a build with a real recorder waits on the store.
+    if !health.real_recorder_available || health.recorder.kind() != "stub" {
+        return None;
+    }
     let read = enabled_camera_count(&health.store).await;
     let enabled = {
         let mut last = health.enabled_cameras.lock();
@@ -2263,13 +2268,26 @@ async fn recorder_issue(health: &EngineHealth) -> Option<EdgeDegradation> {
     )
 }
 
+/// How long [`enabled_camera_count`] waits for the store. A pool acquire
+/// alone waits up to 30 s, and `GET /api/v1/health` has to answer inside
+/// the installer's 2 s probe (`curl -m 2` in `wait_for_health`).
+const HEALTH_STORE_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The cameras [`recorder_issue`] counts: the store's enabled ones, or
-/// `None` when the camera list could not be read.
+/// `None` when the camera list could not be read in
+/// [`HEALTH_STORE_READ_TIMEOUT`].
 async fn enabled_camera_count(store: &Store) -> Option<usize> {
-    match store.list_cameras().await {
-        Ok(cameras) => Some(cameras.iter().filter(|c| c.ingest.enabled).count()),
-        Err(e) => {
+    match tokio::time::timeout(HEALTH_STORE_READ_TIMEOUT, store.list_cameras()).await {
+        Ok(Ok(cameras)) => Some(cameras.iter().filter(|c| c.ingest.enabled).count()),
+        Ok(Err(e)) => {
             warn!(error = %e, "health: camera list query failed");
+            None
+        }
+        Err(_) => {
+            warn!(
+                timeout_ms = HEALTH_STORE_READ_TIMEOUT.as_millis() as u64,
+                "health: camera list query timed out"
+            );
             None
         }
     }
@@ -2626,6 +2644,45 @@ mod health_tests {
                 );
             }
         }
+    }
+
+    /// Only a stub on a build with a real recorder reads the store, so every
+    /// other box answers both surfaces without waiting on the pool.
+    #[tokio::test]
+    async fn a_box_that_cannot_raise_the_recorder_issue_does_not_wait_on_the_store() {
+        let (store, dir) = default_config_store(true).await;
+        let store = Arc::new(store);
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(
+                store
+                    .pool()
+                    .acquire()
+                    .await
+                    .expect("hold a pool connection"),
+            );
+        }
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store,
+            crate::live_view::LiveViewManager::new(
+                Arc::new(nexus_pipeline::LatestFrameCache::new()),
+                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            ),
+        );
+
+        let started = std::time::Instant::now();
+        assert_eq!(recorder_issue(&health).await, None);
+        assert!(
+            started.elapsed() < HEALTH_STORE_READ_TIMEOUT,
+            "no store read was needed, but the answer took {:?}",
+            started.elapsed(),
+        );
+        drop(held);
     }
 
     /// The feature gate, stated per build: only a `gstreamer` build, where
