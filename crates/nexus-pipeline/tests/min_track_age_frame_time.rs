@@ -92,8 +92,18 @@ fn person(i: u64) -> Vec<Detection> {
 /// Track the frame and return how many alerts it fired.
 fn fire(tracker: &dyn Tracker, eval: &RuleEvaluator, i: u64, captured_at: DateTime<Utc>) -> usize {
     let tracked = tracker.update(person(i), captured_at);
-    eval.evaluate(1, i, &String::from("t"), W, H, &[], &tracked)
-        .len()
+    eval.evaluate(
+        1,
+        i,
+        captured_at,
+        std::time::Instant::now(),
+        &String::from("t"),
+        W,
+        H,
+        &[],
+        &tracked,
+    )
+    .len()
 }
 
 /// 30 frames captured at 30 fps, tracked as fast as this loop runs. The

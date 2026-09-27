@@ -1192,6 +1192,8 @@ async fn run_camera(
                     evaluator.evaluate(
                         cfg.id,
                         frame_id,
+                        frame.captured_at,
+                        frame.captured_mono,
                         &trace_id,
                         frame.width,
                         frame.height,

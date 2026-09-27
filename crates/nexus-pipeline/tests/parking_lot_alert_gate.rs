@@ -161,8 +161,17 @@ impl Sim {
             .iter()
             .filter(|t| !(filtering && is_object_static(t)));
 
-        self.evaluator
-            .evaluate(1, f.frame_id, &f.trace_id, FRAME_W, FRAME_H, &[], dynamic)
+        self.evaluator.evaluate(
+            1,
+            f.frame_id,
+            f.captured_at,
+            f.captured_mono,
+            &f.trace_id,
+            FRAME_W,
+            FRAME_H,
+            &[],
+            dynamic,
+        )
     }
 
     /// Run `frames` steps with the object parked at a fixed point and

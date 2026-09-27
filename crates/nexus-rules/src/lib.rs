@@ -10,13 +10,13 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use cel_interpreter::objects::{Key, Map as CelMap};
 use cel_interpreter::{Context, Program, Value as CelValue};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use nexus_config::{RuleConfig, RulesBackendKind, RulesConfig, ZoneConfig};
 use nexus_types::{AlertEvent, Artifacts, CameraId, FrameId, Severity, TraceId, TrackedObject};
 use parking_lot::Mutex;
@@ -268,7 +268,8 @@ struct StaticAlertState {
 #[derive(Default, Clone)]
 struct TrackState {
     consecutive_hits: u32,
-    last_emitted_unix_ms: i64,
+    /// Capture stamp of the frame the last alert fired on.
+    last_emitted: Option<Instant>,
     static_alerts: HashMap<u64, StaticAlertState>,
 }
 
@@ -336,6 +337,12 @@ impl RuleEvaluator {
     /// rather than threading the whole `Frame`, so this crate stays
     /// free of any frame/image dependency.
     ///
+    /// `captured_at` and `captured_mono` are the frame's two capture
+    /// stamps (`Frame::captured_at`, `Frame::captured_mono`). An alert
+    /// carries `captured_at`; `cooldown_ms` is measured on
+    /// `captured_mono`, so neither a backlog drained in a burst nor a
+    /// step of the wall clock moves it.
+    ///
     /// `camera_zones` is the **full** zone list configured on the
     /// camera that produced `objects`. Zones are looked up by `id`
     /// against `rule.zones` (the rule stores only ids); a rule with
@@ -344,24 +351,21 @@ impl RuleEvaluator {
     /// `objects` is any cloneable iterator, walked once after a clone counts
     /// it: the supervisor passes the frame's non-static tracks without
     /// copying them, and a `&[TrackedObject]` or `&Vec` works as before.
-    #[allow(clippy::too_many_arguments)] // 8 args is the natural shape: rule eval inherently needs frame
-                                         // dims + zones + identifiers; bundling them would just push the
-                                         // boilerplate to every caller.
+    #[allow(clippy::too_many_arguments)] // 10 args is the natural shape: rule eval inherently needs frame
+                                         // stamps + dims + zones + identifiers; bundling them would just push
+                                         // the boilerplate to every caller.
     pub fn evaluate<'a>(
         &self,
         camera_id: CameraId,
         frame_id: FrameId,
+        captured_at: DateTime<Utc>,
+        captured_mono: Instant,
         trace_id: &TraceId,
         frame_width: u32,
         frame_height: u32,
         camera_zones: &[ZoneConfig],
         objects: impl IntoIterator<Item = &'a TrackedObject, IntoIter: Clone>,
     ) -> Vec<AlertEvent> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-
         let rules = self.rules.load();
         let mut out = Vec::new();
         let mut state = self.track_state.lock();
@@ -526,10 +530,14 @@ impl RuleEvaluator {
                         continue;
                     }
                 }
-                if now_ms - entry.last_emitted_unix_ms < cfg.debounce.cooldown_ms as i64 {
+                let cooldown = Duration::from_millis(cfg.debounce.cooldown_ms);
+                if entry
+                    .last_emitted
+                    .is_some_and(|last| captured_mono.saturating_duration_since(last) < cooldown)
+                {
                     continue;
                 }
-                entry.last_emitted_unix_ms = now_ms;
+                entry.last_emitted = Some(captured_mono);
                 if static_alert_epoch.is_some() {
                     entry.static_alerts.entry(o.track_id).or_default().emitted = true;
                 }
@@ -571,7 +579,7 @@ impl RuleEvaluator {
                     // above, so there is no stale fallback to draw.
                     bbox: Some(detection_bbox),
                     frame_id,
-                    captured_at: Utc::now(),
+                    captured_at,
                     trace_id: trace_id.clone(),
                     frame_w: frame_width,
                     frame_h: frame_height,
@@ -755,6 +763,8 @@ mod tests {
         let alerts = ev.evaluate(
             1,
             42,
+            Utc::now(),
+            Instant::now(),
             &"trace-1".into(),
             100,
             100,
@@ -773,6 +783,8 @@ mod tests {
         let alerts = ev.evaluate(
             1,
             42,
+            Utc::now(),
+            Instant::now(),
             &"trace-2".into(),
             100,
             100,
@@ -795,6 +807,8 @@ mod tests {
         let alerts_a = ev_a.evaluate(
             1,
             1,
+            Utc::now(),
+            Instant::now(),
             &"t".into(),
             100,
             100,
@@ -811,6 +825,8 @@ mod tests {
         let alerts_b = ev_b.evaluate(
             1,
             1,
+            Utc::now(),
+            Instant::now(),
             &"t".into(),
             100,
             100,
@@ -835,6 +851,8 @@ mod tests {
         let alerts = ev.evaluate(
             1,
             1,
+            Utc::now(),
+            Instant::now(),
             &"t".into(),
             100,
             100,
@@ -860,7 +878,17 @@ mod tests {
         let mut coasting = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
         coasting.detection_bbox = None;
 
-        let alerts = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[coasting]);
+        let alerts = ev.evaluate(
+            1,
+            1,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[coasting],
+        );
         assert!(
             alerts.is_empty(),
             "predicted-only track must not fire, got {alerts:?}"
@@ -878,16 +906,124 @@ mod tests {
         let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
 
         let live = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
-        let first = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[live]);
+        let first = ev.evaluate(
+            1,
+            1,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[live],
+        );
         assert_eq!(first.len(), 1, "the real detection should fire once");
 
         let mut coasting = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
         coasting.detection_bbox = None;
         for frame_id in 2..32 {
-            let alerts = ev.evaluate(1, frame_id, &"t".into(), 100, 100, &[], &[coasting.clone()]);
+            let alerts = ev.evaluate(
+                1,
+                frame_id,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &[coasting.clone()],
+            );
             assert!(
                 alerts.is_empty(),
                 "coasting frame {frame_id} re-fired: {alerts:?}"
+            );
+        }
+    }
+
+    /// A backlogged frame's alert carries the time its frame was captured,
+    /// not the time the rule ran.
+    #[test]
+    fn an_alert_carries_its_frames_capture_time() {
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule_with_zones(None)]).unwrap();
+        let captured_at = Utc::now() - chrono::Duration::seconds(5);
+        let person = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        let alerts = ev.evaluate(
+            1,
+            1,
+            captured_at,
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[person],
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].captured_at, captured_at);
+    }
+
+    /// A backlog drained in a burst: frames captured a second apart are
+    /// evaluated back to back. The 500 ms cooldown is measured between their
+    /// captures, so every frame fires.
+    #[test]
+    fn a_burst_after_a_backlog_is_cooled_down_in_capture_time() {
+        let mut rule = rule_with_zones(None);
+        rule.debounce.cooldown_ms = 500;
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let (mono0, wall0) = (Instant::now(), Utc::now());
+        let person = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        let fired = (0..4i64)
+            .filter(|&i| {
+                let alerts = ev.evaluate(
+                    1,
+                    i as u64,
+                    wall0 + chrono::Duration::seconds(i),
+                    mono0 + std::time::Duration::from_secs(i as u64),
+                    &"t".into(),
+                    100,
+                    100,
+                    &[],
+                    std::slice::from_ref(&person),
+                );
+                !alerts.is_empty()
+            })
+            .count();
+        assert_eq!(fired, 4, "frames a second apart, 500 ms cooldown");
+    }
+
+    /// The cooldown is measured on the monotonic stamp, so an hour's step of
+    /// the wall clock either way neither ends a 500 ms cooldown early nor
+    /// extends it.
+    #[test]
+    fn a_wall_clock_step_does_not_move_the_cooldown() {
+        for step_ms in [3_600_000, -3_600_000] {
+            let mut rule = rule_with_zones(None);
+            rule.debounce.cooldown_ms = 500;
+            let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+            let (mono0, wall0) = (Instant::now(), Utc::now());
+            let person = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+            let fires = |frame_id: u64, ms: i64, step_ms: i64| {
+                !ev.evaluate(
+                    1,
+                    frame_id,
+                    wall0 + chrono::Duration::milliseconds(ms + step_ms),
+                    mono0 + std::time::Duration::from_millis(ms as u64),
+                    &"t".into(),
+                    100,
+                    100,
+                    &[],
+                    std::slice::from_ref(&person),
+                )
+                .is_empty()
+            };
+            assert!(fires(1, 0, 0), "the first match fires");
+            assert!(
+                !fires(2, 100, step_ms),
+                "{step_ms} ms step: 100 ms later is inside the cooldown"
+            );
+            assert!(
+                fires(3, 600, step_ms),
+                "{step_ms} ms step: 600 ms later is past the cooldown"
             );
         }
     }
@@ -906,13 +1042,43 @@ mod tests {
             JsonValue::Number(0.into()),
         );
 
-        let first_debounce = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        let first_debounce = ev.evaluate(
+            1,
+            1,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[vehicle.clone()],
+        );
         assert!(first_debounce.is_empty());
-        let first_alert = ev.evaluate(1, 2, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        let first_alert = ev.evaluate(
+            1,
+            2,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[vehicle.clone()],
+        );
         assert_eq!(first_alert.len(), 1);
 
         for frame_id in 3..20 {
-            let alerts = ev.evaluate(1, frame_id, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+            let alerts = ev.evaluate(
+                1,
+                frame_id,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &[vehicle.clone()],
+            );
             assert!(alerts.is_empty(), "epoch 0 re-fired on frame {frame_id}");
         }
 
@@ -920,9 +1086,29 @@ mod tests {
             STATIC_ALERT_EPOCH_ATTRIBUTE_KEY.into(),
             JsonValue::Number(1.into()),
         );
-        let break_debounce = ev.evaluate(1, 20, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        let break_debounce = ev.evaluate(
+            1,
+            20,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[vehicle.clone()],
+        );
         assert!(break_debounce.is_empty());
-        let break_alert = ev.evaluate(1, 21, &"t".into(), 100, 100, &[], &[vehicle]);
+        let break_alert = ev.evaluate(
+            1,
+            21,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[vehicle],
+        );
         assert_eq!(
             break_alert.len(),
             1,
@@ -950,15 +1136,45 @@ mod tests {
 
         let objects = vec![first, second];
         assert!(ev
-            .evaluate(1, 1, &"t".into(), 100, 100, &[], &objects)
+            .evaluate(
+                1,
+                1,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &objects
+            )
             .is_empty());
         assert_eq!(
-            ev.evaluate(1, 2, &"t".into(), 100, 100, &[], &objects)
-                .len(),
+            ev.evaluate(
+                1,
+                2,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &objects
+            )
+            .len(),
             2
         );
         assert!(ev
-            .evaluate(1, 3, &"t".into(), 100, 100, &[], &objects)
+            .evaluate(
+                1,
+                3,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &objects
+            )
             .is_empty());
     }
 
@@ -978,7 +1194,17 @@ mod tests {
         };
         o.detection_bbox = Some(raw);
 
-        let alerts = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[o]);
+        let alerts = ev.evaluate(
+            1,
+            1,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[o],
+        );
         assert_eq!(alerts.len(), 1);
         assert_eq!(
             alerts[0].bbox,
@@ -1251,7 +1477,17 @@ mod tests {
         }
         let ev = RuleEvaluator::new(&unit_rules_cfg(), &rules).unwrap();
         let fired: Vec<(String, u64)> = ev
-            .evaluate(3, 1, &"t".to_string(), 1000, 1000, &[], &objects)
+            .evaluate(
+                3,
+                1,
+                Utc::now(),
+                Instant::now(),
+                &"t".to_string(),
+                1000,
+                1000,
+                &[],
+                &objects,
+            )
             .into_iter()
             .map(|e| (e.rule_id, e.track_id.unwrap()))
             .collect();
@@ -1329,7 +1565,17 @@ mod tests {
             next: 0,
         };
         let fired: Vec<(String, u64)> = ev
-            .evaluate(3, 1, &"t".to_string(), 1000, 1000, &[], iter)
+            .evaluate(
+                3,
+                1,
+                Utc::now(),
+                Instant::now(),
+                &"t".to_string(),
+                1000,
+                1000,
+                &[],
+                iter,
+            )
             .into_iter()
             .map(|e| (e.rule_id, e.track_id.unwrap()))
             .collect();

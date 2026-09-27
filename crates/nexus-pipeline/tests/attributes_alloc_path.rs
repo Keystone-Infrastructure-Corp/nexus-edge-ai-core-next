@@ -225,7 +225,19 @@ fn rule_stage(eval: &RuleEvaluator, strip: bool) -> (u64, u64) {
     let mut objects = 0;
     for (f, tracked) in scenario() {
         let input = if strip { stripped(&tracked) } else { tracked };
-        let (events, n) = allocs(|| eval.evaluate(1, f.frame_id, &trace_id, W, H, &zones, &input));
+        let (events, n) = allocs(|| {
+            eval.evaluate(
+                1,
+                f.frame_id,
+                f.captured_at,
+                f.captured_mono,
+                &trace_id,
+                W,
+                H,
+                &zones,
+                &input,
+            )
+        });
         assert!(events.is_empty());
         total += n;
         objects += input.len() as u64;
@@ -317,7 +329,19 @@ fn whole_path_census_with_two_rules() {
         let (mut tracked, a) = allocs(|| tracker.update(dets, f.captured_at));
         let ((), b) = allocs(|| annotator.annotate(&f, &zones, &[], &mut tracked));
         let (decisions, c) = allocs(|| emitter.tick(1, &tracked, f.captured_at));
-        let (events, d) = allocs(|| evaluator.evaluate(1, i, &trace_id, W, H, &zones, &tracked));
+        let (events, d) = allocs(|| {
+            evaluator.evaluate(
+                1,
+                i,
+                f.captured_at,
+                f.captured_mono,
+                &trace_id,
+                W,
+                H,
+                &zones,
+                &tracked,
+            )
+        });
         drop((decisions, events));
         if i >= WARMUP {
             for (s, n) in stage.iter_mut().zip([a, b, c, d]) {
