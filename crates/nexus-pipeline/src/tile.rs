@@ -40,6 +40,10 @@ pub enum TileError {
     /// Zero-area ROI — degenerate, would produce an empty crop.
     #[error("ROI has zero area: {0:?}")]
     EmptyRoi(TileRoi),
+    /// The parent's buffer is not `width * height * 3` bytes, so its
+    /// rows are not where `width` puts them.
+    #[error("parent frame buffer is {got} bytes, expected {expected}")]
+    BufferSize { got: usize, expected: usize },
 }
 
 /// Pixel-space sub-region of a supervisor frame.
@@ -206,6 +210,13 @@ pub fn crop_to_tile_rgb(parent: &Frame, roi: TileRoi) -> Result<Frame, TileError
     }
     let bytes_per_px = 3usize; // both supported formats are 3-byte interleaved
     let parent_stride = parent.width as usize * bytes_per_px;
+    let expected = parent_stride * parent.height as usize;
+    if parent.data.len() != expected {
+        return Err(TileError::BufferSize {
+            got: parent.data.len(),
+            expected,
+        });
+    }
     let roi_stride = roi.w as usize * bytes_per_px;
     let roi_x_byte = roi.x as usize * bytes_per_px;
     let mut buf = Vec::with_capacity(roi_stride * roi.h as usize);
@@ -557,6 +568,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, TileError::EmptyRoi(_)));
+    }
+
+    /// The crop trusts `width`/`height`, so a buffer that is not exactly
+    /// `width * height * 3` slices out of bounds (short) or crops sheared
+    /// rows (GStreamer's padded stride at 642 px, 1926 bytes of pixels in a
+    /// 1928-byte row), and a release build aborts on the panic.
+    #[test]
+    fn crop_rejects_a_buffer_that_does_not_match_the_frame_size() {
+        let roi = TileRoi {
+            x: 0,
+            y: 0,
+            w: 642,
+            h: 361,
+        };
+        for len in [642 * 361 * 3 - 1, 1928 * 361] {
+            let parent = Frame {
+                data: Arc::new(vec![0u8; len]),
+                ..solid_frame(642, 361, 0)
+            };
+            assert_eq!(
+                crop_to_tile_rgb(&parent, roi).err(),
+                Some(TileError::BufferSize {
+                    got: len,
+                    expected: 642 * 361 * 3
+                })
+            );
+        }
     }
 
     // ---- map_tile_dets_to_frame -------------------------------------------
