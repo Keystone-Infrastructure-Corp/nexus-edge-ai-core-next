@@ -192,9 +192,9 @@ pub trait ClipRecorder: Send + Sync {
     /// recorder overrides it; failure to build the ingester is
     /// logged + swallowed (the camera will refuse clips, but the
     /// rest of the engine keeps running). The engine calls it again, with
-    /// the same arguments, on every reconcile pass until it succeeds,
-    /// without restarting the camera, so return `Err` only for a failure a
-    /// later call can cure.
+    /// the URL, frame and codec the camera's start used, on every reconcile
+    /// pass until it succeeds, without restarting the camera, so return
+    /// `Err` only for a failure a later call can cure.
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
     fn add_camera_ingester(
@@ -226,18 +226,19 @@ pub trait ClipRecorder: Send + Sync {
     /// any of it (invariants I1–I5).
     ///
     /// The engine calls this with `Some(url)` when it starts the camera,
-    /// and again, with the same arguments, on every reconcile pass while the
-    /// camera runs, without restarting it: SPEC-069's retry on the long
-    /// backoff. So `Ok(())` for a session that is running must be a no-op,
-    /// and a call that finds the camera's session shut down by the SPEC-069
-    /// fallback must start a new one; the running frame source takes it up
-    /// once it delivers. The default no-op, for recorders without substream
-    /// sessions, has nothing to register, and that is not a failure. `Err`
-    /// means no new session was registered (an earlier one may remain, but
-    /// the engine tears a camera's session down before it starts the camera
-    /// again), and the next pass calls again. For `None` nothing is
-    /// retried: the engine logs a failed teardown when it applies a
-    /// camera's config, and discards the result when it stops the camera.
+    /// and again, with the URL, frame and codec the start used, on every
+    /// reconcile pass while the camera runs, without restarting it:
+    /// SPEC-069's retry on the long backoff. So `Ok(())` for a session that
+    /// is running must be a no-op, and a call that finds the camera's
+    /// session shut down by the SPEC-069 fallback must start a new one; the
+    /// running frame source takes it up once it delivers. The default no-op,
+    /// for recorders without substream sessions, has nothing to register,
+    /// and that is not a failure. `Err` means no new session was registered
+    /// (an earlier one may remain, but the engine tears a camera's session
+    /// down before it starts the camera again), and the next pass calls
+    /// again. For `None` nothing is retried: the engine logs a failed
+    /// teardown when it applies a camera's config, and discards the result
+    /// when it stops the camera.
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
     fn set_camera_analysis_ingester(

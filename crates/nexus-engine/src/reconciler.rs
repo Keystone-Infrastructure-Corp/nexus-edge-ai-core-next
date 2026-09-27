@@ -634,15 +634,16 @@ pub(crate) async fn register_boot_sessions(
 }
 
 /// Register again, without restarting the camera, what `entry`'s start
-/// registered beside its supervisor, and record the answers in the entry:
+/// registered beside its supervisor (the same URL, frame and codec, at the
+/// camera's current `max_fps`), and record the answers in the entry:
 /// SPEC-069's retry "on the long backoff already used for session
-/// rebuilds", once per pass. A main ingester is retried while it is
-/// outstanding. The substream session is registered on every pass, with the
-/// codec its start resolved, because a session the SPEC-069 fallback shut
-/// down leaves nothing in the entry to say so. For a running session the
-/// recorder's registration is a no-op; for one that was shut down it starts
-/// a new one, which the camera's running frame source takes up once it
-/// delivers.
+/// rebuilds", once per pass (each 30 s tick, and each config change). A
+/// main ingester is retried while it is outstanding. The substream session
+/// is registered on every pass, with the codec its start resolved, because a
+/// session the SPEC-069 fallback shut down leaves nothing in the entry to
+/// say so. For a running session the recorder's registration is a no-op; for
+/// one that was shut down it starts a new one, which the camera's running
+/// frame source takes up once it delivers.
 fn retry_sessions(args: &ReconcilerArgs, cam: &CameraConfig, entry: &RunningCameraEntry) {
     let cam_id = cam.id;
     let (sup_w, sup_h) = entry.key.supervisor_dims;
@@ -2398,26 +2399,39 @@ mod tests {
         );
     }
 
-    /// Records, by camera, the frame each registration and each clip open
-    /// asked for, and how many main ingesters and substream sessions had been
-    /// registered when the supervisor built its frame source. Each
-    /// registration sleeps for `delay`, the way a codec probe or a pipeline
-    /// build takes time, so a supervisor spawned before its registrations
-    /// would build its source first.
+    /// A registration as the recorder received it: the URL, `max_fps`, RGB
+    /// frame and codec it was called with.
+    type Registration = (String, u32, (u32, u32), CodecKind);
+
+    /// Records, by camera, every main-ingester and substream registration
+    /// call and the frame each clip open asked for, and how many main
+    /// ingesters and substream sessions had been registered when the
+    /// supervisor built its frame source. Each registration sleeps for
+    /// `delay`, the way a codec probe or a pipeline build takes time, so a
+    /// supervisor spawned before its registrations would build its source
+    /// first. A camera in `refuse_main_first` has that many main-ingester
+    /// calls refused before one is accepted.
     #[derive(Default)]
     struct StartRecorder {
         delay: std::time::Duration,
-        ingester_dims: Mutex<HashMap<CameraId, Vec<(u32, u32)>>>,
-        analysis_dims: Mutex<HashMap<CameraId, Vec<(u32, u32)>>>,
+        refuse_main_first: Mutex<HashMap<CameraId, usize>>,
+        ingesters: Mutex<HashMap<CameraId, Vec<Registration>>>,
+        substreams: Mutex<HashMap<CameraId, Vec<Registration>>>,
         clip_dims: Mutex<HashMap<CameraId, Vec<(u32, u32)>>>,
         registered_at_source_build: Mutex<HashMap<CameraId, Vec<(usize, usize)>>>,
     }
 
     impl StartRecorder {
-        fn dims(map: &Mutex<HashMap<CameraId, Vec<(u32, u32)>>>, id: CameraId) -> Vec<(u32, u32)> {
+        fn calls<T: Clone>(map: &Mutex<HashMap<CameraId, Vec<T>>>, id: CameraId) -> Vec<T> {
             map.lock().get(&id).cloned().unwrap_or_default()
         }
-        fn count(map: &Mutex<HashMap<CameraId, Vec<(u32, u32)>>>, id: CameraId) -> usize {
+        fn frames(
+            map: &Mutex<HashMap<CameraId, Vec<Registration>>>,
+            id: CameraId,
+        ) -> Vec<(u32, u32)> {
+            Self::calls(map, id).into_iter().map(|r| r.2).collect()
+        }
+        fn count<T>(map: &Mutex<HashMap<CameraId, Vec<T>>>, id: CameraId) -> usize {
             map.lock().get(&id).map_or(0, Vec::len)
         }
     }
@@ -2449,37 +2463,47 @@ mod tests {
         fn add_camera_ingester(
             &self,
             camera_id: CameraId,
-            _url: &str,
+            url: &str,
             _pre_roll_secs: u32,
-            _max_fps: u32,
+            max_fps: u32,
             rgb_w: u32,
             rgb_h: u32,
-            _codec: CodecKind,
+            codec: CodecKind,
         ) -> Result<(), RecorderError> {
             std::thread::sleep(self.delay);
-            self.ingester_dims
-                .lock()
-                .entry(camera_id)
-                .or_default()
-                .push((rgb_w, rgb_h));
+            self.ingesters.lock().entry(camera_id).or_default().push((
+                url.to_string(),
+                max_fps,
+                (rgb_w, rgb_h),
+                codec,
+            ));
+            if let Some(n) = self.refuse_main_first.lock().get_mut(&camera_id) {
+                if *n > 0 {
+                    *n -= 1;
+                    return Err(RecorderError::Io(std::io::Error::other(
+                        "ingester: scripted refusal",
+                    )));
+                }
+            }
             Ok(())
         }
         fn set_camera_analysis_ingester(
             &self,
             camera_id: CameraId,
             analysis_url: Option<&str>,
-            _max_fps: u32,
+            max_fps: u32,
             rgb_w: u32,
             rgb_h: u32,
-            _codec: CodecKind,
+            codec: CodecKind,
         ) -> Result<(), RecorderError> {
-            if analysis_url.is_some() {
+            if let Some(url) = analysis_url {
                 std::thread::sleep(self.delay);
-                self.analysis_dims
-                    .lock()
-                    .entry(camera_id)
-                    .or_default()
-                    .push((rgb_w, rgb_h));
+                self.substreams.lock().entry(camera_id).or_default().push((
+                    url.to_string(),
+                    max_fps,
+                    (rgb_w, rgb_h),
+                    codec,
+                ));
             }
             Ok(())
         }
@@ -2488,8 +2512,8 @@ mod tests {
             camera_id: CameraId,
         ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
             let registered = (
-                Self::count(&self.ingester_dims, camera_id),
-                Self::count(&self.analysis_dims, camera_id),
+                Self::count(&self.ingesters, camera_id),
+                Self::count(&self.substreams, camera_id),
             );
             self.registered_at_source_build
                 .lock()
@@ -2552,7 +2576,7 @@ mod tests {
                     entries[&id].key.supervisor_dims, dims,
                     "{phase}: camera {id}'s entry"
                 );
-                let ingesters = StartRecorder::dims(&recorder.ingester_dims, id);
+                let ingesters = StartRecorder::frames(&recorder.ingesters, id);
                 // Boot's main ingesters are built by `build_gst_recorder`, not
                 // through the recorder trait.
                 if phase == "a start" {
@@ -2563,11 +2587,11 @@ mod tests {
                     );
                 }
                 assert_eq!(
-                    StartRecorder::dims(&recorder.analysis_dims, id),
+                    StartRecorder::frames(&recorder.substreams, id),
                     vec![dims],
                     "{phase}: camera {id}'s substream session"
                 );
-                let clips = StartRecorder::dims(&recorder.clip_dims, id);
+                let clips = StartRecorder::calls(&recorder.clip_dims, id);
                 assert!(
                     clips.iter().all(|c| *c == dims),
                     "{phase}: camera {id}'s supervisor opened clips at {clips:?}, its entry \
@@ -2606,6 +2630,172 @@ mod tests {
             "(main ingesters, substream sessions) registered when the supervisor built its \
              frame source"
         );
+    }
+
+    /// An RTSP server on loopback that answers `DESCRIBE` on any path with
+    /// one H.265 video track, as a camera answers the codec probe. Returns
+    /// its `rtsp://host:port` and the number of probes (connections) it has
+    /// answered.
+    async fn an_rtsp_server_answering_h265() -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("rtsp://{}", listener.local_addr().expect("addr"));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let answered = probes.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                answered.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while let Ok(n @ 1..) = sock.read(&mut chunk).await {
+                        buf.extend_from_slice(&chunk[..n]);
+                        while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                            buf.drain(..end + 4);
+                            let cseq = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("CSeq: "))
+                                .unwrap_or("0");
+                            let sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H265/90000\r\n";
+                            let reply = if head.starts_with("DESCRIBE") {
+                                format!(
+                                    "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Type: \
+                                     application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                                    sdp.len()
+                                )
+                            } else {
+                                format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n")
+                            };
+                            if sock.write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (base, probes)
+    }
+
+    /// Each pass registers again exactly what the camera's start registered,
+    /// and probes nothing: the URL, `max_fps`, frame and codec of a main
+    /// ingester that is outstanding, and of the substream session.
+    /// `GstClipRecorder`'s registration is a no-op for a running session
+    /// only when the URL and codec match, so any other argument rebuilds the
+    /// running session, and clears the camera's decode health, on every pass;
+    /// and a session rebuilt at another frame feeds the supervisor frames of
+    /// a size its entry does not record. Camera 7's main stream is pinned to
+    /// H.264 and its substream answers the probe with H.265, so a retry with
+    /// the main codec, the configured one or a literal cannot pass for the
+    /// probed one. Camera 8's main stream is auto-codec, probed as H.265, and
+    /// its first two main-ingester registrations are refused. Both run at
+    /// frames that are not the default. Each is started by a pass, then
+    /// seeded as at boot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_pass_registers_again_exactly_what_the_cameras_start_registered() {
+        let (server, probes) = an_rtsp_server_answering_h265().await;
+        let mut sub = cam_with_id(7);
+        sub.ingest.codec = Some(CodecKind::H264);
+        sub.ingest.analysis_url = Some(Url::parse(&format!("{server}/sub")).unwrap());
+        sub.behavior.supervisor_width = Some(1024);
+        let mut auto = cam_with_id(8);
+        auto.ingest.url = Url::parse(&format!("{server}/main")).unwrap();
+        auto.ingest.codec = None;
+        auto.detector.model_override = Some(nexus_config::ModelConfig {
+            kind: "mock".into(),
+            input_width: 640,
+            ..Default::default()
+        });
+        let main_7: Registration = (sub.ingest.url.to_string(), 15, (1024, 576), CodecKind::H264);
+        let sub_7: Registration = (format!("{server}/sub"), 15, (1024, 576), CodecKind::H265);
+        let main_8: Registration = (auto.ingest.url.to_string(), 15, (640, 360), CodecKind::H265);
+        let cams = [sub, auto];
+
+        for phase in ["a start", "boot"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let recorder = Arc::new(StartRecorder::default());
+            recorder.refuse_main_first.lock().insert(8, 2);
+            let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
+            if phase == "boot" {
+                // What `build_gst_recorder` registers: camera 7's main
+                // ingester built, and camera 8's, probed as H.265, did not.
+                let boot = register_boot_sessions(
+                    args.recorder.as_ref(),
+                    vec![
+                        (&cams[0], CodecKind::H264, (1024, 576), true),
+                        (&cams[1], CodecKind::H265, (640, 360), false),
+                    ],
+                )
+                .await;
+                seed_like_boot(&args, boot).await;
+            } else {
+                reconcile(&args).await.expect("start pass");
+            }
+            let probed_at_start = probes.load(Ordering::SeqCst);
+            let started: HashMap<CameraId, RunningCameraEntry> = args.handles.lock().clone();
+
+            for _ in 0..3 {
+                reconcile(&args).await.expect("reconcile pass");
+            }
+
+            let restarted: Vec<CameraId> = started
+                .iter()
+                .filter(|(id, entry)| {
+                    !args
+                        .handles
+                        .lock()
+                        .get(id)
+                        .is_some_and(|e| Arc::ptr_eq(&e.task, &entry.task))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            let main_pending_8 = sessions_of(&args.handles, 8).main_pending;
+            abort_all(&args.handles);
+            assert!(
+                restarted.is_empty(),
+                "{phase}: a pass restarted {restarted:?}"
+            );
+            assert_eq!(
+                probes.load(Ordering::SeqCst),
+                probed_at_start,
+                "{phase}: a pass probed the camera, which only its start does"
+            );
+            assert_eq!(
+                StartRecorder::calls(&recorder.substreams, 7),
+                vec![sub_7.clone(); 4],
+                "{phase}: camera 7's substream, registered by its start and again by each of \
+                 three passes, with the codec the start probed"
+            );
+            // Boot's main ingesters are built by `build_gst_recorder`, not
+            // through the recorder trait.
+            let mains_7 = if phase == "boot" {
+                vec![]
+            } else {
+                vec![main_7.clone()]
+            };
+            assert_eq!(
+                StartRecorder::calls(&recorder.ingesters, 7),
+                mains_7,
+                "{phase}: camera 7's main ingester registered, so no pass registers it again"
+            );
+            assert_eq!(
+                StartRecorder::calls(&recorder.ingesters, 8),
+                vec![main_8.clone(); 3],
+                "{phase}: camera 8's main ingester, refused twice and then accepted, with the \
+                 codec its start resolved"
+            );
+            assert_eq!(
+                main_pending_8, None,
+                "{phase}: the accepted retry must be recorded in the entry"
+            );
+            assert!(
+                StartRecorder::calls(&recorder.substreams, 8).is_empty(),
+                "{phase}: camera 8 has no substream"
+            );
+        }
     }
 
     /// Every field the no-change guard compares, for camera shapes no other
