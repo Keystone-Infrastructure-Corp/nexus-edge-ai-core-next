@@ -94,7 +94,7 @@ describe("dashboard Engine tile", () => {
     renderDashboard();
 
     const tile = await engineTile();
-    expect(await within(tile).findByText("DEGRADED")).toBeTruthy();
+    expect((await within(tile).findByText("DEGRADED")).className).toContain("text-warning");
     expect(tile.textContent).toContain("detector_unavailable");
     expect(tile.textContent).toContain("recorder_stub");
     expect(within(tile).queryByText("…")).toBeNull();
@@ -141,7 +141,7 @@ describe("dashboard Engine tile", () => {
     renderDashboard();
 
     const tile = await engineTile();
-    expect(await within(tile).findByText("OK")).toBeTruthy();
+    expect((await within(tile).findByText("OK")).className).toContain("text-success");
     expect(within(tile).getByText("v0.1.99")).toBeTruthy();
     expect(screen.queryByText(/degraded/i)).toBeNull();
   });
@@ -151,7 +151,7 @@ describe("dashboard Engine tile", () => {
     renderDashboard();
 
     const tile = await engineTile();
-    expect(await within(tile).findByText("ERROR")).toBeTruthy();
+    expect((await within(tile).findByText("ERROR")).className).toContain("text-destructive");
     expect(screen.queryByText(/degraded/i)).toBeNull();
   });
 

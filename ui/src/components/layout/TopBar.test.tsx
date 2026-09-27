@@ -76,7 +76,36 @@ describe("TopBar engine-health pill", () => {
     const pill = await screen.findByText(/degraded/);
     expect(pill.textContent).toContain("recorder_stub");
     expect(pill.getAttribute("title")).toContain(RECORDER_STUB.detail);
+    expect(pill.className).toContain("bg-warning");
     expect(screen.queryByText("starting…")).toBeNull();
+  });
+
+  it("names every issue, and each code once", async () => {
+    // Two kinds can fail at once (`nexus_inference::health` keeps one entry
+    // per kind), so a code can repeat across issues.
+    const yolo = { component: "detector", code: "detector_unavailable", kind: "yolo" };
+    const ppe = {
+      component: "detector",
+      code: "detector_unavailable",
+      kind: "ppe",
+      detail: "no detector implementation ships for this model kind",
+    };
+    stubEngine(() =>
+      Promise.resolve(
+        json({ status: "degraded", version: "0.1.99", issues: [yolo, ppe, RECORDER_STUB] }),
+      ),
+    );
+    renderTopBar();
+
+    const pill = await screen.findByText(/degraded/);
+    expect(pill.textContent).toBe("degraded • detector_unavailable, recorder_stub");
+    expect(pill.getAttribute("title")).toBe(
+      [
+        "detector_unavailable (yolo)",
+        "detector_unavailable (ppe): no detector implementation ships for this model kind",
+        `recorder_stub: ${RECORDER_STUB.detail}`,
+      ].join("\n"),
+    );
   });
 
   it("names the issue when the engine withholds its detail", async () => {
@@ -119,7 +148,7 @@ describe("TopBar engine-health pill", () => {
     );
     renderTopBar();
 
-    expect(await screen.findByText("online • 0.1.99")).toBeTruthy();
+    expect((await screen.findByText("online • 0.1.99")).className).toContain("bg-success");
   });
 
   it("says starting while the health query has not answered", async () => {
@@ -154,9 +183,8 @@ describe("TopBar engine-health pill", () => {
     stubEngine(() => Promise.resolve(json({ error: "boom" }, 500)));
     renderTopBar();
 
-    expect(
-      await screen.findByText("engine unreachable", undefined, { timeout: 4_000 }),
-    ).toBeTruthy();
+    const pill = await screen.findByText("engine unreachable", undefined, { timeout: 4_000 });
+    expect(pill.className).toContain("bg-destructive");
   });
 });
 
