@@ -5,7 +5,7 @@
 // only for a health query that has not answered.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DashboardPage } from "@/pages/dashboard";
@@ -34,16 +34,42 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-/** Stub `fetch`: `/health` answers with `health`; everything else 404s. */
-function stubEngine(health: () => Promise<Response>) {
+/**
+ * Stub `fetch`: `/health` answers with `health`, a path in `routes` with its
+ * answer (the query string is ignored); everything else 404s.
+ */
+function stubEngine(
+  health: () => Promise<Response>,
+  routes: Record<string, () => Promise<Response>> = {},
+) {
   vi.stubGlobal(
     "fetch",
     vi.fn((input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/api/v1/health")) return health();
+      const path = new URL(String(input), "http://engine").pathname;
+      if (path === "/api/v1/health") return health();
+      const route = routes[path];
+      if (route) return route();
       return Promise.resolve(json({ error: "not stubbed" }, 404));
     }),
   );
+}
+
+const pending = () => new Promise<Response>(() => {});
+const failing = () => Promise.resolve(json({ error: "boom" }, 500));
+const healthy = () =>
+  Promise.resolve(json({ status: "ok", version: "0.1.99", issues: [] }));
+
+/** The fields of `GET /api/v1/system/metrics` the dashboard reads. */
+function metrics(disks: { total_bytes: number; available_bytes: number }[]) {
+  return {
+    uptime_secs: 60,
+    cpu: { count: 4, usage_pct: 37.4, per_core_pct: [], frequency_mhz: 2000 },
+    memory: { total_bytes: 8_000, used_bytes: 2_000, available_bytes: 6_000 },
+    gpu: null,
+    npu: null,
+    disks: disks.map((d, i) => ({ name: `disk${i}`, mount_point: `/m${i}`, ...d })),
+    captured_at: new Date().toISOString(),
+  };
 }
 
 class SilentEventSource {
@@ -51,6 +77,14 @@ class SilentEventSource {
   onmessage: (() => void) | null = null;
   onerror: (() => void) | null = null;
   close() {}
+}
+
+/** An alert stream that connects and then stays quiet. */
+class OpenEventSource extends SilentEventSource {
+  constructor() {
+    super();
+    queueMicrotask(() => this.onopen?.());
+  }
 }
 
 function renderDashboard(): QueryClient {
@@ -63,12 +97,30 @@ function renderDashboard(): QueryClient {
   return client;
 }
 
-/** The Engine KPI tile: the Card whose CardTitle reads "Engine". */
-async function engineTile(): Promise<HTMLElement> {
-  const title = await screen.findByText("Engine");
-  const card = title.parentElement?.parentElement; // CardTitle → CardHeader → Card
-  if (!card) throw new Error("Engine tile not found");
-  return card;
+/**
+ * The KPI or system card whose CardTitle reads `label` and that shows a
+ * reading. The Cameras KPI shares its title with the Cameras card, which has
+ * no reading.
+ */
+async function tile(label: string): Promise<HTMLElement> {
+  for (const title of await screen.findAllByText(label)) {
+    const card = title.parentElement?.parentElement; // CardTitle → CardHeader → Card
+    if (card?.querySelector(".text-2xl")) return card;
+  }
+  throw new Error(`${label} tile not found`);
+}
+
+/** The Engine KPI tile. */
+const engineTile = () => tile("Engine");
+
+/** The reading a tile shows. */
+async function reading(label: string): Promise<string> {
+  return (await tile(label)).querySelector(".text-2xl")?.textContent ?? "";
+}
+
+/** The classes of a tile's reading, which carry its accent colour. */
+function accentOf(card: HTMLElement): string {
+  return card.querySelector(".text-2xl")?.className ?? "";
 }
 
 beforeEach(() => {
@@ -179,5 +231,161 @@ describe("dashboard Engine tile", () => {
     const tile = await engineTile();
     expect(within(tile).getByText("…")).toBeTruthy();
     expect(screen.queryByText(/degraded/i)).toBeNull();
+  });
+});
+
+// The rest of the dashboard states readings too, and must not state one it
+// has not read: a query that has not answered shows "…", one that failed
+// shows "—" and says it failed, and neither shows a default such as 0.
+describe("dashboard readings", () => {
+  it("does not count cameras before the camera list answers", async () => {
+    stubEngine(healthy, { "/api/v1/cameras": pending });
+    renderDashboard();
+
+    expect(await reading("Cameras")).toBe("…");
+    expect(screen.queryByText("0 configured")).toBeNull();
+    expect(screen.queryByText("No cameras configured")).toBeNull();
+  });
+
+  it("says the camera list failed instead of that no cameras are configured", async () => {
+    stubEngine(healthy, { "/api/v1/cameras": failing });
+    renderDashboard();
+
+    await waitFor(async () => expect(await reading("Cameras")).toBe("—"));
+    expect(within(await tile("Cameras")).getByText("Failed to load cameras")).toBeTruthy();
+    expect(screen.queryByText("0 configured")).toBeNull();
+    expect(screen.queryByText("No cameras configured")).toBeNull();
+    expect(screen.queryByText(/Add a camera/)).toBeNull();
+    expect(screen.getAllByText("Failed to load cameras")).toHaveLength(2);
+  });
+
+  it("counts the cameras it read, and says none are configured only then", async () => {
+    stubEngine(healthy, { "/api/v1/cameras": () => Promise.resolve(json([])) });
+    renderDashboard();
+
+    expect(await screen.findByText("No cameras configured")).toBeTruthy();
+    expect(await reading("Cameras")).toBe("0");
+    expect(screen.getByText("0 configured")).toBeTruthy();
+  });
+
+  it("does not count alerts before the event list answers", async () => {
+    stubEngine(healthy, { "/api/v1/events": pending });
+    renderDashboard();
+
+    expect(await reading("Alerts (last hour)")).toBe("…");
+    expect(accentOf(await tile("Alerts (last hour)"))).not.toContain("text-warning");
+  });
+
+  it("says the event list failed instead of counting no alerts", async () => {
+    stubEngine(healthy, { "/api/v1/events": failing });
+    renderDashboard();
+
+    await waitFor(async () => expect(await reading("Alerts (last hour)")).toBe("—"));
+    expect(within(await tile("Alerts (last hour)")).getByText("Failed to load events")).toBeTruthy();
+  });
+
+  it("counts the alerts it read in the last hour", async () => {
+    const at = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
+    stubEngine(healthy, {
+      "/api/v1/events": () =>
+        Promise.resolve(json([{ captured_at: at(60_000) }, { captured_at: at(7_200_000) }])),
+    });
+    renderDashboard();
+
+    await waitFor(async () => expect(await reading("Alerts (last hour)")).toBe("1"));
+    expect(accentOf(await tile("Alerts (last hour)"))).toContain("text-warning");
+  });
+
+  it("does not report CPU, memory or disk use before the metrics answer", async () => {
+    stubEngine(healthy, { "/api/v1/system/metrics": pending });
+    renderDashboard();
+
+    expect(await reading("Disk used (worst)")).toBe("…");
+    expect(await reading("CPU")).toBe("…");
+    expect(await reading("Memory")).toBe("…");
+  });
+
+  it("says the metrics failed instead of reporting 0% use", async () => {
+    stubEngine(healthy, { "/api/v1/system/metrics": failing });
+    renderDashboard();
+
+    await waitFor(async () => expect(await reading("Disk used (worst)")).toBe("—"));
+    expect(within(await tile("Disk used (worst)")).getByText("Failed to load metrics")).toBeTruthy();
+    expect(await reading("CPU")).toBe("—");
+    expect(await reading("Memory")).toBe("—");
+  });
+
+  it("does not report 0% disk use for an engine that measured no disk", async () => {
+    stubEngine(healthy, {
+      "/api/v1/system/metrics": () => Promise.resolve(json(metrics([]))),
+    });
+    renderDashboard();
+
+    await screen.findByText("0 disks");
+    expect(await reading("Disk used (worst)")).toBe("—");
+  });
+
+  it("reports the CPU, memory and worst disk use it read", async () => {
+    stubEngine(healthy, {
+      "/api/v1/system/metrics": () =>
+        Promise.resolve(
+          json(
+            metrics([
+              { total_bytes: 100, available_bytes: 60 },
+              { total_bytes: 100, available_bytes: 20 },
+              { total_bytes: 0, available_bytes: 0 },
+            ]),
+          ),
+        ),
+    });
+    renderDashboard();
+
+    await screen.findByText("3 disks");
+    expect(await reading("Disk used (worst)")).toBe("80%");
+    expect(accentOf(await tile("Disk used (worst)"))).toContain("text-warning");
+    expect(await reading("CPU")).toBe("37%");
+    expect(await reading("Memory")).toBe("25%");
+  });
+
+  it("does not call a camera stalled before its frame metadata answers", async () => {
+    stubEngine(healthy, {
+      "/api/v1/cameras": () =>
+        Promise.resolve(json([{ id: 7, name: "Front door", url: "rtsp://cam" }])),
+      "/api/v1/cameras/7/frames/latest.json": pending,
+    });
+    renderDashboard();
+
+    expect(await screen.findByText("Front door")).toBeTruthy();
+    expect(screen.queryByText("STALLED")).toBeNull();
+  });
+
+  it("calls a camera stalled when the engine has no frame for it", async () => {
+    stubEngine(healthy, {
+      "/api/v1/cameras": () =>
+        Promise.resolve(json([{ id: 7, name: "Front door", url: "rtsp://cam" }])),
+    });
+    renderDashboard();
+
+    expect(await screen.findByText("STALLED")).toBeTruthy();
+  });
+
+  it("does not say no alerts fired while the alert stream is not connected", async () => {
+    stubEngine(healthy);
+    renderDashboard();
+
+    // The status badge proves the card rendered with the stream still connecting.
+    expect(await screen.findByText("connecting")).toBeTruthy();
+    expect(screen.queryByText("Quiet on the wire")).toBeNull();
+    expect(screen.queryByText(/No alerts have/)).toBeNull();
+    expect(screen.getByText("Not connected")).toBeTruthy();
+  });
+
+  it("says the wire is quiet once the alert stream is connected", async () => {
+    vi.stubGlobal("EventSource", OpenEventSource);
+    stubEngine(healthy);
+    renderDashboard();
+
+    expect(await screen.findByText("Quiet on the wire")).toBeTruthy();
+    expect(screen.getByText("No alerts have arrived since you opened this page.")).toBeTruthy();
   });
 });
