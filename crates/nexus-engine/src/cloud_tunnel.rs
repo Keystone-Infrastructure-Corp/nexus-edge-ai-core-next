@@ -2703,6 +2703,34 @@ mod health_tests {
         }
     }
 
+    /// A good read replaces the count a failed read would reuse, so the
+    /// issue follows the cameras in both directions: enabling the first
+    /// camera behind the stub raises it, and disabling the last clears it.
+    #[tokio::test]
+    async fn a_good_read_replaces_the_last_known_count() {
+        for enabled in [false, true] {
+            let (store, dir) = default_config_store(enabled).await;
+            let store = Arc::new(store);
+            let health = stub_health(store.clone(), &dir);
+            assert_eq!(
+                recorder_issue(&health).await.is_some(),
+                enabled,
+                "fixture: the first read's answer",
+            );
+
+            for mut camera in store.list_cameras().await.expect("list cameras") {
+                camera.ingest.enabled = !enabled;
+                store.upsert_camera(&camera).await.expect("flip the camera");
+            }
+            assert_eq!(
+                recorder_issue(&health).await.is_some(),
+                !enabled,
+                "the next good read must decide the answer (enabled: {})",
+                !enabled,
+            );
+        }
+    }
+
     /// Only a stub on a build with a real recorder reads the store, so every
     /// other box answers both surfaces without waiting on the pool.
     #[tokio::test]
