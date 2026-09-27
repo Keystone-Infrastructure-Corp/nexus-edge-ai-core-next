@@ -3130,7 +3130,8 @@ async fn get_model_prompts(
 /// + per-camera occupancy strip directly off this body.
 #[derive(serde::Serialize)]
 struct StorageLocalResponse {
-    /// `stub` until the GStreamer recorder lands in Stage B.
+    /// The running recorder's `kind()`: `gstreamer`, or `stub`, which
+    /// writes a 0-byte placeholder for every clip.
     recorder_kind: &'static str,
     /// True iff the watermark sampler has the recorder paused. UI
     /// uses this to render the "evicting / no new clips" banner.

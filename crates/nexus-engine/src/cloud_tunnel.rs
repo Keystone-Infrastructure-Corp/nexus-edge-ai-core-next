@@ -2394,7 +2394,7 @@ mod health_tests {
     /// `status == "ok"`: status folds in the process-global detector
     /// registry, which a sibling test in this binary writes and never
     /// clears, so the stronger assertion only passed by winning a race
-    /// (BUG-155).
+    /// (BUG-159).
     #[test]
     fn healthy_decode_capacity_does_not_raise_an_issue() {
         let cap = crate::system_metrics::DecodeCapacity {
