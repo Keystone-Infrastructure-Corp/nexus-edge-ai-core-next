@@ -229,13 +229,15 @@ pub struct CameraHandle {
     pub task: JoinHandle<()>,
 }
 
-/// Aborts its task on drop.
+/// Aborts its task on drop, so a task the supervisor spawns ends with it —
+/// dropping a bare `JoinHandle` detaches the task instead.
 ///
-/// Every `FrameSource` learns the camera is gone from `tx.closed()`, which
-/// only resolves once the matching `Receiver` is dropped. The live-view tap
-/// holds that receiver, so it has to die with the supervisor task — dropping
-/// a bare `JoinHandle` detaches it instead, leaving the source decoding at
-/// full rate forever (BUG-136).
+/// The live-view tap holds the source's `Receiver`, so it has to die with the
+/// supervisor task, or a source that watches `tx.closed()` would decode at
+/// full rate forever (BUG-136). The source task is held the same way, because
+/// not every source watches: `VirtualSource` never looks, and a
+/// `SharedRtspSource` parked on a shut-down ingester never wakes to. Detached,
+/// each outlived its supervisor, one per camera restart (BUG-223).
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -539,11 +541,11 @@ async fn run_camera(
             current_supervisor_h,
         );
         let cam_id = cfg.id;
-        let source_task = tokio::spawn(async move {
+        let mut source_task = AbortOnDrop(tokio::spawn(async move {
             if let Err(e) = source.run(tx).await {
                 warn!(camera_id = cam_id, "frame source ended: {e}");
             }
-        });
+        }));
 
         // Live-view tap (BUG-136). Publishes every decoded frame to the
         // cache so the cloud wall runs at decode rate instead of inheriting
@@ -1463,8 +1465,8 @@ async fn run_camera(
         // ingester; we abort the now-stale source task, drain it,
         // and continue the outer loop to spawn a fresh source that
         // will subscribe to the new shared RGB tap.
-        source_task.abort();
-        let _ = source_task.await;
+        source_task.0.abort();
+        let _ = (&mut source_task.0).await;
         if !rebuild_source {
             break 'outer;
         }

@@ -972,10 +972,14 @@ impl RtspSource {
         // this task, but the spawn_blocking thread keeps the bus + a strong
         // pipeline ref alive, and the tokio runtime can never finish dropping.
         // Symptom: engine ignores Ctrl-C and needs SIGKILL. Fix: short
-        // `timed_pop` poll that checks an AtomicBool every 100ms, and a
-        // sibling future that flips the flag the moment the mpsc receiver is
-        // dropped (which happens as soon as the supervisor task is aborted).
+        // `timed_pop` poll that checks an AtomicBool every 100ms, flipped by
+        // `SessionTeardown` however this session ends.
         let shutdown = Arc::new(AtomicBool::new(false));
+        let _teardown = SessionTeardown {
+            shutdown: shutdown.clone(),
+            pipeline: pipeline.clone(),
+            camera_id,
+        };
         let shutdown_bus = shutdown.clone();
         let pipeline_for_bus = pipeline.clone();
         // Dedicated OS thread, NOT tokio::task::spawn_blocking: this loop
@@ -1019,9 +1023,10 @@ impl RtspSource {
             .map_err(|e| FrameSourceError::Backend(format!("spawn bus thread: {e}")))?;
 
         // `tx.closed()` resolves the moment the supervisor's Receiver is
-        // dropped (typically within microseconds of `task.abort()`). Racing
-        // it against the bus join means a Ctrl-C tear-down doesn't have to
-        // wait for an RTSP timeout or an EOS that may never come.
+        // dropped. Racing it against the bus join means a session nobody
+        // reads doesn't have to wait for an RTSP timeout or an EOS that may
+        // never come. (An aborted supervisor aborts this task outright;
+        // `SessionTeardown` ends the session then.)
         //
         // The stall watchdog covers the silent-failure case that
         // neither the bus nor the supervisor catches: rtspsrc
@@ -1061,28 +1066,41 @@ impl RtspSource {
                 r.map_err(|e| FrameSourceError::Backend(format!("bus thread dropped: {e}")))?
                     .map_err(FrameSourceError::Backend)
             }
-            _ = tx.closed() => {
-                shutdown.store(true, Ordering::Relaxed);
-                Err(FrameSourceError::Closed)
-            }
-            e = &mut stall_watchdog => {
-                shutdown.store(true, Ordering::Relaxed);
-                Err(e)
-            }
+            _ = tx.closed() => Err(FrameSourceError::Closed),
+            e = &mut stall_watchdog => Err(e),
         };
-
-        // Null the pipeline regardless of which branch won. This unblocks
-        // any in-flight bus dispatch on the (now-detached) blocking thread,
-        // which will then observe `shutdown=true` on its next poll and exit
-        // within ≤100 ms — no thread leak, no Drop hang. Detached because
-        // we are on a tokio worker and `rtspsrc` parked in a read on a dead
-        // camera makes the transition unbounded.
-        crate::teardown::null_pipeline_detached(
-            pipeline,
-            "source::RtspSource::run",
-            Some(camera_id),
-        );
         bus_result
+    }
+}
+
+/// Ends one [`RtspSource`] session when dropped, whichever branch of its
+/// `select!` won — or none: the supervisor aborts the source task when it
+/// ends (BUG-223), and an aborted session never runs the code after its
+/// await. Before this guard that code was the only teardown, so an aborted
+/// session left the bus thread polling and the pipeline PLAYING, holding the
+/// camera's RTSP session for the life of the process.
+///
+/// Nulling the pipeline unblocks any in-flight bus dispatch on the bus
+/// thread, which then observes `shutdown` on its next poll and exits within
+/// ≤100 ms — no thread leak, no Drop hang. Detached because this runs on a
+/// tokio worker and `rtspsrc` parked in a read on a dead camera makes the
+/// transition unbounded.
+#[cfg(feature = "gstreamer")]
+struct SessionTeardown {
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    pipeline: gstreamer::Pipeline,
+    camera_id: CameraId,
+}
+
+#[cfg(feature = "gstreamer")]
+impl Drop for SessionTeardown {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        crate::teardown::null_pipeline_detached(
+            self.pipeline.clone(),
+            "source::RtspSource::run",
+            Some(self.camera_id),
+        );
     }
 }
 
