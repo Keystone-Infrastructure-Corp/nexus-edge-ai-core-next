@@ -1076,9 +1076,9 @@ impl RtspSource {
 /// Ends one [`RtspSource`] session when dropped, whichever branch of its
 /// `select!` won — or none: the supervisor aborts the source task when it
 /// ends (BUG-223), and an aborted session never runs the code after its
-/// await. Before this guard that code was the only teardown, so an aborted
-/// session left the bus thread polling and the pipeline PLAYING, holding the
-/// camera's RTSP session for the life of the process.
+/// await. Without this guard that code is the only teardown, so an aborted
+/// session would leave the bus thread polling and the pipeline PLAYING,
+/// holding the camera's RTSP session: one more connection per restart.
 ///
 /// Nulling the pipeline unblocks any in-flight bus dispatch on the bus
 /// thread, which then observes `shutdown` on its next poll and exits within
@@ -1401,6 +1401,27 @@ mod tests {
         .await
         .expect("a session that never delivers must still expire");
         assert!(quiet_for > FIRE_TIMEOUT, "reported {quiet_for:?}");
+    }
+
+    /// BUG-223: an aborted session runs nothing after its await, so dropping
+    /// its `SessionTeardown` is the only thing that tells its bus thread to
+    /// stop. Nulling the pipeline alone would leave that thread polling, with
+    /// the bus and a pipeline ref, once per camera restart.
+    #[cfg(feature = "gstreamer")]
+    #[test]
+    fn an_ended_session_tells_its_bus_thread_to_stop() {
+        gst_init::ensure().expect("gst init");
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        drop(SessionTeardown {
+            shutdown: shutdown.clone(),
+            pipeline: gstreamer::Pipeline::new(),
+            camera_id: 1,
+        });
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "the ended session never told its bus thread to stop, so the thread \
+             keeps polling, holding the bus and the pipeline"
+        );
     }
 }
 
