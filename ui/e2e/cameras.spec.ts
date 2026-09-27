@@ -3,9 +3,23 @@
 // Fresh DB has no cameras → empty state visible.
 // Add-camera button opens the editor sheet with required fields.
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 import { loginAsAdmin } from "./helpers";
+
+// Hold every GET /models/prompts until the returned release is called, so a
+// spec can look at the page while the engine's default model is unread.
+async function holdPromptsCatalog(page: Page): Promise<() => void> {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/v1/models/prompts", async (route) => {
+    await held;
+    await route.continue();
+  });
+  return release;
+}
 
 test.describe("cameras", () => {
   test.beforeEach(async ({ page }) => {
@@ -47,6 +61,49 @@ test.describe("cameras", () => {
     ).toBeHidden();
   });
 
+  // The preview's frame comes from GET /models/prompts, the engine's default
+  // model. While that read is in flight the preview says so and states no
+  // frame, not a 512 × 288 guess; once it lands, the engine's frame.
+  test("add-camera preview states no frame until the default model is read", async ({
+    page,
+  }) => {
+    const release = await holdPromptsCatalog(page);
+    await page.goto("/cameras");
+    await page.getByRole("button", { name: /add camera/i }).click();
+
+    await expect(
+      page.getByText("Reading the engine's default model…"),
+    ).toBeVisible();
+    await expect(page.getByText(/^Analysis \d/)).toHaveCount(0);
+
+    release();
+    await expect(page.getByText(/^Analysis 1024 × 576 · /)).toBeVisible();
+    await expect(
+      page.getByText("Reading the engine's default model…"),
+    ).toHaveCount(0);
+  });
+
+  test("add-camera preview states no frame when the default model cannot be read", async ({
+    page,
+  }) => {
+    await page.route("**/api/v1/models/prompts", (route) =>
+      route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "e2e: catalog unavailable" }),
+      }),
+    );
+    await page.goto("/cameras");
+    await page.getByRole("button", { name: /add camera/i }).click();
+
+    await expect(
+      page.getByText(
+        "Analysis frame unknown: the engine's default model could not be read.",
+      ),
+    ).toBeVisible();
+    await expect(page.getByText(/^Analysis \d/)).toHaveCount(0);
+  });
+
   test("discover sheet opens", async ({ page }) => {
     await page.goto("/cameras");
     await page.getByRole("button", { name: /discover/i }).click();
@@ -55,4 +112,3 @@ test.describe("cameras", () => {
     await page.getByRole("button", { name: /cidr scan/i }).click();
     await expect(page.getByPlaceholder(/192\.168\.1\.0\/24/i)).toBeVisible();
   });
-});
