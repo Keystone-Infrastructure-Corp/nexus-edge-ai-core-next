@@ -400,7 +400,9 @@ jobs:
           # there. This is the only job with a GStreamer runtime to run it.
           # `gstreamer-webrtc` implies `gstreamer`, so this one invocation also
           # covers webrtc.rs's launch-string assertions at no extra cost.
-          cargo test  --locked -p nexus-pipeline  --features gstreamer-webrtc --lib
+          # `--tests`, not `--lib`: the BUG-223 source-lifecycle and SPEC-075
+          # F2 decode-health tests under `tests/` are gstreamer-gated too.
+          cargo test  --locked -p nexus-pipeline  --features gstreamer-webrtc --tests
           cargo check --locked -p nexus-inference --features ort,ep-cpu
           # The workspace `cargo test` job runs with default features, so
           # everything behind `#![cfg(feature = "ort")]` is invisible to it.
