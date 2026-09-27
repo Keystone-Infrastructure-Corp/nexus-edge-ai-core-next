@@ -7170,6 +7170,7 @@ mod tests {
             recorder.clone(),
             store.clone(),
             live_view.clone(),
+            crate::reconciler::HandleMap::default(),
         ));
         let state = super::ApiState {
             store: store.clone(),
@@ -10284,6 +10285,7 @@ mod tests {
                 Arc::new(nexus_pipeline::LatestFrameCache::new()),
                 Arc::new(nexus_cloud_client::TunnelOutbox::new()),
             ),
+            crate::reconciler::HandleMap::default(),
         );
         let body = super::health_body(health.rollup().await);
         let issue = body["issues"]

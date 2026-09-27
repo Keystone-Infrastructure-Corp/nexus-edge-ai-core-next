@@ -2895,4 +2895,58 @@ mod tests {
         left_alone_by_two_passes("after a start").await;
         abort_all(&args.handles);
     }
+
+    /// A supervisor that ended on its own analyses nothing until a pass
+    /// restarts it, and the only thing that announced it, a
+    /// `PIPELINE_STATUS` `Stopped` with no subscriber, reached no surface.
+    /// The health roll-up both surfaces report reads the same handle map
+    /// this module does, so it names the camera until the restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exited_supervisor_is_on_the_health_roll_up_until_it_is_restarted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::EndsOnce)]);
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        let health = crate::cloud_tunnel::EngineHealth::new(
+            args.recorder.clone(),
+            args.store.clone(),
+            args.live_view.clone(),
+            args.handles.clone(),
+        );
+        let stopped = |h: nexus_cloud_protocol::v1::EdgeHealth| {
+            h.issues
+                .into_iter()
+                .flatten()
+                .find(|i| i.code == "camera_pipeline_stopped")
+        };
+
+        reconcile(&args).await.expect("first pass");
+        wait_until(
+            "precondition: the supervisor should end once its frame source returns",
+            || supervisor_ended(&args.handles, 7),
+        )
+        .await;
+        let issue = stopped(health.rollup().await);
+
+        reconcile(&args).await.expect("the pass that restarts it");
+        wait_until("the restarted supervisor never delivered a frame", || {
+            args.frame_stats
+                .snapshot(7)
+                .is_some_and(|s| s.frames_emitted > 0)
+        })
+        .await;
+        let after_restart = stopped(health.rollup().await);
+        abort_all(&args.handles);
+
+        let issue = issue.expect("a supervisor that exited on its own must be on the roll-up");
+        assert_eq!(issue.component, "pipeline");
+        assert!(
+            issue.detail.ends_with(": 7"),
+            "names the camera: {}",
+            issue.detail
+        );
+        assert_eq!(
+            after_restart, None,
+            "a restarted supervisor is not reported"
+        );
+    }
 }

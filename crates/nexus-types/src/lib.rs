@@ -501,7 +501,7 @@ pub struct AlertEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline status (for /api/v1/health and the ops bus)
+// Pipeline status (the ops bus's `pipeline.status` topic)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

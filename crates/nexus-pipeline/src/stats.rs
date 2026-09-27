@@ -12,9 +12,9 @@
 //! camera is first seen.
 //!
 //! Why a separate registry instead of squatting on the existing bus
-//! `PIPELINE_STATUS` topic: that topic publishes only on supervisor
-//! state transitions (Initializing → Running → Stopped), not on
-//! every frame, so it can't carry a live fps EMA.
+//! `PIPELINE_STATUS` topic: that topic publishes only when a supervisor
+//! starts (`Initializing`) and when it ends on its own (`Stopped`), not
+//! on every frame, so it can't carry a live fps EMA.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;

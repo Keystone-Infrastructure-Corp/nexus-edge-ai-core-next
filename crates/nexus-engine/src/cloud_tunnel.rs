@@ -2078,6 +2078,8 @@ pub struct EngineHealth {
     recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
     store: Arc<Store>,
     live_view: Arc<crate::live_view::LiveViewManager>,
+    /// The running supervisors, as the reconciler keeps them.
+    supervisors: crate::reconciler::HandleMap,
     /// The last enabled-camera count a store read returned, which a failed
     /// read reuses ([`recorder_issue`]). `None` until a read succeeds.
     enabled_cameras: parking_lot::Mutex<Option<usize>>,
@@ -2090,8 +2092,15 @@ impl EngineHealth {
         recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
         store: Arc<Store>,
         live_view: Arc<crate::live_view::LiveViewManager>,
+        supervisors: crate::reconciler::HandleMap,
     ) -> Self {
-        Self::with_real_recorder(cfg!(feature = "gstreamer"), recorder, store, live_view)
+        Self::with_real_recorder(
+            cfg!(feature = "gstreamer"),
+            recorder,
+            store,
+            live_view,
+            supervisors,
+        )
     }
 
     /// [`Self::new`] with the build's feature as an argument, so a test can
@@ -2101,12 +2110,14 @@ impl EngineHealth {
         recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
         store: Arc<Store>,
         live_view: Arc<crate::live_view::LiveViewManager>,
+        supervisors: crate::reconciler::HandleMap,
     ) -> Self {
         Self {
             real_recorder_available,
             recorder,
             store,
             live_view,
+            supervisors,
             enabled_cameras: parking_lot::Mutex::new(None),
         }
     }
@@ -2117,14 +2128,61 @@ impl EngineHealth {
         edge_health(
             &self.live_view.stalled_cameras(),
             crate::system_metrics::snapshot().decode_capacity.as_ref(),
-            recorder_issue(self).await,
+            recorder_issue(self)
+                .await
+                .into_iter()
+                .chain(exited_supervisors_issue(&self.exited_supervisors())),
         )
+    }
+
+    /// Cameras whose supervisor task has finished while the reconciler
+    /// still holds it. `stop_camera` removes an entry before it aborts the
+    /// task, and shutdown drains the map before aborting, so a finished task
+    /// still in the map ended on its own: its frame source returned (the
+    /// `PIPELINE_STATUS` `Stopped` nothing subscribes to) or it panicked.
+    fn exited_supervisors(&self) -> Vec<nexus_types::CameraId> {
+        let mut exited: Vec<_> = self
+            .supervisors
+            .lock()
+            .iter()
+            .filter(|(_, entry)| entry.task.is_finished())
+            .map(|(&camera_id, _)| camera_id)
+            .collect();
+        exited.sort_unstable();
+        exited
     }
 }
 
+/// The cameras [`EngineHealth::exited_supervisors`] finds, as one issue. The
+/// reconciler restarts each on its next pass; until then the camera
+/// detects, alerts and opens motion clips for nothing, and without this
+/// issue it reads only as offline, like a camera that is unreachable.
+fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegradation> {
+    if exited.is_empty() {
+        return None;
+    }
+    let ids = exited
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(EdgeDegradation {
+        component: "pipeline".to_string(),
+        code: "camera_pipeline_stopped".to_string(),
+        detail: truncate_detail(&format!(
+            "the analysis pipeline of {} camera(s) exited without being stopped, so they \
+             detect, alert and open motion clips for nothing until the engine restarts them \
+             on its next supervision pass: {ids}",
+            exited.len(),
+        )),
+    })
+}
+
 /// Build the health roll-up from the process-wide degradation registry,
-/// plus any live-view sources that have stopped producing frames and a stub
-/// recorder behind enabled cameras ([`recorder_issue`]).
+/// plus any live-view sources that have stopped producing frames, an
+/// oversubscribed video engine, and the issues [`EngineHealth`] derives
+/// itself (`others`: a stub recorder behind enabled cameras, exited
+/// supervisors).
 ///
 /// `status` is `degraded` iff at least one issue is open, matching the
 /// schema's stated invariant. The cloud renders unknown `code`s verbatim, so
@@ -2137,13 +2195,13 @@ impl EngineHealth {
 fn edge_health(
     stalled_cameras: &[nexus_types::CameraId],
     decode_capacity: Option<&crate::system_metrics::DecodeCapacity>,
-    recorder: Option<EdgeDegradation>,
+    others: impl IntoIterator<Item = EdgeDegradation>,
 ) -> EdgeHealth {
     edge_health_from(
         nexus_inference::health::degradations(),
         stalled_cameras,
         decode_capacity,
-        recorder,
+        others,
     )
 }
 
@@ -2154,7 +2212,7 @@ fn edge_health_from(
     detector: Vec<nexus_inference::health::DetectorDegradation>,
     stalled_cameras: &[nexus_types::CameraId],
     decode_capacity: Option<&crate::system_metrics::DecodeCapacity>,
-    recorder: Option<EdgeDegradation>,
+    others: impl IntoIterator<Item = EdgeDegradation>,
 ) -> EdgeHealth {
     let mut issues: Vec<EdgeDegradation> = detector
         .into_iter()
@@ -2199,7 +2257,7 @@ fn edge_health_from(
             });
         }
     }
-    issues.extend(recorder);
+    issues.extend(others);
     issues.truncate(HEALTH_ISSUES_MAX);
     EdgeHealth {
         status: if issues.is_empty() { "ok" } else { "degraded" }.to_string(),
@@ -2539,6 +2597,7 @@ mod health_tests {
                 Arc::new(nexus_pipeline::LatestFrameCache::new()),
                 Arc::new(nexus_cloud_client::TunnelOutbox::new()),
             ),
+            crate::reconciler::HandleMap::default(),
         )
     }
 
@@ -2673,6 +2732,7 @@ mod health_tests {
                 Arc::new(nexus_pipeline::LatestFrameCache::new()),
                 Arc::new(nexus_cloud_client::TunnelOutbox::new()),
             ),
+            crate::reconciler::HandleMap::default(),
         );
 
         let started = std::time::Instant::now();
@@ -2701,6 +2761,7 @@ mod health_tests {
                 Arc::new(nexus_pipeline::LatestFrameCache::new()),
                 Arc::new(nexus_cloud_client::TunnelOutbox::new()),
             ),
+            crate::reconciler::HandleMap::default(),
         );
         let recorder_issue = health
             .rollup()
@@ -3597,6 +3658,7 @@ mod heartbeat_ack_tests {
             )),
             store.clone(),
             live_view_manager(),
+            crate::reconciler::HandleMap::default(),
         );
         let tunnel = FirstEnvelopeTunnel::default();
         pump_heartbeats(
@@ -3679,6 +3741,7 @@ mod heartbeat_ack_tests {
             )),
             store.clone(),
             live_view_manager(),
+            crate::reconciler::HandleMap::default(),
         );
         let frame_stats = FrameStatsRegistry::new();
         let liveness = TunnelLiveness::new();
@@ -3760,6 +3823,7 @@ mod heartbeat_ack_tests {
                 )),
                 store.clone(),
                 live_view_manager(),
+                crate::reconciler::HandleMap::default(),
             );
             let frame_stats = FrameStatsRegistry::new();
             let liveness = TunnelLiveness::new();

@@ -885,6 +885,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         recorder.clone(),
         store.clone(),
         live_view_manager.clone(),
+        running.clone(),
     ));
 
     // Cloud entitlement cache — populated from inbound `entitlement_update`
