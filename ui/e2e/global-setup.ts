@@ -124,8 +124,10 @@ export default async function globalSetup() {
       ``,
       `[inference.model]`,
       `kind = "mock"`,
-      `input_width = 640`,
-      `input_height = 480`,
+      // A ladder rung other than 512, so cameras.spec can tell a preview
+      // sized from the engine's default model from one that assumes 512.
+      `input_width = 1024`,
+      `input_height = 576`,
       ``,
       `[tracker]`,
       `backend = "iou_naive"`,

@@ -29,11 +29,16 @@ test.describe("cameras", () => {
       page.getByRole("heading", { name: /^new camera$/i }),
     ).toBeVisible();
     await expect(
-      page.getByPlaceholder(/cam-front-door/i),
+      page.getByPlaceholder(/front door/i),
     ).toBeVisible();
     await expect(
       page.getByPlaceholder(/rtsp:\/\//i),
     ).toBeVisible();
+
+    // A new camera has no model override, so the engine analyses it at its
+    // default model's width: global-setup's 1024, a 1024 × 576 frame. The
+    // tiling preview must state that frame, not a fixed 512.
+    await expect(page.getByText(/^Analysis 1024 × 576 · /)).toBeVisible();
 
     // Cancel closes the sheet.
     await page.getByRole("button", { name: /^cancel$/i }).click();

@@ -7179,6 +7179,8 @@ mod tests {
             // tests cover it end-to-end.
             model_prompts: Arc::new(crate::models_catalog::ModelPromptsCatalog {
                 default_kind: "mock".into(),
+                default_input_width: 512,
+                default_input_height: 288,
                 kinds: vec![],
                 by_kind: std::collections::BTreeMap::new(),
             }),

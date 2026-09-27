@@ -502,6 +502,11 @@ export interface ModelPromptsCatalog {
   /// The default `inference.model.kind` from the engine's config —
   /// the kind every camera without a `model_override` runs against.
   default_kind: string;
+  /// The default model's input shape (`inference.model.input_width` /
+  /// `input_height`): what a camera without a `model_override` runs at,
+  /// and so what sizes its analysis frame.
+  default_input_width: number;
+  default_input_height: number;
   /// Stable-ordered list (the array form is preferred for dropdown
   /// rendering — see `by_kind` for keyed lookup).
   kinds: ModelPromptsEntry[];
