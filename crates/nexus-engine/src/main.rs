@@ -6,12 +6,9 @@ use clap::{Parser, Subcommand};
 use nexus_bus::build_bus;
 use nexus_config::{CameraConfig, Config, InferenceConfig, RecorderKind};
 use nexus_inference::InferenceRouter;
-use nexus_pipeline::{
-    spawn_camera, FrameStatsRegistry, LatestFrameCache, StaticAnchorClearRegistry,
-};
+use nexus_pipeline::{FrameStatsRegistry, LatestFrameCache, StaticAnchorClearRegistry};
 use nexus_rules::RuleEvaluator;
 use nexus_store::Store;
-use nexus_tracker::build_tracker;
 use tracing::{debug, info, warn};
 
 mod admin_auth;
@@ -1074,28 +1071,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // What the reconciler's no-change guard compares, with the substream
         // URL build_recorder registered: the answer start_camera records after
         // a restart, so the first reconcile pass does not read it as a change.
-        let key = reconciler::EntryKey::at_boot(&reconciler_args, &cam, &mut boot_analysis);
-        let detector = router.detector_for_camera(&cam);
-        let detector_low_res = router.detector_for_camera_low_res(&cam);
-        // Fresh per-camera tracker — see the comment on `cfg.tracker`
-        // above for why sharing one Arc across cameras is wrong.
-        let tracker: Arc<dyn nexus_tracker::Tracker> = Arc::from(build_tracker(&cfg.tracker));
-        // Per-camera supervisor (analysis) RGB frame size. Defaults to
-        // the camera's resolved detector input width; M_NATIVE_ASPECT
-        // lets a camera analyse at a larger native-16:9 ladder rung
-        // (`behavior.supervisor_width`) so the tile grid divides the
-        // frame into exact model-sized tiles. See
-        // `reconciler::supervisor_dims_for`.
-        let (sup_w, sup_h) = key.supervisor_dims();
-        // M_TILE_REINFER (G1) Phase B2.1 — effective per-camera `top_k`
-        // for the post-merge cascade re-cap; matches the equivalent
-        // computation in `reconciler::start_camera`.
-        let effective_top_k = cam
-            .detector
-            .model_override
-            .as_ref()
-            .and_then(|m| m.top_k)
-            .or(cfg.inference.model.top_k);
+        let start = reconciler::EntryKey::at_boot(&reconciler_args, &cam, &mut boot_analysis);
         let seed_for_cam: Vec<nexus_pipeline::EntityLocalSeed> = sighting_seed_all
             .iter()
             .filter(|r| r.camera_id == cam_id)
@@ -1107,33 +1083,10 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
                 last_seen_at: r.last_seen_at,
             })
             .collect();
-        let h = spawn_camera(
-            cam,
-            detector,
-            detector_low_res,
-            tracker,
-            cfg.tracker.annotator.clone(),
-            cfg.tracker.static_object.clone(),
-            cfg.runtime.clips.clone(),
-            cfg.runtime.state_dir.clone(),
-            evaluator.clone(),
-            store.clone(),
-            recorder.clone(),
-            bus.clone(),
-            cache.clone(),
-            frame_stats.clone(),
-            static_clear.clone(),
-            sup_w,
-            sup_h,
-            sighting_hook.clone(),
-            sighting_cfg,
-            seed_for_cam,
-            sighting_persist.clone(),
-            effective_top_k,
-            sink_router.clone(),
-            alert_clip_schedule_gate.clone(),
-        );
-        running.lock().insert(cam_id, key.spawned(h.task));
+        // Spawned at the frame the entry records: see
+        // `reconciler::spawn_supervisor`.
+        let entry = reconciler::spawn_supervisor(&reconciler_args, cam, start, seed_for_cam);
+        running.lock().insert(cam_id, entry);
     }
 
     // Storage safety floor (M2.1 Stage A PR 4). Watermark sampler
