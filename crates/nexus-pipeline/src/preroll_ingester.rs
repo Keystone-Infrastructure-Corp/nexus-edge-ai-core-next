@@ -453,6 +453,13 @@ impl PreRollIngester {
         self.frame_tap.as_ref().map(|t| t.tx.subscribe())
     }
 
+    /// The RGB tap's sender, so a test can deliver frames the way a decoding
+    /// session would, and see who subscribed.
+    #[cfg(test)]
+    pub(crate) fn rgb_tap_sender(&self) -> Option<broadcast::Sender<Frame>> {
+        self.frame_tap.as_ref().map(|t| t.tx.clone())
+    }
+
     /// Open or close the RGB tap's valve (SPEC-069). Closing it stops
     /// this session decoding for analysis without touching the NAL
     /// branch beside it, so recording, pre-roll and HD live view are

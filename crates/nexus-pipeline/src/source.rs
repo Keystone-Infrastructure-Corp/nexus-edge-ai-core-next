@@ -449,6 +449,17 @@ pub struct SharedRtspSource {
     /// rebuilt by any of this — recording and HD live view are not
     /// collateral (SPEC-069 invariants I2\u2013I5).
     pub analysis: Option<std::sync::Arc<crate::preroll_ingester::PreRollIngester>>,
+    /// The recorder's substream sessions, by camera. While analysis reads
+    /// the main stream, a live session found here is the engine's retry
+    /// (SPEC-069: after a fallback, or a registration that failed): it is
+    /// read beside the main stream until it delivers a frame, then taken
+    /// up, and given up if it delivers none inside
+    /// [`ANALYSIS_FIRST_FRAME_GRACE`]. Waiting on it never valves the main
+    /// stream off, so a retry that fails costs analysis nothing.
+    pub analysis_sessions: crate::gst_clip_recorder::IngesterRegistry,
+    /// The camera's decode counters, reset when this source takes one of
+    /// those sessions up, since they then describe another geometry.
+    pub decode_health: Option<std::sync::Arc<crate::stats::DecodeHealthRegistry>>,
     /// SPEC-069 Phase 1 (P3) — where the analysis-stream status this
     /// source observes gets published for `GET /v1/cameras/{id}/stats`.
     /// `None` in tests/callers that don't care to observe it.
@@ -481,12 +492,11 @@ impl FrameSource for SharedRtspSource {
             reg.observe_mainstream_by_design(self.camera_id);
         }
         let mut rx = self.frames_from(reading_analysis)?;
-        let expected_fps = self
-            .analysis
-            .as_ref()
-            .and_then(|a| a.rgb_tap_fps())
-            .unwrap_or(0);
-        let started = std::time::Instant::now();
+        // The session analysis reads, or last read: the one this source
+        // started with, or one it has taken up since.
+        let mut analysis = self.analysis.clone();
+        let mut expected_fps = analysis.as_ref().and_then(|a| a.rgb_tap_fps()).unwrap_or(0);
+        let mut started = std::time::Instant::now();
         let mut frames: u64 = 0;
         // Rate is judged over a rolling window, not the session's
         // lifetime — see `AnalysisObservation::frames`. `window_start`
@@ -498,6 +508,9 @@ impl FrameSource for SharedRtspSource {
         // Geometry of the last frame delivered, for `analysis_stream`'s
         // width/height (P3). Whichever session is active at the time.
         let mut last_frame_dims: (u32, u32) = (0, 0);
+        // While analysis reads the main stream: a substream session
+        // registered since, read beside it until it delivers.
+        let mut standby: Option<Standby> = None;
         let mut health_tick =
             tokio::time::interval(std::time::Duration::from_secs(ANALYSIS_HEALTH_TICK_SECS));
         health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -510,7 +523,11 @@ impl FrameSource for SharedRtspSource {
                 return Err(FrameSourceError::Closed);
             }
             tokio::select! {
-                _ = health_tick.tick(), if reading_analysis => {
+                _ = health_tick.tick() => {
+                    if !reading_analysis {
+                        self.watch_for_a_session(&mut standby);
+                        continue;
+                    }
                     // Before the first frame, judge against the session's
                     // age (the grace window); afterwards, against the
                     // rolling window so a collapse is caught while it is
@@ -523,10 +540,7 @@ impl FrameSource for SharedRtspSource {
                     let verdict = analysis_verdict(&AnalysisObservation {
                         frames: obs_frames,
                         elapsed: obs_elapsed,
-                        session_live: self
-                            .analysis
-                            .as_ref()
-                            .is_some_and(|a| a.is_buffering()),
+                        session_live: analysis.as_ref().is_some_and(|a| a.is_buffering()),
                         expected_fps,
                     });
                     if let (AnalysisVerdict::Healthy, Some(reg)) =
@@ -558,7 +572,7 @@ impl FrameSource for SharedRtspSource {
                         // reconnecting with no subscriber would turn one
                         // decode into two for the life of the camera —
                         // the precise cost this phase exists to remove.
-                        if let Some(a) = self.analysis.as_ref() {
+                        if let Some(a) = analysis.as_ref() {
                             a.shutdown();
                         }
                         if let Some(reg) = self.analysis_stream.as_ref() {
@@ -566,6 +580,44 @@ impl FrameSource for SharedRtspSource {
                         }
                         reading_analysis = false;
                         rx = self.frames_from(false)?;
+                    }
+                }
+                recv = standby_frame(&mut standby) => {
+                    let Some((session, standby_rx, _)) = standby.take() else {
+                        continue;
+                    };
+                    let frame = match recv {
+                        Ok(frame) => Some(frame),
+                        // Frames arriving faster than they are read still
+                        // prove the session delivers.
+                        Err(RecvError::Lagged(_)) => None,
+                        Err(RecvError::Closed) => continue,
+                    };
+                    tracing::info!(
+                        camera_id = self.camera_id,
+                        "analysis substream session delivering; analysis reads it again, \
+                         main-stream rgb tap valved off"
+                    );
+                    self.ingester.set_rgb_valve_closed(true);
+                    if let Some(h) = self.decode_health.as_ref() {
+                        h.reset(self.camera_id);
+                    }
+                    if let Some(reg) = self.analysis_stream.as_ref() {
+                        reg.observe_probing(self.camera_id);
+                    }
+                    expected_fps = session.rgb_tap_fps().unwrap_or(0);
+                    analysis = Some(session);
+                    rx = standby_rx;
+                    reading_analysis = true;
+                    started = std::time::Instant::now();
+                    frames = 0;
+                    window_start = started;
+                    window_frames = 0;
+                    if let Some(frame) = frame {
+                        frames += 1;
+                        window_frames += 1;
+                        last_frame_dims = (frame.width, frame.height);
+                        let _ = tx.try_send(frame);
                     }
                 }
                 recv = rx.recv() => match recv {
@@ -604,8 +656,67 @@ impl FrameSource for SharedRtspSource {
 /// How often the analysis session's health is re-judged.
 pub const ANALYSIS_HEALTH_TICK_SECS: u64 = 5;
 
+/// A substream session read beside the main stream until it delivers, and
+/// when the source first saw it.
+#[cfg(feature = "gstreamer")]
+type Standby = (
+    std::sync::Arc<crate::preroll_ingester::PreRollIngester>,
+    tokio::sync::broadcast::Receiver<Frame>,
+    std::time::Instant,
+);
+
+/// The standby session's next frame; never resolves while there is none.
+#[cfg(feature = "gstreamer")]
+async fn standby_frame(
+    standby: &mut Option<Standby>,
+) -> Result<Frame, tokio::sync::broadcast::error::RecvError> {
+    match standby {
+        Some((_, rx, _)) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(feature = "gstreamer")]
 impl SharedRtspSource {
+    /// While analysis reads the main stream: start reading a live
+    /// substream session the engine registered since, or give up on the one
+    /// being read if it delivered nothing inside the first-frame grace. A
+    /// given-up session is shut down, so it neither reconnects with no
+    /// reader nor comes back here until the engine registers it again.
+    fn watch_for_a_session(&self, standby: &mut Option<Standby>) {
+        let Some((session, _, since)) = standby.as_ref() else {
+            let fresh = self
+                .analysis_sessions
+                .read()
+                .get(&self.camera_id)
+                .filter(|a| !a.is_shutdown())
+                .cloned();
+            *standby = fresh.and_then(|s| {
+                let rx = s.subscribe_frames()?;
+                Some((s, rx, std::time::Instant::now()))
+            });
+            return;
+        };
+        let verdict = analysis_verdict(&AnalysisObservation {
+            frames: 0,
+            elapsed: since.elapsed(),
+            session_live: session.is_buffering(),
+            expected_fps: 0,
+        });
+        if let AnalysisVerdict::FallBack(reason) = verdict {
+            tracing::debug!(
+                camera_id = self.camera_id,
+                ?reason,
+                "analysis substream session delivered nothing; analysis stays on the main stream"
+            );
+            session.shutdown();
+            if let Some(reg) = self.analysis_stream.as_ref() {
+                reg.observe_unavailable(self.camera_id, reason.as_str());
+            }
+            *standby = None;
+        }
+    }
+
     fn frames_from(
         &self,
         analysis: bool,

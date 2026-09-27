@@ -158,13 +158,14 @@ pub struct GstClipRecorder {
     /// and went stale on every restart — see BUG-144.
     ingesters: IngesterRegistry,
     /// Second, substream-only sessions keyed by camera (SPEC-069).
-    /// Read by `shared_frame_source` and by nothing else — in
-    /// particular never by the clip path, which resolves its ingester
-    /// from [`Self::ingesters`] so a clip is always cut from the main
-    /// stream's NAL broadcast (invariants I1–I4). Kept as a separate
-    /// map rather than a field on the main ingester precisely so the
-    /// clip path cannot reach one by accident.
-    analysis_ingesters: PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>,
+    /// Read by `shared_frame_source` and by the frame sources it hands
+    /// out, which take up a session registered after they started, and
+    /// by nothing else — in particular never by the clip path, which
+    /// resolves its ingester from [`Self::ingesters`] so a clip is always
+    /// cut from the main stream's NAL broadcast (invariants I1–I4). Kept
+    /// as a separate map rather than a field on the main ingester
+    /// precisely so the clip path cannot reach one by accident.
+    analysis_ingesters: IngesterRegistry,
     panic: PlMutex<bool>,
     /// Per-clip GStreamer + pump state. Held under a tokio Mutex
     /// because the close path awaits on the pump shutdown and the
@@ -361,7 +362,7 @@ impl GstClipRecorder {
             store,
             clips_dir: clips_dir.as_ref().to_path_buf(),
             ingesters: Arc::new(PlRwLock::new(ingesters)),
-            analysis_ingesters: PlRwLock::new(HashMap::new()),
+            analysis_ingesters: Arc::new(PlRwLock::new(HashMap::new())),
             panic: PlMutex::new(false),
             open: Mutex::new(HashMap::new()),
             bus: None,
@@ -1402,11 +1403,18 @@ impl ClipRecorder for GstClipRecorder {
             }
             return Ok(());
         };
-        if let Some(existing) = self.analysis_ingesters.read().get(&camera_id) {
-            if existing.url() == url && existing.codec() == codec && !existing.is_shutdown() {
-                return Ok(());
+        // The engine calls this again on every reconcile pass: a no-op for a
+        // running session, and a retry for one the SPEC-069 fallback shut
+        // down, which is logged once, by the fallback, not on every retry.
+        let retry = match self.analysis_ingesters.read().get(&camera_id) {
+            Some(existing) if existing.url() == url && existing.codec() == codec => {
+                if !existing.is_shutdown() {
+                    return Ok(());
+                }
+                true
             }
-        }
+            _ => false,
+        };
         // pre_roll_secs = 0: this session exists only to decode. Its
         // ring never accumulates and nothing subscribes to its NAL
         // broadcast — clips come from the main session's.
@@ -1427,11 +1435,19 @@ impl ClipRecorder for GstClipRecorder {
         }
         // Analysis moves to a different stream at a different resolution, so
         // the camera's cumulative decode counters no longer describe one
-        // geometry. Reset rather than blend.
-        if let Some(h) = self.decode_health.as_ref() {
-            h.reset(camera_id);
+        // geometry. Reset rather than blend. A retry does not move it: the
+        // running source reads the main stream until it takes the new session
+        // up, and resets them then.
+        if !retry {
+            if let Some(h) = self.decode_health.as_ref() {
+                h.reset(camera_id);
+            }
         }
-        info!(camera_id, %url, codec = %codec, "analysis substream session started");
+        if retry {
+            debug!(camera_id, codec = %codec, "analysis substream session started again (retry)");
+        } else {
+            info!(camera_id, %url, codec = %codec, "analysis substream session started");
+        }
         Ok(())
     }
 
@@ -1458,6 +1474,8 @@ impl ClipRecorder for GstClipRecorder {
             // camera would analyse nothing until the grace window expired —
             // once per supervisor restart, forever.
             analysis: self.live_analysis_ingester(camera_id),
+            analysis_sessions: Arc::clone(&self.analysis_ingesters),
+            decode_health: self.decode_health.clone(),
             analysis_stream: self.analysis_stream.clone(),
         }))
     }
@@ -3058,6 +3076,81 @@ mod tests {
         assert!(!second.is_shutdown(), "the rebuilt session must be live");
     }
 
+    /// The engine registers every camera's substream again on every
+    /// reconcile pass, so for a session that is running the call must be a
+    /// no-op: rebuilding it would cut the running frame source off its
+    /// substream on every pass.
+    #[tokio::test]
+    async fn a_running_analysis_session_is_left_alone_by_a_repeat_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new()).unwrap();
+        const SUB: &str = "rtsp://127.0.0.1:1/substream";
+
+        rec.set_camera_analysis_ingester(99, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session registers");
+        let first = rec.analysis_ingesters.read().get(&99).cloned().unwrap();
+        rec.set_camera_analysis_ingester(99, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("a repeat registration succeeds");
+        let second = rec.analysis_ingesters.read().get(&99).cloned().unwrap();
+        first.shutdown();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a repeat registration rebuilt a running analysis session"
+        );
+    }
+
+    /// A retry rebuilds a session the SPEC-069 fallback shut down while
+    /// analysis still reads the main stream, so the camera's decode counters
+    /// still describe the main stream and must survive it. The engine retries
+    /// on every pass while the substream stays refused; clearing them each
+    /// time wipes the main stream's `decoder_input_drops`, the losing-frames
+    /// signal. The running source resets them when it takes the new session
+    /// up.
+    #[tokio::test]
+    async fn a_retried_analysis_session_leaves_the_main_streams_decode_health_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let health = std::sync::Arc::new(crate::stats::DecodeHealthRegistry::default());
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new())
+            .unwrap()
+            .with_decode_health(health.clone());
+        const SUB: &str = "rtsp://127.0.0.1:1/substream";
+
+        rec.set_camera_analysis_ingester(7, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session registers");
+        // The fallback shuts it down, and analysis reads the main stream,
+        // which drops access units.
+        rec.analysis_ingesters.read()[&7].shutdown();
+        for _ in 0..40 {
+            health.observe_decoder_input_drop(7);
+        }
+        rec.set_camera_analysis_ingester(7, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        rec.analysis_ingesters.read()[&7].shutdown();
+
+        assert_eq!(
+            health.snapshot(7).map(|h| h.decoder_input_drops),
+            Some(40),
+            "a retry cleared the main stream's decode counters"
+        );
+    }
+
     /// Decode health is keyed per camera, and BOTH sessions write to that one
     /// key — `observe_decoder_output` accumulates. Moving analysis between the
     /// main stream and the substream changes the geometry those counters
@@ -3119,6 +3212,192 @@ mod tests {
             0,
             "falling back to the main stream must not carry the substream's \
              counters onto a different geometry"
+        );
+    }
+
+    /// Camera 7's frame source, running, over a main session on a dead URL,
+    /// so every frame the source delivers came from a substream session.
+    async fn a_running_source_over_a_silent_main_stream(
+        dir: &Path,
+    ) -> (
+        GstClipRecorder,
+        Arc<PreRollIngester>,
+        tokio::sync::mpsc::Receiver<nexus_types::Frame>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let main = PreRollIngester::new_with_rgb(
+            7,
+            "rtsp://127.0.0.1:1/main",
+            0,
+            CodecKind::H264,
+            crate::decode::DecodeMode::default(),
+            15,
+            512,
+            288,
+            None,
+        )
+        .unwrap();
+        let rec = GstClipRecorder::new(store, dir, HashMap::from([(7, main.clone())]))
+            .unwrap()
+            .with_decode_health(Arc::new(crate::stats::DecodeHealthRegistry::default()));
+        let source = rec
+            .shared_frame_source(7)
+            .expect("camera 7 has a main session with an rgb tap");
+        let (tx, frames) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = source.run(tx).await;
+        });
+        (rec, main, frames, task)
+    }
+
+    fn rgb_frame() -> nexus_types::Frame {
+        nexus_types::Frame {
+            camera_id: 7,
+            frame_id: 0,
+            captured_at: chrono::Utc::now(),
+            width: 512,
+            height: 288,
+            format: nexus_types::PixelFormat::Rgb24,
+            data: Arc::new(vec![0; 512 * 288 * 3]),
+            trace_id: String::new(),
+        }
+    }
+
+    /// SPEC-069's retry: a substream session registered while a camera's
+    /// frame source already runs, after a fallback or a refused
+    /// registration, is what the engine's retry produces. The source must
+    /// take it up once it delivers a frame, and valve the main stream's rgb
+    /// tap off again, without being rebuilt; a source that looks for its
+    /// substream only when it is built never analyses it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_substream_session_registered_after_its_source_started_is_taken_up_once_it_delivers()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, mut frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path()).await;
+
+        rec.set_camera_analysis_ingester(
+            7,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .expect("analysis session registers");
+        let session = rec.analysis_ingesters.read()[&7].clone();
+        let tap = session.rgb_tap_sender().expect("rgb tap");
+        // The main stream's decode counters, which the registration leaves.
+        let health = rec.decode_health.clone().expect("decode health");
+        for _ in 0..40 {
+            health.observe_decoder_input_drop(7);
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let delivered = loop {
+            let _ = tap.send(rgb_frame());
+            if frames.try_recv().is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let valved = main.rgb_valve_is_closed();
+        let drops = health.snapshot(7).map_or(0, |h| h.decoder_input_drops);
+        task.abort();
+        session.shutdown();
+        main.shutdown();
+        assert!(
+            delivered,
+            "the running source never took up the substream session registered after it started"
+        );
+        assert!(
+            valved,
+            "analysis reads the substream, so the main stream's rgb tap must be valved off"
+        );
+        assert_eq!(
+            drops, 0,
+            "taking the substream up must reset the camera's decode counters, or the main \
+             stream's drops read as the substream losing frames"
+        );
+    }
+
+    /// The same retry when the substream stays silent: the source must keep
+    /// analysing the main stream while it waits, and give the session up
+    /// (shut it down) once the first-frame grace runs out, so a retry that
+    /// fails costs analysis nothing and does not leave a second session
+    /// reconnecting for the life of the camera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_substream_session_is_given_up_while_the_main_stream_keeps_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, _frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path()).await;
+
+        rec.set_camera_analysis_ingester(
+            7,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .expect("analysis session registers");
+        let session = rec.analysis_ingesters.read()[&7].clone();
+        let tap = session.rgb_tap_sender().expect("rgb tap");
+        let health = rec.decode_health.clone().expect("decode health");
+        for _ in 0..40 {
+            health.observe_decoder_input_drop(7);
+        }
+
+        let wait = |what: &'static str, secs: u64, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+            let ok = loop {
+                if done() {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            (what, ok)
+        };
+        let watched = wait("the source never watched the new session", 15, &|| {
+            tap.receiver_count() > 0
+        });
+        let open_while_waiting = !main.rgb_valve_is_closed();
+        let given_up = wait("the silent session was never given up", 40, &|| {
+            session.is_shutdown()
+        });
+        let open_after = !main.rgb_valve_is_closed();
+        let drops = health.snapshot(7).map_or(0, |h| h.decoder_input_drops);
+        task.abort();
+        session.shutdown();
+        main.shutdown();
+        for (what, ok) in [watched, given_up] {
+            assert!(ok, "{what}");
+        }
+        assert!(
+            open_while_waiting,
+            "waiting on a silent substream valved the main stream off: analysis sees nothing"
+        );
+        assert!(
+            open_after,
+            "giving the substream up must leave analysis on the main stream"
+        );
+        assert_eq!(
+            drops, 40,
+            "analysis never left the main stream, so its decode counters must survive"
         );
     }
 
