@@ -1350,10 +1350,10 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A live engine as 9.5 and 9.6 see it: every backend slot ready, storage
-    /// not in panic, and `issues` as its `GET /api/v1/health` roll-up. Every
-    /// other route 404s, so the checks that read them fail; no test here
-    /// asserts on those.
+    /// A live engine as 9.5 and 9.6 see it: `backends` as its
+    /// `GET /api/v1/backends`, storage not in panic, and `issues` as its
+    /// `GET /api/v1/health` roll-up. Every other route 404s, so the checks that
+    /// read them fail; no test here asserts on those.
     struct FakeEngine {
         server: MockServer,
         // Declared after `server` so the server drops while its runtime is
@@ -1361,7 +1361,15 @@ mod tests {
         _rt: tokio::runtime::Runtime,
     }
 
+    /// [`fake_engine_with_backends`] over a pool whose one slot is ready.
     fn fake_engine(health: Value) -> FakeEngine {
+        fake_engine_with_backends(
+            health,
+            json!({ "mode": "pool", "slots": [{ "id": 0, "state": "ready" }] }),
+        )
+    }
+
+    fn fake_engine_with_backends(health: Value, backends: Value) -> FakeEngine {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -1375,10 +1383,7 @@ mod tests {
                     "/api/v1/storage/local",
                     json!({ "recorder_kind": "stub", "panic": false, "free_pct": 80.0 }),
                 ),
-                (
-                    "/api/v1/backends",
-                    json!({ "mode": "pool", "slots": [{ "id": 0, "state": "ready" }] }),
-                ),
+                ("/api/v1/backends", backends),
             ] {
                 Mock::given(method("GET"))
                     .and(path(route))
@@ -1447,6 +1452,27 @@ mod tests {
             status_of(&outcomes, "9.6"),
             Status::Pass,
             "a detector issue is not a storage failure: {outcomes:?}"
+        );
+    }
+
+    /// `in_process` is the config default, and 9.5 only warns on it. A
+    /// detector issue must still fail the check, not leave it at that warning.
+    #[test]
+    fn a_detector_issue_fails_the_backends_check_on_the_in_process_default() {
+        let in_process = json!({ "mode": "in_process", "slots": [] });
+        let degraded = fake_engine_with_backends(
+            health_with(&[("detector", "detector_unavailable")]),
+            in_process.clone(),
+        );
+        let outcomes = run(&degraded);
+        assert_eq!(status_of(&outcomes, "9.5"), Status::Fail, "{outcomes:?}");
+
+        let healthy = fake_engine_with_backends(health_with(&[]), in_process);
+        let outcomes = run(&healthy);
+        assert_eq!(
+            status_of(&outcomes, "9.5"),
+            Status::Warn,
+            "with no issue the in_process note stands: {outcomes:?}"
         );
     }
 
