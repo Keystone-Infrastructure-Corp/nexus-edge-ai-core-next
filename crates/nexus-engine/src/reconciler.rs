@@ -887,6 +887,7 @@ mod tests {
         for (what, cam, default_width, want) in [
             ("the default width", cam(None), 512, (512, 288)),
             ("another default width", cam(None), 640, (640, 360)),
+            ("a width off the ladder", cam(None), 600, (600, 338)),
             (
                 "a model override, over the default",
                 shaped(&|c| model_width(c, 640)),

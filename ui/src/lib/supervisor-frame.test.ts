@@ -17,6 +17,7 @@ describe("supervisorDimsFor", () => {
   >([
     ["the default width", null, undefined, 512, [512, 288]],
     ["another default width", null, undefined, 640, [640, 360]],
+    ["a width off the ladder", null, undefined, 600, [600, 338]],
     [
       "a model override, over the default",
       override(640),
