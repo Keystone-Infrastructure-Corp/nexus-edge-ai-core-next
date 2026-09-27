@@ -2946,26 +2946,73 @@ mod tests {
         );
     }
 
+    /// The roll-up built from these args reads their live-view manager, the
+    /// one the cloud's subscriptions reach: a subscribed camera that
+    /// produces no frame stalls there and is on the roll-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_health_roll_up_reports_a_stall_on_the_reconcilers_live_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = reconciler_args(ScriptedRecorder::new(&[]), dir.path(), &[]).await;
+        let health = crate::cloud_tunnel::EngineHealth::new(&args);
+        args.live_view
+            .on_subscribe(&nexus_cloud_protocol::v1::LbrSubscribePayload {
+                camera_id: 7,
+                tile_w: Some(320),
+                tile_h: Some(180),
+                fps_tier: Some("grid".to_string()),
+            });
+        wait_until("precondition: the subscribed camera should stall", || {
+            args.live_view.stalled_cameras() == vec![7]
+        })
+        .await;
+
+        let issue = health
+            .rollup()
+            .await
+            .issues
+            .into_iter()
+            .flatten()
+            .find(|i| i.code == "camera_source_stalled")
+            .expect("a stall on the reconciler's live view must be on the roll-up");
+        assert!(
+            issue.detail.ends_with(": 7"),
+            "names the camera: {}",
+            issue.detail
+        );
+    }
+
     /// The feature gate, stated per build, on the roll-up `main` builds from
     /// these args: a stub behind an enabled camera is reported only by a
-    /// `gstreamer` build, where a real recorder was available.
+    /// `gstreamer` build, where a real recorder was available. The recorder
+    /// read is the one these args run, so a recorder that is not the stub is
+    /// reported by no build.
     #[tokio::test]
     async fn only_a_gstreamer_build_raises_the_recorder_issue() {
+        async fn recorder_issue(
+            args: &ReconcilerArgs,
+        ) -> Option<nexus_cloud_protocol::v1::EdgeDegradation> {
+            crate::cloud_tunnel::EngineHealth::new(args)
+                .rollup()
+                .await
+                .issues
+                .unwrap_or_default()
+                .into_iter()
+                .find(|i| i.component == "recorder")
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let mut args = reconciler_args(ScriptedRecorder::new(&[]), dir.path(), &[cam(None)]).await;
+        assert_eq!(
+            recorder_issue(&args).await,
+            None,
+            "a recorder that is not the stub must not be reported",
+        );
+
         args.recorder = Arc::new(nexus_pipeline::StubClipRecorder::new(
             args.store.clone(),
             dir.path().join("clips"),
         ));
-        let recorder_issue = crate::cloud_tunnel::EngineHealth::new(&args)
-            .rollup()
-            .await
-            .issues
-            .unwrap_or_default()
-            .into_iter()
-            .find(|i| i.component == "recorder");
         assert_eq!(
-            recorder_issue.is_some(),
+            recorder_issue(&args).await.is_some(),
             cfg!(feature = "gstreamer"),
             "a gstreamer build must report a stub recorder behind an enabled camera, \
              and a build without the feature must not",

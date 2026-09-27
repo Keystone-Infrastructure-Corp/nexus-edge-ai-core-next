@@ -2091,17 +2091,20 @@ impl EngineHealth {
     /// cannot hand it a copy of any of them. A real recorder was available
     /// iff this is a `gstreamer` build (see [`recorder_issue`]).
     pub(crate) fn new(reconciler: &crate::reconciler::ReconcilerArgs) -> Self {
-        Self::with_real_recorder(
-            cfg!(feature = "gstreamer"),
-            reconciler.recorder.clone(),
-            reconciler.store.clone(),
-            reconciler.live_view.clone(),
-            reconciler.handles.clone(),
-        )
+        Self {
+            real_recorder_available: cfg!(feature = "gstreamer"),
+            recorder: reconciler.recorder.clone(),
+            store: reconciler.store.clone(),
+            live_view: reconciler.live_view.clone(),
+            supervisors: reconciler.handles.clone(),
+            enabled_cameras: parking_lot::Mutex::new(None),
+        }
     }
 
     /// [`Self::new`] with the build's feature as an argument, so a test can
-    /// run the recorder issue's raising branch on any build.
+    /// run the recorder issue's raising branch on any build. Test-only, so
+    /// `main` cannot build the roll-up with a literal gate.
+    #[cfg(test)]
     pub(crate) fn with_real_recorder(
         real_recorder_available: bool,
         recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
