@@ -677,6 +677,7 @@ async fn run(
                     &live_view,
                     &frame_stats,
                     recorder_kind,
+                    &webrtc,
                 );
                 let dispatch = pump_rpc_dispatch(
                     &*conn,
@@ -1008,8 +1009,8 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             // builds a send-only publisher webrtcbin, gathers ICE, and emits
             // live_hd_offer. live_hd_answer carries the SFU's answer;
             // live_hd_stop tears the publisher down. No-op (logged) without
-            // the gstreamer-webrtc feature — the heartbeat never advertised
-            // `hd_sfu` then, so this is defence in depth.
+            // the gstreamer-webrtc feature — a bridge that cannot publish
+            // never has `hd_sfu` advertised for it, so this is defence in depth.
             EnvelopeBody::LiveHdStart(payload) => {
                 webrtc.on_live_hd_start(payload, outbox);
             }
@@ -1204,6 +1205,11 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// an expanding operator to the matching client adapter. No back-compat — the
 /// old single `webrtc` tag is gone. Additive on wire `v=1`.
 ///
+/// `hd_transport` is `None` when the WebRTC bridge cannot publish
+/// ([`crate::webrtc_bridge::WebRtcBridge::can_publish`]): the stub recorder,
+/// or a build without `gstreamer-webrtc`. Such a core drops every HD start, so
+/// it advertises no HD transport (BUG-225).
+///
 /// `talkdown_webrtc` is deliberately **not** advertised. It used to be pushed
 /// whenever `feature = "gstreamer-webrtc"` was on, but that feature gates the
 /// HD *publish* bridge ([`crate::webrtc_bridge`]); this engine has no
@@ -1214,10 +1220,13 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// Opus decode → PCMU/PCMA → the camera's RTSP backchannel, whose URL and codec
 /// [`nexus_types::CameraTalkDown`] already discovers), gated on the camera
 /// actually having one.
-fn heartbeat_caps(hd_transport: nexus_types::HdTransport) -> Vec<String> {
-    vec!["live_view".to_string(), hd_transport.cap_tag().to_string()]
+fn heartbeat_caps(hd_transport: Option<nexus_types::HdTransport>) -> Vec<String> {
+    let mut caps = vec!["live_view".to_string()];
+    caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
+    caps
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump_heartbeats<H: TunnelHandle>(
     handle: &H,
     _core_id: &str,
@@ -1226,6 +1235,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
     live_view: &crate::live_view::LiveViewManager,
     frame_stats: &nexus_pipeline::FrameStatsRegistry,
     recorder_kind: &'static str,
+    webrtc: &crate::webrtc_bridge::WebRtcBridge,
 ) {
     // Reaching this function at all means the WSS handshake and the mTLS
     // client-certificate check both succeeded.
@@ -1301,7 +1311,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
             body: EnvelopeBody::Heartbeat(HeartbeatPayload {
                 edge_ts_unix_ms: Some(now_unix_ms()),
                 name,
-                caps: Some(heartbeat_caps(hd_transport)),
+                caps: Some(heartbeat_caps(webrtc.can_publish().then_some(hd_transport))),
                 online_cameras,
                 queued_alerts,
                 release,
@@ -2264,7 +2274,7 @@ mod health_tests {
     #[test]
     fn no_transport_advertises_talk_down() {
         for t in nexus_types::HdTransport::all() {
-            let caps = heartbeat_caps(t);
+            let caps = heartbeat_caps(Some(t));
             assert!(
                 caps.contains(&"live_view".to_string()),
                 "{t} must still advertise the LBR pump: {caps:?}"
@@ -2273,6 +2283,16 @@ mod health_tests {
                 !caps.iter().any(|c| c.contains("talkdown")),
                 "{t} advertised talk-down with no sub-pipeline behind it: {caps:?}"
             );
+        }
+    }
+
+    /// A bridge that can publish advertises its configured transport; one
+    /// that cannot advertises none (BUG-225).
+    #[test]
+    fn the_hd_transport_is_advertised_only_when_the_bridge_can_publish() {
+        assert_eq!(heartbeat_caps(None), ["live_view"]);
+        for t in nexus_types::HdTransport::all() {
+            assert_eq!(heartbeat_caps(Some(t)), ["live_view", t.cap_tag()]);
         }
     }
 
@@ -3317,6 +3337,64 @@ mod heartbeat_ack_tests {
         )
     }
 
+    /// Keeps the first envelope, then reports the socket gone, which makes
+    /// `pump_heartbeats` return after exactly one heartbeat.
+    #[derive(Default)]
+    struct FirstEnvelopeTunnel {
+        sent: parking_lot::Mutex<Vec<Envelope>>,
+    }
+
+    #[async_trait]
+    impl TunnelHandle for FirstEnvelopeTunnel {
+        async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
+            self.sent.lock().push(envelope);
+            Err(TunnelError::Disconnected)
+        }
+    }
+
+    /// The `caps` of the first heartbeat `pump_heartbeats` sends over
+    /// `webrtc`.
+    async fn first_heartbeat_caps(webrtc: &crate::webrtc_bridge::WebRtcBridge) -> Vec<String> {
+        let (store, _dir) = test_store().await;
+        let tunnel = FirstEnvelopeTunnel::default();
+        pump_heartbeats(
+            &tunnel,
+            "core-1",
+            store,
+            &TunnelLiveness::new(),
+            &live_view_manager(),
+            &FrameStatsRegistry::new(),
+            "gstreamer",
+            webrtc,
+        )
+        .await;
+        let sent = tunnel.sent.lock();
+        match &sent[0].body {
+            EnvelopeBody::Heartbeat(h) => h.caps.clone().expect("the heartbeat carries caps"),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+    }
+
+    /// BUG-225: a stub recorder's WebRTC bridge is disabled, as is every
+    /// bridge on a build without `gstreamer-webrtc`, and a disabled bridge
+    /// drops every HD start. The heartbeat must not offer HD from it.
+    #[tokio::test]
+    async fn a_bridge_that_cannot_publish_puts_no_hd_transport_on_the_heartbeat() {
+        let bridge = crate::webrtc_bridge::WebRtcBridge::disabled();
+        assert_eq!(first_heartbeat_caps(&bridge).await, ["live_view"]);
+    }
+
+    /// The bridge a gstreamer recorder builds publishes, so its heartbeat
+    /// offers the configured transport (`sfu` until the store says otherwise).
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test]
+    async fn a_bridge_that_can_publish_puts_its_hd_transport_on_the_heartbeat() {
+        let bridge = crate::webrtc_bridge::WebRtcBridge::new(Arc::new(parking_lot::RwLock::new(
+            std::collections::HashMap::new(),
+        )));
+        assert_eq!(first_heartbeat_caps(&bridge).await, ["live_view", "hd_sfu"]);
+    }
+
     /// The go-dark watchdog reflips an appliance to its previous release
     /// on this signal. Enqueueing a heartbeat onto a local channel proves
     /// the channel had room, not that the cloud is reachable — a half-open
@@ -3332,6 +3410,7 @@ mod heartbeat_ack_tests {
         let frame_stats = FrameStatsRegistry::new();
         let liveness = TunnelLiveness::new();
         let tunnel = HalfOpenTunnel::default();
+        let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
 
         let pump = pump_heartbeats(
             &tunnel,
@@ -3341,6 +3420,7 @@ mod heartbeat_ack_tests {
             &live_view,
             &frame_stats,
             "gstreamer",
+            &webrtc,
         );
         tokio::pin!(pump);
         // Poll for the condition rather than paying a fixed wait: the pump

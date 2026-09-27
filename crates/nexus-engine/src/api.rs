@@ -10231,7 +10231,7 @@ mod tests {
             .seed_from_config_if_empty(&cfg)
             .await
             .expect("seed the store as boot does");
-        let (recorder, _webrtc, _analysis) = crate::build_recorder(
+        let (recorder, webrtc, _analysis) = crate::build_recorder(
             &cfg.runtime.clips.recorder,
             store.clone(),
             &dir.path().join("clips"),
@@ -10251,6 +10251,10 @@ mod tests {
         .await
         .expect("build_recorder");
         assert_eq!(recorder.kind(), "stub", "boot must construct the stub");
+        assert!(
+            !webrtc.can_publish(),
+            "the stub's WebRTC bridge drops every HD start, so the heartbeat must not offer HD"
+        );
 
         let body = super::health_body(
             crate::cloud_tunnel::recorder_issue_in(true, recorder.kind(), &store).await,

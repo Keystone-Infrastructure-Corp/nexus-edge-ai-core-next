@@ -15,9 +15,10 @@
 //!
 //! The type is compiled **unconditionally** so `cloud_tunnel.rs` can hold one
 //! `Arc<WebRtcBridge>` regardless of features. When the `gstreamer-webrtc`
-//! feature is off every method is a logged no-op — and the heartbeat also omits
-//! the `hd_sfu` / `hd_moq` capability, so a cloud never starts an HD publish on
-//! such a core in the first place.
+//! feature is off every method is a logged no-op. A bridge that cannot publish
+//! (that build, or [`WebRtcBridge::disabled`] behind the stub recorder) is also
+//! kept off the heartbeat: its `hd_sfu` / `hd_moq` capability is omitted (see
+//! [`WebRtcBridge::can_publish`]).
 
 use std::sync::Arc;
 
@@ -53,6 +54,8 @@ pub use nexus_pipeline::IngesterRegistry;
 pub struct WebRtcBridge {
     #[cfg(feature = "gstreamer-webrtc")]
     inner: parking_lot::Mutex<Inner>,
+    /// True only for a bridge built by `new`; see [`Self::can_publish`].
+    publishes: bool,
 }
 
 #[cfg(feature = "gstreamer-webrtc")]
@@ -98,6 +101,7 @@ impl WebRtcBridge {
                 ingesters,
                 sessions: HashMap::new(),
             }),
+            publishes: true,
         })
     }
 
@@ -112,7 +116,16 @@ impl WebRtcBridge {
                 ingesters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
                 sessions: HashMap::new(),
             }),
+            publishes: false,
         })
+    }
+
+    /// Whether this bridge can publish HD at all, which is what the heartbeat
+    /// advertises an HD transport on. Only a bridge built by `new` can: it
+    /// reads the real recorder's camera ingesters. [`Self::disabled`] holds
+    /// none, so it drops every `live_hd_start` (BUG-225).
+    pub fn can_publish(&self) -> bool {
+        self.publishes
     }
 
     /// Handle an inbound `live_hd_start`: build a publisher (offerer) session
