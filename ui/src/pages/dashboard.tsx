@@ -55,6 +55,9 @@ import { PageHeader } from "@/pages/placeholder";
 
 const STALE_FRAME_MS = 5_000;
 const SPARK_WINDOW = 60;
+// The events query reads the newest this many, so an hour that holds all of
+// them may hold more than were read.
+const RECENT_EVENTS = 100;
 
 export function DashboardPage() {
   const metricsQuery = useQuery({
@@ -70,7 +73,7 @@ export function DashboardPage() {
   });
   const eventsQuery = useQuery({
     queryKey: ["events", "recent"],
-    queryFn: () => listEvents(100),
+    queryFn: () => listEvents(RECENT_EVENTS),
     refetchInterval: 60_000,
   });
   const healthQuery = useQuery({
@@ -203,7 +206,11 @@ export function DashboardPage() {
           icon={<Activity className="h-4 w-4" />}
           label="Alerts (last hour)"
           value={
-            eventsLastHour === null ? notRead(eventsQuery) : `${eventsLastHour}`
+            eventsLastHour === null
+              ? notRead(eventsQuery)
+              : eventsLastHour === RECENT_EVENTS
+                ? `${eventsLastHour}+`
+                : `${eventsLastHour}`
           }
           hint={
             eventsLastHour === null && eventsQuery.isError
@@ -466,7 +473,7 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {backendsQuery.isLoading ? (
+            {backendsQuery.isPending ? (
               <Skeleton className="h-16 w-full" />
             ) : backendsQuery.data ? (
               <div className="space-y-2 text-sm">

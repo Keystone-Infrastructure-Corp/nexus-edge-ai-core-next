@@ -4,7 +4,7 @@
 // degraded and name its issues, with the detail the engine sent. "…" is
 // only for a health query that has not answered.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -296,6 +296,31 @@ describe("dashboard readings", () => {
     expect(accentOf(await tile("Alerts (last hour)"))).toContain("text-warning");
   });
 
+  it("does not cap the hour's alerts at the events it asked for", async () => {
+    // The page asks for the newest 100 events; when every one is inside the
+    // hour, the hour may hold more than were read.
+    const now = new Date().toISOString();
+    stubEngine(healthy, {
+      "/api/v1/events": () =>
+        Promise.resolve(json(Array.from({ length: 100 }, () => ({ captured_at: now })))),
+    });
+    renderDashboard();
+
+    await waitFor(async () => expect(await reading("Alerts (last hour)")).toBe("100+"));
+  });
+
+  it("counts the hour's alerts exactly when the events it read reach past the hour", async () => {
+    const at = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
+    const events = [
+      ...Array.from({ length: 99 }, () => ({ captured_at: at(60_000) })),
+      { captured_at: at(7_200_000) },
+    ];
+    stubEngine(healthy, { "/api/v1/events": () => Promise.resolve(json(events)) });
+    renderDashboard();
+
+    await waitFor(async () => expect(await reading("Alerts (last hour)")).toBe("99"));
+  });
+
   it("does not report CPU, memory or disk use before the metrics answer", async () => {
     stubEngine(healthy, { "/api/v1/system/metrics": pending });
     renderDashboard();
@@ -387,5 +412,28 @@ describe("dashboard readings", () => {
 
     expect(await screen.findByText("Quiet on the wire")).toBeTruthy();
     expect(screen.getByText("No alerts have arrived since you opened this page.")).toBeTruthy();
+  });
+
+  it("does not call the backends unavailable before their request has been sent", async () => {
+    // Offline, a query is paused: it has not answered, but it is not loading.
+    onlineManager.setOnline(false);
+    try {
+      stubEngine(healthy, {
+        "/api/v1/backends": () => Promise.resolve(json({ mode: "in_process", slots: [] })),
+      });
+      renderDashboard();
+
+      expect(await screen.findByText("Inference")).toBeTruthy();
+      expect(screen.queryByText("Backends unavailable")).toBeNull();
+    } finally {
+      onlineManager.setOnline(true);
+    }
+  });
+
+  it("says the backends are unavailable once their request fails", async () => {
+    stubEngine(healthy, { "/api/v1/backends": failing });
+    renderDashboard();
+
+    expect(await screen.findByText("Backends unavailable")).toBeTruthy();
   });
 });
