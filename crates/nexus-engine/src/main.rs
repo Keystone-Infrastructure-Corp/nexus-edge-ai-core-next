@@ -826,12 +826,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
             .unwrap_or(true),
     ));
 
-    // Sizes both the boot RGB taps, in `build_recorder`, and every camera's
-    // supervisor and entry, through `ReconcilerArgs`. Only this one binding
-    // keeps the two equal, and no test sizes a boot tap (with or without the
-    // gstreamer feature): a tap sized apart from its supervisor misplaces
-    // burned-in alert boxes and misreports clip frame size until the camera
-    // next restarts.
+    // Sizes both the boot RGB taps, in `build_recorder`, and the guard's
+    // frame for every camera, through `ReconcilerArgs`. A boot entry records
+    // its tap's frame and its supervisor is spawned at it, so a tap sized
+    // apart from the guard is a changed frame the first reconcile pass
+    // restarts, not a supervisor misreading its tap's frames.
     let default_detector_width = cfg.inference.model.input_width;
     let (recorder, webrtc_bridge, mut boot_analysis) = build_recorder(
         &cfg.runtime.clips.recorder,
@@ -2546,6 +2545,9 @@ async fn build_gst_recorder(
     // and supervisor dims already resolved by the loop below so the
     // registration pass does not recompute them.
     let mut analysis_pending: Vec<(&CameraConfig, nexus_types::CodecKind, (u32, u32))> = Vec::new();
+    // The frame each built ingester's RGB tap runs at, which its boot entry
+    // records as the camera's supervisor dims.
+    let mut taps = std::collections::HashMap::new();
     for cam in cameras {
         if !cam.ingest.enabled {
             continue;
@@ -2553,8 +2555,8 @@ async fn build_gst_recorder(
         // Per-camera supervisor (RGB analysis) frame size. Defaults to
         // the camera's resolved detector input width; M_NATIVE_ASPECT
         // allows a larger native-16:9 ladder rung via
-        // `behavior.supervisor_width`. Matches what the engine spawn
-        // site passes to `spawn_camera`.
+        // `behavior.supervisor_width`. The boot entry records the built
+        // tap's frame, and the supervisor is spawned at the entry's.
         let (rgb_w, rgb_h) = crate::reconciler::supervisor_dims_for(cam, default_detector_width);
         // Autodetect codec for cameras stored with `codec=None`
         // (operator picked "auto", or row predates the column).
@@ -2610,6 +2612,7 @@ async fn build_gst_recorder(
                     rgb_h,
                     "pre-roll ingester started (with shared rgb tap)"
                 );
+                taps.insert(cam.id, (ing.rgb_w(), ing.rgb_h()));
                 ingesters.insert(cam.id, ing);
                 if cam.ingest.analysis_url.is_some() {
                     analysis_pending.push((cam, codec, (rgb_w, rgb_h)));
@@ -2650,7 +2653,9 @@ async fn build_gst_recorder(
     // these on hot-add and on every reconcile-triggered restart. Boot has to
     // register them too and record what registered, or the first reconcile
     // pass restarts every converted camera to register one.
-    let analysis = crate::reconciler::register_analysis_sessions(&rec, analysis_pending).await;
+    let analysis = crate::reconciler::register_analysis_sessions(&rec, analysis_pending)
+        .await
+        .with_taps(taps);
     Ok((Arc::new(rec), webrtc, analysis))
 }
 

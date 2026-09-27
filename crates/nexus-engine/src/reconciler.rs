@@ -123,9 +123,11 @@ impl EntryKey {
     }
 
     /// A boot entry's key: the guard's, with the substream URL boot
-    /// registered for `cam` in place of the configured one. The call drains
-    /// that camera's entry from `boot_analysis`, so the key it returns is the
-    /// only record of it. An extra call as a bare statement fails
+    /// registered for `cam` in place of the configured one, and the frame
+    /// its boot RGB tap was built at in place of the guard's. A camera with
+    /// no boot tap builds its own frame source at the guard's frame. The call
+    /// drains that camera's entry from `boot_analysis`, so the key it returns
+    /// is the only record of it. An extra call as a bare statement fails
     /// `clippy -D warnings` on this `#[must_use]`; `let _ =` still passes.
     #[must_use = "this drains the camera's boot entry, which only the returned key records"]
     pub(crate) fn at_boot(
@@ -133,9 +135,14 @@ impl EntryKey {
         cam: &CameraConfig,
         boot_analysis: &mut BootAnalysis,
     ) -> Self {
+        let want = Self::wanted(args, cam);
         Self {
             analysis_url: boot_analysis.0.remove(&cam.id),
-            ..Self::wanted(args, cam)
+            supervisor_dims: boot_analysis
+                .1
+                .remove(&cam.id)
+                .unwrap_or(want.supervisor_dims),
+            ..want
         }
     }
 
@@ -162,15 +169,31 @@ impl EntryKey {
 /// over a throwaway `StubClipRecorder`, which accepts every substream; and a
 /// second `at_boot` call for a camera, or one made with a doctored copy of
 /// it, which drains its entry so the real key records `None`.
+///
+/// It also holds the frame each camera's boot RGB tap was built at, from
+/// [`BootAnalysis::with_taps`], which each boot entry records as its
+/// supervisor dims: the tap and the entry then cannot disagree, and a tap
+/// sized apart from the guard is a changed frame the first reconcile pass
+/// restarts, not a supervisor misreading its frames until the next restart.
 #[must_use = "each boot entry's analysis_url comes from this map, through EntryKey::at_boot"]
-pub(crate) struct BootAnalysis(HashMap<CameraId, String>);
+pub(crate) struct BootAnalysis(HashMap<CameraId, String>, HashMap<CameraId, (u32, u32)>);
+
+impl BootAnalysis {
+    /// The frame `(width, height)` each camera's boot RGB tap was built at,
+    /// read back from the built ingester. Only `build_gst_recorder` builds
+    /// taps; the stub arms have none.
+    #[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
+    pub(crate) fn with_taps(self, taps: HashMap<CameraId, (u32, u32)>) -> Self {
+        Self(self.0, taps)
+    }
+}
 
 /// The supervisor (RGB analysis) frame `(width, height)` a camera runs at:
 /// its detector input width — the `model_override`'s, else
 /// `default_detector_width` — raised to `behavior.supervisor_width` when
-/// that is larger. The only copy of the rule: the no-change guard, boot's
-/// entries and the boot RGB tap in `build_gst_recorder` all size from it,
-/// and `camera_reprobe` ranks substreams against it.
+/// that is larger. The only copy of the rule: the no-change guard and the
+/// boot RGB tap in `build_gst_recorder` size from it, boot's entries record
+/// the tap's frame, and `camera_reprobe` ranks substreams against it.
 pub(crate) fn supervisor_dims_for(cam: &CameraConfig, default_detector_width: u32) -> (u32, u32) {
     let det_w = cam
         .detector
@@ -553,7 +576,7 @@ pub(crate) async fn register_analysis_sessions(
             registered.insert(cam.id, url);
         }
     }
-    BootAnalysis(registered)
+    BootAnalysis(registered, HashMap::new())
 }
 
 async fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, want: EntryKey) {
@@ -899,8 +922,8 @@ mod tests {
     /// arm's wiring at the source level instead, the same audit-test shape as
     /// `gst_clip_recorder::pipeline_string_is_codec_passthrough`. Each needle
     /// must occur exactly once, so it names one line: the gstreamer arm's
-    /// registration, and that arm's return of what it registered. The stub
-    /// arms are driven for real by
+    /// registration, the boot taps it hands on, and that arm's return of
+    /// what it registered. The stub arms are driven for real by
     /// `the_stub_boot_path_registers_every_enabled_substream`.
     #[test]
     fn the_boot_path_registers_analysis_sessions() {
@@ -917,6 +940,14 @@ mod tests {
                 "build_gst_recorder must return what it registered: an empty map boots every \
                  converted camera with no substream recorded, and the first reconcile pass \
                  restarts it, main ingester included.",
+            ),
+            (
+                ".with_taps(taps)",
+                "build_gst_recorder must hand boot the frame each RGB tap was built at: \
+                 without it a boot entry records the guard's frame, and a tap sized apart \
+                 from it feeds its supervisor frames of another size until the camera \
+                 next restarts. a_boot_entry_records_the_frame_its_rgb_tap_was_built_at \
+                 checks the real arm, but CI runs no gstreamer tests of this crate.",
             ),
         ] {
             assert_eq!(
@@ -1684,6 +1715,17 @@ mod tests {
         dir: &std::path::Path,
         cameras: &[CameraConfig],
     ) -> (Arc<dyn ClipRecorder>, BootAnalysis) {
+        build_recorder_at_width(kind, dir, cameras, 512).await
+    }
+
+    /// [`build_recorder_like_main`], sizing the boot RGB taps from
+    /// `default_detector_width`.
+    async fn build_recorder_at_width(
+        kind: &RecorderKind,
+        dir: &std::path::Path,
+        cameras: &[CameraConfig],
+        default_detector_width: u32,
+    ) -> (Arc<dyn ClipRecorder>, BootAnalysis) {
         let store = Arc::new(
             Store::open(&nexus_config::StoreConfig {
                 url: format!("sqlite://{}?mode=rwc", dir.join("recorder.db").display()),
@@ -1697,7 +1739,7 @@ mod tests {
             store,
             &dir.join("clips"),
             cameras,
-            512,
+            default_detector_width,
             0,
             nexus_config::DecodeMode::default(),
             Arc::new(nexus_bus::BroadcastBus::new(64)),
@@ -1712,6 +1754,87 @@ mod tests {
         .await
         .expect("build_recorder");
         (recorder, boot_analysis)
+    }
+
+    /// `at_boot` takes a camera's frame from its boot tap, when it has one,
+    /// over the guard's; a camera with no boot tap gets the guard's.
+    #[tokio::test]
+    async fn a_boot_entry_takes_its_frame_from_its_tap_when_it_has_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cams = [cam_with_id(7), cam_with_id(8)];
+        let recorder = Arc::new(RecordingRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
+        let mut boot = register_analysis_sessions(recorder.as_ref(), Vec::new())
+            .await
+            .with_taps(HashMap::from([(7, (1024, 576))]));
+        assert_eq!(
+            EntryKey::at_boot(&args, &cams[0], &mut boot).supervisor_dims(),
+            (1024, 576),
+            "a camera with a boot tap records the tap's frame"
+        );
+        assert_eq!(
+            EntryKey::at_boot(&args, &cams[1], &mut boot).supervisor_dims(),
+            (512, 288),
+            "a camera with no boot tap records the guard's frame"
+        );
+    }
+
+    /// A boot entry records the frame its RGB tap was built at, so the two
+    /// cannot disagree whatever width `main` hands `build_recorder`. Here
+    /// the taps are sized from a 1024 px default and the guard from 512:
+    /// each entry must still match its tap, and the guard then sees a
+    /// changed frame and restarts the camera at the width it wants. The
+    /// oracle is the recorder's own resize, which reports no rebuild only
+    /// when the tap already has the asked-for dims.
+    #[cfg(feature = "gstreamer")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_boot_entry_records_the_frame_its_rgb_tap_was_built_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A closed local port: every ingester builds, none connects.
+        let with = |id: CameraId, shape: &dyn Fn(&mut CameraConfig)| {
+            let mut c = cam_with_id(id);
+            c.ingest.url = Url::parse(&format!("rtsp://127.0.0.1:1/cam-{id}")).unwrap();
+            shape(&mut c);
+            c
+        };
+        let cams = [
+            with(7, &|_| {}),
+            with(8, &|c| c.behavior.supervisor_width = Some(256)),
+            with(9, &|c| c.behavior.supervisor_width = Some(1536)),
+            with(10, &|c| {
+                c.detector.model_override = Some(nexus_config::ModelConfig {
+                    kind: "mock".into(),
+                    input_width: 512,
+                    ..Default::default()
+                })
+            }),
+        ];
+        let (recorder, mut boot) =
+            build_recorder_at_width(&RecorderKind::Gstreamer, dir.path(), &cams, 1024).await;
+        let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
+        for cam in &cams {
+            let key = EntryKey::at_boot(&args, cam, &mut boot);
+            let (w, h) = key.supervisor_dims();
+            assert!(
+                recorder.shared_frame_source(cam.id).is_some(),
+                "camera {} has no boot RGB tap",
+                cam.id
+            );
+            assert!(
+                !recorder
+                    .resize_camera_rgb_tap(cam.id, w, h)
+                    .expect("resize"),
+                "camera {}: the entry records {w}x{h}, which is not its tap's frame",
+                cam.id
+            );
+            // Cameras 9 and 10 size the same at either default width.
+            assert_eq!(
+                key == EntryKey::wanted(&args, cam),
+                matches!(cam.id, 9 | 10),
+                "camera {}: the guard must see a frame the widths split",
+                cam.id
+            );
+        }
     }
 
     /// The stub arms of `build_recorder` run the same registration pass as
