@@ -14,11 +14,11 @@
 //! * **First emit** on the first frame where the track's `age_frames`
 //!   ≥ `min_track_age_frames`. The scheduler mints a UUIDv7 as the
 //!   wire `entity_local_id` and stamps `is_first = true`.
-//! * **Periodic re-emit** every `emit_interval` of wall-clock after
+//! * **Periodic re-emit** every `emit_interval` of capture time after
 //!   the first emit, while the track is still seen. `is_first = false`
 //!   on every subsequent emit.
 //! * **Track GC**: once a track is absent for `track_gc_after` of
-//!   wall-clock (default = `2 * emit_interval`), its entry is dropped;
+//!   capture time (default = `2 * emit_interval`), its entry is dropped;
 //!   if the same `track_id` appears later, it gets a brand-new
 //!   `entity_local_id`. The cloud-side cross-camera linker re-stitches
 //!   the global identity via pgvector, so a slightly chatty
@@ -36,7 +36,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use nexus_types::{BBox, CameraId, Frame, TrackId, TrackedObject};
@@ -178,10 +178,12 @@ struct TrackState {
     entity_local_id: String,
     started_ts: DateTime<Utc>,
     /// `None` until the track first crosses the `min_track_age_frames`
-    /// threshold and the first emit fires.
-    last_emit_at: Option<DateTime<Utc>>,
+    /// threshold and the first emit fires. This and `last_seen_at` are
+    /// frames' `captured_mono`, so a wall-clock step moves neither the
+    /// cadence nor the GC.
+    last_emit_at: Option<Instant>,
     /// `last_seen_at` is updated every frame the track is present.
-    last_seen_at: DateTime<Utc>,
+    last_seen_at: Instant,
 }
 
 impl SightingScheduler {
@@ -281,6 +283,10 @@ impl SightingScheduler {
     /// Synchronously emits zero or more [`SightingSnapshot`]s via
     /// `hook.submit()` and returns the count of snapshots emitted
     /// (for the supervisor's frame-stats counter).
+    ///
+    /// `now` is the frame's wall-clock capture time, which the snapshots
+    /// and the persisted rows carry; the cadence and the GC are measured
+    /// on `frame.captured_mono`.
     pub fn tick<'a>(
         &mut self,
         frame: &Arc<Frame>,
@@ -289,6 +295,7 @@ impl SightingScheduler {
         hook: &dyn SightingHook,
     ) -> usize {
         let tracked = tracked.into_iter();
+        let now_mono = frame.captured_mono;
         // M_PERF_CROWD B2 — pick the periodic re-emit cadence based
         // on the current per-camera tracked-object count. Threshold
         // 0 disables crowded mode (always use the regular interval).
@@ -310,18 +317,18 @@ impl SightingScheduler {
                             entity_local_id: s.entity_local_id,
                             started_ts: s.started_ts,
                             last_emit_at: None,
-                            last_seen_at: s.last_seen_at,
+                            last_seen_at: now_mono,
                         }
                     } else {
                         TrackState {
                             entity_local_id: new_local_id(),
                             started_ts: now,
                             last_emit_at: None,
-                            last_seen_at: now,
+                            last_seen_at: now_mono,
                         }
                     }
                 });
-                entry.last_seen_at = now;
+                entry.last_seen_at = now_mono;
                 let stable = obj.age_frames >= self.min_track_age_frames;
                 match entry.last_emit_at {
                     None if stable => Some(EmitPlan {
@@ -329,10 +336,7 @@ impl SightingScheduler {
                         started_ts: entry.started_ts,
                         is_first: true,
                     }),
-                    Some(prev)
-                        if now.signed_duration_since(prev).to_std().unwrap_or_default()
-                            >= periodic_interval =>
-                    {
+                    Some(prev) if now_mono.saturating_duration_since(prev) >= periodic_interval => {
                         Some(EmitPlan {
                             entity_local_id: entry.entity_local_id.clone(),
                             started_ts: entry.started_ts,
@@ -366,12 +370,16 @@ impl SightingScheduler {
                     let interval_ms = self.emit_interval.as_millis().min(i64::MAX as u128) as i64;
                     if interval_ms > 0 {
                         let jitter_ms = self.rng.gen_range(0..interval_ms);
-                        now - chrono::Duration::milliseconds(jitter_ms)
+                        // An Instant cannot always be moved back that far
+                        // (near the platform clock's origin).
+                        now_mono
+                            .checked_sub(Duration::from_millis(jitter_ms as u64))
+                            .unwrap_or(now_mono)
                     } else {
-                        now
+                        now_mono
                     }
                 } else {
-                    now
+                    now_mono
                 };
                 // Re-borrow to stamp last_emit_at now that submit returned.
                 if let Some(entry) = self.tracks.get_mut(&obj.track_id) {
@@ -391,11 +399,7 @@ impl SightingScheduler {
         let gc_horizon = self.track_gc_after;
         let mut gc_drops: Vec<TrackId> = Vec::new();
         self.tracks.retain(|track_id, state| {
-            let keep = now
-                .signed_duration_since(state.last_seen_at)
-                .to_std()
-                .map(|d| d < gc_horizon)
-                .unwrap_or(true);
+            let keep = now_mono.saturating_duration_since(state.last_seen_at) < gc_horizon;
             if !keep {
                 gc_drops.push(*track_id);
             }
@@ -403,7 +407,9 @@ impl SightingScheduler {
         });
         // Also drop any seed entries that were never touched and are
         // now past the GC horizon — keeps the seed map from growing
-        // unbounded when the tracker never re-issues a stale id.
+        // unbounded when the tracker never re-issues a stale id. A seed's
+        // `last_seen_at` comes from the store, in wall-clock time, so this
+        // horizon stays on it.
         self.seed.retain(|_, s| {
             now.signed_duration_since(s.last_seen_at)
                 < chrono::Duration::from_std(gc_horizon)
@@ -459,6 +465,25 @@ mod tests {
         })
     }
 
+    /// Ticks with `base` as a source would have captured it at `t`: its
+    /// monotonic stamp is as far after `base`'s as `t` is after `base`'s
+    /// wall-clock stamp, so the two clocks agree.
+    fn tick_at(
+        sched: &mut SightingScheduler,
+        base: &Arc<Frame>,
+        objects: &[TrackedObject],
+        t: DateTime<Utc>,
+        hook: &dyn SightingHook,
+    ) -> usize {
+        let since_base = (t - base.captured_at).to_std().expect("t is after base");
+        let frame = Arc::new(Frame {
+            captured_at: t,
+            captured_mono: base.captured_mono + since_base,
+            ..Frame::clone(base)
+        });
+        sched.tick(&frame, objects, t, hook)
+    }
+
     fn tracked(id: TrackId, age: u32) -> TrackedObject {
         TrackedObject {
             track_id: id,
@@ -511,7 +536,8 @@ mod tests {
         assert_eq!(sched.tick(&frame, &[tracked(1, 2)], t0, &hook), 1);
         // 1s later — too soon, no emit.
         assert_eq!(
-            sched.tick(
+            tick_at(
+                &mut sched,
                 &frame,
                 &[tracked(1, 3)],
                 t0 + chrono::Duration::seconds(1),
@@ -521,7 +547,8 @@ mod tests {
         );
         // 4s after first — still inside interval.
         assert_eq!(
-            sched.tick(
+            tick_at(
+                &mut sched,
                 &frame,
                 &[tracked(1, 4)],
                 t0 + chrono::Duration::seconds(4),
@@ -531,7 +558,8 @@ mod tests {
         );
         // 5s after first — fires periodic.
         assert_eq!(
-            sched.tick(
+            tick_at(
+                &mut sched,
                 &frame,
                 &[tracked(1, 5)],
                 t0 + chrono::Duration::seconds(5),
@@ -580,9 +608,16 @@ mod tests {
         let id_a = hook.seen.lock()[0].entity_local_id.clone();
         // Skip the track for 20s — well past gc_after=10s. Tick with
         // no objects so the scheduler's GC sweep can run.
-        sched.tick(&frame, &[], t0 + chrono::Duration::seconds(20), &hook);
+        tick_at(
+            &mut sched,
+            &frame,
+            &[],
+            t0 + chrono::Duration::seconds(20),
+            &hook,
+        );
         // Same track_id reappears: it's a new lifecycle, new id.
-        sched.tick(
+        tick_at(
+            &mut sched,
             &frame,
             &[tracked(1, 2)],
             t0 + chrono::Duration::seconds(21),
@@ -722,10 +757,72 @@ mod tests {
         let frame = dummy_frame(7, t0);
         sched.tick(&frame, &[tracked(42, 2)], t0, &hook);
         // 20s with no objects — well past gc_after=10s.
-        sched.tick(&frame, &[], t0 + chrono::Duration::seconds(20), &hook);
+        tick_at(
+            &mut sched,
+            &frame,
+            &[],
+            t0 + chrono::Duration::seconds(20),
+            &hook,
+        );
         let deletes = persist.deletes.lock();
         assert_eq!(deletes.len(), 1);
         assert_eq!(deletes[0], (7, 42));
+    }
+
+    /// The re-emit cadence and the GC of an absent track are measured on the
+    /// frames' monotonic stamps, so a step of the wall clock between two
+    /// frames moves neither. The sightings keep the frames' wall-clock time.
+    #[test]
+    fn a_wall_clock_step_moves_neither_the_re_emit_cadence_nor_track_gc() {
+        let mut outcomes = Vec::new();
+        for step_s in [3_600, -3_600] {
+            let hook = CaptureHook::default();
+            let persist = Arc::new(CapturePersist::default());
+            // emit_interval 5 s, so gc_after 10 s.
+            let mut sched = SightingScheduler::new_with_persistence(
+                7,
+                1,
+                Duration::from_secs(5),
+                Vec::new(),
+                persist.clone(),
+            );
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            let mono0 = std::time::Instant::now();
+            let base = dummy_frame(7, t0);
+            let (mut emitted_at, mut dropped_at) = (Vec::new(), None);
+            // Frames a second apart; the wall clock steps at second 6.
+            for s in 0..=25_i64 {
+                let wall = t0 + chrono::Duration::seconds(s + if s >= 6 { step_s } else { 0 });
+                let frame = Arc::new(Frame {
+                    captured_at: wall,
+                    captured_mono: mono0 + Duration::from_secs(s as u64),
+                    ..Frame::clone(&base)
+                });
+                // Track 1 is seen on every frame, track 2 until second 3.
+                let objects = if s <= 3 {
+                    vec![tracked(1, 2), tracked(2, 2)]
+                } else {
+                    vec![tracked(1, 2)]
+                };
+                let before = hook.seen.lock().len();
+                sched.tick(&frame, &objects, wall, &hook);
+                let seen = hook.seen.lock();
+                for snap in seen[before..].iter().filter(|snap| snap.track_id == 1) {
+                    assert_eq!(snap.ts, wall, "a sighting keeps its frame's wall time");
+                    emitted_at.push(s);
+                }
+                if dropped_at.is_none() && !persist.deletes.lock().is_empty() {
+                    dropped_at = Some(s);
+                }
+            }
+            outcomes.push((step_s, emitted_at, dropped_at));
+        }
+        // Per step: the seconds of capture time track 1 was sighted on, and
+        // the second track 2 (last seen at second 3) was dropped, 10 s later.
+        assert_eq!(
+            outcomes,
+            [3_600, -3_600].map(|step_s| (step_s, vec![0, 5, 10, 15, 20, 25], Some(13)))
+        );
     }
 
     // ---- M_PERF_CROWD B2 — adaptive re-id cadence ----
@@ -754,7 +851,7 @@ mod tests {
         // At t+5s (= regular emit_interval), periodic re-emit must fire
         // for all 50 because crowded mode is disabled.
         let t5 = t0 + chrono::Duration::seconds(5);
-        assert_eq!(sched.tick(&frame, &many, t5, &hook), 50);
+        assert_eq!(tick_at(&mut sched, &frame, &many, t5, &hook), 50);
     }
 
     #[test]
@@ -773,13 +870,13 @@ mod tests {
         // t0+5s: regular emit_interval has elapsed but crowded cadence
         // has not — no periodic emits.
         let t5 = t0 + chrono::Duration::seconds(5);
-        assert_eq!(sched.tick(&frame, &many, t5, &hook), 0);
+        assert_eq!(tick_at(&mut sched, &frame, &many, t5, &hook), 0);
         // t0+14s: still below crowded 15s threshold.
         let t14 = t0 + chrono::Duration::seconds(14);
-        assert_eq!(sched.tick(&frame, &many, t14, &hook), 0);
+        assert_eq!(tick_at(&mut sched, &frame, &many, t14, &hook), 0);
         // t0+15s: crowded interval elapsed → re-emit fires for all 50.
         let t15 = t0 + chrono::Duration::seconds(15);
-        assert_eq!(sched.tick(&frame, &many, t15, &hook), 50);
+        assert_eq!(tick_at(&mut sched, &frame, &many, t15, &hook), 50);
     }
 
     #[test]
@@ -795,7 +892,7 @@ mod tests {
         hook.seen.lock().clear();
         // t0+5s — regular cadence fires.
         let t5 = t0 + chrono::Duration::seconds(5);
-        assert_eq!(sched.tick(&frame, &few, t5, &hook), 10);
+        assert_eq!(tick_at(&mut sched, &frame, &few, t5, &hook), 10);
     }
 
     #[test]
@@ -817,7 +914,7 @@ mod tests {
         let mut next = many.clone();
         next.push(tracked(99, 2));
         let t1 = t0 + chrono::Duration::seconds(1);
-        assert_eq!(sched.tick(&frame, &next, t1, &hook), 1);
+        assert_eq!(tick_at(&mut sched, &frame, &next, t1, &hook), 1);
         let seen = hook.seen.lock();
         assert_eq!(seen.len(), 1);
         assert!(seen[0].is_first);
@@ -841,7 +938,7 @@ mod tests {
         hook.seen.lock().clear();
         for ms in 1..=5_000 {
             let t = t0 + chrono::Duration::milliseconds(ms);
-            if sched.tick(&frame, &[tracked(1, 3)], t, &hook) == 1 {
+            if tick_at(sched, &frame, &[tracked(1, 3)], t, &hook) == 1 {
                 return Some(ms);
             }
         }
