@@ -226,8 +226,8 @@ export function DashboardPage() {
           hint={
             engine.verdict === "degraded"
               ? `${issueCodes(engine.read.issues)} · v${engine.read.version}`
-              : healthQuery.data?.version
-                ? `v${healthQuery.data.version}`
+              : engine.verdict === "ok"
+                ? `v${engine.read.version}`
                 : ""
           }
           accent={

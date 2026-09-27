@@ -53,13 +53,14 @@ class SilentEventSource {
   close() {}
 }
 
-function renderDashboard() {
+function renderDashboard(): QueryClient {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
       <DashboardPage />
     </QueryClientProvider>,
   );
+  return client;
 }
 
 /** The Engine KPI tile: the Card whose CardTitle reads "Engine". */
@@ -152,6 +153,23 @@ describe("dashboard Engine tile", () => {
     const tile = await engineTile();
     expect(await within(tile).findByText("ERROR")).toBeTruthy();
     expect(screen.queryByText(/degraded/i)).toBeNull();
+  });
+
+  it("renders ERROR without the last answer's version when a later request fails", async () => {
+    let answer = () =>
+      Promise.resolve(json({ status: "ok", version: "0.1.99", issues: [] }));
+    stubEngine(() => answer());
+    const client = renderDashboard();
+    const tile = await engineTile();
+    await within(tile).findByText("OK");
+
+    answer = () => Promise.resolve(json({ error: "boom" }, 500));
+    void client.refetchQueries({ queryKey: ["health"] });
+
+    expect(await within(tile).findByText("ERROR")).toBeTruthy();
+    // The stale answer is still in the cache; the tile did not render it.
+    expect(client.getQueryData(["health"])).toBeDefined();
+    expect(tile.textContent).not.toContain("0.1.99");
   });
 
   it("renders … while the health query has not answered", async () => {
