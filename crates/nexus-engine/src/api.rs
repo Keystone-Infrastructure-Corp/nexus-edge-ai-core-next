@@ -8871,7 +8871,7 @@ mod tests {
 
     /// A camera write cannot store a number JSON has no literal for. `1e39`
     /// is beyond f32's range, so it parses to infinity, and `serde_json`
-    /// writes that as `null`, which no later camera-list read can parse. One
+    /// writes that as `null`, which no later read of the row can parse. One
     /// such PUT used to answer 200 and leave every `list_cameras` failing.
     /// Both writes refuse it with 400 and leave the stored camera as it was.
     #[tokio::test]

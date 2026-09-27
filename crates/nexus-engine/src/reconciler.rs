@@ -312,9 +312,10 @@ pub struct ReconcilerArgs {
     /// schedule as the boot-time ones.
     pub alert_clip_schedule_gate: Arc<dyn nexus_pipeline::AlertClipScheduleGate>,
     pub handles: HandleMap,
-    /// The camera rows the last read of the camera list could not decode,
-    /// which therefore do not run: set by `main` from its boot read and by
-    /// every [`reconcile`] pass, and reported by the health roll-up.
+    /// The camera rows the last read of the camera list could not decode:
+    /// set by `main` from its boot read and by every [`reconcile`] pass whose
+    /// read succeeds, and reported by the health roll-up. Such a camera is
+    /// not started, and one already running keeps its last configuration.
     pub unreadable_cameras: Arc<Mutex<Vec<CameraId>>>,
     /// Phase 10 Live View — so stopping a camera also reaps its LBR pump.
     /// Without this the pump is reaped only by an `lbr_unsubscribe` from the
@@ -419,7 +420,7 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
 ///     whose ingest URL has changed, or whose supervisor has exited.
 async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     let (live, unreadable) = args.store.list_readable_cameras().await?;
-    *args.unreadable_cameras.lock() = unreadable;
+    *args.unreadable_cameras.lock() = unreadable.clone();
 
     // Snapshot current state under a short lock so the rest of the
     // pass can run without holding it. The clone is cheap — at most
@@ -432,9 +433,10 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         .map(|c| c.id)
         .collect();
 
-    // 1. Remove anything that is gone-or-disabled.
+    // 1. Remove anything that is gone-or-disabled. A camera whose row this
+    //    build cannot read is neither: it keeps its last configuration.
     for id in current.keys().copied().collect::<Vec<_>>() {
-        if !live_enabled.contains(&id) {
+        if !live_enabled.contains(&id) && !unreadable.contains(&id) {
             stop_camera(args, id);
             // Reap the LBR pump here and *only* here. A camera that is gone
             // or disabled has no frames to pump, so its encode task would
@@ -3029,20 +3031,25 @@ mod tests {
     /// wrote with a codec this build has no variant for, must not stop the
     /// others. The pass runs every camera it can read, the health roll-up
     /// names the one it cannot, and once the row is saved again the next
-    /// pass runs it and the issue clears. The pass used to fail at its read,
-    /// so no camera was added, removed or restarted while the row was there.
+    /// pass runs it and the issue clears. A camera already running when its
+    /// row stops reading keeps running, as it did when the pass failed at
+    /// its read: then no camera was added, removed or restarted while the
+    /// row was there.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_camera_row_this_build_cannot_read_is_reported_and_the_rest_run() {
         let dir = tempfile::tempdir().expect("tempdir");
         let recorder =
             ScriptedRecorder::new(&[(7, SourceScript::NeverEnds), (8, SourceScript::NeverEnds)]);
         let args = reconciler_args(recorder, dir.path(), &[cam_with_id(7), cam_with_id(8)]).await;
-        sqlx::query(
-            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = 8",
-        )
-        .execute(args.store.pool())
-        .await
-        .expect("rewrite camera 8's row");
+        let break_row = |id: CameraId| {
+            sqlx::query(
+                "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') \
+                 WHERE id = ?",
+            )
+            .bind(id)
+            .execute(args.store.pool())
+        };
+        break_row(8).await.expect("rewrite camera 8's row");
         let health = crate::cloud_tunnel::EngineHealth::new(&args);
         let unreadable = |h: nexus_cloud_protocol::v1::EdgeHealth| {
             h.issues
@@ -3068,6 +3075,12 @@ mod tests {
             .expect("the pass after the row is saved");
         let running_after = running();
         let after = unreadable(health.rollup().await);
+        break_row(7).await.expect("rewrite camera 7's row");
+        reconcile(&args)
+            .await
+            .expect("the pass after a running camera's row stops reading");
+        let kept = running() == vec![7, 8] && !supervisor_ended(&args.handles, 7);
+        let running_camera_issue = unreadable(health.rollup().await);
         abort_all(&args.handles);
 
         pass.expect("a pass over a store with one unreadable row");
@@ -3080,5 +3093,15 @@ mod tests {
         );
         assert_eq!(running_after, vec![7, 8], "the saved row runs");
         assert_eq!(after, None, "a row that reads again is not reported");
+        assert!(
+            kept,
+            "a running camera whose row stops reading keeps running"
+        );
+        let issue = running_camera_issue.expect("its row is on the roll-up");
+        assert!(
+            issue.detail.ends_with(": 7"),
+            "names the camera: {}",
+            issue.detail
+        );
     }
 }

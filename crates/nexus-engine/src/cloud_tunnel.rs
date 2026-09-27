@@ -2080,7 +2080,7 @@ pub struct EngineHealth {
     live_view: Arc<crate::live_view::LiveViewManager>,
     /// The running supervisors, as the reconciler keeps them.
     supervisors: crate::reconciler::HandleMap,
-    /// The camera rows the reconciler could not read.
+    /// The camera rows boot's or the reconciler's last read could not decode.
     unreadable_cameras: Arc<parking_lot::Mutex<Vec<nexus_types::CameraId>>>,
     /// What the store reads [`recorder_issue`] makes have returned.
     last_read: parking_lot::Mutex<LastRead>,
@@ -2195,9 +2195,11 @@ fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegr
     })
 }
 
-/// The camera rows the reconciler could not read, as one issue. Such a
-/// camera does not run, and no other issue names it: the read that skips
-/// its row succeeds.
+/// The camera rows boot or the reconciler could not read
+/// ([`crate::reconciler::ReconcilerArgs::unreadable_cameras`]), as one issue.
+/// No change to such a camera applies, and no other issue names it: the read
+/// that skips its row succeeds. The console's camera list, which reads every
+/// row, fails meanwhile, so the detail names the calls that clear it.
 fn unreadable_cameras_issue(ids: &[nexus_types::CameraId]) -> Option<EdgeDegradation> {
     if ids.is_empty() {
         return None;
@@ -2211,8 +2213,9 @@ fn unreadable_cameras_issue(ids: &[nexus_types::CameraId]) -> Option<EdgeDegrada
         component: "store".to_string(),
         code: "camera_config_unreadable".to_string(),
         detail: truncate_detail(&format!(
-            "this engine build cannot read the stored configuration of {} camera(s), so they \
-             do not run and nothing on them is detected, alerted on or recorded: {list}",
+            "this engine build cannot read the stored configuration of {} camera(s). A camera \
+             not already running does not start, and one running keeps its last configuration, \
+             until it is saved again (PUT /api/v1/cameras/{{id}}) or deleted: {list}",
             ids.len(),
         )),
     })

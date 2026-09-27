@@ -3244,10 +3244,12 @@ pub struct CameraConfig {
 impl CameraConfig {
     /// Refuse a float that is not a finite number: `inf`, `nan`, or a number
     /// beyond f32's range, which parses to infinity. JSON has no literal for
-    /// one, so `serde_json` stores it as `null`, and a camera row holding
-    /// that fails every later read of the camera list. Every write that
-    /// takes a camera from outside checks this first: the config file at
-    /// load, and the admin API's and fleet apply's camera writes.
+    /// one, so `serde_json` stores it as `null`, and no later read can decode
+    /// a camera row holding that: the engine cannot apply the camera's stored
+    /// configuration, and every read of the whole camera list, such as the
+    /// console's, fails. Every write that takes a camera from outside checks
+    /// this first: the config file at load, and the admin API's and fleet
+    /// apply's camera writes.
     pub fn validate_finite(&self) -> Result<(), String> {
         for zone in &self.zones {
             if zone
@@ -4750,7 +4752,7 @@ tile_trigger = 12
     /// The config file seeds the store's camera rows, and a camera number
     /// JSON has no literal for (TOML's `inf` and `nan`, or `1e39`, which is
     /// beyond f32's range and parses to infinity) is stored as `null`, which
-    /// fails every later read of the camera list. So load refuses one,
+    /// no later read of the camera's row can decode. So load refuses one,
     /// wherever a camera carries a float.
     #[test]
     fn a_camera_number_json_cannot_hold_is_refused_at_load() {
