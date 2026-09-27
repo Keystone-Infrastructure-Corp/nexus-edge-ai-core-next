@@ -2899,19 +2899,15 @@ mod tests {
     /// A supervisor that ended on its own analyses nothing until a pass
     /// restarts it, and the only thing that announced it, a
     /// `PIPELINE_STATUS` `Stopped` with no subscriber, reached no surface.
-    /// The health roll-up both surfaces report reads the same handle map
-    /// this module does, so it names the camera until the restart.
+    /// The health roll-up both surfaces report is built from these args, so
+    /// it reads the handle map this module keeps and names the camera until
+    /// the restart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_exited_supervisor_is_on_the_health_roll_up_until_it_is_restarted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let recorder = ScriptedRecorder::new(&[(7, SourceScript::EndsOnce)]);
         let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
-        let health = crate::cloud_tunnel::EngineHealth::new(
-            args.recorder.clone(),
-            args.store.clone(),
-            args.live_view.clone(),
-            args.handles.clone(),
-        );
+        let health = crate::cloud_tunnel::EngineHealth::new(&args);
         let stopped = |h: nexus_cloud_protocol::v1::EdgeHealth| {
             h.issues
                 .into_iter()
@@ -2947,6 +2943,32 @@ mod tests {
         assert_eq!(
             after_restart, None,
             "a restarted supervisor is not reported"
+        );
+    }
+
+    /// The feature gate, stated per build, on the roll-up `main` builds from
+    /// these args: a stub behind an enabled camera is reported only by a
+    /// `gstreamer` build, where a real recorder was available.
+    #[tokio::test]
+    async fn only_a_gstreamer_build_raises_the_recorder_issue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = reconciler_args(ScriptedRecorder::new(&[]), dir.path(), &[cam(None)]).await;
+        args.recorder = Arc::new(nexus_pipeline::StubClipRecorder::new(
+            args.store.clone(),
+            dir.path().join("clips"),
+        ));
+        let recorder_issue = crate::cloud_tunnel::EngineHealth::new(&args)
+            .rollup()
+            .await
+            .issues
+            .unwrap_or_default()
+            .into_iter()
+            .find(|i| i.component == "recorder");
+        assert_eq!(
+            recorder_issue.is_some(),
+            cfg!(feature = "gstreamer"),
+            "a gstreamer build must report a stub recorder behind an enabled camera, \
+             and a build without the feature must not",
         );
     }
 }

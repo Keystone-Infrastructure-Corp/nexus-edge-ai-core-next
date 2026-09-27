@@ -2086,20 +2086,17 @@ pub struct EngineHealth {
 }
 
 impl EngineHealth {
-    /// A real recorder was available iff this is a `gstreamer` build (see
-    /// [`recorder_issue`]).
-    pub(crate) fn new(
-        recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
-        store: Arc<Store>,
-        live_view: Arc<crate::live_view::LiveViewManager>,
-        supervisors: crate::reconciler::HandleMap,
-    ) -> Self {
+    /// The roll-up over what the reconciler runs the cameras with: its
+    /// recorder, store, live-view manager and supervisor map, so `main`
+    /// cannot hand it a copy of any of them. A real recorder was available
+    /// iff this is a `gstreamer` build (see [`recorder_issue`]).
+    pub(crate) fn new(reconciler: &crate::reconciler::ReconcilerArgs) -> Self {
         Self::with_real_recorder(
             cfg!(feature = "gstreamer"),
-            recorder,
-            store,
-            live_view,
-            supervisors,
+            reconciler.recorder.clone(),
+            reconciler.store.clone(),
+            reconciler.live_view.clone(),
+            reconciler.handles.clone(),
         )
     }
 
@@ -2743,39 +2740,6 @@ mod health_tests {
             started.elapsed(),
         );
         drop(held);
-    }
-
-    /// The feature gate, stated per build: only a `gstreamer` build, where
-    /// a real recorder was available, raises the issue.
-    #[tokio::test]
-    async fn only_a_gstreamer_build_raises_the_recorder_issue() {
-        let (store, dir) = default_config_store(true).await;
-        let store = Arc::new(store);
-        let health = EngineHealth::new(
-            Arc::new(StubClipRecorder::new(
-                store.clone(),
-                dir.path().join("clips"),
-            )),
-            store,
-            crate::live_view::LiveViewManager::new(
-                Arc::new(nexus_pipeline::LatestFrameCache::new()),
-                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
-            ),
-            crate::reconciler::HandleMap::default(),
-        );
-        let recorder_issue = health
-            .rollup()
-            .await
-            .issues
-            .unwrap_or_default()
-            .into_iter()
-            .find(|i| i.component == "recorder");
-        assert_eq!(
-            recorder_issue.is_some(),
-            cfg!(feature = "gstreamer"),
-            "a gstreamer build must report a stub recorder behind an enabled camera, \
-             and a build without the feature must not",
-        );
     }
 
     /// A real recorder behind an enabled camera is the healthy case.
@@ -3734,7 +3698,8 @@ mod heartbeat_ack_tests {
     #[tokio::test]
     async fn sending_a_heartbeat_is_not_proof_the_cloud_received_it() {
         let (store, dir) = test_store().await;
-        let health = EngineHealth::new(
+        let health = EngineHealth::with_real_recorder(
+            false,
             Arc::new(nexus_pipeline::StubClipRecorder::new(
                 store.clone(),
                 dir.path().join("clips"),
