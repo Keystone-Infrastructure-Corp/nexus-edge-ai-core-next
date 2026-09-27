@@ -181,8 +181,9 @@ pub fn pick_tiles(
 /// Extract the ROI sub-region of `parent` as a fresh `Frame`.
 ///
 /// The returned `Frame` carries the same `camera_id`, `frame_id`,
-/// `captured_at`, `format`, and `trace_id` as the parent — those
-/// are properties of the *capture moment*, not the spatial extent.
+/// `captured_at`, `captured_mono`, `format`, and `trace_id` as the
+/// parent — those are properties of the *capture moment*, not the
+/// spatial extent.
 /// `width`/`height` are the crop dimensions, NOT the parent's.
 ///
 /// Allocates a fresh `Vec<u8>` for the crop's pixel data because
@@ -230,6 +231,7 @@ pub fn crop_to_tile_rgb(parent: &Frame, roi: TileRoi) -> Result<Frame, TileError
         camera_id: parent.camera_id,
         frame_id: parent.frame_id,
         captured_at: parent.captured_at,
+        captured_mono: parent.captured_mono,
         width: roi.w,
         height: roi.h,
         format: parent.format,
@@ -293,6 +295,7 @@ mod tests {
             camera_id: 11,
             frame_id: 1,
             captured_at: Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,
@@ -323,6 +326,7 @@ mod tests {
             camera_id: 11,
             frame_id: 1,
             captured_at: Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,

@@ -98,6 +98,7 @@ fn frame(frame_id: u64) -> Frame {
         camera_id: 1,
         frame_id,
         captured_at: Utc.timestamp_millis_opt(frame_id as i64 * 33).unwrap(),
+        captured_mono: std::time::Instant::now(),
         width: FRAME_W,
         height: FRAME_H,
         format: PixelFormat::Rgb24,

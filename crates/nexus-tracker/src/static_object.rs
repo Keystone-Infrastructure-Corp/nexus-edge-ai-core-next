@@ -655,6 +655,7 @@ mod tests {
             camera_id,
             frame_id,
             captured_at: Utc.timestamp_millis_opt(ms).unwrap(),
+            captured_mono: std::time::Instant::now(),
             width: 1920,
             height: 1080,
             format: PixelFormat::Rgb24,

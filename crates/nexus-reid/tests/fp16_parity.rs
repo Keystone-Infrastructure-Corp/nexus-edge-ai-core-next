@@ -64,6 +64,7 @@ fn frame(w: u32, h: u32, color: [u8; 3]) -> Frame {
         camera_id: 1,
         frame_id: 1,
         captured_at: chrono::Utc::now(),
+        captured_mono: std::time::Instant::now(),
         width: w,
         height: h,
         format: PixelFormat::Rgb24,

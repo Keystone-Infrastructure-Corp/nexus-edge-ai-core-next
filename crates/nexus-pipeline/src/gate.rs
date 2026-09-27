@@ -189,6 +189,7 @@ mod tests {
             camera_id: 1,
             frame_id: i as u64,
             captured_at: base + chrono::Duration::microseconds(i * FRAME_INTERVAL_US),
+            captured_mono: std::time::Instant::now(),
             width: 64,
             height: 64,
             format: PixelFormat::Rgb24,

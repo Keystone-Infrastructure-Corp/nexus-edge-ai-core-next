@@ -104,6 +104,9 @@ impl WireFrame {
             camera_id: self.camera_id,
             frame_id: self.frame_id,
             captured_at: self.captured_at,
+            // Process-local, so it does not cross the pipe. The worker's
+            // copy only feeds the detector, which reads no clock.
+            captured_mono: std::time::Instant::now(),
             width: self.width,
             height: self.height,
             format: self.format,

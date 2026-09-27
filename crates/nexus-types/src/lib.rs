@@ -20,6 +20,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -121,7 +122,13 @@ pub enum PixelFormat {
 pub struct Frame {
     pub camera_id: CameraId,
     pub frame_id: FrameId,
+    /// Wall-clock capture time: what a person or the cloud is shown.
     pub captured_at: DateTime<Utc>,
+    /// The monotonic clock, read beside `captured_at`. Every duration
+    /// between frames is measured on this, because the wall clock moves
+    /// when it is stepped (an NTP sync on a box without an RTC). It is
+    /// process-local, so a `Frame` is never serialized.
+    pub captured_mono: Instant,
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
@@ -1003,6 +1010,7 @@ mod tests {
             camera_id: 1,
             frame_id: 1,
             captured_at: Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: 2,
             height: 1,
             format,

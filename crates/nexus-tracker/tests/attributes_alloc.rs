@@ -85,6 +85,7 @@ fn frame(i: u64) -> Frame {
         captured_at: Utc
             .timestamp_millis_opt(1_700_000_000_000 + i as i64 * 33)
             .unwrap(),
+        captured_mono: std::time::Instant::now(),
         width: W,
         height: H,
         format: PixelFormat::Rgb24,

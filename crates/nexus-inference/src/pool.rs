@@ -163,6 +163,7 @@ mod tests {
             camera_id: 1,
             frame_id: 0,
             captured_at: chrono::Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: 640,
             height: 480,
             format: nexus_types::PixelFormat::Rgb24,

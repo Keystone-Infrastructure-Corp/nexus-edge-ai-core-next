@@ -1158,6 +1158,7 @@ async fn run_session(
                         camera_id,
                         frame_id,
                         captured_at: Utc::now(),
+                        captured_mono: Instant::now(),
                         width: info.width(),
                         height: info.height(),
                         format: PixelFormat::Rgb24,

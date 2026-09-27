@@ -73,6 +73,7 @@ fn synth_frame(w: u32, h: u32) -> Frame {
         camera_id: 1,
         frame_id: 1,
         captured_at: Utc::now(),
+        captured_mono: std::time::Instant::now(),
         width: w,
         height: h,
         format: PixelFormat::Rgb24,

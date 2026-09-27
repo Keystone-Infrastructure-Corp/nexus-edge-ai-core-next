@@ -773,6 +773,7 @@ mod tests {
             camera_id: 1,
             frame_id: 1,
             captured_at: chrono::Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: 2,
             height: 1,
             format,

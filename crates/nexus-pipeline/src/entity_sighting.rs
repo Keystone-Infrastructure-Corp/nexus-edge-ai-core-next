@@ -450,6 +450,7 @@ mod tests {
             camera_id,
             frame_id: 1,
             captured_at,
+            captured_mono: std::time::Instant::now(),
             width: 960,
             height: 540,
             format: PixelFormat::Rgb24,
