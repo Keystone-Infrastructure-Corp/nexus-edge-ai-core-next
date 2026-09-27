@@ -304,7 +304,8 @@ pub struct TrackedObject {
     pub detection_bbox: Option<BBox>,
     /// Frames since this track was first seen.
     pub age_frames: u32,
-    /// Wall-clock age of the track in milliseconds.
+    /// Age of the track in milliseconds of frame time: this frame's
+    /// `captured_at` minus that of the frame the track was first seen on.
     pub age_ms: u64,
     /// Tracker + annotator outputs (motion.speed_class, dwell.zone_state, …).
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]

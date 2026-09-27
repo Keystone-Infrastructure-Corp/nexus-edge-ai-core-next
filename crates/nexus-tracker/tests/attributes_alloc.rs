@@ -169,7 +169,7 @@ fn run(parking_lot_mode: bool) -> [f64; 4] {
     for i in 0..WARMUP + FRAMES {
         let f = frame(i);
         let dets = detections(i);
-        let (mut tracked, a) = allocs(|| tracker.update(dets));
+        let (mut tracked, a) = allocs(|| tracker.update(dets, f.captured_at));
         let anchors: Vec<_> = sf
             .as_ref()
             .map(|s| s.anchors().to_vec())

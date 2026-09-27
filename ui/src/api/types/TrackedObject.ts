@@ -15,7 +15,8 @@ detection_bbox: BBox | null,
  */
 age_frames: number, 
 /**
- * Wall-clock age of the track in milliseconds.
+ * Age of the track in milliseconds of frame time: this frame's
+ * `captured_at` minus that of the frame the track was first seen on.
  */
 age_ms: bigint, 
 /**

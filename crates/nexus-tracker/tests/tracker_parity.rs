@@ -2,6 +2,7 @@
 //! switching `tracker.backend` changes association quality, never what a rule
 //! or sink can read. Each test runs the same detections through both.
 
+use chrono::{DateTime, Duration, Utc};
 use nexus_config::{TrackerBackendKind, TrackerConfig};
 use nexus_tracker::{build_tracker, Tracker};
 use nexus_types::{BBox, Detection, TrackedObject};
@@ -12,6 +13,11 @@ fn tracker(backend: TrackerBackendKind) -> Box<dyn Tracker> {
         backend,
         ..Default::default()
     })
+}
+
+/// Frame `i` of a 10 fps camera.
+fn at(i: u32) -> DateTime<Utc> {
+    DateTime::UNIX_EPOCH + Duration::milliseconds(i64::from(i) * 100)
 }
 
 fn det(label: &str, x: f32, attributes: Map<String, Value>) -> Detection {
@@ -57,8 +63,8 @@ fn both_trackers_carry_this_frames_detection_attributes() {
             ),
             det("vehicle.car", 400.0 + x, Map::new()),
         ];
-        let from_iou = iou.update(dets.clone());
-        let from_byte = byte.update(dets.clone());
+        let from_iou = iou.update(dets.clone(), at(i));
+        let from_byte = byte.update(dets.clone(), at(i));
         for d in &dets {
             let a = by_detection(&from_iou, &d.bbox);
             let b = by_detection(&from_byte, &d.bbox);
@@ -78,5 +84,42 @@ fn both_trackers_carry_this_frames_detection_attributes() {
                 d.label
             );
         }
+    }
+}
+
+/// `age_ms` is how long the camera has watched the object: the difference
+/// between two frames' capture times, whatever the wall clock did while they
+/// were processed. This loop runs far faster than the 10 fps it replays.
+#[test]
+fn both_trackers_age_tracks_in_frame_time() {
+    for backend in [TrackerBackendKind::IouNaive, TrackerBackendKind::Bytetrack] {
+        let t = tracker(backend);
+        for i in 0..5u32 {
+            let out = t.update(vec![det("person", 10.0 + i as f32, Map::new())], at(i));
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].age_ms, u64::from(i) * 100, "{backend:?} frame {i}");
+        }
+    }
+}
+
+/// `captured_at` is wall-clock, so it can step backwards (an NTP correction).
+/// The track survives, and its age holds at zero until the clock passes its
+/// first frame again: an unclamped negative elapsed time cast to `u64` is
+/// about 1.8e19 ms, old enough for every `min_track_age_ms` gate.
+#[test]
+fn a_clock_stepped_back_keeps_the_track_and_holds_its_age_at_zero() {
+    for backend in [TrackerBackendKind::IouNaive, TrackerBackendKind::Bytetrack] {
+        let t = tracker(backend);
+        let first = t.update(vec![det("person", 10.0, Map::new())], at(10));
+        let back = t.update(vec![det("person", 11.0, Map::new())], at(0));
+        assert_eq!(back.len(), 1, "{backend:?}");
+        assert_eq!(
+            back[0].track_id, first[0].track_id,
+            "{backend:?}: a backward clock step dropped the track"
+        );
+        assert_eq!(
+            back[0].age_ms, 0,
+            "{backend:?}: age after a backward clock step"
+        );
     }
 }

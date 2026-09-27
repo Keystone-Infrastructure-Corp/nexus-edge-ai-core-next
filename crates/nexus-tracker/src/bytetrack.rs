@@ -28,8 +28,7 @@
 //! one instance is owned per camera, so no `cameraId` map is needed
 //! — state lives behind a single `Mutex<ByteTrackState>` here.
 
-use std::time::Instant;
-
+use chrono::{DateTime, Utc};
 use nexus_config::ByteTrackConfig;
 use nexus_types::{BBox, Detection, TrackId, TrackedObject};
 use parking_lot::Mutex;
@@ -58,7 +57,7 @@ struct TrackState {
     age_frames: u32,
     hit_streak: u32,
     missed_frames: u32,
-    born_at: Instant,
+    born_at: DateTime<Utc>,
     lifecycle: Lifecycle,
     /// The attributes of the detection this track matched on the current
     /// frame, moved into the emitted object. Empty on a predicted-only
@@ -89,9 +88,12 @@ impl ByteTrackTracker {
 }
 
 impl Tracker for ByteTrackTracker {
-    fn update(&self, mut detections: Vec<Detection>) -> Vec<TrackedObject> {
+    fn update(
+        &self,
+        mut detections: Vec<Detection>,
+        captured_at: DateTime<Utc>,
+    ) -> Vec<TrackedObject> {
         let cfg = &self.cfg;
-        let now = Instant::now();
         let mut state = self.inner.lock();
 
         // ---- 1. Predict + age. ----
@@ -175,7 +177,7 @@ impl Tracker for ByteTrackTracker {
                 age_frames: 1,
                 hit_streak: 1,
                 missed_frames: 0,
-                born_at: now,
+                born_at: captured_at,
                 lifecycle,
                 attributes: std::mem::take(&mut d.attributes),
             });
@@ -221,7 +223,10 @@ impl Tracker for ByteTrackTracker {
                     // matched, so t.bbox == d.bbox); None when predicted-only.
                     detection_bbox: (t.missed_frames == 0).then_some(t.bbox),
                     age_frames: t.age_frames,
-                    age_ms: now.duration_since(t.born_at).as_millis() as u64,
+                    age_ms: captured_at
+                        .signed_duration_since(t.born_at)
+                        .num_milliseconds()
+                        .max(0) as u64,
                     attributes: attrs,
                 }
             })
@@ -397,6 +402,8 @@ fn associate_pass(
 mod tests {
     use super::*;
 
+    const T: DateTime<Utc> = DateTime::UNIX_EPOCH;
+
     fn det(label: &str, x: f32, conf: f32) -> Detection {
         Detection {
             label: label.into(),
@@ -418,8 +425,8 @@ mod tests {
     #[test]
     fn high_conf_detection_creates_track_and_keeps_id() {
         let t = ByteTrackTracker::new(cfg_default());
-        let f1 = t.update(vec![det("person", 0.0, 0.9)]);
-        let f2 = t.update(vec![det("person", 1.0, 0.9)]);
+        let f1 = t.update(vec![det("person", 0.0, 0.9)], T);
+        let f2 = t.update(vec![det("person", 1.0, 0.9)], T);
         assert_eq!(f1.len(), 1);
         assert_eq!(f2.len(), 1);
         assert_eq!(f1[0].track_id, f2[0].track_id);
@@ -429,11 +436,11 @@ mod tests {
     #[test]
     fn label_change_starts_new_track() {
         let t = ByteTrackTracker::new(cfg_default());
-        let f1 = t.update(vec![det("person", 0.0, 0.9)]);
+        let f1 = t.update(vec![det("person", 0.0, 0.9)], T);
         // Frame 2 has only a `dog` detection at the same coords. The
         // existing person track stays alive (now lost) and a new dog
         // track spawns. The contract is: distinct ids per label.
-        let f2 = t.update(vec![det("dog", 0.0, 0.9)]);
+        let f2 = t.update(vec![det("dog", 0.0, 0.9)], T);
         let person_id = f1
             .iter()
             .find(|o| o.label == "person")
@@ -454,11 +461,11 @@ mod tests {
         cfg.low_confidence = 0.1;
         let t = ByteTrackTracker::new(cfg);
 
-        let f1 = t.update(vec![det("person", 0.0, 0.9)]);
+        let f1 = t.update(vec![det("person", 0.0, 0.9)], T);
         // Simulate occlusion: only a low-confidence detection survives,
         // and slightly to the right. ByteTrack's second pass should keep
         // the track alive with the same id.
-        let f2 = t.update(vec![det("person", 1.0, 0.2)]);
+        let f2 = t.update(vec![det("person", 1.0, 0.2)], T);
         assert_eq!(f1.len(), 1);
         assert_eq!(f2.len(), 1);
         assert_eq!(f1[0].track_id, f2[0].track_id);
@@ -470,18 +477,18 @@ mod tests {
         cfg.max_lost_frames = 2;
         let t = ByteTrackTracker::new(cfg);
 
-        let f1 = t.update(vec![det("person", 0.0, 0.9)]);
+        let f1 = t.update(vec![det("person", 0.0, 0.9)], T);
         assert_eq!(f1[0].attributes["tracking.lifecycle"], "confirmed");
 
         // Frame with no detections — track ages and demotes to lost.
-        let f2 = t.update(vec![]);
+        let f2 = t.update(vec![], T);
         assert_eq!(f2.len(), 1);
         assert_eq!(f2[0].attributes["tracking.lifecycle"], "lost");
         assert_eq!(f2[0].attributes["tracking.predicted_only"], true);
 
         // Two more empty frames push past max_lost_frames=2 → retired.
-        let _ = t.update(vec![]);
-        let f4 = t.update(vec![]);
+        let _ = t.update(vec![], T);
+        let f4 = t.update(vec![], T);
         assert!(
             f4.is_empty(),
             "track should retire after max_lost_frames empty frames"
@@ -496,13 +503,13 @@ mod tests {
 
         // First two hits — track exists internally but is Tentative,
         // so it's filtered out of the emit list.
-        let f1 = t.update(vec![det("person", 0.0, 0.9)]);
+        let f1 = t.update(vec![det("person", 0.0, 0.9)], T);
         assert!(f1.is_empty(), "tentative track must not emit");
-        let f2 = t.update(vec![det("person", 1.0, 0.9)]);
+        let f2 = t.update(vec![det("person", 1.0, 0.9)], T);
         assert!(f2.is_empty(), "still tentative");
 
         // Third hit promotes to confirmed.
-        let f3 = t.update(vec![det("person", 2.0, 0.9)]);
+        let f3 = t.update(vec![det("person", 2.0, 0.9)], T);
         assert_eq!(f3.len(), 1);
         assert_eq!(f3[0].attributes["tracking.lifecycle"], "confirmed");
     }
@@ -511,13 +518,13 @@ mod tests {
     fn velocity_ema_predicts_motion() {
         let t = ByteTrackTracker::new(cfg_default());
         // Three frames of consistent rightward drift establish velocity.
-        let _ = t.update(vec![det("person", 0.0, 0.9)]);
-        let _ = t.update(vec![det("person", 5.0, 0.9)]);
-        let _ = t.update(vec![det("person", 10.0, 0.9)]);
+        let _ = t.update(vec![det("person", 0.0, 0.9)], T);
+        let _ = t.update(vec![det("person", 5.0, 0.9)], T);
+        let _ = t.update(vec![det("person", 10.0, 0.9)], T);
         // Now skip a frame (no detection). Internally the bbox should be
         // predicted forward so a detection at x=20 still matches via IoU.
-        let _ = t.update(vec![]);
-        let f5 = t.update(vec![det("person", 20.0, 0.9)]);
+        let _ = t.update(vec![], T);
+        let f5 = t.update(vec![det("person", 20.0, 0.9)], T);
         assert_eq!(f5.len(), 1, "velocity prediction should keep the match");
     }
 
@@ -526,7 +533,7 @@ mod tests {
         let mut cfg = cfg_default();
         cfg.low_confidence = 0.3;
         let t = ByteTrackTracker::new(cfg);
-        let out = t.update(vec![det("person", 0.0, 0.05)]);
+        let out = t.update(vec![det("person", 0.0, 0.05)], T);
         assert!(out.is_empty(), "below low_confidence → no track");
     }
 
@@ -539,10 +546,10 @@ mod tests {
         cfg.display_smoothing_alpha = 0.5;
         cfg.max_lost_frames = 2;
         let t = ByteTrackTracker::new(cfg);
-        let _ = t.update(vec![det("person", 0.0, 0.9)]);
+        let _ = t.update(vec![det("person", 0.0, 0.9)], T);
         // Object moved to x=3. The emitted (smoothed) bbox lags between 0
         // and 3; detection_bbox must equal the raw detection (x1 == 3.0).
-        let f2 = t.update(vec![det("person", 3.0, 0.9)]);
+        let f2 = t.update(vec![det("person", 3.0, 0.9)], T);
         let p = f2
             .iter()
             .find(|o| o.label == "person")
@@ -558,7 +565,7 @@ mod tests {
 
         // Predicted-only frame (no detection): detection_bbox is None while
         // the track is still emitted with a predicted `bbox`.
-        let f3 = t.update(vec![]);
+        let f3 = t.update(vec![], T);
         let p = f3
             .iter()
             .find(|o| o.label == "person")
@@ -575,17 +582,17 @@ mod tests {
         let t = ByteTrackTracker::new(cfg_default());
         let mut d = det("person", 0.0, 0.9);
         d.attributes.insert("ppe.hardhat".into(), json!(true));
-        let f1 = t.update(vec![d]);
+        let f1 = t.update(vec![d], T);
         assert_eq!(f1[0].attributes["ppe.hardhat"], true);
         assert_eq!(f1[0].attributes["tracking.lifecycle"], "confirmed");
 
         // Predicted-only: no detection this frame, so nothing describes it.
-        let f2 = t.update(vec![]);
+        let f2 = t.update(vec![], T);
         assert_eq!(f2[0].attributes["tracking.predicted_only"], true);
         assert!(!f2[0].attributes.contains_key("ppe.hardhat"));
 
         // Re-matched by a detection without the attribute: none carried over.
-        let f3 = t.update(vec![det("person", 1.0, 0.9)]);
+        let f3 = t.update(vec![det("person", 1.0, 0.9)], T);
         assert_eq!(f3[0].track_id, f1[0].track_id);
         assert!(!f3[0].attributes.contains_key("ppe.hardhat"));
     }
@@ -595,12 +602,12 @@ mod tests {
         let mut cfg = cfg_default();
         cfg.display_smoothing_alpha = 0.5;
         let t = ByteTrackTracker::new(cfg);
-        let _ = t.update(vec![det("person", 0.0, 0.9)]);
+        let _ = t.update(vec![det("person", 0.0, 0.9)], T);
         // Detection drifts a bit — small enough to keep the IoU match
         // (default match_iou_threshold = 0.3) but big enough that the
         // smoothed display bbox lands strictly between the prior and
         // the new bbox.
-        let f2 = t.update(vec![det("person", 3.0, 0.9)]);
+        let f2 = t.update(vec![det("person", 3.0, 0.9)], T);
         let person = f2
             .iter()
             .find(|o| o.label == "person")
@@ -671,8 +678,8 @@ mod tests {
         let t_b = ByteTrackTracker::new(cfg_bucketed);
 
         for (i, frame) in frames.iter().enumerate() {
-            let out_n = t_n.update(frame.clone());
-            let out_b = t_b.update(frame.clone());
+            let out_n = t_n.update(frame.clone(), T);
+            let out_b = t_b.update(frame.clone(), T);
             assert_eq!(
                 out_n.len(),
                 out_b.len(),
@@ -707,8 +714,8 @@ mod tests {
         let mut cfg = cfg_default();
         cfg.spatial_bucket_size_px = Some(0);
         let t = ByteTrackTracker::new(cfg);
-        let f1 = t.update(vec![det("person", 0.0, 0.9)]);
-        let f2 = t.update(vec![det("person", 1.0, 0.9)]);
+        let f1 = t.update(vec![det("person", 0.0, 0.9)], T);
+        let f2 = t.update(vec![det("person", 1.0, 0.9)], T);
         assert_eq!(f1.len(), 1);
         assert_eq!(f2.len(), 1);
         assert_eq!(f1[0].track_id, f2[0].track_id);

@@ -166,8 +166,8 @@ fn rule(id: &str, when: &str) -> RuleConfig {
             severity: "low".into(),
         },
         gates: RuleGates::default(),
-        // ByteTrack's age_ms is wall-clock and this loop runs far faster than
-        // real time; the default 500 ms would skip every object.
+        // Evaluate every object from its first frame; this bound is about
+        // binding cost, not the age gate.
         debounce: RuleDebounce {
             min_track_age_ms: 0,
             ..Default::default()
@@ -195,7 +195,7 @@ fn scenario() -> Vec<(Frame, Vec<TrackedObject>)> {
     let mut out = Vec::new();
     for i in 0..WARMUP + FRAMES {
         let f = frame(i);
-        let mut tracked = tracker.update(detections(i));
+        let mut tracked = tracker.update(detections(i), f.captured_at);
         annotator.annotate(&f, &zones, &[], &mut tracked);
         if i >= WARMUP {
             assert_eq!(tracked.len(), PERSONS + VEHICLES);
@@ -313,7 +313,7 @@ fn whole_path_census_with_two_rules() {
     for i in 0..WARMUP + FRAMES {
         let f = frame(i);
         let dets = detections(i);
-        let (mut tracked, a) = allocs(|| tracker.update(dets));
+        let (mut tracked, a) = allocs(|| tracker.update(dets, f.captured_at));
         let ((), b) = allocs(|| annotator.annotate(&f, &zones, &[], &mut tracked));
         let (decisions, c) = allocs(|| emitter.tick(1, &tracked, f.captured_at));
         let (events, d) = allocs(|| evaluator.evaluate(1, i, &trace_id, W, H, &zones, &tracked));

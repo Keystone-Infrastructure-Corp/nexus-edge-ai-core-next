@@ -934,7 +934,7 @@ async fn run_camera(
 
                 let mut tracked = {
                     let _g = info_span!("frame.track", tracker = tracker.name()).entered();
-                    tracker.update(detections)
+                    tracker.update(detections, frame.captured_at)
                 };
                 // M_PERF_CROWD Phase E1 — feed the post-tracker
                 // tracked-object count back into the skip policy's EMA so
