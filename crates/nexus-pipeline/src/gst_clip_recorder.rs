@@ -3409,6 +3409,75 @@ mod tests {
         );
     }
 
+    /// Taking a substream session up zeroes the camera's decode counters,
+    /// which then describe another geometry, but must not retire the camera:
+    /// `DecodeHealthRegistry::clear` is for a stopped camera, whose next
+    /// ingester claims it back, and nothing claims a running camera back, so
+    /// the probes of the session it now reads would go unrecorded until it
+    /// restarts. Both registrations a running source takes up: a first one,
+    /// which the recorder resets for itself, and a retry of a session the
+    /// fallback shut down, which only the take-up resets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_taken_up_substream_session_keeps_recording_the_cameras_decode_health() {
+        for retry in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (rec, main, mut frames, task) =
+                a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+            if retry {
+                // A session the fallback shut down, which stays registered
+                // until a retry replaces it. Shut down before it is
+                // registered, so the running source never reads it.
+                let fell_back = PreRollIngester::new_with_rgb(
+                    7,
+                    SUBSTREAM,
+                    0,
+                    CodecKind::H264,
+                    crate::decode::DecodeMode::default(),
+                    15,
+                    512,
+                    288,
+                    None,
+                )
+                .unwrap();
+                fell_back.shutdown();
+                rec.analysis_ingesters.write().insert(7, fell_back);
+            }
+            rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+                .expect("analysis session registers");
+            let session = rec.analysis_ingesters.read()[&7].clone();
+            let tap = session.rgb_tap_sender().expect("rgb tap");
+            let health = rec.decode_health.clone().expect("decode health");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let delivered = loop {
+                let _ = tap.send(rgb_frame());
+                if frames.try_recv().is_ok() {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            // The taken-up session's decoder, as its probe records a frame.
+            health.observe_decoder_output(7);
+            let recorded = health.snapshot(7).map(|h| h.decoder_output_frames);
+            task.abort();
+            session.shutdown();
+            main.shutdown();
+            assert!(
+                delivered,
+                "retry={retry}: precondition: the running source never took the session up"
+            );
+            assert_eq!(
+                recorded,
+                Some(1),
+                "retry={retry}: taking the session up retired the camera, so the decode \
+                 health of the session analysis now reads is never recorded"
+            );
+        }
+    }
+
     /// The same retry when the substream stays silent: the source must keep
     /// analysing the main stream while it waits, and give the session up
     /// (shut it down, and report it unavailable) once the first-frame grace
