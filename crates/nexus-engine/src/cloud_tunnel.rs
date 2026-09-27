@@ -2151,9 +2151,10 @@ impl EngineHealth {
 }
 
 /// The cameras [`EngineHealth::exited_supervisors`] finds, as one issue. The
-/// reconciler restarts each on its next pass; until then the camera
-/// detects, alerts and opens motion clips for nothing, and without this
-/// issue it reads only as offline, like a camera that is unreachable.
+/// reconciler restarts each on its next pass that reads the camera list;
+/// until then nothing on the camera is detected, alerted on or saved as a
+/// motion clip, and without this issue it reads only as offline, like a
+/// camera that is unreachable.
 fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegradation> {
     if exited.is_empty() {
         return None;
@@ -2167,9 +2168,9 @@ fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegr
         component: "pipeline".to_string(),
         code: "camera_pipeline_stopped".to_string(),
         detail: truncate_detail(&format!(
-            "the analysis pipeline of {} camera(s) exited without being stopped, so they \
-             detect, alert and open motion clips for nothing until the engine restarts them \
-             on its next supervision pass: {ids}",
+            "the analysis pipeline of {} camera(s) exited without being stopped, so nothing \
+             on them is detected, alerted on or saved as a motion clip until it is restarted: \
+             {ids}",
             exited.len(),
         )),
     })
