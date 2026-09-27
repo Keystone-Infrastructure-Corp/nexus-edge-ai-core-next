@@ -48,7 +48,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkline } from "@/components/ui/sparkline";
 import { useSSE } from "@/hooks/useSSE";
-import { engineHealth, issueCodes } from "@/lib/engineHealth";
+import { engineHealth, issueCodes, issueName } from "@/lib/engineHealth";
 import { ageMs, formatAgo, formatBytes, formatDuration } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/pages/placeholder";
@@ -258,7 +258,7 @@ export function DashboardPage() {
                     <span className="font-medium">{issue.component}</span>
                     {/* Verbatim: a code this UI has no copy for still shows. */}
                     <span className="font-mono text-xs text-muted-foreground">
-                      {issue.code}
+                      {issueName(issue)}
                     </span>
                   </div>
                   {issue.detail ? (

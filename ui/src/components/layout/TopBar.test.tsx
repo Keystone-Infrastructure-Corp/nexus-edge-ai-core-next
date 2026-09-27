@@ -47,7 +47,7 @@ function stubEngine(
   );
 }
 
-function renderTopBar() {
+function renderTopBar(): QueryClient {
   const client = new QueryClient();
   render(
     <QueryClientProvider client={client}>
@@ -56,6 +56,7 @@ function renderTopBar() {
       </AuthProvider>
     </QueryClientProvider>,
   );
+  return client;
 }
 
 afterEach(() => {
@@ -92,6 +93,26 @@ describe("TopBar engine-health pill", () => {
     expect(pill.getAttribute("title")).toBe("recorder_stub");
   });
 
+  it("names the detector kind in the hover text", async () => {
+    // Verbatim from a real engine booted with `kind = "ppe"`: the detail
+    // does not say which kind failed.
+    const ppe = {
+      component: "detector",
+      code: "detector_unavailable",
+      kind: "ppe",
+      detail: "no detector implementation ships for this model kind",
+    };
+    stubEngine(() =>
+      Promise.resolve(json({ status: "degraded", version: "0.1.99", issues: [ppe] })),
+    );
+    renderTopBar();
+
+    const pill = await screen.findByText(/degraded/);
+    expect(pill.getAttribute("title")).toBe(
+      "detector_unavailable (ppe): no detector implementation ships for this model kind",
+    );
+  });
+
   it("says online with the version when the engine reports ok", async () => {
     stubEngine(() =>
       Promise.resolve(json({ status: "ok", version: "0.1.99", issues: [] })),
@@ -107,6 +128,26 @@ describe("TopBar engine-health pill", () => {
 
     expect(await screen.findByText("starting…")).toBeTruthy();
     expect(screen.queryByText(/degraded|online/)).toBeNull();
+  });
+
+  it("says unreachable, not the last answer, when a later request fails", async () => {
+    let answer = () =>
+      Promise.resolve(
+        json({ status: "degraded", version: "0.1.99", issues: [RECORDER_STUB] }),
+      );
+    stubEngine(() => answer());
+    const client = renderTopBar();
+    await screen.findByText(/degraded/);
+
+    answer = () => Promise.resolve(json({ error: "boom" }, 500));
+    void client.refetchQueries({ queryKey: ["health"] });
+
+    expect(
+      await screen.findByText("engine unreachable", undefined, { timeout: 4_000 }),
+    ).toBeTruthy();
+    // The stale answer is still in the cache; the pill did not render it.
+    expect(client.getQueryData(["health"])).toBeDefined();
+    expect(screen.queryByText(/degraded/)).toBeNull();
   });
 
   it("says unreachable when the health query fails", async () => {

@@ -102,6 +102,23 @@ describe("dashboard Engine tile", () => {
     expect(screen.getByText(DETECTOR_UNAVAILABLE.detail)).toBeTruthy();
   });
 
+  it("names the detector kind, which a detector's detail need not", async () => {
+    // Verbatim from a real engine booted with `kind = "ppe"`: the detail
+    // does not say which kind failed, so the row must.
+    const ppe = {
+      component: "detector",
+      code: "detector_unavailable",
+      kind: "ppe",
+      detail: "no detector implementation ships for this model kind",
+    };
+    stubEngine(() =>
+      Promise.resolve(json({ status: "degraded", version: "0.1.99", issues: [ppe] })),
+    );
+    renderDashboard();
+
+    expect(await screen.findByText("detector_unavailable (ppe)")).toBeTruthy();
+  });
+
   it("names the issues when the engine withholds their detail", async () => {
     const withoutDetail = { component: "recorder", code: "recorder_stub" };
     stubEngine(() =>

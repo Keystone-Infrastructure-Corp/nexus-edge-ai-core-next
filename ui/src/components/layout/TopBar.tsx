@@ -14,7 +14,7 @@ import { getHealth } from "@/api/system";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useAuth, useSession } from "@/lib/auth";
-import { engineHealth, issueCodes } from "@/lib/engineHealth";
+import { engineHealth, issueCodes, issueName } from "@/lib/engineHealth";
 import { cn } from "@/lib/utils";
 
 interface CloudStatusResponse {
@@ -70,7 +70,7 @@ export function TopBar() {
   const healthTitle =
     engine.verdict === "degraded"
       ? engine.read.issues
-          .map((i) => (i.detail ? `${i.code}: ${i.detail}` : i.code))
+          .map((i) => (i.detail ? `${issueName(i)}: ${i.detail}` : issueName(i)))
           .join("\n")
       : undefined;
 
