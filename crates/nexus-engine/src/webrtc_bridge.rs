@@ -17,7 +17,8 @@
 //! `Arc<WebRtcBridge>` regardless of features. When the `gstreamer-webrtc`
 //! feature is off every method is a logged no-op. A bridge that cannot publish
 //! (that build, or [`WebRtcBridge::disabled`] behind the stub recorder) is also
-//! kept off the heartbeat: its `hd_sfu` / `hd_moq` capability is omitted (see
+//! kept off the heartbeat: its `hd_sfu` / `hd_moq` capability is omitted, as is
+//! `hd_moq` on a core without the `moqsink` plugin (see
 //! [`WebRtcBridge::can_publish`]).
 
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use nexus_cloud_client::TunnelOutbox;
 use nexus_cloud_protocol::v1::{
     LiveHdAnswerPayload, LiveHdBitratePayload, LiveHdStartPayload, LiveHdStopPayload,
 };
+use nexus_types::HdTransport;
 use tracing::debug;
 
 #[cfg(feature = "gstreamer-webrtc")]
@@ -54,8 +56,8 @@ pub use nexus_pipeline::IngesterRegistry;
 pub struct WebRtcBridge {
     #[cfg(feature = "gstreamer-webrtc")]
     inner: parking_lot::Mutex<Inner>,
-    /// True only for a bridge built by `new`; see [`Self::can_publish`].
-    publishes: bool,
+    /// The HD transports this bridge can publish on; see [`Self::can_publish`].
+    publishes: &'static [HdTransport],
 }
 
 #[cfg(feature = "gstreamer-webrtc")]
@@ -101,7 +103,11 @@ impl WebRtcBridge {
                 ingesters,
                 sessions: HashMap::new(),
             }),
-            publishes: true,
+            publishes: if nexus_pipeline::MoqSession::plugin_available() {
+                &[HdTransport::Sfu, HdTransport::Moq]
+            } else {
+                &[HdTransport::Sfu]
+            },
         })
     }
 
@@ -116,16 +122,18 @@ impl WebRtcBridge {
                 ingesters: Arc::new(parking_lot::RwLock::new(HashMap::new())),
                 sessions: HashMap::new(),
             }),
-            publishes: false,
+            publishes: &[],
         })
     }
 
-    /// Whether this bridge can publish HD at all, which is what the heartbeat
-    /// advertises an HD transport on. Only a bridge built by `new` can: it
-    /// reads the real recorder's camera ingesters. [`Self::disabled`] holds
-    /// none, so it drops every `live_hd_start` (BUG-225).
-    pub fn can_publish(&self) -> bool {
-        self.publishes
+    /// Whether this bridge can publish HD on `transport`, which is what the
+    /// heartbeat advertises that transport on. Only a bridge built by `new`
+    /// can: it reads the real recorder's camera ingesters. [`Self::disabled`]
+    /// holds none, so it drops every `live_hd_start` (BUG-225). MoQ also needs
+    /// the `moqsink` plugin, which no installer ships; without it every MoQ
+    /// start fails with `PluginMissing`.
+    pub fn can_publish(&self, transport: HdTransport) -> bool {
+        self.publishes.contains(&transport)
     }
 
     /// Handle an inbound `live_hd_start`: build a publisher (offerer) session

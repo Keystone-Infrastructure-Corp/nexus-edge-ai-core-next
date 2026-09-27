@@ -1205,10 +1205,11 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// an expanding operator to the matching client adapter. No back-compat — the
 /// old single `webrtc` tag is gone. Additive on wire `v=1`.
 ///
-/// `hd_transport` is `None` when the WebRTC bridge cannot publish
-/// ([`crate::webrtc_bridge::WebRtcBridge::can_publish`]): the stub recorder,
-/// or a build without `gstreamer-webrtc`. Such a core drops every HD start, so
-/// it advertises no HD transport (BUG-225).
+/// `hd_transport` is `None` when the WebRTC bridge cannot publish on the
+/// configured transport ([`crate::webrtc_bridge::WebRtcBridge::can_publish`]):
+/// the stub recorder, a build without `gstreamer-webrtc`, or MoQ without the
+/// `moqsink` plugin. Such a core drops every HD start on that transport, so it
+/// advertises no HD transport (BUG-225).
 ///
 /// `talkdown_webrtc` is deliberately **not** advertised. It used to be pushed
 /// whenever `feature = "gstreamer-webrtc"` was on, but that feature gates the
@@ -1311,7 +1312,9 @@ async fn pump_heartbeats<H: TunnelHandle>(
             body: EnvelopeBody::Heartbeat(HeartbeatPayload {
                 edge_ts_unix_ms: Some(now_unix_ms()),
                 name,
-                caps: Some(heartbeat_caps(webrtc.can_publish().then_some(hd_transport))),
+                caps: Some(heartbeat_caps(
+                    webrtc.can_publish(hd_transport).then_some(hd_transport),
+                )),
                 online_cameras,
                 queued_alerts,
                 release,
@@ -3353,9 +3356,19 @@ mod heartbeat_ack_tests {
     }
 
     /// The `caps` of the first heartbeat `pump_heartbeats` sends over
-    /// `webrtc`.
-    async fn first_heartbeat_caps(webrtc: &crate::webrtc_bridge::WebRtcBridge) -> Vec<String> {
+    /// `webrtc` from a core configured for `hd_transport`.
+    async fn first_heartbeat_caps(
+        webrtc: &crate::webrtc_bridge::WebRtcBridge,
+        hd_transport: nexus_types::HdTransport,
+    ) -> Vec<String> {
         let (store, _dir) = test_store().await;
+        store
+            .write_runtime_setting(
+                crate::admin_runtime::KEY_HD_TRANSPORT,
+                Some(&hd_transport.to_string()),
+            )
+            .await
+            .expect("configure the HD transport");
         let tunnel = FirstEnvelopeTunnel::default();
         pump_heartbeats(
             &tunnel,
@@ -3381,7 +3394,9 @@ mod heartbeat_ack_tests {
     #[tokio::test]
     async fn a_bridge_that_cannot_publish_puts_no_hd_transport_on_the_heartbeat() {
         let bridge = crate::webrtc_bridge::WebRtcBridge::disabled();
-        assert_eq!(first_heartbeat_caps(&bridge).await, ["live_view"]);
+        for t in nexus_types::HdTransport::all() {
+            assert_eq!(first_heartbeat_caps(&bridge, t).await, ["live_view"], "{t}");
+        }
     }
 
     /// The bridge a gstreamer recorder builds publishes, so its heartbeat
@@ -3392,7 +3407,30 @@ mod heartbeat_ack_tests {
         let bridge = crate::webrtc_bridge::WebRtcBridge::new(Arc::new(parking_lot::RwLock::new(
             std::collections::HashMap::new(),
         )));
-        assert_eq!(first_heartbeat_caps(&bridge).await, ["live_view", "hd_sfu"]);
+        assert_eq!(
+            first_heartbeat_caps(&bridge, nexus_types::HdTransport::Sfu).await,
+            ["live_view", "hd_sfu"]
+        );
+    }
+
+    /// MoQ publishes through `moqsink`, which no installer ships. A core
+    /// without it refuses every MoQ start with `PluginMissing`, so it must not
+    /// advertise `hd_moq`; one that has it does.
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test]
+    async fn a_core_advertises_moq_only_when_moqsink_is_installed() {
+        let bridge = crate::webrtc_bridge::WebRtcBridge::new(Arc::new(parking_lot::RwLock::new(
+            std::collections::HashMap::new(),
+        )));
+        let expected: &[&str] = if nexus_pipeline::MoqSession::plugin_available() {
+            &["live_view", "hd_moq"]
+        } else {
+            &["live_view"]
+        };
+        assert_eq!(
+            first_heartbeat_caps(&bridge, nexus_types::HdTransport::Moq).await,
+            expected
+        );
     }
 
     /// The go-dark watchdog reflips an appliance to its previous release

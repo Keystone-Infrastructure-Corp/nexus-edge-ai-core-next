@@ -10252,7 +10252,9 @@ mod tests {
         .expect("build_recorder");
         assert_eq!(recorder.kind(), "stub", "boot must construct the stub");
         assert!(
-            !webrtc.can_publish(),
+            !nexus_types::HdTransport::all()
+                .into_iter()
+                .any(|t| webrtc.can_publish(t)),
             "the stub's WebRTC bridge drops every HD start, so the heartbeat must not offer HD"
         );
 
