@@ -272,21 +272,27 @@ pub fn spawn(args: ReconcilerArgs) -> JoinHandle<()> {
 const SUPERVISE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
+    // Without the subscription the loop keeps ticking on a stream that never
+    // yields: losing hot-add must not also stop the periodic pass that
+    // restarts an exited supervisor.
     let mut stream = match args
         .bus
         .subscribe::<serde_json::Value>(topic::CONFIG_CHANGED)
         .await
     {
-        Ok(s) => s,
+        Ok(s) => {
+            info!("camera reconciler: subscribed to config.changed");
+            s
+        }
         Err(e) => {
             error!(
                 error = %e,
-                "camera reconciler: failed to subscribe to config.changed; camera hot-add is disabled"
+                "camera reconciler: failed to subscribe to config.changed; camera edits now \
+                 apply only on the periodic pass"
             );
-            return;
+            Box::pin(futures::stream::pending())
         }
     };
-    info!("camera reconciler: subscribed to config.changed");
 
     // First periodic pass one period after start, not at once: `main` has
     // only just spawned every camera and seeded `handles`.
@@ -300,7 +306,14 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
     loop {
         tokio::select! {
             msg = stream.next() => {
-                let Some(msg) = msg else { break };
+                let Some(msg) = msg else {
+                    error!(
+                        "camera reconciler: config.changed stream ended; camera edits now \
+                         apply only on the periodic pass"
+                    );
+                    stream = Box::pin(futures::stream::pending());
+                    continue;
+                };
                 match msg {
                     Ok(v) => {
                         // Schema:
@@ -331,7 +344,6 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
             }
         }
     }
-    warn!("camera reconciler: bus stream closed; exiting");
 }
 
 /// One reconciliation pass. Compares `store.list_cameras()` to the
@@ -1267,6 +1279,82 @@ mod tests {
             0,
             "a periodic pass tore down a healthy camera's ingester"
         );
+    }
+
+    /// Publishes through a real bus; subscribes the way `refuse` says.
+    ///
+    /// No `Bus` in the workspace does either today: `BroadcastBus`
+    /// subscribes infallibly and its stream cannot end while the reconciler
+    /// holds the bus, and `NatsBus` cannot be constructed. The periodic pass
+    /// must not depend on that staying true.
+    struct BrokenSubscriptions {
+        bus: nexus_bus::BroadcastBus,
+        /// `true`: every subscribe fails. `false`: it succeeds with a stream
+        /// that has already ended.
+        refuse: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Bus for BrokenSubscriptions {
+        async fn publish_raw(
+            &self,
+            topic: &str,
+            payload: Arc<serde_json::Value>,
+        ) -> Result<(), nexus_bus::BusError> {
+            self.bus.publish_raw(topic, payload).await
+        }
+        async fn subscribe_raw(
+            &self,
+            _topic: &str,
+        ) -> Result<nexus_bus::DynStream, nexus_bus::BusError> {
+            if self.refuse {
+                Err(nexus_bus::BusError::BackendUnavailable("test: refused"))
+            } else {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+    }
+
+    /// F3 put supervision on the same loop as the `config.changed`
+    /// subscription, so losing the subscription also stopped the pass that
+    /// restarts an exited supervisor. Losing hot-add is one thing; losing
+    /// supervision with it is not.
+    async fn assert_supervision_survives(refuse: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::EndsOnce)]);
+        let mut args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        args.bus = Arc::new(BrokenSubscriptions {
+            bus: nexus_bus::BroadcastBus::new(64),
+            refuse,
+        });
+        let handles = args.handles.clone();
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until(
+            "precondition: the supervisor should end once its frame source returns",
+            || supervisor_ended(&handles, 7),
+        )
+        .await;
+
+        let reconciler = tokio::spawn(run(args, std::time::Duration::from_millis(50)));
+        wait_until(
+            "the reconciler lost its config.changed subscription and stopped supervising: \
+             camera 7's exited supervisor was never restarted",
+            || recorder.sources_built(7) == 2 && !supervisor_ended(&handles, 7),
+        )
+        .await;
+        reconciler.abort();
+        abort_all(&handles);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_subscription_does_not_stop_supervision() {
+        assert_supervision_survives(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ended_subscription_does_not_stop_supervision() {
+        assert_supervision_survives(false).await;
     }
 
     /// An `http://` substream keeps the codec probe off the network:
