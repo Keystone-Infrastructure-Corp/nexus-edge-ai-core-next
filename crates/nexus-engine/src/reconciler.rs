@@ -3092,7 +3092,7 @@ mod tests {
         let running_camera_issue = unreadable(health.rollup().await);
         abort_all(&args.handles);
 
-        pass.expect("a pass over a store with one unreadable row");
+        pass.expect("a pass over a store with two unreadable rows");
         assert_eq!(running_with_the_row, vec![7], "the readable camera runs");
         let issue = issue.expect("the unreadable rows must be on the roll-up");
         assert_eq!(issue.component, "store");
