@@ -2093,8 +2093,9 @@ struct LastRead {
     /// reuses for up to [`UNREAD_REPORTED_AFTER`]. `None` until a read
     /// succeeds.
     enabled: Option<usize>,
-    /// When the reads started failing, while the latest one has failed.
-    failing_since: Option<std::time::Instant>,
+    /// When the reads started failing, while the latest one has failed. On
+    /// tokio's clock, so a test can move it on past the bound.
+    failing_since: Option<tokio::time::Instant>,
 }
 
 impl EngineHealth {
@@ -2371,7 +2372,7 @@ async fn recorder_issue(health: &EngineHealth) -> Option<EdgeDegradation> {
             read
         } else if last
             .failing_since
-            .get_or_insert_with(std::time::Instant::now)
+            .get_or_insert_with(tokio::time::Instant::now)
             .elapsed()
             < UNREAD_REPORTED_AFTER
         {
@@ -2750,11 +2751,12 @@ mod health_tests {
     }
 
     /// The last good count must not stand in for a list that stays unread.
-    /// Once the reads have failed for [`UNREAD_REPORTED_AFTER`], the stub is
-    /// reported with the detail that says the list could not be read, even
-    /// though the last good read found no enabled camera and the box was ok.
-    /// The reconciler's own read fails the same way, so no camera change is
-    /// applied meanwhile. A good read restarts the clock.
+    /// Once the reads have failed for 60 s ([`UNREAD_REPORTED_AFTER`]), the
+    /// stub is reported with the detail that says the list could not be
+    /// read, even though the last good read found no enabled camera and the
+    /// box was ok; at 59 s it is not yet. The reconciler's own read fails the
+    /// same way, so no camera change is applied meanwhile. A good read
+    /// restarts the clock.
     #[tokio::test]
     async fn a_camera_list_that_stays_unread_is_reported_after_the_bound() {
         let (store, dir) = default_config_store(false).await;
@@ -2766,15 +2768,14 @@ mod health_tests {
                 .flatten()
                 .find(|i| i.code == "recorder_stub")
         };
-        let fail_for_the_whole_bound = || {
-            let mut last = health.last_read.lock();
-            let since = last.failing_since.expect("a failed read started the clock");
-            last.failing_since = Some(
-                since
-                    .checked_sub(UNREAD_REPORTED_AFTER)
-                    .expect("the clock reaches back over the bound"),
-            );
-        };
+        // Moves the runtime's clock on while the reads keep failing. Forward,
+        // so it cannot reach back past the host's boot the way taking the
+        // bound off the clock's start can on a runner up for less than it.
+        async fn fail_for(secs: u64) {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(secs)).await;
+            tokio::time::resume();
+        }
         assert_eq!(
             recorder_stub(health.rollup().await),
             None,
@@ -2787,9 +2788,15 @@ mod health_tests {
             None,
             "a failed read inside the bound keeps the last good answer",
         );
-        fail_for_the_whole_bound();
+        fail_for(59).await;
+        assert_eq!(
+            recorder_stub(health.rollup().await),
+            None,
+            "reads failing for 59 s are still inside the bound",
+        );
+        fail_for(1).await;
         let issue = recorder_stub(health.rollup().await)
-            .expect("a camera list unread for the whole bound must be reported");
+            .expect("a camera list unread for 60 s must be reported");
         assert!(
             issue.detail.contains("could not be read"),
             "the detail must say the list was not read: {}",
