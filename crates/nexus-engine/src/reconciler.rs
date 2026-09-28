@@ -3028,11 +3028,11 @@ mod tests {
         );
     }
 
-    /// One camera row this build cannot read, such as one a newer release
+    /// A camera row this build cannot read, such as one a newer release
     /// wrote with a codec this build has no variant for, must not stop the
     /// others. The pass runs every camera it can read, the health roll-up
-    /// names the one it cannot, and once the row is saved again the next
-    /// pass runs it and the issue clears. The pass used to fail at its read,
+    /// names each one it cannot, and once the rows are saved again the next
+    /// pass runs them and the issue clears. The pass used to fail at its read,
     /// so no camera was added, removed or restarted while the row was there.
     /// A camera whose row stops reading while it runs is stopped, as boot
     /// would leave it: what runs is what the store can read, so a restart
@@ -3040,9 +3040,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_camera_row_this_build_cannot_read_is_reported_and_the_rest_run() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let recorder =
-            ScriptedRecorder::new(&[(7, SourceScript::NeverEnds), (8, SourceScript::NeverEnds)]);
-        let args = reconciler_args(recorder, dir.path(), &[cam_with_id(7), cam_with_id(8)]).await;
+        let recorder = ScriptedRecorder::new(&[
+            (7, SourceScript::NeverEnds),
+            (8, SourceScript::NeverEnds),
+            (9, SourceScript::NeverEnds),
+        ]);
+        let cameras = [cam_with_id(7), cam_with_id(8), cam_with_id(9)];
+        let args = reconciler_args(recorder, dir.path(), &cameras).await;
         let break_row = |id: CameraId| {
             sqlx::query(
                 "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') \
@@ -3052,6 +3056,7 @@ mod tests {
             .execute(args.store.pool())
         };
         break_row(8).await.expect("rewrite camera 8's row");
+        break_row(9).await.expect("rewrite camera 9's row");
         let health = crate::cloud_tunnel::EngineHealth::new(&args);
         let unreadable = |h: nexus_cloud_protocol::v1::EdgeHealth| {
             h.issues
@@ -3068,13 +3073,15 @@ mod tests {
         let pass = reconcile(&args).await;
         let running_with_the_row = running();
         let issue = unreadable(health.rollup().await);
-        args.store
-            .upsert_camera(&cam_with_id(8))
-            .await
-            .expect("save camera 8 again");
+        for id in [8, 9] {
+            args.store
+                .upsert_camera(&cam_with_id(id))
+                .await
+                .expect("save the camera again");
+        }
         reconcile(&args)
             .await
-            .expect("the pass after the row is saved");
+            .expect("the pass after the rows are saved");
         let running_after = running();
         let after = unreadable(health.rollup().await);
         break_row(7).await.expect("rewrite camera 7's row");
@@ -3087,17 +3094,18 @@ mod tests {
 
         pass.expect("a pass over a store with one unreadable row");
         assert_eq!(running_with_the_row, vec![7], "the readable camera runs");
-        let issue = issue.expect("the unreadable row must be on the roll-up");
+        let issue = issue.expect("the unreadable rows must be on the roll-up");
+        assert_eq!(issue.component, "store");
         assert!(
-            issue.detail.ends_with(": 8"),
-            "names the camera: {}",
+            issue.detail.ends_with(": 8,9"),
+            "names both cameras: {}",
             issue.detail
         );
-        assert_eq!(running_after, vec![7, 8], "the saved row runs");
-        assert_eq!(after, None, "a row that reads again is not reported");
+        assert_eq!(running_after, vec![7, 8, 9], "the saved rows run");
+        assert_eq!(after, None, "rows that read again are not reported");
         assert_eq!(
             running_after_break,
-            vec![8],
+            vec![8, 9],
             "a running camera whose row stops reading is stopped, as at boot",
         );
         let issue = running_camera_issue.expect("its row is on the roll-up");
