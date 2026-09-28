@@ -5,7 +5,7 @@
 //! row (one a newer release wrote with a codec this build has no variant
 //! for), so the engine exited at boot and crash-looped under systemd after
 //! any restart or rollback. It now reads row by row: the readable cameras
-//! run, and the roll-up names the row it could not read from the first
+//! run, and the roll-up names each row it could not read from the first
 //! health answer. No unit test reaches `main`'s read, so this runs the
 //! binary, found through cargo's `CARGO_BIN_EXE_nexus-engine`.
 
@@ -182,11 +182,11 @@ input_height = 480
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     let issue = camera_config_unreadable(&first)
-        .unwrap_or_else(|| panic!("the first health answer must report the row: {first}"));
+        .unwrap_or_else(|| panic!("the first health answer must report the rows: {first}"));
     assert_eq!(issue["component"], "store", "{first}");
     assert_eq!(first["status"], "degraded", "{first}");
 
-    // The detail, which names the camera, goes to a signed-in caller only.
+    // The detail, which names the cameras, goes to a signed-in caller only.
     let token = http
         .post(format!("{base}/auth/first-run-setup"))
         .json(&serde_json::json!({
