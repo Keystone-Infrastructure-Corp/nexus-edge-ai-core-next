@@ -2619,6 +2619,53 @@ mod health_tests {
         );
     }
 
+    /// The answers the local UI's tests render (`ui/src/lib/
+    /// engineHealth.fixture.json`) are the ones `GET /api/v1/health` gives:
+    /// one issue of every code the roll-up raises, for a signed-in caller and
+    /// for anyone else. The UI's issue type was first written against the
+    /// body from before the roll-up, where a detector issue carried its kind
+    /// apart from a detail that did not name it; this fails when the file
+    /// and the engine disagree, so the UI cannot keep rendering a shape the
+    /// engine no longer sends.
+    #[test]
+    fn the_ui_renders_the_health_answers_the_engine_gives() {
+        let cap = crate::system_metrics::DecodeCapacity {
+            binding_engine: "video-enhance".to_string(),
+            binding_engine_pct: 99.1,
+            oversubscribed: true,
+        };
+        let health = edge_health_from(
+            vec![nexus_inference::health::DetectorDegradation {
+                kind: "ppe".to_string(),
+                reason: "no detector implementation ships for this model kind".to_string(),
+            }],
+            &[4],
+            Some(&cap),
+            recorder_issue_for(true, "stub", Some(1))
+                .into_iter()
+                .chain(exited_supervisors_issue(&[5]))
+                .chain(unreadable_cameras_issue(&[2, 3])),
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ui/src/lib/engineHealth.fixture.json");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("read the UI's health fixture"),
+        )
+        .expect("the UI's health fixture is JSON");
+        for (caller, signed_in) in [("signed_in", true), ("anonymous", false)] {
+            let mut body = crate::api::health_body(health.clone(), signed_in);
+            body.as_object_mut()
+                .expect("the health body is an object")
+                .remove("version");
+            assert_eq!(
+                body,
+                fixture[caller],
+                "{caller}: {} must hold what the engine answers: {body}",
+                path.display(),
+            );
+        }
+    }
+
     /// A store seeded as boot seeds it, from the engine's default config,
     /// with every camera's `ingest.enabled` set to `enabled`. No frame has
     /// arrived, which is the state of the first heartbeat after a restart.

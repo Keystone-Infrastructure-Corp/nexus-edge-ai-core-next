@@ -779,9 +779,10 @@ export interface HealthIssue {
   component: string;
   /** Stable machine-readable cause. Render unknown codes verbatim. */
   code: string;
-  /** Detector issues only: the detector kind that failed to build. */
-  kind?: string;
-  /** Operator-facing explanation. Absent when the engine withholds it. */
+  /**
+   * Operator-facing explanation; a detector issue's starts with the kind
+   * that failed to build. Only a signed-in caller gets it.
+   */
   detail?: string;
 }
 

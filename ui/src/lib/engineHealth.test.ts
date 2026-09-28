@@ -41,8 +41,8 @@ describe("issueCodes", () => {
   it("names each distinct code once, verbatim", () => {
     expect(
       issueCodes([
-        { component: "detector", code: "detector_unavailable", kind: "yolo" },
-        { component: "detector", code: "detector_unavailable", kind: "yoloe" },
+        { component: "detector", code: "detector_unavailable", detail: "yolo: no model" },
+        { component: "detector", code: "detector_unavailable", detail: "yoloe: no model" },
         { component: "x", code: "a_code_this_ui_has_never_seen" },
       ]),
     ).toBe("detector_unavailable, a_code_this_ui_has_never_seen");

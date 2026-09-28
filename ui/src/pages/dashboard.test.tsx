@@ -8,6 +8,7 @@ import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import ENGINE from "@/lib/engineHealth.fixture.json";
 import { DashboardPage } from "@/pages/dashboard";
 
 const RECORDER_STUB = {
@@ -17,12 +18,11 @@ const RECORDER_STUB = {
     'the clip recorder is the stub, so running cameras are detected but nothing is recorded; set [runtime.clips] recorder = "gstreamer" in /etc/nexus/nexus.toml (or re-run install.sh without --keep-config) and restart nexus-engine. This needs shell or remote-shell access to the box.',
 };
 
-// A detector issue as `health_body` in the engine's api.rs builds it: it
-// also carries the detector `kind`.
+// A detector issue as `health_body` in the engine's api.rs builds it: its
+// detail starts with the detector kind.
 const DETECTOR_UNAVAILABLE = {
   component: "detector",
   code: "detector_unavailable",
-  kind: "yolo",
   detail:
     "yolo: no ONNX export for requested shape 640x640 in /opt/nexus/current/share/models; available: 512x288, 1024x576, 1536x864",
 };
@@ -155,21 +155,33 @@ describe("dashboard Engine tile", () => {
     expect(screen.getByText(DETECTOR_UNAVAILABLE.detail)).toBeTruthy();
   });
 
-  it("names the detector kind, which a detector's detail need not", async () => {
-    // Verbatim from a real engine booted with `kind = "ppe"`: the detail
-    // does not say which kind failed, so the row must.
-    const ppe = {
-      component: "detector",
-      code: "detector_unavailable",
-      kind: "ppe",
-      detail: "no detector implementation ships for this model kind",
-    };
+  it("names the detector kind, which the engine puts in the detail", async () => {
+    const ppe = ENGINE.signed_in.issues.find((i) => i.component === "detector");
     stubEngine(() =>
       Promise.resolve(json({ status: "degraded", version: "0.1.99", issues: [ppe] })),
     );
     renderDashboard();
 
-    expect(await screen.findByText("detector_unavailable (ppe)")).toBeTruthy();
+    expect(
+      await screen.findByText("ppe: no detector implementation ships for this model kind"),
+    ).toBeTruthy();
+  });
+
+  it("lists every issue the engine answers with, with the detail only a signed-in caller gets", async () => {
+    for (const answer of [ENGINE.signed_in, ENGINE.anonymous]) {
+      stubEngine(() => Promise.resolve(json({ ...answer, version: "0.1.99" })));
+      renderDashboard();
+
+      const tile = await engineTile();
+      expect(await within(tile).findByText("DEGRADED")).toBeTruthy();
+      for (const issue of ENGINE.signed_in.issues) {
+        const row = screen.getByText(issue.code).closest("li");
+        expect(row?.textContent).toBe(
+          `${issue.component}${issue.code}${answer === ENGINE.signed_in ? issue.detail : ""}`,
+        );
+      }
+      cleanup();
+    }
   });
 
   it("names the issues when the engine withholds their detail", async () => {

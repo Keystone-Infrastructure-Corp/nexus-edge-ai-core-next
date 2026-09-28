@@ -1115,7 +1115,7 @@ async fn health(
 
 /// The body of [`health`], apart from the handler so a test can drive it
 /// with the roll-up of the recorder that boot really builds.
-fn health_body(
+pub(crate) fn health_body(
     health: nexus_cloud_protocol::v1::EdgeHealth,
     with_detail: bool,
 ) -> serde_json::Value {

@@ -13,6 +13,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TopBar } from "@/components/layout/TopBar";
 import { AuthProvider } from "@/lib/auth";
+// What the engine answers, for a signed-in caller and for anyone else: the
+// engine's the_ui_renders_the_health_answers_the_engine_gives (cloud_tunnel.rs)
+// fails when this file and its answer differ.
+import ENGINE from "@/lib/engineHealth.fixture.json";
 
 // The recorder issue exactly as `recorder_issue_for` in the engine's
 // cloud_tunnel.rs builds it.
@@ -83,12 +87,15 @@ describe("TopBar engine-health pill", () => {
   it("names every issue, and each code once", async () => {
     // Two kinds can fail at once (`nexus_inference::health` keeps one entry
     // per kind), so a code can repeat across issues.
-    const yolo = { component: "detector", code: "detector_unavailable", kind: "yolo" };
+    const yolo = {
+      component: "detector",
+      code: "detector_unavailable",
+      detail: "yolo: no ONNX export for requested shape 640x640",
+    };
     const ppe = {
       component: "detector",
       code: "detector_unavailable",
-      kind: "ppe",
-      detail: "no detector implementation ships for this model kind",
+      detail: "ppe: no detector implementation ships for this model kind",
     };
     stubEngine(() =>
       Promise.resolve(
@@ -101,8 +108,8 @@ describe("TopBar engine-health pill", () => {
     expect(pill.textContent).toBe("degraded • detector_unavailable, recorder_stub");
     expect(pill.getAttribute("title")).toBe(
       [
-        "detector_unavailable (yolo)",
-        "detector_unavailable (ppe): no detector implementation ships for this model kind",
+        "detector_unavailable: yolo: no ONNX export for requested shape 640x640",
+        "detector_unavailable: ppe: no detector implementation ships for this model kind",
         `recorder_stub: ${RECORDER_STUB.detail}`,
       ].join("\n"),
     );
@@ -123,14 +130,8 @@ describe("TopBar engine-health pill", () => {
   });
 
   it("names the detector kind in the hover text", async () => {
-    // Verbatim from a real engine booted with `kind = "ppe"`: the detail
-    // does not say which kind failed.
-    const ppe = {
-      component: "detector",
-      code: "detector_unavailable",
-      kind: "ppe",
-      detail: "no detector implementation ships for this model kind",
-    };
+    // The engine sends no separate kind: a detector's detail starts with it.
+    const ppe = ENGINE.signed_in.issues.find((i) => i.component === "detector");
     stubEngine(() =>
       Promise.resolve(json({ status: "degraded", version: "0.1.99", issues: [ppe] })),
     );
@@ -138,8 +139,26 @@ describe("TopBar engine-health pill", () => {
 
     const pill = await screen.findByText(/degraded/);
     expect(pill.getAttribute("title")).toBe(
-      "detector_unavailable (ppe): no detector implementation ships for this model kind",
+      "detector_unavailable: ppe: no detector implementation ships for this model kind",
     );
+  });
+
+  it("names every issue the engine answers with, with the detail only a signed-in caller gets", async () => {
+    const codes = ENGINE.signed_in.issues.map((i) => i.code);
+    expect(codes).toEqual(expect.arrayContaining(["camera_pipeline_stopped", "camera_config_unreadable"]));
+    for (const answer of [ENGINE.signed_in, ENGINE.anonymous]) {
+      stubEngine(() => Promise.resolve(json({ ...answer, version: "0.1.99" })));
+      renderTopBar();
+
+      const pill = await screen.findByText(/degraded/);
+      expect(pill.textContent).toBe(`degraded • ${codes.join(", ")}`);
+      expect(pill.getAttribute("title")).toBe(
+        answer.issues
+          .map((i) => ("detail" in i ? `${i.code}: ${i.detail}` : i.code))
+          .join("\n"),
+      );
+      cleanup();
+    }
   });
 
   it("says online with the version when the engine reports ok", async () => {

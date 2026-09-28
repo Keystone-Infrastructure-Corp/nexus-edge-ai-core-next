@@ -1,0 +1,66 @@
+{
+  "signed_in": {
+    "status": "degraded",
+    "issues": [
+      {
+        "component": "detector",
+        "code": "detector_unavailable",
+        "detail": "ppe: no detector implementation ships for this model kind"
+      },
+      {
+        "component": "live_view",
+        "code": "camera_source_stalled",
+        "detail": "1 subscribed camera(s) have produced no new frame for >5s: 4"
+      },
+      {
+        "component": "decode",
+        "code": "decode_oversubscribed",
+        "detail": "video-enhance at 99.1% — this fixed-function video engine is oversubscribed and shared by every camera decoding on it"
+      },
+      {
+        "component": "recorder",
+        "code": "recorder_stub",
+        "detail": "the clip recorder is the stub, so running cameras are detected but nothing is recorded; set [runtime.clips] recorder = \"gstreamer\" in /etc/nexus/nexus.toml (or re-run install.sh without --keep-config) and restart nexus-engine. This needs shell or remote-shell access to the box."
+      },
+      {
+        "component": "pipeline",
+        "code": "camera_pipeline_stopped",
+        "detail": "the analysis pipeline of 1 camera(s) exited without being stopped, so nothing on them is detected, alerted on or saved as a motion clip until it is restarted: 5"
+      },
+      {
+        "component": "store",
+        "code": "camera_config_unreadable",
+        "detail": "this engine build cannot read the stored configuration of 2 camera(s), so they do not run and nothing on them is detected, alerted on or recorded until each is deleted (DELETE /api/v1/cameras/{id}) or saved again with its whole configuration (PUT /api/v1/cameras/{id}): 2,3"
+      }
+    ]
+  },
+  "anonymous": {
+    "status": "degraded",
+    "issues": [
+      {
+        "component": "detector",
+        "code": "detector_unavailable"
+      },
+      {
+        "component": "live_view",
+        "code": "camera_source_stalled"
+      },
+      {
+        "component": "decode",
+        "code": "decode_oversubscribed"
+      },
+      {
+        "component": "recorder",
+        "code": "recorder_stub"
+      },
+      {
+        "component": "pipeline",
+        "code": "camera_pipeline_stopped"
+      },
+      {
+        "component": "store",
+        "code": "camera_config_unreadable"
+      }
+    ]
+  }
+}

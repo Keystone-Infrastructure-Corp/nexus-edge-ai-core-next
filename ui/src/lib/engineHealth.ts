@@ -22,14 +22,6 @@ export function engineHealth(q: {
   return { verdict: q.data.status === "ok" ? "ok" : "degraded", read: q.data };
 }
 
-/**
- * One issue's name: its code, verbatim, plus the detector kind when it has
- * one. A detector's detail need not say which kind failed.
- */
-export function issueName(issue: HealthIssue): string {
-  return issue.kind ? `${issue.code} (${issue.kind})` : issue.code;
-}
-
 /** The distinct issue codes, verbatim, so a code this UI has no copy for still shows. */
 export function issueCodes(issues: HealthIssue[]): string {
   return [...new Set(issues.map((i) => i.code))].join(", ");
