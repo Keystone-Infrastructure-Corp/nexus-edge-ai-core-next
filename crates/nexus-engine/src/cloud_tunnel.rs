@@ -2768,9 +2768,10 @@ mod health_tests {
                 .flatten()
                 .find(|i| i.code == "recorder_stub")
         };
-        // Moves the runtime's clock on while the reads keep failing. Forward,
-        // so it cannot reach back past the host's boot the way taking the
-        // bound off the clock's start can on a runner up for less than it.
+        // Moves the runtime's clock on while the reads keep failing, so the
+        // bound is pinned at a literal 59 s and 60 s. Real time still counts
+        // too, so the clock starts, and is read at 59 s, in `recorder_issue`
+        // alone: one failed read, not the rest of the roll-up.
         async fn fail_for(secs: u64) {
             tokio::time::pause();
             tokio::time::advance(Duration::from_secs(secs)).await;
@@ -2784,13 +2785,13 @@ mod health_tests {
 
         make_the_camera_list_unreadable(&store).await;
         assert_eq!(
-            recorder_stub(health.rollup().await),
+            recorder_issue(&health).await,
             None,
             "a failed read inside the bound keeps the last good answer",
         );
         fail_for(59).await;
         assert_eq!(
-            recorder_stub(health.rollup().await),
+            recorder_issue(&health).await,
             None,
             "reads failing for 59 s are still inside the bound",
         );
