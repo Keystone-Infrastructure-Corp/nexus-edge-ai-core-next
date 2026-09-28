@@ -54,29 +54,28 @@ fn camera(id: i64) -> CameraConfig {
     .expect("a minimal camera")
 }
 
-/// Cameras 1 and 2, with camera 2 given a codec this build has no variant
-/// for, so the camera list can no longer be read in one piece.
+/// Cameras 1 to 3, with cameras 2 and 3 given a codec this build has no
+/// variant for, so the camera list can no longer be read in one piece.
 async fn seed_the_store(db: &Path) {
     let store = Store::open(&StoreConfig {
         url: format!("sqlite:{}?mode=rwc", db.display()),
-        seed_from_config: false,
-        duckdb_attach: false,
-        duckdb_path: PathBuf::from("/tmp/unused.duckdb"),
+        ..StoreConfig::default()
     })
     .await
     .expect("Store::open");
-    for id in [1, 2] {
+    for id in [1, 2, 3] {
         store
             .upsert_camera(&camera(id))
             .await
             .expect("store a camera");
     }
     sqlx::query(
-        "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = 2",
+        "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') \
+         WHERE id IN (2, 3)",
     )
     .execute(store.pool())
     .await
-    .expect("rewrite camera 2's row");
+    .expect("rewrite cameras 2 and 3's rows");
     assert!(
         store.list_cameras().await.is_err(),
         "fixture: the camera list can no longer be read in one piece",
@@ -159,9 +158,10 @@ input_height = 480
         .expect("http client");
 
     // Boot reads the cameras before the API listens, so the first answer
-    // must already name the row. The reconciler's first pass, which would
-    // find it too, runs 30 s after boot.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // must already report the rows. The reconciler's first pass, which
+    // would find them too, runs 30 s after boot, so an answer later than
+    // 25 s could not tell the two apart and fails the test instead.
+    let deadline = Instant::now() + Duration::from_secs(25);
     let first = loop {
         if let Some(status) = engine.exited() {
             panic!(
@@ -170,11 +170,13 @@ input_height = 480
             );
         }
         if let Ok(r) = http.get(format!("{base}/health")).send().await {
-            break r.json::<Value>().await.expect("a health body");
+            if r.status().is_success() {
+                break r.json::<Value>().await.expect("a health body");
+            }
         }
         assert!(
             Instant::now() < deadline,
-            "no health answer within 60 s:\n{}",
+            "no health answer within 25 s:\n{}",
             engine.log_tail(),
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -213,24 +215,26 @@ input_height = 480
     let detail = camera_config_unreadable(&signed_in)
         .and_then(|i| i["detail"].as_str())
         .unwrap_or_else(|| panic!("a signed-in caller gets the detail: {signed_in}"));
-    assert!(detail.ends_with(": 2"), "names camera 2: {detail}");
+    assert!(detail.ends_with(": 2,3"), "names cameras 2 and 3: {detail}");
 
     // The readable camera runs: its supervisor has put frame stats up.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        if let Some(status) = engine.exited() {
+            panic!("the engine exited ({status}):\n{}", engine.log_tail());
+        }
         let stats = http
             .get(format!("{base}/cameras/1/stats"))
             .bearer_auth(&token)
             .send()
-            .await
-            .expect("camera 1's stats");
-        if stats.status().is_success() {
+            .await;
+        if stats.as_ref().is_ok_and(|r| r.status().is_success()) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "camera 1 must run beside the unreadable row (stats: {}):\n{}",
-            stats.status(),
+            "camera 1 must run beside the unreadable rows (stats: {:?}):\n{}",
+            stats.map(|r| r.status()),
             engine.log_tail(),
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -239,6 +243,14 @@ input_height = 480
         engine.exited(),
         None,
         "the engine must keep running:\n{}",
+        engine.log_tail(),
+    );
+    // A release build aborts on a panic in any task, so one here, which the
+    // test build survives, would take a shipped engine down.
+    let log = std::fs::read_to_string(&engine.log).expect("read the engine log");
+    assert!(
+        !log.contains("panicked at"),
+        "no task may panic on the unreadable rows:\n{}",
         engine.log_tail(),
     );
 }
