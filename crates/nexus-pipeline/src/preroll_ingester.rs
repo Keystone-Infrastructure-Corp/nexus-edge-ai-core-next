@@ -209,6 +209,10 @@ pub struct PreRollIngester {
     /// rebuild that reopened the valve would silently put a
     /// substream-analysing camera back on main-stream decode.
     rgb_valve_closed: Arc<AtomicBool>,
+    /// Whether this session has delivered a frame to analysis
+    /// ([`Self::mark_delivered`]). Only a session that has is handed to a
+    /// new frame source to start on (SPEC-069).
+    delivered: AtomicBool,
     /// Active GStreamer pipeline, populated by the supervisor each
     /// time it (re)builds a session. Drop sets it to NULL
     /// synchronously so the GObject ref cycle teardown doesn't
@@ -374,6 +378,7 @@ impl PreRollIngester {
             live_tx,
             frame_tap,
             rgb_valve_closed,
+            delivered: AtomicBool::new(false),
             active_pipeline,
             shutdown,
             task: Mutex::new(Some(task)),
@@ -559,6 +564,21 @@ impl PreRollIngester {
     /// the Arc, so they have to be able to ask.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Record that this session delivered a frame to analysis. Set by the
+    /// frame source that takes it up, and carried over by a crowd resize
+    /// that rebuilds the session at new dims.
+    pub fn mark_delivered(&self) {
+        self.delivered.store(true, Ordering::Release);
+    }
+
+    /// Has this session delivered a frame to analysis? A new frame source
+    /// starts on a substream session only when it has: one that has not may
+    /// be a retry of a refused substream, and starting on it valves the
+    /// main stream off for the whole first-frame grace (SPEC-069).
+    pub fn has_delivered(&self) -> bool {
+        self.delivered.load(Ordering::Acquire)
     }
 }
 

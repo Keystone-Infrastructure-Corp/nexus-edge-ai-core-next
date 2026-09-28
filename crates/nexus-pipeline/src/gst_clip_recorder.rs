@@ -417,9 +417,10 @@ impl GstClipRecorder {
         Arc::clone(&self.ingesters)
     }
 
-    /// The camera's SPEC-069 analysis session, while it is live. A new
+    /// The camera's SPEC-069 analysis session, while it is live. A
     /// `SharedRtspSource` reads its frames from this session and valves the
-    /// main RGB tap off, so the crowd resize rebuilds it beside the main
+    /// main RGB tap off (a new one at once if it has delivered, otherwise
+    /// once it does), so the crowd resize rebuilds it beside the main
     /// tap. A session the fallback shut down is not live: the supervisor
     /// reads the main tap again.
     fn live_analysis_ingester(&self, camera_id: CameraId) -> Option<Arc<PreRollIngester>> {
@@ -459,10 +460,12 @@ impl GstClipRecorder {
                     ing.rgb_w(),
                     ing.rgb_h(),
                     ing.has_rgb_tap(),
+                    ing.has_delivered(),
                 )
             })
         };
-        let Some((url, codec, pre_roll_secs, max_fps, cur_w, cur_h, had_rgb)) = snapshot else {
+        let Some((url, codec, pre_roll_secs, max_fps, cur_w, cur_h, had_rgb, delivered)) = snapshot
+        else {
             debug!(
                 camera_id,
                 new_rgb_w, new_rgb_h, "resize_camera_rgb_tap: no ingester registered"
@@ -494,6 +497,11 @@ impl GstClipRecorder {
             self.decode_health.clone(),
         )
         .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
+        // The same stream at new dims: a session that delivered keeps the
+        // SPEC-069 start path, and a retry that has not stays unproven.
+        if delivered {
+            new_ing.mark_delivered();
+        }
         let prev = taps.write().insert(camera_id, new_ing);
         if let Some(prev_ing) = prev {
             // Same justification as the URL-change replace path in
@@ -1480,8 +1488,14 @@ impl ClipRecorder for GstClipRecorder {
             // handed to a new source: `subscribe_frames` would still return
             // a receiver, the main RGB valve would be closed for it, and the
             // camera would analyse nothing until the grace window expired —
-            // once per supervisor restart, forever.
-            analysis: self.live_analysis_ingester(camera_id),
+            // once per supervisor restart, forever. Nor may one that has not
+            // delivered yet, for the same reason: while a substream stays
+            // refused, the engine's retry sits here most of the time. The
+            // new source starts on the main stream and its watch takes such
+            // a session up once it delivers.
+            analysis: self
+                .live_analysis_ingester(camera_id)
+                .filter(|a| a.has_delivered()),
             analysis_sessions: Arc::clone(&self.analysis_ingesters),
             decode_health: self.decode_health.clone(),
             analysis_stream: self.analysis_stream.clone(),
@@ -3226,9 +3240,9 @@ mod tests {
     /// Camera 7's frame source, running, over a main session on a dead URL,
     /// so every frame the source delivers came from a session's rgb tap, which
     /// the test feeds. With `substream_at_start`, a substream session on a
-    /// dead URL is registered before the source is built, as a camera's start
-    /// registers one. The recorder publishes decode health and analysis-stream
-    /// status.
+    /// dead URL that has delivered before is registered before the source is
+    /// built, so the source starts on it (SPEC-069's start path). The
+    /// recorder publishes decode health and analysis-stream status.
     async fn a_running_source_over_a_silent_main_stream(
         dir: &Path,
         substream_at_start: bool,
@@ -3265,6 +3279,7 @@ mod tests {
         if substream_at_start {
             rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
                 .expect("analysis session registers");
+            rec.analysis_ingesters.read()[&7].mark_delivered();
         }
         let source = rec
             .shared_frame_source(7)
@@ -3612,6 +3627,133 @@ mod tests {
             delivered && valved,
             "the next retry's session delivered, and the source did not take it up \
              (frame delivered: {delivered}, main valve closed: {valved})"
+        );
+    }
+
+    /// The crowd resize rebuilds a camera's frame source while the engine's
+    /// retry of a refused substream is registered: a session that has not
+    /// delivered a frame. The rebuilt source must not start on it, since
+    /// that valves the main stream off and analyses nothing for the whole
+    /// first-frame grace; it starts on the main stream and leaves the retry
+    /// to its watch, as the source it replaced did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_rebuilt_while_an_unproven_retry_is_registered_keeps_analysing_the_main_stream(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, _main, _frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        // The crowd resize, then the supervisor's rebuild of its source.
+        assert!(
+            rec.resize_camera_rgb_tap(7, 640, 360).expect("resize"),
+            "precondition: the resize must ask for a rebuilt source"
+        );
+        task.abort();
+        let main = rec.ingesters.read()[&7].clone();
+        let retry = rec.analysis_ingesters.read()[&7].clone();
+        let source = rec.shared_frame_source(7).expect("the rebuilt source");
+        let (tx, mut frames) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = source.run(tx).await;
+        });
+        let (feeding, feeder) = feed(
+            main.rgb_tap_sender().expect("rgb tap"),
+            Duration::from_millis(50),
+        );
+        let reached = tokio::time::timeout(Duration::from_secs(3), frames.recv())
+            .await
+            .is_ok_and(|f| f.is_some());
+        let open = !main.rgb_valve_is_closed();
+        let reported = rec
+            .analysis_stream
+            .as_ref()
+            .and_then(|r| r.snapshot(7))
+            .map(|s| (s.mode, s.state));
+
+        feeding.store(false, std::sync::atomic::Ordering::SeqCst);
+        task.abort();
+        retry.shutdown();
+        main.shutdown();
+        let _ = feeder.join();
+        assert!(
+            reached,
+            "the main stream delivered and none of its frames reached analysis: the rebuilt \
+             source started on a retry's session that has never delivered"
+        );
+        assert!(
+            open,
+            "the rebuilt source valved the main stream off for a session that has never delivered"
+        );
+        assert_eq!(
+            reported,
+            Some(("substream".to_string(), "probing".to_string())),
+            "a substream session is registered and not yet judged: the camera is probing it, \
+             not reading the main stream by design"
+        );
+    }
+
+    /// The SPEC-069 start path, for the session it is right for: one that has
+    /// delivered. A running source takes a substream session up once it
+    /// delivers; a source the crowd resize then rebuilds starts on the
+    /// resized session, with the main stream valved off, rather than decoding
+    /// the main stream until the new session's first frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_rebuilt_after_its_substream_delivered_starts_on_the_substream_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, _main, mut frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session registers");
+        let session = rec.analysis_ingesters.read()[&7].clone();
+        let tap = session.rgb_tap_sender().expect("rgb tap");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let read = loop {
+            let _ = tap.send(rgb_frame());
+            if frames.try_recv().is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(
+            rec.resize_camera_rgb_tap(7, 640, 360).expect("resize"),
+            "precondition: the resize must ask for a rebuilt source"
+        );
+        task.abort();
+        let main = rec.ingesters.read()[&7].clone();
+        let resized = rec.analysis_ingesters.read()[&7].clone();
+        let source = rec.shared_frame_source(7).expect("the rebuilt source");
+        let (tx, mut frames) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = source.run(tx).await;
+        });
+        // Before the resized session sends anything: a source that started on
+        // the main stream would valve it off only once that session delivers.
+        let valved = within(2.0, || main.rgb_valve_is_closed());
+        let (feeding, feeder) = feed(
+            resized.rgb_tap_sender().expect("rgb tap"),
+            Duration::from_millis(50),
+        );
+        let reached = tokio::time::timeout(Duration::from_secs(3), frames.recv())
+            .await
+            .is_ok_and(|f| f.is_some());
+
+        feeding.store(false, std::sync::atomic::Ordering::SeqCst);
+        task.abort();
+        resized.shutdown();
+        main.shutdown();
+        let _ = feeder.join();
+        assert!(
+            read,
+            "precondition: the running source never read its substream"
+        );
+        assert!(
+            reached && valved,
+            "the rebuilt source did not start on the resized substream session (frame reached \
+             analysis: {reached}, main valve closed before it delivered: {valved})"
         );
     }
 

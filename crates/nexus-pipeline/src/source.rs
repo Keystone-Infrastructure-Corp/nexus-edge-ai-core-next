@@ -451,8 +451,9 @@ pub struct SharedRtspSource {
     /// collateral (SPEC-069 invariants I2\u2013I5).
     pub analysis: Option<std::sync::Arc<crate::preroll_ingester::PreRollIngester>>,
     /// The recorder's substream sessions, by camera. While analysis reads
-    /// the main stream, a live session found here is the engine's retry
-    /// (SPEC-069: after a fallback, or a registration that failed): it is
+    /// the main stream, a live session found here is one that has not
+    /// delivered yet: the camera's first, or the engine's retry (SPEC-069:
+    /// after a fallback, or a registration that failed). It is
     /// read beside the main stream until it delivers a frame, then taken
     /// up, and given up if it delivers none inside
     /// [`ANALYSIS_FIRST_FRAME_GRACE`]. Waiting on it never valves the main
@@ -488,9 +489,16 @@ impl FrameSource for SharedRtspSource {
                 reg.observe_probing(self.camera_id);
             }
         } else if let Some(reg) = self.analysis_stream.as_ref() {
-            // No substream configured — this is the intended,
-            // healthy state, not a fallback.
-            reg.observe_mainstream_by_design(self.camera_id);
+            if self.registered_session().is_some() {
+                // A substream session that has not delivered yet: this
+                // source reads the main stream and its watch takes the
+                // session up once it delivers.
+                reg.observe_probing(self.camera_id);
+            } else {
+                // No substream configured — this is the intended,
+                // healthy state, not a fallback.
+                reg.observe_mainstream_by_design(self.camera_id);
+            }
         }
         let mut rx = self.frames_from(reading_analysis)?;
         // The session analysis reads, or last read: the one this source
@@ -599,6 +607,7 @@ impl FrameSource for SharedRtspSource {
                         "analysis substream session delivering; analysis reads it again, \
                          main-stream rgb tap valved off"
                     );
+                    session.mark_delivered();
                     self.ingester.set_rgb_valve_closed(true);
                     if let Some(h) = self.decode_health.as_ref() {
                         h.reset(self.camera_id);
@@ -686,13 +695,7 @@ impl SharedRtspSource {
     /// reader nor comes back here until the engine registers it again.
     fn watch_for_a_session(&self, standby: &mut Option<Standby>) {
         let Some((session, _, since)) = standby.as_ref() else {
-            let fresh = self
-                .analysis_sessions
-                .read()
-                .get(&self.camera_id)
-                .filter(|a| !a.is_shutdown())
-                .cloned();
-            *standby = fresh.and_then(|s| {
+            *standby = self.registered_session().and_then(|s| {
                 let rx = s.subscribe_frames()?;
                 Some((s, rx, std::time::Instant::now()))
             });
@@ -716,6 +719,18 @@ impl SharedRtspSource {
             }
             *standby = None;
         }
+    }
+
+    /// The camera's substream session in the recorder's registry, unless the
+    /// fallback or a give-up shut it down.
+    fn registered_session(
+        &self,
+    ) -> Option<std::sync::Arc<crate::preroll_ingester::PreRollIngester>> {
+        self.analysis_sessions
+            .read()
+            .get(&self.camera_id)
+            .filter(|a| !a.is_shutdown())
+            .cloned()
     }
 
     /// The main session's frames or, with `analysis`, those of the session
