@@ -92,11 +92,11 @@ pub struct ClipMeta {
     pub size_bytes: i64,
     pub codec: String,
     pub container: String,
-    /// True when the clip was **discarded at close time** because its
-    /// duration fell below [`MIN_CLIP_DURATION_MS`]. The on-disk file
-    /// has been unlinked and the `motion_clips` row + every
-    /// CASCADE-linked child has been removed via
-    /// [`Store::cascade_delete_clip_metadata`]. The supervisor treats
+    /// True when the clip was **discarded at close time** because it was
+    /// too short or empty. The on-disk file has been unlinked and the
+    /// `motion_clips` row removed via [`Store::discard_clip_metadata`],
+    /// which detaches linked alert events first so they (and their
+    /// undelivered outbox rows) survive the discard. The supervisor treats
     /// this as a normal outcome (no clip ever existed for this
     /// motion burst); diagnostic fields above are populated for
     /// logging only.
@@ -723,9 +723,7 @@ impl ClipRecorder for StubClipRecorder {
                     );
                 }
             }
-            self.store
-                .cascade_delete_clip_metadata(handle.clip_id)
-                .await?;
+            self.store.discard_clip_metadata(handle.clip_id).await?;
             return Ok(ClipMeta {
                 clip_id: handle.clip_id,
                 camera_id: state.camera_id,
