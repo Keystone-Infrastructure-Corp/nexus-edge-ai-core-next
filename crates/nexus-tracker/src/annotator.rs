@@ -29,6 +29,7 @@ use nexus_config::{AnnotatorConfig, ZoneConfig, ZoneKind};
 use nexus_types::{Frame, TrackId, TrackedObject};
 use serde_json::json;
 
+use crate::rate::InferenceRate;
 use crate::static_object::StaticAnchor;
 
 const FIRST_FRAME_DT_SECONDS: f64 = 1.0 / 30.0;
@@ -65,6 +66,8 @@ pub struct TrackAnnotator {
     /// Phase 8.1 — anchor ids seen on the previous frame, so removal
     /// (anchor present last frame, absent now) can be reported.
     prev_anchor_ids: Vec<String>,
+    /// Measured inference rate; converts `parked_min_secs` to frames.
+    rate: InferenceRate,
 }
 
 impl TrackAnnotator {
@@ -74,6 +77,7 @@ impl TrackAnnotator {
             state_by_track: HashMap::new(),
             frame_tick: 0,
             prev_anchor_ids: Vec::new(),
+            rate: InferenceRate::default(),
         }
     }
 
@@ -92,6 +96,8 @@ impl TrackAnnotator {
         objects: &mut [TrackedObject],
     ) {
         self.frame_tick = self.frame_tick.saturating_add(1);
+        self.rate
+            .observe(frame.captured_at.timestamp_millis() as f64 / 1_000.0);
         if objects.is_empty() {
             self.gc_stale();
             return;
@@ -152,6 +158,10 @@ impl TrackAnnotator {
         };
         // Phase 8.1 anchor ids present this frame (label@cx×cy, integer px).
         let anchor_ids: Vec<String> = anchors.iter().map(anchor_id).collect();
+        let parked_min_frames = self
+            .cfg
+            .parked_min_frames_to_flag
+            .unwrap_or_else(|| self.rate.frames(self.cfg.parked_min_secs));
 
         for o in objects.iter_mut() {
             let state = self.state_by_track.entry(o.track_id).or_default();
@@ -237,7 +247,7 @@ impl TrackAnnotator {
                 } else {
                     state.parked_frames_accum = 0;
                 }
-                let parked = state.parked_frames_accum >= self.cfg.parked_min_frames_to_flag;
+                let parked = state.parked_frames_accum >= parked_min_frames;
                 o.attributes.insert(
                     "motion.parked_vehicle".into(),
                     json!(if parked { "yes" } else { "no" }),
@@ -627,7 +637,7 @@ mod tests {
     #[test]
     fn parked_vehicle_flips_yes_after_min_frames() {
         let cfg = AnnotatorConfig {
-            parked_min_frames_to_flag: 3,
+            parked_min_frames_to_flag: Some(3),
             ..Default::default()
         };
         let mut a = TrackAnnotator::new(cfg);
@@ -641,6 +651,21 @@ mod tests {
                 "frame {i}"
             );
         }
+    }
+
+    #[test]
+    fn parked_default_is_one_second_at_the_measured_rate() {
+        // #335: at ~2 inferences/s the default flags after ~1 s (2 frames),
+        // not after 30 frames (15 s).
+        let mut a = TrackAnnotator::new(AnnotatorConfig::default());
+        let flags: Vec<_> = (0..4)
+            .map(|i| {
+                let mut o = vec![obj(1, "vehicle.car", 100.0, 100.0)];
+                a.annotate(&frame_at_ms(i * 500, 1920, 1080), &[], &[], &mut o);
+                o[0].attributes["motion.parked_vehicle"].clone()
+            })
+            .collect();
+        assert_eq!(flags, vec!["no", "yes", "yes", "yes"]);
     }
 
     #[test]

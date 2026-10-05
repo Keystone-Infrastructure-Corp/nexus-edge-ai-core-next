@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 pub mod annotator;
 pub mod bytetrack;
 pub mod motion;
+mod rate;
 pub mod static_object;
 pub mod zone_filter;
 pub use annotator::TrackAnnotator;

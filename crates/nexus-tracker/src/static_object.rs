@@ -2,9 +2,10 @@
 //! `EventFilter::staticVehicle*` block in
 //! `src/tracking/event_filter.cpp`.
 //!
-//! Vehicles whose smoothed per-frame movement stays below
-//! `significant_movement_pixels` for `dwell_frames` consecutive frames
-//! are *promoted* to "static" and dropped from the rule-eval slice
+//! Vehicles (and, with `anchor_persons`, people) whose smoothed per-frame
+//! movement stays below `significant_movement_pixels` for `dwell_frames`
+//! consecutive frames (default: `dwell_secs` at the measured inference
+//! rate) are *promoted* to "static" and dropped from the rule-eval slice
 //! (i.e. parked cars stop firing alerts). Promoted tracks are written
 //! to a per-camera anchor registry on disk so the suppression survives
 //! a restart.
@@ -29,6 +30,8 @@ use nexus_types::{CameraId, Frame, TrackId, TrackedObject};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
+
+use crate::rate::InferenceRate;
 
 /// Attribute key stamped on a `TrackedObject` by [`StaticObjectFilter::classify`]
 /// when the track has been promoted to "static" (parked vehicle, etc.).
@@ -132,6 +135,8 @@ pub struct StaticObjectFilter {
     /// also eligible for static-anchor promotion (equipment: `ladder`,
     /// `wheelbarrow`, etc.). Empty preserves vehicle-only behaviour.
     extra_anchor_classes: Vec<String>,
+    /// Measured inference rate; converts `dwell_secs` to frames.
+    rate: InferenceRate,
 }
 
 impl StaticObjectFilter {
@@ -168,6 +173,7 @@ impl StaticObjectFilter {
                 .into_iter()
                 .map(|s| s.to_lowercase())
                 .collect(),
+            rate: InferenceRate::default(),
         }
     }
 
@@ -182,11 +188,13 @@ impl StaticObjectFilter {
     }
 
     /// Is `label` eligible for static-anchor promotion on this camera?
-    /// Vehicles always are; Phase 8.1 `static_anchor_classes` adds
-    /// equipment labels. Single source of truth for both the
-    /// classification pass and the attribute-stamping pass.
+    /// Vehicles always are; `person` is when `anchor_persons` is set;
+    /// Phase 8.1 `static_anchor_classes` adds equipment labels. Single
+    /// source of truth for both the classification pass and the
+    /// attribute-stamping pass.
     fn is_anchor_eligible(&self, label: &str) -> bool {
         is_vehicle_label(label)
+            || (self.cfg.anchor_persons && label.eq_ignore_ascii_case("person"))
             || self
                 .extra_anchor_classes
                 .iter()
@@ -237,19 +245,24 @@ impl StaticObjectFilter {
     /// persistent anchor registry.
     pub fn classify(&mut self, _frame: &Frame, objects: &mut [TrackedObject]) {
         let mut dirty = false;
+        // Wall-clock used to refresh / age anchors. Pulled from the
+        // frame so tests and replay scenarios behave deterministically.
+        let frame_ms = _frame.captured_at.timestamp_millis();
+        self.rate.observe(frame_ms as f64 / 1_000.0);
 
         // Walk the object list, classifying each. Borrow-checker: pull
         // values out before the per-track state borrow.
-        let cfg_dwell = self.cfg.dwell_frames.max(1);
+        let cfg_dwell = self
+            .cfg
+            .dwell_frames
+            .unwrap_or_else(|| self.rate.frames(self.cfg.dwell_secs))
+            .max(1);
         let cfg_sig_px = self.cfg.significant_movement_pixels.max(1) as f64;
         let cfg_sig_frames = self.cfg.significant_movement_frames.max(1);
         let cfg_alpha = self.cfg.movement_ema_alpha.clamp(0.01, 1.0) as f64;
         let cfg_match_dist = self.cfg.match_distance_pixels.max(1) as f32;
         let cfg_reset_px = self.cfg.track_id_reuse_reset_pixels as f64;
         let cfg_persistence = self.cfg.persistence_enabled;
-        // Wall-clock used to refresh / age anchors. Pulled from the
-        // frame so tests and replay scenarios behave deterministically.
-        let frame_ms = _frame.captured_at.timestamp_millis();
 
         // Build a "static?" verdict per-index without touching the
         // objects yet, because we mutate `self.anchors` inside the
@@ -694,7 +707,9 @@ mod tests {
     fn parked_vehicle_is_suppressed_after_dwell_frames() {
         // Tight thresholds so the test runs in 4 frames.
         let cfg = StaticObjectConfig {
-            dwell_frames: 3,
+            dwell_frames: Some(3),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -722,7 +737,9 @@ mod tests {
     #[test]
     fn moving_vehicle_is_not_suppressed() {
         let cfg = StaticObjectConfig {
-            dwell_frames: 3,
+            dwell_frames: Some(3),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -749,7 +766,9 @@ mod tests {
         // re-alerts a stationary ladder every cooldown window (BUG-020,
         // equipment variant).
         let cfg = StaticObjectConfig {
-            dwell_frames: 3,
+            dwell_frames: Some(3),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -782,7 +801,9 @@ mod tests {
         // arrival (and the newcomer's own match keeps refreshing the
         // TTL, so the sweep never reclaims it either).
         let cfg = StaticObjectConfig {
-            dwell_frames: 3,
+            dwell_frames: Some(3),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -818,11 +839,82 @@ mod tests {
         );
     }
 
+    /// #335 invariant: with default config, a parked vehicle the detector
+    /// sees once and then loses must promote to static before ByteTrack
+    /// retires its track — at Hailo-8's ~1.9 fps and at 30 fps alike.
+    #[test]
+    fn default_dwell_promotes_before_default_max_lost_retires() {
+        use crate::bytetrack::ByteTrackTracker;
+        use nexus_config::TrackerConfig;
+        use nexus_types::Detection;
+        use std::time::{Duration, Instant};
+
+        for fps in [1.9_f64, 30.0] {
+            let cfg = TrackerConfig::default();
+            let tracker = ByteTrackTracker::new(cfg.bytetrack);
+            let mut f = StaticObjectFilter::new(cfg.static_object, 1, None);
+            let t0 = Instant::now();
+            let car = vehicle(0, 500.0, 300.0);
+            let mut promoted_at = None;
+            let mut retired_at = None;
+            for i in 0..2_000u64 {
+                let secs = i as f64 / fps;
+                let dets = if i == 0 {
+                    vec![Detection {
+                        label: car.label.clone(),
+                        confidence: 0.9,
+                        bbox: car.bbox,
+                        attributes: Default::default(),
+                    }]
+                } else {
+                    vec![]
+                };
+                let mut tracked = tracker.update_at(dets, t0 + Duration::from_secs_f64(secs));
+                if tracked.is_empty() {
+                    retired_at = Some(i);
+                    break;
+                }
+                f.classify(&frame(1, i, (secs * 1_000.0) as i64), &mut tracked);
+                if promoted_at.is_none() && tracked.iter().any(is_object_static) {
+                    promoted_at = Some(i);
+                }
+            }
+            let (p, r) = (promoted_at, retired_at);
+            assert!(
+                matches!((p, r), (Some(p), Some(r)) if p < r),
+                "{fps} fps: promoted at {p:?}, retired at {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stationary_person_is_suppressed_when_anchor_persons_is_on() {
+        // #335: a phantom stationary `person` (misdetected furniture) must
+        // stop looping alerts on a parking_lot_mode camera.
+        let cfg = StaticObjectConfig {
+            dwell_frames: Some(3),
+            persistence_enabled: false,
+            ..Default::default()
+        };
+        assert!(cfg.anchor_persons, "default on");
+        let mut f = StaticObjectFilter::new(cfg, 1, None);
+        let mut kept = Vec::new();
+        for i in 0..4 {
+            let mut objs = vec![person(7, 100.0, 100.0)];
+            f.filter(&frame(1, i, i as i64 * 500), &mut objs);
+            kept.push(objs.len());
+        }
+        assert_eq!(kept, vec![1, 1, 0, 0], "promotes on the third static frame");
+    }
+
     #[test]
     fn non_vehicle_labels_bypass_filter() {
-        // Even a perfectly stationary person must NEVER be dropped.
+        // With `anchor_persons` off, even a perfectly stationary person
+        // must NEVER be dropped.
         let cfg = StaticObjectConfig {
-            dwell_frames: 1,
+            dwell_frames: Some(1),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 1,
             significant_movement_frames: 1,
             movement_ema_alpha: 1.0,
@@ -842,7 +934,9 @@ mod tests {
     #[test]
     fn promoted_track_writes_persistent_anchor() {
         let cfg = StaticObjectConfig {
-            dwell_frames: 2,
+            dwell_frames: Some(2),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -867,7 +961,9 @@ mod tests {
     fn fresh_track_matching_existing_anchor_is_suppressed() {
         // Pre-seed with an anchor on disk via load.
         let cfg = StaticObjectConfig {
-            dwell_frames: 999,
+            dwell_frames: Some(999),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -895,7 +991,9 @@ mod tests {
     #[test]
     fn anchor_is_erased_when_vehicle_starts_moving_again() {
         let cfg = StaticObjectConfig {
-            dwell_frames: 999,
+            dwell_frames: Some(999),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -936,7 +1034,9 @@ mod tests {
     #[test]
     fn breaking_static_gate_advances_epoch_and_requires_fresh_dwell() {
         let cfg = StaticObjectConfig {
-            dwell_frames: 3,
+            dwell_frames: Some(3),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -989,7 +1089,9 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         let cfg = StaticObjectConfig {
-            dwell_frames: 2,
+            dwell_frames: Some(2),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -1031,7 +1133,9 @@ mod tests {
         // same `track_id` shows up 400 px away. With the reset guard
         // enabled the new occupant must NOT inherit `static_promoted`.
         let cfg = StaticObjectConfig {
-            dwell_frames: 2,
+            dwell_frames: Some(2),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -1086,7 +1190,9 @@ mod tests {
         // — the guard is off, so the new occupant DOES inherit the
         // promoted state. Verifies the kill switch.
         let cfg = StaticObjectConfig {
-            dwell_frames: 2,
+            dwell_frames: Some(2),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -1120,7 +1226,9 @@ mod tests {
         // and suppression FSM don't keep showing it after the vehicle
         // has driven out of view.
         let cfg = StaticObjectConfig {
-            dwell_frames: 999,
+            dwell_frames: Some(999),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -1156,7 +1264,9 @@ mod tests {
         // Inverse of the above: a parked vehicle keeps reappearing in
         // every frame. Even with a tight TTL the anchor must stay put.
         let cfg = StaticObjectConfig {
-            dwell_frames: 999,
+            dwell_frames: Some(999),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
@@ -1192,7 +1302,9 @@ mod tests {
         // immediately sweep them. This avoids a one-time mass-prune
         // event after upgrading the binary.
         let cfg = StaticObjectConfig {
-            dwell_frames: 999,
+            dwell_frames: Some(999),
+            dwell_secs: 0.0,
+            anchor_persons: false,
             significant_movement_pixels: 10,
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
