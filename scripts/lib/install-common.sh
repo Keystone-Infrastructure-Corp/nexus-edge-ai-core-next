@@ -3003,8 +3003,10 @@ swap_current_symlink() {
 
     # ln -sfn is the canonical "atomic replace a symlink" recipe:
     # it creates a temp symlink with target_version then rename(2)s
-    # it over the existing one.
-    ln -sfn "releases/$target_version" "$link"
+    # it over the existing one. Absolute target to match
+    # nexus-apply-release, which also writes current -> an absolute
+    # release_path (see deploy/nexus-apply-release).
+    ln -sfn "$NEXUS_PREFIX/releases/$target_version" "$link"
 
     # NOTE: these log lines MUST go to stderr. This function returns the
     # previous version via stdout (`printf '%s' "$previous"` below) and
