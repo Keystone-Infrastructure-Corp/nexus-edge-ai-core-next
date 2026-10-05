@@ -318,7 +318,7 @@ Concretely the installer:
 | **Install Intel iGPU + Arc dGPU stack** (kobuk-team PPA + iHD 25.x + Level Zero + media + compute — see §5.1 / §5.2) | apt + PPA                                          | on      | `--no-drivers`                     |
 | **Install Intel NPU driver v1.32.1** (Lunar Lake + Meteor Lake; requires kernel ≥ 6.10 — see §5.3) | `wget` + `apt install ./intel-*.deb`              | on†    | `--no-drivers`                     |
 | **Auto-install `linux-generic-hwe-24.04`** when NPU hardware is detected on a < 6.10 kernel, then exit asking for a reboot | apt                                          | on      | `--no-drivers`                     |
-| Generate `/etc/nexus/nexus.toml` via `nexus-probe emit-config` (first install only) | `install -m 0644`                                  | on      | n/a (preserved on upgrades)         |
+| Generate `/etc/nexus/nexus.toml` via `nexus-probe emit-config` — regenerates on every run, backing up the old file to `nexus.toml.bak.<ts>` first | `install -m 0644`                                  | on      | `--keep-config` to preserve the existing file |
 | Install `/etc/systemd/system/nexus-engine.service` | from `etc-templates/systemd/`                       | on      | n/a                                |
 | Atomically flip `/opt/nexus/current` → new release | `ln -sfn`                                          | on      | n/a                                |
 | `systemctl enable --now nexus-engine`      | systemd                                                 | on      | `--no-start`                       |
@@ -1293,18 +1293,21 @@ client_id = "nexus-engine"
 ### 6.7 Upgrades + rollback
 
 **Upgrade to the current `stable` release** — same one-liner, just
-rerun. The existing `/etc/nexus/nexus.toml` is preserved:
+rerun. By default this **regenerates** `/etc/nexus/nexus.toml` from
+the box's current hardware (backing the old file up to
+`nexus.toml.bak.<ts>` first); pass `--keep-config` to preserve a
+hand-tuned file instead:
 
 ```bash
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s --
 ```
 
-**Pin a specific version:**
+**Pin a specific version** (add `--keep-config` too on a hand-tuned box):
 
 ```bash
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/bootstrap.sh \
-  | sudo bash -s -- --version v0.2.0
+  | sudo bash -s -- --version v0.2.0 --keep-config
 ```
 
 The previous release dir stays at `/opt/nexus/releases/<previous>/`
