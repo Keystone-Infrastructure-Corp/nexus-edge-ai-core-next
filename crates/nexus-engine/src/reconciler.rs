@@ -1779,6 +1779,8 @@ mod tests {
             _codec: CodecKind,
         ) -> Result<(), RecorderError> {
             self.mains_tried.fetch_add(1, Ordering::SeqCst);
+            // `try_update` is the 1.99 name; it does not exist at the 1.88 MSRV.
+            #[allow(deprecated)]
             let refused = self
                 .refuse_main_first
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
