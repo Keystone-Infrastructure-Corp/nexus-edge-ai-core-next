@@ -35,7 +35,6 @@ use nexus_types::{BBox, Detection, TrackId, TrackedObject};
 use parking_lot::Mutex;
 use serde_json::json;
 
-use crate::rate::InferenceRate;
 use crate::Tracker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,14 +65,11 @@ struct TrackState {
 struct ByteTrackState {
     next_id: TrackId,
     tracks: Vec<TrackState>,
-    /// Measured inference rate; converts `max_lost_secs` to frames.
-    rate: InferenceRate,
 }
 
 pub struct ByteTrackTracker {
     cfg: ByteTrackConfig,
     inner: Mutex<ByteTrackState>,
-    created_at: Instant,
 }
 
 impl ByteTrackTracker {
@@ -83,32 +79,16 @@ impl ByteTrackTracker {
             inner: Mutex::new(ByteTrackState {
                 next_id: 1,
                 tracks: Vec::new(),
-                rate: InferenceRate::default(),
             }),
-            created_at: Instant::now(),
         }
     }
 }
 
 impl Tracker for ByteTrackTracker {
     fn update(&self, detections: Vec<Detection>) -> Vec<TrackedObject> {
-        self.update_at(detections, Instant::now())
-    }
-
-    fn name(&self) -> &'static str {
-        "bytetrack"
-    }
-}
-
-impl ByteTrackTracker {
-    /// [`Tracker::update`] with an explicit clock, so tests can drive a
-    /// given inference rate.
-    pub(crate) fn update_at(&self, detections: Vec<Detection>, now: Instant) -> Vec<TrackedObject> {
         let cfg = &self.cfg;
+        let now = Instant::now();
         let mut state = self.inner.lock();
-        state
-            .rate
-            .observe(now.saturating_duration_since(self.created_at).as_secs_f64());
 
         // ---- 1. Predict + age. ----
         for t in state.tracks.iter_mut() {
@@ -200,9 +180,7 @@ impl ByteTrackTracker {
         // doesn't get one last emission. (Order chosen so the test
         // contract holds: max_lost_frames=N means a confirmed track that
         // just demoted to lost can still emit for N more frames.)
-        let max_lost = cfg
-            .max_lost_frames
-            .unwrap_or_else(|| state.rate.frames(cfg.max_lost_secs));
+        let max_lost = cfg.max_lost_frames;
         let max_tent_miss = cfg.tentative_max_missed_frames;
         state.tracks.retain(|t| match t.lifecycle {
             Lifecycle::Tentative => t.missed_frames <= max_tent_miss,
@@ -245,6 +223,10 @@ impl ByteTrackTracker {
             .collect();
 
         out
+    }
+
+    fn name(&self) -> &'static str {
+        "bytetrack"
     }
 }
 
@@ -478,7 +460,7 @@ mod tests {
     #[test]
     fn unmatched_track_demotes_to_lost_then_retires() {
         let mut cfg = cfg_default();
-        cfg.max_lost_frames = Some(2);
+        cfg.max_lost_frames = 2;
         let t = ByteTrackTracker::new(cfg);
 
         let f1 = t.update(vec![det("person", 0.0, 0.9)]);
@@ -548,7 +530,7 @@ mod tests {
         // and burned-in alert clips draw the object where it actually is.
         let mut cfg = cfg_default();
         cfg.display_smoothing_alpha = 0.5;
-        cfg.max_lost_frames = Some(2);
+        cfg.max_lost_frames = 2;
         let t = ByteTrackTracker::new(cfg);
         let _ = t.update(vec![det("person", 0.0, 0.9)]);
         // Object moved to x=3. The emitted (smoothed) bbox lags between 0

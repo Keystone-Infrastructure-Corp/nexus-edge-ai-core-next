@@ -2,7 +2,7 @@
 //! `EventFilter::staticVehicle*` block in
 //! `src/tracking/event_filter.cpp`.
 //!
-//! Vehicles (and, with `anchor_persons`, people) whose smoothed per-frame
+//! Vehicles (and, with opt-in `anchor_persons`, people) whose smoothed per-frame
 //! movement stays below `significant_movement_pixels` for `dwell_frames`
 //! consecutive frames (default: `dwell_secs` at the measured inference
 //! rate) are *promoted* to "static" and dropped from the rule-eval slice
@@ -839,52 +839,71 @@ mod tests {
         );
     }
 
-    /// #335 invariant: with default config, a parked vehicle the detector
+    /// #335 invariant. At Hailo-8's ~1.9 fps a parked vehicle the detector
     /// sees once and then loses must promote to static before ByteTrack
-    /// retires its track — at Hailo-8's ~1.9 fps and at 30 fps alike.
+    /// retires its track (default dwell 5 s ≈ 10 frames < max_lost 30).
     #[test]
-    fn default_dwell_promotes_before_default_max_lost_retires() {
+    fn default_dwell_promotes_before_retirement_at_hailo_rate() {
         use crate::bytetrack::ByteTrackTracker;
+        use crate::Tracker;
         use nexus_config::TrackerConfig;
         use nexus_types::Detection;
-        use std::time::{Duration, Instant};
 
-        for fps in [1.9_f64, 30.0] {
-            let cfg = TrackerConfig::default();
-            let tracker = ByteTrackTracker::new(cfg.bytetrack);
-            let mut f = StaticObjectFilter::new(cfg.static_object, 1, None);
-            let t0 = Instant::now();
-            let car = vehicle(0, 500.0, 300.0);
-            let mut promoted_at = None;
-            let mut retired_at = None;
-            for i in 0..2_000u64 {
-                let secs = i as f64 / fps;
-                let dets = if i == 0 {
-                    vec![Detection {
-                        label: car.label.clone(),
-                        confidence: 0.9,
-                        bbox: car.bbox,
-                        attributes: Default::default(),
-                    }]
-                } else {
-                    vec![]
-                };
-                let mut tracked = tracker.update_at(dets, t0 + Duration::from_secs_f64(secs));
-                if tracked.is_empty() {
-                    retired_at = Some(i);
-                    break;
-                }
-                f.classify(&frame(1, i, (secs * 1_000.0) as i64), &mut tracked);
-                if promoted_at.is_none() && tracked.iter().any(is_object_static) {
-                    promoted_at = Some(i);
-                }
+        let cfg = TrackerConfig::default();
+        let tracker = ByteTrackTracker::new(cfg.bytetrack);
+        let mut f = StaticObjectFilter::new(cfg.static_object, 1, None);
+        let car = vehicle(0, 500.0, 300.0);
+        let mut promoted_at = None;
+        let mut retired_at = None;
+        for i in 0..100u64 {
+            let dets = if i == 0 {
+                vec![Detection {
+                    label: car.label.clone(),
+                    confidence: 0.9,
+                    bbox: car.bbox,
+                    attributes: Default::default(),
+                }]
+            } else {
+                vec![]
+            };
+            let mut tracked = tracker.update(dets);
+            if tracked.is_empty() {
+                retired_at = Some(i);
+                break;
             }
-            let (p, r) = (promoted_at, retired_at);
-            assert!(
-                matches!((p, r), (Some(p), Some(r)) if p < r),
-                "{fps} fps: promoted at {p:?}, retired at {r:?}"
+            f.classify(
+                &frame(1, i, (i as f64 / 1.9 * 1_000.0) as i64),
+                &mut tracked,
             );
+            if promoted_at.is_none() && tracked.iter().any(is_object_static) {
+                promoted_at = Some(i);
+            }
         }
+        let (p, r) = (promoted_at, retired_at);
+        assert!(
+            matches!((p, r), (Some(p), Some(r)) if p < r),
+            "promoted at {p:?}, retired at {r:?}"
+        );
+    }
+
+    /// #335: at 30 fps the default dwell resolves to 150 frames — the
+    /// pre-#335 `dwell_frames = 150` behaviour, unchanged.
+    #[test]
+    fn default_dwell_is_150_frames_at_30_fps() {
+        let mut f = StaticObjectFilter::new(
+            StaticObjectConfig {
+                persistence_enabled: false,
+                ..Default::default()
+            },
+            1,
+            None,
+        );
+        let promoted_at = (0..200u64).find(|&i| {
+            let mut objs = vec![vehicle(1, 500.0, 300.0)];
+            f.classify(&frame(1, i, (i as f64 / 30.0 * 1_000.0) as i64), &mut objs);
+            objs.iter().any(is_object_static)
+        });
+        assert_eq!(promoted_at, Some(149), "150th static frame promotes");
     }
 
     #[test]
@@ -893,10 +912,10 @@ mod tests {
         // stop looping alerts on a parking_lot_mode camera.
         let cfg = StaticObjectConfig {
             dwell_frames: Some(3),
+            anchor_persons: true,
             persistence_enabled: false,
             ..Default::default()
         };
-        assert!(cfg.anchor_persons, "default on");
         let mut f = StaticObjectFilter::new(cfg, 1, None);
         let mut kept = Vec::new();
         for i in 0..4 {

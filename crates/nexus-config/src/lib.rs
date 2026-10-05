@@ -1593,16 +1593,9 @@ pub struct ByteTrackConfig {
     #[serde(default = "default_bytetrack_match_iou_threshold")]
     pub match_iou_threshold: f32,
     /// Frames a confirmed/lost track may go without a match before being
-    /// retired. Unset (default): derived from `max_lost_secs` at the
-    /// camera's measured inference rate. Set to pin a frame count.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_lost_frames: Option<u32>,
-    /// Wall-clock lost-track lifetime used when `max_lost_frames` is
-    /// unset. Default: 10 s. Keep it above `static_object.dwell_secs` so
-    /// a parked vehicle the detector stops seeing is promoted to static
-    /// before its track is retired (#335).
-    #[serde(default = "default_bytetrack_max_lost_secs")]
-    pub max_lost_secs: f32,
+    /// retired. v1 default: 30.
+    #[serde(default = "default_bytetrack_max_lost_frames")]
+    pub max_lost_frames: u32,
     /// Hit streak required for a tentative track to be promoted to
     /// confirmed. v1 default: 1 (promote on first hit — keeps event
     /// suppression off when detections are intermittent).
@@ -1631,8 +1624,7 @@ impl Default for ByteTrackConfig {
             high_confidence: default_bytetrack_high_confidence(),
             low_confidence: default_bytetrack_low_confidence(),
             match_iou_threshold: default_bytetrack_match_iou_threshold(),
-            max_lost_frames: None,
-            max_lost_secs: default_bytetrack_max_lost_secs(),
+            max_lost_frames: default_bytetrack_max_lost_frames(),
             confirm_frames: default_bytetrack_confirm_frames(),
             tentative_max_missed_frames: default_bytetrack_tentative_max_missed_frames(),
             display_smoothing_alpha: default_bytetrack_display_smoothing_alpha(),
@@ -1656,8 +1648,8 @@ fn default_bytetrack_low_confidence() -> f32 {
 fn default_bytetrack_match_iou_threshold() -> f32 {
     0.3
 }
-fn default_bytetrack_max_lost_secs() -> f32 {
-    10.0
+fn default_bytetrack_max_lost_frames() -> u32 {
+    30
 }
 fn default_bytetrack_confirm_frames() -> u32 {
     1
@@ -1831,14 +1823,16 @@ pub struct StaticObjectConfig {
     /// measured inference rate. Set to pin a frame count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dwell_frames: Option<u32>,
-    /// Wall-clock dwell used when `dwell_frames` is unset. Default: 5 s.
-    /// Keep it below `bytetrack.max_lost_secs` (#335).
+    /// Wall-clock dwell used when `dwell_frames` is unset. Default: 5 s,
+    /// so on a ~1.9 fps Hailo-8 camera a parked vehicle promotes (~10
+    /// frames) before ByteTrack retires its track (#335).
     #[serde(default = "default_static_object_dwell_secs")]
     pub dwell_secs: f32,
     /// Also promote stationary `person` tracks to anchors, so a phantom
     /// stationary person (e.g. a misdetected gym machine) stops looping
-    /// alerts on a `parking_lot_mode` camera. Default: true.
-    #[serde(default = "default_true")]
+    /// alerts on a `parking_lot_mode` camera. Opt-in per site: a
+    /// stationary person is suppressed until they move. Default: false.
+    #[serde(default)]
     pub anchor_persons: bool,
     /// Px-EMA threshold above which a static track is considered
     /// "moving again". v1 default: 36.
@@ -1887,7 +1881,7 @@ impl Default for StaticObjectConfig {
         Self {
             dwell_frames: None,
             dwell_secs: default_static_object_dwell_secs(),
-            anchor_persons: true,
+            anchor_persons: false,
             significant_movement_pixels: default_static_object_significant_movement_pixels(),
             significant_movement_frames: default_static_object_significant_movement_frames(),
             movement_ema_alpha: default_static_object_movement_ema_alpha(),
@@ -3586,25 +3580,26 @@ mod tests {
         assert_eq!(json["kind"], "email");
     }
 
-    /// #335: tracker thresholds default to wall-clock durations (a parked
-    /// vehicle's dwell fits inside the lost-track lifetime), and an
-    /// explicit frame count — the field operators already set — still
-    /// parses and wins.
+    /// #335: dwell / parked thresholds default to wall-clock durations,
+    /// and an explicit frame count — the fields operators already set —
+    /// still parses and wins.
     #[test]
     fn tracker_thresholds_default_to_durations_and_frames_still_parse() {
         let d = TrackerConfig::default();
-        assert!(d.static_object.dwell_secs < d.bytetrack.max_lost_secs);
         assert_eq!(d.static_object.dwell_frames, None);
-        assert_eq!(d.bytetrack.max_lost_frames, None);
         assert_eq!(d.annotator.parked_min_frames_to_flag, None);
-        assert!(d.static_object.anchor_persons);
+        assert_eq!(d.bytetrack.max_lost_frames, 30);
+        assert!(
+            !d.static_object.anchor_persons,
+            "person anchoring is opt-in"
+        );
 
         let cfg: TrackerConfig = toml::from_str(
             "[static_object]\ndwell_frames = 20\n[bytetrack]\nmax_lost_frames = 60\n",
         )
         .unwrap();
         assert_eq!(cfg.static_object.dwell_frames, Some(20));
-        assert_eq!(cfg.bytetrack.max_lost_frames, Some(60));
+        assert_eq!(cfg.bytetrack.max_lost_frames, 60);
     }
 
     /// Minimal TOML (only the required fields) must parse, with every
