@@ -2187,25 +2187,37 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // systemd SIGKILLs mid-teardown (#360). Budget: 5 s for these background
     // tasks together (one shared deadline, not 5 s each), 15 s recorder drain,
     // 4 s teardown pool, 3 s detector threads = 27 s.
+    //
+    // Signals go out to every task together, then all nine handles are
+    // awaited concurrently against the one shared deadline. Signalling and
+    // awaiting one task at a time would let a slow task (e.g. `cold_handle`,
+    // whose loop also runs reannounce) burn the whole 5s before later tasks
+    // — including the dispatcher and `cloud_tunnel`'s outbox drain — are
+    // even told to stop.
     let tasks_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let _ = cold_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, cold_handle).await;
     let _ = retention_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, retention_handle).await;
     let _ = audit_retention_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, audit_retention_handle).await;
     let _ = alert_clip_evict_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, alert_clip_evict_handle).await;
     let _ = usb_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, usb_watch_handle).await;
     let _ = dispatcher_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, dispatcher_handle).await;
     let _ = delivery_reload_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, delivery_reload_handle).await;
     let _ = sinks_reload_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, sinks_reload_handle).await;
     let _ = cloud_tunnel_shutdown_tx.send(());
-    let _ = tokio::time::timeout_at(tasks_deadline, cloud_tunnel_handle).await;
+    let _ = tokio::time::timeout_at(tasks_deadline, async {
+        tokio::join!(
+            cold_handle,
+            retention_handle,
+            audit_retention_handle,
+            alert_clip_evict_handle,
+            usb_watch_handle,
+            dispatcher_handle,
+            delivery_reload_handle,
+            sinks_reload_handle,
+            cloud_tunnel_handle,
+        )
+    })
+    .await;
     reconciler_handle.abort();
     roster_handle.abort();
     state_hashes_handle.abort();
