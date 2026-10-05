@@ -928,9 +928,27 @@ impl ClipRecorder for GstClipRecorder {
             );
         }
 
-        // M2.1 spec: discard sub-3s clips. The pipeline + filesink
-        // are already torn down so we can safely unlink the file.
-        if duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
+        // #358: a clip the muxer accepted nothing for, or whose file is
+        // a bare stub, is a failed recording. Without this the wall-clock
+        // fallback above clears the sub-3s check and the empty file is
+        // stamped, cold-replicated and announced as footage.
+        let file_bytes = fs::metadata(&state.path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let empty_reason = empty_clip_reason(media_ms, file_bytes);
+        if let Some(reason) = empty_reason {
+            warn!(
+                camera_id = state.camera_id,
+                clip_id = handle.clip_id,
+                reason,
+                media_ms,
+                wall_ms,
+                file_bytes,
+                "gst recorder: clip recorded no playable media -- failing it \
+                 (delete file + cascade-delete metadata, not replicated)"
+            );
+        } else if duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
             warn!(
                 camera_id = state.camera_id,
                 clip_id = handle.clip_id,
@@ -938,13 +956,18 @@ impl ClipRecorder for GstClipRecorder {
                 min_ms = crate::recorder::MIN_CLIP_DURATION_MS,
                 "gst recorder: clip too short -- discarding (delete file + cascade-delete metadata)"
             );
+        }
+
+        // M2.1 spec: discard sub-3s clips. The pipeline + filesink
+        // are already torn down so we can safely unlink the file.
+        if empty_reason.is_some() || duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
             if let Err(e) = fs::remove_file(&state.path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     warn!(
                         clip_id = handle.clip_id,
                         path = %state.path.display(),
                         error = %e,
-                        "gst recorder: failed to unlink discarded short clip"
+                        "gst recorder: failed to unlink discarded clip"
                     );
                 }
             }
@@ -1854,6 +1877,22 @@ const FALLBACK_FRAME_INTERVAL_NS: u64 = 33_333_333;
 /// frame interval is added to account for that frame's own on-screen
 /// time. `None` (nothing was ever written) yields 0, which `close()`
 /// treats as "fall back to the wall clock".
+/// Smallest closed clip file that can hold any video. An mp4 with no
+/// samples is an ftyp+moov stub of well under this.
+const MIN_PLAYABLE_CLIP_BYTES: u64 = 1024;
+
+/// Why a closed clip holds no playable media, or `None` if it may. Either
+/// condition fails the clip outright, whatever its wall-clock span (#358).
+fn empty_clip_reason(media_ms: i64, file_bytes: u64) -> Option<&'static str> {
+    if media_ms == 0 {
+        Some("muxer accepted no samples")
+    } else if file_bytes < MIN_PLAYABLE_CLIP_BYTES {
+        Some("clip file under 1 KiB")
+    } else {
+        None
+    }
+}
+
 fn media_duration_ms(last_written_pts_ns: Option<u64>) -> i64 {
     last_written_pts_ns
         .map(|ns| ((ns + FALLBACK_FRAME_INTERVAL_NS) / 1_000_000) as i64)
@@ -2532,9 +2571,23 @@ mod tests {
     }
 
     #[test]
+    fn a_clip_with_no_media_or_a_stub_file_is_failed() {
+        // The muxer accepted nothing: failed, however long the wall
+        // clock ran and however big the file is.
+        assert!(empty_clip_reason(0, 5_000_000).is_some());
+        // Samples were pushed but the parser dropped every one, leaving
+        // a 0-byte file (the SDP-only parameter-set camera in #358).
+        assert!(empty_clip_reason(26_000, 0).is_some());
+        assert!(empty_clip_reason(26_000, 863).is_some());
+        assert!(empty_clip_reason(26_000, MIN_PLAYABLE_CLIP_BYTES - 1).is_some());
+        // A real clip is kept.
+        assert_eq!(empty_clip_reason(26_000, MIN_PLAYABLE_CLIP_BYTES), None);
+        assert_eq!(empty_clip_reason(33, 400_000), None);
+    }
+
+    #[test]
     fn media_duration_counts_the_final_frame() {
-        // Nothing written -> 0, which close() reads as "use the wall
-        // clock".
+        // Nothing written -> 0, which close() fails as an empty clip.
         assert_eq!(media_duration_ms(None), 0);
         // A single sample at PTS 0 is still one frame long, not zero,
         // otherwise every one-frame clip would look empty.
@@ -3077,5 +3130,176 @@ mod tests {
             "the clip must be cut from the main session's codec (h264), not \
              the analysis session's (h265) — got {meta:?}"
         );
+    }
+}
+
+// #358 regression fixture: a stream that carries SPS/PPS once per session
+// (what `rtph264depay` injects from the SDP sprop) and a clip whose
+// snapshot starts at the second GOP. Needs `x264enc` + `avdec_h264`
+// (the Linux CI `gstreamer` job, local dev); skips without them.
+#[cfg(test)]
+mod sdp_only_param_set_tests {
+    use super::*;
+    use crate::param_sets::ParamSetCache;
+    use gstreamer_app::AppSink;
+
+    fn has_elements(names: &[&str]) -> bool {
+        gst::init().is_ok() && names.iter().all(|n| gst::ElementFactory::find(n).is_some())
+    }
+
+    /// Four GOPs of H.264, AU-aligned, with SPS/PPS on every IDR.
+    fn gen_aus() -> Vec<NalSample> {
+        let desc = "videotestsrc num-buffers=60 is-live=false \
+             ! video/x-raw,width=320,height=240,framerate=30/1 \
+             ! x264enc key-int-max=15 tune=zerolatency \
+             ! h264parse config-interval=-1 \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=out sync=false";
+        let pipeline = gst::parse::launch(desc)
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut out = Vec::new();
+        while let Ok(sample) = sink.pull_sample() {
+            let buffer = sample.buffer().unwrap();
+            let pts = buffer.pts().map(|t| Duration::from_nanos(t.nseconds()));
+            out.push(NalSample {
+                pts,
+                dts: pts,
+                is_keyframe: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
+                data: buffer.map_readable().unwrap().to_vec(),
+            });
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        out
+    }
+
+    /// Mux `samples` through the recorder's own pipeline; return the file
+    /// size and whether it decodes to EOS.
+    fn record(samples: &[NalSample]) -> (u64, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        let (pipeline, appsrc) = GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let base = samples[0].pts.unwrap();
+        let mut last = None;
+        for s in samples {
+            last = Some(push_sample(&appsrc, s, base, last, FALLBACK_FRAME_INTERVAL_NS).unwrap());
+        }
+        let _ = appsrc.end_of_stream();
+        let bus = pipeline.bus().unwrap();
+        let _ = bus.timed_pop_filtered(
+            Some(gst::ClockTime::from_seconds(10)),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let loc = path.to_string_lossy().replace('"', "");
+        let check = gst::parse::launch(&format!(
+            "filesrc location=\"{loc}\" ! qtdemux ! h264parse ! avdec_h264 ! fakesink sync=false"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let decoded = check.set_state(gst::State::Playing).is_ok()
+            && matches!(
+                check
+                    .bus()
+                    .unwrap()
+                    .timed_pop_filtered(
+                        Some(gst::ClockTime::from_seconds(10)),
+                        &[gst::MessageType::Eos, gst::MessageType::Error],
+                    )
+                    .map(|m| m.type_()),
+                Some(gst::MessageType::Eos)
+            );
+        check.set_state(gst::State::Null).unwrap();
+        (size, decoded)
+    }
+
+    /// Drop every in-band SPS/PPS after the first AU, which is what an
+    /// SDP-only camera looks like downstream of `rtph264depay`.
+    fn strip_repeated_params(mut samples: Vec<NalSample>) -> Vec<NalSample> {
+        for s in samples.iter_mut().skip(1) {
+            let d = &s.data;
+            let mut starts = Vec::new();
+            let mut i = 0;
+            while i + 3 < d.len() {
+                if d[i..i + 4] == [0, 0, 0, 1] {
+                    starts.push(i);
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            }
+            let mut kept = Vec::with_capacity(d.len());
+            for (n, &st) in starts.iter().enumerate() {
+                let end = starts.get(n + 1).copied().unwrap_or(d.len());
+                if !matches!(d[st + 4] & 0x1f, 7 | 8) {
+                    kept.extend_from_slice(&d[st..end]);
+                }
+            }
+            s.data = kept;
+        }
+        samples
+    }
+
+    fn from_second_gop(samples: Vec<NalSample>) -> Vec<NalSample> {
+        let second = samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_keyframe)
+            .nth(1)
+            .map(|(i, _)| i)
+            .expect("fixture has a second GOP");
+        samples[second..].to_vec()
+    }
+
+    fn through_cache(samples: Vec<NalSample>) -> Vec<NalSample> {
+        let mut cache = ParamSetCache::new(false);
+        samples
+            .into_iter()
+            .map(|mut s| {
+                if let Some(data) = cache.process(&s.data) {
+                    s.data = data;
+                }
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_second_gop_clip_from_an_sdp_only_stream_plays_back() {
+        if !has_elements(&["x264enc", "avdec_h264", "mp4mux"]) {
+            eprintln!("skipping: x264enc/avdec_h264/mp4mux not available");
+            return;
+        }
+        let aus = strip_repeated_params(gen_aus());
+        // Without re-injection the second GOP has no SPS/PPS: the
+        // recorder writes nothing playable (the #358 0-byte clips).
+        let (_, decoded) = record(&from_second_gop(aus.clone()));
+        assert!(!decoded, "fixture must reproduce the bare-IDR failure");
+        let (size, decoded) = record(&from_second_gop(through_cache(aus)));
+        assert!(decoded, "re-injected clip must decode");
+        assert!(size >= MIN_PLAYABLE_CLIP_BYTES, "clip is {size} bytes");
+    }
+
+    #[test]
+    fn a_stream_with_params_on_every_idr_is_byte_identical() {
+        if !has_elements(&["x264enc"]) {
+            eprintln!("skipping: x264enc not available");
+            return;
+        }
+        let aus = gen_aus();
+        let mut cache = ParamSetCache::new(false);
+        for s in &aus {
+            assert_eq!(cache.process(&s.data), None, "no AU may be rewritten");
+        }
     }
 }

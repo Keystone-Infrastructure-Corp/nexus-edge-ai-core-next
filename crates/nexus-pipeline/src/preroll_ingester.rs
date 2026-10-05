@@ -43,9 +43,16 @@
 //! camera's byte-stream through unchanged: cameras that already
 //! include SPS/PPS per keyframe work end-to-end, and clips for
 //! cameras that DON'T (some Axis/Hikvision models in legacy modes)
-//! only become un-decodable when the snapshot starts mid-GOP — a
-//! known limitation we can revisit by caching the most-recent
-//! SPS/PPS NALs and prepending them to AUs that lack them.
+//! send their parameter sets only in the SDP, so after the first GOP
+//! of a session every IDR arrives bare and every clip that starts
+//! there is un-decodable (#358). The tap callback therefore runs each
+//! access unit through [`crate::param_sets::ParamSetCache`], which
+//! remembers the most recent SPS/PPS (and VPS for H.265) seen on the
+//! session — including the copy `rtph26Xdepay` injects from
+//! `sprop-parameter-sets` at session start — and prepends them to an
+//! IDR access unit that carries none. An AU that already carries any
+//! parameter set passes through byte-identical, so cameras that send
+//! them per keyframe never see a doubled pair.
 //! See also `gst_clip_recorder::push_sample` for the per-buffer
 //! PTS synthesis that complements this fix.
 //!
@@ -83,6 +90,7 @@ use crate::decode::{
     FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, TerminalRung, FLAT_FRAME_EVAL_WINDOW,
     FLAT_FRAME_TERMINAL_TRIPS, FLAT_FRAME_TRIP, FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP,
 };
+use crate::param_sets::ParamSetCache;
 use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
 use crate::stats::DecodeHealthRegistry;
@@ -812,6 +820,9 @@ async fn run_session(
     // so a normally-recording session never trips the watchdog.
     let last_sample_at = std::sync::Arc::new(parking_lot::Mutex::new(None::<Instant>));
     let last_sample_at_cb = last_sample_at.clone();
+    // Re-inject cached parameter sets into bare IDRs (#358). Fresh per
+    // session: the depayloader re-sends the sprop copy on reconnect.
+    let mut param_sets = ParamSetCache::new(codec.base() == "h265");
     sink.set_callbacks(
         AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -838,7 +849,9 @@ async fn run_session(
                     pts,
                     dts,
                     is_keyframe,
-                    data: map.as_slice().to_vec(),
+                    data: param_sets
+                        .process(map.as_slice())
+                        .unwrap_or_else(|| map.as_slice().to_vec()),
                 };
                 // Bump the stall watchdog before anything downstream
                 // runs: this sample DID arrive from the camera, and a
