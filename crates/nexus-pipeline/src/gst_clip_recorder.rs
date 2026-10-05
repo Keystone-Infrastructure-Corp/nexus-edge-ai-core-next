@@ -928,15 +928,15 @@ impl ClipRecorder for GstClipRecorder {
             );
         }
 
-        // #358: a clip the muxer accepted nothing for, or whose file is
-        // a bare stub, is a failed recording. Without this the wall-clock
-        // fallback above clears the sub-3s check and the empty file is
-        // stamped, cold-replicated and announced as footage.
+        // #358: a clip whose file is missing or a bare stub is a failed
+        // recording. Without this the wall-clock fallback above clears
+        // the sub-3s check and the empty file is stamped, cold-replicated
+        // and announced as footage.
         let file_bytes = fs::metadata(&state.path)
             .await
             .map(|m| m.len())
             .unwrap_or(0);
-        let empty_reason = empty_clip_reason(media_ms, file_bytes);
+        let empty_reason = empty_clip_reason(file_bytes);
         if let Some(reason) = empty_reason {
             warn!(
                 camera_id = state.camera_id,
@@ -946,7 +946,7 @@ impl ClipRecorder for GstClipRecorder {
                 wall_ms,
                 file_bytes,
                 "gst recorder: clip recorded no playable media -- failing it \
-                 (delete file + cascade-delete metadata, not replicated)"
+                 (delete file + clip row, keep its alerts, not replicated)"
             );
         } else if duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
             warn!(
@@ -954,12 +954,15 @@ impl ClipRecorder for GstClipRecorder {
                 clip_id = handle.clip_id,
                 duration_ms,
                 min_ms = crate::recorder::MIN_CLIP_DURATION_MS,
-                "gst recorder: clip too short -- discarding (delete file + cascade-delete metadata)"
+                "gst recorder: clip too short -- discarding (delete file + clip row, keep its alerts)"
             );
         }
 
         // M2.1 spec: discard sub-3s clips. The pipeline + filesink
-        // are already torn down so we can safely unlink the file.
+        // are already torn down so we can safely unlink the file. The
+        // row goes but its alerts stay: the supervisor linked every
+        // alert that fired meanwhile to this clip, and a cascade delete
+        // would take them and their undelivered outbox rows with it.
         if empty_reason.is_some() || duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
             if let Err(e) = fs::remove_file(&state.path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -971,9 +974,7 @@ impl ClipRecorder for GstClipRecorder {
                     );
                 }
             }
-            self.store
-                .cascade_delete_clip_metadata(handle.clip_id)
-                .await?;
+            self.store.discard_clip_metadata(handle.clip_id).await?;
             return Ok(ClipMeta {
                 clip_id: handle.clip_id,
                 camera_id: state.camera_id,
@@ -1872,27 +1873,24 @@ pub(crate) fn push_sample(
 /// the first place.
 const FALLBACK_FRAME_INTERVAL_NS: u64 = 33_333_333;
 
-/// Convert the muxer's last-accepted rebased PTS into a clip duration
-/// in milliseconds. The PTS is the *start* of the final sample, so one
-/// frame interval is added to account for that frame's own on-screen
-/// time. `None` (nothing was ever written) yields 0, which `close()`
-/// treats as "fall back to the wall clock".
 /// Smallest closed clip file that can hold any video. An mp4 with no
 /// samples is an ftyp+moov stub of well under this.
 const MIN_PLAYABLE_CLIP_BYTES: u64 = 1024;
 
-/// Why a closed clip holds no playable media, or `None` if it may. Either
-/// condition fails the clip outright, whatever its wall-clock span (#358).
-fn empty_clip_reason(media_ms: i64, file_bytes: u64) -> Option<&'static str> {
-    if media_ms == 0 {
-        Some("muxer accepted no samples")
-    } else if file_bytes < MIN_PLAYABLE_CLIP_BYTES {
-        Some("clip file under 1 KiB")
-    } else {
-        None
-    }
+/// Why a closed clip holds no playable media, or `None` if it may. The
+/// file is the decisive signal (a missing file is 0 bytes): a stub fails
+/// the clip outright, whatever its wall-clock span (#358). The media
+/// timeline is not consulted -- it reads 0 for a real clip whenever the
+/// live pump timed out or panicked before reporting its stats.
+fn empty_clip_reason(file_bytes: u64) -> Option<&'static str> {
+    (file_bytes < MIN_PLAYABLE_CLIP_BYTES).then_some("clip file under 1 KiB")
 }
 
+/// Convert the muxer's last-accepted rebased PTS into a clip duration
+/// in milliseconds. The PTS is the *start* of the final sample, so one
+/// frame interval is added to account for that frame's own on-screen
+/// time. `None` (no PTS was reported, e.g. the pump's stats were lost)
+/// yields 0, which `close()` treats as "fall back to the wall clock".
 fn media_duration_ms(last_written_pts_ns: Option<u64>) -> i64 {
     last_written_pts_ns
         .map(|ns| ((ns + FALLBACK_FRAME_INTERVAL_NS) / 1_000_000) as i64)
@@ -2571,23 +2569,23 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_with_no_media_or_a_stub_file_is_failed() {
-        // The muxer accepted nothing: failed, however long the wall
-        // clock ran and however big the file is.
-        assert!(empty_clip_reason(0, 5_000_000).is_some());
+    fn a_clip_with_a_missing_or_stub_file_is_failed() {
         // Samples were pushed but the parser dropped every one, leaving
-        // a 0-byte file (the SDP-only parameter-set camera in #358).
-        assert!(empty_clip_reason(26_000, 0).is_some());
-        assert!(empty_clip_reason(26_000, 863).is_some());
-        assert!(empty_clip_reason(26_000, MIN_PLAYABLE_CLIP_BYTES - 1).is_some());
-        // A real clip is kept.
-        assert_eq!(empty_clip_reason(26_000, MIN_PLAYABLE_CLIP_BYTES), None);
-        assert_eq!(empty_clip_reason(33, 400_000), None);
+        // a 0-byte (or missing) file (the SDP-only camera in #358).
+        assert!(empty_clip_reason(0).is_some());
+        assert!(empty_clip_reason(863).is_some());
+        assert!(empty_clip_reason(MIN_PLAYABLE_CLIP_BYTES - 1).is_some());
+        // A real file is kept -- even when the pump's stats were lost
+        // and the media timeline reads 0; close() then falls back to
+        // the wall clock for its duration.
+        assert_eq!(empty_clip_reason(MIN_PLAYABLE_CLIP_BYTES), None);
+        assert_eq!(empty_clip_reason(5_000_000), None);
     }
 
     #[test]
     fn media_duration_counts_the_final_frame() {
-        // Nothing written -> 0, which close() fails as an empty clip.
+        // No PTS reported -> 0, which close() replaces with the wall
+        // clock (the file, not this, decides whether the clip is empty).
         assert_eq!(media_duration_ms(None), 0);
         // A single sample at PTS 0 is still one frame long, not zero,
         // otherwise every one-frame clip would look empty.

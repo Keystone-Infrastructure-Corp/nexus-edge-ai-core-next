@@ -319,6 +319,9 @@ impl Store {
             if Self::migration_applied(pool, id).await? {
                 continue;
             }
+            // Some migrations (e.g. 0035's index build) take minutes on
+            // a large DB; say so up front so it isn't read as a hang.
+            info!(migration = %id, "applying schema migration");
             // A migration may opt out of the wrapping transaction so it
             // can perform a parent-table rebuild safely. The official
             // SQLite recipe for that requires `PRAGMA foreign_keys=OFF`
@@ -811,6 +814,33 @@ impl Store {
                 Ok(Some(serde_json::from_str(&s)?))
             }
         }
+    }
+
+    /// Delete a clip the recorder failed (empty, or under the minimum
+    /// duration) WITHOUT taking its alerts with it. Unlike
+    /// [`Self::cascade_delete_clip_metadata`] — eviction of real
+    /// footage — the alerts linked to a failed clip are still real
+    /// alerts, so they are detached (`clip_id = NULL`) in the same
+    /// transaction before the row goes; otherwise `events.clip_id`'s
+    /// CASCADE (0003) would delete them and, through
+    /// `alert_sink_outbox.event_id`, their undelivered outbox rows.
+    /// The clip row itself is gone, so it is never cold-replicated or
+    /// announced.
+    pub async fn discard_clip_metadata(&self, clip_id: ClipId) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE events SET clip_id = NULL WHERE clip_id = ?")
+            .bind(clip_id)
+            .execute(&mut *tx)
+            .await?;
+        let res = sqlx::query("DELETE FROM motion_clips WHERE id = ?")
+            .bind(clip_id)
+            .execute(&mut *tx)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Given candidate event ids parsed from snapshot filenames on
