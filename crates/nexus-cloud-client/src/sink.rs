@@ -106,8 +106,8 @@ impl CloudConsoleSink {
     ///
     /// Returns [`TunnelError`] from the underlying handle (e.g.
     /// `Disconnected` when the WSS tunnel is currently down — the
-    /// replicator logs and continues; the polling backstop +
-    /// future Phase 6.17 sweep reconcile any lost envelopes).
+    /// replicator logs and continues; its polling backstop re-sends
+    /// any `clip_replicated` the cloud has not acked).
     pub async fn publish_clip_replicated(
         &self,
         clip: ClipReplicatedProjection,
@@ -249,7 +249,7 @@ pub struct ClipReplicatedProjection {
     pub size_bytes: u64,
     /// 64-character lowercase hex of the streaming SHA-256 computed
     /// over the MP4 bytes during write on the edge. Cloud stores in
-    /// `clips.sha256` and the Phase 6.17 integrity sweep verifies
+    /// `clips.sha256` and the cloud integrity sweep verifies
     /// against Blob on read.
     pub sha256_hex: String,
     /// Video codec inside the MP4. `None` → cloud defaults to `h264`.

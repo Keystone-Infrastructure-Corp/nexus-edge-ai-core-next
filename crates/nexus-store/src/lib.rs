@@ -201,6 +201,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0035_motion_events_captured_at_index",
         include_str!("../migrations/0035_motion_events_captured_at_index.sql"),
     ),
+    (
+        "NNNN_PLACEHOLDER_clip_announce",
+        include_str!("../migrations/NNNN_PLACEHOLDER_clip_announce.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

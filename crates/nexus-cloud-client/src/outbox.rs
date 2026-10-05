@@ -24,12 +24,13 @@
 //!
 //! * `send` returns `Ok(())` only when the active handle accepted the
 //!   envelope. `TunnelError::Disconnected` means "no handle is
-//!   currently installed" — callers log and move on; the next
-//!   polling backstop pass (cold replicator) or the Phase 6.17
-//!   reconciler sweep will re-publish anything dropped.
+//!   currently installed" — callers log and move on.
 //! * The outbox does NOT persist envelopes. If an envelope was sent
-//!   while disconnected, it is lost from the engine's perspective —
-//!   the cloud-side reconciler is the authoritative recovery path.
+//!   while disconnected, it is lost unless the publisher keeps its
+//!   own durable state. `clip_replicated` does (#759): the cold
+//!   replicator records each announce on the clip's row and re-sends
+//!   it on every polling backstop until the cloud answers with a
+//!   `clip_replicated_ack`.
 //! * Cloning the outbox handle is cheap (one `Arc::clone`).
 
 use std::sync::Arc;

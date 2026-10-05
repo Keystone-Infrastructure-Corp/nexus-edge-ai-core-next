@@ -269,6 +269,59 @@ impl Store {
         Ok(())
     }
 
+    /// #759 — alert-clip twin of [`Store::stamp_clip_announce`]: record
+    /// the blob URL and the `meta.id` of the `clip_replicated` about to
+    /// be sent, before sending it.
+    pub async fn stamp_alert_clip_announce(
+        &self,
+        id: AlertClipId,
+        blob_url: &str,
+        announce_id: &str,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE alert_clips SET cloud_blob_url = ?, cloud_announce_id = ? WHERE id = ?",
+        )
+        .bind(blob_url)
+        .bind(announce_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("alert_clip id={id}")));
+        }
+        Ok(())
+    }
+
+    /// #759 — alert-clip twin of [`Store::clips_pending_cloud_announce`]:
+    /// cold-uploaded alert clips the cloud has not acked yet, each paired
+    /// with its blob URL, oldest upload first, uploaded at or before
+    /// `cutoff`.
+    pub async fn alert_clips_pending_cloud_announce(
+        &self,
+        limit: i64,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<(AlertClipRow, String)>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ALERT_CLIP_COLUMNS}, cloud_blob_url FROM alert_clips
+              WHERE cloud_blob_url IS NOT NULL
+                AND cloud_announced_at IS NULL
+                AND cold_uploaded_at IS NOT NULL
+                AND cold_uploaded_at <= ?
+              ORDER BY cold_uploaded_at ASC
+              LIMIT ?"
+        ))
+        .bind(cutoff.to_rfc3339())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let url = row.get::<String, _>("cloud_blob_url");
+                alert_clip_row_from_row(row).map(|clip| (clip, url))
+            })
+            .collect()
+    }
+
     /// Record a failed cold-upload attempt (increment `cold_attempts`,
     /// stamp the error + attempt time). The `cold_last_attempt_at`
     /// gate in [`Self::alert_clips_pending_cold_upload`] then holds the
