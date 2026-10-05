@@ -116,9 +116,10 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
     let due = now - Duration::minutes(1);
     for (id, msg) in [(stored, "m-2"), (rejected, "m-3"), (unacked, "m-4")] {
         store
-            .stamp_clip_announce(id, &format!("https://blob.test/{id}.mp4"), msg, due)
+            .stamp_clip_announce(id, &format!("https://blob.test/{id}.mp4"), msg)
             .await
             .unwrap();
+        store.record_clip_announce_sent(id, due).await.unwrap();
     }
 
     let pending = store.clips_pending_cloud_announce(10, now).await.unwrap();
@@ -164,12 +165,11 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
         .unwrap()
         .is_empty());
     store
-        .stamp_clip_announce(
-            unacked,
-            "https://blob.test/u.mp4",
-            "m-5",
-            now + Duration::hours(1),
-        )
+        .stamp_clip_announce(unacked, "https://blob.test/u.mp4", "m-5")
+        .await
+        .unwrap();
+    store
+        .record_clip_announce_sent(unacked, now + Duration::hours(1))
         .await
         .unwrap();
     assert!(store
@@ -183,6 +183,49 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
         .unwrap();
     assert_eq!(pending_ids(&pending), vec![unacked]);
     assert_eq!(pending[0].2, 2);
+}
+
+/// #759 re-review fix — `stamp_clip_announce` (called before every send,
+/// so the ack can match the id) must not by itself count as an attempt
+/// or start the backoff: only [`Store::record_clip_announce_sent`],
+/// called after a send actually succeeds, does. A send that fails
+/// (tunnel down) therefore leaves the clip due immediately instead of
+/// burning an attempt and doubling the backoff for nothing.
+#[tokio::test]
+async fn stamping_alone_does_not_burn_an_attempt_recording_a_sent_does() {
+    let (store, _tmp) = fresh_store().await;
+    let now = Utc::now();
+    let id = cold_motion_clip(&store, 1).await;
+
+    store
+        .stamp_clip_announce(id, "https://blob.test/1.mp4", "env-1")
+        .await
+        .unwrap();
+    let pending = store.clips_pending_cloud_announce(10, now).await.unwrap();
+    assert_eq!(pending.len(), 1, "stamping makes the clip pending");
+    assert_eq!(
+        pending[0].2, 0,
+        "stamping the envelope id alone must not burn an attempt"
+    );
+
+    let next_at = now + Duration::minutes(5);
+    store.record_clip_announce_sent(id, next_at).await.unwrap();
+    assert!(
+        store
+            .clips_pending_cloud_announce(10, now)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a recorded send holds the clip back until next_at"
+    );
+    let pending = store
+        .clips_pending_cloud_announce(10, next_at)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending[0].2, 1,
+        "the successful send counted as exactly one attempt"
+    );
 }
 
 #[tokio::test]
@@ -216,7 +259,11 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
             .await
             .unwrap();
         store
-            .stamp_alert_clip_announce(id, "https://blob.test/a.mp4", &format!("a-{id}"), now)
+            .stamp_alert_clip_announce(id, "https://blob.test/a.mp4", &format!("a-{id}"))
+            .await
+            .unwrap();
+        store
+            .record_alert_clip_announce_sent(id, now)
             .await
             .unwrap();
         ids.push(id);

@@ -1118,25 +1118,49 @@ impl Store {
     /// answers. Once the clip is cold-uploaded it stays in
     /// [`Self::clips_pending_cloud_announce`] until
     /// [`Self::record_clip_announce_ack`] stamps the cloud's ack.
-    /// Counts the send in `cloud_announce_attempts` and holds the clip
-    /// out of the re-announce set until `next_at` (the caller's
-    /// backoff).
+    ///
+    /// Does NOT advance `cloud_announce_attempts` / `cloud_announce_next_at`
+    /// — a send that then fails must not burn an attempt or push the
+    /// backoff out. Call [`Self::record_clip_announce_sent`] once
+    /// `send_announce` returns `Ok`.
     pub async fn stamp_clip_announce(
         &self,
         clip_id: ClipId,
         blob_url: &str,
         announce_id: &str,
-        next_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         let res = sqlx::query(
             "UPDATE motion_clips
-                SET cloud_blob_url = ?, cloud_announce_id = ?,
-                    cloud_announce_attempts = cloud_announce_attempts + 1,
-                    cloud_announce_next_at = ?
+                SET cloud_blob_url = ?, cloud_announce_id = ?
               WHERE id = ?",
         )
         .bind(blob_url)
         .bind(announce_id)
+        .bind(clip_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
+        }
+        Ok(())
+    }
+
+    /// #759 — record a successful `clip_replicated` send: counts the
+    /// attempt in `cloud_announce_attempts` and holds the clip out of
+    /// [`Self::clips_pending_cloud_announce`] until `next_at` (the
+    /// caller's backoff). Call only after `send_announce` returns
+    /// `Ok`; see [`Self::stamp_clip_announce`].
+    pub async fn record_clip_announce_sent(
+        &self,
+        clip_id: ClipId,
+        next_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE motion_clips
+                SET cloud_announce_attempts = cloud_announce_attempts + 1,
+                    cloud_announce_next_at = ?
+              WHERE id = ?",
+        )
         .bind(next_at.to_rfc3339())
         .bind(clip_id)
         .execute(&self.pool)

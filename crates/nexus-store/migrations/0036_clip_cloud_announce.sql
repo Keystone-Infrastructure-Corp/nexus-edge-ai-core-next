@@ -16,8 +16,11 @@
 --   * `cloud_announce_id`    — `meta.id` of the most recent
 --                              `clip_replicated` sent; the ack's
 --                              `in_reply_to` is matched against it.
---   * `cloud_announced_at`   — RFC3339 of the ack. Set on every ack, so a
---                              permanently rejected clip is not retried.
+--   * `cloud_announced_at`   — RFC3339 of the ack. Set only by the FIRST
+--                              ack matched while this is still NULL (a
+--                              later ack for a superseded announce id
+--                              matches nothing), so a permanently
+--                              rejected clip is not retried.
 --   * `cloud_announce_error` — the cloud's `permanent_failure` reason;
 --                              NULL when the cloud stored the clip.
 --   * `cloud_announce_attempts` — `clip_replicated` sends so far.

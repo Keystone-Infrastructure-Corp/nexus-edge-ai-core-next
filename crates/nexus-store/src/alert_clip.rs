@@ -271,24 +271,49 @@ impl Store {
 
     /// #759 — alert-clip twin of [`Store::stamp_clip_announce`]: record
     /// the blob URL and the `meta.id` of the `clip_replicated` about to
-    /// be sent, before sending it, counting the send and holding the
-    /// clip back until `next_at`.
+    /// be sent, before sending it.
+    ///
+    /// Does NOT advance `cloud_announce_attempts` / `cloud_announce_next_at`
+    /// — a send that then fails must not burn an attempt or push the
+    /// backoff out. Call [`Self::record_alert_clip_announce_sent`] once
+    /// `send_announce` returns `Ok`.
     pub async fn stamp_alert_clip_announce(
         &self,
         id: AlertClipId,
         blob_url: &str,
         announce_id: &str,
-        next_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         let res = sqlx::query(
             "UPDATE alert_clips
-                SET cloud_blob_url = ?, cloud_announce_id = ?,
-                    cloud_announce_attempts = cloud_announce_attempts + 1,
-                    cloud_announce_next_at = ?
+                SET cloud_blob_url = ?, cloud_announce_id = ?
               WHERE id = ?",
         )
         .bind(blob_url)
         .bind(announce_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("alert_clip id={id}")));
+        }
+        Ok(())
+    }
+
+    /// #759 — alert-clip twin of [`Store::record_clip_announce_sent`]:
+    /// counts a successful send and holds the clip back until
+    /// `next_at`. Call only after `send_announce` returns `Ok`; see
+    /// [`Self::stamp_alert_clip_announce`].
+    pub async fn record_alert_clip_announce_sent(
+        &self,
+        id: AlertClipId,
+        next_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE alert_clips
+                SET cloud_announce_attempts = cloud_announce_attempts + 1,
+                    cloud_announce_next_at = ?
+              WHERE id = ?",
+        )
         .bind(next_at.to_rfc3339())
         .bind(id)
         .execute(&self.pool)

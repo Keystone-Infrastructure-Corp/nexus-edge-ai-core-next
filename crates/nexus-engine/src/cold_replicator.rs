@@ -108,13 +108,6 @@ fn announce_next_at(now: chrono::DateTime<Utc>, attempts: i64) -> chrono::DateTi
     now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(6))
 }
 
-/// #759 — whether `put` receipts from this backend carry a blob URL
-/// (only Azure's do). A backend that cannot yield a URL has nothing to
-/// announce, so its "blob already exists" fast path stays safe.
-fn backend_yields_cloud_url(backend: &dyn nexus_storage::ColdBackend) -> bool {
-    backend.kind() == "azure"
-}
-
 /// Configuration for the replicator task. All fields are owned so
 /// the spawn site can `clone()` and move into the spawn future.
 #[derive(Clone)]
@@ -713,10 +706,13 @@ async fn send_announce(
 /// and the clip leaves the set). The cloud sends no ack on a transient
 /// failure, so this is also the retry for those. Runs on the polling
 /// backstop, at most [`ANNOUNCE_BATCH`] per table, and the pass stops
-/// at the first failed send (the tunnel is down). Each send pushes the
-/// clip's next attempt out by [`announce_next_at`] and the pending set
-/// is taken earliest-next-attempt first, so clips the cloud never acks
-/// cycle behind newer ones instead of filling every batch.
+/// at the first failed send (the tunnel is down). Only a *successful*
+/// send pushes the clip's next attempt out by [`announce_next_at`] —
+/// a failed send leaves attempts/next_at untouched so it is retried
+/// immediately rather than burning backoff on a send that never left
+/// the box. The pending set is taken earliest-next-attempt first, so
+/// clips the cloud never acks cycle behind newer ones instead of
+/// filling every batch.
 async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::DateTime<Utc>) {
     let Some(outbox) = cfg.outbox.as_deref() else {
         return;
@@ -742,10 +738,7 @@ async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::Date
             url.clone(),
             attached_history(enrollment.as_ref(), clip.started_at),
         );
-        if let Err(e) = store
-            .stamp_clip_announce(clip.id, &url, &env.meta.id, announce_next_at(now, attempts))
-            .await
-        {
+        if let Err(e) = store.stamp_clip_announce(clip.id, &url, &env.meta.id).await {
             warn!(clip_id = clip.id, error = %e, "cold replicator: stamp_clip_announce failed");
             continue;
         }
@@ -754,6 +747,12 @@ async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::Date
             .is_err()
         {
             return;
+        }
+        if let Err(e) = store
+            .record_clip_announce_sent(clip.id, announce_next_at(now, attempts))
+            .await
+        {
+            warn!(clip_id = clip.id, error = %e, "cold replicator: record_clip_announce_sent failed");
         }
     }
 
@@ -767,7 +766,7 @@ async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::Date
     for (clip, url, attempts) in alert {
         let env = alert_clip_envelope(&clip, url.clone());
         if let Err(e) = store
-            .stamp_alert_clip_announce(clip.id, &url, &env.meta.id, announce_next_at(now, attempts))
+            .stamp_alert_clip_announce(clip.id, &url, &env.meta.id)
             .await
         {
             warn!(alert_clip_id = clip.id, error = %e, "cold replicator: stamp_alert_clip_announce failed");
@@ -778,6 +777,12 @@ async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::Date
             .is_err()
         {
             return;
+        }
+        if let Err(e) = store
+            .record_alert_clip_announce_sent(clip.id, announce_next_at(now, attempts))
+            .await
+        {
+            warn!(alert_clip_id = clip.id, error = %e, "cold replicator: record_alert_clip_announce_sent failed");
         }
     }
 }
@@ -881,7 +886,7 @@ async fn upload_alert_clip_one(
     // taken when nothing will be announced — the announce needs the
     // blob URL, which only a put receipt carries, and `put` is
     // idempotent (#759: skipping it left a blob with no cloud row).
-    let announces = cfg.outbox.is_some() && backend_yields_cloud_url(backend);
+    let announces = cfg.outbox.is_some() && backend.yields_cloud_url();
     let cold_url = match backend.exists(&cold_path, sha256).await {
         Ok(true) if !announces => {
             debug!(
@@ -916,12 +921,7 @@ async fn upload_alert_clip_one(
         Some(url) => {
             let env = alert_clip_envelope(clip, url.clone());
             store
-                .stamp_alert_clip_announce(
-                    clip.id,
-                    &url,
-                    &env.meta.id,
-                    announce_next_at(Utc::now(), 0),
-                )
+                .stamp_alert_clip_announce(clip.id, &url, &env.meta.id)
                 .await
                 .map_err(UploadError::Store)?;
             Some(env)
@@ -942,7 +942,17 @@ async fn upload_alert_clip_one(
         .map_err(UploadError::Store)?;
 
     if let (Some(outbox), Some(env)) = (cfg.outbox.as_deref(), announce) {
-        let _ = send_announce(outbox, env, &edge_clip_id).await;
+        // #759 — only a successful send counts the attempt and starts
+        // the backoff; a failed send leaves the clip due immediately
+        // so `reannounce` retries it on the very next backstop pass.
+        if send_announce(outbox, env, &edge_clip_id).await.is_ok() {
+            if let Err(e) = store
+                .record_alert_clip_announce_sent(clip.id, announce_next_at(Utc::now(), 0))
+                .await
+            {
+                warn!(alert_clip_id = clip.id, error = %e, "cold replicator: record_alert_clip_announce_sent failed");
+            }
+        }
     }
 
     Ok(())
@@ -992,7 +1002,7 @@ async fn upload_one(
     // — the announce needs the blob URL, which only a put receipt
     // carries, and `put` is idempotent (#759: skipping it left a
     // blob with no cloud row).
-    let announces = cfg.outbox.is_some() && backend_yields_cloud_url(backend);
+    let announces = cfg.outbox.is_some() && backend.yields_cloud_url();
     match backend.exists(&cold_path, sha256).await {
         Ok(true) if !announces => {
             debug!(
@@ -1055,7 +1065,7 @@ async fn upload_one(
         Some(url) => {
             let env = motion_clip_envelope(clip, url.clone(), attached_history);
             store
-                .stamp_clip_announce(clip.id, &url, &env.meta.id, announce_next_at(Utc::now(), 0))
+                .stamp_clip_announce(clip.id, &url, &env.meta.id)
                 .await
                 .map_err(UploadError::Store)?;
             Some(env)
@@ -1077,9 +1087,21 @@ async fn upload_one(
 
     // Phase 2 · Step 2.8 — emit `clip_replicated` to cloud after
     // the local commit. A failed or un-acked send is re-sent by
-    // `reannounce` on the polling backstop.
+    // `reannounce` on the polling backstop. #759 — only a successful
+    // send counts the attempt and starts the backoff; a failed send
+    // leaves the clip due immediately for the next backstop pass.
     if let (Some(outbox), Some(env)) = (cfg.outbox.as_deref(), announce) {
-        let _ = send_announce(outbox, env, &clip.id.to_string()).await;
+        if send_announce(outbox, env, &clip.id.to_string())
+            .await
+            .is_ok()
+        {
+            if let Err(e) = store
+                .record_clip_announce_sent(clip.id, announce_next_at(Utc::now(), 0))
+                .await
+            {
+                warn!(clip_id = clip.id, error = %e, "cold replicator: record_clip_announce_sent failed");
+            }
+        }
     }
 
     debug!(
@@ -1178,11 +1200,13 @@ mod tests {
             &self.handle
         }
         fn kind(&self) -> &str {
-            if *self.with_url.lock() {
-                "azure"
-            } else {
-                "lan"
-            }
+            "mock"
+        }
+        /// #759 — mirrors Azure's override when configured with a URL,
+        /// so the announce fast-path tests exercise the real trait
+        /// method rather than a `kind()` string match.
+        fn yields_cloud_url(&self) -> bool {
+            *self.with_url.lock()
         }
         async fn put(
             &self,
@@ -1777,12 +1801,16 @@ mod tests {
     /// #759 — a `clip_replicated` lost to a down tunnel (or never acked)
     /// is re-sent by every backstop pass until the cloud acks the
     /// latest send; a `permanent_failure` ack also ends the retries.
+    /// Also covers the re-review fix: a send that never left the box
+    /// must not burn an attempt or start a backoff — only a send that
+    /// actually reached the tunnel does.
     #[tokio::test]
     async fn unacked_clip_is_reannounced_until_acked() {
         let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
         let backend = MockBackend::new("mock", HealthStatus::Ok);
         *backend.with_url.lock() = true;
-        // Boot-before-tunnel: no handle installed, so the first send fails.
+        // Boot-before-tunnel: no handle installed, so the upload's
+        // announce attempt fails.
         let outbox = Arc::new(TunnelOutbox::new());
         let cfg = announce_cfg(clips_dir, outbox.clone());
         let clip = store.get_clip(clip_id).await.unwrap().unwrap();
@@ -1805,13 +1833,33 @@ mod tests {
             .cold_uploaded_at
             .is_some());
 
+        // The failed send above must not have counted as an attempt or
+        // pushed a backoff: the clip is due right now, not held back
+        // `ANNOUNCE_BACKOFF_BASE`.
+        let pending = store
+            .clips_pending_cloud_announce(10, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "a failed send leaves the clip due now");
+        assert_eq!(pending[0].2, 0, "a failed send must not burn an attempt");
+
         let tunnel = Arc::new(CapturingTunnel::default());
         outbox.set_handle(Some(tunnel.clone()));
         let at = |h: i64| Utc::now() + ChronoDuration::hours(h);
 
-        // Inside the first backoff window nothing is re-sent.
+        // Tunnel is up now: the very next backstop pass sends it — no
+        // backoff was earned by the earlier failure.
         reannounce(&cfg, &store, Utc::now()).await;
-        assert!(tunnel.sent.lock().is_empty());
+        assert_eq!(tunnel.sent.lock().len(), 1);
+
+        // That send succeeded, so a real backoff now applies: an
+        // immediate second pass skips it.
+        reannounce(&cfg, &store, Utc::now()).await;
+        assert_eq!(
+            tunnel.sent.lock().len(),
+            1,
+            "inside the backoff window, not re-sent"
+        );
 
         reannounce(&cfg, &store, at(1)).await;
         // The send pushed the next attempt out: an immediate pass skips it.
@@ -1823,7 +1871,7 @@ mod tests {
             .iter()
             .map(|e| e.meta.id.clone())
             .collect();
-        assert_eq!(sent.len(), 2, "no ack → re-sent once each backoff elapses");
+        assert_eq!(sent.len(), 3, "no ack → re-sent once each backoff elapses");
 
         // An ack for a superseded send does not stop the loop.
         store
@@ -1832,7 +1880,7 @@ mod tests {
             .unwrap();
         reannounce(&cfg, &store, at(4)).await;
         let latest = tunnel.sent.lock().last().unwrap().meta.id.clone();
-        assert_eq!(tunnel.sent.lock().len(), 3);
+        assert_eq!(tunnel.sent.lock().len(), 4);
 
         store
             .record_clip_announce_ack(&latest, Utc::now(), Some("unknown camera"))
@@ -1841,7 +1889,7 @@ mod tests {
         reannounce(&cfg, &store, at(48)).await;
         assert_eq!(
             tunnel.sent.lock().len(),
-            3,
+            4,
             "a permanently rejected clip is not re-sent"
         );
     }
@@ -1879,9 +1927,10 @@ mod tests {
                         .unwrap();
                 }
                 store
-                    .stamp_clip_announce(id, "https://blob.test/x.mp4", "old", due)
+                    .stamp_clip_announce(id, "https://blob.test/x.mp4", "old")
                     .await
                     .unwrap();
+                store.record_clip_announce_sent(id, due).await.unwrap();
                 store
                     .mark_cold_replicated(
                         id,
