@@ -726,6 +726,120 @@ mod tests {
         );
     }
 
+    /// `y = Neg(x)` over a float `[1, 1]` tensor, encoded by hand so the
+    /// test below needs no model file.
+    fn neg_model() -> Vec<u8> {
+        fn varint(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+        fn int(field: u64, v: u64, out: &mut Vec<u8>) {
+            varint(field << 3, out);
+            varint(v, out);
+        }
+        fn bytes(field: u64, v: &[u8], out: &mut Vec<u8>) {
+            varint((field << 3) | 2, out);
+            varint(v.len() as u64, out);
+            out.extend_from_slice(v);
+        }
+
+        // TensorShapeProto.Dimension { dim_value: 1 }, twice.
+        let mut dim = Vec::new();
+        int(1, 1, &mut dim);
+        let mut shape = Vec::new();
+        bytes(1, &dim, &mut shape);
+        bytes(1, &dim, &mut shape);
+        // TypeProto { tensor_type: { elem_type: FLOAT, shape } }.
+        let mut tensor = Vec::new();
+        int(1, 1, &mut tensor);
+        bytes(2, &shape, &mut tensor);
+        let mut ty = Vec::new();
+        bytes(1, &tensor, &mut ty);
+        let value_info = |name: &[u8]| {
+            let mut v = Vec::new();
+            bytes(1, name, &mut v);
+            bytes(2, &ty, &mut v);
+            v
+        };
+        let mut node = Vec::new();
+        bytes(1, b"x", &mut node);
+        bytes(2, b"y", &mut node);
+        bytes(4, b"Neg", &mut node);
+        let mut graph = Vec::new();
+        bytes(1, &node, &mut graph);
+        bytes(2, b"g", &mut graph);
+        bytes(11, &value_info(b"x"), &mut graph);
+        bytes(12, &value_info(b"y"), &mut graph);
+        let mut opset = Vec::new();
+        int(2, 13, &mut opset);
+        // ModelProto { ir_version: 8, graph, opset_import: [13] }.
+        let mut model = Vec::new();
+        int(1, 8, &mut model);
+        bytes(7, &graph, &mut model);
+        bytes(8, &opset, &mut model);
+        model
+    }
+
+    /// Pins that `OrtSession::run` and its `Drop` both wait for the
+    /// shared WebGPU context lock. Only the flag decides whether the lock
+    /// is taken, so a CPU session with the flag set stands in for a WebGPU
+    /// one. Needs the ORT library, which CI loads only in the system-libs
+    /// job (`ORT_DYLIB_PATH`); elsewhere it returns early.
+    #[test]
+    fn a_webgpu_session_runs_and_releases_only_under_the_lock() {
+        if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+            eprintln!("skipped: ORT_DYLIB_PATH is not set");
+            return;
+        }
+        let model = std::env::temp_dir().join("nexus-neg-model.onnx");
+        std::fs::write(&model, neg_model()).expect("write model");
+        let cpu = ["cpu".to_owned()];
+        let tuning = SessionTuning::default();
+        let mut built = commit(&model, &cpu, &tuning).expect("commit");
+        let _ = std::fs::remove_file(&model);
+        built.session.shares_webgpu_context = true;
+
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel::<()>();
+        let held = SHARED_WEBGPU_CONTEXT.lock();
+        let worker = std::thread::spawn(move || {
+            use ort::value::TensorRef;
+            let mut session = built.session;
+            let x = ndarray::Array2::<f32>::ones((1, 1));
+            let input = TensorRef::from_array_view(x.view()).expect("tensor");
+            session.run(ort::inputs![input]).expect("run");
+            done_tx.send("ran").expect("send");
+            release.recv().expect("release signal");
+            drop(session);
+            done_tx.send("released").expect("send");
+        });
+
+        let wait = Duration::from_millis(300);
+        assert!(
+            done.recv_timeout(wait).is_err(),
+            "run did not wait for the lock"
+        );
+        drop(held);
+        assert_eq!(done.recv_timeout(Duration::from_secs(10)), Ok("ran"));
+
+        let held = SHARED_WEBGPU_CONTEXT.lock();
+        release_tx.send(()).expect("send");
+        assert!(
+            done.recv_timeout(wait).is_err(),
+            "drop did not wait for the lock"
+        );
+        drop(held);
+        assert_eq!(done.recv_timeout(Duration::from_secs(10)), Ok("released"));
+        worker.join().expect("worker");
+    }
+
     #[test]
     fn accelerated_sessions_get_a_small_pool() {
         assert_eq!(auto_intra_threads(1, true), ACCELERATED_INTRA_THREADS);
