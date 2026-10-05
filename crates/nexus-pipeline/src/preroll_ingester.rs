@@ -86,9 +86,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::decode::{
-    frame_fingerprint, rgb_frame_looks_degenerate, select_decode_chain, DecodeMode,
-    FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, TerminalRung, FLAT_FRAME_EVAL_WINDOW,
-    FLAT_FRAME_TERMINAL_TRIPS, FLAT_FRAME_TRIP, FRAME_LOOP_EVAL_WINDOW, FRAME_LOOP_TRIP,
+    frame_fingerprint, resolve_session_codec, rgb_frame_looks_degenerate, select_decode_chain,
+    DecodeMode, FlatFrameDetector, FrameLoopDetector, GstFactoryProbe, TerminalRung,
+    FLAT_FRAME_EVAL_WINDOW, FLAT_FRAME_TERMINAL_TRIPS, FLAT_FRAME_TRIP, FRAME_LOOP_EVAL_WINDOW,
+    FRAME_LOOP_TRIP,
 };
 use crate::param_sets::ParamSetCache;
 use crate::preroll::{NalRingBuffer, NalSample};
@@ -179,7 +180,15 @@ pub struct PreRollIngester {
     /// (Hikvision H.264+/H.265+, Dahua Smart Codec) collapse to
     /// their base via [`CodecKind::base`] — GStreamer's stock
     /// parsers handle the SVC bitstream as plain H.264/H.265.
+    ///
+    /// This is the *configured* codec, the ingester's identity for the
+    /// recorder's rebuild checks. What the live session actually parses
+    /// is [`Self::stream_codec`].
     codec: CodecKind,
+    /// Codec the supervisor builds each session with. Starts as `codec`
+    /// and is replaced by the stream's own when the SDP disagrees
+    /// (#359), so a wrongly pinned codec cannot loop `not-linked` forever.
+    stream_codec: Arc<Mutex<CodecKind>>,
     /// Pre-roll window the ring buffer was sized for. Stored on the
     /// struct so the recorder can read it back when it needs to
     /// rebuild this ingester at new RGB dims without losing the
@@ -327,6 +336,8 @@ impl PreRollIngester {
         // has never rendered a real frame, which is a wrong-chain verdict
         // rather than a reaction to load (BUG-070).
         let task_force_software = Arc::new(AtomicBool::new(false));
+        let stream_codec = Arc::new(Mutex::new(codec));
+        let task_stream_codec = stream_codec.clone();
         let task_decode_health = decode_health;
         let rgb_valve_closed = Arc::new(AtomicBool::new(false));
         let task_rgb_valve_closed = rgb_valve_closed.clone();
@@ -334,7 +345,7 @@ impl PreRollIngester {
             run_supervisor(
                 camera_id,
                 task_url,
-                codec,
+                task_stream_codec,
                 decode_mode,
                 task_ring,
                 task_tx,
@@ -352,6 +363,7 @@ impl PreRollIngester {
             camera_id,
             url,
             codec,
+            stream_codec,
             pre_roll_secs,
             ring,
             live_tx,
@@ -371,12 +383,20 @@ impl PreRollIngester {
         &self.url
     }
 
-    /// Wire codec the ingester's GStreamer pipeline is parsing.
+    /// Codec this ingester was configured with. Identity for the
+    /// recorder's "same URL + codec, keep it" checks; see
+    /// [`Self::stream_codec`] for what the session is parsing.
+    pub fn codec(&self) -> CodecKind {
+        self.codec
+    }
+
+    /// Wire codec the ingester's GStreamer pipeline is parsing — the
+    /// configured codec unless the camera's SDP named another (#359).
     /// Used by the recorder at `open()` to capture into
     /// `OpenState.codec` so the per-clip mp4mux chain spins up
     /// the matching parser without an extra config lookup.
-    pub fn codec(&self) -> CodecKind {
-        self.codec
+    pub fn stream_codec(&self) -> CodecKind {
+        *self.stream_codec.lock()
     }
 
     /// Pre-roll window the ring was sized for at construction. Used
@@ -534,7 +554,7 @@ impl PreRollIngester {
 async fn run_supervisor(
     camera_id: CameraId,
     url: String,
-    codec: CodecKind,
+    stream_codec: Arc<Mutex<CodecKind>>,
     decode_mode: DecodeMode,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
@@ -548,7 +568,7 @@ async fn run_supervisor(
     info!(
         camera_id,
         url,
-        codec = %codec,
+        codec = %*stream_codec.lock(),
         rgb_tap = frame_tap.is_some(),
         "preroll ingester supervisor starting (always-on)"
     );
@@ -566,10 +586,12 @@ async fn run_supervisor(
             decode_mode
         };
         let session_start = std::time::Instant::now();
+        let codec = *stream_codec.lock();
         match run_session(
             camera_id,
             &url,
             codec,
+            stream_codec.clone(),
             effective_mode,
             ring.clone(),
             live_tx.clone(),
@@ -601,7 +623,9 @@ async fn run_supervisor(
                 // MAX_BACKOFF and leaves it there for the life of the
                 // process. The stall watchdog (#336) makes that
                 // reachable far more often than a bus error did.
-                if session_start.elapsed() >= HEALTHY_SESSION {
+                // A session that found the stream's real codec retries
+                // with it straight away.
+                if session_start.elapsed() >= HEALTHY_SESSION || *stream_codec.lock() != codec {
                     backoff = Duration::from_millis(500);
                 }
             }
@@ -619,6 +643,7 @@ async fn run_session(
     camera_id: CameraId,
     url: &str,
     codec: CodecKind,
+    stream_codec: Arc<Mutex<CodecKind>>,
     decode_mode: DecodeMode,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
@@ -682,7 +707,7 @@ async fn run_session(
     //              instead of stalling the shared upstream parser.
     let desc = match &frame_tap {
         None => format!(
-            "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
+            "rtspsrc name=rtsp location=\"{url_safe}\" latency=500 protocols=tcp \
              ! {rtp_depay} \
              ! {parse} config-interval=0 \
              ! {base_caps},stream-format=byte-stream,alignment=au \
@@ -718,7 +743,7 @@ async fn run_session(
                 "preroll RGB tap decode backend selected"
             );
             format!(
-                "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
+                "rtspsrc name=rtsp location=\"{url_safe}\" latency=500 protocols=tcp \
              ! {rtp_depay} \
              ! {parse} config-interval=0 \
              ! {base_caps},stream-format=byte-stream,alignment=au \
@@ -741,6 +766,37 @@ async fn run_session(
         .map_err(|e| IngesterError::Pipeline(format!("parse::launch: {e}")))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| IngesterError::Pipeline("downcast Pipeline".into()))?;
+
+    // #359: a pinned codec is never probed, so check it against the SDP.
+    // On a mismatch the depayloader cannot link and the session fails
+    // `not-linked`; recording the stream's codec here makes the
+    // supervisor rebuild the next session with it instead of looping.
+    if let Some(rtsp) = pipeline.by_name("rtsp") {
+        rtsp.connect_pad_added(move |_, pad| {
+            let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+            let Some(s) = caps.structure(0) else {
+                return;
+            };
+            if s.get::<&str>("media").is_ok_and(|m| m != "video") {
+                return;
+            }
+            let Ok(encoding_name) = s.get::<&str>("encoding-name") else {
+                return;
+            };
+            let (chosen, mismatch) = resolve_session_codec(codec, encoding_name);
+            if mismatch {
+                warn!(
+                    camera_id,
+                    configured = %codec,
+                    detected = %chosen,
+                    encoding_name,
+                    "preroll ingester: camera stream codec disagrees with the configured codec; \
+                     rebuilding the session with the stream's codec (fix the camera's codec setting)"
+                );
+                *stream_codec.lock() = chosen;
+            }
+        });
+    }
 
     // Join the process-wide VA/GL display rather than standing up a
     // per-camera one. Must be installed before the first state change

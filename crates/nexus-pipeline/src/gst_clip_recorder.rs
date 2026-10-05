@@ -603,7 +603,7 @@ impl ClipRecorder for GstClipRecorder {
                 return Err(RecorderError::Refused);
             }
         };
-        let codec = ingester.codec();
+        let codec = ingester.stream_codec();
 
         // Resolve USB hot-tier routing once at open(). The choice
         // is captured into `OpenState` so close() finishes the clip
@@ -1534,7 +1534,7 @@ impl ClipRecorder for GstClipRecorder {
         };
 
         let ingester = self.ingesters.read().get(&camera_id).cloned()?;
-        let codec = ingester.codec();
+        let codec = ingester.stream_codec();
         // Snapshot + trim the pre-roll ring; derive the window-start
         // wall-clock from the trimmed pre span so per-frame box lookup
         // lands on the right instant.
