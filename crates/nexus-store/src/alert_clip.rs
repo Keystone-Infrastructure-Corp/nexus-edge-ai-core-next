@@ -142,20 +142,30 @@ impl Store {
     ///
     /// `building` must stay: the file sits at the final path while the
     /// sha256 is hashed, before the row flips to `ready`.
-    /// Returns `(path, state)` because the scanner needs two different
+    /// Returns `(id, path, state)` because the scanner needs two different
     /// sets from it: everything here is spared from deletion, but only
     /// `ready` is expected to have a file. A `building` row's final path
     /// legitimately does not exist yet — the encoder is still writing
     /// the partial — so counting it as "missing" would warn on every
-    /// in-flight clip.
-    pub async fn known_alert_clip_paths(&self) -> Result<Vec<(String, String)>, StoreError> {
-        let rows =
-            sqlx::query("SELECT path, state FROM alert_clips WHERE state IN ('building', 'ready')")
-                .fetch_all(&self.pool)
-                .await?;
+    /// in-flight clip. The id lets it evict a `ready` row whose file is
+    /// gone (#343).
+    pub async fn known_alert_clip_paths(
+        &self,
+    ) -> Result<Vec<(AlertClipId, String, String)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, path, state FROM alert_clips WHERE state IN ('building', 'ready')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .map(|r| {
+                (
+                    r.get::<i64, _>(0),
+                    r.get::<String, _>(1),
+                    r.get::<String, _>(2),
+                )
+            })
             .collect())
     }
 

@@ -11,13 +11,21 @@
 //!    device" panic floor.
 //!
 //! 2. **Orphan-file scan.** Same cadence. Walks every file under
-//!    `clips_dir` and compares to `store.known_clip_paths()`.
+//!    `clips_dir` and compares to the clip tables' known paths.
 //!    * Files on disk with no DB row -> deleted (file leaked because
 //!      a previous process crashed mid-recorder.open before the
 //!      `motion_clips` insert committed, or mid-eviction after the
 //!      DELETE but before the unlink).
 //!    * DB rows with no file -> logged at warn but NOT deleted, so
-//!      operators can investigate (a dropped LUN, manual rm, etc).
+//!      operators can investigate (a dropped LUN, manual rm, etc). A
+//!      `ready` alert clip with no file is the exception: its row is
+//!      flipped to `evicted` so alarms stop resolving a clip that
+//!      cannot be attached.
+//!
+//!    The known set spans `motion_clips` (including the USB vault) and
+//!    `alert_clips` (`clips_dir/alert/...`, `building` and `ready`);
+//!    files younger than [`ORPHAN_MIN_AGE`] — e.g. an alert builder's
+//!    in-flight `.partial.mp4` — are never treated as orphans.
 //!
 //! Both jobs honour `tokio::select!` against the engine's shutdown
 //! signal so a Ctrl-C between sweep ticks doesn't have to wait the
@@ -204,10 +212,13 @@ pub async fn sweep_once(
     // to `ready` — but it is not yet expected, so it must not be
     // reported missing while the encoder is still working.
     let mut expected: HashSet<PathBuf> = known.clone();
-    for (rel, state) in store.known_alert_clip_paths().await? {
+    // `ready` alert clips by path, so a fileless one can be evicted below.
+    let mut ready_alert: HashMap<PathBuf, i64> = HashMap::new();
+    for (id, rel, state) in store.known_alert_clip_paths().await? {
         let abs = clips_dir.join(rel);
         if state == "ready" {
             expected.insert(abs.clone());
+            ready_alert.insert(abs.clone(), id);
         }
         known.insert(abs);
     }
@@ -280,11 +291,24 @@ pub async fn sweep_once(
             );
             continue;
         }
+        out.missing += 1;
+        // A `ready` alert clip with no file would be resolved by the
+        // dispatcher on every linked alarm and shipped clip-less behind a
+        // row that still claims a clip (#343). `evicted` is the state that
+        // says "this alert HAD a clip"; motion rows stay for review.
+        if let Some(&id) = ready_alert.get(path) {
+            warn!(
+                alert_clip_id = id,
+                path = %path.display(),
+                "ready alert clip file does not exist on disk; marking row evicted"
+            );
+            store.mark_alert_clip_evicted(id).await?;
+            continue;
+        }
         warn!(
             path = %path.display(),
             "DB references clip file that does not exist on disk; row LEFT in place for operator review"
         );
-        out.missing += 1;
     }
 
     Ok(out)
@@ -621,7 +645,7 @@ mod tests {
         // spared set.
         let spared = store.known_alert_clip_paths().await.unwrap();
         assert!(
-            !spared.iter().any(|(p, _)| p == &rel),
+            !spared.iter().any(|(_, p, _)| p == &rel),
             "a failed alert clip must not be in the spared set: {spared:?}"
         );
     }
@@ -861,6 +885,50 @@ mod tests {
         assert!(
             store.get_clip(clip_id).await.unwrap().is_some(),
             "row must NOT be auto-deleted just because the file is gone"
+        );
+    }
+
+    /// #343: a `ready` alert clip whose file is gone must not stay
+    /// `ready` forever -- the dispatcher would keep resolving it and
+    /// shipping every linked alarm clip-less. The sweep flips it to
+    /// `evicted`, the state that already means "this alert HAD a clip".
+    #[tokio::test]
+    async fn a_ready_alert_clip_with_no_file_is_marked_evicted() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+
+        let rel = format!(
+            "alert/1/{}/{}.mp4",
+            now.format("%Y-%m-%d"),
+            now.timestamp_millis()
+        );
+        let id = store
+            .insert_alert_clip(&nexus_store::NewAlertClip {
+                camera_id: 1,
+                started_at: now,
+                path: rel.clone(),
+            })
+            .await
+            .unwrap();
+        store
+            .mark_alert_clip_ready(id, 1000, 10, None)
+            .await
+            .unwrap();
+        // The day directory survives; only the file is gone.
+        tokio::fs::create_dir_all(clips_dir.join(&rel).parent().unwrap())
+            .await
+            .unwrap();
+
+        let cutoff = now - chrono::Duration::days(30);
+        let res = sweep_once(&store, &clips_dir, cutoff, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(res.missing, 1);
+        let row = store.get_alert_clip(id).await.unwrap().unwrap();
+        assert_eq!(
+            row.state, "evicted",
+            "a fileless ready alert clip must be evicted"
         );
     }
 
