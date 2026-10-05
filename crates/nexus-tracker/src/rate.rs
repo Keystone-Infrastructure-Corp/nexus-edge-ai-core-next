@@ -10,23 +10,20 @@ const MIN_INTERVAL_SECS: f64 = 1.0 / 60.0;
 const MAX_INTERVAL_SECS: f64 = 5.0;
 /// EWMA weight of the newest interval.
 const ALPHA: f64 = 0.1;
-/// A gap longer than this multiple of the estimate is a discontinuity (stall,
-/// reconnect, paused stream), not a sample: blending even one 5 s gap into a
-/// 30 fps estimate would cut every `*_secs` threshold ~16x for about a second,
-/// long enough to promote a briefly stopped vehicle to a static anchor. 4x
-/// still blends in ordinary jitter and up to three dropped frames in a row.
-const DISCONTINUITY_FACTOR: f64 = 4.0;
-/// This many consecutive discontinuities mean the rate genuinely dropped
-/// (e.g. 30 -> 1.9 fps), so the estimate is re-seeded from the latest gap.
-const RESEED_AFTER: u32 = 3;
+/// Each gap is winsorized to at most this multiple of the estimate before it
+/// is blended in, so one stall (reconnect, paused stream) can stretch the
+/// estimate by at most `1 + ALPHA * (WINSOR_FACTOR - 1)` = 1.3x per frame
+/// instead of collapsing a 30 fps estimate ~16x. Unlike rejecting such gaps,
+/// clamping still samples them: alternating short/long gaps (bursty delivery)
+/// converge on the true mean, and a sustained rate drop grows the estimate
+/// 1.3x per frame until the gaps fit under the clamp.
+const WINSOR_FACTOR: f64 = 4.0;
 
 /// EWMA of the interval between consecutive inferences on one camera.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InferenceRate {
     last_secs: Option<f64>,
     interval_secs: Option<f64>,
-    /// Consecutive gaps rejected as discontinuities.
-    rejected: u32,
 }
 
 impl InferenceRate {
@@ -37,22 +34,10 @@ impl InferenceRate {
             let dt = t_secs - prev;
             if dt > 0.0 {
                 let dt = dt.clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
-                self.interval_secs = match self.interval_secs {
-                    Some(ewma) if dt > DISCONTINUITY_FACTOR * ewma => {
-                        self.rejected += 1;
-                        if self.rejected < RESEED_AFTER {
-                            Some(ewma)
-                        } else {
-                            self.rejected = 0;
-                            Some(dt)
-                        }
-                    }
-                    Some(ewma) => {
-                        self.rejected = 0;
-                        Some(ALPHA * dt + (1.0 - ALPHA) * ewma)
-                    }
-                    None => Some(dt),
-                };
+                self.interval_secs = Some(match self.interval_secs {
+                    Some(ewma) => ALPHA * dt.min(WINSOR_FACTOR * ewma) + (1.0 - ALPHA) * ewma,
+                    None => dt,
+                });
             }
         }
         self.last_secs = Some(t_secs);
@@ -89,37 +74,62 @@ mod tests {
     }
 
     #[test]
-    fn stall_is_skipped_and_duplicate_timestamps_ignored() {
+    fn duplicates_are_ignored_and_an_hour_gap_is_winsorized() {
         let mut r = at_fps(2.0, 10);
-        r.observe(4.5); // duplicate of the last timestamp
-        r.observe(3600.0); // an hour-long stall is a discontinuity, not a sample
+        r.observe(4.5); // duplicate of the last timestamp: ignored
         assert_eq!(r.frames(10.0), 20);
+        // An hour-long gap clamps to 5 s, then winsorizes to 4 x 0.5 s = 2 s,
+        // so the estimate moves to 0.1 * 2 + 0.9 * 0.5 = 0.65 s: frames(10)
+        // drops to 15, never below 20 / 1.3 for a single gap.
+        r.observe(3600.0);
+        assert_eq!(r.frames(10.0), 15);
     }
 
     #[test]
-    fn a_stall_does_not_collapse_a_30_fps_estimate() {
+    fn a_stall_barely_moves_a_30_fps_estimate() {
         let mut r = at_fps(30.0, 100);
         let t = 99.0 / 30.0 + 3.0; // one 3 s stall
         r.observe(t);
-        assert!(r.frames(5.0) >= 140, "got {}", r.frames(5.0));
-        // Normal frames after the stall keep the estimate at 30 fps.
+        // 3 s winsorizes to 4/30 s: 0.1 * 4/30 + 0.9/30 = 1.3/30 -> ~115.
+        assert!(r.frames(5.0) >= 110, "got {}", r.frames(5.0));
         for i in 1..=30 {
             r.observe(t + i as f64 / 30.0);
-            assert!(r.frames(5.0) >= 140, "frame {i}: got {}", r.frames(5.0));
         }
+        assert!(r.frames(5.0) >= 145, "got {}", r.frames(5.0));
     }
 
     #[test]
     fn a_sustained_drop_to_hailo_rate_converges() {
         let mut r = at_fps(30.0, 100);
         let t0 = 99.0 / 30.0;
-        for i in 1..=RESEED_AFTER {
+        let mut converged_at = None;
+        for i in 1..=60u32 {
             r.observe(t0 + i as f64 / 1.9);
+            match converged_at {
+                None if r.frames(10.0) == 19 => converged_at = Some(i),
+                None => {}
+                Some(_) => assert_eq!(r.frames(10.0), 19, "slow frame {i}"),
+            }
         }
-        assert_eq!(r.frames(10.0), 19);
-        for i in RESEED_AFTER + 1..=RESEED_AFTER + 20 {
-            r.observe(t0 + i as f64 / 1.9);
-            assert_eq!(r.frames(10.0), 19);
+        let n = converged_at.expect("never converged");
+        assert!(n <= 40, "converged after {n} slow frames");
+    }
+
+    #[test]
+    fn alternating_short_and_long_gaps_track_the_mean_interval() {
+        // Bursty delivery: 1/60 s then 1 s, repeated. True mean ~0.508 s.
+        let mut r = InferenceRate::default();
+        let mut t = 0.0;
+        r.observe(t);
+        for i in 0..400 {
+            t += if i % 2 == 0 { 1.0 / 60.0 } else { 1.0 };
+            r.observe(t);
         }
+        let mean = (1.0 / 60.0 + 1.0) / 2.0;
+        let est = r.interval_secs.unwrap();
+        assert!(
+            (est - mean).abs() <= 0.3 * mean,
+            "estimate {est} not within 30% of {mean}"
+        );
     }
 }
