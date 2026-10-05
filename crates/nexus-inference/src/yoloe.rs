@@ -6,7 +6,7 @@
 //! a separate **visual-prompt** path that takes a reference-image
 //! embedding instead of a text label. Phase B (this module) wires the
 //! text-prompt path only; Phase E adds the visual-prompt session in a
-//! sibling struct so the two never share Mutex<Session> state.
+//! sibling struct so the two never share Mutex<OrtSession> state.
 //!
 //! Per the M3 design:
 //!
@@ -41,19 +41,18 @@ use async_trait::async_trait;
 use ndarray::{s, Array2, Ix2};
 use nexus_config::{CameraConfigUpdate, InferenceConfig};
 use nexus_types::{BBox, CameraId, Detection, Frame};
-use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
-use crate::session_tuning::{self, SessionTuning};
+use crate::session_tuning::{self, OrtSession, SessionTuning};
 use crate::yolo::{frame_rgb, preprocess_nchw};
 
 /// One YOLOE ONNX session + the prompt vocabulary it was exported
 /// with + a per-camera subset filter.
 pub struct YoloeDetector {
-    session: Mutex<Session>,
+    session: Mutex<OrtSession>,
     input_w: u32,
     input_h: u32,
     score_threshold: f32,
@@ -278,7 +277,7 @@ impl Detector for YoloeDetector {
         // for a converted copy.
         let rgb = frame_rgb(frame)?;
 
-        let session_for_blocking: &Mutex<Session> = &self.session;
+        let session_for_blocking: &Mutex<OrtSession> = &self.session;
         let vocab = &self.vocab;
         tokio::task::block_in_place(|| {
             let mut sess = session_for_blocking.lock();
@@ -323,7 +322,7 @@ impl Detector for YoloeDetector {
 
 #[allow(clippy::too_many_arguments)]
 fn run_yoloe(
-    session: &mut Session,
+    session: &mut OrtSession,
     rgb: &[u8],
     frame_w: u32,
     frame_h: u32,

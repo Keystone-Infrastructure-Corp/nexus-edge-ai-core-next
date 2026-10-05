@@ -19,7 +19,7 @@
 //!
 //! Design decisions:
 //!
-//! * **Sync `encode()` under a `Mutex<Session>`** — matches the
+//! * **Sync `encode()` under a `Mutex<OrtSession>`** — matches the
 //!   YOLO-World detector pattern. The caller wraps in
 //!   `tokio::task::spawn_blocking` if it needs to keep the
 //!   reactor responsive (admin upload handler does).
@@ -39,13 +39,12 @@
 
 use std::path::{Path, PathBuf};
 
-use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
 use crate::detectors::InferenceError;
-use crate::session_tuning::{self, SessionTuning};
+use crate::session_tuning::{self, OrtSession, SessionTuning};
 use crate::yolo::preprocess_nchw;
 
 /// One image-encoder ONNX session. Cheap to clone (the underlying
@@ -53,7 +52,7 @@ use crate::yolo::preprocess_nchw;
 /// serialize through it — encoding is fast (~10 ms on CPU for a
 /// 640×640 crop), so a single session is plenty).
 pub struct ImageEncoder {
-    session: Mutex<Session>,
+    session: Mutex<OrtSession>,
     input_w: u32,
     input_h: u32,
     /// Length of every embedding the session emits. Validated on
