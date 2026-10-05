@@ -263,7 +263,9 @@ impl WebRtcBridge {
             );
             return;
         };
-        let codec = ingester.codec();
+        // The codec the session is actually parsing (#359), not the
+        // configured one: the NAL feed carries whatever the SDP named.
+        let codec = ingester.stream_codec();
         let nal_rx = ingester.subscribe();
 
         // Build the transport-specific publisher over the shared NAL feed.

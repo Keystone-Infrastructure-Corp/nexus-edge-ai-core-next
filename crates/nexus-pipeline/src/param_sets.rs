@@ -13,8 +13,13 @@
 //! [`ParamSetCache`] remembers the most recent VPS/SPS/PPS seen on the
 //! session (which includes the depayloader's sprop copy) and prepends
 //! them to an IDR access unit that carries none. An access unit that
-//! already carries any parameter set is never touched, so cameras that
-//! send them per keyframe produce byte-identical output.
+//! already carries any parameter set (even just one of VPS/SPS/PPS)
+//! counts as "has params" and is never touched, so cameras that send
+//! them per keyframe produce byte-identical output.
+//!
+//! Only the latest VPS, the latest SPS and the latest PPS are kept --
+//! one slot each, not one per parameter-set id. A stream that uses
+//! several SPS/PPS ids gets back only the most recent of each.
 
 /// Per-session cache of the most recent parameter-set NAL units, stored
 /// without their start codes.
