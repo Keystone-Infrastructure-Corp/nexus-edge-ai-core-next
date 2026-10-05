@@ -48,9 +48,9 @@
 //! ---------------------
 //! ORT's WebGPU EP gives every session that brings no device of its own
 //! the same default context, and that context is not safe to use from
-//! two threads at once. [`OrtSession`] serialises commit and run across
-//! every WebGPU-backed session in the process; sessions on other EPs
-//! are untouched (#363).
+//! two threads at once. [`OrtSession`] serialises commit, run and
+//! release across every WebGPU-backed session in the process; sessions
+//! on other EPs are untouched (#363).
 
 #![cfg(feature = "ort")]
 
@@ -199,7 +199,9 @@ fn has_accelerator(names: &[String]) -> bool {
 /// True iff `names` registered the WebGPU EP, so the session lands on
 /// ORT's shared default WebGPU context.
 fn shares_webgpu_context(names: &[String]) -> bool {
-    names.iter().any(|n| n == execution_providers::WEBGPU_EP_NAME)
+    names
+        .iter()
+        .any(|n| n == execution_providers::WEBGPU_EP_NAME)
 }
 
 /// Resolve the intra-op pool size for one session.
@@ -216,9 +218,9 @@ pub fn auto_intra_threads(concurrent_sessions: usize, accelerated: bool) -> usiz
 /// pending-kernel list — is not synchronised. Two WebGPU sessions in
 /// flight at once corrupt it: heap corruption and SIGSEGV inside
 /// `libonnxruntime`, and GPU command-stream faults that end in a ring
-/// reset (#363). Every commit and run on a WebGPU-backed session holds
-/// this lock; sessions on any other EP never take it.
-static SHARED_WEBGPU_CONTEXT: Mutex<()> = parking_lot::const_mutex(());
+/// reset (#363). Every commit, run and release of a WebGPU-backed
+/// session holds this lock; sessions on any other EP never take it.
+static SHARED_WEBGPU_CONTEXT: Mutex<()> = Mutex::new(());
 
 /// Hold [`SHARED_WEBGPU_CONTEXT`] when `shared` is true.
 fn lock_shared_webgpu_context(shared: bool) -> Option<MutexGuard<'static, ()>> {
@@ -226,15 +228,17 @@ fn lock_shared_webgpu_context(shared: bool) -> Option<MutexGuard<'static, ()>> {
 }
 
 /// An ORT [`Session`] that serialises itself against every other
-/// session on ORT's shared WebGPU context. It exposes `run` only, so
-/// no caller can reach the underlying session without the lock.
+/// session on ORT's shared WebGPU context. It exposes `run` only and
+/// releases the session under the same lock, so no caller can reach
+/// the underlying session without it.
 pub struct OrtSession {
-    session: Session,
+    /// `Some` until [`Drop`] releases it under the lock.
+    session: Option<Session>,
     shares_webgpu_context: bool,
 }
 
 impl OrtSession {
-    /// [`Session::run`], holding [`SHARED_WEBGPU_CONTEXT`] for the
+    /// [`Session::run`], holding the shared WebGPU context lock for the
     /// duration of the ORT call when this session is on the WebGPU EP.
     /// The outputs come back as host tensors, so reading and dropping
     /// them after the lock is released does not touch the context.
@@ -243,7 +247,19 @@ impl OrtSession {
         input_values: impl Into<SessionInputs<'i, 'v, N>>,
     ) -> ort::Result<SessionOutputs<'s>> {
         let _context = lock_shared_webgpu_context(self.shares_webgpu_context);
-        self.session.run(input_values)
+        self.session
+            .as_mut()
+            .expect("an OrtSession holds its session until it is dropped")
+            .run(input_values)
+    }
+}
+
+impl Drop for OrtSession {
+    /// Releasing a WebGPU session frees its buffers back into the shared
+    /// context's buffer managers, which a concurrent run also mutates.
+    fn drop(&mut self) {
+        let _context = lock_shared_webgpu_context(self.shares_webgpu_context);
+        self.session = None;
     }
 }
 
@@ -423,7 +439,7 @@ fn commit(
 
     Ok(BuiltSession {
         session: OrtSession {
-            session,
+            session: Some(session),
             shares_webgpu_context: webgpu,
         },
         ep_names,
@@ -652,16 +668,26 @@ mod tests {
 
     #[test]
     fn only_the_webgpu_ep_shares_the_webgpu_context() {
-        assert!(shares_webgpu_context(&["vulkan(webgpu)".into(), "cpu(fallback)".into()]));
+        assert!(shares_webgpu_context(&[
+            "vulkan(webgpu)".into(),
+            "cpu(fallback)".into()
+        ]));
         assert!(!shares_webgpu_context(&["cpu".into()]));
-        assert!(!shares_webgpu_context(&["openvino(NPU)".into(), "cpu".into()]));
-        assert!(!shares_webgpu_context(&["cuda".into(), "cpu(fallback)".into()]));
+        assert!(!shares_webgpu_context(&[
+            "openvino(NPU)".into(),
+            "cpu".into()
+        ]));
+        assert!(!shares_webgpu_context(&[
+            "cuda".into(),
+            "cpu(fallback)".into()
+        ]));
     }
 
     /// The defect #363 was filed for: two WebGPU sessions on two detector
     /// workers were inside ORT at once. The race itself needs a GPU (the
     /// harness on the issue reproduced it on an AMD 680M), so this pins
-    /// the lock that prevents it.
+    /// the lock that prevents it. That `run`, `commit` and `drop` take it
+    /// is not covered here: that needs a real session and a model.
     #[test]
     fn webgpu_sessions_never_overlap_and_other_sessions_are_not_held_back() {
         fn peak_overlap(shared: bool) -> usize {
@@ -689,8 +715,15 @@ mod tests {
             peak.load(Ordering::SeqCst)
         }
 
-        assert_eq!(peak_overlap(true), 1, "two WebGPU sessions were inside ORT together");
-        assert!(peak_overlap(false) > 1, "sessions on other EPs were serialised");
+        assert_eq!(
+            peak_overlap(true),
+            1,
+            "two WebGPU sessions were inside ORT together"
+        );
+        assert!(
+            peak_overlap(false) > 1,
+            "sessions on other EPs were serialised"
+        );
     }
 
     #[test]
