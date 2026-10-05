@@ -1,0 +1,30 @@
+-- 0035_motion_events_captured_at_index.sql
+--
+-- #349 — the diagnostics export's motion_events read full-scans the table.
+--
+-- `Store::list_motion_events_across_cameras` (motion.rs) runs, when the caller passes
+-- no camera filter:
+--
+--   SELECT ... FROM motion_events
+--    WHERE captured_at BETWEEN ? AND ?
+--    ORDER BY captured_at DESC
+--    LIMIT ?
+--
+-- The only time index is `idx_motion_events_camera_ts (camera_id,
+-- captured_at)`, which a predicate without `camera_id` cannot seek, so
+-- the plan was `SCAN motion_events` + `USE TEMP B-TREE FOR ORDER BY`.
+-- On MORGAN (32.6M rows, 19.5 GB) that took 56.9 s against the export's
+-- 30 s loopback timeout, so diagnostics could never be collected from
+-- the cores large enough to need them.
+--
+-- With `captured_at` leading, the planner walks the index backwards over
+-- the window and stops at LIMIT: no full scan, no sort.
+--
+-- Building this index on a table that size is itself a one-off cost
+-- paid at the first engine start after upgrade (minutes, not hours, on
+-- a 30-day 17-camera core). It is paid once; the scan it replaces was
+-- paid on every export.
+--
+-- Forward-only + idempotent via the `schema_migrations` ledger.
+CREATE INDEX IF NOT EXISTS idx_motion_events_ts
+    ON motion_events (captured_at);

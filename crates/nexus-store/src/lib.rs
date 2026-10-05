@@ -197,6 +197,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0034_outbox_drain_index",
         include_str!("../migrations/0034_outbox_drain_index.sql"),
     ),
+    (
+        "0035_motion_events_captured_at_index",
+        include_str!("../migrations/0035_motion_events_captured_at_index.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]
