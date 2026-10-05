@@ -271,18 +271,25 @@ impl Store {
 
     /// #759 — alert-clip twin of [`Store::stamp_clip_announce`]: record
     /// the blob URL and the `meta.id` of the `clip_replicated` about to
-    /// be sent, before sending it.
+    /// be sent, before sending it, counting the send and holding the
+    /// clip back until `next_at`.
     pub async fn stamp_alert_clip_announce(
         &self,
         id: AlertClipId,
         blob_url: &str,
         announce_id: &str,
+        next_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         let res = sqlx::query(
-            "UPDATE alert_clips SET cloud_blob_url = ?, cloud_announce_id = ? WHERE id = ?",
+            "UPDATE alert_clips
+                SET cloud_blob_url = ?, cloud_announce_id = ?,
+                    cloud_announce_attempts = cloud_announce_attempts + 1,
+                    cloud_announce_next_at = ?
+              WHERE id = ?",
         )
         .bind(blob_url)
         .bind(announce_id)
+        .bind(next_at.to_rfc3339())
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -293,31 +300,32 @@ impl Store {
     }
 
     /// #759 — alert-clip twin of [`Store::clips_pending_cloud_announce`]:
-    /// cold-uploaded alert clips the cloud has not acked yet, each paired
-    /// with its blob URL, oldest upload first, uploaded at or before
-    /// `cutoff`.
+    /// cold-uploaded alert clips the cloud has not acked yet whose
+    /// backoff has elapsed at `now`, each paired with its blob URL and
+    /// send count, earliest next attempt first.
     pub async fn alert_clips_pending_cloud_announce(
         &self,
         limit: i64,
-        cutoff: DateTime<Utc>,
-    ) -> Result<Vec<(AlertClipRow, String)>, StoreError> {
+        now: DateTime<Utc>,
+    ) -> Result<Vec<(AlertClipRow, String, i64)>, StoreError> {
         let rows = sqlx::query(&format!(
-            "SELECT {ALERT_CLIP_COLUMNS}, cloud_blob_url FROM alert_clips
+            "SELECT {ALERT_CLIP_COLUMNS}, cloud_blob_url, cloud_announce_attempts FROM alert_clips
               WHERE cloud_blob_url IS NOT NULL
                 AND cloud_announced_at IS NULL
                 AND cold_uploaded_at IS NOT NULL
-                AND cold_uploaded_at <= ?
-              ORDER BY cold_uploaded_at ASC
+                AND (cloud_announce_next_at IS NULL OR cloud_announce_next_at <= ?)
+              ORDER BY cloud_announce_next_at ASC
               LIMIT ?"
         ))
-        .bind(cutoff.to_rfc3339())
+        .bind(now.to_rfc3339())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
             .map(|row| {
                 let url = row.get::<String, _>("cloud_blob_url");
-                alert_clip_row_from_row(row).map(|clip| (clip, url))
+                let attempts = row.get::<i64, _>("cloud_announce_attempts");
+                alert_clip_row_from_row(row).map(|clip| (clip, url, attempts))
             })
             .collect()
     }

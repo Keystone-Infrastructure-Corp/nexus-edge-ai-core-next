@@ -98,8 +98,8 @@ async fn cold_motion_clip(store: &Store, n: i64) -> i64 {
     id
 }
 
-fn pending_ids(rows: &[(nexus_store::ClipRow, String)]) -> Vec<i64> {
-    rows.iter().map(|(c, _)| c.id).collect()
+fn pending_ids(rows: &[(nexus_store::ClipRow, String, i64)]) -> Vec<i64> {
+    rows.iter().map(|(c, _, _)| c.id).collect()
 }
 
 #[tokio::test]
@@ -113,9 +113,10 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
     let stored = cold_motion_clip(&store, 2).await;
     let rejected = cold_motion_clip(&store, 3).await;
     let unacked = cold_motion_clip(&store, 4).await;
+    let due = now - Duration::minutes(1);
     for (id, msg) in [(stored, "m-2"), (rejected, "m-3"), (unacked, "m-4")] {
         store
-            .stamp_clip_announce(id, &format!("https://blob.test/{id}.mp4"), msg)
+            .stamp_clip_announce(id, &format!("https://blob.test/{id}.mp4"), msg, due)
             .await
             .unwrap();
     }
@@ -124,6 +125,7 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
     assert_eq!(pending_ids(&pending), vec![stored, rejected, unacked]);
     assert!(!pending_ids(&pending).contains(&lan));
     assert_eq!(pending[0].1, format!("https://blob.test/{stored}.mp4"));
+    assert_eq!(pending[0].2, 1, "the stamp counts the send");
 
     assert_eq!(
         store
@@ -139,14 +141,14 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
             .unwrap(),
         1
     );
-    // An ack for an id that was superseded by a re-send matches nothing.
-    assert_eq!(
-        store
-            .record_clip_announce_ack("stale", now, None)
-            .await
-            .unwrap(),
-        0
-    );
+    // An ack for an id that was superseded by a re-send matches nothing,
+    // and a repeated ack does not overwrite the first.
+    for id in ["stale", "m-3"] {
+        assert_eq!(
+            store.record_clip_announce_ack(id, now, None).await.unwrap(),
+            0
+        );
+    }
 
     let pending = store.clips_pending_cloud_announce(10, now).await.unwrap();
     assert_eq!(
@@ -155,13 +157,32 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
         "a stored or permanently-rejected clip is never re-announced"
     );
 
-    // The cutoff holds back a clip uploaded after it.
-    let early = now - Duration::hours(3);
+    // A clip is held back until its next attempt is due.
     assert!(store
-        .clips_pending_cloud_announce(10, early)
+        .clips_pending_cloud_announce(10, due - Duration::seconds(1))
         .await
         .unwrap()
         .is_empty());
+    store
+        .stamp_clip_announce(
+            unacked,
+            "https://blob.test/u.mp4",
+            "m-5",
+            now + Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .clips_pending_cloud_announce(10, now)
+        .await
+        .unwrap()
+        .is_empty());
+    let pending = store
+        .clips_pending_cloud_announce(10, now + Duration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(pending_ids(&pending), vec![unacked]);
+    assert_eq!(pending[0].2, 2);
 }
 
 #[tokio::test]
@@ -195,7 +216,7 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
             .await
             .unwrap();
         store
-            .stamp_alert_clip_announce(id, "https://blob.test/a.mp4", &format!("a-{id}"))
+            .stamp_alert_clip_announce(id, "https://blob.test/a.mp4", &format!("a-{id}"), now)
             .await
             .unwrap();
         ids.push(id);
@@ -205,7 +226,10 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
         .alert_clips_pending_cloud_announce(10, now)
         .await
         .unwrap();
-    assert_eq!(pending.iter().map(|(c, _)| c.id).collect::<Vec<_>>(), ids);
+    assert_eq!(
+        pending.iter().map(|(c, _, _)| c.id).collect::<Vec<_>>(),
+        ids
+    );
     assert_eq!(pending[0].1, "https://blob.test/a.mp4");
 
     // The shared ack handler reaches alert clips too.
@@ -218,7 +242,7 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
         .await
         .unwrap();
     assert_eq!(
-        pending.iter().map(|(c, _)| c.id).collect::<Vec<_>>(),
+        pending.iter().map(|(c, _, _)| c.id).collect::<Vec<_>>(),
         vec![ids[1]]
     );
 }

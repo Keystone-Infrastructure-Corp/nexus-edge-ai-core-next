@@ -20,22 +20,42 @@
 --                              permanently rejected clip is not retried.
 --   * `cloud_announce_error` — the cloud's `permanent_failure` reason;
 --                              NULL when the cloud stored the clip.
+--   * `cloud_announce_attempts` — `clip_replicated` sends so far.
+--   * `cloud_announce_next_at`  — RFC3339 before which the clip is not
+--                              re-sent (exponential backoff). The
+--                              re-announce pass orders by it, so a clip
+--                              the cloud never acks moves to the back
+--                              after each send and cannot starve newer
+--                              clips.
 
 ALTER TABLE motion_clips ADD COLUMN cloud_blob_url TEXT;
 ALTER TABLE motion_clips ADD COLUMN cloud_announce_id TEXT;
 ALTER TABLE motion_clips ADD COLUMN cloud_announced_at TEXT;
 ALTER TABLE motion_clips ADD COLUMN cloud_announce_error TEXT;
+ALTER TABLE motion_clips ADD COLUMN cloud_announce_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE motion_clips ADD COLUMN cloud_announce_next_at TEXT;
 
 ALTER TABLE alert_clips ADD COLUMN cloud_blob_url TEXT;
 ALTER TABLE alert_clips ADD COLUMN cloud_announce_id TEXT;
 ALTER TABLE alert_clips ADD COLUMN cloud_announced_at TEXT;
 ALTER TABLE alert_clips ADD COLUMN cloud_announce_error TEXT;
+ALTER TABLE alert_clips ADD COLUMN cloud_announce_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE alert_clips ADD COLUMN cloud_announce_next_at TEXT;
 
 -- Drive the re-announce pass: only cold-uploaded, un-acked rows with a
 -- URL, so the working set stays tiny.
 CREATE INDEX IF NOT EXISTS idx_motion_clips_pending_announce
-    ON motion_clips(cold_uploaded_at)
+    ON motion_clips(cloud_announce_next_at)
     WHERE cloud_blob_url IS NOT NULL AND cloud_announced_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_alert_clips_pending_announce
-    ON alert_clips(cold_uploaded_at)
+    ON alert_clips(cloud_announce_next_at)
     WHERE cloud_blob_url IS NOT NULL AND cloud_announced_at IS NULL;
+
+-- Match a `clip_replicated_ack` to its clip without scanning either
+-- table; only un-acked rows can match.
+CREATE INDEX IF NOT EXISTS idx_motion_clips_announce_id
+    ON motion_clips(cloud_announce_id)
+    WHERE cloud_announced_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_alert_clips_announce_id
+    ON alert_clips(cloud_announce_id)
+    WHERE cloud_announced_at IS NULL;
