@@ -202,8 +202,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0035_motion_events_captured_at_index.sql"),
     ),
     (
-        "NNNN_PLACEHOLDER_clip_announce",
-        include_str!("../migrations/NNNN_PLACEHOLDER_clip_announce.sql"),
+        "0036_clip_cloud_announce",
+        include_str!("../migrations/0036_clip_cloud_announce.sql"),
     ),
 ];
 
