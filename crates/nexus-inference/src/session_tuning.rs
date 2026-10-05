@@ -230,7 +230,9 @@ fn lock_shared_webgpu_context(shared: bool) -> Option<MutexGuard<'static, ()>> {
 /// An ORT [`Session`] that serialises itself against every other
 /// session on ORT's shared WebGPU context. It exposes `run` only and
 /// releases the session under the same lock, so no caller can reach
-/// the underlying session without it.
+/// the underlying session without it. Don't keep an owned output past
+/// the `OrtSession`: it keeps the ORT session alive, and the final
+/// release would then happen outside the lock.
 pub struct OrtSession {
     /// `Some` until [`Drop`] releases it under the lock.
     session: Option<Session>,
@@ -259,7 +261,9 @@ impl Drop for OrtSession {
     /// context's buffer managers, which a concurrent run also mutates.
     fn drop(&mut self) {
         let _context = lock_shared_webgpu_context(self.shares_webgpu_context);
-        self.session = None;
+        // Release while `_context` is held. Leaving it to the field drop
+        // would run after the guard is gone.
+        drop(self.session.take());
     }
 }
 
@@ -410,7 +414,9 @@ fn commit(
 
     // A commit builds on the shared WebGPU context too, and not only at
     // startup: the YOLOE image encoder is committed on the first
-    // visual-prompt upload, while the detectors are running.
+    // visual-prompt upload, while the detectors are running. The lock is
+    // not re-entrant: nothing may run or drop an `OrtSession` while it
+    // is held here.
     let webgpu = shares_webgpu_context(&ep_names);
     let _context = lock_shared_webgpu_context(webgpu);
     let session = Session::builder()
@@ -686,8 +692,9 @@ mod tests {
     /// The defect #363 was filed for: two WebGPU sessions on two detector
     /// workers were inside ORT at once. The race itself needs a GPU (the
     /// harness on the issue reproduced it on an AMD 680M), so this pins
-    /// the lock that prevents it. That `run`, `commit` and `drop` take it
-    /// is not covered here: that needs a real session and a model.
+    /// the lock that prevents it. That `run` and `drop` take it is pinned
+    /// by `a_webgpu_session_runs_and_releases_only_under_the_lock`; that
+    /// `commit` does is not, because only a WebGPU EP sets the flag there.
     #[test]
     fn webgpu_sessions_never_overlap_and_other_sessions_are_not_held_back() {
         fn peak_overlap(shared: bool) -> usize {
@@ -791,14 +798,18 @@ mod tests {
     /// shared WebGPU context lock. Only the flag decides whether the lock
     /// is taken, so a CPU session with the flag set stands in for a WebGPU
     /// one. Needs the ORT library, which CI loads only in the system-libs
-    /// job (`ORT_DYLIB_PATH`); elsewhere it returns early.
+    /// job (`ORT_DYLIB_PATH`), so it runs on PRs labelled `system-libs`
+    /// and on pushes to main; elsewhere it returns early.
     #[test]
     fn a_webgpu_session_runs_and_releases_only_under_the_lock() {
+        use std::sync::mpsc::RecvTimeoutError;
+
         if std::env::var_os("ORT_DYLIB_PATH").is_none() {
             eprintln!("skipped: ORT_DYLIB_PATH is not set");
             return;
         }
-        let model = std::env::temp_dir().join("nexus-neg-model.onnx");
+        let name = format!("nexus-neg-{}.onnx", std::process::id());
+        let model = std::env::temp_dir().join(name);
         std::fs::write(&model, neg_model()).expect("write model");
         let cpu = ["cpu".to_owned()];
         let tuning = SessionTuning::default();
@@ -822,8 +833,9 @@ mod tests {
         });
 
         let wait = Duration::from_millis(300);
-        assert!(
-            done.recv_timeout(wait).is_err(),
+        assert_eq!(
+            done.recv_timeout(wait),
+            Err(RecvTimeoutError::Timeout),
             "run did not wait for the lock"
         );
         drop(held);
@@ -831,8 +843,9 @@ mod tests {
 
         let held = SHARED_WEBGPU_CONTEXT.lock();
         release_tx.send(()).expect("send");
-        assert!(
-            done.recv_timeout(wait).is_err(),
+        assert_eq!(
+            done.recv_timeout(wait),
+            Err(RecvTimeoutError::Timeout),
             "drop did not wait for the lock"
         );
         drop(held);
