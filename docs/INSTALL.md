@@ -1674,6 +1674,7 @@ is the one you cannot fix remotely by definition.
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
 | `curl /api/v1/health` returns connection refused | Engine isn't up. | `systemctl status nexus-engine`; check logs (§8.1). |
+| `journalctl -u nexus-engine -p warning` prints `-- No entries --` | Engines before #350 log every line at `PRIORITY=6`, so `-p` can never match. | Filter by text instead: `journalctl -u nexus-engine -g 'WARN\|ERROR'`. |
 | Engine refuses to start with `auth.mode = "none" is only allowed when server.api_bind is on loopback` | Since M-Install Checkpoint 2 the engine refuses to bind unauthenticated APIs onto a LAN. | Either change `[server].api_bind` to `127.0.0.1:8089` (LAN-only deployments), or set `[auth].mode = "local"`. The one-time admin password is at `/var/lib/nexus/state/bootstrap-password.txt` (mode 0600). |
 | Engine logs `auth: bootstrap admin created` / `one_time_password=<value>` at boot | First boot under `mode = "local"`. | Copy the OTP from `/var/lib/nexus/state/bootstrap-password.txt`, log in once at `http://<host>/login`, finish the wizard. |
 | UI loads but `/` returns 404 | `ui_root` mismatch — engine pointing at a path that doesn't exist. | `ls /opt/nexus/current/share/ui/index.html` should exist; `[server].ui_root` in `/etc/nexus/nexus.toml` should be `/opt/nexus/current/share/ui`. |

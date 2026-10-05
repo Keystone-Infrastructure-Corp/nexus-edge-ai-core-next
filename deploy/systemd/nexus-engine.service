@@ -47,6 +47,10 @@ WorkingDirectory=/var/lib/nexus
 Environment=ORT_DYLIB_PATH=/opt/nexus/current/lib/onnxruntime/libonnxruntime.so
 Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime
 Environment=RUST_LOG=info,nexus=info
+# The engine prefixes each stdout line with `<N>` (sd-daemon(3)) when it sees
+# JOURNAL_STREAM, so journald records the real tracing level as PRIORITY and
+# `journalctl -p warning` works (#350). systemd's default; set explicitly.
+SyslogLevelPrefix=yes
 
 # glibc allocator tuning (BUG-036). Together these cut retained RSS after a
 # four-camera workload from 4487 MB to 320 MB, and steady-state footprint while
