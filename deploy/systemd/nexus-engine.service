@@ -121,7 +121,9 @@ ExecStart=/opt/nexus/current/bin/nexus-engine --config /etc/nexus/nexus.toml
 # open mp4mux so clips finish writing instead of stranding at a
 # header-only 864-byte stub on restart, then drains the cloud outbox
 # before exiting 0. TimeoutStopSec caps the drain; on expiry systemd
-# escalates to SIGKILL.
+# escalates to SIGKILL. The engine budgets its own bounded waits (27 s, see
+# the SIGTERM sequence in main.rs) under this value, because an OTA never
+# re-applies this file and so cannot raise it on an installed box (#360).
 TimeoutStopSec=30s
 KillSignal=SIGTERM
 
