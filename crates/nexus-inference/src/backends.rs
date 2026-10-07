@@ -216,6 +216,53 @@ const DEVICE_FAILURE_STREAK: u32 = 32;
 /// the life of the process over it.
 const DEVICE_FAILURE_WINDOW: Duration = Duration::from_secs(15);
 
+type DetectorThread = (channel::Sender<WorkerCmd>, std::thread::JoinHandle<()>);
+
+/// Every `nexus-detector-{slot}` thread this process has started. Backends are
+/// shared through `Arc`s that outlive `main`'s shutdown sequence, so their
+/// `Drop` never runs before exit; this lets SIGTERM stop and join the threads
+/// instead of letting process exit race a driver call on them (#360).
+static DETECTOR_THREADS: std::sync::Mutex<Vec<DetectorThread>> = std::sync::Mutex::new(Vec::new());
+
+/// Send `Shutdown` to every detector worker thread and join them, waiting at
+/// most `timeout`. Returns `true` if every thread exited. A worker finishes the
+/// frame it is on first; one wedged inside a driver call is left behind rather
+/// than holding up exit. Blocking — never call from an async context.
+#[must_use]
+pub fn shutdown_detector_threads(timeout: Duration) -> bool {
+    let threads = std::mem::take(&mut *DETECTOR_THREADS.lock().unwrap_or_else(|p| p.into_inner()));
+    shutdown_and_join(threads, timeout)
+}
+
+fn shutdown_and_join(threads: Vec<DetectorThread>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut pending: Vec<_> = threads
+        .into_iter()
+        .map(|(tx, handle)| {
+            let _ = tx.send(WorkerCmd::Shutdown);
+            handle
+        })
+        .collect();
+    loop {
+        let (done, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|h| h.is_finished());
+        for h in done {
+            let _ = h.join();
+        }
+        pending = rest;
+        if pending.is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                remaining = pending.len(),
+                "detector worker threads did not exit before the shutdown deadline"
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 pub struct ThreadIsolatedBackend {
     slot: i32,
     common: Arc<BackendCommon>,
@@ -248,7 +295,7 @@ impl ThreadIsolatedBackend {
         let common_for_thread = common.clone();
         let factory_for_thread = factory.clone();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("nexus-detector-{}", slot))
             .spawn(move || {
                 Self::run_worker(
@@ -260,6 +307,11 @@ impl ThreadIsolatedBackend {
                 );
             })
             .map_err(InferenceError::Io)?;
+        {
+            let mut threads = DETECTOR_THREADS.lock().unwrap_or_else(|p| p.into_inner());
+            threads.retain(|(_, h)| !h.is_finished());
+            threads.push((tx.clone(), handle));
+        }
 
         Ok(Self {
             slot,
@@ -1079,5 +1131,50 @@ mod tests {
             "a slot whose detector never replies must leave rotation, or \
              `pick_ready` keeps sending it frames forever"
         );
+    }
+
+    /// Take this test's own workers out of the process-global registry so the
+    /// shutdown below cannot touch threads other concurrent tests are using.
+    fn take_threads_for_slot(slot: i32) -> Vec<DetectorThread> {
+        let name = format!("nexus-detector-{slot}");
+        let mut threads = DETECTOR_THREADS.lock().unwrap();
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *threads)
+            .into_iter()
+            .partition(|(_, h)| h.thread().name() == Some(name.as_str()));
+        *threads = rest;
+        mine
+    }
+
+    /// #360: SIGTERM must be able to stop and join the detector threads while
+    /// the backend is still alive (its `Arc`s outlive the shutdown sequence).
+    #[test]
+    fn shutdown_joins_detector_thread_while_backend_is_alive() {
+        let cfg = InferenceConfig::default();
+        let detector: Arc<dyn Detector> = Arc::new(BlockInPlaceProbe);
+        let backend = ThreadIsolatedBackend::start(9_001, detector, &cfg).expect("worker spawn");
+        wait_until_ready(&backend);
+        let threads = take_threads_for_slot(9_001);
+        assert_eq!(threads.len(), 1, "the worker thread must be registered");
+        assert!(shutdown_and_join(
+            threads,
+            std::time::Duration::from_secs(5)
+        ));
+        drop(backend);
+    }
+
+    /// A worker that never exits must not hold shutdown past its deadline.
+    #[test]
+    fn shutdown_join_is_bounded() {
+        let (tx, rx) = channel::unbounded::<WorkerCmd>();
+        let stuck = std::thread::spawn(move || {
+            let _rx = rx;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        });
+        let started = std::time::Instant::now();
+        assert!(!shutdown_and_join(
+            vec![(tx, stuck)],
+            std::time::Duration::from_millis(100)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

@@ -2183,24 +2183,41 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     }
 
     safety_handle.abort();
+    // Every bounded wait below shares the unit's `TimeoutStopSec=30s`; past it
+    // systemd SIGKILLs mid-teardown (#360). Budget: 5 s for these background
+    // tasks together (one shared deadline, not 5 s each), 15 s recorder drain,
+    // 4 s teardown pool, 3 s detector threads = 27 s.
+    //
+    // Signals go out to every task together, then all nine handles are
+    // awaited concurrently against the one shared deadline. Signalling and
+    // awaiting one task at a time would let a slow task (e.g. `cold_handle`,
+    // whose loop also runs reannounce) burn the whole 5s before later tasks
+    // — including the dispatcher and `cloud_tunnel`'s outbox drain — are
+    // even told to stop.
+    let tasks_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let _ = cold_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cold_handle).await;
     let _ = retention_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retention_handle).await;
     let _ = audit_retention_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), audit_retention_handle).await;
     let _ = alert_clip_evict_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), alert_clip_evict_handle).await;
     let _ = usb_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), usb_watch_handle).await;
     let _ = dispatcher_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), dispatcher_handle).await;
     let _ = delivery_reload_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), delivery_reload_handle).await;
     let _ = sinks_reload_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), sinks_reload_handle).await;
     let _ = cloud_tunnel_shutdown_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cloud_tunnel_handle).await;
+    let _ = tokio::time::timeout_at(tasks_deadline, async {
+        tokio::join!(
+            cold_handle,
+            retention_handle,
+            audit_retention_handle,
+            alert_clip_evict_handle,
+            usb_watch_handle,
+            dispatcher_handle,
+            delivery_reload_handle,
+            sinks_reload_handle,
+            cloud_tunnel_handle,
+        )
+    })
+    .await;
     reconciler_handle.abort();
     roster_handle.abort();
     state_hashes_handle.abort();
@@ -2218,11 +2235,38 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // `moov` atom instead of stranding as header-only `.partial.mp4`
     // stubs across an OTA restart. Bounded well under the unit's
     // `TimeoutStopSec=30s` so a wedged muxer can't block the restart.
-    match tokio::time::timeout(std::time::Duration::from_secs(20), recorder.shutdown()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(15), recorder.shutdown()).await {
         Ok(()) => {}
         Err(_) => tracing::warn!(
-            "recorder shutdown drain exceeded 20s; proceeding to exit (some clips may be truncated)"
+            "recorder shutdown drain exceeded 15s; proceeding to exit (some clips may be truncated)"
         ),
+    }
+
+    // #360: the supervisors aborted above hand their pipelines to the
+    // `gst-teardown` pool, and the detector threads are still running. Let
+    // both finish before `main` returns so process exit does not race a
+    // driver call (iHD / OpenCL) on those threads. Both waits block, so they
+    // run off the runtime's workers.
+    #[cfg(feature = "gstreamer")]
+    {
+        let drained = tokio::task::spawn_blocking(|| {
+            nexus_pipeline::teardown::wait_until_drained(std::time::Duration::from_secs(4))
+        })
+        .await
+        .unwrap_or(false);
+        if !drained {
+            tracing::warn!(
+                "gst teardown pool did not drain within 4s; exiting with NULL transitions in flight"
+            );
+        }
+    }
+    let joined = tokio::task::spawn_blocking(|| {
+        nexus_inference::backends::shutdown_detector_threads(std::time::Duration::from_secs(3))
+    })
+    .await
+    .unwrap_or(false);
+    if !joined {
+        tracing::warn!("detector threads did not exit within 3s; exiting with inference in flight");
     }
 
     Ok(())

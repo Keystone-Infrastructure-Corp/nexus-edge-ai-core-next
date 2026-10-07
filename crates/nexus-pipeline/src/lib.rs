@@ -25,6 +25,7 @@ pub mod decode;
 pub mod entity_sighting;
 pub mod gate;
 pub mod overlay;
+pub mod param_sets;
 pub mod post_roll;
 pub mod preroll;
 pub mod recorder;

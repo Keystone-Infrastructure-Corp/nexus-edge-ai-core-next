@@ -1112,6 +1112,144 @@ impl Store {
         Ok(())
     }
 
+    /// #759 — record the blob URL a clip was uploaded to and the
+    /// `meta.id` of the `clip_replicated` about to announce it. Stamped
+    /// BEFORE the send so the ack can never arrive ahead of the id it
+    /// answers. Once the clip is cold-uploaded it stays in
+    /// [`Self::clips_pending_cloud_announce`] until
+    /// [`Self::record_clip_announce_ack`] stamps the cloud's ack. Also
+    /// records the enrolled `core_id`, which owns the announce: a later
+    /// enrollment never re-sends it.
+    ///
+    /// Does NOT advance `cloud_announce_attempts` / `cloud_announce_next_at`
+    /// — a send that then fails must not burn an attempt or push the
+    /// backoff out. Call [`Self::record_clip_announce_sent`] once
+    /// `send_announce` returns `Ok`.
+    pub async fn stamp_clip_announce(
+        &self,
+        clip_id: ClipId,
+        blob_url: &str,
+        announce_id: &str,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE motion_clips
+                SET cloud_blob_url = ?, cloud_announce_id = ?,
+                    cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
+              WHERE id = ?",
+        )
+        .bind(blob_url)
+        .bind(announce_id)
+        .bind(clip_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
+        }
+        Ok(())
+    }
+
+    /// #759 — record a successful `clip_replicated` send: counts the
+    /// attempt in `cloud_announce_attempts` and holds the clip out of
+    /// [`Self::clips_pending_cloud_announce`] until `next_at` (the
+    /// caller's backoff). Call only after `send_announce` returns
+    /// `Ok`; see [`Self::stamp_clip_announce`].
+    pub async fn record_clip_announce_sent(
+        &self,
+        clip_id: ClipId,
+        next_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE motion_clips
+                SET cloud_announce_attempts = cloud_announce_attempts + 1,
+                    cloud_announce_next_at = ?
+              WHERE id = ?",
+        )
+        .bind(next_at.to_rfc3339())
+        .bind(clip_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
+        }
+        Ok(())
+    }
+
+    /// #759 — cold-uploaded clips whose `clip_replicated` the cloud has
+    /// not acked yet and whose backoff has elapsed at `now`, each paired
+    /// with its blob URL and the number of sends so far. Only clips
+    /// stamped under the current enrollment's `core_id` and started at
+    /// or after `floor` (its upload floor; `None` disables) are
+    /// returned — none when the box is not enrolled. Ordered by
+    /// next attempt, earliest first, so a clip that is re-sent moves
+    /// behind every clip still waiting and a never-acked clip cannot
+    /// starve newer ones.
+    pub async fn clips_pending_cloud_announce(
+        &self,
+        limit: i64,
+        now: DateTime<Utc>,
+        floor: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(ClipRow, String, i64)>, StoreError> {
+        let select = CLIP_SELECT_COLUMNS_BASE.replacen(
+            "FROM motion_clips",
+            ", cloud_blob_url, cloud_announce_attempts FROM motion_clips",
+            1,
+        );
+        let floor_str = floor.map(|f| f.to_rfc3339());
+        let rows = sqlx::query(&format!(
+            "{select}
+              WHERE cloud_blob_url IS NOT NULL
+                AND cloud_announced_at IS NULL
+                AND cold_uploaded_at IS NOT NULL
+                AND cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
+                AND (? IS NULL OR started_at >= ?)
+                AND (cloud_announce_next_at IS NULL OR cloud_announce_next_at <= ?)
+              ORDER BY cloud_announce_next_at ASC
+              LIMIT ?"
+        ))
+        .bind(&floor_str)
+        .bind(&floor_str)
+        .bind(now.to_rfc3339())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let url = row.get::<String, _>("cloud_blob_url");
+                let attempts = row.get::<i64, _>("cloud_announce_attempts");
+                clip_row_from_row(row).map(|clip| (clip, url, attempts))
+            })
+            .collect()
+    }
+
+    /// #759 — apply a `clip_replicated_ack` to whichever motion or alert
+    /// clip was last announced as `announce_id` (the ack's
+    /// `in_reply_to`). Any ack ends the re-announce loop; `rejection` is
+    /// the cloud's `permanent_failure` reason, recorded so a rejected
+    /// clip is visible rather than silently dropped. Returns the rows
+    /// matched — 0 for an ack superseded by a later re-send.
+    pub async fn record_clip_announce_ack(
+        &self,
+        announce_id: &str,
+        acked_at: DateTime<Utc>,
+        rejection: Option<&str>,
+    ) -> Result<u64, StoreError> {
+        let mut matched = 0;
+        for table in ["motion_clips", "alert_clips"] {
+            matched += sqlx::query(&format!(
+                "UPDATE {table}
+                    SET cloud_announced_at = ?, cloud_announce_error = ?
+                  WHERE cloud_announce_id = ? AND cloud_announced_at IS NULL"
+            ))
+            .bind(acked_at.to_rfc3339())
+            .bind(rejection)
+            .bind(announce_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        }
+        Ok(matched)
+    }
+
     /// Record a failed cold-upload attempt for backoff scheduling
     /// (migration 0023). Increments `cold_attempts` in SQL — which is
     /// authoritative even if the caller's `ClipRow` snapshot was

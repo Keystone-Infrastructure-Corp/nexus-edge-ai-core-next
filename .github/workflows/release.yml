@@ -286,8 +286,10 @@ jobs:
       # tag BEFORE any compile or `npm ci` runs.
       #
       # Why this instead of relying on `build.rs`'s NEXUS_RELEASE_VERSION
-      # path alone: build.rs only feeds `nexus-engine`. The release
-      # tarball also ships
+      # path alone: build.rs only feeds `nexus-engine` (and, as of
+      # edge#353, `nexus-hailo-backend` -- see that crate's `build.rs`,
+      # which feeds `nexus-hailo-probe`'s `--version` the same way). The
+      # release tarball also ships
       #
       #   * `nexus-sinks` (outbound webhook `User-Agent`)
       #   * `nexus-telemetry` (OTel `service.version` resource attr)

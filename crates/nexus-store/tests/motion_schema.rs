@@ -808,3 +808,46 @@ async fn find_largest_quarantined_hot_clip_none_when_all_healthy() {
         .unwrap()
         .is_none());
 }
+
+/// #349 — the cross-camera window read (`list_motion_events_across_cameras`
+/// with no camera filter, which the diagnostics export issues) must seek
+/// `idx_motion_events_ts` rather than scan the table and sort it. On a
+/// 32.6M-row core the scan took 57 s and the export never completed.
+///
+/// Asserts the plan, not a timing, so it stays deterministic in CI.
+#[tokio::test]
+async fn cross_camera_window_read_seeks_the_captured_at_index() {
+    let (store, _dir) = fresh_store().await;
+
+    // Must stay in step with `Store::list_motion_events_across_cameras`
+    // when called with `camera_ids = None`.
+    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN
+         SELECT id, camera_id, clip_id, track_id, kind, captured_at,
+                bbox_x1, bbox_y1, bbox_x2, bbox_y2,
+                label, confidence, attributes_json
+           FROM motion_events
+          WHERE captured_at BETWEEN ? AND ?
+          ORDER BY captured_at DESC LIMIT ?",
+    )
+    .bind((Utc::now() - Duration::hours(1)).to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(1000_i64)
+    .fetch_all(store.pool())
+    .await
+    .expect("explain query plan");
+    let detail = plan
+        .iter()
+        .map(|r| r.3.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    assert!(
+        detail.contains("idx_motion_events_ts"),
+        "window read must use idx_motion_events_ts, got plan: {detail}",
+    );
+    assert!(
+        !detail.contains("USE TEMP B-TREE"),
+        "window read must not sort; the index is already in captured_at order: {detail}",
+    );
+}

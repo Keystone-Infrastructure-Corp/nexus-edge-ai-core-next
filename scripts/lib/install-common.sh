@@ -221,6 +221,12 @@ system_prep() {
         log "skipping firewall rules (NEXUS_PREP_FIREWALL=0)"
     fi
 
+    # Unconditional — stock Ubuntu Server ships unattended-upgrades
+    # enabled out of the box, so this runs whether or not
+    # --enable-auto-updates was passed (that flag only controls
+    # whether install.sh itself installs + turns the feature on).
+    _system_prep_unattended_upgrades_guard
+
     if (( install_autoupdates )); then
         _system_prep_unattended_upgrades
     fi
@@ -333,6 +339,73 @@ _system_prep_firewall() {
     ufw allow 80/tcp   comment 'nexus-engine UI alias'  >/dev/null 2>&1 || true
     ufw allow 443/tcp  comment 'nexus-engine HTTPS'     >/dev/null 2>&1 || true
     ufw allow 8089/tcp comment 'nexus-engine API + UI' >/dev/null 2>&1 || true
+}
+
+# Unconditional guard against Ubuntu's unattended-upgrades touching the
+# engine and its media stack (#337). Runs regardless of
+# --enable-auto-updates, which only gates whether install.sh itself
+# installs + enables unattended-upgrades below — Ubuntu Server 24.04
+# ships it active by default, so the box is exposed either way.
+#
+# Two problems, two fixes:
+#
+#   1. needrestart (unattended-upgrades' post-dpkg hook) restarts any
+#      service holding a since-upgraded library open. Ubuntu's
+#      apt-daily-upgrade.timer fires inside 06:00-07:00 UTC
+#      fleet-wide, so this lands mid-shift: recording stops, and the
+#      restart's retention-orphan sweep deletes any alert clip whose
+#      DB row hadn't been written yet.
+#   2. The same upgrade can move gstreamer1.0-plugins-good (rtspsrc,
+#      the RTP depayloaders, isomp4/mp4mux — the whole ingest +
+#      recording path) and the VA-API decode drivers out from under
+#      the engine, untested, the same night, fleet-wide. Each Nexus
+#      release is tested against a specific GStreamer/VA-API pairing.
+#
+# Tradeoff: security fixes for the held packages now ship via Nexus
+# releases instead of unattended-upgrades, so that package set needs
+# an owner watching upstream CVEs for it.
+#
+# Idempotent: both files are fully overwritten (not appended) on every
+# run, so a re-install reproduces the same content.
+_system_prep_unattended_upgrades_guard() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        return 0
+    fi
+
+    install -d -m 0755 /etc/needrestart/conf.d
+    cat >/etc/needrestart/conf.d/50-nexus.conf <<'EOF'
+# Nexus: don't let needrestart bounce nexus-engine.service out from
+# under a live recording session after an unattended-upgrades run.
+# The engine picks up updated libraries at its next planned restart
+# (an OTA apply or a deliberate maintenance restart) instead. See
+# issue #337.
+$nrconf{override_rc}{qr(^nexus-engine\.service$)} = 0;
+EOF
+
+    cat >/etc/apt/apt.conf.d/51-nexus-media-hold.conf <<'EOF'
+// Nexus: keep the engine's GStreamer runtime and VA-API decode
+// drivers off unattended-upgrades so they only move through a tested
+// Nexus release (deploy/apt-requirements.txt is the source of truth
+// for the exact package list). Each driver is listed by name: holding
+// the va-driver-all metapackage does not hold its dependencies. See
+// issue #337 — an overnight Ubuntu security update to
+// gstreamer1.0-plugins-good changed the engine's RTSP/MP4 stack,
+// untested, fleet-wide, the same night needrestart tried to bounce
+// nexus-engine.service. Tradeoff: security fixes for
+// this package set now ship via Nexus releases, which needs an owner.
+Unattended-Upgrade::Package-Blacklist {
+    "^gstreamer1\.0-";
+    "^libgstreamer";
+    "^va-driver-all$";
+    "^vainfo$";
+    "^i965-va-driver$";
+    "^intel-media-va-driver$";
+    "^intel-media-va-driver-non-free$";
+    "^mesa-va-drivers$";
+};
+EOF
+
+    log "guarded nexus-engine + media stack from needrestart/unattended-upgrades (/etc/needrestart/conf.d/50-nexus.conf, /etc/apt/apt.conf.d/51-nexus-media-hold.conf)"
 }
 
 # Optional: configure unattended-upgrades for security patches. Off
@@ -2935,8 +3008,10 @@ swap_current_symlink() {
 
     # ln -sfn is the canonical "atomic replace a symlink" recipe:
     # it creates a temp symlink with target_version then rename(2)s
-    # it over the existing one.
-    ln -sfn "releases/$target_version" "$link"
+    # it over the existing one. Absolute target to match
+    # nexus-apply-release, which also writes current -> an absolute
+    # release_path (see deploy/nexus-apply-release).
+    ln -sfn "$NEXUS_PREFIX/releases/$target_version" "$link"
 
     # NOTE: these log lines MUST go to stderr. This function returns the
     # previous version via stdout (`printf '%s' "$previous"` below) and

@@ -6,9 +6,10 @@
 //!     nexus-hailo-probe --hef m.hef --images DIR --csv OUT.csv
 //!                                                   # run raw RGB frames, one row per detection
 //!     ... --stats                                   # also print raw output stats for the first frame
+//!     nexus-hailo-probe --version                   # print the release version and exit 0
 //!
-//! Exits non-zero on any failure. Designed for `journalctl`-friendly
-//! line output rather than pretty TUI.
+//! Exits non-zero on any failure, including an unrecognized argument.
+//! Designed for `journalctl`-friendly line output rather than pretty TUI.
 
 use std::env;
 use std::path::PathBuf;
@@ -17,7 +18,24 @@ use std::process::ExitCode;
 use nexus_hailo_backend::{InferSession, OutputLayout};
 use tracing_subscriber::{fmt, EnvFilter};
 
+const USAGE: &str =
+    "usage: nexus-hailo-probe [--version] [--hef PATH [--images DIR --csv OUT.csv] [--stats]]";
+
 fn main() -> ExitCode {
+    let args = match parse_args(env::args().skip(1)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("nexus-hailo-probe: {e}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if args.version {
+        println!("nexus-hailo-probe {}", env!("NEXUS_BUILD_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -41,15 +59,24 @@ fn main() -> ExitCode {
         }
         Ok(devs) => {
             for (i, d) in devs.iter().enumerate() {
-                println!(
-                    "device[{i}]: board={} serial={} fw={}.{}.{} part={}",
-                    d.board_name,
-                    d.serial,
-                    d.fw_version.0,
-                    d.fw_version.1,
-                    d.fw_version.2,
-                    d.device_id,
-                );
+                // HailoRT does not populate `board_name` for every part;
+                // printing an empty `board=` field is noise, not signal.
+                if d.board_name.is_empty() {
+                    println!(
+                        "device[{i}]: serial={} fw={}.{}.{} part={}",
+                        d.serial, d.fw_version.0, d.fw_version.1, d.fw_version.2, d.device_id,
+                    );
+                } else {
+                    println!(
+                        "device[{i}]: board={} serial={} fw={}.{}.{} part={}",
+                        d.board_name,
+                        d.serial,
+                        d.fw_version.0,
+                        d.fw_version.1,
+                        d.fw_version.2,
+                        d.device_id,
+                    );
+                }
             }
         }
         Err(e) => {
@@ -59,9 +86,13 @@ fn main() -> ExitCode {
     }
 
     // --- if --hef given, open + run one dummy frame ---
-    let hef_path = parse_flag("--hef");
-    if let Some(path) = hef_path {
-        match probe_hef(&path) {
+    if let Some(path) = args.hef {
+        match probe_hef(
+            &path,
+            args.images.as_deref(),
+            args.csv.as_deref(),
+            args.stats,
+        ) {
             Ok(()) => {
                 println!("nexus-hailo-probe: OK");
                 ExitCode::SUCCESS
@@ -76,14 +107,51 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_flag(flag: &str) -> Option<PathBuf> {
-    let mut args = env::args().skip(1);
+/// Parsed command-line arguments. Kept as a tiny pure function (no
+/// `std::env` access) so the parsing logic -- in particular, rejecting
+/// an unrecognized argument instead of silently ignoring it (edge#353)
+/// -- is unit-testable without a subprocess.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Args {
+    version: bool,
+    hef: Option<PathBuf>,
+    images: Option<PathBuf>,
+    csv: Option<PathBuf>,
+    stats: bool,
+}
+
+fn parse_args<I>(args: I) -> Result<Args, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut out = Args::default();
+    let mut args = args.into_iter();
     while let Some(a) = args.next() {
-        if a == flag {
-            return args.next().map(PathBuf::from);
+        match a.as_str() {
+            "--version" => out.version = true,
+            "--stats" => out.stats = true,
+            "--hef" => {
+                out.hef =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--hef requires a path argument".to_string()
+                    })?));
+            }
+            "--images" => {
+                out.images =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--images requires a directory argument".to_string()
+                    })?));
+            }
+            "--csv" => {
+                out.csv =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--csv requires a path argument".to_string()
+                    })?));
+            }
+            other => return Err(format!("unrecognized argument '{other}'")),
         }
     }
-    None
+    Ok(out)
 }
 
 /// `--stats`: per-output min / max / mean / fraction-positive of the dequantised
@@ -135,6 +203,7 @@ fn run_images(
     layout: &OutputLayout,
     dir: &std::path::Path,
     csv: &std::path::Path,
+    stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
     let want = session.input_frame_size();
@@ -184,7 +253,7 @@ fn run_images(
                 continue;
             }
         };
-        if run == 0 && env::args().any(|a| a == "--stats") {
+        if run == 0 && stats {
             print_output_stats(&name, &out_names, raw);
         }
         for d in nexus_hailo_backend::decode_detections(raw, layout, 200) {
@@ -209,7 +278,12 @@ fn run_images(
     Ok(())
 }
 
-fn probe_hef(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn probe_hef(
+    path: &std::path::Path,
+    images: Option<&std::path::Path>,
+    csv: Option<&std::path::Path>,
+    stats: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("opening HEF: {}", path.display());
     let mut session = InferSession::open(path, None, None)?;
     let (h, w, c) = session.input_shape();
@@ -277,9 +351,56 @@ fn probe_hef(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             d.class_id, d.score, d.x_min, d.y_min, d.x_max, d.y_max,
         );
     }
-    if let Some(dir) = parse_flag("--images") {
-        let csv = parse_flag("--csv").ok_or("--images needs --csv <path>")?;
-        run_images(&mut session, &layout, &dir, &csv)?;
+    if let Some(dir) = images {
+        let csv = csv.ok_or("--images needs --csv <path>")?;
+        run_images(&mut session, &layout, dir, csv, stats)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_is_default() {
+        assert_eq!(parse_args(args(&[])).unwrap(), Args::default());
+    }
+
+    #[test]
+    fn version_flag_sets_version() {
+        let parsed = parse_args(args(&["--version"])).unwrap();
+        assert!(parsed.version);
+    }
+
+    #[test]
+    fn hef_images_csv_and_stats_are_parsed() {
+        let parsed = parse_args(args(&[
+            "--hef", "m.hef", "--images", "dir", "--csv", "out.csv", "--stats",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.hef, Some(PathBuf::from("m.hef")));
+        assert_eq!(parsed.images, Some(PathBuf::from("dir")));
+        assert_eq!(parsed.csv, Some(PathBuf::from("out.csv")));
+        assert!(parsed.stats);
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected() {
+        assert!(parse_args(args(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn stray_positional_is_rejected() {
+        assert!(parse_args(args(&["not-a-flag"])).is_err());
+    }
+
+    #[test]
+    fn hef_missing_value_is_rejected() {
+        assert!(parse_args(args(&["--hef"])).is_err());
+    }
 }

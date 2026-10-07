@@ -798,16 +798,20 @@ pub async fn process_row(
                         if tokio::fs::try_exists(&abs).await.unwrap_or(false) {
                             event.artifacts.clip = Some(abs.to_string_lossy().into_owned());
                         } else {
-                            debug!(
+                            warn!(
                                 outbox_id = row.id,
+                                event_id = %row.event_id,
+                                alert_clip_id = alert_clip.id,
                                 path = %abs.display(),
                                 "alert clip file absent on disk; delivering clip-less"
                             );
                         }
                     }
                 } else if alert_clip.state == "failed" {
-                    debug!(
+                    warn!(
                         outbox_id = row.id,
+                        event_id = %row.event_id,
+                        alert_clip_id = alert_clip.id,
                         "alert clip build failed; delivering clip-less"
                     );
                 } else if within_alert_clip_grace(&event) {
@@ -817,8 +821,10 @@ pub async fn process_row(
                     schedule_clip_wait(store, &row, "alert clip still building").await;
                     return;
                 } else {
-                    debug!(
+                    warn!(
                         outbox_id = row.id,
+                        event_id = %row.event_id,
+                        alert_clip_id = alert_clip.id,
                         state = %alert_clip.state,
                         "alert clip not ready within grace; delivering clip-less"
                     );

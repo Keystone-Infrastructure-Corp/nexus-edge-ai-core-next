@@ -169,6 +169,16 @@ pub trait ColdBackend: Send + Sync {
     /// `local`, `usb`, `lan`, `gdrive`, `onedrive`).
     fn kind(&self) -> &str;
 
+    /// #759 — whether this backend's `put` can yield a
+    /// [`PutReceipt::cold_url`] worth announcing to the cloud. Only a
+    /// backend that surfaces a durable, cloud-reachable blob URL
+    /// (Azure) overrides this to `true`; LAN/USB/gdrive/onedrive never
+    /// do, so skipping a redundant `put` on an `exists` hit is always
+    /// safe for them. Default `false`.
+    fn yields_cloud_url(&self) -> bool {
+        false
+    }
+
     /// Upload a single clip. `path` is relative to the backend's
     /// configured root (e.g. `cam1/1700000000_15000.mp4`); the
     /// implementation enforces that traversal-safe path resolution

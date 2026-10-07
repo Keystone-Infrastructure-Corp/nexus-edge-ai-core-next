@@ -25,6 +25,10 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{trace::Sampler, Resource};
 use std::io::IsTerminal;
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 pub struct TelemetryGuard {
@@ -37,6 +41,49 @@ impl Drop for TelemetryGuard {
             // Best-effort flush; ignore errors during shutdown.
             let _ = p.shutdown();
         }
+    }
+}
+
+/// True when stdout is connected to journald. systemd sets `JOURNAL_STREAM`
+/// for a service whose stdout/stderr is a journal stream; it is absent for an
+/// interactive run, where a `<N>` prefix would only be noise.
+fn journal_prefix_enabled(journal_stream: Option<std::ffi::OsString>) -> bool {
+    journal_stream.is_some_and(|v| !v.is_empty())
+}
+
+/// The sd-daemon(3) syslog priority prefix for a `tracing` level.
+fn syslog_prefix(level: &Level) -> &'static str {
+    match *level {
+        Level::ERROR => "<3>",
+        Level::WARN => "<4>",
+        Level::INFO => "<6>",
+        Level::DEBUG | Level::TRACE => "<7>",
+    }
+}
+
+/// Wraps an event formatter, prepending the syslog priority prefix when
+/// `enabled` so journald (`SyslogLevelPrefix=yes`) records the real level.
+struct SyslogPrefix<F> {
+    inner: F,
+    enabled: bool,
+}
+
+impl<S, N, F> FormatEvent<S, N> for SyslogPrefix<F>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    F: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        if self.enabled {
+            writer.write_str(syslog_prefix(event.metadata().level()))?;
+        }
+        self.inner.format_event(ctx, writer, event)
     }
 }
 
@@ -66,14 +113,28 @@ pub fn init(
     // hardcoding: interactive `cargo run` keeps colour, the service does not.
     let ansi = std::io::stderr().is_terminal();
 
+    // Under systemd, stdout is a journald stream that stamps every line
+    // PRIORITY=6 unless the line starts with a `<N>` syslog prefix (#350).
+    let journal = journal_prefix_enabled(std::env::var_os("JOURNAL_STREAM"));
+
     let fmt_layer = if cfg.json_logs {
-        tracing_subscriber::fmt::layer().json().boxed()
+        tracing_subscriber::fmt::layer()
+            .json()
+            .event_format(SyslogPrefix {
+                inner: tracing_subscriber::fmt::format().json(),
+                enabled: journal,
+            })
+            .boxed()
     } else {
         tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_line_number(false)
             .with_ansi(ansi)
-            .compact()
+            .event_format(SyslogPrefix {
+                inner: tracing_subscriber::fmt::format()
+                    .with_target(true)
+                    .with_line_number(false)
+                    .compact(),
+                enabled: journal,
+            })
             .boxed()
     };
 
@@ -145,4 +206,66 @@ pub fn init(
     }
 
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syslog_prefix_maps_every_level() {
+        assert_eq!(syslog_prefix(&Level::ERROR), "<3>");
+        assert_eq!(syslog_prefix(&Level::WARN), "<4>");
+        assert_eq!(syslog_prefix(&Level::INFO), "<6>");
+        assert_eq!(syslog_prefix(&Level::DEBUG), "<7>");
+        assert_eq!(syslog_prefix(&Level::TRACE), "<7>");
+    }
+
+    #[test]
+    fn prefix_only_when_journal_stream_is_set() {
+        assert!(!journal_prefix_enabled(None));
+        assert!(!journal_prefix_enabled(Some("".into())));
+        assert!(journal_prefix_enabled(Some("8:12345".into())));
+    }
+
+    #[test]
+    fn formatter_prepends_prefix_only_when_enabled() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        for (enabled, want) in [(true, "<4>"), (false, "")] {
+            let buf = Buf::default();
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(buf.clone())
+                .event_format(SyslogPrefix {
+                    inner: tracing_subscriber::fmt::format().compact(),
+                    enabled,
+                });
+            let sub = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::with_default(sub, || tracing::warn!("boom"));
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(out.contains("WARN"), "{out}");
+            assert_eq!(out.starts_with('<'), enabled, "{out}");
+            assert!(out.starts_with(want), "{out}");
+        }
+    }
 }

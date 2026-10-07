@@ -6,7 +6,7 @@
 #   1. From inside an extracted release tarball (the usual case
 #      driven by scripts/bootstrap.sh):
 #
-#         cd /opt/nexus/releases/v0.2.0
+#         cd /opt/nexus/releases/0.2.0
 #         sudo ./scripts/install.sh
 #
 #   2. From a clone of this repo, against a release tarball you
@@ -46,7 +46,7 @@
 set -euo pipefail
 
 # Resolve our own directory so `source ./lib/install-common.sh` works
-# whether the script was invoked from `/opt/nexus/releases/v.../` or
+# whether the script was invoked from `/opt/nexus/releases/.../` or
 # from a checkout.
 SCRIPT_DIR="$( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd )"
 # shellcheck source=lib/install-common.sh
@@ -184,7 +184,13 @@ while [[ $# -gt 0 ]]; do
         --force-profile)      FORCE_PROFILE="$2"; shift 2 ;;
         --keep-config)        KEEP_CONFIG=1; shift ;;
         --tarball)            TARBALL="$2"; shift 2 ;;
-        --version)            VERSION="$2"; shift 2 ;;
+        # Strip a leading 'v' so the release directory name matches
+        # the bare version the OTA path (nexus-apply-release) and
+        # the engine's own reported version use. bootstrap.sh forwards
+        # its (tag-shaped) --version straight through; the tag itself
+        # is only needed for the download URL, which is resolved
+        # before install.sh ever runs.
+        --version)            VERSION="${2#v}"; shift 2 ;;
         --no-start)           NO_START=1; shift ;;
         --unattended)         UNATTENDED=1; shift ;;
         --admin-password-file) ADMIN_PASSWORD_FILE="$2"; shift 2 ;;
@@ -267,9 +273,12 @@ if [[ -n "$TARBALL" ]]; then
     verify_sha256 "$TARBALL" "$sha_file"
 
     # Pull VERSION out of the tarball without doing a full extract.
+    # The file holds the release tag (e.g. v0.1.220); strip a leading
+    # 'v' so the release directory name matches the bare version the
+    # OTA path and the engine itself use.
     extracted_version="$(tar -xzOf "$TARBALL" --wildcards '*/VERSION' 2>/dev/null | head -n1)"
     [[ -n "$extracted_version" ]] || die "tarball is missing VERSION file"
-    VERSION="${VERSION:-$extracted_version}"
+    VERSION="${VERSION:-${extracted_version#v}}"
 
     RELEASE_DIR="$NEXUS_PREFIX/releases/$VERSION"
     if [[ -d "$RELEASE_DIR" ]]; then
@@ -293,7 +302,10 @@ if [[ -n "$TARBALL" ]]; then
 else
     if [[ -r "$SCRIPT_DIR/../VERSION" ]]; then
         src_dir="$( cd "$SCRIPT_DIR/.." && pwd )"
+        # Same tag-vs-bare-version note as the --version flag above:
+        # the VERSION file holds the release tag.
         VERSION="${VERSION:-$(cat "$src_dir/VERSION")}"
+        VERSION="${VERSION#v}"
         canonical="$NEXUS_PREFIX/releases/$VERSION"
 
         if [[ "$src_dir" == "$canonical" ]]; then

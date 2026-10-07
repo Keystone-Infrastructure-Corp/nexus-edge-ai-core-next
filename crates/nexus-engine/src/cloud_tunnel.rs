@@ -798,13 +798,45 @@ fn verify_update_actor(
     Ok(actor)
 }
 
+/// #759 — apply a `clip_replicated_ack` to the clip whose
+/// `clip_replicated` it answers (`in_reply_to`), ending the cold
+/// replicator's re-announce loop for it. `permanent_failure` records
+/// the cloud's reason; any other status means the cloud stored the
+/// clip. (A transient cloud failure sends no ack, so the clip stays
+/// pending and is re-sent.)
+async fn record_clip_replicated_ack(
+    store: &Store,
+    in_reply_to: Option<&str>,
+    ack: &nexus_cloud_protocol::v1::ClipReplicatedAckPayload,
+) {
+    let Some(reply_id) = in_reply_to else {
+        warn!(status = %ack.status, "clip_replicated_ack missing in_reply_to; cannot correlate");
+        return;
+    };
+    let rejection = (ack.status == "permanent_failure")
+        .then(|| ack.reason.as_deref().unwrap_or("permanent_failure"));
+    if let Some(reason) = rejection {
+        warn!(in_reply_to = %reply_id, reason, "cloud permanently rejected clip_replicated");
+    }
+    match store
+        .record_clip_announce_ack(reply_id, chrono::Utc::now(), rejection)
+        .await
+    {
+        Ok(matched) => {
+            debug!(in_reply_to = %reply_id, status = %ack.status, matched, "clip_replicated_ack recorded");
+        }
+        Err(e) => {
+            warn!(in_reply_to = %reply_id, error = %e, "clip_replicated_ack: store update failed")
+        }
+    }
+}
+
 /// Drain inbound envelopes off the tunnel reader's channel. For
 /// every `rpc_call`, build the response envelope (with the
 /// `EngineRpcHandler`-derived status code) and send it back through
 /// the same `TunnelHandle`. Non-RpcCall envelopes (entitlement_update,
-/// clip_replicated_ack, future cloud→edge variants) are debug-logged
-/// and skipped — those have their own consumers wired elsewhere or
-/// are not yet handled.
+/// future cloud→edge variants) are debug-logged and skipped — those
+/// have their own consumers wired elsewhere or are not yet handled.
 ///
 /// Returns when:
 ///   * the inbound channel is closed (tunnel reader exited),
@@ -913,6 +945,9 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         warn!(core_id = %core_id, status = %ack.status, "alert_ack missing in_reply_to; cannot correlate");
                     }
                 }
+            }
+            EnvelopeBody::ClipReplicatedAck(ack) => {
+                record_clip_replicated_ack(store, env.meta.in_reply_to.as_deref(), ack).await;
             }
             EnvelopeBody::DiagCollect(payload) => {
                 // Phase 7.0a — verified out-of-band here (NOT through the
@@ -3595,5 +3630,82 @@ mod enrollment_wait_tests {
             .expect("shutdown did not interrupt a parked poll")
             .expect("waiter task panicked");
         assert!(got.is_none(), "shutdown must return None");
+    }
+}
+
+#[cfg(test)]
+mod clip_replicated_ack_tests {
+    use nexus_cloud_protocol::v1::ClipReplicatedAckPayload;
+    use nexus_config::StoreConfig;
+
+    use super::*;
+
+    fn ack(status: &str, reason: Option<&str>) -> ClipReplicatedAckPayload {
+        ClipReplicatedAckPayload {
+            status: status.to_string(),
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    /// #759 — a success ack marks the clip announced, `permanent_failure`
+    /// records the reason (and also ends retries), and a clip with no ack
+    /// stays pending so the cold replicator re-sends it.
+    #[tokio::test]
+    async fn clip_replicated_ack_marks_the_announced_clip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            url: format!(
+                "sqlite://{}?mode=rwc",
+                dir.path().join("nexus.db").display()
+            ),
+            ..StoreConfig::default()
+        })
+        .await
+        .expect("open store");
+        sqlx::query(
+            "INSERT INTO cameras (id, name, url, config_json) VALUES (1, 'c', 'rtsp://x', '{}')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        for (id, msg) in [(1, "m-ok"), (2, "m-bad"), (3, "m-unacked")] {
+            sqlx::query(
+                "INSERT INTO motion_clips (id, camera_id, started_at, hot_handle, hot_path, cloud_announce_id)
+                 VALUES (?, 1, '2026-01-01T00:00:00+00:00', 'local', 'c.mp4', ?)",
+            )
+            .bind(id)
+            .bind(msg)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        // `stored` is off-schema; any non-`permanent_failure` status is success.
+        record_clip_replicated_ack(&store, Some("m-ok"), &ack("stored", None)).await;
+        record_clip_replicated_ack(
+            &store,
+            Some("m-bad"),
+            &ack("permanent_failure", Some("unknown camera")),
+        )
+        .await;
+        // Uncorrelatable: touches nothing.
+        record_clip_replicated_ack(&store, None, &ack("stored", None)).await;
+
+        let rows: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, cloud_announced_at, cloud_announce_error FROM motion_clips ORDER BY id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            rows[0].1.is_some() && rows[0].2.is_none(),
+            "stored: {rows:?}"
+        );
+        assert!(
+            rows[1].1.is_some(),
+            "rejected clip must stop retrying: {rows:?}"
+        );
+        assert_eq!(rows[1].2.as_deref(), Some("unknown camera"));
+        assert!(rows[2].1.is_none(), "no ack → still pending: {rows:?}");
     }
 }

@@ -47,7 +47,9 @@ const FRAME_H: u32 = 1080;
 /// nothing touches the disk.
 fn tight_static_cfg() -> StaticObjectConfig {
     StaticObjectConfig {
-        dwell_frames: 3,
+        dwell_frames: Some(3),
+        dwell_secs: 0.0,
+        anchor_persons: false,
         significant_movement_pixels: 10,
         significant_movement_frames: 2,
         movement_ema_alpha: 1.0,

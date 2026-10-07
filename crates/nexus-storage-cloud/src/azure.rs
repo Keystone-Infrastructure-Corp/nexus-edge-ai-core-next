@@ -655,6 +655,12 @@ impl ColdBackend for AzureBlobBackend {
         "azure"
     }
 
+    /// #759 — the only `ColdBackend` whose `PutReceipt::cold_url` is
+    /// ever `Some`.
+    fn yields_cloud_url(&self) -> bool {
+        true
+    }
+
     async fn put(
         &self,
         path: &str,

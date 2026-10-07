@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use nexus_config::{CameraConfig, InferenceConfig, ModelConfig};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
 use crate::pool::DetectorPool;
@@ -133,22 +133,46 @@ impl InferenceRouter {
             if key == default_key || layers.contains_key(&key) {
                 continue;
             }
+            // Every camera that resolves to this override identity, so a
+            // failure names all of them rather than the first one seen.
+            let camera_ids: Vec<i64> = cameras
+                .iter()
+                .filter(|c| {
+                    c.detector.model_override.as_ref().map(LayerKey::from_model)
+                        == Some(key.clone())
+                })
+                .map(|c| c.id)
+                .collect();
             let derived = derive_inference_cfg(default_cfg, override_cfg);
             match build_with_context(&derived, &ctx) {
                 Ok(layer) => {
-                    info!(
-                        key = %key.display(),
-                        camera_id = cam.id,
-                        "router: built override inference layer"
-                    );
+                    // A fail-soft build still returns Ok, with a detector
+                    // that reports nothing; its own error log names only
+                    // `inference.model`, so say which config it really was.
+                    if layer.detector.name() == "unavailable" {
+                        error!(
+                            key = %key.display(),
+                            camera_ids = ?camera_ids,
+                            "router: the per-camera model_override (not inference.model) \
+                             for these cameras failed to build; they will report ZERO \
+                             detections until that override is corrected"
+                        );
+                    } else {
+                        info!(
+                            key = %key.display(),
+                            camera_ids = ?camera_ids,
+                            "router: built override inference layer"
+                        );
+                    }
                     layers.insert(key, layer);
                 }
                 Err(e) => {
                     warn!(
                         key = %key.display(),
-                        camera_id = cam.id,
-                        "router: failed to build override layer ({e}); \
-                         camera will fall back to the default identity"
+                        camera_ids = ?camera_ids,
+                        "router: failed to build the per-camera model_override layer \
+                         (not inference.model) ({e}); these cameras will fall back to \
+                         the default identity"
                     );
                 }
             }
@@ -311,12 +335,23 @@ impl InferenceRouter {
 /// `model` substruct for the camera's override. Backend strategy /
 /// worker count / EP priority / fail-soft are inherited because they're
 /// host-level decisions, not per-camera ones.
+///
+/// Within `model`, `pack_path` is the one field inherited when the
+/// override leaves it `None`: it names where this host keeps its model
+/// files, and the cloud's `normalize_detector_config` projection never
+/// sends it, so a `None` there means "not stated", not "no pack" (#357).
+/// Every other field is taken from the override as-is — in particular
+/// `top_k` / `min_bbox_area_px` / `nms_spatial_bucket_size_px`, where
+/// `None` is a meaningful "off" a camera may legitimately ask for.
 fn derive_inference_cfg(
     default: &InferenceConfig,
     override_model: &ModelConfig,
 ) -> InferenceConfig {
     let mut derived = default.clone();
     derived.model = override_model.clone();
+    if derived.model.pack_path.is_none() {
+        derived.model.pack_path = default.model.pack_path.clone();
+    }
     derived
 }
 
@@ -613,5 +648,51 @@ mod tests {
         assert!(keys.iter().any(|k| k == "mock@1280x1280"), "got {keys:?}");
         // Exactly four distinct identities — no duplicate 960 layer.
         assert_eq!(keys.len(), 4, "got {keys:?}");
+    }
+
+    /// Issue #357 — the cloud's `normalize_detector_config` projection
+    /// never sends `pack_path` in a per-camera `model_override`, so an
+    /// override that only changes the shape must inherit the default's
+    /// pack. Before the fix the whole `model` was replaced and every
+    /// pack-based detector (`yolo`, `yoloe`, `yoloe_visual`) refused to
+    /// load, leaving the camera on zero detections.
+    #[test]
+    fn derived_cfg_inherits_default_pack_path_for_shape_only_override() {
+        let mut cfg = cfg_with_kind("yolo");
+        cfg.model.pack_path = Some("/opt/nexus/current/share/models".into());
+        let override_model = ModelConfig {
+            kind: "yolo".into(),
+            preset: "1536x864".into(),
+            input_width: 1536,
+            input_height: 864,
+            ..Default::default()
+        };
+        assert_eq!(override_model.pack_path, None);
+
+        let derived = derive_inference_cfg(&cfg, &override_model);
+
+        assert_eq!(derived.model.pack_path, cfg.model.pack_path);
+        assert_eq!(derived.model.preset, "1536x864");
+        assert_eq!(derived.model.input_width, 1536);
+        assert_eq!(derived.model.input_height, 864);
+    }
+
+    /// An override that names its own `pack_path` keeps it.
+    #[test]
+    fn derived_cfg_keeps_an_explicit_override_pack_path() {
+        let mut cfg = cfg_with_kind("yolo");
+        cfg.model.pack_path = Some("/default/pack".into());
+        let override_model = ModelConfig {
+            kind: "yolo".into(),
+            pack_path: Some("/override/pack".into()),
+            ..Default::default()
+        };
+
+        let derived = derive_inference_cfg(&cfg, &override_model);
+
+        assert_eq!(
+            derived.model.pack_path,
+            Some(std::path::PathBuf::from("/override/pack"))
+        );
     }
 }

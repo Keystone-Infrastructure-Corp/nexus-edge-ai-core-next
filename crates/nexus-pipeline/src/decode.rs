@@ -206,6 +206,28 @@ impl DecodeChain {
     }
 }
 
+/// Codec to run an RTSP session with, given the camera's configured codec
+/// and the SDP `encoding-name` on the session's video pad. Returns the
+/// chosen codec and whether the two disagreed (#359). A configured codec
+/// that matches the stream's base is kept as given (H.264+ stays H.264+);
+/// an encoding this pipeline cannot parse keeps the configured codec.
+pub fn resolve_session_codec(
+    configured: nexus_types::CodecKind,
+    encoding_name: &str,
+) -> (nexus_types::CodecKind, bool) {
+    use nexus_types::CodecKind;
+    let detected = match encoding_name.to_ascii_uppercase().as_str() {
+        "H264" => CodecKind::H264,
+        "H265" | "HEVC" => CodecKind::H265,
+        _ => return (configured, false),
+    };
+    if detected.base() == configured.base() {
+        (configured, false)
+    } else {
+        (detected, true)
+    }
+}
+
 fn va_decoder(codec_base: &str) -> &'static str {
     match codec_base {
         "h265" => "vah265dec",
@@ -1167,6 +1189,37 @@ pub fn install_shared_display_context(pipeline: &gstreamer::Pipeline) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_pinned_codec_that_disagrees_with_the_stream_follows_the_stream() {
+        use nexus_types::CodecKind;
+        assert_eq!(
+            resolve_session_codec(CodecKind::H264, "H265"),
+            (CodecKind::H265, true)
+        );
+        assert_eq!(
+            resolve_session_codec(CodecKind::H265Plus, "H264"),
+            (CodecKind::H264, true)
+        );
+        assert_eq!(
+            resolve_session_codec(CodecKind::H264, "HEVC"),
+            (CodecKind::H265, true)
+        );
+        // Agreement keeps the configured codec, including the `_plus` tag.
+        assert_eq!(
+            resolve_session_codec(CodecKind::H264, "H264"),
+            (CodecKind::H264, false)
+        );
+        assert_eq!(
+            resolve_session_codec(CodecKind::H265Plus, "h265"),
+            (CodecKind::H265Plus, false)
+        );
+        // An encoding we cannot parse is not a mismatch we can fix.
+        assert_eq!(
+            resolve_session_codec(CodecKind::H264, "JPEG"),
+            (CodecKind::H264, false)
+        );
+    }
 
     /// Test probe: reports a fixed set of "registered" factories plus a
     /// controllable `va_bypass_postproc` (AMD-radeonsi) flag and an explicit

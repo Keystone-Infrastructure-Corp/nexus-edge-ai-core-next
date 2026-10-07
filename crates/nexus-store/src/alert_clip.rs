@@ -142,20 +142,30 @@ impl Store {
     ///
     /// `building` must stay: the file sits at the final path while the
     /// sha256 is hashed, before the row flips to `ready`.
-    /// Returns `(path, state)` because the scanner needs two different
+    /// Returns `(id, path, state)` because the scanner needs two different
     /// sets from it: everything here is spared from deletion, but only
     /// `ready` is expected to have a file. A `building` row's final path
     /// legitimately does not exist yet — the encoder is still writing
     /// the partial — so counting it as "missing" would warn on every
-    /// in-flight clip.
-    pub async fn known_alert_clip_paths(&self) -> Result<Vec<(String, String)>, StoreError> {
-        let rows =
-            sqlx::query("SELECT path, state FROM alert_clips WHERE state IN ('building', 'ready')")
-                .fetch_all(&self.pool)
-                .await?;
+    /// in-flight clip. The id lets it evict a `ready` row whose file is
+    /// gone (#343).
+    pub async fn known_alert_clip_paths(
+        &self,
+    ) -> Result<Vec<(AlertClipId, String, String)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, path, state FROM alert_clips WHERE state IN ('building', 'ready')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .map(|r| {
+                (
+                    r.get::<i64, _>(0),
+                    r.get::<String, _>(1),
+                    r.get::<String, _>(2),
+                )
+            })
             .collect())
     }
 
@@ -257,6 +267,100 @@ impl Store {
             return Err(StoreError::NotFound(format!("alert_clip id={id}")));
         }
         Ok(())
+    }
+
+    /// #759 — alert-clip twin of [`Store::stamp_clip_announce`]: record
+    /// the blob URL and the `meta.id` of the `clip_replicated` about to
+    /// be sent, before sending it, under the enrolled `core_id`.
+    ///
+    /// Does NOT advance `cloud_announce_attempts` / `cloud_announce_next_at`
+    /// — a send that then fails must not burn an attempt or push the
+    /// backoff out. Call [`Self::record_alert_clip_announce_sent`] once
+    /// `send_announce` returns `Ok`.
+    pub async fn stamp_alert_clip_announce(
+        &self,
+        id: AlertClipId,
+        blob_url: &str,
+        announce_id: &str,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE alert_clips
+                SET cloud_blob_url = ?, cloud_announce_id = ?,
+                    cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
+              WHERE id = ?",
+        )
+        .bind(blob_url)
+        .bind(announce_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("alert_clip id={id}")));
+        }
+        Ok(())
+    }
+
+    /// #759 — alert-clip twin of [`Store::record_clip_announce_sent`]:
+    /// counts a successful send and holds the clip back until
+    /// `next_at`. Call only after `send_announce` returns `Ok`; see
+    /// [`Self::stamp_alert_clip_announce`].
+    pub async fn record_alert_clip_announce_sent(
+        &self,
+        id: AlertClipId,
+        next_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE alert_clips
+                SET cloud_announce_attempts = cloud_announce_attempts + 1,
+                    cloud_announce_next_at = ?
+              WHERE id = ?",
+        )
+        .bind(next_at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("alert_clip id={id}")));
+        }
+        Ok(())
+    }
+
+    /// #759 — alert-clip twin of [`Store::clips_pending_cloud_announce`]:
+    /// cold-uploaded alert clips the cloud has not acked yet whose
+    /// backoff has elapsed at `now`, each paired with its blob URL and
+    /// send count, earliest next attempt first — current enrollment's
+    /// `core_id` only, started at or after `floor`.
+    pub async fn alert_clips_pending_cloud_announce(
+        &self,
+        limit: i64,
+        now: DateTime<Utc>,
+        floor: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(AlertClipRow, String, i64)>, StoreError> {
+        let floor_str = floor.map(|f| f.to_rfc3339());
+        let rows = sqlx::query(&format!(
+            "SELECT {ALERT_CLIP_COLUMNS}, cloud_blob_url, cloud_announce_attempts FROM alert_clips
+              WHERE cloud_blob_url IS NOT NULL
+                AND cloud_announced_at IS NULL
+                AND cold_uploaded_at IS NOT NULL
+                AND cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
+                AND (? IS NULL OR started_at >= ?)
+                AND (cloud_announce_next_at IS NULL OR cloud_announce_next_at <= ?)
+              ORDER BY cloud_announce_next_at ASC
+              LIMIT ?"
+        ))
+        .bind(&floor_str)
+        .bind(&floor_str)
+        .bind(now.to_rfc3339())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let url = row.get::<String, _>("cloud_blob_url");
+                let attempts = row.get::<i64, _>("cloud_announce_attempts");
+                alert_clip_row_from_row(row).map(|clip| (clip, url, attempts))
+            })
+            .collect()
     }
 
     /// Record a failed cold-upload attempt (increment `cold_attempts`,

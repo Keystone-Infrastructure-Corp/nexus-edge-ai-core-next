@@ -51,13 +51,23 @@ const MAX_MAX_BYTES: u64 = 536_870_912;
 const AZURE_API_VERSION: &str = "2023-11-03";
 /// Maximum SAS PUT attempts before giving up.
 const MAX_UPLOAD_ATTEMPTS: u32 = 3;
+/// Mirrors the 30s timeout on the admin-passthrough `reqwest::Client` built
+/// in `cloud_tunnel.rs` (the client this module reuses as
+/// `EngineRpcHandler::http_client`). Only used to word the timeout message
+/// below — the real enforcement lives on that client.
+const LOOPBACK_EXPORT_TIMEOUT_SECS: u64 = 30;
 
 /// A stable diagnostics failure mode. Each variant maps to one of the
 /// cloud's locked `diag_collections.error_code` enum values via
 /// [`Self::code`]; [`Self::message`] is the scrubbed, operator-facing
 /// string stamped into `diag_ready.error_message`.
 enum DiagError {
-    /// The loopback export request failed or returned non-2xx.
+    /// The loopback export request failed or returned non-2xx. This
+    /// includes an elapsed client-side timeout waiting on a slow export
+    /// handler (e.g. an unindexed `motion_events` scan, #349) — the message
+    /// text distinguishes that case from a genuine transport/connect
+    /// failure via [`classify_timeout`], since `reqwest` renders both as
+    /// the same "error sending request for url" `Display` text.
     TarballFailed(String),
     /// The streamed tarball exceeded the negotiated `max_bytes` cap.
     TarballTooLarge(u64),
@@ -202,6 +212,26 @@ async fn collect_and_upload(
     Ok((size, sqlite_included))
 }
 
+/// Distinguishes an elapsed client-side timeout from any other
+/// transport/connect error for a failed loopback export call. `reqwest`
+/// renders both through `Display` as the same "error sending request for
+/// url" text, which reads to an operator as a connectivity failure even
+/// when the real cause is a slow handler on the other end of the loopback
+/// call (#349 — a full `motion_events` scan took 57s against this 30s
+/// client timeout). `non_timeout_message` is returned unchanged for any
+/// non-timeout error; pure over the extracted flag and message so it's
+/// unit-testable without a live socket.
+fn classify_timeout(is_timeout: bool, non_timeout_message: String) -> String {
+    if is_timeout {
+        format!(
+            "diagnostics export timed out after {LOOPBACK_EXPORT_TIMEOUT_SECS}s \
+             (the engine's export handler was still running)"
+        )
+    } else {
+        non_timeout_message
+    }
+}
+
 /// GET the engine's own loopback diagnostics export, streaming the gzip
 /// body into memory and aborting if it would exceed `max_bytes`. Returns
 /// the body plus whether the edge included the optional sqlite snapshot
@@ -235,10 +265,12 @@ async fn assemble_tarball(
         req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
     }
 
-    let mut resp = req
-        .send()
-        .await
-        .map_err(|e| DiagError::TarballFailed(format!("loopback export request failed: {e}")))?;
+    let mut resp = req.send().await.map_err(|e| {
+        DiagError::TarballFailed(classify_timeout(
+            e.is_timeout(),
+            format!("loopback export request failed: {e}"),
+        ))
+    })?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -262,7 +294,10 @@ async fn assemble_tarball(
 
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| {
-        DiagError::TarballFailed(format!("reading loopback export body failed: {e}"))
+        DiagError::TarballFailed(classify_timeout(
+            e.is_timeout(),
+            format!("reading loopback export body failed: {e}"),
+        ))
     })? {
         if buf.len() as u64 + chunk.len() as u64 > max_bytes {
             return Err(DiagError::TarballTooLarge(max_bytes));
@@ -342,4 +377,39 @@ async fn upload_to_sas(
 /// error page can't bloat the log line or the wire `error_message`.
 fn truncate(s: &str) -> String {
     s.chars().take(200).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_timeout;
+
+    // #349: a full `motion_events` scan made the export handler run past
+    // the client's 30s timeout; reqwest's elapsed-timeout error and a
+    // genuine transport/connect error both `Display` as "error sending
+    // request for url", so the operator-facing message must name the
+    // stage that actually failed instead of repeating that wording.
+
+    #[test]
+    fn timeout_names_the_slow_handler_not_the_network() {
+        let msg = classify_timeout(true, "loopback export request failed: boom".to_string());
+        assert!(
+            msg.contains("timed out after 30s"),
+            "message should state the elapsed timeout: {msg}"
+        );
+        assert!(
+            msg.contains("export handler was still running"),
+            "message should point at the handler, not the network: {msg}"
+        );
+        assert!(
+            !msg.contains("error sending request for url"),
+            "timeout message should not repeat the misleading transport wording: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_timeout_passes_the_original_message_through() {
+        let original = "loopback export request failed: connection refused".to_string();
+        let msg = classify_timeout(false, original.clone());
+        assert_eq!(msg, original);
+    }
 }

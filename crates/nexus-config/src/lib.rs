@@ -1681,9 +1681,15 @@ pub struct AnnotatorConfig {
     #[serde(default = "default_annotator_parked_ema_threshold_px")]
     pub parked_ema_threshold_px: f32,
     /// Frames a vehicle track must stay below `parked_ema_threshold_px`
-    /// before `motion.parked_vehicle = "yes"`. v1 default: 30 (~1 s @ 30 fps).
-    #[serde(default = "default_annotator_parked_min_frames_to_flag")]
-    pub parked_min_frames_to_flag: u32,
+    /// before `motion.parked_vehicle = "yes"`. Unset (default): derived
+    /// from `parked_min_secs` at the camera's measured inference rate.
+    /// Set to pin a frame count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_min_frames_to_flag: Option<u32>,
+    /// Wall-clock parked time used when `parked_min_frames_to_flag` is
+    /// unset. Default: 1 s.
+    #[serde(default = "default_annotator_parked_min_secs")]
+    pub parked_min_secs: f32,
     /// Direction (px/sec EMA magnitude) below which `motion.direction`
     /// is reported as `"none"`. v1 default: 8.0.
     #[serde(default = "default_annotator_direction_min_px_per_sec")]
@@ -1749,7 +1755,8 @@ impl Default for AnnotatorConfig {
             speed_running_px_per_sec: default_annotator_speed_running_px_per_sec(),
             speed_vehicle_px_per_sec: default_annotator_speed_vehicle_px_per_sec(),
             parked_ema_threshold_px: default_annotator_parked_ema_threshold_px(),
-            parked_min_frames_to_flag: default_annotator_parked_min_frames_to_flag(),
+            parked_min_frames_to_flag: None,
+            parked_min_secs: default_annotator_parked_min_secs(),
             direction_min_px_per_sec: default_annotator_direction_min_px_per_sec(),
             movement_ema_alpha: default_annotator_movement_ema_alpha(),
             direction_ema_alpha: default_annotator_direction_ema_alpha(),
@@ -1777,8 +1784,8 @@ fn default_annotator_speed_vehicle_px_per_sec() -> f32 {
 fn default_annotator_parked_ema_threshold_px() -> f32 {
     1.5
 }
-fn default_annotator_parked_min_frames_to_flag() -> u32 {
-    30
+fn default_annotator_parked_min_secs() -> f32 {
+    1.0
 }
 fn default_annotator_direction_min_px_per_sec() -> f32 {
     8.0
@@ -1812,9 +1819,21 @@ pub struct StaticObjectConfig {
     /// Frames a vehicle track must dwell below
     /// `significant_movement_pixels` (EMA-smoothed) before promoting
     /// to "static" and being suppressed from the rule eval slice.
-    /// v1 default: 150 (~5 s @ 30 fps).
-    #[serde(default = "default_static_object_dwell_frames")]
-    pub dwell_frames: u32,
+    /// Unset (default): derived from `dwell_secs` at the camera's
+    /// measured inference rate. Set to pin a frame count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dwell_frames: Option<u32>,
+    /// Wall-clock dwell used when `dwell_frames` is unset. Default: 5 s,
+    /// so on a ~1.9 fps Hailo-8 camera a parked vehicle promotes (~10
+    /// frames) before ByteTrack retires its track (#335).
+    #[serde(default = "default_static_object_dwell_secs")]
+    pub dwell_secs: f32,
+    /// Also promote stationary `person` tracks to anchors, so a phantom
+    /// stationary person (e.g. a misdetected gym machine) stops looping
+    /// alerts on a `parking_lot_mode` camera. Opt-in per site: a
+    /// stationary person is suppressed until they move. Default: false.
+    #[serde(default)]
+    pub anchor_persons: bool,
     /// Px-EMA threshold above which a static track is considered
     /// "moving again". v1 default: 36.
     #[serde(default = "default_static_object_significant_movement_pixels")]
@@ -1860,7 +1879,9 @@ pub struct StaticObjectConfig {
 impl Default for StaticObjectConfig {
     fn default() -> Self {
         Self {
-            dwell_frames: default_static_object_dwell_frames(),
+            dwell_frames: None,
+            dwell_secs: default_static_object_dwell_secs(),
+            anchor_persons: false,
             significant_movement_pixels: default_static_object_significant_movement_pixels(),
             significant_movement_frames: default_static_object_significant_movement_frames(),
             movement_ema_alpha: default_static_object_movement_ema_alpha(),
@@ -1872,8 +1893,8 @@ impl Default for StaticObjectConfig {
     }
 }
 
-fn default_static_object_dwell_frames() -> u32 {
-    150
+fn default_static_object_dwell_secs() -> f32 {
+    5.0
 }
 fn default_static_object_significant_movement_pixels() -> u32 {
     36
@@ -3557,6 +3578,28 @@ mod tests {
         assert_eq!(cfg.name(), "site-ops");
         let json = serde_json::to_value(&cfg).unwrap();
         assert_eq!(json["kind"], "email");
+    }
+
+    /// #335: dwell / parked thresholds default to wall-clock durations,
+    /// and an explicit frame count — the fields operators already set —
+    /// still parses and wins.
+    #[test]
+    fn tracker_thresholds_default_to_durations_and_frames_still_parse() {
+        let d = TrackerConfig::default();
+        assert_eq!(d.static_object.dwell_frames, None);
+        assert_eq!(d.annotator.parked_min_frames_to_flag, None);
+        assert_eq!(d.bytetrack.max_lost_frames, 30);
+        assert!(
+            !d.static_object.anchor_persons,
+            "person anchoring is opt-in"
+        );
+
+        let cfg: TrackerConfig = toml::from_str(
+            "[static_object]\ndwell_frames = 20\n[bytetrack]\nmax_lost_frames = 60\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.static_object.dwell_frames, Some(20));
+        assert_eq!(cfg.bytetrack.max_lost_frames, 60);
     }
 
     /// Minimal TOML (only the required fields) must parse, with every

@@ -318,7 +318,7 @@ Concretely the installer:
 | **Install Intel iGPU + Arc dGPU stack** (kobuk-team PPA + iHD 25.x + Level Zero + media + compute — see §5.1 / §5.2) | apt + PPA                                          | on      | `--no-drivers`                     |
 | **Install Intel NPU driver v1.32.1** (Lunar Lake + Meteor Lake; requires kernel ≥ 6.10 — see §5.3) | `wget` + `apt install ./intel-*.deb`              | on†    | `--no-drivers`                     |
 | **Auto-install `linux-generic-hwe-24.04`** when NPU hardware is detected on a < 6.10 kernel, then exit asking for a reboot | apt                                          | on      | `--no-drivers`                     |
-| Generate `/etc/nexus/nexus.toml` via `nexus-probe emit-config` (first install only) | `install -m 0644`                                  | on      | n/a (preserved on upgrades)         |
+| Generate `/etc/nexus/nexus.toml` via `nexus-probe emit-config` — regenerates on every run, backing up the old file to `nexus.toml.bak.<ts>` first | `install -m 0644`                                  | on      | `--keep-config` to preserve the existing file |
 | Install `/etc/systemd/system/nexus-engine.service` | from `etc-templates/systemd/`                       | on      | n/a                                |
 | Atomically flip `/opt/nexus/current` → new release | `ln -sfn`                                          | on      | n/a                                |
 | `systemctl enable --now nexus-engine`      | systemd                                                 | on      | `--no-start`                       |
@@ -1293,18 +1293,21 @@ client_id = "nexus-engine"
 ### 6.7 Upgrades + rollback
 
 **Upgrade to the current `stable` release** — same one-liner, just
-rerun. The existing `/etc/nexus/nexus.toml` is preserved:
+rerun. By default this **regenerates** `/etc/nexus/nexus.toml` from
+the box's current hardware (backing the old file up to
+`nexus.toml.bak.<ts>` first); pass `--keep-config` to preserve a
+hand-tuned file instead:
 
 ```bash
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s --
 ```
 
-**Pin a specific version:**
+**Pin a specific version** (add `--keep-config` too on a hand-tuned box):
 
 ```bash
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/bootstrap.sh \
-  | sudo bash -s -- --version v0.2.0
+  | sudo bash -s -- --version v0.2.0 --keep-config
 ```
 
 The previous release dir stays at `/opt/nexus/releases/<previous>/`
@@ -1671,6 +1674,7 @@ is the one you cannot fix remotely by definition.
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
 | `curl /api/v1/health` returns connection refused | Engine isn't up. | `systemctl status nexus-engine`; check logs (§8.1). |
+| `journalctl -u nexus-engine -p warning` prints `-- No entries --` | Engines before #350 log every line at `PRIORITY=6`, so `-p` can never match. | Filter by text instead: `journalctl -u nexus-engine -g 'WARN\|ERROR'`. |
 | Engine refuses to start with `auth.mode = "none" is only allowed when server.api_bind is on loopback` | Since M-Install Checkpoint 2 the engine refuses to bind unauthenticated APIs onto a LAN. | Either change `[server].api_bind` to `127.0.0.1:8089` (LAN-only deployments), or set `[auth].mode = "local"`. The one-time admin password is at `/var/lib/nexus/state/bootstrap-password.txt` (mode 0600). |
 | Engine logs `auth: bootstrap admin created` / `one_time_password=<value>` at boot | First boot under `mode = "local"`. | Copy the OTP from `/var/lib/nexus/state/bootstrap-password.txt`, log in once at `http://<host>/login`, finish the wizard. |
 | UI loads but `/` returns 404 | `ui_root` mismatch — engine pointing at a path that doesn't exist. | `ls /opt/nexus/current/share/ui/index.html` should exist; `[server].ui_root` in `/etc/nexus/nexus.toml` should be `/opt/nexus/current/share/ui`. |

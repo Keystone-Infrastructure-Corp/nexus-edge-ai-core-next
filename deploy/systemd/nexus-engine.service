@@ -47,6 +47,10 @@ WorkingDirectory=/var/lib/nexus
 Environment=ORT_DYLIB_PATH=/opt/nexus/current/lib/onnxruntime/libonnxruntime.so
 Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime
 Environment=RUST_LOG=info,nexus=info
+# The engine prefixes each stdout line with `<N>` (sd-daemon(3)) when it sees
+# JOURNAL_STREAM, so journald records the real tracing level as PRIORITY and
+# `journalctl -p warning` works (#350). systemd's default; set explicitly.
+SyslogLevelPrefix=yes
 
 # glibc allocator tuning (BUG-036). Together these cut retained RSS after a
 # four-camera workload from 4487 MB to 320 MB, and steady-state footprint while
@@ -117,7 +121,9 @@ ExecStart=/opt/nexus/current/bin/nexus-engine --config /etc/nexus/nexus.toml
 # open mp4mux so clips finish writing instead of stranding at a
 # header-only 864-byte stub on restart, then drains the cloud outbox
 # before exiting 0. TimeoutStopSec caps the drain; on expiry systemd
-# escalates to SIGKILL.
+# escalates to SIGKILL. The engine budgets its own bounded waits (27 s, see
+# the SIGTERM sequence in main.rs) under this value, because an OTA never
+# re-applies this file and so cannot raise it on an installed box (#360).
 TimeoutStopSec=30s
 KillSignal=SIGTERM
 
