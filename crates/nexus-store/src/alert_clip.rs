@@ -271,7 +271,7 @@ impl Store {
 
     /// #759 — alert-clip twin of [`Store::stamp_clip_announce`]: record
     /// the blob URL and the `meta.id` of the `clip_replicated` about to
-    /// be sent, before sending it.
+    /// be sent, before sending it, under the enrolled `core_id`.
     ///
     /// Does NOT advance `cloud_announce_attempts` / `cloud_announce_next_at`
     /// — a send that then fails must not burn an attempt or push the
@@ -285,7 +285,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         let res = sqlx::query(
             "UPDATE alert_clips
-                SET cloud_blob_url = ?, cloud_announce_id = ?
+                SET cloud_blob_url = ?, cloud_announce_id = ?,
+                    cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
               WHERE id = ?",
         )
         .bind(blob_url)
@@ -327,7 +328,8 @@ impl Store {
     /// #759 — alert-clip twin of [`Store::clips_pending_cloud_announce`]:
     /// cold-uploaded alert clips the cloud has not acked yet whose
     /// backoff has elapsed at `now`, each paired with its blob URL and
-    /// send count, earliest next attempt first.
+    /// send count, earliest next attempt first — current enrollment's
+    /// `core_id` only.
     pub async fn alert_clips_pending_cloud_announce(
         &self,
         limit: i64,
@@ -338,6 +340,7 @@ impl Store {
               WHERE cloud_blob_url IS NOT NULL
                 AND cloud_announced_at IS NULL
                 AND cold_uploaded_at IS NOT NULL
+                AND cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
                 AND (cloud_announce_next_at IS NULL OR cloud_announce_next_at <= ?)
               ORDER BY cloud_announce_next_at ASC
               LIMIT ?"

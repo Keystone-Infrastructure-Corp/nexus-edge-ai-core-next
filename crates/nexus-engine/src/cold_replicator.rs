@@ -712,7 +712,8 @@ async fn send_announce(
 /// immediately rather than burning backoff on a send that never left
 /// the box. The pending set is taken earliest-next-attempt first, so
 /// clips the cloud never acks cycle behind newer ones instead of
-/// filling every batch.
+/// filling every batch. Only clips uploaded under the current
+/// enrollment's core are re-sent; a prior enrollment's are never.
 async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::DateTime<Utc>) {
     let Some(outbox) = cfg.outbox.as_deref() else {
         return;
@@ -1745,6 +1746,71 @@ mod tests {
         }
     }
 
+    /// Enroll the store as `core_id` with the default no-history policy.
+    /// An announce belongs to the core enrolled when its clip uploaded.
+    async fn enroll(store: &Store, core_id: &str) {
+        store
+            .set_cloud_enrollment(&nexus_store::cloud::CloudEnrollment {
+                core_id: core_id.into(),
+                gateway_url: "wss://gateway.test/v1/tunnel".into(),
+                cert_pem: "x".into(),
+                private_key_pem: "x".into(),
+                ca_chain_pem: "x".into(),
+                entitlement_jwt: "x".into(),
+                signing_key_pem: None,
+                signing_kid: None,
+                enrolled_at: Utc::now(), // overwritten by DB default
+                attach_replay_after: None,
+                server_cert_pem: None,
+                server_private_key_pem: None,
+                ssh_ca_public_key: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// PR #366 review — an announce whose upload predates a re-enrollment
+    /// belongs to the old core: its blob URL is in the old core's
+    /// namespace, and the new core never asked for it. The re-announce
+    /// pass must not send it down the new tunnel, whether the enrollment
+    /// was cleared first (disconnect) or overwritten in place.
+    #[tokio::test]
+    async fn reannounce_does_not_cross_an_enrollment_boundary() {
+        for clear_first in [true, false] {
+            let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+            enroll(&store, "11111111-2222-3333-4444-555555555555").await;
+            let backend = MockBackend::new("mock", HealthStatus::Ok);
+            *backend.with_url.lock() = true;
+            // The old tunnel is down, so the upload's announce is pending.
+            let outbox = Arc::new(TunnelOutbox::new());
+            let cfg = announce_cfg(clips_dir, outbox.clone());
+            let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+            upload_one(
+                &cfg,
+                &store,
+                &*backend,
+                &TokenBucket::new(0),
+                "mock",
+                &clip,
+                None,
+            )
+            .await
+            .unwrap();
+
+            if clear_first {
+                store.clear_cloud_enrollment().await.unwrap();
+            }
+            enroll(&store, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").await;
+            let new_tunnel = Arc::new(CapturingTunnel::default());
+            outbox.set_handle(Some(new_tunnel.clone()));
+            reannounce(&cfg, &store, Utc::now()).await;
+            let sent = new_tunnel.sent.lock();
+            assert!(
+                sent.is_empty(),
+                "prior enrollment's clip sent to the new core (clear_first={clear_first}): {sent:?}"
+            );
+        }
+    }
     /// #759 — a blob that is already on the backend (crash between
     /// upload and mark) used to be stamped cold with no announce, so
     /// the cloud never got a row. With an outbox wired the clip is
@@ -1759,6 +1825,7 @@ mod tests {
         let tunnel = Arc::new(CapturingTunnel::default());
         let outbox = Arc::new(TunnelOutbox::new());
         outbox.set_handle(Some(tunnel.clone()));
+        enroll(&store, "11111111-2222-3333-4444-555555555555").await;
         let cfg = announce_cfg(clips_dir, outbox);
 
         let clip = store.get_clip(clip_id).await.unwrap().unwrap();
@@ -1812,6 +1879,7 @@ mod tests {
         // Boot-before-tunnel: no handle installed, so the upload's
         // announce attempt fails.
         let outbox = Arc::new(TunnelOutbox::new());
+        enroll(&store, "11111111-2222-3333-4444-555555555555").await;
         let cfg = announce_cfg(clips_dir, outbox.clone());
         let clip = store.get_clip(clip_id).await.unwrap().unwrap();
         upload_one(
@@ -1904,6 +1972,7 @@ mod tests {
         let tunnel = Arc::new(CapturingTunnel::default());
         let outbox = Arc::new(TunnelOutbox::new());
         outbox.set_handle(Some(tunnel.clone()));
+        enroll(&store, "11111111-2222-3333-4444-555555555555").await;
         let cfg = announce_cfg(clips_dir, outbox);
         let t0 = Utc::now() - ChronoDuration::days(1);
 

@@ -205,6 +205,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0036_clip_cloud_announce",
         include_str!("../migrations/0036_clip_cloud_announce.sql"),
     ),
+    (
+        "0037_clip_announce_core",
+        include_str!("../migrations/0037_clip_announce_core.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

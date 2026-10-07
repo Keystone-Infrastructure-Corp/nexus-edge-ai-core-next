@@ -1117,7 +1117,9 @@ impl Store {
     /// BEFORE the send so the ack can never arrive ahead of the id it
     /// answers. Once the clip is cold-uploaded it stays in
     /// [`Self::clips_pending_cloud_announce`] until
-    /// [`Self::record_clip_announce_ack`] stamps the cloud's ack.
+    /// [`Self::record_clip_announce_ack`] stamps the cloud's ack. Also
+    /// records the enrolled `core_id`, which owns the announce: a later
+    /// enrollment never re-sends it.
     ///
     /// Does NOT advance `cloud_announce_attempts` / `cloud_announce_next_at`
     /// — a send that then fails must not burn an attempt or push the
@@ -1131,7 +1133,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         let res = sqlx::query(
             "UPDATE motion_clips
-                SET cloud_blob_url = ?, cloud_announce_id = ?
+                SET cloud_blob_url = ?, cloud_announce_id = ?,
+                    cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
               WHERE id = ?",
         )
         .bind(blob_url)
@@ -1173,7 +1176,9 @@ impl Store {
 
     /// #759 — cold-uploaded clips whose `clip_replicated` the cloud has
     /// not acked yet and whose backoff has elapsed at `now`, each paired
-    /// with its blob URL and the number of sends so far. Ordered by
+    /// with its blob URL and the number of sends so far. Only clips
+    /// stamped under the current enrollment's `core_id` are returned —
+    /// none when the box is not enrolled. Ordered by
     /// next attempt, earliest first, so a clip that is re-sent moves
     /// behind every clip still waiting and a never-acked clip cannot
     /// starve newer ones.
@@ -1192,6 +1197,7 @@ impl Store {
               WHERE cloud_blob_url IS NOT NULL
                 AND cloud_announced_at IS NULL
                 AND cold_uploaded_at IS NOT NULL
+                AND cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
                 AND (cloud_announce_next_at IS NULL OR cloud_announce_next_at <= ?)
               ORDER BY cloud_announce_next_at ASC
               LIMIT ?"

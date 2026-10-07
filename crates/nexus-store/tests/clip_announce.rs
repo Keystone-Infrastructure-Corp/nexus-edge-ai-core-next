@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use chrono::{Duration, Utc};
 use nexus_config::{CameraConfig, StoreConfig};
+use nexus_store::cloud::CloudEnrollment;
 use nexus_store::{AlertClipColdMark, ClipClose, ClipColdMark, NewAlertClip, NewClip, Store};
 use tempfile::TempDir;
 use url::Url;
@@ -52,7 +53,61 @@ async fn fresh_store() -> (Store, TempDir) {
         .upsert_storage_backend("azure", "azure_blob", "{}")
         .await
         .unwrap();
+    enroll(&store, CORE_A).await;
     (store, dir)
+}
+
+const CORE_A: &str = "11111111-2222-3333-4444-555555555555";
+const CORE_B: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+async fn enroll(store: &Store, core_id: &str) {
+    store
+        .set_cloud_enrollment(&CloudEnrollment {
+            core_id: core_id.into(),
+            gateway_url: "wss://gateway.test/v1/tunnel".into(),
+            cert_pem: "x".into(),
+            private_key_pem: "x".into(),
+            ca_chain_pem: "x".into(),
+            entitlement_jwt: "x".into(),
+            signing_key_pem: None,
+            signing_kid: None,
+            enrolled_at: Utc::now(),
+            attach_replay_after: None,
+            server_cert_pem: None,
+            server_private_key_pem: None,
+            ssh_ca_public_key: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// A ready alert clip, cold-uploaded an hour ago.
+async fn cold_alert_clip(store: &Store, n: i64) -> i64 {
+    let now = Utc::now();
+    let id = store
+        .insert_alert_clip(&NewAlertClip {
+            camera_id: 1,
+            started_at: now - Duration::hours(2),
+            path: format!("alert/1/{n}.mp4"),
+        })
+        .await
+        .unwrap();
+    store
+        .mark_alert_clip_ready(id, 5_000, 10, Some(&format!("{id:064x}")))
+        .await
+        .unwrap();
+    store
+        .mark_alert_clip_cold_replicated(
+            id,
+            &AlertClipColdMark {
+                cold_handle: "azure".into(),
+                cold_path: format!("alert/1/alert-{id}.mp4"),
+                cold_uploaded_at: now - Duration::hours(1),
+            },
+        )
+        .await
+        .unwrap();
+    id
 }
 
 /// A closed motion clip, cold-uploaded an hour ago.
@@ -235,29 +290,7 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
 
     let mut ids = Vec::new();
     for n in 0..2 {
-        let id = store
-            .insert_alert_clip(&NewAlertClip {
-                camera_id: 1,
-                started_at: now - Duration::hours(2),
-                path: format!("alert/1/{n}.mp4"),
-            })
-            .await
-            .unwrap();
-        store
-            .mark_alert_clip_ready(id, 5_000, 10, Some(&format!("{id:064x}")))
-            .await
-            .unwrap();
-        store
-            .mark_alert_clip_cold_replicated(
-                id,
-                &AlertClipColdMark {
-                    cold_handle: "azure".into(),
-                    cold_path: format!("alert/1/alert-{id}.mp4"),
-                    cold_uploaded_at: now - Duration::hours(1),
-                },
-            )
-            .await
-            .unwrap();
+        let id = cold_alert_clip(&store, n).await;
         store
             .stamp_alert_clip_announce(id, "https://blob.test/a.mp4", &format!("a-{id}"))
             .await
@@ -292,4 +325,52 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
         pending.iter().map(|(c, _, _)| c.id).collect::<Vec<_>>(),
         vec![ids[1]]
     );
+}
+
+/// Motion and alert clip ids pending re-announce at `now`.
+async fn pending(store: &Store, now: chrono::DateTime<Utc>) -> (Vec<i64>, Vec<i64>) {
+    let motion = store.clips_pending_cloud_announce(10, now).await.unwrap();
+    let alert = store
+        .alert_clips_pending_cloud_announce(10, now)
+        .await
+        .unwrap();
+    (
+        pending_ids(&motion),
+        alert.iter().map(|(c, _, _)| c.id).collect(),
+    )
+}
+
+/// PR #366 review — an announce belongs to the core enrolled when it was
+/// stamped. Re-enrolling as a different core (in place, or after a
+/// disconnect) takes both motion and alert announces out of the pending
+/// set; they are not the new core's to receive.
+#[tokio::test]
+async fn pending_announces_belong_to_the_enrollment_that_stamped_them() {
+    let (store, _tmp) = fresh_store().await;
+    let now = Utc::now();
+    let motion = cold_motion_clip(&store, 1).await;
+    let alert = cold_alert_clip(&store, 1).await;
+    store
+        .stamp_clip_announce(motion, "https://blob.test/m.mp4", "m-1")
+        .await
+        .unwrap();
+    store
+        .stamp_alert_clip_announce(alert, "https://blob.test/a.mp4", "a-1")
+        .await
+        .unwrap();
+    assert_eq!(pending(&store, now).await, (vec![motion], vec![alert]));
+
+    enroll(&store, CORE_B).await;
+    assert_eq!(
+        pending(&store, now).await,
+        (vec![], vec![]),
+        "overwritten in place"
+    );
+
+    store.clear_cloud_enrollment().await.unwrap();
+    assert_eq!(pending(&store, now).await, (vec![], vec![]), "not enrolled");
+
+    // The owning core is still the owner if it comes back.
+    enroll(&store, CORE_A).await;
+    assert_eq!(pending(&store, now).await, (vec![motion], vec![alert]));
 }
