@@ -386,10 +386,12 @@ EOF
 // Nexus: keep the engine's GStreamer runtime and VA-API decode
 // drivers off unattended-upgrades so they only move through a tested
 // Nexus release (deploy/apt-requirements.txt is the source of truth
-// for the exact package list). See issue #337 — an overnight Ubuntu
-// security update to gstreamer1.0-plugins-good changed the engine's
-// RTSP/MP4 stack, untested, fleet-wide, the same night needrestart
-// tried to bounce nexus-engine.service. Tradeoff: security fixes for
+// for the exact package list). Each driver is listed by name: holding
+// the va-driver-all metapackage does not hold its dependencies. See
+// issue #337 — an overnight Ubuntu security update to
+// gstreamer1.0-plugins-good changed the engine's RTSP/MP4 stack,
+// untested, fleet-wide, the same night needrestart tried to bounce
+// nexus-engine.service. Tradeoff: security fixes for
 // this package set now ship via Nexus releases, which needs an owner.
 Unattended-Upgrade::Package-Blacklist {
     "^gstreamer1\.0-";
@@ -397,6 +399,9 @@ Unattended-Upgrade::Package-Blacklist {
     "^va-driver-all$";
     "^vainfo$";
     "^i965-va-driver$";
+    "^intel-media-va-driver$";
+    "^intel-media-va-driver-non-free$";
+    "^mesa-va-drivers$";
 };
 EOF
 
