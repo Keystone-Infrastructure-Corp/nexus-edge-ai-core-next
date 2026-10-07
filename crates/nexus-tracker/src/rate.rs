@@ -3,6 +3,8 @@
 //! in (#335). Frame-count defaults written against 30 fps were ~16x too
 //! long on a Hailo-8 core running ~1.9 inferences/s/camera.
 
+use std::time::Instant;
+
 /// Rate assumed until two calls have been observed.
 const DEFAULT_INTERVAL_SECS: f64 = 1.0 / 30.0;
 /// Clamp on a single observed interval: 60 fps .. 0.2 fps.
@@ -22,11 +24,25 @@ const WINSOR_FACTOR: f64 = 4.0;
 /// EWMA of the interval between consecutive inferences on one camera.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InferenceRate {
+    /// First stamp `observe_at` saw; the origin its seconds count from.
+    origin: Option<Instant>,
     last_secs: Option<f64>,
     interval_secs: Option<f64>,
 }
 
 impl InferenceRate {
+    /// Record an inference whose frame was captured at `captured_mono`
+    /// (`Frame::captured_mono`). The interval is a duration between frames,
+    /// so it reads the monotonic stamp: a wall-clock step moves it not at all.
+    pub(crate) fn observe_at(&mut self, captured_mono: Instant) {
+        let origin = *self.origin.get_or_insert(captured_mono);
+        self.observe(
+            captured_mono
+                .saturating_duration_since(origin)
+                .as_secs_f64(),
+        );
+    }
+
     /// Record an inference at `t_secs` (any monotonic origin). Non-positive
     /// deltas (duplicate or out-of-order timestamps) are ignored.
     pub(crate) fn observe(&mut self, t_secs: f64) {

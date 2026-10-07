@@ -248,7 +248,7 @@ impl StaticObjectFilter {
         // Wall-clock used to refresh / age anchors. Pulled from the
         // frame so tests and replay scenarios behave deterministically.
         let frame_ms = _frame.captured_at.timestamp_millis();
-        self.rate.observe(frame_ms as f64 / 1_000.0);
+        self.rate.observe_at(_frame.captured_mono);
 
         // Walk the object list, classifying each. Borrow-checker: pull
         // values out before the per-track state borrow.
@@ -650,12 +650,20 @@ mod tests {
     use nexus_types::{BBox, Frame, PixelFormat, TrackedObject};
     use std::sync::Arc;
 
+    /// The monotonic stamp read beside wall time `ms`, for a clock that was
+    /// never stepped.
+    fn mono_ms(ms: i64) -> std::time::Instant {
+        static T0: std::sync::LazyLock<std::time::Instant> =
+            std::sync::LazyLock::new(std::time::Instant::now);
+        *T0 + std::time::Duration::from_millis(ms as u64)
+    }
+
     fn frame(camera_id: CameraId, frame_id: u64, ms: i64) -> Frame {
         Frame {
             camera_id,
             frame_id,
             captured_at: Utc.timestamp_millis_opt(ms).unwrap(),
-            captured_mono: std::time::Instant::now(),
+            captured_mono: mono_ms(ms),
             width: 1920,
             height: 1080,
             format: PixelFormat::Rgb24,
@@ -857,6 +865,7 @@ mod tests {
         let mut promoted_at = None;
         let mut retired_at = None;
         for i in 0..100u64 {
+            let ms = (i as f64 / 1.9 * 1_000.0) as i64;
             let dets = if i == 0 {
                 vec![Detection {
                     label: car.label.clone(),
@@ -867,15 +876,13 @@ mod tests {
             } else {
                 vec![]
             };
-            let mut tracked = tracker.update(dets);
+            // Capture time at 1.9 fps, the stamp `frame` gives the classifier.
+            let mut tracked = tracker.update(dets, mono_ms(ms));
             if tracked.is_empty() {
                 retired_at = Some(i);
                 break;
             }
-            f.classify(
-                &frame(1, i, (i as f64 / 1.9 * 1_000.0) as i64),
-                &mut tracked,
-            );
+            f.classify(&frame(1, i, ms), &mut tracked);
             if promoted_at.is_none() && tracked.iter().any(is_object_static) {
                 promoted_at = Some(i);
             }
@@ -885,6 +892,33 @@ mod tests {
             matches!((p, r), (Some(p), Some(r)) if p < r),
             "promoted at {p:?}, retired at {r:?}"
         );
+    }
+
+    /// The measured inference rate is a duration between frames, so it is
+    /// read on the monotonic capture stamp: an hour's step of the wall clock
+    /// either way leaves the default dwell at 10 frames at 2 fps.
+    #[test]
+    fn a_wall_clock_step_does_not_move_the_default_dwell() {
+        for step_ms in [3_600_000i64, -3_600_000] {
+            let mut f = StaticObjectFilter::new(
+                StaticObjectConfig {
+                    persistence_enabled: false,
+                    ..Default::default()
+                },
+                1,
+                None,
+            );
+            let promoted_at = (0..40u64).find(|&i| {
+                let mut fr = frame(1, i, i as i64 * 500);
+                if i >= 3 {
+                    fr.captured_at += chrono::Duration::milliseconds(step_ms);
+                }
+                let mut objs = vec![vehicle(1, 500.0, 300.0)];
+                f.classify(&fr, &mut objs);
+                objs.iter().any(is_object_static)
+            });
+            assert_eq!(promoted_at, Some(9), "{step_ms} ms step");
+        }
     }
 
     /// #335: at 30 fps the default dwell resolves to 150 frames — the

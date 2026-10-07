@@ -132,13 +132,13 @@ fn scene() -> (Vec<FrameMetadata>, Vec<String>) {
         ..Default::default()
     });
     let mut annotator = TrackAnnotator::new(AnnotatorConfig {
-        parked_min_frames_to_flag: 5,
+        parked_min_frames_to_flag: Some(5),
         tool_proximity_labels: vec!["ladder".into()],
         ..Default::default()
     });
     let mut sf = StaticObjectFilter::new(
         StaticObjectConfig {
-            dwell_frames: 5,
+            dwell_frames: Some(5),
             ..Default::default()
         },
         1,

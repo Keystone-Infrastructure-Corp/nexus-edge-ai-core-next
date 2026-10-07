@@ -96,8 +96,7 @@ impl TrackAnnotator {
         objects: &mut [TrackedObject],
     ) {
         self.frame_tick = self.frame_tick.saturating_add(1);
-        self.rate
-            .observe(frame.captured_at.timestamp_millis() as f64 / 1_000.0);
+        self.rate.observe_at(frame.captured_mono);
         if objects.is_empty() {
             self.gc_stale();
             return;
@@ -709,6 +708,29 @@ mod tests {
             })
             .collect();
         assert_eq!(flags, vec!["no", "yes", "yes", "yes"]);
+    }
+
+    /// The measured inference rate is a duration between frames, so it is
+    /// read on the monotonic capture stamp: an hour's step of the wall clock
+    /// either way leaves a 5 s parked threshold at 10 frames at 2 fps.
+    #[test]
+    fn a_wall_clock_step_does_not_move_the_parked_threshold() {
+        for step_ms in [3_600_000, -3_600_000] {
+            let mut a = TrackAnnotator::new(AnnotatorConfig {
+                parked_min_secs: 5.0,
+                ..Default::default()
+            });
+            let flipped_at = (0..40i64).find(|&i| {
+                let mut f = frame_at_ms(i * 500, 1920, 1080);
+                if i >= 3 {
+                    f.captured_at += chrono::Duration::milliseconds(step_ms);
+                }
+                let mut o = vec![obj(1, "vehicle.car", 100.0, 100.0)];
+                a.annotate(&f, &[], &[], &mut o);
+                o[0].attributes["motion.parked_vehicle"] == "yes"
+            });
+            assert_eq!(flipped_at, Some(9), "{step_ms} ms step");
+        }
     }
 
     #[test]
