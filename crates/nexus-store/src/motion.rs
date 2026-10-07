@@ -1177,8 +1177,9 @@ impl Store {
     /// #759 — cold-uploaded clips whose `clip_replicated` the cloud has
     /// not acked yet and whose backoff has elapsed at `now`, each paired
     /// with its blob URL and the number of sends so far. Only clips
-    /// stamped under the current enrollment's `core_id` are returned —
-    /// none when the box is not enrolled. Ordered by
+    /// stamped under the current enrollment's `core_id` and started at
+    /// or after `floor` (its upload floor; `None` disables) are
+    /// returned — none when the box is not enrolled. Ordered by
     /// next attempt, earliest first, so a clip that is re-sent moves
     /// behind every clip still waiting and a never-acked clip cannot
     /// starve newer ones.
@@ -1186,22 +1187,27 @@ impl Store {
         &self,
         limit: i64,
         now: DateTime<Utc>,
+        floor: Option<DateTime<Utc>>,
     ) -> Result<Vec<(ClipRow, String, i64)>, StoreError> {
         let select = CLIP_SELECT_COLUMNS_BASE.replacen(
             "FROM motion_clips",
             ", cloud_blob_url, cloud_announce_attempts FROM motion_clips",
             1,
         );
+        let floor_str = floor.map(|f| f.to_rfc3339());
         let rows = sqlx::query(&format!(
             "{select}
               WHERE cloud_blob_url IS NOT NULL
                 AND cloud_announced_at IS NULL
                 AND cold_uploaded_at IS NOT NULL
                 AND cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
+                AND (? IS NULL OR started_at >= ?)
                 AND (cloud_announce_next_at IS NULL OR cloud_announce_next_at <= ?)
               ORDER BY cloud_announce_next_at ASC
               LIMIT ?"
         ))
+        .bind(&floor_str)
+        .bind(&floor_str)
         .bind(now.to_rfc3339())
         .bind(limit)
         .fetch_all(&self.pool)

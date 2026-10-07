@@ -177,7 +177,10 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
         store.record_clip_announce_sent(id, due).await.unwrap();
     }
 
-    let pending = store.clips_pending_cloud_announce(10, now).await.unwrap();
+    let pending = store
+        .clips_pending_cloud_announce(10, now, None)
+        .await
+        .unwrap();
     assert_eq!(pending_ids(&pending), vec![stored, rejected, unacked]);
     assert!(!pending_ids(&pending).contains(&lan));
     assert_eq!(pending[0].1, format!("https://blob.test/{stored}.mp4"));
@@ -206,7 +209,10 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
         );
     }
 
-    let pending = store.clips_pending_cloud_announce(10, now).await.unwrap();
+    let pending = store
+        .clips_pending_cloud_announce(10, now, None)
+        .await
+        .unwrap();
     assert_eq!(
         pending_ids(&pending),
         vec![unacked],
@@ -215,7 +221,7 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
 
     // A clip is held back until its next attempt is due.
     assert!(store
-        .clips_pending_cloud_announce(10, due - Duration::seconds(1))
+        .clips_pending_cloud_announce(10, due - Duration::seconds(1), None)
         .await
         .unwrap()
         .is_empty());
@@ -228,12 +234,12 @@ async fn unacked_motion_clip_is_pending_until_the_cloud_acks_it() {
         .await
         .unwrap();
     assert!(store
-        .clips_pending_cloud_announce(10, now)
+        .clips_pending_cloud_announce(10, now, None)
         .await
         .unwrap()
         .is_empty());
     let pending = store
-        .clips_pending_cloud_announce(10, now + Duration::hours(1))
+        .clips_pending_cloud_announce(10, now + Duration::hours(1), None)
         .await
         .unwrap();
     assert_eq!(pending_ids(&pending), vec![unacked]);
@@ -256,7 +262,10 @@ async fn stamping_alone_does_not_burn_an_attempt_recording_a_sent_does() {
         .stamp_clip_announce(id, "https://blob.test/1.mp4", "env-1")
         .await
         .unwrap();
-    let pending = store.clips_pending_cloud_announce(10, now).await.unwrap();
+    let pending = store
+        .clips_pending_cloud_announce(10, now, None)
+        .await
+        .unwrap();
     assert_eq!(pending.len(), 1, "stamping makes the clip pending");
     assert_eq!(
         pending[0].2, 0,
@@ -267,14 +276,14 @@ async fn stamping_alone_does_not_burn_an_attempt_recording_a_sent_does() {
     store.record_clip_announce_sent(id, next_at).await.unwrap();
     assert!(
         store
-            .clips_pending_cloud_announce(10, now)
+            .clips_pending_cloud_announce(10, now, None)
             .await
             .unwrap()
             .is_empty(),
         "a recorded send holds the clip back until next_at"
     );
     let pending = store
-        .clips_pending_cloud_announce(10, next_at)
+        .clips_pending_cloud_announce(10, next_at, None)
         .await
         .unwrap();
     assert_eq!(
@@ -303,7 +312,7 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
     }
 
     let pending = store
-        .alert_clips_pending_cloud_announce(10, now)
+        .alert_clips_pending_cloud_announce(10, now, None)
         .await
         .unwrap();
     assert_eq!(
@@ -318,7 +327,7 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
         .await
         .unwrap();
     let pending = store
-        .alert_clips_pending_cloud_announce(10, now)
+        .alert_clips_pending_cloud_announce(10, now, None)
         .await
         .unwrap();
     assert_eq!(
@@ -327,11 +336,18 @@ async fn unacked_alert_clip_is_pending_until_the_cloud_acks_it() {
     );
 }
 
-/// Motion and alert clip ids pending re-announce at `now`.
-async fn pending(store: &Store, now: chrono::DateTime<Utc>) -> (Vec<i64>, Vec<i64>) {
-    let motion = store.clips_pending_cloud_announce(10, now).await.unwrap();
+/// Motion and alert clip ids pending re-announce at `now`, at or after `floor`.
+async fn pending(
+    store: &Store,
+    now: chrono::DateTime<Utc>,
+    floor: Option<chrono::DateTime<Utc>>,
+) -> (Vec<i64>, Vec<i64>) {
+    let motion = store
+        .clips_pending_cloud_announce(10, now, floor)
+        .await
+        .unwrap();
     let alert = store
-        .alert_clips_pending_cloud_announce(10, now)
+        .alert_clips_pending_cloud_announce(10, now, floor)
         .await
         .unwrap();
     (
@@ -358,19 +374,41 @@ async fn pending_announces_belong_to_the_enrollment_that_stamped_them() {
         .stamp_alert_clip_announce(alert, "https://blob.test/a.mp4", "a-1")
         .await
         .unwrap();
-    assert_eq!(pending(&store, now).await, (vec![motion], vec![alert]));
+    assert_eq!(
+        pending(&store, now, None).await,
+        (vec![motion], vec![alert])
+    );
 
     enroll(&store, CORE_B).await;
     assert_eq!(
-        pending(&store, now).await,
+        pending(&store, now, None).await,
         (vec![], vec![]),
         "overwritten in place"
     );
 
     store.clear_cloud_enrollment().await.unwrap();
-    assert_eq!(pending(&store, now).await, (vec![], vec![]), "not enrolled");
+    assert_eq!(
+        pending(&store, now, None).await,
+        (vec![], vec![]),
+        "not enrolled"
+    );
 
-    // The owning core is still the owner if it comes back.
+    // The owning core is still the owner if it comes back, but only
+    // clips inside the new enrollment's upload floor are pending: the
+    // clips started two hours ago.
     enroll(&store, CORE_A).await;
-    assert_eq!(pending(&store, now).await, (vec![motion], vec![alert]));
+    assert_eq!(
+        pending(&store, now, None).await,
+        (vec![motion], vec![alert])
+    );
+    assert_eq!(
+        pending(&store, now, Some(now)).await,
+        (vec![], vec![]),
+        "before the floor"
+    );
+    assert_eq!(
+        pending(&store, now, Some(now - Duration::days(1))).await,
+        (vec![motion], vec![alert]),
+        "inside a --keep-history floor"
+    );
 }

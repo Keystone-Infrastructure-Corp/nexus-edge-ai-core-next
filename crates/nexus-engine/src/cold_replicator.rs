@@ -480,9 +480,7 @@ async fn tick(
             None
         }
     };
-    let floor = enrollment
-        .as_ref()
-        .map(|e| e.attach_replay_after.unwrap_or(e.enrolled_at));
+    let floor = upload_floor(enrollment.as_ref());
 
     // 4. Pull a batch of eligible pending clips and process
     // oldest-first. The floor predicate is applied in SQL so the
@@ -621,6 +619,14 @@ async fn tick(
     }
 }
 
+/// Phase 2 · Step 2.9 — the earliest `started_at` the current
+/// enrollment sends to the cloud: the `--keep-history` cutoff, else
+/// `enrolled_at`. `None` (not enrolled) means no floor. Applied to the
+/// upload drain and to re-announces alike.
+fn upload_floor(enrollment: Option<&CloudEnrollment>) -> Option<chrono::DateTime<Utc>> {
+    enrollment.map(|e| e.attach_replay_after.unwrap_or(e.enrolled_at))
+}
+
 /// Phase 2 · Step 2.9 — `attached_history: true` iff (a) the operator
 /// opted into history replay AND (b) the clip predates the enrollment
 /// timestamp. The combination means "this clip would not exist in the
@@ -713,7 +719,10 @@ async fn send_announce(
 /// the box. The pending set is taken earliest-next-attempt first, so
 /// clips the cloud never acks cycle behind newer ones instead of
 /// filling every batch. Only clips uploaded under the current
-/// enrollment's core are re-sent; a prior enrollment's are never.
+/// enrollment's core, and inside its [`upload_floor`], are re-sent —
+/// a prior enrollment's never, and a same-core re-enrollment without
+/// `--keep-history` drops the old enrollment's backlog like the upload
+/// drain does.
 async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::DateTime<Utc>) {
     let Some(outbox) = cfg.outbox.as_deref() else {
         return;
@@ -725,9 +734,10 @@ async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::Date
         warn!(error = %e, "cold replicator: get_cloud_enrollment failed");
         None
     });
+    let floor = upload_floor(enrollment.as_ref());
 
     let motion = store
-        .clips_pending_cloud_announce(ANNOUNCE_BATCH, now)
+        .clips_pending_cloud_announce(ANNOUNCE_BATCH, now, floor)
         .await
         .unwrap_or_else(|e| {
             warn!(error = %e, "cold replicator: clips_pending_cloud_announce failed");
@@ -758,7 +768,7 @@ async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::Date
     }
 
     let alert = store
-        .alert_clips_pending_cloud_announce(ANNOUNCE_BATCH, now)
+        .alert_clips_pending_cloud_announce(ANNOUNCE_BATCH, now, floor)
         .await
         .unwrap_or_else(|e| {
             warn!(error = %e, "cold replicator: alert_clips_pending_cloud_announce failed");
@@ -1746,9 +1756,18 @@ mod tests {
         }
     }
 
-    /// Enroll the store as `core_id` with the default no-history policy.
-    /// An announce belongs to the core enrolled when its clip uploaded.
-    async fn enroll(store: &Store, core_id: &str) {
+    const CORE_A: &str = "11111111-2222-3333-4444-555555555555";
+    const CORE_B: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    /// Enroll the store as `core_id` at `enrolled_at`, with
+    /// `attach_replay_after` as the `--keep-history` cutoff (`None` is
+    /// the default no-history policy).
+    async fn enroll(
+        store: &Store,
+        core_id: &str,
+        enrolled_at: chrono::DateTime<Utc>,
+        attach_replay_after: Option<chrono::DateTime<Utc>>,
+    ) {
         store
             .set_cloud_enrollment(&nexus_store::cloud::CloudEnrollment {
                 core_id: core_id.into(),
@@ -1759,26 +1778,40 @@ mod tests {
                 entitlement_jwt: "x".into(),
                 signing_key_pem: None,
                 signing_kid: None,
-                enrolled_at: Utc::now(), // overwritten by DB default
-                attach_replay_after: None,
+                enrolled_at, // overwritten by DB default; reset below
+                attach_replay_after,
                 server_cert_pem: None,
                 server_private_key_pem: None,
                 ssh_ca_public_key: None,
             })
             .await
             .unwrap();
+        sqlx::query("UPDATE cloud_enrollment SET enrolled_at = ?")
+            .bind(enrolled_at.to_rfc3339())
+            .execute(store.pool())
+            .await
+            .unwrap();
     }
 
-    /// PR #366 review — an announce whose upload predates a re-enrollment
-    /// belongs to the old core: its blob URL is in the old core's
-    /// namespace, and the new core never asked for it. The re-announce
-    /// pass must not send it down the new tunnel, whether the enrollment
-    /// was cleared first (disconnect) or overwritten in place.
+    /// PR #366 review — a lost announce is only re-sent if the enrollment
+    /// now in force would upload the clip: never to a different core
+    /// (its blob URL is in the old core's namespace), whether the
+    /// enrollment was cleared first or overwritten in place, and to the
+    /// same core only inside the new enrollment's history policy.
     #[tokio::test]
     async fn reannounce_does_not_cross_an_enrollment_boundary() {
-        for clear_first in [true, false] {
+        let hour_ago = || Some(Utc::now() - ChronoDuration::hours(1));
+        // (re-enrolled core, clear first, --keep-history cutoff, re-sent)
+        let cases = [
+            (CORE_B, true, None, false),
+            (CORE_B, false, None, false),
+            (CORE_B, false, hour_ago(), false),
+            (CORE_A, true, None, false),
+            (CORE_A, true, hour_ago(), true),
+        ];
+        for (core, clear_first, keep_history, resent) in cases {
             let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
-            enroll(&store, "11111111-2222-3333-4444-555555555555").await;
+            enroll(&store, CORE_A, Utc::now() - ChronoDuration::hours(1), None).await;
             let backend = MockBackend::new("mock", HealthStatus::Ok);
             *backend.with_url.lock() = true;
             // The old tunnel is down, so the upload's announce is pending.
@@ -1800,17 +1833,28 @@ mod tests {
             if clear_first {
                 store.clear_cloud_enrollment().await.unwrap();
             }
-            enroll(&store, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").await;
+            enroll(&store, core, Utc::now(), keep_history).await;
             let new_tunnel = Arc::new(CapturingTunnel::default());
             outbox.set_handle(Some(new_tunnel.clone()));
             reannounce(&cfg, &store, Utc::now()).await;
             let sent = new_tunnel.sent.lock();
-            assert!(
-                sent.is_empty(),
-                "prior enrollment's clip sent to the new core (clear_first={clear_first}): {sent:?}"
-            );
+            let case =
+                format!("core={core} clear_first={clear_first} keep_history={keep_history:?}");
+            if !resent {
+                assert!(
+                    sent.is_empty(),
+                    "{case}: re-sent across the boundary: {sent:?}"
+                );
+                continue;
+            }
+            assert_eq!(sent.len(), 1, "{case}: not re-sent");
+            let nexus_cloud_protocol::v1::EnvelopeBody::ClipReplicated(p) = &sent[0].body else {
+                panic!("expected clip_replicated, got {:?}", sent[0].body);
+            };
+            assert_eq!(p.attached_history, Some(true), "{case}: imported history");
         }
     }
+
     /// #759 — a blob that is already on the backend (crash between
     /// upload and mark) used to be stamped cold with no announce, so
     /// the cloud never got a row. With an outbox wired the clip is
@@ -1825,7 +1869,7 @@ mod tests {
         let tunnel = Arc::new(CapturingTunnel::default());
         let outbox = Arc::new(TunnelOutbox::new());
         outbox.set_handle(Some(tunnel.clone()));
-        enroll(&store, "11111111-2222-3333-4444-555555555555").await;
+        enroll(&store, CORE_A, Utc::now() - ChronoDuration::hours(1), None).await;
         let cfg = announce_cfg(clips_dir, outbox);
 
         let clip = store.get_clip(clip_id).await.unwrap().unwrap();
@@ -1879,7 +1923,7 @@ mod tests {
         // Boot-before-tunnel: no handle installed, so the upload's
         // announce attempt fails.
         let outbox = Arc::new(TunnelOutbox::new());
-        enroll(&store, "11111111-2222-3333-4444-555555555555").await;
+        enroll(&store, CORE_A, Utc::now() - ChronoDuration::hours(1), None).await;
         let cfg = announce_cfg(clips_dir, outbox.clone());
         let clip = store.get_clip(clip_id).await.unwrap().unwrap();
         upload_one(
@@ -1905,7 +1949,7 @@ mod tests {
         // pushed a backoff: the clip is due right now, not held back
         // `ANNOUNCE_BACKOFF_BASE`.
         let pending = store
-            .clips_pending_cloud_announce(10, Utc::now())
+            .clips_pending_cloud_announce(10, Utc::now(), None)
             .await
             .unwrap();
         assert_eq!(pending.len(), 1, "a failed send leaves the clip due now");
@@ -1972,7 +2016,7 @@ mod tests {
         let tunnel = Arc::new(CapturingTunnel::default());
         let outbox = Arc::new(TunnelOutbox::new());
         outbox.set_handle(Some(tunnel.clone()));
-        enroll(&store, "11111111-2222-3333-4444-555555555555").await;
+        enroll(&store, CORE_A, Utc::now() - ChronoDuration::days(2), None).await;
         let cfg = announce_cfg(clips_dir, outbox);
         let t0 = Utc::now() - ChronoDuration::days(1);
 

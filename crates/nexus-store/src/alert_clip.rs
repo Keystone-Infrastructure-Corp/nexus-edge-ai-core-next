@@ -329,22 +329,27 @@ impl Store {
     /// cold-uploaded alert clips the cloud has not acked yet whose
     /// backoff has elapsed at `now`, each paired with its blob URL and
     /// send count, earliest next attempt first — current enrollment's
-    /// `core_id` only.
+    /// `core_id` only, started at or after `floor`.
     pub async fn alert_clips_pending_cloud_announce(
         &self,
         limit: i64,
         now: DateTime<Utc>,
+        floor: Option<DateTime<Utc>>,
     ) -> Result<Vec<(AlertClipRow, String, i64)>, StoreError> {
+        let floor_str = floor.map(|f| f.to_rfc3339());
         let rows = sqlx::query(&format!(
             "SELECT {ALERT_CLIP_COLUMNS}, cloud_blob_url, cloud_announce_attempts FROM alert_clips
               WHERE cloud_blob_url IS NOT NULL
                 AND cloud_announced_at IS NULL
                 AND cold_uploaded_at IS NOT NULL
                 AND cloud_announce_core_id = (SELECT core_id FROM cloud_enrollment WHERE id = 1)
+                AND (? IS NULL OR started_at >= ?)
                 AND (cloud_announce_next_at IS NULL OR cloud_announce_next_at <= ?)
               ORDER BY cloud_announce_next_at ASC
               LIMIT ?"
         ))
+        .bind(&floor_str)
+        .bind(&floor_str)
         .bind(now.to_rfc3339())
         .bind(limit)
         .fetch_all(&self.pool)
