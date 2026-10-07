@@ -1459,6 +1459,8 @@ mod tests {
                 return Ok(());
             }
             self.registrations_tried.fetch_add(1, Ordering::SeqCst);
+            // `try_update` replaces this in rustc 1.99, above the 1.88 MSRV.
+            #[allow(deprecated)]
             let refused = self
                 .refuse_first
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
