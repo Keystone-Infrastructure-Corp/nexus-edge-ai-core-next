@@ -46,16 +46,24 @@ fn field_rule() -> RuleConfig {
     }
 }
 
-/// Alerts fired while an 80 px vehicle crosses the frame, moving 50 px
-/// (0.625 of its length) per analysed frame.
-fn alerts_for_a_crossing(tracker_cfg: ByteTrackConfig) -> usize {
+/// A vehicle `length` px long crossing the frame at 0.625 of its length per
+/// analysed frame: (length, height, frames in view). The near one steps
+/// 75 px, past the static filter's 60 px ID-reuse guard.
+const CROSSINGS: [(f32, f32, u64); 2] = [(80.0, 50.0, 8), (120.0, 70.0, 5)];
+
+/// Alerts fired while one vehicle crosses the frame.
+fn alerts_for_a_crossing(
+    tracker_cfg: ByteTrackConfig,
+    (length, height, frames): (f32, f32, u64),
+) -> usize {
     let tracker = ByteTrackTracker::new(tracker_cfg);
+    // MORGAN's ID-reuse guard is the default 60 px.
     let mut filter = StaticObjectFilter::new(StaticObjectConfig::default(), 14, None);
     let eval = RuleEvaluator::new(&RulesConfig::default(), &[field_rule()]).unwrap();
     let t0 = Instant::now();
     let mut fired = 0;
-    for i in 0..8u64 {
-        let x = 10.0 + i as f32 * 50.0;
+    for i in 0..frames {
+        let x = 10.0 + i as f32 * length * 0.625;
         let frame = Frame {
             camera_id: 14,
             frame_id: i,
@@ -73,8 +81,8 @@ fn alerts_for_a_crossing(tracker_cfg: ByteTrackConfig) -> usize {
             bbox: BBox {
                 x1: x,
                 y1: 150.0,
-                x2: x + 80.0,
-                y2: 200.0,
+                x2: x + length,
+                y2: 150.0 + height,
             },
             attributes: Default::default(),
         };
@@ -100,7 +108,13 @@ fn alerts_for_a_crossing(tracker_cfg: ByteTrackConfig) -> usize {
 
 #[test]
 fn a_vehicle_crossing_a_parking_lot_camera_at_the_field_rate_alerts_once() {
-    assert_eq!(alerts_for_a_crossing(ByteTrackConfig::default()), 1);
+    for crossing in CROSSINGS {
+        assert_eq!(
+            alerts_for_a_crossing(ByteTrackConfig::default(), crossing),
+            1,
+            "{crossing:?}"
+        );
+    }
 }
 
 #[test]
@@ -109,5 +123,11 @@ fn without_the_motion_pass_the_same_crossing_never_alerts() {
         motion_match_box_lengths_per_sec: 0.0,
         ..Default::default()
     };
-    assert_eq!(alerts_for_a_crossing(cfg), 0);
+    for crossing in CROSSINGS {
+        assert_eq!(
+            alerts_for_a_crossing(cfg.clone(), crossing),
+            0,
+            "{crossing:?}"
+        );
+    }
 }

@@ -303,7 +303,13 @@ impl StaticObjectFilter {
             // state so the new vehicle doesn't inherit a stale
             // `static_promoted = true` from the previous occupant.
             // `cfg_reset_px == 0` disables the guard entirely.
-            if cfg_reset_px > 0.0 {
+            //
+            // Only a promoted track has a verdict to inherit. An unpromoted
+            // track that jumps is a moving vehicle: at low analysis rates
+            // ByteTrack links one across steps longer than this threshold
+            // (#362), and a fresh alert epoch on every step would re-arm its
+            // alert each frame or reset its rule streak each frame.
+            if cfg_reset_px > 0.0 && state.static_promoted {
                 if let Some((px, py)) = state.last_center {
                     let dx = (center.0 - px) as f64;
                     let dy = (center.1 - py) as f64;
@@ -1272,6 +1278,27 @@ mod tests {
         let mut objs = vec![vehicle(99, 910.0, 500.0)];
         f.filter(&frame(1, 4, 132), &mut objs);
         assert_eq!(objs.len(), 1, "second frame must also pass");
+    }
+
+    /// #362: at low analysis rates ByteTrack links a moving vehicle across
+    /// steps longer than `track_id_reuse_reset_pixels`. A track that was
+    /// never promoted has no stale verdict to shed, so such a step must not
+    /// restart its alert epoch: that re-armed the alert on every frame, or
+    /// reset a `consecutive_frames` streak on every frame so it never fired.
+    #[test]
+    fn a_moving_vehicle_keeps_its_alert_epoch_across_long_steps() {
+        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+        let epochs: Vec<_> = (0..5u64)
+            .map(|i| {
+                let mut objs = vec![vehicle(42, 60.0 + i as f32 * 75.0, 175.0)];
+                f.classify(&frame(1, i, i as i64 * 690), &mut objs);
+                objs[0]
+                    .attributes
+                    .get(ALERT_EPOCH_ATTRIBUTE_KEY)
+                    .and_then(Value::as_u64)
+            })
+            .collect();
+        assert_eq!(epochs, vec![Some(0); 5]);
     }
 
     #[test]
