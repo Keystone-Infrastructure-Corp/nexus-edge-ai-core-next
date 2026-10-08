@@ -12,8 +12,8 @@
 //!    detection. Match if IoU `>= match_iou_threshold`.
 //! 4. **Second pass.** Unmatched tracks try the same trick on the low
 //!    bucket — that's the "BYTE" of ByteTrack: rescue tracks during
-//!    occlusion using detections you'd otherwise discard.
-//! 4b. **Motion pass.** A track still unmatched may take the nearest
+//!    occlusion using detections you'd otherwise discard. A **motion
+//!    pass** then lets a track still unmatched take the nearest
 //!    same-label detection within `motion_match_box_lengths_per_sec` of
 //!    it, scaled by the time since its last match. IoU alone cannot link
 //!    a vehicle that moves more than ~half its box between analysed
