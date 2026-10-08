@@ -415,7 +415,10 @@ const MOTION_MATCH_MIN_SPEED: f32 = 0.1;
 /// nearest pairs first. A track is eligible if it has no velocity yet (one
 /// match) or is measurably moving; a detection must lie within
 /// `motion_match_box_lengths_per_sec` box lengths per second of the time
-/// since the track's last match, and be between half and twice its size.
+/// since the track's last match, and be between half and twice its size. A
+/// moving track only takes a detection that is not behind where it was last
+/// seen: one behind is another vehicle, such as a follower that appears
+/// while its leader is unseen.
 fn associate_by_motion(
     tracks: &mut [TrackState],
     detections: &mut [Detection],
@@ -444,6 +447,10 @@ fn associate_by_motion(
         }
         let reach = cfg.motion_match_box_lengths_per_sec * length * gap.as_secs_f32();
         let (tcx, tcy) = t.bbox.center();
+        // The box has been predicted forward by one velocity step per frame
+        // since the last match, so this is where the track was last seen.
+        let steps = (t.missed_frames + 1) as f32;
+        let (seen_x, seen_y) = (tcx - t.velocity_x * steps, tcy - t.velocity_y * steps);
         for (i, d) in detections.iter().enumerate() {
             if det_used[i] || d.confidence < cfg.low_confidence || d.label != t.label {
                 continue;
@@ -453,8 +460,9 @@ fn associate_by_motion(
                 continue;
             }
             let (dcx, dcy) = d.bbox.center();
+            let behind = (dcx - seen_x) * t.velocity_x + (dcy - seen_y) * t.velocity_y < 0.0;
             let dist = (dcx - tcx).hypot(dcy - tcy);
-            if dist <= reach {
+            if dist <= reach && !behind {
                 pairs.push((dist, t_idx, i));
             }
         }
@@ -883,6 +891,40 @@ mod tests {
         assert_ne!(a, b, "b must be its own track");
         let (d, _) = drive(&t, &[(2_070, vec![car(370.0, 100.0)])]);
         assert_eq!(d, b);
+    }
+
+    #[test]
+    fn a_vehicle_behind_a_lost_leader_does_not_take_its_track() {
+        // Review of #369: a leader drives right at 30 px per frame and is
+        // then lost; a follower appears behind it, inside the reach. It is
+        // another vehicle, so it must get its own track.
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let (leader, _) = drive(&t, &[(0, x1(350.0)), (690, x1(380.0)), (1_380, x1(410.0))]);
+        let (follower, _) = drive(
+            &t,
+            &[(2_070, x1(270.0)), (2_760, x1(300.0)), (3_450, x1(330.0))],
+        );
+        assert_eq!(leader.len(), 1);
+        assert_eq!(follower.len(), 1);
+        assert_ne!(leader, follower, "the follower took the leader's track");
+    }
+
+    #[test]
+    fn a_vehicle_that_slows_while_unseen_keeps_its_track() {
+        // 120 px per frame, then missed for two frames, then seen 100 px on
+        // from where it was last seen: ahead of that, but well short of
+        // where its velocity predicted. It slowed; it is the same vehicle.
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let mut frames: Vec<_> = (0..4u64)
+            .map(|i| (i * FIELD_INTERVAL_MS, x1(i as f32 * 120.0)))
+            .collect();
+        frames.push((4 * FIELD_INTERVAL_MS, vec![]));
+        frames.push((5 * FIELD_INTERVAL_MS, vec![]));
+        frames.push((6 * FIELD_INTERVAL_MS, x1(460.0)));
+        let (ids, _) = drive(&t, &frames);
+        assert_eq!(ids.len(), 1, "{ids:?}");
     }
 
     #[test]

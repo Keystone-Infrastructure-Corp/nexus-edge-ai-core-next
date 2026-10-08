@@ -235,6 +235,22 @@ fn every_pass_alerts_once_with_no_cooldown() {
     }
 }
 
+/// Review of #369: a leader seen three times and then lost, and a follower
+/// behind it. Two vehicles, two alerts, as with IoU-only association.
+#[test]
+fn a_follower_seen_after_its_leader_is_lost_alerts_on_its_own() {
+    let pass: Pass = (
+        (100.0, 60.0),
+        [350.0, 380.0, 410.0, 270.0, 300.0, 330.0]
+            .map(Some)
+            .to_vec(),
+    );
+    assert_eq!(
+        alerts_for(ByteTrackConfig::default(), field_rule(2, 0), &pass),
+        2
+    );
+}
+
 /// A lane in front of a row of anchored parked cars, the usual parking-lot
 /// view: the pass comes within a parked car's anchor radius on some frames.
 /// The field rule alerts exactly once and every rule alerts at least once.
