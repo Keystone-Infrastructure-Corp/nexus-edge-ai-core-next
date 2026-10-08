@@ -411,14 +411,20 @@ const MOTION_MATCH_MAX_FRAMES: u32 = 4;
 /// front of it; while it is visible the IoU pass already gave it its own.
 const MOTION_MATCH_MIN_SPEED: f32 = 0.1;
 
+/// How far behind where it was last seen, in box lengths along its travel, a
+/// moving track still takes a detection. Box jitter, float error in the
+/// stepped-back position and a vehicle that stopped where it was last seen
+/// all land within it; a follower behind a lost leader lands further back.
+const MOTION_MATCH_BACKWARD_SLACK: f32 = 0.25;
+
 /// Link unmatched tracks to unused same-label detections by distance,
 /// nearest pairs first. A track is eligible if it has no velocity yet (one
 /// match) or is measurably moving; a detection must lie within
 /// `motion_match_box_lengths_per_sec` box lengths per second of the time
 /// since the track's last match, and be between half and twice its size. A
-/// moving track only takes a detection that is not behind where it was last
-/// seen: one behind is another vehicle, such as a follower that appears
-/// while its leader is unseen.
+/// moving track only takes a detection that is not clearly behind where it
+/// was last seen: one behind is another vehicle, such as a follower that
+/// appears while its leader is unseen.
 fn associate_by_motion(
     tracks: &mut [TrackState],
     detections: &mut [Detection],
@@ -460,7 +466,10 @@ fn associate_by_motion(
                 continue;
             }
             let (dcx, dcy) = d.bbox.center();
-            let behind = (dcx - seen_x) * t.velocity_x + (dcy - seen_y) * t.velocity_y < 0.0;
+            let behind = t.hits > 1
+                && ((dcx - seen_x) * t.velocity_x + (dcy - seen_y) * t.velocity_y)
+                    / t.velocity_x.hypot(t.velocity_y)
+                    < -MOTION_MATCH_BACKWARD_SLACK * length;
             let dist = (dcx - tcx).hypot(dcy - tcy);
             if dist <= reach && !behind {
                 pairs.push((dist, t_idx, i));
@@ -925,6 +934,23 @@ mod tests {
         frames.push((6 * FIELD_INTERVAL_MS, x1(460.0)));
         let (ids, _) = drive(&t, &frames);
         assert_eq!(ids.len(), 1, "{ids:?}");
+    }
+
+    #[test]
+    fn a_vehicle_that_stops_while_unseen_keeps_its_track() {
+        // 60 px per frame, missed for a frame, then parked where it was last
+        // seen or a few px short of it (box jitter): the same vehicle.
+        for back in [0.0f32, 3.0, 8.0] {
+            let t = ByteTrackTracker::new(cfg_default());
+            let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+            let mut frames: Vec<_> = (0..4u64)
+                .map(|i| (i * FIELD_INTERVAL_MS, x1(i as f32 * 60.0)))
+                .collect();
+            frames.push((4 * FIELD_INTERVAL_MS, vec![]));
+            frames.push((5 * FIELD_INTERVAL_MS, x1(180.0 - back)));
+            let (ids, _) = drive(&t, &frames);
+            assert_eq!(ids.len(), 1, "{back} px back: {ids:?}");
+        }
     }
 
     #[test]
