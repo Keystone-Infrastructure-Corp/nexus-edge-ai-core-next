@@ -235,6 +235,56 @@ fn every_pass_alerts_once_with_no_cooldown() {
     }
 }
 
+/// Review of #369 (P2): a vehicle at a steady speed while the analysis rate
+/// rises from one frame per 690 ms to one per 133 ms is one vehicle, one
+/// alert, even with no cooldown.
+#[test]
+fn a_vehicle_alerts_once_when_the_analysis_rate_rises() {
+    let mut frames: Vec<(u64, f32)> = [
+        0.0f32, 20.0, 50.0, 90.0, 140.0, 200.0, 270.0, 350.0, 430.0, 510.0, 590.0,
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, &x)| (i as u64 * INTERVAL_MS, x))
+    .collect();
+    let t_last = 10 * INTERVAL_MS;
+    frames.extend((1..=6u64).map(|k| (t_last + k * 133, 590.0 + 80.0 * (k * 133) as f32 / 690.0)));
+    let tracker = ByteTrackTracker::new(ByteTrackConfig::default());
+    let mut filter = StaticObjectFilter::new(StaticObjectConfig::default(), 14, None);
+    let eval = RuleEvaluator::new(&RulesConfig::default(), &[field_rule(2, 0)]).unwrap();
+    let t0 = Instant::now();
+    let mut fired = 0;
+    for (i, (ms, x)) in frames.into_iter().enumerate() {
+        let frame = Frame {
+            camera_id: 14,
+            frame_id: i as u64,
+            captured_at: Utc.timestamp_millis_opt(ms as i64).unwrap(),
+            captured_mono: t0 + Duration::from_millis(ms),
+            width: 1024,
+            height: 576,
+            format: PixelFormat::Rgb24,
+            data: Arc::new(vec![]),
+            trace_id: format!("trace-{i}"),
+        };
+        let mut tracked = tracker.update(vec![car(x, 150.0, (100.0, 60.0))], frame.captured_mono);
+        filter.classify(&frame, &mut tracked);
+        fired += eval
+            .evaluate(
+                14,
+                i as u64,
+                frame.captured_at,
+                frame.captured_mono,
+                &frame.trace_id,
+                1024,
+                576,
+                &[],
+                &tracked,
+            )
+            .len();
+    }
+    assert_eq!(fired, 1);
+}
+
 /// Review of #369: a leader seen three times and then lost, and a follower
 /// behind it. Two vehicles, two alerts, as with IoU-only association.
 #[test]

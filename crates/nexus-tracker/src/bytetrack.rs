@@ -82,6 +82,9 @@ struct ByteTrackState {
     /// Candidate (score, track, detection) pairs, reused by every pass so
     /// association allocates nothing per frame once it has grown.
     pairs: Vec<(f32, usize, usize)>,
+    /// Capture time of the previous update, from which a track's box is
+    /// predicted forward when velocity is per second.
+    last_update: Option<Instant>,
 }
 
 pub struct ByteTrackTracker {
@@ -97,6 +100,7 @@ impl ByteTrackTracker {
                 next_id: 1,
                 tracks: Vec::new(),
                 pairs: Vec::new(),
+                last_update: None,
             }),
         }
     }
@@ -108,9 +112,20 @@ impl Tracker for ByteTrackTracker {
         let mut guard = self.inner.lock();
         let state = &mut *guard;
 
+        // The motion pass, and the velocity and assignment fixes it relies on.
+        // Off (0), association is exactly main's IoU-only ByteTrack. On,
+        // velocity is per second, because the analysis rate is not fixed: it
+        // is the shared detector's capacity over its cameras (#362).
+        let motion = (cfg.motion_match_box_lengths_per_sec > 0.0).then_some(captured_mono);
+        let dt = state.last_update.map_or(0.0, |prev| {
+            captured_mono.saturating_duration_since(prev).as_secs_f32()
+        });
+        state.last_update = Some(captured_mono);
+
         // ---- 1. Predict + age. ----
         for t in state.tracks.iter_mut() {
-            t.bbox = predict(t.bbox, t.velocity_x, t.velocity_y);
+            let step = if motion.is_some() { dt } else { 1.0 };
+            t.bbox = predict(t.bbox, t.velocity_x * step, t.velocity_y * step);
             t.age_frames = t.age_frames.saturating_add(1);
         }
 
@@ -124,10 +139,6 @@ impl Tracker for ByteTrackTracker {
                 low_idx.push(i);
             }
         }
-
-        // The motion pass, and the velocity and assignment fixes it relies on.
-        // Off (0), association is exactly main's IoU-only ByteTrack.
-        let motion = cfg.motion_match_box_lengths_per_sec > 0.0;
 
         let mut det_used = vec![false; detections.len()];
         let mut track_matched = vec![false; state.tracks.len()];
@@ -163,7 +174,7 @@ impl Tracker for ByteTrackTracker {
         );
 
         // ---- 4b. Motion pass: what overlap could not link. ----
-        if motion {
+        if motion.is_some() {
             associate_by_motion(
                 &mut state.tracks,
                 &mut state.pairs,
@@ -302,7 +313,8 @@ fn blend(new: BBox, prior: BBox, alpha: f32) -> BBox {
 /// One association pass over `det_indices`. Mutates the tracks (velocity,
 /// bbox, lifecycle, hit streak) and the `det_used` / `track_matched`
 /// vectors, and moves each matched detection's attributes onto its track.
-/// With `motion` on, pairs are assigned best IoU first across all tracks,
+/// `motion` is the frame's capture time when the motion pass is on, else
+/// `None`. With it on, pairs are assigned best IoU first across all tracks,
 /// not track by track in creation order: otherwise an older track, such as a
 /// lost leader's coasting box, takes a detection that overlaps another track
 /// better (#362). Ties go to the earlier track, then the earlier detection.
@@ -330,7 +342,7 @@ fn associate_pass(
     confirm_frames: u32,
     display_smoothing_alpha: f32,
     spatial_bucket_size_px: Option<u32>,
-    motion: bool,
+    motion: Option<Instant>,
 ) {
     // Build the spatial grid once per pass when bucketing is enabled.
     // Maps cell -> indices into `detections` (already filtered to this
@@ -384,7 +396,7 @@ fn associate_pass(
             }
         }
     }
-    if motion {
+    if motion.is_some() {
         pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     } else {
         // Stable, and pairs were pushed in the order main's sweep visits
@@ -416,11 +428,12 @@ fn associate_pass(
 const MOTION_MATCH_MAX_GAP: Duration = Duration::from_millis(2_500);
 const MOTION_MATCH_MAX_FRAMES: u32 = 4;
 
-/// Speed, in box lengths per analysed frame, below which a track with a
-/// velocity is treated as stationary and left out of the motion pass. A
-/// parked car's track must not take the detection of a vehicle passing in
-/// front of it; while it is visible the IoU pass already gave it its own.
-const MOTION_MATCH_MIN_SPEED: f32 = 0.1;
+/// Speed, in box lengths per second, below which a track with a velocity is
+/// treated as stationary and left out of the motion pass. A parked car's
+/// track must not take the detection of a vehicle passing in front of it;
+/// while it is visible the IoU pass already gave it its own. 0.15 is 0.1 box
+/// lengths per analysed frame at the #362 core's 1.45 fps.
+const MOTION_MATCH_MIN_SPEED: f32 = 0.15;
 
 /// How far behind where it was last seen, in box lengths along its travel, a
 /// moving track still takes a detection. A moving vehicle cannot reappear
@@ -467,10 +480,10 @@ fn associate_by_motion(
         }
         let reach = cfg.motion_match_box_lengths_per_sec * length * gap.as_secs_f32();
         let (tcx, tcy) = t.bbox.center();
-        // The box has been predicted forward by one velocity step per frame
-        // since the last match, so this is where the track was last seen.
-        let steps = (t.missed_frames + 1) as f32;
-        let (seen_x, seen_y) = (tcx - t.velocity_x * steps, tcy - t.velocity_y * steps);
+        // The box has been predicted forward at its velocity since the last
+        // match, so this is where the track was last seen.
+        let secs = gap.as_secs_f32();
+        let (seen_x, seen_y) = (tcx - t.velocity_x * secs, tcy - t.velocity_y * secs);
         for (i, d) in detections.iter().enumerate() {
             if det_used[i] || d.confidence < cfg.low_confidence || d.label != t.label {
                 continue;
@@ -502,34 +515,43 @@ fn associate_by_motion(
             &mut detections[i],
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
-            true,
+            Some(now),
         );
     }
 }
 
-/// Fold detection `d` into track `t`. `motion` selects the velocity
-/// estimate: the displacement per frame since the box was last observed, or
-/// main's.
+/// Fold detection `d` into track `t`. `motion` (the frame's capture time
+/// when the motion pass is on) selects the velocity estimate: pixels per
+/// second since the box was last observed, or main's pixels per frame.
 fn apply_match(
     t: &mut TrackState,
     d: &mut Detection,
     confirm_frames: u32,
     display_smoothing_alpha: f32,
-    motion: bool,
+    motion: Option<Instant>,
 ) {
-    // `t.bbox` has been predicted forward one velocity step per frame since
-    // the box was last observed, so the gap to it is only the prediction's
-    // error. Main (v1) fed that error to the EMA, which settles at half the
-    // true step and leaves a lost track's predicted box trailing its vehicle
-    // (#362); the displacement per frame since the last observation does not.
-    let (dx, dy) = if motion {
-        let steps = (t.missed_frames + 1) as f32;
-        (
-            (d.bbox.x1 - t.bbox.x1) / steps + t.velocity_x,
-            (d.bbox.y1 - t.bbox.y1) / steps + t.velocity_y,
-        )
-    } else {
-        (d.bbox.x1 - t.bbox.x1, d.bbox.y1 - t.bbox.y1)
+    // `t.bbox` has been predicted forward at the track's velocity since the
+    // box was last observed, so the gap to it is only the prediction's error.
+    // Main (v1) fed that error to the EMA, which settles at half the true
+    // step and leaves a lost track's predicted box trailing its vehicle
+    // (#362). The displacement since the last observation, per second, does
+    // not, and stays right when the analysis rate changes. With no time
+    // elapsed there is nothing to observe, and the velocity is kept.
+    let (dx, dy) = match motion {
+        Some(now) => {
+            let secs = now
+                .saturating_duration_since(t.last_matched_at)
+                .as_secs_f32();
+            if secs > 0.0 {
+                (
+                    (d.bbox.x1 - t.bbox.x1) / secs + t.velocity_x,
+                    (d.bbox.y1 - t.bbox.y1) / secs + t.velocity_y,
+                )
+            } else {
+                (t.velocity_x, t.velocity_y)
+            }
+        }
+        None => (d.bbox.x1 - t.bbox.x1, d.bbox.y1 - t.bbox.y1),
     };
     // Same EMA constants as v1: 0.6 weight on prior velocity, 0.4 on
     // newly observed dx/dy.
@@ -679,13 +701,13 @@ mod tests {
     fn velocity_ema_predicts_motion() {
         let t = ByteTrackTracker::new(cfg_default());
         // Three frames of consistent rightward drift establish velocity.
-        let _ = t.update(vec![det("person", 0.0, 0.9)], *T);
-        let _ = t.update(vec![det("person", 5.0, 0.9)], *T);
-        let _ = t.update(vec![det("person", 10.0, 0.9)], *T);
+        let _ = t.update(vec![det("person", 0.0, 0.9)], at_ms(0));
+        let _ = t.update(vec![det("person", 5.0, 0.9)], at_ms(66));
+        let _ = t.update(vec![det("person", 10.0, 0.9)], at_ms(132));
         // Now skip a frame (no detection). Internally the bbox should be
         // predicted forward so a detection at x=20 still matches via IoU.
-        let _ = t.update(vec![], *T);
-        let f5 = t.update(vec![det("person", 20.0, 0.9)], *T);
+        let _ = t.update(vec![], at_ms(198));
+        let f5 = t.update(vec![det("person", 20.0, 0.9)], at_ms(264));
         assert_eq!(f5.len(), 1, "velocity prediction should keep the match");
     }
 
@@ -984,11 +1006,11 @@ mod tests {
     }
 
     #[test]
-    fn velocity_converges_to_the_step_per_frame() {
-        // A box moving 10 px per frame, matched by IoU every frame. With the
-        // motion pass off the tracker is main's: v1's estimate settles at
-        // half the step.
-        for (speed, want) in [(3.0f32, 10.0f32), (0.0, 5.0)] {
+    fn velocity_converges_to_the_true_speed() {
+        // A box moving 10 px per 66 ms frame, matched by IoU every frame:
+        // 151.5 px/s. With the motion pass off the tracker is main's: v1's
+        // estimate is per frame and settles at half the step.
+        for (speed, want) in [(3.0f32, 10.0f32 / 0.066), (0.0, 5.0)] {
             let mut cfg = cfg_default();
             cfg.motion_match_box_lengths_per_sec = speed;
             let t = ByteTrackTracker::new(cfg);
@@ -998,8 +1020,8 @@ mod tests {
             }
             let v = t.inner.lock().tracks[0].velocity_x;
             assert!(
-                (v - want).abs() < 1.0,
-                "motion {speed}: velocity {v} px/frame, want {want}"
+                (v - want).abs() < want * 0.05,
+                "motion {speed}: velocity {v}, want {want}"
             );
         }
     }
@@ -1048,6 +1070,36 @@ mod tests {
             .and_then(|o| o.detection_bbox)
             .map(|b| b.x1);
         assert_eq!(got, Some(60.0));
+    }
+
+    /// Review of #369 (P2): the analysis rate rises when the shared
+    /// detector's load drops. A vehicle seen every frame at a steady
+    /// 80 px per 690 ms, then sampled every 133 ms, must keep one track.
+    pub(crate) fn cadence_change() -> Vec<(u64, Vec<Detection>)> {
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let slow = [
+            0.0f32, 20.0, 50.0, 90.0, 140.0, 200.0, 270.0, 350.0, 430.0, 510.0, 590.0,
+        ];
+        let mut frames: Vec<_> = slow
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| (i as u64 * FIELD_INTERVAL_MS, x1(x)))
+            .collect();
+        let t_last = (slow.len() as u64 - 1) * FIELD_INTERVAL_MS;
+        for k in 1..=6u64 {
+            frames.push((
+                t_last + k * 133,
+                x1(590.0 + 80.0 * (k * 133) as f32 / 690.0),
+            ));
+        }
+        frames
+    }
+
+    #[test]
+    fn a_vehicle_keeps_its_track_when_the_analysis_rate_rises() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let (ids, _) = drive(&t, &cadence_change());
+        assert_eq!(ids.len(), 1, "{ids:?}");
     }
 
     #[test]
