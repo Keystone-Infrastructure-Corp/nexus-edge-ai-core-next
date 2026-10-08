@@ -52,7 +52,7 @@ use nexus_types::{
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 const SEEDED_KEY: &str = "seeded_from_toml";
 
@@ -462,10 +462,43 @@ impl Store {
             .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let s: String = r.get(0);
+            let s: String = r.try_get(0)?;
             out.push(serde_json::from_str(&s)?);
         }
         Ok(out)
+    }
+
+    /// [`Store::list_cameras`], decoded row by row: the cameras this build
+    /// can read, and the ids of the rows it cannot (one a newer release wrote
+    /// with a value this build has no variant for, say), each logged.
+    /// `list_cameras` fails on such a row. Boot, the reconciler, the health
+    /// roll-up and a camera change's audit pre-state read with this, so that
+    /// the other cameras run; a caller that must not drop a camera keeps
+    /// `list_cameras`, as the cloud roster does, since a camera absent from
+    /// it is removed cloud-side.
+    pub async fn list_readable_cameras(
+        &self,
+    ) -> Result<(Vec<CameraConfig>, Vec<CameraId>), StoreError> {
+        let rows = sqlx::query("SELECT id, config_json FROM cameras ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut readable = Vec::with_capacity(rows.len());
+        let mut unreadable = Vec::new();
+        for r in rows {
+            let id: CameraId = r.get(0);
+            let cam = r
+                .try_get::<&str, _>(1)
+                .map_err(StoreError::from)
+                .and_then(|json| serde_json::from_str(json).map_err(StoreError::from));
+            match cam {
+                Ok(cam) => readable.push(cam),
+                Err(e) => {
+                    warn!(camera_id = id, error = %e, "store: this build cannot read the camera's row");
+                    unreadable.push(id);
+                }
+            }
+        }
+        Ok((readable, unreadable))
     }
 
     pub async fn upsert_camera(&self, cam: &CameraConfig) -> Result<(), StoreError> {

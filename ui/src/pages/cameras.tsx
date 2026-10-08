@@ -82,6 +82,7 @@ import {
   decodeSummaryText,
   decodeVerdictPresentation,
 } from "@/lib/decodeCapacity";
+import { detectorInputFor, supervisorDimsFor } from "@/lib/supervisor-frame";
 
 const EMPTY_CAMERA: CameraConfig = {
   // 0 is the sentinel for "no server-assigned id yet". The
@@ -610,18 +611,36 @@ function CameraEditor({
   // M_NATIVE_ASPECT — live tiling-geometry preview. The supervisor
   // (analysis) frame can be a larger native-16:9 ladder rung than the
   // model input; when it divides evenly by the tile grid, each tile is
-  // pixel-identical to the model input (zero resampling).
-  const modelInputW =
-    (draft.model_override as ModelOverride | null)?.input_width ?? 512;
-  const modelInputH =
-    (draft.model_override as ModelOverride | null)?.input_height ?? 288;
-  const supervisorHeight = (w: number) => {
-    const h = Math.floor((w * 9) / 16);
-    return h % 2 === 0 ? h : h + 1;
-  };
+  // pixel-identical to the model input (zero resampling). A camera with
+  // no model override runs at the engine's default model, so until the
+  // catalog is read the preview states no frame.
+  const promptsCatalog = useQuery({
+    queryKey: ["models", "prompts"],
+    queryFn: getModelPromptsCatalog,
+    staleTime: 5 * 60_000,
+  });
+  const modelInput = detectorInputFor(
+    draft.model_override as ModelOverride | null,
+    promptsCatalog.data && {
+      w: promptsCatalog.data.default_input_width,
+      h: promptsCatalog.data.default_input_height,
+    },
+  );
   const tilePreview = (() => {
-    const supW = draft.supervisor_width ?? modelInputW;
-    const supH = supervisorHeight(supW);
+    if (!modelInput) {
+      return {
+        text: promptsCatalog.isError
+          ? "Analysis frame unknown: the engine's default model could not be read."
+          : "Reading the engine's default model…",
+        cost: "",
+        exact: undefined,
+      };
+    }
+    const { w: modelInputW, h: modelInputH } = modelInput;
+    const [supW, supH] = supervisorDimsFor(
+      modelInputW,
+      draft.supervisor_width,
+    );
     const cols = draft.tile_grid === "g3x3" ? 3 : 2;
     const rows = cols;
     const tileW = Math.floor(supW / cols);
@@ -1123,7 +1142,9 @@ function CameraEditor({
               className="rounded-md border border-border bg-background px-2 py-1 text-sm disabled:opacity-60"
             >
               <option value="">Match model input (default)</option>
-              {SHAPE_LADDER.filter((s) => s.w >= modelInputW).map((s) => (
+              {SHAPE_LADDER.filter(
+                (s) => !modelInput || s.w >= modelInput.w,
+              ).map((s) => (
                 <option key={s.w} value={String(s.w)}>
                   {s.tier} — {s.w} × {s.h}
                 </option>
@@ -1131,9 +1152,11 @@ function CameraEditor({
             </select>
             <span
               className={
-                tilePreview.exact
-                  ? "text-[11px] text-emerald-600 dark:text-emerald-400"
-                  : "text-[11px] text-amber-600 dark:text-amber-400"
+                tilePreview.exact === undefined
+                  ? "text-[11px] text-muted-foreground"
+                  : tilePreview.exact
+                    ? "text-[11px] text-emerald-600 dark:text-emerald-400"
+                    : "text-[11px] text-amber-600 dark:text-amber-400"
               }
             >
               {tilePreview.text}
@@ -1170,7 +1193,13 @@ function CameraEditor({
               className="rounded-md border border-border bg-background px-2 py-1 text-sm"
             >
               <option value="">Off — always full-res</option>
-              {SHAPE_LADDER.filter((s) => s.w < modelInputW).map((s) => (
+              {/* Until the detector input is read, offer only the saved
+                  rung, so a saved value is not shown as "Off". */}
+              {SHAPE_LADDER.filter((s) =>
+                modelInput
+                  ? s.w < modelInput.w
+                  : s.w === draft.detector_downscale_to_width,
+              ).map((s) => (
                 <option key={s.w} value={String(s.w)}>
                   {s.tier} — {s.w} × {s.h}
                 </option>

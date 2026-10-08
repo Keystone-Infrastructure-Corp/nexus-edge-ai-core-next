@@ -23,8 +23,8 @@
 //! `stale_state_frames` empty observations.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
-use chrono::{DateTime, Utc};
 use nexus_config::{AnnotatorConfig, ZoneConfig, ZoneKind};
 use nexus_types::{Frame, TrackId, TrackedObject};
 use serde_json::json;
@@ -38,8 +38,8 @@ type CenterGrid = HashMap<(i32, i32), Vec<(f32, f32)>>;
 
 #[derive(Debug, Default, Clone)]
 struct PerTrackState {
-    first_seen_at: Option<DateTime<Utc>>,
-    last_seen_at: Option<DateTime<Utc>>,
+    first_seen_at: Option<Instant>,
+    last_seen_at: Option<Instant>,
     last_seen_tick: u64,
     last_center: Option<(f32, f32)>,
     /// EMA of px/frame movement magnitude. Drives speed_class and parked.
@@ -54,9 +54,9 @@ struct PerTrackState {
     /// Phase 8.1 — id of the static anchor this track is currently
     /// within proximity of (None when clear). Drives near_static_vehicle_id.
     near_anchor_id: Option<String>,
-    /// Phase 8.1 — first wall-clock at which the track entered the
+    /// Phase 8.1 — capture stamp at which the track entered the
     /// current anchor's proximity. Drives near_static_vehicle_seconds.
-    near_anchor_since: Option<DateTime<Utc>>,
+    near_anchor_since: Option<Instant>,
 }
 
 pub struct TrackAnnotator {
@@ -96,8 +96,7 @@ impl TrackAnnotator {
         objects: &mut [TrackedObject],
     ) {
         self.frame_tick = self.frame_tick.saturating_add(1);
-        self.rate
-            .observe(frame.captured_at.timestamp_millis() as f64 / 1_000.0);
+        self.rate.observe_at(frame.captured_mono);
         if objects.is_empty() {
             self.gc_stale();
             return;
@@ -165,15 +164,12 @@ impl TrackAnnotator {
 
         for o in objects.iter_mut() {
             let state = self.state_by_track.entry(o.track_id).or_default();
-            let now = frame.captured_at;
+            let now = frame.captured_mono;
             let center = o.bbox.center();
             // ---- dt seconds since last observation ----
             let dt_seconds = match state.last_seen_at {
                 Some(prev) => {
-                    let delta_us = now
-                        .signed_duration_since(prev)
-                        .num_microseconds()
-                        .unwrap_or(0);
+                    let delta_us = now.saturating_duration_since(prev).as_micros();
                     if delta_us > 0 {
                         delta_us as f64 / 1_000_000.0
                     } else {
@@ -257,7 +253,7 @@ impl TrackAnnotator {
             // ---- dwell_seconds (integer seconds since first_seen_at) ----
             let dwell_ms = state
                 .first_seen_at
-                .map(|first| now.signed_duration_since(first).num_milliseconds().max(0))
+                .map(|first| now.saturating_duration_since(first).as_millis() as u64)
                 .unwrap_or(0);
             o.attributes
                 .insert("motion.dwell_seconds".into(), json!(dwell_ms / 1000));
@@ -286,8 +282,15 @@ impl TrackAnnotator {
                     center.1 / frame_h.max(1.0),
                     &zone.polygon,
                 );
-                let inside_prev = state.inside_by_zone.get(&zone.id).copied().unwrap_or(false);
-                state.inside_by_zone.insert(zone.id.clone(), inside_now);
+                // Update the flag in place: re-inserting would allocate the
+                // zone id for every track on every frame.
+                let inside_prev = match state.inside_by_zone.get_mut(&zone.id) {
+                    Some(inside) => std::mem::replace(inside, inside_now),
+                    None => {
+                        state.inside_by_zone.insert(zone.id.clone(), inside_now);
+                        false
+                    }
+                };
 
                 if inside_now {
                     inside_zone_ids.push(zone.id.clone());
@@ -379,7 +382,7 @@ impl TrackAnnotator {
                     }
                     let secs = state
                         .near_anchor_since
-                        .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                        .map(|t| now.saturating_duration_since(t).as_secs())
                         .unwrap_or(0);
                     o.attributes
                         .insert("motion.near_static_vehicle_id".into(), json!(id));
@@ -529,15 +532,24 @@ pub(crate) fn point_in_normalized_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
     use nexus_types::{BBox, Frame, PixelFormat};
     use std::sync::Arc;
+
+    /// The monotonic stamp read beside wall time `ms`, for a clock that was
+    /// never stepped.
+    fn mono_ms(ms: i64) -> std::time::Instant {
+        static T0: std::sync::LazyLock<std::time::Instant> =
+            std::sync::LazyLock::new(std::time::Instant::now);
+        *T0 + std::time::Duration::from_millis(ms as u64)
+    }
 
     fn frame_at(secs: i64, w: u32, h: u32) -> Frame {
         Frame {
             camera_id: 1,
             frame_id: secs as u64,
             captured_at: Utc.timestamp_opt(secs, 0).unwrap(),
+            captured_mono: mono_ms(secs * 1000),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,
@@ -551,6 +563,7 @@ mod tests {
             camera_id: 1,
             frame_id: ms as u64,
             captured_at: Utc.timestamp_millis_opt(ms).unwrap(),
+            captured_mono: mono_ms(ms),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,
@@ -604,6 +617,35 @@ mod tests {
             if i == 4 {
                 assert_eq!(o[0].attributes["motion.speed_class"], "running");
                 assert_eq!(o[0].attributes["motion.direction"], "e");
+            }
+        }
+    }
+
+    /// Dwell and speed are measured on the monotonic capture stamp, so an
+    /// hour's step of the wall clock either way moves neither: a person
+    /// walking 6 px every 100 ms stays `walking`, and dwells 100 ms a frame.
+    #[test]
+    fn a_wall_clock_step_moves_neither_dwell_nor_speed() {
+        for step_ms in [3_600_000, -3_600_000] {
+            let mut a = TrackAnnotator::new(AnnotatorConfig::default());
+            for i in 0..30i64 {
+                let mut f = frame_at_ms(i * 100, 1920, 1080);
+                if i >= 15 {
+                    f.captured_at += chrono::Duration::milliseconds(step_ms);
+                }
+                let mut o = vec![obj(1, "person", 100.0 + 6.0 * i as f32, 500.0)];
+                a.annotate(&f, &[], &[], &mut o);
+                assert_eq!(
+                    o[0].attributes["motion.dwell_seconds"],
+                    json!(i / 10),
+                    "{step_ms} ms step: frame {i}'s dwell"
+                );
+                if i >= 10 {
+                    assert_eq!(
+                        o[0].attributes["motion.speed_class"], "walking",
+                        "{step_ms} ms step: frame {i}'s speed"
+                    );
+                }
             }
         }
     }
@@ -668,6 +710,29 @@ mod tests {
         assert_eq!(flags, vec!["no", "yes", "yes", "yes"]);
     }
 
+    /// The measured inference rate is a duration between frames, so it is
+    /// read on the monotonic capture stamp: an hour's step of the wall clock
+    /// either way leaves a 5 s parked threshold at 10 frames at 2 fps.
+    #[test]
+    fn a_wall_clock_step_does_not_move_the_parked_threshold() {
+        for step_ms in [3_600_000, -3_600_000] {
+            let mut a = TrackAnnotator::new(AnnotatorConfig {
+                parked_min_secs: 5.0,
+                ..Default::default()
+            });
+            let flipped_at = (0..40i64).find(|&i| {
+                let mut f = frame_at_ms(i * 500, 1920, 1080);
+                if i >= 3 {
+                    f.captured_at += chrono::Duration::milliseconds(step_ms);
+                }
+                let mut o = vec![obj(1, "vehicle.car", 100.0, 100.0)];
+                a.annotate(&f, &[], &[], &mut o);
+                o[0].attributes["motion.parked_vehicle"] == "yes"
+            });
+            assert_eq!(flipped_at, Some(9), "{step_ms} ms step");
+        }
+    }
+
     #[test]
     fn dwell_seconds_counts_from_first_observation() {
         let mut a = TrackAnnotator::new(AnnotatorConfig::default());
@@ -711,6 +776,29 @@ mod tests {
         let mut o = vec![obj(1, "person", 1700.0, 100.0)];
         a.annotate(&frame_at(3, 1920, 1080), &zones, &[], &mut o);
         assert_eq!(o[0].attributes["motion.zone_state"], "exiting");
+    }
+
+    #[test]
+    fn a_track_first_seen_inside_a_zone_is_entering() {
+        let mut a = TrackAnnotator::new(AnnotatorConfig::default());
+        let zones = vec![ZoneConfig {
+            id: "z1".into(),
+            name: "z1".into(),
+            polygon: vec![(0.0, 0.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5)],
+            kind: ZoneKind::Inclusion,
+            min_bbox_area_px_override: None,
+        }];
+        let mut o = vec![obj(1, "person", 200.0, 200.0)];
+        a.annotate(&frame_at(0, 1920, 1080), &zones, &[], &mut o);
+        assert_eq!(o[0].attributes["motion.zone_state"], "entering");
+
+        // Still inside on the next frame: entering is reported once.
+        let mut o = vec![obj(1, "person", 300.0, 300.0)];
+        a.annotate(&frame_at(1, 1920, 1080), &zones, &[], &mut o);
+        assert_eq!(
+            o[0].attributes["motion.zone_state"], "inside",
+            "the first sight of a zone must record that the track is inside it"
+        );
     }
 
     #[test]

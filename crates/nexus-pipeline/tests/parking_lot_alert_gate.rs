@@ -98,6 +98,7 @@ fn frame(frame_id: u64) -> Frame {
         camera_id: 1,
         frame_id,
         captured_at: Utc.timestamp_millis_opt(frame_id as i64 * 33).unwrap(),
+        captured_mono: std::time::Instant::now(),
         width: FRAME_W,
         height: FRAME_H,
         format: PixelFormat::Rgb24,
@@ -123,7 +124,7 @@ fn object(track_id: u64, label: &str, cx: f32, cy: f32) -> TrackedObject {
         detection_bbox: Some(bbox),
         age_frames: 10,
         age_ms: 1000,
-        attributes: serde_json::Map::new(),
+        attributes: Default::default(),
     }
 }
 
@@ -149,20 +150,28 @@ impl Sim {
         let f = frame(self.frame_id);
         self.frame_id += 1;
 
-        let dynamic: Vec<TrackedObject> = match self.filter.as_mut() {
+        let filtering = match self.filter.as_mut() {
             Some(filter) => {
                 filter.classify(&f, &mut objects);
-                objects
-                    .iter()
-                    .filter(|t| !is_object_static(t))
-                    .cloned()
-                    .collect()
+                true
             }
-            None => objects,
+            None => false,
         };
+        let dynamic = objects
+            .iter()
+            .filter(|t| !(filtering && is_object_static(t)));
 
-        self.evaluator
-            .evaluate(1, f.frame_id, &f.trace_id, FRAME_W, FRAME_H, &[], &dynamic)
+        self.evaluator.evaluate(
+            1,
+            f.frame_id,
+            f.captured_at,
+            f.captured_mono,
+            &f.trace_id,
+            FRAME_W,
+            FRAME_H,
+            &[],
+            dynamic,
+        )
     }
 
     /// Run `frames` steps with the object parked at a fixed point and
@@ -207,7 +216,7 @@ fn rules_engine_honours_the_epoch_key_produced_by_the_tracker() {
     let mut ev = Sim::new(None, &[rule_for("vehicle.car", 0)]);
     let mut o = object(7, "vehicle.car", 500.0, 500.0);
     o.attributes
-        .insert(ALERT_EPOCH_ATTRIBUTE_KEY.to_string(), serde_json::json!(0));
+        .insert(ALERT_EPOCH_ATTRIBUTE_KEY.into(), serde_json::json!(0));
 
     let first = ev.step(vec![o.clone()]);
     let second = ev.step(vec![o]);

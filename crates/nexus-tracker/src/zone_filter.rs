@@ -124,6 +124,7 @@ mod tests {
             camera_id: 1,
             frame_id: 1,
             captured_at: chrono::Utc.timestamp_opt(0, 0).unwrap(),
+            captured_mono: std::time::Instant::now(),
             width: 1920,
             height: 1080,
             format: PixelFormat::Rgb24,

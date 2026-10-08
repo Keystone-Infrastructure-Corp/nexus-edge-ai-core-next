@@ -31,6 +31,7 @@ fn frame_of(w: u32, h: u32, trace: &str) -> Frame {
         camera_id: 7,
         frame_id: 1,
         captured_at: chrono::Utc::now(),
+        captured_mono: std::time::Instant::now(),
         width: w,
         height: h,
         format: PixelFormat::Rgb24,

@@ -42,7 +42,10 @@ pub use zone_filter::{filter_excluded_zones, filter_zone_min_area};
 // ---------------------------------------------------------------------------
 
 pub trait Tracker: Send + Sync {
-    fn update(&self, detections: Vec<Detection>) -> Vec<TrackedObject>;
+    /// Associate one frame's detections. `captured_mono` is that frame's
+    /// monotonic capture stamp (`Frame::captured_mono`); a track's `age_ms`
+    /// is measured in it, so a step of the wall clock does not move it.
+    fn update(&self, detections: Vec<Detection>, captured_mono: Instant) -> Vec<TrackedObject>;
     fn name(&self) -> &'static str;
 }
 
@@ -98,14 +101,14 @@ impl IouNaiveTracker {
 }
 
 impl Tracker for IouNaiveTracker {
-    fn update(&self, detections: Vec<Detection>) -> Vec<TrackedObject> {
-        let now = Instant::now();
+    fn update(&self, detections: Vec<Detection>, captured_mono: Instant) -> Vec<TrackedObject> {
+        let now = captured_mono;
         let mut state = self.inner.lock();
 
-        // Drop stale tracks.
+        // Drop tracks unseen for `ttl` of capture time.
         state
             .active
-            .retain(|_, t| now.duration_since(t.last_seen) < self.ttl);
+            .retain(|_, t| now.saturating_duration_since(t.last_seen) < self.ttl);
 
         let mut matched_track_ids: Vec<TrackId> = Vec::with_capacity(detections.len());
         let mut consumed: std::collections::HashSet<TrackId> = Default::default();
@@ -165,7 +168,7 @@ impl Tracker for IouNaiveTracker {
                     // box IS the raw detection box for this frame.
                     detection_bbox: Some(t.bbox),
                     age_frames: t.age_frames,
-                    age_ms: now.duration_since(t.born_at).as_millis() as u64,
+                    age_ms: now.saturating_duration_since(t.born_at).as_millis() as u64,
                     attributes: d.attributes.clone(),
                 });
             }
@@ -188,6 +191,8 @@ impl Tracker for IouNaiveTracker {
 mod tests {
     use super::*;
 
+    static T: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
     fn det(label: &str, x: f32) -> Detection {
         Detection {
             label: label.into(),
@@ -206,17 +211,32 @@ mod tests {
     fn iou_assigns_stable_id_across_frames() {
         let cfg = TrackerConfig::default();
         let t = IouNaiveTracker::new(&cfg);
-        let f1 = t.update(vec![det("person", 0.0)]);
-        let f2 = t.update(vec![det("person", 1.0)]);
+        let f1 = t.update(vec![det("person", 0.0)], *T);
+        let f2 = t.update(vec![det("person", 1.0)], *T);
         assert_eq!(f1[0].track_id, f2[0].track_id);
+    }
+
+    #[test]
+    fn iou_ttl_is_measured_in_frame_time() {
+        let cfg = TrackerConfig::default();
+        let t = IouNaiveTracker::new(&cfg);
+        let ttl = Duration::from_millis(cfg.track_ttl_ms);
+        let f1 = t.update(vec![det("person", 0.0)], *T);
+        // Unseen for less than the TTL of video: the same track.
+        let f2 = t.update(vec![det("person", 1.0)], *T + ttl / 2);
+        assert_eq!(f1[0].track_id, f2[0].track_id);
+        // Unseen for longer than the TTL of video, however fast the frames
+        // were processed: the track expired and this is a new one.
+        let f3 = t.update(vec![det("person", 2.0)], *T + ttl / 2 + ttl * 2);
+        assert_ne!(f2[0].track_id, f3[0].track_id);
     }
 
     #[test]
     fn iou_assigns_new_id_on_label_change() {
         let cfg = TrackerConfig::default();
         let t = IouNaiveTracker::new(&cfg);
-        let f1 = t.update(vec![det("person", 0.0)]);
-        let f2 = t.update(vec![det("dog", 0.0)]);
+        let f1 = t.update(vec![det("person", 0.0)], *T);
+        let f2 = t.update(vec![det("dog", 0.0)], *T);
         assert_ne!(f1[0].track_id, f2[0].track_id);
     }
 }

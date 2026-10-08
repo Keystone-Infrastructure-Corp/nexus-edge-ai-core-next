@@ -102,6 +102,15 @@ jobs:
       - name: cargo clippy (hailo linked path)
         run: cargo clippy --locked -p nexus-hailo-backend --features linked --all-targets -- -D warnings
 
+      # nexus-inference's `ort`- and `ep-*`-gated code is invisible to the
+      # workspace clippy above, which runs default features, and four lints
+      # sat in it unseen (SPEC-075). This is the release build's EP set. It
+      # needs nothing installed: `ort` is `load-dynamic`, whose build script
+      # neither downloads nor links ONNX Runtime, and `ep-hailo` pulls the
+      # `dlopen`-based `linked` backend linted in the step above.
+      - name: cargo clippy (nexus-inference, release EP features)
+        run: cargo clippy --locked -p nexus-inference --features ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt,ep-hailo,ep-rocm,ep-vulkan --all-targets -- -D warnings
+
       # Enforces AGENTS.md rule 2: no face-recognition models in `models/`,
       # no non-commercial / research-only license values on any entry.
       # See [xtask/README.md](../../xtask/README.md). Runs without
@@ -350,15 +359,27 @@ jobs:
       #     `tokio/test-util` re-checks tokio, hyper, axum, sqlx and reqwest),
       #     and rust-cache saves only on a key miss, so that re-check repeats
       #     every run until then.
-      # The ort lines in the next step stay `cargo check`: clippy with `-p`
-      # also lints every workspace crate it depends on, and nexus-inference's
-      # `ort` build is not warning-free yet.
+      # The ort lines in the next step stay `cargo check`; the `rust` job
+      # lints nexus-inference's `ort` code on every PR (`cargo clippy
+      # (nexus-inference, release EP features)`).
       - name: cargo clippy (gstreamer, deny warnings)
         run: |
           cargo clippy --locked -p nexus-pipeline --features gstreamer --all-targets -- -D warnings
           cargo clippy --locked -p nexus-pipeline --features gstreamer-webrtc --all-targets -- -D warnings
           cargo clippy --locked -p nexus-engine --features gstreamer --all-targets -- -D warnings
           cargo clippy --locked -p nexus-engine --features gstreamer-webrtc --all-targets -- -D warnings
+
+      # The workspace `cargo test` job runs nexus-engine with default
+      # features, so a test whose answer depends on `gstreamer` only ever
+      # checks the non-gstreamer half there. The health roll-up's feature
+      # gate is one: `EngineHealth::new` stuck at "no real recorder" passes
+      # every default-feature test, and only
+      # `only_a_gstreamer_build_raises_the_recorder_issue` on this build
+      # fails it. The GIO override is the one the next step documents.
+      - name: cargo test (nexus-engine, gstreamer)
+        env:
+          GIO_USE_PROXY_RESOLVER: dummy
+        run: cargo test --locked -p nexus-engine --features gstreamer --bin nexus-engine
 
       - name: cargo check + test (gstreamer + ort)
         # `GIO_USE_PROXY_RESOLVER=dummy`: forces GIO to pick its no-op proxy
@@ -391,7 +412,9 @@ jobs:
           # there. This is the only job with a GStreamer runtime to run it.
           # `gstreamer-webrtc` implies `gstreamer`, so this one invocation also
           # covers webrtc.rs's launch-string assertions at no extra cost.
-          cargo test  --locked -p nexus-pipeline  --features gstreamer-webrtc --lib
+          # `--tests`, not `--lib`: the BUG-223 source-lifecycle and SPEC-075
+          # F2 decode-health tests under `tests/` are gstreamer-gated too.
+          cargo test  --locked -p nexus-pipeline  --features gstreamer-webrtc --tests
           cargo check --locked -p nexus-inference --features ort,ep-cpu
           # The workspace `cargo test` job runs with default features, so
           # everything behind `#![cfg(feature = "ort")]` is invisible to it.

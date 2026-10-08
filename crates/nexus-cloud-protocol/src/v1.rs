@@ -318,19 +318,19 @@ pub struct DiagReadyPayload {
     pub status: String,
 }
 
-/// Additive on v=1. One machine-routable loss-of-function condition, referenced by `EdgeHealth.issues`. The cloud renders these verbatim on the core detail page; `detail` is written to be actionable by an operator without shell access to the box. NOTE: named `EdgeDegradation` rather than `EdgeHealthIssue` so it sorts BEFORE `EdgeHealth` — the TS emitter writes `$defs` in sorted order and zod evaluates `z.object` shapes eagerly, so a referent that sorts after its referrer is a temporal-dead-zone ReferenceError at module load.
+/// Additive on v=1. One machine-routable loss-of-function condition, referenced by `EdgeHealth.issues`. The cloud renders these verbatim on the core detail page; `detail` is written to be actionable by an operator, and says so when the fix needs shell access to the box. NOTE: named `EdgeDegradation` rather than `EdgeHealthIssue` so it sorts BEFORE `EdgeHealth` — the TS emitter writes `$defs` in sorted order and zod evaluates `z.object` shapes eagerly, so a referent that sorts after its referrer is a temporal-dead-zone ReferenceError at module load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeDegradation {
-    /// Stable machine-readable cause. Defined codes: `detector_unavailable` (the configured model could not be loaded, so the engine reports zero detections). Unknown codes MUST render as the raw string rather than being dropped, so a newer edge can report a condition an older console has no special-casing for.
+    /// Stable machine-readable cause. Defined codes, each with the `component` it is reported under: `detector_unavailable` (`detector`: a configured model could not be loaded, so the engine reports zero detections for it; one issue per failed model), `camera_source_stalled` (`live_view`: subscribed cameras have produced no new frame for longer than the live-view stall window; one issue naming every such camera), `decode_oversubscribed` (`decode`: a fixed-function video decode engine is oversubscribed, so every camera decoding on it drops or duplicates frames), `recorder_stub` (`recorder`: the clip recorder is the stub while cameras are enabled, or while the camera list cannot be read to count them, so nothing is recorded), `camera_pipeline_stopped` (`pipeline`: a camera's analysis pipeline exited without being stopped, so nothing on it is detected, alerted on or saved as a motion clip until the engine's next supervision pass restarts it; one issue naming every such camera), `camera_config_unreadable` (`store`: stored camera rows this engine build cannot read, so those cameras do not run until each is deleted or saved again; one issue naming every such camera). The cloud notifies when a code joins the set of open codes, never when only a `detail` changes, so a code names a kind of condition, never one occurrence of it. Unknown codes MUST render as the raw string rather than being dropped, so a newer edge can report a condition an older console has no special-casing for.
     pub code: String,
     /// Subsystem that is impaired, e.g. `detector`. Used to group issues in the UI.
     pub component: String,
-    /// Operator-facing explanation, truncated by the edge to 512 chars. For `detector_unavailable` this carries the model resolver's diagnostic, which names both the shape that was requested and the shapes present in the model pack.
+    /// Operator-facing explanation, truncated by the edge to 512 chars. For `detector_unavailable` this is the detector kind, a colon, and its diagnostic; for a model that failed to resolve, the diagnostic names both the shape that was requested and the shapes present in the model pack.
     pub detail: String,
 }
 
-/// Additive on v=1. Edge-reported health roll-up carried on the heartbeat. `ok` means every subsystem the edge self-checks is functioning; `degraded` means the engine is up (still recording, streaming, and answering the tunnel) but has a known loss of function described in `issues`.
+/// Additive on v=1. Edge-reported health roll-up carried on the heartbeat. `ok` means every subsystem the edge self-checks is functioning; `degraded` means the engine is up and answering the tunnel but has at least one known loss of function described in `issues`. What still works depends on the issue: under `recorder_stub` nothing is recorded, and under `detector_unavailable` the failed model detects nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeHealth {

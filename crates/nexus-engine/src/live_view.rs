@@ -42,7 +42,6 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use image::ImageEncoder;
 use nexus_cloud_client::{build_lbr_frame_envelope, TunnelOutbox};
 use nexus_cloud_protocol::v1::{LbrSubscribePayload, LbrUnsubscribePayload};
 use nexus_pipeline::LatestFrameCache;
@@ -558,26 +557,17 @@ fn encode_lbr(frame: &Frame, tile_w: Option<u32>) -> Result<Vec<u8>, String> {
         .rgb24()
         .map_err(|format| format!("unsupported pixel format {format:?}"))?;
     let (tw, th) = target_size(frame.width, frame.height, tile_w);
-    let mut out = Vec::new();
     if tw == frame.width && th == frame.height {
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, LBR_JPEG_QUALITY)
-            .write_image(
-                &rgb,
-                frame.width,
-                frame.height,
-                image::ExtendedColorType::Rgb8,
-            )
-            .map_err(|e| e.to_string())?;
+        nexus_pipeline::jpeg::encode_rgb24(&rgb, frame.width, frame.height, LBR_JPEG_QUALITY)
     } else {
         let img =
             image::ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(frame.width, frame.height, &rgb)
+                // `from_raw` accepts a longer buffer and would resize it sheared.
+                .filter(|_| rgb.len() == frame.stride() * frame.height as usize)
                 .ok_or_else(|| "frame buffer size mismatch".to_string())?;
         let resized = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, LBR_JPEG_QUALITY)
-            .write_image(resized.as_raw(), tw, th, image::ExtendedColorType::Rgb8)
-            .map_err(|e| e.to_string())?;
+        nexus_pipeline::jpeg::encode_rgb24(resized.as_raw(), tw, th, LBR_JPEG_QUALITY)
     }
-    Ok(out)
 }
 
 /// Target encode dims: clamp the requested tile width to the native frame
@@ -642,7 +632,7 @@ mod tests {
             detection_bbox: None,
             age_frames: 3,
             age_ms: 100,
-            attributes: serde_json::Map::new(),
+            attributes: Default::default(),
         }
     }
 
@@ -742,6 +732,7 @@ mod tests {
             camera_id: 1,
             frame_id: 1,
             captured_at: chrono::Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,
@@ -772,6 +763,27 @@ mod tests {
             encode_lbr(&frame, None).unwrap_err(),
             "unsupported pixel format Nv12"
         );
+    }
+
+    /// `image`'s `JpegEncoder` asserts that the buffer is exactly `w*h*3`,
+    /// and the release profile aborts on a panic, so a wrongly sized frame
+    /// must fail this tick rather than end the engine. The padded case is
+    /// GStreamer's RGB row stride at 642 px (1926 bytes of pixels in a
+    /// 1928-byte row), which the resize path would otherwise encode sheared.
+    #[test]
+    fn encode_rejects_a_buffer_that_does_not_match_the_frame_size() {
+        for len in [642 * 361 * 3 - 1, 1928 * 361] {
+            let frame = Frame {
+                data: Arc::new(vec![0u8; len]),
+                ..rgb_frame(642, 361)
+            };
+            for tile_w in [None, Some(320)] {
+                assert!(
+                    encode_lbr(&frame, tile_w).is_err(),
+                    "{len} bytes, tile {tile_w:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -811,6 +823,7 @@ mod tests {
             camera_id,
             frame_id,
             captured_at: chrono::Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: 16,
             height: 16,
             format: PixelFormat::Rgb24,
@@ -1007,6 +1020,7 @@ mod tests {
                 camera_id: 1,
                 frame_id: 1,
                 captured_at: chrono::Utc::now(),
+                captured_mono: std::time::Instant::now(),
                 width: 640,
                 height: 360,
                 format: PixelFormat::Rgb24,

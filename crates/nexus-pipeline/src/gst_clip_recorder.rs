@@ -158,13 +158,14 @@ pub struct GstClipRecorder {
     /// and went stale on every restart — see BUG-144.
     ingesters: IngesterRegistry,
     /// Second, substream-only sessions keyed by camera (SPEC-069).
-    /// Read by `shared_frame_source` and by nothing else — in
-    /// particular never by the clip path, which resolves its ingester
-    /// from [`Self::ingesters`] so a clip is always cut from the main
-    /// stream's NAL broadcast (invariants I1–I4). Kept as a separate
-    /// map rather than a field on the main ingester precisely so the
-    /// clip path cannot reach one by accident.
-    analysis_ingesters: PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>>,
+    /// Read by `shared_frame_source` and by the frame sources it hands
+    /// out, which take up a session registered after they started, and
+    /// by nothing else — in particular never by the clip path, which
+    /// resolves its ingester from [`Self::ingesters`] so a clip is always
+    /// cut from the main stream's NAL broadcast (invariants I1–I4). Kept
+    /// as a separate map rather than a field on the main ingester
+    /// precisely so the clip path cannot reach one by accident.
+    analysis_ingesters: IngesterRegistry,
     panic: PlMutex<bool>,
     /// Per-clip GStreamer + pump state. Held under a tokio Mutex
     /// because the close path awaits on the pump shutdown and the
@@ -361,7 +362,7 @@ impl GstClipRecorder {
             store,
             clips_dir: clips_dir.as_ref().to_path_buf(),
             ingesters: Arc::new(PlRwLock::new(ingesters)),
-            analysis_ingesters: PlRwLock::new(HashMap::new()),
+            analysis_ingesters: Arc::new(PlRwLock::new(HashMap::new())),
             panic: PlMutex::new(false),
             open: Mutex::new(HashMap::new()),
             bus: None,
@@ -414,6 +415,113 @@ impl GstClipRecorder {
     /// exposes, which is what keeps invariants I2/I3 structural.
     pub fn ingester_registry(&self) -> IngesterRegistry {
         Arc::clone(&self.ingesters)
+    }
+
+    /// The camera's SPEC-069 analysis session, while it is live. A
+    /// `SharedRtspSource` reads its frames from this session and valves the
+    /// main RGB tap off (a new one at once if it has delivered, otherwise
+    /// once it does), so the crowd resize rebuilds it beside the main
+    /// tap. A session the fallback shut down is not live: the supervisor
+    /// reads the main tap again.
+    fn live_analysis_ingester(&self, camera_id: CameraId) -> Option<Arc<PreRollIngester>> {
+        self.analysis_ingesters
+            .read()
+            .get(&camera_id)
+            .filter(|a| !a.is_shutdown())
+            .cloned()
+    }
+
+    /// Rebuild one of the camera's RGB taps, the analysis session's or
+    /// the main ingester's, at `new_rgb_w x new_rgb_h`. `Ok(false)` when
+    /// there is no such tap or it already has those dims.
+    fn resize_tap(
+        &self,
+        analysis: bool,
+        camera_id: CameraId,
+        new_rgb_w: u32,
+        new_rgb_h: u32,
+    ) -> Result<bool, RecorderError> {
+        let taps: &PlRwLock<HashMap<CameraId, Arc<PreRollIngester>>> = if analysis {
+            &self.analysis_ingesters
+        } else {
+            &self.ingesters
+        };
+        // Snapshot the existing ingester's identity + connection
+        // params under a short read lock so we can drop it before
+        // doing the slow PreRollIngester::new_with_rgb call.
+        let snapshot = {
+            let read = taps.read();
+            read.get(&camera_id).map(|ing| {
+                (
+                    ing.url().to_string(),
+                    ing.codec(),
+                    ing.pre_roll_secs(),
+                    ing.max_fps(),
+                    ing.rgb_w(),
+                    ing.rgb_h(),
+                    ing.has_rgb_tap(),
+                    ing.has_delivered(),
+                )
+            })
+        };
+        let Some((url, codec, pre_roll_secs, max_fps, cur_w, cur_h, had_rgb, delivered)) = snapshot
+        else {
+            debug!(
+                camera_id,
+                new_rgb_w, new_rgb_h, "resize_camera_rgb_tap: no ingester registered"
+            );
+            return Ok(false);
+        };
+        if !had_rgb {
+            // Ingester was built via `new` (no RGB tap). Resizing it
+            // would change observable behaviour for callers that
+            // built the legacy path on purpose; refuse instead.
+            debug!(
+                camera_id,
+                "resize_camera_rgb_tap: existing ingester has no RGB tap, skipping"
+            );
+            return Ok(false);
+        }
+        if cur_w == new_rgb_w && cur_h == new_rgb_h {
+            return Ok(false);
+        }
+        let new_ing = PreRollIngester::new_with_rgb(
+            camera_id,
+            url.clone(),
+            pre_roll_secs,
+            codec,
+            self.decode_mode,
+            max_fps,
+            new_rgb_w,
+            new_rgb_h,
+            self.decode_health.clone(),
+        )
+        .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
+        // The same stream at new dims: a session that delivered keeps the
+        // SPEC-069 start path, and a retry that has not stays unproven.
+        if delivered {
+            new_ing.mark_delivered();
+        }
+        let prev = taps.write().insert(camera_id, new_ing);
+        if let Some(prev_ing) = prev {
+            // Same justification as the URL-change replace path in
+            // `add_camera_ingester`: any stale `SharedRtspSource`
+            // clones must NOT keep the previous supervisor
+            // reconnecting against the old (now-superseded) RGB
+            // dims indefinitely.
+            prev_ing.shutdown();
+        }
+        info!(
+            camera_id,
+            %url,
+            prev_w = cur_w,
+            prev_h = cur_h,
+            new_w = new_rgb_w,
+            new_h = new_rgb_h,
+            analysis,
+            "pre-roll ingester RGB tap resized (crowd hysteresis)"
+        );
+        Ok(true)
     }
 
     /// M2.2 Phase 3: attach a USB resolver + preferred label so
@@ -1297,17 +1405,32 @@ impl ClipRecorder for GstClipRecorder {
                 // cumulative counters attributed to a different geometry,
                 // and Phase 1 multiplies those by width x height.
                 if let Some(h) = self.decode_health.as_ref() {
-                    h.clear(camera_id);
+                    h.reset(camera_id);
                 }
                 info!(camera_id, "analysis substream session removed");
             }
             return Ok(());
         };
-        if let Some(existing) = self.analysis_ingesters.read().get(&camera_id) {
-            if existing.url() == url && existing.codec() == codec && !existing.is_shutdown() {
-                return Ok(());
+        // The engine calls this again on every reconcile pass: a no-op for a
+        // running session, and a retry for one the SPEC-069 fallback shut
+        // down, which is logged once, by the fallback, not on every retry.
+        let retry = match self.analysis_ingesters.read().get(&camera_id) {
+            Some(existing) if existing.url() == url && existing.codec() == codec => {
+                if !existing.is_shutdown() {
+                    return Ok(());
+                }
+                true
             }
-        }
+            _ => false,
+        };
+        // At the main tap's frame when there is one: the crowd resize moves
+        // it with the supervisor, while a retry passes the frame the camera
+        // started at, so a session rebuilt after a resize would otherwise
+        // feed the supervisor frames of a size it no longer runs at.
+        let (rgb_w, rgb_h) = match self.ingesters.read().get(&camera_id) {
+            Some(main) if main.has_rgb_tap() => (main.rgb_w(), main.rgb_h()),
+            _ => (rgb_w, rgb_h),
+        };
         // pre_roll_secs = 0: this session exists only to decode. Its
         // ring never accumulates and nothing subscribes to its NAL
         // broadcast — clips come from the main session's.
@@ -1328,11 +1451,19 @@ impl ClipRecorder for GstClipRecorder {
         }
         // Analysis moves to a different stream at a different resolution, so
         // the camera's cumulative decode counters no longer describe one
-        // geometry. Reset rather than blend.
-        if let Some(h) = self.decode_health.as_ref() {
-            h.clear(camera_id);
+        // geometry. Reset rather than blend. A retry does not move it: the
+        // running source reads the main stream until it takes the new session
+        // up, and resets them then.
+        if !retry {
+            if let Some(h) = self.decode_health.as_ref() {
+                h.reset(camera_id);
+            }
         }
-        info!(camera_id, %url, codec = %codec, "analysis substream session started");
+        if retry {
+            debug!(camera_id, codec = %codec, "analysis substream session started again (retry)");
+        } else {
+            info!(camera_id, %url, codec = %codec, "analysis substream session started");
+        }
         Ok(())
     }
 
@@ -1357,13 +1488,16 @@ impl ClipRecorder for GstClipRecorder {
             // handed to a new source: `subscribe_frames` would still return
             // a receiver, the main RGB valve would be closed for it, and the
             // camera would analyse nothing until the grace window expired —
-            // once per supervisor restart, forever.
+            // once per supervisor restart, forever. Nor may one that has not
+            // delivered yet, for the same reason: while a substream stays
+            // refused, the engine's retry sits here most of the time. The
+            // new source starts on the main stream and its watch takes such
+            // a session up once it delivers.
             analysis: self
-                .analysis_ingesters
-                .read()
-                .get(&camera_id)
-                .filter(|a| !a.is_shutdown())
-                .cloned(),
+                .live_analysis_ingester(camera_id)
+                .filter(|a| a.has_delivered()),
+            analysis_sessions: Arc::clone(&self.analysis_ingesters),
+            decode_health: self.decode_health.clone(),
             analysis_stream: self.analysis_stream.clone(),
         }))
     }
@@ -1374,74 +1508,16 @@ impl ClipRecorder for GstClipRecorder {
         new_rgb_w: u32,
         new_rgb_h: u32,
     ) -> Result<bool, RecorderError> {
-        // Snapshot the existing ingester's identity + connection
-        // params under a short read lock so we can drop it before
-        // doing the slow PreRollIngester::new_with_rgb call.
-        let snapshot = {
-            let read = self.ingesters.read();
-            read.get(&camera_id).map(|ing| {
-                (
-                    ing.url().to_string(),
-                    ing.codec(),
-                    ing.pre_roll_secs(),
-                    ing.max_fps(),
-                    ing.rgb_w(),
-                    ing.rgb_h(),
-                    ing.has_rgb_tap(),
-                )
-            })
-        };
-        let Some((url, codec, pre_roll_secs, max_fps, cur_w, cur_h, had_rgb)) = snapshot else {
-            debug!(
-                camera_id,
-                new_rgb_w, new_rgb_h, "resize_camera_rgb_tap: no ingester registered"
-            );
-            return Ok(false);
-        };
-        if !had_rgb {
-            // Ingester was built via `new` (no RGB tap). Resizing it
-            // would change observable behaviour for callers that
-            // built the legacy path on purpose; refuse instead.
-            debug!(
-                camera_id,
-                "resize_camera_rgb_tap: existing ingester has no RGB tap, skipping"
-            );
-            return Ok(false);
-        }
-        if cur_w == new_rgb_w && cur_h == new_rgb_h {
-            return Ok(false);
-        }
-        let new_ing = PreRollIngester::new_with_rgb(
-            camera_id,
-            url.clone(),
-            pre_roll_secs,
-            codec,
-            self.decode_mode,
-            max_fps,
-            new_rgb_w,
-            new_rgb_h,
-            self.decode_health.clone(),
-        )
-        .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
-        let prev = self.ingesters.write().insert(camera_id, new_ing);
-        if let Some(prev_ing) = prev {
-            // Same justification as the URL-change replace path in
-            // `add_camera_ingester`: any stale `SharedRtspSource`
-            // clones must NOT keep the previous supervisor
-            // reconnecting against the old (now-superseded) RGB
-            // dims indefinitely.
-            prev_ing.shutdown();
-        }
-        info!(
-            camera_id,
-            %url,
-            prev_w = cur_w,
-            prev_h = cur_h,
-            new_w = new_rgb_w,
-            new_h = new_rgb_h,
-            "pre-roll ingester RGB tap resized (crowd hysteresis)"
-        );
-        Ok(true)
+        // Boot and `start_camera` build a camera's main and analysis taps at
+        // one frame, the supervisor's, and `SharedRtspSource` falls back from
+        // the analysis session to the main tap without telling the
+        // supervisor. So both taps move: the main one alone leaves the
+        // supervisor reading analysis frames of the old size, and the
+        // analysis one alone leaves a fallback reading main frames of it.
+        let main = self.resize_tap(false, camera_id, new_rgb_w, new_rgb_h)?;
+        let analysis = self.live_analysis_ingester(camera_id).is_some()
+            && self.resize_tap(true, camera_id, new_rgb_w, new_rgb_h)?;
+        Ok(main || analysis)
     }
 
     fn push_alert_boxes(
@@ -2711,6 +2787,29 @@ mod tests {
         assert!(matches!(res, Err(RecorderError::Refused)));
     }
 
+    /// Why the refusal above cannot strand a running camera (BUG-225).
+    /// Building an ingester fails only when GStreamer fails to initialise,
+    /// and `new` shares that one `OnceLock` result. Boot builds every enabled
+    /// camera's ingester before `new`, so if any failed, `new` fails and the
+    /// engine exits; and once a recorder exists, a hot-add cannot fail. A
+    /// fallible step added to `PreRollIngester::build` would let a camera
+    /// refuse every clip with no health issue, and turns this red.
+    #[tokio::test]
+    async fn a_running_recorder_builds_an_ingester_for_any_camera_url() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+        for (id, url, codec) in [
+            (1, "rtsp://127.0.0.1:1/main", CodecKind::H264),
+            (2, "not a url", CodecKind::H265),
+            (3, "", CodecKind::H264),
+        ] {
+            rec.add_camera_ingester(id, url, 5, 15, 512, 288, codec)
+                .unwrap_or_else(|e| panic!("camera {id} ({url:?}) got no ingester: {e}"));
+            assert!(rec.ingester_registry().read().contains_key(&id));
+            rec.remove_camera_ingester(id);
+        }
+    }
+
     #[tokio::test]
     async fn kind_reports_gstreamer() {
         let (store, _dir, clips_dir) = fixture().await;
@@ -2999,6 +3098,81 @@ mod tests {
         assert!(!second.is_shutdown(), "the rebuilt session must be live");
     }
 
+    /// The engine registers every camera's substream again on every
+    /// reconcile pass, so for a session that is running the call must be a
+    /// no-op: rebuilding it would cut the running frame source off its
+    /// substream on every pass.
+    #[tokio::test]
+    async fn a_running_analysis_session_is_left_alone_by_a_repeat_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new()).unwrap();
+        const SUB: &str = "rtsp://127.0.0.1:1/substream";
+
+        rec.set_camera_analysis_ingester(99, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session registers");
+        let first = rec.analysis_ingesters.read().get(&99).cloned().unwrap();
+        rec.set_camera_analysis_ingester(99, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("a repeat registration succeeds");
+        let second = rec.analysis_ingesters.read().get(&99).cloned().unwrap();
+        first.shutdown();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a repeat registration rebuilt a running analysis session"
+        );
+    }
+
+    /// A retry rebuilds a session the SPEC-069 fallback shut down while
+    /// analysis still reads the main stream, so the camera's decode counters
+    /// still describe the main stream and must survive it. The engine retries
+    /// on every pass while the substream stays refused; clearing them each
+    /// time wipes the main stream's `decoder_input_drops`, the losing-frames
+    /// signal. The running source resets them when it takes the new session
+    /// up.
+    #[tokio::test]
+    async fn a_retried_analysis_session_leaves_the_main_streams_decode_health_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let health = std::sync::Arc::new(crate::stats::DecodeHealthRegistry::default());
+        let rec = GstClipRecorder::new(store, dir.path(), HashMap::new())
+            .unwrap()
+            .with_decode_health(health.clone());
+        const SUB: &str = "rtsp://127.0.0.1:1/substream";
+
+        rec.set_camera_analysis_ingester(7, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session registers");
+        // The fallback shuts it down, and analysis reads the main stream,
+        // which drops access units.
+        rec.analysis_ingesters.read()[&7].shutdown();
+        for _ in 0..40 {
+            health.observe_decoder_input_drop(7);
+        }
+        rec.set_camera_analysis_ingester(7, Some(SUB), 15, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        rec.analysis_ingesters.read()[&7].shutdown();
+
+        assert_eq!(
+            health.snapshot(7).map(|h| h.decoder_input_drops),
+            Some(40),
+            "a retry cleared the main stream's decode counters"
+        );
+    }
+
     /// Decode health is keyed per camera, and BOTH sessions write to that one
     /// key — `observe_decoder_output` accumulates. Moving analysis between the
     /// main stream and the substream changes the geometry those counters
@@ -3060,6 +3234,691 @@ mod tests {
             0,
             "falling back to the main stream must not carry the substream's \
              counters onto a different geometry"
+        );
+    }
+
+    /// Camera 7's frame source, running, over a main session on a dead URL,
+    /// so every frame the source delivers came from a session's rgb tap, which
+    /// the test feeds. With `substream_at_start`, a substream session on a
+    /// dead URL that has delivered before is registered before the source is
+    /// built, so the source starts on it (SPEC-069's start path). The
+    /// recorder publishes decode health and analysis-stream status.
+    async fn a_running_source_over_a_silent_main_stream(
+        dir: &Path,
+        substream_at_start: bool,
+    ) -> (
+        GstClipRecorder,
+        Arc<PreRollIngester>,
+        tokio::sync::mpsc::Receiver<nexus_types::Frame>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let store = std::sync::Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let main = PreRollIngester::new_with_rgb(
+            7,
+            "rtsp://127.0.0.1:1/main",
+            0,
+            CodecKind::H264,
+            crate::decode::DecodeMode::default(),
+            15,
+            512,
+            288,
+            None,
+        )
+        .unwrap();
+        let rec = GstClipRecorder::new(store, dir, HashMap::from([(7, main.clone())]))
+            .unwrap()
+            .with_decode_health(Arc::new(crate::stats::DecodeHealthRegistry::default()))
+            .with_analysis_stream(Arc::new(crate::stats::AnalysisStreamRegistry::new()));
+        if substream_at_start {
+            rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+                .expect("analysis session registers");
+            rec.analysis_ingesters.read()[&7].mark_delivered();
+        }
+        let source = rec
+            .shared_frame_source(7)
+            .expect("camera 7 has a main session with an rgb tap");
+        let (tx, frames) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = source.run(tx).await;
+        });
+        (rec, main, frames, task)
+    }
+
+    /// The substream URL the source tests register: dead, so every frame a
+    /// session delivers is one the test sent.
+    const SUBSTREAM: &str = "rtsp://127.0.0.1:1/substream";
+
+    /// Poll `done` every 100 ms for up to `secs` seconds, blocking this worker
+    /// while the source runs on the other; whether it came to hold.
+    fn within(secs: f64, done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs_f64(secs);
+        loop {
+            if done() {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Send a frame into `tap` every `every` from a thread, until the
+    /// returned flag is cleared.
+    fn feed(
+        tap: tokio::sync::broadcast::Sender<nexus_types::Frame>,
+        every: Duration,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let feeding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let running = feeding.clone();
+        let feeder = std::thread::spawn(move || {
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = tap.send(rgb_frame());
+                std::thread::sleep(every);
+            }
+        });
+        (feeding, feeder)
+    }
+
+    fn rgb_frame() -> nexus_types::Frame {
+        nexus_types::Frame {
+            camera_id: 7,
+            frame_id: 0,
+            captured_at: chrono::Utc::now(),
+            captured_mono: std::time::Instant::now(),
+            width: 512,
+            height: 288,
+            format: nexus_types::PixelFormat::Rgb24,
+            data: Arc::new(vec![0; 512 * 288 * 3]),
+            trace_id: String::new(),
+        }
+    }
+
+    /// SPEC-069's retry: a substream session registered while a camera's
+    /// frame source already runs, after a fallback or a refused
+    /// registration, is what the engine's retry produces. The source must
+    /// take it up once it delivers a frame, read it from then on, and valve
+    /// the main stream's rgb tap off again, without being rebuilt; a source
+    /// that looks for its substream only when it is built never analyses it
+    /// again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_substream_session_registered_after_its_source_started_is_taken_up_once_it_delivers()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, mut frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+
+        rec.set_camera_analysis_ingester(
+            7,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .expect("analysis session registers");
+        let session = rec.analysis_ingesters.read()[&7].clone();
+        let tap = session.rgb_tap_sender().expect("rgb tap");
+        // The main stream's decode counters, which the registration leaves.
+        let health = rec.decode_health.clone().expect("decode health");
+        for _ in 0..40 {
+            health.observe_decoder_input_drop(7);
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let delivered = loop {
+            let _ = tap.send(rgb_frame());
+            if frames.try_recv().is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let valved = main.rgb_valve_is_closed();
+        let drops = health.snapshot(7).map_or(0, |h| h.decoder_input_drops);
+        // From then on analysis reads the session: its later frames reach the
+        // source's output too, not only the one that triggered the take-up.
+        while frames.try_recv().is_ok() {}
+        for _ in 0..6 {
+            let _ = tap.send(rgb_frame());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut later = 0;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while later < 6 && frames.recv().await.is_some() {
+                later += 1;
+            }
+        })
+        .await;
+        task.abort();
+        session.shutdown();
+        main.shutdown();
+        assert!(
+            delivered,
+            "the running source never took up the substream session registered after it started"
+        );
+        assert!(
+            valved,
+            "analysis reads the substream, so the main stream's rgb tap must be valved off"
+        );
+        assert_eq!(
+            later, 6,
+            "the taken-up session delivered 6 more frames and {later} reached analysis: the \
+             source must read the session it took up"
+        );
+        assert_eq!(
+            drops, 0,
+            "taking the substream up must reset the camera's decode counters, or the main \
+             stream's drops read as the substream losing frames"
+        );
+    }
+
+    /// Taking a substream session up zeroes the camera's decode counters,
+    /// which then describe another geometry, but must not retire the camera:
+    /// `DecodeHealthRegistry::clear` is for a stopped camera, whose next
+    /// ingester claims it back, and nothing claims a running camera back, so
+    /// the probes of the session it now reads would go unrecorded until it
+    /// restarts. Both registrations a running source takes up: a first one,
+    /// which the recorder resets for itself, and a retry of a session the
+    /// fallback shut down, which only the take-up resets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_taken_up_substream_session_keeps_recording_the_cameras_decode_health() {
+        for retry in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (rec, main, mut frames, task) =
+                a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+            if retry {
+                // A session the fallback shut down, which stays registered
+                // until a retry replaces it. Shut down before it is
+                // registered, so the running source never reads it.
+                let fell_back = PreRollIngester::new_with_rgb(
+                    7,
+                    SUBSTREAM,
+                    0,
+                    CodecKind::H264,
+                    crate::decode::DecodeMode::default(),
+                    15,
+                    512,
+                    288,
+                    None,
+                )
+                .unwrap();
+                fell_back.shutdown();
+                rec.analysis_ingesters.write().insert(7, fell_back);
+            }
+            rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+                .expect("analysis session registers");
+            let session = rec.analysis_ingesters.read()[&7].clone();
+            let tap = session.rgb_tap_sender().expect("rgb tap");
+            let health = rec.decode_health.clone().expect("decode health");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let delivered = loop {
+                let _ = tap.send(rgb_frame());
+                if frames.try_recv().is_ok() {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            // The taken-up session's decoder, as its probe records a frame.
+            health.observe_decoder_output(7);
+            let recorded = health.snapshot(7).map(|h| h.decoder_output_frames);
+            task.abort();
+            session.shutdown();
+            main.shutdown();
+            assert!(
+                delivered,
+                "retry={retry}: precondition: the running source never took the session up"
+            );
+            assert_eq!(
+                recorded,
+                Some(1),
+                "retry={retry}: taking the session up retired the camera, so the decode \
+                 health of the session analysis now reads is never recorded"
+            );
+        }
+    }
+
+    /// The same retry when the substream stays silent: the source must keep
+    /// analysing the main stream while it waits, and give the session up
+    /// (shut it down, and report it unavailable) once the first-frame grace
+    /// runs out, so a retry that fails leaves analysis on the main stream and
+    /// does not leave a second session reconnecting for the life of the
+    /// camera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_substream_session_is_given_up_while_the_main_stream_keeps_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, _frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+
+        rec.set_camera_analysis_ingester(
+            7,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .expect("analysis session registers");
+        let session = rec.analysis_ingesters.read()[&7].clone();
+        let tap = session.rgb_tap_sender().expect("rgb tap");
+        let health = rec.decode_health.clone().expect("decode health");
+        for _ in 0..40 {
+            health.observe_decoder_input_drop(7);
+        }
+
+        let wait = |what: &'static str, secs: u64, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+            let ok = loop {
+                if done() {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            (what, ok)
+        };
+        let watched = wait("the source never watched the new session", 15, &|| {
+            tap.receiver_count() > 0
+        });
+        let open_while_waiting = !main.rgb_valve_is_closed();
+        let given_up = wait("the silent session was never given up", 40, &|| {
+            session.is_shutdown()
+        });
+        let open_after = !main.rgb_valve_is_closed();
+        let drops = health.snapshot(7).map_or(0, |h| h.decoder_input_drops);
+        let status = rec
+            .analysis_stream
+            .as_ref()
+            .and_then(|r| r.snapshot(7))
+            .map(|s| (s.mode, s.state, s.reason));
+        task.abort();
+        session.shutdown();
+        main.shutdown();
+        for (what, ok) in [watched, given_up] {
+            assert!(ok, "{what}");
+        }
+        assert_eq!(
+            status,
+            Some((
+                "mainstream".to_string(),
+                "unavailable".to_string(),
+                Some("refused".to_string())
+            )),
+            "a given-up substream must be reported unavailable, with why"
+        );
+        assert!(
+            open_while_waiting,
+            "waiting on a silent substream valved the main stream off: analysis sees nothing"
+        );
+        assert!(
+            open_after,
+            "giving the substream up must leave analysis on the main stream"
+        );
+        assert_eq!(
+            drops, 40,
+            "analysis never left the main stream, so its decode counters must survive"
+        );
+    }
+
+    /// While a substream stays refused, each pass's retry is given up in turn
+    /// and the next pass registers another. A give-up must leave the source
+    /// watching the registry, so the next retry's session is read beside the
+    /// main stream and taken up once it delivers. A source that kept the
+    /// given-up session would judge the dead one on every tick and never look
+    /// again: each later retry would reconnect, or decode with no reader, for
+    /// the life of the camera, and analysis would stay on the main stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_registered_after_a_give_up_is_watched_and_taken_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, mut frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        let given_up = rec.analysis_ingesters.read()[&7].clone();
+        let gave_up = within(35.0, || given_up.is_shutdown());
+        // The next pass's retry.
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("the next retry registers");
+        let retry = rec.analysis_ingesters.read()[&7].clone();
+        let tap = retry.rgb_tap_sender().expect("rgb tap");
+        let watched = within(7.0, || tap.receiver_count() > 0);
+        let _ = tap.send(rgb_frame());
+        let delivered = tokio::time::timeout(Duration::from_millis(2500), frames.recv())
+            .await
+            .is_ok_and(|f| f.is_some());
+        let valved = main.rgb_valve_is_closed();
+
+        task.abort();
+        given_up.shutdown();
+        retry.shutdown();
+        main.shutdown();
+        assert!(
+            gave_up,
+            "precondition: the source never gave the first retry's silent session up"
+        );
+        assert!(
+            !Arc::ptr_eq(&given_up, &retry),
+            "the next retry must start a new session"
+        );
+        assert!(
+            watched,
+            "the source never watched the retry registered after it gave one up"
+        );
+        assert!(
+            delivered && valved,
+            "the next retry's session delivered, and the source did not take it up \
+             (frame delivered: {delivered}, main valve closed: {valved})"
+        );
+    }
+
+    /// The crowd resize rebuilds a camera's frame source while the engine's
+    /// retry of a refused substream is registered: a session that has not
+    /// delivered a frame. The rebuilt source must not start on it, since
+    /// that valves the main stream off and analyses nothing for the whole
+    /// first-frame grace; it starts on the main stream and leaves the retry
+    /// to its watch, as the source it replaced did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_rebuilt_while_an_unproven_retry_is_registered_keeps_analysing_the_main_stream(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, _main, _frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        // The crowd resize, then the supervisor's rebuild of its source.
+        assert!(
+            rec.resize_camera_rgb_tap(7, 640, 360).expect("resize"),
+            "precondition: the resize must ask for a rebuilt source"
+        );
+        task.abort();
+        let main = rec.ingesters.read()[&7].clone();
+        let retry = rec.analysis_ingesters.read()[&7].clone();
+        let source = rec.shared_frame_source(7).expect("the rebuilt source");
+        let (tx, mut frames) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = source.run(tx).await;
+        });
+        let (feeding, feeder) = feed(
+            main.rgb_tap_sender().expect("rgb tap"),
+            Duration::from_millis(50),
+        );
+        let reached = tokio::time::timeout(Duration::from_secs(3), frames.recv())
+            .await
+            .is_ok_and(|f| f.is_some());
+        let open = !main.rgb_valve_is_closed();
+        let reported = rec
+            .analysis_stream
+            .as_ref()
+            .and_then(|r| r.snapshot(7))
+            .map(|s| (s.mode, s.state));
+
+        feeding.store(false, std::sync::atomic::Ordering::SeqCst);
+        task.abort();
+        retry.shutdown();
+        main.shutdown();
+        let _ = feeder.join();
+        assert!(
+            reached,
+            "the main stream delivered and none of its frames reached analysis: the rebuilt \
+             source started on a retry's session that has never delivered"
+        );
+        assert!(
+            open,
+            "the rebuilt source valved the main stream off for a session that has never delivered"
+        );
+        assert_eq!(
+            reported,
+            Some(("substream".to_string(), "probing".to_string())),
+            "a substream session is registered and not yet judged: the camera is probing it, \
+             not reading the main stream by design"
+        );
+    }
+
+    /// The SPEC-069 start path, for the session it is right for: one that has
+    /// delivered. A running source takes a substream session up once it
+    /// delivers; a source the crowd resize then rebuilds starts on the
+    /// resized session, with the main stream valved off, rather than decoding
+    /// the main stream until the new session's first frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_rebuilt_after_its_substream_delivered_starts_on_the_substream_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, _main, mut frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("analysis session registers");
+        let session = rec.analysis_ingesters.read()[&7].clone();
+        let tap = session.rgb_tap_sender().expect("rgb tap");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let read = loop {
+            let _ = tap.send(rgb_frame());
+            if frames.try_recv().is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(
+            rec.resize_camera_rgb_tap(7, 640, 360).expect("resize"),
+            "precondition: the resize must ask for a rebuilt source"
+        );
+        task.abort();
+        let main = rec.ingesters.read()[&7].clone();
+        let resized = rec.analysis_ingesters.read()[&7].clone();
+        let source = rec.shared_frame_source(7).expect("the rebuilt source");
+        let (tx, mut frames) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = source.run(tx).await;
+        });
+        // Before the resized session sends anything: a source that started on
+        // the main stream would valve it off only once that session delivers.
+        let valved = within(2.0, || main.rgb_valve_is_closed());
+        let (feeding, feeder) = feed(
+            resized.rgb_tap_sender().expect("rgb tap"),
+            Duration::from_millis(50),
+        );
+        let reached = tokio::time::timeout(Duration::from_secs(3), frames.recv())
+            .await
+            .is_ok_and(|f| f.is_some());
+
+        feeding.store(false, std::sync::atomic::Ordering::SeqCst);
+        task.abort();
+        resized.shutdown();
+        main.shutdown();
+        let _ = feeder.join();
+        assert!(
+            read,
+            "precondition: the running source never read its substream"
+        );
+        assert!(
+            reached && valved,
+            "the rebuilt source did not start on the resized substream session (frame reached \
+             analysis: {reached}, main valve closed before it delivered: {valved})"
+        );
+    }
+
+    /// SPEC-069's retry from the state it exists for: a source that started
+    /// on its substream session, fell back from it, and has analysed the main
+    /// stream since. The session it fell back from stays in the recorder's
+    /// registry, shut down, until the engine's retry replaces it, and the
+    /// source must not read it again. The retry's session must then be taken
+    /// up in its place and judged from its own first frame: reported probing,
+    /// with the camera's decode counters reset, and a rate that counts its
+    /// frames, not the main stream's before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_after_a_fallback_is_taken_up_in_place_of_the_session_that_fell_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, _frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), true).await;
+        let status = rec.analysis_stream.clone().expect("analysis stream");
+        let health = rec.decode_health.clone().expect("decode health");
+        let fallen = rec.analysis_ingesters.read()[&7].clone();
+        let fallen_tap = fallen.rgb_tap_sender().expect("rgb tap");
+        let now = || status.snapshot(7).map(|s| (s.mode, s.state, s.reason));
+
+        // The source's own fallback: its session delivers nothing inside the
+        // first-frame grace. Then the main stream delivers, 20 frames a second.
+        let fell_back = within(35.0, || {
+            fallen.is_shutdown() && fallen_tap.receiver_count() == 0
+        });
+        let after_fallback = (main.rgb_valve_is_closed(), now());
+        let (feeding_main, main_feeder) = feed(
+            main.rgb_tap_sender().expect("rgb tap"),
+            Duration::from_millis(50),
+        );
+        // Two health ticks with only the fallen-back session in the registry.
+        let read_again = within(7.0, || fallen_tap.receiver_count() > 0);
+
+        // The engine's retry, and the main stream's decode counters it leaves.
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 15, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        let retry = rec.analysis_ingesters.read()[&7].clone();
+        let retry_tap = retry.rgb_tap_sender().expect("rgb tap");
+        for _ in 0..40 {
+            health.observe_decoder_input_drop(7);
+        }
+        let watched = within(7.0, || retry_tap.receiver_count() > 0);
+        let open_while_waiting = !main.rgb_valve_is_closed();
+        // One frame, just after the health tick that started reading the
+        // session, so the next tick is about 5 s away.
+        let _ = retry_tap.send(rgb_frame());
+        let taken_up = within(2.5, || {
+            main.rgb_valve_is_closed() && now().is_some_and(|(mode, _, _)| mode == "substream")
+        });
+        let drops = health.snapshot(7).map_or(0, |h| h.decoder_input_drops);
+        feeding_main.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Two health ticks later the rate reported is the retry's alone: one
+        // frame over at least 5 s.
+        std::thread::sleep(Duration::from_millis(10_500));
+        let judged = status.snapshot(7);
+
+        task.abort();
+        retry.shutdown();
+        main.shutdown();
+        let _ = main_feeder.join();
+        assert!(
+            fell_back,
+            "precondition: the source never fell back from its silent substream session"
+        );
+        assert_eq!(
+            after_fallback,
+            (
+                false,
+                Some((
+                    "mainstream".to_string(),
+                    "unavailable".to_string(),
+                    Some("refused".to_string())
+                ))
+            ),
+            "precondition: the fallback reopens the main valve and reports why"
+        );
+        assert!(
+            !read_again,
+            "the source read the session it fell back from again, which the fallback shut down"
+        );
+        assert!(
+            !Arc::ptr_eq(&fallen, &retry),
+            "the retry must start a new session"
+        );
+        assert!(watched, "the source never watched the retry's session");
+        assert!(
+            open_while_waiting,
+            "waiting on the retry's session valved the main stream off"
+        );
+        assert!(
+            taken_up,
+            "the retry's session delivered, and the source did not take it up at once, valve \
+             the main stream off and report it probing"
+        );
+        assert_eq!(
+            drops, 0,
+            "taking the retry's session up must reset the camera's decode counters"
+        );
+        let judged = judged.expect("status");
+        assert_eq!(
+            (judged.mode.as_str(), judged.state.as_str()),
+            ("substream", "active"),
+            "the retry's session, one frame in, is inside its rate settle"
+        );
+        assert!(
+            judged.fps < 1.0,
+            "the retry's session delivered one frame, but the source reported {} fps: it counted \
+             frames from before it took the session up",
+            judged.fps
+        );
+    }
+
+    /// A session taken up by a retry is the session analysis reads: judged at
+    /// its own advertised rate, and the one its fallback shuts down.
+    /// Registered at 30 fps and delivering about 10, it is below half its
+    /// rate, so once the rate settles the source must fall back from it and
+    /// shut it down. Judged at the default 15 fps it would pass; a fallback
+    /// that shut another session down would leave it decoding with no reader,
+    /// the double decode SPEC-069 exists to remove.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_taken_up_session_is_judged_at_its_own_rate_and_is_the_one_its_fallback_shuts_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rec, main, _frames, task) =
+            a_running_source_over_a_silent_main_stream(dir.path(), false).await;
+        let status = rec.analysis_stream.clone().expect("analysis stream");
+
+        rec.set_camera_analysis_ingester(7, Some(SUBSTREAM), 30, 512, 288, CodecKind::H264)
+            .expect("the retry registers");
+        let session = rec.analysis_ingesters.read()[&7].clone();
+        let tap = session.rgb_tap_sender().expect("rgb tap");
+        let watched = within(7.0, || tap.receiver_count() > 0);
+        let (feeding, feeder) = feed(tap, Duration::from_millis(100));
+        let taken_up = within(2.0, || main.rgb_valve_is_closed());
+        let fell_back = within(80.0, || session.is_shutdown());
+        let open_after = !main.rgb_valve_is_closed();
+        let after = status.snapshot(7).map(|s| (s.state, s.reason));
+
+        feeding.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = feeder.join();
+        task.abort();
+        session.shutdown();
+        main.shutdown();
+        assert!(
+            watched,
+            "precondition: the source never watched the session"
+        );
+        assert!(
+            taken_up,
+            "precondition: the source never took the session up"
+        );
+        assert!(
+            fell_back,
+            "the session analysis read delivered below half its advertised rate and was not \
+             shut down"
+        );
+        assert!(
+            open_after,
+            "falling back must reopen the main stream's rgb tap"
+        );
+        assert_eq!(
+            after,
+            Some(("unavailable".to_string(), Some("unhealthy".to_string()))),
+            "the fallback must report the session unhealthy"
         );
     }
 
@@ -3128,6 +3987,187 @@ mod tests {
             "the clip must be cut from the main session's codec (h264), not \
              the analysis session's (h265) — got {meta:?}"
         );
+    }
+
+    /// M_PERF_CROWD E2 under SPEC-069. While a camera's analysis session is
+    /// live, the supervisor reads its frames from that session, with the
+    /// main RGB tap valved off, and `SharedRtspSource` falls back to the
+    /// main tap without telling the supervisor. The crowd resize has to move
+    /// both taps to the new frame: without the analysis one the supervisor
+    /// keeps getting frames at the old size while it believes they are
+    /// downscaled, and without the main one a fallback does the same.
+    #[tokio::test]
+    async fn a_crowd_resize_moves_both_taps_while_an_analysis_session_is_live() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+        rec.add_camera_ingester(
+            1,
+            "rtsp://127.0.0.1:1/main",
+            5,
+            15,
+            1024,
+            576,
+            CodecKind::H264,
+        )
+        .expect("main ingester registers");
+        rec.set_camera_analysis_ingester(
+            1,
+            Some("rtsp://127.0.0.1:1/substream"),
+            15,
+            1024,
+            576,
+            CodecKind::H265,
+        )
+        .expect("analysis session registers");
+        let analysis_before = rec.analysis_ingesters.read().get(&1).cloned().unwrap();
+
+        assert!(
+            rec.resize_camera_rgb_tap(1, 512, 288).expect("resize"),
+            "the supervisor must be told to rebuild its source"
+        );
+
+        let analysis_after = rec.analysis_ingesters.read().get(&1).cloned().unwrap();
+        assert_eq!(
+            (analysis_after.rgb_w(), analysis_after.rgb_h()),
+            (512, 288),
+            "the analysis session is the tap the supervisor reads, so it takes the new dims"
+        );
+        assert!(
+            !analysis_after.is_shutdown(),
+            "the rebuilt session must be live"
+        );
+        assert!(
+            analysis_before.is_shutdown(),
+            "the old session must be shut down"
+        );
+        assert_eq!(analysis_after.url(), "rtsp://127.0.0.1:1/substream");
+        assert_eq!(analysis_after.codec(), CodecKind::H265);
+        assert_eq!(analysis_after.max_fps(), 15);
+        assert_eq!(analysis_after.pre_roll_secs(), 0);
+        let main_after = rec.ingesters.read().get(&1).cloned().unwrap();
+        assert_eq!(
+            (main_after.rgb_w(), main_after.rgb_h()),
+            (512, 288),
+            "the main tap is what a fallback reads, so it takes the new dims too"
+        );
+        assert_eq!(main_after.pre_roll_secs(), 5);
+    }
+
+    /// The other side of the rule above: with no analysis session, or one
+    /// the SPEC-069 fallback shut down, the supervisor reads the main tap,
+    /// so that is the tap the crowd resize rebuilds, and a dead analysis
+    /// session is left as it is.
+    #[tokio::test]
+    async fn a_crowd_resize_rebuilds_the_main_tap_when_no_live_analysis_session_feeds_the_supervisor(
+    ) {
+        for fallen_back in [false, true] {
+            let (store, _dir, clips_dir) = fixture().await;
+            let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+            rec.add_camera_ingester(
+                1,
+                "rtsp://127.0.0.1:1/main",
+                5,
+                15,
+                1024,
+                576,
+                CodecKind::H264,
+            )
+            .expect("main ingester registers");
+            if fallen_back {
+                rec.set_camera_analysis_ingester(
+                    1,
+                    Some("rtsp://127.0.0.1:1/substream"),
+                    15,
+                    1024,
+                    576,
+                    CodecKind::H265,
+                )
+                .expect("analysis session registers");
+                // What the fallback does to an unusable substream.
+                rec.analysis_ingesters.read().get(&1).unwrap().shutdown();
+            }
+            let analysis_before = rec.analysis_ingesters.read().get(&1).cloned();
+
+            assert!(rec.resize_camera_rgb_tap(1, 512, 288).expect("resize"));
+
+            let main_after = rec.ingesters.read().get(&1).cloned().unwrap();
+            assert_eq!(
+                (main_after.rgb_w(), main_after.rgb_h()),
+                (512, 288),
+                "fallen_back={fallen_back}: the main tap is the one the supervisor reads"
+            );
+            assert_eq!(main_after.pre_roll_secs(), 5);
+            let analysis_after = rec.analysis_ingesters.read().get(&1).cloned();
+            assert_eq!(
+                analysis_before.map(|a| Arc::as_ptr(&a)),
+                analysis_after.as_ref().map(Arc::as_ptr),
+                "fallen_back={fallen_back}: a dead analysis session must not be rebuilt"
+            );
+            if let Some(a) = analysis_after {
+                assert_eq!((a.rgb_w(), a.rgb_h()), (1024, 576));
+            }
+        }
+    }
+
+    /// E2 under SPEC-069's retry. The crowd resize moves the main tap to the
+    /// supervisor's new frame and leaves a session the fallback shut down as
+    /// it was, and the engine's retry passes the frame the camera started
+    /// at. The session the retry builds is the one the running source takes
+    /// up next, so it must come back at the main tap's frame, the one the
+    /// supervisor runs at, whether the fallback came before the resize or
+    /// after it: at the start's frame the supervisor would read frames of
+    /// one size while it believes they are another.
+    #[tokio::test]
+    async fn a_retried_analysis_session_is_built_at_the_frame_the_crowd_resize_left() {
+        for fell_back_first in [true, false] {
+            let (store, _dir, clips_dir) = fixture().await;
+            let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+            rec.add_camera_ingester(
+                1,
+                "rtsp://127.0.0.1:1/main",
+                5,
+                15,
+                1024,
+                576,
+                CodecKind::H264,
+            )
+            .expect("main ingester registers");
+            let register = || {
+                rec.set_camera_analysis_ingester(
+                    1,
+                    Some("rtsp://127.0.0.1:1/substream"),
+                    15,
+                    1024,
+                    576,
+                    CodecKind::H265,
+                )
+            };
+            register().expect("analysis session registers");
+            // What the fallback does to an unusable substream.
+            let fall_back = || rec.analysis_ingesters.read().get(&1).unwrap().shutdown();
+            if fell_back_first {
+                fall_back();
+            }
+            assert!(rec.resize_camera_rgb_tap(1, 512, 288).expect("resize"));
+            if !fell_back_first {
+                fall_back();
+            }
+
+            // The engine's retry, at the frame the camera started at.
+            register().expect("the retry registers");
+
+            let retried = rec.analysis_ingesters.read().get(&1).cloned().unwrap();
+            assert!(
+                !retried.is_shutdown(),
+                "fell_back_first={fell_back_first}: the retry must build a live session"
+            );
+            assert_eq!(
+                (retried.rgb_w(), retried.rgb_h()),
+                (512, 288),
+                "fell_back_first={fell_back_first}: the retried session must run at the main \
+                 tap's frame, which the crowd resize moved with the supervisor"
+            );
+        }
     }
 }
 

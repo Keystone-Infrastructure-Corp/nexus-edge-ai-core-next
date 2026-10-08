@@ -209,6 +209,10 @@ pub struct PreRollIngester {
     /// rebuild that reopened the valve would silently put a
     /// substream-analysing camera back on main-stream decode.
     rgb_valve_closed: Arc<AtomicBool>,
+    /// Whether this session has delivered a frame to analysis
+    /// ([`Self::mark_delivered`]). Only a session that has is handed to a
+    /// new frame source to start on (SPEC-069).
+    delivered: AtomicBool,
     /// Active GStreamer pipeline, populated by the supervisor each
     /// time it (re)builds a session. Drop sets it to NULL
     /// synchronously so the GObject ref cycle teardown doesn't
@@ -336,6 +340,11 @@ impl PreRollIngester {
         // has never rendered a real frame, which is a wrong-chain verdict
         // rather than a reaction to load (BUG-070).
         let task_force_software = Arc::new(AtomicBool::new(false));
+        // Before the task that installs this ingester's probes: a camera that
+        // `stop_camera` cleared stays retired until its next ingester claims it.
+        if let Some(health) = decode_health.as_ref() {
+            health.begin_session(camera_id);
+        }
         let stream_codec = Arc::new(Mutex::new(codec));
         let task_stream_codec = stream_codec.clone();
         let task_decode_health = decode_health;
@@ -369,6 +378,7 @@ impl PreRollIngester {
             live_tx,
             frame_tap,
             rgb_valve_closed,
+            delivered: AtomicBool::new(false),
             active_pipeline,
             shutdown,
             task: Mutex::new(Some(task)),
@@ -446,6 +456,13 @@ impl PreRollIngester {
     /// the per-camera supervisor task).
     pub fn subscribe_frames(&self) -> Option<broadcast::Receiver<Frame>> {
         self.frame_tap.as_ref().map(|t| t.tx.subscribe())
+    }
+
+    /// The RGB tap's sender, so a test can deliver frames the way a decoding
+    /// session would, and see who subscribed.
+    #[cfg(test)]
+    pub(crate) fn rgb_tap_sender(&self) -> Option<broadcast::Sender<Frame>> {
+        self.frame_tap.as_ref().map(|t| t.tx.clone())
     }
 
     /// Open or close the RGB tap's valve (SPEC-069). Closing it stops
@@ -547,6 +564,21 @@ impl PreRollIngester {
     /// the Arc, so they have to be able to ask.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Record that this session delivered a frame to analysis. Set by the
+    /// frame source that takes it up, and carried over by a crowd resize
+    /// that rebuilds the session at new dims.
+    pub fn mark_delivered(&self) {
+        self.delivered.store(true, Ordering::Release);
+    }
+
+    /// Has this session delivered a frame to analysis? A new frame source
+    /// starts on a substream session only when it has: one that has not may
+    /// be a retry of a refused substream, and starting on it valves the
+    /// main stream off for the whole first-frame grace (SPEC-069).
+    pub fn has_delivered(&self) -> bool {
+        self.delivered.load(Ordering::Acquire)
     }
 }
 
@@ -997,7 +1029,8 @@ async fn run_session(
                     let height = info.height() as usize;
                     let row_bytes = width * 3;
 
-                    if stride < row_bytes || plane.len() < stride * height {
+                    let Some(data) = crate::source::pack_rgb_rows(plane, stride, width, height)
+                    else {
                         error!(
                             camera_id,
                             stride,
@@ -1007,17 +1040,7 @@ async fn run_session(
                             "rgb appsink buffer geometry inconsistent with caps"
                         );
                         return Err(gst::FlowError::Error);
-                    }
-
-                    let mut data = Vec::with_capacity(row_bytes * height);
-                    if stride == row_bytes {
-                        data.extend_from_slice(&plane[..row_bytes * height]);
-                    } else {
-                        for y in 0..height {
-                            let start = y * stride;
-                            data.extend_from_slice(&plane[start..start + row_bytes]);
-                        }
-                    }
+                    };
 
                     // Runtime decode-health guard, armed for the whole
                     // session. A decoder is chosen on element *presence*,
@@ -1155,6 +1178,7 @@ async fn run_session(
                         camera_id,
                         frame_id,
                         captured_at: Utc::now(),
+                        captured_mono: Instant::now(),
                         width: info.width(),
                         height: info.height(),
                         format: PixelFormat::Rgb24,

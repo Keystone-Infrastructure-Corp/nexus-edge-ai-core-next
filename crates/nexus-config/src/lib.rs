@@ -228,6 +228,10 @@ impl Config {
                 "inference.backend = 'pool' requires inference.workers >= 1".into(),
             ));
         }
+        self.inference
+            .model
+            .validate_finite()
+            .map_err(|why| ConfigError::Validation(format!("inference.model {why}")))?;
         for cam in &self.cameras {
             if cam.id <= 0 {
                 return Err(ConfigError::Validation(format!(
@@ -246,6 +250,8 @@ impl Config {
                     cam.ingest.url.scheme()
                 )));
             }
+            cam.validate_finite()
+                .map_err(|why| ConfigError::Validation(format!("camera {}: {why}", cam.id)))?;
             // M_TILE_REINFER (G1) — ban tile cascade on ensemble
             // detectors. Per-member tile budgeting is out of scope
             // for v1; see docs/edge-core/M_TILE_REINFER.md (cloud).
@@ -1444,6 +1450,18 @@ impl ModelConfig {
         for member in &mut self.members {
             member.remap_legacy_shapes();
         }
+    }
+
+    /// Refuse a `score_threshold`, here or in an ensemble member, that is
+    /// not a finite number. See [`CameraConfig::validate_finite`].
+    pub fn validate_finite(&self) -> Result<(), String> {
+        if !self.score_threshold.is_finite() {
+            return Err(format!(
+                "score_threshold must be a finite number (got {})",
+                self.score_threshold
+            ));
+        }
+        self.members.iter().try_for_each(Self::validate_finite)
     }
 }
 
@@ -3223,6 +3241,37 @@ pub struct CameraConfig {
     pub zones: Vec<ZoneConfig>,
 }
 
+impl CameraConfig {
+    /// Refuse a float that is not a finite number: `inf`, `nan`, or a number
+    /// beyond f32's range, which parses to infinity. JSON has no literal for
+    /// one, so `serde_json` stores it as `null`, and no later read can decode
+    /// a camera row holding that: the engine cannot apply the camera's stored
+    /// configuration, and every read of the whole camera list, such as the
+    /// console's, fails. Every write that takes a camera from outside checks
+    /// this first: the config file at load, and the admin API's and fleet
+    /// apply's camera writes.
+    pub fn validate_finite(&self) -> Result<(), String> {
+        for zone in &self.zones {
+            if zone
+                .polygon
+                .iter()
+                .any(|(x, y)| !x.is_finite() || !y.is_finite())
+            {
+                return Err(format!(
+                    "zone '{}' has a polygon vertex that is not a finite number",
+                    zone.id
+                ));
+            }
+        }
+        match &self.detector.model_override {
+            Some(model) => model
+                .validate_finite()
+                .map_err(|why| format!("model_override {why}")),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZoneConfig {
@@ -3389,7 +3438,7 @@ impl RemoteAccessConfig {
 /// `[reid]` block. Disabled by default. When `enabled = true`, the
 /// per-camera supervisor runs the configured [`nexus_reid::Extractor`]
 /// on each stable track once on first-stable and again every
-/// `emit_interval_s` of wall-clock, publishing `entity_sighting`
+/// `emit_interval_s` of capture time, publishing `entity_sighting`
 /// envelopes through the cloud tunnel. See
 /// `crates/nexus-pipeline/src/entity_sighting.rs` for the per-track
 /// FSM and `WEDGE_PLAN.md §4` for the wire contract.
@@ -4698,5 +4747,80 @@ tile_trigger = 12
 "#;
         cfg.cameras.push(toml::from_str(cam_src).unwrap());
         cfg.validate().unwrap();
+    }
+
+    /// The config file seeds the store's camera rows, and a camera number
+    /// JSON has no literal for (TOML's `inf` and `nan`, or `1e39`, which is
+    /// beyond f32's range and parses to infinity) is stored as `null`, which
+    /// no later read of the camera's row can decode. So load refuses one,
+    /// wherever a camera carries a float.
+    #[test]
+    fn a_camera_number_json_cannot_hold_is_refused_at_load() {
+        let zone = |vertex: &str| {
+            format!(
+                "[[zones]]\nid = \"z1\"\nname = \"door\"\npolygon = [{vertex}, [0.1, 0.1], [0.2, 0.9]]\n"
+            )
+        };
+        for (field, cam_src) in [
+            ("zone x", zone("[inf, 0.5]")),
+            ("zone y beyond f32", zone("[0.5, 1e39]")),
+            (
+                "model override threshold",
+                "[model_override]\nscore_threshold = nan\n".to_string(),
+            ),
+            (
+                "ensemble member threshold",
+                "[model_override]\nkind = \"ensemble\"\n\n[[model_override.members]]\n\
+                 score_threshold = -inf\n"
+                    .to_string(),
+            ),
+        ] {
+            let mut cfg = Config::default();
+            cfg.cameras.push(
+                toml::from_str(&format!(
+                    "id = 1\nname = \"c1\"\nurl = \"rtsp://example/cam\"\n\n{cam_src}"
+                ))
+                .unwrap(),
+            );
+            let err = cfg.validate().expect_err(&format!(
+                "{field}: a number JSON cannot hold must be refused"
+            ));
+            assert!(
+                err.to_string().contains("camera 1") && err.to_string().contains("finite"),
+                "{field}: {err}"
+            );
+        }
+
+        let mut cfg = Config::default();
+        cfg.cameras.push(
+            toml::from_str(&format!(
+                "id = 1\nname = \"c1\"\nurl = \"rtsp://example/cam\"\n\n{}\n\
+                 [model_override]\nscore_threshold = 0.4\n",
+                zone("[0.5, 0.5]"),
+            ))
+            .unwrap(),
+        );
+        cfg.validate()
+            .expect("finite numbers in every camera float must validate");
+    }
+
+    /// The default model is stored too: `PUT /admin/inference/model` merges
+    /// its patch onto the boot model and persists the result as JSON, where
+    /// a threshold JSON cannot hold becomes `null` and the saved model no
+    /// longer reads back. So load refuses one there as well.
+    #[test]
+    fn a_default_model_number_json_cannot_hold_is_refused_at_load() {
+        let mut cfg = Config::default();
+        cfg.inference.model.members.push(ModelConfig {
+            score_threshold: f32::NAN,
+            ..ModelConfig::default()
+        });
+        let err = cfg
+            .validate()
+            .expect_err("a member threshold JSON cannot hold must be refused");
+        assert!(
+            err.to_string().contains("inference.model") && err.to_string().contains("finite"),
+            "{err}"
+        );
     }
 }

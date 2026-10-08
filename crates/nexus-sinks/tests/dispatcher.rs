@@ -22,6 +22,8 @@
 //! | `malformed_sink_id_marks_dead`             | poison-pill outbox row          |
 //! | `alert_clip_wait_does_not_consume_retry_budget` | clip wait ≠ delivery attempt |
 //! | `future_dated_event_does_not_wait_forever` | clock-skew wait bound           |
+//! | `backlogged_event_still_waits_the_full_clip_link_grace` | grace runs from the row |
+//! | `backlogged_event_still_waits_the_full_alert_clip_build_grace` | grace runs from the row |
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -118,6 +120,7 @@ struct ScriptedSink {
     calls: AtomicUsize,
     wants_clip: bool,
     script: parking_lot::Mutex<Vec<Result<(), SinkError>>>,
+    delivered_captured_at: parking_lot::Mutex<Vec<DateTime<Utc>>>,
 }
 
 impl ScriptedSink {
@@ -132,6 +135,7 @@ impl ScriptedSink {
             calls: AtomicUsize::new(0),
             wants_clip: false,
             script: parking_lot::Mutex::new(script),
+            delivered_captured_at: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -158,8 +162,9 @@ impl AlertSink for ScriptedSink {
     fn wants_clip(&self) -> bool {
         self.wants_clip
     }
-    async fn deliver(&self, _event: &AlertEvent) -> Result<(), SinkError> {
+    async fn deliver(&self, event: &AlertEvent) -> Result<(), SinkError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.delivered_captured_at.lock().push(event.captured_at);
         let mut script = self.script.lock();
         script
             .pop()
@@ -627,7 +632,7 @@ async fn no_clip_linked_within_grace_schedules_retry() {
     let registry = Arc::new(SinkRegistry::new());
     registry.replace(vec![sink.clone()]);
 
-    // sample_alert's captured_at is Utc::now() → inside the grace.
+    // The row was written just now → inside the grace.
     let (_alert, row) = enqueue_one(&store, 1, "rule.clip", id.as_str()).await;
     let before = Utc::now();
     dispatcher::process_row(
@@ -680,8 +685,72 @@ async fn no_clip_linked_after_grace_delivers() {
     let registry = Arc::new(SinkRegistry::new());
     registry.replace(vec![sink.clone()]);
 
-    // Backdate the alert well past CLIP_LINK_GRACE_SECS (10 s).
+    // The frame was captured 30 s ago; the grace runs from the row, so
+    // backdate the row well past CLIP_LINK_GRACE_SECS (10 s) as well.
     let mut alert = sample_alert(1, "rule.clip.old");
+    alert.captured_at = Utc::now() - chrono::Duration::seconds(30);
+    store
+        .record_event_and_enqueue(&alert, &[id.as_str()])
+        .await
+        .expect("enqueue");
+    let mut row = store
+        .outbox_for_event(&alert.event_id.to_string())
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    row.created_at = Utc::now() - chrono::Duration::seconds(30);
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        None,
+        None,
+        None,
+        TEST_DELIVER_TIMEOUT,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(sink.calls(), 1, "delivers clip-less after grace elapses");
+    assert_eq!(
+        *sink.delivered_captured_at.lock(),
+        vec![alert.captured_at],
+        "the delivered alert still carries the frame's capture time"
+    );
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Sent);
+}
+
+/// Open + close a clip, link it to the given event, and return the
+/// clip's relative hot path. `hot_present` controls whether the row
+/// keeps a hot pointer (soft-evicted clips have `hot_path = NULL`).
+#[tokio::test]
+async fn backlogged_event_still_waits_the_full_clip_link_grace() {
+    // The frame was captured well before the rule fired (a backlogged
+    // pipeline), but the outbox row was only just written. The clip link
+    // follows the row by a few frames, so the link grace runs from the
+    // row, not from the frame: this alert must still wait.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    let id = SinkId::new("webhook", "clip-backlog").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let mut alert = sample_alert(1, "rule.clip.backlog");
     alert.captured_at = Utc::now() - chrono::Duration::seconds(30);
     store
         .record_event_and_enqueue(&alert, &[id.as_str()])
@@ -707,7 +776,11 @@ async fn no_clip_linked_after_grace_delivers() {
     )
     .await;
 
-    assert_eq!(sink.calls(), 1, "delivers clip-less after grace elapses");
+    assert_eq!(
+        sink.calls(),
+        0,
+        "a row written just now must wait for its clip link however old its frame is"
+    );
     let after = store
         .outbox_for_event(&row.event_id)
         .await
@@ -715,12 +788,14 @@ async fn no_clip_linked_after_grace_delivers() {
         .into_iter()
         .next()
         .unwrap();
-    assert_eq!(after.status, OutboxStatus::Sent);
+    assert_eq!(after.status, OutboxStatus::Pending);
+    assert!(after
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("clip link pending"));
 }
 
-/// Open + close a clip, link it to the given event, and return the
-/// clip's relative hot path. `hot_present` controls whether the row
-/// keeps a hot pointer (soft-evicted clips have `hot_path = NULL`).
 async fn link_closed_clip(store: &Arc<Store>, event_id: &str, hot_present: bool) -> String {
     let rel = format!("cam1/{event_id}.mp4");
     let clip_id = store
@@ -940,19 +1015,19 @@ async fn clip_soft_evicted_after_grace_delivers_clipless() {
     let registry = Arc::new(SinkRegistry::new());
     registry.replace(vec![sink.clone()]);
 
-    let mut alert = sample_alert(1, "rule.clip.evicted.old");
-    alert.captured_at = Utc::now() - chrono::Duration::seconds(30);
+    let alert = sample_alert(1, "rule.clip.evicted.old");
     store
         .record_event_and_enqueue(&alert, &[id.as_str()])
         .await
         .expect("enqueue");
-    let row = store
+    let mut row = store
         .outbox_for_event(&alert.event_id.to_string())
         .await
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
+    row.created_at = Utc::now() - chrono::Duration::seconds(30);
     link_closed_clip(&store, &alert.event_id.to_string(), false).await;
 
     dispatcher::process_row(
@@ -1047,6 +1122,82 @@ async fn alert_clip_building_within_grace_retries() {
 }
 
 #[tokio::test]
+async fn backlogged_event_still_waits_the_full_alert_clip_build_grace() {
+    // The builder's cap starts when the build does, after the row is
+    // written, so the build grace runs from the row. A frame captured
+    // longer ago than ALERT_CLIP_BUILD_GRACE_SECS on a row written just
+    // now must still wait for its building alert clip.
+    let (store, _tmp) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    let clips_dir = tempfile::tempdir().expect("clips tmp");
+
+    let id = SinkId::new("webhook", "ac-backlog").unwrap();
+    let sink = Arc::new(ScriptedSink::new(id.clone(), vec![Ok(())]).wanting_clip());
+    let registry = Arc::new(SinkRegistry::new());
+    registry.replace(vec![sink.clone()]);
+
+    let mut alert = sample_alert(1, "rule.ac.backlog");
+    alert.captured_at = Utc::now() - chrono::Duration::seconds(60);
+    store
+        .record_event_and_enqueue(&alert, &[id.as_str()])
+        .await
+        .expect("enqueue");
+    let row = store
+        .outbox_for_event(&alert.event_id.to_string())
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let acid = store
+        .insert_alert_clip(&NewAlertClip {
+            camera_id: 1,
+            started_at: Utc::now(),
+            path: "alert/1/x/backlog.mp4".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .link_event_alert_clip(&alert.event_id.to_string(), acid)
+        .await
+        .unwrap();
+
+    dispatcher::process_row(
+        &store,
+        &registry,
+        &AllowAllPolicy,
+        Some(clips_dir.path()),
+        None,
+        None,
+        TEST_DELIVER_TIMEOUT,
+        row.clone(),
+    )
+    .await;
+
+    assert_eq!(
+        sink.calls(),
+        0,
+        "a row written just now must wait for its alert clip however old its frame is"
+    );
+    let after = store
+        .outbox_for_event(&row.event_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.status, OutboxStatus::Pending);
+    assert!(after
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("still building"));
+}
+
+#[tokio::test]
 async fn alert_clip_wait_does_not_consume_retry_budget() {
     // Regression: a slow alert-clip build used to burn the SAME
     // `attempts` counter that delivery retries draw from. Field data
@@ -1123,7 +1274,7 @@ async fn alert_clip_wait_does_not_consume_retry_budget() {
 #[tokio::test]
 async fn future_dated_event_does_not_wait_forever() {
     // Clip waits are bounded ONLY by wall-clock age now, so a
-    // future-dated `captured_at` (clock step / NTP correction) must not
+    // future-dated `created_at` (clock step / NTP correction) must not
     // read as "forever young" and wedge the alarm. A negative age is
     // treated as past the grace window: deliver clip-less rather than
     // never deliver.
@@ -1139,19 +1290,19 @@ async fn future_dated_event_does_not_wait_forever() {
     let registry = Arc::new(SinkRegistry::new());
     registry.replace(vec![sink.clone()]);
 
-    let mut alert = sample_alert(1, "rule.ac.future");
-    alert.captured_at = Utc::now() + chrono::Duration::seconds(3600);
+    let alert = sample_alert(1, "rule.ac.future");
     store
         .record_event_and_enqueue(&alert, &[id.as_str()])
         .await
         .expect("enqueue");
-    let row = store
+    let mut row = store
         .outbox_for_event(&alert.event_id.to_string())
         .await
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
+    row.created_at = Utc::now() + chrono::Duration::seconds(3600);
     let acid = store
         .insert_alert_clip(&NewAlertClip {
             camera_id: 1,

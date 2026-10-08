@@ -18,11 +18,11 @@
 //! is being shipped as a separate follow-up; see ARCHITECTURE.md.
 //!
 //! This module is pure: no I/O, no async, no clock — the supervisor
-//! pumps it once per frame with `(frame.captured_at, has_live_motion)`
+//! pumps it once per frame with `(frame.captured_mono, has_live_motion)`
 //! and acts on the returned [`PostRollAction`]. That keeps it trivially
 //! testable without a tokio runtime or virtual time.
 
-use chrono::{DateTime, Duration, Utc};
+use std::time::{Duration, Instant};
 
 /// Outcome of a single [`PostRoll::tick`] call. The supervisor uses
 /// these to drive `recorder.close` calls.
@@ -45,7 +45,7 @@ pub enum PostRollAction {
 #[derive(Debug)]
 pub struct PostRoll {
     grace: Duration,
-    pending_close_at: Option<DateTime<Utc>>,
+    pending_close_at: Option<Instant>,
 }
 
 impl PostRoll {
@@ -53,20 +53,21 @@ impl PostRoll {
     /// returns [`PostRollAction::CloseNow`] (matches pre-B3 behaviour).
     pub fn new(grace_secs: u32) -> Self {
         Self {
-            grace: Duration::seconds(i64::from(grace_secs)),
+            grace: Duration::from_secs(u64::from(grace_secs)),
             pending_close_at: None,
         }
     }
 
     /// Pump one frame's lifecycle decision.
     ///
-    /// * `now` — frame's `captured_at` timestamp. Using the frame's own
-    ///   timestamp (not `Utc::now()`) keeps the grace window correct
-    ///   under stalled / replayed streams.
+    /// * `now` — frame's `captured_mono` stamp. Using the frame's own
+    ///   stamp (not the time it is processed) keeps the grace window
+    ///   correct under stalled streams, and a monotonic one keeps a step
+    ///   of the wall clock from ending or extending it.
     /// * `has_live_motion` — true if `live_track_count(camera_id) > 0`
     ///   at this frame. (Born-this-frame counts as live; the supervisor
     ///   already opened the clip before reaching here.)
-    pub fn tick(&mut self, now: DateTime<Utc>, has_live_motion: bool) -> PostRollAction {
+    pub fn tick(&mut self, now: Instant, has_live_motion: bool) -> PostRollAction {
         if has_live_motion {
             // Cancel any pending close — motion is back inside the
             // grace window.
@@ -115,10 +116,10 @@ impl PostRoll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    fn t(secs: u64) -> Instant {
+        static T0: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+        *T0 + Duration::from_secs(secs)
     }
 
     #[test]

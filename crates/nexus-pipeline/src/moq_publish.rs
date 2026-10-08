@@ -102,7 +102,7 @@ impl MoqSession {
 
         // `moqsink` is a runtime plugin, not a build dep — fail cleanly (and
         // fail-open at the caller) when it isn't installed.
-        if gst::ElementFactory::find("moqsink").is_none() {
+        if !Self::plugin_available() {
             return Err(MoqError::PluginMissing);
         }
 
@@ -163,6 +163,13 @@ impl MoqSession {
 }
 
 impl MoqSession {
+    /// Whether `moqsink` is registered, without which [`Self::new_publisher`]
+    /// fails with [`MoqError::PluginMissing`]. The engine's heartbeat asks the
+    /// same question before it advertises the MoQ HD transport.
+    pub fn plugin_available() -> bool {
+        gst::init().is_ok() && gst::ElementFactory::find("moqsink").is_some()
+    }
+
     /// True once the NAL feed task has ended (broadcast closed, EOS, or the
     /// relay consumer stalled past the shared push timeout). Mirrors
     /// [`crate::WebRtcSession::feed_ended`] so the manager-side reaper can drop
@@ -195,7 +202,7 @@ fn build_publish_url(relay_url: &str, token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_publish_url;
+    use super::{build_publish_url, gst, MoqSession};
 
     #[test]
     fn publish_url_appends_jwt_at_root() {
@@ -210,6 +217,17 @@ mod tests {
         assert_eq!(
             build_publish_url("https://relay.example.com/", "tok"),
             "https://relay.example.com/?jwt=tok"
+        );
+    }
+
+    /// The heartbeat advertises the MoQ HD transport on this probe, so it must
+    /// say yes exactly when GStreamer can make the element the publisher needs.
+    #[test]
+    fn the_plugin_probe_matches_whether_moqsink_can_be_made() {
+        gst::init().expect("gstreamer init");
+        assert_eq!(
+            MoqSession::plugin_available(),
+            gst::ElementFactory::make("moqsink").build().is_ok()
         );
     }
 }

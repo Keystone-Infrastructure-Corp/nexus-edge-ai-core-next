@@ -18,12 +18,13 @@
 //!   a 16-tile wall cannot show 15 fps × 16 streams, and inference on frames
 //!   nobody will ever see is pure waste.
 //!
-//! Both bounds are **time-based**, derived from `frame.captured_at`. An
-//! earlier revision counted frames instead (`keyframe_every: 30`), which made
-//! the baseline silently depend on the source rate — at the default 15 fps
-//! ingest cap that yielded a 0.5 fps floor, 4× below the intended 2 fps, and
-//! it was the direct cause of the live-view wall appearing to replay one
-//! frame for seconds at a time on quiet cameras.
+//! Both bounds are **time-based**, derived from `frame.captured_mono`, so a
+//! step of the wall clock moves neither. An earlier revision counted frames
+//! instead (`keyframe_every: 30`), which made the baseline silently depend
+//! on the source rate — at the default 15 fps ingest cap that yielded a
+//! 0.5 fps floor, 4× below the intended 2 fps, and it was the direct cause
+//! of the live-view wall appearing to replay one frame for seconds at a
+//! time on quiet cameras.
 //!
 //! Between the two bounds the motion test decides: downsample the Y plane
 //! (or RGB→Y) by 8×, count per-pixel absolute deltas against the last
@@ -31,7 +32,8 @@
 //! threshold. Roughly 0.3 ms per 1080p frame on a recent CPU — and it is
 //! skipped entirely for frames rejected by the ceiling.
 
-use chrono::{DateTime, Utc};
+use std::time::Instant;
+
 use nexus_types::{Frame, PixelFormat};
 
 /// Baseline floor: pass at least one frame every 500 ms (2 fps) regardless
@@ -48,7 +50,7 @@ pub struct MotionGate {
     pixel_pct_threshold: f32,
     baseline_gap_ms: i64,
     motion_gap_ms: i64,
-    last_pass: Option<DateTime<Utc>>,
+    last_pass: Option<Instant>,
 }
 
 impl MotionGate {
@@ -64,19 +66,11 @@ impl MotionGate {
     }
 
     pub fn allow(&mut self, frame: &Frame) -> bool {
-        let now = frame.captured_at;
+        let now = frame.captured_mono;
         let gap_ms = match self.last_pass {
-            Some(prev) => (now - prev).num_milliseconds(),
+            Some(prev) => now.saturating_duration_since(prev).as_millis() as i64,
             None => i64::MAX,
         };
-
-        // Source clock went backwards (camera reconnect, stream restart).
-        // Treat it as a fresh start rather than stalling the camera until
-        // the clock catches back up to the old high-water mark.
-        if gap_ms < 0 {
-            self.record_pass(frame, now);
-            return true;
-        }
 
         // Ceiling. The cheapest possible rejection: no downsample, no delta
         // scan.
@@ -118,7 +112,7 @@ impl MotionGate {
         moved
     }
 
-    fn record_pass(&mut self, frame: &Frame, now: DateTime<Utc>) {
+    fn record_pass(&mut self, frame: &Frame, now: Instant) {
         self.prev_y = Some(downsample_y(frame));
         self.last_pass = Some(now);
     }
@@ -176,6 +170,7 @@ fn downsample_y(frame: &Frame) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use std::sync::Arc;
 
     /// The ingest default (`CameraIngest::max_fps` falls back to 15), i.e.
@@ -183,12 +178,17 @@ mod tests {
     const SOURCE_FPS: i64 = 15;
     const FRAME_INTERVAL_US: i64 = 1_000_000 / SOURCE_FPS;
 
+    static MONO_BASE: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+
     fn frame_at(i: i64, luma: u8) -> Frame {
         let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         Frame {
             camera_id: 1,
             frame_id: i as u64,
             captured_at: base + chrono::Duration::microseconds(i * FRAME_INTERVAL_US),
+            captured_mono: *MONO_BASE
+                + std::time::Duration::from_micros((i * FRAME_INTERVAL_US) as u64),
             width: 64,
             height: 64,
             format: PixelFormat::Rgb24,
@@ -264,20 +264,32 @@ mod tests {
         );
     }
 
+    /// Both bounds are measured on the monotonic capture stamp, so a step of
+    /// the wall clock either way neither lets a frame past the ceiling nor
+    /// stalls the camera until the wall clock catches up.
     #[test]
-    fn a_backwards_source_clock_does_not_stall_the_camera() {
-        let mut gate = MotionGate::new();
-        assert!(gate.allow(&static_frame(1000)), "first frame always passes");
-
-        // Camera reconnects and its clock restarts well behind the old
-        // high-water mark. Without the negative-gap escape the gate would
-        // reject everything until the clock climbed back past it.
-        assert!(
-            gate.allow(&static_frame(0)),
-            "a backwards clock must re-baseline, not block"
-        );
-        // ...and the new baseline is honoured from there.
-        assert!(!gate.allow(&static_frame(1)), "ceiling applies after reset");
+    fn a_wall_clock_step_does_not_move_the_rate_bounds() {
+        for step_ms in [3_600_000, -3_600_000] {
+            let stepped = |i| {
+                let mut f = static_frame(i);
+                f.captured_at += chrono::Duration::milliseconds(step_ms);
+                f
+            };
+            let mut gate = MotionGate::new();
+            assert!(gate.allow(&static_frame(0)), "first frame always passes");
+            assert!(
+                !gate.allow(&stepped(1)),
+                "{step_ms} ms step: 67 ms later is inside the ceiling"
+            );
+            assert!(
+                !gate.allow(&stepped(7)),
+                "{step_ms} ms step: 467 ms later is short of the floor"
+            );
+            assert!(
+                gate.allow(&stepped(8)),
+                "{step_ms} ms step: 533 ms later reaches the floor"
+            );
+        }
     }
 
     /// A frame whose buffer is shorter than its declared geometry, or whose

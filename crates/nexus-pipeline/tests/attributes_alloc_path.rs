@@ -87,6 +87,9 @@ const VEHICLES: usize = 4;
 const WARMUP: u64 = 30;
 const FRAMES: u64 = 100;
 
+static MONO0: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
 fn frame(i: u64) -> Frame {
     Frame {
         camera_id: 1,
@@ -94,6 +97,7 @@ fn frame(i: u64) -> Frame {
         captured_at: Utc
             .timestamp_millis_opt(1_700_000_000_000 + i as i64 * 33)
             .unwrap(),
+        captured_mono: *MONO0 + std::time::Duration::from_millis(i * 33),
         width: W,
         height: H,
         format: PixelFormat::Rgb24,
@@ -166,8 +170,8 @@ fn rule(id: &str, when: &str) -> RuleConfig {
             severity: "low".into(),
         },
         gates: RuleGates::default(),
-        // ByteTrack's age_ms is wall-clock and this loop runs far faster than
-        // real time; the default 500 ms would skip every object.
+        // Evaluate every object from its first frame; this bound is about
+        // binding cost, not the age gate.
         debounce: RuleDebounce {
             min_track_age_ms: 0,
             ..Default::default()
@@ -195,7 +199,7 @@ fn scenario() -> Vec<(Frame, Vec<TrackedObject>)> {
     let mut out = Vec::new();
     for i in 0..WARMUP + FRAMES {
         let f = frame(i);
-        let mut tracked = tracker.update(detections(i));
+        let mut tracked = tracker.update(detections(i), f.captured_mono);
         annotator.annotate(&f, &zones, &[], &mut tracked);
         if i >= WARMUP {
             assert_eq!(tracked.len(), PERSONS + VEHICLES);
@@ -224,7 +228,19 @@ fn rule_stage(eval: &RuleEvaluator, strip: bool) -> (u64, u64) {
     let mut objects = 0;
     for (f, tracked) in scenario() {
         let input = if strip { stripped(&tracked) } else { tracked };
-        let (events, n) = allocs(|| eval.evaluate(1, f.frame_id, &trace_id, W, H, &zones, &input));
+        let (events, n) = allocs(|| {
+            eval.evaluate(
+                1,
+                f.frame_id,
+                f.captured_at,
+                f.captured_mono,
+                &trace_id,
+                W,
+                H,
+                &zones,
+                &input,
+            )
+        });
         assert!(events.is_empty());
         total += n;
         objects += input.len() as u64;
@@ -232,8 +248,12 @@ fn rule_stage(eval: &RuleEvaluator, strip: bool) -> (u64, u64) {
     (total, objects)
 }
 
+/// The bound sits about halfway between the measured cost and one more
+/// allocation per object, so one extra allocation per object fails it by
+/// about half an allocation, not by the few hundredths that a per-rule,
+/// per-frame cost spread over the objects happens to add.
 #[test]
-fn each_extra_rule_adds_at_most_eight_allocations_per_object() {
+fn each_extra_rule_adds_at_most_five_and_a_half_allocations_per_object() {
     let (one, objects) = rule_stage(&never_matching(1), false);
     let (four, _) = rule_stage(&never_matching(4), false);
     let per_extra_rule = (four - one) as f64 / (3 * objects) as f64;
@@ -243,9 +263,10 @@ fn each_extra_rule_adds_at_most_eight_allocations_per_object() {
         four as f64 / objects as f64
     );
     assert!(
-        per_extra_rule <= 8.0,
+        per_extra_rule <= 5.5,
         "each extra rule costs {per_extra_rule:.2} allocations per object per frame; \
-         the object binding or the CEL Context is being rebuilt per rule"
+         the object binding, the CEL Context or the rule's debounce key is being \
+         rebuilt per object"
     );
 }
 
@@ -266,6 +287,42 @@ fn attributes_are_converted_once_per_object_not_once_per_rule() {
     assert!(
         (four - one).abs() <= 2.0,
         "attribute conversion scales with rule count ({one:.2} -> {four:.2} per object)"
+    );
+}
+
+/// Every attribute name is bound to a CEL key without building one per
+/// object: the annotator stamps the same names on every object on every
+/// frame, and building each cost a `String` and an `Arc`. What is left is
+/// the map itself and the values' own strings and lists. The bound sits
+/// under the cost of one name built again on the 4 vehicles of 20 objects
+/// (0.4 per object).
+#[test]
+fn binding_an_objects_attributes_costs_at_most_thirteen_and_a_half_allocations() {
+    let (full, objects) = rule_stage(&never_matching(1), false);
+    let (bare, _) = rule_stage(&never_matching(1), true);
+    let per_object = (full as f64 - bare as f64) / objects as f64;
+    println!("attributes bound: {per_object:.2} allocs/object/frame");
+    assert!(
+        per_object <= 13.5,
+        "binding an object's attributes costs {per_object:.2} allocations per frame; \
+         an attribute name's CEL key is being built per object"
+    );
+}
+
+/// The binding's 13 constant keys (`label`, `box`, `x1`, ...) are built once
+/// and shared. Allocating them per object costs 26 allocations (a `String`
+/// and an `Arc` each); on an object with no attributes, what is left is the
+/// binding's maps and label plus one rule's evaluation. The bound sits about
+/// halfway to one more allocation per object, as above.
+#[test]
+fn an_object_without_attributes_costs_at_most_fifteen_and_a_half_allocations_with_one_rule() {
+    let (n, objects) = rule_stage(&never_matching(1), true);
+    let per_object = n as f64 / objects as f64;
+    println!("rules x1, attributes stripped: {per_object:.2} allocs/object/frame");
+    assert!(
+        per_object <= 15.5,
+        "one rule costs {per_object:.2} allocations per bare object per frame; \
+         the binding's constant keys are being allocated per object"
     );
 }
 
@@ -291,10 +348,22 @@ fn whole_path_census_with_two_rules() {
     for i in 0..WARMUP + FRAMES {
         let f = frame(i);
         let dets = detections(i);
-        let (mut tracked, a) = allocs(|| tracker.update(dets));
+        let (mut tracked, a) = allocs(|| tracker.update(dets, f.captured_mono));
         let ((), b) = allocs(|| annotator.annotate(&f, &zones, &[], &mut tracked));
-        let (decisions, c) = allocs(|| emitter.tick(1, &tracked, f.captured_at));
-        let (events, d) = allocs(|| evaluator.evaluate(1, i, &trace_id, W, H, &zones, &tracked));
+        let (decisions, c) = allocs(|| emitter.tick(1, &tracked, f.captured_at, f.captured_mono));
+        let (events, d) = allocs(|| {
+            evaluator.evaluate(
+                1,
+                i,
+                f.captured_at,
+                f.captured_mono,
+                &trace_id,
+                W,
+                H,
+                &zones,
+                &tracked,
+            )
+        });
         drop((decisions, events));
         if i >= WARMUP {
             for (s, n) in stage.iter_mut().zip([a, b, c, d]) {

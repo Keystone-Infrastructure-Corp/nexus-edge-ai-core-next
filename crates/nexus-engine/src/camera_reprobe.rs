@@ -198,17 +198,11 @@ fn parse_wxh(s: &str) -> Option<(u32, u32)> {
 /// Pixel count of the supervisor frame this camera's analysis will run
 /// at, which is the floor a substream has to clear.
 ///
-/// Uses the camera's own overrides when it has them and the default
-/// preset's 512 px otherwise. That default is *not* read from
-/// `inference.model.input_width`, which the admin API does not carry —
-/// so a deployment that raised its global detector width could see a
-/// proposal ranked against 512 rather than its true frame. The effect
-/// is confined to which of two substreams is preferred and to the
-/// `below_detector_input` advisory; the reconciler still builds the
-/// session at the camera's real supervisor size.
-pub fn supervisor_pixels_for(cam: &CameraConfig) -> u64 {
-    const DEFAULT_DETECTOR_WIDTH: u32 = 512;
-    let (w, h) = crate::reconciler::supervisor_dims_for(cam, DEFAULT_DETECTOR_WIDTH);
+/// `default_detector_width` is the engine's `inference.model.input_width`,
+/// the width a camera with no model override analyses at: the same
+/// value the reconciler sizes the camera's supervisor with.
+pub fn supervisor_pixels_for(cam: &CameraConfig, default_detector_width: u32) -> u64 {
+    let (w, h) = crate::reconciler::supervisor_dims_for(cam, default_detector_width);
     u64::from(w) * u64::from(h)
 }
 
@@ -382,17 +376,30 @@ mod tests {
     }
 
     /// The floor a substream is ranked against: the camera's supervisor
-    /// frame, with the 512 px default detector width standing in for the
-    /// engine's configured one, which the admin API does not carry.
+    /// frame, at the engine's default detector width when the camera has
+    /// no model override.
     #[test]
-    fn the_substream_floor_is_the_supervisor_frame_at_the_512_px_default() {
+    fn the_substream_floor_is_the_supervisor_frame_at_the_engine_default_width() {
         let shaped = |shape: &dyn Fn(&mut CameraConfig)| {
             let mut c = cam(None);
             shape(&mut c);
             c
         };
-        for (what, cam, want) in [
-            ("the 512 px default", cam(None), 512 * 288),
+        for (what, cam, default_width, want) in [
+            ("the 512 px default", cam(None), 512, 512 * 288),
+            ("a raised default", cam(None), 1024, 1024 * 576),
+            (
+                "a model override, over a raised default",
+                shaped(&|c| {
+                    c.detector.model_override = Some(nexus_config::ModelConfig {
+                        kind: "mock".into(),
+                        input_width: 640,
+                        ..Default::default()
+                    })
+                }),
+                1024,
+                640 * 360,
+            ),
             (
                 "a model override",
                 shaped(&|c| {
@@ -402,20 +409,23 @@ mod tests {
                         ..Default::default()
                     })
                 }),
+                512,
                 640 * 360,
             ),
             (
                 "a supervisor_width below the detector input",
                 shaped(&|c| c.behavior.supervisor_width = Some(256)),
+                512,
                 512 * 288,
             ),
             (
                 "a supervisor_width above the detector input",
                 shaped(&|c| c.behavior.supervisor_width = Some(1024)),
+                512,
                 1024 * 576,
             ),
         ] {
-            assert_eq!(supervisor_pixels_for(&cam), want, "{what}");
+            assert_eq!(supervisor_pixels_for(&cam, default_width), want, "{what}");
         }
     }
 }

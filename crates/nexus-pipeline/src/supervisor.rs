@@ -5,7 +5,6 @@
 //! that opens child spans for `decode/gate/infer/track/rules`. That's how
 //! the `trace_id` field on [`nexus_types::Frame`] is actually backed.
 
-use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -92,48 +91,8 @@ async fn write_alert_snapshot(
     let id = event_id.to_string();
     let label = label.to_string();
     let join = tokio::task::spawn_blocking(move || {
-        use image::ImageEncoder as _;
         let path = dir.join(format!("{id}.jpg"));
-        // The frame buffer is shared (Arc<Frame>); copy it so the
-        // bbox stroke doesn't mutate pixels other subscribers see.
-        let mut pixels = frame.data.to_vec();
-        if let Some(bbox) = bbox {
-            let (stroke, radius) = crate::overlay::box_metrics(frame.width, frame.height);
-            crate::overlay::draw_box_rgb24(
-                &mut pixels,
-                frame.width,
-                frame.height,
-                bbox.x1.round() as i64,
-                bbox.y1.round() as i64,
-                bbox.x2.round() as i64,
-                bbox.y2.round() as i64,
-                stroke,
-                radius,
-                crate::overlay::ALERT_RGB,
-            );
-            // Label chip ("person 0.96") anchored to the box top-left,
-            // burned into the JPEG so the email / SureView copies show
-            // it too — identical to the burned-in alert clip.
-            let chip = crate::overlay::label_text(&label, confidence);
-            crate::overlay::draw_label_chip_rgb24(
-                &mut pixels,
-                frame.width,
-                frame.height,
-                bbox.x1.round() as i64,
-                bbox.y1.round() as i64,
-                &chip,
-                crate::alert_clip::label_px(frame.width),
-            );
-        }
-        let mut out = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, SNAPSHOT_JPEG_QUALITY)
-            .write_image(
-                &pixels[..],
-                frame.width,
-                frame.height,
-                image::ExtendedColorType::Rgb8,
-            )
-            .map_err(|e| format!("jpeg encode: {e}"))?;
+        let out = alert_snapshot_jpeg(&frame, bbox, &label, confidence)?;
         std::fs::write(&path, &out).map_err(|e| format!("write {}: {e}", path.display()))?;
         Ok::<PathBuf, String>(path)
     })
@@ -151,24 +110,62 @@ async fn write_alert_snapshot(
     }
 }
 
+/// Burn the alert's box and label chip into a copy of `frame` and
+/// JPEG-encode it. Blocking; [`write_alert_snapshot`] runs it on the
+/// blocking pool.
+fn alert_snapshot_jpeg(
+    frame: &Frame,
+    bbox: Option<BBox>,
+    label: &str,
+    confidence: Option<f32>,
+) -> Result<Vec<u8>, String> {
+    // The frame buffer is shared (Arc<Frame>); copy it so the
+    // bbox stroke doesn't mutate pixels other subscribers see.
+    let mut pixels = frame.data.to_vec();
+    if let Some(bbox) = bbox {
+        let (stroke, radius) = crate::overlay::box_metrics(frame.width, frame.height);
+        crate::overlay::draw_box_rgb24(
+            &mut pixels,
+            frame.width,
+            frame.height,
+            bbox.x1.round() as i64,
+            bbox.y1.round() as i64,
+            bbox.x2.round() as i64,
+            bbox.y2.round() as i64,
+            stroke,
+            radius,
+            crate::overlay::ALERT_RGB,
+        );
+        // Label chip ("person 0.96") anchored to the box top-left,
+        // burned into the JPEG so the email / SureView copies show
+        // it too — identical to the burned-in alert clip.
+        let chip = crate::overlay::label_text(label, confidence);
+        crate::overlay::draw_label_chip_rgb24(
+            &mut pixels,
+            frame.width,
+            frame.height,
+            bbox.x1.round() as i64,
+            bbox.y1.round() as i64,
+            &chip,
+            crate::alert_clip::label_px(frame.width),
+        );
+    }
+    crate::jpeg::encode_rgb24(&pixels, frame.width, frame.height, SNAPSHOT_JPEG_QUALITY)
+        .map_err(|e| format!("jpeg encode: {e}"))
+}
+
 /// The non-static tracks that rules, sightings, alert-clip boxes and the
-/// motion lifecycle see. Borrows the frame's single tracked set whenever
-/// nothing is filtered out, so the common frame makes no copy of it.
+/// motion lifecycle see, borrowed from the frame's single tracked set. The
+/// moving tracks are not contiguous in that set, whose order the cache and
+/// `FRAME_METADATA` publish, so a static track is skipped rather than the
+/// rest copied into a slice of their own.
 fn dynamic_tracks(
     tracked: &[TrackedObject],
     static_filter_active: bool,
-) -> Cow<'_, [TrackedObject]> {
-    if static_filter_active && tracked.iter().any(is_object_static) {
-        Cow::Owned(
-            tracked
-                .iter()
-                .filter(|t| !is_object_static(t))
-                .cloned()
-                .collect(),
-        )
-    } else {
-        Cow::Borrowed(tracked)
-    }
+) -> impl Iterator<Item = &TrackedObject> + Clone {
+    tracked
+        .iter()
+        .filter(move |t| !(static_filter_active && is_object_static(t)))
 }
 
 /// Most alert snapshots one frame encodes at once. Each holds its own copy
@@ -232,13 +229,15 @@ pub struct CameraHandle {
     pub task: JoinHandle<()>,
 }
 
-/// Aborts its task on drop.
+/// Aborts its task on drop, so a task the supervisor spawns ends with it —
+/// dropping a bare `JoinHandle` detaches the task instead.
 ///
-/// Every `FrameSource` learns the camera is gone from `tx.closed()`, which
-/// only resolves once the matching `Receiver` is dropped. The live-view tap
-/// holds that receiver, so it has to die with the supervisor task — dropping
-/// a bare `JoinHandle` detaches it instead, leaving the source decoding at
-/// full rate forever (BUG-136).
+/// The live-view tap holds the source's `Receiver`, so it has to die with the
+/// supervisor task, or a source that watches `tx.closed()` would decode at
+/// full rate forever (BUG-136). The source task is held the same way, because
+/// not every source watches: `VirtualSource` never looks, and a
+/// `SharedRtspSource` parked on a shut-down ingester never wakes to. Detached,
+/// each outlived its supervisor, one per camera restart (BUG-223).
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -503,12 +502,12 @@ async fn run_camera(
                 "failed to create alert snapshot dir (snapshots disabled for this camera): {e}"
             );
         }
-        // Wall-clock anchor for the currently-open clip. Used to
-        // enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
+        // Monotonic capture stamp of the frame the open clip started on.
+        // Used to enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
         // open clip exceeds 5min we force-close it and (if motion
         // is still active on this frame) the next Born will open a
         // fresh one. Reset to None on every close.
-        let mut clip_opened_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut clip_opened_at: Option<std::time::Instant> = None;
         // Byte cap on the in-flight clip. A corrupt camera H.264
         // stream can balloon a single short clip to multiple GiB
         // long before the 5-min duration cap fires, and such a clip
@@ -542,11 +541,11 @@ async fn run_camera(
             current_supervisor_h,
         );
         let cam_id = cfg.id;
-        let source_task = tokio::spawn(async move {
+        let mut source_task = AbortOnDrop(tokio::spawn(async move {
             if let Err(e) = source.run(tx).await {
                 warn!(camera_id = cam_id, "frame source ended: {e}");
             }
-        });
+        }));
 
         // Live-view tap (BUG-136). Publishes every decoded frame to the
         // cache so the cloud wall runs at decode rate instead of inheriting
@@ -557,6 +556,7 @@ async fn run_camera(
         // a saturated box, which also mis-stamps everything keyed on
         // `frame.captured_at`.
         let epoch = cache.begin_session(cam_id);
+        let stats_epoch = stats.begin_session(cam_id);
         let (latest_tx, mut latest_rx) = watch::channel::<Option<Frame>>(None);
         let tap_cache = cache.clone();
         let tap_stats = stats.clone();
@@ -565,7 +565,13 @@ async fn run_camera(
                 // The true "received from the source" point, which is what
                 // `observe_frame` is documented to measure; inside the
                 // analysis loop it measured inference rate instead.
-                tap_stats.observe_frame(cam_id, frame.captured_at, frame.width, frame.height);
+                tap_stats.observe_frame(
+                    cam_id,
+                    stats_epoch,
+                    frame.captured_at,
+                    frame.width,
+                    frame.height,
+                );
                 tap_cache.put_frame(cam_id, epoch, Arc::new(frame.clone()));
                 if latest_tx.send(Some(frame)).is_err() {
                     break;
@@ -665,7 +671,8 @@ async fn run_camera(
                 // one.
                 let mut force_reopen_after_rotation = false;
                 if let (Some(handle), Some(opened_at)) = (current_clip, clip_opened_at) {
-                    let age_ms = (frame.captured_at - opened_at).num_milliseconds();
+                    let age_ms =
+                        frame.captured_mono.saturating_duration_since(opened_at).as_millis() as i64;
                     let duration_exceeded = age_ms >= MAX_CLIP_DURATION_MS;
 
                     // Byte-cap guard. Sampled every SIZE_STAT_INTERVAL_FRAMES
@@ -928,7 +935,7 @@ async fn run_camera(
 
                 let mut tracked = {
                     let _g = info_span!("frame.track", tracker = tracker.name()).entered();
-                    tracker.update(detections)
+                    tracker.update(detections, frame.captured_mono)
                 };
                 // M_PERF_CROWD Phase E1 — feed the post-tracker
                 // tracked-object count back into the skip policy's EMA so
@@ -941,7 +948,7 @@ async fn run_camera(
                 // current frame we already committed to a detector above.
                 // No-op when the policy is disabled.
                 detector_downscaled =
-                    crowd_hysteresis.observe(tracked.len(), std::time::Instant::now());
+                    crowd_hysteresis.observe(tracked.len(), frame.captured_mono);
                 // M_PERF_CROWD Phase E2 — sustained-crowd supervisor
                 // frame downscale. Independent hysteresis (asymmetric
                 // up/down windows) over the same tracked-object EMA. On
@@ -957,7 +964,7 @@ async fn run_camera(
                 // no RGB-tap ingester for this camera (e.g. stub
                 // recorder in tests).
                 let want_supervisor_downscale =
-                    supervisor_hysteresis.observe(tracked.len(), std::time::Instant::now());
+                    supervisor_hysteresis.observe(tracked.len(), frame.captured_mono);
                 if want_supervisor_downscale != supervisor_downscaled {
                     if let Some(downscale_w) = cfg.behavior.supervisor_downscale_to_width {
                         let (target_w, target_h) = if want_supervisor_downscale {
@@ -1129,8 +1136,7 @@ async fn run_camera(
                 // still appear in the L7 cache + FRAME_METADATA above
                 // so the live viewer can draw it (de-emphasised) and
                 // so the operator can see the static-suppression in
-                // action. When nothing is static this borrows the shared
-                // set instead of copying it.
+                // action. This borrows the shared set; it never copies it.
                 let dynamic_tracked = dynamic_tracks(&tracked_arc, static_filter.is_some());
 
                 // M-Alert-Clip: feed this frame's frame-aligned detection
@@ -1148,7 +1154,7 @@ async fn run_camera(
                 // overlapping survivors yields one box per physical object.
                 if alert_clips_enabled {
                     let mut boxes: Vec<crate::alert_clip::BurnBox> = dynamic_tracked
-                        .iter()
+                        .clone()
                         .filter_map(|t| {
                             let b = t.detection_bbox?;
                             Some(crate::alert_clip::BurnBox {
@@ -1177,7 +1183,7 @@ async fn run_camera(
                 // as rule eval + motion lifecycle).
                 sighting_scheduler.tick(
                     &frame_arc,
-                    &dynamic_tracked,
+                    dynamic_tracked.clone(),
                     frame.captured_at,
                     sighting_hook.as_ref(),
                 );
@@ -1187,11 +1193,13 @@ async fn run_camera(
                     evaluator.evaluate(
                         cfg.id,
                         frame_id,
+                        frame.captured_at,
+                        frame.captured_mono,
                         &trace_id,
                         frame.width,
                         frame.height,
                         &zones,
-                        &dynamic_tracked,
+                        dynamic_tracked.clone(),
                     )
                 };
                 // Alert snapshots — persist a JPEG of the frame that fired
@@ -1304,8 +1312,9 @@ async fn run_camera(
                 // via in_scope(); we don't hold an EnteredSpan guard
                 // across recorder/store awaits because EnteredSpan is
                 // !Send and would break tokio::spawn.
-                let decisions = info_span!("frame.motion")
-                    .in_scope(|| emitter.tick(cfg.id, &dynamic_tracked, frame.captured_at));
+                let decisions = info_span!("frame.motion").in_scope(|| {
+                    emitter.tick(cfg.id, dynamic_tracked, frame.captured_at, frame.captured_mono)
+                });
                 for d in &decisions {
                     let should_open = current_clip.is_none()
                         && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);
@@ -1321,7 +1330,7 @@ async fn run_camera(
                         {
                             Ok(handle) => {
                                 current_clip = Some(handle);
-                                clip_opened_at = Some(d.captured_at);
+                                clip_opened_at = Some(frame.captured_mono);
                                 // One-shot — only the first decision in
                                 // this frame triggers the post-rotation
                                 // reopen.
@@ -1385,7 +1394,7 @@ async fn run_camera(
                                     "alert-triggered motion clip opened (no live motion track)"
                                 );
                                 current_clip = Some(handle);
-                                clip_opened_at = Some(frame.captured_at);
+                                clip_opened_at = Some(frame.captured_mono);
                             }
                             Err(RecorderError::Refused) => {
                                 // Watermark sampler has paused new clips
@@ -1433,7 +1442,7 @@ async fn run_camera(
                 // next frame.
                 let alert_kept_alive = record_motion_clip_on_alert && !events_to_link.is_empty();
                 let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
-                let action = post_roll.tick(frame.captured_at, has_live_motion);
+                let action = post_roll.tick(frame.captured_mono, has_live_motion);
                 if matches!(action, PostRollAction::CloseNow) {
                     if let Some(handle) = current_clip.take() {
                         if let Err(e) = recorder
@@ -1467,8 +1476,8 @@ async fn run_camera(
         // ingester; we abort the now-stale source task, drain it,
         // and continue the outer loop to spawn a fresh source that
         // will subscribe to the new shared RGB tap.
-        source_task.abort();
-        let _ = source_task.await;
+        source_task.0.abort();
+        let _ = (&mut source_task.0).await;
         if !rebuild_source {
             break 'outer;
         }
@@ -1592,7 +1601,7 @@ async fn insert_motion_decision(
         "{}".to_string()
     } else {
         serde_json::to_string(&d.attributes)
-            .expect("serde_json::Map<String, Value> is infallible to serialize")
+            .expect("string-keyed JSON attributes are infallible to serialize")
     };
     let new = NewMotionEvent {
         camera_id: d.camera_id,
@@ -1613,7 +1622,7 @@ mod tests {
     use super::*;
 
     fn track(id: u64, is_static: bool) -> TrackedObject {
-        let mut attributes = serde_json::Map::new();
+        let mut attributes = nexus_types::Attributes::new();
         if is_static {
             attributes.insert(
                 nexus_tracker::STATIC_ATTRIBUTE_KEY.into(),
@@ -1662,25 +1671,35 @@ mod tests {
     #[test]
     fn dynamic_tracks_borrows_when_nothing_is_filtered() {
         let tracked = vec![track(1, false), track(2, false)];
-        let view = dynamic_tracks(&tracked, false);
-        assert!(matches!(view, Cow::Borrowed(_)), "no filter: must borrow");
-        assert!(std::ptr::eq(view.as_ptr(), tracked.as_ptr()));
+        let view: Vec<&TrackedObject> = dynamic_tracks(&tracked, false).collect();
+        assert!(
+            std::ptr::eq(view[0], &tracked[0]) && std::ptr::eq(view[1], &tracked[1]),
+            "no filter: must borrow"
+        );
 
         // Filter active but no track is static: nothing to drop, no copy.
-        let view = dynamic_tracks(&tracked, true);
+        let view: Vec<&TrackedObject> = dynamic_tracks(&tracked, true).collect();
         assert!(
-            matches!(view, Cow::Borrowed(_)),
+            std::ptr::eq(view[0], &tracked[0]) && std::ptr::eq(view[1], &tracked[1]),
             "no static track: must borrow"
         );
+    }
+
+    /// Parking-lot mode with a static track in view: the consumers must
+    /// still read the frame's own moving tracks, in order, not copies.
+    #[test]
+    fn dynamic_tracks_borrows_the_moving_tracks_when_a_static_is_filtered() {
+        let tracked = vec![track(1, false), track(2, true), track(3, false)];
+        let view: Vec<&TrackedObject> = dynamic_tracks(&tracked, true).collect();
+        assert_eq!(view.len(), 2);
+        assert!(std::ptr::eq(view[0], &tracked[0]), "track 1 was copied");
+        assert!(std::ptr::eq(view[1], &tracked[2]), "track 3 was copied");
     }
 
     #[test]
     fn dynamic_tracks_drops_static_tracks() {
         let tracked = vec![track(1, false), track(2, true), track(3, false)];
-        let ids: Vec<u64> = dynamic_tracks(&tracked, true)
-            .iter()
-            .map(|t| t.track_id)
-            .collect();
+        let ids: Vec<u64> = dynamic_tracks(&tracked, true).map(|t| t.track_id).collect();
         assert_eq!(ids, vec![1, 3]);
     }
 
@@ -1738,5 +1757,41 @@ mod tests {
         assert!(events[0].artifacts.snapshot.is_some());
         assert!(events[1].artifacts.snapshot.is_none());
         assert!(events[2].artifacts.snapshot.is_some());
+    }
+
+    /// `image`'s `JpegEncoder` asserts that the buffer is exactly `w*h*3`,
+    /// and the release profile aborts on a panic, so a wrongly sized frame
+    /// must lose its snapshot rather than end the engine. The padded case is
+    /// GStreamer's RGB row stride at 642 px (1926 bytes of pixels in a
+    /// 1928-byte row). Called directly because on the blocking pool a panic
+    /// comes back as the same `None` an error does.
+    #[test]
+    fn a_mis_sized_frame_fails_the_snapshot_instead_of_panicking() {
+        let frame = |len: usize| Frame {
+            camera_id: 1,
+            frame_id: 1,
+            captured_at: chrono::Utc::now(),
+            captured_mono: std::time::Instant::now(),
+            width: 642,
+            height: 361,
+            format: PixelFormat::Rgb24,
+            data: Arc::new(vec![0u8; len]),
+            trace_id: String::new(),
+        };
+        let bbox = Some(BBox {
+            x1: 10.0,
+            y1: 10.0,
+            x2: 100.0,
+            y2: 100.0,
+        });
+        let jpeg = alert_snapshot_jpeg(&frame(642 * 361 * 3), bbox, "person", Some(0.9))
+            .expect("an exact-size frame encodes");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        for len in [642 * 361 * 3 - 1, 1928 * 361] {
+            assert!(
+                alert_snapshot_jpeg(&frame(len), bbox, "person", Some(0.9)).is_err(),
+                "{len} bytes"
+            );
+        }
     }
 }

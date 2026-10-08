@@ -28,10 +28,10 @@
 //! `motion_events.clip_id NOT NULL` invariant requires.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use nexus_types::{BBox, CameraId, TrackId, TrackedObject};
+use nexus_types::{Attributes, BBox, CameraId, TrackId, TrackedObject};
 
 /// Lifecycle kind for a [`MotionDecision`]. Mirrors
 /// `nexus_store::MotionEventKind` deliberately so the supervisor's
@@ -60,7 +60,7 @@ pub struct MotionDecision {
     /// moment of the lifecycle event. Cloned so the supervisor's
     /// downstream mutation of the live `TrackedObject` doesn't
     /// rewrite history.
-    pub attributes: serde_json::Map<String, serde_json::Value>,
+    pub attributes: Attributes,
 }
 
 /// Per-track bookkeeping kept alive between frames so Died can carry
@@ -70,15 +70,15 @@ pub struct MotionDecision {
 /// on the live view).
 #[derive(Debug, Clone)]
 struct TrackSnapshot {
-    /// Last time we emitted Updated, or None if only Born has been
-    /// emitted so far. Used to gate sampling.
-    last_emitted_at: Option<DateTime<Utc>>,
+    /// Capture stamp (`captured_mono`) of the last Updated, or None if
+    /// only Born has been emitted so far. Used to gate sampling.
+    last_emitted_at: Option<Instant>,
     /// Last bbox/label/confidence/attributes seen for the track.
     /// These are what Died will publish.
     last_bbox: BBox,
     last_label: String,
     last_confidence: f32,
-    last_attributes: serde_json::Map<String, serde_json::Value>,
+    last_attributes: Attributes,
 }
 
 /// Shared state for one camera's open tracks.
@@ -127,19 +127,22 @@ impl MotionEventEmitter {
     /// (sorted by track_id), then Updated, then Died. The supervisor
     /// can reuse this ordering when batching writes.
     ///
-    /// `now` is the frame's `captured_at`; passing wall-clock would
-    /// also work but `captured_at` is what the rest of the pipeline
-    /// uses so the rows line up time-wise with `events.captured_at`.
-    pub fn tick(
+    /// `now` is the frame's `captured_at`, stamped on every decision so
+    /// the rows line up time-wise with `events.captured_at`. `now_mono`
+    /// is its `captured_mono`, which the sampling interval is measured
+    /// on so a step of the wall clock does not move it.
+    pub fn tick<'a>(
         &mut self,
         camera_id: CameraId,
-        tracked: &[TrackedObject],
+        tracked: impl IntoIterator<Item = &'a TrackedObject, IntoIter: Clone>,
         now: DateTime<Utc>,
+        now_mono: Instant,
     ) -> Vec<MotionDecision> {
+        let tracked = tracked.into_iter();
         let interval = self.update_interval();
         let state = self.cameras.entry(camera_id).or_default();
 
-        let live: HashSet<TrackId> = tracked.iter().map(|t| t.track_id).collect();
+        let live: HashSet<TrackId> = tracked.clone().map(|t| t.track_id).collect();
         let mut born = Vec::new();
         let mut updated = Vec::new();
 
@@ -163,13 +166,7 @@ impl MotionEventEmitter {
                     let due = match (interval, last_emit) {
                         (None, _) => false,
                         (Some(_), None) => false,
-                        (Some(int), Some(prev)) => {
-                            // chrono Duration -> std::time::Duration
-                            // is fallible only for negative spans;
-                            // use total_microseconds to stay precise.
-                            let gap = (now - prev).num_microseconds().unwrap_or(i64::MAX);
-                            gap >= int.as_micros() as i64
-                        }
+                        (Some(int), Some(prev)) => now_mono.saturating_duration_since(prev) >= int,
                     };
                     // Refresh the last-known snapshot every frame so
                     // Died always carries the most-recent bbox /
@@ -182,7 +179,7 @@ impl MotionEventEmitter {
                     snap.last_confidence = t.confidence;
                     assign_attributes(&mut snap.last_attributes, &t.attributes);
                     if due {
-                        snap.last_emitted_at = Some(now);
+                        snap.last_emitted_at = Some(now_mono);
                         updated.push(decision(camera_id, MotionKind::Updated, now, t));
                     }
                 }
@@ -190,12 +187,12 @@ impl MotionEventEmitter {
         }
 
         // Promote Born tracks to "ready for Updated after one full
-        // interval has elapsed" by stamping them at `now` AFTER the
+        // interval has elapsed" by stamping them at `now_mono` AFTER the
         // born event went out. Doing this in a second pass keeps the
         // first-sample-interval-after-born grace period.
         for d in &born {
             if let Some(snap) = state.tracks.get_mut(&d.track_id) {
-                snap.last_emitted_at = Some(now);
+                snap.last_emitted_at = Some(now_mono);
             }
         }
 
@@ -255,10 +252,7 @@ impl MotionEventEmitter {
 
 /// Make `dst` equal to `src`, keeping `dst`'s keys and string / array
 /// buffers wherever they already fit.
-fn assign_attributes(
-    dst: &mut serde_json::Map<String, serde_json::Value>,
-    src: &serde_json::Map<String, serde_json::Value>,
-) {
+fn assign_attributes(dst: &mut Attributes, src: &Attributes) {
     dst.retain(|k, _| src.contains_key(k));
     for (k, v) in src {
         match dst.get_mut(k) {
@@ -314,8 +308,26 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, 13, 22, 0, 0).unwrap()
     }
 
+    /// The monotonic stamp read beside wall time `at`, for a clock that was
+    /// never stepped.
+    fn mono(at: DateTime<Utc>) -> Instant {
+        static T0: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+        *T0 + (at - t0())
+            .to_std()
+            .expect("test times are not before t0()")
+    }
+
+    fn tick_at<'a>(
+        em: &mut MotionEventEmitter,
+        camera_id: CameraId,
+        tracked: impl IntoIterator<Item = &'a TrackedObject, IntoIter: Clone>,
+        at: DateTime<Utc>,
+    ) -> Vec<MotionDecision> {
+        em.tick(camera_id, tracked, at, mono(at))
+    }
+
     fn tobj(id: TrackId, label: &str) -> TrackedObject {
-        let mut attrs = serde_json::Map::new();
+        let mut attrs = Attributes::new();
         attrs.insert("tracking.hit_streak".into(), json!(3));
         TrackedObject {
             track_id: id,
@@ -337,7 +349,7 @@ mod tests {
     #[test]
     fn first_frame_for_track_emits_born() {
         let mut em = MotionEventEmitter::new(1.0);
-        let out = em.tick(7, &[tobj(1, "person")], t0());
+        let out = tick_at(&mut em, 7, &[tobj(1, "person")], t0());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].camera_id, 7);
         assert_eq!(out[0].track_id, 1);
@@ -350,10 +362,11 @@ mod tests {
     fn updated_is_gated_by_sample_interval() {
         let mut em = MotionEventEmitter::new(1.0); // 1 Hz -> 1s gap
         let now = t0();
-        let _ = em.tick(7, &[tobj(1, "person")], now);
+        let _ = tick_at(&mut em, 7, &[tobj(1, "person")], now);
 
         // 100 ms later: too soon, no Updated.
-        let snap2 = em.tick(
+        let snap2 = tick_at(
+            &mut em,
             7,
             &[tobj(1, "person")],
             now + chrono::Duration::milliseconds(100),
@@ -361,7 +374,8 @@ mod tests {
         assert!(snap2.is_empty(), "100 ms < 1 s should not emit Updated");
 
         // 1.5 s later: due.
-        let snap3 = em.tick(
+        let snap3 = tick_at(
+            &mut em,
             7,
             &[tobj(1, "person")],
             now + chrono::Duration::milliseconds(1_500),
@@ -370,7 +384,8 @@ mod tests {
         assert_eq!(snap3[0].kind, MotionKind::Updated);
 
         // 200 ms after that Updated: too soon again.
-        let snap4 = em.tick(
+        let snap4 = tick_at(
+            &mut em,
             7,
             &[tobj(1, "person")],
             now + chrono::Duration::milliseconds(1_700),
@@ -381,15 +396,20 @@ mod tests {
     #[test]
     fn track_disappearing_emits_died_and_clears_state() {
         let mut em = MotionEventEmitter::new(1.0);
-        let _ = em.tick(7, &[tobj(1, "person")], t0());
-        let out = em.tick(7, &[], t0() + chrono::Duration::milliseconds(50));
+        let _ = tick_at(&mut em, 7, &[tobj(1, "person")], t0());
+        let out = tick_at(&mut em, 7, &[], t0() + chrono::Duration::milliseconds(50));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, MotionKind::Died);
         assert_eq!(out[0].track_id, 1);
         assert_eq!(em.live_track_count(7), 0);
 
         // Same id reappearing later is a NEW Born, not a re-Updated.
-        let out2 = em.tick(7, &[tobj(1, "person")], t0() + chrono::Duration::seconds(5));
+        let out2 = tick_at(
+            &mut em,
+            7,
+            &[tobj(1, "person")],
+            t0() + chrono::Duration::seconds(5),
+        );
         assert_eq!(out2.len(), 1);
         assert_eq!(out2[0].kind, MotionKind::Born);
     }
@@ -401,7 +421,7 @@ mod tests {
         // its LAST visible frame — not zeros.
         let mut em = MotionEventEmitter::new(0.0); // no Updateds, focus the test
         let now = t0();
-        let _ = em.tick(7, &[tobj(1, "person")], now);
+        let _ = tick_at(&mut em, 7, &[tobj(1, "person")], now);
 
         // Frame 2: same id, MOVED bbox.
         let mut moved = tobj(1, "person");
@@ -413,7 +433,8 @@ mod tests {
         };
         moved.label = "person".into();
         moved.confidence = 0.42;
-        let _ = em.tick(
+        let _ = tick_at(
+            &mut em,
             7,
             &[moved.clone()],
             now + chrono::Duration::milliseconds(33),
@@ -421,7 +442,7 @@ mod tests {
 
         // Frame 3: track gone -> Died should carry the moved bbox /
         // confidence, not the original tobj() bbox.
-        let died = em.tick(7, &[], now + chrono::Duration::milliseconds(66));
+        let died = tick_at(&mut em, 7, &[], now + chrono::Duration::milliseconds(66));
         assert_eq!(died.len(), 1);
         assert_eq!(died[0].kind, MotionKind::Died);
         assert_eq!(died[0].bbox.x1, 500.0);
@@ -447,14 +468,19 @@ mod tests {
         ];
         for (i, attrs) in frames.iter().enumerate() {
             let mut o = tobj(1, "person");
-            o.attributes = attrs.as_object().unwrap().clone();
-            em.tick(7, &[o], now + chrono::Duration::milliseconds(33 * i as i64));
+            o.attributes = serde_json::from_value(attrs.clone()).unwrap();
+            tick_at(
+                &mut em,
+                7,
+                &[o],
+                now + chrono::Duration::milliseconds(33 * i as i64),
+            );
         }
-        let died = em.tick(7, &[], now + chrono::Duration::milliseconds(99));
+        let died = tick_at(&mut em, 7, &[], now + chrono::Duration::milliseconds(99));
         assert_eq!(died.len(), 1);
         assert_eq!(died[0].kind, MotionKind::Died);
         assert_eq!(
-            serde_json::Value::Object(died[0].attributes.clone()),
+            serde_json::to_value(&died[0].attributes).unwrap(),
             json!({"added": {"n": true}, "flip": 7.5, "grow": [1, "two", [3]], "late": "x",
                    "speed": "w", "zones": []})
         );
@@ -463,12 +489,12 @@ mod tests {
     #[test]
     fn cameras_are_isolated() {
         let mut em = MotionEventEmitter::new(1.0);
-        let _ = em.tick(7, &[tobj(1, "person")], t0());
-        let _ = em.tick(8, &[tobj(1, "person")], t0());
+        let _ = tick_at(&mut em, 7, &[tobj(1, "person")], t0());
+        let _ = tick_at(&mut em, 8, &[tobj(1, "person")], t0());
         assert_eq!(em.live_track_count(7), 1);
         assert_eq!(em.live_track_count(8), 1);
 
-        let out = em.tick(7, &[], t0() + chrono::Duration::seconds(1));
+        let out = tick_at(&mut em, 7, &[], t0() + chrono::Duration::seconds(1));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].camera_id, 7);
         assert_eq!(em.live_track_count(8), 1, "camera 8 should be untouched");
@@ -478,15 +504,15 @@ mod tests {
     fn sample_hz_zero_disables_updated_but_keeps_born_and_died() {
         let mut em = MotionEventEmitter::new(0.0);
         let now = t0();
-        let born = em.tick(7, &[tobj(1, "person")], now);
+        let born = tick_at(&mut em, 7, &[tobj(1, "person")], now);
         assert_eq!(born[0].kind, MotionKind::Born);
         // Many frames later — still no Updated.
         for i in 1..30 {
             let frame_t = now + chrono::Duration::milliseconds(i * 33);
-            let out = em.tick(7, &[tobj(1, "person")], frame_t);
+            let out = tick_at(&mut em, 7, &[tobj(1, "person")], frame_t);
             assert!(out.is_empty(), "sample_hz=0 must not emit Updated");
         }
-        let died = em.tick(7, &[], now + chrono::Duration::seconds(2));
+        let died = tick_at(&mut em, 7, &[], now + chrono::Duration::seconds(2));
         assert_eq!(died.len(), 1);
         assert_eq!(died[0].kind, MotionKind::Died);
     }
@@ -497,7 +523,7 @@ mod tests {
         // wait until at least one full interval elapses past Born.
         let mut em = MotionEventEmitter::new(1000.0); // 1 ms interval
         let now = t0();
-        let out = em.tick(7, &[tobj(1, "person")], now);
+        let out = tick_at(&mut em, 7, &[tobj(1, "person")], now);
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].kind,
@@ -506,7 +532,8 @@ mod tests {
         );
 
         // 5 ms later (> 1 ms interval): Updated due.
-        let out2 = em.tick(
+        let out2 = tick_at(
+            &mut em,
             7,
             &[tobj(1, "person")],
             now + chrono::Duration::milliseconds(5),
@@ -518,13 +545,18 @@ mod tests {
     #[test]
     fn forget_camera_drops_state() {
         let mut em = MotionEventEmitter::new(1.0);
-        let _ = em.tick(7, &[tobj(1, "person"), tobj(2, "car")], t0());
+        let _ = tick_at(&mut em, 7, &[tobj(1, "person"), tobj(2, "car")], t0());
         assert_eq!(em.live_track_count(7), 2);
         em.forget_camera(7);
         assert_eq!(em.live_track_count(7), 0);
 
         // Reappearing tracks register as Born again.
-        let out = em.tick(7, &[tobj(1, "person")], t0() + chrono::Duration::seconds(1));
+        let out = tick_at(
+            &mut em,
+            7,
+            &[tobj(1, "person")],
+            t0() + chrono::Duration::seconds(1),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, MotionKind::Born);
     }
@@ -535,10 +567,10 @@ mod tests {
         // Frame 2 (1.5 s later): t1 still alive (Updated due), t2 gone (Died), t3 new (Born).
         let mut em = MotionEventEmitter::new(1.0);
         let now = t0();
-        let _ = em.tick(7, &[tobj(1, "person"), tobj(2, "car")], now);
+        let _ = tick_at(&mut em, 7, &[tobj(1, "person"), tobj(2, "car")], now);
 
         let later = now + chrono::Duration::milliseconds(1_500);
-        let out = em.tick(7, &[tobj(1, "person"), tobj(3, "dog")], later);
+        let out = tick_at(&mut em, 7, &[tobj(1, "person"), tobj(3, "dog")], later);
 
         // Order: Born first (track 3), then Updated (1), then Died (2).
         assert_eq!(out.len(), 3);
@@ -548,5 +580,33 @@ mod tests {
         assert_eq!(out[1].track_id, 1);
         assert_eq!(out[2].kind, MotionKind::Died);
         assert_eq!(out[2].track_id, 2);
+    }
+
+    /// Updated is sampled on the monotonic stamp: at 1 Hz, frames 500 ms
+    /// apart emit Updated every other frame across an hour's step of the wall
+    /// clock either way, and each decision keeps its frame's wall time.
+    #[test]
+    fn updated_sampling_ignores_a_wall_clock_step() {
+        for step_ms in [3_600_000, -3_600_000] {
+            let wall = |i: i64| {
+                let step = if i >= 3 { step_ms } else { 0 };
+                t0() + chrono::Duration::milliseconds(500 * i + step)
+            };
+            let mut em = MotionEventEmitter::new(1.0);
+            let mut updated = Vec::new();
+            for i in 0..8i64 {
+                let mono = mono(t0() + chrono::Duration::milliseconds(500 * i));
+                for d in em.tick(7, &[tobj(1, "person")], wall(i), mono) {
+                    if matches!(d.kind, MotionKind::Updated) {
+                        updated.push((i, d.captured_at));
+                    }
+                }
+            }
+            assert_eq!(
+                updated,
+                [2, 4, 6].map(|i| (i, wall(i))),
+                "{step_ms} ms step at frame 3"
+            );
+        }
     }
 }

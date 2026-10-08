@@ -152,8 +152,8 @@ gstreamer-webrtc = "0.23"
 gstreamer-sdp = "0.23"
 gstreamer-rtp = "0.23"
 # MessagePack via serde is the wire codec on the parent <-> worker pipe.
-# Picked over bincode 1.x because Detection.attributes is
-# `serde_json::Map<String, serde_json::Value>` (deserialize_any) + uses
+# Picked over bincode 1.x because Detection.attributes holds
+# `serde_json::Value`s (deserialize_any) + uses
 # `skip_serializing_if`; both require a self-describing format. msgpack is
 # also compact enough for ~1 MB pixel buffers.
 rmp-serde = "1.3"

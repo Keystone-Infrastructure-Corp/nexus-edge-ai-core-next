@@ -8,15 +8,16 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use cel_interpreter::objects::{Key, Map as CelMap};
 use cel_interpreter::{Context, Program, Value as CelValue};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use nexus_config::{RuleConfig, RulesBackendKind, RulesConfig, ZoneConfig};
 use nexus_types::{AlertEvent, Artifacts, CameraId, FrameId, Severity, TraceId, TrackedObject};
 use parking_lot::Mutex;
@@ -129,48 +130,90 @@ fn run_program(compiled: &CompiledRule, ctx: &Context) -> Result<bool, RulesErro
     }
 }
 
+/// The key names of the binding's two fixed maps, in the order
+/// `object_to_cel` supplies their values. Built once: `Key::from(&str)`
+/// allocates a `String` and an `Arc`, 26 allocations per object per frame,
+/// while cloning a built `Key` only bumps its refcount.
+static BOX_KEYS: LazyLock<[Key; 6]> =
+    LazyLock::new(|| ["x1", "y1", "x2", "y2", "width", "height"].map(Key::from));
+static OBJECT_KEYS: LazyLock<[Key; 7]> = LazyLock::new(|| {
+    [
+        "label",
+        "confidence",
+        "track_id",
+        "age_ms",
+        "age_frames",
+        "box",
+        "attributes",
+    ]
+    .map(Key::from)
+});
+
+/// Most attribute names a thread keeps a built `Key` for. The names are data,
+/// so the table stops growing here; a name past it gets a `Key` of its own
+/// per object, as every name did before.
+const ATTRIBUTE_KEYS_MAX: usize = 256;
+
+thread_local! {
+    /// The attribute names this thread has bound, each built into a `Key`
+    /// once. The annotator stamps the same names on every object on every
+    /// frame, and each `Key::from` allocates a `String` and an `Arc`. Per
+    /// thread, so reading and filling it takes no lock.
+    static ATTRIBUTE_KEYS: RefCell<HashMap<String, Key>> = RefCell::new(HashMap::new());
+}
+
+fn attribute_key(keys: &mut HashMap<String, Key>, name: &str) -> Key {
+    if let Some(key) = keys.get(name) {
+        return key.clone();
+    }
+    let key = Key::from(name);
+    if keys.len() < ATTRIBUTE_KEYS_MAX {
+        keys.insert(name.to_owned(), key.clone());
+    }
+    key
+}
+
 /// Bind an object for CEL straight from its typed fields. Produces exactly
 /// what the former `json!` -> `serde_json::Value` -> CEL round trip did (see
 /// the differential test), without building the intermediate tree.
 fn object_to_cel(o: &TrackedObject) -> CelValue {
     let b = &o.bbox;
-    let bbox = cel_map([
-        ("x1", f32_to_cel(b.x1)),
-        ("y1", f32_to_cel(b.y1)),
-        ("x2", f32_to_cel(b.x2)),
-        ("y2", f32_to_cel(b.y2)),
-        ("width", f32_to_cel(b.width())),
-        ("height", f32_to_cel(b.height())),
-    ]);
-    let attributes: HashMap<Key, CelValue> = o
-        .attributes
-        .iter()
-        .map(|(k, v)| (Key::from(k.clone()), json_to_cel(v)))
-        .collect();
-    cel_map([
-        ("label", CelValue::String(Arc::new(o.label.clone()))),
-        ("confidence", f32_to_cel(o.confidence)),
-        ("track_id", u64_to_cel(o.track_id)),
-        ("age_ms", u64_to_cel(o.age_ms)),
-        ("age_frames", CelValue::Int(o.age_frames.into())),
-        ("box", bbox),
-        (
-            "attributes",
+    let bbox = cel_map(
+        &BOX_KEYS,
+        [
+            f32_to_cel(b.x1),
+            f32_to_cel(b.y1),
+            f32_to_cel(b.x2),
+            f32_to_cel(b.y2),
+            f32_to_cel(b.width()),
+            f32_to_cel(b.height()),
+        ],
+    );
+    let attributes: HashMap<Key, CelValue> = ATTRIBUTE_KEYS.with_borrow_mut(|keys| {
+        o.attributes
+            .iter()
+            .map(|(k, v)| (attribute_key(keys, k), json_to_cel(v)))
+            .collect()
+    });
+    cel_map(
+        &OBJECT_KEYS,
+        [
+            CelValue::String(Arc::new(o.label.clone())),
+            f32_to_cel(o.confidence),
+            u64_to_cel(o.track_id),
+            u64_to_cel(o.age_ms),
+            CelValue::Int(o.age_frames.into()),
+            bbox,
             CelValue::Map(CelMap {
                 map: Arc::new(attributes),
             }),
-        ),
-    ])
+        ],
+    )
 }
 
-fn cel_map<const N: usize>(entries: [(&str, CelValue); N]) -> CelValue {
+fn cel_map<const N: usize>(keys: &[Key; N], values: [CelValue; N]) -> CelValue {
     CelValue::Map(CelMap {
-        map: Arc::new(
-            entries
-                .into_iter()
-                .map(|(k, v)| (Key::from(k), v))
-                .collect(),
-        ),
+        map: Arc::new(keys.iter().cloned().zip(values).collect()),
     })
 }
 
@@ -251,7 +294,8 @@ struct StaticAlertState {
 #[derive(Default, Clone)]
 struct TrackState {
     consecutive_hits: u32,
-    last_emitted_unix_ms: i64,
+    /// Capture stamp of the frame the last alert fired on.
+    last_emitted: Option<Instant>,
     static_alerts: HashMap<u64, StaticAlertState>,
 }
 
@@ -319,28 +363,35 @@ impl RuleEvaluator {
     /// rather than threading the whole `Frame`, so this crate stays
     /// free of any frame/image dependency.
     ///
+    /// `captured_at` and `captured_mono` are the frame's two capture
+    /// stamps (`Frame::captured_at`, `Frame::captured_mono`). An alert
+    /// carries `captured_at`; `cooldown_ms` is measured on
+    /// `captured_mono`, so neither a backlog drained in a burst nor a
+    /// step of the wall clock moves it.
+    ///
     /// `camera_zones` is the **full** zone list configured on the
     /// camera that produced `objects`. Zones are looked up by `id`
     /// against `rule.zones` (the rule stores only ids); a rule with
     /// no `zones` set is unaffected by this argument.
-    #[allow(clippy::too_many_arguments)] // 8 args is the natural shape: rule eval inherently needs frame
-                                         // dims + zones + identifiers; bundling them would just push the
-                                         // boilerplate to every caller.
-    pub fn evaluate(
+    ///
+    /// `objects` is any cloneable iterator, walked once after a clone counts
+    /// it: the supervisor passes the frame's non-static tracks without
+    /// copying them, and a `&[TrackedObject]` or `&Vec` works as before.
+    #[allow(clippy::too_many_arguments)] // 10 args is the natural shape: rule eval inherently needs frame
+                                         // stamps + dims + zones + identifiers; bundling them would just
+                                         // push the boilerplate to every caller.
+    pub fn evaluate<'a>(
         &self,
         camera_id: CameraId,
         frame_id: FrameId,
+        captured_at: DateTime<Utc>,
+        captured_mono: Instant,
         trace_id: &TraceId,
         frame_width: u32,
         frame_height: u32,
         camera_zones: &[ZoneConfig],
-        objects: &[TrackedObject],
+        objects: impl IntoIterator<Item = &'a TrackedObject, IntoIter: Clone>,
     ) -> Vec<AlertEvent> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-
         let rules = self.rules.load();
         let mut out = Vec::new();
         let mut state = self.track_state.lock();
@@ -353,8 +404,15 @@ impl RuleEvaluator {
         // One CEL scope, and one binding per object, shared by every rule of
         // this frame and built on first use. `now` is therefore bound once:
         // it is constant across every rule and object in this evaluation.
+        // Each binding is kept beside its object, so a rule only ever reads
+        // the binding of the object it is evaluating.
         let mut cel: Option<Context<'static>> = None;
-        let mut bindings: Vec<Option<CelValue>> = vec![None; objects.len()];
+        let mut objects: Vec<(&TrackedObject, Option<CelValue>)> = {
+            let objects = objects.into_iter();
+            let mut v = Vec::with_capacity(objects.clone().count());
+            v.extend(objects.map(|o| (o, None)));
+            v
+        };
 
         for rule in rules.iter() {
             let cfg = &rule.config;
@@ -408,14 +466,17 @@ impl RuleEvaluator {
                 }
             };
 
-            let key = (cfg.id.clone(), camera_id, 0u64);
-            state
-                .entry(key.clone())
-                .or_default()
+            // Cooldown + debounce are scoped per (rule, camera), not per
+            // track: the fixed `0` collapses every track on this camera
+            // onto one debounce entry so tracker ID churn can't bypass
+            // `cooldown_ms`. Looked up once per rule, not per object.
+            let entry = state.entry((cfg.id.clone(), camera_id, 0u64)).or_default();
+            entry
                 .static_alerts
-                .retain(|track_id, _| objects.iter().any(|o| o.track_id == *track_id));
+                .retain(|track_id, _| objects.iter().any(|(o, _)| o.track_id == *track_id));
 
-            for (idx, o) in objects.iter().enumerate() {
+            for (o, binding) in objects.iter_mut() {
+                let o: &TrackedObject = o;
                 // Rules fire on evidence from THIS frame only. A
                 // predicted-only ("coasting") track carries no
                 // detection on this frame — ByteTrack keeps emitting
@@ -450,7 +511,7 @@ impl RuleEvaluator {
                     }
                 }
 
-                let object = bindings[idx].get_or_insert_with(|| object_to_cel(o));
+                let object = binding.get_or_insert_with(|| object_to_cel(o));
                 let ctx = cel.get_or_insert_with(|| cel_context(camera_id));
                 ctx.add_variable_from_value("object", object.clone());
                 let matched = match run_program(rule, ctx) {
@@ -461,11 +522,6 @@ impl RuleEvaluator {
                     }
                 };
 
-                // Cooldown + debounce are scoped per (rule, camera),
-                // not per track: the fixed `0` collapses every track on
-                // this camera onto one debounce entry so tracker ID
-                // churn can't bypass `cooldown_ms`.
-                let entry = state.entry(key.clone()).or_default();
                 let static_alert_epoch = o
                     .attributes
                     .get(STATIC_ALERT_EPOCH_ATTRIBUTE_KEY)
@@ -500,10 +556,14 @@ impl RuleEvaluator {
                         continue;
                     }
                 }
-                if now_ms - entry.last_emitted_unix_ms < cfg.debounce.cooldown_ms as i64 {
+                let cooldown = Duration::from_millis(cfg.debounce.cooldown_ms);
+                if entry
+                    .last_emitted
+                    .is_some_and(|last| captured_mono.saturating_duration_since(last) < cooldown)
+                {
                     continue;
                 }
-                entry.last_emitted_unix_ms = now_ms;
+                entry.last_emitted = Some(captured_mono);
                 if static_alert_epoch.is_some() {
                     entry.static_alerts.entry(o.track_id).or_default().emitted = true;
                 }
@@ -545,7 +605,7 @@ impl RuleEvaluator {
                     // above, so there is no stale fallback to draw.
                     bbox: Some(detection_bbox),
                     frame_id,
-                    captured_at: Utc::now(),
+                    captured_at,
                     trace_id: trace_id.clone(),
                     frame_w: frame_width,
                     frame_h: frame_height,
@@ -729,6 +789,8 @@ mod tests {
         let alerts = ev.evaluate(
             1,
             42,
+            Utc::now(),
+            Instant::now(),
             &"trace-1".into(),
             100,
             100,
@@ -747,6 +809,8 @@ mod tests {
         let alerts = ev.evaluate(
             1,
             42,
+            Utc::now(),
+            Instant::now(),
             &"trace-2".into(),
             100,
             100,
@@ -769,6 +833,8 @@ mod tests {
         let alerts_a = ev_a.evaluate(
             1,
             1,
+            Utc::now(),
+            Instant::now(),
             &"t".into(),
             100,
             100,
@@ -785,6 +851,8 @@ mod tests {
         let alerts_b = ev_b.evaluate(
             1,
             1,
+            Utc::now(),
+            Instant::now(),
             &"t".into(),
             100,
             100,
@@ -809,6 +877,8 @@ mod tests {
         let alerts = ev.evaluate(
             1,
             1,
+            Utc::now(),
+            Instant::now(),
             &"t".into(),
             100,
             100,
@@ -834,7 +904,17 @@ mod tests {
         let mut coasting = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
         coasting.detection_bbox = None;
 
-        let alerts = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[coasting]);
+        let alerts = ev.evaluate(
+            1,
+            1,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[coasting],
+        );
         assert!(
             alerts.is_empty(),
             "predicted-only track must not fire, got {alerts:?}"
@@ -852,16 +932,124 @@ mod tests {
         let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
 
         let live = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
-        let first = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[live]);
+        let first = ev.evaluate(
+            1,
+            1,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[live],
+        );
         assert_eq!(first.len(), 1, "the real detection should fire once");
 
         let mut coasting = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
         coasting.detection_bbox = None;
         for frame_id in 2..32 {
-            let alerts = ev.evaluate(1, frame_id, &"t".into(), 100, 100, &[], &[coasting.clone()]);
+            let alerts = ev.evaluate(
+                1,
+                frame_id,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &[coasting.clone()],
+            );
             assert!(
                 alerts.is_empty(),
                 "coasting frame {frame_id} re-fired: {alerts:?}"
+            );
+        }
+    }
+
+    /// A backlogged frame's alert carries the time its frame was captured,
+    /// not the time the rule ran.
+    #[test]
+    fn an_alert_carries_its_frames_capture_time() {
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule_with_zones(None)]).unwrap();
+        let captured_at = Utc::now() - chrono::Duration::seconds(5);
+        let person = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        let alerts = ev.evaluate(
+            1,
+            1,
+            captured_at,
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[person],
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].captured_at, captured_at);
+    }
+
+    /// A backlog drained in a burst: frames captured a second apart are
+    /// evaluated back to back. The 500 ms cooldown is measured between their
+    /// captures, so every frame fires.
+    #[test]
+    fn a_burst_after_a_backlog_is_cooled_down_in_capture_time() {
+        let mut rule = rule_with_zones(None);
+        rule.debounce.cooldown_ms = 500;
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let (mono0, wall0) = (Instant::now(), Utc::now());
+        let person = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        let fired = (0..4i64)
+            .filter(|&i| {
+                let alerts = ev.evaluate(
+                    1,
+                    i as u64,
+                    wall0 + chrono::Duration::seconds(i),
+                    mono0 + std::time::Duration::from_secs(i as u64),
+                    &"t".into(),
+                    100,
+                    100,
+                    &[],
+                    std::slice::from_ref(&person),
+                );
+                !alerts.is_empty()
+            })
+            .count();
+        assert_eq!(fired, 4, "frames a second apart, 500 ms cooldown");
+    }
+
+    /// The cooldown is measured on the monotonic stamp, so an hour's step of
+    /// the wall clock either way neither ends a 500 ms cooldown early nor
+    /// extends it.
+    #[test]
+    fn a_wall_clock_step_does_not_move_the_cooldown() {
+        for step_ms in [3_600_000, -3_600_000] {
+            let mut rule = rule_with_zones(None);
+            rule.debounce.cooldown_ms = 500;
+            let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+            let (mono0, wall0) = (Instant::now(), Utc::now());
+            let person = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+            let fires = |frame_id: u64, ms: i64, step_ms: i64| {
+                !ev.evaluate(
+                    1,
+                    frame_id,
+                    wall0 + chrono::Duration::milliseconds(ms + step_ms),
+                    mono0 + std::time::Duration::from_millis(ms as u64),
+                    &"t".into(),
+                    100,
+                    100,
+                    &[],
+                    std::slice::from_ref(&person),
+                )
+                .is_empty()
+            };
+            assert!(fires(1, 0, 0), "the first match fires");
+            assert!(
+                !fires(2, 100, step_ms),
+                "{step_ms} ms step: 100 ms later is inside the cooldown"
+            );
+            assert!(
+                fires(3, 600, step_ms),
+                "{step_ms} ms step: 600 ms later is past the cooldown"
             );
         }
     }
@@ -880,13 +1068,43 @@ mod tests {
             JsonValue::Number(0.into()),
         );
 
-        let first_debounce = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        let first_debounce = ev.evaluate(
+            1,
+            1,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[vehicle.clone()],
+        );
         assert!(first_debounce.is_empty());
-        let first_alert = ev.evaluate(1, 2, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        let first_alert = ev.evaluate(
+            1,
+            2,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[vehicle.clone()],
+        );
         assert_eq!(first_alert.len(), 1);
 
         for frame_id in 3..20 {
-            let alerts = ev.evaluate(1, frame_id, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+            let alerts = ev.evaluate(
+                1,
+                frame_id,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &[vehicle.clone()],
+            );
             assert!(alerts.is_empty(), "epoch 0 re-fired on frame {frame_id}");
         }
 
@@ -894,9 +1112,29 @@ mod tests {
             STATIC_ALERT_EPOCH_ATTRIBUTE_KEY.into(),
             JsonValue::Number(1.into()),
         );
-        let break_debounce = ev.evaluate(1, 20, &"t".into(), 100, 100, &[], &[vehicle.clone()]);
+        let break_debounce = ev.evaluate(
+            1,
+            20,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[vehicle.clone()],
+        );
         assert!(break_debounce.is_empty());
-        let break_alert = ev.evaluate(1, 21, &"t".into(), 100, 100, &[], &[vehicle]);
+        let break_alert = ev.evaluate(
+            1,
+            21,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[vehicle],
+        );
         assert_eq!(
             break_alert.len(),
             1,
@@ -924,15 +1162,45 @@ mod tests {
 
         let objects = vec![first, second];
         assert!(ev
-            .evaluate(1, 1, &"t".into(), 100, 100, &[], &objects)
+            .evaluate(
+                1,
+                1,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &objects
+            )
             .is_empty());
         assert_eq!(
-            ev.evaluate(1, 2, &"t".into(), 100, 100, &[], &objects)
-                .len(),
+            ev.evaluate(
+                1,
+                2,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &objects
+            )
+            .len(),
             2
         );
         assert!(ev
-            .evaluate(1, 3, &"t".into(), 100, 100, &[], &objects)
+            .evaluate(
+                1,
+                3,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                &objects
+            )
             .is_empty());
     }
 
@@ -952,7 +1220,17 @@ mod tests {
         };
         o.detection_bbox = Some(raw);
 
-        let alerts = ev.evaluate(1, 1, &"t".into(), 100, 100, &[], &[o]);
+        let alerts = ev.evaluate(
+            1,
+            1,
+            Utc::now(),
+            Instant::now(),
+            &"t".into(),
+            100,
+            100,
+            &[],
+            &[o],
+        );
         assert_eq!(alerts.len(), 1);
         assert_eq!(
             alerts[0].bbox,
@@ -1064,7 +1342,7 @@ mod tests {
             age_frames: 42,
             age_ms: 1_234,
             attributes: match attributes {
-                JsonValue::Object(m) => m,
+                JsonValue::Object(m) => m.into_iter().map(|(k, v)| (k.into(), v)).collect(),
                 other => panic!("fixture attributes must be an object, got {other}"),
             },
         }
@@ -1153,15 +1431,63 @@ mod tests {
         v
     }
 
+    /// The second pass binds every attribute name from this thread's table
+    /// of built keys rather than building it.
     #[test]
     fn direct_binding_matches_the_json_round_trip_exactly() {
-        for o in binding_fixtures() {
+        for pass in 0..2 {
+            for o in binding_fixtures() {
+                assert_same_cel(
+                    &object_to_cel(&o),
+                    &reference_object_to_cel(&o),
+                    &format!("pass {pass}: object[track {}]", o.track_id),
+                );
+            }
+        }
+    }
+
+    /// Attribute names are data, so the table of built keys is bounded. A
+    /// name past the cap still binds, with a key of its own.
+    #[test]
+    fn the_attribute_key_table_stops_growing_at_its_cap() {
+        let b = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 1.0,
+            y2: 1.0,
+        };
+        for i in 0..ATTRIBUTE_KEYS_MAX + 10 {
+            let mut attributes = serde_json::Map::new();
+            attributes.insert(format!("name-{i}"), i.into());
+            let o = binding_fixture(1, "x", 0.5, b, JsonValue::Object(attributes));
             assert_same_cel(
                 &object_to_cel(&o),
                 &reference_object_to_cel(&o),
-                &format!("object[track {}]", o.track_id),
+                &format!("name-{i}"),
             );
         }
+        assert_eq!(ATTRIBUTE_KEYS.with_borrow(HashMap::len), ATTRIBUTE_KEYS_MAX);
+    }
+
+    /// The 13 constant keys are shared, not built per object. CEL resolves a
+    /// member by hashing a freshly built key, so each shared key must still
+    /// resolve through CEL's own lookup, with its own value.
+    #[test]
+    fn every_constant_binding_key_resolves_through_cel() {
+        let rule = fire_every_match(
+            "all",
+            "object.label == 'person' && object.confidence > 0.89 \
+             && object.confidence < 0.91 && object.track_id == 1 \
+             && object.age_ms == 1234 && object.age_frames == 42 \
+             && object.box.x1 == 10.25 && object.box.y1 == -3.5 \
+             && object.box.x2 == 110.75 && object.box.y2 == 200.0 \
+             && object.box.width == 100.5 && object.box.height == 203.5 \
+             && size(object.attributes) == 0",
+        );
+        let eng = CelEngine::new();
+        let compiled = eng.compile(&rule).unwrap();
+        let object = &binding_fixtures()[0];
+        assert!(matches!(eng.matches(&compiled, object, 3), Ok(true)));
     }
 
     fn fire_every_match(id: &str, when: &str) -> RuleConfig {
@@ -1204,7 +1530,17 @@ mod tests {
         }
         let ev = RuleEvaluator::new(&unit_rules_cfg(), &rules).unwrap();
         let fired: Vec<(String, u64)> = ev
-            .evaluate(3, 1, &"t".to_string(), 1000, 1000, &[], &objects)
+            .evaluate(
+                3,
+                1,
+                Utc::now(),
+                Instant::now(),
+                &"t".to_string(),
+                1000,
+                1000,
+                &[],
+                &objects,
+            )
             .into_iter()
             .map(|e| (e.rule_id, e.track_id.unwrap()))
             .collect();
@@ -1221,6 +1557,85 @@ mod tests {
                 ("box".to_string(), 7),
                 ("box".to_string(), i64::MAX as u64),
             ]
+        );
+    }
+
+    /// `evaluate` takes any cloneable iterator. One whose clones do not
+    /// replay the same sequence breaks what `Clone` promises, but it must
+    /// not make a rule read another object's binding. This one yields its
+    /// objects forward or reversed, alternating with every clone.
+    #[test]
+    fn a_rule_only_reads_the_binding_of_the_object_it_is_evaluating() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Alternating<'a> {
+            objects: &'a [TrackedObject],
+            clones: Rc<Cell<u32>>,
+            reversed: bool,
+            next: usize,
+        }
+        impl Clone for Alternating<'_> {
+            fn clone(&self) -> Self {
+                self.clones.set(self.clones.get() + 1);
+                Self {
+                    objects: self.objects,
+                    clones: self.clones.clone(),
+                    reversed: self.clones.get() % 2 == 1,
+                    next: self.next,
+                }
+            }
+        }
+        impl<'a> Iterator for Alternating<'a> {
+            type Item = &'a TrackedObject;
+            fn next(&mut self) -> Option<&'a TrackedObject> {
+                let objects: &'a [TrackedObject] = self.objects;
+                let (i, n) = (self.next, objects.len());
+                self.next += 1;
+                (i < n).then(|| &objects[if self.reversed { n - 1 - i } else { i }])
+            }
+        }
+
+        let b = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+        };
+        let objects = [
+            binding_fixture(1, "a", 0.9, b, serde_json::json!({})),
+            binding_fixture(2, "b", 0.9, b, serde_json::json!({})),
+        ];
+        let rules = [
+            fire_every_match("is_a", "object.label == 'a'"),
+            fire_every_match("is_b", "object.label == 'b'"),
+        ];
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &rules).unwrap();
+        let iter = Alternating {
+            objects: &objects,
+            clones: Rc::default(),
+            reversed: false,
+            next: 0,
+        };
+        let fired: Vec<(String, u64)> = ev
+            .evaluate(
+                3,
+                1,
+                Utc::now(),
+                Instant::now(),
+                &"t".to_string(),
+                1000,
+                1000,
+                &[],
+                iter,
+            )
+            .into_iter()
+            .map(|e| (e.rule_id, e.track_id.unwrap()))
+            .collect();
+        assert_eq!(
+            fired,
+            vec![("is_a".to_string(), 1), ("is_b".to_string(), 2)],
+            "a rule fired on an object whose label it never matched"
         );
     }
 }

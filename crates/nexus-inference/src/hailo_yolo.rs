@@ -51,9 +51,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use nexus_config::InferenceConfig;
-use nexus_hailo_backend::{
-    decode_detections, Detection as HailoDetection, InferSession, OutputLayout, Telemetry,
-};
+use nexus_hailo_backend::{decode_detections, InferSession, OutputLayout, Telemetry};
 use nexus_types::{BBox, Detection, Frame};
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
@@ -148,29 +146,9 @@ impl Detector for HailoYoloDetector {
         frame: &Frame,
         _prompts: &[String],
     ) -> Result<Vec<Detection>, InferenceError> {
-        let input_w = self.input_w;
-        let input_h = self.input_h;
-        let frame_w = frame.width;
-        let frame_h = frame.height;
-        let score_threshold = self.score_threshold;
-        let output_layout = self.output_layout.clone();
-
         let rgb = frame_rgb(frame)?;
 
-        let session = &self.session;
-        tokio::task::block_in_place(|| {
-            let mut sess = session.lock();
-            run_hailo(
-                &mut sess,
-                &rgb,
-                frame_w,
-                frame_h,
-                input_w,
-                input_h,
-                score_threshold,
-                output_layout,
-            )
-        })
+        tokio::task::block_in_place(|| run_hailo(self, &rgb, frame.width, frame.height))
     }
 
     fn name(&self) -> &'static str {
@@ -178,18 +156,17 @@ impl Detector for HailoYoloDetector {
     }
 }
 
+/// One inference on `detector`'s session, with the network input size,
+/// score threshold and output layout fixed when its HEF was opened.
 fn run_hailo(
-    session: &mut InferSession,
+    detector: &HailoYoloDetector,
     rgb: &[u8],
     frame_w: u32,
     frame_h: u32,
-    input_w: u32,
-    input_h: u32,
-    score_threshold: f32,
-    output_layout: OutputLayout,
 ) -> Result<Vec<Detection>, InferenceError> {
+    let mut session = detector.session.lock();
     // Preprocess: bilinear resize RGB24 → uint8 NHWC.
-    let input = resize_rgb_u8_nhwc(rgb, frame_w, frame_h, input_w, input_h)?;
+    let input = resize_rgb_u8_nhwc(rgb, frame_w, frame_h, detector.input_w, detector.input_h)?;
     let expected = session.input_frame_size();
     if input.len() != expected {
         return Err(InferenceError::Failed(format!(
@@ -206,11 +183,11 @@ fn run_hailo(
     // Decode the per-output buffers. Cap at 1024 detections per frame
     // — far above anything sane; protects against a misconfigured HEF
     // emitting a huge buffer of zeros.
-    let raw = decode_detections(buffers, &output_layout, 1024);
+    let raw = decode_detections(buffers, &detector.output_layout, 1024);
 
     let mut out: Vec<Detection> = Vec::with_capacity(raw.len());
     for det in raw {
-        if det.score < score_threshold {
+        if det.score < detector.score_threshold {
             continue;
         }
         let label = match map_coco_to_domain_label(det.class_id as i32) {

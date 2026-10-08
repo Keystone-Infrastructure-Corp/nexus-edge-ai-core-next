@@ -620,19 +620,9 @@ mod encode {
             let stride = frame_ref.plane_stride().first().copied().unwrap_or(0) as usize;
             let (w, h) = (native_w as usize, native_h as usize);
             let row_bytes = w * 3;
-            if stride < row_bytes || plane.len() < stride * h {
-                return Err(AlertClipError::Gst("decoded RGB geometry mismatch".into()));
-            }
             // Tight-pack into width*height*3 (drop row padding).
-            let mut data = Vec::with_capacity(row_bytes * h);
-            if stride == row_bytes {
-                data.extend_from_slice(&plane[..row_bytes * h]);
-            } else {
-                for y in 0..h {
-                    let s = y * stride;
-                    data.extend_from_slice(&plane[s..s + row_bytes]);
-                }
-            }
+            let mut data = crate::source::pack_rgb_rows(plane, stride, w, h)
+                .ok_or_else(|| AlertClipError::Gst("decoded RGB geometry mismatch".into()))?;
 
             // Input PTS was rebased to the window base, so the first
             // decoded frame anchors 0 for box lookup.

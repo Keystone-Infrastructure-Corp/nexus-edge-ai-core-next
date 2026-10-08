@@ -34,7 +34,6 @@ use axum::routing::{delete, get, put};
 use axum::Json;
 use axum::Router;
 use futures::stream::StreamExt;
-use image::ImageEncoder;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{CameraConfig, RuleConfig};
 use nexus_inference::{BackendStatus, DetectorPool};
@@ -191,6 +190,9 @@ pub struct ApiState {
     /// so without a read surface the only way to tell a stalled source from
     /// a quiet scene was to attach to a live box.
     pub live_view: Arc<crate::live_view::LiveViewManager>,
+    /// The health roll-up `GET /api/v1/health` reports. The same `Arc` the
+    /// cloud tunnel's heartbeat reports, so the two cannot disagree.
+    pub health: Arc<crate::cloud_tunnel::EngineHealth>,
     /// File-defined sinks (`nexus.toml` `[[sinks]]`), snapshot at
     /// boot. The `GET /v1/admin/sinks` handler merges these with the
     /// runtime `alert_sinks` db rows so the console can show which
@@ -1090,46 +1092,51 @@ impl From<nexus_store::StoreError> for ApiError {
 ///
 /// `status` is `"ok"` unless the engine is running with a known loss of
 /// function, in which case it is `"degraded"` and `issues[]` explains
-/// why. One such condition is a detector that failed to build
-/// (see [`nexus_inference::health`]) — the engine keeps recording and
-/// streaming, but reports zero detections, so an operator watching only
-/// the alert count would otherwise see silence and assume all is well.
-/// The other is a stub clip recorder behind enabled cameras (see
-/// [`crate::cloud_tunnel::recorder_issue`]), which detects but keeps no
-/// video. Degraded is still HTTP 200. Computing that issue reads the store,
-/// so the probe makes one camera-list read per request.
-async fn health(State(s): State<ApiState>) -> Json<serde_json::Value> {
-    Json(health_body(
-        crate::cloud_tunnel::recorder_issue(s.recorder.kind(), &s.store).await,
-    ))
+/// why. The issues are the engine's health roll-up
+/// ([`crate::cloud_tunnel::EngineHealth`]), the same set the cloud
+/// heartbeat carries: a detector that failed to build, stalled live-view
+/// sources, an oversubscribed video engine, a stub clip recorder behind
+/// enabled cameras, a camera whose analysis pipeline exited without being
+/// stopped, a camera whose stored configuration this build cannot read.
+/// Degraded is still HTTP 200.
+///
+/// Every caller gets `status` and each issue's `component` and `code`.
+/// Only a signed-in caller gets `detail`, which can say the box keeps no
+/// video and name the file to change; no unauthenticated consumer (the
+/// installer's and e2e's readiness waits, `nexus-doctor`) reads it. With no
+/// admin secret configured every caller counts as signed in, as on every
+/// session-gated route.
+async fn health(
+    State(s): State<ApiState>,
+    crate::auth::require_role::SignedIn(signed_in): crate::auth::require_role::SignedIn,
+) -> Json<serde_json::Value> {
+    Json(health_body(s.health.rollup().await, signed_in))
 }
 
 /// The body of [`health`], apart from the handler so a test can drive it
-/// with the recorder issue computed from the recorder that boot really
-/// builds.
-fn health_body(recorder: Option<nexus_cloud_protocol::v1::EdgeDegradation>) -> serde_json::Value {
-    let degradations = nexus_inference::health::degradations();
-    let mut issues: Vec<serde_json::Value> = degradations
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "component": "detector",
-                "code": "detector_unavailable",
-                "kind": d.kind,
-                "detail": d.reason,
-            })
+/// with the roll-up of the recorder that boot really builds.
+pub(crate) fn health_body(
+    health: nexus_cloud_protocol::v1::EdgeHealth,
+    with_detail: bool,
+) -> serde_json::Value {
+    let issues: Vec<serde_json::Value> = health
+        .issues
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| {
+            let mut issue = serde_json::json!({
+                "component": i.component,
+                "code": i.code,
+            });
+            if with_detail {
+                issue["detail"] = serde_json::Value::String(i.detail);
+            }
+            issue
         })
         .collect();
-    if let Some(i) = recorder {
-        issues.push(serde_json::json!({
-            "component": i.component,
-            "code": i.code,
-            "detail": i.detail,
-        }));
-    }
 
     serde_json::json!({
-        "status": if issues.is_empty() { "ok" } else { "degraded" },
+        "status": health.status,
         // `NEXUS_BUILD_VERSION` is computed in `build.rs` from the
         // release tag (`NEXUS_RELEASE_VERSION`, e.g. `v0.1.27` →
         // `0.1.27`) at CI build-time, falling back to
@@ -1366,6 +1373,7 @@ async fn run_reprobe(
     // not stall the appliance.
     const MAX_INFLIGHT: usize = 8;
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let default_detector_width = s.current_inference_model.input_width;
     let out = futures::stream::iter(cameras.into_iter().map(|cam| async move {
         let probed = match (
             &cam.onvif.endpoint,
@@ -1380,7 +1388,7 @@ async fn run_reprobe(
             .unwrap_or_else(|_| Err("timed out".to_string())),
             _ => Err("no ONVIF endpoint or credentials configured for this camera".to_string()),
         };
-        let sup = crate::camera_reprobe::supervisor_pixels_for(&cam);
+        let sup = crate::camera_reprobe::supervisor_pixels_for(&cam, default_detector_width);
         crate::camera_reprobe::propose_for_camera(&cam, probed, sup, |u| {
             crate::admin_runtime::redact_url_credentials(u)
         })
@@ -1482,17 +1490,20 @@ async fn upsert_camera(
 ) -> Result<Json<CameraConfig>, ApiError> {
     cam.id = id;
     validate_analysis_url(&cam.ingest)?;
+    cam.validate_finite()
+        .map_err(|why| ApiError(StatusCode::BAD_REQUEST, why))?;
     // M6 Phase 4 Step 4.1 — capture pre-state for the audit row so
     // operators can diff before/after on the per-resource history
-    // panel. `None` on a create; `Some(prev)` on update. The list
-    // walk is cheap (rules / cameras are tens of rows), but if it
-    // becomes hot we'd switch to a `get_camera(id)` shortcut.
+    // panel. `None` on a create, or when this camera's own row cannot
+    // be read; `Some(prev)` on update. The list walk is cheap (rules /
+    // cameras are tens of rows), but if it becomes hot we'd switch to a
+    // `get_camera(id)` shortcut.
     let before = s
         .store
-        .list_cameras()
+        .list_readable_cameras()
         .await
         .ok()
-        .and_then(|all| all.into_iter().find(|c| c.id == id));
+        .and_then(|(all, _)| all.into_iter().find(|c| c.id == id));
     let after_str = camera_audit_json(&cam);
     let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
@@ -1575,6 +1586,8 @@ async fn create_camera(
     // honest before the post-insert rewrite.
     cam.id = 0;
     validate_analysis_url(&cam.ingest)?;
+    cam.validate_finite()
+        .map_err(|why| ApiError(StatusCode::BAD_REQUEST, why))?;
     // Codec autodetect: if the operator didn't specify a codec
     // and the source is rtsp/rtsps, run one RTSP DESCRIBE probe
     // against the URL and stamp the result. Best-effort — if
@@ -1669,10 +1682,10 @@ async fn delete_camera(
 ) -> Result<StatusCode, ApiError> {
     let before = s
         .store
-        .list_cameras()
+        .list_readable_cameras()
         .await
         .ok()
-        .and_then(|all| all.into_iter().find(|c| c.id == id));
+        .and_then(|(all, _)| all.into_iter().find(|c| c.id == id));
     let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
     // M6 Phase 4 Step 4.1 (tx-merge) — see upsert_camera.
@@ -2785,7 +2798,7 @@ async fn get_camera_stats(
         .frame_stats
         .snapshot(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
-    let now = chrono::Utc::now();
+    let now = std::time::Instant::now();
     Ok(Json(build_camera_stats_view(&s, id, &snap, now)))
 }
 
@@ -2796,7 +2809,7 @@ fn build_camera_stats_view(
     s: &ApiState,
     id: CameraId,
     snap: &nexus_pipeline::CameraFrameStats,
-    now: chrono::DateTime<chrono::Utc>,
+    now: std::time::Instant,
 ) -> CameraFrameStatsView {
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
@@ -2854,7 +2867,7 @@ fn build_camera_stats_view(
 async fn get_all_camera_stats(
     State(s): State<ApiState>,
 ) -> Result<Json<Vec<CameraFrameStatsView>>, ApiError> {
-    let now = chrono::Utc::now();
+    let now = std::time::Instant::now();
     let views = s
         .frame_stats
         .snapshot_all()
@@ -2972,9 +2985,11 @@ async fn get_static_object_defaults(State(s): State<ApiState>) -> Json<StaticObj
 /// `GetSnapshotUri` with `ter:ActionNotSupported` — a very common gap on
 /// Profile-S-only devices. The frame is already in memory, so this costs
 /// one JPEG encode and never touches the camera.
-pub(crate) fn latest_frame_jpeg(s: &ApiState, id: CameraId) -> Result<Vec<u8>, ApiError> {
-    let entry = s
-        .cache
+pub(crate) fn latest_frame_jpeg(
+    cache: &LatestFrameCache,
+    id: CameraId,
+) -> Result<Vec<u8>, ApiError> {
+    let entry = cache
         .get(id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no frame for camera".into()))?;
     let frame = &entry.frame;
@@ -2987,23 +3002,15 @@ pub(crate) fn latest_frame_jpeg(s: &ApiState, id: CameraId) -> Result<Vec<u8>, A
         )
     })?;
 
-    let mut out = Vec::with_capacity(rgb.len() / 4);
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
-        .write_image(
-            &rgb,
-            frame.width,
-            frame.height,
-            image::ExtendedColorType::Rgb8,
-        )
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(out)
+    nexus_pipeline::jpeg::encode_rgb24(&rgb, frame.width, frame.height, 80)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn get_latest_frame_jpeg(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
 ) -> Result<Response, ApiError> {
-    let out = latest_frame_jpeg(&s, id)?;
+    let out = latest_frame_jpeg(&s.cache, id)?;
     Ok((
         StatusCode::OK,
         [
@@ -3136,7 +3143,8 @@ async fn get_model_prompts(
 /// + per-camera occupancy strip directly off this body.
 #[derive(serde::Serialize)]
 struct StorageLocalResponse {
-    /// `stub` until the GStreamer recorder lands in Stage B.
+    /// The running recorder's `kind()`: `gstreamer`, or `stub`, which
+    /// writes a 0-byte placeholder for every clip.
     recorder_kind: &'static str,
     /// True iff the watermark sampler has the recorder paused. UI
     /// uses this to render the "evicting / no new clips" banner.
@@ -6373,6 +6381,46 @@ mod tests {
         );
     }
 
+    /// `image`'s `JpegEncoder` asserts that the buffer is exactly `w*h*3`,
+    /// and the release profile aborts on a panic, so a wrongly sized frame
+    /// in the cache must fail this request rather than end the engine. The
+    /// padded case is GStreamer's RGB row stride at 642 px (1926 bytes of
+    /// pixels in a 1928-byte row).
+    #[test]
+    fn a_mis_sized_frame_fails_the_snapshot_instead_of_panicking() {
+        use std::sync::Arc;
+        let snapshot = |len: usize| {
+            let cache = nexus_pipeline::LatestFrameCache::new();
+            let epoch = cache.begin_session(7);
+            cache.put_frame(
+                7,
+                epoch,
+                Arc::new(nexus_types::Frame {
+                    camera_id: 7,
+                    frame_id: 1,
+                    captured_at: chrono::Utc::now(),
+                    captured_mono: std::time::Instant::now(),
+                    width: 642,
+                    height: 361,
+                    format: nexus_types::PixelFormat::Rgb24,
+                    data: Arc::new(vec![0u8; len]),
+                    trace_id: String::new(),
+                }),
+            );
+            super::latest_frame_jpeg(&cache, 7)
+        };
+        let jpeg = snapshot(642 * 361 * 3).expect("an exact-size frame encodes");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        for len in [642 * 361 * 3 - 1, 1928 * 361] {
+            let err = snapshot(len).expect_err("a mis-sized frame");
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{len} bytes"
+            );
+        }
+    }
+
     // Gap G1 — `upsert_camera`/`create_camera` had no validation on
     // `analysis_url` at all: a hand-set substream on the wrong scheme, or
     // one identical to `url`, was silently accepted and would shift every
@@ -7061,6 +7109,38 @@ mod tests {
         Arc<nexus_sinks::SinkRegistry>,
         Arc<dyn nexus_bus::Bus>,
     ) {
+        build_test_router_with_model(admin_secret, nexus_config::ModelConfig::default()).await
+    }
+
+    /// [`build_test_router_full`] for an engine whose default inference
+    /// model is `model`, which is what a camera with no model override is
+    /// sized by.
+    async fn build_test_router_with_model(
+        admin_secret: Option<&[u8]>,
+        model: nexus_config::ModelConfig,
+    ) -> (
+        axum::Router,
+        Arc<Store>,
+        tempfile::TempDir,
+        Arc<nexus_sinks::SinkRegistry>,
+        Arc<dyn nexus_bus::Bus>,
+    ) {
+        let (mut state, store, dir, sink_registry, bus) = build_test_state(admin_secret).await;
+        state.current_inference_model = Arc::new(model);
+        (super::router(state), store, dir, sink_registry, bus)
+    }
+
+    /// The state [`build_test_router_full`] routes, for a test that must
+    /// hold one of its handles before the router takes it.
+    async fn build_test_state(
+        admin_secret: Option<&[u8]>,
+    ) -> (
+        super::ApiState,
+        Arc<Store>,
+        tempfile::TempDir,
+        Arc<nexus_sinks::SinkRegistry>,
+        Arc<dyn nexus_bus::Bus>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nexus.db");
         let store = Arc::new(
@@ -7102,6 +7182,19 @@ mod tests {
                 .expect("empty rule set always compiles"),
         );
         let sink_registry = Arc::new(nexus_sinks::SinkRegistry::new());
+        let live_view = crate::live_view::LiveViewManager::new(
+            Arc::new(nexus_pipeline::LatestFrameCache::new()),
+            Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+        );
+        // Built as a `gstreamer` build builds it, so the recorder issue's
+        // raising branch runs on every build.
+        let health = Arc::new(crate::cloud_tunnel::EngineHealth::with_real_recorder(
+            true,
+            recorder.clone(),
+            store.clone(),
+            live_view.clone(),
+            crate::reconciler::HandleMap::default(),
+        ));
         let state = super::ApiState {
             store: store.clone(),
             bus: bus.clone(),
@@ -7130,6 +7223,8 @@ mod tests {
             // tests cover it end-to-end.
             model_prompts: Arc::new(crate::models_catalog::ModelPromptsCatalog {
                 default_kind: "mock".into(),
+                default_input_width: 512,
+                default_input_height: 288,
                 kinds: vec![],
                 by_kind: std::collections::BTreeMap::new(),
             }),
@@ -7142,10 +7237,8 @@ mod tests {
             // live" until a tick completes, which is the correct
             // default: no dispatcher runs in these tests.
             dispatcher_health: Arc::new(nexus_sinks::dispatcher::DispatcherHealth::default()),
-            live_view: crate::live_view::LiveViewManager::new(
-                Arc::new(nexus_pipeline::LatestFrameCache::new()),
-                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
-            ),
+            health,
+            live_view,
             // M7 cloud-managed sinks — no file sinks in tests.
             file_sinks: Arc::new(Vec::new()),
             // M6 — default LockoutConfig is fine for every test
@@ -7177,9 +7270,6 @@ mod tests {
                 #[cfg(feature = "ort")]
                 encoder: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             },
-            // M-Admin Phase 0 follow-up — tests don't exercise
-            // the `GET /v1/admin/server/inference` endpoint;
-            // default ModelConfig is fine.
             current_inference_model: std::sync::Arc::new(nexus_config::ModelConfig::default()),
             // Static-anchors handler reads `<state_dir>/static_objects/cam-<id>.json`;
             // tests don't write that file so the endpoint returns
@@ -7219,8 +7309,7 @@ mod tests {
             remote_access_enabled: false,
             reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
         };
-        let app = super::router(state);
-        (app, store, dir, sink_registry, bus)
+        (state, store, dir, sink_registry, bus)
     }
 
     /// Common wrapper over [`build_test_router_full`] that drops the
@@ -7522,6 +7611,135 @@ mod tests {
             zones: vec![],
         };
         store.upsert_camera(&cam).await.unwrap();
+    }
+
+    /// An ONVIF Media service with three H.264 profiles at one aspect
+    /// ratio, each streaming from `rtsp://127.0.0.1:554/<token>`. The
+    /// `stream` profile is the main stream of a camera seeded by
+    /// [`seed_onvif_camera`]. Every other request (the OSD read) fails,
+    /// which the probes tolerate.
+    async fn serve_onvif_media_stub() -> SocketAddr {
+        use axum::response::IntoResponse;
+        const PROFILES: [(&str, u32, u32); 3] = [
+            ("stream", 1920, 1080),
+            ("sub", 640, 360),
+            ("third", 1280, 720),
+        ];
+        async fn stub(body: String) -> axum::response::Response {
+            if body.contains("GetProfiles") {
+                let profiles: String = PROFILES
+                    .iter()
+                    .map(|(token, w, h)| {
+                        format!(
+                            r#"<trt:Profiles token="{token}"><tt:Name>{token}</tt:Name><tt:VideoEncoderConfiguration token="enc-{token}"><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution></tt:VideoEncoderConfiguration></trt:Profiles>"#
+                        )
+                    })
+                    .collect();
+                let soap = format!(
+                    r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><trt:GetProfilesResponse>{profiles}</trt:GetProfilesResponse></s:Body></s:Envelope>"#
+                );
+                return (StatusCode::OK, soap).into_response();
+            }
+            if let Some((token, _, _)) = PROFILES
+                .iter()
+                .find(|(t, _, _)| body.contains(&format!("ProfileToken>{t}</")))
+            {
+                let soap = format!(
+                    r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><trt:GetStreamUriResponse><trt:MediaUri><tt:Uri>rtsp://127.0.0.1:554/{token}</tt:Uri></trt:MediaUri></trt:GetStreamUriResponse></s:Body></s:Envelope>"#
+                );
+                return (StatusCode::OK, soap).into_response();
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, "unsupported").into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(stub);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        addr
+    }
+
+    /// An engine whose default detector is 1024 px wide: a camera with no
+    /// model override analyses a 1024x576 frame, which the 640x360 profile
+    /// does not cover and the 1280x720 one does.
+    fn wide_default_model() -> nexus_config::ModelConfig {
+        nexus_config::ModelConfig {
+            input_width: 1024,
+            input_height: 576,
+            ..Default::default()
+        }
+    }
+
+    /// Discovery ranks a probed camera's substreams against the frame the
+    /// camera will analyse at once created, which is the engine's default
+    /// detector width, not a fixed 512 px.
+    #[tokio::test]
+    async fn discovery_ranks_substreams_against_the_engines_default_detector_width() {
+        use axum::body::to_bytes;
+        let onvif = serve_onvif_media_stub().await;
+        let (app, _store, _dir, _reg, _bus) =
+            build_test_router_with_model(None, wide_default_model()).await;
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/admin/discovery/sessions/{}/onvif-streams",
+                uuid::Uuid::now_v7()
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "xaddr": format!("http://{onvif}/onvif/device_service"),
+                    "username": "admin",
+                    "password": "secret",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["recommended_main_token"], "stream", "{v}");
+        assert_eq!(
+            v["recommended_analysis_token"], "third",
+            "the smallest profile covering a 1024x576 frame: {v}"
+        );
+        assert_eq!(v.get("analysis_below_detector_input"), None, "{v}");
+    }
+
+    /// The reprobe ranks an existing camera's substreams the same way: a
+    /// camera with no model override against the engine's default width.
+    #[tokio::test]
+    async fn reprobe_ranks_substreams_against_the_engines_default_detector_width() {
+        use axum::body::to_bytes;
+        let onvif = serve_onvif_media_stub().await;
+        let (app, store, _dir, _reg, _bus) =
+            build_test_router_with_model(None, wide_default_model()).await;
+        seed_onvif_camera(
+            &store,
+            1,
+            Some(&format!("http://{onvif}/onvif/device_service")),
+        )
+        .await;
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras/reprobe")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let proposed = v[0]["proposed"].as_str().unwrap_or_default();
+        assert!(
+            proposed.ends_with("/third"),
+            "the smallest profile covering a 1024x576 frame: {v}"
+        );
+        assert_eq!(v[0].get("below_detector_input"), None, "{v}");
     }
 
     /// An operator may not touch the imaging surface — that's
@@ -8652,6 +8870,135 @@ mod tests {
         );
     }
 
+    /// While one camera's row cannot be read, an edit or a delete of another
+    /// camera still records what that camera was before. The pre-state read
+    /// needed every row, so while any one could not be read every camera
+    /// edit was audited as a create and every delete as the deletion of
+    /// nothing.
+    #[tokio::test]
+    async fn a_camera_change_keeps_its_audit_before_state_while_another_row_is_unreadable() {
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mut camera = store.list_cameras().await.expect("list cameras")[0].clone();
+        let mut other = camera.clone();
+        other.id += 1;
+        store
+            .upsert_camera(&other)
+            .await
+            .expect("store a second camera");
+        sqlx::query(
+            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = ?",
+        )
+        .bind(other.id)
+        .execute(store.pool())
+        .await
+        .expect("give the second camera a codec this build cannot read");
+        camera.name = "renamed".to_string();
+        let app = super::router(state);
+        let uri = format!("/api/v1/cameras/{}", camera.id);
+        for (method, body) in [
+            (
+                Method::PUT,
+                Body::from(serde_json::to_string(&camera).unwrap()),
+            ),
+            (Method::DELETE, Body::empty()),
+        ] {
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert!(
+                res.status().is_success(),
+                "{method} {uri}: {}",
+                res.status()
+            );
+        }
+
+        let rows = store
+            .list_audit_for_resource("camera", &camera.id.to_string(), 10)
+            .await
+            .expect("read the camera's audit rows");
+        for (action, was) in [("camera.upsert", "Virtual"), ("camera.delete", "renamed")] {
+            let before = rows
+                .iter()
+                .find(|e| e.action == action)
+                .unwrap_or_else(|| panic!("a {action} audit row: {rows:?}"))
+                .before_json
+                .as_deref()
+                .unwrap_or_default();
+            assert!(
+                before.contains(&format!("\"name\":\"{was}\"")),
+                "{action} must record the camera it changed: {before:?}",
+            );
+        }
+    }
+
+    /// A camera write cannot store a number JSON has no literal for. `1e39`
+    /// is beyond f32's range, so it parses to infinity, and `serde_json`
+    /// writes that as `null`, which no later read of the row can parse. One
+    /// such PUT used to answer 200 and leave every `list_cameras` failing.
+    /// Both writes refuse it with 400 and leave the stored camera as it was.
+    #[tokio::test]
+    async fn a_camera_write_with_a_number_json_cannot_hold_is_refused() {
+        use axum::body::to_bytes;
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let stored = store
+            .list_cameras()
+            .await
+            .expect("fixture: a readable list");
+        let before = serde_json::to_value(&stored).unwrap();
+        let mut zone_vertex = before[0].clone();
+        zone_vertex["zones"] = serde_json::json!([{
+            "id": "z1",
+            "name": "door",
+            "polygon": [[1e39, 0.5], [0.1, 0.1], [0.2, 0.9]],
+        }]);
+        let mut threshold = before[0].clone();
+        threshold["model_override"] = serde_json::json!({ "score_threshold": 1e39 });
+        // Pinned so a create that is let through does not probe the URL.
+        threshold["codec"] = serde_json::json!("h264");
+        let app = super::router(state);
+        for (method, uri, body) in [
+            (
+                Method::PUT,
+                format!("/api/v1/cameras/{}", stored[0].id),
+                zone_vertex,
+            ),
+            (Method::POST, "/api/v1/cameras".to_string(), threshold),
+        ] {
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let text = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{method} {uri} must refuse the number: {}",
+                String::from_utf8_lossy(&text),
+            );
+            let after = store
+                .list_cameras()
+                .await
+                .unwrap_or_else(|e| panic!("{method} {uri} must leave the list readable: {e}"));
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                before,
+                "{method} {uri} must not write",
+            );
+        }
+    }
+
     //
     // Each test stands up its own router so the inserted rows
     // (rules, motion_events, outbox entries) don't leak. We exercise
@@ -9734,6 +10081,30 @@ mod tests {
         assert_eq!(model.preset, "640");
     }
 
+    /// The fleet's `detector_config` is written into every camera's
+    /// `model_override`, so a threshold JSON has no literal for would leave
+    /// every camera row unreadable. It is refused with 400 before any camera
+    /// is written.
+    #[tokio::test]
+    async fn fleet_apply_detector_config_refuses_a_number_json_cannot_hold() {
+        const SECRET: &[u8] = b"fleet-detector-config-non-finite-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        store
+            .upsert_camera(&fleet_test_camera(1, "front"))
+            .await
+            .unwrap();
+
+        let body = serde_json::json!({ "kind": "yolo", "score_threshold": 1e39 });
+        let res = fleet_apply(&app, SECRET, "detector_config", body).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let cameras = store
+            .list_cameras()
+            .await
+            .expect("the camera list must stay readable");
+        assert!(cameras[0].detector.model_override.is_none());
+    }
+
     /// `delivery_settings` upserts the singleton row.
     #[tokio::test]
     async fn fleet_apply_delivery_settings_round_trips() {
@@ -10021,8 +10392,9 @@ mod tests {
     /// so a renamed `kind()` cannot silently disarm it.
     ///
     /// Computed as a `gstreamer` build computes it
-    /// ([`crate::cloud_tunnel::recorder_issue_in`] given `true`), so it
-    /// runs in default-feature CI; `cloud_tunnel` tests the feature gate.
+    /// ([`crate::cloud_tunnel::EngineHealth::with_real_recorder`] given
+    /// `true`), so it runs in default-feature CI; `cloud_tunnel` tests the
+    /// feature gate.
     /// Asserts on the recorder issue, never on `status == "ok"`: the
     /// detector registry is process-global and a sibling test may have
     /// written it (BUG-159).
@@ -10054,7 +10426,7 @@ mod tests {
             .seed_from_config_if_empty(&cfg)
             .await
             .expect("seed the store as boot does");
-        let (recorder, _webrtc, _analysis) = crate::build_recorder(
+        let (recorder, webrtc, _analysis) = crate::build_recorder(
             &cfg.runtime.clips.recorder,
             store.clone(),
             &dir.path().join("clips"),
@@ -10074,10 +10446,24 @@ mod tests {
         .await
         .expect("build_recorder");
         assert_eq!(recorder.kind(), "stub", "boot must construct the stub");
-
-        let body = super::health_body(
-            crate::cloud_tunnel::recorder_issue_in(true, recorder.kind(), &store).await,
+        assert!(
+            !nexus_types::HdTransport::all()
+                .into_iter()
+                .any(|t| webrtc.can_publish(t)),
+            "the stub's WebRTC bridge drops every HD start, so the heartbeat must not offer HD"
         );
+
+        let health = crate::cloud_tunnel::EngineHealth::with_real_recorder(
+            true,
+            recorder,
+            store,
+            crate::live_view::LiveViewManager::new(
+                Arc::new(nexus_pipeline::LatestFrameCache::new()),
+                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            ),
+            crate::reconciler::HandleMap::default(),
+        );
+        let body = super::health_body(health.rollup().await, true);
         let issue = body["issues"]
             .as_array()
             .and_then(|issues| issues.iter().find(|i| i["component"] == "recorder"))
@@ -10085,6 +10471,238 @@ mod tests {
                 panic!("/api/v1/health must report a stub behind an enabled camera: {body}")
             });
         assert_eq!(issue["code"], "recorder_stub", "{body}");
+        assert_eq!(body["status"], "degraded", "{body}");
+    }
+
+    /// `GET /api/v1/health` through the full router, with the caller's
+    /// bearer when there is one.
+    async fn get_health(app: axum::Router, bearer: Option<&str>) -> serde_json::Value {
+        use axum::body::to_bytes;
+        let mut req = Request::builder().method(Method::GET).uri("/api/v1/health");
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "degraded is still HTTP 200");
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The first camera of the engine's default config, stored with
+    /// `ingest.enabled` set to `enabled`.
+    async fn store_default_camera(store: &Store, enabled: bool) {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cfg = nexus_config::Config::load(repo_root.join(crate::DEFAULT_CONFIG))
+            .expect("load the engine's default config");
+        let mut camera = cfg.cameras[0].clone();
+        camera.ingest.enabled = enabled;
+        store
+            .upsert_camera(&camera)
+            .await
+            .expect("store the camera");
+    }
+
+    /// The roll-up's issues apart from the detector's. The detector
+    /// registry is process-global and a sibling test may write it between
+    /// two reads (BUG-159).
+    fn non_detector_issues(
+        health: &nexus_cloud_protocol::v1::EdgeHealth,
+    ) -> Vec<serde_json::Value> {
+        health
+            .issues
+            .iter()
+            .flatten()
+            .filter(|i| i.component != "detector")
+            .map(|i| serde_json::json!({ "component": i.component, "code": i.code, "detail": i.detail }))
+            .collect()
+    }
+
+    /// `GET /api/v1/health` reports the roll-up it shares with the
+    /// heartbeat, not a list of its own: a stub behind an enabled camera is
+    /// on it, and a stub behind only a disabled camera is not. Fails if the
+    /// handler drops the roll-up or computes any part of it apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_reports_the_shared_roll_up() {
+        for enabled in [true, false] {
+            let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+            store_default_camera(&store, enabled).await;
+            let health = state.health.clone();
+
+            let body = get_health(super::router(state), None).await;
+            let local: Vec<serde_json::Value> = body["issues"]
+                .as_array()
+                .expect("issues array")
+                .iter()
+                .filter(|i| i["component"] != "detector")
+                .cloned()
+                .collect();
+            assert_eq!(local, non_detector_issues(&health.rollup().await), "{body}");
+            assert_eq!(
+                local.iter().any(|i| i["code"] == "recorder_stub"),
+                enabled,
+                "a stub behind an enabled camera, and only then: {body}",
+            );
+        }
+    }
+
+    /// `GET /api/v1/health` must answer while the store's pool is exhausted,
+    /// and answer the way an unread camera list answers: a stub is still
+    /// reported, saying the list could not be read. A pool acquire waits up
+    /// to 30 s, and the installer's health probe gives the whole request,
+    /// connect included, 2 s (`curl -m 2` in `wait_for_health`). So the
+    /// answer must come inside 1.5 s: the store read's 1 s bound and half a
+    /// second to spare. A bound equal to the installer's would pass a store
+    /// read that took all of it. The host-metrics snapshot is taken once
+    /// first, so the bound measures the request and not the one-time GPU
+    /// probe (`system_profiler` on macOS, 1 to 3 s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_answers_while_the_store_pool_is_exhausted() {
+        const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_millis(1500);
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let _ = crate::system_metrics::snapshot();
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(
+                store
+                    .pool()
+                    .acquire()
+                    .await
+                    .expect("hold a pool connection"),
+            );
+        }
+
+        let body = tokio::time::timeout(ANSWER_WITHIN, get_health(super::router(state), None))
+            .await
+            .expect("/api/v1/health must answer with the installer's probe to spare");
+        let issue = body["issues"]
+            .as_array()
+            .and_then(|issues| issues.iter().find(|i| i["code"] == "recorder_stub"))
+            .unwrap_or_else(|| panic!("an unread camera list keeps the stub reported: {body}"));
+        assert!(
+            issue["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("could not be read"),
+            "{body}",
+        );
+        drop(held);
+    }
+
+    const HEALTH_SECRET: &[u8] = b"local-health-detail-secret";
+
+    /// A stub behind an enabled camera, on a router with an admin secret,
+    /// so it can tell a signed-in caller from anyone else.
+    async fn degraded_health_state() -> (super::ApiState, Arc<Store>, tempfile::TempDir) {
+        let (state, store, dir, _reg, _bus) = build_test_state(Some(HEALTH_SECRET)).await;
+        store_default_camera(&store, true).await;
+        (state, store, dir)
+    }
+
+    fn recorder_stub_issue(body: &serde_json::Value) -> serde_json::Value {
+        body["issues"]
+            .as_array()
+            .and_then(|issues| issues.iter().find(|i| i["code"] == "recorder_stub"))
+            .cloned()
+            .unwrap_or_else(|| panic!("fixture: the stub is reported: {body}"))
+    }
+
+    /// Any LAN host can call `/api/v1/health`, with no bearer or one that
+    /// does not verify. It learns that the box is degraded, and the
+    /// component and code, but not the detail, which says the box keeps no
+    /// video and names the file to change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_withholds_issue_detail_from_an_unauthenticated_caller() {
+        for bearer in [None, Some(sign_admin_jwt(b"some-other-secret"))] {
+            let (state, _store, _dir) = degraded_health_state().await;
+            let body = get_health(super::router(state), bearer.as_deref()).await;
+            assert_eq!(body["status"], "degraded", "{body}");
+            let issue = recorder_stub_issue(&body);
+            assert_eq!(issue["component"], "recorder", "{body}");
+            assert!(
+                issue.get("detail").is_none(),
+                "an unauthenticated caller must not get the detail: {body}",
+            );
+        }
+    }
+
+    /// A signed-in caller, such as the local UI, gets the detail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_gives_a_signed_in_caller_the_issue_detail() {
+        let (state, _store, _dir) = degraded_health_state().await;
+        let body = get_health(super::router(state), Some(&sign_admin_jwt(HEALTH_SECRET))).await;
+        let issue = recorder_stub_issue(&body);
+        assert!(
+            issue["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("restart nexus-engine")),
+            "a signed-in caller must get the detail: {body}",
+        );
+    }
+
+    /// The local UI polls `/api/v1/health` every 10 s from every signed-in
+    /// page. Checking the caller's session must not count as activity, or
+    /// an open tab would keep its session from ever reaching the idle
+    /// timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn polling_local_health_does_not_keep_a_session_active() {
+        let (mut state, _store, _dir) = degraded_health_state().await;
+        let (tx, mut bumps) = tokio::sync::mpsc::channel(8);
+        state.admin_auth = Arc::new(
+            AdminAuthState::from_secret_bytes(Some(HEALTH_SECRET), false).with_idle_bump_tx(tx),
+        );
+        let token = crate::auth::sessions::issue_access_token(
+            1,
+            nexus_types::Role::Viewer,
+            HEALTH_SECRET,
+            chrono::Utc::now(),
+            chrono::Duration::minutes(5),
+            Some("chain-1"),
+        )
+        .expect("mint a session token");
+
+        let body = get_health(super::router(state), Some(&token)).await;
+        assert!(
+            recorder_stub_issue(&body).get("detail").is_some(),
+            "fixture: the session verified: {body}",
+        );
+        assert!(
+            bumps.try_recv().is_err(),
+            "a health poll must not bump the session's idle clock",
+        );
+    }
+
+    /// The local probe must report what the heartbeat reports. A subscribed
+    /// live-view camera whose source never produced a frame stalls after
+    /// `STALL_AFTER`, and the heartbeat carries that as
+    /// `camera_source_stalled` (`stalled_live_view_sources_become_a_wire_issue`).
+    /// Real clock, because the router reads SQLite and a paused clock races
+    /// sqlx's acquire timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_health_reports_a_stalled_camera_the_heartbeat_reports() {
+        let (state, _store, _dir, _reg, _bus) = build_test_state(None).await;
+        let live_view = state.live_view.clone();
+        live_view.on_subscribe(&nexus_cloud_protocol::v1::LbrSubscribePayload {
+            camera_id: 7,
+            tile_w: Some(320),
+            tile_h: Some(180),
+            fps_tier: Some("grid".to_string()),
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while live_view.stalled_cameras() != vec![7] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture: the subscribed camera never stalled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let body = get_health(super::router(state), None).await;
+        let issue = body["issues"]
+            .as_array()
+            .and_then(|issues| issues.iter().find(|i| i["code"] == "camera_source_stalled"))
+            .unwrap_or_else(|| panic!("/api/v1/health must report the stalled camera: {body}"));
+        assert_eq!(issue["component"], "live_view", "{body}");
         assert_eq!(body["status"], "degraded", "{body}");
     }
 }

@@ -251,7 +251,7 @@ fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
     out.push(check_time_sync());
 
     // 9.1 — engine HTTP responds.
-    let health = check_health(client, base);
+    let (health, health_body) = check_health(client, base);
     let engine_up = matches!(health.status, Status::Pass);
     out.push(health);
 
@@ -292,8 +292,18 @@ fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
     out.push(cameras_outcome);
 
     out.push(check_snapshots(client, base, &enabled_ids));
-    out.push(check_backends_ready(client, base));
-    out.push(check_storage_local(client, base));
+    out.push(fail_on_engine_issues(
+        check_backends_ready(client, base),
+        health_body.as_ref(),
+        "detector",
+        "The detector failed to build, so this engine reports zero detections; the engine log line `DETECTION DISABLED` names the missing model (check `[inference.model]` preset / pack_path).",
+    ));
+    out.push(fail_on_engine_issues(
+        check_storage_local(client, base),
+        health_body.as_ref(),
+        "recorder",
+        "For `recorder_stub`, set `[runtime.clips] recorder = \"gstreamer\"` in /etc/nexus/nexus.toml and restart (INSTALL.md §9, \"Recorder writes 0-byte mp4 files\").",
+    ));
     out.push(check_motion_recent(client, base, &enabled_ids));
     out.push(check_events_recent(client, base));
     out.push(check_npu_runtime());
@@ -370,37 +380,97 @@ fn check_time_sync() -> Outcome {
     }
 }
 
-fn check_health(client: &Client, base: &str) -> Outcome {
+/// 9.1, plus the body as JSON when it parses: the engine's own health
+/// roll-up, which [`fail_on_engine_issues`] grades later checks against.
+fn check_health(client: &Client, base: &str) -> (Outcome, Option<Value>) {
     let url = format!("{base}/api/v1/health");
     match client.get(&url).send() {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
             if status == StatusCode::OK && !body.trim().is_empty() {
-                Outcome::pass(
-                    "9.1",
-                    "engine_http",
-                    "200 OK with non-empty body",
-                    truncate(&body, 80),
+                (
+                    Outcome::pass(
+                        "9.1",
+                        "engine_http",
+                        "200 OK with non-empty body",
+                        truncate(&body, 80),
+                    ),
+                    serde_json::from_str(&body).ok(),
                 )
             } else {
-                Outcome::fail(
-                    "9.1",
-                    "engine_http",
-                    "200 OK with non-empty body",
-                    format!("HTTP {status}; body={}", truncate(&body, 80)),
-                    "INSTALL.md §11 row 1 (engine isn't up — check `systemctl status nexus-engine` / `docker compose ps`).",
+                (
+                    Outcome::fail(
+                        "9.1",
+                        "engine_http",
+                        "200 OK with non-empty body",
+                        format!("HTTP {status}; body={}", truncate(&body, 80)),
+                        "INSTALL.md §11 row 1 (engine isn't up — check `systemctl status nexus-engine` / `docker compose ps`).",
+                    ),
+                    None,
                 )
             }
         }
-        Err(e) => Outcome::fail(
-            "9.1",
-            "engine_http",
-            "200 OK with non-empty body",
-            format!("request failed: {e}"),
-            "INSTALL.md §11 row 1 (engine isn't up — check `systemctl status nexus-engine` / `docker compose ps`).",
+        Err(e) => (
+            Outcome::fail(
+                "9.1",
+                "engine_http",
+                "200 OK with non-empty body",
+                format!("request failed: {e}"),
+                "INSTALL.md §11 row 1 (engine isn't up — check `systemctl status nexus-engine` / `docker compose ps`).",
+            ),
+            None,
         ),
     }
+}
+
+/// Grade a check against the engine's own verdict for `component`: the
+/// `issues[]` of `GET /api/v1/health`, which the engine computes from the
+/// same rule as its heartbeat. Doctor reads that verdict rather than
+/// re-deriving it, so it cannot pass a box the engine reports degraded for
+/// the thing the check covers (BUG-225). A check that already failed keeps
+/// its own reason. A body with no `issues` list says nothing either way, so
+/// it cannot back a pass.
+fn fail_on_engine_issues(
+    check: Outcome,
+    health: Option<&Value>,
+    component: &str,
+    hint: &'static str,
+) -> Outcome {
+    if check.status == Status::Fail {
+        return check;
+    }
+    let expected = format!(
+        "{}, and no {component} issue in /api/v1/health",
+        check.expected
+    );
+    let Some(issues) = health
+        .and_then(|h| h.get("issues"))
+        .and_then(Value::as_array)
+    else {
+        return Outcome::warn(
+            check.step,
+            check.name,
+            &expected,
+            format!("{}; /api/v1/health carried no issues list", check.actual),
+            "Doctor could not read the engine's own health verdict: `curl -fsS http://localhost:8089/api/v1/health`.",
+        );
+    };
+    let codes: Vec<&str> = issues
+        .iter()
+        .filter(|i| i.get("component").and_then(Value::as_str) == Some(component))
+        .map(|i| i.get("code").and_then(Value::as_str).unwrap_or("?"))
+        .collect();
+    if codes.is_empty() {
+        return check;
+    }
+    Outcome::fail(
+        check.step,
+        check.name,
+        &expected,
+        format!("{}; engine reports {}", check.actual, codes.join(", ")),
+        hint,
+    )
 }
 
 fn check_ui_loads(client: &Client, base: &str) -> Outcome {
@@ -1271,4 +1341,156 @@ fn to_rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
 /// extra dep — the workspace MSRV is 1.88.
 fn atty_stdout() -> bool {
     std::io::stdout().is_terminal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A live engine as 9.5 and 9.6 see it: `backends` as its
+    /// `GET /api/v1/backends`, storage not in panic, and `issues` as its
+    /// `GET /api/v1/health` roll-up. Every other route 404s, so the checks that
+    /// read them fail; no test here asserts on those.
+    struct FakeEngine {
+        server: MockServer,
+        // Declared after `server` so the server drops while its runtime is
+        // still up.
+        _rt: tokio::runtime::Runtime,
+    }
+
+    /// [`fake_engine_with_backends`] over a pool whose one slot is ready.
+    fn fake_engine(health: Value) -> FakeEngine {
+        fake_engine_with_backends(
+            health,
+            json!({ "mode": "pool", "slots": [{ "id": 0, "state": "ready" }] }),
+        )
+    }
+
+    fn fake_engine_with_backends(health: Value, backends: Value) -> FakeEngine {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let server = rt.block_on(async {
+            let server = MockServer::start().await;
+            for (route, body) in [
+                ("/api/v1/health", health),
+                (
+                    "/api/v1/storage/local",
+                    json!({ "recorder_kind": "stub", "panic": false, "free_pct": 80.0 }),
+                ),
+                ("/api/v1/backends", backends),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(route))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+            }
+            server
+        });
+        FakeEngine { server, _rt: rt }
+    }
+
+    /// `GET /api/v1/health` as the engine builds it: `degraded` iff an issue
+    /// is open.
+    fn health_with(issues: &[(&str, &str)]) -> Value {
+        let issues: Vec<Value> = issues
+            .iter()
+            .map(|(component, code)| json!({ "component": component, "code": code }))
+            .collect();
+        json!({
+            "status": if issues.is_empty() { "ok" } else { "degraded" },
+            "version": "test",
+            "issues": issues,
+        })
+    }
+
+    fn run(engine: &FakeEngine) -> Vec<Outcome> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        run_checks(&client, &engine.server.uri())
+    }
+
+    fn status_of(outcomes: &[Outcome], step: &str) -> Status {
+        outcomes
+            .iter()
+            .find(|o| o.step == step)
+            .unwrap_or_else(|| panic!("no {step} outcome in {outcomes:?}"))
+            .status
+    }
+
+    /// BUG-225: a stub recorder behind enabled cameras keeps no video, and the
+    /// engine says so in its health roll-up. The storage check read only the
+    /// panic flag, so it passed that box.
+    #[test]
+    fn a_recorder_issue_in_the_engine_health_fails_the_storage_check() {
+        let engine = fake_engine(health_with(&[("recorder", "recorder_stub")]));
+        let outcomes = run(&engine);
+        assert_eq!(status_of(&outcomes, "9.6"), Status::Fail, "{outcomes:?}");
+        assert_eq!(
+            status_of(&outcomes, "9.5"),
+            Status::Pass,
+            "a recorder issue is not a backend failure: {outcomes:?}"
+        );
+    }
+
+    /// The same defect for the detector: a detector that failed to build is
+    /// replaced by one that reports nothing, and its slot still reads `ready`.
+    #[test]
+    fn a_detector_issue_in_the_engine_health_fails_the_backends_check() {
+        let engine = fake_engine(health_with(&[("detector", "detector_unavailable")]));
+        let outcomes = run(&engine);
+        assert_eq!(status_of(&outcomes, "9.5"), Status::Fail, "{outcomes:?}");
+        assert_eq!(
+            status_of(&outcomes, "9.6"),
+            Status::Pass,
+            "a detector issue is not a storage failure: {outcomes:?}"
+        );
+    }
+
+    /// `in_process` is the config default, and 9.5 only warns on it. A
+    /// detector issue must still fail the check, not leave it at that warning.
+    #[test]
+    fn a_detector_issue_fails_the_backends_check_on_the_in_process_default() {
+        let in_process = json!({ "mode": "in_process", "slots": [] });
+        let degraded = fake_engine_with_backends(
+            health_with(&[("detector", "detector_unavailable")]),
+            in_process.clone(),
+        );
+        let outcomes = run(&degraded);
+        assert_eq!(status_of(&outcomes, "9.5"), Status::Fail, "{outcomes:?}");
+
+        let healthy = fake_engine_with_backends(health_with(&[]), in_process);
+        let outcomes = run(&healthy);
+        assert_eq!(
+            status_of(&outcomes, "9.5"),
+            Status::Warn,
+            "with no issue the in_process note stands: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn an_engine_reporting_no_issues_passes_the_storage_and_backends_checks() {
+        let engine = fake_engine(health_with(&[]));
+        let outcomes = run(&engine);
+        assert_eq!(status_of(&outcomes, "9.5"), Status::Pass, "{outcomes:?}");
+        assert_eq!(status_of(&outcomes, "9.6"), Status::Pass, "{outcomes:?}");
+    }
+
+    /// A health body with no `issues` list says nothing about the recorder or
+    /// the detector, so it cannot back a pass for either.
+    #[test]
+    fn a_health_body_without_an_issues_list_cannot_pass_either_check() {
+        let engine = fake_engine(json!({ "status": "ok" }));
+        let outcomes = run(&engine);
+        assert_eq!(status_of(&outcomes, "9.5"), Status::Warn, "{outcomes:?}");
+        assert_eq!(status_of(&outcomes, "9.6"), Status::Warn, "{outcomes:?}");
+    }
 }

@@ -877,6 +877,7 @@ mod tests {
             camera_id: 0,
             frame_id: 0,
             captured_at: Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: 2,
             height: 2,
             format: PixelFormat::Rgb24,

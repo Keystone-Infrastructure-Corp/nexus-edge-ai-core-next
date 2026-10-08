@@ -381,6 +381,25 @@ where
     }
 }
 
+/// Whether the request carries a bearer [`SessionContext`] would accept,
+/// for a route open to everyone that tells a signed-in caller more. Unlike
+/// `Option<SessionContext>`, it does not count the request as session
+/// activity, so a background poll cannot keep an idle session alive.
+pub struct SignedIn(pub bool);
+
+impl<S> FromRequestParts<S> for SignedIn
+where
+    S: Send + Sync,
+    Arc<AdminAuthState>: FromRef<S>,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth = Arc::<AdminAuthState>::from_ref(state);
+        Ok(SignedIn(authorise(&auth, extract_bearer(parts)).is_ok()))
+    }
+}
+
 /// v0.1.36 \u2014 try-send a `(chain_id, now)` bump into the drain
 /// channel. No-op when:
 ///

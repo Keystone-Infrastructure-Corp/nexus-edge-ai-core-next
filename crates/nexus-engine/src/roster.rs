@@ -121,7 +121,11 @@ async fn build_envelope(
                 // nobody is watching in the live-view grid is still
                 // reported correctly (unlike `live_view::stalled_cameras`,
                 // which only tracks cameras with a live-view subscriber).
-                online: Some(frame_stats.snapshot(c.id).is_some_and(|s| s.is_online(now))),
+                online: Some(
+                    frame_stats
+                        .snapshot(c.id)
+                        .is_some_and(|s| s.is_online(std::time::Instant::now())),
+                ),
                 // Phase A: per-camera revision == snapshot revision.
                 // Phase D will introduce real per-row tracking when
                 // cloud-side mutations need optimistic-concurrency.
@@ -529,7 +533,7 @@ mod tests {
         store.upsert_camera(&cam(2, "never-started")).await.unwrap();
 
         let frame_stats = FrameStatsRegistry::new();
-        frame_stats.observe_frame(1, Utc::now(), 960, 540);
+        frame_stats.observe_frame(1, frame_stats.begin_session(1), Utc::now(), 960, 540);
 
         let env = build_envelope(&store, 1, "yolo", &frame_stats)
             .await

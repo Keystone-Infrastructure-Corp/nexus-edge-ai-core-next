@@ -157,6 +157,7 @@ impl FrameSource for VirtualSource {
                 camera_id: self.camera_id,
                 frame_id,
                 captured_at: Utc::now(),
+                captured_mono: Instant::now(),
                 width: self.width,
                 height: self.height,
                 format: PixelFormat::Rgb24,
@@ -449,6 +450,18 @@ pub struct SharedRtspSource {
     /// rebuilt by any of this — recording and HD live view are not
     /// collateral (SPEC-069 invariants I2\u2013I5).
     pub analysis: Option<std::sync::Arc<crate::preroll_ingester::PreRollIngester>>,
+    /// The recorder's substream sessions, by camera. While analysis reads
+    /// the main stream, a live session found here is one that has not
+    /// delivered yet: the camera's first, or the engine's retry (SPEC-069:
+    /// after a fallback, or a registration that failed). It is
+    /// read beside the main stream until it delivers a frame, then taken
+    /// up, and given up if it delivers none inside
+    /// [`ANALYSIS_FIRST_FRAME_GRACE`]. Waiting on it never valves the main
+    /// stream off, so analysis stays on the main stream while a retry fails.
+    pub analysis_sessions: crate::gst_clip_recorder::IngesterRegistry,
+    /// The camera's decode counters, reset when this source takes one of
+    /// those sessions up, since they then describe another geometry.
+    pub decode_health: Option<std::sync::Arc<crate::stats::DecodeHealthRegistry>>,
     /// SPEC-069 Phase 1 (P3) — where the analysis-stream status this
     /// source observes gets published for `GET /v1/cameras/{id}/stats`.
     /// `None` in tests/callers that don't care to observe it.
@@ -476,17 +489,23 @@ impl FrameSource for SharedRtspSource {
                 reg.observe_probing(self.camera_id);
             }
         } else if let Some(reg) = self.analysis_stream.as_ref() {
-            // No substream configured — this is the intended,
-            // healthy state, not a fallback.
-            reg.observe_mainstream_by_design(self.camera_id);
+            if self.registered_session().is_some() {
+                // A substream session that has not delivered yet: this
+                // source reads the main stream and its watch takes the
+                // session up once it delivers.
+                reg.observe_probing(self.camera_id);
+            } else {
+                // No substream configured — this is the intended,
+                // healthy state, not a fallback.
+                reg.observe_mainstream_by_design(self.camera_id);
+            }
         }
         let mut rx = self.frames_from(reading_analysis)?;
-        let expected_fps = self
-            .analysis
-            .as_ref()
-            .and_then(|a| a.rgb_tap_fps())
-            .unwrap_or(0);
-        let started = std::time::Instant::now();
+        // The session analysis reads, or last read: the one this source
+        // started with, or one it has taken up since.
+        let mut analysis = self.analysis.clone();
+        let mut expected_fps = analysis.as_ref().and_then(|a| a.rgb_tap_fps()).unwrap_or(0);
+        let mut started = std::time::Instant::now();
         let mut frames: u64 = 0;
         // Rate is judged over a rolling window, not the session's
         // lifetime — see `AnalysisObservation::frames`. `window_start`
@@ -498,6 +517,9 @@ impl FrameSource for SharedRtspSource {
         // Geometry of the last frame delivered, for `analysis_stream`'s
         // width/height (P3). Whichever session is active at the time.
         let mut last_frame_dims: (u32, u32) = (0, 0);
+        // While analysis reads the main stream: a substream session
+        // registered since, read beside it until it delivers.
+        let mut standby: Option<Standby> = None;
         let mut health_tick =
             tokio::time::interval(std::time::Duration::from_secs(ANALYSIS_HEALTH_TICK_SECS));
         health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -510,7 +532,11 @@ impl FrameSource for SharedRtspSource {
                 return Err(FrameSourceError::Closed);
             }
             tokio::select! {
-                _ = health_tick.tick(), if reading_analysis => {
+                _ = health_tick.tick() => {
+                    if !reading_analysis {
+                        self.watch_for_a_session(&mut standby);
+                        continue;
+                    }
                     // Before the first frame, judge against the session's
                     // age (the grace window); afterwards, against the
                     // rolling window so a collapse is caught while it is
@@ -523,10 +549,7 @@ impl FrameSource for SharedRtspSource {
                     let verdict = analysis_verdict(&AnalysisObservation {
                         frames: obs_frames,
                         elapsed: obs_elapsed,
-                        session_live: self
-                            .analysis
-                            .as_ref()
-                            .is_some_and(|a| a.is_buffering()),
+                        session_live: analysis.as_ref().is_some_and(|a| a.is_buffering()),
                         expected_fps,
                     });
                     if let (AnalysisVerdict::Healthy, Some(reg)) =
@@ -558,7 +581,7 @@ impl FrameSource for SharedRtspSource {
                         // reconnecting with no subscriber would turn one
                         // decode into two for the life of the camera —
                         // the precise cost this phase exists to remove.
-                        if let Some(a) = self.analysis.as_ref() {
+                        if let Some(a) = analysis.as_ref() {
                             a.shutdown();
                         }
                         if let Some(reg) = self.analysis_stream.as_ref() {
@@ -566,6 +589,45 @@ impl FrameSource for SharedRtspSource {
                         }
                         reading_analysis = false;
                         rx = self.frames_from(false)?;
+                    }
+                }
+                recv = standby_frame(&mut standby) => {
+                    let Some((session, standby_rx, _)) = standby.take() else {
+                        continue;
+                    };
+                    let frame = match recv {
+                        Ok(frame) => Some(frame),
+                        // Frames arriving faster than they are read still
+                        // prove the session delivers.
+                        Err(RecvError::Lagged(_)) => None,
+                        Err(RecvError::Closed) => continue,
+                    };
+                    tracing::info!(
+                        camera_id = self.camera_id,
+                        "analysis substream session delivering; analysis reads it again, \
+                         main-stream rgb tap valved off"
+                    );
+                    session.mark_delivered();
+                    self.ingester.set_rgb_valve_closed(true);
+                    if let Some(h) = self.decode_health.as_ref() {
+                        h.reset(self.camera_id);
+                    }
+                    if let Some(reg) = self.analysis_stream.as_ref() {
+                        reg.observe_probing(self.camera_id);
+                    }
+                    expected_fps = session.rgb_tap_fps().unwrap_or(0);
+                    analysis = Some(session);
+                    rx = standby_rx;
+                    reading_analysis = true;
+                    started = std::time::Instant::now();
+                    frames = 0;
+                    window_start = started;
+                    window_frames = 0;
+                    if let Some(frame) = frame {
+                        frames += 1;
+                        window_frames += 1;
+                        last_frame_dims = (frame.width, frame.height);
+                        let _ = tx.try_send(frame);
                     }
                 }
                 recv = rx.recv() => match recv {
@@ -604,8 +666,76 @@ impl FrameSource for SharedRtspSource {
 /// How often the analysis session's health is re-judged.
 pub const ANALYSIS_HEALTH_TICK_SECS: u64 = 5;
 
+/// A substream session read beside the main stream until it delivers, and
+/// when the source first saw it.
+#[cfg(feature = "gstreamer")]
+type Standby = (
+    std::sync::Arc<crate::preroll_ingester::PreRollIngester>,
+    tokio::sync::broadcast::Receiver<Frame>,
+    std::time::Instant,
+);
+
+/// The standby session's next frame; never resolves while there is none.
+#[cfg(feature = "gstreamer")]
+async fn standby_frame(
+    standby: &mut Option<Standby>,
+) -> Result<Frame, tokio::sync::broadcast::error::RecvError> {
+    match standby {
+        Some((_, rx, _)) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(feature = "gstreamer")]
 impl SharedRtspSource {
+    /// While analysis reads the main stream: start reading a live
+    /// substream session the engine registered since, or give up on the one
+    /// being read if it delivered nothing inside the first-frame grace. A
+    /// given-up session is shut down, so it neither reconnects with no
+    /// reader nor comes back here until the engine registers it again.
+    fn watch_for_a_session(&self, standby: &mut Option<Standby>) {
+        let Some((session, _, since)) = standby.as_ref() else {
+            *standby = self.registered_session().and_then(|s| {
+                let rx = s.subscribe_frames()?;
+                Some((s, rx, std::time::Instant::now()))
+            });
+            return;
+        };
+        let verdict = analysis_verdict(&AnalysisObservation {
+            frames: 0,
+            elapsed: since.elapsed(),
+            session_live: session.is_buffering(),
+            expected_fps: 0,
+        });
+        if let AnalysisVerdict::FallBack(reason) = verdict {
+            tracing::debug!(
+                camera_id = self.camera_id,
+                ?reason,
+                "analysis substream session delivered nothing; analysis stays on the main stream"
+            );
+            session.shutdown();
+            if let Some(reg) = self.analysis_stream.as_ref() {
+                reg.observe_unavailable(self.camera_id, reason.as_str());
+            }
+            *standby = None;
+        }
+    }
+
+    /// The camera's substream session in the recorder's registry, unless the
+    /// fallback or a give-up shut it down.
+    fn registered_session(
+        &self,
+    ) -> Option<std::sync::Arc<crate::preroll_ingester::PreRollIngester>> {
+        self.analysis_sessions
+            .read()
+            .get(&self.camera_id)
+            .filter(|a| !a.is_shutdown())
+            .cloned()
+    }
+
+    /// The main session's frames or, with `analysis`, those of the session
+    /// this source started with, if any ([`Self::analysis`]); never those of
+    /// a session taken up since.
     fn frames_from(
         &self,
         analysis: bool,
@@ -643,6 +773,36 @@ pub(crate) mod gst_init {
             Err(e) => Err(FrameSourceError::Backend(format!("gst::init: {e}"))),
         }
     }
+}
+
+/// Copy one RGB plane into the packed `width * height * 3` buffer every
+/// `Frame` consumer reads (the JPEG encoders, the detectors). GStreamer
+/// pads each RGB row to a 4-byte stride, so wherever `width * 3` is not a
+/// multiple of 4 the plane is wider than the picture: a `supervisor_width`
+/// of 1366 gives 4098-byte rows in a 4100-byte stride. `None` when the
+/// plane is smaller than its stride and height say.
+#[cfg(feature = "gstreamer")]
+pub(crate) fn pack_rgb_rows(
+    plane: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
+    let row_bytes = width * 3;
+    if stride < row_bytes || plane.len() < stride * height {
+        return None;
+    }
+    let mut data = Vec::with_capacity(row_bytes * height);
+    if stride == row_bytes {
+        // Hot path: no padding, single bulk copy.
+        data.extend_from_slice(&plane[..row_bytes * height]);
+    } else {
+        for y in 0..height {
+            let start = y * stride;
+            data.extend_from_slice(&plane[start..start + row_bytes]);
+        }
+    }
+    Some(data)
 }
 
 #[cfg(feature = "gstreamer")]
@@ -877,7 +1037,7 @@ impl RtspSource {
                     let height = info.height() as usize;
                     let row_bytes = width * 3;
 
-                    if stride < row_bytes || plane.len() < stride * height {
+                    let Some(data) = pack_rgb_rows(plane, stride, width, height) else {
                         tracing::error!(
                             camera_id = camera_id,
                             stride,
@@ -887,18 +1047,7 @@ impl RtspSource {
                             "rtsp appsink buffer geometry inconsistent with caps"
                         );
                         return Err(gst::FlowError::Error);
-                    }
-
-                    let mut data = Vec::with_capacity(row_bytes * height);
-                    if stride == row_bytes {
-                        // Hot path: no padding, single bulk copy.
-                        data.extend_from_slice(&plane[..row_bytes * height]);
-                    } else {
-                        for y in 0..height {
-                            let start = y * stride;
-                            data.extend_from_slice(&plane[start..start + row_bytes]);
-                        }
-                    }
+                    };
 
                     let frame_id = {
                         let mut g = counter_cb.lock();
@@ -914,6 +1063,7 @@ impl RtspSource {
                         camera_id,
                         frame_id,
                         captured_at: Utc::now(),
+                        captured_mono: Instant::now(),
                         width: info.width(),
                         height: info.height(),
                         format: PixelFormat::Rgb24,
@@ -953,10 +1103,14 @@ impl RtspSource {
         // this task, but the spawn_blocking thread keeps the bus + a strong
         // pipeline ref alive, and the tokio runtime can never finish dropping.
         // Symptom: engine ignores Ctrl-C and needs SIGKILL. Fix: short
-        // `timed_pop` poll that checks an AtomicBool every 100ms, and a
-        // sibling future that flips the flag the moment the mpsc receiver is
-        // dropped (which happens as soon as the supervisor task is aborted).
+        // `timed_pop` poll that checks an AtomicBool every 100ms, flipped by
+        // `SessionTeardown` however this session ends.
         let shutdown = Arc::new(AtomicBool::new(false));
+        let _teardown = SessionTeardown {
+            shutdown: shutdown.clone(),
+            pipeline: pipeline.clone(),
+            camera_id,
+        };
         let shutdown_bus = shutdown.clone();
         let pipeline_for_bus = pipeline.clone();
         // Dedicated OS thread, NOT tokio::task::spawn_blocking: this loop
@@ -1000,9 +1154,10 @@ impl RtspSource {
             .map_err(|e| FrameSourceError::Backend(format!("spawn bus thread: {e}")))?;
 
         // `tx.closed()` resolves the moment the supervisor's Receiver is
-        // dropped (typically within microseconds of `task.abort()`). Racing
-        // it against the bus join means a Ctrl-C tear-down doesn't have to
-        // wait for an RTSP timeout or an EOS that may never come.
+        // dropped. Racing it against the bus join means a session nobody
+        // reads doesn't have to wait for an RTSP timeout or an EOS that may
+        // never come. (An aborted supervisor aborts this task outright;
+        // `SessionTeardown` ends the session then.)
         //
         // The stall watchdog covers the silent-failure case that
         // neither the bus nor the supervisor catches: rtspsrc
@@ -1042,28 +1197,41 @@ impl RtspSource {
                 r.map_err(|e| FrameSourceError::Backend(format!("bus thread dropped: {e}")))?
                     .map_err(FrameSourceError::Backend)
             }
-            _ = tx.closed() => {
-                shutdown.store(true, Ordering::Relaxed);
-                Err(FrameSourceError::Closed)
-            }
-            e = &mut stall_watchdog => {
-                shutdown.store(true, Ordering::Relaxed);
-                Err(e)
-            }
+            _ = tx.closed() => Err(FrameSourceError::Closed),
+            e = &mut stall_watchdog => Err(e),
         };
-
-        // Null the pipeline regardless of which branch won. This unblocks
-        // any in-flight bus dispatch on the (now-detached) blocking thread,
-        // which will then observe `shutdown=true` on its next poll and exit
-        // within ≤100 ms — no thread leak, no Drop hang. Detached because
-        // we are on a tokio worker and `rtspsrc` parked in a read on a dead
-        // camera makes the transition unbounded.
-        crate::teardown::null_pipeline_detached(
-            pipeline,
-            "source::RtspSource::run",
-            Some(camera_id),
-        );
         bus_result
+    }
+}
+
+/// Ends one [`RtspSource`] session when dropped, whichever branch of its
+/// `select!` won — or none: the supervisor aborts the source task when it
+/// ends (BUG-223), and an aborted session never runs the code after its
+/// await. Without this guard that code is the only teardown, so an aborted
+/// session would leave the bus thread polling and the pipeline PLAYING,
+/// holding the camera's RTSP session: one more connection per restart.
+///
+/// Nulling the pipeline unblocks any in-flight bus dispatch on the bus
+/// thread, which then observes `shutdown` on its next poll and exits within
+/// ≤100 ms — no thread leak, no Drop hang. Detached because this runs on a
+/// tokio worker and `rtspsrc` parked in a read on a dead camera makes the
+/// transition unbounded.
+#[cfg(feature = "gstreamer")]
+struct SessionTeardown {
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    pipeline: gstreamer::Pipeline,
+    camera_id: CameraId,
+}
+
+#[cfg(feature = "gstreamer")]
+impl Drop for SessionTeardown {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        crate::teardown::null_pipeline_detached(
+            self.pipeline.clone(),
+            "source::RtspSource::run",
+            Some(self.camera_id),
+        );
     }
 }
 
@@ -1364,5 +1532,99 @@ mod tests {
         .await
         .expect("a session that never delivers must still expire");
         assert!(quiet_for > FIRE_TIMEOUT, "reported {quiet_for:?}");
+    }
+
+    /// BUG-223: an aborted session runs nothing after its await, so dropping
+    /// its `SessionTeardown` is the only thing that tells its bus thread to
+    /// stop. Nulling the pipeline alone would leave that thread polling, with
+    /// the bus and a pipeline ref, once per camera restart.
+    #[cfg(feature = "gstreamer")]
+    #[test]
+    fn an_ended_session_tells_its_bus_thread_to_stop() {
+        gst_init::ensure().expect("gst init");
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        drop(SessionTeardown {
+            shutdown: shutdown.clone(),
+            pipeline: gstreamer::Pipeline::new(),
+            camera_id: 1,
+        });
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "the ended session never told its bus thread to stop, so the thread \
+             keeps polling, holding the bus and the pipeline"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "gstreamer"))]
+mod gst_tests {
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app::AppSink;
+    use gstreamer_video::prelude::*;
+    use gstreamer_video::{VideoFrameRef, VideoInfo};
+
+    /// A real GStreamer RGB buffer at a width where `width * 3` is not a
+    /// multiple of 4 (1366, a `supervisor_width` nothing rejects) arrives
+    /// with padded rows. The frame both RGB taps build from it must be
+    /// exactly `width * height * 3`, row for row, or every JPEG encode of
+    /// it fails and every detector reads it sheared.
+    #[test]
+    fn a_padded_rgb_plane_is_packed_to_width_times_three() {
+        super::gst_init::ensure().expect("gst init");
+        let (w, h) = super::supervisor_frame_for(1366);
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=1 ! {} ! video/x-raw,format=RGB,width={w},height={h} \
+             ! appsink name=sink sync=false",
+            crate::decode::CPU_TAIL
+        ))
+        .expect("launch")
+        .downcast::<gst::Pipeline>()
+        .expect("pipeline");
+        let sink = pipeline
+            .by_name("sink")
+            .expect("sink")
+            .downcast::<AppSink>()
+            .expect("appsink");
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        let sample = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(10))
+            .expect("one sample within 10 s");
+        crate::teardown::null_pipeline_detached(pipeline, "source::gst_tests", None);
+
+        let info = VideoInfo::from_caps(sample.caps().expect("caps")).expect("info");
+        let frame =
+            VideoFrameRef::from_buffer_ref_readable(sample.buffer().expect("buffer"), &info)
+                .expect("map");
+        let plane = frame.plane_data(0).expect("plane");
+        let stride = frame.plane_stride()[0] as usize;
+        let row = w as usize * 3;
+        assert!(
+            stride > row,
+            "GStreamer did not pad a {row}-byte row: stride {stride}"
+        );
+
+        let packed = super::pack_rgb_rows(plane, stride, w as usize, h as usize).expect("pack");
+        assert_eq!(packed.len(), row * h as usize);
+        for y in 0..h as usize {
+            assert_eq!(
+                &packed[y * row..(y + 1) * row],
+                &plane[y * stride..y * stride + row],
+                "row {y}"
+            );
+        }
+        crate::jpeg::encode_rgb24(&packed, w, h, 80).expect("the packed frame encodes");
+    }
+
+    /// A stride narrower than the row, or a plane shorter than its stride
+    /// and height, is refused rather than read overlapping or out of range.
+    #[test]
+    fn a_plane_inconsistent_with_its_geometry_is_refused() {
+        assert_eq!(super::pack_rgb_rows(&[0; 24], 5, 2, 4), None);
+        assert_eq!(super::pack_rgb_rows(&[0; 20], 8, 2, 3), None);
+        assert_eq!(
+            super::pack_rgb_rows(&[0; 24], 8, 2, 3).map(|d| d.len()),
+            Some(18)
+        );
     }
 }

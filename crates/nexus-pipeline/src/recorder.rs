@@ -191,7 +191,10 @@ pub trait ClipRecorder: Send + Sync {
     /// non-pre-roll backend) doesn't have to opt in. The GStreamer
     /// recorder overrides it; failure to build the ingester is
     /// logged + swallowed (the camera will refuse clips, but the
-    /// rest of the engine keeps running).
+    /// rest of the engine keeps running). The engine calls it again, with
+    /// the URL, frame and codec the camera's start used, on every reconcile
+    /// pass until it succeeds, without restarting the camera, so return
+    /// `Err` only for a failure a later call can cure.
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
     fn add_camera_ingester(
@@ -222,19 +225,22 @@ pub trait ClipRecorder: Send + Sync {
     /// broadcast, which is why recording quality cannot be affected by
     /// any of it (invariants I1–I5).
     ///
-    /// The result is the engine's only record of this call, at boot and
-    /// every time the reconciler starts the camera. `Ok(())` for
-    /// `Some(url)` means nothing to retry until the configured URL
-    /// changes: a recorder with substream sessions now has one for `url`;
-    /// the default no-op, for recorders without them, has nothing to
-    /// register, and that is not a failure. `Err` means no new session was
-    /// registered (an earlier one may remain, but the engine tears a
-    /// camera's session down before it starts the camera again). The
-    /// reconciler retries on each pass by restarting the whole camera, main
-    /// recording session included, until a call succeeds, so return `Err`
-    /// only for a failure a later call can cure. For `None` nothing is
-    /// retried: the engine logs a failed teardown when it applies a
-    /// camera's config, and discards the result when it stops the camera.
+    /// The engine calls this with `Some(url)` when it starts the camera,
+    /// and again, with the URL, frame and codec the start used, on every
+    /// reconcile pass while the camera runs, without restarting it:
+    /// SPEC-069's retry on the long backoff. So `Ok(())` for a session that
+    /// is running must be a no-op, and a call that finds the camera's
+    /// session shut down by the SPEC-069 fallback must start a new one, at
+    /// the frame the camera's taps run at now, which
+    /// [`Self::resize_camera_rgb_tap`] may have moved since the start; the
+    /// running frame source takes it up once it delivers. The default no-op,
+    /// for recorders without substream sessions, has nothing to register,
+    /// and that is not a failure. `Err` means no new session was registered
+    /// (an earlier one may remain, but the engine tears a camera's session
+    /// down before it starts the camera again), and the next pass calls
+    /// again. For `None` nothing is retried: the engine logs a failed
+    /// teardown when it applies a camera's config, and discards the result
+    /// when it stops the camera.
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
     fn set_camera_analysis_ingester(
@@ -255,7 +261,9 @@ pub trait ClipRecorder: Send + Sync {
     /// low-res `PreRollIngester` under sustained crowd. Implemented
     /// by the GStreamer recorder via a teardown + rebuild keyed on
     /// the existing ingester's URL/codec/max-fps/pre-roll; other
-    /// recorders are a no-op.
+    /// recorders are a no-op. It resizes every tap
+    /// [`Self::shared_frame_source`] can read from: the main ingester's,
+    /// and the camera's SPEC-069 analysis session's while that is live.
     ///
     /// Returns `Ok(true)` when a rebuild happened (and the
     /// supervisor MUST re-acquire its [`Self::shared_frame_source`]

@@ -47,6 +47,11 @@ pub struct ModelPromptsCatalog {
     /// against. The UI uses this to pick a prompt source when a
     /// camera has no override.
     pub default_kind: String,
+    /// `inference.model.input_width` / `input_height` — the detector
+    /// input a camera with no `model_override` runs at, which sizes its
+    /// supervisor frame. The camera form previews that frame from these.
+    pub default_input_width: u32,
+    pub default_input_height: u32,
     /// One entry per detector kind the engine knows how to build,
     /// regardless of whether the router currently has a layer for
     /// it. The UI camera form lets operators select any of these
@@ -121,6 +126,8 @@ pub fn build_catalog(
         .collect();
     ModelPromptsCatalog {
         default_kind,
+        default_input_width: inference_cfg.model.input_width,
+        default_input_height: inference_cfg.model.input_height,
         kinds,
         by_kind,
     }
@@ -346,6 +353,27 @@ fn read_manifest_prompts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The camera form sizes its analysis-frame preview from the default
+    /// model's input shape for a camera with no `model_override`, the
+    /// shape the engine sizes that camera's supervisor frame from.
+    #[test]
+    fn the_catalog_carries_the_default_models_input_shape() {
+        let inference = nexus_config::InferenceConfig {
+            backend: nexus_config::InferenceBackendKind::InProcess,
+            model: nexus_config::ModelConfig {
+                kind: "mock".into(),
+                input_width: 1024,
+                input_height: 576,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let router = InferenceRouter::build(&inference, &[]).expect("router");
+        let json = serde_json::to_value(build_catalog(&inference, &router)).unwrap();
+        assert_eq!(json["default_input_width"], 1024);
+        assert_eq!(json["default_input_height"], 576);
+    }
 
     #[test]
     fn coco_info_has_12_grouped_labels() {

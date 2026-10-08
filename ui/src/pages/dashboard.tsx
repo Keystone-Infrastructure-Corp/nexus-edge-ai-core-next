@@ -48,12 +48,16 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkline } from "@/components/ui/sparkline";
 import { useSSE } from "@/hooks/useSSE";
+import { engineHealth, issueCodes } from "@/lib/engineHealth";
 import { ageMs, formatAgo, formatBytes, formatDuration } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/pages/placeholder";
 
 const STALE_FRAME_MS = 5_000;
 const SPARK_WINDOW = 60;
+// The events query reads the newest this many, so an hour that holds all of
+// them may hold more than were read.
+const RECENT_EVENTS = 100;
 
 export function DashboardPage() {
   const metricsQuery = useQuery({
@@ -69,7 +73,7 @@ export function DashboardPage() {
   });
   const eventsQuery = useQuery({
     queryKey: ["events", "recent"],
-    queryFn: () => listEvents(100),
+    queryFn: () => listEvents(RECENT_EVENTS),
     refetchInterval: 60_000,
   });
   const healthQuery = useQuery({
@@ -132,9 +136,12 @@ export function DashboardPage() {
     );
   }, [metricsQuery.data]);
 
+  // Readings are `null` / `undefined` until their query has read them, so a
+  // tile shows `notRead` in their place rather than a default such as 0.
   const eventsLastHour = useMemo(() => {
+    if (eventsQuery.data === undefined) return null;
     const cutoff = Date.now() - 60 * 60 * 1000;
-    return (eventsQuery.data ?? []).filter((e) => {
+    return eventsQuery.data.filter((e) => {
       const t = new Date(e.captured_at).getTime();
       return Number.isFinite(t) && t >= cutoff;
     }).length;
@@ -144,22 +151,21 @@ export function DashboardPage() {
     ? (metricsQuery.data.memory.used_bytes /
         Math.max(1, metricsQuery.data.memory.total_bytes)) *
       100
-    : 0;
+    : null;
   const diskPct = useMemo(() => {
-    const disks = metricsQuery.data?.disks ?? [];
-    if (disks.length === 0) return 0;
-    // Pick the disk with the lowest free %.
-    let worst = 0;
-    for (const d of disks) {
+    // Pick the disk with the lowest free %. `null` when no disk reported a
+    // size, which is no reading, not 0%.
+    let worst: number | null = null;
+    for (const d of metricsQuery.data?.disks ?? []) {
       if (d.total_bytes === 0) continue;
       const used = ((d.total_bytes - d.available_bytes) / d.total_bytes) * 100;
-      if (used > worst) worst = used;
+      if (worst === null || used > worst) worst = used;
     }
     return worst;
   }, [metricsQuery.data]);
 
-  const cameras = camerasQuery.data ?? [];
-  const healthOk = healthQuery.data?.status === "ok";
+  const cameras = camerasQuery.data;
+  const engine = engineHealth(healthQuery);
 
   // System sparkline cards: CPU + Memory + Inference are always
   // shown; GPU and NPU are added when the host reports them. Pick a
@@ -187,39 +193,120 @@ export function DashboardPage() {
         <KpiCard
           icon={<Camera className="h-4 w-4" />}
           label="Cameras"
-          value={`${cameras.length}`}
+          value={cameras ? `${cameras.length}` : notRead(camerasQuery)}
           hint={
-            camerasQuery.isLoading ? "Loading…" : `${cameras.length} configured`
+            cameras
+              ? `${cameras.length} configured`
+              : camerasQuery.isError
+                ? "Failed to load cameras"
+                : "Loading…"
           }
         />
         <KpiCard
           icon={<Activity className="h-4 w-4" />}
           label="Alerts (last hour)"
-          value={`${eventsLastHour}`}
-          hint={`SSE: ${sse.status}`}
-          accent={eventsLastHour > 0 ? "warning" : "default"}
+          value={
+            eventsLastHour === null
+              ? notRead(eventsQuery)
+              : eventsLastHour === RECENT_EVENTS
+                ? `${eventsLastHour}+`
+                : `${eventsLastHour}`
+          }
+          hint={
+            eventsLastHour === null && eventsQuery.isError
+              ? "Failed to load events"
+              : `SSE: ${sse.status}`
+          }
+          accent={eventsLastHour !== null && eventsLastHour > 0 ? "warning" : "default"}
         />
         <KpiCard
           icon={<HardDrive className="h-4 w-4" />}
           label="Disk used (worst)"
-          value={`${diskPct.toFixed(0)}%`}
+          value={
+            !metricsQuery.data
+              ? notRead(metricsQuery)
+              : diskPct === null
+                ? "—"
+                : `${diskPct.toFixed(0)}%`
+          }
           hint={
             metricsQuery.data
               ? `${metricsQuery.data.disks.length} disks`
-              : "—"
+              : metricsQuery.isError
+                ? "Failed to load metrics"
+                : "—"
           }
-          accent={diskPct >= 85 ? "destructive" : diskPct >= 70 ? "warning" : "default"}
+          accent={
+            diskPct === null
+              ? "default"
+              : diskPct >= 85
+                ? "destructive"
+                : diskPct >= 70
+                  ? "warning"
+                  : "default"
+          }
         />
         <KpiCard
           icon={<HeartPulse className="h-4 w-4" />}
           label="Engine"
-          value={healthOk ? "OK" : healthQuery.isError ? "ERROR" : "…"}
-          hint={
-            healthQuery.data?.version ? `v${healthQuery.data.version}` : ""
+          value={
+            engine.verdict === "ok"
+              ? "OK"
+              : engine.verdict === "degraded"
+                ? "DEGRADED"
+                : engine.verdict === "unreachable"
+                  ? "ERROR"
+                  : "…"
           }
-          accent={healthOk ? "success" : healthQuery.isError ? "destructive" : "default"}
+          hint={
+            engine.verdict === "degraded"
+              ? `${issueCodes(engine.read.issues)} · v${engine.read.version}`
+              : engine.verdict === "ok"
+                ? `v${engine.read.version}`
+                : ""
+          }
+          accent={
+            engine.verdict === "ok"
+              ? "success"
+              : engine.verdict === "degraded"
+                ? "warning"
+                : engine.verdict === "unreachable"
+                  ? "destructive"
+                  : "default"
+          }
         />
       </div>
+
+      {engine.verdict === "degraded" ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base text-warning">
+              <AlertTriangle className="h-4 w-4" />
+              Engine degraded
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ul className="flex flex-col gap-2">
+              {engine.read.issues.map((issue, i) => (
+                <li key={`${issue.component}:${issue.code}:${i}`} className="text-sm">
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-medium">{issue.component}</span>
+                    {/* Verbatim: a code this UI has no copy for still shows. */}
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {issue.code}
+                    </span>
+                  </div>
+                  {issue.detail ? (
+                    <div className="mt-0.5 text-xs text-muted-foreground">
+                      {issue.detail}
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         {/* Cameras at a glance -------------------------------------- */}
@@ -231,7 +318,9 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {camerasQuery.isLoading ? (
+            {!cameras && camerasQuery.isError ? (
+              <EmptyState title="Failed to load cameras" detail="" />
+            ) : !cameras ? (
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
                 {[0, 1, 2].map((i) => (
                   <Skeleton key={i} className="aspect-video w-full" />
@@ -273,10 +362,17 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {sse.events.length === 0 ? (
+            {/* An empty buffer says nothing arrived, not that nothing fired:
+                the stream does not replay what fires while it is down. */}
+            {sse.events.length === 0 && sse.status !== "open" ? (
+              <EmptyState
+                title="Not connected"
+                detail="Alerts that fire before the stream connects do not show here."
+              />
+            ) : sse.events.length === 0 ? (
               <EmptyState
                 title="Quiet on the wire"
-                detail="No alerts have fired since you opened this page."
+                detail="No alerts have arrived since you opened this page."
               />
             ) : (
               <ul className="flex flex-col gap-2">
@@ -312,7 +408,11 @@ export function DashboardPage() {
           title="CPU"
           values={cpuBuf}
           max={100}
-          primary={`${(metricsQuery.data?.cpu.usage_pct ?? 0).toFixed(0)}%`}
+          primary={
+            metricsQuery.data
+              ? `${metricsQuery.data.cpu.usage_pct.toFixed(0)}%`
+              : notRead(metricsQuery)
+          }
           secondary={
             metricsQuery.data
               ? `${metricsQuery.data.cpu.count} cores · ${metricsQuery.data.cpu.frequency_mhz} MHz`
@@ -324,7 +424,7 @@ export function DashboardPage() {
           title="Memory"
           values={ramBuf}
           max={100}
-          primary={`${memPct.toFixed(0)}%`}
+          primary={memPct === null ? notRead(metricsQuery) : `${memPct.toFixed(0)}%`}
           secondary={
             metricsQuery.data
               ? `${formatBytes(metricsQuery.data.memory.used_bytes)} / ${formatBytes(metricsQuery.data.memory.total_bytes)}`
@@ -373,7 +473,7 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {backendsQuery.isLoading ? (
+            {backendsQuery.isPending ? (
               <Skeleton className="h-16 w-full" />
             ) : backendsQuery.data ? (
               <div className="space-y-2 text-sm">
@@ -617,7 +717,11 @@ function CameraTile({ camera }: { camera: CameraConfig }) {
     retry: 0,
   });
 
-  const stale = ageMs(metaQuery.data?.captured_at) > STALE_FRAME_MS;
+  // Only an answer can say the camera stalled; a metadata request that has
+  // not answered says nothing about it.
+  const stale =
+    metaQuery.data !== undefined &&
+    ageMs(metaQuery.data?.captured_at) > STALE_FRAME_MS;
   const src = `${latestFrameJpegUrl(String(camera.id))}?t=${bust}`;
   const fps = statsQuery.data?.fps_ema ?? 0;
   const dropped = statsQuery.data?.frames_dropped ?? 0;
@@ -704,6 +808,12 @@ function SeverityDot({ severity }: { severity: string | null | undefined }) {
           ? "bg-warning"
           : "bg-primary";
   return <span className={cn("mt-1 h-2 w-2 flex-none rounded-full", cls)} />;
+}
+
+/** What a tile shows for a reading it does not have: "…" while its query is
+ * still asking, "—" once it has failed. */
+function notRead(q: { isError: boolean }): string {
+  return q.isError ? "—" : "…";
 }
 
 function EmptyState({ title, detail }: { title: string; detail: string }) {

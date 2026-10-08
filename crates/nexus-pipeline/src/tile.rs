@@ -40,6 +40,10 @@ pub enum TileError {
     /// Zero-area ROI — degenerate, would produce an empty crop.
     #[error("ROI has zero area: {0:?}")]
     EmptyRoi(TileRoi),
+    /// The parent's buffer is not `width * height * 3` bytes, so its
+    /// rows are not where `width` puts them.
+    #[error("parent frame buffer is {got} bytes, expected {expected}")]
+    BufferSize { got: usize, expected: usize },
 }
 
 /// Pixel-space sub-region of a supervisor frame.
@@ -177,8 +181,9 @@ pub fn pick_tiles(
 /// Extract the ROI sub-region of `parent` as a fresh `Frame`.
 ///
 /// The returned `Frame` carries the same `camera_id`, `frame_id`,
-/// `captured_at`, `format`, and `trace_id` as the parent — those
-/// are properties of the *capture moment*, not the spatial extent.
+/// `captured_at`, `captured_mono`, `format`, and `trace_id` as the
+/// parent — those are properties of the *capture moment*, not the
+/// spatial extent.
 /// `width`/`height` are the crop dimensions, NOT the parent's.
 ///
 /// Allocates a fresh `Vec<u8>` for the crop's pixel data because
@@ -206,6 +211,13 @@ pub fn crop_to_tile_rgb(parent: &Frame, roi: TileRoi) -> Result<Frame, TileError
     }
     let bytes_per_px = 3usize; // both supported formats are 3-byte interleaved
     let parent_stride = parent.width as usize * bytes_per_px;
+    let expected = parent_stride * parent.height as usize;
+    if parent.data.len() != expected {
+        return Err(TileError::BufferSize {
+            got: parent.data.len(),
+            expected,
+        });
+    }
     let roi_stride = roi.w as usize * bytes_per_px;
     let roi_x_byte = roi.x as usize * bytes_per_px;
     let mut buf = Vec::with_capacity(roi_stride * roi.h as usize);
@@ -219,6 +231,7 @@ pub fn crop_to_tile_rgb(parent: &Frame, roi: TileRoi) -> Result<Frame, TileError
         camera_id: parent.camera_id,
         frame_id: parent.frame_id,
         captured_at: parent.captured_at,
+        captured_mono: parent.captured_mono,
         width: roi.w,
         height: roi.h,
         format: parent.format,
@@ -258,7 +271,6 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use nexus_types::PixelFormat;
-    use serde_json::Map;
 
     // ---- helpers -----------------------------------------------------------
 
@@ -272,7 +284,7 @@ mod tests {
                 x2: cx + 5.0,
                 y2: cy + 5.0,
             },
-            attributes: Map::new(),
+            attributes: Default::default(),
         }
     }
 
@@ -282,6 +294,7 @@ mod tests {
             camera_id: 11,
             frame_id: 1,
             captured_at: Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,
@@ -312,6 +325,7 @@ mod tests {
             camera_id: 11,
             frame_id: 1,
             captured_at: Utc::now(),
+            captured_mono: std::time::Instant::now(),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,
@@ -559,6 +573,33 @@ mod tests {
         assert!(matches!(err, TileError::EmptyRoi(_)));
     }
 
+    /// The crop trusts `width`/`height`, so a buffer that is not exactly
+    /// `width * height * 3` slices out of bounds (short) or crops sheared
+    /// rows (GStreamer's padded stride at 642 px, 1926 bytes of pixels in a
+    /// 1928-byte row), and a release build aborts on the panic.
+    #[test]
+    fn crop_rejects_a_buffer_that_does_not_match_the_frame_size() {
+        let roi = TileRoi {
+            x: 0,
+            y: 0,
+            w: 642,
+            h: 361,
+        };
+        for len in [642 * 361 * 3 - 1, 1928 * 361] {
+            let parent = Frame {
+                data: Arc::new(vec![0u8; len]),
+                ..solid_frame(642, 361, 0)
+            };
+            assert_eq!(
+                crop_to_tile_rgb(&parent, roi).err(),
+                Some(TileError::BufferSize {
+                    got: len,
+                    expected: 642 * 361 * 3
+                })
+            );
+        }
+    }
+
     // ---- map_tile_dets_to_frame -------------------------------------------
 
     #[test]
@@ -578,7 +619,7 @@ mod tests {
                 x2: 60.0,
                 y2: 80.0,
             },
-            attributes: Map::new(),
+            attributes: Default::default(),
         }];
         let mapped = map_tile_dets_to_frame(&crop_space, roi);
         assert_eq!(mapped.len(), 1);
@@ -644,7 +685,7 @@ mod tests {
                 x2: 245.0,
                 y2: 140.0,
             },
-            attributes: Map::new(),
+            attributes: Default::default(),
         }];
         let parent_dets = map_tile_dets_to_frame(&crop_dets, tile);
         assert_eq!(parent_dets.len(), 1);

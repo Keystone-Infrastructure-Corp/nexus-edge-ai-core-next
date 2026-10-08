@@ -7,8 +7,8 @@
 //! reserved for diagnostics.
 //!
 //! Why MessagePack + a pipe?
-//! - `Detection.attributes` is `serde_json::Map<String, Value>` with
-//!   `#[serde(skip_serializing_if = "Map::is_empty")]`. Non-self-describing
+//! - `Detection.attributes` is a map of `serde_json::Value`s with
+//!   `#[serde(skip_serializing_if = "BTreeMap::is_empty")]`. Non-self-describing
 //!   formats (bincode) can't round-trip that field, because skipping a
 //!   field has no on-wire marker. MessagePack tags each field, so the
 //!   deserializer correctly applies `#[serde(default)]` when the field
@@ -104,6 +104,9 @@ impl WireFrame {
             camera_id: self.camera_id,
             frame_id: self.frame_id,
             captured_at: self.captured_at,
+            // Process-local, so it does not cross the pipe. The worker's
+            // copy only feeds the detector, which reads no clock.
+            captured_mono: std::time::Instant::now(),
             width: self.width,
             height: self.height,
             format: self.format,
@@ -185,6 +188,38 @@ mod tests {
         write_msg(&mut a, &resp).await.unwrap();
         let got: WorkerResponse = read_msg(&mut b).await.unwrap();
         assert_eq!(got.req_id(), 42);
+    }
+
+    /// A detection's attribute keys are data: any string crosses the pipe,
+    /// and the attributes come out as they went in.
+    #[tokio::test]
+    async fn roundtrip_detection_attributes_through_duplex_pipe() {
+        let mut d = Detection {
+            label: "person".into(),
+            confidence: 0.9,
+            bbox: BBox {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 10.0,
+                y2: 10.0,
+            },
+            attributes: Default::default(),
+        };
+        d.attributes.insert("ppe.hardhat".into(), true.into());
+        d.attributes.insert("".into(), 0.87.into());
+        d.attributes
+            .insert("ключ".into(), serde_json::json!({"b": [1, "x"], "a": null}));
+        let want = serde_json::to_string(&d).unwrap();
+        let resp = WorkerResponse::DetectOk {
+            req_id: 7,
+            detections: vec![d],
+        };
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        write_msg(&mut a, &resp).await.unwrap();
+        let WorkerResponse::DetectOk { detections, .. } = read_msg(&mut b).await.unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(serde_json::to_string(&detections[0]).unwrap(), want);
     }
 
     #[tokio::test]
