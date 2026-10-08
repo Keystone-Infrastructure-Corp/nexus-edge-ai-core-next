@@ -260,8 +260,10 @@ fn vehicle_alerts_again_only_after_it_breaks_the_static_gate() {
     assert_eq!(parked, vec![0], "one alert on arrival");
 
     // Now drive away: 50px per frame, far above the 10px threshold.
-    // The gate needs `significant_movement_frames = 2` consecutive
-    // moving frames, so the new epoch opens on frame 11, not 10.
+    // The first step already leaves the 5px match radius of the anchor
+    // the track parked on, which breaks the gate before
+    // `significant_movement_frames` does (#367), so the new epoch opens
+    // on frame 10.
     let mut fired_after_break = Vec::new();
     for i in 1..=5u64 {
         let idx = sim.frame_id;
@@ -278,7 +280,7 @@ fn vehicle_alerts_again_only_after_it_breaks_the_static_gate() {
 
     assert_eq!(
         fired_after_break,
-        vec![11],
+        vec![10],
         "breaking the static gate must open exactly one new alert epoch on \
          the frame the gate breaks, not one alert per moving frame"
     );
@@ -471,5 +473,53 @@ fn camera_cooldown_still_paces_alerts_across_distinct_vehicles() {
         alerts.len(),
         1,
         "camera-scoped cooldown must still throttle simultaneous tracks"
+    );
+}
+
+#[test]
+fn a_vehicle_linked_into_a_parked_track_alerts_once_it_leaves_the_spot() {
+    // #367, Cam 01: ByteTrack linked a passing sedan into parked car
+    // 8587's promoted track. The sedan inherited "static" and dragged
+    // the anchor along with it, so an any-vehicle rule never saw it.
+    // MORGAN's deployed thresholds; the EMA lag is what lets a moving
+    // car keep a parked track's verdict.
+    let cfg = StaticObjectConfig {
+        dwell_frames: Some(5),
+        significant_movement_pixels: 36,
+        significant_movement_frames: 3,
+        movement_ema_alpha: 0.35,
+        match_distance_pixels: 40,
+        track_id_reuse_reset_pixels: 60,
+        anchor_ttl_secs: 3600,
+        ..tight_static_cfg()
+    };
+    let filter = StaticObjectFilter::new(cfg, 1, None);
+    let mut sim = Sim::new(Some(filter), &[rule_for("vehicle.car", 0)]);
+
+    let mut parked = Vec::new();
+    for i in 0..10u64 {
+        let idx = sim.frame_id;
+        let y = 270.0 - (i % 2) as f32 * 5.0;
+        if !sim
+            .step(vec![object(8587, "vehicle.car", 24.0, y)])
+            .is_empty()
+        {
+            parked.push(idx);
+        }
+    }
+    assert_eq!(parked, vec![0], "the parked car alerts once on arrival");
+
+    let mut fired = Vec::new();
+    for (x, y) in [(36.0, 263.0), (47.0, 250.0), (68.0, 229.0), (88.0, 200.0)] {
+        let idx = sim.frame_id;
+        if !sim.step(vec![object(8587, "vehicle.car", x, y)]).is_empty() {
+            fired.push(idx);
+        }
+    }
+    assert_eq!(
+        fired,
+        vec![12],
+        "the linked vehicle must alert once, on the first frame outside the \
+         parked car's match radius"
     );
 }
