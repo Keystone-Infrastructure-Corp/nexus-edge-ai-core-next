@@ -192,7 +192,14 @@ impl Entry {
             frames_emitted: self.frames_emitted,
             frames_dropped: self.frames_dropped,
             frames_backpressure_dropped: self.frames_backpressure_dropped,
-            analysed_fps: self.analysed_fps,
+            // The rate is computed when a frame is tracked; once none has
+            // been for a whole window, the camera is not being analysed.
+            analysed_fps: match self.analysed.timestamps.back() {
+                Some(last) if now.saturating_duration_since(*last) <= RATE_WINDOW => {
+                    self.analysed_fps
+                }
+                _ => 0.0,
+            },
             source_width: self.source_width,
             source_height: self.source_height,
             tile_invocations: self.tile_invocations,
@@ -885,6 +892,25 @@ mod tests {
             s.analysed_fps
         );
         assert_eq!(s.frames_emitted, 5);
+    }
+
+    /// A camera whose tracker stopped running (every detect failing, every
+    /// frame gated) must not keep reporting its last rate.
+    #[test]
+    fn analysed_fps_reads_zero_once_the_tracker_stops() {
+        let reg = FrameStatsRegistry::new();
+        let epoch = reg.begin_session(1);
+        reg.observe_frame(1, epoch, Utc::now(), 512, 288);
+        reg.observe_analysed(1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        reg.observe_analysed(1);
+        let slot = reg.slot(1).unwrap();
+        let guard = slot.lock();
+        let entry = guard.entry.as_ref().unwrap();
+        let now = Instant::now();
+        assert!(entry.snapshot(now).analysed_fps > 0.0);
+        let later = now + RATE_WINDOW + std::time::Duration::from_secs(1);
+        assert_eq!(entry.snapshot(later).analysed_fps, 0.0);
     }
 
     /// Regression: bursty arrivals (gate drain, queue flush) used to

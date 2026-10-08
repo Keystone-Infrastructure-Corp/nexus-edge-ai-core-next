@@ -105,6 +105,10 @@ struct PerTrackState {
     /// it parks again (#368 review). Only read while the track is not
     /// promoted, so promotion need not clear it.
     departed: bool,
+    /// Whether the track's last detected frame stood still. Coasting
+    /// frames leave it alone, so a parked car hidden behind a passer
+    /// still counts as standing.
+    was_still: bool,
 }
 
 /// Persisted record of a known-static vehicle location for a camera.
@@ -304,12 +308,13 @@ impl StaticObjectFilter {
             // `static_promoted = true` from the previous occupant.
             // `cfg_reset_px == 0` disables the guard entirely.
             //
-            // Only a promoted track has a verdict to inherit. An unpromoted
-            // track that jumps is a moving vehicle: at low analysis rates
-            // ByteTrack links one across steps longer than this threshold
-            // (#362), and a fresh alert epoch on every step would re-arm its
-            // alert each frame or reset its rule streak each frame.
-            if cfg_reset_px > 0.0 && state.static_promoted {
+            // That holds for a track that was parked or standing still. A
+            // track already moving that jumps is the same vehicle: at low
+            // analysis rates ByteTrack links one across steps longer than
+            // this threshold (#362), and a fresh alert epoch on every step
+            // would re-arm its alert each frame or reset its rule streak
+            // each frame.
+            if cfg_reset_px > 0.0 && (state.static_promoted || state.was_still) {
                 if let Some((px, py)) = state.last_center {
                     let dx = (center.0 - px) as f64;
                     let dy = (center.1 - py) as f64;
@@ -338,6 +343,9 @@ impl StaticObjectFilter {
             let still = o.detection_bbox.is_some()
                 && state.last_center.is_some()
                 && instant_movement <= cfg_still_px;
+            if o.detection_bbox.is_some() {
+                state.was_still = still;
+            }
             if state.last_center.is_none() {
                 state.movement_ema = instant_movement;
             } else {
@@ -1299,6 +1307,37 @@ mod tests {
             })
             .collect();
         assert_eq!(epochs, vec![Some(0); 5]);
+    }
+
+    /// The guard's original case, for a track not yet promoted: a car four
+    /// frames into its five-frame dwell, the last of them hidden behind a
+    /// passer (a coasting frame), then the passer linked into its track 70 px
+    /// away. The passer must not inherit the dwell and be hidden.
+    #[test]
+    fn a_passer_linked_into_a_car_still_learning_its_dwell_is_not_hidden() {
+        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+        for i in 0..4u64 {
+            let mut parked = vehicle(7, 100.0, 175.0 - (i % 2) as f32 * 3.0);
+            if i == 3 {
+                parked.detection_bbox = None;
+            }
+            let mut objs = vec![parked];
+            f.classify(&frame(1, i, i as i64 * 690), &mut objs);
+        }
+        for (k, x) in [170.0, 220.0, 270.0, 320.0].into_iter().enumerate() {
+            let i = 4 + k as u64;
+            let mut objs = vec![vehicle(7, x, 175.0)];
+            f.classify(&frame(1, i, i as i64 * 690), &mut objs);
+            assert!(!is_object_static(&objs[0]), "passer hidden at x = {x}");
+            assert_eq!(
+                objs[0]
+                    .attributes
+                    .get(ALERT_EPOCH_ATTRIBUTE_KEY)
+                    .and_then(Value::as_u64),
+                Some(1),
+                "the passer is a new alert episode"
+            );
+        }
     }
 
     #[test]

@@ -23,8 +23,9 @@ const H: u32 = 288;
 /// The field core's measured analysis interval per camera (~1.45 fps).
 const INTERVAL_MS: u64 = 690;
 
-/// "All People and Vehicles", the rule on the #362 camera.
-fn field_rule() -> RuleConfig {
+/// "All People and Vehicles", the rule on the #362 camera, with its
+/// debounce as given.
+fn field_rule(consecutive_frames: u32, cooldown_ms: u64) -> RuleConfig {
     RuleConfig {
         id: "all_people_and_vehicles".into(),
         name: "All People and Vehicles".into(),
@@ -37,8 +38,8 @@ fn field_rule() -> RuleConfig {
         gates: RuleGates::default(),
         debounce: RuleDebounce {
             min_track_age_ms: 500,
-            consecutive_frames: 2,
-            cooldown_ms: 30_000,
+            consecutive_frames,
+            cooldown_ms,
         },
         enabled: true,
         sinks: Vec::new(),
@@ -54,12 +55,13 @@ const CROSSINGS: [(f32, f32, u64); 2] = [(80.0, 50.0, 8), (120.0, 70.0, 5)];
 /// Alerts fired while one vehicle crosses the frame.
 fn alerts_for_a_crossing(
     tracker_cfg: ByteTrackConfig,
+    rule: RuleConfig,
     (length, height, frames): (f32, f32, u64),
 ) -> usize {
     let tracker = ByteTrackTracker::new(tracker_cfg);
     // MORGAN's ID-reuse guard is the default 60 px.
     let mut filter = StaticObjectFilter::new(StaticObjectConfig::default(), 14, None);
-    let eval = RuleEvaluator::new(&RulesConfig::default(), &[field_rule()]).unwrap();
+    let eval = RuleEvaluator::new(&RulesConfig::default(), &[rule]).unwrap();
     let t0 = Instant::now();
     let mut fired = 0;
     for i in 0..frames {
@@ -110,7 +112,7 @@ fn alerts_for_a_crossing(
 fn a_vehicle_crossing_a_parking_lot_camera_at_the_field_rate_alerts_once() {
     for crossing in CROSSINGS {
         assert_eq!(
-            alerts_for_a_crossing(ByteTrackConfig::default(), crossing),
+            alerts_for_a_crossing(ByteTrackConfig::default(), field_rule(2, 30_000), crossing),
             1,
             "{crossing:?}"
         );
@@ -125,8 +127,21 @@ fn without_the_motion_pass_the_same_crossing_never_alerts() {
     };
     for crossing in CROSSINGS {
         assert_eq!(
-            alerts_for_a_crossing(cfg.clone(), crossing),
+            alerts_for_a_crossing(cfg.clone(), field_rule(2, 30_000), crossing),
             0,
+            "{crossing:?}"
+        );
+    }
+}
+
+/// With no cooldown, only the parking-lot alert epoch stops a moving
+/// vehicle re-alerting on every frame of its crossing.
+#[test]
+fn a_crossing_alerts_once_under_a_per_frame_rule_with_no_cooldown() {
+    for crossing in CROSSINGS {
+        assert_eq!(
+            alerts_for_a_crossing(ByteTrackConfig::default(), field_rule(1, 0), crossing),
+            1,
             "{crossing:?}"
         );
     }

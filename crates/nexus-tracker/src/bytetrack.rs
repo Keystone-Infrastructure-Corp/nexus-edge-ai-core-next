@@ -390,18 +390,20 @@ fn associate_pass(
         apply_match(
             t,
             &mut detections[i],
-            1.0,
             confirm_frames,
             display_smoothing_alpha,
         );
     }
 }
 
-/// Longest gap since a track's last match that the motion pass bridges.
-/// The reach grows with the gap, so without a bound a lost track would
-/// eventually reach across the whole frame. The longest gap between
-/// successive detections of the #362 vehicle was 2.39 s.
+/// Longest gap since a track's last match that the motion pass bridges,
+/// in time and in analysed frames. The reach grows with the gap, so without
+/// a time bound a lost track would eventually reach across the whole frame;
+/// without a frame bound, at full frame rate a track missed for dozens of
+/// frames would. The longest gap between successive detections of the #362
+/// vehicle was 2.39 s, about 3.5 analysed frames.
 const MOTION_MATCH_MAX_GAP: Duration = Duration::from_millis(2_500);
+const MOTION_MATCH_MAX_FRAMES: u32 = 4;
 
 /// Speed, in box lengths per analysed frame, below which a track with a
 /// velocity is treated as stationary and left out of the motion pass. A
@@ -410,7 +412,7 @@ const MOTION_MATCH_MAX_GAP: Duration = Duration::from_millis(2_500);
 const MOTION_MATCH_MIN_SPEED: f32 = 0.1;
 
 /// Link unmatched tracks to unused same-label detections by distance,
-/// closest pairs first. A track is eligible if it has no velocity yet (one
+/// nearest pairs first. A track is eligible if it has no velocity yet (one
 /// match) or is measurably moving; a detection must lie within
 /// `motion_match_box_lengths_per_sec` box lengths per second of the time
 /// since the track's last match, and be between half and twice its size.
@@ -428,7 +430,8 @@ fn associate_by_motion(
             continue;
         }
         let gap = now.saturating_duration_since(t.last_matched_at);
-        if gap.is_zero() || gap > MOTION_MATCH_MAX_GAP {
+        if gap.is_zero() || gap > MOTION_MATCH_MAX_GAP || t.missed_frames >= MOTION_MATCH_MAX_FRAMES
+        {
             continue;
         }
         let (tw, th) = (t.bbox.x2 - t.bbox.x1, t.bbox.y2 - t.bbox.y1);
@@ -452,7 +455,7 @@ fn associate_by_motion(
             let (dcx, dcy) = d.bbox.center();
             let dist = (dcx - tcx).hypot(dcy - tcy);
             if dist <= reach {
-                pairs.push((dist / reach, t_idx, i));
+                pairs.push((dist, t_idx, i));
             }
         }
     }
@@ -463,31 +466,24 @@ fn associate_by_motion(
         }
         det_used[i] = true;
         track_matched[t_idx] = true;
-        let t = &mut tracks[t_idx];
-        // The displacement spans every frame since the last match; record
-        // it per frame, as the predictor applies it.
-        let frames = (t.missed_frames + 1) as f32;
         apply_match(
-            t,
+            &mut tracks[t_idx],
             &mut detections[i],
-            frames,
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
         );
     }
 }
 
-/// Fold detection `d` into track `t`. `frames` is how many analysed frames
-/// the observed displacement spans.
+/// Fold detection `d` into track `t`.
 fn apply_match(
     t: &mut TrackState,
     d: &mut Detection,
-    frames: f32,
     confirm_frames: u32,
     display_smoothing_alpha: f32,
 ) {
-    let dx = (d.bbox.x1 - t.bbox.x1) / frames;
-    let dy = (d.bbox.y1 - t.bbox.y1) / frames;
+    let dx = d.bbox.x1 - t.bbox.x1;
+    let dy = d.bbox.y1 - t.bbox.y1;
     // Same EMA constants as v1: 0.6 weight on prior velocity, 0.4 on
     // newly observed dx/dy.
     t.velocity_x = 0.6 * t.velocity_x + 0.4 * dx;
@@ -828,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn a_parked_car_never_takes_a_passing_vehicles_detection() {
+    fn an_established_parked_car_never_takes_a_passing_vehicles_detection() {
         let t = ByteTrackTracker::new(cfg_default());
         let parked: Vec<_> = (0..5)
             .map(|i| (i * FIELD_INTERVAL_MS, vec![car(50.0, 100.0)]))
@@ -862,23 +858,29 @@ mod tests {
     }
 
     #[test]
-    fn a_vehicle_reacquired_after_a_detector_gap_keeps_one_track_at_full_rate() {
-        // 15 fps, 10 px per frame, seen once and then missed for 20 frames.
-        // The link across the gap must record 10 px per frame, not the
-        // 210 px the gap spans, or the next prediction overshoots.
+    fn a_track_missed_for_many_frames_is_not_motion_linked() {
+        // 15 fps: the vehicle is missed for 7 frames, then a detection
+        // appears 100 px away, inside the 3 box-lengths-per-second reach.
+        // At full rate that many misses mean the track lost its object;
+        // the motion pass is for low-rate gaps of a few frames.
         let t = ByteTrackTracker::new(cfg_default());
-        let frames: Vec<_> = (0..25u64)
-            .map(|i| {
-                let dets = if i == 0 || i > 20 {
-                    vec![car(50.0 + i as f32 * 10.0, 100.0)]
-                } else {
-                    Vec::new()
-                };
-                (i * 66, dets)
-            })
-            .collect();
+        let mut frames: Vec<_> = (0..8u64).map(|i| (i * 66, Vec::new())).collect();
+        frames[0].1 = vec![car(50.0, 100.0)];
+        frames.push((8 * 66, vec![car(150.0, 100.0)]));
         let (ids, _) = drive(&t, &frames);
-        assert_eq!(ids.len(), 1, "{ids:?}");
+        assert_eq!(ids.len(), 2, "{ids:?}");
+    }
+
+    #[test]
+    fn a_recent_near_track_wins_over_an_older_far_one() {
+        // a: seen 2.07 s ago, 270 px from the detection. b: seen 0.69 s
+        // ago, 150 px from it. Both are in reach; the nearer one wins.
+        let t = ByteTrackTracker::new(cfg_default());
+        let (a, _) = drive(&t, &[(0, vec![car(100.0, 100.0)]), (690, vec![])]);
+        let (b, _) = drive(&t, &[(1_380, vec![car(520.0, 100.0)])]);
+        assert_ne!(a, b, "b must be its own track");
+        let (d, _) = drive(&t, &[(2_070, vec![car(370.0, 100.0)])]);
+        assert_eq!(d, b);
     }
 
     #[test]
