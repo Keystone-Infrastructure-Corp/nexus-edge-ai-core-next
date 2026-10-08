@@ -105,10 +105,10 @@ struct PerTrackState {
     /// it parks again (#368 review). Only read while the track is not
     /// promoted, so promotion need not clear it.
     departed: bool,
-    /// Whether the track's last detected frame stood still. Coasting
-    /// frames leave it alone, so a parked car hidden behind a passer
-    /// still counts as standing.
-    was_still: bool,
+    /// Whether the track has had a still frame since its state was last
+    /// reset. Together with a low movement EMA, the evidence that it is
+    /// standing (parked or waiting) rather than moving.
+    stood_still: bool,
 }
 
 /// Persisted record of a known-static vehicle location for a camera.
@@ -308,13 +308,16 @@ impl StaticObjectFilter {
             // `static_promoted = true` from the previous occupant.
             // `cfg_reset_px == 0` disables the guard entirely.
             //
-            // That holds for a track that was parked or standing still. A
-            // track already moving that jumps is the same vehicle: at low
+            // That holds for a track that was parked or standing: one that
+            // has stood still and whose movement EMA is still low, so one
+            // partly occluded frame does not change the verdict. A track
+            // that has only moved and jumps is the same vehicle: at low
             // analysis rates ByteTrack links one across steps longer than
             // this threshold (#362), and a fresh alert epoch on every step
             // would re-arm its alert each frame or reset its rule streak
             // each frame.
-            if cfg_reset_px > 0.0 && (state.static_promoted || state.was_still) {
+            let standing = state.stood_still && state.movement_ema < cfg_sig_px;
+            if cfg_reset_px > 0.0 && (state.static_promoted || standing) {
                 if let Some((px, py)) = state.last_center {
                     let dx = (center.0 - px) as f64;
                     let dy = (center.1 - py) as f64;
@@ -343,9 +346,7 @@ impl StaticObjectFilter {
             let still = o.detection_bbox.is_some()
                 && state.last_center.is_some()
                 && instant_movement <= cfg_still_px;
-            if o.detection_bbox.is_some() {
-                state.was_still = still;
-            }
+            state.stood_still |= still;
             if state.last_center.is_none() {
                 state.movement_ema = instant_movement;
             } else {
@@ -1289,54 +1290,71 @@ mod tests {
     }
 
     /// #362: at low analysis rates ByteTrack links a moving vehicle across
-    /// steps longer than `track_id_reuse_reset_pixels`. A track that was
-    /// never promoted has no stale verdict to shed, so such a step must not
+    /// steps longer than `track_id_reuse_reset_pixels`. Such a step must not
     /// restart its alert epoch: that re-armed the alert on every frame, or
     /// reset a `consecutive_frames` streak on every frame so it never fired.
+    /// The second path pauses first, then drives off in sub-threshold steps
+    /// before a long one: by then it is moving, not standing.
     #[test]
     fn a_moving_vehicle_keeps_its_alert_epoch_across_long_steps() {
-        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
-        let epochs: Vec<_> = (0..5u64)
-            .map(|i| {
-                let mut objs = vec![vehicle(42, 60.0 + i as f32 * 75.0, 175.0)];
-                f.classify(&frame(1, i, i as i64 * 690), &mut objs);
-                objs[0]
-                    .attributes
-                    .get(ALERT_EPOCH_ATTRIBUTE_KEY)
-                    .and_then(Value::as_u64)
-            })
-            .collect();
-        assert_eq!(epochs, vec![Some(0); 5]);
+        let paths: [&[f32]; 2] = [
+            &[60.0, 135.0, 210.0, 285.0, 360.0],
+            &[60.0, 65.0, 115.0, 165.0, 215.0, 265.0, 340.0],
+        ];
+        for path in paths {
+            let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+            let epochs: Vec<_> = path
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    let mut objs = vec![vehicle(42, x, 175.0)];
+                    f.classify(&frame(1, i as u64, i as i64 * 690), &mut objs);
+                    objs[0]
+                        .attributes
+                        .get(ALERT_EPOCH_ATTRIBUTE_KEY)
+                        .and_then(Value::as_u64)
+                })
+                .collect();
+            assert_eq!(epochs, vec![Some(0); path.len()], "{path:?}");
+        }
     }
 
-    /// The guard's original case, for a track not yet promoted: a car four
-    /// frames into its five-frame dwell, the last of them hidden behind a
-    /// passer (a coasting frame), then the passer linked into its track 70 px
-    /// away. The passer must not inherit the dwell and be hidden.
+    /// The guard's original case, for a track not yet promoted: a car three
+    /// frames into its five-frame dwell, then a frame on which a passer hides
+    /// it wholly (a coasting frame) or partly (the visible part boxed 18 px
+    /// off), then the passer linked into its track 70 px away. The passer
+    /// must not inherit the dwell and be hidden.
     #[test]
     fn a_passer_linked_into_a_car_still_learning_its_dwell_is_not_hidden() {
-        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
-        for i in 0..4u64 {
-            let mut parked = vehicle(7, 100.0, 175.0 - (i % 2) as f32 * 3.0);
-            if i == 3 {
-                parked.detection_bbox = None;
+        for partly in [false, true] {
+            let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+            for i in 0..3u64 {
+                let mut objs = vec![vehicle(7, 100.0, 175.0 - (i % 2) as f32 * 3.0)];
+                f.classify(&frame(1, i, i as i64 * 690), &mut objs);
             }
-            let mut objs = vec![parked];
-            f.classify(&frame(1, i, i as i64 * 690), &mut objs);
-        }
-        for (k, x) in [170.0, 220.0, 270.0, 320.0].into_iter().enumerate() {
-            let i = 4 + k as u64;
-            let mut objs = vec![vehicle(7, x, 175.0)];
-            f.classify(&frame(1, i, i as i64 * 690), &mut objs);
-            assert!(!is_object_static(&objs[0]), "passer hidden at x = {x}");
-            assert_eq!(
-                objs[0]
-                    .attributes
-                    .get(ALERT_EPOCH_ATTRIBUTE_KEY)
-                    .and_then(Value::as_u64),
-                Some(1),
-                "the passer is a new alert episode"
-            );
+            let mut occluded = vehicle(7, if partly { 118.0 } else { 100.0 }, 175.0);
+            if !partly {
+                occluded.detection_bbox = None;
+            }
+            let mut objs = vec![occluded];
+            f.classify(&frame(1, 3, 3 * 690), &mut objs);
+            for (k, x) in [188.0, 238.0, 288.0, 338.0].into_iter().enumerate() {
+                let i = 4 + k as u64;
+                let mut objs = vec![vehicle(7, x, 175.0)];
+                f.classify(&frame(1, i, i as i64 * 690), &mut objs);
+                assert!(
+                    !is_object_static(&objs[0]),
+                    "partly={partly}: passer hidden at x = {x}"
+                );
+                assert_eq!(
+                    objs[0]
+                        .attributes
+                        .get(ALERT_EPOCH_ATTRIBUTE_KEY)
+                        .and_then(Value::as_u64),
+                    Some(1),
+                    "partly={partly}: the passer is a new alert episode"
+                );
+            }
         }
     }
 

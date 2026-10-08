@@ -858,17 +858,19 @@ mod tests {
     }
 
     #[test]
-    fn a_track_missed_for_many_frames_is_not_motion_linked() {
-        // 15 fps: the vehicle is missed for 7 frames, then a detection
-        // appears 100 px away, inside the 3 box-lengths-per-second reach.
-        // At full rate that many misses mean the track lost its object;
-        // the motion pass is for low-rate gaps of a few frames.
-        let t = ByteTrackTracker::new(cfg_default());
-        let mut frames: Vec<_> = (0..8u64).map(|i| (i * 66, Vec::new())).collect();
-        frames[0].1 = vec![car(50.0, 100.0)];
-        frames.push((8 * 66, vec![car(150.0, 100.0)]));
-        let (ids, _) = drive(&t, &frames);
-        assert_eq!(ids.len(), 2, "{ids:?}");
+    fn motion_links_span_at_most_four_analysed_frames() {
+        // 15 fps: seen once, missed for `missed` frames, then a detection
+        // 70 px away: past IoU, inside the reach. At full rate a track
+        // missed that long has lost its object; the motion pass is for
+        // low-rate gaps of a few frames.
+        for (missed, want) in [(3u64, 1), (4, 2)] {
+            let t = ByteTrackTracker::new(cfg_default());
+            let mut frames: Vec<_> = (0..=missed).map(|i| (i * 66, Vec::new())).collect();
+            frames[0].1 = vec![car(50.0, 100.0)];
+            frames.push(((missed + 1) * 66, vec![car(120.0, 100.0)]));
+            let (ids, _) = drive(&t, &frames);
+            assert_eq!(ids.len(), want, "missed {missed}: {ids:?}");
+        }
     }
 
     #[test]
