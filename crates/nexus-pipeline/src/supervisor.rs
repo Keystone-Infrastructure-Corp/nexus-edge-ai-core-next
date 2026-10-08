@@ -1200,7 +1200,10 @@ async fn run_camera(
                         frame.width,
                         frame.height,
                         &zones,
-                        dynamic_tracked.clone(),
+                        // Every track, static ones included: the evaluator
+                        // skips them but keeps their alert episodes while
+                        // they are hidden (#362).
+                        tracked_arc.iter(),
                     )
                 };
                 // Alert snapshots — persist a JPEG of the frame that fired

@@ -4,7 +4,8 @@
 //! detection became a one-detection track that no rule ever evaluated.
 //!
 //! Drives the real ByteTrack tracker, the parking-lot static filter and the
-//! rule evaluator in the supervisor's order, with synthetic capture times.
+//! rule evaluator in the supervisor's order, with synthetic capture times:
+//! every tracked object goes to the rules, which skip the static ones.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,17 +95,54 @@ fn every_pass() -> Vec<Pass> {
     passes
 }
 
+fn car(x: f32, y1: f32, (length, height): (f32, f32)) -> Detection {
+    Detection {
+        label: "vehicle.car".into(),
+        confidence: 0.6,
+        bbox: BBox {
+            x1: x,
+            y1,
+            x2: x + length,
+            y2: y1 + height,
+        },
+        attributes: Default::default(),
+    }
+}
+
+/// A row of parked cars just above the lane, whose centres the near
+/// crossing passes within the static filter's 40 px anchor radius.
+const PARKED_ROW: [f32; 3] = [10.0, 160.0, 310.0];
+/// Frames the row stands before a pass starts: long enough at this rate for
+/// the default 5 s dwell to anchor it, and for the 30 s cooldown its own
+/// arrival alerts start to run out.
+const PARKED_LEAD_FRAMES: u64 = 50;
+
 /// Alerts fired during one pass.
 fn alerts_for(tracker_cfg: ByteTrackConfig, rule: RuleConfig, pass: &Pass) -> usize {
-    let ((length, height), xs) = pass;
+    alerts_beside(tracker_cfg, rule, pass, &[])
+}
+
+/// Alerts fired during one pass, beside cars parked at `parked` that stand
+/// from the start and are anchored before the pass begins. Alerts the parked
+/// cars raise on arrival are not counted.
+fn alerts_beside(
+    tracker_cfg: ByteTrackConfig,
+    rule: RuleConfig,
+    (size, xs): &Pass,
+    parked: &[f32],
+) -> usize {
     let tracker = ByteTrackTracker::new(tracker_cfg);
     // MORGAN's ID-reuse guard is the default 60 px.
     let mut filter = StaticObjectFilter::new(StaticObjectConfig::default(), 14, None);
     let eval = RuleEvaluator::new(&RulesConfig::default(), &[rule]).unwrap();
+    let lead = if parked.is_empty() {
+        0
+    } else {
+        PARKED_LEAD_FRAMES
+    };
     let t0 = Instant::now();
     let mut fired = 0;
-    for (i, x) in xs.iter().enumerate() {
-        let i = i as u64;
+    for i in 0..lead + xs.len() as u64 {
         let frame = Frame {
             camera_id: 14,
             frame_id: i,
@@ -116,24 +154,22 @@ fn alerts_for(tracker_cfg: ByteTrackConfig, rule: RuleConfig, pass: &Pass) -> us
             data: Arc::new(vec![]),
             trace_id: format!("trace-{i}"),
         };
-        let detections: Vec<Detection> = x
+        let mut detections: Vec<Detection> = parked
             .iter()
-            .map(|&x| Detection {
-                label: "vehicle.car".into(),
-                confidence: 0.6,
-                bbox: BBox {
-                    x1: x,
-                    y1: 150.0,
-                    x2: x + length,
-                    y2: 150.0 + height,
-                },
-                attributes: Default::default(),
-            })
+            .map(|&x| car(x, 130.0, (120.0, 70.0)))
             .collect();
+        if let Some(Some(x)) = i.checked_sub(lead).map(|k| xs[k as usize]) {
+            detections.push(car(x, 150.0, *size));
+        }
         let mut tracked = tracker.update(detections, frame.captured_mono);
         filter.classify(&frame, &mut tracked);
-        let dynamic = tracked.iter().filter(|t| !is_object_static(t));
-        fired += eval
+        if i + 1 == lead {
+            assert!(
+                tracked.iter().all(is_object_static),
+                "the parked row must be anchored before the pass"
+            );
+        }
+        let alerts = eval
             .evaluate(
                 14,
                 i,
@@ -143,9 +179,12 @@ fn alerts_for(tracker_cfg: ByteTrackConfig, rule: RuleConfig, pass: &Pass) -> us
                 W,
                 H,
                 &[],
-                dynamic,
+                &tracked,
             )
             .len();
+        if i >= lead {
+            fired += alerts;
+        }
     }
     fired
 }
@@ -193,5 +232,28 @@ fn every_pass_alerts_once_with_no_cooldown() {
             1,
             "consecutive_frames {consecutive_frames}: {pass:?}"
         );
+    }
+}
+
+/// A lane in front of a row of anchored parked cars, the usual parking-lot
+/// view: the pass comes within a parked car's anchor radius on some frames.
+/// `consecutive_frames 2` rules, the field rule among them, alert exactly
+/// once. A per-frame rule with no cooldown alerts at least once; it can
+/// alert again when a moving vehicle crosses another car's anchor, which the
+/// static filter reads as that car departing (BUG-260, SPEC-077).
+#[test]
+fn every_pass_alerts_beside_a_row_of_parked_cars() {
+    for pass in every_pass() {
+        let alerts = |c, cd| {
+            alerts_beside(
+                ByteTrackConfig::default(),
+                field_rule(c, cd),
+                &pass,
+                &PARKED_ROW,
+            )
+        };
+        assert_eq!(alerts(2, 30_000), 1, "field rule: {pass:?}");
+        assert_eq!(alerts(2, 0), 1, "no cooldown: {pass:?}");
+        assert!(alerts(1, 0) >= 1, "per-frame rule: {pass:?}");
     }
 }

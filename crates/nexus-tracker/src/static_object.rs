@@ -1385,6 +1385,54 @@ mod tests {
         }
     }
 
+    /// A car that left its spot is `departed`, so other cars' anchors do not
+    /// hide it while it drives. If its track is then linked onto another
+    /// parked car (a step over the guard's threshold), that car is parked,
+    /// not departing: its anchor must hide it again once it is still.
+    #[test]
+    fn a_departed_track_linked_onto_a_parked_car_is_hidden_again() {
+        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+        let mut i = 0u64;
+        let mut step = |f: &mut StaticObjectFilter, objs: Vec<TrackedObject>| {
+            let mut objs = objs;
+            f.classify(&frame(1, i, i as i64 * 690), &mut objs);
+            i += 1;
+            objs
+        };
+        for k in 0..8 {
+            let jitter = (k % 2) as f32 * 3.0;
+            step(
+                &mut f,
+                vec![
+                    vehicle(1, 100.0, 175.0 + jitter),
+                    vehicle(2, 300.0, 175.0 + jitter),
+                ],
+            );
+        }
+        assert_eq!(f.anchors().len(), 2, "both cars are anchored");
+        for x in [145.0, 190.0, 235.0] {
+            let objs = step(&mut f, vec![vehicle(1, x, 175.0), vehicle(2, 300.0, 175.0)]);
+            assert!(
+                !is_object_static(&objs[0]),
+                "the departing car is visible at x = {x}"
+            );
+        }
+        // Track 1 now carries car 2, 65 px on; track 2 is gone.
+        let hidden: Vec<bool> = (0..4)
+            .map(|k| {
+                let objs = step(
+                    &mut f,
+                    vec![vehicle(1, 300.0, 175.0 + (k % 2) as f32 * 3.0)],
+                );
+                is_object_static(&objs[0])
+            })
+            .collect();
+        assert!(
+            hidden[2..].iter().all(|&h| h),
+            "car 2 hidden again: {hidden:?}"
+        );
+    }
+
     #[test]
     fn track_id_reuse_guard_disabled_when_zero() {
         // Same scenario as above but with `track_id_reuse_reset_pixels: 0`

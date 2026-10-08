@@ -16,8 +16,8 @@
 //! between a rename and a silently-reverted fix. They live in
 //! `nexus-pipeline` because it is the lowest crate that depends on both.
 //!
-//! `Sim::step` mirrors the supervisor's real wiring — see
-//! `classify()` + the `!is_object_static(t)` partition in
+//! `Sim::step` mirrors the supervisor's real wiring — `classify()`, then
+//! every tracked object to the rules, which skip the static ones — in
 //! `nexus-pipeline/src/supervisor.rs`. Keep the two in sync.
 
 use chrono::{TimeZone, Utc};
@@ -26,7 +26,7 @@ use nexus_config::{
     StaticObjectConfig,
 };
 use nexus_rules::RuleEvaluator;
-use nexus_tracker::{is_object_static, StaticObjectFilter, ALERT_EPOCH_ATTRIBUTE_KEY};
+use nexus_tracker::{StaticObjectFilter, ALERT_EPOCH_ATTRIBUTE_KEY, STATIC_ATTRIBUTE_KEY};
 use nexus_types::{AlertEvent, BBox, Frame, PixelFormat, TrackedObject};
 use std::sync::Arc;
 
@@ -145,7 +145,7 @@ fn object(track_id: u64, label: &str, cx: f32, cy: f32) -> TrackedObject {
 }
 
 /// One camera's worth of the supervisor's per-frame path: static
-/// classification → partition → rule evaluation.
+/// classification → rule evaluation.
 struct Sim {
     filter: Option<StaticObjectFilter>,
     evaluator: RuleEvaluator,
@@ -166,16 +166,9 @@ impl Sim {
         let f = frame(self.frame_id);
         self.frame_id += 1;
 
-        let filtering = match self.filter.as_mut() {
-            Some(filter) => {
-                filter.classify(&f, &mut objects);
-                true
-            }
-            None => false,
-        };
-        let dynamic = objects
-            .iter()
-            .filter(|t| !(filtering && is_object_static(t)));
+        if let Some(filter) = self.filter.as_mut() {
+            filter.classify(&f, &mut objects);
+        }
 
         self.evaluator.evaluate(
             1,
@@ -186,7 +179,7 @@ impl Sim {
             FRAME_W,
             FRAME_H,
             &[],
-            dynamic,
+            &objects,
         )
     }
 
@@ -219,6 +212,18 @@ fn alert_epoch_attribute_key_is_the_agreed_wire_string() {
     // stops working and every parked vehicle re-alerts again.
     assert_eq!(
         ALERT_EPOCH_ATTRIBUTE_KEY, "tracker.static_alert_epoch",
+        "attribute key is a cross-crate contract with nexus-rules; \
+         update both sides together"
+    );
+}
+
+#[test]
+fn static_attribute_key_is_the_agreed_wire_string() {
+    // The supervisor hands rules every tracked object and `nexus-rules`
+    // skips the hidden ones by this key, which it re-declares. A drift turns
+    // every parked car into an alert.
+    assert_eq!(
+        STATIC_ATTRIBUTE_KEY, "tracker.is_static",
         "attribute key is a cross-crate contract with nexus-rules; \
          update both sides together"
     );
