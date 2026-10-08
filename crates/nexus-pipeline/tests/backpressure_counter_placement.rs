@@ -154,7 +154,16 @@ async fn a_slow_analysis_loop_is_counted_as_backpressure_not_reported_healthy() 
         Arc::new(nexus_pipeline::NoopAlertClipScheduleGate),
     );
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Run until three frames have been tracked (the fourth detect has
+    // started), however slowly the runtime starts, so the counts and the
+    // rate below rest on a fixed number of passes, not a fixed window.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while detect_calls.load(Ordering::Relaxed) < 4 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the analysis loop never started its fourth detect");
     handle.task.abort();
 
     let snap = stats.snapshot(1).expect("the camera produced frames");
