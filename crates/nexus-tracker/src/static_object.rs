@@ -12,7 +12,8 @@
 //!
 //! A previously-suppressed track that starts moving again
 //! (significant-movement EMA crossed for
-//! `significant_movement_frames` consecutive frames) gets demoted —
+//! `significant_movement_frames` consecutive frames, or its centre more
+//! than `match_distance_pixels` from where it parked) gets demoted —
 //! the matching anchor is erased from the registry and subsequent
 //! frames flow through to the rule layer.
 //!
@@ -54,8 +55,9 @@ pub const EMA_ATTRIBUTE_KEY: &str = "tracker.movement_ema";
 pub const STATIC_FRAMES_ATTRIBUTE_KEY: &str = "tracker.static_frames";
 pub const MOVING_FRAMES_ATTRIBUTE_KEY: &str = "tracker.moving_consecutive_frames";
 /// Monotonic per-track generation for parking-lot alert deduplication. It
-/// starts at zero and advances only when sustained movement breaks a closed
-/// static-object gate.
+/// starts at zero and advances when the track breaks a closed static-object
+/// gate (sustained movement, or leaving where it parked) and when the
+/// ID-reuse guard resets the track.
 pub const ALERT_EPOCH_ATTRIBUTE_KEY: &str = "tracker.static_alert_epoch";
 
 /// Helper that mirrors the convention used by the supervisor: returns
@@ -98,9 +100,10 @@ struct PerTrackState {
     /// matched to, so a parked car's jitter is measured from where *it*
     /// stands (#367).
     parked_at: Option<(f32, f32)>,
-    /// Set when the track breaks its static gate, cleared when it is
-    /// promoted again. A departed track is a moving vehicle, so another
-    /// vehicle's anchor must not hide it before it parks (#368 review).
+    /// Set when the track breaks its static gate. A departed track is a
+    /// moving vehicle, so another vehicle's anchor must not hide it before
+    /// it parks again (#368 review). Only read while the track is not
+    /// promoted, so promotion need not clear it.
     departed: bool,
 }
 
@@ -349,7 +352,6 @@ impl StaticObjectFilter {
 
             if state.static_frames >= cfg_dwell {
                 state.static_promoted = true;
-                state.departed = false;
             }
 
             // ---- registry-anchor check ----

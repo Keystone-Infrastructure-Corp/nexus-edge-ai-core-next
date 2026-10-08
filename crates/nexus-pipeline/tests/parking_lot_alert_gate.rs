@@ -553,37 +553,44 @@ fn two_cars_parked_inside_one_match_radius_each_alert_once() {
 #[test]
 fn a_car_that_leaves_its_spot_alerts_even_inside_a_neighbours_anchor() {
     // Cars parked at x = 100 and x = 181 each own an anchor. Car A pulls
-    // 41 px forward and stops at x = 141: outside its own spot, but on the
-    // edge of B's anchor. Under the default two-frame debounce it must
-    // alert once, not be hidden by B's anchor after the frame it left
+    // forward and stops outside its own spot but inside B's anchor: at
+    // x = 141 (the review's case, on the edge of B's radius) and at
+    // x = 145 (36 px inside it). Under the default two-frame debounce it
+    // must alert once, not be hidden by B's anchor after the frame it left
     // (#368 review).
-    let filter = StaticObjectFilter::new(morgan_static_cfg(), 1, None);
-    let mut rule = rule_for("vehicle.car", 0);
-    rule.debounce.consecutive_frames = 2;
-    let mut sim = Sim::new(Some(filter), &[rule]);
+    for a_x in [141.0, 145.0] {
+        let filter = StaticObjectFilter::new(morgan_static_cfg(), 1, None);
+        let mut rule = rule_for("vehicle.car", 0);
+        rule.debounce.consecutive_frames = 2;
+        let mut sim = Sim::new(Some(filter), &[rule]);
 
-    let mut parked = 0;
-    for _ in 0..10 {
-        parked += sim
-            .step(vec![
-                object(1, "vehicle.car", 100.0, 100.0),
-                object(2, "vehicle.car", 181.0, 100.0),
-            ])
-            .len();
-    }
-    assert_eq!(parked, 2, "each parked car alerts once on arrival");
+        let mut parked = 0;
+        for _ in 0..10 {
+            parked += sim
+                .step(vec![
+                    object(1, "vehicle.car", 100.0, 100.0),
+                    object(2, "vehicle.car", 181.0, 100.0),
+                ])
+                .len();
+        }
+        assert_eq!(parked, 2, "each parked car alerts once on arrival");
 
-    let mut left = 0;
-    for _ in 0..4 {
-        left += sim
-            .step(vec![
-                object(1, "vehicle.car", 141.0, 100.0),
-                object(2, "vehicle.car", 181.0, 100.0),
-            ])
-            .len();
+        let mut left = Vec::new();
+        for _ in 0..4 {
+            left.extend(
+                sim.step(vec![
+                    object(1, "vehicle.car", a_x, 100.0),
+                    object(2, "vehicle.car", 181.0, 100.0),
+                ])
+                .into_iter()
+                .map(|a| a.track_id),
+            );
+        }
+        assert_eq!(
+            left,
+            vec![Some(1)],
+            "A stopped at x = {a_x}: the car that left its spot alerts once; \
+             the car still parked does not"
+        );
     }
-    assert_eq!(
-        left, 1,
-        "the car that left its spot alerts once; the car still parked does not"
-    );
 }
