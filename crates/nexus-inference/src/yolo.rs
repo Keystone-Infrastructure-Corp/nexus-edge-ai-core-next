@@ -42,17 +42,16 @@ use async_trait::async_trait;
 use ndarray::{s, Array2, Array4};
 use nexus_config::InferenceConfig;
 use nexus_types::{BBox, Detection, Frame};
-use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
-use crate::session_tuning::{self, SessionTuning};
+use crate::session_tuning::{self, OrtSession, SessionTuning};
 
 /// Real ORT-backed YOLO detector.
 pub struct YoloOrtDetector {
-    session: Mutex<Session>,
+    session: Mutex<OrtSession>,
     input_w: u32,
     input_h: u32,
     score_threshold: f32,
@@ -285,7 +284,7 @@ impl Detector for YoloOrtDetector {
 
         // ort sessions are !Sync and `run` takes &mut self, so do the
         // work on a blocking thread and acquire the mutex there.
-        let session_for_blocking: &Mutex<Session> = &self.session;
+        let session_for_blocking: &Mutex<OrtSession> = &self.session;
         // SAFETY-equivalent: we hand the reference into a blocking task via
         // `tokio::task::block_in_place`, which keeps us on the same thread
         // (no Send required) — this is the cheapest way to call &mut from
@@ -310,7 +309,7 @@ impl Detector for YoloOrtDetector {
 }
 
 fn run_yolo(
-    session: &mut Session,
+    session: &mut OrtSession,
     rgb: &[u8],
     frame_w: u32,
     frame_h: u32,

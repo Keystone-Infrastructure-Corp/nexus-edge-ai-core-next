@@ -329,6 +329,11 @@ fn warn_vulkan_unavailable_once() {
     });
 }
 
+/// The label [`selected_for_priority`] gives the WebGPU EP. A session
+/// carrying it lands on ORT's shared default WebGPU context, which is
+/// why `session_tuning` serialises it (#363).
+pub(crate) const WEBGPU_EP_NAME: &str = "vulkan(webgpu)";
+
 /// Build the list of EPs to register with the ORT session, in the
 /// priority order requested by `ep_priority`. Always appends CPU as
 /// the final fallback if it wasn't already in the list.
@@ -530,7 +535,7 @@ fn selected_for_priority_inner(
                             .with_dawn_backend_type(DawnBackendType::Vulkan)
                             .build(),
                     );
-                    names.push("vulkan(webgpu)".into());
+                    names.push(WEBGPU_EP_NAME.into());
                 } else {
                     warn_vulkan_unavailable_once();
                 }

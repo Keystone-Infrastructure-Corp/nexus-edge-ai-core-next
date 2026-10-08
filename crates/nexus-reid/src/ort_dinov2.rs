@@ -25,9 +25,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ndarray::Array4;
-use nexus_inference::session_tuning::{self, SessionTuning};
+use nexus_inference::session_tuning::{self, OrtSession, SessionTuning};
 use nexus_types::{BBox, Frame};
-use ort::session::Session;
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info};
@@ -44,7 +43,7 @@ use crate::{
 /// output is L2-normalised in postprocessing so callers can use plain
 /// dot product as cosine similarity.
 pub struct DinoV2Extractor {
-    session: Mutex<Session>,
+    session: Mutex<OrtSession>,
     model_id: String,
     input_w: u32,
     input_h: u32,
@@ -128,7 +127,7 @@ impl Extractor for DinoV2Extractor {
 
         let model_id = self.model_id.clone();
         let expected_dim = self.expected_dim;
-        let session_for_blocking: &Mutex<Session> = &self.session;
+        let session_for_blocking: &Mutex<OrtSession> = &self.session;
         let result = tokio::task::block_in_place(|| -> Result<Vec<f32>, ExtractorError> {
             let mut sess = session_for_blocking.lock();
             run_dinov2(&mut sess, &nchw, expected_dim)
@@ -228,7 +227,7 @@ impl Extractor for DinoV2Extractor {
         };
         let model_id = self.model_id.clone();
         let expected_dim = self.expected_dim;
-        let session_for_blocking: &Mutex<Session> = &self.session;
+        let session_for_blocking: &Mutex<OrtSession> = &self.session;
         let batched_result =
             tokio::task::block_in_place(|| -> Result<Vec<Vec<f32>>, ExtractorError> {
                 let mut sess = session_for_blocking.lock();
@@ -314,7 +313,7 @@ impl Extractor for DinoV2Extractor {
 
         let model_id = self.model_id.clone();
         let expected_dim = self.expected_dim;
-        let session_for_blocking: &Mutex<Session> = &self.session;
+        let session_for_blocking: &Mutex<OrtSession> = &self.session;
         let result = tokio::task::block_in_place(|| -> Result<Vec<f32>, ExtractorError> {
             let mut sess = session_for_blocking.lock();
             run_dinov2(&mut sess, &nchw, expected_dim)
@@ -407,7 +406,7 @@ impl Extractor for DinoV2Extractor {
         };
         let model_id = self.model_id.clone();
         let expected_dim = self.expected_dim;
-        let session_for_blocking: &Mutex<Session> = &self.session;
+        let session_for_blocking: &Mutex<OrtSession> = &self.session;
         let batched_result =
             tokio::task::block_in_place(|| -> Result<Vec<Vec<f32>>, ExtractorError> {
                 let mut sess = session_for_blocking.lock();
@@ -490,7 +489,7 @@ fn splice_batch_error(
 /// without a per-EP-revalidated dynamic-axis model re-export; at the
 /// re-id emit cadence the per-call overhead is negligible.
 pub fn run_dinov2_batch(
-    session: &mut Session,
+    session: &mut OrtSession,
     nchw: &Array4<f32>,
     expected_dim: usize,
 ) -> Result<Vec<Vec<f32>>, ExtractorError> {
@@ -509,7 +508,7 @@ pub fn run_dinov2_batch(
 /// Single inference step. Public for the integration tests that ship
 /// alongside the model in 5.6 4c.
 pub fn run_dinov2(
-    session: &mut Session,
+    session: &mut OrtSession,
     nchw: &Array4<f32>,
     expected_dim: usize,
 ) -> Result<Vec<f32>, ExtractorError> {
