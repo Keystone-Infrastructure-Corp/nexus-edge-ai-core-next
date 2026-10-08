@@ -47,25 +47,64 @@ fn field_rule(consecutive_frames: u32, cooldown_ms: u64) -> RuleConfig {
     }
 }
 
-/// A vehicle `length` px long crossing the frame at 0.625 of its length per
-/// analysed frame: (length, height, frames in view). The near one steps
-/// 75 px, past the static filter's 60 px ID-reuse guard.
-const CROSSINGS: [(f32, f32, u64); 2] = [(80.0, 50.0, 8), (120.0, 70.0, 5)];
+/// One vehicle's pass: its box size, and its box's left edge on each analysed
+/// frame (`None`: not detected on that frame).
+type Pass = ((f32, f32), Vec<Option<f32>>);
 
-/// Alerts fired while one vehicle crosses the frame.
-fn alerts_for_a_crossing(
-    tracker_cfg: ByteTrackConfig,
-    rule: RuleConfig,
-    (length, height, frames): (f32, f32, u64),
-) -> usize {
+/// Constant-speed crossings at 0.625 of the box length per analysed frame.
+/// The near one steps 75 px, past the static filter's 60 px ID-reuse guard.
+fn crossings() -> Vec<Pass> {
+    vec![
+        (
+            (80.0, 50.0),
+            (0..8).map(|i| Some(10.0 + i as f32 * 50.0)).collect(),
+        ),
+        (
+            (120.0, 70.0),
+            (0..5).map(|i| Some(10.0 + i as f32 * 75.0)).collect(),
+        ),
+    ]
+}
+
+/// The crossings, plus vehicles that stand still for a frame and then
+/// leave: one accelerating away, one driving off and then missed for two
+/// frames.
+fn every_pass() -> Vec<Pass> {
+    let mut passes = crossings();
+    let xs = |v: &[Option<f32>]| v.to_vec();
+    passes.push((
+        (120.0, 70.0),
+        xs(&[10.0, 15.0, 45.0, 90.0, 150.0, 225.0, 300.0].map(Some)),
+    ));
+    passes.push((
+        (100.0, 60.0),
+        xs(&[
+            Some(0.0),
+            Some(5.0),
+            Some(45.0),
+            Some(95.0),
+            Some(160.0),
+            Some(225.0),
+            None,
+            None,
+            Some(390.0),
+            Some(445.0),
+        ]),
+    ));
+    passes
+}
+
+/// Alerts fired during one pass.
+fn alerts_for(tracker_cfg: ByteTrackConfig, rule: RuleConfig, pass: &Pass) -> usize {
+    let ((length, height), xs) = pass;
     let tracker = ByteTrackTracker::new(tracker_cfg);
     // MORGAN's ID-reuse guard is the default 60 px.
     let mut filter = StaticObjectFilter::new(StaticObjectConfig::default(), 14, None);
     let eval = RuleEvaluator::new(&RulesConfig::default(), &[rule]).unwrap();
     let t0 = Instant::now();
     let mut fired = 0;
-    for i in 0..frames {
-        let x = 10.0 + i as f32 * length * 0.625;
+    for (i, x) in xs.iter().enumerate() {
+        let i = i as u64;
         let frame = Frame {
             camera_id: 14,
             frame_id: i,
@@ -77,18 +116,21 @@ fn alerts_for_a_crossing(
             data: Arc::new(vec![]),
             trace_id: format!("trace-{i}"),
         };
-        let car = Detection {
-            label: "vehicle.car".into(),
-            confidence: 0.6,
-            bbox: BBox {
-                x1: x,
-                y1: 150.0,
-                x2: x + length,
-                y2: 150.0 + height,
-            },
-            attributes: Default::default(),
-        };
-        let mut tracked = tracker.update(vec![car], frame.captured_mono);
+        let detections: Vec<Detection> = x
+            .iter()
+            .map(|&x| Detection {
+                label: "vehicle.car".into(),
+                confidence: 0.6,
+                bbox: BBox {
+                    x1: x,
+                    y1: 150.0,
+                    x2: x + length,
+                    y2: 150.0 + height,
+                },
+                attributes: Default::default(),
+            })
+            .collect();
+        let mut tracked = tracker.update(detections, frame.captured_mono);
         filter.classify(&frame, &mut tracked);
         let dynamic = tracked.iter().filter(|t| !is_object_static(t));
         fired += eval
@@ -110,11 +152,11 @@ fn alerts_for_a_crossing(
 
 #[test]
 fn a_vehicle_crossing_a_parking_lot_camera_at_the_field_rate_alerts_once() {
-    for crossing in CROSSINGS {
+    for pass in every_pass() {
         assert_eq!(
-            alerts_for_a_crossing(ByteTrackConfig::default(), field_rule(2, 30_000), crossing),
+            alerts_for(ByteTrackConfig::default(), field_rule(2, 30_000), &pass),
             1,
-            "{crossing:?}"
+            "{pass:?}"
         );
     }
 }
@@ -125,24 +167,31 @@ fn without_the_motion_pass_the_same_crossing_never_alerts() {
         motion_match_box_lengths_per_sec: 0.0,
         ..Default::default()
     };
-    for crossing in CROSSINGS {
+    for pass in crossings() {
         assert_eq!(
-            alerts_for_a_crossing(cfg.clone(), field_rule(2, 30_000), crossing),
+            alerts_for(cfg.clone(), field_rule(2, 30_000), &pass),
             0,
-            "{crossing:?}"
+            "{pass:?}"
         );
     }
 }
 
-/// With no cooldown, only the parking-lot alert epoch stops a moving
-/// vehicle re-alerting on every frame of its crossing.
+/// With no cooldown, only the parking-lot alert episode stops a vehicle
+/// alerting again during its visit: a vehicle that never parks has one.
 #[test]
-fn a_crossing_alerts_once_under_a_per_frame_rule_with_no_cooldown() {
-    for crossing in CROSSINGS {
+fn every_pass_alerts_once_with_no_cooldown() {
+    for (consecutive_frames, pass) in [1, 2]
+        .into_iter()
+        .flat_map(|c| every_pass().into_iter().map(move |p| (c, p)))
+    {
         assert_eq!(
-            alerts_for_a_crossing(ByteTrackConfig::default(), field_rule(1, 0), crossing),
+            alerts_for(
+                ByteTrackConfig::default(),
+                field_rule(consecutive_frames, 0),
+                &pass
+            ),
             1,
-            "{crossing:?}"
+            "consecutive_frames {consecutive_frames}: {pass:?}"
         );
     }
 }
