@@ -92,6 +92,12 @@ pub struct CameraFrameStats {
     /// backend instead of waiting on it — the loop resumes, and the frames it
     /// skipped are counted on the next one through.
     pub frames_backpressure_dropped: u64,
+    /// Frames per second that reached the tracker, over [`RATE_WINDOW`].
+    /// Unlike `fps_ema`, which is the source rate, this is the rate
+    /// association and the rules work at: detector capacity shared among
+    /// every camera on it, often far below the source (#362). Zero until
+    /// two frames have been tracked.
+    pub analysed_fps: f32,
     /// Width of the most recent frame, in pixels. For RTSP this is
     /// the detector frame dimension (currently 960), NOT the camera
     /// native resolution. The UI uses this to scale bbox overlay
@@ -153,6 +159,8 @@ struct Entry {
     tile_invocations: u64,
     tile_detections_added: u64,
     tile_inference_ms_total: u64,
+    analysed: RateWindow,
+    analysed_fps: f32,
 }
 
 impl Entry {
@@ -184,6 +192,7 @@ impl Entry {
             frames_emitted: self.frames_emitted,
             frames_dropped: self.frames_dropped,
             frames_backpressure_dropped: self.frames_backpressure_dropped,
+            analysed_fps: self.analysed_fps,
             source_width: self.source_width,
             source_height: self.source_height,
             tile_invocations: self.tile_invocations,
@@ -274,6 +283,8 @@ impl FrameStatsRegistry {
             tile_invocations: 0,
             tile_detections_added: 0,
             tile_inference_ms_total: 0,
+            analysed: RateWindow::default(),
+            analysed_fps: 0.0,
         });
         // Prune anything older than the window before appending so the
         // VecDeque stays bounded even at high arrival rates.
@@ -340,6 +351,15 @@ impl FrameStatsRegistry {
             }
         }
         entry.last_frame_id = Some(frame_id);
+    }
+
+    /// Record one frame handed to the tracker.
+    pub fn observe_analysed(&self, camera_id: CameraId) {
+        if let Some(slot) = self.slot(camera_id) {
+            if let Some(entry) = slot.lock().entry.as_mut() {
+                entry.analysed_fps = entry.analysed.record(Instant::now());
+            }
+        }
     }
 
     pub fn observe_dropped(&self, camera_id: CameraId) {
@@ -842,6 +862,29 @@ mod tests {
         let s = reg.snapshot(1).unwrap();
         assert!(s.fps_ema > 0.0, "fps_ema should be positive after 2 frames");
         assert_eq!(s.frames_emitted, 2);
+    }
+
+    /// #362: the source delivered 15 fps while the analysis loop tracked
+    /// 1.45, and only the source rate was reported anywhere.
+    #[test]
+    fn analysed_fps_counts_tracked_frames_not_source_frames() {
+        let reg = FrameStatsRegistry::new();
+        let epoch = reg.begin_session(1);
+        for _ in 0..5 {
+            reg.observe_frame(1, epoch, Utc::now(), 512, 288);
+        }
+        reg.observe_analysed(1);
+        let s = reg.snapshot(1).unwrap();
+        assert_eq!(s.analysed_fps, 0.0, "one tracked frame is no rate yet");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        reg.observe_analysed(1);
+        let s = reg.snapshot(1).unwrap();
+        assert!(
+            s.analysed_fps > 5.0 && s.analysed_fps < 40.0,
+            "two frames 50 ms apart: {}",
+            s.analysed_fps
+        );
+        assert_eq!(s.frames_emitted, 5);
     }
 
     /// Regression: bursty arrivals (gate drain, queue flush) used to

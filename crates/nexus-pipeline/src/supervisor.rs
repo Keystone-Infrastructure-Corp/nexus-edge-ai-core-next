@@ -937,6 +937,7 @@ async fn run_camera(
                     let _g = info_span!("frame.track", tracker = tracker.name()).entered();
                     tracker.update(detections, frame.captured_mono)
                 };
+                stats.observe_analysed(cfg.id);
                 // M_PERF_CROWD Phase E1 — feed the post-tracker
                 // tracked-object count back into the skip policy's EMA so
                 // the next frame's skip decision reflects current crowd

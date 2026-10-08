@@ -172,4 +172,13 @@ async fn a_slow_analysis_loop_is_counted_as_backpressure_not_reported_healthy() 
         "every frame that reached the loop cleared the gate at this rate, so a \
          non-zero gate counter means the two are being conflated again"
     );
+    // #362: the rate the tracker and rules run at is the loop's (~1.7 fps
+    // behind a 600 ms detector), not the source's 20 fps, and it was
+    // reported nowhere.
+    assert!(
+        (0.8..=2.5).contains(&snap.analysed_fps),
+        "analysed_fps {} should be the loop's rate, not the source's {}",
+        snap.analysed_fps,
+        snap.fps_ema
+    );
 }
