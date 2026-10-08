@@ -79,6 +79,9 @@ struct TrackState {
 struct ByteTrackState {
     next_id: TrackId,
     tracks: Vec<TrackState>,
+    /// Candidate (score, track, detection) pairs, reused by every pass so
+    /// association allocates nothing per frame once it has grown.
+    pairs: Vec<(f32, usize, usize)>,
 }
 
 pub struct ByteTrackTracker {
@@ -93,6 +96,7 @@ impl ByteTrackTracker {
             inner: Mutex::new(ByteTrackState {
                 next_id: 1,
                 tracks: Vec::new(),
+                pairs: Vec::new(),
             }),
         }
     }
@@ -101,7 +105,8 @@ impl ByteTrackTracker {
 impl Tracker for ByteTrackTracker {
     fn update(&self, mut detections: Vec<Detection>, captured_mono: Instant) -> Vec<TrackedObject> {
         let cfg = &self.cfg;
-        let mut state = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let state = &mut *guard;
 
         // ---- 1. Predict + age. ----
         for t in state.tracks.iter_mut() {
@@ -126,6 +131,7 @@ impl Tracker for ByteTrackTracker {
         // ---- 3. First pass: high-conf detections vs. all tracks. ----
         associate_pass(
             &mut state.tracks,
+            &mut state.pairs,
             &mut detections,
             &high_idx,
             cfg.match_iou_threshold,
@@ -139,6 +145,7 @@ impl Tracker for ByteTrackTracker {
         // ---- 4. Second pass: low-conf detections recover unmatched tracks. ----
         associate_pass(
             &mut state.tracks,
+            &mut state.pairs,
             &mut detections,
             &low_idx,
             cfg.match_iou_threshold,
@@ -153,6 +160,7 @@ impl Tracker for ByteTrackTracker {
         if cfg.motion_match_box_lengths_per_sec > 0.0 {
             associate_by_motion(
                 &mut state.tracks,
+                &mut state.pairs,
                 &mut detections,
                 cfg,
                 captured_mono,
@@ -288,11 +296,14 @@ fn blend(new: BBox, prior: BBox, alpha: f32) -> BBox {
 /// One association pass over `det_indices`. Mutates the tracks (velocity,
 /// bbox, lifecycle, hit streak) and the `det_used` / `track_matched`
 /// vectors, and moves each matched detection's attributes onto its track.
-/// Greedy best-IoU per track — same as v1.
+/// Pairs are assigned best IoU first across all tracks, not track by track
+/// in creation order: otherwise an older track, such as a lost leader's
+/// coasting box, takes a detection that overlaps another track better
+/// (#362). Ties go to the earlier track, then the earlier detection.
 ///
 /// `spatial_bucket_size_px` (Phase M_PERF_CROWD C1):
-/// - `None` or `Some(0)` → original O(N²) sweep (every track scans every
-///   candidate detection).
+/// - `None` or `Some(0)` → O(N²) sweep (every track scans every candidate
+///   detection).
 /// - `Some(n)` → builds a `HashMap<(i32, i32), Vec<usize>>` grid keyed
 ///   by `floor(det_centre / n)` over `det_indices`, then each track only
 ///   scans the 3×3 cell neighbourhood of its own predicted-centre cell.
@@ -302,6 +313,7 @@ fn blend(new: BBox, prior: BBox, alpha: f32) -> BBox {
 #[allow(clippy::too_many_arguments)]
 fn associate_pass(
     tracks: &mut [TrackState],
+    pairs: &mut Vec<(f32, usize, usize)>,
     detections: &mut [Detection],
     det_indices: &[usize],
     match_iou_threshold: f32,
@@ -331,28 +343,23 @@ fn associate_pass(
         _ => None,
     };
 
-    for (t_idx, t) in tracks.iter_mut().enumerate() {
+    pairs.clear();
+    for (t_idx, t) in tracks.iter().enumerate() {
         if track_matched[t_idx] {
             continue;
         }
-        let mut best: Option<(usize, f32)> = None;
-        match &grid {
-            None => {
-                // Original O(N²) sweep — preserves v1 behaviour exactly.
-                for &i in det_indices {
-                    if det_used[i] {
-                        continue;
-                    }
-                    let d = &detections[i];
-                    if d.label != t.label {
-                        continue;
-                    }
-                    let iou = t.bbox.iou(&d.bbox);
-                    if iou > best.map_or(0.0, |(_, b)| b) {
-                        best = Some((i, iou));
-                    }
-                }
+        let mut consider = |i: usize| {
+            let d = &detections[i];
+            if det_used[i] || d.label != t.label {
+                return;
             }
+            let iou = t.bbox.iou(&d.bbox);
+            if iou > 0.0 && iou >= match_iou_threshold {
+                pairs.push((iou, t_idx, i));
+            }
+        };
+        match &grid {
+            None => det_indices.iter().for_each(|&i| consider(i)),
             Some((cell, g)) => {
                 let tcx = (t.bbox.x1 + t.bbox.x2) * 0.5;
                 let tcy = (t.bbox.y1 + t.bbox.y2) * 0.5;
@@ -360,35 +367,23 @@ fn associate_pass(
                 let gy = (tcy / cell).floor() as i32;
                 for dy in -1..=1 {
                     for dx in -1..=1 {
-                        let Some(cell_dets) = g.get(&(gx + dx, gy + dy)) else {
-                            continue;
-                        };
-                        for &i in cell_dets {
-                            if det_used[i] {
-                                continue;
-                            }
-                            let d = &detections[i];
-                            if d.label != t.label {
-                                continue;
-                            }
-                            let iou = t.bbox.iou(&d.bbox);
-                            if iou > best.map_or(0.0, |(_, b)| b) {
-                                best = Some((i, iou));
-                            }
+                        if let Some(cell_dets) = g.get(&(gx + dx, gy + dy)) {
+                            cell_dets.iter().for_each(|&i| consider(i));
                         }
                     }
                 }
             }
         }
-        let Some((i, iou)) = best else { continue };
-        if iou < match_iou_threshold {
+    }
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    for &(_, t_idx, i) in pairs.iter() {
+        if track_matched[t_idx] || det_used[i] {
             continue;
         }
-
         det_used[i] = true;
         track_matched[t_idx] = true;
         apply_match(
-            t,
+            &mut tracks[t_idx],
             &mut detections[i],
             confirm_frames,
             display_smoothing_alpha,
@@ -412,10 +407,12 @@ const MOTION_MATCH_MAX_FRAMES: u32 = 4;
 const MOTION_MATCH_MIN_SPEED: f32 = 0.1;
 
 /// How far behind where it was last seen, in box lengths along its travel, a
-/// moving track still takes a detection. Box jitter, float error in the
-/// stepped-back position and a vehicle that stopped where it was last seen
-/// all land within it; a follower behind a lost leader lands further back.
-const MOTION_MATCH_BACKWARD_SLACK: f32 = 0.25;
+/// moving track still takes a detection. A moving vehicle cannot reappear
+/// behind that point, so this only covers box jitter (2-7 px on parked cars,
+/// BUG-258) and float error in the stepped-back position, so that a vehicle
+/// that stopped where it was last seen keeps its track. A follower, even a
+/// close one, lands further back.
+const MOTION_MATCH_BACKWARD_SLACK: f32 = 0.1;
 
 /// Link unmatched tracks to unused same-label detections by distance,
 /// nearest pairs first. A track is eligible if it has no velocity yet (one
@@ -427,13 +424,14 @@ const MOTION_MATCH_BACKWARD_SLACK: f32 = 0.25;
 /// appears while its leader is unseen.
 fn associate_by_motion(
     tracks: &mut [TrackState],
+    pairs: &mut Vec<(f32, usize, usize)>,
     detections: &mut [Detection],
     cfg: &ByteTrackConfig,
     now: Instant,
     det_used: &mut [bool],
     track_matched: &mut [bool],
 ) {
-    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+    pairs.clear();
     for (t_idx, t) in tracks.iter().enumerate() {
         if track_matched[t_idx] {
             continue;
@@ -477,7 +475,7 @@ fn associate_by_motion(
         }
     }
     pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (_, t_idx, i) in pairs {
+    for &(_, t_idx, i) in pairs.iter() {
         if track_matched[t_idx] || det_used[i] {
             continue;
         }
@@ -499,8 +497,14 @@ fn apply_match(
     confirm_frames: u32,
     display_smoothing_alpha: f32,
 ) {
-    let dx = d.bbox.x1 - t.bbox.x1;
-    let dy = d.bbox.y1 - t.bbox.y1;
+    // Displacement per frame since the box was last observed. `t.bbox` has
+    // been predicted forward one velocity step per frame since then, so the
+    // gap to it is only the prediction's error; v1 fed that error to the EMA,
+    // which settles at half the true step and leaves a lost track's
+    // predicted box trailing its vehicle (#362).
+    let steps = (t.missed_frames + 1) as f32;
+    let dx = (d.bbox.x1 - t.bbox.x1) / steps + t.velocity_x;
+    let dy = (d.bbox.y1 - t.bbox.y1) / steps + t.velocity_y;
     // Same EMA constants as v1: 0.6 weight on prior velocity, 0.4 on
     // newly observed dx/dy.
     t.velocity_x = 0.6 * t.velocity_x + 0.4 * dx;
@@ -951,6 +955,65 @@ mod tests {
             let (ids, _) = drive(&t, &frames);
             assert_eq!(ids.len(), 1, "{back} px back: {ids:?}");
         }
+    }
+
+    #[test]
+    fn velocity_converges_to_the_step_per_frame() {
+        // A box moving 10 px per frame, matched by IoU every frame.
+        let t = ByteTrackTracker::new(cfg_default());
+        for i in 0..15u64 {
+            let _ = t.update(
+                vec![det_at(
+                    "vehicle.car",
+                    i as f32 * 10.0,
+                    0.0,
+                    100.0,
+                    60.0,
+                    0.9,
+                )],
+                at_ms(i * 66),
+            );
+        }
+        let v = t.inner.lock().tracks[0].velocity_x;
+        assert!(
+            (v - 10.0).abs() < 1.0,
+            "velocity {v} px/frame for a 10 px/frame box"
+        );
+    }
+
+    #[test]
+    fn a_close_follower_does_not_join_its_lost_leaders_coasting_box() {
+        // Review of #369: a leader at 60 px per frame is lost; a follower at
+        // the same speed is first seen 0.3 box lengths behind its last-seen
+        // point and drives on into the leader's predicted box. It needs the
+        // velocity to predict the leader where it really is, and the IoU pass
+        // to give the overlapping detection to the track it fits best.
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let leader: Vec<_> = (0..4u64)
+            .map(|i| (i * FIELD_INTERVAL_MS, x1(i as f32 * 60.0)))
+            .collect();
+        let (leader, _) = drive(&t, &leader);
+        let follower: Vec<_> = (0..4u64)
+            .map(|k| ((4 + k) * FIELD_INTERVAL_MS, x1(150.0 + k as f32 * 60.0)))
+            .collect();
+        let (follower, _) = drive(&t, &follower);
+        assert_eq!(follower.len(), 1, "{follower:?}");
+        assert_ne!(follower, leader, "the follower joined the leader's track");
+    }
+
+    #[test]
+    fn a_detection_a_fifth_of_a_box_behind_a_lost_leader_is_another_vehicle() {
+        // A moving vehicle cannot reappear 20 px behind where it was last
+        // seen; only box jitter lands behind it, and that is a few px.
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let leader: Vec<_> = (0..4u64)
+            .map(|i| (i * FIELD_INTERVAL_MS, x1(i as f32 * 60.0)))
+            .collect();
+        let (leader, _) = drive(&t, &leader);
+        let (next, _) = drive(&t, &[(4 * FIELD_INTERVAL_MS, x1(160.0))]);
+        assert_ne!(next, leader);
     }
 
     #[test]
