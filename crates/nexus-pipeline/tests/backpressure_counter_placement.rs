@@ -44,6 +44,13 @@ use url::Url;
 /// gate's `BASELINE_GAP_MS`, so every pass through the loop holds it open
 /// long enough for the source to produce several frames the `watch` then
 /// coalesces down to one.
+///
+/// It must exceed it by more than scheduling jitter. The frame the loop
+/// takes next can be a source interval older than the moment it asks, and
+/// a frame under the gate's floor that has not changed (these are black) is
+/// a legitimate gate drop. At 600 ms the margin was about 50 ms plus loop
+/// overhead: one loaded review run tripped `frames_dropped == 0`, and at
+/// 510 ms 28 of 30 runs on the dev box did.
 struct SlowDetector {
     calls: Arc<AtomicUsize>,
 }
@@ -52,7 +59,7 @@ struct SlowDetector {
 impl Detector for SlowDetector {
     async fn detect(&self, _f: &Frame, _p: &[String]) -> Result<Vec<Detection>, InferenceError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
         Ok(vec![])
     }
 
@@ -83,8 +90,8 @@ async fn a_slow_analysis_loop_is_counted_as_backpressure_not_reported_healthy() 
         .expect("open store"),
     );
 
-    // 20 fps is 50 ms spacing — well inside the 600 ms the detector holds
-    // the loop for, so each pass coalesces roughly a dozen frames away.
+    // 20 fps is 50 ms spacing — well inside the 1 s the detector holds the
+    // loop for, so each pass coalesces roughly twenty frames away.
     let cam = CameraConfig {
         id: 1,
         name: "virtual-backpressure".into(),
@@ -147,7 +154,16 @@ async fn a_slow_analysis_loop_is_counted_as_backpressure_not_reported_healthy() 
         Arc::new(nexus_pipeline::NoopAlertClipScheduleGate),
     );
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Run until three frames have been tracked (the fourth detect has
+    // started), however slowly the runtime starts, so the counts and the
+    // rate below rest on a fixed number of passes, not a fixed window.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while detect_calls.load(Ordering::Relaxed) < 4 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the analysis loop never started its fourth detect");
     handle.task.abort();
 
     let snap = stats.snapshot(1).expect("the camera produced frames");
@@ -171,5 +187,14 @@ async fn a_slow_analysis_loop_is_counted_as_backpressure_not_reported_healthy() 
         snap.frames_dropped, 0,
         "every frame that reached the loop cleared the gate at this rate, so a \
          non-zero gate counter means the two are being conflated again"
+    );
+    // #362: the rate the tracker and rules run at is the loop's (~1 fps
+    // behind a 1 s detector), not the source's 20 fps, and it was reported
+    // nowhere.
+    assert!(
+        (0.5..=2.0).contains(&snap.analysed_fps),
+        "analysed_fps {} should be the loop's rate, not the source's {}",
+        snap.analysed_fps,
+        snap.fps_ema
     );
 }

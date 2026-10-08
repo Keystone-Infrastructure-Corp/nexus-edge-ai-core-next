@@ -1627,6 +1627,13 @@ pub struct ByteTrackConfig {
     /// `alpha`, prior smoothed box weighs `1 - alpha`. v1 default: 0.6.
     #[serde(default = "default_bytetrack_display_smoothing_alpha")]
     pub display_smoothing_alpha: f32,
+    /// Fallback for a track no detection overlapped: link the nearest
+    /// same-label detection whose centre lies within this many box lengths
+    /// (the box's larger side) per second since the track's last match.
+    /// Keeps a moving vehicle on one track when the analysis rate is too low
+    /// for its consecutive boxes to overlap (#362). `0` disables it.
+    #[serde(default = "default_bytetrack_motion_match_box_lengths_per_sec")]
+    pub motion_match_box_lengths_per_sec: f32,
     /// Spatial-bucket cell size (px) for the `associate_pass` neighbour
     /// search (Phase M_PERF_CROWD C3/C1). `None` or `Some(0)` preserves
     /// the original O(N²) sweep; `Some(n)` builds a grid over the
@@ -1646,6 +1653,7 @@ impl Default for ByteTrackConfig {
             confirm_frames: default_bytetrack_confirm_frames(),
             tentative_max_missed_frames: default_bytetrack_tentative_max_missed_frames(),
             display_smoothing_alpha: default_bytetrack_display_smoothing_alpha(),
+            motion_match_box_lengths_per_sec: default_bytetrack_motion_match_box_lengths_per_sec(),
             spatial_bucket_size_px: None,
         }
     }
@@ -1677,6 +1685,9 @@ fn default_bytetrack_tentative_max_missed_frames() -> u32 {
 }
 fn default_bytetrack_display_smoothing_alpha() -> f32 {
     0.6
+}
+fn default_bytetrack_motion_match_box_lengths_per_sec() -> f32 {
+    3.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -937,6 +937,7 @@ async fn run_camera(
                     let _g = info_span!("frame.track", tracker = tracker.name()).entered();
                     tracker.update(detections, frame.captured_mono)
                 };
+                stats.observe_analysed(cfg.id);
                 // M_PERF_CROWD Phase E1 — feed the post-tracker
                 // tracked-object count back into the skip policy's EMA so
                 // the next frame's skip decision reflects current crowd
@@ -1199,7 +1200,10 @@ async fn run_camera(
                         frame.width,
                         frame.height,
                         &zones,
-                        dynamic_tracked.clone(),
+                        // Every track, static ones included: the evaluator
+                        // skips them but keeps their alert episodes while
+                        // they are hidden (#362).
+                        tracked_arc.iter(),
                     )
                 };
                 // Alert snapshots — persist a JPEG of the frame that fired

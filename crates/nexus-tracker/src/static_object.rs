@@ -303,12 +303,20 @@ impl StaticObjectFilter {
             // state so the new vehicle doesn't inherit a stale
             // `static_promoted = true` from the previous occupant.
             // `cfg_reset_px == 0` disables the guard entirely.
+            //
+            // Only a parked track starts a new alert episode here. At low
+            // analysis rates a moving vehicle's own steps exceed this
+            // threshold (#362), and this filter cannot tell them from a
+            // swap; a vehicle that never parked has one episode for its
+            // whole visit, so a new one per step would re-alert it.
             if cfg_reset_px > 0.0 {
                 if let Some((px, py)) = state.last_center {
                     let dx = (center.0 - px) as f64;
                     let dy = (center.1 - py) as f64;
                     if (dx * dx + dy * dy).sqrt() > cfg_reset_px {
-                        let next_alert_epoch = state.alert_epoch.saturating_add(1);
+                        let next_alert_epoch = state
+                            .alert_epoch
+                            .saturating_add(u64::from(state.static_promoted));
                         *state = PerTrackState::default();
                         state.alert_epoch = next_alert_epoch;
                     }
@@ -1272,6 +1280,157 @@ mod tests {
         let mut objs = vec![vehicle(99, 910.0, 500.0)];
         f.filter(&frame(1, 4, 132), &mut objs);
         assert_eq!(objs.len(), 1, "second frame must also pass");
+    }
+
+    /// #362: at low analysis rates ByteTrack links a moving vehicle across
+    /// steps longer than `track_id_reuse_reset_pixels`. Such a step must not
+    /// restart its alert epoch: that re-armed the alert on every frame, or
+    /// reset a `consecutive_frames` streak on every frame so it never fired.
+    /// The second path pauses first, then drives off in sub-threshold steps
+    /// before a long one: by then it is moving, not standing.
+    #[test]
+    fn a_moving_vehicle_keeps_its_alert_epoch_across_long_steps() {
+        let paths: [&[f32]; 2] = [
+            &[60.0, 135.0, 210.0, 285.0, 360.0],
+            &[60.0, 65.0, 115.0, 165.0, 215.0, 265.0, 340.0],
+        ];
+        for path in paths {
+            let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+            let epochs: Vec<_> = path
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    let mut objs = vec![vehicle(42, x, 175.0)];
+                    f.classify(&frame(1, i as u64, i as i64 * 690), &mut objs);
+                    objs[0]
+                        .attributes
+                        .get(ALERT_EPOCH_ATTRIBUTE_KEY)
+                        .and_then(Value::as_u64)
+                })
+                .collect();
+            assert_eq!(epochs, vec![Some(0); path.len()], "{path:?}");
+        }
+    }
+
+    /// The guard's original case, for a track not yet promoted: a car three
+    /// frames into its five-frame dwell, then a passer linked into its track
+    /// about 70 px away. The car is wholly hidden on the frame before (a
+    /// coasting frame), partly hidden (its visible part boxed 18 px off), or
+    /// a box that jitters 12 px and so is never still. The passer must not
+    /// inherit the dwell and be hidden. A track that never parked keeps its
+    /// one alert episode, so the passer shares the car's (#362).
+    #[test]
+    fn a_passer_linked_into_a_car_still_learning_its_dwell_is_not_hidden() {
+        type Seen = (f32, f32, bool);
+        let cases: [(&str, [Seen; 4], f32); 3] = [
+            (
+                "wholly hidden",
+                [
+                    (100.0, 175.0, true),
+                    (100.0, 172.0, true),
+                    (100.0, 175.0, true),
+                    (100.0, 175.0, false),
+                ],
+                188.0,
+            ),
+            (
+                "partly hidden",
+                [
+                    (100.0, 175.0, true),
+                    (100.0, 172.0, true),
+                    (100.0, 175.0, true),
+                    (118.0, 175.0, true),
+                ],
+                188.0,
+            ),
+            (
+                "jittering",
+                [
+                    (100.0, 175.0, true),
+                    (112.0, 175.0, true),
+                    (100.0, 175.0, true),
+                    (112.0, 175.0, true),
+                ],
+                182.0,
+            ),
+        ];
+        for (case, seen, passer_x) in cases {
+            let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+            for (i, (x, y, detected)) in seen.into_iter().enumerate() {
+                let mut car = vehicle(7, x, y);
+                if !detected {
+                    car.detection_bbox = None;
+                }
+                let mut objs = vec![car];
+                f.classify(&frame(1, i as u64, i as i64 * 690), &mut objs);
+            }
+            for k in 0..4u64 {
+                let x = passer_x + k as f32 * 50.0;
+                let i = 4 + k;
+                let mut objs = vec![vehicle(7, x, 175.0)];
+                f.classify(&frame(1, i, i as i64 * 690), &mut objs);
+                assert!(
+                    !is_object_static(&objs[0]),
+                    "{case}: passer hidden at x = {x}"
+                );
+                assert_eq!(
+                    objs[0]
+                        .attributes
+                        .get(ALERT_EPOCH_ATTRIBUTE_KEY)
+                        .and_then(Value::as_u64),
+                    Some(0),
+                    "{case}: a track that never parked keeps its alert episode"
+                );
+            }
+        }
+    }
+
+    /// A car that left its spot is `departed`, so other cars' anchors do not
+    /// hide it while it drives. If its track is then linked onto another
+    /// parked car (a step over the guard's threshold), that car is parked,
+    /// not departing: its anchor must hide it again once it is still.
+    #[test]
+    fn a_departed_track_linked_onto_a_parked_car_is_hidden_again() {
+        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+        let mut i = 0u64;
+        let mut step = |f: &mut StaticObjectFilter, objs: Vec<TrackedObject>| {
+            let mut objs = objs;
+            f.classify(&frame(1, i, i as i64 * 690), &mut objs);
+            i += 1;
+            objs
+        };
+        for k in 0..8 {
+            let jitter = (k % 2) as f32 * 3.0;
+            step(
+                &mut f,
+                vec![
+                    vehicle(1, 100.0, 175.0 + jitter),
+                    vehicle(2, 300.0, 175.0 + jitter),
+                ],
+            );
+        }
+        assert_eq!(f.anchors().len(), 2, "both cars are anchored");
+        for x in [145.0, 190.0, 235.0] {
+            let objs = step(&mut f, vec![vehicle(1, x, 175.0), vehicle(2, 300.0, 175.0)]);
+            assert!(
+                !is_object_static(&objs[0]),
+                "the departing car is visible at x = {x}"
+            );
+        }
+        // Track 1 now carries car 2, 65 px on; track 2 is gone.
+        let hidden: Vec<bool> = (0..4)
+            .map(|k| {
+                let objs = step(
+                    &mut f,
+                    vec![vehicle(1, 300.0, 175.0 + (k % 2) as f32 * 3.0)],
+                );
+                is_object_static(&objs[0])
+            })
+            .collect();
+        assert!(
+            hidden[2..].iter().all(|&h| h),
+            "car 2 hidden again: {hidden:?}"
+        );
     }
 
     #[test]

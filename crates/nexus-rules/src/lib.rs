@@ -27,6 +27,8 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 const STATIC_ALERT_EPOCH_ATTRIBUTE_KEY: &str = "tracker.static_alert_epoch";
+/// Set by the parking-lot static filter on a track it is hiding.
+const STATIC_ATTRIBUTE_KEY: &str = "tracker.is_static";
 
 #[derive(Debug, Error)]
 pub enum RulesError {
@@ -375,8 +377,10 @@ impl RuleEvaluator {
     /// no `zones` set is unaffected by this argument.
     ///
     /// `objects` is any cloneable iterator, walked once after a clone counts
-    /// it: the supervisor passes the frame's non-static tracks without
-    /// copying them, and a `&[TrackedObject]` or `&Vec` works as before.
+    /// it: the supervisor passes every tracked object without copying it,
+    /// and a `&[TrackedObject]` or `&Vec` works as before. A track the
+    /// parking-lot static filter is hiding (`tracker.is_static`) is not
+    /// evaluated, but passing it keeps its alert episode while it is hidden.
     #[allow(clippy::too_many_arguments)] // 10 args is the natural shape: rule eval inherently needs frame
                                          // stamps + dims + zones + identifiers; bundling them would just
                                          // push the boilerplate to every caller.
@@ -477,6 +481,13 @@ impl RuleEvaluator {
 
             for (o, binding) in objects.iter_mut() {
                 let o: &TrackedObject = o;
+                if o.attributes
+                    .get(STATIC_ATTRIBUTE_KEY)
+                    .and_then(JsonValue::as_bool)
+                    == Some(true)
+                {
+                    continue;
+                }
                 // Rules fire on evidence from THIS frame only. A
                 // predicted-only ("coasting") track carries no
                 // detection on this frame — ByteTrack keeps emitting
@@ -1054,6 +1065,50 @@ mod tests {
         }
     }
 
+    /// The parking-lot static filter hides a track on frames it sits within
+    /// an anchor's radius. Such a track is passed in, so its alert episode
+    /// survives the hidden frames, but it is not evaluated (#362).
+    #[test]
+    fn a_track_hidden_by_the_static_filter_is_not_evaluated_but_keeps_its_episode() {
+        let mut rule = rule_with_zones(None);
+        rule.predicate.when = "object.label == 'vehicle.car'".into();
+        rule.debounce.consecutive_frames = 1;
+        rule.debounce.cooldown_ms = 0;
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let mut vehicle = obj_at_pixels(10.0, 10.0, 40.0, 40.0);
+        vehicle.label = "vehicle.car".into();
+        vehicle.attributes.insert(
+            STATIC_ALERT_EPOCH_ATTRIBUTE_KEY.into(),
+            JsonValue::Number(0.into()),
+        );
+        let mut hidden = vehicle.clone();
+        hidden
+            .attributes
+            .insert("tracker.is_static".into(), JsonValue::Bool(true));
+        let alerts = |o: &TrackedObject, frame_id| {
+            ev.evaluate(
+                1,
+                frame_id,
+                Utc::now(),
+                Instant::now(),
+                &"t".into(),
+                100,
+                100,
+                &[],
+                std::slice::from_ref(o),
+            )
+            .len()
+        };
+        assert_eq!(alerts(&hidden, 1), 0, "a hidden track is not evaluated");
+        assert_eq!(alerts(&vehicle, 2), 1);
+        assert_eq!(alerts(&hidden, 3), 0);
+        assert_eq!(
+            alerts(&vehicle, 4),
+            0,
+            "its episode survived the hidden frame"
+        );
+    }
+
     #[test]
     fn parking_vehicle_alerts_once_per_static_gate_epoch() {
         let mut rule = rule_with_zones(None);
@@ -1517,7 +1572,15 @@ mod tests {
             fire_every_match("id", "object.track_id == 1 && camera.id == 3"),
             fire_every_match("box", "object.box.width > 100.0 && object.confidence < 0.7"),
         ];
-        let objects = binding_fixtures();
+        // The evaluator skips a track the static filter is hiding; this
+        // oracle is about bindings, so no fixture is hidden.
+        let objects: Vec<TrackedObject> = binding_fixtures()
+            .into_iter()
+            .map(|mut o| {
+                o.attributes.remove(STATIC_ATTRIBUTE_KEY);
+                o
+            })
+            .collect();
         let eng = CelEngine::new();
         let mut expected: Vec<(String, u64)> = Vec::new();
         for r in &rules {

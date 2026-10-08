@@ -2714,6 +2714,9 @@ struct CameraFrameStatsView {
     /// the latest-wins tap coalescing while the loop is slow or wedged.
     /// Distinct from `frames_dropped`, which is the motion gate doing its job.
     frames_backpressure_dropped: u64,
+    /// Frames per second that reached the tracker: the rate association
+    /// and the rules work at, as opposed to the source rate in `fps_ema`.
+    analysed_fps: f32,
     source_width: u32,
     source_height: u32,
     /// M_TILE_REINFER (G1) — number of frames on which the tile
@@ -2839,6 +2842,7 @@ fn build_camera_stats_view(
         frames_emitted: snap.frames_emitted,
         frames_dropped: snap.frames_dropped,
         frames_backpressure_dropped: snap.frames_backpressure_dropped,
+        analysed_fps: snap.analysed_fps,
         source_width: snap.source_width,
         source_height: snap.source_height,
         tile_invocations: snap.tile_invocations,

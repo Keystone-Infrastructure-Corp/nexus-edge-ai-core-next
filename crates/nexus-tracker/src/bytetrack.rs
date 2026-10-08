@@ -12,7 +12,12 @@
 //!    detection. Match if IoU `>= match_iou_threshold`.
 //! 4. **Second pass.** Unmatched tracks try the same trick on the low
 //!    bucket — that's the "BYTE" of ByteTrack: rescue tracks during
-//!    occlusion using detections you'd otherwise discard.
+//!    occlusion using detections you'd otherwise discard. A **motion
+//!    pass** then lets a track still unmatched take the nearest
+//!    same-label detection within `motion_match_box_lengths_per_sec` of
+//!    it, scaled by the time since its last match. IoU alone cannot link
+//!    a vehicle that moves more than ~half its box between analysed
+//!    frames, which at low analysis rates is most traffic (#362).
 //! 5. **Age unmatched tracks.** Confirmed tracks demote to lost.
 //!    Tentative ones just bump `missed_frames`.
 //! 6. **Spawn.** Every still-unmatched detection above
@@ -28,7 +33,7 @@
 //! one instance is owned per camera, so no `cameraId` map is needed
 //! — state lives behind a single `Mutex<ByteTrackState>` here.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nexus_config::ByteTrackConfig;
 use nexus_types::{Attributes, BBox, Detection, TrackId, TrackedObject};
@@ -59,6 +64,16 @@ struct TrackState {
     hit_streak: u32,
     missed_frames: u32,
     born_at: Instant,
+    /// Capture stamp of the frame this track last matched a detection on.
+    last_matched_at: Instant,
+    /// That detection's box: where the track was last seen.
+    matched_bbox: BBox,
+    /// Seconds between the track's last two matches, the interval its
+    /// latest velocity sample was measured over. 0 until its second match.
+    match_interval: f32,
+    /// Detections matched over the track's life, including the one it
+    /// was born from.
+    hits: u32,
     lifecycle: Lifecycle,
     /// The attributes of the detection this track matched on the current
     /// frame, moved into the emitted object. Empty on a predicted-only
@@ -69,6 +84,12 @@ struct TrackState {
 struct ByteTrackState {
     next_id: TrackId,
     tracks: Vec<TrackState>,
+    /// Candidate (score, track, detection) pairs, reused by every pass so
+    /// association allocates nothing per frame once it has grown.
+    pairs: Vec<(f32, usize, usize)>,
+    /// Capture time of the previous update, from which a track's box is
+    /// predicted forward when velocity is per second.
+    last_update: Option<Instant>,
 }
 
 pub struct ByteTrackTracker {
@@ -83,6 +104,8 @@ impl ByteTrackTracker {
             inner: Mutex::new(ByteTrackState {
                 next_id: 1,
                 tracks: Vec::new(),
+                pairs: Vec::new(),
+                last_update: None,
             }),
         }
     }
@@ -91,11 +114,33 @@ impl ByteTrackTracker {
 impl Tracker for ByteTrackTracker {
     fn update(&self, mut detections: Vec<Detection>, captured_mono: Instant) -> Vec<TrackedObject> {
         let cfg = &self.cfg;
-        let mut state = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let state = &mut *guard;
+
+        // The motion pass, and the velocity and assignment fixes it relies on.
+        // Off (0), association is exactly main's IoU-only ByteTrack. On,
+        // velocity is per second, because the analysis rate is not fixed: it
+        // is the shared detector's capacity over its cameras (#362).
+        let motion = (cfg.motion_match_box_lengths_per_sec > 0.0).then_some(captured_mono);
+        let dt = state.last_update.map_or(0.0, |prev| {
+            captured_mono.saturating_duration_since(prev).as_secs_f32()
+        });
+        state.last_update = Some(captured_mono);
 
         // ---- 1. Predict + age. ----
+        // Per second, motion is extrapolated across the whole gap, up to the
+        // motion pass's horizon, so a stall does not leave a moving track's
+        // box where the vehicle behind it arrives. A velocity that is not
+        // motion goes no further than the interval it was measured over:
+        // carried across a stall, a parked car's box jitter (BUG-258) moves
+        // its box off the car.
         for t in state.tracks.iter_mut() {
-            t.bbox = predict(t.bbox, t.velocity_x, t.velocity_y);
+            let step = match motion {
+                Some(_) if is_moving(t) => dt.min(MOTION_MATCH_MAX_GAP.as_secs_f32()),
+                Some(_) => dt.min(t.match_interval),
+                None => 1.0,
+            };
+            t.bbox = predict(t.bbox, t.velocity_x * step, t.velocity_y * step);
             t.age_frames = t.age_frames.saturating_add(1);
         }
 
@@ -116,6 +161,7 @@ impl Tracker for ByteTrackTracker {
         // ---- 3. First pass: high-conf detections vs. all tracks. ----
         associate_pass(
             &mut state.tracks,
+            &mut state.pairs,
             &mut detections,
             &high_idx,
             cfg.match_iou_threshold,
@@ -124,11 +170,13 @@ impl Tracker for ByteTrackTracker {
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
             cfg.spatial_bucket_size_px,
+            motion,
         );
 
         // ---- 4. Second pass: low-conf detections recover unmatched tracks. ----
         associate_pass(
             &mut state.tracks,
+            &mut state.pairs,
             &mut detections,
             &low_idx,
             cfg.match_iou_threshold,
@@ -137,11 +185,26 @@ impl Tracker for ByteTrackTracker {
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
             cfg.spatial_bucket_size_px,
+            motion,
         );
+
+        // ---- 4b. Motion pass: what overlap could not link. ----
+        if motion.is_some() {
+            associate_by_motion(
+                &mut state.tracks,
+                &mut state.pairs,
+                &mut detections,
+                cfg,
+                captured_mono,
+                &mut det_used,
+                &mut track_matched,
+            );
+        }
 
         // ---- 5. Age unmatched tracks. ----
         for (idx, t) in state.tracks.iter_mut().enumerate() {
             if track_matched[idx] {
+                t.last_matched_at = captured_mono;
                 continue;
             }
             t.missed_frames = t.missed_frames.saturating_add(1);
@@ -175,6 +238,10 @@ impl Tracker for ByteTrackTracker {
                 hit_streak: 1,
                 missed_frames: 0,
                 born_at: captured_mono,
+                last_matched_at: captured_mono,
+                matched_bbox: d.bbox,
+                match_interval: 0.0,
+                hits: 1,
                 lifecycle,
                 attributes: std::mem::take(&mut d.attributes),
             });
@@ -263,11 +330,17 @@ fn blend(new: BBox, prior: BBox, alpha: f32) -> BBox {
 /// One association pass over `det_indices`. Mutates the tracks (velocity,
 /// bbox, lifecycle, hit streak) and the `det_used` / `track_matched`
 /// vectors, and moves each matched detection's attributes onto its track.
-/// Greedy best-IoU per track — same as v1.
+/// `motion` is the frame's capture time when the motion pass is on, else
+/// `None`. With it on, pairs are assigned best IoU first across all tracks,
+/// not track by track in creation order: otherwise an older track, such as a
+/// lost leader's coasting box, takes a detection that overlaps another track
+/// better (#362). Ties go to the earlier track, then the earlier detection.
+/// With it off, each track in creation order takes its best, as on main,
+/// ties included.
 ///
 /// `spatial_bucket_size_px` (Phase M_PERF_CROWD C1):
-/// - `None` or `Some(0)` → original O(N²) sweep (every track scans every
-///   candidate detection).
+/// - `None` or `Some(0)` → O(N²) sweep (every track scans every candidate
+///   detection).
 /// - `Some(n)` → builds a `HashMap<(i32, i32), Vec<usize>>` grid keyed
 ///   by `floor(det_centre / n)` over `det_indices`, then each track only
 ///   scans the 3×3 cell neighbourhood of its own predicted-centre cell.
@@ -277,6 +350,7 @@ fn blend(new: BBox, prior: BBox, alpha: f32) -> BBox {
 #[allow(clippy::too_many_arguments)]
 fn associate_pass(
     tracks: &mut [TrackState],
+    pairs: &mut Vec<(f32, usize, usize)>,
     detections: &mut [Detection],
     det_indices: &[usize],
     match_iou_threshold: f32,
@@ -285,6 +359,7 @@ fn associate_pass(
     confirm_frames: u32,
     display_smoothing_alpha: f32,
     spatial_bucket_size_px: Option<u32>,
+    motion: Option<Instant>,
 ) {
     // Build the spatial grid once per pass when bucketing is enabled.
     // Maps cell -> indices into `detections` (already filtered to this
@@ -306,28 +381,23 @@ fn associate_pass(
         _ => None,
     };
 
-    for (t_idx, t) in tracks.iter_mut().enumerate() {
+    pairs.clear();
+    for (t_idx, t) in tracks.iter().enumerate() {
         if track_matched[t_idx] {
             continue;
         }
-        let mut best: Option<(usize, f32)> = None;
-        match &grid {
-            None => {
-                // Original O(N²) sweep — preserves v1 behaviour exactly.
-                for &i in det_indices {
-                    if det_used[i] {
-                        continue;
-                    }
-                    let d = &detections[i];
-                    if d.label != t.label {
-                        continue;
-                    }
-                    let iou = t.bbox.iou(&d.bbox);
-                    if iou > best.map_or(0.0, |(_, b)| b) {
-                        best = Some((i, iou));
-                    }
-                }
+        let mut consider = |i: usize| {
+            let d = &detections[i];
+            if det_used[i] || d.label != t.label {
+                return;
             }
+            let iou = t.bbox.iou(&d.bbox);
+            if iou > 0.0 && iou >= match_iou_threshold {
+                pairs.push((iou, t_idx, i));
+            }
+        };
+        match &grid {
+            None => det_indices.iter().for_each(|&i| consider(i)),
             Some((cell, g)) => {
                 let tcx = (t.bbox.x1 + t.bbox.x2) * 0.5;
                 let tcy = (t.bbox.y1 + t.bbox.y2) * 0.5;
@@ -335,58 +405,208 @@ fn associate_pass(
                 let gy = (tcy / cell).floor() as i32;
                 for dy in -1..=1 {
                     for dx in -1..=1 {
-                        let Some(cell_dets) = g.get(&(gx + dx, gy + dy)) else {
-                            continue;
-                        };
-                        for &i in cell_dets {
-                            if det_used[i] {
-                                continue;
-                            }
-                            let d = &detections[i];
-                            if d.label != t.label {
-                                continue;
-                            }
-                            let iou = t.bbox.iou(&d.bbox);
-                            if iou > best.map_or(0.0, |(_, b)| b) {
-                                best = Some((i, iou));
-                            }
+                        if let Some(cell_dets) = g.get(&(gx + dx, gy + dy)) {
+                            cell_dets.iter().for_each(|&i| consider(i));
                         }
                     }
                 }
             }
         }
-        let Some((i, iou)) = best else { continue };
-        if iou < match_iou_threshold {
+    }
+    if motion.is_some() {
+        pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    } else {
+        // Stable, and pairs were pushed in the order main's sweep visits
+        // detections, so an exact IoU tie keeps main's winner.
+        pairs.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.total_cmp(&a.0)));
+    }
+    for &(_, t_idx, i) in pairs.iter() {
+        if track_matched[t_idx] || det_used[i] {
             continue;
         }
-
         det_used[i] = true;
         track_matched[t_idx] = true;
+        apply_match(
+            &mut tracks[t_idx],
+            &mut detections[i],
+            confirm_frames,
+            display_smoothing_alpha,
+            motion,
+        );
+    }
+}
 
-        let d = &mut detections[i];
-        let dx = d.bbox.x1 - t.bbox.x1;
-        let dy = d.bbox.y1 - t.bbox.y1;
-        // Same EMA constants as v1: 0.6 weight on prior velocity, 0.4 on
-        // newly observed dx/dy.
-        t.velocity_x = 0.6 * t.velocity_x + 0.4 * dx;
-        t.velocity_y = 0.6 * t.velocity_y + 0.4 * dy;
-        t.bbox = d.bbox;
-        t.display_bbox = blend(d.bbox, t.display_bbox, display_smoothing_alpha);
-        t.confidence = d.confidence;
-        t.attributes = std::mem::take(&mut d.attributes);
-        t.missed_frames = 0;
-        t.hit_streak = t.hit_streak.saturating_add(1);
-        // Promote tentative tracks once they've hit enough frames; recover
-        // lost tracks immediately on any new match.
-        match t.lifecycle {
-            Lifecycle::Tentative if t.hit_streak >= confirm_frames => {
-                t.lifecycle = Lifecycle::Confirmed;
-            }
-            Lifecycle::Lost => {
-                t.lifecycle = Lifecycle::Confirmed;
-            }
-            _ => {}
+/// Longest gap since a track's last match that the motion pass bridges,
+/// in time and in analysed frames. The reach grows with the gap, so without
+/// a time bound a lost track would eventually reach across the whole frame;
+/// without a frame bound, at full frame rate a track missed for dozens of
+/// frames would. The longest gap between successive detections of the #362
+/// vehicle was 2.39 s, about 3.5 analysed frames.
+const MOTION_MATCH_MAX_GAP: Duration = Duration::from_millis(2_500);
+const MOTION_MATCH_MAX_FRAMES: u32 = 4;
+
+/// A track's velocity is motion, not box jitter, if it is at least
+/// `MOTION_MATCH_MIN_SPEED` box lengths per second and covers at least
+/// `MOTION_MATCH_MIN_STEP` box lengths over the interval it was measured
+/// over. The step floor keeps out jitter, which over a 66 ms frame reads as
+/// tens of px per second; at the #362 core's 1.45 fps the two floors nearly
+/// coincide. Only motion is extrapolated across a gap, and only a track in
+/// motion (or with no velocity yet) takes part in the motion pass: a parked
+/// car's track must not take the detection of a vehicle passing in front of
+/// it, and while it is visible the IoU pass already gave it its own.
+const MOTION_MATCH_MIN_SPEED: f32 = 0.15;
+const MOTION_MATCH_MIN_STEP: f32 = 0.1;
+
+fn is_moving(t: &TrackState) -> bool {
+    let length = (t.bbox.x2 - t.bbox.x1).max(t.bbox.y2 - t.bbox.y1);
+    let speed = t.velocity_x.hypot(t.velocity_y);
+    speed >= MOTION_MATCH_MIN_SPEED * length
+        && speed * t.match_interval >= MOTION_MATCH_MIN_STEP * length
+}
+
+/// How far behind where it was last seen, in box lengths along its travel, a
+/// moving track still takes a detection. A moving vehicle cannot reappear
+/// behind that point, so this only covers box jitter (2-7 px on parked cars,
+/// BUG-258) and float error in the stepped-back position, so that a vehicle
+/// that stopped where it was last seen keeps its track. A follower, even a
+/// close one, lands further back.
+const MOTION_MATCH_BACKWARD_SLACK: f32 = 0.1;
+
+/// Link unmatched tracks to unused same-label detections by distance,
+/// nearest pairs first. A track is eligible if it has no velocity yet (one
+/// match) or is measurably moving; a detection must lie within
+/// `motion_match_box_lengths_per_sec` box lengths per second of the time
+/// since the track's last match, and be between half and twice its size. A
+/// moving track only takes a detection that is not clearly behind where it
+/// was last seen: one behind is another vehicle, such as a follower that
+/// appears while its leader is unseen.
+fn associate_by_motion(
+    tracks: &mut [TrackState],
+    pairs: &mut Vec<(f32, usize, usize)>,
+    detections: &mut [Detection],
+    cfg: &ByteTrackConfig,
+    now: Instant,
+    det_used: &mut [bool],
+    track_matched: &mut [bool],
+) {
+    pairs.clear();
+    for (t_idx, t) in tracks.iter().enumerate() {
+        if track_matched[t_idx] {
+            continue;
         }
+        let gap = now.saturating_duration_since(t.last_matched_at);
+        if gap.is_zero() || gap > MOTION_MATCH_MAX_GAP || t.missed_frames >= MOTION_MATCH_MAX_FRAMES
+        {
+            continue;
+        }
+        let (tw, th) = (t.bbox.x2 - t.bbox.x1, t.bbox.y2 - t.bbox.y1);
+        let length = tw.max(th);
+        if length <= 0.0 {
+            continue;
+        }
+        if t.hits > 1 && !is_moving(t) {
+            continue;
+        }
+        let speed = t.velocity_x.hypot(t.velocity_y);
+        let reach = cfg.motion_match_box_lengths_per_sec * length * gap.as_secs_f32();
+        let (tcx, tcy) = t.bbox.center();
+        let (seen_x, seen_y) = t.matched_bbox.center();
+        for (i, d) in detections.iter().enumerate() {
+            if det_used[i] || d.confidence < cfg.low_confidence || d.label != t.label {
+                continue;
+            }
+            let (dw, dh) = (d.bbox.x2 - d.bbox.x1, d.bbox.y2 - d.bbox.y1);
+            if !(0.5..=2.0).contains(&(dw / tw)) || !(0.5..=2.0).contains(&(dh / th)) {
+                continue;
+            }
+            let (dcx, dcy) = d.bbox.center();
+            let behind = t.hits > 1
+                && ((dcx - seen_x) * t.velocity_x + (dcy - seen_y) * t.velocity_y) / speed
+                    < -MOTION_MATCH_BACKWARD_SLACK * length;
+            let dist = (dcx - tcx).hypot(dcy - tcy);
+            if dist <= reach && !behind {
+                pairs.push((dist, t_idx, i));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for &(_, t_idx, i) in pairs.iter() {
+        if track_matched[t_idx] || det_used[i] {
+            continue;
+        }
+        det_used[i] = true;
+        track_matched[t_idx] = true;
+        apply_match(
+            &mut tracks[t_idx],
+            &mut detections[i],
+            cfg.confirm_frames,
+            cfg.display_smoothing_alpha,
+            Some(now),
+        );
+    }
+}
+
+/// Fold detection `d` into track `t`. `motion` (the frame's capture time
+/// when the motion pass is on) selects the velocity estimate: pixels per
+/// second since the box was last observed, or main's pixels per frame.
+fn apply_match(
+    t: &mut TrackState,
+    d: &mut Detection,
+    confirm_frames: u32,
+    display_smoothing_alpha: f32,
+    motion: Option<Instant>,
+) {
+    // Main (v1) fed the EMA the gap between the detection and the predicted
+    // box: only the prediction's error, so it settles at half the true step
+    // and leaves a lost track's predicted box trailing its vehicle (#362).
+    // The displacement since the track was last seen, per second, does not,
+    // and stays right when the analysis rate changes. A sample weighs by the
+    // time it spans against the one before (0.4 at a steady rate), so one
+    // across a 3 s gap outweighs the 66 ms jitter before it. With no time
+    // elapsed there is nothing to observe, and the velocity is kept.
+    match motion {
+        Some(now) => {
+            let secs = now
+                .saturating_duration_since(t.last_matched_at)
+                .as_secs_f32();
+            if secs > 0.0 {
+                let weight = if t.match_interval > 0.0 {
+                    (0.4 * secs / t.match_interval).clamp(0.4, 1.0)
+                } else {
+                    0.4
+                };
+                t.match_interval = secs;
+                let dx = (d.bbox.x1 - t.matched_bbox.x1) / secs;
+                let dy = (d.bbox.y1 - t.matched_bbox.y1) / secs;
+                t.velocity_x += weight * (dx - t.velocity_x);
+                t.velocity_y += weight * (dy - t.velocity_y);
+            }
+        }
+        None => {
+            // Same EMA constants as v1: 0.6 weight on prior velocity, 0.4 on
+            // newly observed dx/dy.
+            t.velocity_x = 0.6 * t.velocity_x + 0.4 * (d.bbox.x1 - t.bbox.x1);
+            t.velocity_y = 0.6 * t.velocity_y + 0.4 * (d.bbox.y1 - t.bbox.y1);
+        }
+    }
+    t.bbox = d.bbox;
+    t.matched_bbox = d.bbox;
+    t.display_bbox = blend(d.bbox, t.display_bbox, display_smoothing_alpha);
+    t.confidence = d.confidence;
+    t.attributes = std::mem::take(&mut d.attributes);
+    t.missed_frames = 0;
+    t.hit_streak = t.hit_streak.saturating_add(1);
+    t.hits = t.hits.saturating_add(1);
+    // Promote tentative tracks once they've hit enough frames; recover
+    // lost tracks immediately on any new match.
+    match t.lifecycle {
+        Lifecycle::Tentative if t.hit_streak >= confirm_frames => {
+            t.lifecycle = Lifecycle::Confirmed;
+        }
+        Lifecycle::Lost => {
+            t.lifecycle = Lifecycle::Confirmed;
+        }
+        _ => {}
     }
 }
 
@@ -514,13 +734,13 @@ mod tests {
     fn velocity_ema_predicts_motion() {
         let t = ByteTrackTracker::new(cfg_default());
         // Three frames of consistent rightward drift establish velocity.
-        let _ = t.update(vec![det("person", 0.0, 0.9)], *T);
-        let _ = t.update(vec![det("person", 5.0, 0.9)], *T);
-        let _ = t.update(vec![det("person", 10.0, 0.9)], *T);
+        let _ = t.update(vec![det("person", 0.0, 0.9)], at_ms(0));
+        let _ = t.update(vec![det("person", 5.0, 0.9)], at_ms(66));
+        let _ = t.update(vec![det("person", 10.0, 0.9)], at_ms(132));
         // Now skip a frame (no detection). Internally the bbox should be
         // predicted forward so a detection at x=20 still matches via IoU.
-        let _ = t.update(vec![], *T);
-        let f5 = t.update(vec![det("person", 20.0, 0.9)], *T);
+        let _ = t.update(vec![], at_ms(198));
+        let f5 = t.update(vec![det("person", 20.0, 0.9)], at_ms(264));
         assert_eq!(f5.len(), 1, "velocity prediction should keep the match");
     }
 
@@ -613,6 +833,663 @@ mod tests {
             display_x > 0.0 && display_x < 3.0,
             "display bbox x ({display_x}) should be between prior (0.0) and new (3.0)"
         );
+    }
+
+    // #362: the field core analysed each camera every ~690 ms. A vehicle
+    // moving 0.626 of its box per analysed frame overlaps its previous box
+    // at IoU 0.23, below `match_iou_threshold`.
+    const FIELD_INTERVAL_MS: u64 = 690;
+
+    fn at_ms(ms: u64) -> Instant {
+        *T + std::time::Duration::from_millis(ms)
+    }
+
+    fn car(cx: f32, cy: f32) -> Detection {
+        det_at("vehicle.car", cx - 50.0, cy - 30.0, 100.0, 60.0, 0.8)
+    }
+
+    /// Distinct track ids among objects carrying a detection this frame,
+    /// and how many of those objects the rule layer would evaluate
+    /// (`detection_bbox` present and at least 500 ms old).
+    fn drive(t: &ByteTrackTracker, frames: &[(u64, Vec<Detection>)]) -> (Vec<TrackId>, usize) {
+        let mut ids = Vec::new();
+        let mut evaluable = 0;
+        for (ms, dets) in frames {
+            for o in t.update(dets.clone(), at_ms(*ms)) {
+                if o.detection_bbox.is_some() {
+                    if !ids.contains(&o.track_id) {
+                        ids.push(o.track_id);
+                    }
+                    if o.age_ms >= 500 {
+                        evaluable += 1;
+                    }
+                }
+            }
+        }
+        (ids, evaluable)
+    }
+
+    fn crossing(step_px: f32, every: u64, frames: u64) -> Vec<(u64, Vec<Detection>)> {
+        (0..frames)
+            .map(|i| {
+                let dets = if i % every == 0 {
+                    vec![car(50.0 + i as f32 * step_px, 100.0)]
+                } else {
+                    Vec::new()
+                };
+                (i * FIELD_INTERVAL_MS, dets)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_vehicle_past_the_iou_cliff_keeps_one_track_at_a_low_analysis_rate() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let (ids, evaluable) = drive(&t, &crossing(62.6, 1, 11));
+        assert_eq!(ids.len(), 1, "one vehicle, one track: {ids:?}");
+        assert_eq!(
+            evaluable, 10,
+            "every frame after the first reaches the rules"
+        );
+    }
+
+    #[test]
+    fn a_vehicle_detected_on_every_third_frame_keeps_one_track() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let (ids, _) = drive(&t, &crossing(62.6, 3, 13));
+        assert_eq!(ids.len(), 1, "{ids:?}");
+    }
+
+    #[test]
+    fn zero_motion_speed_keeps_iou_only_association() {
+        let mut cfg = cfg_default();
+        cfg.motion_match_box_lengths_per_sec = 0.0;
+        let t = ByteTrackTracker::new(cfg);
+        let (ids, evaluable) = drive(&t, &crossing(62.6, 1, 11));
+        assert_eq!(ids.len(), 11);
+        assert_eq!(evaluable, 0);
+    }
+
+    #[test]
+    fn the_motion_reach_grows_with_the_time_since_the_last_match() {
+        for (gap_ms, want) in [(100, 2), (FIELD_INTERVAL_MS, 1), (3_000, 2)] {
+            let t = ByteTrackTracker::new(cfg_default());
+            let (ids, _) = drive(
+                &t,
+                &[
+                    (0, vec![car(50.0, 100.0)]),
+                    (gap_ms, vec![car(112.6, 100.0)]),
+                ],
+            );
+            assert_eq!(ids.len(), want, "gap {gap_ms} ms: {ids:?}");
+        }
+    }
+
+    #[test]
+    fn an_established_parked_car_never_takes_a_passing_vehicles_detection() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let parked: Vec<_> = (0..5)
+            .map(|i| (i * FIELD_INTERVAL_MS, vec![car(50.0, 100.0)]))
+            .collect();
+        let (parked_ids, _) = drive(&t, &parked);
+        // The passer occludes the parked car, so only the passer is
+        // detected, 70 px from the parked track and past IoU.
+        let (ids, _) = drive(&t, &[(5 * FIELD_INTERVAL_MS, vec![car(120.0, 100.0)])]);
+        assert_eq!(ids.len(), 1);
+        assert_ne!(ids[0], parked_ids[0], "the parked track took the passer");
+    }
+
+    #[test]
+    fn the_motion_pass_assigns_the_closest_pairs_first() {
+        // Track a would reach b's detection first in track order; b's own
+        // detection is nearer to b, so b must keep it and a take its own.
+        let small = |cx: f32| det_at("vehicle.car", cx - 20.0, 70.0, 40.0, 60.0, 0.8);
+        let t = ByteTrackTracker::new(cfg_default());
+        let (first, _) = drive(&t, &[(0, vec![small(100.0), small(200.0)])]);
+        let out = t.update(vec![small(170.0), small(10.0)], at_ms(1_380));
+        let id_at = |cx: f32| {
+            out.iter()
+                .find(|o| {
+                    o.detection_bbox
+                        .is_some_and(|b| (b.center().0 - cx).abs() < 0.5)
+                })
+                .map(|o| o.track_id)
+        };
+        assert_eq!(id_at(10.0), Some(first[0]));
+        assert_eq!(id_at(170.0), Some(first[1]));
+    }
+
+    #[test]
+    fn motion_links_span_at_most_four_analysed_frames() {
+        // 15 fps: seen once, missed for `missed` frames, then a detection
+        // 70 px away: past IoU, inside the reach. At full rate a track
+        // missed that long has lost its object; the motion pass is for
+        // low-rate gaps of a few frames.
+        for (missed, want) in [(3u64, 1), (4, 2)] {
+            let t = ByteTrackTracker::new(cfg_default());
+            let mut frames: Vec<_> = (0..=missed).map(|i| (i * 66, Vec::new())).collect();
+            frames[0].1 = vec![car(50.0, 100.0)];
+            frames.push(((missed + 1) * 66, vec![car(120.0, 100.0)]));
+            let (ids, _) = drive(&t, &frames);
+            assert_eq!(ids.len(), want, "missed {missed}: {ids:?}");
+        }
+    }
+
+    #[test]
+    fn a_recent_near_track_wins_over_an_older_far_one() {
+        // a: seen 2.07 s ago, 270 px from the detection. b: seen 0.69 s
+        // ago, 150 px from it. Both are in reach; the nearer one wins.
+        let t = ByteTrackTracker::new(cfg_default());
+        let (a, _) = drive(&t, &[(0, vec![car(100.0, 100.0)]), (690, vec![])]);
+        let (b, _) = drive(&t, &[(1_380, vec![car(520.0, 100.0)])]);
+        assert_ne!(a, b, "b must be its own track");
+        let (d, _) = drive(&t, &[(2_070, vec![car(370.0, 100.0)])]);
+        assert_eq!(d, b);
+    }
+
+    #[test]
+    fn a_vehicle_behind_a_lost_leader_does_not_take_its_track() {
+        // Review of #369: a leader drives right at 30 px per frame and is
+        // then lost; a follower appears behind it, inside the reach. It is
+        // another vehicle, so it must get its own track.
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let (leader, _) = drive(&t, &[(0, x1(350.0)), (690, x1(380.0)), (1_380, x1(410.0))]);
+        let (follower, _) = drive(
+            &t,
+            &[(2_070, x1(270.0)), (2_760, x1(300.0)), (3_450, x1(330.0))],
+        );
+        assert_eq!(leader.len(), 1);
+        assert_eq!(follower.len(), 1);
+        assert_ne!(leader, follower, "the follower took the leader's track");
+    }
+
+    #[test]
+    fn a_vehicle_that_slows_while_unseen_keeps_its_track() {
+        // 120 px per frame, then missed for two frames, then seen 100 px on
+        // from where it was last seen: ahead of that, but well short of
+        // where its velocity predicted. It slowed; it is the same vehicle.
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let mut frames: Vec<_> = (0..4u64)
+            .map(|i| (i * FIELD_INTERVAL_MS, x1(i as f32 * 120.0)))
+            .collect();
+        frames.push((4 * FIELD_INTERVAL_MS, vec![]));
+        frames.push((5 * FIELD_INTERVAL_MS, vec![]));
+        frames.push((6 * FIELD_INTERVAL_MS, x1(460.0)));
+        let (ids, _) = drive(&t, &frames);
+        assert_eq!(ids.len(), 1, "{ids:?}");
+    }
+
+    #[test]
+    fn a_vehicle_that_stops_while_unseen_keeps_its_track() {
+        // 60 px per frame, missed for a frame, then parked where it was last
+        // seen or a few px short of it (box jitter): the same vehicle.
+        for back in [0.0f32, 3.0, 8.0] {
+            let t = ByteTrackTracker::new(cfg_default());
+            let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+            let mut frames: Vec<_> = (0..4u64)
+                .map(|i| (i * FIELD_INTERVAL_MS, x1(i as f32 * 60.0)))
+                .collect();
+            frames.push((4 * FIELD_INTERVAL_MS, vec![]));
+            frames.push((5 * FIELD_INTERVAL_MS, x1(180.0 - back)));
+            let (ids, _) = drive(&t, &frames);
+            assert_eq!(ids.len(), 1, "{back} px back: {ids:?}");
+        }
+    }
+
+    #[test]
+    fn velocity_converges_to_the_true_speed() {
+        // A box moving 10 px per 66 ms frame, matched by IoU every frame:
+        // 151.5 px/s. With the motion pass off the tracker is main's: v1's
+        // estimate is per frame and settles at half the step.
+        for (speed, want) in [(3.0f32, 10.0f32 / 0.066), (0.0, 5.0)] {
+            let mut cfg = cfg_default();
+            cfg.motion_match_box_lengths_per_sec = speed;
+            let t = ByteTrackTracker::new(cfg);
+            for i in 0..15u64 {
+                let d = det_at("vehicle.car", i as f32 * 10.0, 0.0, 100.0, 60.0, 0.9);
+                let _ = t.update(vec![d], at_ms(i * 66));
+            }
+            let v = t.inner.lock().tracks[0].velocity_x;
+            assert!(
+                (v - want).abs() < want * 0.05,
+                "motion {speed}: velocity {v}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn iou_pairs_go_best_first_and_to_the_older_track_with_motion_off() {
+        // Track a (older) overlaps the detection at 0.43, track b at 0.67.
+        // Best first gives it to b; with the motion pass off the tracker is
+        // main's, where each track takes its best in creation order.
+        for (speed, want_older) in [(3.0f32, false), (0.0, true)] {
+            let mut cfg = cfg_default();
+            cfg.motion_match_box_lengths_per_sec = speed;
+            let t = ByteTrackTracker::new(cfg);
+            let d = |x: f32| det_at("vehicle.car", x, 0.0, 100.0, 60.0, 0.9);
+            let first = t.update(vec![d(0.0), d(60.0)], *T);
+            let (older, newer) = (first[0].track_id, first[1].track_id);
+            let out = t.update(vec![d(40.0)], *T);
+            let got = out
+                .iter()
+                .find(|o| o.detection_bbox.is_some())
+                .map(|o| o.track_id);
+            assert_eq!(
+                got,
+                Some(if want_older { older } else { newer }),
+                "motion {speed}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_motion_off_an_exact_iou_tie_goes_where_mains_sweep_puts_it() {
+        // Two detections tie exactly with the track and sit in different
+        // grid cells. Main's sweep keeps the first strictly greater IoU in
+        // the order it visits them, which on the grid is cell order: the
+        // left box, though it is the second detection.
+        let mut cfg = cfg_default();
+        cfg.motion_match_box_lengths_per_sec = 0.0;
+        cfg.spatial_bucket_size_px = Some(50);
+        let t = ByteTrackTracker::new(cfg);
+        let d = |x: f32| det_at("vehicle.car", x, 0.0, 100.0, 60.0, 0.9);
+        let _ = t.update(vec![d(100.0)], *T);
+        let out = t.update(vec![d(140.0), d(60.0)], *T);
+        let got = out
+            .iter()
+            .find(|o| o.track_id == 1)
+            .and_then(|o| o.detection_bbox)
+            .map(|b| b.x1);
+        assert_eq!(got, Some(60.0));
+    }
+
+    /// Review of #369 (P2): the analysis rate rises when the shared
+    /// detector's load drops. A vehicle seen every frame at a steady
+    /// 80 px per 690 ms, then sampled every 133 ms, must keep one track.
+    pub(crate) fn cadence_change() -> Vec<(u64, Vec<Detection>)> {
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let slow = [
+            0.0f32, 20.0, 50.0, 90.0, 140.0, 200.0, 270.0, 350.0, 430.0, 510.0, 590.0,
+        ];
+        let mut frames: Vec<_> = slow
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| (i as u64 * FIELD_INTERVAL_MS, x1(x)))
+            .collect();
+        let t_last = (slow.len() as u64 - 1) * FIELD_INTERVAL_MS;
+        for k in 1..=6u64 {
+            frames.push((
+                t_last + k * 133,
+                x1(590.0 + 80.0 * (k * 133) as f32 / 690.0),
+            ));
+        }
+        frames
+    }
+
+    #[test]
+    fn a_vehicle_keeps_its_track_when_the_analysis_rate_rises() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let (ids, _) = drive(&t, &cadence_change());
+        assert_eq!(ids.len(), 1, "{ids:?}");
+    }
+
+    #[test]
+    fn a_vehicle_keeps_its_track_when_the_analysis_rate_falls() {
+        // 116 px/s, sampled every 133 ms and then every 690 ms.
+        let t = ByteTrackTracker::new(cfg_default());
+        let mut times: Vec<u64> = (0..8).map(|k| k * 133).collect();
+        let last = times[7];
+        times.extend((1..6).map(|k| last + k * FIELD_INTERVAL_MS));
+        let frames: Vec<_> = times
+            .iter()
+            .map(|&ms| {
+                (
+                    ms,
+                    vec![det_at(
+                        "vehicle.car",
+                        ms as f32 * 80.0 / 690.0,
+                        150.0,
+                        100.0,
+                        60.0,
+                        0.8,
+                    )],
+                )
+            })
+            .collect();
+        let (ids, _) = drive(&t, &frames);
+        assert_eq!(ids.len(), 1, "{ids:?}");
+    }
+
+    /// A parked car with ±5 px of seeded box jitter (BUG-258), detected
+    /// every `interval_ms`.
+    fn jittering_parked_car(
+        seed: u64,
+        frames: u64,
+        interval_ms: u64,
+    ) -> Vec<(u64, Vec<Detection>)> {
+        let mut s = seed;
+        let mut jitter = || ((lcg_next(&mut s) >> 33) % 11) as f32 - 5.0;
+        (0..frames)
+            .map(|k| {
+                (
+                    k * interval_ms,
+                    vec![det_at(
+                        "vehicle.car",
+                        200.0 + jitter(),
+                        100.0 + jitter(),
+                        100.0,
+                        60.0,
+                        0.9,
+                    )],
+                )
+            })
+            .collect()
+    }
+
+    /// Review of #369: jitter over a 66 ms frame reads as tens of px per
+    /// second. Carried over a capture stall (an RTSP reconnect, a run of
+    /// detector errors), it moved a parked car's box off the car, which came
+    /// back as a new track.
+    #[test]
+    fn a_parked_car_keeps_its_track_across_a_capture_stall() {
+        for (interval, stall) in [
+            (66u64, 2_600u64),
+            (66, 10_000),
+            (66, 30_000),
+            (FIELD_INTERVAL_MS, 30_000),
+        ] {
+            for seed in 0..10u64 {
+                let t = ByteTrackTracker::new(cfg_default());
+                let mut frames = jittering_parked_car(seed, 33, interval);
+                for (ms, _) in frames.iter_mut().skip(30) {
+                    *ms += stall;
+                }
+                let (ids, _) = drive(&t, &frames);
+                assert_eq!(
+                    ids.len(),
+                    1,
+                    "{interval} ms frames, {stall} ms stall, seed {seed}: {ids:?}"
+                );
+            }
+        }
+    }
+
+    /// Round-11 review: a stream that flaps, delivering one frame every 3 s
+    /// after the car was seen at full rate. Each long interval's sample must
+    /// outweigh the 66 ms jitter before it, or the next gap carries it.
+    #[test]
+    fn a_parked_car_keeps_its_track_through_repeated_stalls() {
+        for interval in [66u64, 125] {
+            for seed in 0..10u64 {
+                let t = ByteTrackTracker::new(cfg_default());
+                let mut frames = jittering_parked_car(seed, 35, interval);
+                for (k, (ms, _)) in frames.iter_mut().enumerate().skip(30) {
+                    *ms = 29 * interval + (k as u64 - 29) * 3_000;
+                }
+                let (ids, _) = drive(&t, &frames);
+                assert_eq!(ids.len(), 1, "{interval} ms frames, seed {seed}: {ids:?}");
+            }
+        }
+    }
+
+    /// Motion is extrapolated at most over the motion pass's 2.5 s horizon. A
+    /// vehicle that parks during a 10 s capture stall, 150 px (about 2 s of
+    /// travel) on, is found where that horizon puts its box, not thrown 10 s
+    /// along its path.
+    #[test]
+    fn a_vehicle_that_parks_during_a_long_stall_keeps_its_track() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let mut frames: Vec<_> = (0..6u64)
+            .map(|k| (k * FIELD_INTERVAL_MS, x1(k as f32 * 50.0)))
+            .collect();
+        frames.extend((0..3u64).map(|k| {
+            (
+                5 * FIELD_INTERVAL_MS + 10_000 + k * FIELD_INTERVAL_MS,
+                x1(400.0),
+            )
+        }));
+        let (ids, _) = drive(&t, &frames);
+        assert_eq!(ids.len(), 1, "{ids:?}");
+    }
+
+    /// Two vehicles 1.2 box lengths apart, centre to centre, across a capture
+    /// stall: each keeps the track it had before it. Predicted short of where
+    /// it went, the leader's box would take the follower's detection by IoU
+    /// (round-11 review). (At 690 ms their first link can already swap them,
+    /// before either has a velocity, as on main.)
+    #[test]
+    fn a_convoy_keeps_its_tracks_across_a_capture_stall() {
+        for (interval, px_per_sec, stall) in [
+            (125u64, 100.0f32, 1_000u64),
+            (125, 150.0, 1_000),
+            (FIELD_INTERVAL_MS, 120.0, 2_000),
+        ] {
+            let t = ByteTrackTracker::new(cfg_default());
+            let mut times: Vec<u64> = (0..10).map(|k| k * interval).collect();
+            let last = times[9];
+            times.extend((0..3).map(|k| last + stall + k * interval));
+            let ids: Vec<_> = times
+                .iter()
+                .map(|&ms| {
+                    let x = ms as f32 * px_per_sec / 1000.0;
+                    let out = t.update(
+                        vec![
+                            det_at("vehicle.car", x + 120.0, 150.0, 100.0, 60.0, 0.9),
+                            det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.9),
+                        ],
+                        at_ms(ms),
+                    );
+                    let id = |x1: f32| {
+                        out.iter()
+                            .find(|o| o.detection_bbox.is_some_and(|b| b.x1 == x1))
+                            .map(|o| o.track_id)
+                    };
+                    (id(x + 120.0), id(x))
+                })
+                .collect();
+            assert!(
+                ids[9..].iter().all(|&pair| pair == ids[9]),
+                "{interval} ms, {px_per_sec} px/s, {stall} ms stall: {:?}",
+                &ids[9..]
+            );
+        }
+    }
+
+    /// Round-11 review: a leader seen on 125 ms frames is lost; a follower
+    /// at the same speed is first seen 0.3 box lengths behind its last-seen
+    /// point, after 690 ms or a 2 s stall, then on 690 ms frames. It must not
+    /// drive into the leader's coasting box and take its track.
+    #[test]
+    fn a_close_follower_gets_its_own_track_after_the_analysis_rate_falls() {
+        for wait in [FIELD_INTERVAL_MS, 2_000] {
+            let t = ByteTrackTracker::new(cfg_default());
+            let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+            let leader: Vec<_> = (0..8u64).map(|k| (k * 125, x1(k as f32 * 12.5))).collect();
+            let (leader, _) = drive(&t, &leader);
+            let follower: Vec<_> = (0..4u64)
+                .map(|k| {
+                    (
+                        875 + wait + k * FIELD_INTERVAL_MS,
+                        x1(87.5 - 30.0 + k as f32 * 69.0),
+                    )
+                })
+                .collect();
+            let (follower, _) = drive(&t, &follower);
+            assert_eq!(follower.len(), 1, "{wait} ms: {follower:?}");
+            assert_ne!(
+                follower, leader,
+                "{wait} ms: the follower joined the leader's track"
+            );
+        }
+    }
+
+    /// Review of #369: at full frame rate the same jitter read as motion, so
+    /// a parked car hidden for three frames took the detection of a vehicle
+    /// passing 68 px from it, beyond IoU reach.
+    #[test]
+    fn a_jittering_parked_car_does_not_take_a_passers_detection_at_full_rate() {
+        for seed in 0..20u64 {
+            let t = ByteTrackTracker::new(cfg_default());
+            let (parked, _) = drive(&t, &jittering_parked_car(seed, 40, 66));
+            let mut rest: Vec<_> = (40..43u64).map(|k| (k * 66, vec![])).collect();
+            rest.push((
+                43 * 66,
+                vec![det_at("vehicle.car", 265.0, 120.0, 100.0, 60.0, 0.9)],
+            ));
+            let (passer, _) = drive(&t, &rest);
+            assert_ne!(passer, parked, "seed {seed}");
+        }
+    }
+
+    /// The speed floor: a parked car's box creeping 5 px per analysed frame,
+    /// then reacquired 14 px on after two hidden frames (two boxes can
+    /// jitter that far apart), covers over 0.1 box lengths across that 2 s
+    /// interval at only ~7 px/s. Hidden again, it must not take a passer's
+    /// detection.
+    #[test]
+    fn a_creeping_parked_car_does_not_take_a_passers_detection() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32, y: f32| vec![det_at("vehicle.car", x, y, 100.0, 60.0, 0.9)];
+        let mut frames: Vec<_> = (0..10u64)
+            .map(|k| (k * FIELD_INTERVAL_MS, x1(200.0, 100.0)))
+            .collect();
+        frames.extend((1..=3u64).map(|k| {
+            (
+                (9 + k) * FIELD_INTERVAL_MS,
+                x1(200.0 + 5.0 * k as f32, 100.0),
+            )
+        }));
+        frames.extend([
+            (13 * FIELD_INTERVAL_MS, vec![]),
+            (14 * FIELD_INTERVAL_MS, vec![]),
+        ]);
+        frames.push((15 * FIELD_INTERVAL_MS, x1(229.0, 100.0)));
+        let (parked, _) = drive(&t, &frames);
+        let (passer, _) = drive(
+            &t,
+            &[
+                (16 * FIELD_INTERVAL_MS, vec![]),
+                (17 * FIELD_INTERVAL_MS, x1(305.0, 120.0)),
+            ],
+        );
+        assert_eq!(parked.len(), 1, "{parked:?}");
+        assert_ne!(passer, parked);
+    }
+
+    /// A parked car seen only twice, at full frame rate, has one velocity
+    /// sample: box jitter over 66 ms. Weighted like any other first sample it
+    /// is not motion, and the car keeps its track across a stall; taken at
+    /// full weight it reads as up to ~200 px/s (round-11 review).
+    #[test]
+    fn a_parked_car_seen_twice_keeps_its_track_across_a_stall() {
+        for seed in 0..20u64 {
+            let mut s = seed;
+            let mut jitter = || ((lcg_next(&mut s) >> 33) % 15) as f32 - 7.0;
+            let t = ByteTrackTracker::new(cfg_default());
+            let frames: Vec<_> = [0u64, 66, 2_066, 2_132, 2_198]
+                .into_iter()
+                .map(|ms| {
+                    (
+                        ms,
+                        vec![det_at(
+                            "vehicle.car",
+                            200.0 + jitter(),
+                            100.0 + jitter(),
+                            100.0,
+                            60.0,
+                            0.9,
+                        )],
+                    )
+                })
+                .collect();
+            let (ids, _) = drive(&t, &frames);
+            assert_eq!(ids.len(), 1, "seed {seed}: {ids:?}");
+        }
+    }
+
+    /// Across a capture stall, what a track learns is the vehicle's speed:
+    /// the sample spans the whole gap.
+    #[test]
+    fn a_vehicle_keeps_its_speed_across_a_capture_stall() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let speed = 80.0 / 0.69;
+        let mut times: Vec<u64> = (0..12).map(|k| k * FIELD_INTERVAL_MS).collect();
+        times.push(times[11] + 2_000);
+        let frames: Vec<_> = times
+            .iter()
+            .map(|&ms| {
+                (
+                    ms,
+                    vec![det_at(
+                        "vehicle.car",
+                        ms as f32 * speed / 1000.0,
+                        150.0,
+                        100.0,
+                        60.0,
+                        0.8,
+                    )],
+                )
+            })
+            .collect();
+        let (ids, _) = drive(&t, &frames);
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        let v = t.inner.lock().tracks[0].velocity_x;
+        assert!(
+            (v - speed).abs() < speed * 0.05,
+            "velocity {v}, want {speed}"
+        );
+    }
+
+    #[test]
+    fn a_close_follower_does_not_join_its_lost_leaders_coasting_box() {
+        // Review of #369: a leader at 60 px per frame is lost; a follower at
+        // the same speed is first seen 0.3 box lengths behind its last-seen
+        // point and drives on into the leader's predicted box. It needs the
+        // velocity to predict the leader where it really is, and the IoU pass
+        // to give the overlapping detection to the track it fits best.
+        let t = ByteTrackTracker::new(cfg_default());
+        let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+        let leader: Vec<_> = (0..4u64)
+            .map(|i| (i * FIELD_INTERVAL_MS, x1(i as f32 * 60.0)))
+            .collect();
+        let (leader, _) = drive(&t, &leader);
+        let follower: Vec<_> = (0..4u64)
+            .map(|k| ((4 + k) * FIELD_INTERVAL_MS, x1(150.0 + k as f32 * 60.0)))
+            .collect();
+        let (follower, _) = drive(&t, &follower);
+        assert_eq!(follower.len(), 1, "{follower:?}");
+        assert_ne!(follower, leader, "the follower joined the leader's track");
+    }
+
+    #[test]
+    fn a_detection_a_fifth_of_a_box_behind_a_lost_leader_is_another_vehicle() {
+        // A moving vehicle cannot reappear 20 px behind where it was last
+        // seen; only box jitter lands behind it, and that is a few px. Also
+        // after a stall.
+        for gap in [FIELD_INTERVAL_MS, 2_000] {
+            let t = ByteTrackTracker::new(cfg_default());
+            let x1 = |x: f32| vec![det_at("vehicle.car", x, 150.0, 100.0, 60.0, 0.8)];
+            let leader: Vec<_> = (0..4u64)
+                .map(|i| (i * FIELD_INTERVAL_MS, x1(i as f32 * 60.0)))
+                .collect();
+            let (leader, _) = drive(&t, &leader);
+            let (next, _) = drive(&t, &[(3 * FIELD_INTERVAL_MS + gap, x1(160.0))]);
+            assert_ne!(next, leader, "{gap} ms");
+        }
+    }
+
+    #[test]
+    fn a_box_of_a_different_size_is_not_motion_linked() {
+        let t = ByteTrackTracker::new(cfg_default());
+        let big = det_at("vehicle.car", 60.0, 40.0, 250.0, 150.0, 0.8);
+        let (ids, _) = drive(
+            &t,
+            &[(0, vec![car(50.0, 100.0)]), (FIELD_INTERVAL_MS, vec![big])],
+        );
+        assert_eq!(ids.len(), 2);
     }
 
     // Phase M_PERF_CROWD C1: bucketed associate_pass must produce
