@@ -60,6 +60,22 @@ fn tight_static_cfg() -> StaticObjectConfig {
     }
 }
 
+/// MORGAN's deployed static-filter settings (#367), with a short pinned
+/// dwell. The EMA lag they leave is what lets a moving car keep a parked
+/// track's verdict.
+fn morgan_static_cfg() -> StaticObjectConfig {
+    StaticObjectConfig {
+        dwell_frames: Some(5),
+        significant_movement_pixels: 36,
+        significant_movement_frames: 3,
+        movement_ema_alpha: 0.35,
+        match_distance_pixels: 40,
+        track_id_reuse_reset_pixels: 60,
+        anchor_ttl_secs: 3600,
+        ..tight_static_cfg()
+    }
+}
+
 fn rules_cfg() -> RulesConfig {
     RulesConfig {
         backend: RulesBackendKind::Cel,
@@ -481,19 +497,7 @@ fn a_vehicle_linked_into_a_parked_track_alerts_once_it_leaves_the_spot() {
     // #367, Cam 01: ByteTrack linked a passing sedan into parked car
     // 8587's promoted track. The sedan inherited "static" and dragged
     // the anchor along with it, so an any-vehicle rule never saw it.
-    // MORGAN's deployed thresholds; the EMA lag is what lets a moving
-    // car keep a parked track's verdict.
-    let cfg = StaticObjectConfig {
-        dwell_frames: Some(5),
-        significant_movement_pixels: 36,
-        significant_movement_frames: 3,
-        movement_ema_alpha: 0.35,
-        match_distance_pixels: 40,
-        track_id_reuse_reset_pixels: 60,
-        anchor_ttl_secs: 3600,
-        ..tight_static_cfg()
-    };
-    let filter = StaticObjectFilter::new(cfg, 1, None);
+    let filter = StaticObjectFilter::new(morgan_static_cfg(), 1, None);
     let mut sim = Sim::new(Some(filter), &[rule_for("vehicle.car", 0)]);
 
     let mut parked = Vec::new();
@@ -530,17 +534,7 @@ fn two_cars_parked_inside_one_match_radius_each_alert_once() {
     // minting its own. B's few px of box jitter must not read as B leaving
     // A's anchor, or each jitter re-alerts B and erases A's anchor (#367
     // review).
-    let cfg = StaticObjectConfig {
-        dwell_frames: Some(5),
-        significant_movement_pixels: 36,
-        significant_movement_frames: 3,
-        movement_ema_alpha: 0.35,
-        match_distance_pixels: 40,
-        track_id_reuse_reset_pixels: 60,
-        anchor_ttl_secs: 3600,
-        ..tight_static_cfg()
-    };
-    let filter = StaticObjectFilter::new(cfg, 1, None);
+    let filter = StaticObjectFilter::new(morgan_static_cfg(), 1, None);
     let mut sim = Sim::new(Some(filter), &[rule_for("vehicle.car", 0)]);
 
     let mut alerts = 0;
@@ -554,4 +548,42 @@ fn two_cars_parked_inside_one_match_radius_each_alert_once() {
             .len();
     }
     assert_eq!(alerts, 2, "each parked car alerts exactly once");
+}
+
+#[test]
+fn a_car_that_leaves_its_spot_alerts_even_inside_a_neighbours_anchor() {
+    // Cars parked at x = 100 and x = 181 each own an anchor. Car A pulls
+    // 41 px forward and stops at x = 141: outside its own spot, but on the
+    // edge of B's anchor. Under the default two-frame debounce it must
+    // alert once, not be hidden by B's anchor after the frame it left
+    // (#368 review).
+    let filter = StaticObjectFilter::new(morgan_static_cfg(), 1, None);
+    let mut rule = rule_for("vehicle.car", 0);
+    rule.debounce.consecutive_frames = 2;
+    let mut sim = Sim::new(Some(filter), &[rule]);
+
+    let mut parked = 0;
+    for _ in 0..10 {
+        parked += sim
+            .step(vec![
+                object(1, "vehicle.car", 100.0, 100.0),
+                object(2, "vehicle.car", 181.0, 100.0),
+            ])
+            .len();
+    }
+    assert_eq!(parked, 2, "each parked car alerts once on arrival");
+
+    let mut left = 0;
+    for _ in 0..4 {
+        left += sim
+            .step(vec![
+                object(1, "vehicle.car", 141.0, 100.0),
+                object(2, "vehicle.car", 181.0, 100.0),
+            ])
+            .len();
+    }
+    assert_eq!(
+        left, 1,
+        "the car that left its spot alerts once; the car still parked does not"
+    );
 }

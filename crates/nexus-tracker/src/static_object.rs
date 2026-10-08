@@ -98,6 +98,10 @@ struct PerTrackState {
     /// matched to, so a parked car's jitter is measured from where *it*
     /// stands (#367).
     parked_at: Option<(f32, f32)>,
+    /// Set when the track breaks its static gate, cleared when it is
+    /// promoted again. A departed track is a moving vehicle, so another
+    /// vehicle's anchor must not hide it before it parks (#368 review).
+    departed: bool,
 }
 
 /// Persisted record of a known-static vehicle location for a camera.
@@ -319,8 +323,12 @@ impl StaticObjectFilter {
             };
             // Only a frame that stood still may place or refresh an
             // anchor. A track's first frame has no step to judge, and at
-            // low frame rates a passing car is mostly first frames.
-            let still = state.last_center.is_some() && instant_movement <= cfg_still_px;
+            // low frame rates a passing car is mostly first frames. A
+            // coasting frame (no detection, the tracker's last box) shows
+            // no movement because nothing was seen (#368 review).
+            let still = o.detection_bbox.is_some()
+                && state.last_center.is_some()
+                && instant_movement <= cfg_still_px;
             if state.last_center.is_none() {
                 state.movement_ema = instant_movement;
             } else {
@@ -341,6 +349,7 @@ impl StaticObjectFilter {
 
             if state.static_frames >= cfg_dwell {
                 state.static_promoted = true;
+                state.departed = false;
             }
 
             // ---- registry-anchor check ----
@@ -388,6 +397,7 @@ impl StaticObjectFilter {
                 }
                 state.static_promoted = false;
                 state.parked_at = None;
+                state.departed = true;
                 state.static_frames = 0;
                 state.alert_epoch = state.alert_epoch.saturating_add(1);
             } else if let Some(idx) = matched_anchor_index.filter(|_| still) {
@@ -407,7 +417,7 @@ impl StaticObjectFilter {
                 false
             };
 
-            let suppress = (still_matches_anchor || state.static_promoted)
+            let suppress = ((still_matches_anchor && !state.departed) || state.static_promoted)
                 && state.moving_consecutive_frames < cfg_sig_frames;
 
             // Promote into the registry while we hold the suppression
@@ -694,17 +704,19 @@ mod tests {
     }
 
     fn vehicle(track_id: TrackId, cx: f32, cy: f32) -> TrackedObject {
+        let bbox = BBox {
+            x1: cx - 25.0,
+            y1: cy - 15.0,
+            x2: cx + 25.0,
+            y2: cy + 15.0,
+        };
         TrackedObject {
             track_id,
             label: "vehicle.car".into(),
             confidence: 0.95,
-            bbox: BBox {
-                x1: cx - 25.0,
-                y1: cy - 15.0,
-                x2: cx + 25.0,
-                y2: cy + 15.0,
-            },
-            detection_bbox: None,
+            bbox,
+            // A detected frame: only those may place or refresh an anchor.
+            detection_bbox: Some(bbox),
             age_frames: 1,
             age_ms: 33,
             attributes: Default::default(),
@@ -716,17 +728,18 @@ mod tests {
     }
 
     fn labeled(track_id: TrackId, label: &str, cx: f32, cy: f32) -> TrackedObject {
+        let bbox = BBox {
+            x1: cx - 10.0,
+            y1: cy - 20.0,
+            x2: cx + 10.0,
+            y2: cy + 20.0,
+        };
         TrackedObject {
             track_id,
             label: label.into(),
             confidence: 0.95,
-            bbox: BBox {
-                x1: cx - 10.0,
-                y1: cy - 20.0,
-                x2: cx + 10.0,
-                y2: cy + 20.0,
-            },
-            detection_bbox: None,
+            bbox,
+            detection_bbox: Some(bbox),
             age_frames: 1,
             age_ms: 33,
             attributes: Default::default(),
@@ -1548,5 +1561,50 @@ mod tests {
                  (last_seen at start: {last_seen:?})"
             );
         }
+    }
+
+    /// ByteTrack keeps emitting a lost track at its last box, with no
+    /// detection, for up to `max_lost_frames`. Those coasting frames show
+    /// no movement but saw nothing, so they must not refresh an anchor, or
+    /// every passing fragment keeps a lane anchor alive for 30 more frames
+    /// (#368 review).
+    #[test]
+    fn a_coasting_track_does_not_refresh_an_anchor() {
+        use crate::bytetrack::ByteTrackTracker;
+        use crate::Tracker;
+        use nexus_config::TrackerConfig;
+        use nexus_types::Detection;
+
+        let tracker = ByteTrackTracker::new(TrackerConfig::default().bytetrack);
+        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+        f.anchors.push(StaticAnchor {
+            label: "vehicle.car".into(),
+            center_x: 500.0,
+            center_y: 300.0,
+            last_seen_unix_ms: Some(0),
+        });
+        let car = vehicle(0, 500.0, 300.0);
+        for i in 0..10u64 {
+            let ms = i as i64 * 690;
+            // Detected on frames 0 and 1, then only coasting.
+            let dets = if i < 2 {
+                vec![Detection {
+                    label: car.label.clone(),
+                    confidence: 0.9,
+                    bbox: car.bbox,
+                    attributes: Default::default(),
+                }]
+            } else {
+                vec![]
+            };
+            let mut tracked = tracker.update(dets, mono_ms(ms));
+            assert_eq!(tracked.len(), 1, "frame {i}: the track is still emitted");
+            f.classify(&frame(1, i, ms), &mut tracked);
+        }
+        assert_eq!(
+            f.anchors()[0].last_seen_unix_ms,
+            Some(690),
+            "only the last detected still frame may refresh the anchor"
+        );
     }
 }
