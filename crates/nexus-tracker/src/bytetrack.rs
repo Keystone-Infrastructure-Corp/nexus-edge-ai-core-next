@@ -125,6 +125,10 @@ impl Tracker for ByteTrackTracker {
             }
         }
 
+        // The motion pass, and the velocity and assignment fixes it relies on.
+        // Off (0), association is exactly main's IoU-only ByteTrack.
+        let motion = cfg.motion_match_box_lengths_per_sec > 0.0;
+
         let mut det_used = vec![false; detections.len()];
         let mut track_matched = vec![false; state.tracks.len()];
 
@@ -140,6 +144,7 @@ impl Tracker for ByteTrackTracker {
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
             cfg.spatial_bucket_size_px,
+            motion,
         );
 
         // ---- 4. Second pass: low-conf detections recover unmatched tracks. ----
@@ -154,10 +159,11 @@ impl Tracker for ByteTrackTracker {
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
             cfg.spatial_bucket_size_px,
+            motion,
         );
 
         // ---- 4b. Motion pass: what overlap could not link. ----
-        if cfg.motion_match_box_lengths_per_sec > 0.0 {
+        if motion {
             associate_by_motion(
                 &mut state.tracks,
                 &mut state.pairs,
@@ -296,10 +302,12 @@ fn blend(new: BBox, prior: BBox, alpha: f32) -> BBox {
 /// One association pass over `det_indices`. Mutates the tracks (velocity,
 /// bbox, lifecycle, hit streak) and the `det_used` / `track_matched`
 /// vectors, and moves each matched detection's attributes onto its track.
-/// Pairs are assigned best IoU first across all tracks, not track by track
-/// in creation order: otherwise an older track, such as a lost leader's
-/// coasting box, takes a detection that overlaps another track better
-/// (#362). Ties go to the earlier track, then the earlier detection.
+/// With `motion` on, pairs are assigned best IoU first across all tracks,
+/// not track by track in creation order: otherwise an older track, such as a
+/// lost leader's coasting box, takes a detection that overlaps another track
+/// better (#362). Ties go to the earlier track, then the earlier detection.
+/// With it off, each track in creation order takes its best, as on main,
+/// ties included.
 ///
 /// `spatial_bucket_size_px` (Phase M_PERF_CROWD C1):
 /// - `None` or `Some(0)` → O(N²) sweep (every track scans every candidate
@@ -322,6 +330,7 @@ fn associate_pass(
     confirm_frames: u32,
     display_smoothing_alpha: f32,
     spatial_bucket_size_px: Option<u32>,
+    motion: bool,
 ) {
     // Build the spatial grid once per pass when bucketing is enabled.
     // Maps cell -> indices into `detections` (already filtered to this
@@ -375,7 +384,13 @@ fn associate_pass(
             }
         }
     }
-    pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    if motion {
+        pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    } else {
+        // Stable, and pairs were pushed in the order main's sweep visits
+        // detections, so an exact IoU tie keeps main's winner.
+        pairs.sort_by(|a, b| a.1.cmp(&b.1).then(b.0.total_cmp(&a.0)));
+    }
     for &(_, t_idx, i) in pairs.iter() {
         if track_matched[t_idx] || det_used[i] {
             continue;
@@ -387,6 +402,7 @@ fn associate_pass(
             &mut detections[i],
             confirm_frames,
             display_smoothing_alpha,
+            motion,
         );
     }
 }
@@ -486,25 +502,35 @@ fn associate_by_motion(
             &mut detections[i],
             cfg.confirm_frames,
             cfg.display_smoothing_alpha,
+            true,
         );
     }
 }
 
-/// Fold detection `d` into track `t`.
+/// Fold detection `d` into track `t`. `motion` selects the velocity
+/// estimate: the displacement per frame since the box was last observed, or
+/// main's.
 fn apply_match(
     t: &mut TrackState,
     d: &mut Detection,
     confirm_frames: u32,
     display_smoothing_alpha: f32,
+    motion: bool,
 ) {
-    // Displacement per frame since the box was last observed. `t.bbox` has
-    // been predicted forward one velocity step per frame since then, so the
-    // gap to it is only the prediction's error; v1 fed that error to the EMA,
-    // which settles at half the true step and leaves a lost track's
-    // predicted box trailing its vehicle (#362).
-    let steps = (t.missed_frames + 1) as f32;
-    let dx = (d.bbox.x1 - t.bbox.x1) / steps + t.velocity_x;
-    let dy = (d.bbox.y1 - t.bbox.y1) / steps + t.velocity_y;
+    // `t.bbox` has been predicted forward one velocity step per frame since
+    // the box was last observed, so the gap to it is only the prediction's
+    // error. Main (v1) fed that error to the EMA, which settles at half the
+    // true step and leaves a lost track's predicted box trailing its vehicle
+    // (#362); the displacement per frame since the last observation does not.
+    let (dx, dy) = if motion {
+        let steps = (t.missed_frames + 1) as f32;
+        (
+            (d.bbox.x1 - t.bbox.x1) / steps + t.velocity_x,
+            (d.bbox.y1 - t.bbox.y1) / steps + t.velocity_y,
+        )
+    } else {
+        (d.bbox.x1 - t.bbox.x1, d.bbox.y1 - t.bbox.y1)
+    };
     // Same EMA constants as v1: 0.6 weight on prior velocity, 0.4 on
     // newly observed dx/dy.
     t.velocity_x = 0.6 * t.velocity_x + 0.4 * dx;
@@ -959,26 +985,69 @@ mod tests {
 
     #[test]
     fn velocity_converges_to_the_step_per_frame() {
-        // A box moving 10 px per frame, matched by IoU every frame.
-        let t = ByteTrackTracker::new(cfg_default());
-        for i in 0..15u64 {
-            let _ = t.update(
-                vec![det_at(
-                    "vehicle.car",
-                    i as f32 * 10.0,
-                    0.0,
-                    100.0,
-                    60.0,
-                    0.9,
-                )],
-                at_ms(i * 66),
+        // A box moving 10 px per frame, matched by IoU every frame. With the
+        // motion pass off the tracker is main's: v1's estimate settles at
+        // half the step.
+        for (speed, want) in [(3.0f32, 10.0f32), (0.0, 5.0)] {
+            let mut cfg = cfg_default();
+            cfg.motion_match_box_lengths_per_sec = speed;
+            let t = ByteTrackTracker::new(cfg);
+            for i in 0..15u64 {
+                let d = det_at("vehicle.car", i as f32 * 10.0, 0.0, 100.0, 60.0, 0.9);
+                let _ = t.update(vec![d], at_ms(i * 66));
+            }
+            let v = t.inner.lock().tracks[0].velocity_x;
+            assert!(
+                (v - want).abs() < 1.0,
+                "motion {speed}: velocity {v} px/frame, want {want}"
             );
         }
-        let v = t.inner.lock().tracks[0].velocity_x;
-        assert!(
-            (v - 10.0).abs() < 1.0,
-            "velocity {v} px/frame for a 10 px/frame box"
-        );
+    }
+
+    #[test]
+    fn iou_pairs_go_best_first_and_to_the_older_track_with_motion_off() {
+        // Track a (older) overlaps the detection at 0.43, track b at 0.67.
+        // Best first gives it to b; with the motion pass off the tracker is
+        // main's, where each track takes its best in creation order.
+        for (speed, want_older) in [(3.0f32, false), (0.0, true)] {
+            let mut cfg = cfg_default();
+            cfg.motion_match_box_lengths_per_sec = speed;
+            let t = ByteTrackTracker::new(cfg);
+            let d = |x: f32| det_at("vehicle.car", x, 0.0, 100.0, 60.0, 0.9);
+            let first = t.update(vec![d(0.0), d(60.0)], *T);
+            let (older, newer) = (first[0].track_id, first[1].track_id);
+            let out = t.update(vec![d(40.0)], *T);
+            let got = out
+                .iter()
+                .find(|o| o.detection_bbox.is_some())
+                .map(|o| o.track_id);
+            assert_eq!(
+                got,
+                Some(if want_older { older } else { newer }),
+                "motion {speed}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_motion_off_an_exact_iou_tie_goes_where_mains_sweep_puts_it() {
+        // Two detections tie exactly with the track and sit in different
+        // grid cells. Main's sweep keeps the first strictly greater IoU in
+        // the order it visits them, which on the grid is cell order: the
+        // left box, though it is the second detection.
+        let mut cfg = cfg_default();
+        cfg.motion_match_box_lengths_per_sec = 0.0;
+        cfg.spatial_bucket_size_px = Some(50);
+        let t = ByteTrackTracker::new(cfg);
+        let d = |x: f32| det_at("vehicle.car", x, 0.0, 100.0, 60.0, 0.9);
+        let _ = t.update(vec![d(100.0)], *T);
+        let out = t.update(vec![d(140.0), d(60.0)], *T);
+        let got = out
+            .iter()
+            .find(|o| o.track_id == 1)
+            .and_then(|o| o.detection_bbox)
+            .map(|b| b.x1);
+        assert_eq!(got, Some(60.0));
     }
 
     #[test]
