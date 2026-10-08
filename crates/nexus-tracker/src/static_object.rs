@@ -12,7 +12,8 @@
 //!
 //! A previously-suppressed track that starts moving again
 //! (significant-movement EMA crossed for
-//! `significant_movement_frames` consecutive frames) gets demoted —
+//! `significant_movement_frames` consecutive frames, or its centre more
+//! than `match_distance_pixels` from where it parked) gets demoted —
 //! the matching anchor is erased from the registry and subsequent
 //! frames flow through to the rule layer.
 //!
@@ -54,8 +55,9 @@ pub const EMA_ATTRIBUTE_KEY: &str = "tracker.movement_ema";
 pub const STATIC_FRAMES_ATTRIBUTE_KEY: &str = "tracker.static_frames";
 pub const MOVING_FRAMES_ATTRIBUTE_KEY: &str = "tracker.moving_consecutive_frames";
 /// Monotonic per-track generation for parking-lot alert deduplication. It
-/// starts at zero and advances only when sustained movement breaks a closed
-/// static-object gate.
+/// starts at zero and advances when the track breaks a closed static-object
+/// gate (sustained movement, or leaving where it parked) and when the
+/// ID-reuse guard resets the track.
 pub const ALERT_EPOCH_ATTRIBUTE_KEY: &str = "tracker.static_alert_epoch";
 
 /// Helper that mirrors the convention used by the supervisor: returns
@@ -93,6 +95,16 @@ struct PerTrackState {
     /// would leave the anchor orphaned and blind the parking space to
     /// every future arrival.
     anchor_center: Option<(f32, f32)>,
+    /// The track's own centre on its first still frame after promotion.
+    /// Unlike `anchor_center`, never a neighbour's anchor the track was
+    /// matched to, so a parked car's jitter is measured from where *it*
+    /// stands (#367).
+    parked_at: Option<(f32, f32)>,
+    /// Set when the track breaks its static gate. A departed track is a
+    /// moving vehicle, so another vehicle's anchor must not hide it before
+    /// it parks again (#368 review). Only read while the track is not
+    /// promoted, so promotion need not clear it.
+    departed: bool,
 }
 
 /// Persisted record of a known-static vehicle location for a camera.
@@ -261,6 +273,10 @@ impl StaticObjectFilter {
         let cfg_sig_frames = self.cfg.significant_movement_frames.max(1);
         let cfg_alpha = self.cfg.movement_ema_alpha.clamp(0.01, 1.0) as f64;
         let cfg_match_dist = self.cfg.match_distance_pixels.max(1) as f32;
+        // Largest single-frame step that still counts as standing still:
+        // above box jitter on a parked car, below a vehicle driving past
+        // one (#367).
+        let cfg_still_px = (cfg_match_dist / 4.0) as f64;
         let cfg_reset_px = self.cfg.track_id_reuse_reset_pixels as f64;
         let cfg_persistence = self.cfg.persistence_enabled;
 
@@ -308,6 +324,14 @@ impl StaticObjectFilter {
                 }
                 None => 0.0,
             };
+            // Only a frame that stood still may place or refresh an
+            // anchor. A track's first frame has no step to judge, and at
+            // low frame rates a passing car is mostly first frames. A
+            // coasting frame (no detection, the tracker's last box) shows
+            // no movement because nothing was seen (#368 review).
+            let still = o.detection_bbox.is_some()
+                && state.last_center.is_some()
+                && instant_movement <= cfg_still_px;
             if state.last_center.is_none() {
                 state.movement_ema = instant_movement;
             } else {
@@ -342,8 +366,19 @@ impl StaticObjectFilter {
             // `static_promoted` before the registry upsert below is
             // essential: otherwise the erased anchor is recreated in the
             // same frame and the vehicle never starts a fresh dwell cycle.
-            let broke_static_gate = state.moving_consecutive_frames >= cfg_sig_frames
-                && (state.static_promoted || matched_anchor_index.is_some());
+            //
+            // A promoted track whose centre is more than the match radius
+            // from where it parked is no longer that parked vehicle: at
+            // low frame rates ByteTrack links a passing car into a parked
+            // car's track, and the car must not inherit the parked verdict
+            // while its EMA catches up (#367).
+            let left_its_spot = state.static_promoted
+                && state
+                    .parked_at
+                    .is_some_and(|(px, py)| (px - center.0).hypot(py - center.1) > cfg_match_dist);
+            let broke_static_gate = left_its_spot
+                || (state.moving_consecutive_frames >= cfg_sig_frames
+                    && (state.static_promoted || matched_anchor_index.is_some()));
             if broke_static_gate {
                 // Erase this track's own anchor. Prefer the position it
                 // was parked at (`anchor_center`) over the live center —
@@ -363,13 +398,17 @@ impl StaticObjectFilter {
                     dirty = true;
                 }
                 state.static_promoted = false;
+                state.parked_at = None;
+                state.departed = true;
                 state.static_frames = 0;
                 state.alert_epoch = state.alert_epoch.saturating_add(1);
-            } else if let Some(idx) = matched_anchor_index {
+            } else if let Some(idx) = matched_anchor_index.filter(|_| still) {
                 // Still parked — refresh `last_seen` so the TTL sweep
                 // doesn't prune an anchor whose vehicle is visibly still
-                // there. In-memory update only; the disk write is debounced
-                // to structural changes (promote / demote / sweep / drift).
+                // there. Traffic passing through does not count, or a lane
+                // anchor would never age out. In-memory update only; the
+                // disk write is debounced to structural changes (promote /
+                // demote / sweep).
                 self.anchors[idx].last_seen_unix_ms = Some(frame_ms);
             }
 
@@ -380,7 +419,7 @@ impl StaticObjectFilter {
                 false
             };
 
-            let suppress = (still_matches_anchor || state.static_promoted)
+            let suppress = ((still_matches_anchor && !state.departed) || state.static_promoted)
                 && state.moving_consecutive_frames < cfg_sig_frames;
 
             // Promote into the registry while we hold the suppression
@@ -392,8 +431,13 @@ impl StaticObjectFilter {
             // `static_promoted` until the gate actually breaks, and
             // without this guard each frame of the drive-off would push
             // a new anchor once it cleared `match_distance_pixels`,
-            // littering the lot with permanent blind spots.
-            if state.static_promoted && cfg_persistence && state.moving_consecutive_frames == 0 {
+            // littering the lot with permanent blind spots. `still` does
+            // the same for a car crawling under the EMA threshold.
+            if state.static_promoted
+                && cfg_persistence
+                && state.moving_consecutive_frames == 0
+                && still
+            {
                 let (anchor_at, mutated) = Self::upsert_anchor(
                     &mut self.anchors,
                     &label_lc,
@@ -404,6 +448,7 @@ impl StaticObjectFilter {
                 // Remember which anchor this track owns so demotion can
                 // erase it after the vehicle has moved away from it.
                 state.anchor_center = Some(anchor_at);
+                state.parked_at.get_or_insert(center);
                 if mutated {
                     dirty = true;
                 }
@@ -520,9 +565,11 @@ impl StaticObjectFilter {
         None
     }
 
-    /// Inserts or merges. Returns the resolved anchor center (so the
+    /// Inserts or refreshes. Returns the resolved anchor center (so the
     /// caller can remember which anchor a track owns) and whether the
-    /// registry mutated.
+    /// registry mutated. An existing anchor never moves: averaging it
+    /// toward each observation let a vehicle linked into a parked
+    /// car's track drag the anchor into the lane (#367).
     fn upsert_anchor(
         anchors: &mut Vec<StaticAnchor>,
         label_lc: &str,
@@ -531,22 +578,8 @@ impl StaticObjectFilter {
         now_ms: i64,
     ) -> ((f32, f32), bool) {
         if let Some(idx) = Self::match_anchor(anchors, label_lc, center, max_dist_px) {
-            // Average toward the new observation — same shape as v1
-            // (`(old + new) * 0.5`). Tiny drift; only triggers a save
-            // when the average actually moves the centroid. Refresh
-            // `last_seen_unix_ms` unconditionally so a parked vehicle
-            // whose centroid never drifts beyond the 0.01 threshold
-            // still keeps its TTL fresh.
-            let prev = (anchors[idx].center_x, anchors[idx].center_y);
             anchors[idx].last_seen_unix_ms = Some(now_ms);
-            let new_cx = (anchors[idx].center_x + center.0) * 0.5;
-            let new_cy = (anchors[idx].center_y + center.1) * 0.5;
-            if (new_cx - prev.0).abs() < 0.01 && (new_cy - prev.1).abs() < 0.01 {
-                return (prev, false);
-            }
-            anchors[idx].center_x = new_cx;
-            anchors[idx].center_y = new_cy;
-            ((new_cx, new_cy), true)
+            ((anchors[idx].center_x, anchors[idx].center_y), false)
         } else {
             anchors.push(StaticAnchor {
                 label: label_lc.to_string(),
@@ -673,17 +706,19 @@ mod tests {
     }
 
     fn vehicle(track_id: TrackId, cx: f32, cy: f32) -> TrackedObject {
+        let bbox = BBox {
+            x1: cx - 25.0,
+            y1: cy - 15.0,
+            x2: cx + 25.0,
+            y2: cy + 15.0,
+        };
         TrackedObject {
             track_id,
             label: "vehicle.car".into(),
             confidence: 0.95,
-            bbox: BBox {
-                x1: cx - 25.0,
-                y1: cy - 15.0,
-                x2: cx + 25.0,
-                y2: cy + 15.0,
-            },
-            detection_bbox: None,
+            bbox,
+            // A detected frame: only those may place or refresh an anchor.
+            detection_bbox: Some(bbox),
             age_frames: 1,
             age_ms: 33,
             attributes: Default::default(),
@@ -695,17 +730,18 @@ mod tests {
     }
 
     fn labeled(track_id: TrackId, label: &str, cx: f32, cy: f32) -> TrackedObject {
+        let bbox = BBox {
+            x1: cx - 10.0,
+            y1: cy - 20.0,
+            x2: cx + 10.0,
+            y2: cy + 20.0,
+        };
         TrackedObject {
             track_id,
             label: label.into(),
             confidence: 0.95,
-            bbox: BBox {
-                x1: cx - 10.0,
-                y1: cy - 20.0,
-                x2: cx + 10.0,
-                y2: cy + 20.0,
-            },
-            detection_bbox: None,
+            bbox,
+            detection_bbox: Some(bbox),
             age_frames: 1,
             age_ms: 33,
             attributes: Default::default(),
@@ -1337,9 +1373,13 @@ mod tests {
             last_seen_unix_ms: Some(0),
         });
 
-        // Frame at t = 5 s, vehicle still parked at the anchor.
-        let mut objs = vec![vehicle(42, 200.0, 200.0)];
-        f.classify(&frame(1, 1, 5_000), &mut objs);
+        // Frames 0.9 s apart over 5 s, vehicle still parked at the anchor.
+        // Each one after the first stood still, so each refreshes (#367:
+        // a track's first frame alone does not).
+        for i in 1..=6u64 {
+            let mut objs = vec![vehicle(42, 200.0, 200.0)];
+            f.classify(&frame(1, i, i as i64 * 900), &mut objs);
+        }
 
         assert_eq!(
             f.anchors().len(),
@@ -1390,6 +1430,183 @@ mod tests {
             f.anchors()[0].last_seen_unix_ms,
             Some(1_000_000),
             "bootstrap must stamp the current frame_ms onto the legacy anchor"
+        );
+    }
+
+    /// MORGAN's deployed settings (#367), in 512×288 analysis pixels, with
+    /// a short pinned dwell so the replays stay small.
+    fn morgan_cfg() -> StaticObjectConfig {
+        StaticObjectConfig {
+            dwell_frames: Some(5),
+            dwell_secs: 0.0,
+            anchor_persons: false,
+            significant_movement_pixels: 36,
+            significant_movement_frames: 3,
+            movement_ema_alpha: 0.35,
+            match_distance_pixels: 40,
+            track_id_reuse_reset_pixels: 60,
+            anchor_ttl_secs: 3600,
+            persistence_enabled: true,
+        }
+    }
+
+    /// Park track 8587 at (24, 270) with a few px of box jitter, then
+    /// replay the grey sedan ByteTrack linked into it (#367, Cam 01,
+    /// 11:54:44 UTC). Returns, per drive-off frame, the registry and
+    /// whether the sedan was hidden.
+    fn replay_linked_sedan() -> Vec<(Vec<StaticAnchor>, bool)> {
+        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+        let mut ms = 0;
+        for i in 0..10u64 {
+            let mut objs = vec![vehicle(8587, 24.0, 270.0 - (i % 2) as f32 * 5.0)];
+            f.classify(&frame(1, i, ms), &mut objs);
+            ms += 690;
+        }
+        assert_eq!(f.anchors().len(), 1, "the parked car is anchored");
+        let path = [(36.0, 263.0), (47.0, 250.0), (68.0, 229.0), (88.0, 200.0)];
+        path.iter()
+            .enumerate()
+            .map(|(i, &(x, y))| {
+                let mut objs = vec![vehicle(8587, x, y)];
+                f.classify(&frame(1, 10 + i as u64, ms), &mut objs);
+                ms += 690;
+                (f.anchors().to_vec(), is_object_static(&objs[0]))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_vehicle_linked_into_a_parked_track_does_not_drag_its_anchor() {
+        for (i, (anchors, _)) in replay_linked_sedan().iter().enumerate() {
+            for a in anchors {
+                let off = ((a.center_x - 24.0).powi(2) + (a.center_y - 268.0).powi(2)).sqrt();
+                assert!(
+                    off < 5.0,
+                    "drive-off frame {i}: anchor at ({}, {}) left the parked \
+                     spot and followed the linked vehicle into the lane",
+                    a.center_x,
+                    a.center_y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_linked_vehicle_is_not_hidden_once_it_leaves_its_anchor() {
+        let hidden: Vec<bool> = replay_linked_sedan().into_iter().map(|(_, h)| h).collect();
+        // (68, 229) is the first centre beyond the 40 px match radius.
+        assert_eq!(
+            &hidden[2..],
+            &[false, false],
+            "a vehicle more than match_distance_pixels from the anchor its \
+             track owns is not that parked car, and must reach the rules \
+             (hidden per frame: {hidden:?})"
+        );
+    }
+
+    #[test]
+    fn a_slow_drag_inside_the_match_radius_does_not_move_the_anchor() {
+        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+        let mut ms = 0;
+        for i in 0..8u64 {
+            let mut objs = vec![vehicle(1, 200.0, 100.0)];
+            f.classify(&frame(1, i, ms), &mut objs);
+            ms += 690;
+        }
+        // 5–12 px steps: inside the match radius, under the EMA threshold.
+        for (i, x) in [205.0, 212.0, 224.0, 236.0].into_iter().enumerate() {
+            let mut objs = vec![vehicle(1, x, 100.0)];
+            f.classify(&frame(1, 8 + i as u64, ms), &mut objs);
+            ms += 690;
+            let a = &f.anchors()[0];
+            assert_eq!(
+                (a.center_x, a.center_y),
+                (200.0, 100.0),
+                "a moving observation must not move the anchor (step {i})"
+            );
+        }
+    }
+
+    #[test]
+    fn traffic_through_an_anchor_does_not_keep_it_alive() {
+        // An anchor left in a lane (the #367 residue, or one loaded from a
+        // pre-fix registry) sees only passing vehicles: each a fresh
+        // two-frame track fragment moving 20 px/frame through it. Only a
+        // vehicle standing still may refresh it, so it must age out.
+        for last_seen in [Some(0), None] {
+            let mut f = StaticObjectFilter::new(
+                StaticObjectConfig {
+                    anchor_ttl_secs: 60,
+                    ..morgan_cfg()
+                },
+                1,
+                None,
+            );
+            f.anchors.push(StaticAnchor {
+                label: "vehicle.car".into(),
+                center_x: 421.0,
+                center_y: 115.0,
+                last_seen_unix_ms: last_seen,
+            });
+            let mut frame_id = 0;
+            for pass in 0..12u64 {
+                let ms = pass as i64 * 10_000;
+                for (step, x) in [411.0, 431.0].into_iter().enumerate() {
+                    let mut objs = vec![vehicle(100 + pass, x, 115.0)];
+                    f.classify(&frame(1, frame_id, ms + step as i64 * 690), &mut objs);
+                    frame_id += 1;
+                }
+            }
+            assert!(
+                f.anchors().is_empty(),
+                "traffic kept a lane anchor alive past its TTL \
+                 (last_seen at start: {last_seen:?})"
+            );
+        }
+    }
+
+    /// ByteTrack keeps emitting a lost track at its last box, with no
+    /// detection, for up to `max_lost_frames`. Those coasting frames show
+    /// no movement but saw nothing, so they must not refresh an anchor, or
+    /// every passing fragment keeps a lane anchor alive for 30 more frames
+    /// (#368 review).
+    #[test]
+    fn a_coasting_track_does_not_refresh_an_anchor() {
+        use crate::bytetrack::ByteTrackTracker;
+        use crate::Tracker;
+        use nexus_config::TrackerConfig;
+        use nexus_types::Detection;
+
+        let tracker = ByteTrackTracker::new(TrackerConfig::default().bytetrack);
+        let mut f = StaticObjectFilter::new(morgan_cfg(), 1, None);
+        f.anchors.push(StaticAnchor {
+            label: "vehicle.car".into(),
+            center_x: 500.0,
+            center_y: 300.0,
+            last_seen_unix_ms: Some(0),
+        });
+        let car = vehicle(0, 500.0, 300.0);
+        for i in 0..10u64 {
+            let ms = i as i64 * 690;
+            // Detected on frames 0 and 1, then only coasting.
+            let dets = if i < 2 {
+                vec![Detection {
+                    label: car.label.clone(),
+                    confidence: 0.9,
+                    bbox: car.bbox,
+                    attributes: Default::default(),
+                }]
+            } else {
+                vec![]
+            };
+            let mut tracked = tracker.update(dets, mono_ms(ms));
+            assert_eq!(tracked.len(), 1, "frame {i}: the track is still emitted");
+            f.classify(&frame(1, i, ms), &mut tracked);
+        }
+        assert_eq!(
+            f.anchors()[0].last_seen_unix_ms,
+            Some(690),
+            "only the last detected still frame may refresh the anchor"
         );
     }
 }
