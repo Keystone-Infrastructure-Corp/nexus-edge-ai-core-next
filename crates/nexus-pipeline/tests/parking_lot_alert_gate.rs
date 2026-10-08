@@ -523,3 +523,35 @@ fn a_vehicle_linked_into_a_parked_track_alerts_once_it_leaves_the_spot() {
          parked car's match radius"
     );
 }
+
+#[test]
+fn two_cars_parked_inside_one_match_radius_each_alert_once() {
+    // Car B parks 35 px from car A and is matched to A's anchor rather than
+    // minting its own. B's few px of box jitter must not read as B leaving
+    // A's anchor, or each jitter re-alerts B and erases A's anchor (#367
+    // review).
+    let cfg = StaticObjectConfig {
+        dwell_frames: Some(5),
+        significant_movement_pixels: 36,
+        significant_movement_frames: 3,
+        movement_ema_alpha: 0.35,
+        match_distance_pixels: 40,
+        track_id_reuse_reset_pixels: 60,
+        anchor_ttl_secs: 3600,
+        ..tight_static_cfg()
+    };
+    let filter = StaticObjectFilter::new(cfg, 1, None);
+    let mut sim = Sim::new(Some(filter), &[rule_for("vehicle.car", 0)]);
+
+    let mut alerts = 0;
+    for i in 0..40u64 {
+        let b_x = 135.0 + (i % 2) as f32 * 6.0;
+        alerts += sim
+            .step(vec![
+                object(1, "vehicle.car", 100.0, 100.0),
+                object(2, "vehicle.car", b_x, 100.0),
+            ])
+            .len();
+    }
+    assert_eq!(alerts, 2, "each parked car alerts exactly once");
+}

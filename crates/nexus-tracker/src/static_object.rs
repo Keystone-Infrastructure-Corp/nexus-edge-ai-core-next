@@ -93,6 +93,11 @@ struct PerTrackState {
     /// would leave the anchor orphaned and blind the parking space to
     /// every future arrival.
     anchor_center: Option<(f32, f32)>,
+    /// The track's own centre on its first still frame after promotion.
+    /// Unlike `anchor_center`, never a neighbour's anchor the track was
+    /// matched to, so a parked car's jitter is measured from where *it*
+    /// stands (#367).
+    parked_at: Option<(f32, f32)>,
 }
 
 /// Persisted record of a known-static vehicle location for a camera.
@@ -351,16 +356,16 @@ impl StaticObjectFilter {
             // essential: otherwise the erased anchor is recreated in the
             // same frame and the vehicle never starts a fresh dwell cycle.
             //
-            // A promoted track whose centre is outside its own anchor's
-            // radius is no longer that parked vehicle: at low frame rates
-            // ByteTrack links a passing car into a parked car's track, and
-            // the car must not inherit the parked verdict while its EMA
-            // catches up (#367).
-            let left_its_anchor = state.static_promoted
+            // A promoted track whose centre is more than the match radius
+            // from where it parked is no longer that parked vehicle: at
+            // low frame rates ByteTrack links a passing car into a parked
+            // car's track, and the car must not inherit the parked verdict
+            // while its EMA catches up (#367).
+            let left_its_spot = state.static_promoted
                 && state
-                    .anchor_center
-                    .is_some_and(|(ax, ay)| (ax - center.0).hypot(ay - center.1) > cfg_match_dist);
-            let broke_static_gate = left_its_anchor
+                    .parked_at
+                    .is_some_and(|(px, py)| (px - center.0).hypot(py - center.1) > cfg_match_dist);
+            let broke_static_gate = left_its_spot
                 || (state.moving_consecutive_frames >= cfg_sig_frames
                     && (state.static_promoted || matched_anchor_index.is_some()));
             if broke_static_gate {
@@ -382,6 +387,7 @@ impl StaticObjectFilter {
                     dirty = true;
                 }
                 state.static_promoted = false;
+                state.parked_at = None;
                 state.static_frames = 0;
                 state.alert_epoch = state.alert_epoch.saturating_add(1);
             } else if let Some(idx) = matched_anchor_index.filter(|_| still) {
@@ -430,6 +436,7 @@ impl StaticObjectFilter {
                 // Remember which anchor this track owns so demotion can
                 // erase it after the vehicle has moved away from it.
                 state.anchor_center = Some(anchor_at);
+                state.parked_at.get_or_insert(center);
                 if mutated {
                     dirty = true;
                 }
