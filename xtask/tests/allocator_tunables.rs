@@ -9,6 +9,8 @@
 //! stops returning memory. The symptom then takes a multi-hour soak on real
 //! hardware to see, which is how the original bug survived as long as it did.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::path::{Path, PathBuf};
 
 /// Widest supervisor frame at the smallest rung of the native-aspect ladder:

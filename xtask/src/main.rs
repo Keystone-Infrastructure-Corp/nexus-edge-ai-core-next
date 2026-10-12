@@ -49,6 +49,12 @@
 //! The check exits 0 on success, 1 on any rule violation, and
 //! prints a one-line summary at the end either way.
 
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "xtask is a command-line tool; terminal output is its interface"
+)]
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 

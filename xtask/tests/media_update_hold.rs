@@ -7,6 +7,8 @@
 //! but not to the hold is upgraded overnight, untested, and nothing fails —
 //! holding the `va-driver-all` metapackage does not hold its dependencies.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
