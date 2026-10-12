@@ -136,7 +136,10 @@
       "_license_comment": "Licence sources. Training data (Objects365v1, GQA, Flickr30k) and the AGPL-3.0 weights licence: https://docs.ultralytics.com/models/yolo-world/ . Weights are distributed by Ultralytics under AGPL-3.0: https://github.com/ultralytics/ultralytics/blob/main/LICENSE . Objects365 is academic purpose only: https://www.objects365.org/download.html . Flickr30k is non-commercial research and/or educational purposes: https://shannon.cs.illinois.edu/DenotationGraph/ .",
       "license": "AGPL-3.0",
       "weights_dataset_license": "Objects365v1:academic-only, GQA:CC-BY-4.0, Flickr30k:non-commercial-research",
-      "dataset_license_waiver": "Shipped under AGPL-3.0, the engine's licence, by product decision on 2026-10-12. Objects365 (academic use only) and Flickr30k (non-commercial research) dataset terms are pending legal review.",
+      "dataset_license_waiver": {
+        "covers": "Objects365v1:academic-only, GQA:CC-BY-4.0, Flickr30k:non-commercial-research",
+        "reason": "Shipped under AGPL-3.0, the engine's licence, by product decision on 2026-10-12. Objects365 (academic use only) and Flickr30k (non-commercial research) dataset terms are pending legal review."
+      },
       "input": {
         "width": 512,
         "height": 288,
@@ -302,7 +305,10 @@
       "_license_comment": "Licence sources. Training data (Objects365v1, GQA, Flickr30k) and the AGPL-3.0 weights licence: https://docs.ultralytics.com/models/yoloe/ . Weights are distributed by Ultralytics under AGPL-3.0: https://github.com/ultralytics/ultralytics/blob/main/LICENSE . Objects365 is academic purpose only: https://www.objects365.org/download.html . Flickr30k is non-commercial research and/or educational purposes: https://shannon.cs.illinois.edu/DenotationGraph/ .",
       "license": "AGPL-3.0",
       "weights_dataset_license": "Objects365v1:academic-only, GQA:CC-BY-4.0, Flickr30k:non-commercial-research",
-      "dataset_license_waiver": "Shipped under AGPL-3.0, the engine's licence, by product decision on 2026-10-12. Objects365 (academic use only) and Flickr30k (non-commercial research) dataset terms are pending legal review.",
+      "dataset_license_waiver": {
+        "covers": "Objects365v1:academic-only, GQA:CC-BY-4.0, Flickr30k:non-commercial-research",
+        "reason": "Shipped under AGPL-3.0, the engine's licence, by product decision on 2026-10-12. Objects365 (academic use only) and Flickr30k (non-commercial research) dataset terms are pending legal review."
+      },
       "input": {
         "width": 512,
         "height": 288,

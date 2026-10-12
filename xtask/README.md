@@ -15,9 +15,18 @@ against the model-license + product-invariant rules recorded in
 | --- | --- |
 | Face-recognition denylist substrings in model `id` or artifact `path` (`AdaFace`, `ArcFace`, `InsightFace`, `Buffalo`, `FaceNet`, `SphereFace`, `CosFace`, `MagFace`) | **Hard error.** These never ship at the edge in v1. |
 | `license` not exactly one of `Apache-2.0`, `MIT`, `BSD-3-Clause`, `Apache-2.0 WITH LLVM-exception`, `AGPL-3.0`, `GPL-3.0` | **Hard error.** Exact match. |
-| `weights_dataset_license` deny values (`non-commercial`, `nc-4.0`, `cc-by-nc`, `research`, `research-only`, `academic`, `unknown`, `proprietary`) | **Hard error.** Case-insensitive substring match, unless the entry has a non-empty `dataset_license_waiver`: the hit is then printed as a `waived:` line on every run. A waiver never excuses the `license` allowlist, missing fields, the face-recognition denylist or the folder scan, and a waiver on an entry with no dataset-license hit is an error. |
+| `weights_dataset_license` deny values (`non-commercial`, `nc-4.0`, `cc-by-nc`, `research`, `research-only`, `academic`, `unknown`, `proprietary`) | **Hard error.** Case-insensitive substring match, unless the entry has a `dataset_license_waiver` object `{ "covers": "<the exact weights_dataset_license string>", "reason": "<text>" }` with a non-empty reason: the hit is then printed as a `waived:` line naming every token hit, on every run. `covers` must equal the entry's current `weights_dataset_license` exactly; a mismatch is an error naming both strings, so editing the dataset licence cannot ride an old waiver. A waiver never excuses the `license` allowlist, missing fields, the face-recognition denylist or the folder scan, and a waiver on an entry with no dataset-license hit is an error. |
 | Missing `license` or `weights_dataset_license` on any entry | **Warning** by default; **error** under `--strict`. |
 | A file under the models directory that no artifact `path` names (exempt: `models-manifest.json`, `.gitkeep`, `<artifact>.sha256` sidecars of listed artifacts); every file name is also checked against the face-recognition denylist | **Hard error.** The directory is the manifest's own by default; `--models-dir <path>` points the scan at downloaded weights. |
+
+There is no exemption for generator intermediates. `tools/models/gen_dinov2_hailo.py`
+writes the build-only `models/dinov2_s_224_hailo_src.onnx` (gitignored, not
+shipped), and a default run over a developer's `models/` will name it as unlisted:
+delete it, or audit a release pack with `--models-dir`. The scan cannot tell a
+developer's folder from a pack, and a pack that carries an unlisted ONNX is the
+accident the rule catches. The `shipping_manifest_is_clean` unit test audits the
+manifest and the git-tracked contents of `models/` only, so local files never
+decide `cargo test`.
 
 Exits non-zero on any error (or warning under `--strict`).
 

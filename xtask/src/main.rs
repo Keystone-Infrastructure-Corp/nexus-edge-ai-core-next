@@ -26,13 +26,17 @@
 //! 3. **Dataset-license deny list.** `weights_dataset_license` is
 //!    rejected when it contains a `LICENSE_DENYLIST` substring
 //!    (`non-commercial`, `cc-by-nc`, `research`, `academic`, ...;
-//!    case-insensitive). A model may carry a non-empty
-//!    `dataset_license_waiver` string: a denylist hit on that model's
-//!    dataset license is then printed as a `waived:` line on every
-//!    run instead of failing. A waiver on a model whose dataset
-//!    license does not hit the denylist is itself an error, and a
-//!    waiver never excuses the license allowlist, a missing field,
-//!    the face-recognition denylist or the folder scan.
+//!    case-insensitive). A model may carry a
+//!    `dataset_license_waiver` object `{ "covers": ..., "reason": ... }`
+//!    with a non-empty reason: a denylist hit on that model's dataset
+//!    license is then printed as a `waived:` line (naming every token
+//!    hit) on every run instead of failing. `covers` must equal the
+//!    entry's current `weights_dataset_license` exactly; a mismatch is
+//!    an error naming both strings, so a later edit to the dataset
+//!    license cannot ride an old waiver. A waiver on a model whose
+//!    dataset license does not hit the denylist is itself an error,
+//!    and a waiver never excuses the license allowlist, a missing
+//!    field, the face-recognition denylist or the folder scan.
 //!
 //! 4. **Missing license / weights_dataset_license fields.** Warned
 //!    by default and elevated to an error under `--strict`.
@@ -44,7 +48,10 @@
 //!    sidecars of listed artifacts. An unlisted file is an error,
 //!    and every file name is checked against the face-recognition
 //!    denylist, so weights no manifest entry names cannot escape
-//!    the rules above.
+//!    the rules above. There are no exemptions for generator
+//!    intermediates: the scan cannot tell a developer's `models/`
+//!    from a release pack, and a pack that carries one is the
+//!    accident this rule exists to catch.
 //!
 //! The check exits 0 on success, 1 on any rule violation, and
 //! prints a one-line summary at the end either way.
@@ -136,7 +143,7 @@ const FACE_REC_DENYLIST: &[&str] = &[
 
 /// Exact `license` values a model entry may declare. AGPL-3.0 and
 /// GPL-3.0 are there because AGENTS.md rule 1 ships YOLO weights under
-/// them and `deny.toml` allows them for the engine.
+/// them, which is compatible with the engine's own AGPL-3.0-or-later.
 const LICENSE_ALLOWLIST: &[&str] = &[
     "Apache-2.0",
     "MIT",
@@ -178,9 +185,19 @@ struct ManifestModel {
     #[serde(default)]
     weights_dataset_license: Option<String>,
     #[serde(default)]
-    dataset_license_waiver: Option<String>,
+    dataset_license_waiver: Option<DatasetLicenseWaiver>,
     #[serde(default)]
     artifacts: Vec<ManifestArtifact>,
+}
+
+/// An explicit, scoped excuse for a `weights_dataset_license` denylist hit.
+#[derive(Debug, Deserialize)]
+struct DatasetLicenseWaiver {
+    /// The exact `weights_dataset_license` string this waiver was written
+    /// for. It applies only while the entry's value still equals this.
+    covers: String,
+    /// Why shipping is accepted.
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,15 +356,19 @@ fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
         }
     }
 
-    // Rule 3: dataset-license deny list, with an explicit waiver.
+    // Rule 3: dataset-license deny list, with an explicit waiver that is
+    // tied to the exact dataset-license string it was written for.
     let waiver = model
         .dataset_license_waiver
-        .as_deref()
-        .filter(|w| !w.trim().is_empty());
-    let mut dataset_hit = None;
+        .as_ref()
+        .filter(|w| !w.reason.trim().is_empty());
+    let mut dataset_hits = None;
     match &model.weights_dataset_license {
         Some(lic) => {
-            dataset_hit = license_denylist_hit(lic).map(|bad| (lic, bad));
+            let hits = license_denylist_hits(lic);
+            if !hits.is_empty() {
+                dataset_hits = Some((lic, hits));
+            }
         }
         None => {
             report.warn(format!(
@@ -356,14 +377,23 @@ fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
             ));
         }
     }
-    match (dataset_hit, waiver) {
-        (Some((lic, bad)), Some(reason)) => report.waive(format!(
-            "model '{}' weights_dataset_license '{}' contains denylisted token '{}' — {}",
-            model.id, lic, bad, reason
+    match (dataset_hits, waiver) {
+        (Some((lic, hits)), Some(w)) if w.covers == *lic => report.waive(format!(
+            "model '{}' weights_dataset_license '{}' contains denylisted {} — {}",
+            model.id,
+            lic,
+            quote_tokens(&hits),
+            w.reason
         )),
-        (Some((lic, bad)), None) => report.error(format!(
-            "model '{}' weights_dataset_license '{}' contains denylisted token '{}'",
-            model.id, lic, bad
+        (Some((lic, _)), Some(w)) => report.error(format!(
+            "model '{}' dataset_license_waiver covers '{}' but weights_dataset_license is now '{}' — re-review the dataset terms and update the waiver's `covers` (and reason)",
+            model.id, w.covers, lic
+        )),
+        (Some((lic, hits)), None) => report.error(format!(
+            "model '{}' weights_dataset_license '{}' contains denylisted {}",
+            model.id,
+            lic,
+            quote_tokens(&hits)
         )),
         (None, _) if model.dataset_license_waiver.is_some() => report.error(format!(
             "model '{}' carries a `dataset_license_waiver` but its weights_dataset_license does not hit the denylist — remove the stale waiver",
@@ -371,6 +401,16 @@ fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
         )),
         (None, _) => {}
     }
+}
+
+/// `token 'a'` or `tokens 'a', 'b'`.
+fn quote_tokens(tokens: &[&str]) -> String {
+    let quoted: Vec<String> = tokens.iter().map(|t| format!("'{t}'")).collect();
+    format!(
+        "token{} {}",
+        if tokens.len() == 1 { "" } else { "s" },
+        quoted.join(", ")
+    )
 }
 
 /// Every regular file under `dir` (recursive, not following symlinked
@@ -429,12 +469,14 @@ fn audit_files(files: &[String], manifest: &Manifest, report: &mut CheckReport) 
     }
 }
 
-fn license_denylist_hit(value: &str) -> Option<&'static str> {
+/// Every denylist token `value` contains, in denylist order.
+fn license_denylist_hits(value: &str) -> Vec<&'static str> {
     let lc = value.to_lowercase();
     LICENSE_DENYLIST
         .iter()
         .copied()
-        .find(|needle| lc.contains(needle))
+        .filter(|needle| lc.contains(needle))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -574,9 +616,14 @@ mod tests {
         assert_eq!(r.warnings.len(), 2);
     }
 
-    fn model_json(license: &str, dataset: &str, waiver: Option<&str>) -> String {
+    /// `waiver` is `(covers, reason)`.
+    fn model_json(license: &str, dataset: &str, waiver: Option<(&str, &str)>) -> String {
         let waiver = waiver
-            .map(|w| format!(r#","dataset_license_waiver":"{w}""#))
+            .map(|(covers, reason)| {
+                format!(
+                    r#","dataset_license_waiver":{{"covers":"{covers}","reason":"{reason}"}}"#
+                )
+            })
             .unwrap_or_default();
         format!(
             r#"{{"models":[{{"id":"x","license":"{license}","weights_dataset_license":"{dataset}"{waiver},"artifacts":[]}}]}}"#
@@ -624,24 +671,89 @@ mod tests {
         );
     }
 
+    const ACADEMIC: &str = "Objects365v1:academic-only";
+    const TWO_HITS: &str = "Objects365v1:academic-only, Flickr30k:non-commercial-research";
+
     #[test]
     fn waiver_turns_a_dataset_hit_into_a_waived_line() {
         let r = audit_manifest(&parse(&model_json(
             "AGPL-3.0",
-            "Objects365v1:academic-only",
-            Some("pending legal review"),
+            ACADEMIC,
+            Some((ACADEMIC, "pending legal review")),
         )));
         assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
         assert_eq!(r.waived.len(), 1);
         assert!(r.waived[0].contains("pending legal review"));
+        assert!(r.waived[0].contains("'academic'"), "{:?}", r.waived);
+    }
+
+    #[test]
+    fn waived_line_names_every_denylisted_token() {
+        let r = audit_manifest(&parse(&model_json(
+            "AGPL-3.0",
+            TWO_HITS,
+            Some((TWO_HITS, "pending legal review")),
+        )));
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+        assert_eq!(r.waived.len(), 1);
+        for token in ["'non-commercial'", "'research'", "'academic'"] {
+            assert!(r.waived[0].contains(token), "{token}: {:?}", r.waived);
+        }
+    }
+
+    #[test]
+    fn unwaived_hit_names_every_denylisted_token() {
+        let r = audit_manifest(&parse(&model_json("AGPL-3.0", TWO_HITS, None)));
+        assert_eq!(r.errors.len(), 1, "errors: {:?}", r.errors);
+        for token in ["'non-commercial'", "'research'", "'academic'"] {
+            assert!(r.errors[0].contains(token), "{token}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn waiver_for_a_different_dataset_license_is_an_error() {
+        // The dataset licence was edited after the waiver was written.
+        let r = audit_manifest(&parse(&model_json(
+            "AGPL-3.0",
+            TWO_HITS,
+            Some((ACADEMIC, "pending legal review")),
+        )));
+        assert!(r.waived.is_empty(), "waived: {:?}", r.waived);
+        assert_eq!(r.errors.len(), 1, "errors: {:?}", r.errors);
+        assert!(r.errors[0].contains(&format!("covers '{ACADEMIC}'")));
+        assert!(r.errors[0].contains(&format!("is now '{TWO_HITS}'")));
+    }
+
+    #[test]
+    fn waiver_covers_must_match_exactly() {
+        // Case and whitespace count: it is a pin, not a pattern.
+        for covers in [
+            "objects365v1:academic-only",
+            "Objects365v1:academic-only ",
+            "Objects365v1",
+        ] {
+            let r = audit_manifest(&parse(&model_json(
+                "AGPL-3.0",
+                ACADEMIC,
+                Some((covers, "pending legal review")),
+            )));
+            assert!(r.waived.is_empty(), "{covers:?}: {:?}", r.waived);
+            assert_eq!(r.errors.len(), 1, "{covers:?}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn string_form_waiver_no_longer_parses() {
+        let json = r#"{"models":[{"id":"x","dataset_license_waiver":"why","artifacts":[]}]}"#;
+        assert!(serde_json::from_str::<Manifest>(json).is_err());
     }
 
     #[test]
     fn empty_waiver_does_not_waive_a_dataset_hit() {
         let r = audit_manifest(&parse(&model_json(
             "AGPL-3.0",
-            "Objects365v1:academic-only",
-            Some("  "),
+            ACADEMIC,
+            Some((ACADEMIC, "  ")),
         )));
         assert!(r.waived.is_empty());
         assert!(r.errors.iter().any(|e| e.contains("academic")));
@@ -651,8 +763,8 @@ mod tests {
     fn waiver_does_not_excuse_a_license_miss() {
         let r = audit_manifest(&parse(&model_json(
             "SSPL-1.0",
-            "Objects365v1:academic-only",
-            Some("pending legal review"),
+            ACADEMIC,
+            Some((ACADEMIC, "pending legal review")),
         )));
         assert_eq!(r.waived.len(), 1);
         assert!(
@@ -665,7 +777,7 @@ mod tests {
     #[test]
     fn waiver_does_not_excuse_missing_fields() {
         let r = audit_manifest(&parse(
-            r#"{"models":[{"id":"x","dataset_license_waiver":"why","artifacts":[]}]}"#,
+            r#"{"models":[{"id":"x","dataset_license_waiver":{"covers":"a","reason":"why"},"artifacts":[]}]}"#,
         ));
         assert_eq!(r.warnings.len(), 2);
         assert!(
@@ -680,7 +792,7 @@ mod tests {
         let r = audit_manifest(&parse(&model_json(
             "AGPL-3.0",
             "COCO:CC-BY-4.0",
-            Some("no longer needed"),
+            Some(("COCO:CC-BY-4.0", "no longer needed")),
         )));
         assert!(r.waived.is_empty());
         assert!(
@@ -759,22 +871,51 @@ mod tests {
         assert_eq!(found, files(&["a.onnx", "sub/b.onnx"]));
     }
 
+    /// Paths under `models/` that git tracks, relative to `models/`. The
+    /// folder also holds out-of-band weights and generator intermediates
+    /// (`/models/*` is gitignored), which differ per machine and must not
+    /// decide a unit test.
+    fn tracked_models_files(root: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["ls-files", "-z", "--", "models"])
+            .current_dir(root)
+            .output()
+            .expect("git must be runnable to list tracked models/ files");
+        assert!(
+            out.status.success(),
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut files: Vec<String> = String::from_utf8(out.stdout)
+            .expect("git paths are utf-8")
+            .split('\0')
+            .filter_map(|p| p.strip_prefix("models/"))
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files
+    }
+
     #[test]
     fn shipping_manifest_is_clean() {
-        // The actual repo manifest and models/ folder must pass the
-        // strict check: no errors, no warnings (every entry declares
-        // both license fields), and no unlisted weight files.
+        // The actual repo manifest and the git-tracked contents of
+        // models/ must pass the strict check: no errors, no warnings
+        // (every entry declares both license fields), and no tracked
+        // weight file outside the manifest. Untracked local files are
+        // deliberately not scanned here; `cargo xtask check-models
+        // --strict` audits a real folder.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask crate has a parent dir");
         let bytes = std::fs::read(root.join("models/models-manifest.json")).expect("readable");
         let manifest: Manifest = serde_json::from_slice(&bytes).expect("manifest parses");
-        let mut r = audit_manifest(&manifest);
-        audit_files(
-            &list_files(&root.join("models")).unwrap(),
-            &manifest,
-            &mut r,
+        let tracked = tracked_models_files(root);
+        assert!(
+            tracked.iter().any(|f| f == "models-manifest.json"),
+            "tracked models/ files: {tracked:?}"
         );
+        let mut r = audit_manifest(&manifest);
+        audit_files(&tracked, &manifest, &mut r);
         assert!(
             r.errors.is_empty() && r.warnings.is_empty(),
             "models/ must pass strict check-models; errors: {:?}, warnings: {:?}",
