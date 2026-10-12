@@ -36,6 +36,7 @@ mod decode_verdict;
 mod delivery_reload;
 mod device_control;
 mod diag_collect;
+mod diag_export;
 mod discovery;
 mod engine_rpc;
 mod entity_local_persist;

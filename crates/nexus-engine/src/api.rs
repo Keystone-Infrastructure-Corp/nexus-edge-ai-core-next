@@ -749,7 +749,7 @@ pub fn router(state: ApiState) -> Router {
         // regardless of bundle size.
         .route(
             "/v1/admin/diagnostics/export",
-            get(crate::admin_runtime::get_diagnostics_export),
+            get(crate::diag_export::get_diagnostics_export),
         )
         // M-Admin Phase 0 cleanup — storage watermark editor.
         // Persists to `engine_runtime_settings.low_watermark_pct`
@@ -1396,7 +1396,7 @@ async fn run_reprobe(
         };
         let sup = crate::camera_reprobe::supervisor_pixels_for(&cam, default_detector_width);
         crate::camera_reprobe::propose_for_camera(&cam, probed, sup, |u| {
-            crate::admin_runtime::redact_url_credentials(u)
+            crate::diag_export::redact_url_credentials(u)
         })
     }))
     .buffer_unordered(MAX_INFLIGHT)
