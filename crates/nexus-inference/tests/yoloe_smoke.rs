@@ -1,4 +1,4 @@
-//! YOLOE (text-mode) ORT smoke test — loads `models/yoloe26_s.onnx` +
+//! YOLOE (text-mode) ORT smoke test — loads `models/yoloe26_s_512x288.onnx` +
 //! the matching `models-manifest.json`, runs it on a synthesized RGB
 //! frame, and verifies the open-vocab session shape works end-to-end.
 //!
@@ -7,7 +7,7 @@
 //!
 //! ```bash
 //! ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
-//!   NEXUS_TEST_YOLOE_MODEL=$PWD/models/yoloe26_s.onnx \
+//!   NEXUS_TEST_YOLOE_MODEL=$PWD/models/yoloe26_s_512x288.onnx \
 //!   NEXUS_TEST_YOLOE_MANIFEST=$PWD/models/models-manifest.json \
 //!   cargo test --locked -p nexus-inference --features ort,ep-cpu \
 //!   yoloe_smoke -- --nocapture
@@ -53,6 +53,18 @@ fn paths() -> Option<(PathBuf, PathBuf)> {
     Some((model, manifest))
 }
 
+/// `(w, h)` from a shipped artifact's `_<w>x<h>.onnx` suffix, so the
+/// session input matches whatever shape the pack file was exported at.
+fn shape_of(model: &std::path::Path) -> (u32, u32) {
+    let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let (w, h) = stem
+        .rsplit('_')
+        .next()
+        .and_then(|s| s.split_once('x'))
+        .expect("model file name must end in _<w>x<h>.onnx");
+    (w.parse().expect("width"), h.parse().expect("height"))
+}
+
 fn synth_frame(w: u32, h: u32) -> Frame {
     // Same shape as yolo_world_smoke — diagonal gradient + vertical bar
     // through the centre so any class-conditioned detector has at least
@@ -94,10 +106,11 @@ async fn yoloe_smoke_runs_on_synthetic_frame() {
         .expect("vocab must load from manifest");
     assert!(!vocab.is_empty(), "manifest yoloe26_s.prompts[] is empty");
 
+    let (mw, mh) = shape_of(&model);
     let det = YoloeDetector::open(
         &model,
-        640,
-        640,
+        mw,
+        mh,
         0.10,
         0.50,
         None,

@@ -444,16 +444,10 @@ jobs:
             -p 'dinov2_s_224.onnx' -p models-manifest.json
 
       # A missing file here must fail the job: the tests below treat it as
-      # "skip, pass". Also exports NEXUS_TEST_PACK, the one env var the
-      # tests that run here read (pack_core_smoke, dinov2_core_smoke).
-      #
-      # NEXUS_TEST_YOLO_MODEL / _YOLOE_MODEL / _YOLO_WORLD_MODEL are
-      # deliberately NOT exported. yolo_smoke, yoloe_smoke and
-      # yolo_world_smoke hard-code a 640x640 input, and no square model has
-      # shipped since pack v5 (M_NATIVE_ASPECT), so against any real pack
-      # file they fail with "invalid dimensions for input: images" rather
-      # than pass. Left unset they skip, as they always have here;
-      # pack_core_smoke covers all three kinds on every shipped shape.
+      # "skip, pass". Also exports the env vars the tests read: NEXUS_TEST_PACK
+      # (pack_core_smoke, dinov2_core_smoke) and the single-file smokes'
+      # model/manifest vars, pointed at the 512x288 artifact of each kind
+      # (the smokes take their input shape from the file name).
       - name: verify model weights and export test env
         run: |
           pack="${RUNNER_TEMP}/model-pack"
@@ -473,7 +467,14 @@ jobs:
             echo "::error::model weights missing after download; the smoke tests would skip silently instead of failing."
             exit 1
           fi
-          echo "NEXUS_TEST_PACK=${pack}" >> "$GITHUB_ENV"
+          {
+            echo "NEXUS_TEST_PACK=${pack}"
+            echo "NEXUS_TEST_YOLO_MODEL=${pack}/yolo26n_512x288.onnx"
+            echo "NEXUS_TEST_YOLOE_MODEL=${pack}/yoloe26_s_512x288.onnx"
+            echo "NEXUS_TEST_YOLOE_MANIFEST=${pack}/models-manifest.json"
+            echo "NEXUS_TEST_YOLO_WORLD_MODEL=${pack}/yolo_world_v2_s_512x288.onnx"
+            echo "NEXUS_TEST_YOLO_WORLD_MANIFEST=${pack}/models-manifest.json"
+          } >> "$GITHUB_ENV"
 
       # This is the only job in this workflow that compiles the gstreamer-gated
       # code, so it is the only place a warning there can fail CI; no clippy in
@@ -564,12 +565,8 @@ jobs:
           # that can execute the rest, which needs the real runtime.
           # `--tests`, not `--lib`: `--lib` skips tests/ entirely, which is
           # where the model-backed smoke tests live. They read
-          # NEXUS_TEST_PACK, exported by the weights step above.
-          # `ensemble_scenario`'s engine-build test is skipped: its header
-          # says it relies on every member resolving to its mock body
-          # ("runs without ORT"), so with `ort` on it gets real detectors
-          # with no pack and asserts a detection the mock would have made.
-          cargo test  --locked -p nexus-inference --features ort,ep-cpu --tests -- --skip ensemble_ppe_plus_visual_uniform_routes_through_engine_build
+          # the NEXUS_TEST_* vars exported by the weights step above.
+          cargo test  --locked -p nexus-inference --features ort,ep-cpu --tests
           # CUDA execution provider: compile-only. No GitHub-hosted runner
           # has an NVIDIA GPU, and the CUDA provider is dlopen'd at session
           # open, so this gates the ep-cuda code path (CUDAExecutionProvider
