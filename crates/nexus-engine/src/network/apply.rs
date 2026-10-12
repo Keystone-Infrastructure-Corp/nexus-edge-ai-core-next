@@ -185,10 +185,15 @@ impl ApplyRegistry {
 
             let token = mint_token();
             let now = Utc::now();
+            #[expect(
+                clippy::unwrap_used,
+                reason = "ROLLBACK_TIMEOUT is a 120 s constant, far inside chrono's range"
+            )]
+            let rollback_after = chrono::Duration::from_std(ROLLBACK_TIMEOUT).unwrap();
             let session = ApplySession {
                 apply_token: token.clone(),
                 started_at: now,
-                rollback_at: now + chrono::Duration::from_std(ROLLBACK_TIMEOUT).unwrap(),
+                rollback_at: now + rollback_after,
             };
 
             let inner = self.inner.clone();

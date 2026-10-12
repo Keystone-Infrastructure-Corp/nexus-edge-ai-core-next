@@ -1105,8 +1105,9 @@ mod intel {
             if let Some(i) = acc.iter().position(|(c, _, _)| *c == class) {
                 &mut acc[i]
             } else {
+                let i = acc.len();
                 acc.push((class, 0, 0));
-                acc.last_mut().expect("just pushed")
+                &mut acc[i]
             }
         }
         for line in content.lines() {
