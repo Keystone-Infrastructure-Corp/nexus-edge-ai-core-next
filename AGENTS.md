@@ -53,13 +53,22 @@ The wedge plan that drives the next three phases of work is
      (DINOv2-S Apache-2.0, OSNet MIT, YOLO* GPL/AGPL upstream) under the engine's AGPL.
 2. **Model-license discipline (`xtask check-models`).** Every file referenced in
    [models/models-manifest.json](models/models-manifest.json) MUST declare two fields:
-   - `license` — resolves to an allowlist `Apache-2.0`, `MIT`, `BSD-3-Clause`,
-     `Apache-2.0 WITH LLVM-exception`. Build fails on `non-commercial`, `research-only`,
-     `unknown`, or any other value.
+   - `license` — an exact match of the allowlist `Apache-2.0`, `MIT`, `BSD-3-Clause`,
+     `Apache-2.0 WITH LLVM-exception`, `AGPL-3.0`, `GPL-3.0` (the last two are the YOLO
+     weights' licences, matching rule 1). Any other value fails the check.
    - `weights_dataset_license` — the license of the training dataset (e.g.
      `LVIS:CC-BY-4.0`, `COCO:CC-BY-4.0`, `LAION-5B:CC-BY-4.0`, `DigiFace-1M:research`).
-     Datasets tagged `research`-only on the dataset side disqualify the weights from
-     shipping, even if the model code itself is permissively licensed.
+     Datasets tagged `research`, `academic`, `non-commercial` (or another denylisted
+     token) on the dataset side disqualify the weights from shipping, even if the model
+     code itself is permissively licensed. The one exception is a model entry that carries
+     a non-empty `dataset_license_waiver` string giving the reason: the hit is then printed
+     as a `waived:` line on every run instead of failing. A waiver never excuses the
+     `license` allowlist, a missing field, or the face-recognition names below, and a
+     waiver on a model whose dataset licence has no hit is an error.
+
+   The check also scans the models directory (`--models-dir`, default the manifest's
+   directory): a weights file that no manifest artifact `path` names fails, whatever its
+   licence, so nothing ships outside these rules.
 
    **HARD product invariant — no face-specific extractor at the edge in v1.** The
    following model names (case-insensitive substring match) fail the check unconditionally:
