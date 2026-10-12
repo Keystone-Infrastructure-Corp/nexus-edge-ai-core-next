@@ -56,6 +56,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
+mod span_cardinality;
+
 /// CLI surface for `cargo xtask <subcommand>`.
 #[derive(Debug, Parser)]
 #[command(name = "xtask", about = "Nexus engine repo maintenance tools")]
@@ -69,6 +71,10 @@ enum Cmd {
     /// Validate models/models-manifest.json against the rules in
     /// AGENTS.md §2. Exits non-zero on any deny-list violation.
     CheckModels(CheckModelsArgs),
+    /// Reject forbidden field keys (secrets, edge-resident URLs,
+    /// per-request / per-frame ids) in `tracing` macros under crates/.
+    /// Exits non-zero on any violation.
+    CheckSpanCardinality,
 }
 
 #[derive(Debug, clap::Args)]
@@ -96,6 +102,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::CheckModels(args) => check_models(args),
+        Cmd::CheckSpanCardinality => {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .context("xtask manifest dir has no parent")?;
+            std::process::exit(span_cardinality::run(root)?);
+        }
     }
 }
 

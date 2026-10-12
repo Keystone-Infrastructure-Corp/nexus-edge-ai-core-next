@@ -25,9 +25,47 @@ Exits non-zero on any error (or warning under `--strict`).
 
 ```yaml
 - name: check models
-  run: cargo xtask check-models
+  run: cargo xtask check-models --strict
 ```
 
-Every model entry now declares both `license` and
-`weights_dataset_license`, so CI can run `--strict`; add
-`--models-dir <path>` to audit downloaded weights.
+Every model entry declares both `license` and `weights_dataset_license`, so
+CI runs `--strict`. The `system-libs` job adds `--models-dir <path>` to audit
+the downloaded weights.
+
+## `cargo xtask check-span-cardinality`
+
+Scans `crates/**/*.rs` for forbidden field keys inside `tracing` event and
+span macros (`trace!` .. `error!`, `event!`, `span!`, `*_span!`) and inside
+`#[instrument(fields(...))]`. Spans reach the cloud through the `TraceLayer`
+and the OTLP exporter, and [`../AGENTS.md`](../AGENTS.md) rule 6 keeps camera
+credentials and RTSP / sink locations on the box, so these keys are blocked at
+the source.
+
+| Key | Why |
+| --- | --- |
+| `password`, `secret`, `token`, `api_key`, `credential`, `credentials` | Credential leak. Same names the engine's diagnostics redactor treats as secret. |
+| `url`, `endpoint` | A camera's `ingest.url` is stored with `user:pass@` userinfo and was being logged under `url`; ONVIF and sink `endpoint`s are customer infrastructure. |
+| `request_id`, `frame_id`, `trace_id` | One fresh value per request or frame: unbounded cardinality as an exported span attribute. |
+
+Matched forms: `key = expr`, `key = %expr`, `key = ?expr`, `"key" = expr`,
+and the shorthand `key,`. Dotted keys match on the last segment. In an event
+macro everything after the first string literal is the message and is not
+inspected; in a span macro that string is the span name and fields follow it.
+Not covered: `Span::record("key", ..)` and the implicit argument capture of a
+bare `#[instrument]`.
+
+Prints `file:line:key` for each violation and exits non-zero. To allow a
+site, put a comment containing `allow: span-cardinality` and a specific
+reason on the key's line or the line directly above it:
+
+```rust
+// allow: span-cardinality trace_id (root frame.lifecycle span only)
+trace_id = %trace_id,
+```
+
+### CI integration
+
+```yaml
+- name: check span cardinality
+  run: cargo xtask check-span-cardinality
+```

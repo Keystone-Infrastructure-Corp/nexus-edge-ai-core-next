@@ -167,8 +167,8 @@ They bias toward caution over speed — for a typo or an obvious one-liner, use 
    Turn imperative tasks into verifiable goals — "fix the bug" becomes "write a test that
    reproduces it, then make it pass". For multi-step work state the plan as `step → verify:`
    pairs, where each verify names a real gate (`cargo test --workspace`, `cargo clippy
-   --workspace --all-targets -- -D warnings`, `cargo xtask check-models`, the `nexus-types`
-   TS-binding drift check) rather than "make it work". Remember macOS-local clippy does not
+   --workspace --all-targets -- -D warnings`, `cargo xtask check-models`, `cargo xtask
+   check-span-cardinality`, the `nexus-types` TS-binding drift check) rather than "make it work". Remember macOS-local clippy does not
    cover the Linux-gated paths — a green local run is a weaker verify than CI.
 
 ### Debugging and review
@@ -218,6 +218,7 @@ Rust, from the repo root:
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Test: `cargo test --workspace`
 - Model licences: `cargo xtask check-models`
+- Span field keys: `cargo xtask check-span-cardinality`
 - Generated TS bindings: `cargo test -p nexus-types --features ts`, then confirm
   `ui/src/api/types/` has no diff — CI fails on drift
 
@@ -336,7 +337,8 @@ implementation notes, do cross-link ADR/SPEC/BUG records that relate to each oth
    `[Phase N · Step M] <verb> <object>` for wedge work that maps to a phase number.
 3. CI gates that must be green: `cargo fmt --check`, `cargo check` + `cargo clippy
    --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
-   `cargo xtask check-models`, and the `nexus-types` TS-binding drift check. The
+   `cargo xtask check-models`, `cargo xtask check-span-cardinality`, and the `nexus-types`
+   TS-binding drift check. The
    GStreamer + ORT integration jobs run on Linux. There is **no `cargo deny`
    gate here** — this repo has no `deny.toml`; licence discipline (Rule 1) is
    enforced by review, unlike the cloud repo where `cargo deny check` is CI.
