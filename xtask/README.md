@@ -51,12 +51,26 @@ Matched forms: `key = expr`, `key = %expr`, `key = ?expr`, `"key" = expr`,
 and the shorthand `key,`. Dotted keys match on the last segment. In an event
 macro everything after the first string literal is the message and is not
 inspected; in a span macro that string is the span name and fields follow it.
-Not covered: `Span::record("key", ..)` and the implicit argument capture of a
-bare `#[instrument]`.
+
+A value rule backs the key list: the camera URL can come back under another key
+(`rtsp_url = %cam.ingest.url`) or as a message argument
+(`info!("connecting to {}", cam.ingest.url)`). Inside the same macro forms, any
+argument whose expression contains `ingest.url` is flagged under the key
+`ingest.url` (field values, message format arguments, and nested non-tracing
+macros such as `format!`; text in string literals and comments is ignored).
+
+Limits: the gate matches names and that one value shape, not secrets. Another
+secret logged under a key that is not in the table above is not caught, nor is
+a credential bound to a local and logged as `x = %local`. Suffix matching was
+rejected on purpose, because it would flag `profile_token` (an ONVIF profile
+name). Also not covered: `Span::record("key", ..)` and the implicit argument
+capture of a bare `#[instrument]`.
 
 Prints `file:line:key` for each violation and exits non-zero. To allow a
-site, put a comment containing `allow: span-cardinality` and a specific
-reason on the key's line or the line directly above it:
+site, put a comment containing `allow: span-cardinality <key>` and a specific
+reason on the violation's line or the line directly above it. The marker must
+name the key it excuses (`ingest.url` for the value rule); a bare marker, or a
+marker for a different key, suppresses nothing:
 
 ```rust
 // allow: span-cardinality trace_id (root frame.lifecycle span only)

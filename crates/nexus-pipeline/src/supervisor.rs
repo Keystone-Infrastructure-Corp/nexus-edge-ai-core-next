@@ -360,6 +360,7 @@ async fn run_camera(
         "camera.pipeline",
         camera_id = cfg.id,
         camera_name = %cfg.name,
+        // allow: span-cardinality ingest.url (scheme() only: no host, no userinfo, a handful of values)
         scheme = %cfg.ingest.url.scheme(),
     );
     async {

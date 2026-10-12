@@ -29,14 +29,34 @@
 //! string is the span name and fields follow it. Other macros (`format!`, `println!`,
 //! `my_info!`) are never inspected.
 //!
-//! Known limits: `Span::record("key", ..)` calls and the implicit
-//! per-argument capture of a bare `#[instrument]` are not inspected.
+//! ## The value rule
+//!
+//! Field keys alone do not catch the credential-bearing camera URL: it can
+//! be logged under another key (`rtsp_url = %cam.ingest.url`) or as a message
+//! argument (`info!("connecting to {}", cam.ingest.url)`). So, inside the same
+//! tracing macro forms, any argument whose expression contains `ingest.url`
+//! is flagged too, under the key `ingest.url`: a field value, a message
+//! format argument, or an argument of a nested non-tracing macro such as
+//! `format!`. Text inside string literals and comments is not an expression
+//! and is ignored.
+//!
+//! ## Known limits
+//!
+//! - The gate matches names and one value shape, not secrets. Another secret
+//!   logged under a key that is not in [`FORBIDDEN_KEYS`] (a `pass` field, a
+//!   bearer header under `auth`, a credential bound to a local first and then
+//!   logged as `x = %local`) is not caught. Suffix matching was rejected on
+//!   purpose: it would flag `profile_token`, an ONVIF profile name.
+//! - `Span::record("key", ..)` calls and the implicit per-argument capture of
+//!   a bare `#[instrument]` are not inspected.
 //!
 //! ## Escape hatch
 //!
 //! A site that genuinely needs a forbidden key carries a comment containing
-//! `allow: span-cardinality` followed by a specific reason, on the line of
-//! the key or on the line directly above it:
+//! `allow: span-cardinality <key>` followed by a specific reason, on the line
+//! of the violation or on the line directly above it. The marker must name
+//! the key it excuses (`ingest.url` for the value rule), so a bare marker
+//! excuses nothing and a marker for one key never covers another:
 //!
 //! ```text
 //! // allow: span-cardinality trace_id (one span per request, not per frame)
@@ -47,8 +67,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Marker that suppresses a violation on its own line or the next one.
+/// Marker that suppresses a violation on its own line or the next one, when
+/// it is followed by the violation's key.
 const ALLOW_MARKER: &str = "allow: span-cardinality";
+
+/// The value rule: an argument expression containing this path is flagged,
+/// whatever key it is logged under. A camera's `ingest.url` is stored with
+/// `user:pass@` userinfo intact.
+const VALUE_RULE_NEEDLE: &str = "ingest.url";
 
 /// Field keys that must not appear on tracing macros, with the reason each
 /// is here. Keep this list small: a key belongs only if it has a concrete
@@ -141,7 +167,8 @@ pub fn run(root: &Path) -> Result<i32> {
     } else {
         eprintln!(
             "check-span-cardinality: {} violation(s). Remove the field, or add \
-             `// {ALLOW_MARKER} <reason>` on the line or the line above.",
+             `// {ALLOW_MARKER} <key> <reason>` naming the key, on the line or the \
+             line above.",
             violations.len()
         );
         Ok(1)
@@ -316,8 +343,9 @@ fn skip_trivia(b: &[u8], mut i: usize, end: usize) -> usize {
 }
 
 enum ArgKind {
-    /// A field with this key, starting at the given offset.
-    Field(String, usize),
+    /// A field with this key, starting at the given offset; the last item is
+    /// the offset where its value expression starts (`None` for shorthand).
+    Field(String, usize, Option<usize>),
     /// A string literal that is not a key: the message. Fields are over.
     Message,
     /// Anything else (`target: ..`, `Level::INFO`, `parent: ..`).
@@ -331,12 +359,14 @@ fn classify_arg(src: &str, start: usize, end: usize) -> ArgKind {
         return ArgKind::Other;
     }
     let key_start = i;
+    let mut value_start = None;
 
     let key: String = if b[i] == b'"' {
         let close = skip_string(b, i + 1);
         let raw = &src[i + 1..close.saturating_sub(1).max(i + 1)];
         i = skip_trivia(b, close, end);
         if i < end && b[i] == b'=' && b.get(i + 1) != Some(&b'=') {
+            value_start = Some(i + 1);
             raw.to_string()
         } else {
             return ArgKind::Message;
@@ -360,13 +390,14 @@ fn classify_arg(src: &str, start: usize, end: usize) -> ArgKind {
             if !is_assign {
                 return ArgKind::Other;
             }
+            value_start = Some(rest + 1);
         }
         name.to_string()
     };
 
     // Dotted keys match on the last segment.
     let last = key.rsplit('.').next().unwrap_or(&key).to_string();
-    ArgKind::Field(last, key_start)
+    ArgKind::Field(last, key_start, value_start)
 }
 
 fn line_of(src: &str, offset: usize) -> usize {
@@ -377,9 +408,46 @@ fn line_of(src: &str, offset: usize) -> usize {
         + 1
 }
 
-fn has_marker(lines: &[&str], line: usize) -> bool {
+/// Whether `text` holds `allow: span-cardinality <key>`, with `key` ending at
+/// a token boundary (so `url` does not match `url_base`).
+fn marker_names_key(text: &str, key: &str) -> bool {
+    let mut rest = text;
+    while let Some(at) = rest.find(ALLOW_MARKER) {
+        rest = &rest[at + ALLOW_MARKER.len()..];
+        let named = rest.trim_start();
+        if let Some(after) = named.strip_prefix(key) {
+            if !after.bytes().next().is_some_and(|c| is_ident_byte(c) || c == b'.') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_marker(lines: &[&str], line: usize, key: &str) -> bool {
     let idx = line - 1;
-    lines[idx].contains(ALLOW_MARKER) || (idx > 0 && lines[idx - 1].contains(ALLOW_MARKER))
+    marker_names_key(lines[idx], key) || (idx > 0 && marker_names_key(lines[idx - 1], key))
+}
+
+/// Offset of the first `ingest.url` in the code (not strings or comments) of
+/// `b[start..end]`, on identifier boundaries.
+fn find_value_needle(b: &[u8], start: usize, end: usize) -> Option<usize> {
+    let needle = VALUE_RULE_NEEDLE.as_bytes();
+    let mut i = start;
+    while i < end {
+        if let Some(next) = skip_opaque(b, i) {
+            i = next;
+            continue;
+        }
+        if b[i..end].starts_with(needle)
+            && (i == 0 || !is_ident_byte(b[i - 1]))
+            && !b.get(i + needle.len()).is_some_and(|&c| is_ident_byte(c))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Inspect the fields inside `b[start..end]` (the contents of a macro's
@@ -392,19 +460,36 @@ fn check_args(
     fields_after_string: bool,
     out: &mut Vec<(usize, String)>,
 ) {
-    for (a, z) in split_args(src.as_bytes(), start, end) {
-        match classify_arg(src, a, z) {
-            ArgKind::Field(key, at) => {
-                if keys.contains(&key.as_str()) {
-                    let line = line_of(src, at);
-                    if !has_marker(lines, line) {
-                        out.push((line, key));
+    let b = src.as_bytes();
+    // In an event macro, arguments after the message are format arguments:
+    // not fields, but still subject to the value rule.
+    let mut past_message = false;
+    for (a, z) in split_args(b, start, end) {
+        let mut value_from = Some(a);
+        if !past_message {
+            match classify_arg(src, a, z) {
+                ArgKind::Field(key, at, value_start) => {
+                    if keys.contains(&key.as_str()) {
+                        let line = line_of(src, at);
+                        if !has_marker(lines, line, &key) {
+                            out.push((line, key));
+                        }
                     }
+                    // Shorthand `cam.ingest.url` is already a `url` key.
+                    value_from = value_start;
+                }
+                ArgKind::Message if fields_after_string => {}
+                ArgKind::Message => past_message = true,
+                ArgKind::Other => {}
+            }
+        }
+        if let Some(from) = value_from {
+            if let Some(at) = find_value_needle(b, from, z) {
+                let line = line_of(src, at);
+                if !has_marker(lines, line, VALUE_RULE_NEEDLE) {
+                    out.push((line, VALUE_RULE_NEEDLE.to_string()));
                 }
             }
-            ArgKind::Message if fields_after_string => {}
-            ArgKind::Message => break,
-            ArgKind::Other => {}
         }
     }
 }
@@ -454,6 +539,9 @@ pub fn scan_source(src: &str, keys: &[&str]) -> Vec<(usize, String)> {
         }
         i += 1;
     }
+    // A nested tracing macro is reached from its parent's arguments too.
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -587,26 +675,101 @@ mod tests {
     #[test]
     fn allow_marker_on_same_line() {
         let src =
-            "info!(\n    trace_id = %t, // allow: span-cardinality one per run\n    \"m\",\n);";
+            "info!(\n    trace_id = %t, // allow: span-cardinality trace_id one per run\n    \"m\",\n);";
         assert!(scan(src).is_empty());
     }
 
     #[test]
     fn allow_marker_on_line_above() {
-        let src = "info!(\n    // allow: span-cardinality one per run\n    trace_id = %t,\n    \"m\",\n);";
+        let src = "info!(\n    // allow: span-cardinality trace_id one per run\n    trace_id = %t,\n    \"m\",\n);";
         assert!(scan(src).is_empty());
     }
 
     #[test]
     fn allow_marker_two_lines_up_does_not_suppress() {
-        let src = "// allow: span-cardinality too far\n\ninfo!(trace_id = %t, \"m\");";
+        let src = "// allow: span-cardinality trace_id too far\n\ninfo!(trace_id = %t, \"m\");";
         assert_eq!(keys_of(src), ["trace_id"]);
     }
 
     #[test]
     fn allow_marker_covers_only_its_key() {
-        let src = "info!(\n    // allow: span-cardinality ok\n    trace_id = %t,\n    token = %k,\n    \"m\",\n);";
+        let src = "info!(\n    // allow: span-cardinality trace_id ok\n    trace_id = %t,\n    token = %k,\n    \"m\",\n);";
         assert_eq!(scan(src), [(4, "token".to_string())]);
+    }
+
+    #[test]
+    fn allow_marker_must_name_the_key() {
+        // A bare marker excuses nothing.
+        let src = "info!(\n    // allow: span-cardinality one per run\n    trace_id = %t,\n    \"m\",\n);";
+        assert_eq!(keys_of(src), ["trace_id"]);
+        // A marker for another key excuses nothing.
+        let src = "// allow: span-cardinality token reason\ninfo!(trace_id = %t, \"m\");";
+        assert_eq!(keys_of(src), ["trace_id"]);
+        // A key that merely starts with the named one does not match it.
+        let src = "// allow: span-cardinality trace_id_v2 reason\ninfo!(trace_id = %t, \"m\");";
+        assert_eq!(keys_of(src), ["trace_id"]);
+        // The key may be followed by punctuation.
+        let src = "// allow: span-cardinality trace_id: reason\ninfo!(trace_id = %t, \"m\");";
+        assert!(scan(src).is_empty());
+    }
+
+    #[test]
+    fn value_rule_flags_camera_url_under_another_key() {
+        assert_eq!(
+            scan("info!(source = %cam.ingest.url, \"x\");"),
+            [(1, "ingest.url".to_string())]
+        );
+        assert_eq!(
+            keys_of("warn_span!(\"x\", src = ?cfg.ingest.url.clone());"),
+            ["ingest.url"]
+        );
+        assert_eq!(
+            keys_of("#[instrument(fields(src = %cam.ingest.url))]\nfn f() {}"),
+            ["ingest.url"]
+        );
+    }
+
+    #[test]
+    fn value_rule_flags_message_format_args() {
+        assert_eq!(
+            scan("info!(\"connecting to {}\", cam.ingest.url);"),
+            [(1, "ingest.url".to_string())]
+        );
+        assert_eq!(
+            keys_of("error!(camera_id = %id, \"failed {}\", format!(\"{}\", cam.ingest.url));"),
+            ["ingest.url"]
+        );
+        assert_eq!(
+            keys_of("info!(\"connecting to {u}\", u = cam.ingest.url);"),
+            ["ingest.url"]
+        );
+    }
+
+    #[test]
+    fn value_rule_reports_the_line_and_honours_a_named_marker() {
+        let src = "info!(\n    camera_id,\n    src = %cam.ingest.url,\n    \"m\",\n);";
+        assert_eq!(scan(src), [(3, "ingest.url".to_string())]);
+        let src = "info!(\n    // allow: span-cardinality ingest.url redacted upstream\n    src = %cam.ingest.url,\n    \"m\",\n);";
+        assert!(scan(src).is_empty());
+        // The `url` key marker does not cover the value rule.
+        let src = "info!(\n    // allow: span-cardinality url reason\n    src = %cam.ingest.url,\n    \"m\",\n);";
+        assert_eq!(keys_of(src), ["ingest.url"]);
+    }
+
+    #[test]
+    fn value_rule_is_precise() {
+        // Only the tracing macros are inspected.
+        assert!(scan("let s = format!(\"{}\", cam.ingest.url);").is_empty());
+        assert!(scan("println!(\"{}\", cam.ingest.url);").is_empty());
+        assert!(scan("my_info!(src = cam.ingest.url);").is_empty());
+        // Not a different path, and not text in a string or comment.
+        assert!(scan("info!(src = %cam.my_ingest.url, \"m\");").is_empty());
+        assert!(scan("info!(src = %cam.ingest.url_kind, \"m\");").is_empty());
+        assert!(scan("info!(\"see ingest.url\", camera_id);").is_empty());
+        assert!(scan("info!(camera_id, /* ingest.url */ \"m\");").is_empty());
+        // An unrelated ingest field is fine, and the profile token is not
+        // a secret key (no suffix matching).
+        assert!(scan("info!(mode = %cam.ingest.mode, profile_token = %p, \"m\");").is_empty());
     }
 
     #[test]
