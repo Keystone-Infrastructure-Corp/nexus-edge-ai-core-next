@@ -620,9 +620,7 @@ mod tests {
     fn model_json(license: &str, dataset: &str, waiver: Option<(&str, &str)>) -> String {
         let waiver = waiver
             .map(|(covers, reason)| {
-                format!(
-                    r#","dataset_license_waiver":{{"covers":"{covers}","reason":"{reason}"}}"#
-                )
+                format!(r#","dataset_license_waiver":{{"covers":"{covers}","reason":"{reason}"}}"#)
             })
             .unwrap_or_default();
         format!(

@@ -416,7 +416,11 @@ fn marker_names_key(text: &str, key: &str) -> bool {
         rest = &rest[at + ALLOW_MARKER.len()..];
         let named = rest.trim_start();
         if let Some(after) = named.strip_prefix(key) {
-            if !after.bytes().next().is_some_and(|c| is_ident_byte(c) || c == b'.') {
+            if !after
+                .bytes()
+                .next()
+                .is_some_and(|c| is_ident_byte(c) || c == b'.')
+            {
                 return true;
             }
         }
