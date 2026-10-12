@@ -26,3 +26,6 @@ chrono = { workspace = true }
 # and `deny_unknown_fields`-clean by construction.
 nexus-config = { workspace = true }
 toml = { workspace = true }
+
+[lints]
+workspace = true

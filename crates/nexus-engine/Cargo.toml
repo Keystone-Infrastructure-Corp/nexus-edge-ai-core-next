@@ -320,3 +320,6 @@ sqlx = { workspace = true }
 # can validate the live HTTP code-path, not just a mocked
 # in-memory fetcher.
 wiremock = { workspace = true }
+
+[lints]
+workspace = true

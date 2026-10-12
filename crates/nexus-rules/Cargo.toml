@@ -19,3 +19,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 arc-swap = { workspace = true }
+
+[lints]
+workspace = true

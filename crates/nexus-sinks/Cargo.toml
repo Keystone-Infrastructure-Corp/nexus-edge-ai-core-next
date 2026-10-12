@@ -104,3 +104,6 @@ wiremock = { workspace = true }
 # pull tokio's `macros` + `rt-multi-thread` via the workspace alias,
 # so just re-declaring the dep here is enough for `#[tokio::test]`.
 tokio = { workspace = true }
+
+[lints]
+workspace = true

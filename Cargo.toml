@@ -348,6 +348,19 @@ futures-util = { version = "0.3", default-features = false, features = [
 
 nexus-pipeline = { path = "crates/nexus-pipeline" }
 
+[workspace.lints.clippy]
+# Mirrors the cloud repo's Tier-1 clippy policy. Edge deliberately does not
+# adopt `pedantic`/`nursery` or a `[workspace.lints.rust]` table (FFI needs
+# `unsafe`). Every member crate opts in with `[lints] workspace = true`.
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"                    # allow with a justification (`#[expect(.., reason = ..)]`)
+panic = "warn"
+todo = "warn"
+dbg_macro = "deny"
+print_stdout = "warn"                   # use tracing
+print_stderr = "warn"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
