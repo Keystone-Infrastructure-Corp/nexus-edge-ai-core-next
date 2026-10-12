@@ -23,7 +23,12 @@
 //!
 //! Recognised forms: `key = expr`, `key = %expr`, `key = ?expr`,
 //! `"key" = expr`, and the shorthand `key,` / `%key,` / `?key,`. A dotted
-//! key (`conn.token`) is matched on its last segment. In an event macro
+//! key (`conn.token`) is matched on its last segment. An event macro also
+//! accepts its fields as a braced group before the message
+//! (`info!({token = %t}, "msg")`, `event!(Level::INFO, {token = %t}, "msg")`);
+//! the group is split into fields and checked like bare ones. The span macros
+//! do not accept that form (a braced argument there is a block expression),
+//! so it is not read as fields. In an event macro
 //! everything after the first string-literal argument is the message and
 //! its format arguments, not fields, and is ignored; in a span macro that
 //! string is the span name and fields follow it. Other macros (`format!`, `println!`,
@@ -348,6 +353,9 @@ enum ArgKind {
     Field(String, usize, Option<usize>),
     /// A string literal that is not a key: the message. Fields are over.
     Message,
+    /// A braced field group, `{ a = 1, b = %c }`: the offsets of its
+    /// contents. Only event macros accept one in the field position.
+    Group(usize, usize),
     /// Anything else (`target: ..`, `Level::INFO`, `parent: ..`).
     Other,
 }
@@ -357,6 +365,14 @@ fn classify_arg(src: &str, start: usize, end: usize) -> ArgKind {
     let mut i = skip_trivia(b, start, end);
     if i >= end {
         return ArgKind::Other;
+    }
+    if b[i] == b'{' {
+        // `{ fields }` is the whole argument, not the head of an expression
+        // such as `{ a }.b`.
+        return match matching_close(b, i) {
+            Some(close) if skip_trivia(b, close + 1, end) >= end => ArgKind::Group(i + 1, close),
+            _ => ArgKind::Other,
+        };
     }
     let key_start = i;
     let mut value_start = None;
@@ -455,7 +471,8 @@ fn find_value_needle(b: &[u8], start: usize, end: usize) -> Option<usize> {
 }
 
 /// Inspect the fields inside `b[start..end]` (the contents of a macro's
-/// parentheses, or of a `fields(...)` group).
+/// parentheses, a `fields(...)` group, or an event macro's braced field
+/// group).
 fn check_args(
     src: &str,
     lines: &[&str],
@@ -481,6 +498,15 @@ fn check_args(
                     }
                     // Shorthand `cam.ingest.url` is already a `url` key.
                     value_from = value_start;
+                }
+                ArgKind::Group(inner_start, inner_end) => {
+                    // A braced group is a field list, and only an event
+                    // macro treats it as one: in a span macro it is a block
+                    // expression, so it stays an ordinary argument.
+                    if !fields_after_string {
+                        check_args(src, lines, keys, (inner_start, inner_end), false, out);
+                        value_from = None;
+                    }
                 }
                 ArgKind::Message if fields_after_string => {}
                 ArgKind::Message => past_message = true,
@@ -816,6 +842,105 @@ mod tests {
     fn nested_macro_in_args_is_scanned() {
         assert_eq!(
             keys_of("let s = info_span!(\"x\", n = { debug!(token = 1); 2 });"),
+            ["token"]
+        );
+    }
+
+    #[test]
+    fn braced_field_group_in_a_level_macro_is_flagged() {
+        assert_eq!(
+            keys_of("tracing::info!({token = %secret}, \"connecting\");"),
+            ["token"]
+        );
+        for m in ["trace", "debug", "info", "warn", "error"] {
+            let src = format!("fn f() {{ {m}!({{token = %t}}, \"msg\"); }}");
+            assert_eq!(keys_of(&src), ["token"], "{m}!");
+        }
+    }
+
+    #[test]
+    fn braced_field_group_in_event_is_flagged() {
+        // Both reviewer cases, against the real key list.
+        let hits = |src: &str| -> Vec<String> {
+            scan_source(src, FORBIDDEN_KEYS)
+                .into_iter()
+                .map(|(_, k)| k)
+                .collect()
+        };
+        assert_eq!(
+            hits("tracing::info!({token = %secret}, \"connecting\");"),
+            ["token"]
+        );
+        assert_eq!(
+            hits("tracing::event!(tracing::Level::INFO, {password = %secret}, \"connecting\");"),
+            ["password"]
+        );
+        assert_eq!(
+            keys_of("event!(target: \"a\", Level::INFO, {n = 1, trace_id = %t}, \"m\");"),
+            ["trace_id"]
+        );
+    }
+
+    #[test]
+    fn braced_field_group_covers_key_forms_and_reports_the_key_line() {
+        assert_eq!(keys_of("info!({\"token\" = 1, n = 2}, \"m\");"), ["token"]);
+        assert_eq!(keys_of("info!({n = 1, ?token}, \"m\");"), ["token"]);
+        assert_eq!(keys_of("info!({n = 1, c.token}, \"m\");"), ["token"]);
+        assert_eq!(
+            scan("info!({\n    n = 1,\n    token = %t,\n}, \"m\");"),
+            [(3, "token".to_string())]
+        );
+    }
+
+    #[test]
+    fn braced_field_group_gets_the_value_rule() {
+        assert_eq!(
+            keys_of("info!({rtsp_url = %cam.ingest.url}, \"m\");"),
+            ["ingest.url", "rtsp_url"]
+        );
+        assert_eq!(
+            keys_of("info!({n = %cam.ingest.url}, \"m\");"),
+            ["ingest.url"]
+        );
+    }
+
+    #[test]
+    fn braced_field_group_honours_the_escape_hatch() {
+        let src = "info!({\n    // allow: span-cardinality token (test fixture)\n    token = 1,\n}, \"m\");";
+        assert!(scan(src).is_empty());
+        let src = "info!({\n    // allow: span-cardinality trace_id (other key)\n    token = 1,\n}, \"m\");";
+        assert_eq!(keys_of(src), ["token"]);
+    }
+
+    #[test]
+    fn braced_field_group_with_only_allowed_fields_is_clean() {
+        assert!(scan("tracing::info!({camera_id = %c, n = 1}, \"m\");").is_empty());
+        assert!(scan("event!(Level::INFO, {camera_id = %c, ?n}, \"m\");").is_empty());
+        assert!(scan("info!({}, \"m\");").is_empty());
+    }
+
+    #[test]
+    fn braces_after_the_message_are_not_fields() {
+        assert!(scan("info!(\"m {}\", { token = 1 });").is_empty());
+        assert!(scan("info!(n = 1, \"m\", { token });").is_empty());
+    }
+
+    #[test]
+    fn braced_expression_is_not_a_field_group() {
+        // `{ token }.len()` is an expression, not a group of fields.
+        assert!(scan("info!(n = { token }.len(), \"m\");").is_empty());
+        assert!(scan("info!({ token }.len(), \"m\");").is_empty());
+    }
+
+    #[test]
+    fn span_macros_do_not_take_braced_field_groups() {
+        // tracing 0.1.44 rejects `{ k = v }` after a span name (it is parsed
+        // as a block expression), so there is no group to read as fields.
+        assert!(scan("let _s = info_span!(\"x\", { token = 1 });").is_empty());
+        assert!(scan("let _s = span!(Level::INFO, \"x\", { token = 1 });").is_empty());
+        // Fields outside the braces are still read.
+        assert_eq!(
+            keys_of("let _s = info_span!(\"x\", { 1 }, token = 1);"),
             ["token"]
         );
     }

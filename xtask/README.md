@@ -60,9 +60,13 @@ the source.
 | `request_id`, `frame_id`, `trace_id` | One fresh value per request or frame: unbounded cardinality as an exported span attribute. |
 
 Matched forms: `key = expr`, `key = %expr`, `key = ?expr`, `"key" = expr`,
-and the shorthand `key,`. Dotted keys match on the last segment. In an event
-macro everything after the first string literal is the message and is not
-inspected; in a span macro that string is the span name and fields follow it.
+and the shorthand `key,`. Dotted keys match on the last segment. An event
+macro may also take its fields as a braced group before the message
+(`info!({token = %t}, "msg")`, `event!(Level::INFO, {token = %t}, "msg")`);
+the group is split into fields and checked like bare ones (span macros do not
+accept that form). In an event macro everything after the first string literal
+is the message and is not inspected; in a span macro that string is the span
+name and fields follow it.
 
 A value rule backs the key list: the camera URL can come back under another key
 (`rtsp_url = %cam.ingest.url`) or as a message argument
