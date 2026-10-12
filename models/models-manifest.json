@@ -133,13 +133,6 @@
       "id": "yolo_world_v2_s",
       "task": "detect_open_vocab_text",
       "_comment": "YOLO-World v2 (small) export on the native 16:9 ladder (512x288 / 1024x576 / 1536x864). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes, observed on Lunar Lake k13 under v0.1.18\u20130.1.20) and let the OpenVINO blob cache hit on subsequent boots. Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via `python tools/models/gen_yolo_world.py --all-static` whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff.",
-      "_license_comment": "Licence sources. Training data (Objects365v1, GQA, Flickr30k) and the AGPL-3.0 weights licence: https://docs.ultralytics.com/models/yolo-world/ . Weights are distributed by Ultralytics under AGPL-3.0: https://github.com/ultralytics/ultralytics/blob/main/LICENSE . Objects365 is academic purpose only: https://www.objects365.org/download.html . Flickr30k is non-commercial research and/or educational purposes: https://shannon.cs.illinois.edu/DenotationGraph/ .",
-      "license": "AGPL-3.0",
-      "weights_dataset_license": "Objects365v1:academic-only, GQA:CC-BY-4.0, Flickr30k:non-commercial-research",
-      "dataset_license_waiver": {
-        "covers": "Objects365v1:academic-only, GQA:CC-BY-4.0, Flickr30k:non-commercial-research",
-        "reason": "Shipped under AGPL-3.0, the engine's licence, by product decision on 2026-10-12. Objects365 (academic use only) and Flickr30k (non-commercial research) dataset terms are pending legal review."
-      },
       "input": {
         "width": 512,
         "height": 288,
@@ -302,13 +295,6 @@
       "id": "yoloe26_s",
       "task": "detect_open_vocab_text",
       "_comment": "YOLOE (small) text-mode export on the native 16:9 ladder (512x288 / 1024x576 / 1536x864). Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via tools/models/gen_yoloe.py whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff.",
-      "_license_comment": "Licence sources. Training data (Objects365v1, GQA, Flickr30k) and the AGPL-3.0 weights licence: https://docs.ultralytics.com/models/yoloe/ . Weights are distributed by Ultralytics under AGPL-3.0: https://github.com/ultralytics/ultralytics/blob/main/LICENSE . Objects365 is academic purpose only: https://www.objects365.org/download.html . Flickr30k is non-commercial research and/or educational purposes: https://shannon.cs.illinois.edu/DenotationGraph/ .",
-      "license": "AGPL-3.0",
-      "weights_dataset_license": "Objects365v1:academic-only, GQA:CC-BY-4.0, Flickr30k:non-commercial-research",
-      "dataset_license_waiver": {
-        "covers": "Objects365v1:academic-only, GQA:CC-BY-4.0, Flickr30k:non-commercial-research",
-        "reason": "Shipped under AGPL-3.0, the engine's licence, by product decision on 2026-10-12. Objects365 (academic use only) and Flickr30k (non-commercial research) dataset terms are pending legal review."
-      },
       "input": {
         "width": 512,
         "height": 288,

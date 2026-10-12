@@ -60,14 +60,7 @@ The wedge plan that drives the next three phases of work is
      `LVIS:CC-BY-4.0`, `COCO:CC-BY-4.0`, `LAION-5B:CC-BY-4.0`, `DigiFace-1M:research`).
      Datasets tagged `research`, `academic`, `non-commercial` (or another denylisted
      token) on the dataset side disqualify the weights from shipping, even if the model
-     code itself is permissively licensed. The one exception is a model entry that carries
-     a `dataset_license_waiver` object `{ "covers": "<its exact weights_dataset_license>",
-     "reason": "<text>" }` with a non-empty reason: the hit is then printed as a `waived:`
-     line naming every token hit, on every run, instead of failing. The waiver applies only
-     while `covers` equals the entry's `weights_dataset_license` exactly (a mismatch is an
-     error), so editing the dataset licence cannot ride an old waiver. A waiver never
-     excuses the `license` allowlist, a missing field, or the face-recognition names below,
-     and a waiver on a model whose dataset licence has no hit is an error.
+     code itself is permissively licensed. A dataset-licence hit is always an error.
 
    The check also scans the models directory (`--models-dir`, default the manifest's
    directory): a weights file that no manifest artifact `path` names fails, whatever its
