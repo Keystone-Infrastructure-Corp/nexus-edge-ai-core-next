@@ -18,7 +18,7 @@ test.describe("admin: server", () => {
 
     // Live editors landed in Phase 0 closeout — bind address +
     // storage watermarks now have inline forms.
-    await expect(page.getByLabel(/change bind address/i)).toBeVisible();
+    await expect(page.getByLabel(/primary bind address/i)).toBeVisible();
     await expect(page.getByText(/storage watermarks/i).first()).toBeVisible();
     await expect(page.getByLabel(/low watermark/i)).toBeVisible();
     await expect(page.getByLabel(/panic watermark/i)).toBeVisible();

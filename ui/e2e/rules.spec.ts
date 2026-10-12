@@ -24,8 +24,9 @@ test.describe("rules", () => {
       page.getByRole("heading", { name: /^new rule$/i }),
     ).toBeVisible();
 
-    // Identity placeholders confirm the sheet rendered.
-    await expect(page.getByPlaceholder(/rule-person-zone/i)).toBeVisible();
+    // Identity fields confirm the sheet rendered. A new rule has no id
+    // input: the engine assigns `rule-<N>` on save.
+    await expect(page.getByText(/auto-assigned on save/i)).toBeVisible();
     await expect(page.getByPlaceholder(/person in dwell zone/i)).toBeVisible();
 
     await page.getByRole("button", { name: /^cancel$/i }).click();
