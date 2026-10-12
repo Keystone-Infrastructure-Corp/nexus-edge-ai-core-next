@@ -2,7 +2,7 @@
 //! restart to take effect but are now mutable through the
 //! admin API instead of by hand-editing `nexus.toml`.
 //!
-//! Three endpoint groups live here, all gated by the
+//! These endpoint groups live here, all gated by the
 //! `admin_auth_layer`:
 //!
 //! 1. **Socket rebind** —
@@ -21,19 +21,6 @@
 //!    The POST is a one-shot probe with no persistence;
 //!    handy for the "Test discovery" button next to the IdP
 //!    URL fields.
-//!
-//! 3. **Streaming diagnostics tarball** —
-//!    `GET /v1/admin/diagnostics/export`. Pure HTTP-level
-//!    replacement for `nexus-doctor bundle --output …`.
-//!    Streams a `.tar.gz` with: redacted `nexus.toml`, system
-//!    metrics snapshot, last-1000 audit rows, last-100 motion
-//!    events, build info, and the recent engine journal
-//!    (`journalctl -u nexus-engine`, 24h window, URL credentials
-//!    redacted) — the last is what an operator reaches for when
-//!    troubleshooting stream drops. Tar is built on a
-//!    `spawn_blocking` worker that writes through a `GzEncoder`
-//!    wrapping the sender half of a bounded mpsc; axum streams the
-//!    receiver half. Memory stays O(buffer size).
 //!
 //! ## Why restart-based vs hot-reload
 //!

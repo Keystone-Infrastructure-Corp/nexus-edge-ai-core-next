@@ -1,5 +1,17 @@
-//! Streaming diagnostics tarball: `GET /v1/admin/diagnostics/export`.
-//! Split out of `admin_runtime`; `diag_collect` is its cloud-triggered consumer.
+//! Streaming diagnostics tarball —
+//! `GET /v1/admin/diagnostics/export`. Pure HTTP-level
+//! replacement for `nexus-doctor bundle --output …`.
+//! Streams a `.tar.gz` with: redacted `nexus.toml`, system
+//! metrics snapshot, last-1000 audit rows, last-100 motion
+//! events, build info, and the recent engine journal
+//! (`journalctl -u nexus-engine`, 24h window, URL credentials
+//! redacted) — the last is what an operator reaches for when
+//! troubleshooting stream drops. Tar is built on a
+//! `spawn_blocking` worker that writes through a `GzEncoder`
+//! wrapping the sender half of a bounded mpsc; axum streams the
+//! receiver half. Memory stays O(buffer size).
+//!
+//! [`crate::diag_collect`] is its cloud-triggered consumer.
 
 use std::io::Write;
 use std::net::SocketAddr;
