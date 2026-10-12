@@ -53,6 +53,7 @@ pub use static_filter::*;
 pub use store::*;
 pub use telemetry::*;
 pub use tracker::*;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("io: {0}")]
