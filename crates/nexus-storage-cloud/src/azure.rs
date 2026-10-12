@@ -324,7 +324,7 @@ impl AzureBlobBackend {
             .body(bytes.to_vec())
             .send()
             .await
-            .map_err(|e| BackendError::Unreachable(format!("azure PUT: {e}")))?;
+            .map_err(|e| BackendError::Unreachable(format!("azure PUT: {}", e.without_url())))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -394,7 +394,12 @@ impl AzureBlobBackend {
                 .body(block.to_vec())
                 .send()
                 .await
-                .map_err(|e| BackendError::Unreachable(format!("azure Put Block {index}: {e}")))?;
+                .map_err(|e| {
+                    BackendError::Unreachable(format!(
+                        "azure Put Block {index}: {}",
+                        e.without_url()
+                    ))
+                })?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -431,7 +436,9 @@ impl AzureBlobBackend {
             .body(list_xml)
             .send()
             .await
-            .map_err(|e| BackendError::Unreachable(format!("azure Put Block List: {e}")))?;
+            .map_err(|e| {
+                BackendError::Unreachable(format!("azure Put Block List: {}", e.without_url()))
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -724,7 +731,7 @@ impl ColdBackend for AzureBlobBackend {
             .header("range", format!("bytes={start}-{end_inclusive}"))
             .send()
             .await
-            .map_err(|e| BackendError::Unreachable(format!("azure GET: {e}")))?;
+            .map_err(|e| BackendError::Unreachable(format!("azure GET: {}", e.without_url())))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -738,7 +745,7 @@ impl ColdBackend for AzureBlobBackend {
         resp.bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| BackendError::Other(format!("azure GET body: {e}")))
+            .map_err(|e| BackendError::Other(format!("azure GET body: {}", e.without_url())))
     }
 
     async fn get_range_stream(
@@ -757,7 +764,9 @@ impl ColdBackend for AzureBlobBackend {
             .header("range", format!("bytes={start}-{end_inclusive}"))
             .send()
             .await
-            .map_err(|e| BackendError::Unreachable(format!("azure GET stream: {e}")))?;
+            .map_err(|e| {
+                BackendError::Unreachable(format!("azure GET stream: {}", e.without_url()))
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -772,7 +781,7 @@ impl ColdBackend for AzureBlobBackend {
         // matches what `OneDriveBackend::get_range_stream` does.
         let stream = resp
             .bytes_stream()
-            .map_err(|e| BackendError::Other(format!("azure GET chunk: {e}")))
+            .map_err(|e| BackendError::Other(format!("azure GET chunk: {}", e.without_url())))
             .boxed();
         Ok(stream)
     }
@@ -803,7 +812,7 @@ impl ColdBackend for AzureBlobBackend {
             .header("x-ms-version", AZURE_API_VERSION)
             .send()
             .await
-            .map_err(|e| BackendError::Unreachable(format!("azure HEAD: {e}")))?;
+            .map_err(|e| BackendError::Unreachable(format!("azure HEAD: {}", e.without_url())))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -1170,6 +1179,32 @@ mod tests {
                 .expect("PUT must succeed");
             assert_eq!(receipt.cold_path, "org-x/core-y/clip-42.mp4");
             assert_eq!(receipt.bytes_written, bytes.len() as u64);
+        }
+
+        #[tokio::test]
+        async fn put_transport_error_does_not_leak_the_sas_signature() {
+            // Port 9 is closed, so reqwest's connect error would otherwise
+            // embed the request URL and with it the SAS signature.
+            let issuer = Arc::new(MockIssuer::new());
+            *issuer.put_response.lock().unwrap() = Some(IssuedSas {
+                url: "http://127.0.0.1:9/blob/clip-42.mp4?sv=fake&sig=SUPERSECRETSIGNATURE".into(),
+                blob_url_unsigned: "http://127.0.0.1:9/blob/clip-42.mp4".into(),
+                expires_at: Utc::now() + chrono::Duration::minutes(15),
+                container: "clips".into(),
+                blob_path: "org-x/core-y/clip-42.mp4".into(),
+            });
+
+            let b = build_backend(issuer);
+            let bytes = b"some clip bytes";
+            let sha = hex::encode(Sha256::digest(bytes));
+            let err = b
+                .put("cam1/clip-42.mp4", bytes, &sha)
+                .await
+                .expect_err("closed port must fail");
+            assert!(
+                !format!("{err} {err:?}").contains("SUPERSECRETSIGNATURE"),
+                "SAS credential leaked into error: {err}"
+            );
         }
 
         #[tokio::test]

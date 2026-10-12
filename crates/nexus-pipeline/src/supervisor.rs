@@ -1567,9 +1567,10 @@ fn build_source(
         #[cfg(not(feature = "gstreamer"))]
         "rtsp" | "rtsps" => {
             let msg = format!(
-                "camera {} url {} requires the `gstreamer` feature; rebuild \
+                "camera {} (host {}) requires the `gstreamer` feature; rebuild \
                  nexus-engine with `cargo build --features gstreamer,...`",
-                cfg.id, cfg.ingest.url
+                cfg.id,
+                cfg.ingest.url.host_str().unwrap_or("unknown")
             );
             error!(camera_id = cfg.id, "{}", msg);
             Box::new(crate::source::FailingSource { message: msg })

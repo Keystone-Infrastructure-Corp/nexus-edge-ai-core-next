@@ -320,13 +320,14 @@ impl GoogleDriveBackend {
             .body(bytes.to_vec())
             .send()
             .await
-            .map_err(|e| BackendError::Unreachable(format!("Drive resumable PUT: {e}")))?;
+            .map_err(|e| {
+                BackendError::Unreachable(format!("Drive resumable PUT: {}", e.without_url()))
+            })?;
         let put = self.unwrap_401(put).await?;
 
-        let file: DriveFile = put
-            .json()
-            .await
-            .map_err(|e| BackendError::Other(format!("Drive resumable PUT parse: {e}")))?;
+        let file: DriveFile = put.json().await.map_err(|e| {
+            BackendError::Other(format!("Drive resumable PUT parse: {}", e.without_url()))
+        })?;
         Ok(file)
     }
 }

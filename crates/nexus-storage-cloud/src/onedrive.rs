@@ -284,12 +284,13 @@ impl OneDriveBackend {
             .body(bytes.to_vec())
             .send()
             .await
-            .map_err(|e| BackendError::Unreachable(format!("Graph upload PUT: {e}")))?;
+            .map_err(|e| {
+                BackendError::Unreachable(format!("Graph upload PUT: {}", e.without_url()))
+            })?;
         let put = self.unwrap_401(put).await?;
-        let item: DriveItem = put
-            .json()
-            .await
-            .map_err(|e| BackendError::Other(format!("Graph upload PUT parse: {e}")))?;
+        let item: DriveItem = put.json().await.map_err(|e| {
+            BackendError::Other(format!("Graph upload PUT parse: {}", e.without_url()))
+        })?;
         Ok(item)
     }
 

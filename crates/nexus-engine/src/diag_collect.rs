@@ -361,7 +361,8 @@ async fn upload_to_sas(
             Err(e) => {
                 if attempt >= MAX_UPLOAD_ATTEMPTS {
                     return Err(DiagError::UploadFailed(format!(
-                        "blob PUT transport error after {attempt} attempts: {e}"
+                        "blob PUT transport error after {attempt} attempts: {}",
+                        e.without_url()
                     )));
                 }
             }

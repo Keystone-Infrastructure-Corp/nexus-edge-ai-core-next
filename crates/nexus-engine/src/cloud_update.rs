@@ -439,7 +439,7 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, ()> {
         .get(url)
         .send()
         .await
-        .map_err(|e| warn!(error = %e, "update: artifact GET failed"))?;
+        .map_err(|e| warn!(error = %e.without_url(), "update: artifact GET failed"))?;
     if !resp.status().is_success() {
         warn!(status = %resp.status(), "update: artifact GET non-200");
         return Err(());
@@ -447,7 +447,7 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, ()> {
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| warn!(error = %e, "update: artifact body read failed"))?;
+        .map_err(|e| warn!(error = %e.without_url(), "update: artifact body read failed"))?;
     Ok(bytes.to_vec())
 }
 
