@@ -479,6 +479,7 @@ async fn forward_admin_request(
             warn!(
                 method = %method_str,
                 path = %path,
+                // allow: span-cardinality url (loopback 127.0.0.1 admin URL the passthrough built itself; no userinfo, not a camera or sink location)
                 url = %url,
                 error = %e,
                 "admin passthrough: loopback request failed",

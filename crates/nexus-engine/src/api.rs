@@ -1606,7 +1606,7 @@ async fn create_camera(
             match crate::discovery::rtsp_probe::probe_codec_for_url(&cam.ingest.url).await {
                 Some(codec) => {
                     tracing::info!(
-                        url = %cam.ingest.url,
+                        name = %cam.name,
                         codec = %codec,
                         "codec autodetected at camera-create"
                     );
@@ -1614,7 +1614,7 @@ async fn create_camera(
                 }
                 None => {
                     tracing::info!(
-                        url = %cam.ingest.url,
+                        name = %cam.name,
                         "codec autodetect failed; leaving codec unspecified \
                          — pipeline will default to H.264 at spawn"
                     );

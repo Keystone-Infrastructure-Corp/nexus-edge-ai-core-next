@@ -299,7 +299,7 @@ impl TunnelClient {
 
         arm_dead_peer_timeout(ws_stream.get_ref());
 
-        info!(url = %self.gateway_url, "cloud tunnel connected");
+        info!(gateway_url = %self.gateway_url, "cloud tunnel connected");
 
         let (mut writer, mut reader) = ws_stream.split();
         // Phase H — uplink priority channels. Three bounded queues drained

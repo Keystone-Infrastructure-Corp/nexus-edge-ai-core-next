@@ -2542,7 +2542,6 @@ async fn build_gst_recorder(
                     Some(c) => {
                         tracing::info!(
                             camera_id = cam.id,
-                            url = %cam.ingest.url,
                             codec = %c,
                             "codec autodetected at boot"
                         );
@@ -2551,7 +2550,6 @@ async fn build_gst_recorder(
                     None => {
                         tracing::warn!(
                             camera_id = cam.id,
-                            url = %cam.ingest.url,
                             "camera codec unspecified and autodetect probe failed; defaulting to h264 — set `ingest.codec` in the camera config to silence"
                         );
                         nexus_types::CodecKind::H264
