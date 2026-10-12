@@ -266,8 +266,9 @@ jobs:
   # block release but not normal PR iteration.
   #
   # Also the only job that runs the model-backed inference smoke tests
-  # (nexus-inference `tests/*_smoke.rs`, `rect_shape_postprocess`, and
-  # nexus-reid `dinov2_core_smoke`). They need real ONNX weights, which are
+  # (nexus-inference `tests/*_smoke.rs` and nexus-reid `dinov2_core_smoke`;
+  # `rect_shape_postprocess` also runs here but uses synthetic tensors and
+  # needs no weights). The smoke tests need real ONNX weights, which are
   # not in git, and each one skips with a printed note -- exit 0 -- when its
   # file is missing, so the weights step below asserts every file exists
   # before they run.
@@ -478,9 +479,11 @@ jobs:
             echo "NEXUS_TEST_YOLO_WORLD_MANIFEST=${pack}/models-manifest.json"
           } >> "$GITHUB_ENV"
 
-      # AGENTS.md rule 2 against the weights that actually ship: every file in
+      # AGENTS.md rule 2 against the downloaded ONNX files: every file in
       # the pack must be named by the repo manifest and pass the
-      # face-recognition name check.
+      # face-recognition name check. This job downloads the ONNX files only;
+      # the release also ships the `*_hailo.hef` files, which are not audited
+      # here.
       - name: cargo xtask check-models (downloaded weights)
         run: cargo xtask check-models --strict --models-dir "${RUNNER_TEMP}/model-pack"
 
