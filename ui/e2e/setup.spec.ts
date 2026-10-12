@@ -4,16 +4,17 @@
 // every OTHER spec lands on /dashboard without seeing the wizard. This
 // spec flips the latch back off via the test-injection endpoint
 // `POST /api/v1/_test/setup_reset`, walks the wizard end-to-end, and
-// re-checks that the latch is flipped back on.
+// re-checks that the latch is flipped back on. That endpoint exists only
+// when the engine is built with `--features test-injection`.
 //
-// IMPORTANT — this spec mutates global engine state in two ways that
-// would break sibling specs if they ran AFTER it:
-//   - It clears `setup_complete`. The wizard then sets it back via
-//     `POST /v1/setup/complete` on Finish.
-//   - It rotates the admin password from the bootstrap OTP to a new
-//     stable value. The sidecar's `adminOtp` is no longer valid after
-//     this spec runs; any sibling spec that uses `loginAsAdmin` will
-//     fail.
+// globalSetup claims the admin account through the first-run form, so the
+// operator has already chosen their password and the wizard has no
+// password step (it appears only for a session with
+// `force_password_reset`).
+//
+// IMPORTANT — this spec clears `setup_complete`, which would break sibling
+// specs if they ran AFTER it. The wizard sets it back via
+// `POST /v1/setup/complete` on Finish.
 //
 // File ordering is the safety net: Playwright runs specs alphabetically
 // with `workers: 1`, and `setup.spec.ts` sorts after every other file
@@ -35,10 +36,6 @@ test.describe.configure({ mode: "serial" });
 test.describe("first-boot setup wizard", () => {
   let context: BrowserContext;
   let page: Page;
-  // The wizard requires us to type the OTP as the OLD password and pick
-  // a new one. Keep both around so the post-flow assertions can sanity
-  // check that the engine actually rotated the password.
-  const newPassword = "wizard-acceptance-passphrase-2025";
 
   test.beforeAll(async ({ browser }) => {
     context = await browser.newContext();
@@ -51,7 +48,7 @@ test.describe("first-boot setup wizard", () => {
     const r = await fetch(`${baseUrl}/api/v1/_test/setup_reset`, {
       method: "POST",
     });
-    expect(r.status).toBe(204);
+    expect(r.status, "is the engine built with --features test-injection?").toBe(204);
   });
 
   test.afterAll(async () => {
@@ -69,7 +66,7 @@ test.describe("first-boot setup wizard", () => {
     ).toBeVisible();
   });
 
-  test("welcome step renders hostname + version, advances to password", async () => {
+  test("welcome step renders hostname + version, advances to cloud", async () => {
     // Already on /setup from the previous test. Hostname and version
     // are rendered into a definition list — assert that the labels are
     // present rather than pinning specific values (workdir-dependent).
@@ -77,47 +74,38 @@ test.describe("first-boot setup wizard", () => {
     await expect(page.getByText(/engine version/i)).toBeVisible();
 
     await page.getByRole("button", { name: /get started/i }).click();
-    // Password step is identified by the "Change password" submit button.
+    // No password step: the operator chose their password at first run.
+    // The cloud step is identified by its "Connect to cloud" button.
     await expect(
-      page.getByRole("button", { name: /change password/i }),
+      page.getByRole("button", { name: /connect to cloud/i }),
     ).toBeVisible();
   });
 
-  test("password step is mandatory and rotates the bootstrap OTP", async () => {
-    const { adminOtp } = readSidecar();
-
-    // The Skip button must be hidden when force_password_reset is true.
-    await expect(
-      page.getByRole("button", { name: /^skip$/i }),
-    ).toHaveCount(0);
-
-    await page.getByLabel(/current password/i).fill(adminOtp);
-    await page.getByLabel(/^new password$/i).fill(newPassword);
-    await page.getByLabel(/confirm new password/i).fill(newPassword);
-    await page.getByRole("button", { name: /change password/i }).click();
-
-    // Engine responds 204; wizard advances to the cameras step. The
-    // cameras step uniquely renders an "Add cameras" CTA button.
+  test("cloud step skips forward to cameras", async () => {
+    await page.getByRole("button", { name: /skip for now/i }).click();
+    // The cameras step uniquely renders an "Add cameras" CTA button.
     await expect(
       page.getByRole("button", { name: /add cameras/i }),
-    ).toBeVisible({ timeout: 10_000 });
+    ).toBeVisible();
   });
 
-  test("cameras step renders count and skips forward", async () => {
-    // Fresh DB → no cameras configured. The CountStep renders the count
-    // and the "Skip for now" / "Add cameras" buttons.
+  test("cameras step renders count and skipping it skips rules too", async () => {
+    // Fresh DB → no cameras configured. With no camera there is nothing
+    // for a rule to fire on, so Skip goes straight to Finish.
     await expect(page.getByText(/cameras configured/i)).toBeVisible();
     await page.getByRole("button", { name: /skip for now/i }).click();
-    // Rules step is identified by its "Add rules" CTA.
+    await expect(
+      page.getByRole("button", { name: /finish setup/i }),
+    ).toBeVisible();
+  });
+
+  test("rules step is one Back from Finish and skips forward", async () => {
+    await page.getByRole("button", { name: /^back$/i }).click();
+    await expect(page.getByText(/rules configured/i)).toBeVisible();
     await expect(
       page.getByRole("button", { name: /add rules/i }),
     ).toBeVisible();
-  });
-
-  test("rules step renders count and skips forward", async () => {
-    await expect(page.getByText(/rules configured/i)).toBeVisible();
     await page.getByRole("button", { name: /skip for now/i }).click();
-    // Finish step is identified by its "Finish setup" button.
     await expect(
       page.getByRole("button", { name: /finish setup/i }),
     ).toBeVisible();
@@ -140,22 +128,5 @@ test.describe("first-boot setup wizard", () => {
   test("re-visiting /setup after completion redirects back to /dashboard", async () => {
     await page.goto("/setup");
     await expect(page).toHaveURL(/\/dashboard/, { timeout: 10_000 });
-  });
-
-  test("password rotation persisted — bootstrap OTP no longer logs in", async () => {
-    const { baseUrl, adminOtp } = readSidecar();
-    const otpAttempt = await fetch(`${baseUrl}/api/v1/auth/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username: "admin", password: adminOtp }),
-    });
-    expect(otpAttempt.status).toBeGreaterThanOrEqual(400);
-
-    const newAttempt = await fetch(`${baseUrl}/api/v1/auth/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username: "admin", password: newPassword }),
-    });
-    expect(newAttempt.ok).toBe(true);
   });
 });

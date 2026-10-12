@@ -218,7 +218,10 @@ UI, from `ui/`:
 - Lint: `npm run lint`
 - Typecheck: `npm run typecheck`
 - Build: `npm run build`
-- End-to-end: `npm run e2e` (Playwright; `npm run e2e:install` once)
+- End-to-end: `npm run e2e` (Playwright; `npm run e2e:install` once). It serves
+  `ui/dist` from `target/debug/nexus-engine`, so run `npm run build` and, from the
+  repo root, `cargo build -p nexus-engine --features test-injection` first: the
+  setup-wizard spec resets the wizard through a test-only endpoint.
 
 Note that CI's `ui` job runs only `typecheck` and `build` — `lint`, `npm test`,
 and Playwright are local gates, so a lint or unit-test regression will not be

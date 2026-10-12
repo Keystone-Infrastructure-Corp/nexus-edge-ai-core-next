@@ -67,7 +67,7 @@ export default async function globalSetup() {
   const enginePath = join(REPO_ROOT, "target", "debug", "nexus-engine");
   if (!existsSync(enginePath)) {
     throw new Error(
-      `nexus-engine binary not found at ${enginePath} — run \`cargo build -p nexus-engine\` first`,
+      `nexus-engine binary not found at ${enginePath} — run \`cargo build -p nexus-engine --features test-injection\` first`,
     );
   }
 
