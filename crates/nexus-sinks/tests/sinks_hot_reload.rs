@@ -23,6 +23,7 @@
 //! to the NEW endpoint.
 
 #![cfg(feature = "webhook")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

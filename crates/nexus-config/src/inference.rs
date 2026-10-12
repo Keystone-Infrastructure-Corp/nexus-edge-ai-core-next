@@ -317,6 +317,10 @@ pub const SHAPE_LADDER: [(u32, u32); 3] = [(512, 288), (1024, 576), (1536, 864)]
 /// intent (640→512×288, 960→1024×576, 1280→1536×864); anything else
 /// snaps to the rung closest in pixel count. Returns `None` when the
 /// shape is already an exact ladder rung.
+#[expect(
+    clippy::expect_used,
+    reason = "SHAPE_LADDER is a non-empty const table, so min_by_key always yields an entry"
+)]
 fn remap_to_ladder(w: u32, h: u32) -> Option<(u32, u32)> {
     if SHAPE_LADDER.contains(&(w, h)) {
         return None;

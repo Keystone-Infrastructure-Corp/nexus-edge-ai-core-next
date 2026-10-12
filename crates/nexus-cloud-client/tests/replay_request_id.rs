@@ -7,6 +7,7 @@
 //! 2. Same `(jti, request_id)` tuple twice → second is `Replay`.
 //! 3. Calling [`Verifier::verify`] with no `request_id` (the v1.7
 //!    contract) still rejects a repeat of the same `jti`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 

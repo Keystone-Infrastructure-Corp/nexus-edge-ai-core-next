@@ -1601,6 +1601,10 @@ async fn insert_motion_decision(
     // Fast-path the common empty-attributes case (avoids cloning the
     // map + allocating a serde_json::Value::Object wrapper for every
     // motion event in a busy scene).
+    #[expect(
+        clippy::expect_used,
+        reason = "serializing a string-keyed JSON map cannot fail"
+    )]
     let attrs_json = if d.attributes.is_empty() {
         "{}".to_string()
     } else {

@@ -24,6 +24,7 @@
 //! | `permanently_flaky_dead_letters` | always 503 → Dead at MAX_ATTEMPTS      |
 
 #![cfg(feature = "webhook")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

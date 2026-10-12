@@ -8,6 +8,7 @@
 //!    `jti`, mismatched `path` all rejected with `actor_token_invalid`.
 //! 3. `system`-sub invoking `create_camera` rejected with
 //!    `actor_token_invalid`; `system`-sub `entitlement_update` accepted.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 

@@ -22,6 +22,7 @@
 //! The bounds count calls into the allocator, so a `cel-interpreter` or
 //! `serde_json` upgrade can legitimately move them. That is a re-baseline,
 //! not a flake; re-measure with the census before loosening a bound.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

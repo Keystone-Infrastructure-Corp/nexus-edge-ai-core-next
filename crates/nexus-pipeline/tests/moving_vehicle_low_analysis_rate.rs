@@ -6,6 +6,7 @@
 //! Drives the real ByteTrack tracker, the parking-lot static filter and the
 //! rule evaluator in the supervisor's order, with synthetic capture times:
 //! every tracked object goes to the rules, which skip the static ones.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

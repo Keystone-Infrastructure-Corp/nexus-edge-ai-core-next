@@ -69,6 +69,10 @@ pub struct EnrollArgs {
 
 /// Run the enrollment subcommand. Loads the store from `cfg.store`,
 /// hits enrollment-svc, persists, exits.
+#[expect(
+    clippy::print_stderr,
+    reason = "`enroll` is a one-shot operator subcommand that runs before telemetry is initialised; the banner must reach the terminal even when telemetry is routed to a file"
+)]
 pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
     let store = Store::open(&cfg.store).await.context("open local store")?;
     let enrolled = perform_enrollment(

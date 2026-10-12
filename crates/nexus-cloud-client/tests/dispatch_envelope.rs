@@ -13,6 +13,7 @@
 //!    admitted (Phase 1.16 contract).
 //! 3. Calling `dispatch_envelope` with a non-`rpc_call` envelope is
 //!    rejected (defensive; the engine should never do this).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 

@@ -5,6 +5,7 @@
 //! a tokio worker. Nothing about the types stops someone reintroducing it, and
 //! the failure is silent at runtime — the reconciler simply stops reconciling.
 //! So the guard is on the source text.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
 

@@ -574,6 +574,10 @@ impl WorkerProcessBackend {
     /// Like [`start`](Self::start) but with an explicit binary path. The
     /// integration tests use this with `CARGO_BIN_EXE_nexus-inference-worker`
     /// so they don't depend on the worker living next to the test runner.
+    #[expect(
+        clippy::print_stderr,
+        reason = "opt-in (NEXUS_WORKER_LOG_STDERR) echo so test runs without a tracing subscriber still surface a crashing worker"
+    )]
     pub fn start_with_program(
         slot: i32,
         program: &std::path::Path,

@@ -13,6 +13,7 @@
 //!   `events.clip_id` flips to NULL via `ON DELETE SET NULL`.
 //! * `link_event_to_clip` cross-stamps the alert row.
 //! * `clips_older_than` returns rows in `started_at ASC` order.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

@@ -123,7 +123,7 @@ fn resolve_first_claim(claims: &IdTokenClaims, claim_paths: &[String]) -> Vec<St
                 }
                 return items
                     .iter()
-                    .map(|i| i.as_str().unwrap().to_string())
+                    .filter_map(|i| i.as_str().map(str::to_string))
                     .collect();
             }
             // Numbers, booleans, objects, null → not a role

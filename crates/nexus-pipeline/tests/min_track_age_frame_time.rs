@@ -14,6 +14,7 @@
 //! The others drive the real tracker backends into the real rule evaluator
 //! with synthetic capture times, so the contract does not depend on how fast
 //! the machine is.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -237,6 +237,10 @@ impl InferenceRouter {
     /// default identity otherwise. Always returns some `Arc<dyn
     /// Detector>` — the default layer is built before this can be
     /// called, so the fallback is total.
+    #[expect(
+        clippy::expect_used,
+        reason = "the default layer is inserted into `layers` in `build_with_visual_store` and `layers` is never mutated afterwards"
+    )]
     pub fn detector_for_camera(&self, cam: &CameraConfig) -> Arc<dyn Detector> {
         let key = cam
             .detector

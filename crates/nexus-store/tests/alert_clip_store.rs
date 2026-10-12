@@ -1,5 +1,6 @@
 //! M-Alert-Clip P2/P3 — `alert_clips` table CRUD, the
 //! `events.alert_clip_id` link, and the P6 eviction gate.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

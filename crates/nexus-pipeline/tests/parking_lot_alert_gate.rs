@@ -19,6 +19,7 @@
 //! `Sim::step` mirrors the supervisor's real wiring — `classify()`, then
 //! every tracked object to the rules, which skip the static ones — in
 //! `nexus-pipeline/src/supervisor.rs`. Keep the two in sync.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use chrono::{TimeZone, Utc};
 use nexus_config::{

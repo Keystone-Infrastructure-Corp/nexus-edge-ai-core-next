@@ -14,6 +14,7 @@
 //!
 //! No ORT; `virtual://` + an in-memory bus + sqlite on a tempdir, mirroring
 //! `live_frame_freshness.rs`. The two GStreamer tests need no camera.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

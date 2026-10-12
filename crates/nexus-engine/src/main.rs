@@ -2235,6 +2235,10 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
 /// is present (or unconditionally when `force == true`). Exits with
 /// a clear error when those paths aren't set in `nexus.toml`, so
 /// the installer's invocation surfaces config-vs-code drift loudly.
+#[expect(
+    clippy::print_stderr,
+    reason = "`tls init` is a one-shot installer subcommand that runs before telemetry is initialised; stderr is its output"
+)]
 fn run_tls_init(cfg: &Config, force: bool) -> Result<()> {
     let cert = cfg
         .server

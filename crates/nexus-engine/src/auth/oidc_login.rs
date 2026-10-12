@@ -130,6 +130,10 @@ pub struct PendingLogin {
 impl PendingLogin {
     fn is_expired(&self, now: chrono::DateTime<Utc>) -> bool {
         // Convert std::time::Duration → chrono::Duration once.
+        #[expect(
+            clippy::expect_used,
+            reason = "PENDING_TTL is a minutes-scale const that fits chrono::Duration"
+        )]
         let ttl = Duration::from_std(PENDING_TTL).expect("PENDING_TTL fits chrono::Duration");
         now - self.created_at > ttl
     }
@@ -200,6 +204,10 @@ pub struct OidcLoginState {
 }
 
 impl FromRef<ApiState> for OidcLoginState {
+    #[expect(
+        clippy::expect_used,
+        reason = "FromRef cannot return an error and api::router mounts the OIDC routes only when oidc_login is Some"
+    )]
     fn from_ref(s: &ApiState) -> Self {
         // `ApiState::oidc_login` is `Option<OidcLoginState>`. We
         // unwrap with `.expect()` here because the router only
@@ -601,6 +609,10 @@ fn redirect_with_oidc_error(base: &str, err: &str) -> Response {
 
 fn mint_url_safe(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
+    #[expect(
+        clippy::expect_used,
+        reason = "the OS RNG does not fail on the platforms the engine ships to; a host without one cannot sign sessions"
+    )]
     getrandom_fill(&mut buf).expect("getrandom must succeed");
     URL_SAFE_NO_PAD.encode(&buf)
 }

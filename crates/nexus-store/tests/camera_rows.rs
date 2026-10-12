@@ -2,6 +2,7 @@
 //! and the ids of those it cannot. Boot and the reconciler read with it, so a
 //! row it cannot read must be reported, never a panic that takes them down;
 //! `list_cameras`, which needs every row, must fail on it, not panic.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

@@ -4769,6 +4769,7 @@ async fn get_admin_sinks(State(s): State<ApiState>) -> Result<Json<AdminSinksRes
     let sinks = order
         .into_iter()
         .map(|id| {
+            #[expect(clippy::expect_used, reason = "`order` is built from the same ids that populated `by_id`, and each id appears once")]
             let (source, mut config) = by_id.remove(&id).expect("id present in order map");
             config.redact_secrets();
             AdminSinkView {
@@ -5181,7 +5182,7 @@ fn is_valid_handle(s: &str) -> bool {
             return false;
         }
     }
-    !s.chars().next().unwrap().is_ascii_uppercase()
+    !s.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
 #[cfg(test)]

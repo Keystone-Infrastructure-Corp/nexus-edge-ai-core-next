@@ -8,6 +8,7 @@
 //! run, and the roll-up names each row it could not read from the first
 //! health answer. No unit test reaches `main`'s read, so this runs the
 //! binary, found through cargo's `CARGO_BIN_EXE_nexus-engine`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

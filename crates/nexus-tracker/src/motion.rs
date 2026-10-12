@@ -173,7 +173,9 @@ impl MotionEventEmitter {
                     // label / attributes, regardless of whether we
                     // emitted an Updated this frame. Refreshed in place:
                     // a steady-state frame reuses the snapshot's buffers.
-                    let snap = state.tracks.get_mut(&t.track_id).unwrap();
+                    let Some(snap) = state.tracks.get_mut(&t.track_id) else {
+                        continue;
+                    };
                     snap.last_bbox = t.bbox;
                     snap.last_label.clone_from(&t.label);
                     snap.last_confidence = t.confidence;
@@ -209,7 +211,9 @@ impl MotionEventEmitter {
             .collect();
         let mut died = Vec::with_capacity(dead.len());
         for track_id in dead {
-            let snap = state.tracks.remove(&track_id).expect("just enumerated");
+            let Some(snap) = state.tracks.remove(&track_id) else {
+                continue;
+            };
             died.push(MotionDecision {
                 camera_id,
                 track_id,

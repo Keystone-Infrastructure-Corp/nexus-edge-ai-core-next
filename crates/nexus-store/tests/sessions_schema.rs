@@ -22,6 +22,7 @@
 //!   and expired+revoked rows but leaves expired-but-still-
 //!   "head" rows (so the UI can render "expired session").
 //! * `ON DELETE CASCADE` from `users` drops the refresh rows.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

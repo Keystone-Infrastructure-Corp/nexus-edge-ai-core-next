@@ -6,6 +6,7 @@
 //! cached `rpc_response` body without re-invoking the handler. Closes
 //! the engine half of the 1.16 acceptance criterion in
 //! [`docs/cloud-console/PHASES.md`](../../../nexus-cloud-console/docs/cloud-console/PHASES.md).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 

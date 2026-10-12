@@ -230,6 +230,10 @@ pub(crate) async fn probe(req: &ProbeRtspReq) -> ProbeRtspResult {
             })
             .collect();
         let top_codec_kind = streams.first().and_then(|s| s.codec_kind);
+        #[expect(
+            clippy::expect_used,
+            reason = "this block is guarded by `!winners.is_empty()`"
+        )]
         let (first_path, first_sdp) = winners.into_iter().next().expect("non-empty");
         return ProbeRtspResult {
             ok: true,

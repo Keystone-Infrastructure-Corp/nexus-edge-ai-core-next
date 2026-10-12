@@ -19,6 +19,12 @@
 //! and labelled with one of the prompts we passed in.
 
 #![cfg(feature = "ort")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stderr
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

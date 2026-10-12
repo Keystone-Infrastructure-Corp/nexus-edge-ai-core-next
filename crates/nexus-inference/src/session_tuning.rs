@@ -244,6 +244,10 @@ impl OrtSession {
     /// duration of the ORT call when this session is on the WebGPU EP.
     /// The outputs come back as host tensors, so reading and dropping
     /// them after the lock is released does not touch the context.
+    #[expect(
+        clippy::expect_used,
+        reason = "`session` is Some from construction and is only taken in Drop, so it is present for every `run`"
+    )]
     pub fn run<'s, 'i, 'v: 'i, const N: usize>(
         &'s mut self,
         input_values: impl Into<SessionInputs<'i, 'v, N>>,

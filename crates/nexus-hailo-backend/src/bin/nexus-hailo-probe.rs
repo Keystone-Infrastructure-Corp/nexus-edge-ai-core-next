@@ -10,6 +10,11 @@
 //!
 //! Exits non-zero on any failure, including an unrecognized argument.
 //! Designed for `journalctl`-friendly line output rather than pretty TUI.
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "diagnostic CLI whose product is line output on stdout (device report, CSV summary) and stderr (exit-status errors); tracing is only initialised after the arg-error and --version paths"
+)]
 
 use std::env;
 use std::path::PathBuf;

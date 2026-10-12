@@ -1,6 +1,7 @@
 //! #759 — durable `clip_replicated` announce state on motion and alert
 //! clips: a cold-uploaded clip stays in the re-announce set until the
 //! cloud acks it (stored or permanently rejected).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

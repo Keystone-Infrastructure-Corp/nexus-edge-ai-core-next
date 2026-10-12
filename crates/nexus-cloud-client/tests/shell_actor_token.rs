@@ -5,6 +5,7 @@
 //! method + path. The two must not be interchangeable in either direction,
 //! because an RPC token is minted for a far broader population than the one
 //! allowed to open a shell.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 

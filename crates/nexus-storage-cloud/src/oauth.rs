@@ -384,6 +384,10 @@ pub fn authorize_url(
     state: &str,
 ) -> String {
     // Common params per RFC 6749 §4.1.1.
+    #[expect(
+        clippy::expect_used,
+        reason = "auth_url is a provider-constant URL or an operator-set value validated at config load"
+    )]
     let mut url = url::Url::parse(&auth_url(provider))
         .expect("auth_url is provider-constant or operator-set; must be valid");
     {

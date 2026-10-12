@@ -10,6 +10,7 @@
 //! for the life of the process. These drive the recorder through both, with a
 //! direct probe write standing in for the pipeline's: no camera is needed.
 #![cfg(feature = "gstreamer")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

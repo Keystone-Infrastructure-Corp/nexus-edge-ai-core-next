@@ -16,6 +16,12 @@
 //!
 //! The bound counts calls into the allocator, so a `serde_json` upgrade can
 //! legitimately move it. That is a re-baseline, not a flake.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout
+)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

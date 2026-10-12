@@ -22,6 +22,10 @@
 //! ORT session when the binary was built with `--features ort,ep-cpu`.
 //! Without those features the worker silently falls back to the
 //! MockDetector — same shape as `build_detector` in the library.
+#![expect(
+    clippy::print_stderr,
+    reason = "out-of-process worker: stdout carries the bincode wire, so stderr is the diagnostic channel the parent forwards onto its tracing subscriber"
+)]
 
 use std::env;
 use std::process::ExitCode;

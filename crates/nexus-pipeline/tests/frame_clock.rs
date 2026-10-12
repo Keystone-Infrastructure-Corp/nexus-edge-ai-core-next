@@ -9,6 +9,7 @@
 //! stamps frames with synthetic clocks and sends a frame only once the one
 //! before it has been tracked, so every expectation is in capture time and
 //! none depends on how fast the machine runs.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

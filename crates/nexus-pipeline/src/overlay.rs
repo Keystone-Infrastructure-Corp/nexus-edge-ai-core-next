@@ -20,6 +20,10 @@ use fontdue::{Font, FontSettings};
 static FONT_BYTES: &[u8] = include_bytes!("../assets/BarlowSemiCondensed-Medium.ttf");
 
 /// Parsed font, built once on first overlay draw.
+#[expect(
+    clippy::expect_used,
+    reason = "FONT_BYTES is a checked-in asset embedded with include_bytes!; it parses or the build artefact is corrupt"
+)]
 fn font() -> &'static Font {
     static FONT: OnceLock<Font> = OnceLock::new();
     FONT.get_or_init(|| {

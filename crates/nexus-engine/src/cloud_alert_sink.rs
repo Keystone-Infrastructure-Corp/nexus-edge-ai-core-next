@@ -255,6 +255,10 @@ impl CloudConsoleAlertSink {
     /// same registry). `snapshots_dir` is `<state_dir>/snapshots`;
     /// `uploader_slot` is filled once the tunnel enrolls.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "the cloud:console sink id is a compile-time constant sink id that satisfies SinkId validation"
+    )]
     pub fn new(
         outbox: Arc<TunnelOutbox>,
         pending_acks: Arc<PendingAckRegistry>,

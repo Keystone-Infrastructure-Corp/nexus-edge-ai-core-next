@@ -12,6 +12,7 @@
 //! * `record_cold_upload_failure(.., quarantined = true)` and
 //!   `quarantine_clip` both drop the clip from the pending set AND
 //!   from `cold_replica_stats().pending_count` permanently.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 
