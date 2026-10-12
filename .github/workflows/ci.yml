@@ -111,13 +111,15 @@ jobs:
       - name: cargo clippy (nexus-inference, release EP features)
         run: cargo clippy --locked -p nexus-inference --features ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt,ep-hailo,ep-rocm,ep-vulkan --all-targets -- -D warnings
 
-      # Enforces AGENTS.md rule 2: no face-recognition models in `models/`,
-      # no non-commercial / research-only license values on any entry.
-      # See [xtask/README.md](../../xtask/README.md). Runs without
-      # `--strict` until every legacy entry is back-filled with both
-      # license fields.
+      # Enforces AGENTS.md rule 2: an allowlisted `license` and a
+      # non-disqualifying `weights_dataset_license` on every manifest entry,
+      # no face-recognition names, and no file in `models/` the manifest does
+      # not name. See [xtask/README.md](../../xtask/README.md). `--strict`
+      # makes a missing field fatal; every entry is back-filled. Here
+      # `models/` holds only the manifest; `system-libs` repeats the check
+      # against the downloaded weights.
       - name: cargo xtask check-models
-        run: cargo xtask check-models
+        run: cargo xtask check-models --strict
 
       - name: cargo xtask check-span-cardinality
         run: cargo xtask check-span-cardinality
@@ -475,6 +477,12 @@ jobs:
             echo "NEXUS_TEST_YOLO_WORLD_MODEL=${pack}/yolo_world_v2_s_512x288.onnx"
             echo "NEXUS_TEST_YOLO_WORLD_MANIFEST=${pack}/models-manifest.json"
           } >> "$GITHUB_ENV"
+
+      # AGENTS.md rule 2 against the weights that actually ship: every file in
+      # the pack must be named by the repo manifest and pass the
+      # face-recognition name check.
+      - name: cargo xtask check-models (downloaded weights)
+        run: cargo xtask check-models --strict --models-dir "${RUNNER_TEMP}/model-pack"
 
       # This is the only job in this workflow that compiles the gstreamer-gated
       # code, so it is the only place a warning there can fail CI; no clippy in
