@@ -333,14 +333,21 @@ implementation notes, do cross-link ADR/SPEC/BUG records that relate to each oth
    `[Phase N · Step M] <verb> <object>` for wedge work that maps to a phase number.
 3. CI gates that must be green: `cargo fmt --check`, `cargo check` + `cargo clippy
    --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
-   `cargo xtask check-models`, `cargo xtask check-span-cardinality`, and the `nexus-types`
-   TS-binding drift check. The
-   GStreamer + ORT integration jobs run on Linux. There is **no `cargo deny`
+   `cargo xtask check-models`, `cargo xtask check-span-cardinality`, the `nexus-types`
+   TS-binding drift check, and the `ui` (lint, vitest, typecheck, build) and `ui-e2e`
+   (Playwright) jobs. Clippy runs under the workspace lint policy
+   (`[workspace.lints.clippy]` in the root `Cargo.toml`, which every crate and `xtask`
+   opt into; `clippy.toml` allows `unwrap`/`expect`/`panic`/prints in tests). With
+   `-D warnings`, its warn-level lints fail CI too. The label-gated
+   GStreamer + ORT integration jobs (`system-libs`) run on Linux, including the model
+   smoke tests against the downloaded `models-v6` weights. There is **no `cargo deny`
    gate here** — this repo has no `deny.toml`; licence discipline (Rule 1) is
    enforced by review, unlike the cloud repo where `cargo deny check` is CI.
 4. macOS-local clippy does NOT catch every Linux-only clippy issue (`#[cfg(target_os
    = "linux")]` gates, `nix` integer width). If your change touches a Linux-gated
-   block, expect at least one CI round-trip.
+   block, run the CI clippy commands in a Linux container (for example
+   `rust:1-slim-bookworm`, fed a `git archive` of the commit) before pushing, or expect
+   at least one CI round-trip.
 5. If the change is decision/spec/bug-worthy, add or update the corresponding record in
    the cloud repo's engineering vault (see "Engineering vault" above) before considering
    it merged.
