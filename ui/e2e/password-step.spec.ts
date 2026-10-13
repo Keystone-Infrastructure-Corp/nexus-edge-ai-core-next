@@ -83,7 +83,7 @@ test.describe("setup wizard: mandatory password step", () => {
     await adminPage.getByLabel(/^username$/i).fill(username);
     await adminPage.getByLabel(/^role$/i).selectOption("admin");
     await adminPage.getByLabel(/set my own password/i).check();
-    await adminPage.getByLabel(/^password \(min 8 chars\)/i).fill(TEMP_PASSWORD);
+    await adminPage.getByLabel(/^password \(min 12 chars\)/i).fill(TEMP_PASSWORD);
     await adminPage.getByRole("button", { name: /^create$/i }).click();
 
     // A supplied password is not echoed back, so there is no OTP modal; the
