@@ -39,9 +39,9 @@ The wedge plan that drives the next three phases of work is
 1. **License discipline (engine is AGPL-3.0-or-later).** This repo's [LICENSE](LICENSE) is
    **AGPL-3.0-or-later**, declared in workspace `Cargo.toml`. Implications:
    - Any new top-level Cargo dep MUST be license-compatible with AGPL-3.0-or-later.
-     `cargo deny check licenses` enforces an allowlist (Apache-2.0, MIT, BSD-2/3-Clause,
-     ISC, MPL-2.0, Unicode-DFS-2016, AGPL-3.0, GPL-3.0). Proprietary or unspecified
-     licenses are rejected.
+     Review enforces an allowlist (Apache-2.0, MIT, BSD-2/3-Clause,
+     ISC, MPL-2.0, Unicode-DFS-2016, AGPL-3.0, GPL-3.0); this repo has no `deny.toml` and
+     no `cargo deny` CI step. Proprietary or unspecified licenses are rejected in review.
    - **No proprietary Azure SDKs** — this is the paired half of cloud
      [REPO_BOUNDARY R2](../nexus-cloud-console/docs/REPO_BOUNDARY.md#r2-the-core-repo-must-not-import-any-azure-sdk).
      All Azure I/O (Blob PUT, Service Bus, Key Vault) happens through cloud-side services
@@ -231,9 +231,9 @@ UI, from `ui/`:
   repo root, `cargo build -p nexus-engine --features test-injection` first: the
   setup-wizard spec resets the wizard through a test-only endpoint.
 
-Note that CI's `ui` job runs only `typecheck` and `build` — `lint`, `npm test`,
-and Playwright are local gates, so a lint or unit-test regression will not be
-caught for you.
+CI's `ui` job runs `lint`, `npm test` (Vitest), `typecheck` and `build`, and the
+always-on `ui-e2e` job runs Playwright against an engine built with
+`--features test-injection`, so all of these are CI gates as well as local ones.
 
 ## Conventions
 
