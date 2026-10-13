@@ -6,14 +6,15 @@
 //! Under the deploy unit's `MALLOC_ARENA_MAX=2` (BUG-036) another thread
 //! can reclaim the freed chunk before the stale read, and the engine
 //! segfaults on ~70% of cold compiles; with the cap unset it measured
-//! 0 of 27 (BUG-277, #360).
+//! 0 of 17 (BUG-277, #360).
 //!
 //! The cap has to stay — it is the engine's memory fix — so the compile
 //! moves instead. Before the engine builds such a session itself,
 //! [`spawn_and_wait`] re-runs this binary as `prewarm-session` without
 //! the cap. The child compiles the kernels and fills the cache, and the
-//! engine's own build of the same model then finds them there and never
-//! calls `Compile()`. If the child crashes anyway, only the child dies.
+//! engine's own build of the same model then finds them there and
+//! normally never calls `Compile()`. If the child crashes anyway, only the
+//! child dies.
 //!
 //! Registered with
 //! [`nexus_inference::session_tuning::register_out_of_process_prewarm`]
@@ -132,6 +133,24 @@ pub fn run_child(model: &Path, ep_priority: &[String]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The child parses exactly the argv [`command`] builds back into the
+    /// same chain, in the same order — taken from `command` itself, so the
+    /// two cannot drift apart.
+    #[test]
+    fn the_child_parses_the_argv_the_engine_builds() {
+        use clap::Parser;
+        let eps = ["gpu".to_owned(), "cpu".to_owned()];
+        let cmd = command(Path::new("/bin/nexus-engine"), Path::new("/m.onnx"), &eps);
+        let argv = std::iter::once(std::ffi::OsStr::new("nexus-engine")).chain(cmd.get_args());
+        match crate::Cli::try_parse_from(argv).map(|cli| cli.command) {
+            Ok(Some(crate::Cmd::PrewarmSession { model, ep_priority })) => {
+                assert_eq!(model, Path::new("/m.onnx"));
+                assert_eq!(ep_priority, eps);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
 
     /// The child must differ from the engine by the arena cap and nothing
     /// else: anything more and it may compile different kernels than the

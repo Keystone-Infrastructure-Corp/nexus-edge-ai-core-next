@@ -63,9 +63,12 @@
 //! cold compiles (BUG-277, edge #360). A binary can therefore register a
 //! hook ([`register_out_of_process_prewarm`]) that builds each
 //! OpenVINO-routed session once in a child process without the cap; that
-//! fills the cache, and the in-process build that follows never reaches
-//! `Compile()` at all. Nothing in this crate spawns a process: with no
-//! hook registered, every session builds exactly as it did before.
+//! fills the cache, and the in-process build that follows normally never
+//! reaches `Compile()`. It still can when the child failed partway, or
+//! when the NEO cache is disabled or unwritable, which leaves this
+//! process no worse off than before the prewarm existed. Nothing in this
+//! crate spawns a process: with no hook registered, every session builds
+//! exactly as it did before.
 
 #![cfg(feature = "ort")]
 
@@ -376,7 +379,16 @@ pub fn build_session(
         ep_priority,
         ACCELERATED_BUILD_TIMEOUT,
         &ACCELERATOR_WEDGED,
-        PREWARM.get().map(|p| p as &DynPrewarm),
+        // Only where OpenVINO can attach at all, the same test
+        // `selected_for_priority` applies: elsewhere the child would build
+        // the rest of the chain cold — a TensorRT engine behind the default
+        // `openvino` entry on an NVIDIA box — and buy nothing for it.
+        PREWARM
+            .get()
+            .filter(|_| {
+                cfg!(feature = "ep-openvino") && execution_providers::openvino_runtime_available()
+            })
+            .map(|p| p as &DynPrewarm),
         move |chain| commit(&path, &chain, &cfg),
     )
 }
@@ -857,6 +869,20 @@ mod tests {
             wedged.load(Ordering::Relaxed),
             "later sessions must skip the accelerator too"
         );
+    }
+
+    /// Once the process has wedged, an OpenVINO chain goes straight to the
+    /// CPU EP: prewarming it would spend a child on an accelerator this
+    /// process has already given up on.
+    #[test]
+    fn a_wedged_process_skips_the_prewarm() {
+        let (built, calls) = build_with_prewarm(
+            &["gpu", "cpu"],
+            PrewarmOutcome::Built,
+            &AtomicBool::new(true),
+        );
+        assert_eq!(built, Ok("cpu".to_owned()));
+        assert_eq!(calls, ["build:cpu"], "a wedged process must not prewarm");
     }
 
     #[test]

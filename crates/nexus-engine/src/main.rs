@@ -2813,29 +2813,4 @@ mod main_tests {
     fn an_empty_ep_list_still_wants_the_workaround() {
         assert!(wants_amd_notiling(&[]));
     }
-
-    /// `ov_prewarm::command` builds exactly this argv, so the child must
-    /// parse it back into the same chain, in the same order.
-    #[cfg(feature = "ort")]
-    #[test]
-    fn the_prewarm_session_subcommand_keeps_the_ep_chain_in_order() {
-        let cli = Cli::try_parse_from([
-            "nexus-engine",
-            "prewarm-session",
-            "--model",
-            "/m.onnx",
-            "--ep",
-            "gpu",
-            "--ep",
-            "cpu",
-        ])
-        .expect("prewarm-session parses");
-        match cli.command {
-            Some(Cmd::PrewarmSession { model, ep_priority }) => {
-                assert_eq!(model, PathBuf::from("/m.onnx"));
-                assert_eq!(ep_priority, ["gpu", "cpu"]);
-            }
-            other => panic!("parsed as {other:?}"),
-        }
-    }
 }
