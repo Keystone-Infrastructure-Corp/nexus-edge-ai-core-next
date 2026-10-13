@@ -60,7 +60,7 @@
 //! engine runs with `MALLOC_ARENA_MAX=2` (BUG-036), and with arenas
 //! shared another thread can reclaim the freed chunk first, so the stale
 //! read returns garbage and the process segfaults — measured at ~70% of
-//! cold compiles (BUG-269, edge #360). A binary can therefore register a
+//! cold compiles (BUG-277, edge #360). A binary can therefore register a
 //! hook ([`register_out_of_process_prewarm`]) that builds each
 //! OpenVINO-routed session once in a child process without the cap; that
 //! fills the cache, and the in-process build that follows never reaches

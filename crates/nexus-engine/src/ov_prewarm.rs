@@ -6,7 +6,7 @@
 //! Under the deploy unit's `MALLOC_ARENA_MAX=2` (BUG-036) another thread
 //! can reclaim the freed chunk before the stale read, and the engine
 //! segfaults on ~70% of cold compiles; with the cap unset it measured
-//! 0 of 27 (BUG-269, #360).
+//! 0 of 27 (BUG-277, #360).
 //!
 //! The cap has to stay — it is the engine's memory fix — so the compile
 //! moves instead. Before the engine builds such a session itself,
