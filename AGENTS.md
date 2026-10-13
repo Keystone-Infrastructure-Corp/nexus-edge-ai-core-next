@@ -338,8 +338,8 @@ implementation notes, do cross-link ADR/SPEC/BUG records that relate to each oth
    (Playwright) jobs. Clippy runs under the workspace lint policy
    (`[workspace.lints.clippy]` in the root `Cargo.toml`, which every crate and `xtask`
    opt into; `clippy.toml` allows `unwrap`/`expect`/`panic`/prints in tests). With
-   `-D warnings`, its warn-level lints fail CI too. The label-gated
-   GStreamer + ORT integration jobs (`system-libs`) run on Linux, including the model
+   `-D warnings`, its warn-level lints fail CI too. The GStreamer + ORT integration jobs
+   (`system-libs`, which run on pushes to `main` and on PRs labelled `system-libs`) run on Linux, including the model
    smoke tests against the downloaded `models-v6` weights. There is **no `cargo deny`
    gate here** — this repo has no `deny.toml`; licence discipline (Rule 1) is
    enforced by review, unlike the cloud repo where `cargo deny check` is CI.

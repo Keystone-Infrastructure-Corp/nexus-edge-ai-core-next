@@ -32,7 +32,6 @@ import { Label } from "@/components/ui/label";
 import { useAuth } from "@/lib/auth";
 import { MIN_PASSWORD_LEN } from "@/lib/password-policy";
 
-
 export function LoginPage() {
   const navigate = useNavigate();
   const { setSessionFromTokens } = useAuth();
