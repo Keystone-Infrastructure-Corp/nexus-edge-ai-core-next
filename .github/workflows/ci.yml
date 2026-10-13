@@ -116,9 +116,10 @@ jobs:
       # no face-recognition names, and no file in `models/` the manifest does
       # not name. See [xtask/README.md](../../xtask/README.md). Every rule
       # except a missing field already fails without `--strict`; a missing
-      # field only warns until the `yolo_world_v2_s` and `yoloe26_s` entries
-      # carry licence fields backed by verified artifact provenance, and
-      # `--strict` is used once they do. Here `models/` holds only the
+      # field only warns because `yolo_world_v2_s` and `yoloe26_s` carry no
+      # `weights_dataset_license` yet (their training-data terms await a
+      # separate decision; BUG-265 in nexus-cloud-console), and `--strict` is
+      # used once they do. Here `models/` holds only the
       # manifest; `system-libs` repeats the check against the downloaded
       # weights.
       - name: cargo xtask check-models

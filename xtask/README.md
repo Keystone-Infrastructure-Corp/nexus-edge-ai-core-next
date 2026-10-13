@@ -38,10 +38,11 @@ Exits non-zero on any error (or warning under `--strict`).
 ```
 
 CI does not run `--strict` yet. The `yolo_world_v2_s` and `yoloe26_s` entries
-carry no licence fields (artifact-level provenance is not verified), so they
-produce missing-field warnings, which `--strict` would turn into failures.
-Every other rule fails without `--strict`. Switch CI to `--strict` once those
-entries carry licence fields backed by verified artifact provenance. The
+carry `license: AGPL-3.0` (Ultralytics' published checkpoints) but no
+`weights_dataset_license`: their training-data terms await a separate decision.
+So they produce missing-field warnings, which `--strict` would turn into
+failures. Every other rule fails without `--strict`. Switch CI to `--strict`
+once those entries carry a `weights_dataset_license`. The
 `system-libs` job adds `--models-dir <path>` to audit the downloaded weights.
 
 ## `cargo xtask check-span-cardinality`

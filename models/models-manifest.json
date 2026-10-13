@@ -133,6 +133,8 @@
       "id": "yolo_world_v2_s",
       "task": "detect_open_vocab_text",
       "_comment": "YOLO-World v2 (small) export on the native 16:9 ladder (512x288 / 1024x576 / 1536x864). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes, observed on Lunar Lake k13 under v0.1.18\u20130.1.20) and let the OpenVINO blob cache hit on subsequent boots. Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via `python tools/models/gen_yolo_world.py --all-static` whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff.",
+      "_license_comment": "Licence source: the export starts from Ultralytics' published checkpoint `yolov8s-worldv2.pt`, downloaded directly from Ultralytics by the ultralytics package (tools/models/gen_yolo_world.py; confirmed by the product owner 2026-10-13). Ultralytics distributes its models under AGPL-3.0: https://github.com/ultralytics/ultralytics/blob/main/LICENSE . weights_dataset_license is not set yet: Ultralytics' docs list Objects365v1, GQA and Flickr30k as training data, whose terms await a separate decision (BUG-265 in nexus-cloud-console).",
+      "license": "AGPL-3.0",
       "input": {
         "width": 512,
         "height": 288,
@@ -295,6 +297,8 @@
       "id": "yoloe26_s",
       "task": "detect_open_vocab_text",
       "_comment": "YOLOE (small) text-mode export on the native 16:9 ladder (512x288 / 1024x576 / 1536x864). Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via tools/models/gen_yoloe.py whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff.",
+      "_license_comment": "Licence source: the export starts from Ultralytics' published checkpoint `yoloe-26s-seg.pt`, downloaded directly from Ultralytics by the ultralytics package (tools/models/gen_yoloe.py; confirmed by the product owner 2026-10-13). Ultralytics distributes its models under AGPL-3.0: https://github.com/ultralytics/ultralytics/blob/main/LICENSE . weights_dataset_license is not set yet: Ultralytics' docs list Objects365v1, GQA and Flickr30k as training data, whose terms await a separate decision (BUG-265 in nexus-cloud-console).",
+      "license": "AGPL-3.0",
       "input": {
         "width": 512,
         "height": 288,
