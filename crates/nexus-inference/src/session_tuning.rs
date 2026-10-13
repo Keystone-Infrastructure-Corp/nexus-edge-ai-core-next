@@ -51,17 +51,33 @@
 //! two threads at once. [`OrtSession`] serialises commit, run and
 //! release across every WebGPU-backed session in the process; sessions
 //! on other EPs are untouched (#363).
+//!
+//! Out-of-process prewarm
+//! ----------------------
+//! Intel's `libopencl-clang` reads a heap block after freeing it inside
+//! `Compile()`, which OpenVINO's GPU plugin calls whenever it compiles
+//! kernels that are not yet in the on-disk NEO compiler cache. The
+//! engine runs with `MALLOC_ARENA_MAX=2` (BUG-036), and with arenas
+//! shared another thread can reclaim the freed chunk first, so the stale
+//! read returns garbage and the process segfaults — measured at ~70% of
+//! cold compiles (BUG-269, edge #360). A binary can therefore register a
+//! hook ([`register_out_of_process_prewarm`]) that builds each
+//! OpenVINO-routed session once in a child process without the cap; that
+//! fills the cache, and the in-process build that follows never reaches
+//! `Compile()` at all. Nothing in this crate spawns a process: with no
+//! hook registered, every session builds exactly as it did before.
 
 #![cfg(feature = "ort")]
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::execution_providers;
 use ort::session::{builder::GraphOptimizationLevel, Session, SessionInputs, SessionOutputs};
 use parking_lot::{Mutex, MutexGuard};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// How long an accelerator-backed session build may run before the
 /// chain is abandoned and rebuilt on the CPU EP.
@@ -92,6 +108,60 @@ static ACCELERATOR_WEDGED: AtomicBool = AtomicBool::new(false);
 /// True iff the chain asks for anything other than the CPU EP.
 fn requests_accelerator(ep_priority: &[String]) -> bool {
     ep_priority.iter().any(|e| !e.starts_with("cpu"))
+}
+
+/// How an out-of-process session build ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrewarmOutcome {
+    /// The child built the session, so the NEO compiler cache now holds
+    /// its kernels.
+    Built,
+    /// The child exited without building it — an error, or the crash the
+    /// prewarm exists to absorb. The reason is for the log.
+    Failed(String),
+    /// The child was still running at the deadline and was killed. This
+    /// is the BUG-120 wedge, seen one process earlier.
+    NeverReturned,
+}
+
+/// Build the session for `model` against `ep_priority` in a separate
+/// process, within the given budget. See the module docs for why.
+pub type Prewarm = fn(&Path, &[String], Duration) -> PrewarmOutcome;
+
+/// [`Prewarm`] as [`build_or_demote_to_cpu`] takes it, so a test can hand
+/// it a capturing closure where the binary hands it a `fn`.
+type DynPrewarm = dyn Fn(&Path, &[String], Duration) -> PrewarmOutcome;
+
+/// The binary's prewarm, if it registered one.
+///
+/// A process-global rather than a `build_session` argument because
+/// sessions are built from half a dozen crates that should not each have
+/// to carry it, and the choice belongs to the executable: only it knows
+/// how to re-invoke itself.
+static PREWARM: OnceLock<Prewarm> = OnceLock::new();
+
+/// Route every OpenVINO-backed session build in this process through
+/// `prewarm` first.
+///
+/// The first registration wins and later calls are ignored, so a test or
+/// library cannot swap the hook out from under a running engine.
+pub fn register_out_of_process_prewarm(prewarm: Prewarm) {
+    let _ = PREWARM.set(prewarm);
+}
+
+/// True iff the chain can put OpenVINO's GPU plugin, and with it
+/// opencl-clang, to work.
+///
+/// Normalised the way [`execution_providers::selected_for_priority`]
+/// normalises entries, so an entry that reaches the plugin is never
+/// missed here. `"npu"` is deliberately absent: the NPU compiler does not
+/// go through opencl-clang. `"openvino"` is included because `OV_DEVICE`
+/// may point it at the GPU.
+fn routes_through_openvino(ep_priority: &[String]) -> bool {
+    ep_priority
+        .iter()
+        .map(|e| e.trim().to_ascii_lowercase())
+        .any(|e| e == "gpu" || e == "openvino")
 }
 
 /// Run `f` on a throwaway thread, giving up after `timeout`.
@@ -291,6 +361,9 @@ pub struct BuiltSession {
 /// [`ACCELERATED_BUILD_TIMEOUT`] and demoted to the CPU EP if the
 /// provider never returns, so a wedged provider degrades the box
 /// instead of bricking it (BUG-120).
+///
+/// A chain that reaches OpenVINO is first built out of process when the
+/// binary registered a prewarm (#360).
 pub fn build_session(
     model_path: &Path,
     ep_priority: &[String],
@@ -303,6 +376,7 @@ pub fn build_session(
         ep_priority,
         ACCELERATED_BUILD_TIMEOUT,
         &ACCELERATOR_WEDGED,
+        PREWARM.get().map(|p| p as &DynPrewarm),
         move |chain| commit(&path, &chain, &cfg),
     )
 }
@@ -312,18 +386,20 @@ pub fn build_session(
 ///
 /// Generic over the build step so the demotion policy is exercisable
 /// without ORT — the failure this exists for cannot be reproduced from
-/// a test on any hardware we own. `wedged` is passed in rather than read
-/// from the global for the same reason.
+/// a test on any hardware we own. `wedged` and `prewarm` are passed in
+/// rather than read from the globals for the same reason.
 ///
 /// A build that *returns* an error is passed through, not demoted: an EP
 /// that says no has already let ORT resolve the rest of the chain. A
 /// build that never returns — or dies without returning — is demoted,
 /// and latches `wedged` so later sessions skip the accelerator entirely.
+/// A prewarm that never returns counts as exactly that.
 fn build_or_demote_to_cpu<T, F>(
     model_path: &Path,
     ep_priority: &[String],
     timeout: Duration,
     wedged: &AtomicBool,
+    prewarm: Option<&DynPrewarm>,
     build: F,
 ) -> Result<T, String>
 where
@@ -347,6 +423,42 @@ where
     }
     if !requests_accelerator(ep_priority) {
         return build(ep_priority.to_vec());
+    }
+
+    // Before the in-process build, so the child's compile fills the NEO
+    // cache and this process — which runs under the arena cap — never
+    // calls opencl-clang's `Compile()` (#360).
+    if let Some(prewarm) = prewarm.filter(|_| routes_through_openvino(ep_priority)) {
+        match prewarm(model_path, ep_priority, timeout) {
+            PrewarmOutcome::Built => {}
+            PrewarmOutcome::Failed(why) => warn!(
+                model = %model_path.display(),
+                ep_priority = ?ep_priority,
+                reason = %why,
+                "the out-of-process session build failed; this process compiles \
+                 the GPU kernels cold itself"
+            ),
+            PrewarmOutcome::NeverReturned => {
+                // Trying the accelerator again here would pay the budget a
+                // second time and then wedge in a thread that can't be
+                // killed, where the child at least could be (BUG-120).
+                wedged.store(true, Ordering::Relaxed);
+                error!(
+                    model = %model_path.display(),
+                    ep_priority = ?ep_priority,
+                    timeout_secs = timeout.as_secs(),
+                    "the out-of-process session build never returned; building on \
+                     the CPU EP, and every later session in this process goes \
+                     straight to the CPU EP"
+                );
+                return bounded_cpu_build(
+                    model_path,
+                    timeout,
+                    build,
+                    "the out-of-process build never returned",
+                );
+            }
+        }
     }
 
     let build = std::sync::Arc::new(build);
@@ -474,6 +586,7 @@ mod tests {
             &["gpu".to_owned(), "cpu".to_owned()],
             Duration::from_millis(150),
             &AtomicBool::new(false),
+            None,
             move |chain| {
                 seen.lock().expect("attempt log").push(chain.join(","));
                 if chain.iter().any(|e| e == "gpu") {
@@ -523,6 +636,7 @@ mod tests {
             &["gpu".to_owned(), "cpu".to_owned()],
             Duration::from_secs(600),
             &wedged,
+            None,
             move |chain| {
                 counted.fetch_add(1, Ordering::Relaxed);
                 Ok(chain.join(","))
@@ -556,6 +670,7 @@ mod tests {
             &["gpu".to_owned(), "cpu".to_owned()],
             Duration::from_secs(30),
             &wedged,
+            None,
             move |_| {
                 counted.fetch_add(1, Ordering::Relaxed);
                 Err("EP register: no device".to_owned())
@@ -582,6 +697,7 @@ mod tests {
             &["cpu".to_owned()],
             Duration::from_millis(1),
             &AtomicBool::new(false),
+            None,
             move |_| Ok(std::thread::current().id()),
         );
         assert_eq!(
@@ -603,6 +719,7 @@ mod tests {
             &["cpu".to_owned()],
             Duration::from_millis(100),
             &AtomicBool::new(true),
+            None,
             move |_| {
                 std::thread::sleep(Duration::from_secs(60));
                 Ok("never delivered")
@@ -617,6 +734,145 @@ mod tests {
             "the deadline did not apply; took {:?}",
             started.elapsed()
         );
+    }
+
+    /// Records every prewarm and every in-process build, in order, so a
+    /// test can assert both that the prewarm ran and that it ran first.
+    type CallLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// An in-process build that logs its chain and returns it joined.
+    fn logging_build(log: &CallLog) -> impl Fn(Vec<String>) -> Result<String, String> {
+        let log = std::sync::Arc::clone(log);
+        move |chain| {
+            let joined = chain.join(",");
+            log.lock()
+                .expect("call log")
+                .push(format!("build:{joined}"));
+            Ok(joined)
+        }
+    }
+
+    /// A prewarm hook that logs its chain and answers `outcome`.
+    fn logging_prewarm(
+        log: &CallLog,
+        outcome: PrewarmOutcome,
+    ) -> impl Fn(&Path, &[String], Duration) -> PrewarmOutcome {
+        let log = std::sync::Arc::clone(log);
+        move |_, chain, _| {
+            log.lock()
+                .expect("call log")
+                .push(format!("prewarm:{}", chain.join(",")));
+            outcome.clone()
+        }
+    }
+
+    fn build_with_prewarm(
+        chain: &[&str],
+        outcome: PrewarmOutcome,
+        wedged: &AtomicBool,
+    ) -> (Result<String, String>, Vec<String>) {
+        let log = CallLog::default();
+        let prewarm = logging_prewarm(&log, outcome);
+        let chain: Vec<String> = chain.iter().map(|e| (*e).to_owned()).collect();
+        let built = build_or_demote_to_cpu(
+            Path::new("/models/detector.onnx"),
+            &chain,
+            Duration::from_secs(30),
+            wedged,
+            Some(&prewarm),
+            logging_build(&log),
+        );
+        let calls = log.lock().expect("call log").clone();
+        (built, calls)
+    }
+
+    /// The point of the prewarm (#360): the out-of-process compile has to
+    /// fill the NEO cache *before* this process compiles, or this process
+    /// still runs opencl-clang under the arena cap.
+    #[test]
+    fn an_openvino_chain_is_prewarmed_once_before_the_in_process_build() {
+        let wedged = AtomicBool::new(false);
+        let (built, calls) = build_with_prewarm(&["gpu", "cpu"], PrewarmOutcome::Built, &wedged);
+        assert_eq!(built, Ok("gpu,cpu".to_owned()));
+        assert_eq!(
+            calls,
+            ["prewarm:gpu,cpu", "build:gpu,cpu"],
+            "the prewarm must run exactly once, and before the in-process build"
+        );
+        assert!(!wedged.load(Ordering::Relaxed));
+    }
+
+    /// Only the OpenVINO GPU plugin compiles kernels through opencl-clang.
+    /// Prewarming any other chain doubles its startup cost for nothing.
+    #[test]
+    fn chains_that_do_not_reach_the_openvino_gpu_plugin_are_not_prewarmed() {
+        for chain in [&["cpu"][..], &["npu"], &["npu", "cpu"], &["cuda", "cpu"]] {
+            let (built, calls) = build_with_prewarm(
+                chain,
+                PrewarmOutcome::NeverReturned,
+                &AtomicBool::new(false),
+            );
+            assert_eq!(built, Ok(chain.join(",")), "chain {chain:?}");
+            assert_eq!(
+                calls,
+                [format!("build:{}", chain.join(","))],
+                "chain {chain:?} was prewarmed"
+            );
+        }
+    }
+
+    /// A prewarm that fails leaves this process no worse off than before
+    /// the prewarm existed: it compiles cold itself, on the chain asked for.
+    #[test]
+    fn a_failed_prewarm_still_builds_the_requested_chain_in_process() {
+        let wedged = AtomicBool::new(false);
+        let (built, calls) = build_with_prewarm(
+            &["gpu", "cpu"],
+            PrewarmOutcome::Failed("signal 11 (SIGSEGV)".to_owned()),
+            &wedged,
+        );
+        assert_eq!(built, Ok("gpu,cpu".to_owned()));
+        assert_eq!(calls, ["prewarm:gpu,cpu", "build:gpu,cpu"]);
+        assert!(
+            !wedged.load(Ordering::Relaxed),
+            "a crashed prewarm is not a wedge and must not demote the process"
+        );
+    }
+
+    /// A prewarm that never returned is the BUG-120 wedge observed one
+    /// process earlier. Trying the accelerator again in-process would pay
+    /// the budget a second time and then wedge with no way out.
+    #[test]
+    fn a_prewarm_that_never_returned_demotes_like_an_in_process_wedge() {
+        let wedged = AtomicBool::new(false);
+        let (built, calls) =
+            build_with_prewarm(&["gpu", "cpu"], PrewarmOutcome::NeverReturned, &wedged);
+        assert_eq!(built, Ok("cpu".to_owned()));
+        assert_eq!(
+            calls,
+            ["prewarm:gpu,cpu", "build:cpu"],
+            "the accelerator chain must not be tried in-process after the prewarm wedged"
+        );
+        assert!(
+            wedged.load(Ordering::Relaxed),
+            "later sessions must skip the accelerator too"
+        );
+    }
+
+    #[test]
+    fn only_gpu_and_openvino_entries_route_through_openvino() {
+        assert!(routes_through_openvino(&["gpu".into(), "cpu".into()]));
+        assert!(routes_through_openvino(&[" GPU ".into()]));
+        assert!(routes_through_openvino(&["OpenVINO".into(), "cpu".into()]));
+        assert!(routes_through_openvino(&["cuda".into(), "openvino".into()]));
+        assert!(!routes_through_openvino(&["npu".into(), "cpu".into()]));
+        assert!(!routes_through_openvino(&["cpu".into()]));
+        assert!(!routes_through_openvino(&[
+            "cuda".into(),
+            "tensorrt".into()
+        ]));
+        assert!(!routes_through_openvino(&["gpu0".into()]));
+        assert!(!routes_through_openvino(&[]));
     }
 
     #[test]
