@@ -211,54 +211,13 @@ fn main() -> Result<()> {
     register_bundled_gst_plugins();
 
     let cli = Cli::parse();
-
-    // Route subcommands BEFORE the serve path. Each subcommand owns
-    // its own tracing / logging story so we don't bring up the full
-    // pipeline scaffold for a one-shot operation. None of these
-    // subcommands consume `cfg.auth.admin_secret_path`, so the
-    // auth-posture pass is deferred into `run()` (the serve path).
-    // Running it here would auto-provision the secret as whatever
-    // user invoked the subcommand — install.sh invokes `tls init`
-    // as root, which is precisely the bug that left
-    // `/var/lib/nexus/state/admin-secret` root-owned and crashed
-    // the unprivileged service on next boot with EACCES.
-    match cli.command.as_ref() {
-        // Ahead of `prepare`: the child needs no config, and every
-        // environment tweak `prepare` makes is already inherited from
-        // the engine that spawned it.
-        #[cfg(feature = "ort")]
-        Some(Cmd::PrewarmSession { model, ep_priority }) => {
-            ov_prewarm::run_child(model, ep_priority)
-        }
-        Some(Cmd::Enroll(args)) => {
-            let (cfg, runtime) = prepare(&cli)?;
-            runtime.block_on(cloud_enroll::run_enroll(&cfg, args))
-        }
-        Some(Cmd::SetAdminPassword(args)) => {
-            let (cfg, runtime) = prepare(&cli)?;
-            runtime.block_on(admin_cli::run(&cfg, args))
-        }
-        Some(Cmd::Tls(TlsCmd::Init { force })) => {
-            let (cfg, _runtime) = prepare(&cli)?;
-            run_tls_init(&cfg, *force)
-        }
-        None => {
-            let (cfg, runtime) = prepare(&cli)?;
-            // Before `run` builds any session. The serve path only: a
-            // subcommand builds none, and the `prewarm-session` child
-            // must compile in-process rather than spawn a child itself.
-            #[cfg(feature = "ort")]
-            nexus_inference::session_tuning::register_out_of_process_prewarm(
-                ov_prewarm::spawn_and_wait,
-            );
-            runtime.block_on(run(cfg, cli))
-        }
+    // Ahead of the config load: the child needs no config, and every
+    // environment tweak below is already inherited from the engine
+    // that spawned it (see `ov_prewarm`, #360).
+    #[cfg(feature = "ort")]
+    if let Some(Cmd::PrewarmSession { model, ep_priority }) = &cli.command {
+        return ov_prewarm::run_child(model, ep_priority);
     }
-}
-
-/// Load the config and apply the process-wide startup settings that
-/// every path except `prewarm-session` needs, ending with the runtime.
-fn prepare(cli: &Cli) -> Result<(Config, tokio::runtime::Runtime)> {
     let config_path = cli.resolved_config_path();
     let (mut cfg, compat) = Config::load_with_compat(&config_path)
         .with_context(|| format!("loading config {:?}", config_path))?;
@@ -291,7 +250,36 @@ fn prepare(cli: &Cli) -> Result<(Config, tokio::runtime::Runtime)> {
     }
 
     let runtime = build_runtime(&cfg.runtime)?;
-    Ok((cfg, runtime))
+
+    // Route subcommands BEFORE the serve path. Each subcommand owns
+    // its own tracing / logging story so we don't bring up the full
+    // pipeline scaffold for a one-shot operation. None of these
+    // subcommands consume `cfg.auth.admin_secret_path`, so the
+    // auth-posture pass is deferred into `run()` (the serve path).
+    // Running it here would auto-provision the secret as whatever
+    // user invoked the subcommand — install.sh invokes `tls init`
+    // as root, which is precisely the bug that left
+    // `/var/lib/nexus/state/admin-secret` root-owned and crashed
+    // the unprivileged service on next boot with EACCES.
+    if let Some(cmd) = cli.command.as_ref() {
+        return match cmd {
+            Cmd::Enroll(args) => runtime.block_on(cloud_enroll::run_enroll(&cfg, args)),
+            Cmd::SetAdminPassword(args) => runtime.block_on(admin_cli::run(&cfg, args)),
+            Cmd::Tls(TlsCmd::Init { force }) => run_tls_init(&cfg, *force),
+            #[cfg(feature = "ort")]
+            Cmd::PrewarmSession { .. } => {
+                unreachable!("prewarm-session returns before the config is loaded")
+            }
+        };
+    }
+
+    // Before `run` builds any session. The serve path only: a subcommand
+    // builds none, and the `prewarm-session` child must compile in-process
+    // rather than spawn a child of its own.
+    #[cfg(feature = "ort")]
+    nexus_inference::session_tuning::register_out_of_process_prewarm(ov_prewarm::spawn_and_wait);
+
+    runtime.block_on(run(cfg, cli))
 }
 
 /// Prepend the release tree's bundled GStreamer plugin directory to
