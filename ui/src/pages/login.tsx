@@ -30,8 +30,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/lib/auth";
+import { MIN_PASSWORD_LEN } from "@/lib/password-policy";
 
-const MIN_PASSWORD_LEN = 12;
 
 export function LoginPage() {
   const navigate = useNavigate();

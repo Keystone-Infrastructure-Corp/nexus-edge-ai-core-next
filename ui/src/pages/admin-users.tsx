@@ -29,6 +29,7 @@ import { Label } from "@/components/ui/label";
 import { Sheet, SheetSection } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatAgo } from "@/lib/format";
+import { MIN_PASSWORD_LEN } from "@/lib/password-policy";
 
 export function AdminUsersPage() {
   const qc = useQueryClient();
@@ -412,8 +413,8 @@ function CreateUserSheet({
       setError("Username is required.");
       return;
     }
-    if (setPassword && password.length < 8) {
-      setError("Password must be at least 8 characters.");
+    if (setPassword && password.length < MIN_PASSWORD_LEN) {
+      setError(`Password must be at least ${MIN_PASSWORD_LEN} characters.`);
       return;
     }
     mutation.mutate();
@@ -478,7 +479,7 @@ function CreateUserSheet({
           </label>
           {setPassword ? (
             <div className="space-y-2">
-              <Label htmlFor="user-pw">Password (min 8 chars)</Label>
+              <Label htmlFor="user-pw">Password (min {MIN_PASSWORD_LEN} chars)</Label>
               <Input
                 id="user-pw"
                 type="password"
