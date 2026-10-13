@@ -8,6 +8,8 @@
 //! wrapper that is never copied into the tarball leaves a sudoers grant pointing
 //! at a file that does not exist. Nothing else in CI would notice either one.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {

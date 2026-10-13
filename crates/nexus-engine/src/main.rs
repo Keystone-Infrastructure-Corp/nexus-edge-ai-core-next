@@ -2235,6 +2235,10 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
 /// is present (or unconditionally when `force == true`). Exits with
 /// a clear error when those paths aren't set in `nexus.toml`, so
 /// the installer's invocation surfaces config-vs-code drift loudly.
+#[expect(
+    clippy::print_stderr,
+    reason = "`tls init` is a one-shot installer subcommand that runs before telemetry is initialised; stderr is its output"
+)]
 fn run_tls_init(cfg: &Config, force: bool) -> Result<()> {
     let cert = cfg
         .server
@@ -2538,7 +2542,6 @@ async fn build_gst_recorder(
                     Some(c) => {
                         tracing::info!(
                             camera_id = cam.id,
-                            url = %cam.ingest.url,
                             codec = %c,
                             "codec autodetected at boot"
                         );
@@ -2547,7 +2550,6 @@ async fn build_gst_recorder(
                     None => {
                         tracing::warn!(
                             camera_id = cam.id,
-                            url = %cam.ingest.url,
                             "camera codec unspecified and autodetect probe failed; defaulting to h264 — set `ingest.codec` in the camera config to silence"
                         );
                         nexus_types::CodecKind::H264

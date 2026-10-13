@@ -18,6 +18,7 @@
 //! covered separately in `tests/dispatcher.rs`.
 
 #![cfg(feature = "sureview")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use chrono::Utc;
 use nexus_config::{SureViewRegion, SureViewSinkConfig};

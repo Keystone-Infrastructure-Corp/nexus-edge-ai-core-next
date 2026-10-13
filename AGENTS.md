@@ -53,13 +53,18 @@ The wedge plan that drives the next three phases of work is
      (DINOv2-S Apache-2.0, OSNet MIT, YOLO* GPL/AGPL upstream) under the engine's AGPL.
 2. **Model-license discipline (`xtask check-models`).** Every file referenced in
    [models/models-manifest.json](models/models-manifest.json) MUST declare two fields:
-   - `license` — resolves to an allowlist `Apache-2.0`, `MIT`, `BSD-3-Clause`,
-     `Apache-2.0 WITH LLVM-exception`. Build fails on `non-commercial`, `research-only`,
-     `unknown`, or any other value.
+   - `license` — an exact match of the allowlist `Apache-2.0`, `MIT`, `BSD-3-Clause`,
+     `Apache-2.0 WITH LLVM-exception`, `AGPL-3.0`, `GPL-3.0` (the last two are the YOLO
+     weights' licences, matching rule 1). Any other value fails the check.
    - `weights_dataset_license` — the license of the training dataset (e.g.
      `LVIS:CC-BY-4.0`, `COCO:CC-BY-4.0`, `LAION-5B:CC-BY-4.0`, `DigiFace-1M:research`).
-     Datasets tagged `research`-only on the dataset side disqualify the weights from
-     shipping, even if the model code itself is permissively licensed.
+     Datasets tagged `research`, `academic`, `non-commercial` (or another denylisted
+     token) on the dataset side disqualify the weights from shipping, even if the model
+     code itself is permissively licensed. A dataset-licence hit is always an error.
+
+   The check also scans the models directory (`--models-dir`, default the manifest's
+   directory): a weights file that no manifest artifact `path` names fails, whatever its
+   licence, so nothing ships outside these rules.
 
    **HARD product invariant — no face-specific extractor at the edge in v1.** The
    following model names (case-insensitive substring match) fail the check unconditionally:
@@ -76,8 +81,10 @@ The wedge plan that drives the next three phases of work is
    alongside a SHA-256 checksum (`v1.CHECKSUM`) recording the cloud-side source of
    truth at
    [nexus-cloud-console/proto/v1.json](../nexus-cloud-console/proto/v1.json) that
-   produced it. Note the checksum is a sync marker verified by review, **not** a CI
-   gate — no job in either repo compares the two today. The edge
+   produced it. No job in this repo checks the checksum. The cloud repo's `wire-parity`
+   workflow (`cargo xtask check-wire-parity`) reads this repo's `main`, reports checksum
+   drift, and fails when the cloud accepts an edge-produced message or bus topic that
+   this mirror or this repo's non-test source lacks. The edge
    itself does NOT carry a copy of `proto/v1.json` — only the generated bindings. See
    [REPO_BOUNDARY R1–R3 in the cloud repo](../nexus-cloud-console/docs/REPO_BOUNDARY.md).
 4. **Wire protocol version pinned to the cloud's `v`.** The engine speaks the version
@@ -156,8 +163,8 @@ They bias toward caution over speed — for a typo or an obvious one-liner, use 
    Turn imperative tasks into verifiable goals — "fix the bug" becomes "write a test that
    reproduces it, then make it pass". For multi-step work state the plan as `step → verify:`
    pairs, where each verify names a real gate (`cargo test --workspace`, `cargo clippy
-   --workspace --all-targets -- -D warnings`, `cargo xtask check-models`, the `nexus-types`
-   TS-binding drift check) rather than "make it work". Remember macOS-local clippy does not
+   --workspace --all-targets -- -D warnings`, `cargo xtask check-models`, `cargo xtask
+   check-span-cardinality`, the `nexus-types` TS-binding drift check) rather than "make it work". Remember macOS-local clippy does not
    cover the Linux-gated paths — a green local run is a weaker verify than CI.
 
 ### Debugging and review
@@ -207,6 +214,7 @@ Rust, from the repo root:
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Test: `cargo test --workspace`
 - Model licences: `cargo xtask check-models`
+- Span field keys: `cargo xtask check-span-cardinality`
 - Generated TS bindings: `cargo test -p nexus-types --features ts`, then confirm
   `ui/src/api/types/` has no diff — CI fails on drift
 
@@ -325,7 +333,8 @@ implementation notes, do cross-link ADR/SPEC/BUG records that relate to each oth
    `[Phase N · Step M] <verb> <object>` for wedge work that maps to a phase number.
 3. CI gates that must be green: `cargo fmt --check`, `cargo check` + `cargo clippy
    --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
-   `cargo xtask check-models`, and the `nexus-types` TS-binding drift check. The
+   `cargo xtask check-models`, `cargo xtask check-span-cardinality`, and the `nexus-types`
+   TS-binding drift check. The
    GStreamer + ORT integration jobs run on Linux. There is **no `cargo deny`
    gate here** — this repo has no `deny.toml`; licence discipline (Rule 1) is
    enforced by review, unlike the cloud repo where `cargo deny check` is CI.

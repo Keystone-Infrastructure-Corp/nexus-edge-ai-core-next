@@ -18,6 +18,7 @@
 //! 5. Removing bindings from the store and re-pushing keeps the
 //!    detector responsive (`detect` still resolves) — the
 //!    empty-binding fail-soft contract.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 

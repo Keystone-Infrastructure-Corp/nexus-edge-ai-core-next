@@ -27,6 +27,7 @@
 //!   surfaces them.
 //! * `get_password_hash_for_login` returns `(id, hash)` for
 //!   active users only.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

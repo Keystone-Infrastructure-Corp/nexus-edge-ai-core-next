@@ -24,6 +24,7 @@
 //! | `future_dated_event_does_not_wait_forever` | clock-skew wait bound           |
 //! | `backlogged_event_still_waits_the_full_clip_link_grace` | grace runs from the row |
 //! | `backlogged_event_still_waits_the_full_alert_clip_build_grace` | grace runs from the row |
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

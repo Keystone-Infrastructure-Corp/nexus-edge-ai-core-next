@@ -535,6 +535,10 @@ pub async fn put_auth_config(
     // the operator gets a 400 with a useful tag instead of
     // a silent boot failure on the next restart.
     let oidc_issuer = if req.mode.allows_oidc() {
+        #[expect(
+            clippy::expect_used,
+            reason = "an OIDC-allowing mode with no [oidc] block is rejected earlier in this function"
+        )]
         let oidc_cfg = req.oidc.as_ref().expect("checked above");
         match OidcClient::discover(oidc_cfg.clone()).await {
             Ok(_) => Some(oidc_cfg.issuer.clone()),

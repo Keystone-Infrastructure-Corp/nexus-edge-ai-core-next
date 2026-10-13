@@ -372,7 +372,7 @@ impl Verifier {
                     .trusted_keys
                     .values()
                     .next()
-                    .expect("len == 1 above")
+                    .ok_or(RejectReason::Invalid(InvalidReason::UnknownKeyId))?
             }
             None => {
                 return Err(RejectReason::Invalid(InvalidReason::UnknownKeyId));

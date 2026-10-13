@@ -31,3 +31,6 @@ libloading = { workspace = true, optional = true }
 [[bin]]
 name = "nexus-hailo-probe"
 path = "src/bin/nexus-hailo-probe.rs"
+
+[lints]
+workspace = true

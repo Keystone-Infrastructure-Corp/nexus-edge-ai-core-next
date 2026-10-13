@@ -1,4 +1,4 @@
-//! YOLO-World ORT smoke test — loads `models/yolo_world_v2_s.onnx` +
+//! YOLO-World ORT smoke test — loads `models/yolo_world_v2_s_512x288.onnx` +
 //! the matching `models-manifest.json`, runs it on a synthesized RGB
 //! frame, and verifies the open-vocab session shape works end-to-end.
 //!
@@ -7,7 +7,7 @@
 //!
 //! ```bash
 //! ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
-//!   NEXUS_TEST_YOLO_WORLD_MODEL=$PWD/models/yolo_world_v2_s.onnx \
+//!   NEXUS_TEST_YOLO_WORLD_MODEL=$PWD/models/yolo_world_v2_s_512x288.onnx \
 //!   NEXUS_TEST_YOLO_WORLD_MANIFEST=$PWD/models/models-manifest.json \
 //!   cargo test --locked -p nexus-inference --features ort,ep-cpu \
 //!   yolo_world_smoke -- --nocapture
@@ -19,6 +19,12 @@
 //! and labelled with one of the prompts we passed in.
 
 #![cfg(feature = "ort")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stderr
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,6 +57,18 @@ fn paths() -> Option<(PathBuf, PathBuf)> {
         return None;
     }
     Some((model, manifest))
+}
+
+/// `(w, h)` from a shipped artifact's `_<w>x<h>.onnx` suffix, so the
+/// session input matches whatever shape the pack file was exported at.
+fn shape_of(model: &std::path::Path) -> (u32, u32) {
+    let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let (w, h) = stem
+        .rsplit('_')
+        .next()
+        .and_then(|s| s.split_once('x'))
+        .expect("model file name must end in _<w>x<h>.onnx");
+    (w.parse().expect("width"), h.parse().expect("height"))
 }
 
 fn synth_frame(w: u32, h: u32) -> Frame {
@@ -97,10 +115,11 @@ async fn yolo_world_smoke_runs_on_synthetic_frame() {
         "manifest yolo_world_v2_s.prompts[] is empty"
     );
 
+    let (mw, mh) = shape_of(&model);
     let det = YoloWorldDetector::open(
         &model,
-        640,
-        640,
+        mw,
+        mh,
         0.10,
         0.50,
         None,

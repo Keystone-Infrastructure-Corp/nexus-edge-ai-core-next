@@ -735,7 +735,6 @@ async fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, want: EntryKey) 
                 Some(c) => {
                     info!(
                         camera_id = cam_id,
-                        %url,
                         codec = %c,
                         "codec autodetected at hot-add"
                     );
@@ -744,7 +743,6 @@ async fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, want: EntryKey) 
                 None => {
                     warn!(
                         camera_id = cam_id,
-                        %url,
                         "camera codec unspecified and autodetect probe failed; defaulting to h264 — set `ingest.codec` in the camera config to silence"
                     );
                     CodecKind::H264
@@ -765,7 +763,6 @@ async fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, want: EntryKey) 
         Err(e) => {
             error!(
                 camera_id = cam_id,
-                %url,
                 error = %e,
                 "camera reconciler: ingester hot-add failed; clips will be refused for this camera \
                  until a pass registers it"
@@ -834,10 +831,7 @@ async fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, want: EntryKey) 
     args.handles.lock().insert(cam_id, entry);
     info!(
         camera_id = cam_id,
-        %url,
-        sup_w,
-        sup_h,
-        "camera reconciler: spawned supervisor + ingester"
+        sup_w, sup_h, "camera reconciler: spawned supervisor + ingester"
     );
 }
 

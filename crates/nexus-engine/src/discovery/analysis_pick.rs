@@ -197,6 +197,10 @@ pub fn pick_analysis_stream(
     // Prefer the smallest profile that still feeds the detector fully;
     // fall back to the largest of the too-small ones, flagged.
     let below_detector_input = sized.iter().all(|(_, px)| *px < supervisor_pixels);
+    #[expect(
+        clippy::expect_used,
+        reason = "`sized` is non-empty (checked above) and the filtered branch only runs when some entry reaches supervisor_pixels"
+    )]
     let best = if below_detector_input {
         sized
             .iter()

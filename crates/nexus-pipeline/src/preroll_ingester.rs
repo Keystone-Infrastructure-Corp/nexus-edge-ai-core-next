@@ -599,7 +599,6 @@ async fn run_supervisor(
 ) {
     info!(
         camera_id,
-        url,
         codec = %*stream_codec.lock(),
         rgb_tap = frame_tap.is_some(),
         "preroll ingester supervisor starting (always-on)"

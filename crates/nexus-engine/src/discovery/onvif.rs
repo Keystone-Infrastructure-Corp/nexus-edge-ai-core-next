@@ -93,6 +93,10 @@ async fn probe_network(bind: Option<Ipv4Addr>) -> Result<Vec<DiscoveredDevice>, 
     // not v4 specifically.)
     let probe_nvt = build_probe_envelope(&Uuid::now_v7(), "dn:NetworkVideoTransmitter");
     let probe_dev = build_probe_envelope(&Uuid::now_v7(), "tds:Device");
+    #[expect(
+        clippy::expect_used,
+        reason = "WS_DISCOVERY_ADDR is a const IPv4:port literal"
+    )]
     let target: SocketAddr = WS_DISCOVERY_ADDR
         .parse()
         .expect("WS-Discovery address is a valid literal SocketAddr");

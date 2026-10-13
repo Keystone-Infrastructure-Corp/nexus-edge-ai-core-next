@@ -16,6 +16,7 @@
 //!   `Ok(false)`).
 //! * `pending_cold_upload_position` reports the right 1-indexed slot
 //!   and `None` for ids that are not pending.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

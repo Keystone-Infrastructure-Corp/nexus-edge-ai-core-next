@@ -162,11 +162,11 @@ fn is_v6_link_local(addr: &Ipv6Addr) -> bool {
 
 fn write_pem(path: &Path, contents: &str, mode: u32) -> Result<()> {
     use std::io::Write;
-    let mut tmp = tempfile::NamedTempFile::new_in(
-        path.parent()
-            .ok_or_else(|| anyhow!("cert path has no parent: {}", path.display()))?,
-    )
-    .with_context(|| format!("tempfile in {}", path.parent().unwrap().display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("cert path has no parent: {}", path.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("tempfile in {}", parent.display()))?;
     tmp.write_all(contents.as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     tmp.as_file().sync_all()?;

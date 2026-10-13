@@ -1,6 +1,7 @@
 //! The two tracker backends must agree on the `TrackedObject` contract, so
 //! switching `tracker.backend` changes association quality, never what a rule
 //! or sink can read. Each test runs the same detections through both.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};

@@ -1599,8 +1599,8 @@ fn strip_sql_line_comments(sql: &str) -> String {
             out.push(c);
             if c == '\'' {
                 // Handle SQL escaped quotes ('').
-                if chars.peek() == Some(&'\'') {
-                    out.push(chars.next().unwrap());
+                if let Some(quote) = chars.next_if_eq(&'\'') {
+                    out.push(quote);
                 } else {
                     in_string = false;
                 }

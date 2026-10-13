@@ -513,7 +513,6 @@ impl GstClipRecorder {
         }
         info!(
             camera_id,
-            %url,
             prev_w = cur_w,
             prev_h = cur_h,
             new_w = new_rgb_w,
@@ -1358,9 +1357,9 @@ impl ClipRecorder for GstClipRecorder {
             // the old URL/codec for an unbounded amount of time
             // after we install the replacement.
             prev_ing.shutdown();
-            info!(camera_id, %url, codec = %codec, "pre-roll ingester replaced (URL or codec changed)");
+            info!(camera_id, codec = %codec, "pre-roll ingester replaced (URL or codec changed)");
         } else {
-            info!(camera_id, %url, pre_roll_secs, max_fps, codec = %codec, "pre-roll ingester started (hot-add)");
+            info!(camera_id, pre_roll_secs, max_fps, codec = %codec, "pre-roll ingester started (hot-add)");
         }
         Ok(())
     }
@@ -1462,7 +1461,7 @@ impl ClipRecorder for GstClipRecorder {
         if retry {
             debug!(camera_id, codec = %codec, "analysis substream session started again (retry)");
         } else {
-            info!(camera_id, %url, codec = %codec, "analysis substream session started");
+            info!(camera_id, codec = %codec, "analysis substream session started");
         }
         Ok(())
     }

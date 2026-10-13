@@ -9,6 +9,8 @@
 //! the contract 404s only on an operator's box, never in CI. And a second copy
 //! of the channel calculation drifts from the first without anything failing.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {

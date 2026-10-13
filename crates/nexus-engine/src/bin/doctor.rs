@@ -15,6 +15,11 @@
 //!
 //! Each check carries a one-line "hint" pointing at the
 //! `INSTALL.md §11` troubleshooting row most likely to apply.
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "operator smoke-test CLI: the colour-coded report on stdout/stderr is its output; no tracing subscriber is installed"
+)]
 
 use std::io::IsTerminal;
 use std::process::ExitCode;

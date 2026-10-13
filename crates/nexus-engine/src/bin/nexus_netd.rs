@@ -33,6 +33,13 @@
 //!   1 = usage / invocation error
 //!   2 = OS-side failure (file I/O, netplan command failed)
 //!   3 = platform unsupported (non-Linux)
+// `allow`, not `expect`: which prints fire depends on the target OS (the
+// non-Linux stub and the Linux path print different streams).
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "privileged one-shot helper invoked via sudo; its status lines on stdout/stderr are read by the calling engine, no tracing subscriber is installed"
+)]
 
 use std::env;
 #[cfg(target_os = "linux")]

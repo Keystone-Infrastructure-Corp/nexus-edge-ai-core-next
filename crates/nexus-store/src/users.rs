@@ -150,13 +150,15 @@ impl Store {
                 // — SQLite error messages aren't structurally stable
                 // enough to parse, so the second hop costs us one
                 // extra round-trip on the unhappy path only.
-                if new.oidc_subject_hash.is_some()
-                    && self
-                        .get_user_by_oidc_subject(new.oidc_subject_hash.unwrap())
+                let subject_taken = match new.oidc_subject_hash {
+                    Some(hash) => self
+                        .get_user_by_oidc_subject(hash)
                         .await
                         .map_err(UsersError::Store)?
-                        .is_some()
-                {
+                        .is_some(),
+                    None => false,
+                };
+                if subject_taken {
                     Err(UsersError::OidcSubjectTaken)
                 } else {
                     Err(UsersError::UsernameTaken)

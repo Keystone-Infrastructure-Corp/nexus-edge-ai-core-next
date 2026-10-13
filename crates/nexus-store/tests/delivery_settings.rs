@@ -2,6 +2,7 @@
 //! `attach_alert_clip` toggle (migration 0028): it defaults ON for a
 //! fresh install and round-trips through put/get without disturbing the
 //! other delivery fields.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

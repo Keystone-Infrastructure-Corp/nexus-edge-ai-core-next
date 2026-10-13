@@ -10,6 +10,7 @@
 //!   dinov2_core_smoke -- --nocapture
 //! ```
 #![cfg(feature = "ort")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

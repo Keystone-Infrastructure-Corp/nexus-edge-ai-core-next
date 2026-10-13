@@ -16,3 +16,6 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 ts-rs = { workspace = true, optional = true }
+
+[lints]
+workspace = true

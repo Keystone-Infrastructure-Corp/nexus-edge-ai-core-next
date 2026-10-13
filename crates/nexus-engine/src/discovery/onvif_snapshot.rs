@@ -58,7 +58,7 @@ pub async fn fetch_snapshot(
         .basic_auth(username, Some(password))
         .send()
         .await
-        .map_err(|e| format!("snapshot GET failed: {e}"))?;
+        .map_err(|e| format!("snapshot GET failed: {}", e.without_url()))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -67,7 +67,7 @@ pub async fn fetch_snapshot(
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| format!("snapshot read failed: {e}"))?;
+        .map_err(|e| format!("snapshot read failed: {}", e.without_url()))?;
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(format!(
             "snapshot too large: {} bytes (cap {MAX_SNAPSHOT_BYTES})",
@@ -95,7 +95,7 @@ pub async fn put_snapshot_to_sas(sas_url: &str, jpeg: &[u8]) -> Result<usize, St
         .body(jpeg.to_vec())
         .send()
         .await
-        .map_err(|e| format!("snapshot SAS PUT failed: {e}"))?;
+        .map_err(|e| format!("snapshot SAS PUT failed: {}", e.without_url()))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -159,6 +159,20 @@ mod tests {
         assert_eq!(
             first_text(&body, "Uri").as_deref(),
             Some("http://192.168.1.64/onvif-http/snapshot?Profile_1")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_snapshot_to_sas_strips_url_on_connection_error() {
+        // Port 9 is closed, so reqwest's connect error would otherwise
+        // embed the request URL and with it the SAS signature.
+        let url = "http://127.0.0.1:9/snap.jpg?sv=2024-08-04&sig=SUPERSECRETSIGNATURE";
+        let err = put_snapshot_to_sas(url, b"jpeg")
+            .await
+            .expect_err("must fail");
+        assert!(
+            !err.contains("SUPERSECRETSIGNATURE"),
+            "SAS credential leaked into error: {err}"
         );
     }
 

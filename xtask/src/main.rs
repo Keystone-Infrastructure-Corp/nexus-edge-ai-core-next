@@ -18,29 +18,49 @@
 //!    pseudonymous-by-default identity vault. See
 //!    [`nexus-cloud-console`'s `docs/product/WEDGE_PLAN.md`](../../nexus-cloud-console/docs/product/WEDGE_PLAN.md).
 //!
-//! 2. **License + dataset-license deny list.** Explicit values that
-//!    are incompatible with the engine's AGPL-3.0-or-later license
-//!    or with commercial redistribution are rejected:
-//!    `non-commercial`, `nc`, `cc-by-nc-*`, `research`,
-//!    `research-only`, `unknown`, `proprietary`. The check is
-//!    case-insensitive on substring; `weights_dataset_license`
-//!    values like `MS1M:research` and `Objects365:CC-BY-NC-4.0`
-//!    trip this rule.
+//! 2. **License allowlist.** `license` must exactly match one of
+//!    `LICENSE_ALLOWLIST` (Apache-2.0, MIT, BSD-3-Clause,
+//!    Apache-2.0 WITH LLVM-exception, AGPL-3.0, GPL-3.0). Any other
+//!    present value is an error.
 //!
-//! 3. **Missing license / weights_dataset_license fields.** Warned
-//!    by default and elevated to an error under `--strict`. The
-//!    distinction lets the gate land before every existing
-//!    manifest entry is fully back-filled; CI runs without
-//!    `--strict` today and with `--strict` once back-fill is done.
+//! 3. **Dataset-license deny list.** `weights_dataset_license` is
+//!    rejected when it contains a `LICENSE_DENYLIST` substring
+//!    (`non-commercial`, `cc-by-nc`, `research`, `academic`, ...;
+//!    case-insensitive). A hit is always an error; there is no
+//!    waiver mechanism.
+//!
+//! 4. **Missing license / weights_dataset_license fields.** Warned
+//!    by default and elevated to an error under `--strict`.
+//!
+//! 5. **Folder scan.** Every file under the models directory (by
+//!    default the manifest's directory; `--models-dir` overrides)
+//!    must be named by an artifact `path`, except
+//!    `models-manifest.json`, `.gitkeep` and `<artifact>.sha256`
+//!    sidecars of listed artifacts. An unlisted file is an error,
+//!    and every file name is checked against the face-recognition
+//!    denylist, so weights no manifest entry names cannot escape
+//!    the rules above. There are no exemptions for generator
+//!    intermediates: the scan cannot tell a developer's `models/`
+//!    from a release pack, and a pack that carries one is the
+//!    accident this rule exists to catch.
 //!
 //! The check exits 0 on success, 1 on any rule violation, and
 //! prints a one-line summary at the end either way.
 
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "xtask is a command-line tool; terminal output is its interface"
+)]
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+
+mod span_cardinality;
 
 /// CLI surface for `cargo xtask <subcommand>`.
 #[derive(Debug, Parser)]
@@ -55,6 +75,10 @@ enum Cmd {
     /// Validate models/models-manifest.json against the rules in
     /// AGENTS.md §2. Exits non-zero on any deny-list violation.
     CheckModels(CheckModelsArgs),
+    /// Reject forbidden field keys (secrets, edge-resident URLs,
+    /// per-request / per-frame ids) in `tracing` macros under crates/.
+    /// Exits non-zero on any violation.
+    CheckSpanCardinality,
 }
 
 #[derive(Debug, clap::Args)]
@@ -70,12 +94,24 @@ struct CheckModelsArgs {
     /// both fields.
     #[arg(long)]
     strict: bool,
+
+    /// Directory scanned for weight files (recursive). Defaults to
+    /// the directory containing the manifest; point it at downloaded
+    /// release weights to audit those.
+    #[arg(long)]
+    models_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::CheckModels(args) => check_models(args),
+        Cmd::CheckSpanCardinality => {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .context("xtask manifest dir has no parent")?;
+            std::process::exit(span_cardinality::run(root)?);
+        }
     }
 }
 
@@ -96,7 +132,19 @@ const FACE_REC_DENYLIST: &[&str] = &[
     "magface",
 ];
 
-/// Substrings that disqualify a license / dataset-license value.
+/// Exact `license` values a model entry may declare. AGPL-3.0 and
+/// GPL-3.0 are there because AGENTS.md rule 1 ships YOLO weights under
+/// them, which is compatible with the engine's own AGPL-3.0-or-later.
+const LICENSE_ALLOWLIST: &[&str] = &[
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "Apache-2.0 WITH LLVM-exception",
+    "AGPL-3.0",
+    "GPL-3.0",
+];
+
+/// Substrings that disqualify a `weights_dataset_license` value.
 /// Match is case-insensitive on the field's full string (so an entry
 /// like `"weights_dataset_license": "MS1M:research"` trips on
 /// `"research"`).
@@ -107,6 +155,7 @@ const LICENSE_DENYLIST: &[&str] = &[
     "cc-by-nc",
     "research-only",
     "research",
+    "academic",
     "unknown",
     "proprietary",
 ];
@@ -159,7 +208,18 @@ fn check_models(args: CheckModelsArgs) -> Result<()> {
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse manifest {}", manifest_path.display()))?;
 
-    let report = audit_manifest(&manifest);
+    let mut report = audit_manifest(&manifest);
+
+    let models_dir = match &args.models_dir {
+        Some(dir) => dir.clone(),
+        None => manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
+    };
+    let files = list_files(&models_dir)
+        .with_context(|| format!("failed to scan models dir {}", models_dir.display()))?;
+    audit_files(&files, &manifest, &mut report);
 
     for w in &report.warnings {
         eprintln!("warn: {w}");
@@ -172,9 +232,11 @@ fn check_models(args: CheckModelsArgs) -> Result<()> {
     let failed = !report.errors.is_empty() || fatal_warnings;
 
     eprintln!(
-        "check-models: {} model{}, {} warning{}, {} error{}{}",
+        "check-models: {} model{}, {} file{} scanned, {} warning{}, {} error{}{}",
         manifest.models.len(),
         if manifest.models.len() == 1 { "" } else { "s" },
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
         report.warnings.len(),
         if report.warnings.len() == 1 { "" } else { "s" },
         report.errors.len(),
@@ -245,13 +307,15 @@ fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
         }
     }
 
-    // Rule 2: license + dataset-license deny list.
+    // Rule 2: `license` must be on the allowlist.
     match &model.license {
         Some(lic) => {
-            if let Some(bad) = license_denylist_hit(lic) {
+            if !LICENSE_ALLOWLIST.contains(&lic.as_str()) {
                 report.error(format!(
-                    "model '{}' license '{}' contains denylisted token '{}'",
-                    model.id, lic, bad
+                    "model '{}' license '{}' is not on the allowlist ({}) — see AGENTS.md rule 2",
+                    model.id,
+                    lic,
+                    LICENSE_ALLOWLIST.join(", ")
                 ));
             }
         }
@@ -262,12 +326,17 @@ fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
             ));
         }
     }
+
+    // Rule 3: dataset-license deny list. A hit is always an error.
     match &model.weights_dataset_license {
         Some(lic) => {
-            if let Some(bad) = license_denylist_hit(lic) {
+            let hits = license_denylist_hits(lic);
+            if !hits.is_empty() {
                 report.error(format!(
-                    "model '{}' weights_dataset_license '{}' contains denylisted token '{}'",
-                    model.id, lic, bad
+                    "model '{}' weights_dataset_license '{}' contains denylisted {}",
+                    model.id,
+                    lic,
+                    quote_tokens(&hits)
                 ));
             }
         }
@@ -280,12 +349,80 @@ fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
     }
 }
 
-fn license_denylist_hit(value: &str) -> Option<&'static str> {
+/// `token 'a'` or `tokens 'a', 'b'`.
+fn quote_tokens(tokens: &[&str]) -> String {
+    let quoted: Vec<String> = tokens.iter().map(|t| format!("'{t}'")).collect();
+    format!(
+        "token{} {}",
+        if tokens.len() == 1 { "" } else { "s" },
+        quoted.join(", ")
+    )
+}
+
+/// Every regular file under `dir` (recursive, not following symlinked
+/// directories), as `/`-separated paths relative to `dir`, sorted.
+fn list_files(dir: &Path) -> std::io::Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                walk(root, &path, out)?;
+            } else if let Ok(rel) = path.strip_prefix(root) {
+                let parts: Vec<_> = rel.iter().map(|c| c.to_string_lossy()).collect();
+                out.push(parts.join("/"));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// Rule 5: every file found must be named by an artifact `path`
+/// (exempt: the manifest itself, `.gitkeep`, and `<artifact>.sha256`
+/// sidecars of listed artifacts), and no file name may match the
+/// face-recognition denylist. Pure over the file list.
+fn audit_files(files: &[String], manifest: &Manifest, report: &mut CheckReport) {
+    let listed: HashSet<&str> = manifest
+        .models
+        .iter()
+        .flat_map(|m| &m.artifacts)
+        .filter_map(|a| a.path.as_deref())
+        .collect();
+    for file in files {
+        let lc = file.to_lowercase();
+        for needle in FACE_REC_DENYLIST {
+            if lc.contains(needle) {
+                report.error(format!(
+                    "file '{}' matches face-rec denylist substring '{}' — see AGENTS.md rule 2",
+                    file, needle
+                ));
+            }
+        }
+        let basename = file.rsplit('/').next().unwrap_or(file);
+        let is_sidecar = file
+            .strip_suffix(".sha256")
+            .is_some_and(|stem| listed.contains(stem));
+        let exempt = file == "models-manifest.json" || basename == ".gitkeep" || is_sidecar;
+        if !exempt && !listed.contains(file.as_str()) {
+            report.error(format!(
+                "file '{file}' is not named by any manifest artifact path — list it or remove it (AGENTS.md rule 2)"
+            ));
+        }
+    }
+}
+
+/// Every denylist token `value` contains, in denylist order.
+fn license_denylist_hits(value: &str) -> Vec<&'static str> {
     let lc = value.to_lowercase();
     LICENSE_DENYLIST
         .iter()
         .copied()
-        .find(|needle| lc.contains(needle))
+        .filter(|needle| lc.contains(needle))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -425,23 +562,206 @@ mod tests {
         assert_eq!(r.warnings.len(), 2);
     }
 
+    fn model_json(license: &str, dataset: &str) -> String {
+        format!(
+            r#"{{"models":[{{"id":"x","license":"{license}","weights_dataset_license":"{dataset}","artifacts":[]}}]}}"#
+        )
+    }
+
     #[test]
-    fn shipping_manifest_is_clean_or_warn_only() {
-        // The actual repo manifest must never error under the default
-        // (non-strict) check — that's the gate this xtask provides.
-        // Warnings about missing license fields on legacy entries are
-        // acceptable until those entries are back-filled.
-        let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn license_allowlist_accepts_listed_values() {
+        for lic in [
+            "AGPL-3.0",
+            "GPL-3.0",
+            "Apache-2.0",
+            "MIT",
+            "BSD-3-Clause",
+            "Apache-2.0 WITH LLVM-exception",
+        ] {
+            let r = audit_manifest(&parse(&model_json(lic, "COCO:CC-BY-4.0")));
+            assert!(r.errors.is_empty(), "{lic}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn license_allowlist_rejects_unlisted_values() {
+        for lic in ["SSPL-1.0", "Llama Community License", "CC-BY-SA-4.0"] {
+            let r = audit_manifest(&parse(&model_json(lic, "COCO:CC-BY-4.0")));
+            assert!(
+                r.errors.iter().any(|e| e.contains(lic)),
+                "{lic}: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn academic_dataset_is_rejected() {
+        let r = audit_manifest(&parse(&model_json("MIT", "Objects365v1:academic-only")));
+        assert!(
+            r.errors.iter().any(|e| e.contains("academic")),
+            "errors: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn dataset_hit_names_every_denylisted_token() {
+        let r = audit_manifest(&parse(&model_json(
+            "AGPL-3.0",
+            "Objects365v1:academic-only, Flickr30k:non-commercial-research",
+        )));
+        assert_eq!(r.errors.len(), 1, "errors: {:?}", r.errors);
+        for token in ["'non-commercial'", "'research'", "'academic'"] {
+            assert!(r.errors[0].contains(token), "{token}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn unverified_dataset_is_an_error_even_with_a_waiver_like_field() {
+        // Regression: a generic waiver once turned any dataset-denylist hit
+        // into success. There is no such mechanism, and a leftover field
+        // of that shape must not change the outcome.
+        let r = audit_manifest(&parse(
+            r#"{"models":[{"id":"x","license":"AGPL-3.0",
+                "weights_dataset_license":"UnverifiedDataset:unknown-proprietary-research-only",
+                "dataset_license_waiver":{"covers":"UnverifiedDataset:unknown-proprietary-research-only","reason":"pending review"},
+                "artifacts":[]}]}"#,
+        ));
+        assert_eq!(r.errors.len(), 1, "errors: {:?}", r.errors);
+        for token in ["'research'", "'unknown'", "'proprietary'"] {
+            assert!(r.errors[0].contains(token), "{token}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn unverified_dataset_is_an_error() {
+        let r = audit_manifest(&parse(&model_json(
+            "Apache-2.0",
+            "UnverifiedDataset:unknown-proprietary-research-only",
+        )));
+        assert_eq!(r.errors.len(), 1, "errors: {:?}", r.errors);
+    }
+
+    fn files(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    const ONE_ARTIFACT: &str = r#"{"models":[{"id":"x","license":"MIT",
+        "weights_dataset_license":"COCO:CC-BY-4.0","artifacts":[{"path":"x_512.onnx"}]}]}"#;
+
+    #[test]
+    fn unlisted_file_is_an_error() {
+        let mut r = CheckReport::default();
+        audit_files(
+            &files(&["x_512.onnx", "stray.onnx"]),
+            &parse(ONE_ARTIFACT),
+            &mut r,
+        );
+        assert_eq!(r.errors.len(), 1, "errors: {:?}", r.errors);
+        assert!(r.errors[0].contains("stray.onnx"));
+    }
+
+    #[test]
+    fn face_rec_file_name_is_an_error() {
+        let mut r = CheckReport::default();
+        audit_files(
+            &files(&["x_512.onnx", "ArcFace_r100.onnx"]),
+            &parse(ONE_ARTIFACT),
+            &mut r,
+        );
+        assert!(
+            r.errors.iter().any(|e| e.contains("arcface")),
+            "errors: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn listed_files_sidecars_manifest_and_gitkeep_are_accepted() {
+        let mut r = CheckReport::default();
+        audit_files(
+            &files(&[
+                ".gitkeep",
+                "models-manifest.json",
+                "x_512.onnx",
+                "x_512.onnx.sha256",
+            ]),
+            &parse(ONE_ARTIFACT),
+            &mut r,
+        );
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn sidecar_of_an_unlisted_artifact_is_an_error() {
+        let mut r = CheckReport::default();
+        audit_files(&files(&["other.onnx.sha256"]), &parse(ONE_ARTIFACT), &mut r);
+        assert_eq!(r.errors.len(), 1, "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn list_files_recurses_and_reports_relative_paths() {
+        let dir = std::env::temp_dir().join(format!("xtask-list-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.onnx"), b"").unwrap();
+        std::fs::write(dir.join("sub/b.onnx"), b"").unwrap();
+        let found = list_files(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, files(&["a.onnx", "sub/b.onnx"]));
+    }
+
+    /// Paths under `models/` that git tracks, relative to `models/`. The
+    /// folder also holds out-of-band weights and generator intermediates
+    /// (`/models/*` is gitignored), which differ per machine and must not
+    /// decide a unit test.
+    fn tracked_models_files(root: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["ls-files", "-z", "--", "models"])
+            .current_dir(root)
+            .output()
+            .expect("git must be runnable to list tracked models/ files");
+        assert!(
+            out.status.success(),
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut files: Vec<String> = String::from_utf8(out.stdout)
+            .expect("git paths are utf-8")
+            .split('\0')
+            .filter_map(|p| p.strip_prefix("models/"))
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn shipping_manifest_is_clean() {
+        // The actual repo manifest and the git-tracked contents of
+        // models/ must pass the check with no errors (missing-field
+        // warnings are allowed): no denylisted or unlisted license, no
+        // tracked weight file outside the manifest. Untracked local files
+        // are deliberately not scanned here; `cargo xtask check-models
+        // --models-dir` audits a real folder.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("xtask crate has a parent dir")
-            .join("models/models-manifest.json");
-        let bytes = std::fs::read(&manifest_path).expect("manifest readable");
+            .expect("xtask crate has a parent dir");
+        let bytes = std::fs::read(root.join("models/models-manifest.json")).expect("readable");
         let manifest: Manifest = serde_json::from_slice(&bytes).expect("manifest parses");
-        let r = audit_manifest(&manifest);
+        let tracked = tracked_models_files(root);
+        assert!(
+            tracked.iter().any(|f| f == "models-manifest.json"),
+            "tracked models/ files: {tracked:?}"
+        );
+        let mut r = audit_manifest(&manifest);
+        audit_files(&tracked, &manifest, &mut r);
         assert!(
             r.errors.is_empty(),
-            "models/models-manifest.json must pass non-strict check-models; errors: {:?}",
-            r.errors
+            "models/ must pass check-models; errors: {:?}, warnings: {:?}",
+            r.errors,
+            r.warnings
         );
     }
 }

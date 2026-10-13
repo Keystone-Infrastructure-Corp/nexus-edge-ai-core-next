@@ -4,6 +4,7 @@
 //! Without `--features ort` the inner wraps `MockDetector`; the
 //! exported behaviour we care about is dispatch + `top_k` plumbing,
 //! both of which are observable in this build.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use nexus_config::{
     CameraBehavior, CameraConfig, CameraConfigUpdate, CameraDetector, CameraIngest,

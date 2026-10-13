@@ -258,6 +258,10 @@ impl Extractor for DinoV2Extractor {
             match slot {
                 Err(e) => out.push(Err(e)),
                 Ok(_) => {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "one survivor embedding is produced per Ok prep slot (survivors.len() == the Ok slot count)"
+                    )]
                     let mut vec = survivor_iter
                         .next()
                         .expect("survivor_iter must match survivor_idx len");
@@ -434,6 +438,10 @@ impl Extractor for DinoV2Extractor {
             match slot {
                 Err(e) => out.push(Err(e)),
                 Ok(_) => {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "one survivor embedding is produced per Ok prep slot (survivors.len() == the Ok slot count)"
+                    )]
                     let mut vec = survivor_iter
                         .next()
                         .expect("survivor_iter must match survivor_idx len");

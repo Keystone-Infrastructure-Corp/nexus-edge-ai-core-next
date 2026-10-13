@@ -20,6 +20,11 @@
 //! thin wrapper.
 //!
 //! [`HardwareProfile`]: nexus_probe::HardwareProfile
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "one-shot CLI: the manifest / config / usage text on stdout and errors on stderr are its output; no tracing subscriber is installed"
+)]
 
 use std::fs;
 use std::path::PathBuf;

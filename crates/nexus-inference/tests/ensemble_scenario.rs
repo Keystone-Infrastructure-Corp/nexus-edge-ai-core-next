@@ -96,10 +96,16 @@ async fn ensemble_ppe_plus_visual_uniform_routes_through_engine_build() {
         .detect(&frame(), &prompts)
         .await
         .expect("ensemble detect");
+    // Without `ort` each member is its mock body, which produces a detection.
+    // Under `ort` a member with no model pack degrades and produces none, by
+    // design (see detector_never_fabricates.rs), so the result is empty.
+    #[cfg(not(feature = "ort"))]
     assert!(
         !dets.is_empty(),
         "ensemble must produce at least one detection from a member"
     );
+    #[cfg(feature = "ort")]
+    assert!(dets.is_empty(), "a pack-less ort member must not fabricate");
 }
 
 #[tokio::test]

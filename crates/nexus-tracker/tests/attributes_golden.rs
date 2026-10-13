@@ -15,6 +15,7 @@
 //! `NEXUS_BLESS_GOLDEN=1 cargo test -p nexus-tracker --test attributes_golden`
 //! rewrites the fixture. Only do that for a change that is meant to alter the
 //! output, and say so in the commit.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 

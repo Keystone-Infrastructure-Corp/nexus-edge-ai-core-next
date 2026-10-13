@@ -525,7 +525,11 @@ async fn publish_single(
     }
 }
 
-async fn publish_batch(outbox: &TunnelOutbox, items: Vec<EntitySightingProjection>, use_f16: bool) {
+async fn publish_batch(
+    outbox: &TunnelOutbox,
+    mut items: Vec<EntitySightingProjection>,
+    use_f16: bool,
+) {
     if items.is_empty() {
         return;
     }
@@ -533,8 +537,10 @@ async fn publish_batch(outbox: &TunnelOutbox, items: Vec<EntitySightingProjectio
     // panic the debug_assert in `build_entity_sighting_batch_envelope`
     // for a zero-item input. Fall back to the plain envelope.
     if items.len() == 1 {
-        publish_single(outbox, items.into_iter().next().unwrap(), use_f16).await;
-        return;
+        if let Some(item) = items.pop() {
+            publish_single(outbox, item, use_f16).await;
+            return;
+        }
     }
     let count = items.len();
     let envelope = build_entity_sighting_batch_envelope(items, use_f16);

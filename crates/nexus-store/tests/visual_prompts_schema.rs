@@ -3,6 +3,7 @@
 //!
 //! Each test boots a fresh tmpdir-backed `Store` so migration 0012
 //! exercises end-to-end (we don't reuse a shared DB).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

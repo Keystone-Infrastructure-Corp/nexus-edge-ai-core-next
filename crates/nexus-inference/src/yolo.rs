@@ -479,6 +479,10 @@ pub(crate) fn preprocess_nchw(
         .collect();
 
     let plane = dw * dh;
+    #[expect(
+        clippy::expect_used,
+        reason = "`tensor` was allocated just above as a standard-layout Array4, which is contiguous"
+    )]
     let out = tensor
         .as_slice_mut()
         .expect("freshly allocated Array4 is contiguous");

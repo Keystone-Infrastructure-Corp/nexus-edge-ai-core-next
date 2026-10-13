@@ -63,6 +63,10 @@ pub struct SetAdminPasswordArgs {
 }
 
 /// Run the subcommand against the store described by `cfg`.
+#[expect(
+    clippy::print_stderr,
+    reason = "`set-admin-password` is a one-shot operator subcommand that runs before telemetry is initialised; stderr is its output"
+)]
 pub async fn run(cfg: &Config, args: &SetAdminPasswordArgs) -> Result<()> {
     if !cfg.auth.mode.allows_local() {
         return Err(anyhow!(

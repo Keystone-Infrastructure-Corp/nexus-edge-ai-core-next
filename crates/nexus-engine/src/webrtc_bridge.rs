@@ -559,6 +559,9 @@ fn base_meta() -> EnvelopeMeta {
     }
 }
 
+// `allow`, not `expect`: clippy only recognises a bare `cfg(test)` as test code,
+// and this module is `cfg(all(test, feature = ...))`.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[cfg(all(test, feature = "gstreamer-webrtc"))]
 mod tests {
     use super::*;

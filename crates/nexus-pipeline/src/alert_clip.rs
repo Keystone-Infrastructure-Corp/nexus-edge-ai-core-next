@@ -733,7 +733,11 @@ mod encode {
                     .map_err(|e| AlertClipError::Gst(format!("encode set Playing: {e}")))?;
                 enc = Some((ep, esrc));
             }
-            let (_, esrc) = enc.as_ref().expect("encode pipeline built above");
+            let Some((_, esrc)) = enc.as_ref() else {
+                return Err(AlertClipError::Gst(
+                    "encode pipeline missing after build".into(),
+                ));
+            };
             // GStreamer's RGB stride is rounded UP to a multiple of 4
             // bytes; our overlay buffer is tightly packed (`width*3` per
             // row). For a native width whose `width*3` isn't 4-aligned the
@@ -997,6 +1001,9 @@ mod tests {
 
 // End-to-end encode test. Runs wherever GStreamer + an H.264 encoder are
 // present (the Linux CI `gstreamer` job, and local dev with `x264enc`).
+// `allow`, not `expect`: clippy only recognises a bare `cfg(test)` as test code,
+// and this module is `cfg(all(test, feature = ...))`.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[cfg(all(test, feature = "gstreamer"))]
 mod gst_tests {
     use std::time::Duration as StdDuration;

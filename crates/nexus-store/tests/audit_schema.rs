@@ -19,6 +19,7 @@
 //!   and partial `resource_kind`/`resource_id` pairs.
 //! * `delete_audit_older_than` deletes everything strictly older
 //!   than `cutoff` and reports the count.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

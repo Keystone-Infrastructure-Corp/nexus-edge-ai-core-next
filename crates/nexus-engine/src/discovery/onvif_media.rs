@@ -298,7 +298,7 @@ async fn get_profiles(
     let profiles = parse_profiles_response(&text)?;
     for p in &profiles {
         debug!(
-            xaddr = %url, ver = ?ver, token = %p.token, name = %p.name,
+            xaddr = %url, ver = ?ver, profile_token = %p.token, name = %p.name,
             codec = ?p.codec, resolution = ?p.resolution,
             "onvif media: parsed profile",
         );

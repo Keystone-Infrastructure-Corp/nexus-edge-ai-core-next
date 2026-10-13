@@ -18,6 +18,7 @@
 //! the incident itself, forever. Before the fix the dispatcher walked
 //! the batch on a single task in `id` order, so that one sink held every
 //! other sink's rows behind it.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

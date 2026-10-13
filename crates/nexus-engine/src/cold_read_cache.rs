@@ -232,6 +232,10 @@ async fn run_one(inner: &Arc<CacheJobsInner>, clip_id: ClipId) -> Result<CacheOu
     // ---------------------------------------------------------------
     // Wait for a slot. The semaphore is global, so under heavy
     // load this naturally back-pressures cold reads.
+    #[expect(
+        clippy::expect_used,
+        reason = "the semaphore is owned by CacheJobsInner, which `inner` keeps alive, and is never closed"
+    )]
     let _permit = inner
         .semaphore
         .clone()

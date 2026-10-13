@@ -15,6 +15,7 @@
 //!   hold.
 //! * `events.event_id` ON DELETE CASCADE propagates to
 //!   `alert_sink_outbox` (M2.1 clip eviction invariant).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 

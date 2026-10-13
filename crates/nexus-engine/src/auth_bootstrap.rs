@@ -48,6 +48,10 @@ const ADMIN_SECRET_BYTES: usize = 32;
 /// `state_dir` is `cfg.runtime.state_dir` resolved by the caller —
 /// passed in (instead of re-derived here) so the test path can
 /// point at a tempdir.
+#[expect(
+    clippy::print_stderr,
+    reason = "runs during boot before telemetry is initialised (main.rs calls it ahead of nexus_telemetry::init)"
+)]
 pub fn apply(cfg: &mut Config, state_dir: &Path) -> Result<()> {
     match cfg.auth.mode {
         AuthMode::Local | AuthMode::Hybrid => {
@@ -76,6 +80,10 @@ pub fn apply(cfg: &mut Config, state_dir: &Path) -> Result<()> {
 /// and return the path. We DON'T log the secret value — it's the
 /// HS256 signing key for session JWTs, not an operator-visible
 /// bearer token.
+#[expect(
+    clippy::print_stderr,
+    reason = "runs during boot before telemetry is initialised (main.rs calls it ahead of nexus_telemetry::init)"
+)]
 fn ensure_admin_secret(state_dir: &Path) -> Result<PathBuf> {
     let path = state_dir.join(ADMIN_SECRET_FILE);
 
@@ -121,6 +129,10 @@ fn generate_token(n_bytes: usize) -> String {
     // ships to (Linux, macOS); a fallback path here would be dead
     // code. Panicking is acceptable: a system without a working
     // CSPRNG cannot host a security-bearing engine in any case.
+    #[expect(
+        clippy::expect_used,
+        reason = "the OS RNG does not fail on the platforms the engine ships to; a host without one cannot hold a signing key"
+    )]
     getrandom::fill(&mut buf).expect("OS RNG must succeed for token generation");
     URL_SAFE_NO_PAD.encode(&buf)
 }

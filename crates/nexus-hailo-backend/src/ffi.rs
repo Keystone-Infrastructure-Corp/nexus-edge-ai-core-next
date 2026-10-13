@@ -652,19 +652,21 @@ pub fn ensure_loaded() -> Result<&'static HailoRt, Error> {
         return Ok(lib);
     }
     let lib = unsafe { load_lib()? };
-    // `OnceLock::set` may lose the race with another thread that also
+    // Initialisation may lose the race with another thread that also
     // called `ensure_loaded()`. That's harmless — both `HailoRt`s hold
     // independent `dlopen` handles for the same .so and either one is
-    // valid. We drop the loser via `_` and read the winner back via
-    // `get().expect()` (always populated at this point).
-    let _ = LIB.set(lib);
-    Ok(LIB.get().expect("LIB initialized above"))
+    // valid. `get_or_init` returns the winner and drops ours if we lost.
+    Ok(LIB.get_or_init(|| lib))
 }
 
 /// Borrow the loaded HailoRt — panics if `ensure_loaded` has not yet
 /// returned `Ok` in this process. Use this in inner helpers that have
 /// already established the load via an `ensure_loaded()?` on entry.
 #[inline]
+#[expect(
+    clippy::expect_used,
+    reason = "documented invariant: every caller runs after `ensure_loaded()?` succeeded"
+)]
 fn lib() -> &'static HailoRt {
     LIB.get()
         .expect("nexus_hailo_backend::ffi::ensure_loaded() must succeed before using FFI wrappers")

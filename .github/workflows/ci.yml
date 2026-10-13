@@ -111,13 +111,22 @@ jobs:
       - name: cargo clippy (nexus-inference, release EP features)
         run: cargo clippy --locked -p nexus-inference --features ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt,ep-hailo,ep-rocm,ep-vulkan --all-targets -- -D warnings
 
-      # Enforces AGENTS.md rule 2: no face-recognition models in `models/`,
-      # no non-commercial / research-only license values on any entry.
-      # See [xtask/README.md](../../xtask/README.md). Runs without
-      # `--strict` until every legacy entry is back-filled with both
-      # license fields.
+      # Enforces AGENTS.md rule 2: an allowlisted `license` and a
+      # non-disqualifying `weights_dataset_license` on every manifest entry,
+      # no face-recognition names, and no file in `models/` the manifest does
+      # not name. See [xtask/README.md](../../xtask/README.md). Every rule
+      # except a missing field already fails without `--strict`; a missing
+      # field only warns because `yolo_world_v2_s` and `yoloe26_s` carry no
+      # `weights_dataset_license` yet (their training-data terms await a
+      # separate decision; BUG-265 in nexus-cloud-console), and `--strict` is
+      # used once they do. Here `models/` holds only the
+      # manifest; `system-libs` repeats the check against the downloaded
+      # weights.
       - name: cargo xtask check-models
         run: cargo xtask check-models
+
+      - name: cargo xtask check-span-cardinality
+        run: cargo xtask check-span-cardinality
 
   # ---------------------------------------------------------------------
   # ts-rs roundtrip — running `cargo test -p nexus-types --features ts`
@@ -151,11 +160,11 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------
-  # UI — TypeScript typecheck + production build. Uploads dist/ so the
+  # UI — lint, vitest, TypeScript typecheck + production build. Uploads dist/ so the
   # docker job (and humans clicking "Download artifact") can grab it.
   # ---------------------------------------------------------------------
   ui:
-    name: ui (typecheck / build)
+    name: ui (lint / test / typecheck / build)
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -170,6 +179,12 @@ jobs:
 
       - name: npm ci
         run: npm ci --no-audit --no-fund
+
+      - name: lint
+        run: npm run lint
+
+      - name: unit tests (vitest)
+        run: npm test
 
       - name: typecheck
         run: npm run typecheck
@@ -186,9 +201,81 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------
+  # UI end-to-end — the Playwright suite under ui/e2e/. Always on: BUG-264
+  # was three specs rotting on main because no job ran them. globalSetup
+  # spawns <repo>/target/debug/nexus-engine (hard-coded path, so the default
+  # target dir is required here) on E2E_PORT and serves ui/dist from it, so
+  # both must be built first. `test-injection` is the engine's test-only
+  # fault/clock injection surface the specs drive. No system libs: default
+  # features, same as the `rust` job.
+  #
+  # `--reporter` on the command line overrides the config's CI-only `github`
+  # reporter so an HTML report exists to upload; `github` stays for inline
+  # annotations.
+  # ---------------------------------------------------------------------
+  ui-e2e:
+    name: ui (playwright e2e)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: install rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-e2e
+
+      - name: build nexus-engine (test-injection)
+        run: cargo build --locked -p nexus-engine --features test-injection
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: npm ci
+        working-directory: ui
+        run: npm ci --no-audit --no-fund
+
+      - name: build ui/dist
+        working-directory: ui
+        run: npm run build
+
+      - name: install chromium (with system deps)
+        working-directory: ui
+        run: npm run e2e:install
+
+      - name: playwright e2e
+        working-directory: ui
+        run: npm run e2e -- --reporter=github,html
+
+      - name: upload playwright report
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: playwright-report
+          path: |
+            ui/playwright-report
+            ui/test-results
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
   # Optional: build with the heavy `gstreamer` + `ort` features enabled.
   # Runs on every push to main and on PRs labeled `system-libs`. Failures
   # block release but not normal PR iteration.
+  #
+  # Also the only job that runs the model-backed inference smoke tests
+  # (nexus-inference `tests/*_smoke.rs` and nexus-reid `dinov2_core_smoke`;
+  # `rect_shape_postprocess` also runs here but uses synthetic tensors and
+  # needs no weights). The smoke tests need real ONNX weights, which are
+  # not in git, and each one skips with a printed note -- exit 0 -- when its
+  # file is missing, so the weights step below asserts every file exists
+  # before they run.
   #
   # Apt cache (~200 MB of .debs) is persisted across runs via
   # `cache-apt-pkgs-action` — first run is ~20 s on the dev box of the
@@ -333,6 +420,79 @@ jobs:
           echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
           echo "ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so"   >> $GITHUB_ENV
 
+      # Weights for the smoke tests, from the `models-${pack_version}` GitHub
+      # Release (the same source the engine release workflow bakes from).
+      # Only what the tests load is fetched: the yolo26n / yoloe26_s /
+      # yolo_world_v2_s ladders (pack_core_smoke walks all three shapes of
+      # all three kinds), dinov2_s_224 and the manifest (pack_core_smoke
+      # reads vocab from it), ~390 MB total. HEFs are skipped.
+      # Cached on pack_version, which the manifest bumps whenever ONNX bytes
+      # change, so a stale cache cannot outlive a model change.
+      - name: read model pack version
+        id: pack
+        run: echo "version=$(jq -r .pack_version models/models-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: cache model weights
+        id: models-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/model-pack
+          key: model-pack-${{ steps.pack.outputs.version }}
+
+      - name: download model weights
+        if: steps.models-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACK_VERSION: ${{ steps.pack.outputs.version }}
+        run: |
+          gh release download "models-${PACK_VERSION}" -R "${GITHUB_REPOSITORY}" \
+            -D "${RUNNER_TEMP}/model-pack" --clobber \
+            -p 'yolo26n_*x*.onnx' -p 'yoloe26_s_*x*.onnx' -p 'yolo_world_v2_s_*x*.onnx' \
+            -p 'dinov2_s_224.onnx' -p models-manifest.json
+
+      # A missing file here must fail the job: the tests below treat it as
+      # "skip, pass". Also exports the env vars the tests read: NEXUS_TEST_PACK
+      # (pack_core_smoke, dinov2_core_smoke) and the single-file smokes'
+      # model/manifest vars, pointed at the 512x288 artifact of each kind
+      # (the smokes take their input shape from the file name).
+      - name: verify model weights and export test env
+        run: |
+          pack="${RUNNER_TEMP}/model-pack"
+          missing=0
+          for f in \
+            yolo26n_512x288.onnx yolo26n_1024x576.onnx yolo26n_1536x864.onnx \
+            yoloe26_s_512x288.onnx yoloe26_s_1024x576.onnx yoloe26_s_1536x864.onnx \
+            yolo_world_v2_s_512x288.onnx yolo_world_v2_s_1024x576.onnx yolo_world_v2_s_1536x864.onnx \
+            dinov2_s_224.onnx models-manifest.json; do
+            if [ -s "${pack}/${f}" ]; then
+              echo "ok: ${f}"
+            else
+              echo "MISSING: ${f}"; missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::model weights missing after download; the smoke tests would skip silently instead of failing."
+            exit 1
+          fi
+          {
+            echo "NEXUS_TEST_PACK=${pack}"
+            echo "NEXUS_TEST_YOLO_MODEL=${pack}/yolo26n_512x288.onnx"
+            echo "NEXUS_TEST_YOLOE_MODEL=${pack}/yoloe26_s_512x288.onnx"
+            echo "NEXUS_TEST_YOLOE_MANIFEST=${pack}/models-manifest.json"
+            echo "NEXUS_TEST_YOLO_WORLD_MODEL=${pack}/yolo_world_v2_s_512x288.onnx"
+            echo "NEXUS_TEST_YOLO_WORLD_MANIFEST=${pack}/models-manifest.json"
+          } >> "$GITHUB_ENV"
+
+      # AGENTS.md rule 2 against the downloaded ONNX files: every file in
+      # the pack must be named by the repo manifest and pass the
+      # face-recognition name check. Not `--strict` for the reason given on
+      # the `rust` job's step: missing licence fields warn, and every other
+      # rule fails regardless. This job downloads the ONNX files only; the
+      # release also ships the `*_hailo.hef` files, which are not audited
+      # here.
+      - name: cargo xtask check-models (downloaded weights)
+        run: cargo xtask check-models --models-dir "${RUNNER_TEMP}/model-pack"
+
       # This is the only job in this workflow that compiles the gstreamer-gated
       # code, so it is the only place a warning there can fail CI; no clippy in
       # the `rust` job enables `gstreamer`. It used to `cargo check` these,
@@ -420,7 +580,10 @@ jobs:
           # everything behind `#![cfg(feature = "ort")]` is invisible to it.
           # The always-on job covers `session_tuning`; this is the only job
           # that can execute the rest, which needs the real runtime.
-          cargo test  --locked -p nexus-inference --features ort,ep-cpu --lib
+          # `--tests`, not `--lib`: `--lib` skips tests/ entirely, which is
+          # where the model-backed smoke tests live. They read
+          # the NEXUS_TEST_* vars exported by the weights step above.
+          cargo test  --locked -p nexus-inference --features ort,ep-cpu --tests
           # CUDA execution provider: compile-only. No GitHub-hosted runner
           # has an NVIDIA GPU, and the CUDA provider is dlopen'd at session
           # open, so this gates the ep-cuda code path (CUDAExecutionProvider
@@ -430,3 +593,6 @@ jobs:
           # ep-cpu implies `ort`, so this is the only job that compiles the
           # cfg(feature = "ort") DINOv2 extractor (nexus-reid/src/ort_dinov2.rs).
           cargo check --locked -p nexus-reid      --features ep-cpu
+          # dinov2_core_smoke (`#![cfg(feature = "ort")]`; ep-cpu implies ort)
+          # loads dinov2_s_224.onnx from NEXUS_TEST_PACK.
+          cargo test  --locked -p nexus-reid      --features ep-cpu --tests

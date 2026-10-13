@@ -171,7 +171,9 @@ impl Entry {
         if self.recent_instants.len() < 2 {
             return 0.0;
         }
-        let oldest = *self.recent_instants.front().expect("len >= 2");
+        let Some(&oldest) = self.recent_instants.front() else {
+            return 0.0;
+        };
         // Divide by elapsed-from-oldest (capped at the window) so the
         // reading decays naturally when the source stops emitting.
         let elapsed = now
@@ -572,12 +574,10 @@ impl RateWindow {
         if n < 2 {
             return 0.0;
         }
-        let span = self
-            .timestamps
-            .back()
-            .unwrap()
-            .duration_since(*self.timestamps.front().unwrap())
-            .as_secs_f32();
+        let (Some(back), Some(front)) = (self.timestamps.back(), self.timestamps.front()) else {
+            return 0.0;
+        };
+        let span = back.duration_since(*front).as_secs_f32();
         if span <= 0.0 {
             return 0.0;
         }

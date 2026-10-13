@@ -360,6 +360,7 @@ async fn run_camera(
         "camera.pipeline",
         camera_id = cfg.id,
         camera_name = %cfg.name,
+        // allow: span-cardinality ingest.url (scheme() only: no host, no userinfo, a handful of values)
         scheme = %cfg.ingest.url.scheme(),
     );
     async {
@@ -626,7 +627,12 @@ async fn run_camera(
             let frame_span = info_span!(
                 "frame.lifecycle",
                 camera_id = cfg.id,
+                // TraceLayer drops "frame.lifecycle" before capturing its fields, and every
+                // log line emitted inside the span inherits them.
+                // allow: span-cardinality frame_id (root frame.lifecycle span only; never on child spans)
                 frame_id,
+                // Links this frame's log lines to events.trace_id and the cloud alert payload.
+                // allow: span-cardinality trace_id (root frame.lifecycle span only; never on sampled frame.* children)
                 trace_id = %trace_id,
             );
 
@@ -657,7 +663,7 @@ async fn run_camera(
                     gate.allow(&frame)
                 };
                 if !pass {
-                    debug!(camera_id = cfg.id, frame_id, "gate dropped frame");
+                    debug!(camera_id = cfg.id, "gate dropped frame");
                     stats.observe_dropped(cfg.id);
                     return ControlFlow::Continue(());
                 }
@@ -763,7 +769,7 @@ async fn run_camera(
                 let detections = if skip_detector {
                     debug!(
                         camera_id = cfg.id,
-                        frame_id, "detector skipped (crowd skip policy)"
+                        "detector skipped (crowd skip policy)"
                     );
                     Vec::new()
                 } else {
@@ -799,7 +805,6 @@ async fn run_camera(
                     if before != kept.len() {
                         debug!(
                             camera_id = cfg.id,
-                            frame_id,
                             before,
                             after = kept.len(),
                             "prompts whitelist dropped detections"
@@ -890,7 +895,6 @@ async fn run_camera(
                                 );
                                 debug!(
                                     camera_id = cfg.id,
-                                    frame_id,
                                     stage1 = detections.len(),
                                     tiles = tiles.len(),
                                     stage2 = stage2.len(),
@@ -921,7 +925,6 @@ async fn run_camera(
                                 // rather than a recall booster.
                                 warn!(
                                     camera_id = cfg.id,
-                                    frame_id,
                                     tiles = tiles.len(),
                                     "tile cascade failed, falling back to stage-1: {e}"
                                 );
@@ -1045,7 +1048,7 @@ async fn run_camera(
                     if dropped > 0 {
                         debug!(
                             camera_id = cfg.id,
-                            frame_id, dropped, "exclusion zone filter dropped objects"
+                            dropped, "exclusion zone filter dropped objects"
                         );
                     }
                     // M_PERF_CROWD Phase B1 — per-zone min-bbox-area
@@ -1060,7 +1063,7 @@ async fn run_camera(
                     if dropped > 0 {
                         debug!(
                             camera_id = cfg.id,
-                            frame_id, dropped, "per-zone min-area override dropped objects"
+                            dropped, "per-zone min-area override dropped objects"
                         );
                     }
                 }
@@ -1565,11 +1568,12 @@ fn build_source(
         #[cfg(not(feature = "gstreamer"))]
         "rtsp" | "rtsps" => {
             let msg = format!(
-                "camera {} url {} requires the `gstreamer` feature; rebuild \
+                "camera {} (host {}) requires the `gstreamer` feature; rebuild \
                  nexus-engine with `cargo build --features gstreamer,...`",
-                cfg.id, cfg.ingest.url
+                cfg.id,
+                cfg.ingest.url.host_str().unwrap_or("unknown")
             );
-            error!(camera_id = cfg.id, url = %cfg.ingest.url, "{}", msg);
+            error!(camera_id = cfg.id, "{}", msg);
             Box::new(crate::source::FailingSource { message: msg })
         }
         _ => Box::new(VirtualSource {
@@ -1601,6 +1605,10 @@ async fn insert_motion_decision(
     // Fast-path the common empty-attributes case (avoids cloning the
     // map + allocating a serde_json::Value::Object wrapper for every
     // motion event in a busy scene).
+    #[expect(
+        clippy::expect_used,
+        reason = "serializing a string-keyed JSON map cannot fail"
+    )]
     let attrs_json = if d.attributes.is_empty() {
         "{}".to_string()
     } else {

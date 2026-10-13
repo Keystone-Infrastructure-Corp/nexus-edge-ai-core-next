@@ -284,12 +284,13 @@ impl OneDriveBackend {
             .body(bytes.to_vec())
             .send()
             .await
-            .map_err(|e| BackendError::Unreachable(format!("Graph upload PUT: {e}")))?;
+            .map_err(|e| {
+                BackendError::Unreachable(format!("Graph upload PUT: {}", e.without_url()))
+            })?;
         let put = self.unwrap_401(put).await?;
-        let item: DriveItem = put
-            .json()
-            .await
-            .map_err(|e| BackendError::Other(format!("Graph upload PUT parse: {e}")))?;
+        let item: DriveItem = put.json().await.map_err(|e| {
+            BackendError::Other(format!("Graph upload PUT parse: {}", e.without_url()))
+        })?;
         Ok(item)
     }
 
@@ -399,12 +400,13 @@ impl ColdBackend for OneDriveBackend {
                 .header("Range", format!("bytes={start}-{end_inclusive}"))
                 .send()
                 .await
-                .map_err(|e| BackendError::Unreachable(format!("Graph download: {e}")))?;
+                .map_err(|e| {
+                    BackendError::Unreachable(format!("Graph download: {}", e.without_url()))
+                })?;
             let resp = self.unwrap_401(resp).await?;
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| BackendError::Unreachable(format!("Graph download body: {e}")))?;
+            let body = resp.bytes().await.map_err(|e| {
+                BackendError::Unreachable(format!("Graph download body: {}", e.without_url()))
+            })?;
             Ok::<Vec<u8>, BackendError>(body.to_vec())
         };
         match do_get().await {
@@ -438,7 +440,9 @@ impl ColdBackend for OneDriveBackend {
                 .header("Range", format!("bytes={start}-{end_inclusive}"))
                 .send()
                 .await
-                .map_err(|e| BackendError::Unreachable(format!("Graph download: {e}")))?;
+                .map_err(|e| {
+                    BackendError::Unreachable(format!("Graph download: {}", e.without_url()))
+                })?;
             let resp = self.unwrap_401(resp).await?;
             Ok::<reqwest::Response, BackendError>(resp)
         };
@@ -450,9 +454,9 @@ impl ColdBackend for OneDriveBackend {
             }
             Err(e) => return Err(e),
         };
-        let s = resp
-            .bytes_stream()
-            .map_err(|e| BackendError::Unreachable(format!("Graph download body: {e}")));
+        let s = resp.bytes_stream().map_err(|e| {
+            BackendError::Unreachable(format!("Graph download body: {}", e.without_url()))
+        });
         Ok(s.boxed())
     }
 
