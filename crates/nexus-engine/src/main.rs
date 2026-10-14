@@ -53,6 +53,9 @@ mod models_catalog;
 mod network;
 mod npu;
 mod oauth_sessions;
+// Only an engine that can build ORT sessions has any to prewarm.
+#[cfg(feature = "ort")]
+mod ov_prewarm;
 mod proc_metrics;
 mod reconciler;
 mod remote_shell;
@@ -149,6 +152,22 @@ enum Cmd {
     /// operator action.
     #[command(subcommand)]
     Tls(TlsCmd),
+
+    /// Build one ORT session and exit. Not for operators: the engine
+    /// re-runs itself with this so OpenVINO's GPU kernels are compiled
+    /// in a process that can crash without taking the engine down
+    /// (see `ov_prewarm`, #360).
+    #[cfg(feature = "ort")]
+    #[command(hide = true)]
+    PrewarmSession {
+        /// The model the engine is about to load.
+        #[arg(long)]
+        model: PathBuf,
+        /// The engine's execution-provider chain for it, in priority
+        /// order, one `--ep` per entry.
+        #[arg(long = "ep", required = true)]
+        ep_priority: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -192,6 +211,13 @@ fn main() -> Result<()> {
     register_bundled_gst_plugins();
 
     let cli = Cli::parse();
+    // Ahead of the config load: the child needs no config, and every
+    // environment tweak below is already inherited from the engine
+    // that spawned it (see `ov_prewarm`, #360).
+    #[cfg(feature = "ort")]
+    if let Some(Cmd::PrewarmSession { model, ep_priority }) = &cli.command {
+        return ov_prewarm::run_child(model, ep_priority);
+    }
     let config_path = cli.resolved_config_path();
     let (mut cfg, compat) = Config::load_with_compat(&config_path)
         .with_context(|| format!("loading config {:?}", config_path))?;
@@ -240,8 +266,18 @@ fn main() -> Result<()> {
             Cmd::Enroll(args) => runtime.block_on(cloud_enroll::run_enroll(&cfg, args)),
             Cmd::SetAdminPassword(args) => runtime.block_on(admin_cli::run(&cfg, args)),
             Cmd::Tls(TlsCmd::Init { force }) => run_tls_init(&cfg, *force),
+            #[cfg(feature = "ort")]
+            Cmd::PrewarmSession { .. } => {
+                unreachable!("prewarm-session returns before the config is loaded")
+            }
         };
     }
+
+    // Before `run` builds any session. The serve path only: a subcommand
+    // builds none, and the `prewarm-session` child must compile in-process
+    // rather than spawn a child of its own.
+    #[cfg(feature = "ort")]
+    nexus_inference::session_tuning::register_out_of_process_prewarm(ov_prewarm::spawn_and_wait);
 
     runtime.block_on(run(cfg, cli))
 }

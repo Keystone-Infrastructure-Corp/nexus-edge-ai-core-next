@@ -91,6 +91,15 @@ jobs:
       - name: cargo test (EP demotion policy, ort feature)
         run: cargo test --locked -p nexus-inference --features ort,ep-cpu --lib session_tuning
 
+      # The engine half of the same fix — `ov_prewarm` and the hidden
+      # `prewarm-session` subcommand (BUG-277, #360) — is behind the engine's
+      # `ort` feature, which no other job enables for nexus-engine. Same
+      # load-dynamic reasoning: no ONNX Runtime needed to lint or test it.
+      - name: cargo clippy + test (engine prewarm, ort feature)
+        run: |
+          cargo clippy --locked -p nexus-engine --features ort,ep-cpu --all-targets -- -D warnings
+          cargo test --locked -p nexus-engine --features ort,ep-cpu --bin nexus-engine ov_prewarm
+
       # `imp.rs`, `ffi.rs` and the `nexus-hailo-probe` binary sit behind
       # `all(target_os = "linux", feature = "linked")`, so the workspace
       # check above compiles `stub.rs` in their place and has never
