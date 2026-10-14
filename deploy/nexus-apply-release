@@ -76,10 +76,12 @@
 #                      from the cloud console. REFUSES to restart when `sshd
 #                      -t` fails, so a bad config can never lock the box out.
 #
-#   engine-restart     `systemctl --no-block restart nexus-engine`. Run by
-#                      `nexus-engine enroll` (as `nexus`) after it persists a
-#                      new enrollment, which a running engine only loads at
-#                      start (BUG-201).
+#   engine-restart     `systemctl restart nexus-engine`, blocking until the
+#                      engine is back up. Run by `nexus-engine enroll` (as
+#                      `nexus`, from an operator shell) after it persists a new
+#                      enrollment, which a running engine only loads at start
+#                      (BUG-201). Never call it from inside the engine's cgroup:
+#                      the stop would kill the caller (see flip_and_restart).
 #
 # NOTE ON ARGUMENTS. sudo's `*` does NOT match `/`, so no mode may accept a
 # path argument — that is precisely why the three ssh modes above read their
@@ -693,8 +695,8 @@ do_sshd_restart() {
 }
 
 do_engine_restart() {
-    systemctl --no-block restart nexus-engine || die "failed to restart nexus-engine"
-    log "restart enqueued for nexus-engine"
+    systemctl restart nexus-engine || die "failed to restart nexus-engine"
+    log "restarted nexus-engine"
 }
 
 case "$mode" in

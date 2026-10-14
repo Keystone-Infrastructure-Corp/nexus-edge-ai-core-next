@@ -92,7 +92,7 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
     );
     // A running engine reads its enrollment once, when the tunnel starts,
     // so it keeps the previous one (or none) until it restarts. Restart it
-    // here so a successful `enroll` means the core is coming online.
+    // here so a successful `enroll` leaves an engine running the new one.
     restart_engine_if_running(engine_is_running, restart_engine)
 }
 
@@ -103,13 +103,17 @@ const APPLY_RELEASE_WRAPPER: &str = "/usr/local/sbin/nexus-apply-release";
 /// Applier mode that restarts `nexus-engine.service`.
 const ENGINE_RESTART_MODE: &str = "engine-restart";
 
+#[expect(
+    clippy::print_stderr,
+    reason = "part of the `enroll` operator banner — see `run_enroll`"
+)]
 fn restart_engine_if_running(
     is_running: impl FnOnce() -> bool,
     restart: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     if !is_running() {
         eprintln!(
-            "nexus-engine: nexus-engine.service is not active; the engine loads this enrollment when it starts"
+            "nexus-engine: nexus-engine.service is not active; the engine loads this enrollment when it next starts"
         );
         return Ok(());
     }
@@ -117,7 +121,7 @@ fn restart_engine_if_running(
         "enrollment is saved, but the running engine could not be restarted to load it — \
          run `sudo systemctl restart nexus-engine` (do not re-run enroll: the code is spent)",
     )?;
-    eprintln!("nexus-engine: restarting nexus-engine.service to bring the cloud tunnel up");
+    eprintln!("nexus-engine: restarted nexus-engine.service; the core comes online once its tunnel connects");
     Ok(())
 }
 
@@ -128,9 +132,13 @@ fn engine_is_running() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+fn restart_argv() -> [&'static str; 3] {
+    ["-n", APPLY_RELEASE_WRAPPER, ENGINE_RESTART_MODE]
+}
+
 fn restart_engine() -> Result<()> {
     let status = std::process::Command::new("sudo")
-        .args(["-n", APPLY_RELEASE_WRAPPER, ENGINE_RESTART_MODE])
+        .args(restart_argv())
         .status()
         .context("spawn sudo")?;
     anyhow::ensure!(
@@ -381,8 +389,23 @@ mod restart_tests {
         assert!(msg.contains("do not re-run enroll"), "{msg}");
     }
 
+    /// `sudo -n <wrapper> <mode>` is what the frozen `nexus-update` grant
+    /// (`nexus-apply-release *`) matches; `-n` fails fast instead of
+    /// prompting for a password the `nexus` user does not have.
+    #[test]
+    fn restart_argv_is_pinned_to_the_granted_wrapper() {
+        assert_eq!(
+            restart_argv(),
+            [
+                "-n",
+                "/usr/local/sbin/nexus-apply-release",
+                "engine-restart"
+            ]
+        );
+    }
+
     /// The mode `enroll` invokes must be one the root-owned applier
-    /// dispatches; sudoers grants the wrapper, not any particular mode.
+    /// dispatches, and that mode must restart the engine.
     #[test]
     fn the_applier_dispatches_the_engine_restart_mode() {
         let applier = include_str!(concat!(
@@ -390,8 +413,19 @@ mod restart_tests {
             "/../../deploy/nexus-apply-release"
         ));
         assert!(
-            applier.contains(&format!("    {ENGINE_RESTART_MODE})")),
-            "deploy/nexus-apply-release has no `{ENGINE_RESTART_MODE})` case"
+            applier.contains(&format!(
+                "    {ENGINE_RESTART_MODE})      do_engine_restart ;;"
+            )),
+            "deploy/nexus-apply-release does not dispatch `{ENGINE_RESTART_MODE}`"
+        );
+        let body = applier
+            .split("do_engine_restart() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("deploy/nexus-apply-release defines do_engine_restart");
+        assert!(
+            body.contains("systemctl restart nexus-engine"),
+            "do_engine_restart does not restart nexus-engine: {body}"
         );
     }
 }
