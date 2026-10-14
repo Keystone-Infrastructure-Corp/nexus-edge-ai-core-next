@@ -51,6 +51,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/lib/auth";
+import { MIN_PASSWORD_LEN } from "@/lib/password-policy";
 
 type Step = "welcome" | "password" | "cloud" | "cameras" | "rules" | "finish";
 
@@ -363,8 +364,8 @@ function PasswordStep({
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (newPassword.length < 12) {
-      setError("New password must be at least 12 characters.");
+    if (newPassword.length < MIN_PASSWORD_LEN) {
+      setError(`New password must be at least ${MIN_PASSWORD_LEN} characters.`);
       return;
     }
     if (newPassword !== confirm) {
@@ -407,12 +408,12 @@ function PasswordStep({
               type="password"
               autoComplete="new-password"
               required
-              minLength={12}
+              minLength={MIN_PASSWORD_LEN}
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
             />
             <p className="text-xs text-muted-foreground">
-              At least 12 characters. Longer is better &mdash; consider a passphrase.
+              At least {MIN_PASSWORD_LEN} characters. Longer is better &mdash; consider a passphrase.
             </p>
           </div>
           <div className="space-y-1.5">

@@ -43,4 +43,32 @@ test.describe("admin: users", () => {
     await expect(page.getByText(username).first()).toBeVisible();
     await expect(page.getByRole("button", { name: /copy/i })).toBeVisible();
   });
+
+  test("create user rejects an 11-character password with the 12-character rule", async ({
+    page,
+  }) => {
+    await page.goto("/admin/users");
+    await page.getByRole("button", { name: /new user/i }).click();
+    await expect(
+      page.getByRole("heading", { name: /^new user$/i }),
+    ).toBeVisible();
+
+    let createPosts = 0;
+    page.on("request", (req) => {
+      if (req.method() === "POST" && req.url().includes("/api/v1/admin/users")) {
+        createPosts += 1;
+      }
+    });
+
+    await page.getByLabel(/^username$/i).fill(`t${Date.now().toString(36)}`);
+    await page.getByLabel(/set my own password/i).check();
+    await expect(page.getByLabel(/^password/i)).toBeVisible();
+    await page.getByLabel(/^password/i).fill("a".repeat(11));
+    await page.getByRole("button", { name: /^create$/i }).click();
+
+    await expect(
+      page.getByText(/password must be at least 12 characters/i),
+    ).toBeVisible();
+    expect(createPosts).toBe(0);
+  });
 });
