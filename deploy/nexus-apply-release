@@ -76,6 +76,13 @@
 #                      from the cloud console. REFUSES to restart when `sshd
 #                      -t` fails, so a bad config can never lock the box out.
 #
+#   engine-restart     `systemctl restart nexus-engine`, blocking until the
+#                      engine is back up. Run by `nexus-engine enroll` (as
+#                      `nexus`, from an operator shell) after it persists a new
+#                      enrollment, which a running engine only loads at start
+#                      (BUG-201). Never call it from inside the engine's cgroup:
+#                      the stop would kill the caller (see flip_and_restart).
+#
 # NOTE ON ARGUMENTS. sudo's `*` does NOT match `/`, so no mode may accept a
 # path argument — that is precisely why the three ssh modes above read their
 # input from FIXED, engine-writable staging paths under $state/ssh/ instead of
@@ -687,6 +694,11 @@ do_sshd_restart() {
     log "restarted $unit"
 }
 
+do_engine_restart() {
+    systemctl restart nexus-engine || die "failed to restart nexus-engine"
+    log "restarted nexus-engine"
+}
+
 case "$mode" in
     apply)  do_apply ;;
     reflip) do_reflip ;;
@@ -694,7 +706,8 @@ case "$mode" in
     ssh-ca-install)      reexec_on_host_mounts; do_ssh_ca_install ;;
     ssh-principals-sync) reexec_on_host_mounts; do_ssh_principals_sync ;;
     sshd-restart)        reexec_on_host_mounts; do_sshd_restart ;;
-    *)      die "usage: nexus-apply-release {apply|reflip|prune} <version> | {ssh-ca-install|ssh-principals-sync|sshd-restart} (got mode='${mode}')" ;;
+    engine-restart)      do_engine_restart ;;
+    *)      die "usage: nexus-apply-release {apply|reflip|prune} <version> | {ssh-ca-install|ssh-principals-sync|sshd-restart|engine-restart} (got mode='${mode}')" ;;
 esac
 
 exit 0
