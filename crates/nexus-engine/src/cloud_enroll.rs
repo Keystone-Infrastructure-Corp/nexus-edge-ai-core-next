@@ -10,8 +10,8 @@
 //!    JWT + signing-key forward-compat fields) into the local
 //!    `cloud_enrollment` row, replacing any previous enrollment.
 //! 5. Print a one-line success banner.
-//!
-//! On next boot, `serve` reads that row and spawns the WSS tunnel.
+//! 6. Restart `nexus-engine.service` if it is running, so the engine
+//!    loads the new enrollment and opens the WSS tunnel (BUG-201).
 //!
 //! Lives in its own module so the serve path's startup graph stays
 //! untouched.
@@ -89,6 +89,53 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
     eprintln!(
         "nexus-engine: enrolled as core_id={} gateway_url={}",
         enrolled.core_id, enrolled.gateway_url,
+    );
+    // A running engine reads its enrollment once, when the tunnel starts,
+    // so it keeps the previous one (or none) until it restarts. Restart it
+    // here so a successful `enroll` means the core is coming online.
+    restart_engine_if_running(engine_is_running, restart_engine)
+}
+
+/// The root-owned applier — the only command the pinned
+/// `/etc/sudoers.d/nexus-update` rule grants the `nexus` user.
+const APPLY_RELEASE_WRAPPER: &str = "/usr/local/sbin/nexus-apply-release";
+
+/// Applier mode that restarts `nexus-engine.service`.
+const ENGINE_RESTART_MODE: &str = "engine-restart";
+
+fn restart_engine_if_running(
+    is_running: impl FnOnce() -> bool,
+    restart: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if !is_running() {
+        eprintln!(
+            "nexus-engine: nexus-engine.service is not active; the engine loads this enrollment when it starts"
+        );
+        return Ok(());
+    }
+    restart().context(
+        "enrollment is saved, but the running engine could not be restarted to load it — \
+         run `sudo systemctl restart nexus-engine` (do not re-run enroll: the code is spent)",
+    )?;
+    eprintln!("nexus-engine: restarting nexus-engine.service to bring the cloud tunnel up");
+    Ok(())
+}
+
+fn engine_is_running() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "nexus-engine"])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn restart_engine() -> Result<()> {
+    let status = std::process::Command::new("sudo")
+        .args(["-n", APPLY_RELEASE_WRAPPER, ENGINE_RESTART_MODE])
+        .status()
+        .context("spawn sudo")?;
+    anyhow::ensure!(
+        status.success(),
+        "`sudo -n {APPLY_RELEASE_WRAPPER} {ENGINE_RESTART_MODE}` failed ({status})"
     );
     Ok(())
 }
@@ -294,4 +341,57 @@ fn hex_lower(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_running_engine_is_restarted() {
+        let restarted = Cell::new(false);
+        restart_engine_if_running(
+            || true,
+            || {
+                restarted.set(true);
+                Ok(())
+            },
+        )
+        .expect("restart succeeded");
+        assert!(
+            restarted.get(),
+            "a running engine keeps its old enrollment until restarted"
+        );
+    }
+
+    #[test]
+    fn a_stopped_engine_is_left_alone() {
+        restart_engine_if_running(|| false, || panic!("must not restart a stopped engine"))
+            .expect("nothing to do");
+    }
+
+    #[test]
+    fn a_failed_restart_fails_the_command_and_names_the_manual_fix() {
+        let err =
+            restart_engine_if_running(|| true, || Err(anyhow!("sudo: a password is required")))
+                .expect_err("the core would stay offline, so enroll must not exit 0");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("sudo systemctl restart nexus-engine"), "{msg}");
+        assert!(msg.contains("do not re-run enroll"), "{msg}");
+    }
+
+    /// The mode `enroll` invokes must be one the root-owned applier
+    /// dispatches; sudoers grants the wrapper, not any particular mode.
+    #[test]
+    fn the_applier_dispatches_the_engine_restart_mode() {
+        let applier = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/nexus-apply-release"
+        ));
+        assert!(
+            applier.contains(&format!("    {ENGINE_RESTART_MODE})")),
+            "deploy/nexus-apply-release has no `{ENGINE_RESTART_MODE})` case"
+        );
+    }
 }
