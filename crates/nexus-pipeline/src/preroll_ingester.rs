@@ -676,16 +676,18 @@ async fn run_supervisor(
 }
 
 /// Push one tap sample into the pre-roll ring. Returns the sample as the
-/// ring stamped it (the copy to broadcast) and, when a new epoch began,
-/// why. A session's first sample and an access unit carrying a changed
-/// SPS begin the epoch before the push, so that sample heads it; the
-/// ring begins one itself when PTS step back past its window.
+/// ring stamped it (the copy to broadcast), when a new epoch began, why,
+/// and, once per episode, the ring's payload bytes when it first had to
+/// drop GOPs for size. A session's first sample and an access unit
+/// carrying a changed SPS begin the epoch before the push, so that sample
+/// heads it; the ring begins one itself when PTS step back past its
+/// window.
 fn push_tap_sample(
     ring: &mut NalRingBuffer,
     sample: NalSample,
     new_session: bool,
     sps_changed: bool,
-) -> (NalSample, Option<&'static str>) {
+) -> (NalSample, Option<&'static str>, Option<usize>) {
     let reason = if new_session {
         Some("new session")
     } else if sps_changed {
@@ -699,7 +701,8 @@ fn push_tap_sample(
     let epoch = ring.epoch();
     let pushed = ring.push(sample);
     let reason = reason.or((pushed.epoch != epoch).then_some("pts stepped back"));
-    (pushed, reason)
+    let byte_cap_trip = ring.take_byte_cap_trip().then(|| ring.bytes());
+    (pushed, reason, byte_cap_trip)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -991,7 +994,7 @@ async fn run_session(
                 // bounded by duration so pushes are O(1) amortised.
                 // The ring stamps the epoch, so broadcast what it
                 // returns: live subscribers and the ring must agree.
-                let (nal, new_epoch) = push_tap_sample(
+                let (nal, new_epoch, byte_cap_trip) = push_tap_sample(
                     &mut cb_ring.lock(),
                     nal,
                     std::mem::take(&mut first_sample),
@@ -999,6 +1002,13 @@ async fn run_session(
                 );
                 if let Some(reason) = new_epoch {
                     info!(camera_id, reason, "pre-roll ring began a new stream epoch");
+                }
+                if let Some(ring_bytes) = byte_cap_trip {
+                    warn!(
+                        camera_id,
+                        ring_bytes,
+                        "pre-roll ring is over its byte cap: dropping the oldest GOPs (PTS not advancing?)"
+                    );
                 }
                 // Broadcast to live subscribers. Errors here just
                 // mean no one is listening (typical: no clip open),
@@ -1464,7 +1474,7 @@ mod tests {
     fn steady_samples_keep_the_epoch() {
         let mut ring = ring_with_old_session();
         let epoch = ring.epoch();
-        let (pushed, reason) = push_tap_sample(&mut ring, nal(1_003_000, false), false, false);
+        let (pushed, reason, _) = push_tap_sample(&mut ring, nal(1_003_000, false), false, false);
         assert_eq!(reason, None);
         assert_eq!(pushed.epoch, epoch);
     }
@@ -1478,7 +1488,7 @@ mod tests {
         assert!(ring.sample_count() > 1);
         // ...even when the new session's PTS are within the window of the
         // old ones (a short first session), so no PTS check would catch it.
-        let (pushed, reason) = push_tap_sample(&mut ring, nal(999_000, true), true, false);
+        let (pushed, reason, _) = push_tap_sample(&mut ring, nal(999_000, true), true, false);
         assert_eq!(reason, Some("new session"));
         assert_ne!(pushed.epoch, old);
         let snap = ring.snapshot();
@@ -1491,7 +1501,7 @@ mod tests {
     fn an_sps_change_begins_the_epoch_before_its_au_is_pushed() {
         let mut ring = ring_with_old_session();
         let old = ring.epoch();
-        let (pushed, reason) = push_tap_sample(&mut ring, nal(1_003_000, true), false, true);
+        let (pushed, reason, _) = push_tap_sample(&mut ring, nal(1_003_000, true), false, true);
         assert_eq!(reason, Some("parameter-set change"));
         assert_ne!(pushed.epoch, old);
         let snap = ring.snapshot();
@@ -1500,10 +1510,40 @@ mod tests {
     }
 
     #[test]
+    fn a_ring_over_its_byte_cap_is_reported_once_per_episode() {
+        static MIB: [u8; 1 << 20] = [0; 1 << 20];
+        let big = |is_keyframe| NalSample {
+            data: bytes::Bytes::from_static(&MIB),
+            ..nal(1_000, is_keyframe)
+        };
+        let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+        let mut reports = Vec::new();
+        for i in 0..300 {
+            let (_, reason, trip) = push_tap_sample(&mut ring, big(i % 30 == 0), i == 0, false);
+            assert_eq!(reason.is_some(), i == 0, "no epoch after the first sample");
+            reports.extend(trip);
+        }
+        assert_eq!(reports.len(), 1, "once, not per frame: {reports:?}");
+        // Reported after the trim: just under the 64 MiB cap.
+        assert!(
+            (32 << 20..=64 << 20).contains(&reports[0]),
+            "reports the bytes held, got {}",
+            reports[0]
+        );
+    }
+
+    #[test]
+    fn normal_samples_report_no_byte_cap_trip() {
+        let mut ring = ring_with_old_session();
+        let (_, _, trip) = push_tap_sample(&mut ring, nal(1_003_000, false), false, false);
+        assert_eq!(trip, None);
+    }
+
+    #[test]
     fn a_pts_step_back_inside_a_session_is_reported() {
         let mut ring = ring_with_old_session();
         let old = ring.epoch();
-        let (pushed, reason) = push_tap_sample(&mut ring, nal(500, true), false, false);
+        let (pushed, reason, _) = push_tap_sample(&mut ring, nal(500, true), false, false);
         assert_eq!(reason, Some("pts stepped back"));
         assert_ne!(pushed.epoch, old);
     }

@@ -22,9 +22,12 @@
 //!   timing logic deterministic in tests and immune to host clock
 //!   jitter.
 //!
-//! * **Bounded memory by *duration*, not byte count.** A camera with
-//!   high bitrate gets fewer samples in the same window than a low
-//!   bitrate one — both keep the same ~`pre_roll_secs` of history.
+//! * **Bounded memory by *duration*, with a byte backstop.** A camera
+//!   with high bitrate gets fewer samples in the same window than a low
+//!   bitrate one — both keep the same ~`pre_roll_secs` of history. If
+//!   PTS stall or creep so the duration trim cannot keep up, the oldest
+//!   GOPs are dropped once the payload passes a fixed byte cap
+//!   ([`NalRingBuffer::take_byte_cap_trip`] reports it once per episode).
 //!
 //! * **One epoch at a time.** Every pushed sample is stamped with the
 //!   ring's current epoch ([`NalSample::epoch`]). A new epoch empties
@@ -32,7 +35,7 @@
 //!   one clip and trimmed against each other. The ingester begins one
 //!   for a new session or a changed SPS
 //!   ([`NalRingBuffer::begin_epoch`]); the ring begins one itself when
-//!   PTS step back by more than the window. Trimming against an older
+//!   PTS step back by more than the window (and at least 2 s). Trimming against an older
 //!   timeline's PTS is what froze the ring after a reconnect (#375).
 //!
 //! * **Snapshot semantics.** [`NalRingBuffer::snapshot`] returns a
@@ -47,6 +50,16 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::Bytes;
+
+/// Floor on the PTS step back that counts as a new timeline: a window of
+/// zero (every analysis ingester) must not read B-frame reordering as a
+/// reset, and no real reordering reaches 2 s.
+const MIN_DISCONTINUITY: Duration = Duration::from_secs(2);
+
+/// Backstop on the payload the ring holds, for a PTS pathology the epoch
+/// logic does not know: normal use is ~5 s of video, about 10 MB even for
+/// a 16 Mbit/s 4K stream.
+const MAX_RING_BYTES: usize = 64 * 1024 * 1024;
 
 /// One H.264 sample as pulled off the GStreamer pipeline. Owns its
 /// payload because the ring buffer outlives the appsink callback's
@@ -113,6 +126,15 @@ pub struct NalRingBuffer {
     newest_pts: Option<Duration>,
     /// Epoch stamped on every sample pushed now.
     epoch: u64,
+    /// Sum of `data.len()` over every held sample.
+    bytes: usize,
+    /// Payload cap; the duration trim is the normal bound, this is the
+    /// backstop.
+    max_bytes: usize,
+    /// A byte trim happened and the caller has not been told yet.
+    byte_cap_trip: bool,
+    /// The ring is in a byte-trim episode: no new trip until it recovers.
+    byte_capped: bool,
 }
 
 impl NalRingBuffer {
@@ -122,7 +144,23 @@ impl NalRingBuffer {
             max_duration,
             newest_pts: None,
             epoch: 0,
+            bytes: 0,
+            max_bytes: MAX_RING_BYTES,
+            byte_cap_trip: false,
+            byte_capped: false,
         }
+    }
+
+    /// Payload bytes currently held.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// True once per byte-trim episode: when the ring first had to drop
+    /// GOPs for size rather than duration. The episode ends when the ring
+    /// falls to half the cap or a new epoch begins, which re-arms it.
+    pub fn take_byte_cap_trip(&mut self) -> bool {
+        std::mem::take(&mut self.byte_cap_trip)
     }
 
     /// The epoch the next pushed sample will carry.
@@ -137,6 +175,9 @@ impl NalRingBuffer {
     pub fn begin_epoch(&mut self) {
         self.gops.clear();
         self.newest_pts = None;
+        self.bytes = 0;
+        self.byte_cap_trip = false;
+        self.byte_capped = false;
         self.epoch += 1;
     }
 
@@ -172,11 +213,12 @@ impl NalRingBuffer {
     ///
     /// The sample is stamped with the ring's epoch and a clone of the
     /// stamped sample is returned for the caller to broadcast. A PTS
-    /// more than `max_duration` below the newest one of the epoch is a
-    /// new timeline (a PTS reset): it begins a new epoch first.
+    /// more than `max_duration` (and at least [`MIN_DISCONTINUITY`])
+    /// below the newest one of the epoch is a new timeline (a PTS reset):
+    /// it begins a new epoch first.
     pub fn push(&mut self, mut sample: NalSample) -> NalSample {
         if let (Some(pts), Some(newest)) = (sample.pts, self.newest_pts) {
-            if newest.saturating_sub(pts) > self.max_duration {
+            if newest.saturating_sub(pts) > self.max_duration.max(MIN_DISCONTINUITY) {
                 self.begin_epoch();
             }
         }
@@ -189,13 +231,38 @@ impl NalRingBuffer {
             // New GOP. Pre-trim before pushing so a high-FPS camera
             // can't temporarily spike memory above the cap.
             self.trim();
+            self.bytes += sample.data.len();
             self.gops.push_back(Gop::new(sample));
         } else if let Some(g) = self.gops.back_mut() {
+            self.bytes += sample.data.len();
             g.samples.push(sample);
         }
         // else: pre-keyframe delta — silently drop.
         self.trim();
+        self.trim_bytes();
         stamped
+    }
+
+    /// Drop the oldest GOPs while the payload is over the cap, never the
+    /// newest one.
+    fn trim_bytes(&mut self) {
+        let mut trimmed = false;
+        while self.bytes > self.max_bytes && self.gops.len() > 1 {
+            self.pop_front_gop();
+            trimmed = true;
+        }
+        if trimmed {
+            self.byte_cap_trip |= !self.byte_capped;
+            self.byte_capped = true;
+        } else if self.bytes <= self.max_bytes / 2 {
+            self.byte_capped = false;
+        }
+    }
+
+    fn pop_front_gop(&mut self) {
+        if let Some(g) = self.gops.pop_front() {
+            self.bytes -= g.samples.iter().map(|s| s.data.len()).sum::<usize>();
+        }
     }
 
     fn trim(&mut self) {
@@ -224,10 +291,10 @@ impl NalRingBuffer {
             if newest.saturating_sub(second_pts) > self.max_duration {
                 // Even if we drop the front, the remainder is still
                 // over budget. Pop and re-evaluate.
-                self.gops.pop_front();
+                self.pop_front_gop();
             } else if newest.saturating_sub(first_pts) > self.max_duration {
                 // Dropping the front brings us back within budget.
-                self.gops.pop_front();
+                self.pop_front_gop();
                 break;
             } else {
                 // Already within budget — nothing to do.
@@ -496,5 +563,155 @@ mod tests {
         assert_eq!(pushed.epoch, epoch);
         assert_eq!(b.epoch(), epoch);
         assert_eq!(b.sample_count(), 3);
+    }
+
+    #[test]
+    fn a_zero_window_does_not_treat_reordered_pts_as_a_new_timeline() {
+        // Analysis ingesters run with pre_roll_secs = 0; B-frame
+        // reordering steps PTS back by a frame or two in decode order.
+        let mut b = NalRingBuffer::new(Duration::ZERO);
+        let epoch = b.epoch();
+        b.push(key(0, b"k0"));
+        for pts in [100, 66, 133, 200, 166, 266, 233] {
+            let pushed = b.push(delta(pts, b"d"));
+            assert_eq!(pushed.epoch, epoch, "reordered pts {pts} began an epoch");
+        }
+        assert_eq!(b.epoch(), epoch);
+    }
+
+    #[test]
+    fn a_zero_window_still_starts_an_epoch_on_a_real_pts_reset() {
+        let mut b = NalRingBuffer::new(Duration::ZERO);
+        b.push(key(100_000, b"k0"));
+        let epoch = b.epoch();
+        let pushed = b.push(key(500, b"k1"));
+        assert_ne!(pushed.epoch, epoch);
+        assert_eq!(b.epoch(), epoch + 1);
+    }
+
+    #[test]
+    fn a_step_back_inside_the_floor_keeps_the_epoch_whatever_the_window() {
+        let mut b = NalRingBuffer::new(Duration::from_millis(500));
+        b.push(key(10_000, b"k0"));
+        let epoch = b.epoch();
+        // 1.5 s back: over the 0.5 s window, under the 2 s floor.
+        let pushed = b.push(delta(8_500, b"d0"));
+        assert_eq!(pushed.epoch, epoch);
+        let pushed = b.push(key(
+            10_000 - MIN_DISCONTINUITY.as_millis() as u64 - 1,
+            b"k1",
+        ));
+        assert_ne!(pushed.epoch, epoch, "past the floor it is a new timeline");
+    }
+
+    static MIB: [u8; 1 << 20] = [0; 1 << 20];
+
+    fn big(pts_ms: u64, is_keyframe: bool) -> NalSample {
+        NalSample {
+            pts: Some(Duration::from_millis(pts_ms)),
+            dts: Some(Duration::from_millis(pts_ms)),
+            is_keyframe,
+            data: Bytes::from_static(&MIB),
+            epoch: 0,
+        }
+    }
+
+    #[test]
+    fn a_stalled_timeline_cannot_grow_the_ring_past_the_byte_cap() {
+        let gop_bytes = 30 * MIB.len();
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        let mut trips = 0;
+        for i in 0..600u64 {
+            // PTS never advance: the duration trim has nothing to do.
+            let pushed = b.push(big(1_000, i % 30 == 0));
+            if b.take_byte_cap_trip() {
+                trips += 1;
+            }
+            assert!(
+                b.bytes() <= MAX_RING_BYTES + gop_bytes,
+                "after frame {i} the ring holds {} bytes",
+                b.bytes()
+            );
+            assert_eq!(
+                b.snapshot().last().unwrap().data.as_ptr(),
+                pushed.data.as_ptr()
+            );
+            assert!(b.gop_count() >= 1, "the newest GOP is never dropped");
+        }
+        assert!(b.bytes() > 0 && b.bytes() <= MAX_RING_BYTES + gop_bytes);
+        assert_eq!(trips, 1, "one episode is reported once, not per push");
+    }
+
+    #[test]
+    fn the_byte_cap_trip_rearms_after_the_ring_recovers() {
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        b.max_bytes = 10 * MIB.len();
+        let mut trips = 0;
+        for i in 0..100u64 {
+            b.push(big(1_000, i % 3 == 0));
+            trips += usize::from(b.take_byte_cap_trip());
+        }
+        assert_eq!(trips, 1);
+        // A new epoch empties the ring and re-arms the report.
+        b.begin_epoch();
+        for i in 0..100u64 {
+            b.push(big(1_000, i % 3 == 0));
+            trips += usize::from(b.take_byte_cap_trip());
+        }
+        assert_eq!(trips, 2);
+        assert_eq!(
+            b.bytes(),
+            b.snapshot().iter().map(|s| s.data.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn the_byte_cap_trip_rearms_when_the_timeline_recovers_without_an_epoch() {
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        b.max_bytes = 10 * MIB.len();
+        let mut trips = 0;
+        for i in 0..100u64 {
+            b.push(big(1_000, i % 3 == 0));
+            trips += usize::from(b.take_byte_cap_trip());
+        }
+        assert_eq!(trips, 1);
+        // PTS advance again: the duration trim empties the big GOPs out.
+        for i in 0..200u64 {
+            b.push(frame(i, 2_000, b"small"));
+            trips += usize::from(b.take_byte_cap_trip());
+        }
+        assert_eq!(trips, 1, "recovery is not a trip");
+        assert!(b.bytes() <= b.max_bytes / 2);
+        // A second stall is a second episode.
+        for i in 0..100u64 {
+            b.push(big(20_000, i % 3 == 0));
+            trips += usize::from(b.take_byte_cap_trip());
+        }
+        assert_eq!(trips, 2);
+    }
+
+    #[test]
+    fn normal_use_never_trips_the_byte_cap() {
+        // 5 s window, 20 fps, ~16 Mbit/s 4K frames (100 kB).
+        let payload = vec![0u8; 100_000];
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        for i in 0..2_000 {
+            b.push(frame(i, 0, &payload));
+            assert!(!b.take_byte_cap_trip());
+        }
+        assert!(b.bytes() < MAX_RING_BYTES / 4, "held {} bytes", b.bytes());
+    }
+
+    #[test]
+    fn byte_accounting_follows_pushes_trims_and_epochs() {
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        b.push(delta(0, b"dropped: no keyframe yet"));
+        assert_eq!(b.bytes(), 0);
+        for i in 0..200 {
+            b.push(frame(i, 0, b"12345"));
+            assert_eq!(b.bytes(), b.sample_count() * 5);
+        }
+        b.begin_epoch();
+        assert_eq!(b.bytes(), 0);
     }
 }
