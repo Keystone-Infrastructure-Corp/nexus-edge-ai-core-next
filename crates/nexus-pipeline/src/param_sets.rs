@@ -24,7 +24,8 @@
 //! It also reports when an access unit changes the SPS (or VPS)
 //! mid-session ([`ParamSetCache::sps_changed`]), so the ingester can
 //! start a new pre-roll epoch there: mp4mux cannot take a new SPS in
-//! the middle of a clip (#376).
+//! the middle of a clip (#376). That comparison is per parameter-set
+//! id, unlike the single re-injection slots above.
 
 /// Per-session cache of the most recent parameter-set NAL units, stored
 /// without their start codes.
@@ -35,9 +36,12 @@ pub struct ParamSetCache {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
     sps_changed: bool,
-    /// H.264 SPS seen this session, by `seq_parameter_set_id`, for
+    /// SPS seen this session, by `seq_parameter_set_id`, for change
+    /// detection only.
+    sps_by_id: Vec<(u32, Vec<u8>)>,
+    /// H.265 VPS seen this session, by `vps_video_parameter_set_id`, for
     /// change detection only.
-    h264_sps_by_id: Vec<(u32, Vec<u8>)>,
+    vps_by_id: Vec<(u32, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,13 +85,18 @@ impl ParamSetCache {
             };
             has_params = true;
             let nal = &au[start..end];
-            if kind == NalKind::Sps && !self.hevc {
-                self.sps_changed |= note_h264_sps(&mut self.h264_sps_by_id, nal);
-            } else if kind != NalKind::Pps {
-                if let Some(prev) = slot.as_deref() {
-                    self.sps_changed |= trim_trailing_zeros(prev) != trim_trailing_zeros(nal);
+            self.sps_changed |= match (kind, self.hevc) {
+                (NalKind::Vps, _) => {
+                    note_by_id(&mut self.vps_by_id, h265_vps_id(nal).unwrap_or(0), nal)
                 }
-            }
+                (NalKind::Sps, false) => {
+                    note_by_id(&mut self.sps_by_id, h264_sps_id(nal).unwrap_or(0), nal)
+                }
+                (NalKind::Sps, true) => {
+                    note_by_id(&mut self.sps_by_id, h265_sps_id(nal).unwrap_or(0), nal)
+                }
+                _ => false,
+            };
             *slot = Some(nal.to_vec());
         }
         if has_params || !has_idr {
@@ -119,14 +128,13 @@ impl ParamSetCache {
     }
 
     /// Whether the access unit last passed to [`Self::process`] carried
-    /// an SPS (or, for H.265, a VPS or SPS) that differs from the one
-    /// before it on this session. Trailing zero bytes are not content.
-    /// The first SPS of a session is not a change, and neither is a PPS:
-    /// a stream alternating PPS ids would otherwise read as a change
-    /// every GOP. H.264 compares per `seq_parameter_set_id`, as
-    /// h264parse stores them: a new id or new bytes for a known id is a
-    /// change, a stream repeating two ids every keyframe is not. H.265
-    /// compares against the previous VPS / SPS.
+    /// an SPS (or, for H.265, a VPS or SPS) that changes what the muxer
+    /// was given. Trailing zero bytes are not content. The first SPS of
+    /// a session is not a change, and neither is a PPS: a stream
+    /// alternating PPS ids would otherwise read as a change every GOP.
+    /// SPS (and VPS) are compared per id, as h264parse / h265parse store
+    /// them: a new id or new bytes for a known id is a change, a stream
+    /// repeating two ids every keyframe is not.
     pub fn sps_changed(&self) -> bool {
         self.sps_changed
     }
@@ -159,11 +167,10 @@ fn trim_trailing_zeros(nal: &[u8]) -> &[u8] {
     &nal[..end]
 }
 
-/// Record an H.264 SPS under its id; `true` when it changes what the
-/// muxer was given (new bytes for a known id, or a new id after the
-/// session's first SPS).
-fn note_h264_sps(seen: &mut Vec<(u32, Vec<u8>)>, nal: &[u8]) -> bool {
-    let id = h264_sps_id(nal).unwrap_or(0);
+/// Record a VPS/SPS under its id; `true` when it changes what the muxer
+/// was given (new bytes for a known id, or a new id after the session's
+/// first of its kind).
+fn note_by_id(seen: &mut Vec<(u32, Vec<u8>)>, id: u32, nal: &[u8]) -> bool {
     let bytes = trim_trailing_zeros(nal);
     let first = seen.is_empty();
     match seen.iter_mut().find(|(i, _)| *i == id) {
@@ -179,24 +186,92 @@ fn note_h264_sps(seen: &mut Vec<(u32, Vec<u8>)>, nal: &[u8]) -> bool {
     }
 }
 
-/// `seq_parameter_set_id`: the ue(v) after the NAL header, profile_idc,
-/// the constraint flags and level_idc. No emulation-prevention byte can
-/// come before it, since profile_idc and level_idc are never zero.
-fn h264_sps_id(nal: &[u8]) -> Option<u32> {
-    let bits = nal.get(4..)?;
-    let bit = |i: usize| bits.get(i / 8).map(|b| u32::from((b >> (7 - i % 8)) & 1));
-    let mut zeros = 0;
-    while bit(zeros)? == 0 {
-        zeros += 1;
-        if zeros > 5 {
-            return None; // ids are 0..=31
+/// Big-endian bit reader over an RBSP; every read fails at the end.
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl BitReader<'_> {
+    fn bit(&mut self) -> Option<u32> {
+        let b = self.data.get(self.pos / 8)?;
+        let v = (b >> (7 - self.pos % 8)) & 1;
+        self.pos += 1;
+        Some(u32::from(v))
+    }
+
+    fn bits(&mut self, n: usize) -> Option<u32> {
+        (0..n).try_fold(0, |v, _| Some((v << 1) | self.bit()?))
+    }
+
+    fn skip(&mut self, n: usize) -> Option<()> {
+        self.pos += n;
+        (self.pos <= self.data.len() * 8).then_some(())
+    }
+
+    /// ue(v) with at most `max_zeros` leading zero bits.
+    fn ue(&mut self, max_zeros: usize) -> Option<u32> {
+        let mut zeros = 0;
+        while self.bit()? == 0 {
+            zeros += 1;
+            if zeros > max_zeros {
+                return None;
+            }
         }
+        Some((1 << zeros) - 1 + self.bits(zeros)?)
     }
-    let mut v = 0;
-    for i in 0..zeros {
-        v = (v << 1) | bit(zeros + 1 + i)?;
+}
+
+/// H.264 `seq_parameter_set_id`: the ue(v) after the NAL header,
+/// profile_idc, the constraint flags and level_idc. No
+/// emulation-prevention byte can come before it, since profile_idc and
+/// level_idc are never zero.
+fn h264_sps_id(nal: &[u8]) -> Option<u32> {
+    let mut r = BitReader {
+        data: nal.get(4..)?,
+        pos: 0,
+    };
+    r.ue(5) // ids are 0..=31
+}
+
+/// H.265 `vps_video_parameter_set_id`: the first 4 bits after the
+/// two-byte NAL header, which no emulation-prevention byte can precede.
+fn h265_vps_id(nal: &[u8]) -> Option<u32> {
+    Some(u32::from(nal.get(2)? >> 4))
+}
+
+/// H.265 `sps_seq_parameter_set_id` (H.265 §7.3.2.2): the ue(v) after
+/// the sps_video_parameter_set_id / max_sub_layers / nesting byte and
+/// `profile_tier_level(1, max_sub_layers_minus1)`. That structure
+/// routinely holds emulation-prevention bytes, so the RBSP is unescaped
+/// first.
+fn h265_sps_id(nal: &[u8]) -> Option<u32> {
+    let mut rbsp = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &b in nal.get(2..)? {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp.push(b);
     }
-    Some((1 << zeros) - 1 + v)
+    let mut r = BitReader {
+        data: &rbsp,
+        pos: 4, // sps_video_parameter_set_id
+    };
+    let m = r.bits(3)? as usize; // sps_max_sub_layers_minus1
+    r.skip(1 + 96)?; // nesting flag, general profile fields and level
+    let flags = (0..m)
+        .map(|_| Some((r.bit()? == 1, r.bit()? == 1)))
+        .collect::<Option<Vec<_>>>()?;
+    if m > 0 {
+        r.skip(2 * (8 - m))?; // reserved_zero_2bits
+    }
+    for (profile, level) in flags {
+        r.skip(if profile { 88 } else { 0 } + if level { 8 } else { 0 })?;
+    }
+    r.ue(4) // ids are 0..=15
 }
 
 /// Split an Annex-B buffer into `(start_code_offset, payload_start,
@@ -454,5 +529,201 @@ mod tests {
         assert!(cache.sps_changed(), "VPS changed");
         cache.process(&au(&[hvps2, hsps2, hpps2, HIDR]));
         assert!(!cache.sps_changed(), "PPS only");
+    }
+
+    // --- H.265 per-id comparison (#376) ---
+
+    /// Insert emulation-prevention bytes, as an encoder does: a 0x03
+    /// after every 0x00 0x00 that is followed by a byte <= 3.
+    fn escape(rbsp: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut zeros = 0;
+        for &b in rbsp {
+            if zeros >= 2 && b <= 3 {
+                out.push(3);
+                zeros = 0;
+            }
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+            out.push(b);
+        }
+        out
+    }
+
+    /// A syntactically valid H.265 SPS NAL: all-zero profile fields (so
+    /// emulation-prevention bytes appear, as in real streams),
+    /// `sub` = (profile_present, level_present) per sub-layer, ending in
+    /// a non-zero `extra` byte so two SPS of one id can differ.
+    fn h265_sps(sub: &[(bool, bool)], id: u32, extra: u8) -> Vec<u8> {
+        let mut bits: Vec<bool> = Vec::new();
+        let mut put = |v: u32, n: u32| {
+            for i in (0..n).rev() {
+                bits.push(i < 32 && (v >> i) & 1 == 1);
+            }
+        };
+        let m = sub.len() as u32;
+        put(0, 4); // sps_video_parameter_set_id
+        put(m, 3); // sps_max_sub_layers_minus1
+        put(1, 1); // sps_temporal_id_nesting_flag
+        put(0, 88); // general profile fields
+        put(93, 8); // general_level_idc
+        for &(p, l) in sub {
+            put(p.into(), 1);
+            put(l.into(), 1);
+        }
+        if m > 0 {
+            put(0, 2 * (8 - m));
+        }
+        for &(p, l) in sub {
+            if p {
+                put(0, 88);
+            }
+            if l {
+                put(90, 8);
+            }
+        }
+        let len = 32 - (id + 1).leading_zeros(); // bits in id + 1
+        put(0, len - 1);
+        put(id + 1, len); // ue(v)
+        put(1, 1); // stop bit
+        let mut rbsp: Vec<u8> = bits
+            .chunks(8)
+            .map(|c| (0..8).fold(0u8, |a, i| (a << 1) | u8::from(c.get(i) == Some(&true))))
+            .collect();
+        rbsp.push(extra);
+        let mut nal = vec![0x42, 0x01];
+        nal.extend(escape(&rbsp));
+        nal
+    }
+
+    fn h265_vps(id: u8, extra: u8) -> Vec<u8> {
+        vec![0x40, 0x01, (id << 4) | 0x0f, extra]
+    }
+
+    #[test]
+    fn h265_sps_id_survives_emulation_prevention_in_profile_tier_level() {
+        // x265 Main SPS; the 0x03 bytes sit inside profile_tier_level.
+        // `a0` starts `1`: sps_seq_parameter_set_id 0.
+        let x265: &[u8] = &[
+            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16,
+        ];
+        assert_eq!(h265_sps_id(x265), Some(0));
+        // The same SPS with `40` (`010`): id 1. Read raw, the 0x03 bytes
+        // would shift every later field and this could not come out as 1.
+        let mut id1 = x265.to_vec();
+        id1[18] = 0x40;
+        assert_eq!(h265_sps_id(&id1), Some(1));
+    }
+
+    #[test]
+    fn h265_sps_id_reads_ids_and_sub_layer_fields() {
+        assert!(h265_sps(&[], 3, 0x11).windows(3).any(|w| w == [0, 0, 3]));
+        for id in [0, 1, 2, 7, 15] {
+            assert_eq!(h265_sps_id(&h265_sps(&[], id, 0x11)), Some(id));
+        }
+        // sps_max_sub_layers_minus1 > 0: the per-sub-layer flags, the
+        // alignment bits and the optional sub-layer fields all come first.
+        let layers: &[&[(bool, bool)]] = &[
+            &[(false, false)],
+            &[(true, false)],
+            &[(false, true)],
+            &[(true, true), (false, true)],
+            &[(true, false), (true, true), (false, false)],
+        ];
+        for sub in layers {
+            assert_eq!(h265_sps_id(&h265_sps(sub, 5, 0x11)), Some(5), "{sub:?}");
+        }
+    }
+
+    #[test]
+    fn h265_sps_id_of_a_truncated_sps_is_none() {
+        let full = h265_sps(&[(true, true)], 1, 0x11);
+        for cut in 0..full.len() - 3 {
+            // Never panics; a cut before the id has nothing to read.
+            assert_eq!(h265_sps_id(&full[..cut]), None, "cut at {cut}");
+        }
+        assert_eq!(h265_sps_id(&[]), None);
+    }
+
+    #[test]
+    fn h265_vps_id_is_the_first_four_rbsp_bits() {
+        assert_eq!(h265_vps_id(&h265_vps(0, 1)), Some(0));
+        assert_eq!(h265_vps_id(&h265_vps(1, 1)), Some(1));
+        assert_eq!(h265_vps_id(&h265_vps(15, 1)), Some(15));
+        assert_eq!(h265_vps_id(&[0x40, 0x01]), None);
+    }
+
+    #[test]
+    fn two_h265_sps_ids_repeated_every_keyframe_are_not_a_change() {
+        let (a, b) = (h265_sps(&[], 0, 0x11), h265_sps(&[], 1, 0x11));
+        let mut cache = ParamSetCache::new(true);
+        cache.process(&au(&[HVPS, &a, &b, HPPS, HIDR]));
+        for _ in 0..3 {
+            cache.process(&au(&[HVPS, &a, &b, HPPS, HIDR]));
+            assert!(
+                !cache.sps_changed(),
+                "a stable second SPS id must not rotate the clip every GOP"
+            );
+        }
+    }
+
+    #[test]
+    fn two_h265_vps_ids_repeated_every_keyframe_are_not_a_change() {
+        let (a, b) = (h265_vps(0, 1), h265_vps(1, 1));
+        let mut cache = ParamSetCache::new(true);
+        cache.process(&au(&[&a, &b, HSPS, HPPS, HIDR]));
+        for _ in 0..3 {
+            cache.process(&au(&[&a, &b, HSPS, HPPS, HIDR]));
+            assert!(!cache.sps_changed(), "a stable second VPS id");
+        }
+    }
+
+    #[test]
+    fn a_new_h265_sps_id_or_new_bytes_for_a_known_id_is_a_change() {
+        let (a, b) = (h265_sps(&[], 0, 0x11), h265_sps(&[], 1, 0x11));
+        let mut cache = ParamSetCache::new(true);
+        cache.process(&au(&[HVPS, &a, HPPS, HIDR]));
+        cache.process(&au(&[HVPS, &a, &b, HPPS, HIDR]));
+        assert!(cache.sps_changed(), "a new SPS id re-caps the muxer");
+        cache.process(&au(&[HVPS, &a, &b, HPPS, HIDR]));
+        assert!(!cache.sps_changed());
+        let b2 = h265_sps(&[], 1, 0x12);
+        cache.process(&au(&[HVPS, &a, &b2, HPPS, HIDR]));
+        assert!(cache.sps_changed(), "new bytes for a known SPS id");
+    }
+
+    #[test]
+    fn a_new_h265_vps_id_or_new_bytes_for_a_known_id_is_a_change() {
+        let mut cache = ParamSetCache::new(true);
+        cache.process(&au(&[&h265_vps(0, 1), HSPS, HPPS, HIDR]));
+        cache.process(&au(&[&h265_vps(0, 1), &h265_vps(1, 1), HSPS, HPPS, HIDR]));
+        assert!(cache.sps_changed(), "a new VPS id");
+        cache.process(&au(&[&h265_vps(0, 1), &h265_vps(1, 1), HSPS, HPPS, HIDR]));
+        assert!(!cache.sps_changed());
+        cache.process(&au(&[&h265_vps(0, 1), &h265_vps(1, 2), HSPS, HPPS, HIDR]));
+        assert!(cache.sps_changed(), "new bytes for a known VPS id");
+    }
+
+    #[test]
+    fn h265_vps_and_sps_ids_are_tracked_independently() {
+        // VPS id 1 and SPS id 1 appearing as the first of their kind is
+        // not a change just because the other kind already has an id 1.
+        let mut cache = ParamSetCache::new(true);
+        cache.process(&au(&[&h265_vps(1, 1), &h265_sps(&[], 1, 0x11), HPPS, HIDR]));
+        assert!(!cache.sps_changed());
+        cache.process(&au(&[&h265_vps(1, 1), &h265_sps(&[], 1, 0x11), HPPS, HIDR]));
+        assert!(!cache.sps_changed());
+    }
+
+    #[test]
+    fn bare_h265_idr_gets_the_latest_sps_of_the_last_id_seen() {
+        // Re-injection keeps its single latest-of-each slot.
+        let (a, b) = (h265_sps(&[], 0, 0x11), h265_sps(&[], 1, 0x11));
+        let mut cache = ParamSetCache::new(true);
+        cache.process(&au(&[HVPS, &a, &b, HPPS, HIDR]));
+        assert_eq!(
+            cache.process(&au(&[HIDR])),
+            Some(au(&[HVPS, &b, HPPS, HIDR]))
+        );
     }
 }
