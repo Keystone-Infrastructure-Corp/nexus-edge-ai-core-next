@@ -66,9 +66,9 @@ use super::require_role::SessionContext;
 /// * When a [`SessionContext`] is present (the post-Phase-4
 ///   admin path), we use it. Legacy HS256 bearers map to
 ///   `LocalUser` with `actor_id = "0"` (no user row) and the
-///   `jti` field (which the layer populates from the bearer's
-///   `sub` claim, or `"loopback"` / `"allow-remote"` for the
-///   no-secret paths) as the actor label.
+///   `jti` field (which the extractor's `decode_to_context`
+///   fills from the bearer's `sub` claim, or `"dev-no-secret"`
+///   on the no-secret path) as the actor label.
 /// * When no context is present, we tag the row as
 ///   `system:unknown` so the operator can spot the gap. This
 ///   should never happen on a properly-mounted route — flag
