@@ -774,6 +774,6 @@ fn get_output_info(vs: hailo_output_vstream) -> Result<hailo_vstream_info_t, Err
 }
 
 fn c_array_to_string(buf: &[std::os::raw::c_char], len: usize) -> String {
-    let bytes: Vec<u8> = buf.iter().take(len).map(|&c| c as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
+    let bytes: Vec<u8> = buf.iter().map(|&c| c as u8).collect();
+    crate::ident::fixed_field_to_string(&bytes, len)
 }

@@ -42,6 +42,11 @@ pub use error::Error;
 /// compiled and tested on every target. See the module docs.
 mod decode;
 
+/// Identity-string conversion; compiled for tests on every target, and for
+/// the real backend on linux+linked.
+#[cfg(any(test, all(target_os = "linux", feature = "linked")))]
+mod ident;
+
 #[cfg(all(target_os = "linux", feature = "linked"))]
 mod ffi;
 #[cfg(all(target_os = "linux", feature = "linked"))]
