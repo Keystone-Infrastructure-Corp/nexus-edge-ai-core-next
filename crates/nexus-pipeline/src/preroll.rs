@@ -26,12 +26,22 @@
 //!   high bitrate gets fewer samples in the same window than a low
 //!   bitrate one — both keep the same ~`pre_roll_secs` of history.
 //!
+//! * **One epoch at a time.** Every pushed sample is stamped with the
+//!   ring's current epoch ([`NalSample::epoch`]). A new epoch empties
+//!   the ring, so it only ever holds samples that can be spliced into
+//!   one clip and trimmed against each other. The ingester begins one
+//!   for a new session or a changed SPS
+//!   ([`NalRingBuffer::begin_epoch`]); the ring begins one itself when
+//!   PTS step back by more than the window. Trimming against an older
+//!   timeline's PTS is what froze the ring after a reconnect (#375).
+//!
 //! * **Snapshot semantics.** [`NalRingBuffer::snapshot`] returns a
 //!   flat `Vec<NalSample>` covering every sample currently in the
 //!   buffer, ordered by arrival. Callers use it to seed an
 //!   `appsrc` at clip-open time. The buffer continues filling
 //!   independently of any snapshot — readers and the writer don't
-//!   block each other.
+//!   block each other. Payloads are refcounted, so a snapshot shares
+//!   frames with the ring rather than copying them.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -60,6 +70,12 @@ pub struct NalSample {
     /// pre-roll ingester normalises to byte-stream (`Annex-B`)
     /// before pushing here so all samples share one parser path.
     pub data: Bytes,
+    /// Stream epoch, stamped by [`NalRingBuffer::push`]. Samples that
+    /// share an epoch are spliceable: same session, same SPS, PTS from
+    /// one timeline. A reconnect, a parameter-set change or a PTS step
+    /// backwards starts a new epoch. The value set before the push is
+    /// ignored.
+    pub epoch: u64,
 }
 
 /// One closed group-of-pictures: keyframe + zero or more
@@ -92,9 +108,11 @@ pub struct NalRingBuffer {
     /// Inclusive upper bound on (newest PTS - oldest PTS). Trim
     /// pops from the front until this is satisfied.
     max_duration: Duration,
-    /// Last PTS we observed across all samples (keyframe or not).
+    /// Newest PTS observed in the current epoch (keyframe or not).
     /// Cached so trim doesn't have to walk the whole buffer.
     newest_pts: Option<Duration>,
+    /// Epoch stamped on every sample pushed now.
+    epoch: u64,
 }
 
 impl NalRingBuffer {
@@ -103,7 +121,23 @@ impl NalRingBuffer {
             gops: VecDeque::new(),
             max_duration,
             newest_pts: None,
+            epoch: 0,
         }
+    }
+
+    /// The epoch the next pushed sample will carry.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Start a new epoch: drop every held GOP and forget the newest
+    /// PTS, so the next keyframe heads a ring whose samples are all
+    /// spliceable. The ingester calls this when a new session delivers
+    /// and before an access unit that changes the SPS.
+    pub fn begin_epoch(&mut self) {
+        self.gops.clear();
+        self.newest_pts = None;
+        self.epoch += 1;
     }
 
     /// Total number of samples currently held.
@@ -135,7 +169,19 @@ impl NalRingBuffer {
     /// keyframe are dropped — without a keyframe head we have nothing
     /// to anchor a GOP on, and a snapshot would start on a delta
     /// frame and decode to garbage.
-    pub fn push(&mut self, sample: NalSample) {
+    ///
+    /// The sample is stamped with the ring's epoch and a clone of the
+    /// stamped sample is returned for the caller to broadcast. A PTS
+    /// more than `max_duration` below the newest one of the epoch is a
+    /// new timeline (a PTS reset): it begins a new epoch first.
+    pub fn push(&mut self, mut sample: NalSample) -> NalSample {
+        if let (Some(pts), Some(newest)) = (sample.pts, self.newest_pts) {
+            if newest.saturating_sub(pts) > self.max_duration {
+                self.begin_epoch();
+            }
+        }
+        sample.epoch = self.epoch;
+        let stamped = sample.clone();
         if let Some(pts) = sample.pts {
             self.newest_pts = Some(self.newest_pts.map_or(pts, |n| n.max(pts)));
         }
@@ -149,6 +195,7 @@ impl NalRingBuffer {
         }
         // else: pre-keyframe delta — silently drop.
         self.trim();
+        stamped
     }
 
     fn trim(&mut self) {
@@ -212,6 +259,7 @@ mod tests {
             dts: Some(Duration::from_millis(pts_ms)),
             is_keyframe: true,
             data: Bytes::copy_from_slice(payload),
+            epoch: 0,
         }
     }
 
@@ -221,6 +269,7 @@ mod tests {
             dts: Some(Duration::from_millis(pts_ms)),
             is_keyframe: false,
             data: Bytes::copy_from_slice(payload),
+            epoch: 0,
         }
     }
 
@@ -315,6 +364,7 @@ mod tests {
             dts: None,
             is_keyframe: false,
             data: Bytes::from_static(b"d0"),
+            epoch: 0,
         };
         b.push(no_pts);
         b.push(delta(33, b"d1"));
@@ -350,5 +400,101 @@ mod tests {
                 "a snapshot must clone refcounts, not frames"
             );
         }
+    }
+
+    /// 30-frame GOPs at 50 ms spacing (20 fps, 1.5 s GOPs).
+    fn frame(i: u64, base_ms: u64, payload: &[u8]) -> NalSample {
+        let pts = base_ms + i * 50;
+        if i.is_multiple_of(30) {
+            key(pts, payload)
+        } else {
+            delta(pts, payload)
+        }
+    }
+
+    /// #375 acceptance: a camera reconnects and its PTS restart near
+    /// zero. The ring used to freeze on the old session's maximum PTS
+    /// and keep every new frame.
+    #[test]
+    fn backward_pts_step_starts_a_new_epoch_and_keeps_the_ring_bounded() {
+        let window = Duration::from_secs(5);
+        let gop = Duration::from_millis(30 * 50);
+        let max_samples = ((window + gop).as_millis() / 50) as usize + 1;
+        let mut b = NalRingBuffer::new(window);
+        for i in 0..90 {
+            b.push(frame(i, 1_000_000, b"old"));
+        }
+        let old_epoch = b.snapshot()[0].epoch;
+        for i in 0..12_000 {
+            let pushed = b.push(frame(i, 500, b"new"));
+            assert_ne!(pushed.epoch, old_epoch, "frame {i} kept the old epoch");
+            assert!(
+                b.sample_count() <= max_samples,
+                "after frame {i} the ring holds {} samples, more than window + one GOP ({max_samples})",
+                b.sample_count()
+            );
+            assert!(b.buffered_duration() <= window + gop);
+            if i % 1_000 == 0 {
+                let snap = b.snapshot();
+                assert!(snap[0].is_keyframe);
+                assert!(
+                    snap.iter()
+                        .all(|s| s.epoch == pushed.epoch && &s.data[..] == b"new"),
+                    "the ring mixed epochs after frame {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn push_returns_the_stamped_sample_the_ring_holds() {
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        b.begin_epoch();
+        let pushed = b.push(NalSample {
+            epoch: 99,
+            ..key(0, b"k0")
+        });
+        let snap = b.snapshot();
+        assert_eq!(pushed.epoch, b.epoch(), "the caller's epoch is ignored");
+        assert_eq!(snap[0].epoch, pushed.epoch);
+        assert_eq!(
+            snap[0].data.as_ptr(),
+            pushed.data.as_ptr(),
+            "the broadcast copy shares the ring's payload"
+        );
+    }
+
+    #[test]
+    fn begin_epoch_clears_the_ring_and_advances_the_epoch() {
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        b.push(key(10_000, b"k0"));
+        b.push(delta(10_050, b"d0"));
+        let before = b.epoch();
+        b.begin_epoch();
+        assert_eq!(b.epoch(), before + 1);
+        assert_eq!(b.sample_count(), 0);
+        assert_eq!(b.buffered_duration(), Duration::ZERO);
+        // Deltas before the new epoch's first keyframe are dropped.
+        b.push(delta(50, b"d1"));
+        assert_eq!(b.sample_count(), 0);
+        // The newest PTS was reset with it: the window is measured on
+        // the new epoch alone, not against the old 10 s.
+        b.push(key(100, b"k1"));
+        b.push(delta(200, b"d2"));
+        assert_eq!(b.buffered_duration(), Duration::from_millis(100));
+        assert!(b.snapshot().iter().all(|s| s.epoch == before + 1));
+    }
+
+    #[test]
+    fn a_backward_step_within_the_window_keeps_the_epoch() {
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        b.push(key(10_000, b"k0"));
+        b.push(delta(10_050, b"d0"));
+        let epoch = b.epoch();
+        // 3 s back: jitter-sized, not a new timeline.
+        let pushed = b.push(key(7_050, b"k1"));
+        assert_eq!(pushed.epoch, epoch);
+        assert_eq!(b.epoch(), epoch);
+        assert_eq!(b.sample_count(), 3);
     }
 }

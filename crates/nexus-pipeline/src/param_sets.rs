@@ -20,6 +20,11 @@
 //! Only the latest VPS, the latest SPS and the latest PPS are kept --
 //! one slot each, not one per parameter-set id. A stream that uses
 //! several SPS/PPS ids gets back only the most recent of each.
+//!
+//! It also reports when an access unit changes the SPS (or VPS)
+//! mid-session ([`ParamSetCache::sps_changed`]), so the ingester can
+//! start a new pre-roll epoch there: mp4mux cannot take a new SPS in
+//! the middle of a clip (#376).
 
 /// Per-session cache of the most recent parameter-set NAL units, stored
 /// without their start codes.
@@ -29,6 +34,7 @@ pub struct ParamSetCache {
     vps: Option<Vec<u8>>,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    sps_changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +63,7 @@ impl ParamSetCache {
         let nals = split_nals(au);
         let mut has_params = false;
         let mut has_idr = false;
+        self.sps_changed = false;
         for &(_, start, end) in &nals {
             let kind = self.kind(au[start]);
             let slot = match kind {
@@ -70,7 +77,13 @@ impl ParamSetCache {
                 _ => continue,
             };
             has_params = true;
-            *slot = Some(au[start..end].to_vec());
+            let nal = &au[start..end];
+            if kind != NalKind::Pps {
+                if let Some(prev) = slot.as_deref() {
+                    self.sps_changed |= trim_trailing_zeros(prev) != trim_trailing_zeros(nal);
+                }
+            }
+            *slot = Some(nal.to_vec());
         }
         if has_params || !has_idr {
             return None;
@@ -100,6 +113,16 @@ impl ParamSetCache {
         Some(out)
     }
 
+    /// Whether the access unit last passed to [`Self::process`] carried
+    /// an SPS (or, for H.265, a VPS or SPS) that differs from the one
+    /// before it on this session. Trailing zero bytes are not content.
+    /// The first SPS of a session is not a change, and neither is a PPS:
+    /// a stream alternating PPS ids would otherwise read as a change
+    /// every GOP.
+    pub fn sps_changed(&self) -> bool {
+        self.sps_changed
+    }
+
     fn kind(&self, header: u8) -> NalKind {
         if self.hevc {
             match (header >> 1) & 0x3f {
@@ -121,6 +144,11 @@ impl ParamSetCache {
             }
         }
     }
+}
+
+fn trim_trailing_zeros(nal: &[u8]) -> &[u8] {
+    let end = nal.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    &nal[..end]
 }
 
 /// Split an Annex-B buffer into `(start_code_offset, payload_start,
@@ -267,5 +295,87 @@ mod tests {
         let mut cache = ParamSetCache::new(true);
         cache.process(&au(&[HSPS, HPPS, HIDR]));
         assert_eq!(cache.process(&au(&[HIDR])), None);
+    }
+
+    #[test]
+    fn the_first_sps_of_a_session_is_not_a_change() {
+        let mut cache = ParamSetCache::new(false);
+        assert_eq!(cache.process(&au(&[SPS, PPS, IDR])), None);
+        assert!(!cache.sps_changed());
+    }
+
+    #[test]
+    fn a_differing_sps_is_a_change_reported_on_that_au_only() {
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[SPS, PPS, IDR]));
+        cache.process(&au(&[P]));
+        // Main -> High profile.
+        let high: &[u8] = &[0x67, 0x64, 0x00, 0x1f];
+        assert_eq!(
+            cache.process(&au(&[high, PPS, IDR])),
+            None,
+            "still passthrough"
+        );
+        assert!(cache.sps_changed());
+        cache.process(&au(&[P]));
+        assert!(!cache.sps_changed(), "the change belongs to one AU");
+        cache.process(&au(&[high, PPS, IDR]));
+        assert!(!cache.sps_changed(), "the new SPS repeated is not a change");
+    }
+
+    #[test]
+    fn a_frame_rate_change_in_the_sps_is_a_change() {
+        // Same profile and level; the VUI timing bytes differ (15 -> 20 fps).
+        let fps15: &[u8] = &[0x67, 0x4d, 0x00, 0x1f, 0x9a, 0x66, 0x02, 0x80, 0x1e, 0x00];
+        let fps20: &[u8] = &[0x67, 0x4d, 0x00, 0x1f, 0x9a, 0x66, 0x02, 0x80, 0x28, 0x00];
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[fps15, PPS, IDR]));
+        assert!(!cache.sps_changed());
+        cache.process(&au(&[AUD, fps20, PPS, IDR]));
+        assert!(cache.sps_changed());
+    }
+
+    #[test]
+    fn an_identical_sps_with_or_without_trailing_zeros_is_not_a_change() {
+        let padded: &[u8] = &[0x67, 0x42, 0x00, 0x1f, 0x00, 0x00];
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[SPS, PPS, IDR]));
+        cache.process(&au(&[padded, PPS, IDR]));
+        assert!(
+            !cache.sps_changed(),
+            "trailing zero bytes are not SPS content"
+        );
+        cache.process(&au(&[SPS, PPS, IDR]));
+        assert!(!cache.sps_changed());
+        // At the very end of the AU too, where no start code follows.
+        cache.process(&au(&[PPS, IDR, padded]));
+        assert!(!cache.sps_changed());
+    }
+
+    #[test]
+    fn a_pps_only_change_is_not_a_change() {
+        let pps2: &[u8] = &[0x68, 0xee, 0x3c, 0x80];
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[SPS, PPS, IDR]));
+        cache.process(&au(&[SPS, pps2, IDR]));
+        assert!(!cache.sps_changed());
+        cache.process(&au(&[pps2, IDR]));
+        assert!(!cache.sps_changed());
+    }
+
+    #[test]
+    fn h265_vps_or_sps_change_is_a_change() {
+        let hsps2: &[u8] = &[0x42, 0x01, 0x02];
+        let hvps2: &[u8] = &[0x40, 0x01, 0x0d];
+        let hpps2: &[u8] = &[0x44, 0x01, 0xc2];
+        let mut cache = ParamSetCache::new(true);
+        cache.process(&au(&[HVPS, HSPS, HPPS, HIDR]));
+        assert!(!cache.sps_changed(), "first VPS/SPS of the session");
+        cache.process(&au(&[HVPS, hsps2, HPPS, HIDR]));
+        assert!(cache.sps_changed(), "SPS changed");
+        cache.process(&au(&[hvps2, hsps2, HPPS, HIDR]));
+        assert!(cache.sps_changed(), "VPS changed");
+        cache.process(&au(&[hvps2, hsps2, hpps2, HIDR]));
+        assert!(!cache.sps_changed(), "PPS only");
     }
 }

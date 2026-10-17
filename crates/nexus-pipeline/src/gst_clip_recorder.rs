@@ -2467,6 +2467,7 @@ mod tests {
             dts: pts_ms.map(Duration::from_millis),
             is_keyframe: is_kf,
             data: bytes::Bytes::copy_from_slice(data),
+            epoch: 0,
         }
     }
 
@@ -4211,6 +4212,7 @@ mod sdp_only_param_set_tests {
                 dts: pts,
                 is_keyframe: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
                 data: bytes::Bytes::copy_from_slice(&buffer.map_readable().unwrap()),
+                epoch: 0,
             });
         }
         pipeline.set_state(gst::State::Null).unwrap();
