@@ -1107,6 +1107,15 @@ impl ClipRecorder for GstClipRecorder {
             });
         }
 
+        // #376: when a second SPS reached mp4mux, its EOS rewrite of a now
+        // larger `moov` overwrote the start of the first `moof`. The clip
+        // closes normally and the file stays (its later fragments are intact
+        // on the hot tier), but it is marked degraded and never replicated.
+        let layout_fault = read_clip_head(&state.path)
+            .await
+            .ok()
+            .and_then(|head| clip_layout_fault(&head));
+
         // Normal close path: rename in-flight file to spec layout
         // `{start_ms}_{duration_ms}.mp4`, stat for size, stamp the row.
         let final_abs = crate::recorder::final_clip_path(
@@ -1179,6 +1188,18 @@ impl ClipRecorder for GstClipRecorder {
                 size_bytes,
                 "gst recorder: clip recorded with gaps -- live samples never reached the muxer"
             );
+        }
+        if let Some(reason) = layout_fault {
+            warn!(
+                camera_id = state.camera_id,
+                clip_id = handle.clip_id,
+                reason,
+                size_bytes,
+                "gst recorder: clip file layout is damaged -- kept on the hot tier, \
+                 marked degraded, not replicated"
+            );
+        }
+        if pump_stats.dropped > 0 || layout_fault.is_some() {
             if let Err(e) = self
                 .store
                 .mark_clip_degraded(handle.clip_id, pump_stats.dropped as i64)
@@ -1188,6 +1209,24 @@ impl ClipRecorder for GstClipRecorder {
                     clip_id = handle.clip_id,
                     error = %e,
                     "gst recorder: failed to stamp degraded clip"
+                );
+            }
+        }
+        // Before `close_clip`, which makes the row eligible for upload.
+        if let Some(reason) = layout_fault {
+            if let Err(e) = self
+                .store
+                .quarantine_clip(
+                    handle.clip_id,
+                    Utc::now(),
+                    &format!("clip layout: {reason}"),
+                )
+                .await
+            {
+                warn!(
+                    clip_id = handle.clip_id,
+                    error = %e,
+                    "gst recorder: failed to quarantine damaged clip"
                 );
             }
         }
@@ -1979,6 +2018,47 @@ const MIN_PLAYABLE_CLIP_BYTES: u64 = 1024;
 /// live pump timed out or panicked before reporting its stats.
 fn empty_clip_reason(file_bytes: u64) -> Option<&'static str> {
     (file_bytes < MIN_PLAYABLE_CLIP_BYTES).then_some("clip file under 1 KiB")
+}
+
+/// How much of a closed clip [`clip_layout_fault`] reads. mp4mux's
+/// fragmented `moov` holds no sample tables (~1 KB, ~166 B more per extra
+/// sample entry), so its `ftyp` + `moov` and the next box header always fit.
+const CLIP_HEAD_BYTES: u64 = 64 * 1024;
+
+async fn read_clip_head(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::new();
+    fs::File::open(path)
+        .await?
+        .take(CLIP_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .await?;
+    Ok(head)
+}
+
+/// Why a closed clip's top-level layout is damaged, or `None` when it
+/// starts `ftyp`, `moov`, `moof`. The #376 shape is a `moov` rewritten
+/// larger at EOS over the first `moof`, which leaves garbage where the
+/// `moof` began and the clip undecodable from offset 0.
+fn clip_layout_fault(head: &[u8]) -> Option<&'static str> {
+    let box_at = |off: usize| {
+        let h = head.get(off..off.checked_add(8)?)?;
+        let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+        Some((size, [h[4], h[5], h[6], h[7]]))
+    };
+    let ftyp = match box_at(0) {
+        Some((size, kind)) if &kind == b"ftyp" && size >= 8 => size,
+        _ => return Some("first box is not ftyp"),
+    };
+    let moov = match box_at(ftyp) {
+        Some((size, kind)) if &kind == b"moov" && size >= 8 => size,
+        _ => return Some("box after ftyp is not moov"),
+    };
+    match box_at(ftyp + moov) {
+        Some((_, kind)) if &kind == b"moof" => None,
+        Some(_) => Some("box after moov is not moof"),
+        None => Some("nothing readable after moov"),
+    }
 }
 
 /// Convert the muxer's last-accepted rebased PTS into a clip duration
@@ -4413,7 +4493,8 @@ mod sdp_only_param_set_tests {
     }
 }
 
-/// #375 / #376: a clip never splices two stream epochs into one file.
+/// #375 / #376: a clip never splices two stream epochs into one file, and a
+/// clip whose header overwrote its first fragment is caught at close.
 #[cfg(test)]
 mod epoch_tests {
     use super::*;
@@ -4787,6 +4868,37 @@ mod epoch_tests {
         );
     }
 
+    /// The close-time check over the head of a real fragmented clip: as
+    /// written, with its `moov` grown by one sample entry (166 B) over the
+    /// start of the first `moof` (the #376 shape), and cut right after `moov`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_layout_check_wants_moof_right_after_moov() {
+        if !has_elements(&["x264enc", "mp4mux"]) {
+            eprintln!("skipping: x264enc/mp4mux not available");
+            return;
+        }
+        let good = record_through_pump(encode(15, "main", 30, Duration::ZERO), Vec::new())
+            .await
+            .bytes;
+        assert_eq!(clip_layout_fault(&good), None);
+
+        let (_, moov_off, moov_size) = top_level_boxes(&good)[1];
+        let moov_end = moov_off + moov_size;
+        let mut grown = good[..moov_end].to_vec();
+        grown[moov_off..moov_off + 4].copy_from_slice(&(moov_size as u32 + 166).to_be_bytes());
+        grown.extend([0u8; 166]);
+        grown.extend(&good[moov_end + 166..]);
+        assert_eq!(
+            clip_layout_fault(&grown),
+            Some("box after moov is not moof")
+        );
+
+        assert_eq!(
+            clip_layout_fault(&good[..moov_end]),
+            Some("nothing readable after moov")
+        );
+    }
+
     async fn store_with_camera(dir: &Path) -> Arc<Store> {
         let store = Arc::new(
             Store::open(&StoreConfig {
@@ -4818,5 +4930,124 @@ mod epoch_tests {
             .await
             .unwrap();
         store
+    }
+
+    /// #376 at close: muxing two SPS into one file makes mp4mux rewrite a
+    /// larger `moov` over the first `moof` at EOS. `close()` keeps that clip
+    /// (its later fragments are recoverable) but takes it out of cold
+    /// replication; a clean clip closes as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clip_whose_header_overwrote_its_first_fragment_is_kept_but_never_replicated() {
+        if !has_elements(&["x264enc", "mp4mux"]) {
+            eprintln!("skipping: x264enc/mp4mux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let a = encode(15, "main", 60, Duration::ZERO);
+        let b = encode(20, "main", 60, Duration::from_secs(4));
+        let mixed: Vec<NalSample> = a.iter().chain(&b).cloned().collect();
+
+        let mut closed = Vec::new();
+        for (n, samples) in [a, mixed].into_iter().enumerate() {
+            let started_at = Utc::now() - chrono::Duration::seconds(60 - 10 * n as i64);
+            let path = crate::recorder::inflight_clip_path(&clips_dir, 1, started_at);
+            fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+            let clip_id = store
+                .open_clip(&NewClip {
+                    camera_id: 1,
+                    started_at,
+                    hot_path: crate::recorder::clip_rel_path(&clips_dir, &path),
+                    codec: "h264".into(),
+                    container: CONTAINER.into(),
+                    hot_handle: "local".into(),
+                    frame_width: 320,
+                    frame_height: 240,
+                })
+                .await
+                .unwrap();
+            let (pipeline, appsrc) =
+                GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let mut last = None;
+            for s in &samples {
+                last = Some(
+                    push_sample(&appsrc, s, Duration::ZERO, last, FALLBACK_FRAME_INTERVAL_NS)
+                        .unwrap(),
+                );
+            }
+            let handle = ClipHandle {
+                clip_id,
+                camera_id: 1,
+            };
+            // The pump of a clip that ended on an epoch change sets this.
+            rec.epoch_ended
+                .write()
+                .insert(clip_id, Arc::new(AtomicBool::new(true)));
+            assert!(rec.ended_on_epoch_change(handle));
+            rec.open.lock().await.insert(
+                clip_id,
+                OpenState {
+                    camera_id: 1,
+                    started_at,
+                    path,
+                    effective_dir: clips_dir.clone(),
+                    hot_handle: "local".into(),
+                    codec: CodecKind::H264,
+                    pipeline,
+                    appsrc,
+                    pump_stop: None,
+                    pump_handle: None,
+                    preroll_last_written_pts_ns: last,
+                },
+            );
+            let meta = rec
+                .close(
+                    handle,
+                    ClipFinal {
+                        ended_at: started_at + chrono::Duration::seconds(8),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!meta.discarded && meta.path.exists(), "clip {n} kept");
+            assert!(!rec.ended_on_epoch_change(handle), "close forgets the clip");
+            closed.push((clip_id, std::fs::read(&meta.path).unwrap()));
+        }
+        let (clean, clean_bytes) = &closed[0];
+        let (damaged, damaged_bytes) = &closed[1];
+        // The fixture reproduces the field shape.
+        assert_eq!(box_after_moov(clean_bytes).as_ref(), Some(b"moof"));
+        assert_eq!(stsd_entries(damaged_bytes), 2);
+        assert_ne!(box_after_moov(damaged_bytes).as_ref(), Some(b"moof"));
+
+        let row = store.get_clip(*damaged).await.unwrap().unwrap();
+        assert!(
+            row.ended_at.is_some() && row.sha256.is_some(),
+            "closed normally"
+        );
+        assert!(row.cold_quarantined, "damaged clip quarantined");
+        assert_eq!(
+            row.cold_last_error.as_deref(),
+            Some("clip layout: box after moov is not moof")
+        );
+        assert!(
+            !store
+                .get_clip(*clean)
+                .await
+                .unwrap()
+                .unwrap()
+                .cold_quarantined
+        );
+        let pending: Vec<ClipId> = store
+            .clips_pending_cold_upload(10, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(pending, [*clean], "only the clean clip is replicated");
     }
 }
