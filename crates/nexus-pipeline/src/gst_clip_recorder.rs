@@ -832,7 +832,9 @@ impl ClipRecorder for GstClipRecorder {
             codec,
             appsrc.clone(),
             live_rx,
-            base_pts,
+            // An empty prepend leaves the pump to start the clip on its
+            // first keyframe and rebase there.
+            (!snapshot_for_blocking.is_empty()).then_some(base_pts),
             gate_rx,
             pump_stop_rx,
             clip_epoch,
@@ -2086,6 +2088,12 @@ fn media_duration_ms(last_written_pts_ns: Option<u64>) -> i64 {
 /// rotates, and returns. So the PTS de-dup only ever compares samples of
 /// one timeline, and mp4mux never sees a second SPS.
 ///
+/// `base_pts` is `None` when the prepend pushed nothing (the ring is empty
+/// right after an epoch change, but the broadcast already carries the new
+/// epoch's deltas). The pump then drops samples until the first keyframe
+/// and rebases the clip on its PTS, so the clip starts decodable and its
+/// duration is its content rather than the epoch's raw PTS.
+///
 /// Runs in two phases. Until `gate` resolves the clip row does not
 /// exist yet and the pre-roll prepend is still writing the head of
 /// the timeline, so the pump only *buffers* what it reads off the
@@ -2107,7 +2115,7 @@ async fn run_live_pump(
     codec: CodecKind,
     appsrc: AppSrc,
     mut live_rx: broadcast::Receiver<NalSample>,
-    base_pts: Duration,
+    mut base_pts: Option<Duration>,
     gate: oneshot::Receiver<PumpGate>,
     mut stop: oneshot::Receiver<()>,
     mut clip_epoch: Option<u64>,
@@ -2140,7 +2148,7 @@ async fn run_live_pump(
         codec: CodecKind,
         appsrc: &AppSrc,
         sample: NalSample,
-        base_pts: Duration,
+        base_pts: &mut Option<Duration>,
         pending: &mut Option<NalSample>,
         last_pushed_pts: &mut Option<Duration>,
         last_written_pts_ns: &mut Option<u64>,
@@ -2157,7 +2165,7 @@ async fn run_live_pump(
                         clip_id,
                         appsrc,
                         last,
-                        base_pts,
+                        *base_pts,
                         last_pushed_pts,
                         last_written_pts_ns,
                     )
@@ -2178,13 +2186,27 @@ async fn run_live_pump(
                 return Ok(());
             }
         }
+        // Empty pre-roll: start the clip on its first keyframe, as the
+        // ring would, and rebase the timeline there.
+        if base_pts.is_none() {
+            if !sample.is_keyframe {
+                return Ok(());
+            }
+            *base_pts = Some(sample.pts.unwrap_or(Duration::ZERO));
+            debug!(
+                camera_id,
+                clip_id,
+                base_pts = ?base_pts,
+                "live pump: empty pre-roll; clip starts on the first live keyframe"
+            );
+        }
         if let Some(to_push) = coalesce_same_pts(pending, sample, codec) {
             push_one(
                 camera_id,
                 clip_id,
                 appsrc,
                 to_push,
-                base_pts,
+                *base_pts,
                 last_pushed_pts,
                 last_written_pts_ns,
             )
@@ -2201,10 +2223,13 @@ async fn run_live_pump(
         clip_id: ClipId,
         appsrc: &AppSrc,
         sample: NalSample,
-        base_pts: Duration,
+        base_pts: Option<Duration>,
         last_pushed_pts: &mut Option<Duration>,
         last_written_pts_ns: &mut Option<u64>,
     ) -> Result<(), ()> {
+        // Set before the first push: by the prepend, or by
+        // `handle_sample` at the first live keyframe.
+        let base_pts = base_pts.unwrap_or_default();
         let push_appsrc = appsrc.clone();
         let pushed_pts = sample.pts;
         let anchor = *last_written_pts_ns;
@@ -2303,7 +2328,7 @@ async fn run_live_pump(
             codec,
             &appsrc,
             sample,
-            base_pts,
+            &mut base_pts,
             &mut pending,
             &mut last_pushed_pts,
             &mut last_written_pts_ns,
@@ -2376,7 +2401,7 @@ async fn run_live_pump(
             recv = live_rx.recv() => match recv {
                 Ok(sample) => {
                     if handle_sample(
-                        camera_id, clip_id, codec, &appsrc, sample, base_pts,
+                        camera_id, clip_id, codec, &appsrc, sample, &mut base_pts,
                         &mut pending, &mut last_pushed_pts, &mut last_written_pts_ns,
                         &mut clip_epoch, &epoch_ended,
                     ).await.is_err() {
@@ -4635,6 +4660,8 @@ mod epoch_tests {
         /// What the pump reported to the supervisor.
         ended_on_epoch_change: bool,
         stats: PumpStats,
+        /// Buffers that left appsrc: what the prepend and the pump pushed.
+        pushed: usize,
         _dir: tempfile::TempDir,
     }
 
@@ -4644,6 +4671,15 @@ mod epoch_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clip.mp4");
         let (pipeline, appsrc) = GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
+        let pushed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = pushed.clone();
+        appsrc
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
         pipeline.set_state(gst::State::Playing).unwrap();
         let base_pts = snapshot
             .iter()
@@ -4671,7 +4707,7 @@ mod epoch_tests {
             CodecKind::H264,
             appsrc.clone(),
             rx,
-            base_pts,
+            (!snapshot.is_empty()).then_some(base_pts),
             gate_rx,
             stop_rx,
             snapshot.first().map(|s| s.epoch),
@@ -4703,6 +4739,7 @@ mod epoch_tests {
             pump_ended,
             ended_on_epoch_change: epoch_ended.load(Ordering::Acquire),
             stats,
+            pushed: pushed.load(Ordering::Relaxed),
             _dir: dir,
         }
     }
@@ -4801,6 +4838,55 @@ mod epoch_tests {
         assert_one_clean_timeline(&next, "clip opened after the reset");
         let ms = media_duration_ms(next.stats.last_written_pts_ns);
         assert!((ms - 5000).abs() <= 50, "new session's 100 frames: {ms} ms");
+    }
+
+    /// Samples the file's fragments carry: the sum of every `trun` count.
+    fn fragment_samples(bytes: &[u8]) -> u32 {
+        let children = |off: usize, size: usize, kind: &'static [u8; 4]| {
+            top_level_boxes(&bytes[off + 8..off + size])
+                .into_iter()
+                .filter(move |b| &b.0 == kind)
+                .map(move |(_, o, s)| (off + 8 + o, s))
+        };
+        top_level_boxes(bytes)
+            .into_iter()
+            .filter(|b| &b.0 == b"moof")
+            .flat_map(|(_, off, size)| children(off, size, b"traf"))
+            .flat_map(|(off, size)| children(off, size, b"trun"))
+            .map(|(off, _)| u32::from_be_bytes(bytes[off + 12..off + 16].try_into().unwrap()))
+            .sum()
+    }
+
+    /// #375: right after an epoch change the ring is empty until the new
+    /// epoch's first keyframe, but the broadcast already carries its delta
+    /// frames, so a clip rotated in then opens on an empty snapshot. The
+    /// pump drops those deltas and rebases the clip on the keyframe: the
+    /// clip starts decodable and its duration is its content, not the
+    /// epoch's raw PTS (here ~3600 s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_preroll_clip_starts_on_the_first_keyframe_and_is_timed_from_it() {
+        if !has_elements(&["x264enc", "avdec_h264", "mp4mux"]) {
+            eprintln!("skipping: x264enc/avdec_h264/mp4mux not available");
+            return;
+        }
+        // Keyframes at frames 0, 20 and 40; the broadcast starts at frame 5.
+        let a = encode(20, "main", 60, Duration::from_secs(3600));
+        let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+        let live: Vec<NalSample> = a[5..].iter().map(|s| ring.push(s.clone())).collect();
+        assert!(!live[0].is_keyframe && live[15].is_keyframe);
+
+        let clip = record_through_pump(Vec::new(), live).await;
+        assert!(!clip.ended_on_epoch_change);
+        assert_one_clean_timeline(&clip, "empty pre-roll clip");
+        assert_eq!(clip.pushed, 40, "the pump pushes no leading delta");
+        assert_eq!(
+            fragment_samples(&clip.bytes),
+            40,
+            "the keyframe and what follows it, no leading delta"
+        );
+        assert_eq!(clip.stats.dropped, 0, "leading deltas are not lag");
+        let ms = media_duration_ms(clip.stats.last_written_pts_ns);
+        assert!((ms - 2000).abs() <= 50, "40 frames at 20 fps: {ms} ms");
     }
 
     /// The alert-clip post window stops at the first sample of another
