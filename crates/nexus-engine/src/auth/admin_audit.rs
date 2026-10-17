@@ -17,12 +17,13 @@
 //! This module fixes both with a single helper —
 //! [`audit_admin_action`] — that:
 //!
-//! * Extracts the [`SessionContext`] that the
-//!   `admin_auth_layer` injected as a request extension. When
-//!   present we know the actor (HS256 `sub` claim, or one of
-//!   the synthetic actors `loopback` / `allow-remote`); when
-//!   absent we fall back to `system:unknown` rather than
-//!   silently dropping the row.
+//! * Takes the [`SessionContext`] the handler's extractor decoded
+//!   from the bearer, not the extension `admin_auth_layer`
+//!   inserts (nothing reads that one). When present we know the
+//!   actor (a legacy bearer's `sub` claim, a session token's user
+//!   id, or the no-secret `dev-no-secret` label); when absent we
+//!   fall back to `system:unknown` rather than silently dropping
+//!   the row.
 //! * Records the client IP and User-Agent so cross-tab forensics
 //!   can correlate a write to a specific browser session.
 //! * Takes an [`AuditOutcome`] so failure-path callers can emit
@@ -65,9 +66,9 @@ use super::require_role::SessionContext;
 /// * When a [`SessionContext`] is present (the post-Phase-4
 ///   admin path), we use it. Legacy HS256 bearers map to
 ///   `LocalUser` with `actor_id = "0"` (no user row) and the
-///   `jti` field (which the layer populates from the bearer's
-///   `sub` claim, or `"loopback"` / `"allow-remote"` for the
-///   no-secret paths) as the actor label.
+///   `jti` field (which the extractor's `decode_to_context`
+///   fills from the bearer's `sub` claim, or `"dev-no-secret"`
+///   on the no-secret path) as the actor label.
 /// * When no context is present, we tag the row as
 ///   `system:unknown` so the operator can spot the gap. This
 ///   should never happen on a properly-mounted route — flag
@@ -279,5 +280,191 @@ mod tests {
         };
         let (_, _, label) = actor_triple(Some(&ctx));
         assert_eq!(label, "system:legacy-admin:loopback");
+    }
+
+    // ----- bearer → audit row, end to end (edge-core #378) -----------------
+
+    const SECRET: &[u8] = b"test-shared-admin-secret-32-bytes!";
+
+    async fn put_camera_47(base: &str, token: &str) {
+        let res = reqwest::Client::new()
+            .put(format!("{base}/api/v1/admin/cameras/47"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+
+    /// The field report: an operator's HS256 bearer carrying `sub` and no
+    /// `jti` was logged by `admin_auth` with its subject, but the audit row
+    /// read `system:legacy-admin:legacy`. The row must name the subject.
+    #[tokio::test]
+    async fn bearer_without_jti_records_its_subject_on_the_audit_row() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let (base, store, _dir) = test_support::spawn_audited_admin_api(
+            crate::admin_auth::AdminAuthState::from_secret_bytes(Some(SECRET), false),
+        )
+        .await;
+        let now = chrono::Utc::now().timestamp();
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "operator:claude-code-session",
+                "iat": now,
+                "exp": now + 300,
+            }),
+            &EncodingKey::from_secret(SECRET),
+        )
+        .unwrap();
+
+        put_camera_47(&base, &token).await;
+
+        let row = test_support::only_camera_row(&store, "47").await;
+        assert_eq!(row.action, "camera.upsert");
+        assert_eq!(row.actor_kind, AuditActorKind::LocalUser);
+        assert_eq!(
+            row.actor_label,
+            "system:legacy-admin:operator:claude-code-session"
+        );
+    }
+
+    /// A role-bearing session token is unaffected: the row names the user,
+    /// and the request still bumps the session's refresh chain.
+    #[tokio::test]
+    async fn session_token_audit_row_still_names_the_user() {
+        let (tx, mut bumps) = tokio::sync::mpsc::channel(8);
+        let (base, store, _dir) = test_support::spawn_audited_admin_api(
+            crate::admin_auth::AdminAuthState::from_secret_bytes(Some(SECRET), false)
+                .with_idle_bump_tx(tx),
+        )
+        .await;
+        let token = crate::auth::sessions::issue_access_token(
+            42,
+            Role::Operator,
+            SECRET,
+            chrono::Utc::now(),
+            chrono::Duration::minutes(15),
+            Some("chain-1"),
+        )
+        .unwrap();
+
+        put_camera_47(&base, &token).await;
+
+        let row = test_support::only_camera_row(&store, "47").await;
+        assert_eq!(row.actor_kind, AuditActorKind::LocalUser);
+        assert_eq!(row.actor_id.as_deref(), Some("42"));
+        assert_eq!(row.actor_label, "user:42");
+        let (chain, _) = bumps.try_recv().expect("the session's chain is bumped");
+        assert_eq!(chain, "chain-1");
+    }
+}
+
+/// The bearer-authorised admin write path end to end, for tests here and
+/// in `engine_rpc`: `admin_auth_layer` in front of a route, the handler's
+/// `Option<SessionContext>` extractor, and [`audit_admin_action`] into a
+/// real SQLite store, served over TCP with `ConnectInfo` as `main.rs`
+/// serves the API. The route is `PUT /api/v1/admin/cameras/{id}` writing
+/// `camera.upsert`, the shape `api::upsert_camera` has.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use axum::extract::{ConnectInfo, FromRef, Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::put;
+    use axum::Router;
+    use nexus_config::StoreConfig;
+    use nexus_store::audit::{AuditEntry, AuditOutcome};
+    use nexus_store::Store;
+
+    use crate::admin_auth::{admin_auth_layer, AdminAuthState};
+    use crate::auth::require_role::SessionContext;
+
+    #[derive(Clone)]
+    struct Fixture {
+        auth: Arc<AdminAuthState>,
+        store: Arc<Store>,
+    }
+
+    impl FromRef<Fixture> for Arc<AdminAuthState> {
+        fn from_ref(f: &Fixture) -> Self {
+            f.auth.clone()
+        }
+    }
+
+    async fn upsert_camera(
+        State(f): State<Fixture>,
+        Path(id): Path<String>,
+        headers: HeaderMap,
+        ConnectInfo(peer): ConnectInfo<SocketAddr>,
+        session: Option<SessionContext>,
+    ) -> StatusCode {
+        super::audit_admin_action(
+            &f.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "camera.upsert",
+            "camera",
+            Some(&id),
+            AuditOutcome::Success,
+            None,
+            None,
+        )
+        .await;
+        StatusCode::NO_CONTENT
+    }
+
+    /// Serve the audited admin write route on an OS-assigned loopback
+    /// port. Returns the base URL (`http://127.0.0.1:NNNNN`), the store
+    /// the rows land in, and the temp dir that must outlive the test.
+    pub(crate) async fn spawn_audited_admin_api(
+        auth: AdminAuthState,
+    ) -> (String, Arc<Store>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!("sqlite:{}?mode=rwc", dir.path().join("nexus.db").display()),
+                seed_from_config: false,
+                duckdb_attach: false,
+                duckdb_path: PathBuf::from("/tmp/unused.duckdb"),
+            })
+            .await
+            .unwrap(),
+        );
+        let auth = Arc::new(auth);
+        let app = Router::new()
+            .route("/api/v1/admin/cameras/{id}", put(upsert_camera))
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                admin_auth_layer,
+            ))
+            .with_state(Fixture {
+                auth,
+                store: store.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        (format!("http://{addr}"), store, dir)
+    }
+
+    /// The single audit row the request wrote for camera `id`.
+    pub(crate) async fn only_camera_row(store: &Store, id: &str) -> AuditEntry {
+        let mut rows = store
+            .list_audit_for_resource("camera", id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected one audit row: {rows:?}");
+        rows.remove(0)
     }
 }

@@ -259,9 +259,10 @@ async fn assemble_tarball(
 
     let mut req = http.get(&url);
     if let Some(secret) = admin_secret {
-        let token = crate::admin_auth::mint_internal_passthrough_bearer(secret).map_err(|e| {
-            DiagError::TarballFailed(format!("minting loopback bearer failed: {e}"))
-        })?;
+        let token =
+            crate::admin_auth::mint_internal_passthrough_bearer(secret, None).map_err(|e| {
+                DiagError::TarballFailed(format!("minting loopback bearer failed: {e}"))
+            })?;
         req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
     }
 

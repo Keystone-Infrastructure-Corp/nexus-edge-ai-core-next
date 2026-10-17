@@ -318,21 +318,24 @@ impl EngineRpcHandler {
     ///   `parse_handler_error` reconstructs the right wire status
     ///   on the cloud side.
     ///
-    /// Auth model: the loopback peer is implicitly trusted by
-    /// `admin_auth_layer` (decision matrix item 3 in
-    /// `admin_auth.rs`), so we don't have to mint an admin bearer
-    /// token per call. The dispatcher has already verified the
-    /// cloud-issued `actor_token` upstream; the audit sink has
-    /// already recorded the cloud actor BEFORE this handler runs.
-    /// The downstream `audit_admin_action` call inside the local
-    /// admin handler records a sibling row with `actor_kind =
-    /// system` (label = `loopback`), so an external auditor sees
-    /// both: the cloud-side row identifying the human, and the
-    /// engine-side row identifying the local-API mutation. Hard
-    /// Rule 6 (R4c — every mutating cloud→edge RPC carries a
-    /// verified `actor_token`) is satisfied by the upstream
-    /// dispatcher check; we re-enforce a `priviledged_role` gate
-    /// here as defence-in-depth.
+    /// Auth model: the dispatcher has already verified the
+    /// cloud-issued `actor_token` upstream, and the audit sink has
+    /// already recorded the cloud actor on a `cloud_rpc.<method>`
+    /// row BEFORE this handler runs. When an admin secret is
+    /// configured, `forward_admin_request` presents an in-process
+    /// HS256 bearer whose `sub` is `system:rpc-passthrough:<actor
+    /// sub>`, so the local admin handler's `audit_admin_action`
+    /// row is labelled
+    /// `system:legacy-admin:system:rpc-passthrough:<actor sub>` —
+    /// both rows name the human. With no secret configured the
+    /// loopback peer is trusted without a bearer (decision matrix
+    /// item 3 in `admin_auth.rs`) and the engine-side row carries
+    /// the dev-mode label `system:legacy-admin:dev-no-secret`,
+    /// leaving the `cloud_rpc.*` row as the only one naming the
+    /// human. Hard Rule 6 (R4c — every mutating cloud→edge RPC
+    /// carries a verified `actor_token`) is satisfied by the
+    /// upstream dispatcher check; we re-enforce a
+    /// `priviledged_role` gate here as defence-in-depth.
     ///
     /// Non-JSON responses (e.g. live-frame JPEGs from
     /// `/cameras/:id/frames/latest`) MUST NOT travel through the
@@ -384,6 +387,7 @@ impl EngineRpcHandler {
             envelope.path,
             body,
             self.admin_secret.as_deref().map(String::as_str),
+            &actor.sub,
         )
         .await;
 
@@ -428,6 +432,7 @@ async fn forward_admin_request(
     path: &str,
     body: Option<&[u8]>,
     admin_secret: Option<&str>,
+    actor_sub: &str,
 ) -> Result<Vec<u8>, String> {
     let method = match method_str.to_ascii_uppercase().as_str() {
         "GET" => reqwest::Method::GET,
@@ -449,7 +454,7 @@ async fn forward_admin_request(
 
     let mut req = http_client.request(method, &url);
     if let Some(secret) = admin_secret {
-        match crate::admin_auth::mint_internal_passthrough_bearer(secret) {
+        match crate::admin_auth::mint_internal_passthrough_bearer(secret, Some(actor_sub)) {
             Ok(token) => {
                 req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
             }
@@ -1057,9 +1062,17 @@ mod tests {
     async fn forward_admin_request_get_2xx_round_trips_body() {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
-        let body = forward_admin_request(&client, &base, "GET", "/admin/cameras", None, None)
-            .await
-            .expect("expected success");
+        let body = forward_admin_request(
+            &client,
+            &base,
+            "GET",
+            "/admin/cameras",
+            None,
+            None,
+            "test-actor",
+        )
+        .await
+        .expect("expected success");
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["cameras"][0]["id"], 1);
         assert_eq!(parsed["cameras"][0]["name"], "cam-A");
@@ -1077,6 +1090,7 @@ mod tests {
             "/admin/cameras",
             Some(body.as_slice()),
             None,
+            "test-actor",
         )
         .await
         .expect("expected success");
@@ -1091,10 +1105,17 @@ mod tests {
     async fn forward_admin_request_404_json_round_trips_status_and_message() {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
-        let wire =
-            forward_admin_request(&client, &base, "DELETE", "/admin/cameras/999", None, None)
-                .await
-                .expect_err("expected 404");
+        let wire = forward_admin_request(
+            &client,
+            &base,
+            "DELETE",
+            "/admin/cameras/999",
+            None,
+            None,
+            "test-actor",
+        )
+        .await
+        .expect_err("expected 404");
         // Round-trip the wire JSON back into a RpcResponsePayload
         // the way the dispatcher does on the way out.
         let resp = parse_handler_error(&wire);
@@ -1120,6 +1141,7 @@ mod tests {
             "/admin/discovery/sessions/abc",
             None,
             None,
+            "test-actor",
         )
         .await
         .expect_err("expected non-2xx");
@@ -1140,9 +1162,17 @@ mod tests {
     async fn forward_admin_request_unknown_method_returns_bad_request_wire() {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
-        let wire = forward_admin_request(&client, &base, "OPTIONS", "/admin/cameras", None, None)
-            .await
-            .expect_err("OPTIONS not supported by passthrough");
+        let wire = forward_admin_request(
+            &client,
+            &base,
+            "OPTIONS",
+            "/admin/cameras",
+            None,
+            None,
+            "test-actor",
+        )
+        .await
+        .expect_err("OPTIONS not supported by passthrough");
         let resp = parse_handler_error(&wire);
         assert_eq!(resp.status, 400);
         assert_eq!(
@@ -1165,6 +1195,7 @@ mod tests {
             "/admin/cameras",
             None,
             None,
+            "test-actor",
         )
         .await
         .expect_err("expected connection error");
@@ -1222,6 +1253,7 @@ mod tests {
             "/admin/echo-auth",
             Some(b"{}"),
             Some(TEST_SECRET),
+            "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c100",
         )
         .await
         .expect("expected success");
@@ -1234,7 +1266,8 @@ mod tests {
             .expect("expected Bearer scheme");
 
         // Verify the engine signed it with the same secret and
-        // tagged the sub as the documented system principal.
+        // tagged the sub as the documented system principal acting
+        // for the verified cloud actor.
         #[derive(serde::Deserialize)]
         struct Claims {
             sub: String,
@@ -1251,7 +1284,7 @@ mod tests {
         .expect("token should verify against the same secret");
         assert_eq!(
             decoded.claims.sub,
-            crate::admin_auth::INTERNAL_PASSTHROUGH_SUB
+            "system:rpc-passthrough:0190f7be-7c6a-7d4f-8f01-d9b1f0c0c100"
         );
     }
 
@@ -1296,10 +1329,61 @@ mod tests {
             "/admin/echo-auth",
             Some(b"{}"),
             None,
+            "test-actor",
         )
         .await
         .expect("expected success");
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(parsed["authorization"].is_null());
+    }
+
+    /// edge-core #378 / R4c: a cloud camera edit writes the `cloud_rpc.*`
+    /// row naming the human, and the local admin API's own mutation row.
+    /// That second row must name the human too — before, it read
+    /// `system:legacy-admin:legacy`, linked to the first only by timestamp.
+    #[tokio::test]
+    async fn cloud_passthrough_write_names_the_verified_actor_on_the_mutation_row() {
+        use crate::admin_auth::AdminAuthState;
+        use crate::auth::admin_audit::test_support;
+
+        const SECRET: &str = "shared-with-admin-auth-do-not-leak";
+        let (base, store, _dir) = test_support::spawn_audited_admin_api(
+            AdminAuthState::from_secret_bytes(Some(SECRET.as_bytes()), false),
+        )
+        .await;
+        let handler = EngineRpcHandler {
+            store: store.clone(),
+            replicator_kick: Arc::new(Notify::new()),
+            loopback_admin_base: Arc::new(ArcSwap::from_pointee(base)),
+            http_client: reqwest::Client::new(),
+            admin_secret: Some(Arc::new(SECRET.to_string())),
+        };
+        let actor = VerifiedActor {
+            sub: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c100".into(),
+            role: "operator".into(),
+            jti: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c101".into(),
+            org_id: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c102".into(),
+            actor_org_id: None,
+        };
+
+        handler
+            .handle(
+                "PUT /admin/cameras/47",
+                EnvelopeContext {
+                    method: "PUT",
+                    path: "/admin/cameras/47",
+                },
+                &actor,
+                Some(b"{}"),
+            )
+            .await
+            .expect("passthrough succeeds");
+
+        let row = test_support::only_camera_row(&store, "47").await;
+        assert_eq!(row.action, "camera.upsert");
+        assert_eq!(
+            row.actor_label,
+            "system:legacy-admin:system:rpc-passthrough:0190f7be-7c6a-7d4f-8f01-d9b1f0c0c100"
+        );
     }
 }

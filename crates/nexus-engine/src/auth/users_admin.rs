@@ -355,7 +355,7 @@ async fn record_user_audit(
     let actor_id_str = actor.0.user_id.to_string();
     let target_str = target_user.to_string();
     let actor_label = if actor.0.is_legacy_admin {
-        "system:legacy-admin-token".to_string()
+        format!("system:legacy-admin:{}", actor.0.jti)
     } else {
         format!("user:{}", actor.0.user_id)
     };
@@ -878,6 +878,47 @@ mod tests {
             .unwrap();
         assert_eq!(uid, body.user.id);
         assert!(super::super::passwords::verify_password(&otp, &phc));
+    }
+
+    /// A legacy bearer's subject reaches the user-admin audit row, as it
+    /// does on every other admin write (edge-core #378).
+    #[tokio::test]
+    async fn legacy_bearer_user_write_records_its_subject_on_the_audit_row() {
+        let (state, store, _dir, _) = fresh_state().await;
+        let now = Utc::now().timestamp();
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "system:rpc-passthrough:user-1",
+                "iat": now,
+                "exp": now + 300,
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(ADMIN_SECRET),
+        )
+        .unwrap();
+        let resp = build_app(state)
+            .oneshot(json_request_with_bearer(
+                "POST",
+                "/admin/users",
+                &token,
+                Some(serde_json::json!({
+                    "username": "alice",
+                    "role": "operator",
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: CreateUserResponse = parse_json(resp).await;
+        let rows = store
+            .list_audit_for_resource("user", &body.user.id.to_string(), 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].actor_label,
+            "system:legacy-admin:system:rpc-passthrough:user-1"
+        );
     }
 
     #[tokio::test]

@@ -87,9 +87,9 @@ pub struct SessionContext {
     /// Effective role for authorisation decisions. For legacy
     /// tokens this is always `Role::Admin`.
     pub role: Role,
-    /// JWT id from the token. For legacy tokens with no `jti`
-    /// claim we synthesise `"legacy"` so the audit log row is
-    /// still populated.
+    /// JWT id from the token. For legacy tokens this is the
+    /// actor label instead: the `sub` claim, else `jti`, else
+    /// `"legacy"`, so the audit log row names the bearer.
     pub jti: String,
     /// `true` iff the caller authenticated via the legacy
     /// `AdminClaims` shape (no `role` claim). The audit log
@@ -267,7 +267,15 @@ fn decode_to_context(token: &str, key: &DecodingKey) -> Result<SessionContext, S
         .as_deref()
         .and_then(|s| UserId::from_str(s).ok())
         .unwrap_or(0);
-    let jti = data.claims.jti.unwrap_or_else(|| "legacy".into());
+    // A legacy token is labelled by its subject, as `admin_auth_layer`
+    // labels it, so the audit row names the bearer rather than
+    // `legacy` (edge-core #378). A role-bearing token keeps its `jti`.
+    let jti = if is_legacy {
+        data.claims.sub.or(data.claims.jti)
+    } else {
+        data.claims.jti
+    }
+    .unwrap_or_else(|| "legacy".into());
     Ok(SessionContext {
         user_id,
         role,
@@ -585,7 +593,9 @@ mod tests {
         assert_eq!(ctx.role, Role::Admin);
         // sub isn't numeric so user_id falls back to 0.
         assert_eq!(ctx.user_id, 0);
-        assert_eq!(ctx.jti, "legacy");
+        // No `jti` claim: the label is the bearer's subject, as
+        // `admin_auth_layer` logs it (edge-core #378).
+        assert_eq!(ctx.jti, "admin-tool");
     }
 
     #[test]
