@@ -80,44 +80,26 @@ impl ParamSetCache {
         self.sps_changed = false;
         self.au_sps_by_id.clear();
         self.au_vps_by_id.clear();
+        // An epoch with none of a kind yet takes every id of that kind in
+        // this AU as its first, not just the first NAL's.
+        let first_vps = self.vps_by_id.is_empty();
+        let first_sps = self.sps_by_id.is_empty();
         for &(_, start, end) in &nals {
-            let kind = self.kind(au[start]);
-            let slot = match kind {
-                NalKind::Vps => &mut self.vps,
-                NalKind::Sps => &mut self.sps,
-                NalKind::Pps => &mut self.pps,
+            let nal = &au[start..end];
+            let kind = self.kind(nal[0]);
+            let (slot, first) = match kind {
+                NalKind::Vps => (&mut self.vps, first_vps),
+                NalKind::Sps => (&mut self.sps, first_sps),
+                NalKind::Pps => (&mut self.pps, false),
                 NalKind::Idr => {
                     has_idr = true;
                     continue;
                 }
                 _ => continue,
             };
-            has_params = true;
-            let nal = &au[start..end];
-            let by_id = match (kind, self.hevc) {
-                (NalKind::Vps, _) => Some((
-                    h265_vps_id(nal),
-                    &mut self.vps_by_id,
-                    &mut self.au_vps_by_id,
-                )),
-                (NalKind::Sps, false) => Some((
-                    h264_sps_id(nal),
-                    &mut self.sps_by_id,
-                    &mut self.au_sps_by_id,
-                )),
-                (NalKind::Sps, true) => Some((
-                    h265_sps_id(nal),
-                    &mut self.sps_by_id,
-                    &mut self.au_sps_by_id,
-                )),
-                _ => None,
-            };
-            if let Some((id, seen, in_au)) = by_id {
-                let id = id.unwrap_or(0);
-                self.sps_changed |= note_by_id(seen, id, nal);
-                note_by_id(in_au, id, nal);
-            }
             *slot = Some(nal.to_vec());
+            has_params = true;
+            self.sps_changed |= self.note(kind, nal, first);
         }
         if self.sps_changed {
             // This AU heads the new epoch.
@@ -126,14 +108,20 @@ impl ParamSetCache {
         if has_params || !has_idr {
             return None;
         }
-        let (Some(sps), Some(pps)) = (&self.sps, &self.pps) else {
+        let (Some(sps), Some(pps)) = (self.sps.clone(), self.pps.clone()) else {
             return None;
         };
         let vps = if self.hevc {
-            Some(self.vps.as_ref()?)
+            Some(self.vps.clone()?)
         } else {
             None
         };
+        // The muxer is given the injected VPS/SPS as if this AU carried
+        // them; they are already this epoch's or its first, never a change.
+        if let Some(vps) = &vps {
+            self.note(NalKind::Vps, vps, true);
+        }
+        self.note(NalKind::Sps, &sps, true);
         // Parameter sets follow an access-unit delimiter if there is one.
         let insert_at = match nals.first() {
             Some(&(_, start, _)) if self.kind(au[start]) == NalKind::Aud => {
@@ -143,7 +131,7 @@ impl ParamSetCache {
         };
         let mut out = Vec::with_capacity(au.len() + 64);
         out.extend_from_slice(&au[..insert_at]);
-        for ps in vps.into_iter().chain([sps, pps]) {
+        for ps in vps.iter().chain([&sps, &pps]) {
             out.extend_from_slice(&[0, 0, 0, 1]);
             out.extend_from_slice(ps);
         }
@@ -154,7 +142,8 @@ impl ParamSetCache {
     /// Whether the access unit last passed to [`Self::process`] carried
     /// an SPS (or, for H.265, a VPS or SPS) that changes what the current
     /// epoch's muxer was given. Trailing zero bytes are not content. The
-    /// first SPS of an epoch is not a change, and neither is a PPS: a
+    /// SPS of an epoch's first AU carrying any (whatever their ids, and
+    /// including injected ones) are not a change, and neither is a PPS: a
     /// stream alternating PPS ids would otherwise read as a change every
     /// GOP. SPS (and VPS) are compared per id, as h264parse / h265parse
     /// store them, against the current epoch's only: a new id or new
@@ -167,12 +156,40 @@ impl ParamSetCache {
 
     /// Begin a new epoch at the access unit last passed to
     /// [`Self::process`]: a fresh muxer starts there, so from now on SPS
-    /// and VPS are compared against that AU's alone. The ingester calls
-    /// this when an epoch begins for a reason other than an SPS change
-    /// (the ring's PTS step back). The re-injection slots are untouched.
+    /// and VPS are compared against that AU's alone (including any it was
+    /// given by injection). The ingester calls this whenever an epoch
+    /// begins; it is a no-op after an SPS change, and matters for the
+    /// ring's PTS step back. The re-injection slots are untouched.
     pub fn begin_epoch(&mut self) {
         self.sps_by_id.clone_from(&self.au_sps_by_id);
         self.vps_by_id.clone_from(&self.au_vps_by_id);
+    }
+
+    /// Record a VPS/SPS under its id in the current epoch's and this
+    /// AU's maps; `true` when it changes what the epoch's muxer was given.
+    /// `first`: the epoch had none of this kind when the AU began.
+    fn note(&mut self, kind: NalKind, nal: &[u8], first: bool) -> bool {
+        let (id, seen, in_au) = match kind {
+            NalKind::Vps => (
+                h265_vps_id(nal),
+                &mut self.vps_by_id,
+                &mut self.au_vps_by_id,
+            ),
+            NalKind::Sps if self.hevc => (
+                h265_sps_id(nal),
+                &mut self.sps_by_id,
+                &mut self.au_sps_by_id,
+            ),
+            NalKind::Sps => (
+                h264_sps_id(nal),
+                &mut self.sps_by_id,
+                &mut self.au_sps_by_id,
+            ),
+            _ => return false,
+        };
+        let id = id.unwrap_or(0);
+        note_by_id(in_au, id, nal, true);
+        note_by_id(seen, id, nal, first)
     }
 
     fn kind(&self, header: u8) -> NalKind {
@@ -204,16 +221,15 @@ fn trim_trailing_zeros(nal: &[u8]) -> &[u8] {
 }
 
 /// Record a VPS/SPS under its id; `true` when it changes what the muxer
-/// was given (new bytes for a known id, or a new id after the epoch's
-/// first of its kind).
-fn note_by_id(seen: &mut Vec<(u32, Vec<u8>)>, id: u32, nal: &[u8]) -> bool {
+/// was given (new bytes for a known id, or a new id), unless it is part
+/// of the epoch's `first` of its kind.
+fn note_by_id(seen: &mut Vec<(u32, Vec<u8>)>, id: u32, nal: &[u8], first: bool) -> bool {
     let bytes = trim_trailing_zeros(nal);
-    let first = seen.is_empty();
     match seen.iter_mut().find(|(i, _)| *i == id) {
         Some((_, prev)) if prev.as_slice() == bytes => false,
         Some((_, prev)) => {
             *prev = bytes.to_vec();
-            true
+            !first
         }
         None => {
             seen.push((id, bytes.to_vec()));
@@ -596,6 +612,59 @@ mod tests {
         cache.process(&au(&[P]));
         cache.begin_epoch();
         assert_eq!(cache.process(&au(&[IDR])), Some(au(&[SPS, PPS, IDR])));
+    }
+
+    #[test]
+    fn parameter_sets_injected_into_a_bare_idr_count_toward_the_epoch() {
+        // #376 review: the muxer is given the injected SPS, so an SPS
+        // after it is compared against it.
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[SPS_ID0, PPS, IDR]));
+        cache.process(&au(&[P]));
+        assert!(cache.process(&au(&[IDR])).is_some(), "injected");
+        assert!(!cache.sps_changed(), "injecting is never a change");
+        // PTS step back at the bare IDR: its new muxer got SPS id 0.
+        cache.begin_epoch();
+        cache.process(&au(&[SPS_ID1, PPS, IDR]));
+        assert!(cache.sps_changed(), "id 1 after the injected id 0");
+    }
+
+    #[test]
+    fn an_sps_injected_after_an_epoch_begun_at_a_delta_is_that_epochs_first() {
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[SPS_ID0, PPS, IDR]));
+        cache.process(&au(&[P]));
+        cache.begin_epoch();
+        assert!(cache.process(&au(&[IDR])).is_some(), "injected");
+        cache.process(&au(&[SPS_ID1, PPS, IDR]));
+        assert!(cache.sps_changed(), "id 1 after the injected id 0");
+    }
+
+    #[test]
+    fn h265_vps_injected_into_a_bare_idr_counts_toward_the_epoch() {
+        let mut cache = ParamSetCache::new(true);
+        cache.process(&au(&[&h265_vps(0, 1), HSPS, HPPS, HIDR]));
+        assert!(cache.process(&au(&[HIDR])).is_some(), "injected");
+        cache.begin_epoch();
+        cache.process(&au(&[&h265_vps(1, 1), HSPS, HPPS, HIDR]));
+        assert!(cache.sps_changed(), "VPS id 1 after the injected id 0");
+    }
+
+    #[test]
+    fn every_id_of_an_epochs_first_au_is_its_first() {
+        // #376 review: "first of the epoch" is per access unit, not per NAL.
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[SPS_ID0, SPS_ID1, PPS, IDR]));
+        assert!(!cache.sps_changed(), "both ids head the session");
+        cache.process(&au(&[P]));
+        cache.begin_epoch();
+        cache.process(&au(&[SPS_ID0, SPS_ID1, PPS, IDR]));
+        assert!(!cache.sps_changed(), "both ids head the epoch");
+        // seq_parameter_set_id 2 (`011...`).
+        let sps_id2: &[u8] = &[0x67, 0x4d, 0x00, 0x1f, 0x6d, 0x33, 0x01, 0x40];
+        assert_eq!(h264_sps_id(sps_id2), Some(2));
+        cache.process(&au(&[SPS_ID0, SPS_ID1, sps_id2, PPS, IDR]));
+        assert!(cache.sps_changed(), "a new id after the epoch's first AU");
     }
 
     #[test]
