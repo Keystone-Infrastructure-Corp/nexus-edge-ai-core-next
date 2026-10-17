@@ -643,6 +643,24 @@ mod tests {
     }
 
     #[test]
+    fn the_byte_cap_never_drops_the_newest_gop() {
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        b.max_bytes = 2 * MIB.len();
+        let mut pushed = None;
+        // One 5 MiB GOP, larger than the cap on its own.
+        for i in 0..5u64 {
+            pushed = Some(b.push(big(1_000, i == 0)));
+        }
+        assert_eq!(b.gop_count(), 1);
+        let snap = b.snapshot();
+        assert_eq!(snap.len(), 5);
+        assert_eq!(
+            snap.last().unwrap().data.as_ptr(),
+            pushed.unwrap().data.as_ptr()
+        );
+    }
+
+    #[test]
     fn the_byte_cap_trip_rearms_after_the_ring_recovers() {
         let mut b = NalRingBuffer::new(Duration::from_secs(5));
         b.max_bytes = 10 * MIB.len();
