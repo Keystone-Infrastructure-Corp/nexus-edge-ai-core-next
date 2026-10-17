@@ -17,12 +17,13 @@
 //! This module fixes both with a single helper —
 //! [`audit_admin_action`] — that:
 //!
-//! * Extracts the [`SessionContext`] that the
-//!   `admin_auth_layer` injected as a request extension. When
-//!   present we know the actor (HS256 `sub` claim, or one of
-//!   the synthetic actors `loopback` / `allow-remote`); when
-//!   absent we fall back to `system:unknown` rather than
-//!   silently dropping the row.
+//! * Takes the [`SessionContext`] the handler's extractor decoded
+//!   from the bearer, not the extension `admin_auth_layer`
+//!   inserts (nothing reads that one). When present we know the
+//!   actor (a legacy bearer's `sub` claim, a session token's user
+//!   id, or the no-secret `dev-no-secret` label); when absent we
+//!   fall back to `system:unknown` rather than silently dropping
+//!   the row.
 //! * Records the client IP and User-Agent so cross-tab forensics
 //!   can correlate a write to a specific browser session.
 //! * Takes an [`AuditOutcome`] so failure-path callers can emit
