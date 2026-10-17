@@ -153,6 +153,16 @@ pub trait ClipRecorder: Send + Sync {
         None
     }
 
+    /// True once the clip's media has ended because the camera's stream
+    /// epoch changed (a reconnect, a PTS reset or a new SPS, #375/#376): the
+    /// recorder writes nothing after it, so the supervisor rotates to a fresh
+    /// clip, which opens on the new epoch. Polled on every frame while a clip
+    /// is open, so it must stay cheap. The default (`false`) never rotates.
+    #[allow(unused_variables)]
+    fn ended_on_epoch_change(&self, handle: ClipHandle) -> bool {
+        false
+    }
+
     /// Set or clear the panic flag. The watermark sampler calls
     /// `set_panic(true)` when free space is below
     /// `panic_watermark_pct` and `set_panic(false)` once eviction has

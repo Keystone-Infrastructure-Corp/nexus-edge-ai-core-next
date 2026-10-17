@@ -32,7 +32,7 @@ use nexus_pipeline::{
     RecorderError, StubClipRecorder,
 };
 use nexus_rules::RuleEvaluator;
-use nexus_store::{MotionEventKind, MotionEventRow, Store};
+use nexus_store::{ClipId, MotionEventKind, MotionEventRow, Store};
 use nexus_tracker::build_tracker;
 use nexus_types::{AlertEvent, BBox, CameraId, Detection, Frame, FrameMetadata, PixelFormat};
 use parking_lot::Mutex;
@@ -107,13 +107,22 @@ struct Recording {
     opened: Mutex<Vec<DateTime<Utc>>>,
     closed: Mutex<Vec<DateTime<Utc>>>,
     resized: AtomicUsize,
+    last_opened: Mutex<Option<ClipId>>,
+    /// The clip whose media ended on a stream epoch change.
+    epoch_ended: Mutex<Option<ClipId>>,
 }
 
 #[async_trait]
 impl ClipRecorder for Recording {
     async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
         self.opened.lock().push(args.started_at);
-        self.stub.open(args).await
+        let handle = self.stub.open(args).await?;
+        *self.last_opened.lock() = Some(handle.clip_id);
+        Ok(handle)
+    }
+
+    fn ended_on_epoch_change(&self, handle: ClipHandle) -> bool {
+        *self.epoch_ended.lock() == Some(handle.clip_id)
     }
 
     /// Not the stub's close: it would discard a clip whose wall-clock span a
@@ -222,6 +231,9 @@ struct Scenario {
     clips: ClipsConfig,
     behavior: CameraBehavior,
     low_res: bool,
+    /// The recorder reports the open clip ended on an epoch change from
+    /// this frame on.
+    epoch_change_at: Option<usize>,
 }
 
 impl Scenario {
@@ -234,6 +246,7 @@ impl Scenario {
             clips: ClipsConfig::default(),
             behavior: CameraBehavior::default(),
             low_res: false,
+            epoch_change_at: None,
         }
     }
 }
@@ -319,6 +332,8 @@ async fn run(s: Scenario) -> Outcome {
         opened: Mutex::new(Vec::new()),
         closed: Mutex::new(Vec::new()),
         resized: AtomicUsize::new(0),
+        last_opened: Mutex::new(None),
+        epoch_ended: Mutex::new(None),
     });
     let people = || {
         Arc::new(People {
@@ -362,6 +377,9 @@ async fn run(s: Scenario) -> Outcome {
     let mut tracked = Vec::new();
     let mut resized = Vec::new();
     for i in 0..=n {
+        if s.epoch_change_at == Some(i) {
+            *recorder.epoch_ended.lock() = *recorder.last_opened.lock();
+        }
         go.send(()).expect("source running");
         loop {
             let m = tokio::time::timeout(Duration::from_secs(10), metadata.next())
@@ -499,6 +517,22 @@ async fn a_wall_clock_step_does_not_move_clip_rotation() {
             "{ctx}: reopened on the rotation frame"
         );
     }
+}
+
+/// A clip whose media ended on a stream epoch change (#375/#376) is rotated
+/// on the next frame, and reopened there while motion is live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clip_that_ended_on_an_epoch_change_is_rotated() {
+    let clock = Clock::new(1_000, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1; 6], Bytetrack);
+    s.epoch_change_at = Some(3);
+    let o = run(s).await;
+    assert_eq!(o.closed, [clock.wall(3)], "rotated on frame 3");
+    assert_eq!(
+        o.opened,
+        [clock.wall(0), clock.wall(3)],
+        "reopened on the rotation frame"
+    );
 }
 
 /// Both crowd hysteresis windows (the E3 detector downscale and the E2

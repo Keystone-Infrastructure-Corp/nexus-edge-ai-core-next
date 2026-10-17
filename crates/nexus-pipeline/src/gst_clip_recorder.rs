@@ -171,6 +171,10 @@ pub struct GstClipRecorder {
     /// because the close path awaits on the pump shutdown and the
     /// bus drain.
     open: Mutex<HashMap<ClipId, OpenState>>,
+    /// Per open clip, set by its live pump when a sample of another
+    /// stream epoch ended the clip's media (#375/#376). Kept out of
+    /// [`Self::open`] because the supervisor reads it on every frame.
+    epoch_ended: PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>,
     /// M2.2: optional bus for publishing `CLIP_CLOSED` so the cold
     /// replicator can pick up new clips event-driven instead of
     /// waiting on its 5-min polling backstop. None in tests that
@@ -365,6 +369,7 @@ impl GstClipRecorder {
             analysis_ingesters: Arc::new(PlRwLock::new(HashMap::new())),
             panic: PlMutex::new(false),
             open: Mutex::new(HashMap::new()),
+            epoch_ended: PlRwLock::new(HashMap::new()),
             bus: None,
             usb_resolver: None,
             preferred_usb_label: crate::recorder::PreferredUsbLabel::default(),
@@ -776,6 +781,9 @@ impl ClipRecorder for GstClipRecorder {
         // a complete AU per push. See `coalesce_same_pts` for why
         // the InSight cameras need this.
         let snapshot_tail_pts = snapshot.iter().filter_map(|s| s.pts).next_back();
+        // The clip's stream epoch (#375/#376). A ring snapshot holds exactly
+        // one; when it is empty the pump adopts the first live sample's.
+        let clip_epoch = snapshot.first().map(|s| s.epoch);
         let snapshot_for_blocking: Vec<NalSample> = {
             let mut pending: Option<NalSample> = None;
             let mut out: Vec<NalSample> = Vec::with_capacity(snapshot.len());
@@ -818,6 +826,7 @@ impl ClipRecorder for GstClipRecorder {
         // hands it the clip id and the pre-roll's PTS cursor.
         let (gate_tx, gate_rx) = oneshot::channel::<PumpGate>();
         let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
+        let epoch_ended = Arc::new(AtomicBool::new(false));
         let pump_handle = tokio::spawn(run_live_pump(
             args.camera_id,
             codec,
@@ -826,6 +835,8 @@ impl ClipRecorder for GstClipRecorder {
             base_pts,
             gate_rx,
             pump_stop_rx,
+            clip_epoch,
+            epoch_ended.clone(),
         ));
 
         let appsrc_for_blocking = appsrc.clone();
@@ -899,6 +910,7 @@ impl ClipRecorder for GstClipRecorder {
             last_written_pts_ns: preroll_last_written_pts_ns,
         });
 
+        self.epoch_ended.write().insert(clip_id, epoch_ended);
         self.open.lock().await.insert(
             clip_id,
             OpenState {
@@ -928,6 +940,7 @@ impl ClipRecorder for GstClipRecorder {
     }
 
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
+        self.epoch_ended.write().remove(&handle.clip_id);
         let mut state = self
             .open
             .lock()
@@ -1241,6 +1254,13 @@ impl ClipRecorder for GstClipRecorder {
             open.get(&handle.clip_id).map(|s| s.path.clone())?
         };
         tokio::fs::metadata(&path).await.ok().map(|m| m.len())
+    }
+
+    fn ended_on_epoch_change(&self, handle: ClipHandle) -> bool {
+        self.epoch_ended
+            .read()
+            .get(&handle.clip_id)
+            .is_some_and(|ended| ended.load(Ordering::Acquire))
     }
 
     async fn shutdown(&self) {
@@ -1979,6 +1999,13 @@ fn media_duration_ms(last_written_pts_ns: Option<u64>) -> i64 {
 /// configured with `block=true` and the underlying push can stall
 /// for tens of ms on filesink/disk pressure.
 ///
+/// One clip holds one stream epoch (#375/#376): `clip_epoch` is the
+/// pre-roll snapshot's, or the first live sample's when the snapshot was
+/// empty. The first sample of any other epoch ends the clip's media — the
+/// pump pushes nothing from it on, sets `epoch_ended` so the supervisor
+/// rotates, and returns. So the PTS de-dup only ever compares samples of
+/// one timeline, and mp4mux never sees a second SPS.
+///
 /// Runs in two phases. Until `gate` resolves the clip row does not
 /// exist yet and the pre-roll prepend is still writing the head of
 /// the timeline, so the pump only *buffers* what it reads off the
@@ -1994,6 +2021,7 @@ fn media_duration_ms(last_written_pts_ns: Option<u64>) -> i64 {
 /// the 200 ms flush timer fires without a new arrival (flush
 /// `pending` so a stalled stream doesn't strand the last AU). See
 /// the module docstring + [`coalesce_same_pts`] for the pathology.
+#[allow(clippy::too_many_arguments)]
 async fn run_live_pump(
     camera_id: CameraId,
     codec: CodecKind,
@@ -2002,6 +2030,8 @@ async fn run_live_pump(
     base_pts: Duration,
     gate: oneshot::Receiver<PumpGate>,
     mut stop: oneshot::Receiver<()>,
+    mut clip_epoch: Option<u64>,
+    epoch_ended: Arc<AtomicBool>,
 ) -> PumpStats {
     let mut stats = PumpStats::default();
     let mut pending: Option<NalSample> = None;
@@ -2034,7 +2064,33 @@ async fn run_live_pump(
         pending: &mut Option<NalSample>,
         last_pushed_pts: &mut Option<Duration>,
         last_written_pts_ns: &mut Option<u64>,
+        clip_epoch: &mut Option<u64>,
+        epoch_ended: &AtomicBool,
     ) -> Result<(), ()> {
+        if sample.epoch != *clip_epoch.get_or_insert(sample.epoch) {
+            // Flush a pending AU of the clip's own epoch first, as the
+            // stop path does, and only if it carries a slice.
+            if let Some(last) = pending.take() {
+                if contains_slice_nal(&last.data, codec) {
+                    let _ = push_one(
+                        camera_id,
+                        clip_id,
+                        appsrc,
+                        last,
+                        base_pts,
+                        last_pushed_pts,
+                        last_written_pts_ns,
+                    )
+                    .await;
+                }
+            }
+            epoch_ended.store(true, Ordering::Release);
+            info!(
+                camera_id,
+                clip_id, "live pump: stream epoch changed; ending this clip's media"
+            );
+            return Err(());
+        }
         // De-dup: skip anything whose PTS is at-or-before the last
         // sample we pushed from the snapshot.
         if let (Some(spts), Some(last)) = (sample.pts, *last_pushed_pts) {
@@ -2171,6 +2227,8 @@ async fn run_live_pump(
             &mut pending,
             &mut last_pushed_pts,
             &mut last_written_pts_ns,
+            &mut clip_epoch,
+            &epoch_ended,
         )
         .await
         .is_err()
@@ -2240,6 +2298,7 @@ async fn run_live_pump(
                     if handle_sample(
                         camera_id, clip_id, codec, &appsrc, sample, base_pts,
                         &mut pending, &mut last_pushed_pts, &mut last_written_pts_ns,
+                        &mut clip_epoch, &epoch_ended,
                     ).await.is_err() {
                         break;
                     }
@@ -2294,6 +2353,12 @@ async fn run_alert_clip_builder(
     // Collect the post window, deduping against the pre snapshot's tail
     // PTS (a sample can straddle the snapshot/live boundary).
     let pre_tail_pts = pre.iter().filter_map(|s| s.pts).next_back();
+    // One stream epoch per clip (#375/#376): the pre-roll's, or the first
+    // collected sample's when the pre-roll is empty. A sample of another
+    // epoch ends the collection, so the clip ends early instead of
+    // splicing two timelines.
+    let mut epoch = pre.first().map(|s| s.epoch);
+    let mut ended_on_epoch_change = false;
     // Hard cap on total collection so a continuous stream of coalescing
     // alerts can't extend the deadline forever and starve the encode.
     // Measured from now (~first arm) using the configured build timeout.
@@ -2310,6 +2375,10 @@ async fn run_alert_clip_builder(
         let remaining = Duration::from_millis((dl - now).max(0) as u64);
         match tokio::time::timeout(remaining, live_rx.recv()).await {
             Ok(Ok(sample)) => {
+                if sample.epoch != *epoch.get_or_insert(sample.epoch) {
+                    ended_on_epoch_change = true;
+                    break;
+                }
                 if let (Some(sp), Some(tp)) = (sample.pts, pre_tail_pts) {
                     if sp <= tp {
                         deduped += 1;
@@ -2337,6 +2406,7 @@ async fn run_alert_clip_builder(
         pre_samples = pre.len(),
         post_samples = post.len(),
         deduped,
+        ended_on_epoch_change,
         "alert clip window collected"
     );
     let mut window = pre;
@@ -4340,5 +4410,413 @@ mod sdp_only_param_set_tests {
         for s in &aus {
             assert_eq!(cache.process(&s.data), None, "no AU may be rewritten");
         }
+    }
+}
+
+/// #375 / #376: a clip never splices two stream epochs into one file.
+#[cfg(test)]
+mod epoch_tests {
+    use super::*;
+    use crate::preroll::NalRingBuffer;
+    use gstreamer_app::AppSink;
+    use nexus_config::{CameraConfig, StoreConfig};
+
+    fn has_elements(names: &[&str]) -> bool {
+        gst::init().is_ok() && names.iter().all(|n| gst::ElementFactory::find(n).is_some())
+    }
+
+    /// `n` AUs of `profile` H.264 at `fps`, a keyframe every second, stamped
+    /// `start`, `start + 1/fps`, ... — the way the #376 repro encodes them.
+    fn encode(fps: u32, profile: &str, n: u32, start: Duration) -> Vec<NalSample> {
+        let desc = format!(
+            "videotestsrc num-buffers={n} pattern=ball \
+             ! video/x-raw,width=320,height=240,framerate={fps}/1 \
+             ! x264enc bframes=0 key-int-max={fps} tune=zerolatency \
+             ! video/x-h264,profile={profile},stream-format=byte-stream,alignment=au \
+             ! appsink name=out sync=false"
+        );
+        let pipeline = gst::parse::launch(&desc)
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut out = Vec::new();
+        while let Ok(sample) = sink.pull_sample() {
+            let buffer = sample.buffer().unwrap();
+            let pts = start + Duration::from_secs(1) * out.len() as u32 / fps;
+            out.push(NalSample {
+                pts: Some(pts),
+                dts: Some(pts),
+                is_keyframe: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
+                data: bytes::Bytes::copy_from_slice(&buffer.map_readable().unwrap()),
+                epoch: 0,
+            });
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        out
+    }
+
+    /// `(type, offset, size)` of each top-level box `bytes` holds.
+    fn top_level_boxes(bytes: &[u8]) -> Vec<([u8; 4], usize, usize)> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while let Some(h) = bytes.get(off..off + 8) {
+            let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+            out.push(([h[4], h[5], h[6], h[7]], off, size));
+            if size < 8 {
+                break;
+            }
+            off += size;
+        }
+        out
+    }
+
+    /// Type of the box after `moov`, or `None` when nothing follows it.
+    fn box_after_moov(bytes: &[u8]) -> Option<[u8; 4]> {
+        let boxes = top_level_boxes(bytes);
+        let moov = boxes.iter().position(|b| &b.0 == b"moov")?;
+        boxes.get(moov + 1).map(|b| b.0)
+    }
+
+    /// Sample entries in the video track's `stsd`.
+    fn stsd_entries(bytes: &[u8]) -> u32 {
+        fn find(bytes: &[u8], path: &[&[u8; 4]]) -> Option<usize> {
+            let mut off = 0;
+            while let Some(h) = bytes.get(off..off + 8) {
+                let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+                if size < 8 {
+                    return None;
+                }
+                if &h[4..8] == path[0] {
+                    return if path.len() == 1 {
+                        Some(off)
+                    } else {
+                        find(&bytes[off + 8..off + size], &path[1..]).map(|o| off + 8 + o)
+                    };
+                }
+                off += size;
+            }
+            None
+        }
+        let stsd = find(
+            bytes,
+            &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"],
+        )
+        .expect("file has an stsd");
+        u32::from_be_bytes(bytes[stsd + 12..stsd + 16].try_into().unwrap())
+    }
+
+    /// Whether `path` decodes to EOS from offset 0.
+    fn decodes(path: &Path) -> bool {
+        let loc = path.to_string_lossy().replace('"', "");
+        let check = gst::parse::launch(&format!(
+            "filesrc location=\"{loc}\" ! qtdemux ! h264parse ! avdec_h264 ! fakesink sync=false"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let eos = check.set_state(gst::State::Playing).is_ok()
+            && matches!(
+                check
+                    .bus()
+                    .unwrap()
+                    .timed_pop_filtered(
+                        Some(gst::ClockTime::from_seconds(10)),
+                        &[gst::MessageType::Eos, gst::MessageType::Error],
+                    )
+                    .map(|m| m.type_()),
+                Some(gst::MessageType::Eos)
+            );
+        check.set_state(gst::State::Null).unwrap();
+        eos
+    }
+
+    /// Send EOS and wait for the muxer to finish the file.
+    fn finish(pipeline: &gst::Pipeline, appsrc: &AppSrc) {
+        let _ = appsrc.end_of_stream();
+        let _ = pipeline.bus().unwrap().timed_pop_filtered(
+            Some(gst::ClockTime::from_seconds(10)),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    struct Recorded {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        /// The pump stopped on its own, before the stop signal.
+        pump_ended: bool,
+        /// What the pump reported to the supervisor.
+        ended_on_epoch_change: bool,
+        stats: PumpStats,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Record a clip the way `open()` + `close()` do: prepend `snapshot`,
+    /// then run the live pump over `live` as the ingester broadcasts it.
+    async fn record_through_pump(snapshot: Vec<NalSample>, live: Vec<NalSample>) -> Recorded {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        let (pipeline, appsrc) = GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let base_pts = snapshot
+            .iter()
+            .find_map(|s| s.pts)
+            .unwrap_or(Duration::ZERO);
+        let mut last_written = None;
+        for s in &snapshot {
+            last_written = Some(
+                push_sample(
+                    &appsrc,
+                    s,
+                    base_pts,
+                    last_written,
+                    FALLBACK_FRAME_INTERVAL_NS,
+                )
+                .unwrap(),
+            );
+        }
+        let (tx, rx) = broadcast::channel(1024);
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let epoch_ended = Arc::new(AtomicBool::new(false));
+        let mut pump = tokio::spawn(run_live_pump(
+            1,
+            CodecKind::H264,
+            appsrc.clone(),
+            rx,
+            base_pts,
+            gate_rx,
+            stop_rx,
+            snapshot.first().map(|s| s.epoch),
+            epoch_ended.clone(),
+        ));
+        gate_tx
+            .send(PumpGate {
+                clip_id: 1,
+                last_pushed_pts: snapshot.iter().filter_map(|s| s.pts).next_back(),
+                last_written_pts_ns: last_written,
+            })
+            .unwrap();
+        for s in live {
+            tx.send(s).unwrap();
+        }
+        let (pump_ended, stats) =
+            match tokio::time::timeout(Duration::from_millis(1500), &mut pump).await {
+                Ok(stats) => (true, stats.unwrap()),
+                Err(_) => {
+                    let _ = stop_tx.send(());
+                    (false, pump.await.unwrap())
+                }
+            };
+        finish(&pipeline, &appsrc);
+        let bytes = std::fs::read(&path).unwrap();
+        Recorded {
+            path,
+            bytes,
+            pump_ended,
+            ended_on_epoch_change: epoch_ended.load(Ordering::Acquire),
+            stats,
+            _dir: dir,
+        }
+    }
+
+    /// One stsd entry, `moof` right after `moov`, decodes from offset 0.
+    fn assert_one_clean_timeline(clip: &Recorded, what: &str) {
+        assert_eq!(stsd_entries(&clip.bytes), 1, "{what}: stsd entries");
+        assert_eq!(
+            box_after_moov(&clip.bytes).as_ref(),
+            Some(b"moof"),
+            "{what}: box after moov"
+        );
+        assert!(decodes(&clip.path), "{what}: decodes from offset 0");
+    }
+
+    /// #376: the camera re-sends its SPS (15 -> 20 fps, then Main -> High)
+    /// while a clip is open. The ingester begins an epoch before that AU, so
+    /// the open clip stops at it and asks to rotate, and the next clip, cut
+    /// from the ring, starts on the new SPS. Neither file carries a second
+    /// sample entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clip_open_across_an_sps_change_ends_at_it_and_the_next_starts_on_the_new_sps() {
+        if !has_elements(&["x264enc", "avdec_h264", "mp4mux"]) {
+            eprintln!("skipping: x264enc/avdec_h264/mp4mux not available");
+            return;
+        }
+        for (change, (fps_a, profile_a), (fps_b, profile_b)) in [
+            ("frame rate", (15, "main"), (20, "main")),
+            ("profile", (20, "main"), (20, "high")),
+        ] {
+            let a = encode(fps_a, profile_a, 3 * fps_a, Duration::ZERO);
+            let b = encode(fps_b, profile_b, 3 * fps_b, Duration::from_secs(3));
+            let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+            let gop = fps_a as usize;
+            for s in &a[..gop] {
+                ring.push(s.clone());
+            }
+            let snapshot = ring.snapshot();
+            let mut live: Vec<NalSample> = a[gop..].iter().map(|s| ring.push(s.clone())).collect();
+            // What the ingester does before an AU carrying a changed SPS.
+            ring.begin_epoch();
+            live.extend(b.iter().map(|s| ring.push(s.clone())));
+
+            let clip = record_through_pump(snapshot, live).await;
+            assert!(
+                clip.pump_ended,
+                "{change}: the pump must stop at the epoch change"
+            );
+            assert!(clip.ended_on_epoch_change, "{change}: and ask to rotate");
+            assert_one_clean_timeline(&clip, &format!("{change}: clip open across it"));
+
+            let next = ring.snapshot();
+            assert!(next[0].is_keyframe && next.iter().all(|s| s.epoch == ring.epoch()));
+            let next = record_through_pump(next, Vec::new()).await;
+            assert!(!next.ended_on_epoch_change);
+            assert_one_clean_timeline(&next, &format!("{change}: clip opened after it"));
+        }
+    }
+
+    /// #375: the camera reconnects and its PTS restart near zero. The open
+    /// clip keeps nothing of the new session and asks to rotate; the next
+    /// clip's media duration is what it holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clip_open_across_a_pts_reset_ends_at_it_and_the_next_is_timed_by_its_content() {
+        if !has_elements(&["x264enc", "avdec_h264", "mp4mux"]) {
+            eprintln!("skipping: x264enc/avdec_h264/mp4mux not available");
+            return;
+        }
+        let a = encode(20, "main", 60, Duration::from_secs(1000));
+        let b = encode(20, "main", 100, Duration::from_millis(500));
+        let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+        for s in &a[..20] {
+            ring.push(s.clone());
+        }
+        let snapshot = ring.snapshot();
+        // The ring begins the new epoch itself when PTS step back.
+        let live: Vec<NalSample> = a[20..]
+            .iter()
+            .chain(&b)
+            .map(|s| ring.push(s.clone()))
+            .collect();
+
+        let clip = record_through_pump(snapshot, live).await;
+        assert!(clip.pump_ended, "the pump must stop at the epoch change");
+        assert!(
+            clip.ended_on_epoch_change,
+            "and ask the supervisor to rotate"
+        );
+        assert_one_clean_timeline(&clip, "clip open across the reset");
+        let ms = media_duration_ms(clip.stats.last_written_pts_ns);
+        assert!((ms - 3000).abs() <= 50, "old session only: {ms} ms");
+
+        let next = ring.snapshot();
+        assert_eq!(next.len(), 100, "the ring holds the new session");
+        let next = record_through_pump(next, Vec::new()).await;
+        assert_one_clean_timeline(&next, "clip opened after the reset");
+        let ms = media_duration_ms(next.stats.last_written_pts_ns);
+        assert!((ms - 5000).abs() <= 50, "new session's 100 frames: {ms} ms");
+    }
+
+    /// The alert-clip post window stops at the first sample of another
+    /// epoch: the clip ends early rather than splicing the new SPS's frames
+    /// onto its pre-roll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_alert_clip_ends_its_post_window_at_an_epoch_change() {
+        if !has_elements(&["x264enc", "avdec_h264", "mp4mux"]) {
+            eprintln!("skipping: x264enc/avdec_h264/mp4mux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let a = encode(15, "main", 60, Duration::ZERO);
+        let b = encode(20, "main", 40, Duration::from_secs(4));
+        let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+        for s in &a[..15] {
+            ring.push(s.clone());
+        }
+        let pre = ring.snapshot();
+        let (tx, live_rx) = broadcast::channel(1024);
+        for s in &a[15..] {
+            tx.send(ring.push(s.clone())).unwrap();
+        }
+        ring.begin_epoch();
+        for s in &b {
+            tx.send(ring.push(s.clone())).unwrap();
+        }
+        let window_start = Utc::now();
+        let alert_clip_id = store
+            .insert_alert_clip(&NewAlertClip {
+                camera_id: 1,
+                started_at: window_start,
+                path: alert_clip_rel_path(1, window_start)
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .await
+            .unwrap();
+        let slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        run_alert_clip_builder(
+            store.clone(),
+            dir.path().to_path_buf(),
+            Arc::new(PlMutex::new(HashMap::new())),
+            AlertClipsConfig::default(),
+            1,
+            CodecKind::H264,
+            alert_clip_id,
+            window_start,
+            pre,
+            live_rx,
+            None,
+            Arc::new(AtomicI64::new(Utc::now().timestamp_millis() + 3000)),
+            None,
+            slot,
+        )
+        .await;
+        let row = store.get_alert_clip(alert_clip_id).await.unwrap().unwrap();
+        assert_eq!(row.state, "ready");
+        // First to last frame of the 15 fps segment: 59 / 15 s.
+        assert!(
+            (row.duration_ms - 3933).abs() <= 70,
+            "the 15 fps segment only: {} ms",
+            row.duration_ms
+        );
+    }
+
+    async fn store_with_camera(dir: &Path) -> Arc<Store> {
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!("sqlite:{}?mode=rwc", dir.join("nexus.db").display()),
+                seed_from_config: false,
+                duckdb_attach: false,
+                duckdb_path: PathBuf::from("/tmp/unused.duckdb"),
+            })
+            .await
+            .unwrap(),
+        );
+        store
+            .upsert_camera(&CameraConfig {
+                id: 1,
+                name: "front".into(),
+                ingest: nexus_config::CameraIngest {
+                    url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    analysis_url: None,
+                    enabled: true,
+                    max_fps: 0,
+                    codec: None,
+                },
+                detector: nexus_config::CameraDetector::default(),
+                behavior: nexus_config::CameraBehavior::default(),
+                onvif: Default::default(),
+                talk_down: Default::default(),
+                zones: vec![],
+            })
+            .await
+            .unwrap();
+        store
     }
 }

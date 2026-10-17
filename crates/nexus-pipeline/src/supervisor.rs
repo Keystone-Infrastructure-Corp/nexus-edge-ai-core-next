@@ -707,7 +707,16 @@ async fn run_camera(
                         }
                     }
 
-                    if duration_exceeded || size_exceeded {
+                    let epoch_changed = recorder.ended_on_epoch_change(handle);
+                    if epoch_changed {
+                        info!(
+                            camera_id = cfg.id,
+                            clip_id = handle.clip_id,
+                            "rotating clip: stream epoch changed"
+                        );
+                    }
+
+                    if duration_exceeded || size_exceeded || epoch_changed {
                         if duration_exceeded {
                             debug!(
                                 camera_id = cfg.id,
