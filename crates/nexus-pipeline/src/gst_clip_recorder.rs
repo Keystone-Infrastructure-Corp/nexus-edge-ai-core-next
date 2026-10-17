@@ -782,7 +782,7 @@ impl ClipRecorder for GstClipRecorder {
         // the InSight cameras need this.
         let snapshot_tail_pts = snapshot.iter().filter_map(|s| s.pts).next_back();
         // The clip's stream epoch (#375/#376). A ring snapshot holds exactly
-        // one; when it is empty the pump adopts the first live sample's.
+        // one; when it is empty the pump adopts the first live keyframe's.
         let clip_epoch = snapshot.first().map(|s| s.epoch);
         let snapshot_for_blocking: Vec<NalSample> = {
             let mut pending: Option<NalSample> = None;
@@ -942,7 +942,7 @@ impl ClipRecorder for GstClipRecorder {
     }
 
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
-        self.epoch_ended.write().remove(&handle.clip_id);
+        let epoch_ended = self.epoch_ended.write().remove(&handle.clip_id);
         let mut state = self
             .open
             .lock()
@@ -1059,6 +1059,12 @@ impl ClipRecorder for GstClipRecorder {
             .map(|m| m.len())
             .unwrap_or(0);
         let empty_reason = empty_clip_reason(file_bytes);
+        // A clip that ended on a stream epoch change (#375/#376) is kept
+        // however short: `begin_epoch` emptied the ring, so its footage is
+        // in no other clip.
+        let ended_on_epoch_change = epoch_ended.is_some_and(|e| e.load(Ordering::Acquire));
+        let too_short =
+            duration_ms < crate::recorder::MIN_CLIP_DURATION_MS && !ended_on_epoch_change;
         if let Some(reason) = empty_reason {
             warn!(
                 camera_id = state.camera_id,
@@ -1070,13 +1076,20 @@ impl ClipRecorder for GstClipRecorder {
                 "gst recorder: clip recorded no playable media -- failing it \
                  (delete file + clip row, keep its alerts, not replicated)"
             );
-        } else if duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
+        } else if too_short {
             warn!(
                 camera_id = state.camera_id,
                 clip_id = handle.clip_id,
                 duration_ms,
                 min_ms = crate::recorder::MIN_CLIP_DURATION_MS,
                 "gst recorder: clip too short -- discarding (delete file + clip row, keep its alerts)"
+            );
+        } else if duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
+            info!(
+                camera_id = state.camera_id,
+                clip_id = handle.clip_id,
+                duration_ms,
+                "gst recorder: keeping a short clip that ended on a stream epoch change"
             );
         }
 
@@ -1085,7 +1098,7 @@ impl ClipRecorder for GstClipRecorder {
         // row goes but its alerts stay: the supervisor linked every
         // alert that fired meanwhile to this clip, and a cascade delete
         // would take them and their undelivered outbox rows with it.
-        if empty_reason.is_some() || duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
+        if empty_reason.is_some() || too_short {
             if let Err(e) = fs::remove_file(&state.path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     warn!(
@@ -2082,7 +2095,7 @@ fn media_duration_ms(last_written_pts_ns: Option<u64>) -> i64 {
 /// for tens of ms on filesink/disk pressure.
 ///
 /// One clip holds one stream epoch (#375/#376): `clip_epoch` is the
-/// pre-roll snapshot's, or the first live sample's when the snapshot was
+/// pre-roll snapshot's, or the first live keyframe's when the snapshot was
 /// empty. The first sample of any other epoch ends the clip's media — the
 /// pump pushes nothing from it on, sets `epoch_ended` so the supervisor
 /// rotates, and returns. So the PTS de-dup only ever compares samples of
@@ -2155,6 +2168,11 @@ async fn run_live_pump(
         clip_epoch: &mut Option<u64>,
         epoch_ended: &AtomicBool,
     ) -> Result<(), ()> {
+        // Empty snapshot: the clip's epoch is its first keyframe's, not
+        // that of a delta the keyframe gate below would drop anyway.
+        if clip_epoch.is_none() && !sample.is_keyframe {
+            return Ok(());
+        }
         if sample.epoch != *clip_epoch.get_or_insert(sample.epoch) {
             // Flush a pending AU of the clip's own epoch first, as the
             // stop path does, and only if it carries a slice.
@@ -2459,7 +2477,7 @@ async fn run_alert_clip_builder(
     // PTS (a sample can straddle the snapshot/live boundary).
     let pre_tail_pts = pre.iter().filter_map(|s| s.pts).next_back();
     // One stream epoch per clip (#375/#376): the pre-roll's, or the first
-    // collected sample's when the pre-roll is empty. A sample of another
+    // collected keyframe's when the pre-roll is empty. A sample of another
     // epoch ends the collection, so the clip ends early instead of
     // splicing two timelines.
     let mut epoch = pre.first().map(|s| s.epoch);
@@ -2480,6 +2498,11 @@ async fn run_alert_clip_builder(
         let remaining = Duration::from_millis((dl - now).max(0) as u64);
         match tokio::time::timeout(remaining, live_rx.recv()).await {
             Ok(Ok(sample)) => {
+                // Empty pre-roll: the window starts on its first keyframe and
+                // takes that keyframe's epoch, as the live pump does.
+                if epoch.is_none() && !sample.is_keyframe {
+                    continue;
+                }
                 if sample.epoch != *epoch.get_or_insert(sample.epoch) {
                     ended_on_epoch_change = true;
                     break;
@@ -4889,6 +4912,111 @@ mod epoch_tests {
         assert!((ms - 2000).abs() <= 50, "40 frames at 20 fps: {ms} ms");
     }
 
+    /// #375: an empty-snapshot clip takes its epoch from its first keyframe.
+    /// A delta of the previous epoch still on the broadcast must not set it:
+    /// the pump drops that delta, so the clip would end at the keyframe
+    /// having pushed nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_preroll_clip_takes_its_epoch_from_its_first_keyframe() {
+        if !has_elements(&["x264enc", "avdec_h264", "mp4mux"]) {
+            eprintln!("skipping: x264enc/avdec_h264/mp4mux not available");
+            return;
+        }
+        let old = encode(20, "main", 20, Duration::ZERO);
+        let new = encode(20, "main", 40, Duration::from_secs(1));
+        assert!(!old[5].is_keyframe && new[0].is_keyframe);
+        let live: Vec<NalSample> = std::iter::once(NalSample {
+            epoch: 0,
+            ..old[5].clone()
+        })
+        .chain(new.iter().map(|s| NalSample {
+            epoch: 1,
+            ..s.clone()
+        }))
+        .collect();
+
+        let clip = record_through_pump(Vec::new(), live).await;
+        assert!(
+            !clip.ended_on_epoch_change && !clip.pump_ended,
+            "the stale delta does not end the clip"
+        );
+        assert_eq!(clip.pushed, 40, "the new epoch's frames are recorded");
+        assert_one_clean_timeline(&clip, "empty pre-roll clip after a stale delta");
+    }
+
+    /// #375: an alert clip armed right after an epoch change has an empty
+    /// pre-roll while the broadcast carries the new epoch's deltas, possibly
+    /// behind a delta of the old one. Its window starts on the first keyframe
+    /// and takes that keyframe's epoch, as an empty-snapshot clip does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_preroll_alert_clip_starts_on_the_first_keyframe() {
+        if !has_elements(&["x264enc", "avdec_h264", "mp4mux"]) {
+            eprintln!("skipping: x264enc/avdec_h264/mp4mux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        // Keyframes at frames 0, 20 and 40; the broadcast starts at frame 5.
+        let a = encode(20, "main", 60, Duration::from_secs(3600));
+        assert!(!a[5].is_keyframe && a[20].is_keyframe);
+        let stale = NalSample {
+            epoch: 0,
+            ..encode(20, "main", 10, Duration::ZERO)[5].clone()
+        };
+        for (n, (what, lead)) in [
+            ("leading deltas", None),
+            ("a stale delta first", Some(stale)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (tx, live_rx) = broadcast::channel(1024);
+            for s in lead.into_iter().chain(a[5..].iter().map(|s| NalSample {
+                epoch: 1,
+                ..s.clone()
+            })) {
+                tx.send(s).unwrap();
+            }
+            let window_start = Utc::now() - chrono::Duration::seconds(10 * n as i64);
+            let alert_clip_id = store
+                .insert_alert_clip(&NewAlertClip {
+                    camera_id: 1,
+                    started_at: window_start,
+                    path: alert_clip_rel_path(1, window_start)
+                        .to_string_lossy()
+                        .into_owned(),
+                })
+                .await
+                .unwrap();
+            let slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+            run_alert_clip_builder(
+                store.clone(),
+                dir.path().to_path_buf(),
+                Arc::new(PlMutex::new(HashMap::new())),
+                AlertClipsConfig::default(),
+                1,
+                CodecKind::H264,
+                alert_clip_id,
+                window_start,
+                Vec::new(),
+                live_rx,
+                None,
+                Arc::new(AtomicI64::new(Utc::now().timestamp_millis() + 3000)),
+                None,
+                slot,
+            )
+            .await;
+            let row = store.get_alert_clip(alert_clip_id).await.unwrap().unwrap();
+            assert_eq!(row.state, "ready", "{what}");
+            // First to last frame from the keyframe on: 39 / 20 s.
+            assert!(
+                (row.duration_ms - 1950).abs() <= 70,
+                "{what}: the keyframe and what follows it: {} ms",
+                row.duration_ms
+            );
+        }
+    }
+
     /// The alert-clip post window stops at the first sample of another
     /// epoch: the clip ends early rather than splicing the new SPS's frames
     /// onto its pre-roll.
@@ -5135,5 +5263,102 @@ mod epoch_tests {
             .map(|c| c.id)
             .collect();
         assert_eq!(pending, [*clean], "only the clean clip is replicated");
+    }
+
+    /// #375/#376: two epoch changes under 3 s apart leave a short clip
+    /// between them whose footage is in no other clip (`begin_epoch` emptied
+    /// the ring), so `close()` keeps it. A short clip that did not end on an
+    /// epoch change is still discarded, and a stub file is still failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_clip_is_kept_only_when_it_ended_on_an_epoch_change() {
+        if !has_elements(&["x264enc", "mp4mux"]) {
+            eprintln!("skipping: x264enc/mp4mux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        // Two seconds of media.
+        let short = encode(15, "main", 30, Duration::ZERO);
+
+        for (n, (what, samples, epoch_ended, kept)) in [
+            ("short, ended on an epoch change", &short[..], true, true),
+            ("short, did not", &short[..], false, false),
+            ("stub file, ended on an epoch change", &[][..], true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let started_at = Utc::now() - chrono::Duration::seconds(60 - 10 * n as i64);
+            let path = crate::recorder::inflight_clip_path(&clips_dir, 1, started_at);
+            fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+            let clip_id = store
+                .open_clip(&NewClip {
+                    camera_id: 1,
+                    started_at,
+                    hot_path: crate::recorder::clip_rel_path(&clips_dir, &path),
+                    codec: "h264".into(),
+                    container: CONTAINER.into(),
+                    hot_handle: "local".into(),
+                    frame_width: 320,
+                    frame_height: 240,
+                })
+                .await
+                .unwrap();
+            let (pipeline, appsrc) =
+                GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let mut last = None;
+            for s in samples {
+                last = Some(
+                    push_sample(&appsrc, s, Duration::ZERO, last, FALLBACK_FRAME_INTERVAL_NS)
+                        .unwrap(),
+                );
+            }
+            rec.epoch_ended
+                .write()
+                .insert(clip_id, Arc::new(AtomicBool::new(epoch_ended)));
+            rec.open.lock().await.insert(
+                clip_id,
+                OpenState {
+                    camera_id: 1,
+                    started_at,
+                    path,
+                    effective_dir: clips_dir.clone(),
+                    hot_handle: "local".into(),
+                    codec: CodecKind::H264,
+                    pipeline,
+                    appsrc,
+                    pump_stop: None,
+                    pump_handle: None,
+                    preroll_last_written_pts_ns: last,
+                },
+            );
+            let meta = rec
+                .close(
+                    ClipHandle {
+                        clip_id,
+                        camera_id: 1,
+                    },
+                    ClipFinal {
+                        ended_at: started_at + chrono::Duration::seconds(8),
+                    },
+                )
+                .await
+                .unwrap();
+            let row = store.get_clip(clip_id).await.unwrap();
+            if kept {
+                assert!(meta.duration_ms < crate::recorder::MIN_CLIP_DURATION_MS);
+                assert!(!meta.discarded && meta.path.exists(), "{what}: file kept");
+                assert!(
+                    row.is_some_and(|r| r.ended_at.is_some()),
+                    "{what}: row closed"
+                );
+            } else {
+                assert!(meta.discarded && !meta.path.exists(), "{what}: file gone");
+                assert!(row.is_none(), "{what}: row gone");
+            }
+        }
     }
 }
