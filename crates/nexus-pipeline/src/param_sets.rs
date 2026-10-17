@@ -35,6 +35,9 @@ pub struct ParamSetCache {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
     sps_changed: bool,
+    /// H.264 SPS seen this session, by `seq_parameter_set_id`, for
+    /// change detection only.
+    h264_sps_by_id: Vec<(u32, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +81,9 @@ impl ParamSetCache {
             };
             has_params = true;
             let nal = &au[start..end];
-            if kind != NalKind::Pps {
+            if kind == NalKind::Sps && !self.hevc {
+                self.sps_changed |= note_h264_sps(&mut self.h264_sps_by_id, nal);
+            } else if kind != NalKind::Pps {
                 if let Some(prev) = slot.as_deref() {
                     self.sps_changed |= trim_trailing_zeros(prev) != trim_trailing_zeros(nal);
                 }
@@ -118,7 +123,10 @@ impl ParamSetCache {
     /// before it on this session. Trailing zero bytes are not content.
     /// The first SPS of a session is not a change, and neither is a PPS:
     /// a stream alternating PPS ids would otherwise read as a change
-    /// every GOP.
+    /// every GOP. H.264 compares per `seq_parameter_set_id`, as
+    /// h264parse stores them: a new id or new bytes for a known id is a
+    /// change, a stream repeating two ids every keyframe is not. H.265
+    /// compares against the previous VPS / SPS.
     pub fn sps_changed(&self) -> bool {
         self.sps_changed
     }
@@ -149,6 +157,46 @@ impl ParamSetCache {
 fn trim_trailing_zeros(nal: &[u8]) -> &[u8] {
     let end = nal.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     &nal[..end]
+}
+
+/// Record an H.264 SPS under its id; `true` when it changes what the
+/// muxer was given (new bytes for a known id, or a new id after the
+/// session's first SPS).
+fn note_h264_sps(seen: &mut Vec<(u32, Vec<u8>)>, nal: &[u8]) -> bool {
+    let id = h264_sps_id(nal).unwrap_or(0);
+    let bytes = trim_trailing_zeros(nal);
+    let first = seen.is_empty();
+    match seen.iter_mut().find(|(i, _)| *i == id) {
+        Some((_, prev)) if prev.as_slice() == bytes => false,
+        Some((_, prev)) => {
+            *prev = bytes.to_vec();
+            true
+        }
+        None => {
+            seen.push((id, bytes.to_vec()));
+            !first
+        }
+    }
+}
+
+/// `seq_parameter_set_id`: the ue(v) after the NAL header, profile_idc,
+/// the constraint flags and level_idc. No emulation-prevention byte can
+/// come before it, since profile_idc and level_idc are never zero.
+fn h264_sps_id(nal: &[u8]) -> Option<u32> {
+    let bits = nal.get(4..)?;
+    let bit = |i: usize| bits.get(i / 8).map(|b| u32::from((b >> (7 - i % 8)) & 1));
+    let mut zeros = 0;
+    while bit(zeros)? == 0 {
+        zeros += 1;
+        if zeros > 5 {
+            return None; // ids are 0..=31
+        }
+    }
+    let mut v = 0;
+    for i in 0..zeros {
+        v = (v << 1) | bit(zeros + 1 + i)?;
+    }
+    Some((1 << zeros) - 1 + v)
 }
 
 /// Split an Annex-B buffer into `(start_code_offset, payload_start,
@@ -332,6 +380,35 @@ mod tests {
         cache.process(&au(&[fps15, PPS, IDR]));
         assert!(!cache.sps_changed());
         cache.process(&au(&[AUD, fps20, PPS, IDR]));
+        assert!(cache.sps_changed());
+    }
+
+    // Main-profile SPS NALs whose seq_parameter_set_id (the ue(v) after
+    // level_idc) is 0 (`1...`) and 1 (`010...`).
+    const SPS_ID0: &[u8] = &[0x67, 0x4d, 0x00, 0x1f, 0x9a, 0x66, 0x02, 0x80];
+    const SPS_ID1: &[u8] = &[0x67, 0x4d, 0x00, 0x1f, 0x4d, 0x33, 0x01, 0x40];
+
+    #[test]
+    fn two_sps_ids_repeated_every_keyframe_are_not_a_change() {
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[SPS_ID0, SPS_ID1, PPS, IDR]));
+        for _ in 0..3 {
+            cache.process(&au(&[SPS_ID0, SPS_ID1, PPS, IDR]));
+            assert!(
+                !cache.sps_changed(),
+                "a stable second SPS id must not rotate the clip every GOP"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_sps_id_or_new_bytes_for_a_known_id_is_a_change() {
+        let mut cache = ParamSetCache::new(false);
+        cache.process(&au(&[SPS_ID0, PPS, IDR]));
+        cache.process(&au(&[SPS_ID0, SPS_ID1, PPS, IDR]));
+        assert!(cache.sps_changed(), "a new SPS id re-caps the muxer");
+        let id1_changed: &[u8] = &[0x67, 0x4d, 0x00, 0x1f, 0x4d, 0x33, 0x01, 0x48];
+        cache.process(&au(&[SPS_ID0, id1_changed, PPS, IDR]));
         assert!(cache.sps_changed());
     }
 
