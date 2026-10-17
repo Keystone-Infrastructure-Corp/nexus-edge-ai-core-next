@@ -1001,6 +1001,10 @@ async fn run_session(
                     sps_changed,
                 );
                 if let Some(reason) = new_epoch {
+                    // The cache compares parameter sets per epoch. A
+                    // no-op after a change or at a session's first
+                    // sample; needed when PTS stepped back.
+                    param_sets.begin_epoch();
                     info!(camera_id, reason, "pre-roll ring began a new stream epoch");
                 }
                 if let Some(ring_bytes) = byte_cap_trip {

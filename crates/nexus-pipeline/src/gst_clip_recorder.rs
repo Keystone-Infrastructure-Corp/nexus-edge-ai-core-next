@@ -4557,10 +4557,23 @@ mod epoch_tests {
     /// `n` AUs of `profile` H.264 at `fps`, a keyframe every second, stamped
     /// `start`, `start + 1/fps`, ... — the way the #376 repro encodes them.
     fn encode(fps: u32, profile: &str, n: u32, start: Duration) -> Vec<NalSample> {
+        encode_with_sps_id(fps, profile, n, start, 0)
+    }
+
+    /// [`encode`] with x264's `sps-id` option, which numbers the SPS (and
+    /// the PPS that refers to it) `sps_id` instead of 0.
+    fn encode_with_sps_id(
+        fps: u32,
+        profile: &str,
+        n: u32,
+        start: Duration,
+        sps_id: u32,
+    ) -> Vec<NalSample> {
         let desc = format!(
             "videotestsrc num-buffers={n} pattern=ball \
              ! video/x-raw,width=320,height=240,framerate={fps}/1 \
              ! x264enc bframes=0 key-int-max={fps} tune=zerolatency \
+               option-string=sps-id={sps_id} \
              ! video/x-h264,profile={profile},stream-format=byte-stream,alignment=au \
              ! appsink name=out sync=false"
         );
@@ -4820,6 +4833,68 @@ mod epoch_tests {
             assert!(!next.ended_on_epoch_change);
             assert_one_clean_timeline(&next, &format!("{change}: clip opened after it"));
         }
+    }
+
+    /// PR #379 review: the camera goes A (SPS id 0, 15 fps) -> B (SPS id 1,
+    /// 20 fps) -> back to A. Each rotated clip has a fresh muxer that knows
+    /// only its own epoch's SPS, so the return to A must rotate as well.
+    /// Epochs are decided by a real `ParamSetCache` and the ring, the way
+    /// the ingester's `push_tap_sample` decides them (mirrored here: it is
+    /// private to `preroll_ingester`; PTS never step back in this stream).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_return_to_an_earlier_sps_rotates_again_and_every_clip_has_one_sample_entry() {
+        if !has_elements(&["x264enc", "avdec_h264", "mp4mux"]) {
+            eprintln!("skipping: x264enc/avdec_h264/mp4mux not available");
+            return;
+        }
+        let a = encode_with_sps_id(15, "main", 30, Duration::ZERO, 0);
+        let b = encode_with_sps_id(20, "main", 40, Duration::from_secs(2), 1);
+        let a_again = encode_with_sps_id(15, "main", 30, Duration::from_secs(4), 0);
+        let mut cache = crate::param_sets::ParamSetCache::new(false);
+        let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+        let stamped: Vec<NalSample> = a
+            .iter()
+            .chain(&b)
+            .chain(&a_again)
+            .map(|s| {
+                let data = cache
+                    .process(&s.data)
+                    .map_or_else(|| s.data.clone(), bytes::Bytes::from);
+                // A changed SPS begins the epoch before its AU is pushed.
+                if cache.sps_changed() {
+                    ring.begin_epoch();
+                }
+                ring.push(NalSample { data, ..s.clone() })
+            })
+            .collect();
+
+        // Each epoch is recorded by its own clip, as the supervisor rotates:
+        // cut from the ring at the epoch's head (its first GOP), the rest
+        // arriving live until the pump stops at the next epoch.
+        let mut clips = 0;
+        let mut start = 0;
+        while start < stamped.len() {
+            let epoch = stamped[start].epoch;
+            let end = stamped[start..]
+                .iter()
+                .position(|s| s.epoch != epoch)
+                .map_or(stamped.len(), |p| start + p);
+            let gop = stamped[start + 1..end]
+                .iter()
+                .position(|s| s.is_keyframe)
+                .map_or(end, |p| start + 1 + p);
+            let clip =
+                record_through_pump(stamped[start..gop].to_vec(), stamped[gop..].to_vec()).await;
+            clips += 1;
+            assert_one_clean_timeline(&clip, &format!("clip {clips}"));
+            let last = end == stamped.len();
+            assert_eq!(
+                clip.ended_on_epoch_change, !last,
+                "clip {clips}: rotates at the next transition"
+            );
+            start = end;
+        }
+        assert_eq!(clips, 3, "a rotation at both transitions");
     }
 
     /// #375: the camera reconnects and its PTS restart near zero. The open
