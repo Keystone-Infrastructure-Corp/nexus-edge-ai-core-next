@@ -951,7 +951,7 @@ mod tests {
             pts: Some(Duration::from_millis(pts_ms)),
             dts: Some(Duration::from_millis(pts_ms)),
             is_keyframe: keyframe,
-            data: vec![0u8; 8],
+            data: bytes::Bytes::from(vec![0u8; 8]),
         }
     }
 
@@ -1050,7 +1050,7 @@ mod gst_tests {
                 pts,
                 dts: pts,
                 is_keyframe,
-                data: map.to_vec(),
+                data: bytes::Bytes::copy_from_slice(&map),
             });
         }
         pipeline.set_state(gst::State::Null).unwrap();

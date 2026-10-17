@@ -936,9 +936,12 @@ async fn run_session(
                     pts,
                     dts,
                     is_keyframe,
+                    // The one copy out of the gst buffer; every ring
+                    // snapshot and broadcast after this shares it.
                     data: param_sets
                         .process(map.as_slice())
-                        .unwrap_or_else(|| map.as_slice().to_vec()),
+                        .unwrap_or_else(|| map.as_slice().to_vec())
+                        .into(),
                 };
                 // Bump the stall watchdog before anything downstream
                 // runs: this sample DID arrive from the camera, and a

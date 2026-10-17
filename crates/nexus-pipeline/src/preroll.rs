@@ -36,9 +36,13 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use bytes::Bytes;
+
 /// One H.264 sample as pulled off the GStreamer pipeline. Owns its
 /// payload because the ring buffer outlives the appsink callback's
-/// borrowed `gst::Buffer`.
+/// borrowed `gst::Buffer`. The payload is a refcounted [`Bytes`], so
+/// cloning a sample (ring snapshot, broadcast fan-out) shares the
+/// frame instead of copying it.
 #[derive(Debug, Clone)]
 pub struct NalSample {
     /// Presentation timestamp from the source (RTP). `None` is
@@ -55,7 +59,7 @@ pub struct NalSample {
     /// Raw H.264 NAL bytes in the source's stream-format. The
     /// pre-roll ingester normalises to byte-stream (`Annex-B`)
     /// before pushing here so all samples share one parser path.
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 /// One closed group-of-pictures: keyframe + zero or more
@@ -207,7 +211,7 @@ mod tests {
             pts: Some(Duration::from_millis(pts_ms)),
             dts: Some(Duration::from_millis(pts_ms)),
             is_keyframe: true,
-            data: payload.to_vec(),
+            data: Bytes::copy_from_slice(payload),
         }
     }
 
@@ -216,7 +220,7 @@ mod tests {
             pts: Some(Duration::from_millis(pts_ms)),
             dts: Some(Duration::from_millis(pts_ms)),
             is_keyframe: false,
-            data: payload.to_vec(),
+            data: Bytes::copy_from_slice(payload),
         }
     }
 
@@ -246,9 +250,9 @@ mod tests {
         let snap = b.snapshot();
         assert_eq!(snap.len(), 3);
         assert!(snap[0].is_keyframe);
-        assert_eq!(snap[0].data, b"k0");
-        assert_eq!(snap[1].data, b"d0");
-        assert_eq!(snap[2].data, b"d1");
+        assert_eq!(snap[0].data, &b"k0"[..]);
+        assert_eq!(snap[1].data, &b"d0"[..]);
+        assert_eq!(snap[2].data, &b"d1"[..]);
     }
 
     #[test]
@@ -310,7 +314,7 @@ mod tests {
             pts: None,
             dts: None,
             is_keyframe: false,
-            data: b"d0".to_vec(),
+            data: Bytes::from_static(b"d0"),
         };
         b.push(no_pts);
         b.push(delta(33, b"d1"));
@@ -330,5 +334,21 @@ mod tests {
         assert_eq!(s1.len(), 2);
         assert_eq!(s2.len(), 2);
         assert_eq!(b.sample_count(), 2);
+    }
+
+    #[test]
+    fn snapshot_shares_payload_memory_with_the_ring() {
+        let mut b = NalRingBuffer::new(Duration::from_secs(5));
+        b.push(key(0, b"k0"));
+        b.push(delta(33, b"d0"));
+        let s1 = b.snapshot();
+        let s2 = b.snapshot();
+        for (x, y) in s1.iter().zip(&s2) {
+            assert_eq!(
+                x.data.as_ptr(),
+                y.data.as_ptr(),
+                "a snapshot must clone refcounts, not frames"
+            );
+        }
     }
 }

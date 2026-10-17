@@ -1773,7 +1773,7 @@ fn coalesce_same_pts(
             let prev_incomplete = !contains_slice_nal(&prev.data, codec);
             if same_pts || prev_incomplete {
                 let mut merged = prev;
-                merged.data.extend_from_slice(&incoming.data);
+                merged.data = [&merged.data[..], &incoming.data[..]].concat().into();
                 merged.is_keyframe = merged.is_keyframe || incoming.is_keyframe;
                 // Prefer the earlier (smaller) dts so monotonic
                 // expectations downstream still hold.
@@ -2466,7 +2466,7 @@ mod tests {
             pts: pts_ms.map(Duration::from_millis),
             dts: pts_ms.map(Duration::from_millis),
             is_keyframe: is_kf,
-            data: data.to_vec(),
+            data: bytes::Bytes::copy_from_slice(data),
         }
     }
 
@@ -4210,7 +4210,7 @@ mod sdp_only_param_set_tests {
                 pts,
                 dts: pts,
                 is_keyframe: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
-                data: buffer.map_readable().unwrap().to_vec(),
+                data: bytes::Bytes::copy_from_slice(&buffer.map_readable().unwrap()),
             });
         }
         pipeline.set_state(gst::State::Null).unwrap();
@@ -4282,7 +4282,7 @@ mod sdp_only_param_set_tests {
                     kept.extend_from_slice(&d[st..end]);
                 }
             }
-            s.data = kept;
+            s.data = kept.into();
         }
         samples
     }
@@ -4304,7 +4304,7 @@ mod sdp_only_param_set_tests {
             .into_iter()
             .map(|mut s| {
                 if let Some(data) = cache.process(&s.data) {
-                    s.data = data;
+                    s.data = data.into();
                 }
                 s
             })

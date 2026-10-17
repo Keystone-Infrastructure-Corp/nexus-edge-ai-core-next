@@ -1737,7 +1737,7 @@ mod tests {
             pts: Some(Duration::from_millis(pts_ms)),
             dts: None,
             is_keyframe: key,
-            data: vec![0u8],
+            data: bytes::Bytes::from_static(&[0u8]),
         };
         let mut clock = FeedClock::new();
         // First AU rebases to zero regardless of the camera's absolute clock.
@@ -1752,7 +1752,7 @@ mod tests {
             pts: None,
             dts: None,
             is_keyframe: false,
-            data: vec![0u8],
+            data: bytes::Bytes::from_static(&[0u8]),
         };
         assert_eq!(clock.resolve(&no_pts), Duration::from_millis(106));
         // A backward jump is clamped forward, keeping the timeline monotonic.
