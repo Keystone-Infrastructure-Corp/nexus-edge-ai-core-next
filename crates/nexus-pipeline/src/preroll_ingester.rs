@@ -58,10 +58,16 @@
 //!
 //! Re-connect strategy: the ingester runs an async supervisor that
 //! tears the pipeline down and rebuilds it on bus error or EOS, with
-//! exponential backoff capped at 30s. The ring buffer survives
-//! reconnect (we keep what we last buffered) but is NOT rewound — a
-//! camera that drops for 60s leaves a 60s pre-roll gap on the next
-//! recording, which is still better than zero pre-roll.
+//! exponential backoff capped at 30s. The ring buffer keeps what the
+//! old session buffered through the outage, so a clip opened while the
+//! camera is down still gets that pre-roll. The new session's first
+//! sample then begins a new ring epoch, which clears it: a rebuilt
+//! pipeline restarts PTS near zero, and the old frames can be neither
+//! trimmed against nor spliced ahead of the new ones (#375 — trimming
+//! against the old session's PTS froze the ring and grew it without
+//! bound). The same happens before an access unit that changes the
+//! SPS, which mp4mux cannot take mid-clip (#376). A camera that drops
+//! for 60s still leaves a 60s pre-roll gap on the next recording.
 //!
 //! Memory cost: roughly `bitrate_bytes_per_sec * pre_roll_secs`.
 //! ~2 MB per camera at 4 Mbps 1080p, ~5 MB at 4K. Bounded by the
@@ -669,6 +675,43 @@ async fn run_supervisor(
     }
 }
 
+/// Push one tap sample into the pre-roll ring. Returns the sample as the
+/// ring stamped it (the copy to broadcast), when a new epoch began, why,
+/// and, once per episode, the ring's payload bytes when it first had to
+/// drop GOPs for size. A session's first sample and an access unit
+/// carrying a changed SPS (per `param_sets`, which has processed the
+/// sample) begin the epoch before the push, so that sample heads it; the
+/// ring begins one itself when PTS step back past its window. Whatever
+/// the reason, `param_sets` then compares against this sample's
+/// parameter sets alone, as the new epoch's muxer has been given.
+fn push_tap_sample(
+    ring: &mut NalRingBuffer,
+    sample: NalSample,
+    new_session: bool,
+    param_sets: &mut ParamSetCache,
+) -> (NalSample, Option<&'static str>, Option<usize>) {
+    let reason = if new_session {
+        Some("new session")
+    } else if param_sets.sps_changed() {
+        Some("parameter-set change")
+    } else {
+        None
+    };
+    if reason.is_some() {
+        ring.begin_epoch();
+    }
+    let epoch = ring.epoch();
+    let pushed = ring.push(sample);
+    let reason = reason.or((pushed.epoch != epoch).then_some("pts stepped back"));
+    if reason.is_some() {
+        // A no-op after a change or at a session's first sample; needed
+        // when PTS stepped back.
+        param_sets.begin_epoch();
+    }
+    let byte_cap_trip = ring.take_byte_cap_trip().then(|| ring.bytes());
+    (pushed, reason, byte_cap_trip)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     camera_id: CameraId,
@@ -910,6 +953,8 @@ async fn run_session(
     // Re-inject cached parameter sets into bare IDRs (#358). Fresh per
     // session: the depayloader re-sends the sprop copy on reconnect.
     let mut param_sets = ParamSetCache::new(codec.base() == "h265");
+    // This session's first sample begins a new pre-roll epoch.
+    let mut first_sample = true;
     sink.set_callbacks(
         AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -936,9 +981,14 @@ async fn run_session(
                     pts,
                     dts,
                     is_keyframe,
+                    // The one copy out of the gst buffer; every ring
+                    // snapshot and broadcast after this shares it.
                     data: param_sets
                         .process(map.as_slice())
-                        .unwrap_or_else(|| map.as_slice().to_vec()),
+                        .unwrap_or_else(|| map.as_slice().to_vec())
+                        .into(),
+                    // Stamped by the ring below.
+                    epoch: 0,
                 };
                 // Bump the stall watchdog before anything downstream
                 // runs: this sample DID arrive from the camera, and a
@@ -948,7 +998,24 @@ async fn run_session(
                 // Push into ring first so a slow broadcast doesn't
                 // delay the buffer's persistence path. The ring is
                 // bounded by duration so pushes are O(1) amortised.
-                cb_ring.lock().push(nal.clone());
+                // The ring stamps the epoch, so broadcast what it
+                // returns: live subscribers and the ring must agree.
+                let (nal, new_epoch, byte_cap_trip) = push_tap_sample(
+                    &mut cb_ring.lock(),
+                    nal,
+                    std::mem::take(&mut first_sample),
+                    &mut param_sets,
+                );
+                if let Some(reason) = new_epoch {
+                    info!(camera_id, reason, "pre-roll ring began a new stream epoch");
+                }
+                if let Some(ring_bytes) = byte_cap_trip {
+                    warn!(
+                        camera_id,
+                        ring_bytes,
+                        "pre-roll ring is over its byte cap: dropping the oldest GOPs (PTS not advancing?)"
+                    );
+                }
                 // Broadcast to live subscribers. Errors here just
                 // mean no one is listening (typical: no clip open),
                 // which is fine — the ring carries us either way.
@@ -1383,5 +1450,178 @@ impl Drop for PreRollIngester {
         // directly) and this last-Arc-drop path stay byte-identical.
         self.shutdown();
         debug!(camera_id = self.camera_id, "preroll ingester dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nal(pts_ms: u64, is_keyframe: bool) -> NalSample {
+        NalSample {
+            pts: Some(Duration::from_millis(pts_ms)),
+            dts: Some(Duration::from_millis(pts_ms)),
+            is_keyframe,
+            data: bytes::Bytes::from_static(b"au"),
+            epoch: 0,
+        }
+    }
+
+    /// A ring holding the previous session's pre-roll, PTS near 1000 s.
+    fn ring_with_old_session() -> NalRingBuffer {
+        let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+        for (i, pts) in (1_000_000..1_003_000).step_by(50).enumerate() {
+            push_tap_sample(
+                &mut ring,
+                nal(pts, i.is_multiple_of(30)),
+                i == 0,
+                &mut ParamSetCache::new(false),
+            );
+        }
+        ring
+    }
+
+    #[test]
+    fn steady_samples_keep_the_epoch() {
+        let mut ring = ring_with_old_session();
+        let epoch = ring.epoch();
+        let (pushed, reason, _) = push_tap_sample(
+            &mut ring,
+            nal(1_003_000, false),
+            false,
+            &mut ParamSetCache::new(false),
+        );
+        assert_eq!(reason, None);
+        assert_eq!(pushed.epoch, epoch);
+    }
+
+    #[test]
+    fn the_first_sample_of_a_new_session_heads_a_new_epoch() {
+        let mut ring = ring_with_old_session();
+        let old = ring.epoch();
+        // The outage leaves the old pre-roll in place until the new
+        // session delivers...
+        assert!(ring.sample_count() > 1);
+        // ...even when the new session's PTS are within the window of the
+        // old ones (a short first session), so no PTS check would catch it.
+        let (pushed, reason, _) = push_tap_sample(
+            &mut ring,
+            nal(999_000, true),
+            true,
+            &mut ParamSetCache::new(false),
+        );
+        assert_eq!(reason, Some("new session"));
+        assert_ne!(pushed.epoch, old);
+        let snap = ring.snapshot();
+        assert_eq!(snap.len(), 1, "the old session's pre-roll is gone");
+        assert_eq!(snap[0].epoch, pushed.epoch);
+        assert_eq!(snap[0].data.as_ptr(), pushed.data.as_ptr());
+    }
+
+    // H.264 SPS whose seq_parameter_set_id is 0 and 1, a PPS and an IDR.
+    const SPS_ID0: &[u8] = &[0x67, 0x4d, 0x00, 0x1f, 0x9a, 0x66, 0x02, 0x80];
+    const SPS_ID1: &[u8] = &[0x67, 0x4d, 0x00, 0x1f, 0x4d, 0x33, 0x01, 0x40];
+    const PPS: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+    const IDR: &[u8] = &[0x65, 0x88, 0x84, 0x00];
+
+    /// An Annex-B keyframe access unit, run through `cache` as the tap
+    /// callback does.
+    fn keyframe(cache: &mut ParamSetCache, pts_ms: u64, nals: &[&[u8]]) -> NalSample {
+        let au: Vec<u8> = nals
+            .iter()
+            .flat_map(|n| [0, 0, 0, 1].iter().chain(*n))
+            .copied()
+            .collect();
+        cache.process(&au);
+        NalSample {
+            data: au.into(),
+            ..nal(pts_ms, true)
+        }
+    }
+
+    #[test]
+    fn an_sps_change_begins_the_epoch_before_its_au_is_pushed() {
+        let mut ring = ring_with_old_session();
+        let old = ring.epoch();
+        let mut cache = ParamSetCache::new(false);
+        keyframe(&mut cache, 1_000_000, &[SPS_ID0, PPS, IDR]);
+        let sample = keyframe(&mut cache, 1_003_000, &[SPS_ID1, PPS, IDR]);
+        let (pushed, reason, _) = push_tap_sample(&mut ring, sample, false, &mut cache);
+        assert_eq!(reason, Some("parameter-set change"));
+        assert_ne!(pushed.epoch, old);
+        let snap = ring.snapshot();
+        assert_eq!(snap.len(), 1, "the AU carrying the new SPS heads the epoch");
+        assert_eq!(snap[0].epoch, pushed.epoch);
+    }
+
+    #[test]
+    fn a_ring_over_its_byte_cap_is_reported_once_per_episode() {
+        static MIB: [u8; 1 << 20] = [0; 1 << 20];
+        let big = |is_keyframe| NalSample {
+            data: bytes::Bytes::from_static(&MIB),
+            ..nal(1_000, is_keyframe)
+        };
+        let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+        let mut reports = Vec::new();
+        for i in 0..300 {
+            let (_, reason, trip) = push_tap_sample(
+                &mut ring,
+                big(i % 30 == 0),
+                i == 0,
+                &mut ParamSetCache::new(false),
+            );
+            assert_eq!(reason.is_some(), i == 0, "no epoch after the first sample");
+            reports.extend(trip);
+        }
+        assert_eq!(reports.len(), 1, "once, not per frame: {reports:?}");
+        // Reported after the trim: just under the 64 MiB cap.
+        assert!(
+            (32 << 20..=64 << 20).contains(&reports[0]),
+            "reports the bytes held, got {}",
+            reports[0]
+        );
+    }
+
+    #[test]
+    fn normal_samples_report_no_byte_cap_trip() {
+        let mut ring = ring_with_old_session();
+        let (_, _, trip) = push_tap_sample(
+            &mut ring,
+            nal(1_003_000, false),
+            false,
+            &mut ParamSetCache::new(false),
+        );
+        assert_eq!(trip, None);
+    }
+
+    #[test]
+    fn a_pts_step_back_inside_a_session_is_reported() {
+        let mut ring = ring_with_old_session();
+        let old = ring.epoch();
+        let (pushed, reason, _) = push_tap_sample(
+            &mut ring,
+            nal(500, true),
+            false,
+            &mut ParamSetCache::new(false),
+        );
+        assert_eq!(reason, Some("pts stepped back"));
+        assert_ne!(pushed.epoch, old);
+    }
+
+    #[test]
+    fn a_pts_step_back_rebases_the_parameter_set_cache_on_its_au() {
+        // #376 review: the new epoch's muxer starts at the step-back AU, so
+        // the cache must compare against that AU's SPS alone.
+        let mut ring = NalRingBuffer::new(Duration::from_secs(5));
+        let mut cache = ParamSetCache::new(false);
+        let head = keyframe(&mut cache, 1_000_000, &[SPS_ID0, SPS_ID1, PPS, IDR]);
+        push_tap_sample(&mut ring, head, true, &mut cache);
+        let back = keyframe(&mut cache, 500, &[SPS_ID0, PPS, IDR]);
+        let (_, reason, _) = push_tap_sample(&mut ring, back, false, &mut cache);
+        assert_eq!(reason, Some("pts stepped back"));
+        // SPS id 1 is new to this epoch's muxer.
+        let next = keyframe(&mut cache, 1_000, &[SPS_ID1, PPS, IDR]);
+        let (_, reason, _) = push_tap_sample(&mut ring, next, false, &mut cache);
+        assert_eq!(reason, Some("parameter-set change"));
     }
 }

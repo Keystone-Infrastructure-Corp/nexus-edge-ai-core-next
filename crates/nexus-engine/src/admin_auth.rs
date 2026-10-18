@@ -338,7 +338,9 @@ fn verify_token(token: &str, key: &DecodingKey) -> Result<AdminClaims, AdminAuth
 /// into the engine's own audit log via the HS256 path's
 /// `SessionContext::jti`. Kept as a `system:` prefix so audit
 /// queries can filter machine-issued bearers from operator-issued
-/// ones.
+/// ones. A bearer minted for a cloud actor carries
+/// `system:rpc-passthrough:<actor sub>`; the diagnostics collector's
+/// carries this constant alone.
 pub const INTERNAL_PASSTHROUGH_SUB: &str = "system:rpc-passthrough";
 
 /// TTL for the in-process bearer minted by
@@ -373,8 +375,16 @@ const INTERNAL_PASSTHROUGH_TTL_SECS: u64 = 60;
 /// A compromise of the engine process already grants the attacker
 /// read access to the secret file on disk, so there is no new
 /// privilege escalation surface.
+///
+/// `actor_sub` is the `sub` of the cloud `actor_token` the RPC
+/// dispatcher already verified, appended to the bearer's subject so
+/// the engine-side mutation row names the human behind the
+/// passthrough (edge-core #378, REPO_BOUNDARY R4c). It must never be
+/// an unverified value. `None` for the diagnostics collector, which
+/// acts for no human.
 pub fn mint_internal_passthrough_bearer(
     secret: &str,
+    actor_sub: Option<&str>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -383,7 +393,10 @@ pub fn mint_internal_passthrough_bearer(
         .unwrap_or(0);
     let claims = AdminClaims {
         exp: now + INTERNAL_PASSTHROUGH_TTL_SECS,
-        sub: Some(INTERNAL_PASSTHROUGH_SUB.to_string()),
+        sub: Some(match actor_sub {
+            Some(actor) => format!("{INTERNAL_PASSTHROUGH_SUB}:{actor}"),
+            None => INTERNAL_PASSTHROUGH_SUB.to_string(),
+        }),
         iat: Some(now),
     };
     jsonwebtoken::encode(
@@ -690,6 +703,25 @@ mod tests {
         let app = make_app(AdminAuthState::from_secret_bytes(None, true));
         let res = app.oneshot(req_with_peer(&[], remote())).await.unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// The cloud passthrough's bearer names the verified actor; the
+    /// diagnostics collector's stays the bare system principal, so the
+    /// two remain distinguishable in the audit log (edge-core #378).
+    #[test]
+    fn internal_bearer_subject_names_the_actor_only_when_given_one() {
+        let secret = std::str::from_utf8(TEST_SECRET).unwrap();
+        let sub = |actor| {
+            let token = mint_internal_passthrough_bearer(secret, actor).unwrap();
+            verify_token(&token, &DecodingKey::from_secret(TEST_SECRET))
+                .unwrap()
+                .sub
+        };
+        assert_eq!(
+            sub(Some("user-1")).as_deref(),
+            Some("system:rpc-passthrough:user-1")
+        );
+        assert_eq!(sub(None).as_deref(), Some(INTERNAL_PASSTHROUGH_SUB));
     }
 
     #[test]

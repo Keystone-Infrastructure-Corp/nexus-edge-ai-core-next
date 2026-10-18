@@ -212,11 +212,20 @@ pub fn dedupe_burn_boxes(boxes: &mut Vec<BurnBox>) {
 /// value without a bespoke GOP walker.
 #[must_use]
 pub fn trim_preroll(samples: Vec<NalSample>, pre: Duration) -> Vec<NalSample> {
+    // A snapshot holds one epoch; the fresh ring re-stamps it, so put
+    // the source epoch back.
+    let epoch = samples.first().map(|s| s.epoch);
     let mut ring = NalRingBuffer::new(pre);
     for s in samples {
         ring.push(s);
     }
-    ring.snapshot()
+    let mut out = ring.snapshot();
+    if let Some(epoch) = epoch {
+        for s in &mut out {
+            s.epoch = epoch;
+        }
+    }
+    out
 }
 
 /// Relative path (under `clips_dir`) for an alert clip, mirroring the
@@ -951,7 +960,8 @@ mod tests {
             pts: Some(Duration::from_millis(pts_ms)),
             dts: Some(Duration::from_millis(pts_ms)),
             is_keyframe: keyframe,
-            data: vec![0u8; 8],
+            data: bytes::Bytes::from(vec![0u8; 8]),
+            epoch: 0,
         }
     }
 
@@ -982,6 +992,19 @@ mod tests {
             span <= Duration::from_secs(2),
             "trimmed span {span:?} must not exceed the 2s pre window"
         );
+    }
+
+    #[test]
+    fn trim_preroll_keeps_the_snapshot_epoch() {
+        // Replaying through a fresh ring must not re-stamp the samples:
+        // the recorder compares their epoch with the live stream's.
+        let samples: Vec<NalSample> = [nal(0, true), nal(500, false), nal(1000, true)]
+            .into_iter()
+            .map(|s| NalSample { epoch: 7, ..s })
+            .collect();
+        let trimmed = trim_preroll(samples, Duration::from_secs(2));
+        assert!(!trimmed.is_empty());
+        assert!(trimmed.iter().all(|s| s.epoch == 7));
     }
 
     #[test]
@@ -1050,7 +1073,8 @@ mod gst_tests {
                 pts,
                 dts: pts,
                 is_keyframe,
-                data: map.to_vec(),
+                data: bytes::Bytes::copy_from_slice(&map),
+                epoch: 0,
             });
         }
         pipeline.set_state(gst::State::Null).unwrap();
