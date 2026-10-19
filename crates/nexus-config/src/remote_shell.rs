@@ -15,15 +15,25 @@ use serde::{Deserialize, Serialize};
 ///   cloud could name the target, a compromised control plane could use
 ///   any core as a pivot into its owner's LAN. The `shell_session_open`
 ///   payload has no `target` field at all.
-/// * **Consent is local.** An org admin grants access in the console,
-///   but the box owner still had to switch this on. Neither party can
-///   act alone.
+/// * **The box owner may opt out.** The cloud can switch remote access
+///   on or off live (an owner-role `PUT /admin/remote_access` over the
+///   verified RPC tunnel) unless the box owner sets
+///   `cloud_may_enable = false`, which makes `enabled` here the only way
+///   on. The cloud can always switch it off. An org admin's per-session
+///   grant is still required on top of either switch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteAccessConfig {
     /// Master switch. Defaults `false`.
     #[serde(default)]
     pub enabled: bool,
+    /// Whether the cloud may switch remote access on for this appliance.
+    /// Defaults `true`, so a core that never wrote this key gets the
+    /// cloud toggle after an OTA without a `nexus.toml` rewrite. Set
+    /// `false` to opt out: a cloud "on" is then refused, while a cloud
+    /// "off" is still honoured.
+    #[serde(default = "default_cloud_may_enable")]
+    pub cloud_may_enable: bool,
     /// Where the byte pipe terminates. Defaults to the local sshd.
     /// Must be a loopback or private address — see
     /// [`Self::target_is_local`].
@@ -35,6 +45,10 @@ pub struct RemoteAccessConfig {
     /// open past what the box owner agreed to.
     #[serde(default = "default_shell_max_session_secs")]
     pub max_session_secs: u64,
+}
+
+const fn default_cloud_may_enable() -> bool {
+    true
 }
 
 fn default_shell_target() -> String {
@@ -49,6 +63,7 @@ impl Default for RemoteAccessConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            cloud_may_enable: default_cloud_may_enable(),
             target: default_shell_target(),
             max_session_secs: default_shell_max_session_secs(),
         }

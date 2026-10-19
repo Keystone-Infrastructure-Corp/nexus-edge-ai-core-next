@@ -1577,6 +1577,13 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // `cloud_liveness` for why an unreachable-but-working appliance is
     // the failure mode worth its own machinery.
     let tunnel_liveness = std::sync::Arc::new(cloud_liveness::TunnelLiveness::new());
+    // The live `[remote_access]` switch: `nexus.toml` folded with the
+    // cloud's persisted toggle. One instance, shared by the tunnel's shell
+    // manager, the RPC handler's owner-only toggle and `ApiState`.
+    let remote_access = std::sync::Arc::new(remote_shell::RemoteAccess::new(
+        cfg.remote_access.clone(),
+        admin_runtime::resolve_persisted_remote_access_enabled(&store, &cfg.remote_access).await,
+    ));
 
     let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(
         store.clone(),
@@ -1595,7 +1602,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         Some(trace_rx),
         loopback_admin_base.clone(),
         cloud_passthrough_admin_secret,
-        cfg.remote_access.clone(),
+        remote_access.clone(),
         tunnel_liveness.clone(),
         cloud_tunnel::StorageWatermarkHandle {
             signal: watermark_signal.clone(),
@@ -1793,7 +1800,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         // every successful extract. Drive `/v1/admin/reid/status`.
         reid_config: Arc::new(cfg.reid.clone()),
         lan_proxy_enabled: cfg.lan_proxy.enabled,
-        remote_access_enabled: cfg.remote_access.enabled,
+        remote_access,
         reid_stats: reid_stats.clone(),
     };
 

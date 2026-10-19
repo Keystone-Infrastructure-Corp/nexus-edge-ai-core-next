@@ -1597,18 +1597,24 @@ yet — that's M2.2 (cold-mirror replication).
 
 ### 8.3 Remote shell (off by default)
 
-Nexus support cannot open a shell on this box. Access exists only if
-**you** enable it here, and then only for a session **your** org
-administrator explicitly grants, for a duration they choose, to a
+Nexus support cannot open a shell on this box. Remote access is on only
+when **you** enable it here or an **owner** of your org switches it on
+from the console — and even then a session exists only when **your** org
+administrator explicitly grants one, for a duration they choose, to a
 person they choose. There is no standing credential and no path that
 starts on our side.
 
-Enabling it is two steps, both yours:
+The console's switch applies live and persists across restarts; it can
+always switch remote access off. To refuse the console's "on", set
+`cloud_may_enable = false`.
+
+Enabling it locally is two steps, both yours:
 
 ```toml
 # /etc/nexus/nexus.toml
 [remote_access]
 enabled = true            # opt in
+cloud_may_enable = true   # false = the console may not switch this on
 target = "127.0.0.1:22"   # must be local; sshd must be listening here
 max_session_secs = 1800   # hard local ceiling — the cloud may ask for
                           # less, never for more
@@ -1631,8 +1637,10 @@ Notes worth knowing before you turn it on:
   replayable.
 - `max_session_secs` is enforced locally. Setting it low is a real
   ceiling, not a hint.
-- Setting `enabled = false` and restarting is a complete kill switch
-  and does not require us.
+- Once an org owner has switched it on from the console, `enabled = false`
+  alone no longer turns it off at the next boot (the persisted cloud "on"
+  wins). The local kill switch is `enabled = false` **and**
+  `cloud_may_enable = false`, then restart; it does not require us.
 
 ### 8.4 Go-dark insurance
 

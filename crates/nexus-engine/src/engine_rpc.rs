@@ -43,7 +43,7 @@ use serde_json::json;
 #[cfg(test)]
 use serde_json::Value;
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Engine-side RPC handler. Owns the `Store` (for clip lookups
 /// and audit), a `Notify` shared with the cold replicator (so the
@@ -82,7 +82,16 @@ pub struct EngineRpcHandler {
     /// loopback admin call must carry an HS256 bearer signed by
     /// this secret.
     pub admin_secret: Option<Arc<String>>,
+    /// The live `[remote_access]` switch, shared with the tunnel's shell
+    /// manager and `ApiState`. Only [`Self::handle_put_remote_access`]
+    /// writes it.
+    pub remote_access: Arc<crate::remote_shell::RemoteAccess>,
 }
+
+/// Refusal when the cloud tries to switch remote access on for a box
+/// whose owner opted out.
+pub const CLOUD_MAY_NOT_ENABLE: &str =
+    "the box owner has set [remote_access] cloud_may_enable = false on this appliance";
 
 /// Granular handler error. Each variant maps to an HTTP status code
 /// in [`Self::status`] and a wire `error` code in [`Self::code`].
@@ -178,6 +187,15 @@ impl Handler for EngineRpcHandler {
                 .await
                 .map_err(EngineRpcError::into_wire_json);
         }
+        // The cloud's remote-access toggle is handled in-process and ONLY
+        // here: the local admin API serves the GET but has no setter, so
+        // nothing but a verified, owner-role RPC can switch it.
+        if envelope.method.eq_ignore_ascii_case("PUT") && is_remote_access_path(envelope.path) {
+            return self
+                .handle_put_remote_access(actor, body)
+                .await
+                .map_err(EngineRpcError::into_wire_json);
+        }
         // Phase A Step 5: every other `/admin/*` path is forwarded
         // verbatim to the engine's own local admin API. This unblocks
         // the full cloud-side administration & troubleshooting
@@ -215,6 +233,45 @@ impl EngineRpcHandler {
             crate::diag_collect::run(http, loopback_admin_base, admin_secret, payload, outbox)
                 .await;
         });
+    }
+
+    /// `PUT /admin/remote_access` `{"enabled": bool}` — switch remote
+    /// access on or off live. Owner role only (anything else is NotFound,
+    /// like every other unauthorised arm). Switching on is refused while
+    /// the box owner has `cloud_may_enable = false`; switching off is
+    /// always allowed. The choice is persisted so it survives a restart.
+    async fn handle_put_remote_access(
+        &self,
+        actor: &VerifiedActor,
+        body: Option<&[u8]>,
+    ) -> Result<Vec<u8>, EngineRpcError> {
+        #[derive(Deserialize)]
+        struct Req {
+            enabled: bool,
+        }
+        if actor.role != "owner" {
+            return Err(EngineRpcError::NotFound(
+                "no handler for this path".to_string(),
+            ));
+        }
+        let req: Req = body
+            .and_then(|b| serde_json::from_slice(b).ok())
+            .ok_or_else(|| {
+                EngineRpcError::BadRequest("body must be {\"enabled\": bool}".to_string())
+            })?;
+        if req.enabled && !self.remote_access.cloud_may_enable() {
+            return Err(EngineRpcError::Conflict(CLOUD_MAY_NOT_ENABLE.to_string()));
+        }
+        crate::admin_runtime::persist_remote_access_enabled(&self.store, req.enabled)
+            .await
+            .map_err(|e| EngineRpcError::Internal(format!("persist remote_access_enabled: {e}")))?;
+        self.remote_access.set_enabled(req.enabled);
+        info!(
+            enabled = req.enabled,
+            actor_sub = %actor.sub,
+            "remote access switched by the cloud",
+        );
+        Ok(serde_json::to_vec(&self.remote_access.state()).unwrap_or_default())
     }
 
     async fn handle_expedite(
@@ -779,6 +836,11 @@ fn parse_expedite_clip_id(path: &str) -> Option<i64> {
         return None;
     }
     id_str.parse::<i64>().ok()
+}
+
+/// Exact match for the remote-access toggle, tolerating one trailing slash.
+fn is_remote_access_path(path: &str) -> bool {
+    path.strip_suffix('/').unwrap_or(path) == "/admin/remote_access"
 }
 
 fn is_expedite_path(path: &str) -> bool {
@@ -1357,6 +1419,10 @@ mod tests {
             loopback_admin_base: Arc::new(ArcSwap::from_pointee(base)),
             http_client: reqwest::Client::new(),
             admin_secret: Some(Arc::new(SECRET.to_string())),
+            remote_access: Arc::new(crate::remote_shell::RemoteAccess::new(
+                nexus_config::RemoteAccessConfig::default(),
+                false,
+            )),
         };
         let actor = VerifiedActor {
             sub: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c100".into(),
@@ -1384,6 +1450,187 @@ mod tests {
         assert_eq!(
             row.actor_label,
             "system:legacy-admin:system:rpc-passthrough:0190f7be-7c6a-7d4f-8f01-d9b1f0c0c100"
+        );
+    }
+
+    // ── PUT /admin/remote_access ──────────────────────────────────
+
+    async fn remote_access_handler(
+        cloud_may_enable: bool,
+        enabled: bool,
+    ) -> (
+        EngineRpcHandler,
+        Arc<crate::remote_shell::RemoteAccess>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite:{}?mode=rwc", dir.path().join("nexus.db").display()),
+                seed_from_config: false,
+                duckdb_attach: false,
+                duckdb_path: std::path::PathBuf::from("/tmp/unused.duckdb"),
+            })
+            .await
+            .unwrap(),
+        );
+        let access = Arc::new(crate::remote_shell::RemoteAccess::new(
+            nexus_config::RemoteAccessConfig {
+                cloud_may_enable,
+                ..Default::default()
+            },
+            enabled,
+        ));
+        let handler = EngineRpcHandler {
+            store,
+            replicator_kick: Arc::new(Notify::new()),
+            loopback_admin_base: Arc::new(ArcSwap::from_pointee("http://127.0.0.1:1".to_string())),
+            http_client: reqwest::Client::new(),
+            admin_secret: None,
+            remote_access: Arc::clone(&access),
+        };
+        (handler, access, dir)
+    }
+
+    fn actor_with_role(role: &str) -> VerifiedActor {
+        VerifiedActor {
+            sub: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c200".into(),
+            role: role.into(),
+            jti: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c201".into(),
+            org_id: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c202".into(),
+            actor_org_id: None,
+        }
+    }
+
+    async fn put_remote_access(
+        handler: &EngineRpcHandler,
+        role: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        handler
+            .handle(
+                "PUT",
+                EnvelopeContext {
+                    method: "put",
+                    path,
+                },
+                &actor_with_role(role),
+                Some(body),
+            )
+            .await
+    }
+
+    fn wire_status(err: &str) -> u64 {
+        serde_json::from_str::<Value>(err).unwrap()["status"]
+            .as_u64()
+            .unwrap()
+    }
+
+    #[test]
+    fn remote_access_path_is_exact_with_an_optional_trailing_slash() {
+        assert!(is_remote_access_path("/admin/remote_access"));
+        assert!(is_remote_access_path("/admin/remote_access/"));
+        assert!(!is_remote_access_path("/admin/remote_access/x"));
+        assert!(!is_remote_access_path("/admin/remote-access"));
+        assert!(!is_remote_access_path("/admin/remote_access//"));
+    }
+
+    #[tokio::test]
+    async fn remote_access_owner_enable_applies_live_and_persists() {
+        let (handler, access, _dir) = remote_access_handler(true, false).await;
+        let body = put_remote_access(
+            &handler,
+            "owner",
+            "/admin/remote_access",
+            br#"{"enabled":true}"#,
+        )
+        .await
+        .expect("owner enable succeeds");
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, json!({ "enabled": true, "cloud_may_enable": true }));
+        assert!(access.is_enabled());
+        assert_eq!(
+            crate::admin_runtime::read_persisted_remote_access_enabled(&handler.store).await,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_access_non_owner_is_not_found_and_changes_nothing() {
+        for role in ["admin", "operator", "viewer", "anonymous"] {
+            let (handler, access, _dir) = remote_access_handler(true, false).await;
+            let err = put_remote_access(
+                &handler,
+                role,
+                "/admin/remote_access/",
+                br#"{"enabled":true}"#,
+            )
+            .await
+            .expect_err("non-owner refused");
+            assert_eq!(wire_status(&err), 404, "{role}");
+            assert!(!access.is_enabled(), "{role}");
+            assert_eq!(
+                crate::admin_runtime::read_persisted_remote_access_enabled(&handler.store).await,
+                None,
+                "{role}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_access_bad_body_is_bad_request() {
+        let (handler, _access, _dir) = remote_access_handler(true, false).await;
+        for body in [&b"not json"[..], br#"{"enabled":"yes"}"#, b"{}"] {
+            let err = put_remote_access(&handler, "owner", "/admin/remote_access", body)
+                .await
+                .expect_err("bad body refused");
+            assert_eq!(wire_status(&err), 400);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_access_enable_is_conflict_when_owner_opted_out() {
+        let (handler, access, _dir) = remote_access_handler(false, false).await;
+        let err = put_remote_access(
+            &handler,
+            "owner",
+            "/admin/remote_access",
+            br#"{"enabled":true}"#,
+        )
+        .await
+        .expect_err("opted-out box refuses a cloud enable");
+        let v: Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["status"], json!(409));
+        assert_eq!(v["message"], json!(CLOUD_MAY_NOT_ENABLE));
+        assert!(!access.is_enabled());
+        assert_eq!(
+            crate::admin_runtime::read_persisted_remote_access_enabled(&handler.store).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_access_disable_is_allowed_when_opted_out_and_closes_sessions() {
+        let (handler, access, _dir) = remote_access_handler(false, true).await;
+        let manager = crate::remote_shell::tests::attached_manager(&access);
+        let mut cancel = manager.insert_test_session("s-1");
+
+        let body = put_remote_access(
+            &handler,
+            "owner",
+            "/admin/remote_access",
+            br#"{"enabled":false}"#,
+        )
+        .await
+        .expect("disable is always allowed");
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, json!({ "enabled": false, "cloud_may_enable": false }));
+        assert!(!access.is_enabled());
+        assert!(cancel.try_recv().is_ok(), "live session cancelled");
+        assert_eq!(
+            crate::admin_runtime::read_persisted_remote_access_enabled(&handler.store).await,
+            Some(false)
         );
     }
 }
