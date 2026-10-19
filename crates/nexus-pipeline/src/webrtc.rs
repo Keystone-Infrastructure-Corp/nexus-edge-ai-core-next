@@ -1026,7 +1026,7 @@ const FORCED_KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 /// The event is let through as-is, never re-issued: the original already
 /// reaches the encoder, so a second copy would only double the request. (A
 /// re-issue via `send_event` on the encoder's *sink* pad was refused by
-/// GStreamer as an upstream event sent the wrong way — BUG-285.)
+/// GStreamer as an upstream event sent the wrong way — BUG-290.)
 ///
 /// Forced IDRs are debounced to [`FORCED_KEYFRAME_MIN_INTERVAL`]: within the
 /// cooldown the redundant upstream FKU is dropped (`PadProbeReturn::Drop`) so
@@ -1894,7 +1894,7 @@ mod tests {
     /// it at all. The hook used to re-issue the request with `send_event` on
     /// the encoder's *sink* pad, which GStreamer refuses for an upstream event
     /// ("sending custom-upstream event in wrong direction", logged 110 times in
-    /// one production journal) — BUG-285.
+    /// one production journal) — BUG-290.
     ///
     /// Same element chain as [`transcode_pipeline_desc`] around the hook, with
     /// `x264enc` standing in for the VA encoder and a `fakesink` for
