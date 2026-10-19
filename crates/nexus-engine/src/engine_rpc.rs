@@ -262,6 +262,15 @@ impl EngineRpcHandler {
         if req.enabled && !self.remote_access.cloud_may_enable() {
             return Err(EngineRpcError::Conflict(CLOUD_MAY_NOT_ENABLE.to_string()));
         }
+        // Load-time validation only covers `enabled = true` in nexus.toml,
+        // so refuse to switch on a box whose target would make it a relay.
+        // `admit` re-checks on every open as a backstop.
+        if req.enabled && !self.remote_access.config().target_is_local() {
+            return Err(EngineRpcError::Conflict(format!(
+                "[remote_access] target '{}' is not a loopback or private address on this appliance",
+                self.remote_access.config().target
+            )));
+        }
         crate::admin_runtime::persist_remote_access_enabled(&self.store, req.enabled)
             .await
             .map_err(|e| EngineRpcError::Internal(format!("persist remote_access_enabled: {e}")))?;
@@ -1603,6 +1612,40 @@ mod tests {
         let v: Value = serde_json::from_str(&err).unwrap();
         assert_eq!(v["status"], json!(409));
         assert_eq!(v["message"], json!(CLOUD_MAY_NOT_ENABLE));
+        assert!(!access.is_enabled());
+        assert_eq!(
+            crate::admin_runtime::read_persisted_remote_access_enabled(&handler.store).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_access_enable_is_conflict_for_a_public_target() {
+        let (mut handler, _unused, _dir) = remote_access_handler(true, false).await;
+        let access = Arc::new(crate::remote_shell::RemoteAccess::new(
+            nexus_config::RemoteAccessConfig {
+                target: "8.8.8.8:22".to_string(),
+                ..Default::default()
+            },
+            false,
+        ));
+        handler.remote_access = Arc::clone(&access);
+        let err = put_remote_access(
+            &handler,
+            "owner",
+            "/admin/remote_access",
+            br#"{"enabled":true}"#,
+        )
+        .await
+        .expect_err("a public target is never cloud-enabled");
+        let v: Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["status"], json!(409));
+        assert_eq!(
+            v["message"],
+            json!(
+                "[remote_access] target '8.8.8.8:22' is not a loopback or private address on this appliance"
+            )
+        );
         assert!(!access.is_enabled());
         assert_eq!(
             crate::admin_runtime::read_persisted_remote_access_enabled(&handler.store).await,
