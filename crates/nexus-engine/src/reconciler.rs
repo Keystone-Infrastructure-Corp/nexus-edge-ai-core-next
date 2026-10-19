@@ -75,6 +75,9 @@ pub type HandleMap = Arc<Mutex<HashMap<CameraId, RunningCameraEntry>>>;
 #[derive(Clone)]
 pub struct RunningCameraEntry {
     pub task: Arc<JoinHandle<()>>,
+    /// The supervisor's graceful stop ([`nexus_pipeline::CameraHandle::stop`]),
+    /// which [`stop_camera`] uses so an open clip is closed, not abandoned.
+    stop: Arc<tokio::sync::watch::Sender<bool>>,
     /// What the supervisor was started for, which each reconcile pass
     /// compares with what the camera's row asks for now.
     key: EntryKey,
@@ -541,7 +544,7 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
 
 /// One reconciliation pass. Compares `store.list_readable_cameras()` to the
 /// in-memory `handles` map and:
-///   * aborts the supervisor + removes the ingester for any camera
+///   * stops the supervisor + removes the ingester for any camera
 ///     that is missing from the DB, has `ingest.enabled = false`, or
 ///     whose row this build cannot read;
 ///   * spawns a fresh supervisor + ingester for any enabled camera
@@ -567,7 +570,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     //    cannot read: boot would not have started it either.
     for id in current.keys().copied().collect::<Vec<_>>() {
         if !live_enabled.contains(&id) {
-            stop_camera(args, id);
+            stop_camera(args, id).await;
             // Reap the LBR pump here and *only* here. A camera that is gone
             // or disabled has no frames to pump, so its encode task would
             // poll a cache entry that will never be refilled. The restart
@@ -599,7 +602,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             }
             Some(entry) => {
                 // A finished task here was not stopped by us: `stop_camera`
-                // removes the entry before it aborts the task.
+                // removes the entry before it stops the task.
                 if entry.task.is_finished() {
                     error!(
                         camera_id = cam_id,
@@ -639,7 +642,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         "camera reconciler: camera behavior changed; restarting supervisor"
                     );
                 }
-                stop_camera(args, cam_id);
+                stop_camera(args, cam_id).await;
             }
             None => {}
         }
@@ -649,13 +652,37 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
-    // Remove before abort: a finished task still in the map reads as a crash.
+/// How long [`stop_camera`] waits for a supervisor to stop on its own before
+/// aborting it. Stopping finishes the frame in flight and closes the open
+/// clip, well under a second normally; the bound is for a supervisor wedged
+/// in an await (a hung detector or recorder call), which would otherwise
+/// hold up every camera behind it in the pass.
+const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
+    // Remove before stopping: a finished task still in the map reads as a crash.
     let removed = args.handles.lock().remove(&cam_id);
     if let Some(entry) = removed {
-        entry.task.abort();
-        info!(camera_id = cam_id, "camera reconciler: aborted supervisor");
+        // Stop, not abort: an aborted supervisor never reaches the close of
+        // its open motion clip, which is abandoned (BUG-285). The receiver
+        // drops when `run_camera` returns, which is what `closed` awaits.
+        let _ = entry.stop.send(true);
+        if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, entry.stop.closed())
+            .await
+            .is_ok()
+        {
+            info!(camera_id = cam_id, "camera reconciler: stopped supervisor");
+        } else {
+            entry.task.abort();
+            warn!(
+                camera_id = cam_id,
+                timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
+                "camera reconciler: supervisor did not stop in time; aborted it, and any \
+                 clip it had open is abandoned"
+            );
+        }
     }
+    // Only now that the supervisor is done: its clip closes on this ingester.
     args.recorder.remove_camera_ingester(cam_id);
     // The substream session lives in a separate map and would otherwise
     // keep its RTSP connection and decode chain alive with no
@@ -1048,6 +1075,7 @@ pub(crate) fn spawn_supervisor(
     );
     RunningCameraEntry {
         task: Arc::new(handle.task),
+        stop: Arc::new(handle.stop),
         key: start.key,
         sessions: start.sessions,
     }
@@ -1704,6 +1732,149 @@ mod tests {
         abort_all(&args.handles);
     }
 
+    /// What [`ClipLogRecorder`] was asked to do, in the order it was asked.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ClipCall {
+        Open(i64),
+        Close(i64),
+        IngesterRemoved,
+    }
+
+    /// Accepts every clip and logs each open, close and ingester removal in
+    /// call order, so a test can see whether a restart finalized the clip
+    /// its old supervisor had open, and while the ingester recording it
+    /// still existed. Frames come from a `VirtualSource` that never ends.
+    #[derive(Default)]
+    struct ClipLogRecorder {
+        calls: Mutex<Vec<ClipCall>>,
+    }
+
+    impl ClipLogRecorder {
+        fn calls(&self) -> Vec<ClipCall> {
+            self.calls.lock().clone()
+        }
+
+        fn opens(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|c| matches!(c, ClipCall::Open(_)))
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClipRecorder for ClipLogRecorder {
+        async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
+            let clip_id = self.opens() as i64 + 1;
+            self.calls.lock().push(ClipCall::Open(clip_id));
+            Ok(ClipHandle {
+                clip_id,
+                camera_id: args.camera_id,
+            })
+        }
+        async fn close(
+            &self,
+            handle: ClipHandle,
+            _args: ClipFinal,
+        ) -> Result<ClipMeta, RecorderError> {
+            self.calls.lock().push(ClipCall::Close(handle.clip_id));
+            Ok(ClipMeta {
+                clip_id: handle.clip_id,
+                camera_id: handle.camera_id,
+                path: PathBuf::new(),
+                duration_ms: 0,
+                size_bytes: 0,
+                codec: "h264".into(),
+                container: "mp4".into(),
+                discarded: false,
+            })
+        }
+        fn set_panic(&self, _panic: bool) {}
+        fn is_panic(&self) -> bool {
+            false
+        }
+        fn kind(&self) -> &'static str {
+            "clip-log"
+        }
+        fn remove_camera_ingester(&self, _camera_id: CameraId) {
+            self.calls.lock().push(ClipCall::IngesterRemoved);
+        }
+        fn shared_frame_source(
+            &self,
+            camera_id: CameraId,
+        ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
+            Some(Box::new(nexus_pipeline::VirtualSource {
+                camera_id,
+                width: 512,
+                height: 288,
+                fps: 10,
+            }))
+        }
+    }
+
+    /// BUG-285 review — the restart a behavior edit triggers used to abort
+    /// the old supervisor mid-await. `run_camera` finalizes its open motion
+    /// clip only after its frame loop ends, which an abort skips, so every
+    /// restart with motion on screen abandoned a clip: opened, never closed,
+    /// its row left with no `ended_at` and its file never finalized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_behavior_edit_closes_the_open_clip_before_the_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        // The mock detector reports a person on every frame, so the motion
+        // tracker declares it `Born` and the supervisor opens a clip.
+        wait_until("precondition: the first supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        assert_eq!(
+            recorder.calls(),
+            [ClipCall::Open(1)],
+            "precondition: the first clip is still open when the edit lands"
+        );
+        let original = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+
+        let mut toggled = cam(None);
+        toggled.behavior.parking_lot_mode = true;
+        args.store
+            .upsert_camera(&toggled)
+            .await
+            .expect("toggle parking-lot mode");
+        reconcile(&args).await.expect("pass after the edit");
+
+        let replaced = args
+            .handles
+            .lock()
+            .get(&7)
+            .is_some_and(|now| !Arc::ptr_eq(&now.task, &original.task));
+        wait_until("the replacement supervisor opened a clip", || {
+            recorder.opens() == 2
+        })
+        .await;
+        abort_all(&args.handles);
+        assert!(replaced, "the behavior edit must replace the supervisor");
+        let calls = recorder.calls();
+        assert_eq!(
+            calls[..calls.len().min(4)],
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "the restart must close the old supervisor's open clip, while its ingester still \
+             exists, before the replacement opens one: an aborted supervisor abandons the clip"
+        );
+    }
+
     /// One named `CameraBehavior` edit, for the tables below.
     type BehaviorMutation = (&'static str, fn(&mut CameraBehavior));
 
@@ -1888,7 +2059,7 @@ mod tests {
         assert_supervision_survives(false).await;
     }
 
-    /// `stop_camera` aborts the supervisor and shuts the ingesters down, and
+    /// `stop_camera` stops the supervisor and shuts the ingesters down, and
     /// neither is synchronous: the tap can be mid-frame and a pipeline's
     /// probes keep firing until its detached NULL lands. Writes from either
     /// after the stop must not make a stopped camera read as running to the
@@ -1903,7 +2074,7 @@ mod tests {
         args.frame_stats.observe_frame(7, tap, now, 512, 288);
         args.decode_health.observe_decoder_output(7);
 
-        stop_camera(&args, 7);
+        stop_camera(&args, 7).await;
         args.frame_stats.observe_frame(7, tap, now, 512, 288);
         args.decode_health.observe_decoder_output(7);
 
