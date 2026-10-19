@@ -2002,7 +2002,11 @@ mod tests {
         let fku_total = fku_at_enc.load(Ordering::SeqCst);
         wait_for(before + 30);
         let forced = frames.lock()[before..].iter().filter(|k| **k).count();
-        let _ = pipeline.set_state(gst::State::Null);
+        crate::teardown::null_pipeline_detached(
+            pipeline.clone(),
+            "webrtc::tests::browser_pli_forces_exactly_one_encoder_keyframe",
+            None,
+        );
 
         let wrong = wrong_direction.load(Ordering::SeqCst);
         eprintln!(
