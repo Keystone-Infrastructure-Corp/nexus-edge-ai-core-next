@@ -1908,15 +1908,15 @@ mod tests {
         if gst::init().is_err() {
             return;
         }
-        if gst::ElementFactory::find("x264enc").is_none() {
-            // `gst-plugins-ugly` absent; covered where the webrtc feature builds.
-            eprintln!("x264enc not available: test not run");
-            return;
-        }
+        // A missing element is a failure, not a skip (CI installs plugins-ugly).
+        assert!(
+            gst::ElementFactory::find("x264enc").is_some(),
+            "x264enc (gst-plugins-ugly) is required for this test"
+        );
 
         let wrong_direction = Arc::new(AtomicUsize::new(0));
         let wd = wrong_direction.clone();
-        let _log = gst::glib::log_set_handler(
+        let log = gst::glib::log_set_handler(
             Some("GStreamer"),
             gst::glib::LogLevels::LEVEL_WARNING | gst::glib::LogLevels::LEVEL_CRITICAL,
             false,
@@ -1979,7 +1979,8 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        // What rtpsession builds for an inbound PLI.
+        // An inbound PLI as rtpsession sends it upstream: a force-key-unit with
+        // `all-headers=false` (the builder adds defaulted running-time/count).
         let pli = || {
             gstreamer_video::UpstreamForceKeyUnitEvent::builder()
                 .all_headers(false)
@@ -2008,6 +2009,8 @@ mod tests {
             None,
         );
 
+        // Uninstall before asserting so the handler can't count other tests' logs.
+        gst::glib::log_remove_handler(Some("GStreamer"), log);
         let wrong = wrong_direction.load(Ordering::SeqCst);
         eprintln!(
             "pli accepted={accepted} keyframes_within_30={forced} \
