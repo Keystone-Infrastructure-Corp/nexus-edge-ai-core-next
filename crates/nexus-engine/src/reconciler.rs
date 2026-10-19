@@ -27,10 +27,12 @@
 //! codec change, an `analysis_url` (SPEC-069) that was added, changed
 //! or removed, and a change to most — not all — of the camera's
 //! `behavior` block ([`changed_behavior_field`] names the three it
-//! deliberately ignores). Detector prompts and rules do not: a prompt edit
-//! is frozen in the supervisor's `cfg` snapshot the same way behavior was,
-//! and nothing in this process pushes it to a live task today, so it still
-//! needs a process restart.
+//! deliberately ignores). Rules are not a trigger either, because they
+//! hot-reload through the rule evaluator. Detector prompts and zones are not
+//! triggers and do not hot-reload: each is frozen in the supervisor's `cfg`
+//! snapshot the same way behavior was, and nothing in this process pushes
+//! them to a live task today, so an edit to either still needs a process
+//! restart.
 //!
 //! A registration the recorder refused, and a substream session the
 //! SPEC-069 fallback shut down, are not restart triggers: each pass
@@ -125,14 +127,23 @@ pub(crate) struct EntryKey {
 }
 
 /// Field by field rather than derived, because the behavior half compares
-/// only what [`changed_behavior_field`] says a restart can apply.
+/// only what [`changed_behavior_field`] says a restart can apply. `self` is
+/// destructured so a new field breaks the build here instead of being
+/// silently left out of the guard, which the derive used to prevent.
 impl PartialEq for EntryKey {
     fn eq(&self, other: &Self) -> bool {
-        self.url == other.url
-            && self.supervisor_dims == other.supervisor_dims
-            && self.codec == other.codec
-            && self.analysis_url == other.analysis_url
-            && changed_behavior_field(&self.behavior, &other.behavior).is_none()
+        let EntryKey {
+            url,
+            supervisor_dims,
+            codec,
+            analysis_url,
+            behavior,
+        } = self;
+        *url == other.url
+            && *supervisor_dims == other.supervisor_dims
+            && *codec == other.codec
+            && *analysis_url == other.analysis_url
+            && changed_behavior_field(behavior, &other.behavior).is_none()
     }
 }
 
@@ -199,15 +210,16 @@ impl EntryKey {
 /// * `detector_downscale_to_width` / `detector_downscale_to_height` — these
 ///   select a pre-built inference layer keyed on `(kind, width, height)`,
 ///   and `InferenceRouter` builds its layer set once at boot from the
-///   boot-time camera list. Restarting on an edit would look up a layer
-///   nobody built, get `None`, and leave the camera on its high-res
-///   detector — losing adaptive downscale that had been working, on top of
-///   the gap. Applying these needs a router rebuild, which is separate work.
+///   boot-time camera list. Restarting on an edit would usually look up a
+///   layer nobody built (unless another camera booted with that target),
+///   get `None`, and leave the camera on its high-res detector — losing
+///   adaptive downscale that had been working, on top of the gap. Applying
+///   these needs a router rebuild, which is separate work.
 ///
 ///   **This only avoids the gap when they are edited alone.** Edited
 ///   together with any compared field, the compared field triggers the
 ///   restart and the camera comes back on its high-res detector as above.
-///   `start_camera` emits a `warn!` for that state so it is diagnosable
+///   `spawn_supervisor` emits a `warn!` for that state so it is diagnosable
 ///   rather than silent.
 fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Option<&'static str> {
     let CameraBehavior {
@@ -978,18 +990,21 @@ pub(crate) fn spawn_supervisor(
     // edited since then has no layer and adaptive downscale is silently off
     // for this camera until the process restarts. Say so: this is reachable
     // whenever a downscale-target edit rides along with a field that does
-    // trigger a restart (see [`changed_behavior_field`]).
+    // trigger a restart (see [`changed_behavior_field`]). Both targets are
+    // required: with either unset there is no layer to look up at all.
     if detector_low_res.is_none()
         && cam.behavior.detector_downscale_crowded_threshold.is_some()
         && cam.behavior.detector_downscale_sustained_secs.is_some()
+        && cam.behavior.detector_downscale_to_width.is_some()
+        && cam.behavior.detector_downscale_to_height.is_some()
     {
         warn!(
             camera_id = cam.id,
             to_width = ?cam.behavior.detector_downscale_to_width,
             to_height = ?cam.behavior.detector_downscale_to_height,
             "camera reconciler: adaptive detector downscale is configured but no \
-             low-res layer exists for this target; camera stays on its high-res \
-             detector until the engine restarts"
+             low-res layer was built at boot for this target; camera stays on its \
+             high-res detector"
         );
     }
     // M_TILE_REINFER (G1) Phase B2.1 — effective per-camera `top_k`.
@@ -1644,6 +1659,13 @@ mod tests {
         let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
 
         reconcile(&args).await.expect("initial pass");
+        // Otherwise the restart could abort the first supervisor before it
+        // built its source, and the count below would never reach 2.
+        wait_until(
+            "precondition: the first supervisor built its source",
+            || recorder.sources_built(7) == 1,
+        )
+        .await;
         let original = args
             .handles
             .lock()
@@ -3106,7 +3128,9 @@ mod tests {
 
     /// Every field the no-change guard compares, for camera shapes no other
     /// test builds: an auto codec, a `supervisor_width` below and above the
-    /// detector input, and a `model_override`. Each camera is seeded by
+    /// detector input, a `model_override`, and behavior fields the guard
+    /// compares (BUG-285) — a boot seed that dropped them would restart that
+    /// camera on the first pass. Each camera is seeded by
     /// boot's [`EntryKey::at_boot`], then started by a pass through
     /// `start_camera`, and after each the next two passes must leave it
     /// alone. The entry must record the configured codec (`None`), never the
@@ -3133,6 +3157,10 @@ mod tests {
                     ..Default::default()
                 })
             }),
+            shaped(11, &|c| {
+                c.behavior.parking_lot_mode = true;
+                c.behavior.tile_trigger = Some(5);
+            }),
         ];
         // (id, configured codec, supervisor frame) each entry must record.
         let want = [
@@ -3140,12 +3168,14 @@ mod tests {
             (8, Some(CodecKind::H265), (512, 288)),
             (9, Some(CodecKind::H265), (1024, 576)),
             (10, Some(CodecKind::H265), (640, 360)),
+            (11, Some(CodecKind::H265), (512, 288)),
         ];
         let recorder = ScriptedRecorder::new(&[
             (7, SourceScript::NeverEnds),
             (8, SourceScript::NeverEnds),
             (9, SourceScript::NeverEnds),
             (10, SourceScript::NeverEnds),
+            (11, SourceScript::NeverEnds),
         ]);
         let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
 
