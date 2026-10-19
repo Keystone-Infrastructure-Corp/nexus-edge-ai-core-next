@@ -1849,9 +1849,21 @@ pub(crate) const KEY_REMOTE_ACCESS_ENABLED: &str = "remote_access_enabled";
 ///   that sticks even over `enabled = true` in `nexus.toml`;
 /// * persisted `true` → `enabled || cloud_may_enable`: a cloud "on" is
 ///   ignored once the box owner sets `cloud_may_enable = false`;
-/// * nothing persisted → `nexus.toml`'s `enabled`.
+/// * nothing persisted → `nexus.toml`'s `enabled`;
+///
+/// and in every case off when `target` is not local, because `admit`
+/// refuses every session to such a target — reporting "on" would be a lie.
 #[must_use]
-pub const fn effective_remote_access_enabled(
+pub fn effective_remote_access_enabled(
+    toml: &nexus_config::RemoteAccessConfig,
+    persisted: Option<bool>,
+) -> bool {
+    requested_remote_access_enabled(toml, persisted) && toml.target_is_local()
+}
+
+/// What `nexus.toml` and the persisted cloud choice ask for, before the
+/// target check.
+const fn requested_remote_access_enabled(
     toml: &nexus_config::RemoteAccessConfig,
     persisted: Option<bool>,
 ) -> bool {
@@ -1894,7 +1906,12 @@ pub async fn resolve_persisted_remote_access_enabled(
 ) -> bool {
     let persisted = read_persisted_remote_access_enabled(store).await;
     let effective = effective_remote_access_enabled(toml, persisted);
-    if persisted.is_some() && effective != toml.enabled {
+    if requested_remote_access_enabled(toml, persisted) && !effective {
+        tracing::warn!(
+            target = %toml.target,
+            "[remote_access] target is not a loopback or private address; remote access stays disabled",
+        );
+    } else if persisted.is_some() && effective != toml.enabled {
         tracing::warn!(
             persisted,
             toml_enabled = toml.enabled,
@@ -1955,6 +1972,16 @@ mod tests {
                 effective_remote_access_enabled(&cfg(enabled, may), persisted),
                 want,
                 "persisted={persisted:?} cloud_may_enable={may} enabled={enabled}",
+            );
+            // A non-local target is always off: `admit` would refuse every
+            // session, so the switch must never read as on.
+            let public = nexus_config::RemoteAccessConfig {
+                target: "8.8.8.8:22".to_string(),
+                ..cfg(enabled, may)
+            };
+            assert!(
+                !effective_remote_access_enabled(&public, persisted),
+                "non-local target: persisted={persisted:?} cloud_may_enable={may} enabled={enabled}",
             );
         }
     }

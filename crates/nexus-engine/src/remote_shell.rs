@@ -76,6 +76,17 @@ enum Stop {
     Operator,
     /// Engine shutting down or tunnel gone.
     Shutdown,
+    /// Remote access switched off on this core.
+    Disabled,
+}
+
+/// The wire `close_reason` for a session the engine cancelled itself.
+const fn cancelled_reason(stop: Option<Stop>) -> &'static str {
+    match stop {
+        Some(Stop::Shutdown) => reason::CORE_SHUTDOWN,
+        Some(Stop::Disabled) => reason::DISABLED_ON_CORE,
+        Some(Stop::Operator) | None => reason::OPERATOR_KILL,
+    }
 }
 
 /// The live `[remote_access]` switch — the ONE answer to "is remote access
@@ -90,6 +101,10 @@ pub struct RemoteAccess {
     cfg: RemoteAccessConfig,
     enabled: AtomicBool,
     attached: Mutex<Option<Attached>>,
+    /// Held across persist + [`Self::set_enabled`] by the cloud toggle so
+    /// two concurrent PUTs cannot leave the persisted and live values
+    /// disagreeing.
+    toggle: tokio::sync::Mutex<()>,
 }
 
 /// What the tunnel hands over once it has an enrollment.
@@ -133,7 +148,14 @@ impl RemoteAccess {
             cfg,
             enabled: AtomicBool::new(enabled),
             attached: Mutex::new(None),
+            toggle: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Serialise a toggle: hold the guard across persisting the choice and
+    /// applying it with [`Self::set_enabled`].
+    pub async fn lock_toggle(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.toggle.lock().await
     }
 
     /// Whether remote access is on right now.
@@ -182,7 +204,7 @@ impl RemoteAccess {
                 adopt_ssh_ca(ssh_ca);
             }
         } else if let Some(m) = manager {
-            m.close_all();
+            m.stop_all(Stop::Disabled);
         }
     }
 
@@ -314,20 +336,30 @@ impl RemoteShellManager {
         let session_id = payload.session_id.clone();
 
         if let Err((why, detail)) = self.admit(&payload, &session_id) {
-            warn!(
-                session_id = %session_id,
-                reason = why,
-                detail = %detail,
-                "remote shell session refused",
-            );
-            let this = Arc::clone(self);
-            let sid = session_id.clone();
-            tokio::spawn(async move {
-                this.report_closed(&sid, why, 0, 0, Some(detail)).await;
-            });
+            self.refuse(&session_id, why, detail);
             return;
         }
+        self.start(payload);
+    }
 
+    /// Log a refusal and report it to the cloud.
+    fn refuse(self: &Arc<Self>, session_id: &str, why: &'static str, detail: String) {
+        warn!(
+            session_id = %session_id,
+            reason = why,
+            detail = %detail,
+            "remote shell session refused",
+        );
+        let this = Arc::clone(self);
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            this.report_closed(&sid, why, 0, 0, Some(detail)).await;
+        });
+    }
+
+    /// Register an admitted session and run it on a detached task.
+    fn start(self: &Arc<Self>, payload: ShellSessionOpenPayload) {
+        let session_id = payload.session_id.clone();
         let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
         let stop_slot = Arc::new(Mutex::new(None));
         {
@@ -347,9 +379,17 @@ impl RemoteShellManager {
             );
         }
         // A live disable that landed between `admit` and the insert above
-        // ran its `close_all` before this session existed; catch it here.
+        // ran its close before this session existed; catch it here, before
+        // any principal is authorised or anything is dialled.
         if !self.is_enabled() {
-            self.stop_session(&session_id, Stop::Shutdown);
+            self.live.lock().remove(&session_id);
+            self.refuse(
+                &session_id,
+                reason::DISABLED_ON_CORE,
+                "remote access was disabled on this appliance while the session was opening"
+                    .to_string(),
+            );
+            return;
         }
         // Authorise this session's principal BEFORE announcing the session as
         // open. The recipient still has to paste an ssh command, so the
@@ -397,10 +437,22 @@ impl RemoteShellManager {
     /// away can no longer be revoked, so it does not get to keep
     /// running.
     pub fn close_all(&self) {
+        self.stop_all(Stop::Shutdown);
+    }
+
+    fn stop_all(&self, why: Stop) {
         let ids: Vec<String> = self.live.lock().keys().cloned().collect();
         for id in ids {
-            self.stop_session(&id, Stop::Shutdown);
+            self.stop_session(&id, why);
         }
+    }
+
+    /// The `close_reason` a cancelled test session would report.
+    #[cfg(test)]
+    pub(crate) fn test_stop_reason(&self, session_id: &str) -> Option<&'static str> {
+        let slot = Arc::clone(&self.live.lock().get(session_id)?.stop);
+        let stop = *slot.lock();
+        stop.map(|s| cancelled_reason(Some(s)))
     }
 
     /// Register a stand-in live session and hand back its cancel receiver,
@@ -526,10 +578,7 @@ impl RemoteShellManager {
             ShellStop::Expired => reason::EXPIRED,
             ShellStop::ByteLimit => reason::BYTE_LIMIT,
             ShellStop::LocalIoError => reason::SSHD_UNREACHABLE,
-            ShellStop::Cancelled => match *stop_slot.lock() {
-                Some(Stop::Shutdown) => reason::CORE_SHUTDOWN,
-                Some(Stop::Operator) | None => reason::OPERATOR_KILL,
-            },
+            ShellStop::Cancelled => cancelled_reason(*stop_slot.lock()),
         };
 
         Outcome {
@@ -723,6 +772,13 @@ pub(crate) mod tests {
 
     /// A manager over `access`, wired as the tunnel wires it.
     pub(crate) fn attached_manager(access: &Arc<RemoteAccess>) -> Arc<RemoteShellManager> {
+        manager_with_outbox(access, Arc::new(nexus_cloud_client::TunnelOutbox::new()))
+    }
+
+    fn manager_with_outbox(
+        access: &Arc<RemoteAccess>,
+        outbox: Arc<nexus_cloud_client::TunnelOutbox>,
+    ) -> Arc<RemoteShellManager> {
         let manager = Arc::new(RemoteShellManager::new(
             Arc::clone(access),
             nexus_cloud_client::tunnel::TunnelClient::new(
@@ -732,10 +788,26 @@ pub(crate) mod tests {
                 Vec::new(),
             ),
             None,
-            Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            outbox,
         ));
         access.attach(&manager, None);
         manager
+    }
+
+    /// Records every envelope the manager reports.
+    #[derive(Default)]
+    struct CapturingTunnel {
+        sent: parking_lot::Mutex<Vec<nexus_cloud_protocol::v1::Envelope>>,
+    }
+    #[async_trait::async_trait]
+    impl nexus_cloud_client::TunnelHandle for CapturingTunnel {
+        async fn send(
+            &self,
+            envelope: nexus_cloud_protocol::v1::Envelope,
+        ) -> Result<(), nexus_cloud_client::TunnelError> {
+            self.sent.lock().push(envelope);
+            Ok(())
+        }
     }
 
     /// The switch is live: the manager, the RPC toggle and the local API
@@ -775,6 +847,74 @@ pub(crate) mod tests {
             cancel.try_recv().is_ok(),
             "disabling must cancel the live session"
         );
+        assert_eq!(
+            manager.test_stop_reason("s-1"),
+            Some(super::reason::DISABLED_ON_CORE),
+            "a live disable reports disabled_on_core, not core_shutdown"
+        );
+    }
+
+    /// The tunnel going away is still a shutdown, not a disable.
+    #[tokio::test]
+    async fn remote_access_tunnel_close_all_reports_core_shutdown() {
+        let access = Arc::new(RemoteAccess::new(
+            nexus_config::RemoteAccessConfig::default(),
+            true,
+        ));
+        let manager = attached_manager(&access);
+        let mut cancel = manager.insert_test_session("s-1");
+
+        manager.close_all();
+        assert!(cancel.try_recv().is_ok());
+        assert_eq!(
+            manager.test_stop_reason("s-1"),
+            Some(super::reason::CORE_SHUTDOWN)
+        );
+    }
+
+    /// A disable that lands between `admit` and registration: the session
+    /// is dropped and reported as `disabled_on_core` before anything is
+    /// authorised or dialled.
+    #[tokio::test]
+    async fn remote_access_disabled_after_admit_stops_before_dialing() {
+        let access = Arc::new(RemoteAccess::new(
+            nexus_config::RemoteAccessConfig::default(),
+            false,
+        ));
+        let tunnel = Arc::new(CapturingTunnel::default());
+        let outbox = Arc::new(nexus_cloud_client::TunnelOutbox::new());
+        outbox.set_handle(Some(tunnel.clone()));
+        let manager = manager_with_outbox(&access, outbox);
+
+        manager.start(nexus_cloud_protocol::v1::ShellSessionOpenPayload {
+            actor_token: String::new(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            max_bytes: None,
+            session_id: "s-race".to_string(),
+            side_channel_url: "wss://cloud.invalid/shell/s-race".to_string(),
+        });
+
+        assert!(
+            manager.live.lock().is_empty(),
+            "session not left registered"
+        );
+        // Only the refusal report runs; give it a chance to land.
+        for _ in 0..100 {
+            if !tunnel.sent.lock().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let sent = tunnel.sent.lock();
+        assert_eq!(sent.len(), 1, "exactly one report, no session run");
+        match &sent[0].body {
+            nexus_cloud_protocol::v1::EnvelopeBody::ShellSessionClosed(p) => {
+                assert_eq!(p.session_id, "s-race");
+                assert_eq!(p.reason, super::reason::DISABLED_ON_CORE);
+                assert_eq!(p.bytes_up, Some(0));
+            }
+            other => panic!("unexpected envelope: {other:?}"),
+        }
     }
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 

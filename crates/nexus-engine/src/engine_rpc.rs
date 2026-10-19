@@ -271,6 +271,9 @@ impl EngineRpcHandler {
                 self.remote_access.config().target
             )));
         }
+        // Serialise persist + apply so two concurrent PUTs cannot leave the
+        // persisted and live values disagreeing.
+        let _toggle = self.remote_access.lock_toggle().await;
         crate::admin_runtime::persist_remote_access_enabled(&self.store, req.enabled)
             .await
             .map_err(|e| EngineRpcError::Internal(format!("persist remote_access_enabled: {e}")))?;
@@ -1672,8 +1675,37 @@ mod tests {
         assert!(!access.is_enabled());
         assert!(cancel.try_recv().is_ok(), "live session cancelled");
         assert_eq!(
+            manager.test_stop_reason("s-1"),
+            Some("disabled_on_core"),
+            "a cloud disable reports disabled_on_core"
+        );
+        assert_eq!(
             crate::admin_runtime::read_persisted_remote_access_enabled(&handler.store).await,
             Some(false)
         );
+    }
+
+    /// Two concurrent opposite toggles end with the persisted value and the
+    /// live switch agreeing, whichever wins. Spawned on a multi-thread
+    /// runtime so the two PUTs really interleave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remote_access_concurrent_toggles_leave_persisted_equal_to_live() {
+        let (handler, access, _dir) = remote_access_handler(true, false).await;
+        let handler = Arc::new(handler);
+        for _ in 0..2000 {
+            let put = |body: &'static [u8]| {
+                let h = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    put_remote_access(&h, "owner", "/admin/remote_access", body).await
+                })
+            };
+            let (a, b) = tokio::join!(put(br#"{"enabled":true}"#), put(br#"{"enabled":false}"#));
+            a.unwrap().expect("enable succeeds");
+            b.unwrap().expect("disable succeeds");
+            assert_eq!(
+                crate::admin_runtime::read_persisted_remote_access_enabled(&handler.store).await,
+                Some(access.is_enabled())
+            );
+        }
     }
 }

@@ -1641,6 +1641,10 @@ Notes worth knowing before you turn it on:
   alone no longer turns it off at the next boot (the persisted cloud "on"
   wins). The local kill switch is `enabled = false` **and**
   `cloud_may_enable = false`, then restart; it does not require us.
+- The reverse holds too: once the console has switched it off,
+  `enabled = true` here does not turn it back on (the persisted cloud
+  "off" wins). The route back is `cloud_may_enable = true`, restart, then
+  an org owner turns it on from the console.
 
 ### 8.4 Go-dark insurance
 

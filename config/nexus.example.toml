@@ -346,6 +346,9 @@ enabled = true
 # Once an org owner has switched it on, `enabled = false` alone no longer
 # turns it off at the next boot (the persisted cloud "on" wins). The local
 # kill switch is `enabled = false` AND `cloud_may_enable = false`, then restart.
+# The reverse holds too: once the console has switched it off, `enabled = true`
+# here does not turn it back on (the persisted cloud "off" wins). The route
+# back is `cloud_may_enable = true`, restart, then an org owner turns it on.
 #
 # `target` is deliberately NOT something the cloud can specify. The engine
 # only ever connects to the address configured here; it refuses to start
