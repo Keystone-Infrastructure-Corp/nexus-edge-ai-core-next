@@ -188,24 +188,35 @@ impl RemoteAccess {
     /// Apply a toggle live. The caller has already authorised it and
     /// enforced `cloud_may_enable`.
     ///
-    /// Off tears down every live session. On (re-)adopts the cloud's SSH
-    /// CA when the enrollment carries one — idempotent, fire-and-forget,
-    /// exactly what the tunnel does at boot for a box enabled in
-    /// `nexus.toml`, without which native sessions on a live-enabled box
-    /// would be refused by sshd.
-    pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::SeqCst);
+    /// Off tears down every live session. On acts only on the off→on
+    /// transition — an enable while already on is a no-op, because the
+    /// CA installer truncates the principal file and would revoke a
+    /// session still waiting to authenticate. On that transition the
+    /// cloud's SSH CA is adopted ([`RemoteShellManager::adopt_ssh_ca`])
+    /// BEFORE the switch is published: while it is still off no session
+    /// can be admitted, so the installer cannot wipe a live principal.
+    /// Adoption failure is logged and the switch is still turned on. With
+    /// no manager attached yet only the flag flips; [`Self::attach`]
+    /// adopts the CA then.
+    pub async fn set_enabled(&self, enabled: bool) {
         let (manager, ssh_ca) = match self.attached.lock().as_ref() {
             Some(a) => (a.manager.upgrade(), a.ssh_ca.clone()),
             None => (None, None),
         };
-        if enabled {
-            if manager.is_some() {
-                adopt_ssh_ca(ssh_ca);
+        if !enabled {
+            self.enabled.store(false, Ordering::SeqCst);
+            if let Some(m) = manager {
+                m.stop_all(Stop::Disabled);
             }
-        } else if let Some(m) = manager {
-            m.stop_all(Stop::Disabled);
+            return;
         }
+        if self.is_enabled() {
+            return;
+        }
+        if let Some(m) = manager {
+            m.adopt_ssh_ca(ssh_ca).await;
+        }
+        self.enabled.store(true, Ordering::SeqCst);
     }
 
     /// Called once by the tunnel after it builds the manager. Adopts the
@@ -216,34 +227,38 @@ impl RemoteAccess {
             ssh_ca: ssh_ca.clone(),
         });
         if self.is_enabled() {
-            adopt_ssh_ca(ssh_ca);
+            let m = Arc::clone(manager);
+            tokio::spawn(async move { m.adopt_ssh_ca(ssh_ca).await });
         }
     }
 }
 
-/// Adopt the cloud's SSH certificate authority. Idempotent, so it also
-/// repairs a drop-in an OS-level sshd reconfiguration removed.
-/// Deliberately fire-and-forget: a box with no sshd, or a failed
-/// adoption, must never delay or block the control tunnel or the RPC
-/// that switched remote access on — remote shell just stays unavailable
-/// and every later session open reports the failure to the console.
-fn adopt_ssh_ca(ssh_ca: Option<String>) {
-    let Some(ca) = ssh_ca else {
-        warn!(
-            "remote access is enabled but this enrollment carries no SSH CA; \
-             re-enroll against a cloud that has one provisioned"
-        );
-        return;
-    };
-    tokio::spawn(async move {
-        match crate::ssh_ca::install_ca(&ca).await {
-            Ok(()) => info!("remote access: SSH CA adopted"),
-            Err(e) => warn!(
-                reason = e.code(),
-                "remote access: SSH CA adoption failed; native sessions will be refused"
-            ),
-        }
-    });
+/// The two privileged operations that write sshd's principal file. A
+/// trait only so tests can observe their order; production is
+/// [`HostApplier`].
+#[async_trait::async_trait]
+trait SshApplier: Send + Sync {
+    async fn install_ca(&self, ca: &str) -> Result<(), crate::ssh_ca::SshCaError>;
+    async fn sync_principals(
+        &self,
+        live: std::collections::BTreeSet<String>,
+    ) -> Result<(), crate::ssh_ca::SshCaError>;
+}
+
+/// [`crate::ssh_ca`] through the root-owned applier.
+struct HostApplier;
+
+#[async_trait::async_trait]
+impl SshApplier for HostApplier {
+    async fn install_ca(&self, ca: &str) -> Result<(), crate::ssh_ca::SshCaError> {
+        crate::ssh_ca::install_ca(ca).await
+    }
+    async fn sync_principals(
+        &self,
+        live: std::collections::BTreeSet<String>,
+    ) -> Result<(), crate::ssh_ca::SshCaError> {
+        crate::ssh_ca::sync_principals(live).await
+    }
 }
 
 /// Owns every live remote-shell session on this engine.
@@ -253,6 +268,11 @@ pub struct RemoteShellManager {
     verifier: Option<Verifier>,
     outbox: Arc<TunnelOutbox>,
     live: Mutex<HashMap<String, LiveSession>>,
+    applier: Arc<dyn SshApplier>,
+    /// Held by every principal-file writer — CA install and principal
+    /// sync — so they never interleave and each sync snapshots `live`
+    /// at write time.
+    principals_writer: tokio::sync::Mutex<()>,
 }
 
 /// Cancellation handle plus the reason the cancel was requested. The
@@ -289,7 +309,16 @@ impl RemoteShellManager {
             verifier,
             outbox,
             live: Mutex::new(HashMap::new()),
+            applier: Arc::new(HostApplier),
+            principals_writer: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Swap the privileged applier for a test double.
+    #[cfg(test)]
+    fn with_applier(mut self, applier: Arc<dyn SshApplier>) -> Self {
+        self.applier = applier;
+        self
     }
 
     /// Whether remote access is on right now — a live read of the shared
@@ -316,16 +345,54 @@ impl RemoteShellManager {
     /// round trip, and a failure here is fail-*closed* for new logins in the
     /// open direction (no principal → no login) while an already-established
     /// TCP session is still killed by the pump's own cancellation path.
-    fn resync_principals(&self) {
-        let live: std::collections::BTreeSet<String> = self.live.lock().keys().cloned().collect();
+    ///
+    /// The write runs under `principals_writer` and snapshots the live set
+    /// only once it holds it, so whichever write lands last is the current
+    /// set — never a stale spawn-time snapshot, never undone by a CA install.
+    fn resync_principals(self: &Arc<Self>) {
+        let this = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(e) = crate::ssh_ca::sync_principals(live).await {
-                warn!(
-                    reason = e.code(),
-                    "remote access: could not sync session principals"
-                );
-            }
+            let _writer = this.principals_writer.lock().await;
+            this.write_principals().await;
         });
+    }
+
+    /// Write the current live set. Caller holds `principals_writer`.
+    async fn write_principals(&self) {
+        let live: std::collections::BTreeSet<String> = self.live.lock().keys().cloned().collect();
+        if let Err(e) = self.applier.sync_principals(live).await {
+            warn!(
+                reason = e.code(),
+                "remote access: could not sync session principals"
+            );
+        }
+    }
+
+    /// Adopt the cloud's SSH certificate authority. Idempotent, so it also
+    /// repairs a drop-in an OS-level sshd reconfiguration removed. The
+    /// installer truncates the principal file, so the install and an
+    /// authoritative re-write of the live set both run under
+    /// `principals_writer`: a session that opened meanwhile keeps its
+    /// principal. Failure is logged, never returned — a box with no sshd
+    /// must not block the tunnel or the toggle; remote shell just stays
+    /// unavailable and every later session open reports the failure.
+    async fn adopt_ssh_ca(&self, ssh_ca: Option<String>) {
+        let Some(ca) = ssh_ca else {
+            warn!(
+                "remote access is enabled but this enrollment carries no SSH CA; \
+                 re-enroll against a cloud that has one provisioned"
+            );
+            return;
+        };
+        let _writer = self.principals_writer.lock().await;
+        match self.applier.install_ca(&ca).await {
+            Ok(()) => info!("remote access: SSH CA adopted"),
+            Err(e) => warn!(
+                reason = e.code(),
+                "remote access: SSH CA adoption failed; native sessions will be refused"
+            ),
+        }
+        self.write_principals().await;
     }
 
     /// Handle an inbound `shell_session_open`.
@@ -768,6 +835,8 @@ fn remaining_until(expires_at: &str, now: DateTime<Utc>) -> Result<Option<Durati
 pub(crate) mod tests {
     use super::{remaining_until, side_channel_host};
     use super::{RemoteAccess, RemoteShellManager};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// A manager over `access`, wired as the tunnel wires it.
@@ -822,12 +891,12 @@ pub(crate) mod tests {
         let manager = attached_manager(&access);
         assert!(!manager.is_enabled());
 
-        access.set_enabled(true);
+        access.set_enabled(true).await;
         assert!(manager.is_enabled());
         assert!(access.state().enabled);
         assert!(access.state().cloud_may_enable);
 
-        access.set_enabled(false);
+        access.set_enabled(false).await;
         assert!(!manager.is_enabled());
     }
 
@@ -842,7 +911,7 @@ pub(crate) mod tests {
         let manager = attached_manager(&access);
         let mut cancel = manager.insert_test_session("s-1");
 
-        access.set_enabled(false);
+        access.set_enabled(false).await;
         assert!(
             cancel.try_recv().is_ok(),
             "disabling must cancel the live session"
@@ -915,6 +984,193 @@ pub(crate) mod tests {
             }
             other => panic!("unexpected envelope: {other:?}"),
         }
+    }
+
+    /// Stands in for the root-owned applier. Models sshd's principal file
+    /// — the CA installer truncates it, a sync replaces it — and records
+    /// whether the switch was already on while each install ran.
+    #[derive(Default)]
+    struct FakeApplier {
+        access: parking_lot::Mutex<Option<std::sync::Weak<RemoteAccess>>>,
+        installs: parking_lot::Mutex<Vec<bool>>,
+        file: parking_lot::Mutex<BTreeSet<String>>,
+        syncs: AtomicUsize,
+        /// When set, the next sync parks on this gate until released.
+        hold_next_sync: parking_lot::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        sync_parked: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::SshApplier for FakeApplier {
+        async fn install_ca(&self, _ca: &str) -> Result<(), crate::ssh_ca::SshCaError> {
+            let on = self
+                .access
+                .lock()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|a| a.is_enabled());
+            // A real install is a `sudo` round trip: let anything racing it run.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            self.installs.lock().push(on);
+            self.file.lock().clear();
+            Ok(())
+        }
+        async fn sync_principals(
+            &self,
+            live: BTreeSet<String>,
+        ) -> Result<(), crate::ssh_ca::SshCaError> {
+            let gate = self.hold_next_sync.lock().take();
+            if let Some(gate) = gate {
+                self.sync_parked.store(true, Ordering::SeqCst);
+                drop(gate.acquire().await);
+            }
+            *self.file.lock() = live;
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A manager over `access` whose privileged ops go to a [`FakeApplier`],
+    /// attached with an SSH CA as the tunnel attaches it.
+    fn manager_with_fake(
+        access: &Arc<RemoteAccess>,
+    ) -> (Arc<RemoteShellManager>, Arc<FakeApplier>) {
+        let fake = Arc::new(FakeApplier::default());
+        *fake.access.lock() = Some(Arc::downgrade(access));
+        let manager = Arc::new(
+            RemoteShellManager::new(
+                Arc::clone(access),
+                nexus_cloud_client::tunnel::TunnelClient::new(
+                    "wss://cloud.invalid/v1/tunnel",
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                None,
+                Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            )
+            .with_applier(fake.clone()),
+        );
+        access.attach(&manager, Some("ssh-ed25519 AAAAfake nexus-ca".to_string()));
+        (manager, fake)
+    }
+
+    /// Let every spawned task run to completion (or to a parked gate).
+    async fn settle() {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn set(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// An enable while already on is a no-op: the CA installer truncates
+    /// the principal file, so re-running it would revoke a session that is
+    /// waiting to authenticate.
+    #[tokio::test]
+    async fn remote_access_repeated_enable_does_not_reinstall_the_ca() {
+        let access = Arc::new(RemoteAccess::new(
+            nexus_config::RemoteAccessConfig::default(),
+            false,
+        ));
+        let (_manager, fake) = manager_with_fake(&access);
+
+        access.set_enabled(true).await;
+        settle().await;
+        assert_eq!(fake.installs.lock().len(), 1, "off→on adopts the CA");
+
+        access.set_enabled(true).await;
+        settle().await;
+        assert_eq!(
+            fake.installs.lock().len(),
+            1,
+            "on→on must not run the installer again"
+        );
+    }
+
+    /// The off→on transition installs the CA while the switch is still
+    /// off, so no session can be admitted underneath the truncate.
+    #[tokio::test]
+    async fn remote_access_enable_installs_the_ca_before_switching_on() {
+        let access = Arc::new(RemoteAccess::new(
+            nexus_config::RemoteAccessConfig::default(),
+            false,
+        ));
+        let (_manager, fake) = manager_with_fake(&access);
+
+        access.set_enabled(true).await;
+        settle().await;
+        assert_eq!(
+            *fake.installs.lock(),
+            vec![false],
+            "the installer ran while remote access was still off"
+        );
+        assert!(access.is_enabled());
+    }
+
+    /// A session opened the moment the enable returns keeps its principal:
+    /// the install has finished, so the session's sync is the last write.
+    #[tokio::test]
+    async fn remote_access_session_opened_right_after_enable_keeps_its_principal() {
+        let access = Arc::new(RemoteAccess::new(
+            nexus_config::RemoteAccessConfig::default(),
+            false,
+        ));
+        let (manager, fake) = manager_with_fake(&access);
+
+        access.set_enabled(true).await;
+        // What `start` does once `admit` passes.
+        let _cancel = manager.insert_test_session("s-1");
+        manager.resync_principals();
+        settle().await;
+
+        assert_eq!(fake.installs.lock().len(), 1);
+        assert_eq!(*fake.file.lock(), set(&["s-1"]));
+    }
+
+    /// Two syncs racing: the second waits for the first and snapshots the
+    /// live set when it writes, so the last write is the current set even
+    /// when the first write is slow.
+    #[tokio::test]
+    async fn remote_access_principal_syncs_write_the_set_current_at_write_time() {
+        let access = Arc::new(RemoteAccess::new(
+            nexus_config::RemoteAccessConfig::default(),
+            false,
+        ));
+        let (manager, fake) = manager_with_fake(&access);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fake.hold_next_sync.lock() = Some(Arc::clone(&gate));
+
+        let _s1 = manager.insert_test_session("s-1");
+        manager.resync_principals();
+        for _ in 0..200 {
+            if fake.sync_parked.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fake.sync_parked.load(Ordering::SeqCst),
+            "first sync is in flight"
+        );
+
+        let _s2 = manager.insert_test_session("s-2");
+        manager.live.lock().remove("s-1");
+        manager.resync_principals();
+        settle().await;
+        gate.add_permits(1);
+        settle().await;
+
+        assert_eq!(fake.syncs.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *fake.file.lock(),
+            set(&["s-2"]),
+            "last write is the live set"
+        );
     }
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 

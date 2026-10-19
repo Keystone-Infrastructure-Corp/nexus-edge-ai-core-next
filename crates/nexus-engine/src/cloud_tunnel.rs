@@ -615,7 +615,7 @@ async fn run(
     ));
     // Hand the manager and the enrollment's SSH CA to the shared switch.
     // When remote access is already on this adopts the CA now (idempotent,
-    // fire-and-forget — see `remote_shell::adopt_ssh_ca`); a later live
+    // fire-and-forget — see `RemoteShellManager::adopt_ssh_ca`); a later live
     // enable from the cloud adopts it then. A core with remote access off
     // never installs `TrustedUserCAKeys`.
     remote_access.attach(&remote_shell, enrollment.ssh_ca_public_key.clone());

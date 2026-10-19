@@ -277,7 +277,7 @@ impl EngineRpcHandler {
         crate::admin_runtime::persist_remote_access_enabled(&self.store, req.enabled)
             .await
             .map_err(|e| EngineRpcError::Internal(format!("persist remote_access_enabled: {e}")))?;
-        self.remote_access.set_enabled(req.enabled);
+        self.remote_access.set_enabled(req.enabled).await;
         info!(
             enabled = req.enabled,
             actor_sub = %actor.sub,

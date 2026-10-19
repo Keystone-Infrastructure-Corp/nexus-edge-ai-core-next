@@ -5837,7 +5837,7 @@ mod tests {
             get(app.clone()).await,
             serde_json::json!({ "enabled": false, "cloud_may_enable": false })
         );
-        access.set_enabled(true);
+        access.set_enabled(true).await;
         assert_eq!(get(app.clone()).await["enabled"], serde_json::json!(true));
 
         let mut put = Request::builder()
