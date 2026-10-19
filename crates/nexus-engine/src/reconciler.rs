@@ -91,8 +91,9 @@ impl RunningCameraEntry {
     /// Whether the supervisor finished without having been asked to stop: its
     /// frame source returned, or it panicked. [`stop_camera`] keeps an entry
     /// in the map while it stops the task, so a finished task alone no longer
-    /// separates that from a crash. The stop request is set before the task
-    /// can end because of it, so the two cannot be misread.
+    /// separates that from a crash. A crash that coincides with the stop
+    /// request reads as a stop, which is harmless: `stop_camera` removes the
+    /// entry and the camera restarts at once.
     pub(crate) fn exited_on_its_own(&self) -> bool {
         self.task.is_finished() && !*self.stop.borrow()
     }
@@ -2006,7 +2007,10 @@ mod tests {
     /// recorder down. `stop_camera` used to take the entry out of the map
     /// first, so the supervisor it was stopping, a frame paused in
     /// `recorder.open` here, was in nobody's sweep: it kept running past the
-    /// recorder's shutdown and could open a clip nothing would finalize.
+    /// recorder's shutdown and could open a clip nothing would finalize. The
+    /// steps below replay `main.rs`'s shutdown order — abort the reconciler,
+    /// drain and abort the handle map, shut the recorder down — and do not
+    /// join the reconciler, the stricter case; keep them in step with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_shutdown_during_a_behavior_restart_aborts_the_stopping_supervisor() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2060,8 +2064,9 @@ mod tests {
         )
         .await;
         recorder.release();
-        // Nothing observable follows a supervisor that is already gone, so
-        // this is a bounded wait for a late `open` that must not happen.
+        // Guards against a second supervisor the sweep missed: once the
+        // stopped one is gone, only an escapee could still complete an
+        // `open`, so this is a bounded wait for one that must not happen.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         abort_all(&args.handles);
 
