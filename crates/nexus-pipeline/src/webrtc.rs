@@ -1015,29 +1015,33 @@ const FORCED_KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Forward browser keyframe requests (RTCP PLI/FIR) to the encoder. `webrtcbin`
 /// translates an inbound PLI/FIR into an upstream `GstForceKeyUnit` custom
-/// event; we intercept it on the payloader's src pad and re-issue a
-/// force-key-unit directly to the encoder's sink pad so `vah264enc` emits a
-/// fresh IDR immediately. Without this, a viewer that loses reference frames
-/// (e.g. after a relay hiccup) has to wait up to the scheduled GOP
-/// (`key-int-max`, ~4s) for the next keyframe — and if the gap outlasts the GOP
-/// it stays black forever. Only meaningful on the transcode path (the `enc`/`pay` elements
+/// event, which travels upstream through the payloader, the egress queue and
+/// `h264parse` to the encoder's src pad, so `vah264enc` emits a fresh IDR on
+/// its next frame. Without this, a viewer that loses reference frames (e.g.
+/// after a relay hiccup) has to wait up to the scheduled GOP (`key-int-max`,
+/// ~4s) for the next keyframe — and if the gap outlasts the GOP it stays black
+/// forever. Only meaningful on the transcode path (the `enc`/`pay` elements
 /// exist); passthrough has no encoder to retarget.
+///
+/// The event is let through as-is, never re-issued: the original already
+/// reaches the encoder, so a second copy would only double the request. (A
+/// re-issue via `send_event` on the encoder's *sink* pad was refused by
+/// GStreamer as an upstream event sent the wrong way — BUG-285.)
 ///
 /// Forced IDRs are debounced to [`FORCED_KEYFRAME_MIN_INTERVAL`]: within the
 /// cooldown the redundant upstream FKU is dropped (`PadProbeReturn::Drop`) so
 /// the encoder is not driven into a keyframe storm that outruns the congestion
 /// budget and blacks the stream out.
 fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
-    let Some(enc) = pipeline.by_name("enc") else {
+    if pipeline.by_name("enc").is_none() {
         return;
-    };
+    }
     let Some(pay) = pipeline.by_name("pay") else {
         return;
     };
     let Some(pay_src) = pay.static_pad("src") else {
         return;
     };
-    let enc_weak = enc.downgrade();
     let last_forced: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
     let _ = pay_src.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_pad, info| {
         let Some(gst::PadProbeData::Event(ev)) = &info.data else {
@@ -1060,15 +1064,7 @@ fn wire_keyframe_on_pli(pipeline: &gst::Pipeline, camera_id: CameraId) {
             }
             *last = Some(now);
         }
-        if let Some(enc) = enc_weak.upgrade() {
-            if let Some(sink) = enc.static_pad("sink") {
-                let s = gst::Structure::builder("GstForceKeyUnit")
-                    .field("all-headers", true)
-                    .build();
-                let _ = sink.send_event(gst::event::CustomUpstream::new(s));
-                debug!(camera_id, "webrtc: PLI/FIR -> forced encoder keyframe");
-            }
-        }
+        debug!(camera_id, "webrtc: PLI/FIR -> forced encoder keyframe");
         gst::PadProbeReturn::Ok
     });
 }
@@ -1891,5 +1887,141 @@ mod tests {
         assert_eq!(turn_url_for("turn:host:3478", Some("u"), None), None);
         // Non-TURN scheme.
         assert_eq!(turn_url_for("stun:host:3478", Some("u"), Some("p")), None);
+    }
+
+    /// One browser PLI must reach the encoder as exactly one force-key-unit
+    /// and produce an IDR, and a second PLI inside the cooldown must not reach
+    /// it at all. The hook used to re-issue the request with `send_event` on
+    /// the encoder's *sink* pad, which GStreamer refuses for an upstream event
+    /// ("sending custom-upstream event in wrong direction", logged 110 times in
+    /// one production journal) — BUG-285.
+    ///
+    /// Same element chain as [`transcode_pipeline_desc`] around the hook, with
+    /// `x264enc` standing in for the VA encoder and a `fakesink` for
+    /// `webrtcbin`; the PLI is injected where `webrtcbin` injects it, on the
+    /// payloader's downstream peer. `key-int-max` is far beyond the test's
+    /// horizon, so any IDR after the first one was forced.
+    #[test]
+    fn browser_pli_forces_exactly_one_encoder_keyframe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        if gst::init().is_err() {
+            return;
+        }
+        if gst::ElementFactory::find("x264enc").is_none() {
+            // `gst-plugins-ugly` absent; covered where the webrtc feature builds.
+            eprintln!("x264enc not available: test not run");
+            return;
+        }
+
+        let wrong_direction = Arc::new(AtomicUsize::new(0));
+        let wd = wrong_direction.clone();
+        let _log = gst::glib::log_set_handler(
+            Some("GStreamer"),
+            gst::glib::LogLevels::LEVEL_WARNING | gst::glib::LogLevels::LEVEL_CRITICAL,
+            false,
+            false,
+            move |_, _, msg| {
+                eprintln!("glib: {msg}");
+                if msg.contains("wrong direction") {
+                    wd.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        );
+
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc is-live=true \
+               ! video/x-raw,width=320,height=240,framerate=30/1 \
+               ! x264enc name=enc key-int-max=100000 tune=zerolatency speed-preset=ultrafast \
+               ! h264parse config-interval=1 \
+               ! {EGRESS_QUEUE} \
+               ! rtph264pay name=pay pt=96 config-interval=1 mtu=1200 \
+               ! fakesink name=sink sync=false"
+        ))
+        .expect("test pipeline parses")
+        .downcast::<gst::Pipeline>()
+        .expect("launch yields a pipeline");
+        wire_keyframe_on_pli(&pipeline, 285);
+
+        let enc_src = pipeline
+            .by_name("enc")
+            .and_then(|e| e.static_pad("src"))
+            .expect("enc src pad");
+        // Every force-key-unit the encoder is handed, by either route.
+        let fku_at_enc = Arc::new(AtomicUsize::new(0));
+        let f = fku_at_enc.clone();
+        enc_src.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(ev)) = &info.data {
+                if ev
+                    .structure()
+                    .is_some_and(|s| s.name() == "GstForceKeyUnit")
+                {
+                    f.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        // Encoded frames, and whether each was a keyframe.
+        let frames = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
+        let fr = frames.clone();
+        enc_src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(buf)) = &info.data {
+                fr.lock()
+                    .push(!buf.flags().contains(gst::BufferFlags::DELTA_UNIT));
+            }
+            gst::PadProbeReturn::Ok
+        });
+
+        let wait_for = |n: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while frames.lock().len() < n {
+                assert!(std::time::Instant::now() < deadline, "encoder stalled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // What rtpsession builds for an inbound PLI.
+        let pli = || {
+            gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+                .all_headers(false)
+                .build()
+        };
+        let sink_pad = pipeline
+            .by_name("sink")
+            .and_then(|e| e.static_pad("sink"))
+            .expect("sink pad");
+
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        wait_for(10);
+        let before = frames.lock().len();
+        // The upstream push is synchronous: when it returns, the event has
+        // reached (or been dropped before) the encoder.
+        let accepted = sink_pad.push_event(pli());
+        let fku_first = fku_at_enc.load(Ordering::SeqCst);
+        // A PLI storm: the next request lands well inside the cooldown.
+        sink_pad.push_event(pli());
+        let fku_total = fku_at_enc.load(Ordering::SeqCst);
+        wait_for(before + 30);
+        let forced = frames.lock()[before..].iter().filter(|k| **k).count();
+        let _ = pipeline.set_state(gst::State::Null);
+
+        let wrong = wrong_direction.load(Ordering::SeqCst);
+        eprintln!(
+            "pli accepted={accepted} keyframes_within_30={forced} \
+             fku_at_enc after first pli={fku_first} after second pli={fku_total} \
+             wrong_direction_warnings={wrong}"
+        );
+        assert_eq!(
+            forced, 1,
+            "a PLI storm must yield exactly one IDR within 30 frames"
+        );
+        assert_eq!(wrong, 0, "force-key-unit sent the wrong way on a pad");
+        assert_eq!(
+            fku_first, 1,
+            "one PLI must hand the encoder exactly one FKU"
+        );
+        assert_eq!(
+            fku_total, 1,
+            "a PLI inside the cooldown must not reach the encoder"
+        );
     }
 }
