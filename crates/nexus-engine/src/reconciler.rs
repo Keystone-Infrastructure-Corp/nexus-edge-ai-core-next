@@ -656,8 +656,15 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
 /// aborting it. Stopping finishes the frame in flight and closes the open
 /// clip, well under a second normally; the bound is for a supervisor wedged
 /// in an await (a hung detector or recorder call), which would otherwise
-/// hold up every camera behind it in the pass.
-const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// hold up every camera behind it in the pass. Stops run one after another
+/// in a pass, so normal closes are serialized too.
+///
+/// It sits well above the recorder's own worst-case close — up to 2 s for
+/// the live pump plus `EOS_DRAIN_TIMEOUT` (5 s) for the drain — because an
+/// abort that lands *inside* that close is worse than none: the clip has
+/// already left the recorder's open map, so neither its finalization nor the
+/// recorder-wide shutdown drain will ever reach it.
+const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     // Remove before stopping: a finished task still in the map reads as a crash.
@@ -1687,8 +1694,8 @@ mod tests {
         let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
 
         reconcile(&args).await.expect("initial pass");
-        // Otherwise the restart could abort the first supervisor before it
-        // built its source, and the count below would never reach 2.
+        // Pin the first supervisor's source before the edit, so the count
+        // below is exactly one source per supervisor.
         wait_until(
             "precondition: the first supervisor built its source",
             || recorder.sources_built(7) == 1,

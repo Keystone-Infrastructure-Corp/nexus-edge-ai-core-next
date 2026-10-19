@@ -1,8 +1,9 @@
 //! BUG-223 — a camera's frame source must end with its supervisor.
 //!
 //! A supervisor can still end by `task.abort()`: `stop_camera` falls back to
-//! it when a graceful stop times out, and process shutdown aborts every one. The source runs in a task of its own, and a bare
-//! `JoinHandle` detaches on drop, so whether the source then ends depended on
+//! it when a graceful stop times out, and process shutdown aborts every one.
+//! The source runs in a task of its own, and a bare `JoinHandle` detaches on
+//! drop, so whether the source then ends depended on
 //! the source noticing its receiver had gone. `VirtualSource` never looks,
 //! and a `SharedRtspSource` reading the main stream (no substream health tick
 //! to wake it) parks on an ingester that a stopped camera has shut down: it
