@@ -87,6 +87,17 @@ pub struct RunningCameraEntry {
     sessions: Sessions,
 }
 
+impl RunningCameraEntry {
+    /// Whether the supervisor finished without having been asked to stop: its
+    /// frame source returned, or it panicked. [`stop_camera`] keeps an entry
+    /// in the map while it stops the task, so a finished task alone no longer
+    /// separates that from a crash. The stop request is set before the task
+    /// can end because of it, so the two cannot be misread.
+    pub(crate) fn exited_on_its_own(&self) -> bool {
+        self.task.is_finished() && !*self.stop.borrow()
+    }
+}
+
 /// What [`reconcile`]'s no-change guard compares for a camera: the config
 /// its supervisor was started for, and nothing the recorder answered. Its
 /// fields are private to this module, and every side derives them in
@@ -602,7 +613,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             }
             Some(entry) => {
                 // A finished task here was not stopped by us: `stop_camera`
-                // removes the entry before it stops the task.
+                // runs in this task, so no pass sees an entry mid-stop.
                 if entry.task.is_finished() {
                     error!(
                         camera_id = cam_id,
@@ -667,20 +678,31 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
 const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
-    // Remove before stopping: a finished task still in the map reads as a crash.
-    let removed = args.handles.lock().remove(&cam_id);
-    if let Some(entry) = removed {
+    // The entry stays in the map until the supervisor has ended. Shutdown
+    // (`main.rs`) aborts the reconciler without joining it, then aborts every
+    // supervisor it finds in the map before the recorder's shutdown snapshot.
+    // An entry removed up front would leave a supervisor that is still mid-stop
+    // (a frame paused in `recorder.open`, say) out of that sweep, free to open
+    // a clip after the snapshot that nothing would finalize. The price is that
+    // a finished task in the map no longer always means a crash:
+    // [`RunningCameraEntry::exited_on_its_own`] tells the two apart.
+    let stopping = args
+        .handles
+        .lock()
+        .get(&cam_id)
+        .map(|entry| (entry.stop.clone(), entry.task.clone()));
+    if let Some((stop, task)) = stopping {
         // Stop, not abort: an aborted supervisor never reaches the close of
         // its open motion clip, which is abandoned (BUG-285). The receiver
         // drops when `run_camera` returns, which is what `closed` awaits.
-        let _ = entry.stop.send(true);
-        if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, entry.stop.closed())
+        let _ = stop.send(true);
+        if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
             .await
             .is_ok()
         {
             info!(camera_id = cam_id, "camera reconciler: stopped supervisor");
         } else {
-            entry.task.abort();
+            task.abort();
             warn!(
                 camera_id = cam_id,
                 timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
@@ -688,6 +710,7 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
                  clip it had open is abandoned"
             );
         }
+        args.handles.lock().remove(&cam_id);
     }
     // Only now that the supervisor is done: its clip closes on this ingester.
     args.recorder.remove_camera_ingester(cam_id);
@@ -1879,6 +1902,181 @@ mod tests {
             ],
             "the restart must close the old supervisor's open clip, while its ingester still \
              exists, before the replacement opens one: an aborted supervisor abandons the clip"
+        );
+    }
+
+    /// What [`GatedOpenRecorder`] saw, in the order it saw it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GateCall {
+        /// A supervisor called `open` and is waiting on the gate.
+        OpenBlocked,
+        /// An `open` got through the gate and returned.
+        OpenCompleted,
+        /// The test's stand-in for `main`'s `recorder.shutdown()`.
+        RecorderShutdown,
+    }
+
+    /// Holds every `open` at a gate the test releases, and logs when one
+    /// completes, so a test can park a supervisor mid-frame the way a slow
+    /// `recorder.open` does and see whether it outlives the recorder's
+    /// shutdown. Frames come from a `VirtualSource` that never ends.
+    struct GatedOpenRecorder {
+        calls: Mutex<Vec<GateCall>>,
+        /// No permits until [`Self::release`]: an `open` waits for one.
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl GatedOpenRecorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn calls(&self) -> Vec<GateCall> {
+            self.calls.lock().clone()
+        }
+
+        /// Lets every `open`, this one and later ones, through.
+        fn release(&self) {
+            self.gate.add_permits(1 << 16);
+        }
+
+        fn shutdown(&self) {
+            self.calls.lock().push(GateCall::RecorderShutdown);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClipRecorder for GatedOpenRecorder {
+        async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
+            self.calls.lock().push(GateCall::OpenBlocked);
+            self.gate
+                .acquire()
+                .await
+                .expect("gate is never closed")
+                .forget();
+            self.calls.lock().push(GateCall::OpenCompleted);
+            Ok(ClipHandle {
+                clip_id: 1,
+                camera_id: args.camera_id,
+            })
+        }
+        async fn close(
+            &self,
+            handle: ClipHandle,
+            _args: ClipFinal,
+        ) -> Result<ClipMeta, RecorderError> {
+            Ok(ClipMeta {
+                clip_id: handle.clip_id,
+                camera_id: handle.camera_id,
+                path: PathBuf::new(),
+                duration_ms: 0,
+                size_bytes: 0,
+                codec: "h264".into(),
+                container: "mp4".into(),
+                discarded: false,
+            })
+        }
+        fn set_panic(&self, _panic: bool) {}
+        fn is_panic(&self) -> bool {
+            false
+        }
+        fn kind(&self) -> &'static str {
+            "gated-open"
+        }
+        fn remove_camera_ingester(&self, _camera_id: CameraId) {}
+        fn shared_frame_source(
+            &self,
+            camera_id: CameraId,
+        ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
+            Some(Box::new(nexus_pipeline::VirtualSource {
+                camera_id,
+                width: 512,
+                height: 288,
+                fps: 10,
+            }))
+        }
+    }
+
+    /// BUG-285 review — a shutdown that lands while `stop_camera` waits for a
+    /// supervisor to stop. `main` aborts the reconciler without joining it,
+    /// aborts the supervisors it finds in the handle map, then shuts the
+    /// recorder down. `stop_camera` used to take the entry out of the map
+    /// first, so the supervisor it was stopping, a frame paused in
+    /// `recorder.open` here, was in nobody's sweep: it kept running past the
+    /// recorder's shutdown and could open a clip nothing would finalize.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_during_a_behavior_restart_aborts_the_stopping_supervisor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = GatedOpenRecorder::new();
+        let args = Arc::new(reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await);
+
+        reconcile(&args).await.expect("initial pass");
+        // The mock detector reports a person on every frame, so the first
+        // frame to reach the supervisor's loop calls `open`, which waits.
+        wait_until(
+            "precondition: the supervisor is blocked inside recorder.open",
+            || recorder.calls() == [GateCall::OpenBlocked],
+        )
+        .await;
+        let original = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+
+        let mut toggled = cam(None);
+        toggled.behavior.parking_lot_mode = true;
+        args.store
+            .upsert_camera(&toggled)
+            .await
+            .expect("toggle parking-lot mode");
+        let reconciling = tokio::spawn({
+            let args = args.clone();
+            async move { reconcile(&args).await }
+        });
+        // The supervisor cannot honour the stop while it waits on the gate,
+        // so the reconciler stays inside `stop_camera` from here on.
+        wait_until("the reconciler asked the supervisor to stop", || {
+            *original.stop.borrow()
+        })
+        .await;
+
+        // `main`'s shutdown, in its order: the reconciler is aborted and not
+        // awaited, every supervisor still in the map is aborted, and only
+        // then does the recorder shut down.
+        reconciling.abort();
+        for (_, entry) in args.handles.lock().drain() {
+            entry.task.abort();
+        }
+        recorder.shutdown();
+
+        wait_until(
+            "shutdown never aborted the supervisor that stop_camera was stopping",
+            || original.task.is_finished(),
+        )
+        .await;
+        recorder.release();
+        // Nothing observable follows a supervisor that is already gone, so
+        // this is a bounded wait for a late `open` that must not happen.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        abort_all(&args.handles);
+
+        let calls = recorder.calls();
+        let after_shutdown = &calls[calls
+            .iter()
+            .position(|c| *c == GateCall::RecorderShutdown)
+            .expect("the shutdown marker was logged")..];
+        assert!(
+            !after_shutdown.contains(&GateCall::OpenCompleted),
+            "a clip was opened after the recorder shut down: {calls:?}"
+        );
+        assert!(
+            original.task.is_finished(),
+            "the supervisor outlived shutdown"
         );
     }
 
@@ -3458,6 +3656,53 @@ mod tests {
             after_restart, None,
             "a restarted supervisor is not reported"
         );
+    }
+
+    /// `stop_camera` keeps an entry in the map while it stops the task, so a
+    /// finished task in the map is no longer proof of a crash. A supervisor
+    /// the reconciler asked to stop, found finished before its entry is
+    /// removed, must not be reported as "exited without being stopped".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_that_finished_after_a_stop_request_is_not_on_the_health_roll_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let health = crate::cloud_tunnel::EngineHealth::new(&args);
+        let stopped = |h: nexus_cloud_protocol::v1::EdgeHealth| {
+            h.issues
+                .into_iter()
+                .flatten()
+                .find(|i| i.code == "camera_pipeline_stopped")
+        };
+
+        reconcile(&args).await.expect("first pass");
+        let entry = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+        assert!(!entry.exited_on_its_own(), "a running supervisor");
+
+        // What `stop_camera` does first; the entry stays in the map after.
+        let _ = entry.stop.send(true);
+        wait_until("the stopped supervisor should end", || {
+            entry.task.is_finished()
+        })
+        .await;
+        assert!(
+            supervisor_ended(&args.handles, 7),
+            "precondition: the finished supervisor is still in the map"
+        );
+        let issue = stopped(health.rollup().await);
+        let on_its_own = entry.exited_on_its_own();
+        abort_all(&args.handles);
+
+        assert_eq!(
+            issue, None,
+            "a stop the reconciler asked for is not a crash"
+        );
+        assert!(!on_its_own, "it finished because it was asked to");
     }
 
     /// The roll-up built from these args reads their live-view manager, the
