@@ -227,6 +227,12 @@ impl Default for SightingSchedulerConfig {
 pub struct CameraHandle {
     pub camera_id: CameraId,
     pub task: JoinHandle<()>,
+    /// Send `true` to stop the supervisor gracefully: it finishes the frame
+    /// it is on, closes its open motion clip and returns. Aborting `task`
+    /// instead skips that close and abandons the clip. `closed()` resolves
+    /// once the supervisor has returned, since its receiver drops with it.
+    /// Dropping this sender requests nothing.
+    pub stop: watch::Sender<bool>,
 }
 
 /// Aborts its task on drop, so a task the supervisor spawns ends with it —
@@ -300,6 +306,7 @@ pub fn spawn_camera(
     alert_clip_gate: Arc<dyn AlertClipScheduleGate>,
 ) -> CameraHandle {
     let camera_id = cfg.id;
+    let (stop, stop_rx) = watch::channel(false);
     let task = tokio::spawn(run_camera(
         cfg,
         detector,
@@ -325,8 +332,33 @@ pub fn spawn_camera(
         effective_top_k,
         sink_router,
         alert_clip_gate,
+        stop_rx,
     ));
-    CameraHandle { camera_id, task }
+    CameraHandle {
+        camera_id,
+        task,
+        stop,
+    }
+}
+
+/// Wait for the analysis loop's next frame. `false` ends the loop: the
+/// source is gone, or [`CameraHandle::stop`] asked the supervisor to stop.
+/// A stop wins over a frame that is ready at the same time, and a dropped
+/// stop sender never ends the loop.
+async fn next_frame_or_stop(
+    latest: &mut watch::Receiver<Option<Frame>>,
+    stop: &mut watch::Receiver<bool>,
+) -> bool {
+    let stop_requested = async {
+        if stop.wait_for(|requested| *requested).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        biased;
+        () = stop_requested => false,
+        changed = latest.changed() => changed.is_ok(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -355,6 +387,7 @@ async fn run_camera(
     effective_top_k: Option<usize>,
     sink_router: Arc<dyn SinkRouter>,
     alert_clip_gate: Arc<dyn AlertClipScheduleGate>,
+    mut stop: watch::Receiver<bool>,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -587,7 +620,7 @@ async fn run_camera(
         // new RGB dims.
         let mut rebuild_source = false;
 
-        while latest_rx.changed().await.is_ok() {
+        while next_frame_or_stop(&mut latest_rx, &mut stop).await {
             let frame = match latest_rx.borrow_and_update().clone() {
                 Some(f) => f,
                 None => continue,
@@ -1491,10 +1524,11 @@ async fn run_camera(
         // case the recorder has already swapped its pre-roll
         // ingester; we abort the now-stale source task, drain it,
         // and continue the outer loop to spawn a fresh source that
-        // will subscribe to the new shared RGB tap.
+        // will subscribe to the new shared RGB tap. A requested stop
+        // never rebuilds: it falls through to the final close below.
         source_task.0.abort();
         let _ = (&mut source_task.0).await;
-        if !rebuild_source {
+        if !rebuild_source || *stop.borrow() {
             break 'outer;
         }
         }

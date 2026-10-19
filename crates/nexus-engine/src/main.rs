@@ -2213,12 +2213,18 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     })
     .await;
     reconciler_handle.abort();
+    // `abort` only requests cancellation: a reconciler mid-poll on another
+    // worker could still insert a supervisor it just spawned after the drain
+    // below, and that one would never be aborted (BUG-285). Joining waits
+    // only for that poll to return — the reconciler parks at awaits — so
+    // nothing re-populates the map once it is drained.
+    let _ = reconciler_handle.await;
     roster_handle.abort();
     state_hashes_handle.abort();
     model_catalog_handle.abort();
     // Abort every per-camera supervisor. `drain()` empties the map
-    // under one lock acquisition; the reconciler is already aborted
-    // above so nothing will re-populate it.
+    // under one lock acquisition; the reconciler has ended above, so
+    // nothing will re-populate it.
     for (_, entry) in running.lock().drain() {
         entry.task.abort();
     }

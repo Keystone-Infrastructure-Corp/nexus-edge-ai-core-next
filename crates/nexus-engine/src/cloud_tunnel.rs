@@ -2153,16 +2153,18 @@ impl EngineHealth {
     }
 
     /// Cameras whose supervisor task has finished while the reconciler
-    /// still holds it. `stop_camera` removes an entry before it aborts the
-    /// task, and shutdown drains the map before aborting, so a finished task
-    /// still in the map ended on its own: its frame source returned (the
-    /// `PIPELINE_STATUS` `Stopped` nothing subscribes to) or it panicked.
+    /// still holds it. `stop_camera` keeps an entry in the map while it stops
+    /// the task, so a finished task alone is not enough: one the reconciler
+    /// asked to stop is on its way out, not a crash. Shutdown drains the map
+    /// before aborting. What remains ended on its own
+    /// ([`crate::reconciler::RunningCameraEntry::exited_on_its_own`]): its frame source returned
+    /// (the `PIPELINE_STATUS` `Stopped` nothing subscribes to) or it panicked.
     fn exited_supervisors(&self) -> Vec<nexus_types::CameraId> {
         let mut exited: Vec<_> = self
             .supervisors
             .lock()
             .iter()
-            .filter(|(_, entry)| entry.task.is_finished())
+            .filter(|(_, entry)| entry.exited_on_its_own())
             .map(|(&camera_id, _)| camera_id)
             .collect();
         exited.sort_unstable();

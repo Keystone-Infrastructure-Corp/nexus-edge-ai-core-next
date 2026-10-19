@@ -242,8 +242,8 @@ impl FrameStatsRegistry {
     /// Claim the camera for a new source session; the returned epoch is what
     /// that session's [`Self::observe_frame`] calls must carry.
     ///
-    /// `stop_camera` aborts the supervisor and then clears, and abort is
-    /// asynchronous, so the stopped session's tap can still be mid-frame.
+    /// `stop_camera` ends the supervisor and then clears, and the tap task it
+    /// leaves behind is aborted asynchronously, so it can still be mid-frame.
     /// Its write loses on the epoch rather than on timing, instead of
     /// bringing a stopped camera back as a running one.
     pub fn begin_session(&self, camera_id: CameraId) -> u64 {
@@ -1044,8 +1044,9 @@ mod tests {
         assert!(reg.snapshot(1).is_none());
     }
 
-    /// `stop_camera` aborts the supervisor and then clears, and abort is
-    /// asynchronous: the tap can still be mid-frame when the clear lands.
+    /// `stop_camera` ends the supervisor and then clears, and the tap task it
+    /// leaves behind is aborted asynchronously: it can still be mid-frame when
+    /// the clear lands.
     /// Its write must not bring the stopped camera back: the heartbeat's
     /// `online_cameras` and the roster's `online` would count it online for
     /// [`CAMERA_OFFLINE_AFTER_MS`], and `/stats` and the diagnostics bundle

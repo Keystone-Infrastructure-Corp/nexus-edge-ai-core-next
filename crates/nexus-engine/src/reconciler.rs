@@ -24,11 +24,15 @@
 //! Restart triggers today: a supervisor that exited without being
 //! stopped (nothing announces that, hence the periodic pass), ingest
 //! URL change, supervisor (analysis) frame dimension change, ingest
-//! codec change, and an `analysis_url` (SPEC-069) that was added, changed
-//! or removed. Detector / threshold / rule changes do not — those still
-//! require a process restart (or a future, finer-grained hot-reload
-//! path). This matches the UX where the admin UI surfaces camera ingest
-//! edits as the primary live operation.
+//! codec change, an `analysis_url` (SPEC-069) that was added, changed
+//! or removed, and a change to most — not all — of the camera's
+//! `behavior` block ([`changed_behavior_field`] names the three it
+//! deliberately ignores). Rules are not a trigger either, because they
+//! hot-reload through the rule evaluator. Detector prompts and zones are not
+//! triggers and do not hot-reload: each is frozen in the supervisor's `cfg`
+//! snapshot the same way behavior was, and nothing in this process pushes
+//! them to a live task today, so an edit to either still needs a process
+//! restart.
 //!
 //! A registration the recorder refused, and a substream session the
 //! SPEC-069 fallback shut down, are not restart triggers: each pass
@@ -41,7 +45,9 @@ use std::sync::Arc;
 use futures::StreamExt;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::TrackerConfig;
-use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
+use nexus_config::{
+    AnnotatorConfig, CameraBehavior, CameraConfig, ClipsConfig, StaticObjectConfig,
+};
 use nexus_inference::InferenceRouter;
 use nexus_pipeline::{
     spawn_camera, ClipRecorder, DecodeHealthRegistry, FrameStatsRegistry, LatestFrameCache,
@@ -69,6 +75,9 @@ pub type HandleMap = Arc<Mutex<HashMap<CameraId, RunningCameraEntry>>>;
 #[derive(Clone)]
 pub struct RunningCameraEntry {
     pub task: Arc<JoinHandle<()>>,
+    /// The supervisor's graceful stop ([`nexus_pipeline::CameraHandle::stop`]),
+    /// which [`stop_camera`] uses so an open clip is closed, not abandoned.
+    stop: Arc<tokio::sync::watch::Sender<bool>>,
     /// What the supervisor was started for, which each reconcile pass
     /// compares with what the camera's row asks for now.
     key: EntryKey,
@@ -78,12 +87,24 @@ pub struct RunningCameraEntry {
     sessions: Sessions,
 }
 
+impl RunningCameraEntry {
+    /// Whether the supervisor finished without having been asked to stop: its
+    /// frame source returned, or it panicked. [`stop_camera`] keeps an entry
+    /// in the map while it stops the task, so a finished task alone no longer
+    /// separates that from a crash. A crash that coincides with the stop
+    /// request reads as a stop, which is harmless: `stop_camera` removes the
+    /// entry and the camera restarts at once.
+    pub(crate) fn exited_on_its_own(&self) -> bool {
+        self.task.is_finished() && !*self.stop.borrow()
+    }
+}
+
 /// What [`reconcile`]'s no-change guard compares for a camera: the config
 /// its supervisor was started for, and nothing the recorder answered. Its
 /// fields are private to this module, and every side derives them in
 /// [`EntryKey::wanted`], so a boot entry, a started entry and the guard's
 /// expectation cannot disagree.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct EntryKey {
     /// Current ingest URL. Compared on each reconcile pass to
     /// decide whether a respawn is needed.
@@ -111,6 +132,34 @@ pub(crate) struct EntryKey {
     /// registration recorded here would restart the camera, main recording
     /// ingester included, on every pass (BUG-224).
     analysis_url: Option<String>,
+    /// The camera's `behavior` block. Most of it is consumed once inside
+    /// `run_camera` — the static-object filter, the detector-skip policy,
+    /// the crowd-hysteresis pair, the tile grid — and then frozen in that
+    /// task's `cfg` snapshot, so a restart is the only way to apply an edit
+    /// (BUG-285). Which fields that covers is decided in
+    /// [`changed_behavior_field`], not here.
+    behavior: CameraBehavior,
+}
+
+/// Field by field rather than derived, because the behavior half compares
+/// only what [`changed_behavior_field`] says a restart can apply. `self` is
+/// destructured so a new field breaks the build here instead of being
+/// silently left out of the guard, which the derive used to prevent.
+impl PartialEq for EntryKey {
+    fn eq(&self, other: &Self) -> bool {
+        let EntryKey {
+            url,
+            supervisor_dims,
+            codec,
+            analysis_url,
+            behavior,
+        } = self;
+        *url == other.url
+            && *supervisor_dims == other.supervisor_dims
+            && *codec == other.codec
+            && *analysis_url == other.analysis_url
+            && changed_behavior_field(behavior, &other.behavior).is_none()
+    }
 }
 
 impl EntryKey {
@@ -121,6 +170,7 @@ impl EntryKey {
             supervisor_dims: supervisor_dims_for(cam, args.default_detector_width),
             codec: cam.ingest.codec,
             analysis_url: cam.ingest.analysis_url.as_ref().map(ToString::to_string),
+            behavior: cam.behavior.clone(),
         }
     }
 
@@ -148,6 +198,100 @@ impl EntryKey {
                 analysis: None,
             }),
         }
+    }
+}
+
+/// The name of the first `behavior` field that differs from the block a
+/// running supervisor was started with in a way only a restart can apply,
+/// or `None` when the running supervisor is still correct. Returning the
+/// name rather than a bool is what lets the restart log say *which* field
+/// moved.
+///
+/// `want` is destructured exhaustively on purpose. Adding a field to
+/// [`CameraBehavior`] breaks this build and forces a decision about it:
+/// tracking these one at a time by hand is what let a `parking_lot_mode`
+/// toggle sit dead until the next process restart (BUG-285). A `..`
+/// rest-pattern here would reintroduce the bug on the next field added.
+///
+/// Three fields are deliberately excluded, because restarting does not
+/// apply them and the video gap would buy nothing:
+///
+/// * `supervisor_width` — feeds `supervisor_dims`, which [`EntryKey`]
+///   already compares. It resolves through [`supervisor_dims_for`], so an
+///   edit that does not move the resolved frame is genuinely a no-op.
+///   **This exclusion is only sound while `supervisor_dims_for` reads
+///   `supervisor_width`.** If it ever stops, move the field into the
+///   compared chain in the same commit.
+/// * `detector_downscale_to_width` / `detector_downscale_to_height` — these
+///   select a pre-built inference layer keyed on `(kind, width, height)`,
+///   and `InferenceRouter` builds its layer set once at boot from the
+///   boot-time camera list. Restarting on an edit would usually look up a
+///   layer nobody built (unless another camera booted with that target),
+///   get `None`, and leave the camera on its high-res detector — losing
+///   adaptive downscale that had been working, on top of the gap. Applying
+///   these needs a router rebuild, which is separate work.
+///
+///   **This only avoids the gap when they are edited alone.** Edited
+///   together with any compared field, the compared field triggers the
+///   restart and the camera comes back on its high-res detector as above.
+///   `spawn_supervisor` emits a `warn!` for that state so it is diagnosable
+///   rather than silent.
+fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Option<&'static str> {
+    let CameraBehavior {
+        parking_lot_mode,
+        anchor_ttl_secs,
+        detector_skip_crowded_threshold,
+        detector_skip_every_n_frames,
+        detector_downscale_crowded_threshold,
+        detector_downscale_sustained_secs,
+        supervisor_downscale_crowded_threshold,
+        supervisor_downscale_sustained_secs,
+        supervisor_upscale_clear_secs,
+        supervisor_downscale_to_width,
+        tile_enabled,
+        tile_trigger,
+        tile_max_per_frame,
+        tile_grid,
+        // Excluded — see the doc comment above. Named, not `..`, so a new
+        // field cannot join them by accident.
+        supervisor_width: _,
+        detector_downscale_to_width: _,
+        detector_downscale_to_height: _,
+    } = want;
+
+    if *parking_lot_mode != started.parking_lot_mode {
+        Some("parking_lot_mode")
+    } else if *anchor_ttl_secs != started.anchor_ttl_secs {
+        Some("anchor_ttl_secs")
+    } else if *detector_skip_crowded_threshold != started.detector_skip_crowded_threshold {
+        Some("detector_skip_crowded_threshold")
+    } else if *detector_skip_every_n_frames != started.detector_skip_every_n_frames {
+        Some("detector_skip_every_n_frames")
+    } else if *detector_downscale_crowded_threshold != started.detector_downscale_crowded_threshold
+    {
+        Some("detector_downscale_crowded_threshold")
+    } else if *detector_downscale_sustained_secs != started.detector_downscale_sustained_secs {
+        Some("detector_downscale_sustained_secs")
+    } else if *supervisor_downscale_crowded_threshold
+        != started.supervisor_downscale_crowded_threshold
+    {
+        Some("supervisor_downscale_crowded_threshold")
+    } else if *supervisor_downscale_sustained_secs != started.supervisor_downscale_sustained_secs {
+        Some("supervisor_downscale_sustained_secs")
+    } else if *supervisor_upscale_clear_secs != started.supervisor_upscale_clear_secs {
+        Some("supervisor_upscale_clear_secs")
+    } else if *supervisor_downscale_to_width != started.supervisor_downscale_to_width {
+        Some("supervisor_downscale_to_width")
+    } else if *tile_enabled != started.tile_enabled {
+        Some("tile_enabled")
+    } else if *tile_trigger != started.tile_trigger {
+        Some("tile_trigger")
+    } else if *tile_max_per_frame != started.tile_max_per_frame {
+        Some("tile_max_per_frame")
+    } else if *tile_grid != started.tile_grid {
+        Some("tile_grid")
+    } else {
+        None
     }
 }
 
@@ -412,7 +556,7 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
 
 /// One reconciliation pass. Compares `store.list_readable_cameras()` to the
 /// in-memory `handles` map and:
-///   * aborts the supervisor + removes the ingester for any camera
+///   * stops the supervisor + removes the ingester for any camera
 ///     that is missing from the DB, has `ingest.enabled = false`, or
 ///     whose row this build cannot read;
 ///   * spawns a fresh supervisor + ingester for any enabled camera
@@ -438,7 +582,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     //    cannot read: boot would not have started it either.
     for id in current.keys().copied().collect::<Vec<_>>() {
         if !live_enabled.contains(&id) {
-            stop_camera(args, id);
+            stop_camera(args, id).await;
             // Reap the LBR pump here and *only* here. A camera that is gone
             // or disabled has no frames to pump, so its encode task would
             // poll a cache entry that will never be refilled. The restart
@@ -457,7 +601,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         let cam_id = cam.id;
         let want = EntryKey::wanted(args, &cam);
         match current.get(&cam_id) {
-            // `==` compares url, dims, codec, then analysis_url.
+            // `==` compares url, dims, codec, analysis_url, then behavior.
             Some(entry) if entry.key == want && !entry.task.is_finished() => {
                 // No change — supervisor still alive, URL still the
                 // same, supervisor dims still match, ingest codec
@@ -470,7 +614,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             }
             Some(entry) => {
                 // A finished task here was not stopped by us: `stop_camera`
-                // removes the entry before it aborts the task.
+                // runs in this task, so no pass sees an entry mid-stop.
                 if entry.task.is_finished() {
                     error!(
                         camera_id = cam_id,
@@ -497,13 +641,20 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         new_codec = ?want.codec,
                         "camera reconciler: ingest codec changed; restarting supervisor"
                     );
-                } else {
+                } else if entry.key.analysis_url != want.analysis_url {
                     info!(
                         camera_id = cam_id,
                         "camera reconciler: analysis stream changed; restarting supervisor"
                     );
+                } else {
+                    info!(
+                        camera_id = cam_id,
+                        field = changed_behavior_field(&entry.key.behavior, &want.behavior)
+                            .unwrap_or("unknown"),
+                        "camera reconciler: camera behavior changed; restarting supervisor"
+                    );
                 }
-                stop_camera(args, cam_id);
+                stop_camera(args, cam_id).await;
             }
             None => {}
         }
@@ -513,13 +664,56 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
-    // Remove before abort: a finished task still in the map reads as a crash.
-    let removed = args.handles.lock().remove(&cam_id);
-    if let Some(entry) = removed {
-        entry.task.abort();
-        info!(camera_id = cam_id, "camera reconciler: aborted supervisor");
+/// How long [`stop_camera`] waits for a supervisor to stop on its own before
+/// aborting it. Stopping finishes the frame in flight and closes the open
+/// clip, well under a second normally; the bound is for a supervisor wedged
+/// in an await (a hung detector or recorder call), which would otherwise
+/// hold up every camera behind it in the pass. Stops run one after another
+/// in a pass, so normal closes are serialized too.
+///
+/// It sits well above the recorder's own worst-case close — up to 2 s for
+/// the live pump plus `EOS_DRAIN_TIMEOUT` (5 s) for the drain — because an
+/// abort that lands *inside* that close is worse than none: the clip has
+/// already left the recorder's open map, so neither its finalization nor the
+/// recorder-wide shutdown drain will ever reach it.
+const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
+    // The entry stays in the map until the supervisor has ended. Shutdown
+    // (`main.rs`) aborts the reconciler without joining it, then aborts every
+    // supervisor it finds in the map before the recorder's shutdown snapshot.
+    // An entry removed up front would leave a supervisor that is still mid-stop
+    // (a frame paused in `recorder.open`, say) out of that sweep, free to open
+    // a clip after the snapshot that nothing would finalize. The price is that
+    // a finished task in the map no longer always means a crash:
+    // [`RunningCameraEntry::exited_on_its_own`] tells the two apart.
+    let stopping = args
+        .handles
+        .lock()
+        .get(&cam_id)
+        .map(|entry| (entry.stop.clone(), entry.task.clone()));
+    if let Some((stop, task)) = stopping {
+        // Stop, not abort: an aborted supervisor never reaches the close of
+        // its open motion clip, which is abandoned (BUG-285). The receiver
+        // drops when `run_camera` returns, which is what `closed` awaits.
+        let _ = stop.send(true);
+        if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
+            .await
+            .is_ok()
+        {
+            info!(camera_id = cam_id, "camera reconciler: stopped supervisor");
+        } else {
+            task.abort();
+            warn!(
+                camera_id = cam_id,
+                timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
+                "camera reconciler: supervisor did not stop in time; aborted it, and any \
+                 clip it had open is abandoned"
+            );
+        }
+        args.handles.lock().remove(&cam_id);
     }
+    // Only now that the supervisor is done: its clip closes on this ingester.
     args.recorder.remove_camera_ingester(cam_id);
     // The substream session lives in a separate map and would otherwise
     // keep its RTSP connection and decode chain alive with no
@@ -850,6 +1044,27 @@ pub(crate) fn spawn_supervisor(
     let (sup_w, sup_h) = start.key.supervisor_dims;
     let detector = args.router.detector_for_camera(&cam);
     let detector_low_res = args.router.detector_for_camera_low_res(&cam);
+    // The router builds its layer set once at boot, so a downscale target
+    // edited since then has no layer and adaptive downscale is silently off
+    // for this camera until the process restarts. Say so: this is reachable
+    // whenever a downscale-target edit rides along with a field that does
+    // trigger a restart (see [`changed_behavior_field`]). Both targets are
+    // required: with either unset there is no layer to look up at all.
+    if detector_low_res.is_none()
+        && cam.behavior.detector_downscale_crowded_threshold.is_some()
+        && cam.behavior.detector_downscale_sustained_secs.is_some()
+        && cam.behavior.detector_downscale_to_width.is_some()
+        && cam.behavior.detector_downscale_to_height.is_some()
+    {
+        warn!(
+            camera_id = cam.id,
+            to_width = ?cam.behavior.detector_downscale_to_width,
+            to_height = ?cam.behavior.detector_downscale_to_height,
+            "camera reconciler: adaptive detector downscale is configured but no \
+             low-res layer was built at boot for this target; camera stays on its \
+             high-res detector"
+        );
+    }
     // M_TILE_REINFER (G1) Phase B2.1 — effective per-camera `top_k`.
     // Per-camera `model_override.top_k` wins over the global
     // `inference.model.top_k`; both being `None` means no post-merge
@@ -891,6 +1106,7 @@ pub(crate) fn spawn_supervisor(
     );
     RunningCameraEntry {
         task: Arc::new(handle.task),
+        stop: Arc::new(handle.stop),
         key: start.key,
         sessions: start.sessions,
     }
@@ -901,6 +1117,7 @@ mod tests {
     use super::*;
     use nexus_config::{
         CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown, RecorderKind,
+        TileGridConfig,
     };
     use nexus_pipeline::{ClipFinal, ClipHandle, ClipMeta, OpenClip, RecorderError};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1489,6 +1706,493 @@ mod tests {
         );
     }
 
+    /// BUG-285 — `behavior.parking_lot_mode` is read once in `run_camera` to
+    /// build the static-object filter and then frozen in that task's `cfg`
+    /// snapshot. A guard that does not notice the flip leaves the old
+    /// supervisor running, nothing re-enters `run_camera`, and the operator's
+    /// toggle does nothing until the engine restarts — with no log line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parking_lot_mode_toggle_restarts_the_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        // Pin the first supervisor's source before the edit, so the count
+        // below is exactly one source per supervisor.
+        wait_until(
+            "precondition: the first supervisor built its source",
+            || recorder.sources_built(7) == 1,
+        )
+        .await;
+        let original = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+
+        let mut toggled = cam(None);
+        toggled.behavior.parking_lot_mode = true;
+        args.store
+            .upsert_camera(&toggled)
+            .await
+            .expect("toggle parking-lot mode");
+        reconcile(&args).await.expect("pass after the edit");
+
+        let now = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 running");
+        if Arc::ptr_eq(&now.task, &original.task) {
+            abort_all(&args.handles);
+            panic!(
+                "flipping parking_lot_mode left the supervisor that was spawned with it off: \
+                 the static-object filter is built once at spawn, so parking-lot mode stays \
+                 off until the engine restarts"
+            );
+        }
+        // The supervisor builds its frame source inside its own task.
+        wait_until(
+            "the restarted supervisor never built a fresh frame source",
+            || recorder.sources_built(7) == 2,
+        )
+        .await;
+        abort_all(&args.handles);
+    }
+
+    /// What [`ClipLogRecorder`] was asked to do, in the order it was asked.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ClipCall {
+        Open(i64),
+        Close(i64),
+        IngesterRemoved,
+    }
+
+    /// Accepts every clip and logs each open, close and ingester removal in
+    /// call order, so a test can see whether a restart finalized the clip
+    /// its old supervisor had open, and while the ingester recording it
+    /// still existed. Frames come from a `VirtualSource` that never ends.
+    #[derive(Default)]
+    struct ClipLogRecorder {
+        calls: Mutex<Vec<ClipCall>>,
+    }
+
+    impl ClipLogRecorder {
+        fn calls(&self) -> Vec<ClipCall> {
+            self.calls.lock().clone()
+        }
+
+        fn opens(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|c| matches!(c, ClipCall::Open(_)))
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClipRecorder for ClipLogRecorder {
+        async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
+            let clip_id = self.opens() as i64 + 1;
+            self.calls.lock().push(ClipCall::Open(clip_id));
+            Ok(ClipHandle {
+                clip_id,
+                camera_id: args.camera_id,
+            })
+        }
+        async fn close(
+            &self,
+            handle: ClipHandle,
+            _args: ClipFinal,
+        ) -> Result<ClipMeta, RecorderError> {
+            self.calls.lock().push(ClipCall::Close(handle.clip_id));
+            Ok(ClipMeta {
+                clip_id: handle.clip_id,
+                camera_id: handle.camera_id,
+                path: PathBuf::new(),
+                duration_ms: 0,
+                size_bytes: 0,
+                codec: "h264".into(),
+                container: "mp4".into(),
+                discarded: false,
+            })
+        }
+        fn set_panic(&self, _panic: bool) {}
+        fn is_panic(&self) -> bool {
+            false
+        }
+        fn kind(&self) -> &'static str {
+            "clip-log"
+        }
+        fn remove_camera_ingester(&self, _camera_id: CameraId) {
+            self.calls.lock().push(ClipCall::IngesterRemoved);
+        }
+        fn shared_frame_source(
+            &self,
+            camera_id: CameraId,
+        ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
+            Some(Box::new(nexus_pipeline::VirtualSource {
+                camera_id,
+                width: 512,
+                height: 288,
+                fps: 10,
+            }))
+        }
+    }
+
+    /// BUG-285 review — the restart a behavior edit triggers used to abort
+    /// the old supervisor mid-await. `run_camera` finalizes its open motion
+    /// clip only after its frame loop ends, which an abort skips, so every
+    /// restart with motion on screen abandoned a clip: opened, never closed,
+    /// its row left with no `ended_at` and its file never finalized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_behavior_edit_closes_the_open_clip_before_the_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        // The mock detector reports a person on every frame, so the motion
+        // tracker declares it `Born` and the supervisor opens a clip.
+        wait_until("precondition: the first supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        assert_eq!(
+            recorder.calls(),
+            [ClipCall::Open(1)],
+            "precondition: the first clip is still open when the edit lands"
+        );
+        let original = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+
+        let mut toggled = cam(None);
+        toggled.behavior.parking_lot_mode = true;
+        args.store
+            .upsert_camera(&toggled)
+            .await
+            .expect("toggle parking-lot mode");
+        reconcile(&args).await.expect("pass after the edit");
+
+        let replaced = args
+            .handles
+            .lock()
+            .get(&7)
+            .is_some_and(|now| !Arc::ptr_eq(&now.task, &original.task));
+        wait_until("the replacement supervisor opened a clip", || {
+            recorder.opens() == 2
+        })
+        .await;
+        abort_all(&args.handles);
+        assert!(replaced, "the behavior edit must replace the supervisor");
+        let calls = recorder.calls();
+        assert_eq!(
+            calls[..calls.len().min(4)],
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "the restart must close the old supervisor's open clip, while its ingester still \
+             exists, before the replacement opens one: an aborted supervisor abandons the clip"
+        );
+    }
+
+    /// What [`GatedOpenRecorder`] saw, in the order it saw it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GateCall {
+        /// A supervisor called `open` and is waiting on the gate.
+        OpenBlocked,
+        /// An `open` got through the gate and returned.
+        OpenCompleted,
+        /// The test's stand-in for `main`'s `recorder.shutdown()`.
+        RecorderShutdown,
+    }
+
+    /// Holds every `open` at a gate the test releases, and logs when one
+    /// completes, so a test can park a supervisor mid-frame the way a slow
+    /// `recorder.open` does and see whether it outlives the recorder's
+    /// shutdown. Frames come from a `VirtualSource` that never ends.
+    struct GatedOpenRecorder {
+        calls: Mutex<Vec<GateCall>>,
+        /// No permits until [`Self::release`]: an `open` waits for one.
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl GatedOpenRecorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn calls(&self) -> Vec<GateCall> {
+            self.calls.lock().clone()
+        }
+
+        /// Lets every `open`, this one and later ones, through.
+        fn release(&self) {
+            self.gate.add_permits(1 << 16);
+        }
+
+        fn shutdown(&self) {
+            self.calls.lock().push(GateCall::RecorderShutdown);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClipRecorder for GatedOpenRecorder {
+        async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
+            self.calls.lock().push(GateCall::OpenBlocked);
+            self.gate
+                .acquire()
+                .await
+                .expect("gate is never closed")
+                .forget();
+            self.calls.lock().push(GateCall::OpenCompleted);
+            Ok(ClipHandle {
+                clip_id: 1,
+                camera_id: args.camera_id,
+            })
+        }
+        async fn close(
+            &self,
+            handle: ClipHandle,
+            _args: ClipFinal,
+        ) -> Result<ClipMeta, RecorderError> {
+            Ok(ClipMeta {
+                clip_id: handle.clip_id,
+                camera_id: handle.camera_id,
+                path: PathBuf::new(),
+                duration_ms: 0,
+                size_bytes: 0,
+                codec: "h264".into(),
+                container: "mp4".into(),
+                discarded: false,
+            })
+        }
+        fn set_panic(&self, _panic: bool) {}
+        fn is_panic(&self) -> bool {
+            false
+        }
+        fn kind(&self) -> &'static str {
+            "gated-open"
+        }
+        fn remove_camera_ingester(&self, _camera_id: CameraId) {}
+        fn shared_frame_source(
+            &self,
+            camera_id: CameraId,
+        ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
+            Some(Box::new(nexus_pipeline::VirtualSource {
+                camera_id,
+                width: 512,
+                height: 288,
+                fps: 10,
+            }))
+        }
+    }
+
+    /// BUG-285 review — a shutdown that lands while `stop_camera` waits for a
+    /// supervisor to stop. `main` aborts the reconciler without joining it,
+    /// aborts the supervisors it finds in the handle map, then shuts the
+    /// recorder down. `stop_camera` used to take the entry out of the map
+    /// first, so the supervisor it was stopping, a frame paused in
+    /// `recorder.open` here, was in nobody's sweep: it kept running past the
+    /// recorder's shutdown and could open a clip nothing would finalize. The
+    /// steps below replay `main.rs`'s shutdown order — abort the reconciler,
+    /// drain and abort the handle map, shut the recorder down — and do not
+    /// join the reconciler, the stricter case; keep them in step with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_during_a_behavior_restart_aborts_the_stopping_supervisor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = GatedOpenRecorder::new();
+        let args = Arc::new(reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await);
+
+        reconcile(&args).await.expect("initial pass");
+        // The mock detector reports a person on every frame, so the first
+        // frame to reach the supervisor's loop calls `open`, which waits.
+        wait_until(
+            "precondition: the supervisor is blocked inside recorder.open",
+            || recorder.calls() == [GateCall::OpenBlocked],
+        )
+        .await;
+        let original = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+
+        let mut toggled = cam(None);
+        toggled.behavior.parking_lot_mode = true;
+        args.store
+            .upsert_camera(&toggled)
+            .await
+            .expect("toggle parking-lot mode");
+        let reconciling = tokio::spawn({
+            let args = args.clone();
+            async move { reconcile(&args).await }
+        });
+        // The supervisor cannot honour the stop while it waits on the gate,
+        // so the reconciler stays inside `stop_camera` from here on.
+        wait_until("the reconciler asked the supervisor to stop", || {
+            *original.stop.borrow()
+        })
+        .await;
+
+        // `main`'s shutdown, in its order: the reconciler is aborted and not
+        // awaited, every supervisor still in the map is aborted, and only
+        // then does the recorder shut down.
+        reconciling.abort();
+        for (_, entry) in args.handles.lock().drain() {
+            entry.task.abort();
+        }
+        recorder.shutdown();
+
+        wait_until(
+            "shutdown never aborted the supervisor that stop_camera was stopping",
+            || original.task.is_finished(),
+        )
+        .await;
+        recorder.release();
+        // Guards against a second supervisor the sweep missed: once the
+        // stopped one is gone, only an escapee could still complete an
+        // `open`, so this is a bounded wait for one that must not happen.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        abort_all(&args.handles);
+
+        let calls = recorder.calls();
+        let after_shutdown = &calls[calls
+            .iter()
+            .position(|c| *c == GateCall::RecorderShutdown)
+            .expect("the shutdown marker was logged")..];
+        assert!(
+            !after_shutdown.contains(&GateCall::OpenCompleted),
+            "a clip was opened after the recorder shut down: {calls:?}"
+        );
+        assert!(
+            original.task.is_finished(),
+            "the supervisor outlived shutdown"
+        );
+    }
+
+    /// One named `CameraBehavior` edit, for the tables below.
+    type BehaviorMutation = (&'static str, fn(&mut CameraBehavior));
+
+    /// The key a camera's entry records, with `behavior` in place of the
+    /// default. The ingest half is held fixed so only behavior can differ.
+    fn key_with(behavior: &CameraBehavior) -> EntryKey {
+        let c = cam(None);
+        EntryKey {
+            url: c.ingest.url.to_string(),
+            supervisor_dims: (512, 288),
+            codec: c.ingest.codec,
+            analysis_url: None,
+            behavior: behavior.clone(),
+        }
+    }
+
+    /// The defect is a class, not one field: each of these is consumed at
+    /// spawn and then frozen in the task's `cfg` snapshot, so each needs a
+    /// restart to take effect. The second assertion pins the name the
+    /// restart log reports — a mis-paired arm in a fourteen-way chain of
+    /// same-typed `Option<u32>` fields is an easy copy-paste and otherwise
+    /// invisible.
+    #[test]
+    fn every_spawn_frozen_behavior_field_changes_the_key() {
+        let before = CameraBehavior::default();
+        let mutations: Vec<BehaviorMutation> = vec![
+            ("parking_lot_mode", |b| b.parking_lot_mode = true),
+            ("anchor_ttl_secs", |b| b.anchor_ttl_secs = Some(900)),
+            ("detector_skip_crowded_threshold", |b| {
+                b.detector_skip_crowded_threshold = Some(25)
+            }),
+            ("detector_skip_every_n_frames", |b| {
+                b.detector_skip_every_n_frames = Some(3)
+            }),
+            ("detector_downscale_crowded_threshold", |b| {
+                b.detector_downscale_crowded_threshold = Some(30)
+            }),
+            ("detector_downscale_sustained_secs", |b| {
+                b.detector_downscale_sustained_secs = Some(60)
+            }),
+            ("supervisor_downscale_crowded_threshold", |b| {
+                b.supervisor_downscale_crowded_threshold = Some(40)
+            }),
+            ("supervisor_downscale_sustained_secs", |b| {
+                b.supervisor_downscale_sustained_secs = Some(60)
+            }),
+            ("supervisor_upscale_clear_secs", |b| {
+                b.supervisor_upscale_clear_secs = Some(300)
+            }),
+            ("supervisor_downscale_to_width", |b| {
+                b.supervisor_downscale_to_width = Some(640)
+            }),
+            ("tile_enabled", |b| b.tile_enabled = Some(true)),
+            ("tile_trigger", |b| b.tile_trigger = Some(12)),
+            ("tile_max_per_frame", |b| b.tile_max_per_frame = Some(4)),
+            ("tile_grid", |b| b.tile_grid = Some(TileGridConfig::G3x3)),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut after = before.clone();
+            mutate(&mut after);
+            assert!(
+                key_with(&before) != key_with(&after),
+                "changing behavior.{field} must restart the supervisor — it is \
+                 consumed once at spawn and then frozen in the task's cfg snapshot"
+            );
+            assert_eq!(
+                changed_behavior_field(&before, &after),
+                Some(field),
+                "the restart log must name the field that actually changed"
+            );
+        }
+    }
+
+    /// The exclusions in [`changed_behavior_field`] are a decision, not an
+    /// oversight, so they are pinned like any other behaviour. A restart
+    /// cannot apply these three; the two downscale targets would come back
+    /// on the high-res detector, because the router builds its layer set
+    /// once at boot. If a future change makes any of them restart-applicable,
+    /// delete its arm here in the same commit.
+    #[test]
+    fn the_deliberately_excluded_behavior_fields_do_not_change_the_key() {
+        let before = CameraBehavior {
+            detector_downscale_to_width: Some(640),
+            detector_downscale_to_height: Some(640),
+            ..CameraBehavior::default()
+        };
+        let exclusions: Vec<BehaviorMutation> = vec![
+            ("supervisor_width", |b| b.supervisor_width = Some(512)),
+            ("detector_downscale_to_width", |b| {
+                b.detector_downscale_to_width = Some(320)
+            }),
+            ("detector_downscale_to_height", |b| {
+                b.detector_downscale_to_height = Some(320)
+            }),
+        ];
+
+        for (field, mutate) in exclusions {
+            let mut after = before.clone();
+            mutate(&mut after);
+            assert!(
+                key_with(&before) == key_with(&after),
+                "behavior.{field} must NOT restart the supervisor on its own — a \
+                 restart cannot apply it, so the gap would buy nothing"
+            );
+        }
+    }
+
     /// Publishes through a real bus; subscribes the way `refuse` says.
     ///
     /// No `Bus` in the workspace does either today: `BroadcastBus`
@@ -1565,7 +2269,7 @@ mod tests {
         assert_supervision_survives(false).await;
     }
 
-    /// `stop_camera` aborts the supervisor and shuts the ingesters down, and
+    /// `stop_camera` stops the supervisor and shuts the ingesters down, and
     /// neither is synchronous: the tap can be mid-frame and a pipeline's
     /// probes keep firing until its detached NULL lands. Writes from either
     /// after the stop must not make a stopped camera read as running to the
@@ -1580,7 +2284,7 @@ mod tests {
         args.frame_stats.observe_frame(7, tap, now, 512, 288);
         args.decode_health.observe_decoder_output(7);
 
-        stop_camera(&args, 7);
+        stop_camera(&args, 7).await;
         args.frame_stats.observe_frame(7, tap, now, 512, 288);
         args.decode_health.observe_decoder_output(7);
 
@@ -2805,7 +3509,9 @@ mod tests {
 
     /// Every field the no-change guard compares, for camera shapes no other
     /// test builds: an auto codec, a `supervisor_width` below and above the
-    /// detector input, and a `model_override`. Each camera is seeded by
+    /// detector input, a `model_override`, and behavior fields the guard
+    /// compares (BUG-285) — a boot seed that dropped them would restart that
+    /// camera on the first pass. Each camera is seeded by
     /// boot's [`EntryKey::at_boot`], then started by a pass through
     /// `start_camera`, and after each the next two passes must leave it
     /// alone. The entry must record the configured codec (`None`), never the
@@ -2832,6 +3538,10 @@ mod tests {
                     ..Default::default()
                 })
             }),
+            shaped(11, &|c| {
+                c.behavior.parking_lot_mode = true;
+                c.behavior.tile_trigger = Some(5);
+            }),
         ];
         // (id, configured codec, supervisor frame) each entry must record.
         let want = [
@@ -2839,12 +3549,14 @@ mod tests {
             (8, Some(CodecKind::H265), (512, 288)),
             (9, Some(CodecKind::H265), (1024, 576)),
             (10, Some(CodecKind::H265), (640, 360)),
+            (11, Some(CodecKind::H265), (512, 288)),
         ];
         let recorder = ScriptedRecorder::new(&[
             (7, SourceScript::NeverEnds),
             (8, SourceScript::NeverEnds),
             (9, SourceScript::NeverEnds),
             (10, SourceScript::NeverEnds),
+            (11, SourceScript::NeverEnds),
         ]);
         let args = reconciler_args(recorder.clone(), dir.path(), &cams).await;
 
@@ -2949,6 +3661,53 @@ mod tests {
             after_restart, None,
             "a restarted supervisor is not reported"
         );
+    }
+
+    /// `stop_camera` keeps an entry in the map while it stops the task, so a
+    /// finished task in the map is no longer proof of a crash. A supervisor
+    /// the reconciler asked to stop, found finished before its entry is
+    /// removed, must not be reported as "exited without being stopped".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_that_finished_after_a_stop_request_is_not_on_the_health_roll_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let health = crate::cloud_tunnel::EngineHealth::new(&args);
+        let stopped = |h: nexus_cloud_protocol::v1::EdgeHealth| {
+            h.issues
+                .into_iter()
+                .flatten()
+                .find(|i| i.code == "camera_pipeline_stopped")
+        };
+
+        reconcile(&args).await.expect("first pass");
+        let entry = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+        assert!(!entry.exited_on_its_own(), "a running supervisor");
+
+        // What `stop_camera` does first; the entry stays in the map after.
+        let _ = entry.stop.send(true);
+        wait_until("the stopped supervisor should end", || {
+            entry.task.is_finished()
+        })
+        .await;
+        assert!(
+            supervisor_ended(&args.handles, 7),
+            "precondition: the finished supervisor is still in the map"
+        );
+        let issue = stopped(health.rollup().await);
+        let on_its_own = entry.exited_on_its_own();
+        abort_all(&args.handles);
+
+        assert_eq!(
+            issue, None,
+            "a stop the reconciler asked for is not a crash"
+        );
+        assert!(!on_its_own, "it finished because it was asked to");
     }
 
     /// The roll-up built from these args reads their live-view manager, the

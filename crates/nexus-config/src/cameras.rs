@@ -168,9 +168,9 @@ pub struct CameraBehavior {
     /// Per-camera override for `tracker.static_object.anchor_ttl_secs`.
     /// When `Some`, the supervisor replaces the global TTL with this
     /// value when constructing the camera's `StaticObjectFilter`.
-    /// `None` means "inherit the engine default". Restart required:
-    /// the value is read once at supervisor start and not hot-reloaded
-    /// — the reconciler only respawns on URL change today.
+    /// `None` means "inherit the engine default". Read once at supervisor
+    /// start; an edit applies when the reconciler restarts the camera's
+    /// supervisor for it (BUG-285).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_ttl_secs: Option<u32>,
     /// M_NATIVE_ASPECT — analysis (supervisor) frame width, decoupled

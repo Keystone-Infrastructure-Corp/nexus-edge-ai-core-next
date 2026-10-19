@@ -1,8 +1,9 @@
 //! BUG-223 — a camera's frame source must end with its supervisor.
 //!
-//! `stop_camera` and every reconciler restart end a supervisor with
-//! `task.abort()`. The source runs in a task of its own, and a bare
-//! `JoinHandle` detaches on drop, so whether the source then ends depended on
+//! A supervisor can still end by `task.abort()`: `stop_camera` falls back to
+//! it when a graceful stop times out, and process shutdown aborts every one.
+//! The source runs in a task of its own, and a bare `JoinHandle` detaches on
+//! drop, so whether the source then ends depended on
 //! the source noticing its receiver had gone. `VirtualSource` never looks,
 //! and a `SharedRtspSource` reading the main stream (no substream health tick
 //! to wake it) parks on an ingester that a stopped camera has shut down: it
@@ -278,7 +279,7 @@ async fn a_stopped_supervisor_releases_the_ingester_its_source_reads() {
     // Let the source reach its receive.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // What `stop_camera` does: abort the supervisor, then shut the ingester.
+    // What `stop_camera`'s timeout fallback does: abort, then shut the ingester.
     handle.task.abort();
     ingester.shutdown();
     drop(ingester);
