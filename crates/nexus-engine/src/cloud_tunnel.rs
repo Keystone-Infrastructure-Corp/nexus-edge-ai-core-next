@@ -143,7 +143,7 @@ pub fn spawn_tunnel(
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
     admin_secret: Option<Arc<String>>,
-    remote_access: nexus_config::RemoteAccessConfig,
+    remote_access: Arc<crate::remote_shell::RemoteAccess>,
     liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
     watermark: StorageWatermarkHandle,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
@@ -204,6 +204,7 @@ pub fn spawn_tunnel(
             &loopback_admin_base,
             &admin_http_client,
             admin_secret.as_ref(),
+            &remote_access,
         );
         run(
             enrollment,
@@ -245,6 +246,7 @@ fn build_rpc_dispatcher(
     loopback_admin_base: &Arc<arc_swap::ArcSwap<String>>,
     http_client: &reqwest::Client,
     admin_secret: Option<&Arc<String>>,
+    remote_access: &Arc<crate::remote_shell::RemoteAccess>,
 ) -> Option<Arc<RpcDispatcher<EngineRpcHandler>>> {
     let signing_pem = enrollment.signing_key_pem.as_deref().or_else(|| {
         warn!(
@@ -306,6 +308,7 @@ fn build_rpc_dispatcher(
         loopback_admin_base: loopback_admin_base.clone(),
         http_client: http_client.clone(),
         admin_secret: admin_secret.cloned(),
+        remote_access: Arc::clone(remote_access),
     };
     let dispatcher = RpcDispatcher::new(verifier, policy, handler)
         .with_audit_sink(Arc::new(EngineAuditSink {
@@ -588,7 +591,7 @@ async fn run(
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     webrtc: Arc<crate::webrtc_bridge::WebRtcBridge>,
     store: Arc<Store>,
-    remote_access: nexus_config::RemoteAccessConfig,
+    remote_access: Arc<crate::remote_shell::RemoteAccess>,
     liveness: Arc<crate::cloud_liveness::TunnelLiveness>,
     watermark: StorageWatermarkHandle,
     mut shutdown: oneshot::Receiver<()>,
@@ -605,37 +608,17 @@ async fn run(
     // — see the `close_all` on the reconnect path below — because a
     // session the console can no longer revoke has no business running.
     let remote_shell = Arc::new(crate::remote_shell::RemoteShellManager::new(
-        remote_access,
+        Arc::clone(&remote_access),
         client.clone(),
         dispatcher.as_ref().map(|d| d.verifier().clone()),
         Arc::clone(&cloud_outbox),
     ));
-    // Adopt the cloud's SSH certificate authority. Runs once per engine
-    // start, and only when BOTH the box owner opted in locally and the
-    // cloud actually shipped a CA in the enrollment bundle. Idempotent, so
-    // it also repairs a drop-in an OS-level sshd reconfiguration removed.
-    // Deliberately fire-and-forget: a box with no sshd, or a failed
-    // adoption, must never delay or block the control tunnel — remote
-    // shell just stays unavailable and every later session open reports
-    // the failure to the console.
-    if remote_shell.is_enabled() {
-        if let Some(ca) = enrollment.ssh_ca_public_key.clone() {
-            tokio::spawn(async move {
-                match crate::ssh_ca::install_ca(&ca).await {
-                    Ok(()) => info!("remote access: SSH CA adopted"),
-                    Err(e) => warn!(
-                        reason = e.code(),
-                        "remote access: SSH CA adoption failed; native sessions will be refused"
-                    ),
-                }
-            });
-        } else {
-            warn!(
-                "remote access is enabled locally but this enrollment carries no SSH CA; \
-                 re-enroll against a cloud that has one provisioned"
-            );
-        }
-    }
+    // Hand the manager and the enrollment's SSH CA to the shared switch.
+    // When remote access is already on this adopts the CA now (idempotent,
+    // fire-and-forget — see `RemoteShellManager::adopt_ssh_ca`); a later live
+    // enable from the cloud adopts it then. A core with remote access off
+    // never installs `TrustedUserCAKeys`.
+    remote_access.attach(&remote_shell, enrollment.ssh_ca_public_key.clone());
     let mut backoff = BACKOFF_MIN;
     let core_id = enrollment.core_id.clone();
     // Outlives the connection on purpose: this is the decode-health
@@ -4222,7 +4205,10 @@ mod heartbeat_ack_tests {
 
         let webrtc = crate::webrtc_bridge::WebRtcBridge::disabled();
         let remote_shell = Arc::new(crate::remote_shell::RemoteShellManager::new(
-            nexus_config::RemoteAccessConfig::default(),
+            Arc::new(crate::remote_shell::RemoteAccess::new(
+                nexus_config::RemoteAccessConfig::default(),
+                false,
+            )),
             nexus_cloud_client::tunnel::TunnelClient::new(
                 "wss://cloud.invalid/v1/tunnel",
                 Vec::new(),

@@ -257,6 +257,32 @@ fn remote_access_is_off_by_default() {
     assert_eq!(cfg.remote_access.target, "127.0.0.1:22");
 }
 
+/// The cloud may switch remote access on unless the box owner opts out,
+/// and a `[remote_access]` block written before the key existed must
+/// read as "may" — that is what lets an OTA'd core gain the cloud toggle
+/// without a `nexus.toml` rewrite. `enabled` itself stays off.
+#[test]
+fn remote_access_cloud_may_enable_defaults_true_and_parses_an_opt_out() {
+    assert!(RemoteAccessConfig::default().cloud_may_enable);
+    assert!(
+        Config {
+            cameras: vec![],
+            ..Default::default()
+        }
+        .remote_access
+        .cloud_may_enable
+    );
+
+    let legacy: RemoteAccessConfig =
+        toml::from_str("enabled = false\ntarget = \"127.0.0.1:22\"\n").unwrap();
+    assert!(legacy.cloud_may_enable, "a missing key means the cloud may");
+    assert!(!legacy.enabled);
+
+    let opted_out: RemoteAccessConfig = toml::from_str("cloud_may_enable = false\n").unwrap();
+    assert!(!opted_out.cloud_may_enable);
+    assert!(!opted_out.enabled);
+}
+
 /// The shell target is a *local* address by construction — the point
 /// of the feature is reaching this box's own sshd, not turning the
 /// appliance into a jump host for the rest of the customer's LAN.

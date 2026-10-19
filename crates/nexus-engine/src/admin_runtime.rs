@@ -1832,9 +1832,191 @@ pub async fn resolve_persisted_reid_enabled(store: &Store, toml_enabled: bool) -
     }
 }
 
+// ── Remote access: the cloud's live toggle ──────────────────────
+//
+// The cloud switches `[remote_access]` on/off through the owner-only
+// `PUT /admin/remote_access` arm in `engine_rpc` (there is no local HTTP
+// setter). The choice is persisted here so it survives a restart, and
+// folded over `nexus.toml` at boot by
+// [`resolve_persisted_remote_access_enabled`].
+
+/// Cloud-persisted remote-access switch, stored as `"true"` / `"false"`.
+pub(crate) const KEY_REMOTE_ACCESS_ENABLED: &str = "remote_access_enabled";
+
+/// The boot-time effective remote-access switch.
+///
+/// * persisted `false` → off: the cloud can always switch it off, and
+///   that sticks even over `enabled = true` in `nexus.toml`;
+/// * persisted `true` → `enabled || cloud_may_enable`: a cloud "on" is
+///   ignored once the box owner sets `cloud_may_enable = false`;
+/// * nothing persisted → `nexus.toml`'s `enabled`;
+///
+/// and in every case off when `target` is not local, because `admit`
+/// refuses every session to such a target — reporting "on" would be a lie.
+#[must_use]
+pub fn effective_remote_access_enabled(
+    toml: &nexus_config::RemoteAccessConfig,
+    persisted: Option<bool>,
+) -> bool {
+    requested_remote_access_enabled(toml, persisted) && toml.target_is_local()
+}
+
+/// What `nexus.toml` and the persisted cloud choice ask for, before the
+/// target check.
+const fn requested_remote_access_enabled(
+    toml: &nexus_config::RemoteAccessConfig,
+    persisted: Option<bool>,
+) -> bool {
+    match persisted {
+        Some(false) => false,
+        Some(true) => toml.enabled || toml.cloud_may_enable,
+        None => toml.enabled,
+    }
+}
+
+/// Read the cloud-persisted switch. A missing, NULL, unparseable or
+/// unreadable row is `None` — "the cloud never said" — so boot falls back
+/// to `nexus.toml`.
+pub async fn read_persisted_remote_access_enabled(store: &Store) -> Option<bool> {
+    match store.read_runtime_setting(KEY_REMOTE_ACCESS_ENABLED).await {
+        Ok(Some(Some(raw))) => match raw.trim().parse::<bool>() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    raw = %raw,
+                    error = %e,
+                    "engine_runtime_settings.remote_access_enabled failed to parse as bool; using nexus.toml",
+                );
+                None
+            }
+        },
+        Ok(Some(None) | None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read remote_access_enabled from engine_runtime_settings; using nexus.toml");
+            None
+        }
+    }
+}
+
+/// Boot resolver `main.rs` calls before building the shared
+/// [`crate::remote_shell::RemoteAccess`] switch.
+pub async fn resolve_persisted_remote_access_enabled(
+    store: &Store,
+    toml: &nexus_config::RemoteAccessConfig,
+) -> bool {
+    let persisted = read_persisted_remote_access_enabled(store).await;
+    let effective = effective_remote_access_enabled(toml, persisted);
+    if requested_remote_access_enabled(toml, persisted) && !effective {
+        tracing::warn!(
+            target = %toml.target,
+            "[remote_access] target is not a loopback or private address; remote access stays disabled",
+        );
+    } else if persisted.is_some() && effective != toml.enabled {
+        tracing::warn!(
+            persisted,
+            toml_enabled = toml.enabled,
+            cloud_may_enable = toml.cloud_may_enable,
+            effective,
+            "applying cloud-persisted [remote_access] enabled from engine_runtime_settings (overrides nexus.toml)",
+        );
+    }
+    effective
+}
+
+/// Persist the cloud's toggle so it survives a restart.
+///
+/// # Errors
+/// Propagates the store write failure.
+pub async fn persist_remote_access_enabled(
+    store: &Store,
+    enabled: bool,
+) -> Result<(), nexus_store::StoreError> {
+    store
+        .write_runtime_setting(
+            KEY_REMOTE_ACCESS_ENABLED,
+            Some(if enabled { "true" } else { "false" }),
+        )
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The full grid: persisted {none, on, off} × `cloud_may_enable`
+    /// {true, false}, each with `enabled` off and on in `nexus.toml`.
+    #[test]
+    fn remote_access_boot_resolver_grid() {
+        let cfg = |enabled, cloud_may_enable| nexus_config::RemoteAccessConfig {
+            enabled,
+            cloud_may_enable,
+            ..Default::default()
+        };
+        // (persisted, cloud_may_enable, toml enabled) -> effective
+        let grid = [
+            (None, true, false, false),
+            (None, true, true, true),
+            (None, false, false, false),
+            (None, false, true, true),
+            (Some(true), true, false, true),
+            (Some(true), true, true, true),
+            (Some(true), false, false, false),
+            (Some(true), false, true, true),
+            (Some(false), true, false, false),
+            (Some(false), true, true, false),
+            (Some(false), false, false, false),
+            (Some(false), false, true, false),
+        ];
+        for (persisted, may, enabled, want) in grid {
+            assert_eq!(
+                effective_remote_access_enabled(&cfg(enabled, may), persisted),
+                want,
+                "persisted={persisted:?} cloud_may_enable={may} enabled={enabled}",
+            );
+            // A non-local target is always off: `admit` would refuse every
+            // session, so the switch must never read as on.
+            let public = nexus_config::RemoteAccessConfig {
+                target: "8.8.8.8:22".to_string(),
+                ..cfg(enabled, may)
+            };
+            assert!(
+                !effective_remote_access_enabled(&public, persisted),
+                "non-local target: persisted={persisted:?} cloud_may_enable={may} enabled={enabled}",
+            );
+        }
+    }
+
+    /// The persisted row round-trips through the store, and a row that
+    /// does not parse falls back to `nexus.toml` instead of guessing.
+    #[tokio::test]
+    async fn remote_access_persisted_row_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&nexus_config::StoreConfig {
+            url: format!("sqlite:{}?mode=rwc", dir.path().join("nexus.db").display()),
+            seed_from_config: false,
+            duckdb_attach: false,
+            duckdb_path: std::path::PathBuf::from("/tmp/unused.duckdb"),
+        })
+        .await
+        .unwrap();
+        let toml = nexus_config::RemoteAccessConfig::default();
+
+        assert_eq!(read_persisted_remote_access_enabled(&store).await, None);
+        assert!(!resolve_persisted_remote_access_enabled(&store, &toml).await);
+
+        persist_remote_access_enabled(&store, true).await.unwrap();
+        assert_eq!(
+            read_persisted_remote_access_enabled(&store).await,
+            Some(true)
+        );
+        assert!(resolve_persisted_remote_access_enabled(&store, &toml).await);
+
+        store
+            .write_runtime_setting(KEY_REMOTE_ACCESS_ENABLED, Some("maybe"))
+            .await
+            .unwrap();
+        assert_eq!(read_persisted_remote_access_enabled(&store).await, None);
+    }
 
     #[test]
     fn ui_bind_update_deserialises_all_three_actions() {

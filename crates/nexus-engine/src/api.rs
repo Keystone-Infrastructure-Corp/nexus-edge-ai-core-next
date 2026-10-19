@@ -312,13 +312,12 @@ pub struct ApiState {
     /// is opt-in per REPO_BOUNDARY R5c §5). When `false`,
     /// `crate::lan_proxy::proxy_request` rejects every call.
     pub lan_proxy_enabled: bool,
-    /// Whether admin-granted remote shell support access is enabled on
-    /// this appliance. Sourced from `[remote_access] enabled` at boot;
-    /// defaults `false`. Gates the sshd control surface exposed to the
-    /// cloud (`POST /v1/admin/remote-access/restart-sshd`) so a core
-    /// whose owner never opted in has no sshd control at all.
-    /// Restart-required, like `lan_proxy_enabled`.
-    pub remote_access_enabled: bool,
+    /// The live remote-access switch, shared with the cloud tunnel's
+    /// shell manager and the RPC handler's owner-only toggle. Gates the
+    /// sshd control surface exposed to the cloud
+    /// (`POST /v1/admin/remote-access/restart-sshd`) and backs
+    /// `GET /v1/admin/remote_access`. Live, not a boot snapshot.
+    pub remote_access: Arc<crate::remote_shell::RemoteAccess>,
     /// Phase 5.6 · R7 — shared with the `CloudEntitySightingHook`
     /// worker (writer) and the `/v1/admin/reid/status` endpoint
     /// (reader). Always present even when `reid.enabled = false`
@@ -701,6 +700,13 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/v1/admin/remote-access/restart-sshd",
             axum::routing::post(crate::remote_shell::post_admin_restart_sshd),
+        )
+        // Live remote-access switch + the box owner's `cloud_may_enable`.
+        // GET only: the setter is the owner-only `PUT /admin/remote_access`
+        // arm in `engine_rpc`, reachable solely over the verified tunnel.
+        .route(
+            "/v1/admin/remote_access",
+            get(crate::remote_shell::get_admin_remote_access),
         )
         // Phase 7.5 · Step 7.5.4 — cloud fleet-settings apply. The
         // cloud api-gateway fans a resolved category value out to
@@ -5783,10 +5789,68 @@ mod tests {
             // route tests exercise the real handler; the default-off
             // behaviour is pinned by the nexus-config default test.
             lan_proxy_enabled: true,
-            remote_access_enabled: false,
+            remote_access: Arc::new(crate::remote_shell::RemoteAccess::new(
+                nexus_config::RemoteAccessConfig::default(),
+                false,
+            )),
             reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
         };
         (state, store, dir, sink_registry, bus)
+    }
+
+    /// `GET /api/v1/admin/remote_access` reports the live switch and the
+    /// box owner's opt-out, and there is no local writer: a local PUT is
+    /// refused, so only the verified RPC arm can toggle it.
+    #[tokio::test]
+    async fn remote_access_get_reports_both_fields_and_has_no_local_setter() {
+        use axum::body::to_bytes;
+        const ADMIN_SECRET: &[u8] = b"remote-access-get-secret-abc";
+        let (mut state, _store, _dir, _reg, _bus) = build_test_state(Some(ADMIN_SECRET)).await;
+        let access = Arc::new(crate::remote_shell::RemoteAccess::new(
+            nexus_config::RemoteAccessConfig {
+                cloud_may_enable: false,
+                ..Default::default()
+            },
+            false,
+        ));
+        state.remote_access = access.clone();
+        let app = super::router(state);
+        let token = sign_admin_jwt(ADMIN_SECRET);
+
+        let get = |app: axum::Router| {
+            let token = token.clone();
+            async move {
+                let mut req = Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/admin/remote_access")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+                let res = app.oneshot(req).await.unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        assert_eq!(
+            get(app.clone()).await,
+            serde_json::json!({ "enabled": false, "cloud_may_enable": false })
+        );
+        access.set_enabled(true).await;
+        assert_eq!(get(app.clone()).await["enabled"], serde_json::json!(true));
+
+        let mut put = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/remote_access")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(r#"{"enabled":false}"#))
+            .unwrap();
+        put.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(put).await.unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(access.is_enabled(), "a local PUT must not reach the setter");
     }
 
     /// Common wrapper over [`build_test_router_full`] that drops the
