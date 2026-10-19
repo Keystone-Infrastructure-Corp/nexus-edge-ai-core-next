@@ -2153,7 +2153,7 @@ impl EngineHealth {
     }
 
     /// Cameras whose supervisor task has finished while the reconciler
-    /// still holds it. `stop_camera` removes an entry before it aborts the
+    /// still holds it. `stop_camera` removes an entry before it stops the
     /// task, and shutdown drains the map before aborting, so a finished task
     /// still in the map ended on its own: its frame source returned (the
     /// `PIPELINE_STATUS` `Stopped` nothing subscribes to) or it panicked.

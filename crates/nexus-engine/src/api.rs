@@ -1732,7 +1732,7 @@ async fn delete_camera(
         return Err(e.into());
     }
     // Same channel as upsert — the reconciler diffs the live set
-    // against the DB and aborts the supervisor for any removed id.
+    // against the DB and stops the supervisor for any removed id.
     let _ = s
         .bus
         .publish(
