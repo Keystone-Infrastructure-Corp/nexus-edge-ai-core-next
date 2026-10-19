@@ -24,11 +24,13 @@
 //! Restart triggers today: a supervisor that exited without being
 //! stopped (nothing announces that, hence the periodic pass), ingest
 //! URL change, supervisor (analysis) frame dimension change, ingest
-//! codec change, and an `analysis_url` (SPEC-069) that was added, changed
-//! or removed. Detector / threshold / rule changes do not — those still
-//! require a process restart (or a future, finer-grained hot-reload
-//! path). This matches the UX where the admin UI surfaces camera ingest
-//! edits as the primary live operation.
+//! codec change, an `analysis_url` (SPEC-069) that was added, changed
+//! or removed, and a change to most — not all — of the camera's
+//! `behavior` block ([`changed_behavior_field`] names the three it
+//! deliberately ignores). Detector prompts and rules do not: a prompt edit
+//! is frozen in the supervisor's `cfg` snapshot the same way behavior was,
+//! and nothing in this process pushes it to a live task today, so it still
+//! needs a process restart.
 //!
 //! A registration the recorder refused, and a substream session the
 //! SPEC-069 fallback shut down, are not restart triggers: each pass
@@ -41,7 +43,9 @@ use std::sync::Arc;
 use futures::StreamExt;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::TrackerConfig;
-use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
+use nexus_config::{
+    AnnotatorConfig, CameraBehavior, CameraConfig, ClipsConfig, StaticObjectConfig,
+};
 use nexus_inference::InferenceRouter;
 use nexus_pipeline::{
     spawn_camera, ClipRecorder, DecodeHealthRegistry, FrameStatsRegistry, LatestFrameCache,
@@ -83,7 +87,7 @@ pub struct RunningCameraEntry {
 /// fields are private to this module, and every side derives them in
 /// [`EntryKey::wanted`], so a boot entry, a started entry and the guard's
 /// expectation cannot disagree.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct EntryKey {
     /// Current ingest URL. Compared on each reconcile pass to
     /// decide whether a respawn is needed.
@@ -111,6 +115,25 @@ pub(crate) struct EntryKey {
     /// registration recorded here would restart the camera, main recording
     /// ingester included, on every pass (BUG-224).
     analysis_url: Option<String>,
+    /// The camera's `behavior` block. Most of it is consumed once inside
+    /// `run_camera` — the static-object filter, the detector-skip policy,
+    /// the crowd-hysteresis pair, the tile grid — and then frozen in that
+    /// task's `cfg` snapshot, so a restart is the only way to apply an edit
+    /// (BUG-285). Which fields that covers is decided in
+    /// [`changed_behavior_field`], not here.
+    behavior: CameraBehavior,
+}
+
+/// Field by field rather than derived, because the behavior half compares
+/// only what [`changed_behavior_field`] says a restart can apply.
+impl PartialEq for EntryKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+            && self.supervisor_dims == other.supervisor_dims
+            && self.codec == other.codec
+            && self.analysis_url == other.analysis_url
+            && changed_behavior_field(&self.behavior, &other.behavior).is_none()
+    }
 }
 
 impl EntryKey {
@@ -121,6 +144,7 @@ impl EntryKey {
             supervisor_dims: supervisor_dims_for(cam, args.default_detector_width),
             codec: cam.ingest.codec,
             analysis_url: cam.ingest.analysis_url.as_ref().map(ToString::to_string),
+            behavior: cam.behavior.clone(),
         }
     }
 
@@ -148,6 +172,99 @@ impl EntryKey {
                 analysis: None,
             }),
         }
+    }
+}
+
+/// The name of the first `behavior` field that differs from the block a
+/// running supervisor was started with in a way only a restart can apply,
+/// or `None` when the running supervisor is still correct. Returning the
+/// name rather than a bool is what lets the restart log say *which* field
+/// moved.
+///
+/// `want` is destructured exhaustively on purpose. Adding a field to
+/// [`CameraBehavior`] breaks this build and forces a decision about it:
+/// tracking these one at a time by hand is what let a `parking_lot_mode`
+/// toggle sit dead until the next process restart (BUG-285). A `..`
+/// rest-pattern here would reintroduce the bug on the next field added.
+///
+/// Three fields are deliberately excluded, because restarting does not
+/// apply them and the video gap would buy nothing:
+///
+/// * `supervisor_width` — feeds `supervisor_dims`, which [`EntryKey`]
+///   already compares. It resolves through [`supervisor_dims_for`], so an
+///   edit that does not move the resolved frame is genuinely a no-op.
+///   **This exclusion is only sound while `supervisor_dims_for` reads
+///   `supervisor_width`.** If it ever stops, move the field into the
+///   compared chain in the same commit.
+/// * `detector_downscale_to_width` / `detector_downscale_to_height` — these
+///   select a pre-built inference layer keyed on `(kind, width, height)`,
+///   and `InferenceRouter` builds its layer set once at boot from the
+///   boot-time camera list. Restarting on an edit would look up a layer
+///   nobody built, get `None`, and leave the camera on its high-res
+///   detector — losing adaptive downscale that had been working, on top of
+///   the gap. Applying these needs a router rebuild, which is separate work.
+///
+///   **This only avoids the gap when they are edited alone.** Edited
+///   together with any compared field, the compared field triggers the
+///   restart and the camera comes back on its high-res detector as above.
+///   `start_camera` emits a `warn!` for that state so it is diagnosable
+///   rather than silent.
+fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Option<&'static str> {
+    let CameraBehavior {
+        parking_lot_mode,
+        anchor_ttl_secs,
+        detector_skip_crowded_threshold,
+        detector_skip_every_n_frames,
+        detector_downscale_crowded_threshold,
+        detector_downscale_sustained_secs,
+        supervisor_downscale_crowded_threshold,
+        supervisor_downscale_sustained_secs,
+        supervisor_upscale_clear_secs,
+        supervisor_downscale_to_width,
+        tile_enabled,
+        tile_trigger,
+        tile_max_per_frame,
+        tile_grid,
+        // Excluded — see the doc comment above. Named, not `..`, so a new
+        // field cannot join them by accident.
+        supervisor_width: _,
+        detector_downscale_to_width: _,
+        detector_downscale_to_height: _,
+    } = want;
+
+    if *parking_lot_mode != started.parking_lot_mode {
+        Some("parking_lot_mode")
+    } else if *anchor_ttl_secs != started.anchor_ttl_secs {
+        Some("anchor_ttl_secs")
+    } else if *detector_skip_crowded_threshold != started.detector_skip_crowded_threshold {
+        Some("detector_skip_crowded_threshold")
+    } else if *detector_skip_every_n_frames != started.detector_skip_every_n_frames {
+        Some("detector_skip_every_n_frames")
+    } else if *detector_downscale_crowded_threshold != started.detector_downscale_crowded_threshold
+    {
+        Some("detector_downscale_crowded_threshold")
+    } else if *detector_downscale_sustained_secs != started.detector_downscale_sustained_secs {
+        Some("detector_downscale_sustained_secs")
+    } else if *supervisor_downscale_crowded_threshold
+        != started.supervisor_downscale_crowded_threshold
+    {
+        Some("supervisor_downscale_crowded_threshold")
+    } else if *supervisor_downscale_sustained_secs != started.supervisor_downscale_sustained_secs {
+        Some("supervisor_downscale_sustained_secs")
+    } else if *supervisor_upscale_clear_secs != started.supervisor_upscale_clear_secs {
+        Some("supervisor_upscale_clear_secs")
+    } else if *supervisor_downscale_to_width != started.supervisor_downscale_to_width {
+        Some("supervisor_downscale_to_width")
+    } else if *tile_enabled != started.tile_enabled {
+        Some("tile_enabled")
+    } else if *tile_trigger != started.tile_trigger {
+        Some("tile_trigger")
+    } else if *tile_max_per_frame != started.tile_max_per_frame {
+        Some("tile_max_per_frame")
+    } else if *tile_grid != started.tile_grid {
+        Some("tile_grid")
+    } else {
+        None
     }
 }
 
@@ -457,7 +574,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         let cam_id = cam.id;
         let want = EntryKey::wanted(args, &cam);
         match current.get(&cam_id) {
-            // `==` compares url, dims, codec, then analysis_url.
+            // `==` compares url, dims, codec, analysis_url, then behavior.
             Some(entry) if entry.key == want && !entry.task.is_finished() => {
                 // No change — supervisor still alive, URL still the
                 // same, supervisor dims still match, ingest codec
@@ -497,10 +614,17 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         new_codec = ?want.codec,
                         "camera reconciler: ingest codec changed; restarting supervisor"
                     );
-                } else {
+                } else if entry.key.analysis_url != want.analysis_url {
                     info!(
                         camera_id = cam_id,
                         "camera reconciler: analysis stream changed; restarting supervisor"
+                    );
+                } else {
+                    info!(
+                        camera_id = cam_id,
+                        field = changed_behavior_field(&entry.key.behavior, &want.behavior)
+                            .unwrap_or("unknown"),
+                        "camera reconciler: camera behavior changed; restarting supervisor"
                     );
                 }
                 stop_camera(args, cam_id);
@@ -850,6 +974,24 @@ pub(crate) fn spawn_supervisor(
     let (sup_w, sup_h) = start.key.supervisor_dims;
     let detector = args.router.detector_for_camera(&cam);
     let detector_low_res = args.router.detector_for_camera_low_res(&cam);
+    // The router builds its layer set once at boot, so a downscale target
+    // edited since then has no layer and adaptive downscale is silently off
+    // for this camera until the process restarts. Say so: this is reachable
+    // whenever a downscale-target edit rides along with a field that does
+    // trigger a restart (see [`changed_behavior_field`]).
+    if detector_low_res.is_none()
+        && cam.behavior.detector_downscale_crowded_threshold.is_some()
+        && cam.behavior.detector_downscale_sustained_secs.is_some()
+    {
+        warn!(
+            camera_id = cam.id,
+            to_width = ?cam.behavior.detector_downscale_to_width,
+            to_height = ?cam.behavior.detector_downscale_to_height,
+            "camera reconciler: adaptive detector downscale is configured but no \
+             low-res layer exists for this target; camera stays on its high-res \
+             detector until the engine restarts"
+        );
+    }
     // M_TILE_REINFER (G1) Phase B2.1 — effective per-camera `top_k`.
     // Per-camera `model_override.top_k` wins over the global
     // `inference.model.top_k`; both being `None` means no post-merge
@@ -901,6 +1043,7 @@ mod tests {
     use super::*;
     use nexus_config::{
         CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown, RecorderKind,
+        TileGridConfig,
     };
     use nexus_pipeline::{ClipFinal, ClipHandle, ClipMeta, OpenClip, RecorderError};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1487,6 +1630,164 @@ mod tests {
             0,
             "a periodic pass tore down a healthy camera's ingester"
         );
+    }
+
+    /// BUG-285 — `behavior.parking_lot_mode` is read once in `run_camera` to
+    /// build the static-object filter and then frozen in that task's `cfg`
+    /// snapshot. A guard that does not notice the flip leaves the old
+    /// supervisor running, nothing re-enters `run_camera`, and the operator's
+    /// toggle does nothing until the engine restarts — with no log line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parking_lot_mode_toggle_restarts_the_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        let original = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+
+        let mut toggled = cam(None);
+        toggled.behavior.parking_lot_mode = true;
+        args.store
+            .upsert_camera(&toggled)
+            .await
+            .expect("toggle parking-lot mode");
+        reconcile(&args).await.expect("pass after the edit");
+
+        let now = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 running");
+        if Arc::ptr_eq(&now.task, &original.task) {
+            abort_all(&args.handles);
+            panic!(
+                "flipping parking_lot_mode left the supervisor that was spawned with it off: \
+                 the static-object filter is built once at spawn, so parking-lot mode stays \
+                 off until the engine restarts"
+            );
+        }
+        // The supervisor builds its frame source inside its own task.
+        wait_until(
+            "the restarted supervisor never built a fresh frame source",
+            || recorder.sources_built(7) == 2,
+        )
+        .await;
+        abort_all(&args.handles);
+    }
+
+    /// One named `CameraBehavior` edit, for the tables below.
+    type BehaviorMutation = (&'static str, fn(&mut CameraBehavior));
+
+    /// The key a camera's entry records, with `behavior` in place of the
+    /// default. The ingest half is held fixed so only behavior can differ.
+    fn key_with(behavior: &CameraBehavior) -> EntryKey {
+        let c = cam(None);
+        EntryKey {
+            url: c.ingest.url.to_string(),
+            supervisor_dims: (512, 288),
+            codec: c.ingest.codec,
+            analysis_url: None,
+            behavior: behavior.clone(),
+        }
+    }
+
+    /// The defect is a class, not one field: each of these is consumed at
+    /// spawn and then frozen in the task's `cfg` snapshot, so each needs a
+    /// restart to take effect. The second assertion pins the name the
+    /// restart log reports — a mis-paired arm in a fourteen-way chain of
+    /// same-typed `Option<u32>` fields is an easy copy-paste and otherwise
+    /// invisible.
+    #[test]
+    fn every_spawn_frozen_behavior_field_changes_the_key() {
+        let before = CameraBehavior::default();
+        let mutations: Vec<BehaviorMutation> = vec![
+            ("parking_lot_mode", |b| b.parking_lot_mode = true),
+            ("anchor_ttl_secs", |b| b.anchor_ttl_secs = Some(900)),
+            ("detector_skip_crowded_threshold", |b| {
+                b.detector_skip_crowded_threshold = Some(25)
+            }),
+            ("detector_skip_every_n_frames", |b| {
+                b.detector_skip_every_n_frames = Some(3)
+            }),
+            ("detector_downscale_crowded_threshold", |b| {
+                b.detector_downscale_crowded_threshold = Some(30)
+            }),
+            ("detector_downscale_sustained_secs", |b| {
+                b.detector_downscale_sustained_secs = Some(60)
+            }),
+            ("supervisor_downscale_crowded_threshold", |b| {
+                b.supervisor_downscale_crowded_threshold = Some(40)
+            }),
+            ("supervisor_downscale_sustained_secs", |b| {
+                b.supervisor_downscale_sustained_secs = Some(60)
+            }),
+            ("supervisor_upscale_clear_secs", |b| {
+                b.supervisor_upscale_clear_secs = Some(300)
+            }),
+            ("supervisor_downscale_to_width", |b| {
+                b.supervisor_downscale_to_width = Some(640)
+            }),
+            ("tile_enabled", |b| b.tile_enabled = Some(true)),
+            ("tile_trigger", |b| b.tile_trigger = Some(12)),
+            ("tile_max_per_frame", |b| b.tile_max_per_frame = Some(4)),
+            ("tile_grid", |b| b.tile_grid = Some(TileGridConfig::G3x3)),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut after = before.clone();
+            mutate(&mut after);
+            assert!(
+                key_with(&before) != key_with(&after),
+                "changing behavior.{field} must restart the supervisor — it is \
+                 consumed once at spawn and then frozen in the task's cfg snapshot"
+            );
+            assert_eq!(
+                changed_behavior_field(&before, &after),
+                Some(field),
+                "the restart log must name the field that actually changed"
+            );
+        }
+    }
+
+    /// The exclusions in [`changed_behavior_field`] are a decision, not an
+    /// oversight, so they are pinned like any other behaviour. A restart
+    /// cannot apply these three; the two downscale targets would come back
+    /// on the high-res detector, because the router builds its layer set
+    /// once at boot. If a future change makes any of them restart-applicable,
+    /// delete its arm here in the same commit.
+    #[test]
+    fn the_deliberately_excluded_behavior_fields_do_not_change_the_key() {
+        let before = CameraBehavior {
+            detector_downscale_to_width: Some(640),
+            detector_downscale_to_height: Some(640),
+            ..CameraBehavior::default()
+        };
+        let exclusions: Vec<BehaviorMutation> = vec![
+            ("supervisor_width", |b| b.supervisor_width = Some(512)),
+            ("detector_downscale_to_width", |b| {
+                b.detector_downscale_to_width = Some(320)
+            }),
+            ("detector_downscale_to_height", |b| {
+                b.detector_downscale_to_height = Some(320)
+            }),
+        ];
+
+        for (field, mutate) in exclusions {
+            let mut after = before.clone();
+            mutate(&mut after);
+            assert!(
+                key_with(&before) == key_with(&after),
+                "behavior.{field} must NOT restart the supervisor on its own — a \
+                 restart cannot apply it, so the gap would buy nothing"
+            );
+        }
     }
 
     /// Publishes through a real bus; subscribes the way `refuse` says.
