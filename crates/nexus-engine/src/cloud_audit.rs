@@ -187,6 +187,7 @@ mod tests {
             jti: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c101".into(),
             org_id: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c102".into(),
             actor_org_id: None,
+            perm: None,
         }
     }
 
@@ -206,6 +207,7 @@ mod tests {
             jti: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c200".into(),
             org_id: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c201".into(),
             actor_org_id: None,
+            perm: None,
         }
     }
 

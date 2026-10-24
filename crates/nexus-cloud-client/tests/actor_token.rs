@@ -479,27 +479,15 @@ fn acting_org_claim_reaches_the_verified_actor() {
     assert_eq!(actor.actor_org_id, None);
 }
 
-/// SPEC-071 P3 / BUG-095 — the whole functional delta of the `perm` claim on
-/// this side is "a token carrying it verifies instead of being rejected as
-/// malformed".
-///
-/// That is not a free property. `ActorTokenClaims` is
-/// `#[serde(deny_unknown_fields)]`, so before this claim existed in the
-/// generated struct the first half of this test failed with
-/// `InvalidReason::MalformedClaims` — which is exactly what an engine build
-/// older than this one still does, and why the cloud must not emit `perm`
-/// until the fleet has converged (WIRE_PROTOCOL.md §11.2).
-///
-/// The absent case is asserted alongside so "claim omitted" and "claim
-/// rejected" cannot be confused, and `VerifiedActor` is checked to confirm
-/// the claim stays audit-only: `role` is still what the engine enforces on.
+/// The verified capability is retained without inventing a preset role.
 #[test]
-fn permission_claim_is_accepted_and_stays_audit_only() {
+fn permission_claim_is_retained_without_promoting_the_role() {
     let (sk, verifier) = build_verifier_with("k1");
     let now = Utc::now().timestamp();
 
     let mut spec = TokenSpec::fresh(now, "POST", "/admin/cameras", "k1");
-    spec.perm = Some("cameras.control".to_owned());
+    spec.role = "viewer".into();
+    spec.perm = Some("settings.write".to_owned());
     let token = mint(&sk, &spec);
 
     let actor = verifier
@@ -511,10 +499,8 @@ fn permission_claim_is_accepted_and_stays_audit_only() {
             },
         )
         .expect("a token carrying `perm` must verify on a build that knows it");
-    assert_eq!(
-        actor.role, "operator",
-        "`role` remains the claim the engine enforces on"
-    );
+    assert_eq!(actor.role, "viewer");
+    assert_eq!(actor.perm.as_deref(), Some("settings.write"));
 
     // A signer that supplied no permission omits the claim entirely; the
     // same build must still accept that token.
@@ -528,4 +514,207 @@ fn permission_claim_is_accepted_and_stays_audit_only() {
             },
         )
         .expect("a token without `perm` must keep verifying");
+}
+
+#[tokio::test]
+async fn a_signed_permission_must_match_the_actual_action_before_dispatch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingHandler(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Handler for CountingHandler {
+        async fn handle(
+            &self,
+            _: &str,
+            _: EnvelopeContext<'_>,
+            _: &VerifiedActor,
+            _: Option<&[u8]>,
+        ) -> Result<Vec<u8>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+    let (sk, verifier) = build_verifier_with("k1");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = RpcDispatcher::new(
+        verifier,
+        SystemMethodPolicy::default(),
+        CountingHandler(calls.clone()),
+    );
+    for (method, path, permission) in [
+        ("PUT", "/admin/cameras/1", "live.ptz"),
+        (
+            "POST",
+            "/admin/cameras/1/firmware:upgrade",
+            "settings.write",
+        ),
+        (
+            "PUT",
+            "/admin/cameras/1/network/interface",
+            "settings.write",
+        ),
+        ("PUT", "/admin/remote_access", "settings.write"),
+        ("POST", "/admin/proxy", "settings.write"),
+        ("POST", "/admin/cameras/1/onvif/raw", "settings.write"),
+        ("POST", "/admin/unknown", "settings.write"),
+        ("PUT", "/admin/cameras/1", "unknown.permission"),
+        (
+            "PUT",
+            "/admin/cameras/1/../../remote_access",
+            "settings.write",
+        ),
+        ("PUT", "/admin/cameras/%31", "settings.write"),
+    ] {
+        let mut spec = TokenSpec::fresh(Utc::now().timestamp(), method, path, "k1");
+        spec.role = "owner".into();
+        spec.perm = Some(permission.into());
+        let result = dispatcher
+            .dispatch(
+                "write",
+                EnvelopeContext { method, path },
+                Some(&mint(&sk, &spec)),
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "{method} {path} accepted {permission}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "denial must precede handler invocation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn signed_camera_and_ptz_actions_bind_the_body_before_the_handler() {
+    let (sk, verifier) = build_verifier_with("k1");
+    let dispatcher = RpcDispatcher::new(verifier, SystemMethodPolicy::default(), OkHandler);
+    for (path, permission, body, allowed) in [
+        (
+            "/admin/cameras/1/ptz",
+            "live.ptz",
+            json!({"action":"move"}),
+            true,
+        ),
+        (
+            "/admin/cameras/1/ptz",
+            "live.ptz",
+            json!({"action":"set_home"}),
+            false,
+        ),
+        (
+            "/admin/cameras/1/ptz",
+            "settings.write",
+            json!({"action":"set_home"}),
+            true,
+        ),
+        (
+            "/admin/cameras/1/ptz",
+            "settings.write",
+            json!({"action":"move"}),
+            false,
+        ),
+        (
+            "/admin/cameras/1/ptz",
+            "live.ptz",
+            json!({"action":"move","camera_id":2}),
+            false,
+        ),
+        (
+            "/admin/cameras/1/ptz",
+            "live.ptz",
+            json!({"action":"move","nested":{"camera_ids":[1,2]}}),
+            false,
+        ),
+        (
+            "/admin/cameras/1/ptz",
+            "live.ptz",
+            json!({"action":"move","camera_id":1}),
+            true,
+        ),
+        (
+            "/admin/cameras/1/ptz",
+            "live.ptz",
+            json!({"action":"new_unknown_action"}),
+            false,
+        ),
+    ] {
+        let mut spec = TokenSpec::fresh(Utc::now().timestamp(), "POST", path, "k1");
+        spec.role = "viewer".into();
+        spec.perm = Some(permission.into());
+        let result = dispatcher
+            .dispatch(
+                "ptz",
+                EnvelopeContext {
+                    method: "POST",
+                    path,
+                },
+                Some(&mint(&sk, &spec)),
+                Some(&serde_json::to_vec(&body).unwrap()),
+            )
+            .await;
+        assert_eq!(result.is_ok(), allowed, "{permission} {body}");
+    }
+}
+
+#[tokio::test]
+async fn signed_permissions_preserve_the_system_method_allowlist() {
+    let (sk, verifier) = build_verifier_with("k1");
+    let dispatcher = RpcDispatcher::new(verifier, SystemMethodPolicy::default(), OkHandler);
+    let mut spec = TokenSpec::fresh(Utc::now().timestamp(), "POST", "/admin/cameras", "k1");
+    spec.sub = "system:fleet".into();
+    spec.perm = Some("settings.write".into());
+    let err = dispatcher
+        .dispatch(
+            "create_camera",
+            EnvelopeContext {
+                method: "POST",
+                path: "/admin/cameras",
+            },
+            Some(&mint(&sk, &spec)),
+            Some(b"{}"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DispatchError::Reject(RejectReason::Invalid(
+            InvalidReason::SystemSubNotPermittedForMethod
+        ))
+    ));
+}
+
+#[test]
+fn logical_tunnel_permissions_are_exact_and_keep_viewer_role() {
+    let (sk, verifier) = build_verifier_with("k1");
+    for (path, required) in [
+        ("diag_collect", "diagnostics.collect"),
+        ("update_assignment", "fleet.apply"),
+        ("update_cancel", "fleet.apply"),
+        ("update_rollback", "fleet.apply"),
+    ] {
+        for permission in [required, "settings.write"] {
+            let mut spec = TokenSpec::fresh(Utc::now().timestamp(), "POST", path, "k1");
+            spec.role = "viewer".into();
+            spec.perm = Some(permission.into());
+            let result = verifier.verify(
+                &mint(&sk, &spec),
+                EnvelopeContext {
+                    method: "POST",
+                    path,
+                },
+            );
+            assert_eq!(result.is_ok(), permission == required);
+            if let Ok(actor) = result {
+                assert_eq!(actor.role, "viewer");
+                assert!(actor.allows_rpc(
+                    EnvelopeContext {
+                        method: "POST",
+                        path
+                    },
+                    None,
+                    false
+                ));
+            }
+        }
+    }
 }

@@ -329,6 +329,11 @@ impl<H: Handler> RpcDispatcher<H> {
         // arrived is still rejected rather than silently re-run.
         if let (Some(cache), Some(rid)) = (self.response_cache.as_ref(), request_id) {
             let actor = self.verifier.verify_no_replay(token, envelope)?;
+            if !actor.allows_rpc(envelope, body, true) {
+                return Err(DispatchError::Reject(RejectReason::Invalid(
+                    InvalidReason::PermissionMismatch,
+                )));
+            }
             if let Some(cached) = cache.get(&actor.jti, rid) {
                 // Byte-identical replay — bypass handler, audit, and
                 // system-sub gate. The original call already ran them.
@@ -363,6 +368,11 @@ impl<H: Handler> RpcDispatcher<H> {
         let actor = self
             .verifier
             .verify_with_request_id(token, envelope, request_id)?;
+        if !actor.allows_rpc(envelope, body, true) {
+            return Err(DispatchError::Reject(RejectReason::Invalid(
+                InvalidReason::PermissionMismatch,
+            )));
+        }
         self.check_system_sub_and_audit(method, envelope, &actor)
             .await?;
         self.handler
@@ -446,5 +456,6 @@ fn anonymous_read_actor() -> VerifiedActor {
         // An unauthenticated read has no human behind it, so there is no org
         // it could have been acting for.
         actor_org_id: None,
+        perm: None,
     }
 }
