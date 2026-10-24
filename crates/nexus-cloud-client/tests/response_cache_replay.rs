@@ -124,14 +124,14 @@ async fn duplicate_jti_and_request_id_replays_byte_identically() {
     let now = Utc::now().timestamp();
     let request_id = uuid::Uuid::now_v7().to_string();
     let jti = uuid::Uuid::now_v7().to_string();
-    let tok = mint(&sk, "k1", &jti, "POST", "/admin/v1/cameras", now);
+    let tok = mint(&sk, "k1", &jti, "POST", "/admin/cameras", now);
 
     let env = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(request_id),
     });
 
@@ -171,13 +171,13 @@ async fn retry_with_fresh_jti_re_runs_handler_in_engine() {
     let request_id = uuid::Uuid::now_v7().to_string();
 
     let jti1 = uuid::Uuid::now_v7().to_string();
-    let tok1 = mint(&sk, "k1", &jti1, "POST", "/admin/v1/cameras", now);
+    let tok1 = mint(&sk, "k1", &jti1, "POST", "/admin/cameras", now);
     let env1 = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok1),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(request_id.clone()),
     });
     let _first = dispatcher
@@ -195,13 +195,13 @@ async fn retry_with_fresh_jti_re_runs_handler_in_engine() {
     // miss + retry. We assert the engine still produces a fresh,
     // valid body in that case rather than rejecting the call.
     let jti2 = uuid::Uuid::now_v7().to_string();
-    let tok2 = mint(&sk, "k1", &jti2, "POST", "/admin/v1/cameras", now);
+    let tok2 = mint(&sk, "k1", &jti2, "POST", "/admin/cameras", now);
     let env2 = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok2),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(request_id),
     });
     let second = dispatcher
@@ -223,13 +223,13 @@ async fn rpc_call_without_request_id_falls_back_to_replay_rejection() {
     let (sk, dispatcher, calls) = build_dispatcher_with_response_cache();
     let now = Utc::now().timestamp();
     let jti = uuid::Uuid::now_v7().to_string();
-    let tok = mint(&sk, "k1", &jti, "POST", "/admin/v1/cameras", now);
+    let tok = mint(&sk, "k1", &jti, "POST", "/admin/cameras", now);
     let env = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: None,
     });
 
@@ -277,13 +277,13 @@ async fn cache_miss_after_eviction_rejects_rather_than_re_runs() {
 
     let rid1 = uuid::Uuid::now_v7().to_string();
     let jti1 = uuid::Uuid::now_v7().to_string();
-    let tok1 = mint(&sk, "k1", &jti1, "POST", "/admin/v1/cameras", now);
+    let tok1 = mint(&sk, "k1", &jti1, "POST", "/admin/cameras", now);
     let env1 = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok1),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(rid1),
     });
     dispatcher
@@ -294,13 +294,13 @@ async fn cache_miss_after_eviction_rejects_rather_than_re_runs() {
     // Distinct (jti, rid) — evicts the first response from the cache.
     let rid2 = uuid::Uuid::now_v7().to_string();
     let jti2 = uuid::Uuid::now_v7().to_string();
-    let tok2 = mint(&sk, "k1", &jti2, "POST", "/admin/v1/cameras", now);
+    let tok2 = mint(&sk, "k1", &jti2, "POST", "/admin/cameras", now);
     let env2 = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok2),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(rid2),
     });
     dispatcher
