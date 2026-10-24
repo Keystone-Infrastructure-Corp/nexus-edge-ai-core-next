@@ -68,6 +68,8 @@ pub enum InvalidReason {
     MethodMismatch,
     /// `path` claim did not match the envelope `rpc_call.path`.
     PathMismatch,
+    /// Signed permission does not authorize the actual action or body target.
+    PermissionMismatch,
     /// Token expired more than the 30 s skew window ago.
     Expired,
     /// Token's `iat` is more than 30 s in the future (forged ahead of
