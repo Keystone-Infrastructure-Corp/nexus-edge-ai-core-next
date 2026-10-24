@@ -299,20 +299,13 @@ fn build_rpc_dispatcher(
     // reply-bound `RpcCall` dispatch path). Human-actor forced assignments
     // and cancels ride the owner/admin/operator lane and skip this gate.
     let mut policy = SystemMethodPolicy::default();
-    policy.permit("update_assignment");
-    policy.permit("update_cancel");
-    policy.permit("update_rollback");
     // API autoapply uses owner metadata but a narrowly bound system identity.
-    for category in [
-        "rules",
-        "text_prompts",
-        "visual_prompts",
-        "detector_config",
-        "delivery_settings",
-        "alert_sinks",
-        "live_view",
-    ] {
-        policy.permit(category);
+    // Both lists are the ones `VerifiedActor::allows_system_action` enforces.
+    for method in nexus_cloud_client::actor_token::UPDATE_ORCHESTRATOR_ACTIONS
+        .iter()
+        .chain(nexus_cloud_client::actor_token::FLEET_CATEGORIES)
+    {
+        policy.permit(*method);
     }
     let handler = EngineRpcHandler {
         store: store.clone(),
@@ -1065,7 +1058,9 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         // Legacy routine assignments use the signed manifest.
                         // Every supplied actor token is authoritative and must
                         // pass before the handler can persist state or emit progress.
-                        // Force and downgrades still require a token.
+                        // Force and downgrades still require a token: a
+                        // tokenless assignment may only move to a newer
+                        // version (or re-ack the running one).
                         let forced = p.force.unwrap_or(false) || p.allow_downgrade.unwrap_or(false);
                         if forced || p.actor_token.is_some() {
                             let Some(disp) = dispatcher else {
@@ -1097,6 +1092,18 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                                     continue;
                                 }
                             }
+                        } else if !crate::cloud_update::tokenless_target_allowed(&p.target_version)
+                        {
+                            // The manifest signature does not cover the force or
+                            // downgrade flags, so clearing them must not let an
+                            // older signed manifest install without a token.
+                            warn!(
+                                core_id = %core_id,
+                                assignment_id = %p.assignment_id,
+                                target_version = %p.target_version,
+                                "tokenless update_assignment would downgrade; dropping",
+                            );
+                            continue;
                         }
                         crate::cloud_update::handle_assignment(
                             Arc::clone(store),
@@ -4499,6 +4506,44 @@ mod heartbeat_ack_tests {
                 usize::from(allowed),
                 "denied assignments emit no progress"
             );
+        }
+    }
+
+    /// The manifest signature does not cover `force` / `allow_downgrade`, so a
+    /// tokenless assignment must never install an older version.
+    #[tokio::test]
+    async fn tokenless_assignments_never_downgrade() {
+        let running = env!("NEXUS_BUILD_VERSION");
+        assert_ne!(running, "0.0.0", "test needs an older version to send");
+        let major: u64 = running.split('.').next().unwrap().parse().unwrap();
+        for (target, allowed) in [
+            ("0.0.0".to_string(), false),
+            (format!("{}.0.0", major + 1), true),
+        ] {
+            let (store, _dir) = test_store().await;
+            let key = service_test_key();
+            let dispatcher = service_test_dispatcher(&key, &store, "http://127.0.0.1:1".into());
+            let payload = nexus_cloud_protocol::v1::UpdateAssignmentPayload {
+                actor_token: None,
+                allow_downgrade: None,
+                force: None,
+                artifact_sha256: "a".repeat(64),
+                artifact_url: "https://invalid.test/release".into(),
+                assignment_id: uuid::Uuid::now_v7().to_string(),
+                channel: "review-test".into(),
+                deferral_until: None,
+                manifest_url: None,
+                signature: String::new(),
+                target_version: target.clone(),
+            };
+            let sent =
+                pump_test_envelope(&store, &dispatcher, EnvelopeBody::UpdateAssignment(payload))
+                    .await;
+            let state = crate::cloud_update::read_state(&store).await;
+            assert_eq!(state.assigned_channel.is_some(), allowed, "{target}");
+            if !allowed {
+                assert_eq!(sent, 0, "a refused downgrade emits no progress");
+            }
         }
     }
 

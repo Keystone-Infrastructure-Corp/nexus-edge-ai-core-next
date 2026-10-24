@@ -1865,6 +1865,43 @@ mod tests {
             ),
             ("viewer", None, "PUT", "/admin/cameras/1", json!({}), false),
             ("owner", None, "PUT", "/admin/cameras/1", json!({}), true),
+            // A legacy (perm-less) token never reaches an opaque or unmapped
+            // mutating route, whatever its role.
+            ("owner", None, "POST", "/admin/proxy", json!({}), false),
+            (
+                "owner",
+                None,
+                "POST",
+                "/admin/cameras/1/onvif/raw",
+                json!({}),
+                false,
+            ),
+            ("owner", None, "POST", "/admin/unmapped", json!({}), false),
+            // The cloud's core rename and core delete sign cores.manage.
+            (
+                "viewer",
+                Some("cores.manage"),
+                "PUT",
+                "/admin/server/identity",
+                json!({}),
+                true,
+            ),
+            (
+                "viewer",
+                Some("cores.manage"),
+                "DELETE",
+                "/admin/cloud/enrollment",
+                json!({}),
+                true,
+            ),
+            (
+                "owner",
+                Some("cores.manage"),
+                "PUT",
+                "/admin/server/bind",
+                json!({}),
+                false,
+            ),
         ] {
             let token = signed_test_token(&key, role, permission, method, path);
             let result = dispatcher

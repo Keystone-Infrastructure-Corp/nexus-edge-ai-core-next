@@ -20,7 +20,17 @@
 //! 8. Checks `http_method == envelope.method` and `path == envelope.path`.
 //! 9. Checks `iat <= now + SKEW` and `exp > now - SKEW`. The 30 s skew
 //!    window matches Phase 1.15 (`docs/ARCHITECTURE.md §3.7`).
-//! 10. Consults the [`JtiReplayCache`] — replays are rejected.
+//! 10. When the token carries `perm`, checks that the edge's action table
+//!     maps `(method, path)` to that permission.
+//! 11. Checks the system-action contract: a `system:` subject may only
+//!     invoke its service's exact actions, and a non-system subject may not
+//!     claim the `system` role.
+//! 12. Consults the [`JtiReplayCache`] — replays are rejected.
+//!
+//! The dispatcher then applies [`VerifiedActor::allows_rpc`] before the
+//! handler runs: the signed permission must also match the request body
+//! (PTZ action, camera ids), and a token without `perm` falls back to its
+//! role only on a route the action table maps.
 //!
 //! All post-parse rejections collapse to `RejectReason::Invalid(_)` on
 //! the wire to avoid leaking which check failed. The fine-grained
@@ -50,6 +60,25 @@ pub const SHELL_AUDIENCE: &str = "nexus-edge-shell";
 
 /// Clock-skew window per Phase 1.15. ±30 s on both sides.
 pub const CLOCK_SKEW_SECS: i64 = 30;
+
+/// Logical OTA verbs `system:update-orchestrator` may invoke. The engine's
+/// dispatcher system-method policy is built from this same list.
+pub const UPDATE_ORCHESTRATOR_ACTIONS: &[&str] =
+    &["update_assignment", "update_cancel", "update_rollback"];
+
+/// Fleet categories behind `POST /admin/fleet/<category>`: the only routes
+/// `system:api-gateway` (autoapply) may invoke, and the routes that take
+/// `fleet.apply`. The engine's dispatcher system-method policy is built
+/// from this same list.
+pub const FLEET_CATEGORIES: &[&str] = &[
+    "rules",
+    "text_prompts",
+    "visual_prompts",
+    "detector_config",
+    "delivery_settings",
+    "alert_sinks",
+    "live_view",
+];
 
 /// A single trusted Ed25519 verification key bundled at enrollment.
 ///
@@ -108,20 +137,13 @@ impl VerifiedActor {
         }
         envelope.method == "POST"
             && match self.sub.as_str() {
-                "system:update-orchestrator" => matches!(
-                    envelope.path,
-                    "update_assignment" | "update_cancel" | "update_rollback"
-                ),
-                "system:api-gateway" => matches!(
-                    envelope.path,
-                    "/admin/fleet/rules"
-                        | "/admin/fleet/text_prompts"
-                        | "/admin/fleet/visual_prompts"
-                        | "/admin/fleet/detector_config"
-                        | "/admin/fleet/delivery_settings"
-                        | "/admin/fleet/alert_sinks"
-                        | "/admin/fleet/live_view"
-                ),
+                "system:update-orchestrator" => {
+                    UPDATE_ORCHESTRATOR_ACTIONS.contains(&envelope.path)
+                }
+                "system:api-gateway" => envelope
+                    .path
+                    .strip_prefix("/admin/fleet/")
+                    .is_some_and(|category| FLEET_CATEGORIES.contains(&category)),
                 _ => false,
             }
     }
@@ -139,25 +161,43 @@ impl VerifiedActor {
             return false;
         }
         let Some(permission) = self.perm.as_deref() else {
-            return legacy_allowed;
+            // Role-only fallback, kept only for tokens minted before the cloud
+            // signs `perm`; removed once every cloud mint path signs it (cloud
+            // ADR-090). Even then a mutating route needs an entry in the action
+            // table, so the opaque LAN proxy, raw SOAP and unmapped routes
+            // always require a signed permission.
+            let safe = matches!(
+                envelope.method.to_ascii_uppercase().as_str(),
+                "GET" | "HEAD" | "OPTIONS"
+            );
+            return legacy_allowed && (safe || !rpc_permissions(envelope).is_empty());
         };
         rpc_permissions(envelope).contains(&permission)
             && rpc_body_matches(envelope, permission, body)
     }
 }
 
-/// Explicit edge action contract. No wildcard grants for unknown admin routes,
-/// raw SOAP, or arbitrary LAN proxy requests. Query data cannot change the path.
-fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
-    let path = envelope.path.split('?').next().unwrap_or(envelope.path);
+/// The one path normalizer both [`rpc_permissions`] and [`rpc_body_matches`]
+/// use: the query is dropped, the leading `/` is optional and one trailing
+/// `/` is stripped. Encoded, empty and dot segments yield `None`.
+fn rpc_path_parts(path: &str) -> Option<Vec<&str>> {
+    let path = path.split('?').next().unwrap_or(path);
     if path.contains(['%', '#', '\\'])
         || path.contains("//")
         || path.split('/').any(|part| matches!(part, "." | ".."))
     {
-        return &[];
+        return None;
     }
     let path = path.strip_suffix('/').unwrap_or(path);
-    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    Some(path.trim_start_matches('/').split('/').collect())
+}
+
+/// Explicit edge action contract. No wildcard grants for unknown admin routes,
+/// raw SOAP, or arbitrary LAN proxy requests. Query data cannot change the path.
+fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
+    let Some(parts) = rpc_path_parts(envelope.path) else {
+        return &[];
+    };
     let verb = envelope.method.to_ascii_uppercase();
     let method = verb.as_str();
     match (method, parts.as_slice()) {
@@ -170,17 +210,19 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         ("POST", ["admin", "clips", id, "replicate"]) if id.parse::<u64>().is_ok() => {
             &["clips.expedite"]
         }
-        (
-            "POST",
-            ["admin", "fleet", "rules" | "text_prompts" | "visual_prompts" | "detector_config" | "delivery_settings"
-            | "alert_sinks" | "live_view"],
-        ) => &["fleet.apply"],
+        ("POST", ["admin", "fleet", category]) if FLEET_CATEGORIES.contains(category) => {
+            &["fleet.apply"]
+        }
         ("PUT", ["admin", "network", "plan" | "roles"])
         | ("POST", ["admin", "network", "plan", "apply" | "confirm" | "rollback"]) => {
             &["settings.network"]
         }
         (_, ["admin", "cameras", id, tail @ ..]) if id.parse::<u64>().is_ok() => {
             camera_rpc_permissions(method, tail)
+        }
+        // The cloud's typed core rename and core delete sign cores.manage.
+        ("PUT", ["admin", "server", "identity"]) | ("DELETE", ["admin", "cloud", "enrollment"]) => {
+            &["settings.write", "cores.manage"]
         }
         ("POST", ["admin", "cameras"])
         | ("POST", ["admin", "cameras", "reprobe"])
@@ -201,11 +243,10 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         )
         | ("POST", ["admin", "visual-prompts"])
         | ("DELETE", ["admin", "visual-prompts", _])
-        | ("PUT", ["admin", "server", "bind" | "watermarks" | "inference" | "identity"])
+        | ("PUT", ["admin", "server", "bind" | "watermarks" | "inference"])
         | ("POST", ["admin", "server", "restart"])
         | ("PUT", ["admin", "auth", "config"])
         | ("POST", ["admin", "auth", "oidc", "test-discovery"])
-        | ("DELETE", ["admin", "cloud", "enrollment"])
         | ("POST", ["admin", "cloud", "enroll"]) => &["settings.write"],
         ("POST", ["admin", "users"])
         | ("PUT" | "DELETE", ["admin", "users", _])
@@ -265,14 +306,10 @@ fn camera_rpc_permissions(method: &str, tail: &[&str]) -> &'static [&'static str
 }
 
 fn rpc_body_matches(envelope: EnvelopeContext<'_>, permission: &str, body: Option<&[u8]>) -> bool {
-    let path = envelope
-        .path
-        .split('?')
-        .next()
-        .unwrap_or(envelope.path)
-        .trim_end_matches('/');
-    let parts: Vec<&str> = path.split('/').collect();
-    let ["", "admin", "cameras", camera, tail @ ..] = parts.as_slice() else {
+    let Some(parts) = rpc_path_parts(envelope.path) else {
+        return false;
+    };
+    let ["admin", "cameras", camera, tail @ ..] = parts.as_slice() else {
         return true;
     };
     let Ok(camera) = camera.parse::<u64>() else {

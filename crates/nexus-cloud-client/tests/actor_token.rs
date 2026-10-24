@@ -837,6 +837,71 @@ async fn system_actors_are_bound_to_their_actual_service_actions() {
     }
 }
 
+/// The role-only fallback exists for tokens minted before the cloud signed
+/// `perm`; it must not open a mutating route the edge has no action for.
+#[tokio::test]
+async fn a_perm_less_token_reaches_only_mapped_mutating_routes() {
+    let (sk, verifier) = build_verifier_with("k1");
+    let dispatcher = RpcDispatcher::new(verifier, SystemMethodPolicy::default(), OkHandler);
+    for (method, path, allowed) in [
+        ("POST", "/admin/proxy", false),
+        ("POST", "/admin/cameras/1/onvif/raw", false),
+        ("PUT", "/admin/unmapped", false),
+        ("POST", "/admin/cameras", true),
+        ("PUT", "/admin/cameras/1", true),
+        ("GET", "/admin/unmapped", true),
+    ] {
+        let mut spec = TokenSpec::fresh(Utc::now().timestamp(), method, path, "k1");
+        spec.role = "owner".into();
+        let result = dispatcher
+            .dispatch(
+                "write",
+                EnvelopeContext { method, path },
+                Some(&mint(&sk, &spec)),
+                None,
+            )
+            .await;
+        assert_eq!(result.is_ok(), allowed, "{method} {path}");
+    }
+}
+
+/// The action and camera binding uses the same path shape as the
+/// permission table, so a path without its leading `/` cannot map to
+/// `live.ptz` and then skip the body check.
+#[test]
+fn ptz_body_binding_applies_to_every_path_shape_the_table_maps() {
+    let actor = VerifiedActor {
+        sub: "human".into(),
+        role: "viewer".into(),
+        perm: Some("live.ptz".into()),
+        jti: "jti".into(),
+        org_id: ORG_ID.into(),
+        actor_org_id: None,
+    };
+    for path in [
+        "/admin/cameras/1/ptz",
+        "admin/cameras/1/ptz",
+        "/admin/cameras/1/ptz/",
+    ] {
+        let envelope = EnvelopeContext {
+            method: "POST",
+            path,
+        };
+        for (body, allowed) in [
+            (json!({"action":"move"}), true),
+            (json!({"action":"set_home"}), false),
+            (json!({"action":"move","camera_id":2}), false),
+        ] {
+            let bytes = serde_json::to_vec(&body).unwrap();
+            assert_eq!(
+                actor.allows_rpc(envelope, Some(&bytes), false),
+                allowed,
+                "{path} {body}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn cached_ptz_success_cannot_authorize_a_changed_action_or_camera() {
     let (sk, verifier) = build_verifier_with("k1");
