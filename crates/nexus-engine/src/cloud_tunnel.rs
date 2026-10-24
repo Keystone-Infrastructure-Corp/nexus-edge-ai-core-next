@@ -748,10 +748,9 @@ async fn run(
 /// mirrors the `diag_collect` gate: verify the signature + claims against a
 /// LOGICAL RPC path (there is no HTTP path on an update payload — the cloud
 /// binds `path=update_assignment` / `update_cancel` / `update_rollback`),
-/// then require EITHER a privileged human role (owner/admin/operator) OR a
-/// `system:`-sub token whose logical path is on the dispatcher's
-/// system-method whitelist — the same authorisation the dispatcher applies
-/// to an inbound `rpc_call`.
+/// then require the action's signed permission, falling back to privileged
+/// human roles for legacy tokens. System subjects additionally require the
+/// dispatcher's method allowlist, just as on an inbound `rpc_call`.
 fn verify_update_actor(
     disp: &RpcDispatcher<EngineRpcHandler>,
     token: Option<&str>,
@@ -768,17 +767,27 @@ fn verify_update_actor(
             },
         )
         .map_err(|reason| format!("actor_token invalid: {reason}"))?;
-    if actor.sub.starts_with("system:") {
-        if !disp.policy().allows(logical_path) {
-            return Err(format!(
-                "system sub `{}` not permitted for `{logical_path}`",
-                actor.sub
-            ));
-        }
-    } else if !crate::engine_rpc::is_priviledged_role(&actor.role) {
-        return Err(format!("actor role `{}` lacks privilege", actor.role));
+    if !tunnel_actor_allowed(&actor, disp.policy(), logical_path) {
+        return Err("actor lacks the requested capability".to_string());
     }
     Ok(actor)
+}
+
+/// Both logical-envelope paths keep the system allowlist as an independent
+/// requirement; a signed capability never promotes a system subject.
+fn tunnel_actor_allowed(actor: &VerifiedActor, policy: &SystemMethodPolicy, path: &str) -> bool {
+    let system = actor.sub.starts_with("system:");
+    if system && !policy.allows(path) {
+        return false;
+    }
+    actor.allows_rpc(
+        EnvelopeContext {
+            method: "POST",
+            path,
+        },
+        None,
+        system || crate::engine_rpc::is_priviledged_role(&actor.role),
+    )
 }
 
 /// #759 — apply a `clip_replicated_ack` to the clip whose
@@ -955,7 +964,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         path: "diag_collect",
                     },
                 ) {
-                    Ok(actor) if crate::engine_rpc::is_priviledged_role(&actor.role) => {
+                    Ok(actor) if tunnel_actor_allowed(&actor, disp.policy(), "diag_collect") => {
                         disp.handler()
                             .spawn_diag_collect(payload.clone(), Arc::clone(outbox));
                     }
@@ -963,7 +972,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         warn!(
                             core_id = %core_id,
                             role = %actor.role,
-                            "diag_collect actor lacks a privileged role; dropping",
+                            "diag_collect actor lacks the requested capability; dropping",
                         );
                     }
                     Err(reason) => {
@@ -1204,7 +1213,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// [`nexus_types::CameraTalkDown`] already discovers), gated on the camera
 /// actually having one.
 fn heartbeat_caps(hd_transport: Option<nexus_types::HdTransport>) -> Vec<String> {
-    let mut caps = vec!["live_view".to_string()];
+    let mut caps = vec!["live_view".to_string(), "actor_perm_v1".to_string()];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
     caps
 }
@@ -2461,6 +2470,36 @@ mod health_tests {
     use super::*;
     use nexus_pipeline::StubClipRecorder;
 
+    #[test]
+    fn logical_actions_require_their_capability_and_keep_the_system_allowlist() {
+        let mut policy = SystemMethodPolicy::default();
+        policy.permit("update_assignment");
+        let mut actor = VerifiedActor {
+            sub: "human".into(),
+            role: "viewer".into(),
+            perm: Some("diagnostics.collect".into()),
+            jti: "test".into(),
+            org_id: "org".into(),
+            actor_org_id: None,
+        };
+        assert!(tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+        assert!(!tunnel_actor_allowed(&actor, &policy, "update_assignment"));
+        actor.perm = Some("fleet.apply".into());
+        assert!(tunnel_actor_allowed(&actor, &policy, "update_assignment"));
+        actor.sub = "system:fleet".into();
+        assert!(tunnel_actor_allowed(&actor, &policy, "update_assignment"));
+        assert!(!tunnel_actor_allowed(&actor, &policy, "update_cancel"));
+        actor.perm = Some("diagnostics.collect".into());
+        assert!(!tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+        actor.sub = "human".into();
+        actor.perm = None;
+        assert!(!tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+        actor.role = "owner".into();
+        assert!(tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+        actor.perm = Some("settings.write".into());
+        assert!(!tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+    }
+
     /// The engine must not advertise a capability it cannot perform. Talk-down
     /// audio has no receive-side pipeline here, so no transport may leak the
     /// `talkdown_webrtc` tag onto the heartbeat — a cloud that routed an
@@ -2484,9 +2523,12 @@ mod health_tests {
     /// that cannot advertises none (BUG-225).
     #[test]
     fn the_hd_transport_is_advertised_only_when_the_bridge_can_publish() {
-        assert_eq!(heartbeat_caps(None), ["live_view"]);
+        assert_eq!(heartbeat_caps(None), ["live_view", "actor_perm_v1"]);
         for t in nexus_types::HdTransport::all() {
-            assert_eq!(heartbeat_caps(Some(t)), ["live_view", t.cap_tag()]);
+            assert_eq!(
+                heartbeat_caps(Some(t)),
+                ["live_view", "actor_perm_v1", t.cap_tag()]
+            );
         }
     }
 
@@ -3938,7 +3980,11 @@ mod heartbeat_ack_tests {
     async fn a_bridge_that_cannot_publish_puts_no_hd_transport_on_the_heartbeat() {
         let bridge = crate::webrtc_bridge::WebRtcBridge::disabled();
         for t in nexus_types::HdTransport::all() {
-            assert_eq!(first_heartbeat_caps(&bridge, t).await, ["live_view"], "{t}");
+            assert_eq!(
+                first_heartbeat_caps(&bridge, t).await,
+                ["live_view", "actor_perm_v1"],
+                "{t}"
+            );
         }
     }
 
@@ -3952,7 +3998,7 @@ mod heartbeat_ack_tests {
         )));
         assert_eq!(
             first_heartbeat_caps(&bridge, nexus_types::HdTransport::Sfu).await,
-            ["live_view", "hd_sfu"]
+            ["live_view", "actor_perm_v1", "hd_sfu"]
         );
     }
 
@@ -3966,9 +4012,9 @@ mod heartbeat_ack_tests {
             std::collections::HashMap::new(),
         )));
         let expected: &[&str] = if nexus_pipeline::MoqSession::plugin_available() {
-            &["live_view", "hd_moq"]
+            &["live_view", "actor_perm_v1", "hd_moq"]
         } else {
-            &["live_view"]
+            &["live_view", "actor_perm_v1"]
         };
         assert_eq!(
             first_heartbeat_caps(&bridge, nexus_types::HdTransport::Moq).await,
