@@ -7,7 +7,7 @@
 //! 2. Bad-signature, wrong-`aud`, wrong-`core_id`, expired, replayed
 //!    `jti`, mismatched `path` all rejected with `actor_token_invalid`.
 //! 3. `system`-sub invoking `create_camera` rejected with
-//!    `actor_token_invalid`; `system`-sub `entitlement_update` accepted.
+//!    `actor_token_invalid`; `system`-sub actor RPCs have a service-specific action contract.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
@@ -402,7 +402,7 @@ async fn system_sub_invoking_create_camera_rejected() {
 }
 
 #[tokio::test]
-async fn system_sub_entitlement_update_accepted() {
+async fn entitlement_service_cannot_use_actor_rpc_instead_of_entitlement_jwt() {
     let (sk, verifier) = build_verifier_with("k1");
     let dispatcher = RpcDispatcher::new(verifier, SystemMethodPolicy::default(), OkHandler);
     let now = Utc::now().timestamp();
@@ -410,7 +410,7 @@ async fn system_sub_entitlement_update_accepted() {
     spec.sub = "system:entitlement-svc".into();
     spec.role = "system:entitlement-svc".into();
     let tok = mint(&sk, &spec);
-    let body = dispatcher
+    let error = dispatcher
         .dispatch(
             "entitlement_update",
             EnvelopeContext {
@@ -421,8 +421,8 @@ async fn system_sub_entitlement_update_accepted() {
             None,
         )
         .await
-        .expect("system entitlement update accepted");
-    assert_eq!(body, b"ok");
+        .expect_err("entitlement updates use their separate signed JWT envelope");
+    assert_eq!(error.wire_code(), "actor_token_invalid");
 }
 
 // -----------------------------------------------------------------------------
@@ -716,5 +716,173 @@ fn logical_tunnel_permissions_are_exact_and_keep_viewer_role() {
                 ));
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn system_actors_are_bound_to_their_actual_service_actions() {
+    for (subject, role, path, permission, allowed) in [
+        (
+            "system:notify-svc",
+            "system",
+            "update_assignment",
+            Some("fleet.apply"),
+            false,
+        ),
+        (
+            "system:notify-svc",
+            "system",
+            "/admin/fleet/rules",
+            None,
+            false,
+        ),
+        (
+            "system:api-gateway",
+            "owner",
+            "update_rollback",
+            Some("fleet.apply"),
+            false,
+        ),
+        (
+            "system:update-orchestrator",
+            "system",
+            "/admin/fleet/rules",
+            Some("fleet.apply"),
+            false,
+        ),
+        (
+            "system:unknown",
+            "owner",
+            "update_cancel",
+            Some("fleet.apply"),
+            false,
+        ),
+        (
+            "user:human",
+            "system",
+            "update_cancel",
+            Some("fleet.apply"),
+            false,
+        ),
+        ("user:human", "system", "update_cancel", None, false),
+        (
+            "system:update-orchestrator",
+            "system",
+            "update_assignment",
+            Some("fleet.firmware"),
+            true,
+        ),
+        (
+            "system:update-orchestrator",
+            "system",
+            "update_cancel",
+            Some("fleet.apply"),
+            true,
+        ),
+        (
+            "system:update-orchestrator",
+            "system",
+            "update_rollback",
+            None,
+            true,
+        ),
+        (
+            "system:api-gateway",
+            "owner",
+            "/admin/fleet/rules",
+            Some("fleet.apply"),
+            true,
+        ),
+        (
+            "system:api-gateway",
+            "owner",
+            "/admin/fleet/live_view",
+            None,
+            true,
+        ),
+        (
+            "system:api-gateway",
+            "owner",
+            "/admin/fleet/unknown",
+            None,
+            false,
+        ),
+    ] {
+        let (sk, verifier) = build_verifier_with("k1");
+        let dispatcher = RpcDispatcher::new(
+            verifier,
+            SystemMethodPolicy::permitting(["test"]),
+            OkHandler,
+        );
+        let mut spec = TokenSpec::fresh(Utc::now().timestamp(), "POST", path, "k1");
+        spec.sub = subject.into();
+        spec.role = role.into();
+        spec.perm = permission.map(str::to_owned);
+        let result = dispatcher
+            .dispatch(
+                "test",
+                EnvelopeContext {
+                    method: "POST",
+                    path,
+                },
+                Some(&mint(&sk, &spec)),
+                None,
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "{subject} {role} {path} {permission:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cached_ptz_success_cannot_authorize_a_changed_action_or_camera() {
+    let (sk, verifier) = build_verifier_with("k1");
+    let dispatcher = RpcDispatcher::new(verifier, SystemMethodPolicy::default(), OkHandler)
+        .with_response_cache(Arc::new(
+            nexus_cloud_client::response_cache::RpcResponseCache::new(),
+        ));
+    let path = "/admin/cameras/1/ptz";
+    let mut spec = TokenSpec::fresh(Utc::now().timestamp(), "POST", path, "k1");
+    spec.perm = Some("live.ptz".into());
+    let token = mint(&sk, &spec);
+    let make_envelope = |body: serde_json::Value| nexus_cloud_protocol::v1::Envelope {
+        meta: nexus_cloud_protocol::v1::EnvelopeMeta {
+            id: "same-request".into(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+            ts: Utc::now().to_rfc3339(),
+            v: 1,
+        },
+        body: nexus_cloud_protocol::v1::EnvelopeBody::RpcCall(
+            nexus_cloud_protocol::v1::RpcCallPayload {
+                actor_token: Some(token.clone()),
+                method: "POST".into(),
+                path: path.into(),
+                headers: None,
+                request_id: Some("cached-ptz".into()),
+                body: Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::to_vec(&body).unwrap()),
+                ),
+            },
+        ),
+    };
+    let valid = make_envelope(json!({"action":"stop","camera_id":1}));
+    assert!(dispatcher.dispatch_envelope(&valid).await.is_ok());
+    assert!(dispatcher.dispatch_envelope(&valid).await.is_ok());
+    for body in [
+        json!({"action":"set_preset","camera_id":1}),
+        json!({"action":"stop","camera_id":2}),
+    ] {
+        assert!(matches!(
+            dispatcher.dispatch_envelope(&make_envelope(body)).await,
+            Err(DispatchError::Reject(RejectReason::Invalid(
+                InvalidReason::PermissionMismatch
+            )))
+        ));
     }
 }

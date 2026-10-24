@@ -72,7 +72,7 @@ pub struct VerifiedActor {
     /// accounts.
     pub sub: String,
     /// `role` claim — `viewer`, `operator`, `admin`, `owner`, or
-    /// `system:<svc>` for system tokens.
+    /// `system` for internal service tokens.
     pub role: String,
     /// Exact signed capability; absent only on legacy or separate shell grants.
     pub perm: Option<String>,
@@ -99,6 +99,33 @@ pub struct VerifiedActor {
 }
 
 impl VerifiedActor {
+    /// Service actors are confined to existing producers' exact actions, even
+    /// when a legacy token omits its permission. Entitlements use a different JWT.
+    #[must_use]
+    pub fn allows_system_action(&self, envelope: EnvelopeContext<'_>) -> bool {
+        if !self.sub.starts_with("system:") {
+            return self.role != "system" && !self.role.starts_with("system:");
+        }
+        envelope.method == "POST"
+            && match self.sub.as_str() {
+                "system:update-orchestrator" => matches!(
+                    envelope.path,
+                    "update_assignment" | "update_cancel" | "update_rollback"
+                ),
+                "system:api-gateway" => matches!(
+                    envelope.path,
+                    "/admin/fleet/rules"
+                        | "/admin/fleet/text_prompts"
+                        | "/admin/fleet/visual_prompts"
+                        | "/admin/fleet/detector_config"
+                        | "/admin/fleet/delivery_settings"
+                        | "/admin/fleet/alert_sinks"
+                        | "/admin/fleet/live_view"
+                ),
+                _ => false,
+            }
+    }
+
     /// Signed capabilities take precedence over preset roles. Legacy callers
     /// retain the supplied role decision; shell grants use a separate audience.
     #[must_use]
@@ -108,6 +135,9 @@ impl VerifiedActor {
         body: Option<&[u8]>,
         legacy_allowed: bool,
     ) -> bool {
+        if !self.allows_system_action(envelope) {
+            return false;
+        }
         let Some(permission) = self.perm.as_deref() else {
             return legacy_allowed;
         };
@@ -132,7 +162,9 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
     let method = verb.as_str();
     match (method, parts.as_slice()) {
         ("POST", ["diag_collect"]) => &["diagnostics.collect"],
-        ("POST", ["update_assignment" | "update_cancel" | "update_rollback"]) => &["fleet.apply"],
+        ("POST", ["update_assignment" | "update_cancel" | "update_rollback"]) => {
+            &["fleet.apply", "fleet.firmware"]
+        }
         ("PUT", ["admin", "remote_access"]) => &["shell.policy"],
         ("POST", ["admin", "remote-access", "restart-sshd"]) => &["shell.manage"],
         ("POST", ["admin", "clips", id, "replicate"]) if id.parse::<u64>().is_ok() => {
@@ -459,14 +491,20 @@ impl Verifier {
             return Err(RejectReason::Invalid(InvalidReason::PermissionMismatch));
         }
 
-        Ok(VerifiedActor {
+        let actor = VerifiedActor {
             sub: claims.sub,
             role: claims.role,
             perm: claims.perm,
             jti: claims.jti,
             org_id: claims.org_id,
             actor_org_id: claims.actor_org_id.map(|id| id.to_string()),
-        })
+        };
+        if !actor.allows_system_action(envelope) {
+            return Err(RejectReason::Invalid(
+                InvalidReason::SystemSubNotPermittedForMethod,
+            ));
+        }
+        Ok(actor)
     }
 
     /// Verify a remote-shell `actor_token` — the grant that authorises
