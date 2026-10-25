@@ -58,7 +58,11 @@ additional score, automatic whole-repository audit, or extra reviewer is introdu
 ## Units and integration
 
 The top level owns planning, scores, integration, engineering records, and final gates.
-Delegate only substantial independent work. Each implementation agent owns a worktree at
+Refresh/rebase the integration tree before dispatch per `AGENTS.md`, preserving local
+work. Record each original dispatched base SHA in the ledger; it never changes for that
+unit even if origin/main or the integration tree advances. Units never rebase or merge;
+redispatch from a fresh pinned base when needed. Delegate only substantial independent
+work. Each implementation agent owns a worktree at
 the current integrated top HEAD, branch `il/<slug>/<unit>`, path
 `/tmp/nx-<slug>-u-edge-<unit>`, and target `/tmp/nx-<slug>-target-u-edge-<unit>`.
 Redispatch with a new `-r<n>` suffix on all three. Disjoint file allowlists may run in
@@ -82,8 +86,8 @@ UI context if applicable: <design skill/context; approved mock; tokens/component
 Read AGENTS.md. Create and use your own worktree from the supplied base. Echo canonical
 path/base/branch before editing. Use your own CARGO_TARGET_DIR and E2E_PORT, respecting
 the E2E serialization and engine-path constraints below. Cap terminal output.
-Before staging each commit fetch/rebase origin/main per AGENTS.md, preserving local work.
-Commit only allowlisted files. Report canonical path, actual base/head/commit SHAs,
+Keep the supplied base fixed: never rebase or merge, per AGENTS.md's unit exception.
+Commit only allowlisted files. Report canonical path, supplied base/head/commit SHAs,
 changed paths, exact verification results, skipped gates, assumptions, and open findings.
 Never push, merge, deploy, or edit another tree.
 ```
@@ -95,8 +99,10 @@ Record fallback to the host default when unavailable. Two failed cheap-tier atte
 require a stronger approach rather than a third identical attempt.
 
 Before accepting a report, compare canonical paths (macOS `/tmp` may be `/private/tmp`),
-verify branch head equals reported SHA and base is its ancestor, and inspect every commit
-for allowlist compliance. Reject a mismatched report. Cherry-pick accepted commits into
+verify branch head equals reported SHA and the ORIGINAL dispatched base from the ledger
+is its ancestor; never substitute an agent-reported replacement base. Inspect every
+commit in `<original-dispatched-base>..<unit-head>` for allowlist compliance. Reject a
+mismatched report. Cherry-pick only those unit commits into
 `$TOP` in dependency order; resolve conflicts there or redispatch, never copy source.
 Rerun each unit's verification in the integrated tree; only that evidence counts.
 Before every top-level commit fetch/rebase `origin/main` per `AGENTS.md`; preserve local

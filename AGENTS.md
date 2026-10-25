@@ -327,6 +327,10 @@ implementation notes, do cross-link ADR/SPEC/BUG records that relate to each oth
    that the squash-merge model cannot collapse cleanly. If you have local work in
    progress, `git stash` first or use `git pull --rebase --autostash`. Resolve any
    rebase conflicts before continuing.
+   Exception: `implement-loop` unit agents work from the orchestrator's pinned SHA and
+   never rebase or merge. The orchestrator refreshes/rebases the integration tree before
+   dispatch and its own commits, verifies units against their original dispatched bases,
+   and redispatches from a fresh pinned base when needed.
 1. Pick a step from the wedge plan or a milestone doc in the cloud repo's docs index
    (linked above). Cross-repo work that lands in both repos in the same PR pair is
    common — open companion PRs.
