@@ -307,15 +307,14 @@ jobs:
   #     element is a panic rather than a skip. Covers videotestsrc /
   #     videoconvert / videoscale (base), qtdemux + mp4mux (good),
   #     h26Xparse (bad), x264enc (ugly), avdec_h26X (libav).
+  #   * gstreamer1.0-nice: libnice, webrtcbin's ICE backend. The talk-down
+  #     live receiver (`talkdown_rx`) and the engine's live talk-down tests
+  #     negotiate a real loopback connection, which needs it (ADR-090).
+  #     The HD publisher test `negotiation_wiring_does_not_leak_the_webrtcbin`
+  #     builds a BARE `webrtcbin` and `return`s early when it will not build,
+  #     which makes `gstreamer1.0-plugins-bad` load-bearing: dropping it turns
+  #     a leak regression into a silent pass.
   # NOT installed (would be runtime-only / not exercised by this job):
-  #   * libnice / gstreamer1.0-nice — webrtcbin's ICE backend. The
-  #     `gstreamer-webrtc` tests mostly assert launch STRINGS, and the one
-  #     that does instantiate an element
-  #     (`negotiation_wiring_does_not_leak_the_webrtcbin`) builds a BARE
-  #     `webrtcbin` and never negotiates, so it needs no ICE agent. That test
-  #     does make `gstreamer1.0-plugins-bad` (installed above) load-bearing:
-  #     it `return`s early when `webrtcbin` will not build, so dropping that
-  #     package turns a leak regression into a silent pass.
   #   * libssl-dev (workspace uses rustls everywhere; Cargo.lock has no
   #     openssl / openssl-sys / native-tls — re-verify if that changes).
   #   * libunwind-dev (was needed only on ubuntu-22.04; 24.04 resolves
@@ -368,9 +367,10 @@ jobs:
           # `libglib2.0-dev` is a transitive dep of libgstreamer1.0-dev, named
           # explicitly so a runner image that stops preinstalling it cannot
           # quietly drop `glib-2.0.pc` out of the cached set.
-          packages: pkg-config libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+          packages: pkg-config libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice
           # 5 -> 7. 6 was burned by a run that cached the failed install above.
-          version: 7
+          # 7 -> 8: gstreamer1.0-nice for the talk-down live loopback tests.
+          version: 8
 
       # The caching action reports success whenever the cache *restores*,
       # regardless of whether the packages it was supposed to provide are
@@ -548,7 +548,11 @@ jobs:
       - name: cargo test (nexus-engine, gstreamer)
         env:
           GIO_USE_PROXY_RESOLVER: dummy
-        run: cargo test --locked -p nexus-engine --features gstreamer --bin nexus-engine
+        run: |
+          cargo test --locked -p nexus-engine --features gstreamer --bin nexus-engine
+          # Live talk-down (ADR-090) only exists with `gstreamer-webrtc`; its
+          # engine tests negotiate a real loopback webrtcbin, so run them here.
+          cargo test --locked -p nexus-engine --features gstreamer-webrtc --bin nexus-engine talk_down_live
 
       - name: cargo check + test (gstreamer + ort)
         # `GIO_USE_PROXY_RESOLVER=dummy`: forces GIO to pick its no-op proxy
