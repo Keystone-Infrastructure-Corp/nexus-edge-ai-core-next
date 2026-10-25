@@ -1086,7 +1086,12 @@ mod tests {
             [40, 120, 200][(i % 3) as usize]
         })
         .await;
-        assert!(n <= 6, "a loop must replay at ~1 fps; emitted {n} in 2 s");
+        // 3 fresh frames, then one per LOOP_KEEPALIVE: 4 or 5. Fewer means the
+        // loop froze the cell; more means it replayed faster than 1 fps.
+        assert!(
+            (4..=5).contains(&n),
+            "a loop must replay at ~1 fps; emitted {n} in 2 s"
+        );
     }
 
     /// A static scene emits at the tier floor, not the ceiling.
