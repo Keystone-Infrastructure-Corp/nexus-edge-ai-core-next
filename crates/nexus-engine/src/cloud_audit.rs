@@ -125,7 +125,8 @@ pub(crate) fn build_before_json(
         r#"{{"method":"{}","http_method":"{}","path":"{}","org_id":"{}"{}}}"#,
         json_escape(method),
         json_escape(envelope.method),
-        json_escape(envelope.path),
+        // A query can carry a SAS signature; audit rows never keep it.
+        json_escape(envelope.path.split('?').next().unwrap_or_default()),
         json_escape(&actor.org_id),
         acting,
     )

@@ -1569,7 +1569,8 @@ mod tests {
             ..actor_with_role("operator")
         };
         for (method, path, actor) in [
-            ("station", "/admin/cameras/7", station),
+            // A query can carry a SAS signature; it never reaches the row.
+            ("station", "/admin/cameras/7?sig=s3cret&se=2026", station),
             ("ordinary", "/admin/cameras/8", actor_with_role("operator")),
         ] {
             sink.record(

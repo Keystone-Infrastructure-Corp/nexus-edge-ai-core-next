@@ -40,6 +40,8 @@ pub enum TalkdownError {
 const T1: Duration = Duration::from_millis(500);
 /// How long [`SipCall::hangup`] waits for the BYE's 200.
 const BYE_WAIT: Duration = Duration::from_secs(2);
+/// A send this long after the previous one starts a new talkspurt: two frames.
+const SEND_GAP: Duration = Duration::from_millis(40);
 
 /// An answered call. Dropping it without [`SipCall::hangup`] still sends one
 /// best-effort BYE (without waiting for the 200).
@@ -52,8 +54,10 @@ pub struct SipCall {
     codec: Codec,
     rtp: UdpSocket,
     seq: u16,
+    /// The next packet's timestamp when it follows the last one contiguously.
     timestamp: u32,
     ssrc: u32,
+    last_sent: Option<Instant>,
     hung_up: bool,
 }
 
@@ -138,7 +142,10 @@ pub async fn place_call(target: &SipTarget, timeout: Duration) -> Result<SipCall
     // Open our side of the media flow before the speaker's RTP reaches this
     // socket: a host network filter that sees the flow start inbound can hold
     // every packet we later send on it (bench, 2026-10-25).
-    rtp.connect(rtp_dest).await?;
+    if let Err(e) = rtp.connect(rtp_dest).await {
+        let _ = leg.bye(cseq + 1, &to).await;
+        return Err(e.into());
+    }
     let r = getrandom::u64().unwrap_or_default();
     let mut call = SipCall {
         leg,
@@ -149,6 +156,7 @@ pub async fn place_call(target: &SipTarget, timeout: Duration) -> Result<SipCall
         seq: r as u16,
         timestamp: (r >> 16) as u32,
         ssrc: getrandom::u32().unwrap_or_default(),
+        last_sent: None,
         hung_up: false,
     };
     call.send_frame(&[]).await?;
@@ -163,14 +171,41 @@ impl SipCall {
             let msg = "send_frame takes at most one 20 ms frame";
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg).into());
         }
+        let now = Instant::now();
+        let mut marker = 0;
+        if let Some(gap) = self
+            .last_sent
+            .map(|at| now - at)
+            .filter(|gap| *gap > SEND_GAP)
+        {
+            // After a gap (the opener, then live audio once WebRTC is up)
+            // stamp on the wall clock and mark the talkspurt (RFC 3551 §4.1),
+            // or a jitter buffer anchored on the earlier packets plays this
+            // one late. One 8 kHz sample per 125 µs; `timestamp` already
+            // holds the previous packet's +160.
+            let samples = (gap.as_micros() / 125) as u32;
+            self.timestamp = self
+                .timestamp
+                .wrapping_add(samples)
+                .wrapping_sub(FRAME_SAMPLES as u32);
+            marker = 0x80;
+        }
         let mut packet = Vec::with_capacity(12 + FRAME_SAMPLES);
-        packet.extend_from_slice(&[0x80, self.codec.payload_type()]);
+        packet.extend_from_slice(&[0x80, marker | self.codec.payload_type()]);
         packet.extend_from_slice(&self.seq.to_be_bytes());
         packet.extend_from_slice(&self.timestamp.to_be_bytes());
         packet.extend_from_slice(&self.ssrc.to_be_bytes());
         let samples = pcm.iter().copied().chain(std::iter::repeat(0));
         packet.extend(samples.take(FRAME_SAMPLES).map(|s| self.codec.encode(s)));
-        self.rtp.send(&packet).await?;
+        if let Err(e) = self.rtp.send(&packet).await {
+            // The connected socket reports an earlier ICMP port-unreachable
+            // (a speaker not listening yet) on this send: lose the frame,
+            // not the call.
+            if e.kind() != std::io::ErrorKind::ConnectionRefused {
+                return Err(e.into());
+            }
+        }
+        self.last_sent = Some(now);
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(FRAME_SAMPLES as u32);
         Ok(())
@@ -732,6 +767,107 @@ pub(crate) mod tests {
         assert!(buf[12..n].iter().all(|&b| b == 0xd5), "A-law silence");
         call.hangup().await.unwrap();
         uas.await.unwrap();
+    }
+
+    /// A call answering on loopback with `body` as its SDP; BYE ends the UAS.
+    async fn answering_uas(body: String) -> (u16, JoinHandle<Vec<String>>) {
+        fake_uas("BYE", move |req| {
+            if req.starts_with("INVITE") {
+                vec![reply(req, "200 OK", SDP, &body)]
+            } else if req.starts_with("BYE") {
+                vec![reply(req, "200 OK", "", "")]
+            } else {
+                vec![]
+            }
+        })
+        .await
+    }
+
+    /// The marker bit, sequence number and timestamp of the next RTP packet.
+    async fn recv_rtp(rtp: &UdpSocket) -> (bool, u16, u32) {
+        let mut buf = [0u8; 2048];
+        timeout(Duration::from_secs(1), rtp.recv(&mut buf))
+            .await
+            .expect("an RTP packet")
+            .unwrap();
+        let ts = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        (buf[1] & 0x80 != 0, u16::from_be_bytes([buf[2], buf[3]]), ts)
+    }
+
+    /// Live audio follows the opening frame only once WebRTC is up, ~0.3–1 s
+    /// later; stamped opener+160, a jitter buffer anchored on the opener
+    /// would see it, and everything after it, as late.
+    #[tokio::test]
+    async fn a_frame_after_a_send_gap_is_stamped_on_the_wall_clock_and_marked() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (port, uas) = answering_uas(answer(rtp.local_addr().unwrap().port(), "0")).await;
+        let mut call = place_call(&target(port), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let (marker, seq, ts) = recv_rtp(&rtp).await;
+        assert!(!marker);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        call.send_frame(&[]).await.unwrap();
+        let (marker, gap_seq, gap_ts) = recv_rtp(&rtp).await;
+        assert!(marker, "a talkspurt after a gap starts with the marker bit");
+        assert_eq!(
+            gap_seq,
+            seq.wrapping_add(1),
+            "sequence numbers stay contiguous"
+        );
+        let delta = gap_ts.wrapping_sub(ts);
+        assert!(delta >= 1440, "180 ms or more at 8 kHz, got {delta}");
+
+        // Back-to-back frames are contiguous: +160, no marker.
+        call.send_frame(&[]).await.unwrap();
+        call.send_frame(&[]).await.unwrap();
+        let mut prev = (gap_seq, gap_ts);
+        for _ in 0..2 {
+            let (marker, seq, ts) = recv_rtp(&rtp).await;
+            assert!(!marker);
+            assert_eq!(
+                (seq, ts),
+                (prev.0.wrapping_add(1), prev.1.wrapping_add(160))
+            );
+            prev = (seq, ts);
+        }
+        call.hangup().await.unwrap();
+        uas.await.unwrap();
+    }
+
+    /// The RTP socket is connected, so an answer whose media address it
+    /// cannot reach (IPv6 from an IPv4 socket) fails after the 200 — and the
+    /// answered call must still be hung up.
+    #[tokio::test]
+    async fn an_unconnectable_media_address_is_hung_up() {
+        let ipv6 = answer(9, "0").replace("c=IN IP4 127.0.0.1", "c=IN IP6 ::1");
+        let (port, uas) = answering_uas(ipv6).await;
+        let err = place_call(&target(port), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TalkdownError::Io(_)), "{err}");
+        assert_eq!(methods(&uas.await.unwrap()), ["INVITE", "ACK", "BYE"]);
+    }
+
+    /// A speaker not yet listening on its RTP port answers the opener with
+    /// ICMP port-unreachable, which the connected socket reports on the next
+    /// send; that frame is lost, the call is not.
+    #[tokio::test]
+    async fn a_closed_rtp_port_loses_frames_not_the_call() {
+        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let (port, uas) = answering_uas(answer(closed_port, "0")).await;
+        let mut call = place_call(&target(port), Duration::from_secs(2))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            call.send_frame(&[]).await.unwrap();
+        }
+        call.hangup().await.unwrap();
+        assert_eq!(methods(&uas.await.unwrap()), ["INVITE", "ACK", "BYE"]);
     }
 
     #[tokio::test]

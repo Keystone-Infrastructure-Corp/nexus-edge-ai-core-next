@@ -73,16 +73,22 @@ impl SpeakerConfig {
         if self.port == 0 {
             return Err("port must not be 0".into());
         }
-        // The SIP driver splices these into a quoted Digest header line.
-        for (field, value) in [("username", &self.username), ("password", &self.password)] {
-            if value
-                .as_deref()
-                .is_some_and(|v| v.chars().any(|c| c.is_control() || c == '"'))
-            {
-                return Err(format!(
-                    "{field} must not contain a control character or a double quote"
-                ));
-            }
+        // The SIP driver quotes the username in its Digest header line, where
+        // a trailing `\` would escape the closing quote. The password only
+        // feeds the MD5 digest.
+        let username = self.username.as_deref().unwrap_or_default();
+        if username
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\')
+        {
+            return Err(
+                "username must not contain a control character, a double quote or a backslash"
+                    .into(),
+            );
+        }
+        let password = self.password.as_deref().unwrap_or_default();
+        if password.chars().any(char::is_control) {
+            return Err("password must not contain a control character".into());
         }
         Ok(())
     }
@@ -130,11 +136,13 @@ mod tests {
 
     #[test]
     fn validate_rejects_credentials_that_would_break_a_sip_header() {
-        for bad in ["a\r\nVia: x", "a\nb", "a\u{7f}", "a\"b"] {
+        for bad in ["a\r\nVia: x", "a\nb", "a\u{7f}", "a\"b", "a\\"] {
             let mut sp = speaker("192.0.2.10");
             sp.username = Some(bad.into());
             let err = sp.validate().unwrap_err();
             assert!(err.contains("username"), "{bad:?}: {err}");
+        }
+        for bad in ["a\r\nVia: x", "a\nb", "a\u{7f}"] {
             let mut sp = speaker("192.0.2.10");
             sp.password = Some(bad.into());
             let err = sp.validate().unwrap_err();
@@ -144,7 +152,8 @@ mod tests {
         sp.username = Some("admin".into());
         sp.password = Some(String::new());
         assert_eq!(sp.validate(), Ok(()));
-        sp.password = Some("p@ss w0rd!".into());
+        // The password only feeds the MD5 digest, never the header line.
+        sp.password = Some(r#"p@ss "w0rd"\!"#.into());
         assert_eq!(sp.validate(), Ok(()));
     }
 
