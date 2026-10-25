@@ -588,6 +588,26 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
         )
+        // ADR-090 — IP speakers and each camera's talk-down speaker. Same
+        // gate as the camera routes above; see `crate::speakers_admin`.
+        .route(
+            "/v1/admin/speakers",
+            get(crate::speakers_admin::list_speakers).post(crate::speakers_admin::create_speaker),
+        )
+        .route(
+            "/v1/admin/speakers/{id}",
+            get(crate::speakers_admin::get_speaker)
+                .put(crate::speakers_admin::update_speaker)
+                .delete(crate::speakers_admin::delete_speaker),
+        )
+        .route(
+            "/v1/admin/speakers/{id}/cameras",
+            put(crate::speakers_admin::put_speaker_cameras),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/talk-down",
+            get(crate::speakers_admin::get_talk_down).put(crate::speakers_admin::put_talk_down),
+        )
         // Phase 7.6 · Step 7.6.3 — ONVIF device control. These drive
         // the per-camera SOAP client (`crate::discovery::onvif_*`)
         // against the camera's edge-resident endpoint + credentials.
@@ -9245,5 +9265,345 @@ mod tests {
             .unwrap_or_else(|| panic!("/api/v1/health must report the stalled camera: {body}"));
         assert_eq!(issue["component"], "live_view", "{body}");
         assert_eq!(body["status"], "degraded", "{body}");
+    }
+
+    // ===============================================================
+    // ADR-090 — IP speakers and camera talk-down assignment
+    // ===============================================================
+
+    /// One admin call from loopback with no secret configured (the gate's
+    /// fallback path); returns the status and the raw body.
+    async fn speaker_call(
+        app: &axum::Router,
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn speaker_json(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+    }
+
+    /// The password is written, kept, replaced and cleared through the API,
+    /// and never appears in a response, an audit row or a bus event.
+    #[tokio::test]
+    async fn speaker_crud_round_trip_never_shows_the_password() {
+        use futures::StreamExt;
+        use nexus_bus::BusExt;
+
+        let (app, store, _dir, _reg, bus) = build_test_router_full(None).await;
+        let mut changed = bus
+            .subscribe::<serde_json::Value>(nexus_bus::topic::CONFIG_CHANGED)
+            .await
+            .unwrap();
+        let secrets = ["first-secret", "second-secret"];
+        let mut bodies = Vec::new();
+
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({
+                "name": "lobby",
+                "host": "192.0.2.10",
+                "username": "admin",
+                "password": secrets[0],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = speaker_json(&body);
+        let id = created["id"].as_i64().expect("an assigned id");
+        assert_eq!(
+            created,
+            serde_json::json!({
+                "id": id,
+                "name": "lobby",
+                "host": "192.0.2.10",
+                "port": 5060,
+                "driver": "sip",
+                "username": "admin",
+                "has_password": true,
+                "camera_ids": [],
+            })
+        );
+        bodies.push(body);
+        let uri = format!("/api/v1/admin/speakers/{id}");
+
+        for path in ["/api/v1/admin/speakers", uri.as_str()] {
+            let (status, body) = speaker_call(&app, Method::GET, path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            bodies.push(body);
+        }
+
+        // Absent keeps the stored password, a value replaces it, "" clears it.
+        for (password, stored) in [
+            (None, Some(secrets[0])),
+            (Some(secrets[1]), Some(secrets[1])),
+            (Some(""), None),
+        ] {
+            let mut input = serde_json::json!({ "name": "front", "host": "speaker.lan" });
+            if let Some(p) = password {
+                input["password"] = p.into();
+            }
+            let (status, body) = speaker_call(&app, Method::PUT, &uri, Some(input)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(speaker_json(&body)["has_password"], stored.is_some());
+            let row = store.get_speaker(id).await.unwrap().expect("the speaker");
+            assert_eq!(row.password.as_deref(), stored, "after PUT {password:?}");
+            assert_eq!(row.host, "speaker.lan");
+            bodies.push(body);
+        }
+
+        let (status, _) = speaker_call(&app, Method::DELETE, &uri, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = speaker_call(&app, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let rows = store
+            .list_audit_for_resource("speaker", &id.to_string(), 50)
+            .await
+            .unwrap();
+        let actions: Vec<&str> = rows.iter().map(|r| r.action.as_str()).collect();
+        for action in ["speaker.create", "speaker.update", "speaker.delete"] {
+            assert!(actions.contains(&action), "{action} in {actions:?}");
+        }
+        let audit: Vec<String> = rows
+            .iter()
+            .flat_map(|r| [r.before_json.clone(), r.after_json.clone()])
+            .flatten()
+            .collect();
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), changed.next()).await
+        {
+            events.push(ev.unwrap().to_string());
+        }
+        assert_eq!(
+            events.len(),
+            5,
+            "one config.changed per mutation: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| e.contains(r#""kind":"speaker""#)),
+            "{events:?}"
+        );
+
+        for text in bodies.iter().chain(&audit).chain(&events) {
+            for secret in secrets {
+                assert!(!text.contains(secret), "password leaked into {text}");
+            }
+            assert!(!text.contains(r#""password""#), "password key in {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn speaker_input_is_validated_and_unknown_ids_are_refused() {
+        let (app, store, _dir) = build_test_router(None).await;
+        seed_onvif_camera(&store, 1, None).await;
+        for bad in [
+            serde_json::json!({ "name": "", "host": "192.0.2.10" }),
+            serde_json::json!({ "name": "x", "host": "sip://192.0.2.10" }),
+            serde_json::json!({ "name": "x", "host": "192.0.2.10", "port": 0 }),
+            serde_json::json!({ "name": "x", "host": "192.0.2.10", "driver": "onvif" }),
+        ] {
+            let (status, body) = speaker_call(
+                &app,
+                Method::POST,
+                "/api/v1/admin/speakers",
+                Some(bad.clone()),
+            )
+            .await;
+            assert!(status.is_client_error(), "{bad} answered {status}: {body}");
+        }
+        assert!(store.list_speakers().await.unwrap().is_empty());
+
+        let (_, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({ "name": "a", "host": "192.0.2.10" })),
+        )
+        .await;
+        let id = speaker_json(&body)["id"].as_i64().unwrap();
+        let input = serde_json::json!({ "name": "a", "host": "192.0.2.10" });
+        for (method, uri, body, want) in [
+            (
+                Method::GET,
+                "/api/v1/admin/speakers/999".to_string(),
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::PUT,
+                "/api/v1/admin/speakers/999".to_string(),
+                Some(input.clone()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::DELETE,
+                "/api/v1/admin/speakers/999".to_string(),
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::PUT,
+                "/api/v1/admin/speakers/999/cameras".to_string(),
+                Some(serde_json::json!({ "camera_ids": [1] })),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::PUT,
+                format!("/api/v1/admin/speakers/{id}/cameras"),
+                Some(serde_json::json!({ "camera_ids": [1, 999] })),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/api/v1/admin/cameras/999/talk-down".to_string(),
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::PUT,
+                "/api/v1/admin/cameras/999/talk-down".to_string(),
+                Some(serde_json::json!({ "speaker_id": id })),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::PUT,
+                "/api/v1/admin/cameras/1/talk-down".to_string(),
+                Some(serde_json::json!({ "speaker_id": 999 })),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let (status, body) = speaker_call(&app, method.clone(), &uri, body).await;
+            assert_eq!(status, want, "{method} {uri}: {body}");
+        }
+        // The refused assignment changed nothing.
+        assert_eq!(
+            store.speaker_camera_ids(id).await.unwrap(),
+            Vec::<i64>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn speaker_cameras_and_camera_talk_down_round_trip() {
+        let (app, store, _dir) = build_test_router(None).await;
+        for cam in [1, 2] {
+            seed_onvif_camera(&store, cam, None).await;
+        }
+        let mut ids = Vec::new();
+        for name in ["a", "b"] {
+            let (_, body) = speaker_call(
+                &app,
+                Method::POST,
+                "/api/v1/admin/speakers",
+                Some(serde_json::json!({ "name": name, "host": "192.0.2.10" })),
+            )
+            .await;
+            ids.push(speaker_json(&body)["id"].as_i64().unwrap());
+        }
+        let (a, b) = (ids[0], ids[1]);
+        let talk_down = |cam: i64, speaker: Option<(i64, &str)>| {
+            serde_json::json!({
+                "camera_id": cam,
+                "speaker": speaker.map(|(id, name)| serde_json::json!({
+                    "id": id, "name": name, "driver": "sip",
+                })),
+            })
+        };
+
+        let (status, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body), talk_down(1, None));
+
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            &format!("/api/v1/admin/speakers/{a}/cameras"),
+            Some(serde_json::json!({ "camera_ids": [2, 1, 2] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body)["camera_ids"], serde_json::json!([1, 2]));
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        assert_eq!(speaker_json(&body), talk_down(1, Some((a, "a"))));
+
+        // Camera 1 moves to B; A keeps camera 2.
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/cameras/1/talk-down",
+            Some(serde_json::json!({ "speaker_id": b })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body), talk_down(1, Some((b, "b"))));
+        let (_, body) = speaker_call(
+            &app,
+            Method::GET,
+            &format!("/api/v1/admin/speakers/{a}"),
+            None,
+        )
+        .await;
+        assert_eq!(speaker_json(&body)["camera_ids"], serde_json::json!([2]));
+
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/cameras/1/talk-down",
+            Some(serde_json::json!({ "speaker_id": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body), talk_down(1, None));
+
+        let camera_audit = store
+            .list_audit_for_resource("camera", "1", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            camera_audit
+                .iter()
+                .filter(|r| r.action == "camera.talk_down_assign")
+                .count(),
+            2
+        );
+        let speaker_audit = store
+            .list_audit_for_resource("speaker", &a.to_string(), 10)
+            .await
+            .unwrap();
+        assert!(speaker_audit
+            .iter()
+            .any(|r| r.action == "speaker.assign_cameras"));
+
+        // Deleting the speaker clears the camera's talk-down.
+        let (status, _) = speaker_call(
+            &app,
+            Method::DELETE,
+            &format!("/api/v1/admin/speakers/{a}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/2/talk-down", None).await;
+        assert_eq!(speaker_json(&body), talk_down(2, None));
     }
 }

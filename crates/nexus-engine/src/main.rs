@@ -64,6 +64,7 @@ mod roster;
 mod setup;
 mod sink_router;
 mod sinks_reload;
+mod speakers_admin;
 mod ssh_ca;
 mod state_hashes;
 mod storage_safety;
