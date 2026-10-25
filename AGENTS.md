@@ -145,8 +145,9 @@ They bias toward caution over speed — for a typo or an obvious one-liner, use 
    assumptions explicitly. Where a requirement has more than one reading, present the
    readings instead of silently picking one. If a simpler approach exists, say so and push
    back. If something is genuinely unclear and the answer changes the design, stop and ask
-   — the exception is an autonomous run under the `implement-loop` skill (in the cloud
-   repo), which records the assumption and keeps going rather than yielding.
+   — the exception is an autonomous run under the local
+   [implement-loop skill](.agents/skills/implement-loop/SKILL.md), which records the
+   assumption and keeps going rather than yielding.
 2. **Simplicity first.** The minimum code that solves the problem, nothing speculative. No
    features beyond what was asked, no abstraction for single-use code, no configurability
    nobody requested, no error handling for states that cannot occur. If 200 lines could be
