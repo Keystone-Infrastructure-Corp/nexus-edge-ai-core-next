@@ -318,7 +318,13 @@ pub(crate) fn tokenless_target_allowed(target: &str) -> bool {
 
 fn tokenless_target_allowed_from(running: &str, target: &str) -> bool {
     fn parse(version: &str) -> Option<(u64, u64, u64)> {
-        let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
+        let mut parts = version.split('.').map(|part| {
+            // Digits only, like the cloud's `^[0-9]+\.[0-9]+\.[0-9]+$`:
+            // `str::parse` alone would accept a leading `+`.
+            (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| part.parse::<u64>().ok())
+                .flatten()
+        });
         let parsed = (parts.next()??, parts.next()??, parts.next()??);
         parts.next().is_none().then_some(parsed)
     }
@@ -924,6 +930,15 @@ mod tests {
             ("0.1.227", "0.1.228-rc.1", false),
             ("0.1.227", "0.1", false),
             ("0.1.227", "0.1.228.1", false),
+            ("0.1.227", "0.1.+228", false),
+            ("0.1.227", "v0.1.229", false),
+            ("0.1.227", " 0.1.229", false),
+            ("0.1.227", "0.1.229 ", false),
+            ("0.1.227", "0..1", false),
+            ("0.1.227", "0.1.99999999999999999999", false),
+            ("0.1.0-dev", "9.9.9", false),
+            ("0.1.0-dev", "0.1.0-dev", true),
+            ("0.1.9", "0.1.010", true),
         ] {
             assert_eq!(
                 tokenless_target_allowed_from(running, target),
