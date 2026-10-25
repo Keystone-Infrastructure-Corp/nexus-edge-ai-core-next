@@ -1101,7 +1101,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                                 core_id = %core_id,
                                 assignment_id = %p.assignment_id,
                                 target_version = %p.target_version,
-                                "tokenless update_assignment would downgrade; dropping",
+                                "tokenless update_assignment target is not a strictly newer plain version; dropping",
                             );
                             continue;
                         }

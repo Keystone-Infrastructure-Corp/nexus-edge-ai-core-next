@@ -939,6 +939,8 @@ mod tests {
             ("0.1.0-dev", "9.9.9", false),
             ("0.1.0-dev", "0.1.0-dev", true),
             ("0.1.9", "0.1.010", true),
+            ("0.1.1", "0.1.01", false),
+            ("0.1.227", "0.1.\u{ff12}", false),
         ] {
             assert_eq!(
                 tokenless_target_allowed_from(running, target),
