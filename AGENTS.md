@@ -145,8 +145,9 @@ They bias toward caution over speed — for a typo or an obvious one-liner, use 
    assumptions explicitly. Where a requirement has more than one reading, present the
    readings instead of silently picking one. If a simpler approach exists, say so and push
    back. If something is genuinely unclear and the answer changes the design, stop and ask
-   — the exception is an autonomous run under the `implement-loop` skill (in the cloud
-   repo), which records the assumption and keeps going rather than yielding.
+   — the exception is an autonomous run under the local
+   [implement-loop skill](.agents/skills/implement-loop/SKILL.md), which records the
+   assumption and keeps going rather than yielding.
 2. **Simplicity first.** The minimum code that solves the problem, nothing speculative. No
    features beyond what was asked, no abstraction for single-use code, no configurability
    nobody requested, no error handling for states that cannot occur. If 200 lines could be
@@ -326,6 +327,10 @@ implementation notes, do cross-link ADR/SPEC/BUG records that relate to each oth
    that the squash-merge model cannot collapse cleanly. If you have local work in
    progress, `git stash` first or use `git pull --rebase --autostash`. Resolve any
    rebase conflicts before continuing.
+   Exception: `implement-loop` unit agents work from the orchestrator's pinned SHA and
+   never rebase or merge. The orchestrator refreshes/rebases the integration tree before
+   dispatch and its own commits, verifies units against their original dispatched bases,
+   and redispatches from a fresh pinned base when needed.
 1. Pick a step from the wedge plan or a milestone doc in the cloud repo's docs index
    (linked above). Cross-repo work that lands in both repos in the same PR pair is
    common — open companion PRs.
