@@ -30,7 +30,7 @@
 //! The dispatcher then applies [`VerifiedActor::allows_rpc`] before the
 //! handler runs: the signed permission must also match the request body
 //! (PTZ action, camera ids), and a token without `perm` falls back to its
-//! role only on a route the action table maps.
+//! role only for a safe method or a mutating route the action table maps.
 //!
 //! All post-parse rejections collapse to `RejectReason::Invalid(_)` on
 //! the wire to avoid leaking which check failed. The fine-grained
@@ -163,9 +163,9 @@ impl VerifiedActor {
         let Some(permission) = self.perm.as_deref() else {
             // Role-only fallback, kept only for tokens minted before the cloud
             // signs `perm`; removed once every cloud mint path signs it (cloud
-            // ADR-090). Even then a mutating route needs an entry in the action
-            // table, so the opaque LAN proxy, raw SOAP and unmapped routes
-            // always require a signed permission.
+            // ADR-090). While it exists, a mutating route still needs an entry
+            // in the action table, so the opaque LAN proxy, raw SOAP and
+            // unmapped routes always require a signed permission.
             let safe = matches!(
                 envelope.method.to_ascii_uppercase().as_str(),
                 "GET" | "HEAD" | "OPTIONS"

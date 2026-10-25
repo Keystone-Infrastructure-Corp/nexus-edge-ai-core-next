@@ -4515,11 +4515,9 @@ mod heartbeat_ack_tests {
     async fn tokenless_assignments_never_downgrade() {
         let running = env!("NEXUS_BUILD_VERSION");
         assert_ne!(running, "0.0.0", "test needs an older version to send");
-        let major: u64 = running.split('.').next().unwrap().parse().unwrap();
-        for (target, allowed) in [
-            ("0.0.0".to_string(), false),
-            (format!("{}.0.0", major + 1), true),
-        ] {
+        // The accepted case is the idempotent re-ack, which spawns no install
+        // task; strictly newer targets are covered in `cloud_update`.
+        for (target, allowed) in [("0.0.0".to_string(), false), (running.to_string(), true)] {
             let (store, _dir) = test_store().await;
             let key = service_test_key();
             let dispatcher = service_test_dispatcher(&key, &store, "http://127.0.0.1:1".into());
