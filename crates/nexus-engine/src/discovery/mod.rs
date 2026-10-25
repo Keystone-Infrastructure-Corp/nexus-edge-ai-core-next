@@ -188,6 +188,20 @@ pub struct SessionCreatedResp {
     pub total_targets: Option<u32>,
 }
 
+/// A host that answered a SIP `OPTIONS` ping during a CIDR scan —
+/// a standalone IP speaker (they do not speak WS-Discovery).
+/// Reported on [`DiscoverySessionView::speakers`], never in `found`:
+/// [`DeviceKind`] is a closed enum on deployed consoles.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredSpeaker {
+    pub ip: String,
+    pub port: u16,
+    /// The reply's `User-Agent` (else `Server`) header; `None` when
+    /// the speaker sent neither.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+}
+
 /// Wire shape returned by `GET /api/v1/admin/discovery/sessions/:id`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoverySessionView {
@@ -199,6 +213,10 @@ pub struct DiscoverySessionView {
     pub total_targets: Option<u32>,
     pub scanned: u32,
     pub found: Vec<DiscoveredDevice>,
+    /// SIP speakers found by a CIDR scan. Omitted when empty so the
+    /// wire shape is unchanged for consoles that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speakers: Vec<DiscoveredSpeaker>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// `true` when the session was terminated by an explicit
@@ -391,6 +409,7 @@ pub(crate) struct SessionInner {
     pub total_targets: Option<u32>,
     pub scanned: u32,
     pub found: Vec<DiscoveredDevice>,
+    pub speakers: Vec<DiscoveredSpeaker>,
     pub error: Option<String>,
     /// Set to `true` by [`DiscoverySessions::cancel`] when the
     /// operator hits `POST .../sessions/:id/cancel`. The spawned
@@ -412,6 +431,7 @@ impl SessionInner {
             total_targets: self.total_targets,
             scanned: self.scanned,
             found: self.found.clone(),
+            speakers: self.speakers.clone(),
             error: self.error.clone(),
             cancelled: self.cancelled,
         }
@@ -453,6 +473,7 @@ impl DiscoverySessions {
             total_targets,
             scanned: 0,
             found: Vec::new(),
+            speakers: Vec::new(),
             error: None,
             cancelled: false,
         }));
@@ -934,7 +955,8 @@ pub(crate) fn validate_scan_req(req: &ScanReq) -> Result<ScanPlan, String> {
     // the operator-requested ceiling.
     const FD_RESERVE: u64 = 256;
     let requested = req.concurrency.filter(|&n| n > 0).unwrap_or(64).min(256);
-    let port_count = ports.len().max(1) as u64;
+    // +1: the per-host SIP OPTIONS UDP socket.
+    let port_count = ports.len().max(1) as u64 + 1;
     let concurrency = {
         #[cfg(unix)]
         let fd_soft = crate::fd_limit::current_fd_soft_limit();
@@ -1163,6 +1185,28 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("malformed CIDR"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn view_omits_speakers_key_when_empty_and_emits_it_otherwise() {
+        let reg = DiscoverySessions::new();
+        let (id, inner) = reg.start(DiscoveryKind::Scan, Some(1));
+        let json = serde_json::to_value(reg.get(&id).unwrap()).unwrap();
+        assert!(
+            json.get("speakers").is_none(),
+            "old consoles must see the unchanged wire shape: {json}"
+        );
+
+        inner.lock().speakers.push(DiscoveredSpeaker {
+            ip: "192.168.1.66".to_string(),
+            port: 5060,
+            user_agent: Some("TSIP".to_string()),
+        });
+        let json = serde_json::to_value(reg.get(&id).unwrap()).unwrap();
+        assert_eq!(
+            json["speakers"],
+            serde_json::json!([{"ip": "192.168.1.66", "port": 5060, "user_agent": "TSIP"}])
+        );
     }
 
     #[tokio::test]
