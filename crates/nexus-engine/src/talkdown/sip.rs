@@ -58,23 +58,6 @@ pub struct SipCall {
     hung_up: bool,
 }
 
-/// Send SIP `OPTIONS`; on any final response return its `User-Agent` (or
-/// `Server`) header, or an empty string when it has neither.
-pub async fn options_ping(host: &str, port: u16, timeout: Duration) -> Option<String> {
-    let deadline = Instant::now() + timeout;
-    let leg = timeout_at(deadline, Leg::open(host, port))
-        .await
-        .ok()?
-        .ok()?;
-    let to = format!("<{}>", leg.uri);
-    let resp = leg
-        .transact("OPTIONS", 1, &branch(), &to, "", "", deadline)
-        .await
-        .ok()??;
-    let ua = resp.header("user-agent").or_else(|| resp.header("server"));
-    Some(ua.unwrap_or_default().to_string())
-}
-
 /// INVITE `target` directly by IP (no REGISTER) offering PCMU and PCMA, and
 /// wait up to `timeout` for a final answer. A 401/407 is retried once with
 /// Digest credentials when the target has them.
@@ -152,10 +135,6 @@ pub async fn place_call(target: &SipTarget, timeout: Duration) -> Result<SipCall
 }
 
 impl SipCall {
-    pub fn codec(&self) -> Codec {
-        self.codec
-    }
-
     /// Send one 20 ms frame (at most 160 samples, padded with silence) as one
     /// RTP packet. The caller paces.
     pub async fn send_frame(&mut self, pcm: &[i16]) -> Result<(), TalkdownError> {
@@ -550,19 +529,20 @@ fn split_quoted_csv(s: &str) -> Vec<&str> {
     out
 }
 
+/// Also the fake speaker of the talk-down endpoint tests in `crate::api`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::talkdown::tone_pcm;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
-    const SDP: &str = "Content-Type: application/sdp\r\n";
+    pub(crate) const SDP: &str = "Content-Type: application/sdp\r\n";
 
     /// A SIP UAS on loopback. `respond` maps each request to the responses
     /// sent back; the task returns every request seen, ending with the first
     /// one that starts with `until`.
-    async fn fake_uas(
+    pub(crate) async fn fake_uas(
         until: &'static str,
         respond: impl Fn(&str) -> Vec<String> + Send + 'static,
     ) -> (u16, JoinHandle<Vec<String>>) {
@@ -591,7 +571,7 @@ mod tests {
     }
 
     /// A response to `req` copying its Via/From/To/Call-ID/CSeq, with a To-tag.
-    fn reply(req: &str, status: &str, extra: &str, body: &str) -> String {
+    pub(crate) fn reply(req: &str, status: &str, extra: &str, body: &str) -> String {
         let mut out = format!("SIP/2.0 {status}\r\n");
         for line in req.lines().skip(1).take_while(|l| !l.is_empty()) {
             let name = line.split(':').next().unwrap().to_ascii_lowercase();
@@ -626,22 +606,11 @@ mod tests {
         }
     }
 
-    fn answer(rtp_port: u16, pts: &str) -> String {
+    pub(crate) fn answer(rtp_port: u16, pts: &str) -> String {
         format!(
             "v=0\r\no=uas 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
              m=audio {rtp_port} RTP/AVP {pts}\r\na=sendrecv\r\n"
         )
-    }
-
-    #[tokio::test]
-    async fn options_ping_returns_user_agent() {
-        let (port, uas) = fake_uas("OPTIONS", |req| {
-            vec![reply(req, "200 OK", "User-Agent: TSIP\r\n", "")]
-        })
-        .await;
-        let ua = options_ping("127.0.0.1", port, Duration::from_secs(2)).await;
-        assert_eq!(ua.as_deref(), Some("TSIP"));
-        uas.await.unwrap();
     }
 
     #[tokio::test]
@@ -666,7 +635,7 @@ mod tests {
         let mut call = place_call(&target(port), Duration::from_secs(2))
             .await
             .unwrap();
-        assert_eq!(call.codec(), Codec::Pcma);
+        assert_eq!(call.codec, Codec::Pcma);
         // 70 ms = 560 samples: three full frames and one padded with silence.
         call.play_pcm(&tone_pcm(70), &CancellationToken::new())
             .await
@@ -720,7 +689,7 @@ mod tests {
         t.password = Some("s3cret".into());
 
         let call = place_call(&t, Duration::from_secs(2)).await.unwrap();
-        assert_eq!(call.codec(), Codec::Pcmu);
+        assert_eq!(call.codec, Codec::Pcmu);
         call.hangup().await.unwrap();
 
         let seen = uas.await.unwrap();

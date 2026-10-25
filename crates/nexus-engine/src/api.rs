@@ -324,6 +324,10 @@ pub struct ApiState {
     /// so the response shape is stable; the snapshot is just
     /// empty in that case.
     pub reid_stats: Arc<crate::cloud_sighting::ReidStatsRegistry>,
+    /// ADR-090 — the talk-down sessions, at most one per speaker. Read by
+    /// the talk-down GET (`busy`) and driven by its start/stop and the
+    /// speaker test in `crate::speakers_admin`.
+    pub talkdown: crate::talkdown::session::TalkdownSessions,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -606,7 +610,17 @@ pub fn router(state: ApiState) -> Router {
         )
         .route(
             "/v1/admin/cameras/{camera_id}/talk-down",
-            get(crate::speakers_admin::get_talk_down).put(crate::speakers_admin::put_talk_down),
+            get(crate::speakers_admin::get_talk_down)
+                .put(crate::speakers_admin::put_talk_down)
+                .post(crate::speakers_admin::start_talk_down),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/talk-down/stop",
+            axum::routing::post(crate::speakers_admin::stop_talk_down),
+        )
+        .route(
+            "/v1/admin/speakers/{id}/test",
+            axum::routing::post(crate::speakers_admin::test_speaker),
         )
         // Phase 7.6 · Step 7.6.3 — ONVIF device control. These drive
         // the per-camera SOAP client (`crate::discovery::onvif_*`)
@@ -5814,6 +5828,7 @@ mod tests {
                 false,
             )),
             reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
+            talkdown: Default::default(),
         };
         (state, store, dir, sink_registry, bus)
     }
@@ -9526,11 +9541,18 @@ mod tests {
                 })),
             })
         };
+        // The GET also reports whether the speaker is playing and what it can play.
+        let read = |cam: i64, speaker: Option<(i64, &str)>| {
+            let mut view = talk_down(cam, speaker);
+            view["busy"] = false.into();
+            view["modes"] = serde_json::json!(["tone", "clip"]);
+            view
+        };
 
         let (status, body) =
             speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(speaker_json(&body), talk_down(1, None));
+        assert_eq!(speaker_json(&body), read(1, None));
 
         let (status, body) = speaker_call(
             &app,
@@ -9543,7 +9565,7 @@ mod tests {
         assert_eq!(speaker_json(&body)["camera_ids"], serde_json::json!([1, 2]));
         let (_, body) =
             speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
-        assert_eq!(speaker_json(&body), talk_down(1, Some((a, "a"))));
+        assert_eq!(speaker_json(&body), read(1, Some((a, "a"))));
 
         // Camera 1 moves to B; A keeps camera 2.
         let (status, body) = speaker_call(
@@ -9604,6 +9626,533 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, body) =
             speaker_call(&app, Method::GET, "/api/v1/admin/cameras/2/talk-down", None).await;
-        assert_eq!(speaker_json(&body), talk_down(2, None));
+        assert_eq!(speaker_json(&body), read(2, None));
+    }
+
+    // ===============================================================
+    // ADR-090 — talk-down sessions
+    // ===============================================================
+
+    use crate::talkdown::session::TalkdownSessions;
+    use crate::talkdown::sip::tests::{answer, fake_uas, reply, SDP};
+
+    /// A fake speaker that answers PCMU toward the returned RTP socket and
+    /// OKs the BYE. Its task returns every SIP request seen, ending with the BYE.
+    async fn fake_speaker() -> (
+        u16,
+        tokio::net::UdpSocket,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        let rtp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let (port, uas) = fake_uas("BYE", move |req| {
+            if req.starts_with("INVITE") {
+                vec![reply(req, "200 OK", SDP, &answer(rtp_port, "0"))]
+            } else if req.starts_with("BYE") {
+                vec![reply(req, "200 OK", "", "")]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        (port, rtp, uas)
+    }
+
+    fn sip_methods(seen: &[String]) -> Vec<&str> {
+        seen.iter().map(|r| r.split(' ').next().unwrap()).collect()
+    }
+
+    /// Create a speaker at `host:port` and assign it to `camera`.
+    async fn assign_speaker(app: &axum::Router, camera: i64, host: &str, port: u16) -> i64 {
+        let (status, body) = speaker_call(
+            app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({ "name": "spk", "host": host, "port": port })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = speaker_json(&body)["id"].as_i64().unwrap();
+        let (status, body) = speaker_call(
+            app,
+            Method::PUT,
+            &format!("/api/v1/admin/cameras/{camera}/talk-down"),
+            Some(serde_json::json!({ "speaker_id": id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        id
+    }
+
+    /// An app whose camera 1 has the speaker at `host:port`; returns its id.
+    async fn talkdown_app(
+        sessions: TalkdownSessions,
+        host: &str,
+        port: u16,
+    ) -> (axum::Router, Arc<Store>, tempfile::TempDir, i64) {
+        let (mut state, store, dir, _reg, _bus) = build_test_state(None).await;
+        state.talkdown = sessions;
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        let id = assign_speaker(&app, 1, host, port).await;
+        (app, store, dir, id)
+    }
+
+    async fn start_talk_down(
+        app: &axum::Router,
+        camera: i64,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let uri = format!("/api/v1/admin/cameras/{camera}/talk-down");
+        speaker_call(app, Method::POST, &uri, Some(body)).await
+    }
+
+    async fn talk_down_busy(app: &axum::Router) -> bool {
+        let (status, body) =
+            speaker_call(app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let view = speaker_json(&body);
+        assert_eq!(view["modes"], serde_json::json!(["tone", "clip"]), "{body}");
+        view["busy"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("busy in {body}"))
+    }
+
+    /// The session releases the speaker just after the BYE's 200.
+    async fn wait_idle(app: &axum::Router, within: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + within;
+        while talk_down_busy(app).await {
+            assert!(tokio::time::Instant::now() < deadline, "speaker still busy");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    fn error_code(body: &str) -> String {
+        let v = speaker_json(body);
+        assert!(
+            v["message"].is_string(),
+            "a message beside the code: {body}"
+        );
+        v["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// A RIFF/WAVE file: `fmt ` (PCM), an unknown `LIST` chunk to skip, `data`.
+    fn wav(channels: u16, rate: u32, samples: &[i16]) -> Vec<u8> {
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&(rate * 2 * u32::from(channels)).to_le_bytes());
+        fmt.extend_from_slice(&(2 * channels).to_le_bytes());
+        fmt.extend_from_slice(&16u16.to_le_bytes());
+        let mut body = b"WAVE".to_vec();
+        for (id, chunk) in [
+            (b"fmt ", fmt.as_slice()),
+            (b"LIST", b"INFOx".as_slice()),
+            (b"data", data.as_slice()),
+        ] {
+            body.extend_from_slice(id);
+            body.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            body.extend_from_slice(chunk);
+            if chunk.len() % 2 == 1 {
+                body.push(0);
+            }
+        }
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend(body);
+        out
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    async fn serve(server: &wiremock::MockServer, path: &str, body: Vec<u8>) {
+        wiremock::Mock::given(wiremock::matchers::path(path))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(server)
+            .await;
+    }
+
+    /// No audit row for the camera carries the clip URL (a bearer SAS).
+    async fn assert_audit_has_no_url(store: &Store, secret: &str) {
+        let rows = store
+            .list_audit_for_resource("camera", "1", 50)
+            .await
+            .unwrap();
+        assert!(rows.iter().any(|r| r.action == "talk_down.start"));
+        for r in &rows {
+            for text in [&r.before_json, &r.after_json].into_iter().flatten() {
+                assert!(!text.contains(secret), "clip URL in the audit row {text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn talk_down_tone_plays_then_hangs_up_and_frees_the_speaker() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        assert!(!talk_down_busy(&app).await);
+
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let started = speaker_json(&body);
+        assert_eq!(started["speaker_id"], speaker);
+        assert_eq!(started["camera_id"], 1);
+        assert_eq!(started["mode"], "tone");
+        let session_id = started["session_id"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(session_id).is_ok(), "{body}");
+        assert!(talk_down_busy(&app).await, "busy while playing");
+
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .expect("BYE within the 2 s chime")
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+
+        // The 2 s chime then 300 ms of silence: 115 PCMU frames, the last silent.
+        let mut buf = [0u8; 2048];
+        let mut frames = Vec::new();
+        while let Ok(n) = rtp.try_recv(&mut buf) {
+            assert_eq!(n, 12 + 160);
+            assert_eq!(buf[1] & 0x7f, 0, "PCMU");
+            frames.push(buf[12..n].to_vec());
+        }
+        assert_eq!(frames.len(), 115);
+        assert!(frames[114].iter().all(|&b| b == 0xff), "µ-law silence tail");
+
+        let rows = store
+            .list_audit_for_resource("camera", "1", 50)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.action == "talk_down.start")
+            .expect("talk_down.start audited");
+        let after = speaker_json(row.after_json.as_deref().unwrap());
+        assert_eq!(after["session_id"], session_id);
+        assert_eq!(after["speaker_id"], speaker);
+        assert_eq!(after["mode"], "tone");
+    }
+
+    #[tokio::test]
+    async fn talk_down_is_one_session_per_speaker_and_stop_hangs_up_early() {
+        let (port, _rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        // Camera 2 shares the speaker: the lock is the speaker's, not the camera's.
+        seed_onvif_camera(&store, 2, None).await;
+        let (status, _) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/cameras/2/talk-down",
+            Some(serde_json::json!({ "speaker_id": speaker })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let started = std::time::Instant::now();
+        let tone = serde_json::json!({ "mode": "tone" });
+        let (status, body) = start_talk_down(&app, 1, tone.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for (status, body) in [
+            start_talk_down(&app, 1, tone.clone()).await,
+            start_talk_down(&app, 2, tone.clone()).await,
+            speaker_call(
+                &app,
+                Method::POST,
+                &format!("/api/v1/admin/speakers/{speaker}/test"),
+                None,
+            )
+            .await,
+        ] {
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(error_code(&body), "talk_down_busy");
+        }
+
+        // Camera 2 stops the session camera 1 started.
+        let stop = "/api/v1/admin/cameras/2/talk-down/stop";
+        let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "BYE before the 2 s chime ended: {:?}",
+            started.elapsed()
+        );
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+
+        let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "idle stop: {body}");
+        let (status, _) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/cameras/999/talk-down/stop",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let actions = |rows: Vec<nexus_store::AuditEntry>| {
+            rows.into_iter()
+                .map(|r| (r.action, r.outcome))
+                .collect::<Vec<_>>()
+        };
+        let cam1 = actions(
+            store
+                .list_audit_for_resource("camera", "1", 50)
+                .await
+                .unwrap(),
+        );
+        let cam2 = actions(
+            store
+                .list_audit_for_resource("camera", "2", 50)
+                .await
+                .unwrap(),
+        );
+        let count = |rows: &[(String, nexus_store::AuditOutcome)], action: &str, ok: bool| {
+            rows.iter()
+                .filter(|(a, o)| {
+                    a == action && matches!(o, nexus_store::AuditOutcome::Success) == ok
+                })
+                .count()
+        };
+        assert_eq!(count(&cam1, "talk_down.start", true), 1, "{cam1:?}");
+        assert_eq!(count(&cam1, "talk_down.start", false), 1, "{cam1:?}");
+        assert_eq!(count(&cam2, "talk_down.start", false), 1, "{cam2:?}");
+        assert_eq!(count(&cam2, "talk_down.stop", true), 2, "{cam2:?}");
+    }
+
+    #[tokio::test]
+    async fn talk_down_refuses_unknown_and_unassigned_cameras_and_unknown_modes() {
+        let (app, store, _dir) = build_test_router(None).await;
+        seed_onvif_camera(&store, 1, None).await;
+        seed_onvif_camera(&store, 2, None).await;
+        let tone = serde_json::json!({ "mode": "tone" });
+
+        let (status, body) = start_talk_down(&app, 999, tone.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = start_talk_down(&app, 2, tone.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "talk_down_unsupported");
+
+        // Nothing listens on the discard port; no call is placed for these.
+        assign_speaker(&app, 1, "127.0.0.1", 9).await;
+        for bad in [
+            serde_json::json!({ "mode": "siren" }),
+            serde_json::json!({}),
+            serde_json::json!({ "mode": "clip" }),
+        ] {
+            let (status, body) = start_talk_down(&app, 1, bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+        let (status, body) =
+            speaker_call(&app, Method::POST, "/api/v1/admin/speakers/999/test", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!talk_down_busy(&app).await);
+    }
+
+    #[tokio::test]
+    async fn talk_down_clip_plays_the_wav_samples() {
+        let samples: Vec<i16> = (0..800)
+            .map(|i| ((i * 977) % 20_000 - 10_000) as i16)
+            .collect();
+        let clip = wav(1, 8000, &samples);
+        let server = wiremock::MockServer::start().await;
+        serve(&server, "/clip.wav", clip.clone()).await;
+        let url = format!("{}/clip.wav?sv=2024&sig=SAS-SIGNATURE", server.uri());
+        let (port, rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, _) =
+            talkdown_app(TalkdownSessions::allowing_http(), "127.0.0.1", port).await;
+
+        let body = serde_json::json!({
+            "mode": "clip",
+            "clip": { "url": url, "sha256": sha256_hex(&clip).to_uppercase() },
+        });
+        let (status, body) = start_talk_down(&app, 1, body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body)["mode"], "clip");
+
+        let mut buf = [0u8; 2048];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), rtp.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let want: Vec<u8> = samples[..160]
+            .iter()
+            .map(|&s| crate::talkdown::g711::ulaw(s))
+            .collect();
+        assert_eq!(
+            &buf[12..n],
+            want.as_slice(),
+            "the clip's first frame, µ-law"
+        );
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        assert_audit_has_no_url(&store, "SAS-SIGNATURE").await;
+    }
+
+    #[tokio::test]
+    async fn talk_down_clip_refusals_place_no_call() {
+        let tone = wav(1, 8000, &crate::talkdown::tone_pcm(100));
+        let server = wiremock::MockServer::start().await;
+        let files = [
+            ("/good.wav", tone.clone()),
+            ("/stereo.wav", wav(2, 8000, &[0; 400])),
+            ("/16k.wav", wav(1, 16_000, &[0; 400])),
+            ("/text.wav", b"not a wave file".to_vec()),
+            ("/big.wav", wav(1, 8000, &vec![0; 512 * 1024 + 1])),
+        ];
+        for (path, body) in &files {
+            serve(&server, path, body.clone()).await;
+        }
+        // A speaker that never hears a request: any INVITE would land here.
+        let speaker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = speaker.local_addr().unwrap().port();
+        let (app, store, _dir, _) =
+            talkdown_app(TalkdownSessions::allowing_http(), "127.0.0.1", port).await;
+        let clip = |path: &str, sha: String| {
+            serde_json::json!({
+                "mode": "clip",
+                "clip": { "url": format!("{}{path}?sig=SAS-SIGNATURE", server.uri()), "sha256": sha },
+            })
+        };
+
+        let mut cases = vec![clip("/good.wav", sha256_hex(b"something else"))];
+        cases.extend(
+            files[1..]
+                .iter()
+                .map(|(path, body)| clip(path, sha256_hex(body))),
+        );
+        cases.push(clip("/missing.wav", sha256_hex(b"")));
+        for case in cases {
+            let (status, body) = start_talk_down(&app, 1, case.clone()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{case}: {body}");
+            assert_eq!(error_code(&body), "clip_invalid", "{case}");
+            assert!(!body.contains("SAS-SIGNATURE"), "URL echoed: {body}");
+        }
+        assert!(!talk_down_busy(&app).await);
+        assert_audit_has_no_url(&store, "SAS-SIGNATURE").await;
+
+        // The engine's own sessions take https only.
+        let (prod, _store, _dir2, _) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        let (status, body) = start_talk_down(&prod, 1, clip("/good.wav", sha256_hex(&tone))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(error_code(&body), "clip_invalid");
+
+        let mut buf = [0u8; 2048];
+        let heard = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            speaker.recv(&mut buf),
+        )
+        .await;
+        assert!(heard.is_err(), "a refused clip placed a call");
+    }
+
+    #[tokio::test]
+    async fn talk_down_to_a_silent_speaker_is_502_and_frees_it() {
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let (app, _store, _dir, _) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(error_code(&body), "speaker_unreachable");
+        assert_eq!(speaker_json(&body)["message"], "speaker did not answer");
+        assert!(!talk_down_busy(&app).await);
+        // A start that gets as far as claiming the speaker is not refused as busy.
+        let bad_clip = serde_json::json!({
+            "mode": "clip", "clip": { "url": "ftp://x/y.wav", "sha256": "00" },
+        });
+        let (status, body) = start_talk_down(&app, 1, bad_clip).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+
+    #[tokio::test]
+    async fn talk_down_speaker_test_plays_the_chime_and_answers_after_the_hangup() {
+        let (port, _rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+
+        let started = std::time::Instant::now();
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            &format!("/api/v1/admin/speakers/{speaker}/test"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body), serde_json::json!({ "ok": true }));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(1), uas)
+            .await
+            .expect("the BYE was sent before the answer")
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        assert!(!talk_down_busy(&app).await);
+        let rows = store
+            .list_audit_for_resource("speaker", &speaker.to_string(), 50)
+            .await
+            .unwrap();
+        assert!(rows.iter().any(|r| r.action == "speaker.test"
+            && matches!(r.outcome, nexus_store::AuditOutcome::Success)));
+
+        // A speaker that turns the call away.
+        let (busy_port, busy_uas) = fake_uas("ACK", |req| {
+            if req.starts_with("INVITE") {
+                vec![reply(req, "486 Busy Here", "", "")]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        seed_onvif_camera(&store, 2, None).await;
+        let other = assign_speaker(&app, 2, "127.0.0.1", busy_port).await;
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            &format!("/api/v1/admin/speakers/{other}/test"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(error_code(&body), "speaker_unreachable");
+        assert_eq!(speaker_json(&body)["message"], "speaker answered SIP 486");
+        busy_uas.await.unwrap();
+    }
+
+    /// Plays the chime through the talk-down endpoint on a real speaker:
+    /// `NEXUS_TALKDOWN_HW=192.168.1.66 cargo test -p nexus-engine talkdown_hw -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a SIP speaker on the LAN: set NEXUS_TALKDOWN_HW=<ip>"]
+    async fn talkdown_hw_endpoint_tone() {
+        let host = std::env::var("NEXUS_TALKDOWN_HW").expect("set NEXUS_TALKDOWN_HW");
+        let (app, _store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), &host, 5060).await;
+        let started = std::time::Instant::now();
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        println!(
+            "POST talk-down -> {status} {body} after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(talk_down_busy(&app).await, "busy while playing");
+        wait_idle(&app, std::time::Duration::from_secs(10)).await;
+        println!("speaker {speaker} free again after {:?}", started.elapsed());
     }
 }

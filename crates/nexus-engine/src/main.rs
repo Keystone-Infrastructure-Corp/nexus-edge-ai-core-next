@@ -1804,6 +1804,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         lan_proxy_enabled: cfg.lan_proxy.enabled,
         remote_access,
         reid_stats: reid_stats.clone(),
+        talkdown: Default::default(),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds
