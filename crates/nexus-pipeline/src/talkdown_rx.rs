@@ -291,7 +291,7 @@ mod tests {
     use tokio::time::{timeout, timeout_at, Instant};
 
     /// The live path needs libnice's `nicesrc`/`nicesink`, which CI's
-    /// `system-libs` job does not install; there this test reports a skip.
+    /// `system-libs` job installs; a host without them reports a skip.
     fn missing_elements() -> Vec<&'static str> {
         if gst::init().is_err() {
             return vec!["gstreamer"];

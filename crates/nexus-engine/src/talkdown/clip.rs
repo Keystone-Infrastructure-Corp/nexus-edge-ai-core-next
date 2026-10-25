@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 
 /// Reading stops past this many bytes.
 const MAX_BYTES: usize = 1 << 20;
-const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+// 5 s fetch + the 9 s call bound in session.rs stays inside the cloud's 15 s rpc timeout.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Fetch the clip at `url` and return its samples, or why it was refused.
 /// `allow_http` exists for the tests' plain-http clip server only.

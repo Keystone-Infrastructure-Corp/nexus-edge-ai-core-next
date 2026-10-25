@@ -10322,8 +10322,18 @@ mod tests {
         let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "live" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+        // Nor for an offer with no audio: it is refused before the speaker rings.
         let no_audio = serde_json::json!({ "mode": "live", "sdp_offer": "v=0\r\n" });
         let (status, body) = start_talk_down(&app, 1, no_audio).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(error_code(&body), "talk_down_negotiation_failed");
+
+        // An audio offer the receiver cannot answer hangs up the answered call.
+        // The fake speaker stops at its first BYE, so this being the call it
+        // saw also shows the no-audio offer placed none.
+        let no_ice = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+        let no_ice = serde_json::json!({ "mode": "live", "sdp_offer": no_ice });
+        let (status, body) = start_talk_down(&app, 1, no_ice).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
         assert_eq!(error_code(&body), "talk_down_negotiation_failed");
         let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)

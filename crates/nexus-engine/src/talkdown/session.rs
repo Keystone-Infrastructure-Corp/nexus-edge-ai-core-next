@@ -135,6 +135,14 @@ impl TalkdownSessions {
         if matches!(audio, Audio::Live { .. }) {
             return Err(StartError::LiveUnsupported);
         }
+        // The receiver refuses an offer with no audio too, but only after the
+        // call: refuse it here so the speaker never rings for it.
+        #[cfg(feature = "gstreamer-webrtc")]
+        if let Audio::Live { sdp_offer, .. } = audio {
+            if !sdp_offer.lines().any(|l| l.starts_with("m=audio ")) {
+                return Err(StartError::Negotiation("the offer has no audio".into()));
+            }
+        }
         let session = self.claim(speaker.id, camera_id)?;
         let mut pcm = match audio {
             Audio::Tone => tone_pcm(TONE_MS),

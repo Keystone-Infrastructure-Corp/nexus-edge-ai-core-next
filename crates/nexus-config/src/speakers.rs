@@ -73,6 +73,17 @@ impl SpeakerConfig {
         if self.port == 0 {
             return Err("port must not be 0".into());
         }
+        // The SIP driver splices these into a quoted Digest header line.
+        for (field, value) in [("username", &self.username), ("password", &self.password)] {
+            if value
+                .as_deref()
+                .is_some_and(|v| v.chars().any(|c| c.is_control() || c == '"'))
+            {
+                return Err(format!(
+                    "{field} must not contain a control character or a double quote"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -115,6 +126,26 @@ mod tests {
         sp.name = "lobby".into();
         sp.port = 0;
         assert!(sp.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_credentials_that_would_break_a_sip_header() {
+        for bad in ["a\r\nVia: x", "a\nb", "a\u{7f}", "a\"b"] {
+            let mut sp = speaker("192.0.2.10");
+            sp.username = Some(bad.into());
+            let err = sp.validate().unwrap_err();
+            assert!(err.contains("username"), "{bad:?}: {err}");
+            let mut sp = speaker("192.0.2.10");
+            sp.password = Some(bad.into());
+            let err = sp.validate().unwrap_err();
+            assert!(err.contains("password"), "{bad:?}: {err}");
+        }
+        let mut sp = speaker("192.0.2.10");
+        sp.username = Some("admin".into());
+        sp.password = Some(String::new());
+        assert_eq!(sp.validate(), Ok(()));
+        sp.password = Some("p@ss w0rd!".into());
+        assert_eq!(sp.validate(), Ok(()));
     }
 
     #[test]
