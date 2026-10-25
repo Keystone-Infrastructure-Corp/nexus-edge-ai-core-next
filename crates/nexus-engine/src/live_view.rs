@@ -165,8 +165,9 @@ impl LbrBudget {
 /// ~29 cells frozen indefinitely.
 ///
 /// Bypassing is bounded: the keepalive is at most two encodes per camera per
-/// second (grid tier), so worst-case load is `2N + max_per_sec` encodes/sec, and an encode
-/// is a small-tile resize + JPEG, not a decode.
+/// second (grid tier; eight for a focus cell), so worst-case load for an
+/// all-grid wall is `2N + max_per_sec` encodes/sec, and an encode is a
+/// small-tile resize + JPEG, not a decode.
 fn should_emit(
     new_frame: bool,
     scene_changed: bool,
@@ -1081,6 +1082,21 @@ mod tests {
         assert!(
             (6..=9).contains(&n),
             "focus floor is 8 fps; emitted {n} in 1 s"
+        );
+    }
+
+    /// Motion is judged against the last frame *sent*, not the last one
+    /// seen: a slow drift whose per-tick step is under the gate's delta
+    /// still bursts once it adds up against what the viewer is showing.
+    #[tokio::test(start_paused = true)]
+    async fn slow_drift_accumulates_against_the_last_sent_frame() {
+        // +5 per frame is +10 per 125 ms grid tick (under the delta of 16),
+        // but +20 against the last sent frame every second tick: ~4 fps.
+        // Judged tick-to-tick it would never move and sit at the 2 fps floor.
+        let n = emitted_over("grid", Duration::from_secs(2), |i| (60 + i * 5) as u8).await;
+        assert!(
+            n >= 7,
+            "drift should burst above the 2 fps floor; emitted {n} in 2 s"
         );
     }
 }
