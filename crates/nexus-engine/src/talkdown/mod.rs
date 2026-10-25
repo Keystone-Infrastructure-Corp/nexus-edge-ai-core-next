@@ -1,10 +1,13 @@
 //! Talk-down: play audio through an IP speaker assigned to a camera (ADR-090).
 //! `sip` is the only driver: a direct-IP SIP call streaming G.711 RTP.
 //! [`session`] runs the calls the admin endpoints in `crate::speakers_admin`
-//! start, one per speaker; [`clip`] loads a canned clip for one.
+//! start, one per speaker; [`clip`] loads a canned clip for one, and `live`
+//! (built with `gstreamer-webrtc`) receives an operator's microphone for one.
 
 pub mod clip;
 pub mod g711;
+#[cfg(feature = "gstreamer-webrtc")]
+pub mod live;
 pub mod session;
 pub mod sip;
 

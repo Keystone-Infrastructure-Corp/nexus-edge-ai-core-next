@@ -9545,7 +9545,7 @@ mod tests {
         let read = |cam: i64, speaker: Option<(i64, &str)>| {
             let mut view = talk_down(cam, speaker);
             view["busy"] = false.into();
-            view["modes"] = serde_json::json!(["tone", "clip"]);
+            view["modes"] = serde_json::json!(crate::talkdown::session::MODES);
             view
         };
 
@@ -9712,7 +9712,11 @@ mod tests {
             speaker_call(app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let view = speaker_json(&body);
-        assert_eq!(view["modes"], serde_json::json!(["tone", "clip"]), "{body}");
+        assert_eq!(
+            view["modes"],
+            serde_json::json!(crate::talkdown::session::MODES),
+            "{body}"
+        );
         view["busy"]
             .as_bool()
             .unwrap_or_else(|| panic!("busy in {body}"))
@@ -10154,5 +10158,200 @@ mod tests {
         assert!(talk_down_busy(&app).await, "busy while playing");
         wait_idle(&app, std::time::Duration::from_secs(10)).await;
         println!("speaker {speaker} free again after {:?}", started.elapsed());
+    }
+
+    #[cfg(not(feature = "gstreamer-webrtc"))]
+    #[tokio::test]
+    async fn talk_down_live_is_unsupported_without_webrtc() {
+        // A speaker that never hears a request: any INVITE would land here.
+        let speaker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = speaker.local_addr().unwrap().port();
+        let (app, _store, _dir, _) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+
+        let live = serde_json::json!({ "mode": "live", "sdp_offer": "v=0\r\n", "ice_servers": [] });
+        let (status, body) = start_talk_down(&app, 1, live).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "talk_down_unsupported");
+        assert!(speaker_json(&body)["message"]
+            .as_str()
+            .unwrap()
+            .contains("live audio"));
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        assert_eq!(
+            speaker_json(&body)["modes"],
+            serde_json::json!(["tone", "clip"])
+        );
+        let mut buf = [0u8; 2048];
+        let heard = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            speaker.recv(&mut buf),
+        )
+        .await;
+        assert!(heard.is_err(), "a refused live start placed a call");
+    }
+
+    /// Start a live session on camera 1, fed by an in-process Opus tone that
+    /// stands in for the SFU; drop the returned sender to stop the audio.
+    #[cfg(feature = "gstreamer-webrtc")]
+    async fn start_live(
+        app: &axum::Router,
+    ) -> (nexus_pipeline::talkdown_rx::ToneSender, serde_json::Value) {
+        let (sender, offer) = nexus_pipeline::talkdown_rx::ToneSender::offer()
+            .await
+            .unwrap();
+        let live = serde_json::json!({ "mode": "live", "sdp_offer": offer, "ice_servers": [] });
+        let (status, body) = start_talk_down(app, 1, live).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let started = speaker_json(&body);
+        let answer = started["sdp_answer"].as_str().expect("an sdp_answer");
+        sender.set_answer(answer).await.unwrap();
+        (sender, started)
+    }
+
+    /// Wait for a PCMU frame with a sample louder than ±1000.
+    #[cfg(feature = "gstreamer-webrtc")]
+    async fn hear_audio(rtp: &tokio::net::UdpSocket) {
+        let loud = crate::talkdown::g711::ulaw(1000) & 0x7f;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = tokio::time::timeout_at(deadline, rtp.recv(&mut buf))
+                .await
+                .expect("audible RTP within 5 s")
+                .unwrap();
+            assert_eq!(n, 12 + 160);
+            assert_eq!(buf[1] & 0x7f, 0, "PCMU");
+            if buf[12..n].iter().any(|&b| b & 0x7f < loud) {
+                return;
+            }
+        }
+    }
+
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn talk_down_live_forwards_the_microphone_until_stopped() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+
+        let (_sender, started) = start_live(&app).await;
+        assert_eq!(started["mode"], "live");
+        assert_eq!(started["speaker_id"], speaker);
+        assert_eq!(started["camera_id"], 1);
+        let answer = started["sdp_answer"].as_str().unwrap();
+        assert!(answer.contains("a=recvonly"), "{answer}");
+        hear_audio(&rtp).await;
+        assert!(talk_down_busy(&app).await, "busy while live");
+
+        let stop = "/api/v1/admin/cameras/1/talk-down/stop";
+        let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .expect("BYE after the stop")
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+
+        let rows = store
+            .list_audit_for_resource("camera", "1", 50)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.action == "talk_down.start")
+            .expect("talk_down.start audited");
+        let after = speaker_json(row.after_json.as_deref().unwrap());
+        assert_eq!(after["mode"], "live");
+        assert_eq!(after["session_id"], started["session_id"]);
+        for r in &rows {
+            for text in [&r.before_json, &r.after_json].into_iter().flatten() {
+                assert!(
+                    !text.contains("sdp_answer") && !text.contains("ice-pwd"),
+                    "SDP in the audit row {text}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn talk_down_live_hangs_up_when_the_audio_stops() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (app, _store, _dir, _) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+
+        let (sender, _) = start_live(&app).await;
+        hear_audio(&rtp).await;
+        drop(sender);
+        let stopped = std::time::Instant::now();
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), uas)
+            .await
+            .expect("BYE after the idle limit")
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        // The test build's idle limit is 2 s, then the 300 ms tail.
+        assert!(
+            stopped.elapsed() >= std::time::Duration::from_secs(2),
+            "BYE {:?} after the audio stopped",
+            stopped.elapsed()
+        );
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+    }
+
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn talk_down_live_offer_failures_hang_up_and_free_the_speaker() {
+        let (port, _rtp, uas) = fake_speaker().await;
+        let (app, _store, _dir, _) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+
+        // No offer at all is the caller's mistake; no call is placed for it.
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "live" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let no_audio = serde_json::json!({ "mode": "live", "sdp_offer": "v=0\r\n" });
+        let (status, body) = start_talk_down(&app, 1, no_audio).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(error_code(&body), "talk_down_negotiation_failed");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .expect("the answered call is hung up")
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        assert!(!talk_down_busy(&app).await);
+    }
+
+    /// Feeds a 3 s tone through the live path to a real speaker:
+    /// `NEXUS_TALKDOWN_HW=192.168.1.66 cargo test -p nexus-engine --features gstreamer-webrtc talkdown_hw_live -- --ignored --nocapture`
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a SIP speaker on the LAN: set NEXUS_TALKDOWN_HW=<ip>"]
+    async fn talkdown_hw_live() {
+        let host = std::env::var("NEXUS_TALKDOWN_HW").expect("set NEXUS_TALKDOWN_HW");
+        let (app, _store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), &host, 5060).await;
+        let started = std::time::Instant::now();
+        let (sender, body) = start_live(&app).await;
+        println!(
+            "POST live talk-down -> 200 session {} after {:?}",
+            body["session_id"],
+            started.elapsed()
+        );
+        assert!(talk_down_busy(&app).await, "busy while live");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // A session that already ended here failed its RTP sends.
+        assert!(talk_down_busy(&app).await, "the call ended mid-tone");
+        drop(sender);
+        let stopped = std::time::Instant::now();
+        println!("tone stopped after {:?}", started.elapsed());
+        wait_idle(&app, std::time::Duration::from_secs(10)).await;
+        println!("speaker {speaker} free again after {:?}", started.elapsed());
+        assert!(
+            stopped.elapsed() >= std::time::Duration::from_secs(2),
+            "hung up on the idle limit"
+        );
     }
 }

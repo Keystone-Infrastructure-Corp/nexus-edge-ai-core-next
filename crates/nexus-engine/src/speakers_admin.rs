@@ -10,14 +10,16 @@
 //!   `{"speaker_id": id | null}`; the GET also says whether the speaker is
 //!   `busy` and which `modes` it can play
 //! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down` — play a
-//!   [`Audio`] on the camera's speaker; answers once the speaker picks up
+//!   [`Audio`] on the camera's speaker; answers once the speaker picks up,
+//!   and for `live` audio once the edge has its `sdp_answer` for the SFU
 //! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down/stop`
 //! * `POST           /api/v1/admin/speakers/{id}/test` — play the chime and
 //!   answer when it has finished
 //!
 //! A talk-down action refused for a reason the cloud acts on answers
 //! [`Refusal`]'s `{"error": code, "message": …}`: `talk_down_unsupported`,
-//! `talk_down_busy`, `clip_invalid` or `speaker_unreachable`.
+//! `talk_down_busy`, `clip_invalid`, `speaker_unreachable` or
+//! `talk_down_negotiation_failed`.
 //!
 //! A create or update body is a [`SpeakerConfig`] without `id`. On an update
 //! an absent `password` keeps the stored one and `""` clears it. The password
@@ -214,6 +216,16 @@ impl From<StartError> for Refusal {
                 "speaker_unreachable",
                 e.to_string(),
             ),
+            #[cfg(not(feature = "gstreamer-webrtc"))]
+            StartError::LiveUnsupported => Self(
+                StatusCode::CONFLICT,
+                "talk_down_unsupported",
+                "live audio is not built into this engine".into(),
+            ),
+            #[cfg(feature = "gstreamer-webrtc")]
+            StartError::Negotiation(why) => {
+                Self(StatusCode::BAD_GATEWAY, "talk_down_negotiation_failed", why)
+            }
         }
     }
 }
@@ -555,13 +567,15 @@ pub(crate) async fn start_talk_down(
         })?;
         let Json(audio) =
             body.map_err(|e| Refusal(StatusCode::BAD_REQUEST, "bad_request", e.body_text()))?;
-        let (session_id, _playing) = s.talkdown.start(&sp, Some(camera_id), &audio).await?;
-        Ok::<_, Refusal>(serde_json::json!({
+        let (session_id, sdp_answer, _playing) =
+            s.talkdown.start(&sp, Some(camera_id), &audio).await?;
+        let started = serde_json::json!({
             "session_id": session_id,
             "speaker_id": sp.id,
             "camera_id": camera_id,
             "mode": audio.mode(),
-        }))
+        });
+        Ok::<_, Refusal>((started, sdp_answer))
     }
     .await;
     let caller = Caller {
@@ -571,10 +585,21 @@ pub(crate) async fn start_talk_down(
         peer,
     };
     let id = camera_id.to_string();
+    // The audit row leaves out the SDP answer: it carries ICE credentials.
     caller
-        .audit("talk_down.start", "camera", &id, res.as_ref())
+        .audit(
+            "talk_down.start",
+            "camera",
+            &id,
+            res.as_ref().map(|(started, _)| started),
+        )
         .await;
-    res.map(Json)
+    res.map(|(mut started, sdp_answer)| {
+        if let Some(sdp) = sdp_answer {
+            started["sdp_answer"] = sdp.into();
+        }
+        Json(started)
+    })
 }
 
 /// Idempotent: 204 whether or not the speaker was playing.
@@ -616,7 +641,7 @@ pub(crate) async fn test_speaker(
 ) -> Result<Json<serde_json::Value>, Refusal> {
     let res: Result<_, Refusal> = async {
         let sp = stored(&s, id).await?;
-        let (_, playing) = s.talkdown.start(&sp, None, &Audio::Tone).await?;
+        let (_, _, playing) = s.talkdown.start(&sp, None, &Audio::Tone).await?;
         match playing.await {
             Ok(Ok(())) => Ok(serde_json::json!({ "ok": true })),
             Ok(Err(e)) => Err(StartError::Call(e).into()),

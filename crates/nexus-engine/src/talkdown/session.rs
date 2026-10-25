@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nexus_cloud_protocol::v1::IceServer;
 use nexus_config::{SpeakerConfig, SpeakerId};
 use nexus_types::CameraId;
 use parking_lot::Mutex;
@@ -16,11 +17,17 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[cfg(feature = "gstreamer-webrtc")]
+use super::live::Live;
 use super::sip::{place_call, SipTarget, TalkdownError};
 use super::{clip, tone_pcm};
 
 /// What this build can play, as the talk-down GET lists it.
-pub const MODES: [&str; 2] = ["tone", "clip"];
+pub const MODES: &[&str] = if cfg!(feature = "gstreamer-webrtc") {
+    &["tone", "clip", "live"]
+} else {
+    &["tone", "clip"]
+};
 
 /// How long a speaker gets to answer the INVITE.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(8);
@@ -29,13 +36,26 @@ const TONE_MS: u32 = 2000;
 /// speaker still has buffered.
 const TAIL_SAMPLES: usize = 300 * 8;
 
-/// A start request's body: `{"mode": "tone"}` or
-/// `{"mode": "clip", "clip": {"url": …, "sha256": …}}`.
+/// A start request's body: `{"mode": "tone"}`,
+/// `{"mode": "clip", "clip": {"url": …, "sha256": …}}` or
+/// `{"mode": "live", "sdp_offer": …, "ice_servers": […]}`.
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum Audio {
     Tone,
-    Clip { clip: ClipRef },
+    Clip {
+        clip: ClipRef,
+    },
+    /// The SFU's subscriber offer for the operator's microphone track. Parsed
+    /// in every build so a build without live audio refuses it by name.
+    #[cfg_attr(not(feature = "gstreamer-webrtc"), allow(dead_code))]
+    Live {
+        /// Carries ICE credentials: never logged.
+        sdp_offer: String,
+        /// TURN entries carry credentials: never logged.
+        #[serde(default)]
+        ice_servers: Vec<IceServer>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -50,6 +70,7 @@ impl Audio {
         match self {
             Self::Tone => "tone",
             Self::Clip { .. } => "clip",
+            Self::Live { .. } => "live",
         }
     }
 }
@@ -59,6 +80,12 @@ pub enum StartError {
     /// Why the clip was refused; never contains its URL.
     Clip(String),
     Call(TalkdownError),
+    /// This build has no live audio.
+    #[cfg(not(feature = "gstreamer-webrtc"))]
+    LiveUnsupported,
+    /// The receiver could not answer the SFU's offer; never contains the SDP.
+    #[cfg(feature = "gstreamer-webrtc")]
+    Negotiation(String),
 }
 
 /// The engine's talk-down sessions, shared by every handler.
@@ -95,19 +122,26 @@ impl TalkdownSessions {
 
     /// Claim the speaker, load the audio and call the speaker. Once it
     /// answers, the audio plays in a spawned task that then hangs up; this
-    /// returns the session id and that task.
+    /// returns the session id, the SDP answer of a live session, and that
+    /// task. A live session answers the SFU's offer only after the speaker
+    /// has answered, so an unreachable speaker fails fast.
     pub async fn start(
         &self,
         speaker: &SpeakerConfig,
         camera_id: Option<CameraId>,
         audio: &Audio,
-    ) -> Result<(Uuid, JoinHandle<Result<(), TalkdownError>>), StartError> {
+    ) -> Result<(Uuid, Option<String>, JoinHandle<Result<(), TalkdownError>>), StartError> {
+        #[cfg(not(feature = "gstreamer-webrtc"))]
+        if matches!(audio, Audio::Live { .. }) {
+            return Err(StartError::LiveUnsupported);
+        }
         let session = self.claim(speaker.id, camera_id)?;
         let mut pcm = match audio {
             Audio::Tone => tone_pcm(TONE_MS),
             Audio::Clip { clip } => clip::fetch(&clip.url, &clip.sha256, self.allow_http)
                 .await
                 .map_err(StartError::Clip)?,
+            Audio::Live { .. } => Vec::new(),
         };
         pcm.resize(pcm.len() + TAIL_SAMPLES, 0);
         let target = SipTarget {
@@ -130,8 +164,36 @@ impl TalkdownSessions {
         let mut call = answered
             .unwrap_or(Err(TalkdownError::Unreachable))
             .map_err(StartError::Call)?;
+        // A failed negotiation drops `call`, which sends its BYE, then
+        // `session`, which releases the speaker.
+        #[cfg(feature = "gstreamer-webrtc")]
+        let (live, sdp_answer) = match audio {
+            Audio::Live {
+                sdp_offer,
+                ice_servers,
+            } => {
+                let (live, answer) = Live::answer(sdp_offer, ice_servers)
+                    .await
+                    .map_err(StartError::Negotiation)?;
+                (Some(live), Some(answer))
+            }
+            _ => (None, None),
+        };
+        #[cfg(not(feature = "gstreamer-webrtc"))]
+        let sdp_answer = None;
         let id = session.id;
         let task = tokio::spawn(async move {
+            #[cfg(feature = "gstreamer-webrtc")]
+            let played = match live {
+                // The silent tail plays after a stop too, so the BYE does
+                // not clip the operator's last words.
+                Some(live) => match live.forward(&mut call, &session.cancel).await {
+                    Ok(()) => call.play_pcm(&pcm, &CancellationToken::new()).await,
+                    e => e,
+                },
+                None => call.play_pcm(&pcm, &session.cancel).await,
+            };
+            #[cfg(not(feature = "gstreamer-webrtc"))]
             let played = call.play_pcm(&pcm, &session.cancel).await;
             let res = match played {
                 Ok(()) => call.hangup().await,
@@ -143,7 +205,7 @@ impl TalkdownSessions {
             res
             // `session` drops here, after the hangup: the speaker is free.
         });
-        Ok((id, task))
+        Ok((id, sdp_answer, task))
     }
 
     fn claim(
