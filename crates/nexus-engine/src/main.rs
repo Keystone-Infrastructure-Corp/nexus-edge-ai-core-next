@@ -69,6 +69,7 @@ mod ssh_ca;
 mod state_hashes;
 mod storage_safety;
 mod system_metrics;
+mod talkdown;
 mod webrtc_bridge;
 // M7 Step 6F2 — only compiled when the `test-injection` feature
 // is on (off in any production build). Wires the dev-only
