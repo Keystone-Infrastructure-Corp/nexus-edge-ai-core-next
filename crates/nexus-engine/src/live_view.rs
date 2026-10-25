@@ -60,6 +60,9 @@ const LBR_JPEG_QUALITY: u8 = 72;
 /// detection stays simple. Per tier: 2 fps grid, 8 fps focus.
 const GRID_KEEPALIVE: Duration = Duration::from_millis(500);
 const FOCUS_KEEPALIVE: Duration = Duration::from_millis(125);
+/// Keepalive for a suppressed decoder loop, on every tier. Deliberately not
+/// the tier floor: at a focus cell's 8 fps a replayed cycle reads as live.
+const LOOP_KEEPALIVE: Duration = Duration::from_secs(1);
 
 /// A subscribed camera that has produced no new `frame_id` for this long is
 /// reported as stalled. Generous relative to the slowest tier (`GRID_FPS`)
@@ -503,7 +506,7 @@ fn spawn_pump(
                     warn!(camera_id, "live view: frame cycle cleared");
                     loop_logged = false;
                 }
-                let stale_dup = cycle.is_some() && !keepalive_due;
+                let stale_dup = cycle.is_some() && now.duration_since(last_emit) < LOOP_KEEPALIVE;
 
                 // Encode only when there is a NEW frame to send and either
                 // the scene changed or a keepalive is due. See
@@ -1068,6 +1071,22 @@ mod tests {
         // guard's window, so this is motion, not a decoder loop.
         let n = emitted_over("grid", Duration::from_secs(2), |i| ((i * 20) % 256) as u8).await;
         assert!(n >= 12, "grid ceiling is 8 fps; emitted {n} in 2 s");
+        let n = emitted_over("focus", Duration::from_secs(1), |i| ((i * 20) % 256) as u8).await;
+        assert!(n >= 12, "focus ceiling is 15 fps; emitted {n} in 1 s");
+    }
+
+    /// A decoder re-serving a short cycle of old frames is held to the 1 s
+    /// loop keepalive on every tier. Letting the tier floor through would
+    /// replay the loop at ~8 fps on a focus cell: a fake-smooth stale video.
+    #[tokio::test(start_paused = true)]
+    async fn a_looping_decoder_is_held_to_one_fps_on_the_focus_tier() {
+        // Period-3 cycle: each step is motion (> 16), and every frame from
+        // the fourth on repeats content already sent at distance 3.
+        let n = emitted_over("focus", Duration::from_secs(2), |i| {
+            [40, 120, 200][(i % 3) as usize]
+        })
+        .await;
+        assert!(n <= 6, "a loop must replay at ~1 fps; emitted {n} in 2 s");
     }
 
     /// A static scene emits at the tier floor, not the ceiling.
@@ -1075,7 +1094,7 @@ mod tests {
     async fn a_static_scene_emits_at_the_tier_floor() {
         let n = emitted_over("grid", Duration::from_secs(2), |_| 90).await;
         assert!(
-            (3..=5).contains(&n),
+            (4..=5).contains(&n),
             "grid floor is 2 fps; emitted {n} in 2 s"
         );
         let n = emitted_over("focus", Duration::from_secs(1), |_| 90).await;
