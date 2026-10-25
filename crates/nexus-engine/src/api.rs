@@ -9819,7 +9819,8 @@ mod tests {
         assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
         wait_idle(&app, std::time::Duration::from_secs(1)).await;
 
-        // The 2 s chime then 300 ms of silence: 115 PCMU frames, the last silent.
+        // One silent frame opening the media flow, the 2 s chime, then 300 ms
+        // of silence: 116 PCMU frames, the last silent.
         let mut buf = [0u8; 2048];
         let mut frames = Vec::new();
         while let Ok(n) = rtp.try_recv(&mut buf) {
@@ -9827,8 +9828,12 @@ mod tests {
             assert_eq!(buf[1] & 0x7f, 0, "PCMU");
             frames.push(buf[12..n].to_vec());
         }
-        assert_eq!(frames.len(), 115);
-        assert!(frames[114].iter().all(|&b| b == 0xff), "µ-law silence tail");
+        assert_eq!(frames.len(), 116);
+        assert!(
+            frames[0].iter().all(|&b| b == 0xff),
+            "the silent opening frame"
+        );
+        assert!(frames[115].iter().all(|&b| b == 0xff), "µ-law silence tail");
 
         let rows = store
             .list_audit_for_resource("camera", "1", 50)
@@ -9987,6 +9992,11 @@ mod tests {
         assert_eq!(speaker_json(&body)["mode"], "clip");
 
         let mut buf = [0u8; 2048];
+        // The first packet is the silent frame that opens the media flow.
+        tokio::time::timeout(std::time::Duration::from_secs(1), rtp.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         let n = tokio::time::timeout(std::time::Duration::from_secs(1), rtp.recv(&mut buf))
             .await
             .unwrap()

@@ -51,7 +51,6 @@ pub struct SipCall {
     invite_cseq: u32,
     codec: Codec,
     rtp: UdpSocket,
-    rtp_dest: SocketAddr,
     seq: u16,
     timestamp: u32,
     ssrc: u32,
@@ -136,19 +135,24 @@ pub async fn place_call(target: &SipTarget, timeout: Duration) -> Result<SipCall
             return Err(e);
         }
     };
+    // Open our side of the media flow before the speaker's RTP reaches this
+    // socket: a host network filter that sees the flow start inbound can hold
+    // every packet we later send on it (bench, 2026-10-25).
+    rtp.connect(rtp_dest).await?;
     let r = getrandom::u64().unwrap_or_default();
-    Ok(SipCall {
+    let mut call = SipCall {
         leg,
         to,
         invite_cseq: cseq,
         codec,
         rtp,
-        rtp_dest,
         seq: r as u16,
         timestamp: (r >> 16) as u32,
         ssrc: getrandom::u32().unwrap_or_default(),
         hung_up: false,
-    })
+    };
+    call.send_frame(&[]).await?;
+    Ok(call)
 }
 
 impl SipCall {
@@ -166,7 +170,7 @@ impl SipCall {
         packet.extend_from_slice(&self.ssrc.to_be_bytes());
         let samples = pcm.iter().copied().chain(std::iter::repeat(0));
         packet.extend(samples.take(FRAME_SAMPLES).map(|s| self.codec.encode(s)));
-        self.rtp.send_to(&packet, self.rtp_dest).await?;
+        self.rtp.send(&packet).await?;
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(FRAME_SAMPLES as u32);
         Ok(())
@@ -664,13 +668,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(call.codec, Codec::Pcma);
+        // The call opens its media flow with one silent frame; then
         // 70 ms = 560 samples: three full frames and one padded with silence.
         call.play_pcm(&tone_pcm(70), &CancellationToken::new())
             .await
             .unwrap();
         let mut buf = [0u8; 2048];
         let mut seqs = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             let n = timeout(Duration::from_secs(1), rtp.recv(&mut buf))
                 .await
                 .unwrap()
@@ -694,6 +699,39 @@ pub(crate) mod tests {
             assert!(header(in_dialog, "To").unwrap().ends_with(";tag=uas1"));
         }
         assert_eq!(header(&seen[2], "CSeq"), Some("2 BYE"));
+    }
+
+    /// A host filter that sees a UDP flow start with the speaker's RTP can
+    /// hold every packet we later send on it (bench, 2026-10-25), so the call
+    /// opens its media flow itself the moment it is answered.
+    #[tokio::test]
+    async fn an_answered_call_opens_its_media_flow_with_one_silent_frame() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let (port, uas) = fake_uas("BYE", move |req| {
+            if req.starts_with("INVITE") {
+                vec![reply(req, "200 OK", SDP, &answer(rtp_port, "8"))]
+            } else if req.starts_with("BYE") {
+                vec![reply(req, "200 OK", "", "")]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+
+        let call = place_call(&target(port), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let n = timeout(Duration::from_secs(1), rtp.recv(&mut buf))
+            .await
+            .expect("an RTP packet before any audio is sent")
+            .unwrap();
+        assert_eq!(n, 12 + FRAME_SAMPLES);
+        assert_eq!(buf[1] & 0x7f, 8);
+        assert!(buf[12..n].iter().all(|&b| b == 0xd5), "A-law silence");
+        call.hangup().await.unwrap();
+        uas.await.unwrap();
     }
 
     #[tokio::test]
