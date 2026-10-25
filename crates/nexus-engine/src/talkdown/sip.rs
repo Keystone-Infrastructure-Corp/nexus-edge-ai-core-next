@@ -58,6 +58,23 @@ pub struct SipCall {
     hung_up: bool,
 }
 
+/// Send SIP `OPTIONS`; on any final response return its `User-Agent` (or
+/// `Server`) header, or an empty string when it has neither.
+pub async fn options_ping(host: &str, port: u16, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let leg = timeout_at(deadline, Leg::open(host, port))
+        .await
+        .ok()?
+        .ok()?;
+    let to = format!("<{}>", leg.uri);
+    let resp = leg
+        .transact("OPTIONS", 1, &branch(), &to, "", "", deadline)
+        .await
+        .ok()??;
+    let ua = resp.header("user-agent").or_else(|| resp.header("server"));
+    Some(ua.unwrap_or_default().to_string())
+}
+
 /// INVITE `target` directly by IP (no REGISTER) offering PCMU and PCMA, and
 /// wait up to `timeout` for a final answer. A 401/407 is retried once with
 /// Digest credentials when the target has them.
@@ -611,6 +628,17 @@ pub(crate) mod tests {
             "v=0\r\no=uas 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
              m=audio {rtp_port} RTP/AVP {pts}\r\na=sendrecv\r\n"
         )
+    }
+
+    #[tokio::test]
+    async fn options_ping_returns_user_agent() {
+        let (port, uas) = fake_uas("OPTIONS", |req| {
+            vec![reply(req, "200 OK", "User-Agent: TSIP\r\n", "")]
+        })
+        .await;
+        let ua = options_ping("127.0.0.1", port, Duration::from_secs(2)).await;
+        assert_eq!(ua.as_deref(), Some("TSIP"));
+        uas.await.unwrap();
     }
 
     #[tokio::test]
