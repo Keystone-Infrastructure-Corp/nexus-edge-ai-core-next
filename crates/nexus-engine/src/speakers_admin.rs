@@ -94,7 +94,9 @@ pub(crate) struct TalkDownInput {
     speaker_id: Option<SpeakerId>,
 }
 
+/// A misspelled field is a 400, not a stop of every session on the camera.
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StopInput {
     session_id: Option<Uuid>,
 }

@@ -10276,6 +10276,26 @@ mod tests {
         );
     }
 
+    /// A stop body with a field the edge does not know (a misspelled
+    /// `session_id`) is refused, not read as a stop of every session.
+    #[tokio::test]
+    async fn talk_down_stop_refuses_an_unknown_field() {
+        let (port, _rtp, _uas) = fake_speaker().await;
+        let (app, _store, _dir, _) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let misspelled = serde_json::json!({ "sessionId": speaker_json(&body)["session_id"] });
+        let stop = "/api/v1/admin/cameras/1/talk-down/stop";
+        let (status, body) = speaker_call(&app, Method::POST, stop, Some(misspelled)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            talk_down_busy(&app).await,
+            "the refused stop ended the session"
+        );
+    }
+
     #[tokio::test]
     async fn talk_down_refuses_unknown_and_unassigned_cameras_and_unknown_modes() {
         let (app, store, _dir) = build_test_router(None).await;
