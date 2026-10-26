@@ -709,23 +709,7 @@ pub(crate) async fn test_speaker(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     session: Option<SessionContext>,
 ) -> Result<Json<serde_json::Value>, Refusal> {
-    let res: Result<_, Refusal> = async {
-        let sp = stored(&s, id).await?;
-        let (_, _, playing) = s
-            .talkdown
-            .start(&sp, None, &Audio::Tone, async { true })
-            .await?;
-        match playing.await {
-            Ok(Ok(())) => Ok(serde_json::json!({ "ok": true })),
-            Ok(Err(e)) => Err(StartError::Call(e).into()),
-            Err(e) => Err(Refusal(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                e.to_string(),
-            )),
-        }
-    }
-    .await;
+    let res = async { test_on(&s, &stored(&s, id).await?).await }.await;
     let caller = Caller {
         s: &s,
         session,
@@ -736,4 +720,26 @@ pub(crate) async fn test_speaker(
         .audit("speaker.test", "speaker", &id.to_string(), res.as_ref())
         .await;
     res.map(Json)
+}
+
+/// Play the chime on `sp`, which the caller read, and answer when it has
+/// finished; refused once `sp` has been deleted or edited.
+pub(crate) async fn test_on(
+    s: &ApiState,
+    sp: &SpeakerConfig,
+) -> Result<serde_json::Value, Refusal> {
+    // The claim's re-read, as in `start_on`: a delete or an edit commits
+    // before its stop, which either finds this claim or this re-read sees it.
+    let unchanged =
+        async { matches!(s.store.get_speaker(sp.id).await, Ok(Some(now)) if now == *sp) };
+    let (_, _, playing) = s.talkdown.start(sp, None, &Audio::Tone, unchanged).await?;
+    match playing.await {
+        Ok(Ok(())) => Ok(serde_json::json!({ "ok": true })),
+        Ok(Err(e)) => Err(StartError::Call(e).into()),
+        Err(e) => Err(Refusal(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            e.to_string(),
+        )),
+    }
 }

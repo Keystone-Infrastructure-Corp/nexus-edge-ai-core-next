@@ -10080,6 +10080,38 @@ mod tests {
         }
     }
 
+    /// A speaker test that read the speaker before a delete or an edit, and
+    /// claims it only after that change's cleanup found nothing to end, is
+    /// refused and dials nothing.
+    #[tokio::test]
+    async fn talk_down_speaker_test_from_a_speaker_read_before_a_change_is_refused() {
+        for change in ["delete a", "edit a"] {
+            let (port, _rtp, mut uas) = fake_speaker().await;
+            let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+            let app = super::router(state.clone());
+            seed_onvif_camera(&store, 1, None).await;
+            let a = assign_speaker(&app, 1, "127.0.0.1", port).await;
+
+            let read = store.get_speaker(a).await.unwrap().unwrap();
+            let (method, uri, body) = parting(change, a, a);
+            let (status, body) = speaker_call(&app, method, &uri, body).await;
+            assert!(status.is_success(), "{change}: {status} {body}");
+
+            let refusal = match crate::speakers_admin::test_on(&state, &read).await {
+                Err(refusal) => axum::response::IntoResponse::into_response(refusal),
+                Ok(_) => {
+                    let seen = uas.await.unwrap();
+                    panic!("{change}: the test called a: {:?}", sip_methods(&seen));
+                }
+            };
+            assert_eq!(refusal.status(), StatusCode::CONFLICT, "{change}");
+            assert!(!state.talkdown.is_busy(a), "{change}: a stayed claimed");
+            let heard = tokio::time::timeout(std::time::Duration::from_millis(200), &mut uas).await;
+            assert!(heard.is_err(), "{change}: a was called");
+            uas.abort();
+        }
+    }
+
     /// A parting while the speaker rings CANCELs the INVITE at once, not at
     /// the answer timeout; the start is refused and frees the speaker.
     #[tokio::test]
