@@ -9884,9 +9884,16 @@ mod tests {
             assert_eq!(error_code(&body), "talk_down_busy");
         }
 
-        // Camera 2 stops the session camera 1 started.
-        let stop = "/api/v1/admin/cameras/2/talk-down/stop";
-        let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
+        // A stop ends the session its own camera started: camera 2's leaves
+        // camera 1's playing on the speaker they share.
+        let stop = |camera: i64| format!("/api/v1/admin/cameras/{camera}/talk-down/stop");
+        let (status, body) = speaker_call(&app, Method::POST, &stop(2), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(
+            talk_down_busy(&app).await,
+            "camera 2 stopped camera 1's session"
+        );
+        let (status, body) = speaker_call(&app, Method::POST, &stop(1), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
             .await
@@ -9900,7 +9907,7 @@ mod tests {
         );
         wait_idle(&app, std::time::Duration::from_secs(1)).await;
 
-        let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
+        let (status, body) = speaker_call(&app, Method::POST, &stop(1), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "idle stop: {body}");
         let (status, _) = speaker_call(
             &app,
@@ -9938,7 +9945,109 @@ mod tests {
         assert_eq!(count(&cam1, "talk_down.start", true), 1, "{cam1:?}");
         assert_eq!(count(&cam1, "talk_down.start", false), 1, "{cam1:?}");
         assert_eq!(count(&cam2, "talk_down.start", false), 1, "{cam2:?}");
-        assert_eq!(count(&cam2, "talk_down.stop", true), 2, "{cam2:?}");
+        assert_eq!(count(&cam1, "talk_down.stop", true), 2, "{cam1:?}");
+        assert_eq!(count(&cam2, "talk_down.stop", true), 1, "{cam2:?}");
+    }
+
+    /// A session ends as soon as its camera stops pairing with its speaker:
+    /// the camera moves to another speaker (by either route), the speaker
+    /// drops the camera, or the speaker is deleted. No stop is sent; the
+    /// camera's stop afterwards finds nothing, and never calls the new speaker.
+    #[tokio::test]
+    async fn talk_down_ends_when_its_camera_and_speaker_part() {
+        for change in [
+            "camera to b",
+            "b takes camera",
+            "a drops camera",
+            "delete a",
+        ] {
+            let (port, _rtp, uas) = fake_speaker().await;
+            let (app, store, _dir, a) =
+                talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+            let b_sip = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            seed_onvif_camera(&store, 2, None).await;
+            let b = assign_speaker(&app, 2, "127.0.0.1", b_sip.local_addr().unwrap().port()).await;
+
+            let started = std::time::Instant::now();
+            let (status, body) =
+                start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+            assert_eq!(status, StatusCode::OK, "{change}: {body}");
+            let (method, uri, body) = match change {
+                "camera to b" => (
+                    Method::PUT,
+                    "/api/v1/admin/cameras/1/talk-down".to_string(),
+                    Some(serde_json::json!({ "speaker_id": b })),
+                ),
+                "b takes camera" => (
+                    Method::PUT,
+                    format!("/api/v1/admin/speakers/{b}/cameras"),
+                    Some(serde_json::json!({ "camera_ids": [1, 2] })),
+                ),
+                "a drops camera" => (
+                    Method::PUT,
+                    format!("/api/v1/admin/speakers/{a}/cameras"),
+                    Some(serde_json::json!({ "camera_ids": [] })),
+                ),
+                _ => (Method::DELETE, format!("/api/v1/admin/speakers/{a}"), None),
+            };
+            let (status, body) = speaker_call(&app, method, &uri, body).await;
+            assert!(status.is_success(), "{change}: {status} {body}");
+
+            let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+                .await
+                .unwrap_or_else(|_| panic!("{change}: no BYE"))
+                .unwrap();
+            assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"], "{change}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(1500),
+                "{change}: BYE before the 2 s chime ended: {:?}",
+                started.elapsed()
+            );
+            let stop = "/api/v1/admin/cameras/1/talk-down/stop";
+            let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{change}: {body}");
+            let mut buf = [0u8; 64];
+            assert!(b_sip.try_recv(&mut buf).is_err(), "{change}: b was called");
+        }
+    }
+
+    /// Camera 1 moves to the speaker camera 2 is playing on: camera 1's stop
+    /// is not camera 2's, and the chime plays to its end.
+    #[tokio::test]
+    async fn talk_down_stop_never_ends_another_cameras_session() {
+        // Speaker a, on the discard port, is never called.
+        let (app, store, _dir, _a) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", 9).await;
+        let (port, _rtp, uas) = fake_speaker().await;
+        seed_onvif_camera(&store, 2, None).await;
+        let b = assign_speaker(&app, 2, "127.0.0.1", port).await;
+
+        let started = std::time::Instant::now();
+        let (status, body) = start_talk_down(&app, 2, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/cameras/1/talk-down",
+            Some(serde_json::json!({ "speaker_id": b })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let stop = "/api/v1/admin/cameras/1/talk-down/stop";
+        let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(talk_down_busy(&app).await, "camera 2's session still plays");
+
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .expect("BYE after the chime")
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "camera 1's stop ended camera 2's chime: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

@@ -12,9 +12,13 @@
 //! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down` — play a
 //!   [`Audio`] on the camera's speaker; answers once the speaker picks up,
 //!   and for `live` audio once the edge has its `sdp_answer` for the SFU
-//! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down/stop`
+//! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down/stop` — end
+//!   the session this camera started
 //! * `POST           /api/v1/admin/speakers/{id}/test` — play the chime and
 //!   answer when it has finished
+//!
+//! A session ends as soon as its camera and speaker part: a delete of the
+//! speaker, or an assignment that moves the camera off it.
 //!
 //! A talk-down action refused for a reason the cloud acts on answers
 //! [`Refusal`]'s `{"error": code, "message": …}`: `talk_down_unsupported`,
@@ -411,6 +415,7 @@ pub(crate) async fn delete_speaker(
         )
         .await
         .map_err(refused(StatusCode::NOT_FOUND))?;
+    s.talkdown.stop_where(|speaker_id, _| speaker_id == id);
     publish(
         &s,
         serde_json::json!({ "kind": "speaker", "action": "delete", "speaker_id": id }),
@@ -460,6 +465,11 @@ pub(crate) async fn put_speaker_cameras(
         )
         .await
         .map_err(refused(StatusCode::BAD_REQUEST))?;
+    // A listed camera's session on another speaker, and this speaker's
+    // session from a camera no longer listed, have lost their pairing.
+    s.talkdown.stop_where(|speaker_id, camera| {
+        camera.is_some_and(|c| out.camera_ids.contains(&c) != (speaker_id == id))
+    });
     publish(
         &s,
         serde_json::json!({ "kind": "speaker", "action": "assign_cameras", "speaker_id": id }),
@@ -468,11 +478,8 @@ pub(crate) async fn put_speaker_cameras(
     Ok(Json(out))
 }
 
-/// The camera's talk-down speaker; 404 for an unknown camera.
-async fn camera_speaker(
-    s: &ApiState,
-    camera_id: CameraId,
-) -> Result<Option<SpeakerConfig>, ApiError> {
+/// 404 for an unknown camera.
+async fn known_camera(s: &ApiState, camera_id: CameraId) -> Result<(), ApiError> {
     let (readable, unreadable) = s.store.list_readable_cameras().await?;
     if !readable.iter().any(|c| c.id == camera_id) && !unreadable.contains(&camera_id) {
         return Err(ApiError(
@@ -480,6 +487,15 @@ async fn camera_speaker(
             format!("unknown camera {camera_id}"),
         ));
     }
+    Ok(())
+}
+
+/// The camera's talk-down speaker; 404 for an unknown camera.
+async fn camera_speaker(
+    s: &ApiState,
+    camera_id: CameraId,
+) -> Result<Option<SpeakerConfig>, ApiError> {
+    known_camera(s, camera_id).await?;
     Ok(s.store.speaker_for_camera(camera_id).await?)
 }
 
@@ -536,6 +552,9 @@ pub(crate) async fn put_talk_down(
         )
         .await
         .map_err(refused(StatusCode::NOT_FOUND))?;
+    s.talkdown.stop_where(|speaker_id, camera| {
+        camera == Some(camera_id) && Some(speaker_id) != body.speaker_id
+    });
     publish(
         &s,
         serde_json::json!({
@@ -602,7 +621,9 @@ pub(crate) async fn start_talk_down(
     })
 }
 
-/// Idempotent: 204 whether or not the speaker was playing.
+/// End the session this camera started, on whichever speaker it plays; a
+/// session another camera started on a shared speaker is not this camera's
+/// to end. Idempotent: 204 whether or not there was one.
 pub(crate) async fn stop_talk_down(
     State(s): State<ApiState>,
     Path(camera_id): Path<CameraId>,
@@ -610,12 +631,11 @@ pub(crate) async fn stop_talk_down(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     session: Option<SessionContext>,
 ) -> Result<StatusCode, Refusal> {
-    let res = camera_speaker(&s, camera_id)
+    let res = known_camera(&s, camera_id)
         .await
-        .map(|sp| {
-            let speaker_id = sp.map(|sp| sp.id);
-            let stopped = speaker_id.is_some_and(|id| s.talkdown.stop(id));
-            serde_json::json!({ "speaker_id": speaker_id, "stopped": stopped })
+        .map(|()| {
+            let stopped = s.talkdown.stop_where(|_, camera| camera == Some(camera_id));
+            serde_json::json!({ "speaker_ids": stopped, "stopped": !stopped.is_empty() })
         })
         .map_err(Refusal::from);
     let caller = Caller {

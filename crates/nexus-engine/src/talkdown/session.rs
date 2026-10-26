@@ -88,10 +88,13 @@ pub enum StartError {
     Negotiation(String),
 }
 
+/// Each busy speaker: the camera that started its session, and the session's cancel.
+type Active = Arc<Mutex<HashMap<SpeakerId, (Option<CameraId>, CancellationToken)>>>;
+
 /// The engine's talk-down sessions, shared by every handler.
 #[derive(Clone, Default)]
 pub struct TalkdownSessions {
-    active: Arc<Mutex<HashMap<SpeakerId, CancellationToken>>>,
+    active: Active,
     /// Only [`Self::allowing_http`] sets it.
     allow_http: bool,
 }
@@ -110,14 +113,19 @@ impl TalkdownSessions {
         self.active.lock().contains_key(&speaker_id)
     }
 
-    /// Cancel the speaker's session, whoever started it. It hangs up, then
-    /// releases the speaker. Returns whether there was one.
-    pub fn stop(&self, speaker_id: SpeakerId) -> bool {
+    /// Cancel every session `ends` picks by its speaker and the camera that
+    /// started it (`None` for a speaker test). Each hangs up, then releases
+    /// its speaker. Returns their speakers.
+    pub fn stop_where(&self, ends: impl Fn(SpeakerId, Option<CameraId>) -> bool) -> Vec<SpeakerId> {
         let active = self.active.lock();
         active
-            .get(&speaker_id)
-            .map(CancellationToken::cancel)
-            .is_some()
+            .iter()
+            .filter(|(&speaker_id, (camera_id, _))| ends(speaker_id, *camera_id))
+            .map(|(&speaker_id, (_, cancel))| {
+                cancel.cancel();
+                speaker_id
+            })
+            .collect()
     }
 
     /// Claim the speaker, load the audio and call the speaker. Once it
@@ -224,7 +232,7 @@ impl TalkdownSessions {
         let cancel = CancellationToken::new();
         match self.active.lock().entry(speaker_id) {
             Entry::Occupied(_) => return Err(StartError::Busy),
-            Entry::Vacant(slot) => slot.insert(cancel.clone()),
+            Entry::Vacant(slot) => slot.insert((camera_id, cancel.clone())),
         };
         Ok(Session {
             active: self.active.clone(),
@@ -238,7 +246,7 @@ impl TalkdownSessions {
 
 /// A claimed speaker. Dropping it releases the speaker.
 struct Session {
-    active: Arc<Mutex<HashMap<SpeakerId, CancellationToken>>>,
+    active: Active,
     id: Uuid,
     speaker_id: SpeakerId,
     /// The camera that started it; `None` for an installer's speaker test.
@@ -273,6 +281,6 @@ mod tests {
         });
         assert!(task.await.unwrap_err().is_panic());
         assert!(!sessions.is_busy(7));
-        assert!(!sessions.stop(7));
+        assert!(sessions.stop_where(|_, _| true).is_empty());
     }
 }
