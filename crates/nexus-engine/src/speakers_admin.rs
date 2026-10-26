@@ -1,4 +1,4 @@
-//! ADR-090 — admin API for IP speakers and each camera's talk-down speaker.
+//! ADR-091 — admin API for IP speakers and each camera's talk-down speaker.
 //!
 //! Routes (admin-gated in [`crate::api::router`], beside the camera routes):
 //!

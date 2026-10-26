@@ -1,4 +1,4 @@
-//! IP speakers (ADR-090): devices a core owns, assigned to cameras as their
+//! IP speakers (ADR-091): devices a core owns, assigned to cameras as their
 //! talk-down path. Edited through `/v1/admin/speakers` and stored in the
 //! `speakers` table; credentials stay on the edge.
 
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub type SpeakerId = i64;
 
 /// How the edge reaches a speaker. `sip` is the only driver built; others
-/// are additive (ADR-090).
+/// are additive (ADR-091).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeakerDriver {

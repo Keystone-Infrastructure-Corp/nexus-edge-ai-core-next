@@ -1,4 +1,4 @@
-//! Minimal SIP UAC over UDP for direct-IP talk-down calls (ADR-090): INVITE a
+//! Minimal SIP UAC over UDP for direct-IP talk-down calls (ADR-091): INVITE a
 //! speaker, stream G.711 RTP at it, BYE. No REGISTER, TCP/TLS, re-INVITE or
 //! inbound calls. Bench recipe: `docs/edge-core/TALKDOWN_SPEAKERS.md`.
 

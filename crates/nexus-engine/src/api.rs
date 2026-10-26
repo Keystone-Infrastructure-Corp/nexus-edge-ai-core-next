@@ -324,7 +324,7 @@ pub struct ApiState {
     /// so the response shape is stable; the snapshot is just
     /// empty in that case.
     pub reid_stats: Arc<crate::cloud_sighting::ReidStatsRegistry>,
-    /// ADR-090 — the talk-down sessions, at most one per speaker. Read by
+    /// ADR-091 — the talk-down sessions, at most one per speaker. Read by
     /// the talk-down GET (`busy`) and driven by its start/stop and the
     /// speaker test in `crate::speakers_admin`.
     pub talkdown: crate::talkdown::session::TalkdownSessions,
@@ -592,7 +592,7 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
         )
-        // ADR-090 — IP speakers and each camera's talk-down speaker. Same
+        // ADR-091 — IP speakers and each camera's talk-down speaker. Same
         // gate as the camera routes above; see `crate::speakers_admin`.
         .route(
             "/v1/admin/speakers",
@@ -9285,7 +9285,7 @@ mod tests {
     }
 
     // ===============================================================
-    // ADR-090 — IP speakers and camera talk-down assignment
+    // ADR-091 — IP speakers and camera talk-down assignment
     // ===============================================================
 
     /// One admin call from loopback with no secret configured (the gate's
@@ -9632,7 +9632,7 @@ mod tests {
     }
 
     // ===============================================================
-    // ADR-090 — talk-down sessions
+    // ADR-091 — talk-down sessions
     // ===============================================================
 
     use crate::talkdown::session::TalkdownSessions;

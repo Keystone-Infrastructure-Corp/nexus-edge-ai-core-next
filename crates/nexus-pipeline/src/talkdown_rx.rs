@@ -1,4 +1,4 @@
-//! Live talk-down receiver (ADR-090 §5): pull an operator's microphone track
+//! Live talk-down receiver (ADR-091 §5): pull an operator's microphone track
 //! from the SFU with a receive-only `webrtcbin` and hand it out as 20 ms
 //! frames of 8 kHz mono PCM, ready for a G.711 speaker call.
 //!

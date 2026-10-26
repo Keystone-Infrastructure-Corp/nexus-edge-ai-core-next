@@ -1,4 +1,4 @@
-//! Talk-down: play audio through an IP speaker assigned to a camera (ADR-090).
+//! Talk-down: play audio through an IP speaker assigned to a camera (ADR-091).
 //! `sip` is the only driver: a direct-IP SIP call streaming G.711 RTP.
 //! [`session`] runs the calls the admin endpoints in `crate::speakers_admin`
 //! start, one per speaker; [`clip`] loads a canned clip for one, and `live`

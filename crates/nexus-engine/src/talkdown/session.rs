@@ -1,4 +1,4 @@
-//! Talk-down sessions (ADR-090): at most one per speaker. A start claims the
+//! Talk-down sessions (ADR-091): at most one per speaker. A start claims the
 //! speaker before anything slow happens, and the claim is a guard that
 //! releases the speaker when dropped, so every exit releases it: a refused
 //! clip, an unanswered call, the end of playback, a panic in the play task.

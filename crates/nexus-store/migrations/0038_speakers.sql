@@ -1,4 +1,4 @@
--- ADR-090: IP speakers are core devices, and a camera's talk-down speaker
+-- ADR-091: IP speakers are core devices, and a camera's talk-down speaker
 -- is an assignment row, not a field on the camera.
 --
 --   * `speakers.config_json` — the serialised `nexus_config::SpeakerConfig`,

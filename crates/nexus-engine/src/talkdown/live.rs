@@ -1,4 +1,4 @@
-//! Live talk-down (ADR-090 §5): the operator's microphone, pulled from the
+//! Live talk-down (ADR-091 §5): the operator's microphone, pulled from the
 //! SFU by a receive-only `webrtcbin` and forwarded to the speaker's call frame
 //! by frame as it arrives. The network paces it; nothing here does.
 

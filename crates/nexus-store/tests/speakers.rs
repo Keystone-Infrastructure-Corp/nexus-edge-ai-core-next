@@ -1,4 +1,4 @@
-//! Speakers and their camera assignments (ADR-090). One speaker serves any
+//! Speakers and their camera assignments (ADR-091). One speaker serves any
 //! number of cameras, a camera has at most one speaker, and deleting either
 //! side clears the link.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

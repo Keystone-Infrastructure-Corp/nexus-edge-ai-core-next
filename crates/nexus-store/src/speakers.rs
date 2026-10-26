@@ -1,4 +1,4 @@
-//! IP speakers and their camera assignments (ADR-090, migration
+//! IP speakers and their camera assignments (ADR-091, migration
 //! `0038_speakers.sql`). `config_json` is the serialised
 //! [`SpeakerConfig`], credentials included; it never leaves the edge.
 //!

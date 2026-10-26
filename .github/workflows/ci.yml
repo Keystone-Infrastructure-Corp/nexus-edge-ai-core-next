@@ -309,7 +309,7 @@ jobs:
   #     h26Xparse (bad), x264enc (ugly), avdec_h26X (libav).
   #   * gstreamer1.0-nice: libnice, webrtcbin's ICE backend. The talk-down
   #     live receiver (`talkdown_rx`) and the engine's live talk-down tests
-  #     negotiate a real loopback connection, which needs it (ADR-090).
+  #     negotiate a real loopback connection, which needs it (ADR-091).
   #     The HD publisher test `negotiation_wiring_does_not_leak_the_webrtcbin`
   #     builds a BARE `webrtcbin` and `return`s early when it will not build,
   #     which makes `gstreamer1.0-plugins-bad` load-bearing: dropping it turns
@@ -550,7 +550,7 @@ jobs:
           GIO_USE_PROXY_RESOLVER: dummy
         run: |
           cargo test --locked -p nexus-engine --features gstreamer --bin nexus-engine
-          # Live talk-down (ADR-090) only exists with `gstreamer-webrtc`; its
+          # Live talk-down (ADR-091) only exists with `gstreamer-webrtc`; its
           # engine tests negotiate a real loopback webrtcbin, so run them here.
           cargo test --locked -p nexus-engine --features gstreamer-webrtc --bin nexus-engine talk_down_live
 
