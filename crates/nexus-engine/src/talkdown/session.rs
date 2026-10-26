@@ -119,6 +119,15 @@ impl TalkdownSessions {
         self.active.lock().contains_key(&speaker_id)
     }
 
+    /// The camera that started the speaker's session (`None` for a speaker
+    /// test) and its id, if one holds the speaker.
+    pub fn session_of(&self, speaker_id: SpeakerId) -> Option<(Option<CameraId>, Uuid)> {
+        self.active
+            .lock()
+            .get(&speaker_id)
+            .map(|(camera, id, _)| (*camera, *id))
+    }
+
     /// Cancel every session `ends` picks by its speaker, the camera that
     /// started it (`None` for a speaker test) and its id. Each hangs up, then
     /// releases its speaker. Returns their speakers.

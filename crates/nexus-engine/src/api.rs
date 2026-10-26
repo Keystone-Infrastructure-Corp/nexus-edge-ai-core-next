@@ -9547,6 +9547,7 @@ mod tests {
         let read = |cam: i64, speaker: Option<(i64, &str)>| {
             let mut view = talk_down(cam, speaker);
             view["busy"] = false.into();
+            view["session_id"] = serde_json::Value::Null;
             view["modes"] = serde_json::json!(crate::talkdown::session::MODES);
             view
         };
@@ -9849,6 +9850,52 @@ mod tests {
         assert_eq!(after["session_id"], session_id);
         assert_eq!(after["speaker_id"], speaker);
         assert_eq!(after["mode"], "tone");
+    }
+
+    #[tokio::test]
+    async fn talk_down_read_names_the_session_its_camera_started() {
+        let (port, _rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        seed_onvif_camera(&store, 2, None).await;
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/cameras/2/talk-down",
+            Some(serde_json::json!({ "speaker_id": speaker })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let read = |camera: i64| {
+            let app = app.clone();
+            async move {
+                let uri = format!("/api/v1/admin/cameras/{camera}/talk-down");
+                let (status, body) = speaker_call(&app, Method::GET, &uri, None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                speaker_json(&body)
+            }
+        };
+
+        let idle = read(1).await;
+        assert_eq!(idle["session_id"], serde_json::Value::Null);
+        assert_eq!(idle["busy"], false);
+
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let session_id = speaker_json(&body)["session_id"].clone();
+        let mine = read(1).await;
+        assert_eq!(mine["session_id"], session_id);
+        assert_eq!(mine["busy"], true);
+        let other = read(2).await;
+        assert_eq!(other["session_id"], serde_json::Value::Null);
+        assert_eq!(other["busy"], true, "camera 1's session holds the speaker");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .expect("BYE within the 2 s chime")
+            .unwrap();
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        assert_eq!(read(1).await["session_id"], serde_json::Value::Null);
     }
 
     #[tokio::test]

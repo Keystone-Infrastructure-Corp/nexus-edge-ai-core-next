@@ -8,7 +8,8 @@
 //!   the speaker's whole camera set
 //! * `GET|PUT        /api/v1/admin/cameras/{camera_id}/talk-down` —
 //!   `{"speaker_id": id | null}`; the GET also says whether the speaker is
-//!   `busy` and which `modes` it can play
+//!   `busy`, the `session_id` this camera started on it, and which `modes`
+//!   it can play
 //! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down` — play a
 //!   [`Audio`] on the camera's speaker; answers once the speaker picks up,
 //!   and for `live` audio once the edge has its `sdp_answer` for the SFU
@@ -527,7 +528,17 @@ pub(crate) async fn get_talk_down(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let sp = camera_speaker(&s, camera_id).await?;
     let mut out = talk_down(camera_id, sp.as_ref());
-    out["busy"] = sp.is_some_and(|sp| s.talkdown.is_busy(sp.id)).into();
+    out["busy"] = sp
+        .as_ref()
+        .is_some_and(|sp| s.talkdown.is_busy(sp.id))
+        .into();
+    // The session on the speaker, only when this camera started it.
+    out["session_id"] = sp
+        .as_ref()
+        .and_then(|sp| s.talkdown.session_of(sp.id))
+        .filter(|(camera, _)| *camera == Some(camera_id))
+        .map(|(_, id)| id.to_string())
+        .into();
     out["modes"] = serde_json::json!(MODES);
     Ok(Json(out))
 }
