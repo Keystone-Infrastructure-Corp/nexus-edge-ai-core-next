@@ -80,6 +80,8 @@ pub enum StartError {
     Busy,
     /// The camera no longer pairs with the speaker the caller read.
     Unpaired,
+    /// A stop or a parting ended the session before it played.
+    Stopped,
     /// Why the clip was refused; never contains its URL.
     Clip(String),
     Call(TalkdownError),
@@ -139,7 +141,10 @@ impl TalkdownSessions {
     ///
     /// `paired` re-reads whether the camera still pairs with `speaker`. A
     /// parting commits before its `stop_where`, so that stop either finds
-    /// this claim, or ran before it and the re-read sees the parting.
+    /// this claim, or ran before it and the re-read sees the parting. A stop
+    /// that finds the claim before the audio plays ends the start: the clip
+    /// fetch or the live negotiation is abandoned, a ringing INVITE is
+    /// CANCELled, and an answered call is hung up.
     pub async fn start(
         &self,
         speaker: &SpeakerConfig,
@@ -163,12 +168,19 @@ impl TalkdownSessions {
         if !paired.await {
             return Err(StartError::Unpaired);
         }
-        let mut pcm = match audio {
-            Audio::Tone => tone_pcm(TONE_MS),
-            Audio::Clip { clip } => clip::fetch(&clip.url, &clip.sha256, self.allow_http)
-                .await
-                .map_err(StartError::Clip)?,
-            Audio::Live { .. } => Vec::new(),
+        let load = async {
+            match audio {
+                Audio::Tone => Ok(tone_pcm(TONE_MS)),
+                Audio::Clip { clip } => clip::fetch(&clip.url, &clip.sha256, self.allow_http)
+                    .await
+                    .map_err(StartError::Clip),
+                Audio::Live { .. } => Ok(Vec::new()),
+            }
+        };
+        let mut pcm = tokio::select! {
+            biased;
+            () = session.cancel.cancelled() => return Err(StartError::Stopped),
+            pcm = load => pcm?,
         };
         pcm.resize(pcm.len() + TAIL_SAMPLES, 0);
         let target = SipTarget {
@@ -185,29 +197,42 @@ impl TalkdownSessions {
         // way; bound them too if a socket ever stalls after the answer.
         let answered = tokio::time::timeout(
             ANSWER_TIMEOUT + Duration::from_secs(1),
-            place_call(&target, ANSWER_TIMEOUT),
+            place_call(&target, ANSWER_TIMEOUT, &session.cancel),
         )
         .await;
         let mut call = answered
             .unwrap_or(Err(TalkdownError::Unreachable))
-            .map_err(StartError::Call)?;
-        // A failed negotiation drops `call`, which sends its BYE, then
-        // `session`, which releases the speaker.
+            .map_err(|e| {
+                if session.cancel.is_cancelled() {
+                    StartError::Stopped
+                } else {
+                    StartError::Call(e)
+                }
+            })?;
+        // A failed or stopped negotiation drops `call`, which sends its BYE,
+        // then `session`, which releases the speaker.
         #[cfg(feature = "gstreamer-webrtc")]
         let (live, sdp_answer) = match audio {
             Audio::Live {
                 sdp_offer,
                 ice_servers,
             } => {
-                let (live, answer) = Live::answer(sdp_offer, ice_servers)
-                    .await
-                    .map_err(StartError::Negotiation)?;
+                let (live, answer) = tokio::select! {
+                    () = session.cancel.cancelled() => return Err(StartError::Stopped),
+                    negotiated = Live::answer(sdp_offer, ice_servers) => {
+                        negotiated.map_err(StartError::Negotiation)?
+                    }
+                };
                 (Some(live), Some(answer))
             }
             _ => (None, None),
         };
         #[cfg(not(feature = "gstreamer-webrtc"))]
         let sdp_answer = None;
+        // A stop that crossed the answer: hang up rather than report success.
+        if session.cancel.is_cancelled() {
+            return Err(StartError::Stopped);
+        }
         let id = session.id;
         let task = tokio::spawn(async move {
             #[cfg(feature = "gstreamer-webrtc")]

@@ -220,6 +220,11 @@ impl From<StartError> for Refusal {
                 "talk_down_unsupported",
                 "the camera's talk-down speaker changed".into(),
             ),
+            StartError::Stopped => Self(
+                StatusCode::CONFLICT,
+                "talk_down_unsupported",
+                "the session was stopped before it played".into(),
+            ),
             StartError::Clip(why) => Self(StatusCode::UNPROCESSABLE_ENTITY, "clip_invalid", why),
             StartError::Call(e) => Self(
                 StatusCode::BAD_GATEWAY,

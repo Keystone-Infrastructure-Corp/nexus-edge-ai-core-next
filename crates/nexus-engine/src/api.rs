@@ -10073,6 +10073,62 @@ mod tests {
         }
     }
 
+    /// A parting while the speaker rings CANCELs the INVITE at once, not at
+    /// the answer timeout; the start is refused and frees the speaker.
+    #[tokio::test]
+    async fn talk_down_parting_while_the_speaker_rings_cancels_the_call() {
+        let rang = Arc::new(tokio::sync::Notify::new());
+        let invite = std::sync::Mutex::new(String::new());
+        let ringing = rang.clone();
+        let (port, uas) = fake_uas("ACK", move |req| {
+            if req.starts_with("INVITE") {
+                *invite.lock().unwrap() = req.to_string();
+                ringing.notify_one();
+                vec![reply(req, "180 Ringing", "", "")]
+            } else if req.starts_with("CANCEL") {
+                let invite = invite.lock().unwrap();
+                vec![
+                    reply(&invite, "487 Request Terminated", "", ""),
+                    reply(req, "200 OK", "", ""),
+                ]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        let sessions = TalkdownSessions::default();
+        let (app, store, _dir, a) = talkdown_app(sessions.clone(), "127.0.0.1", port).await;
+        let b_sip = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        seed_onvif_camera(&store, 2, None).await;
+        let b = assign_speaker(&app, 2, "127.0.0.1", b_sip.local_addr().unwrap().port()).await;
+
+        let starting = app.clone();
+        let start = tokio::spawn(async move {
+            start_talk_down(&starting, 1, serde_json::json!({ "mode": "tone" })).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), rang.notified())
+            .await
+            .expect("the speaker rang");
+        let (method, uri, body) = parting("camera to b", a, b);
+        let (status, body) = speaker_call(&app, method, &uri, body).await;
+        assert!(status.is_success(), "{status} {body}");
+
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(2), uas)
+            .await
+            .expect("a CANCEL well before the 8 s answer timeout")
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "CANCEL", "ACK"]);
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(1), start)
+            .await
+            .expect("the start answers once cancelled")
+            .unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "talk_down_unsupported");
+        assert!(!sessions.is_busy(a), "a stayed claimed");
+        let mut buf = [0u8; 64];
+        assert!(b_sip.try_recv(&mut buf).is_err(), "b was called");
+    }
+
     /// Camera 1 moves to the speaker camera 2 is playing on: camera 1's stop
     /// is not camera 2's, and the chime plays to its end.
     #[tokio::test]

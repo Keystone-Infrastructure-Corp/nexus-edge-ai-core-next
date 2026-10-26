@@ -78,8 +78,9 @@ pub async fn options_ping(
         .ok()?
         .ok()?;
     let to = format!("<{}>", leg.uri);
+    let never = CancellationToken::new();
     let resp = leg
-        .transact("OPTIONS", 1, &branch(), &to, "", "", deadline)
+        .transact("OPTIONS", 1, &branch(), &to, "", "", deadline, &never)
         .await
         .ok()??;
     let ua = resp.header("user-agent").or_else(|| resp.header("server"));
@@ -88,8 +89,13 @@ pub async fn options_ping(
 
 /// INVITE `target` directly by IP (no REGISTER) offering PCMU and PCMA, and
 /// wait up to `timeout` for a final answer. A 401/407 is retried once with
-/// Digest credentials when the target has them.
-pub async fn place_call(target: &SipTarget, timeout: Duration) -> Result<SipCall, TalkdownError> {
+/// Digest credentials when the target has them. `cancel` gives up like the
+/// timeout does: `Unreachable`, and a ringing INVITE is CANCELled.
+pub async fn place_call(
+    target: &SipTarget,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<SipCall, TalkdownError> {
     let deadline = Instant::now() + timeout;
     let leg = timeout_at(deadline, Leg::open(&target.host, target.port, None))
         .await
@@ -102,7 +108,9 @@ pub async fn place_call(target: &SipTarget, timeout: Duration) -> Result<SipCall
     let answer = loop {
         let branch = branch();
         let Some(resp) = leg
-            .transact("INVITE", cseq, &branch, &invite_to, &auth, &sdp, deadline)
+            .transact(
+                "INVITE", cseq, &branch, &invite_to, &auth, &sdp, deadline, cancel,
+            )
             .await?
         else {
             // A final answer can still cross our CANCEL (RFC 3261 §9.1), or
@@ -350,7 +358,7 @@ impl Leg {
 
     /// Send a request, retransmitting on timer A/E (T1, doubling) until a
     /// response for it arrives, then wait for the final one. Returns `None` at
-    /// `deadline`, CANCELling an INVITE that got a provisional.
+    /// `deadline` or on `cancel`, CANCELling an INVITE that got a provisional.
     #[allow(clippy::too_many_arguments)]
     async fn transact(
         &self,
@@ -361,6 +369,7 @@ impl Leg {
         extra: &str,
         body: &str,
         deadline: Instant,
+        cancel: &CancellationToken,
     ) -> std::io::Result<Option<Response>> {
         let msg = self.request(method, cseq, branch, to, extra, body);
         let mut buf = vec![0u8; 8192];
@@ -370,8 +379,12 @@ impl Leg {
         self.send(&msg).await?;
         loop {
             let wake = retransmit_at.map_or(deadline, |at| at.min(deadline));
-            match timeout_at(wake, self.sock.recv_from(&mut buf)).await {
-                Ok(received) => {
+            let received = tokio::select! {
+                received = timeout_at(wake, self.sock.recv_from(&mut buf)) => received.ok(),
+                () = cancel.cancelled() => None,
+            };
+            match received {
+                Some(received) => {
                     let (n, _) = received?;
                     let Some(resp) = Response::parse(&buf[..n]) else {
                         continue;
@@ -384,14 +397,14 @@ impl Leg {
                     }
                     retransmit_at = None;
                 }
-                Err(_) if Instant::now() >= deadline => {
+                None if cancel.is_cancelled() || Instant::now() >= deadline => {
                     if retransmit_at.is_none() && method == "INVITE" {
                         self.send(&self.request("CANCEL", cseq, branch, to, "", ""))
                             .await?;
                     }
                     return Ok(None);
                 }
-                Err(_) => {
+                None => {
                     self.send(&msg).await?;
                     gap *= 2;
                     retransmit_at = Some(Instant::now() + gap);
@@ -429,8 +442,9 @@ impl Leg {
 
     async fn bye(&self, cseq: u32, to: &str) -> Result<(), TalkdownError> {
         let deadline = Instant::now() + BYE_WAIT;
+        let never = CancellationToken::new();
         match self
-            .transact("BYE", cseq, &branch(), to, "", "", deadline)
+            .transact("BYE", cseq, &branch(), to, "", "", deadline, &never)
             .await?
         {
             Some(resp) if resp.status < 300 => Ok(()),
@@ -744,9 +758,13 @@ pub(crate) mod tests {
         })
         .await;
 
-        let mut call = place_call(&target(port), Duration::from_secs(2))
-            .await
-            .unwrap();
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(call.codec, Codec::Pcma);
         // The call opens its media flow with one silent frame; then
         // 70 ms = 560 samples: three full frames and one padded with silence.
@@ -799,9 +817,13 @@ pub(crate) mod tests {
         })
         .await;
 
-        let call = place_call(&target(port), Duration::from_secs(2))
-            .await
-            .unwrap();
+        let call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         let mut buf = [0u8; 2048];
         let n = timeout(Duration::from_secs(1), rtp.recv(&mut buf))
             .await
@@ -846,9 +868,13 @@ pub(crate) mod tests {
     async fn a_frame_after_a_send_gap_is_stamped_on_the_wall_clock_and_marked() {
         let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (port, uas) = answering_uas(answer(rtp.local_addr().unwrap().port(), "0")).await;
-        let mut call = place_call(&target(port), Duration::from_secs(2))
-            .await
-            .unwrap();
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         let (marker, seq, ts) = recv_rtp(&rtp).await;
         assert!(!marker);
 
@@ -888,9 +914,13 @@ pub(crate) mod tests {
     async fn an_unconnectable_media_address_is_hung_up() {
         let ipv6 = answer(9, "0").replace("c=IN IP4 127.0.0.1", "c=IN IP6 ::1");
         let (port, uas) = answering_uas(ipv6).await;
-        let err = place_call(&target(port), Duration::from_secs(2))
-            .await
-            .unwrap_err();
+        let err = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, TalkdownError::Io(_)), "{err}");
         assert_eq!(methods(&uas.await.unwrap()), ["INVITE", "ACK", "BYE"]);
     }
@@ -904,9 +934,13 @@ pub(crate) mod tests {
         let closed_port = closed.local_addr().unwrap().port();
         drop(closed);
         let (port, uas) = answering_uas(answer(closed_port, "0")).await;
-        let mut call = place_call(&target(port), Duration::from_secs(2))
-            .await
-            .unwrap();
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         for _ in 0..3 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             call.send_frame(&[]).await.unwrap();
@@ -935,7 +969,9 @@ pub(crate) mod tests {
         t.username = Some("admin".into());
         t.password = Some("s3cret".into());
 
-        let call = place_call(&t, Duration::from_secs(2)).await.unwrap();
+        let call = place_call(&t, Duration::from_secs(2), &CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(call.codec, Codec::Pcmu);
         call.hangup().await.unwrap();
 
@@ -993,9 +1029,13 @@ pub(crate) mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = sock.local_addr().unwrap().port();
         let started = Instant::now();
-        let err = place_call(&target(port), Duration::from_millis(1200))
-            .await
-            .unwrap_err();
+        let err = place_call(
+            &target(port),
+            Duration::from_millis(1200),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         let took = started.elapsed();
         assert!(matches!(err, TalkdownError::Unreachable), "{err}");
         assert!(took >= Duration::from_millis(1200) && took < Duration::from_secs(2));
@@ -1051,9 +1091,13 @@ pub(crate) mod tests {
             })
             .await;
             let started = Instant::now();
-            let err = place_call(&target(port), Duration::from_millis(600))
-                .await
-                .unwrap_err();
+            let err = place_call(
+                &target(port),
+                Duration::from_millis(600),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
             assert!(matches!(err, TalkdownError::Unreachable), "{status}: {err}");
             assert!(started.elapsed() < Duration::from_millis(900), "{status}");
 
@@ -1088,9 +1132,13 @@ pub(crate) mod tests {
             }
         })
         .await;
-        let err = place_call(&target(port), Duration::from_secs(2))
-            .await
-            .unwrap_err();
+        let err = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, TalkdownError::Rejected(486)), "{err}");
         let seen = uas.await.unwrap();
         assert_eq!(methods(&seen), ["INVITE", "ACK"]);
@@ -1109,9 +1157,13 @@ pub(crate) mod tests {
             }
         })
         .await;
-        let err = place_call(&target(port), Duration::from_secs(2))
-            .await
-            .unwrap_err();
+        let err = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, TalkdownError::NoCommonCodec), "{err}");
         assert_eq!(methods(&uas.await.unwrap()), ["INVITE", "ACK", "BYE"]);
     }
