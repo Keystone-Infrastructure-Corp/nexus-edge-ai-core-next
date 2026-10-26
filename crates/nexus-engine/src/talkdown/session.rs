@@ -5,6 +5,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,6 +78,8 @@ impl Audio {
 
 pub enum StartError {
     Busy,
+    /// The camera no longer pairs with the speaker the caller read.
+    Unpaired,
     /// Why the clip was refused; never contains its URL.
     Clip(String),
     Call(TalkdownError),
@@ -128,16 +131,21 @@ impl TalkdownSessions {
             .collect()
     }
 
-    /// Claim the speaker, load the audio and call the speaker. Once it
-    /// answers, the audio plays in a spawned task that then hangs up; this
-    /// returns the session id, the SDP answer of a live session, and that
-    /// task. A live session answers the SFU's offer only after the speaker
-    /// has answered, so an unreachable speaker fails fast.
+    /// Claim the speaker, check `paired`, load the audio and call the
+    /// speaker. Once it answers, the audio plays in a spawned task that then
+    /// hangs up; this returns the session id, the SDP answer of a live
+    /// session, and that task. A live session answers the SFU's offer only
+    /// after the speaker has answered, so an unreachable speaker fails fast.
+    ///
+    /// `paired` re-reads whether the camera still pairs with `speaker`. A
+    /// parting commits before its `stop_where`, so that stop either finds
+    /// this claim, or ran before it and the re-read sees the parting.
     pub async fn start(
         &self,
         speaker: &SpeakerConfig,
         camera_id: Option<CameraId>,
         audio: &Audio,
+        paired: impl Future<Output = bool>,
     ) -> Result<(Uuid, Option<String>, JoinHandle<Result<(), TalkdownError>>), StartError> {
         #[cfg(not(feature = "gstreamer-webrtc"))]
         if matches!(audio, Audio::Live { .. }) {
@@ -152,6 +160,9 @@ impl TalkdownSessions {
             }
         }
         let session = self.claim(speaker.id, camera_id)?;
+        if !paired.await {
+            return Err(StartError::Unpaired);
+        }
         let mut pcm = match audio {
             Audio::Tone => tone_pcm(TONE_MS),
             Audio::Clip { clip } => clip::fetch(&clip.url, &clip.sha256, self.allow_http)

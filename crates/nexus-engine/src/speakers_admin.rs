@@ -42,6 +42,7 @@ use nexus_config::{SpeakerConfig, SpeakerDriver, SpeakerId};
 use nexus_store::{AuditOutcome, SqliteTx, Store, StoreError};
 use nexus_types::CameraId;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::api::{ApiError, ApiState};
 use crate::auth::admin_audit::{audit_admin_action, audit_admin_action_in_tx};
@@ -213,6 +214,11 @@ impl From<StartError> for Refusal {
                 StatusCode::CONFLICT,
                 "talk_down_busy",
                 "the speaker is already playing".into(),
+            ),
+            StartError::Unpaired => Self(
+                StatusCode::CONFLICT,
+                "talk_down_unsupported",
+                "the camera's talk-down speaker changed".into(),
             ),
             StartError::Clip(why) => Self(StatusCode::UNPROCESSABLE_ENTITY, "clip_invalid", why),
             StartError::Call(e) => Self(
@@ -586,8 +592,7 @@ pub(crate) async fn start_talk_down(
         })?;
         let Json(audio) =
             body.map_err(|e| Refusal(StatusCode::BAD_REQUEST, "bad_request", e.body_text()))?;
-        let (session_id, sdp_answer, _playing) =
-            s.talkdown.start(&sp, Some(camera_id), &audio).await?;
+        let (session_id, sdp_answer) = start_on(&s, camera_id, &sp, &audio).await?;
         let started = serde_json::json!({
             "session_id": session_id,
             "speaker_id": sp.id,
@@ -619,6 +624,23 @@ pub(crate) async fn start_talk_down(
         }
         Json(started)
     })
+}
+
+/// Play `audio` on `sp`, which the caller read as the camera's speaker;
+/// refused once the camera no longer pairs with it.
+pub(crate) async fn start_on(
+    s: &ApiState,
+    camera_id: CameraId,
+    sp: &SpeakerConfig,
+    audio: &Audio,
+) -> Result<(Uuid, Option<String>), Refusal> {
+    // A failed re-read cannot confirm the pairing: refuse rather than call.
+    let paired = async {
+        matches!(s.store.speaker_for_camera(camera_id).await, Ok(Some(now)) if now.id == sp.id)
+    };
+    let (session_id, sdp_answer, _playing) =
+        s.talkdown.start(sp, Some(camera_id), audio, paired).await?;
+    Ok((session_id, sdp_answer))
 }
 
 /// End the session this camera started, on whichever speaker it plays; a
@@ -661,7 +683,10 @@ pub(crate) async fn test_speaker(
 ) -> Result<Json<serde_json::Value>, Refusal> {
     let res: Result<_, Refusal> = async {
         let sp = stored(&s, id).await?;
-        let (_, _, playing) = s.talkdown.start(&sp, None, &Audio::Tone).await?;
+        let (_, _, playing) = s
+            .talkdown
+            .start(&sp, None, &Audio::Tone, async { true })
+            .await?;
         match playing.await {
             Ok(Ok(())) => Ok(serde_json::json!({ "ok": true })),
             Ok(Err(e)) => Err(StartError::Call(e).into()),

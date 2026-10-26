@@ -9951,19 +9951,45 @@ mod tests {
         assert_eq!(count(&cam2, "talk_down.stop", true), 1, "{cam2:?}");
     }
 
-    /// A session ends as soon as its camera stops pairing with its speaker:
-    /// the camera moves to another speaker (by either route), the speaker
-    /// drops the camera, or either is deleted. No stop is sent; the camera's
-    /// stop afterwards finds nothing, and never calls the new speaker.
+    /// Every way camera 1 and its speaker `a` part: the camera moves to `b`
+    /// (by either route), `a` drops the camera, or either is deleted.
+    const PARTINGS: [&str; 5] = [
+        "camera to b",
+        "b takes camera",
+        "a drops camera",
+        "delete a",
+        "delete camera",
+    ];
+
+    /// The request that makes one of [`PARTINGS`].
+    fn parting(change: &str, a: i64, b: i64) -> (Method, String, Option<serde_json::Value>) {
+        match change {
+            "camera to b" => (
+                Method::PUT,
+                "/api/v1/admin/cameras/1/talk-down".to_string(),
+                Some(serde_json::json!({ "speaker_id": b })),
+            ),
+            "b takes camera" => (
+                Method::PUT,
+                format!("/api/v1/admin/speakers/{b}/cameras"),
+                Some(serde_json::json!({ "camera_ids": [1, 2] })),
+            ),
+            "a drops camera" => (
+                Method::PUT,
+                format!("/api/v1/admin/speakers/{a}/cameras"),
+                Some(serde_json::json!({ "camera_ids": [] })),
+            ),
+            "delete a" => (Method::DELETE, format!("/api/v1/admin/speakers/{a}"), None),
+            _ => (Method::DELETE, "/api/v1/admin/cameras/1".to_string(), None),
+        }
+    }
+
+    /// A session ends as soon as its camera stops pairing with its speaker.
+    /// No stop is sent; the camera's stop afterwards finds nothing, and never
+    /// calls the new speaker.
     #[tokio::test]
     async fn talk_down_ends_when_its_camera_and_speaker_part() {
-        for change in [
-            "camera to b",
-            "b takes camera",
-            "a drops camera",
-            "delete a",
-            "delete camera",
-        ] {
+        for change in PARTINGS {
             let (port, _rtp, uas) = fake_speaker().await;
             let (app, store, _dir, a) =
                 talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
@@ -9975,25 +10001,7 @@ mod tests {
             let (status, body) =
                 start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
             assert_eq!(status, StatusCode::OK, "{change}: {body}");
-            let (method, uri, body) = match change {
-                "camera to b" => (
-                    Method::PUT,
-                    "/api/v1/admin/cameras/1/talk-down".to_string(),
-                    Some(serde_json::json!({ "speaker_id": b })),
-                ),
-                "b takes camera" => (
-                    Method::PUT,
-                    format!("/api/v1/admin/speakers/{b}/cameras"),
-                    Some(serde_json::json!({ "camera_ids": [1, 2] })),
-                ),
-                "a drops camera" => (
-                    Method::PUT,
-                    format!("/api/v1/admin/speakers/{a}/cameras"),
-                    Some(serde_json::json!({ "camera_ids": [] })),
-                ),
-                "delete a" => (Method::DELETE, format!("/api/v1/admin/speakers/{a}"), None),
-                _ => (Method::DELETE, "/api/v1/admin/cameras/1".to_string(), None),
-            };
+            let (method, uri, body) = parting(change, a, b);
             let (status, body) = speaker_call(&app, method, &uri, body).await;
             assert!(status.is_success(), "{change}: {status} {body}");
 
@@ -10015,6 +10023,51 @@ mod tests {
                 StatusCode::NO_CONTENT
             };
             assert_eq!(status, want, "{change}: {body}");
+            let mut buf = [0u8; 64];
+            assert!(b_sip.try_recv(&mut buf).is_err(), "{change}: b was called");
+        }
+    }
+
+    /// A start that read the camera's speaker before a parting, and claims
+    /// it only after the parting's cleanup found nothing to end, is refused
+    /// and never calls the speaker it read.
+    #[tokio::test]
+    async fn talk_down_start_from_a_speaker_read_before_a_parting_is_refused() {
+        for change in PARTINGS {
+            let (port, _rtp, mut uas) = fake_speaker().await;
+            let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+            let app = super::router(state.clone());
+            seed_onvif_camera(&store, 1, None).await;
+            let a = assign_speaker(&app, 1, "127.0.0.1", port).await;
+            let b_sip = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            seed_onvif_camera(&store, 2, None).await;
+            let b = assign_speaker(&app, 2, "127.0.0.1", b_sip.local_addr().unwrap().port()).await;
+
+            let read = store.speaker_for_camera(1).await.unwrap().unwrap();
+            let (method, uri, body) = parting(change, a, b);
+            let (status, body) = speaker_call(&app, method, &uri, body).await;
+            assert!(status.is_success(), "{change}: {status} {body}");
+
+            let audio = crate::talkdown::session::Audio::Tone;
+            let refusal = match crate::speakers_admin::start_on(&state, 1, &read, &audio).await {
+                Err(refusal) => axum::response::IntoResponse::into_response(refusal),
+                Ok(_) => {
+                    let seen = uas.await.unwrap();
+                    panic!("{change}: the start called a: {:?}", sip_methods(&seen));
+                }
+            };
+            assert_eq!(refusal.status(), StatusCode::CONFLICT, "{change}");
+            let body = to_bytes(refusal.into_body(), 64 * 1024).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert_eq!(
+                error_code(&body),
+                "talk_down_unsupported",
+                "{change}: {body}"
+            );
+            assert!(!state.talkdown.is_busy(a), "{change}: a stayed claimed");
+            let heard = tokio::time::timeout(std::time::Duration::from_millis(200), &mut uas).await;
+            assert!(heard.is_err(), "{change}: a was called");
+            uas.abort();
             let mut buf = [0u8; 64];
             assert!(b_sip.try_recv(&mut buf).is_err(), "{change}: b was called");
         }
