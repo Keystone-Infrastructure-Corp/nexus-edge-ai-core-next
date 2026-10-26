@@ -82,7 +82,8 @@ pub async fn options_ping(
     let resp = leg
         .transact("OPTIONS", 1, &branch(), &to, "", "", deadline, &never)
         .await
-        .ok()??;
+        .ok()?
+        .ok()?;
     let ua = resp.header("user-agent").or_else(|| resp.header("server"));
     Some(ua.unwrap_or_default().to_string())
 }
@@ -106,17 +107,25 @@ pub async fn place_call(
     let mut cseq = 1;
     let mut auth = String::new();
     let answer = loop {
+        // A stop during the lookup or the 401 round trip sends nothing.
+        if cancel.is_cancelled() {
+            return Err(TalkdownError::Unreachable);
+        }
         let branch = branch();
-        let Some(resp) = leg
+        let resp = match leg
             .transact(
                 "INVITE", cseq, &branch, &invite_to, &auth, &sdp, deadline, cancel,
             )
             .await?
-        else {
-            // A final answer can still cross our CANCEL (RFC 3261 §9.1), or
-            // follow a silent ring: keep the socket to ACK it and hang it up.
-            tokio::spawn(leg.reap_invite(cseq, branch, invite_to));
-            return Err(TalkdownError::Unreachable);
+        {
+            Ok(resp) => resp,
+            Err(rang) => {
+                // A final answer can still cross our CANCEL (RFC 3261 §9.1),
+                // or follow a silent ring: keep the socket to ACK it and hang
+                // it up, and CANCEL on the first provisional if none came yet.
+                tokio::spawn(leg.reap_invite(cseq, branch, invite_to, rang));
+                return Err(TalkdownError::Unreachable);
+            }
         };
         if resp.status >= 300 {
             // A non-2xx is ACKed inside the INVITE transaction (same branch).
@@ -357,8 +366,9 @@ impl Leg {
     }
 
     /// Send a request, retransmitting on timer A/E (T1, doubling) until a
-    /// response for it arrives, then wait for the final one. Returns `None` at
-    /// `deadline` or on `cancel`, CANCELling an INVITE that got a provisional.
+    /// response for it arrives, then wait for the final one. At `deadline` or
+    /// on `cancel` returns `Err(rang)`: whether a provisional arrived, in which
+    /// case an INVITE was CANCELled.
     #[allow(clippy::too_many_arguments)]
     async fn transact(
         &self,
@@ -370,7 +380,7 @@ impl Leg {
         body: &str,
         deadline: Instant,
         cancel: &CancellationToken,
-    ) -> std::io::Result<Option<Response>> {
+    ) -> std::io::Result<Result<Response, bool>> {
         let msg = self.request(method, cseq, branch, to, extra, body);
         let mut buf = vec![0u8; 8192];
         let mut gap = T1;
@@ -393,16 +403,17 @@ impl Leg {
                         continue;
                     }
                     if resp.status >= 200 {
-                        return Ok(Some(resp));
+                        return Ok(Ok(resp));
                     }
                     retransmit_at = None;
                 }
                 None if cancel.is_cancelled() || Instant::now() >= deadline => {
-                    if retransmit_at.is_none() && method == "INVITE" {
+                    let rang = retransmit_at.is_none();
+                    if rang && method == "INVITE" {
                         self.send(&self.request("CANCEL", cseq, branch, to, "", ""))
                             .await?;
                     }
-                    return Ok(None);
+                    return Ok(Err(rang));
                 }
                 None => {
                     self.send(&msg).await?;
@@ -413,17 +424,33 @@ impl Leg {
         }
     }
 
-    /// Read a timed-out INVITE's final response for [`LATE_ANSWER_WAIT`]:
-    /// ACK a refusal (a 487 for our CANCEL) in the INVITE transaction, and
-    /// ACK then BYE an answer nobody is waiting for any more.
-    async fn reap_invite(self, cseq: u32, invite_branch: String, invite_to: String) {
+    /// Read an abandoned INVITE's responses for [`LATE_ANSWER_WAIT`]: CANCEL
+    /// it on its first provisional unless it `rang` already (RFC 3261 §9.1
+    /// forbids a CANCEL before one), ACK a refusal (a 487 for our CANCEL) in
+    /// the INVITE transaction, and ACK then BYE an answer nobody is waiting
+    /// for any more.
+    async fn reap_invite(
+        self,
+        cseq: u32,
+        invite_branch: String,
+        invite_to: String,
+        mut rang: bool,
+    ) {
         let deadline = Instant::now() + LATE_ANSWER_WAIT;
         let mut buf = vec![0u8; 8192];
         while let Ok(Ok((n, _))) = timeout_at(deadline, self.sock.recv_from(&mut buf)).await {
             let Some(resp) = Response::parse(&buf[..n]) else {
                 continue;
             };
-            if resp.status < 200 || !resp.answers(&self.call_id, cseq, "INVITE") {
+            if !resp.answers(&self.call_id, cseq, "INVITE") {
+                continue;
+            }
+            if resp.status < 200 {
+                if !rang {
+                    rang = true;
+                    let cancel = self.request("CANCEL", cseq, &invite_branch, &invite_to, "", "");
+                    let _ = self.send(&cancel).await;
+                }
                 continue;
             }
             let to = resp.header("to").unwrap_or(&invite_to);
@@ -447,9 +474,9 @@ impl Leg {
             .transact("BYE", cseq, &branch(), to, "", "", deadline, &never)
             .await?
         {
-            Some(resp) if resp.status < 300 => Ok(()),
-            Some(resp) => Err(TalkdownError::Rejected(resp.status)),
-            None => Err(TalkdownError::Unreachable),
+            Ok(resp) if resp.status < 300 => Ok(()),
+            Ok(resp) => Err(TalkdownError::Rejected(resp.status)),
+            Err(_) => Err(TalkdownError::Unreachable),
         }
     }
 }
@@ -1119,6 +1146,77 @@ pub(crate) mod tests {
                     "same transaction"
                 );
             }
+        }
+    }
+
+    /// A stop before the INVITE leaves (during the DNS lookup, or the 401
+    /// round trip) gives up without sending it.
+    #[tokio::test]
+    async fn a_call_cancelled_before_it_starts_sends_nothing() {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = place_call(&target(port), Duration::from_secs(2), &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TalkdownError::Unreachable), "{err}");
+        let mut buf = vec![0u8; 8192];
+        let heard = timeout(Duration::from_millis(200), sock.recv(&mut buf)).await;
+        assert!(heard.is_err(), "the cancelled call sent a request");
+    }
+
+    /// A stop before the speaker's first provisional cannot CANCEL yet (RFC
+    /// 3261 §9.1); the CANCEL goes out on that provisional, and the 487 is
+    /// ACKed in the INVITE transaction.
+    #[tokio::test]
+    async fn a_cancel_before_the_first_provisional_is_sent_on_it() {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let uas = tokio::spawn(async move {
+            let mut seen: Vec<String> = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let (n, from) = timeout(Duration::from_secs(3), sock.recv_from(&mut buf))
+                    .await
+                    .expect("fake UAS waited 3 s for a request")
+                    .unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let resps = if req.starts_with("INVITE") {
+                    // The stop lands first; the speaker rings only after it.
+                    stop.cancel();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    vec![reply(&req, "180 Ringing", "", "")]
+                } else if req.starts_with("CANCEL") {
+                    vec![
+                        reply(&seen[0], "487 Request Terminated", "", ""),
+                        reply(&req, "200 OK", "", ""),
+                    ]
+                } else {
+                    vec![]
+                };
+                for resp in resps {
+                    sock.send_to(resp.as_bytes(), from).await.unwrap();
+                }
+                let done = req.starts_with("ACK");
+                seen.push(req);
+                if done {
+                    return seen;
+                }
+            }
+        });
+        let err = place_call(&target(port), Duration::from_secs(2), &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TalkdownError::Unreachable), "{err}");
+
+        let seen = uas.await.unwrap();
+        assert_eq!(methods(&seen), ["INVITE", "CANCEL", "ACK"]);
+        assert_eq!(header(&seen[1], "CSeq"), Some("1 CANCEL"));
+        for later in &seen[1..] {
+            assert_eq!(header(later, "Via"), header(&seen[0], "Via"), "same branch");
         }
     }
 
