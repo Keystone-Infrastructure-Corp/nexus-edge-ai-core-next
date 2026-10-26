@@ -42,6 +42,8 @@ const T1: Duration = Duration::from_millis(500);
 const BYE_WAIT: Duration = Duration::from_secs(2);
 /// A send this long after the previous one starts a new talkspurt: two frames.
 const SEND_GAP: Duration = Duration::from_millis(40);
+/// How long an unanswered INVITE's socket stays open for a late final answer.
+const LATE_ANSWER_WAIT: Duration = Duration::from_secs(4);
 
 /// An answered call. Dropping it without [`SipCall::hangup`] still sends one
 /// best-effort BYE (without waiting for the 200).
@@ -97,6 +99,9 @@ pub async fn place_call(target: &SipTarget, timeout: Duration) -> Result<SipCall
             .transact("INVITE", cseq, &branch, &invite_to, &auth, &sdp, deadline)
             .await?
         else {
+            // A final answer can still cross our CANCEL (RFC 3261 §9.1), or
+            // follow a silent ring: keep the socket to ACK it and hang it up.
+            tokio::spawn(leg.reap_invite(cseq, branch, invite_to));
             return Err(TalkdownError::Unreachable);
         };
         if resp.status >= 300 {
@@ -379,6 +384,33 @@ impl Leg {
                     retransmit_at = Some(Instant::now() + gap);
                 }
             }
+        }
+    }
+
+    /// Read a timed-out INVITE's final response for [`LATE_ANSWER_WAIT`]:
+    /// ACK a refusal (a 487 for our CANCEL) in the INVITE transaction, and
+    /// ACK then BYE an answer nobody is waiting for any more.
+    async fn reap_invite(self, cseq: u32, invite_branch: String, invite_to: String) {
+        let deadline = Instant::now() + LATE_ANSWER_WAIT;
+        let mut buf = vec![0u8; 8192];
+        while let Ok(Ok((n, _))) = timeout_at(deadline, self.sock.recv_from(&mut buf)).await {
+            let Some(resp) = Response::parse(&buf[..n]) else {
+                continue;
+            };
+            if resp.status < 200 || !resp.answers(&self.call_id, cseq, "INVITE") {
+                continue;
+            }
+            let to = resp.header("to").unwrap_or(&invite_to);
+            if resp.status >= 300 {
+                let ack = self.request("ACK", cseq, &invite_branch, to, "", "");
+                let _ = self.send(&ack).await;
+            } else {
+                let _ = self
+                    .send(&self.request("ACK", cseq, &branch(), to, "", ""))
+                    .await;
+                let _ = self.bye(cseq + 1, to).await;
+            }
+            return;
         }
     }
 
@@ -961,6 +993,76 @@ pub(crate) mod tests {
             invites += usize::from(buf[..n].starts_with(b"INVITE"));
         }
         assert_eq!(invites, 2);
+    }
+
+    /// A speaker that rang past the deadline gets our CANCEL, but its final
+    /// answer can cross it (RFC 3261 §9.1). The caller still hears
+    /// `Unreachable` at the deadline; a late 200 is then ACKed and hung up,
+    /// and a 487 is ACKed in the INVITE transaction.
+    #[tokio::test]
+    async fn a_final_answer_crossing_the_cancel_is_acked() {
+        for (status, until, want) in [
+            (
+                "200 OK",
+                "BYE",
+                ["INVITE", "CANCEL", "ACK", "BYE"].as_slice(),
+            ),
+            (
+                "487 Request Terminated",
+                "ACK",
+                &["INVITE", "CANCEL", "ACK"],
+            ),
+        ] {
+            let invite = std::sync::Mutex::new(String::new());
+            let (port, uas) = fake_uas(until, move |req| {
+                if req.starts_with("INVITE") {
+                    *invite.lock().unwrap() = req.to_string();
+                    vec![reply(req, "180 Ringing", "", "")]
+                } else if req.starts_with("CANCEL") {
+                    let invite = invite.lock().unwrap();
+                    let body = if status.starts_with('2') {
+                        answer(9, "0")
+                    } else {
+                        String::new()
+                    };
+                    let extra = if body.is_empty() { "" } else { SDP };
+                    vec![
+                        reply(&invite, status, extra, &body),
+                        reply(req, "200 OK", "", ""),
+                    ]
+                } else if req.starts_with("BYE") {
+                    vec![reply(req, "200 OK", "", "")]
+                } else {
+                    vec![]
+                }
+            })
+            .await;
+            let started = Instant::now();
+            let err = place_call(&target(port), Duration::from_millis(600))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, TalkdownError::Unreachable), "{status}: {err}");
+            assert!(started.elapsed() < Duration::from_millis(900), "{status}");
+
+            let seen = timeout(Duration::from_secs(3), uas)
+                .await
+                .unwrap_or_else(|_| panic!("{status}: the late answer was not ACKed"))
+                .unwrap();
+            assert_eq!(methods(&seen), want, "{status}");
+            let ack = &seen[2];
+            assert!(header(ack, "To").unwrap().ends_with(";tag=uas1"));
+            assert_eq!(header(ack, "CSeq"), Some("1 ACK"));
+            if let Some(bye) = seen.get(3) {
+                assert_eq!(header(bye, "CSeq"), Some("2 BYE"));
+                assert!(header(bye, "To").unwrap().ends_with(";tag=uas1"));
+            } else {
+                assert_eq!(
+                    header(ack, "Via"),
+                    header(&seen[0], "Via"),
+                    "same transaction"
+                );
+            }
+        }
     }
 
     #[tokio::test]
