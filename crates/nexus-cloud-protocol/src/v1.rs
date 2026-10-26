@@ -466,7 +466,7 @@ pub struct IceServer {
     pub username: Option<String>,
 }
 
-/// Edge → Cloud. Phase 10 (additive on v=1). One adaptive-fps JPEG snapshot for a subscribed camera. Fire-and-forget: the cloud LiveHub fans it out to every subscribed browser, and it is the FIRST payload dropped under backpressure (a dropped frame is invisible — the next snapshot supersedes it). The frame is the CLEAN supervisor frame (no detection overlays), resized to the subscriber's tile size, JPEG q70–75. Emitted at ~0.5–1 fps when the scene is static (keepalive) and bursts up to the fps_tier ceiling on motion.
+/// Edge → Cloud. Phase 10 (additive on v=1). One adaptive-fps JPEG snapshot for a subscribed camera. Fire-and-forget: the cloud LiveHub fans it out to every subscribed browser, and it is the FIRST payload dropped under backpressure (a dropped frame is invisible — the next snapshot supersedes it). The frame is the CLEAN supervisor frame (no detection overlays), resized to the subscriber's tile size, JPEG q70–75. Emitted at the fps_tier floor when the scene is static (keepalive: grid 2 fps, focus 8 fps) and bursts up to the tier ceiling on pixel motion (grid 8 fps, focus 15 fps).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LbrFramePayload {

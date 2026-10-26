@@ -44,10 +44,14 @@ pub const BASELINE_GAP_MS: i64 = 500;
 /// matter how much is moving.
 pub const MOTION_GAP_MS: i64 = 125;
 
+/// Per-pixel Y difference above which a sampled pixel counts as changed.
+const DELTA_THRESHOLD: u8 = 16;
+
+/// Fraction of sampled pixels that must change for the scene to count as moving.
+const PIXEL_PCT_THRESHOLD: f32 = 0.005;
+
 pub struct MotionGate {
     prev_y: Option<Vec<u8>>,
-    delta_threshold: u8,
-    pixel_pct_threshold: f32,
     baseline_gap_ms: i64,
     motion_gap_ms: i64,
     last_pass: Option<Instant>,
@@ -57,8 +61,6 @@ impl MotionGate {
     pub fn new() -> Self {
         Self {
             prev_y: None,
-            delta_threshold: 16,
-            pixel_pct_threshold: 0.005,
             baseline_gap_ms: BASELINE_GAP_MS,
             motion_gap_ms: MOTION_GAP_MS,
             last_pass: None,
@@ -91,19 +93,8 @@ impl MotionGate {
         // what I'm showing?"), and it is the only baseline still available
         // now that ceiling-rejected frames are never downsampled.
         let y = downsample_y(frame);
-        let moved = match self.prev_y.as_ref() {
-            Some(prev_y) if prev_y.len() == y.len() => {
-                let mut changed = 0usize;
-                for (a, b) in prev_y.iter().zip(y.iter()) {
-                    if a.abs_diff(*b) > self.delta_threshold {
-                        changed += 1;
-                    }
-                }
-                (changed as f32 / y.len() as f32) >= self.pixel_pct_threshold
-            }
-            // No baseline yet, or the frame geometry changed under us.
-            _ => true,
-        };
+        // No baseline yet counts as motion.
+        let moved = self.prev_y.as_ref().is_none_or(|p| has_motion(p, &y));
 
         if moved {
             self.prev_y = Some(y);
@@ -124,8 +115,23 @@ impl Default for MotionGate {
     }
 }
 
-/// 8× downsample to a Y-only buffer. Cheap nearest-neighbour pick.
-fn downsample_y(frame: &Frame) -> Vec<u8> {
+/// Whether two [`downsample_y`] buffers differ enough to count as motion.
+/// The LBR live-view pump shares this test. A geometry change counts as motion.
+pub fn has_motion(prev_y: &[u8], y: &[u8]) -> bool {
+    if prev_y.len() != y.len() {
+        return true;
+    }
+    let changed = prev_y
+        .iter()
+        .zip(y.iter())
+        .filter(|(a, b)| a.abs_diff(**b) > DELTA_THRESHOLD)
+        .count();
+    (changed as f32 / y.len() as f32) >= PIXEL_PCT_THRESHOLD
+}
+
+/// 8× downsample to a Y-only buffer. Cheap nearest-neighbour pick. Shared
+/// with the LBR live-view pump.
+pub fn downsample_y(frame: &Frame) -> Vec<u8> {
     let scale = 8u32;
     let dw = (frame.width / scale).max(1) as usize;
     let dh = (frame.height / scale).max(1) as usize;

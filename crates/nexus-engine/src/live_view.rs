@@ -17,10 +17,10 @@
 //!   supervisor frame straight out of [`LatestFrameCache`]; it never opens a
 //!   second capture/decode, and it skips ticks where the pipeline has not
 //!   produced a new `frame_id`.
-//! * **Adaptive fps gated on the existing tracked-object set** — the
-//!   confirmed reuse of the detector's output, no new analysis. A static
-//!   scene emits a ~1 fps keepalive; a changing scene bursts up to the tier
-//!   ceiling (`grid` ~4 fps, `focus` ~8 fps).
+//! * **Adaptive fps gated on pixel change** — the motion gate's frame-diff
+//!   test, run on the cached frame itself, no new analysis. A static scene
+//!   emits at the tier floor (`grid` ~2 fps, `focus` ~8 fps); a changing
+//!   scene bursts up to the tier ceiling (`grid` ~8 fps, `focus` ~15 fps).
 //! * **Per-core encode budget** (the hard backstop that yields to
 //!   inference): a shared token bucket caps total encodes/sec across every
 //!   camera, so many simultaneously-moving cameras degrade each other's fps
@@ -44,8 +44,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use nexus_cloud_client::{build_lbr_frame_envelope, TunnelOutbox};
 use nexus_cloud_protocol::v1::{LbrSubscribePayload, LbrUnsubscribePayload};
+use nexus_pipeline::gate::{downsample_y, has_motion};
 use nexus_pipeline::LatestFrameCache;
-use nexus_types::{CameraId, Frame, TrackedObject};
+use nexus_types::{CameraId, Frame};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -54,10 +55,14 @@ use tracing::{debug, warn};
 /// q70–75; 72 is the middle of that band.
 const LBR_JPEG_QUALITY: u8 = 72;
 
-/// Keepalive cadence: even a perfectly static scene emits one frame per
-/// second so a freshly-subscribed cell paints promptly and client-side
-/// stale-frame detection stays simple.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+/// Keepalive floors: even a perfectly static scene emits at this cadence so a
+/// freshly-subscribed cell paints promptly and client-side stale-frame
+/// detection stays simple. Per tier: 2 fps grid, 8 fps focus.
+const GRID_KEEPALIVE: Duration = Duration::from_millis(500);
+const FOCUS_KEEPALIVE: Duration = Duration::from_millis(125);
+/// Keepalive for a suppressed decoder loop, on every tier. Deliberately not
+/// the tier floor: at a focus cell's 8 fps a replayed cycle reads as live.
+const LOOP_KEEPALIVE: Duration = Duration::from_secs(1);
 
 /// A subscribed camera that has produced no new `frame_id` for this long is
 /// reported as stalled. Generous relative to the slowest tier (`GRID_FPS`)
@@ -65,10 +70,10 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// silent for minutes, not seconds.
 pub(crate) const STALL_AFTER: Duration = Duration::from_secs(5);
 /// Adaptive-fps ceiling for a normal grid cell.
-const GRID_FPS: u32 = 4;
+const GRID_FPS: u32 = 8;
 /// Adaptive-fps ceiling for the hovered / selected ("focus") cell — a
 /// warmer preview before the operator decides to expand to HD.
-const FOCUS_FPS: u32 = 8;
+const FOCUS_FPS: u32 = 15;
 
 /// Per-core global LBR encode budget (encodes/sec summed across every
 /// engaged camera). The hard backstop that makes LBR yield to inference —
@@ -90,7 +95,7 @@ const LOOP_WINDOW: usize = 8;
 /// Note the window counts *new-frame* observations, not pump ticks. Since
 /// BUG-136 the cache's frame advances at decode rate, so those observations
 /// arrive as fast as the pump can take them and the window spans roughly
-/// `LOOP_EVAL_WINDOW / GRID_FPS` — about 12 s, not the ~25 s it spanned
+/// `LOOP_EVAL_WINDOW / GRID_FPS` — about 6 s, not the ~25 s it spanned
 /// when the cache was only written once per completed inference.
 const LOOP_EVAL_WINDOW: usize = 48;
 
@@ -153,7 +158,7 @@ impl LbrBudget {
 
 /// Whether this tick should encode and send.
 ///
-/// The shared budget governs **motion bursts only**; the 1 fps keepalive
+/// The shared budget governs **motion bursts only**; the keepalive floor
 /// bypasses it. A single bucket shared across `N` cameras cannot satisfy `N`
 /// keepalives once `N` exceeds [`DEFAULT_BUDGET_PER_SEC`], and because
 /// [`LbrBudget::try_acquire`] is first-come-first-served rather than
@@ -162,9 +167,10 @@ impl LbrBudget {
 /// degrading evenly. A 53-camera wall against a budget of 24 therefore leaves
 /// ~29 cells frozen indefinitely.
 ///
-/// Bypassing is bounded: the keepalive is at most one encode per camera per
-/// second, so worst-case load is `N + max_per_sec` encodes/sec, and an encode
-/// is a small-tile resize + JPEG, not a decode.
+/// Bypassing is bounded: the keepalive is at most two encodes per camera per
+/// second (grid tier; eight for a focus cell), so worst-case load for an
+/// all-grid wall is `2N + max_per_sec` encodes/sec, and an encode is a
+/// small-tile resize + JPEG, not a decode.
 fn should_emit(
     new_frame: bool,
     scene_changed: bool,
@@ -189,6 +195,9 @@ struct PumpParams {
     tile_w: Option<u32>,
     /// Adaptive-fps ceiling for this camera (grid vs focus tier).
     ceiling_fps: u32,
+    /// Static-scene floor for this camera's tier: the longest the pump goes
+    /// without emitting a new frame.
+    keepalive: Duration,
 }
 
 struct PumpEntry {
@@ -258,14 +267,15 @@ impl LiveViewManager {
             );
             return;
         };
-        let ceiling_fps = if payload.fps_tier.as_deref() == Some("focus") {
-            FOCUS_FPS
+        let (ceiling_fps, keepalive) = if payload.fps_tier.as_deref() == Some("focus") {
+            (FOCUS_FPS, FOCUS_KEEPALIVE)
         } else {
-            GRID_FPS
+            (GRID_FPS, GRID_KEEPALIVE)
         };
         let params = PumpParams {
             tile_w: payload.tile_w.and_then(|w| u32::try_from(w).ok()),
             ceiling_fps,
+            keepalive,
         };
         let mut pumps = self.pumps.lock();
         if let Some(entry) = pumps.get(&camera_id) {
@@ -393,7 +403,9 @@ fn spawn_pump(
         use tokio::time::Instant;
 
         let mut last_frame_id: Option<u64> = None;
-        let mut last_sig: u64 = 0;
+        // Y plane of the last frame actually emitted: what the viewer is
+        // showing, so a budget-denied motion frame is re-judged next tick.
+        let mut last_sent_y: Option<Vec<u8>> = None;
         // Rolling window of recent frame content hashes + the current
         // run of suppressed cycle hits. See the loop-guard comment below.
         let mut recent: VecDeque<u64> = VecDeque::with_capacity(LOOP_WINDOW);
@@ -408,25 +420,27 @@ fn spawn_pump(
         // Force the first available frame to emit immediately so a fresh
         // cell paints without waiting for motion or the keepalive tick.
         let mut last_emit = Instant::now()
-            .checked_sub(KEEPALIVE_INTERVAL)
+            .checked_sub(GRID_KEEPALIVE)
             .unwrap_or_else(Instant::now);
         loop {
-            let (tile_w, ceiling_fps) = {
+            let (tile_w, ceiling_fps, keepalive) = {
                 let p = params.lock();
-                (p.tile_w, p.ceiling_fps)
+                (p.tile_w, p.ceiling_fps, p.keepalive)
             };
             let sample_interval = Duration::from_millis(1000 / u64::from(ceiling_fps.max(1)));
 
             if let Some(entry) = cache.get(camera_id) {
                 let frame_id = entry.frame.frame_id;
                 let new_frame = last_frame_id != Some(frame_id);
-                let sig = objects_signature(entry.objects.as_slice());
                 let now = Instant::now();
                 if new_frame {
                     last_new_frame = now;
                 }
-                let scene_changed = new_frame && sig != last_sig;
-                let keepalive_due = now.duration_since(last_emit) >= KEEPALIVE_INTERVAL;
+                let y = new_frame.then(|| downsample_y(&entry.frame));
+                let scene_changed = y
+                    .as_ref()
+                    .is_some_and(|y| last_sent_y.as_ref().is_none_or(|p| has_motion(p, y)));
+                let keepalive_due = now.duration_since(last_emit) >= keepalive;
 
                 // Loop guard. A decoder that re-serves already-delivered
                 // surfaces produces a short rotating cycle of pixel-identical
@@ -492,7 +506,7 @@ fn spawn_pump(
                     warn!(camera_id, "live view: frame cycle cleared");
                     loop_logged = false;
                 }
-                let stale_dup = cycle.is_some() && !keepalive_due;
+                let stale_dup = cycle.is_some() && now.duration_since(last_emit) < LOOP_KEEPALIVE;
 
                 // Encode only when there is a NEW frame to send and either
                 // the scene changed or a keepalive is due. See
@@ -511,12 +525,12 @@ fn spawn_pump(
                                 debug!(camera_id, error = %e, "lbr_frame dropped (tunnel down)");
                             }
                             last_emit = now;
+                            last_sent_y = y;
                         }
                         Err(e) => warn!(camera_id, error = %e, "LBR encode failed; skipping tick"),
                     }
                 }
                 last_frame_id = Some(frame_id);
-                last_sig = sig;
             }
 
             // Report the stall rather than falling silent. `should_emit`
@@ -584,30 +598,6 @@ fn target_size(src_w: u32, src_h: u32, tile_w: Option<u32>) -> (u32, u32) {
     }
 }
 
-/// Cheap FNV-1a signature of the tracked-object set for the adaptive-fps
-/// motion gate. Reuses the detector's already-computed tracks (no new
-/// analysis): a change in the object count, a track id, or any object's
-/// coarse (8-px-bucketed) box centre reads as "scene changing" and bursts
-/// the pump to its fps ceiling; an unchanged signature settles it to the
-/// keepalive rate. Sub-pixel tracker jitter on a truly static object is
-/// absorbed by the coarse bucketing.
-fn objects_signature(objects: &[TrackedObject]) -> u64 {
-    #[inline]
-    fn mix(hash: u64, v: u64) -> u64 {
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        (hash ^ v).wrapping_mul(FNV_PRIME)
-    }
-    let mut hash = mix(0xcbf2_9ce4_8422_2325, objects.len() as u64);
-    for o in objects {
-        let cx = ((o.bbox.x1 + o.bbox.x2) * 0.5 / 8.0) as i64;
-        let cy = ((o.bbox.y1 + o.bbox.y2) * 0.5 / 8.0) as i64;
-        hash = mix(hash, o.track_id);
-        hash = mix(hash, cx as u64);
-        hash = mix(hash, cy as u64);
-    }
-    hash
-}
-
 /// Edge capture wall-clock in unix ms (diagnostics / staleness only).
 fn now_unix_ms() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
@@ -616,52 +606,7 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_types::{BBox, PixelFormat};
-
-    fn obj(track_id: u64, cx: f32, cy: f32) -> TrackedObject {
-        TrackedObject {
-            track_id,
-            label: "person".to_string(),
-            confidence: 0.9,
-            bbox: BBox {
-                x1: cx - 5.0,
-                y1: cy - 5.0,
-                x2: cx + 5.0,
-                y2: cy + 5.0,
-            },
-            detection_bbox: None,
-            age_frames: 3,
-            age_ms: 100,
-            attributes: Default::default(),
-        }
-    }
-
-    #[test]
-    fn signature_stable_under_subpixel_jitter() {
-        let a = vec![obj(1, 100.0, 100.0), obj(2, 200.0, 50.0)];
-        // Jitter under the 8-px bucket must not read as motion.
-        let b = vec![obj(1, 101.0, 100.5), obj(2, 200.5, 51.0)];
-        assert_eq!(objects_signature(&a), objects_signature(&b));
-    }
-
-    #[test]
-    fn signature_changes_on_motion() {
-        let a = vec![obj(1, 100.0, 100.0)];
-        let b = vec![obj(1, 140.0, 100.0)]; // moved > 1 bucket
-        assert_ne!(objects_signature(&a), objects_signature(&b));
-    }
-
-    #[test]
-    fn signature_changes_on_count() {
-        let a = vec![obj(1, 100.0, 100.0)];
-        let b = vec![obj(1, 100.0, 100.0), obj(2, 300.0, 300.0)];
-        assert_ne!(objects_signature(&a), objects_signature(&b));
-    }
-
-    #[test]
-    fn signature_empty_is_stable() {
-        assert_eq!(objects_signature(&[]), objects_signature(&[]));
-    }
+    use nexus_types::PixelFormat;
 
     #[test]
     fn target_size_no_hint_is_native() {
@@ -689,7 +634,7 @@ mod tests {
     }
 
     /// The live-wall starvation this bypass exists for: 53 engaged cameras
-    /// against the default budget of 24. Every cell must still get its 1 fps
+    /// against the default budget of 24. Every cell must still get its
     /// keepalive, or ~29 of them sit frozen on whatever they last sent.
     #[test]
     fn keepalive_survives_a_wall_wider_than_the_budget() {
@@ -1030,10 +975,10 @@ mod tests {
         );
 
         // One frame is enough: the pump primes `last_emit` to one full
-        // KEEPALIVE_INTERVAL in the past, so the first iteration that observes
+        // keepalive interval in the past, so the first iteration that observes
         // this frame is already keepalive-due and emits.
         // Poll for the condition rather than sleeping a guessed duration: the
-        // keepalive cadence is KEEPALIVE_INTERVAL, and a fixed sleep would be
+        // keepalive cadence is the tier floor, and a fixed sleep would be
         // the one machine-speed-dependent assertion in this file.
         let jpeg = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -1068,6 +1013,114 @@ mod tests {
             (img.width(), img.height()),
             (320, 180),
             "pump must downscale the 640x360 frame to the subscribed 320-wide tile"
+        );
+    }
+
+    /// Count the `lbr_frame` envelopes a camera emits while a feeder publishes
+    /// a new `frame_id` every ~66 ms (decode rate) for `run`, with no objects
+    /// ever written. `fill_of` picks each frame's fill.
+    async fn emitted_over(tier: &str, run: Duration, fill_of: impl Fn(u64) -> u8) -> usize {
+        use nexus_cloud_client::{TunnelError, TunnelHandle};
+        use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody};
+
+        #[derive(Default)]
+        struct Capture {
+            sent: Mutex<Vec<Envelope>>,
+        }
+        #[async_trait::async_trait]
+        impl TunnelHandle for Capture {
+            async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
+                self.sent.lock().push(envelope);
+                Ok(())
+            }
+        }
+
+        let tunnel = Arc::new(Capture::default());
+        let cache = Arc::new(LatestFrameCache::new());
+        let outbox = Arc::new(TunnelOutbox::new());
+        outbox.set_handle(Some(tunnel.clone()));
+        let mgr = LiveViewManager::new(cache.clone(), outbox);
+        let epoch = cache.begin_session(2);
+        cache.put_frame(2, epoch, frame_with_fill(2, 1, fill_of(0)));
+        mgr.on_subscribe(&LbrSubscribePayload {
+            camera_id: 2,
+            tile_w: Some(320),
+            tile_h: Some(180),
+            fps_tier: Some(tier.to_string()),
+        });
+
+        let step = Duration::from_millis(66);
+        let mut i = 1u64;
+        let end = tokio::time::Instant::now() + run;
+        while tokio::time::Instant::now() < end {
+            cache.put_frame(2, epoch, frame_with_fill(2, i + 1, fill_of(i)));
+            i += 1;
+            tokio::time::sleep(step).await;
+        }
+        let sent = tunnel.sent.lock();
+        sent.iter()
+            .filter(|e| matches!(e.body, EnvelopeBody::LbrFrame(_)))
+            .count()
+    }
+
+    /// Pixel change alone (no tracked objects) must burst the pump to its
+    /// tier ceiling; the detector's object set is not the motion signal.
+    #[tokio::test(start_paused = true)]
+    async fn pixel_motion_without_detections_bursts_to_the_tier_ceiling() {
+        // Consecutive fills differ by > 16 and do not repeat inside the loop
+        // guard's window, so this is motion, not a decoder loop.
+        let n = emitted_over("grid", Duration::from_secs(2), |i| ((i * 20) % 256) as u8).await;
+        assert!(n >= 12, "grid ceiling is 8 fps; emitted {n} in 2 s");
+        let n = emitted_over("focus", Duration::from_secs(1), |i| ((i * 20) % 256) as u8).await;
+        assert!(n >= 12, "focus ceiling is 15 fps; emitted {n} in 1 s");
+    }
+
+    /// A decoder re-serving a short cycle of old frames is held to the 1 s
+    /// loop keepalive on every tier. Letting the tier floor through would
+    /// replay the loop at ~8 fps on a focus cell: a fake-smooth stale video.
+    #[tokio::test(start_paused = true)]
+    async fn a_looping_decoder_is_held_to_one_fps_on_the_focus_tier() {
+        // Period-3 cycle: each step is motion (> 16), and every frame from
+        // the fourth on repeats content already sent at distance 3.
+        let n = emitted_over("focus", Duration::from_secs(2), |i| {
+            [40, 120, 200][(i % 3) as usize]
+        })
+        .await;
+        // 3 fresh frames, then one per LOOP_KEEPALIVE: 4 or 5. Fewer means the
+        // loop froze the cell; more means it replayed faster than 1 fps.
+        assert!(
+            (4..=5).contains(&n),
+            "a loop must replay at ~1 fps; emitted {n} in 2 s"
+        );
+    }
+
+    /// A static scene emits at the tier floor, not the ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn a_static_scene_emits_at_the_tier_floor() {
+        let n = emitted_over("grid", Duration::from_secs(2), |_| 90).await;
+        assert!(
+            (4..=5).contains(&n),
+            "grid floor is 2 fps; emitted {n} in 2 s"
+        );
+        let n = emitted_over("focus", Duration::from_secs(1), |_| 90).await;
+        assert!(
+            (6..=9).contains(&n),
+            "focus floor is 8 fps; emitted {n} in 1 s"
+        );
+    }
+
+    /// Motion is judged against the last frame *sent*, not the last one
+    /// seen: a slow drift whose per-tick step is under the gate's delta
+    /// still bursts once it adds up against what the viewer is showing.
+    #[tokio::test(start_paused = true)]
+    async fn slow_drift_accumulates_against_the_last_sent_frame() {
+        // +5 per frame is +10 per 125 ms grid tick (under the delta of 16),
+        // but +20 against the last sent frame every second tick: ~4 fps.
+        // Judged tick-to-tick it would never move and sit at the 2 fps floor.
+        let n = emitted_over("grid", Duration::from_secs(2), |i| (60 + i * 5) as u8).await;
+        assert!(
+            n >= 7,
+            "drift should burst above the 2 fps floor; emitted {n} in 2 s"
         );
     }
 }
