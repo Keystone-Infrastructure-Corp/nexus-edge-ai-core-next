@@ -110,12 +110,7 @@ async fn probe_host(
     bind: Option<Ipv4Addr>,
     sip_port: u16,
 ) -> (Option<DiscoveredDevice>, Option<DiscoveredSpeaker>) {
-    // shortcut: `options_ping` cannot source-bind its UDP socket, so a
-    // sweep pinned to the camera NIC skips it rather than let a probe
-    // leave by OS routing; lift once the helper takes a bind address.
-    let sip = bind
-        .is_none()
-        .then(|| tokio::spawn(probe_sip(host, sip_port)));
+    let sip = tokio::spawn(probe_sip(host, sip_port, bind));
     let mut tasks = Vec::with_capacity(ports.len());
     for &port in ports {
         tasks.push(tokio::spawn(probe_one(host, port, bind)));
@@ -155,19 +150,18 @@ async fn probe_host(
         }
         dev
     });
-    let speaker = match sip {
-        Some(t) => t.await.ok().flatten(),
-        None => None,
-    };
+    let speaker = sip.await.ok().flatten();
     (device, speaker)
 }
 
 /// SIP `OPTIONS` ping, bounded by the same 2 s budget as a TCP
 /// probe's read and run concurrently with them, so it adds nothing
-/// to the per-host time.
-async fn probe_sip(host: IpAddr, port: u16) -> Option<DiscoveredSpeaker> {
+/// to the per-host time. Sent from `bind` when the sweep is pinned to the
+/// camera NIC, like the TCP probes.
+async fn probe_sip(host: IpAddr, port: u16, bind: Option<Ipv4Addr>) -> Option<DiscoveredSpeaker> {
     let ip = host.to_string();
-    let ua = crate::talkdown::sip::options_ping(&ip, port, READ_TIMEOUT).await?;
+    let source = bind.map(IpAddr::V4);
+    let ua = crate::talkdown::sip::options_ping(&ip, port, source, READ_TIMEOUT).await?;
     Some(DiscoveredSpeaker {
         ip,
         port,
@@ -513,11 +507,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn camera_nic_pinned_sweep_skips_the_unbindable_sip_probe() {
+    async fn camera_nic_pinned_sweep_reports_the_sip_speaker() {
         let port = fake_sip_speaker().await;
         let pinned = Some(Ipv4Addr::LOCALHOST);
         let (_, speaker) = probe_host("127.0.0.1".parse().unwrap(), &[], pinned, port).await;
-        assert!(speaker.is_none());
+        let speaker = speaker.expect("a pinned sweep still probes SIP");
+        assert_eq!(speaker.port, port);
+        assert_eq!(speaker.user_agent.as_deref(), Some("TSIP"));
     }
 
     /// Bench check against a real speaker (NEXUS_TALKDOWN_HW=<ip>), driven

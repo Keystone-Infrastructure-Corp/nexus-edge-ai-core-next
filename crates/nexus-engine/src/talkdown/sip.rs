@@ -63,11 +63,17 @@ pub struct SipCall {
     hung_up: bool,
 }
 
-/// Send SIP `OPTIONS`; on any final response return its `User-Agent` (or
+/// Send SIP `OPTIONS`, from `source` when given (else the address that
+/// routes to the host); on any final response return its `User-Agent` (or
 /// `Server`) header, or an empty string when it has neither.
-pub async fn options_ping(host: &str, port: u16, timeout: Duration) -> Option<String> {
+pub async fn options_ping(
+    host: &str,
+    port: u16,
+    source: Option<IpAddr>,
+    timeout: Duration,
+) -> Option<String> {
     let deadline = Instant::now() + timeout;
-    let leg = timeout_at(deadline, Leg::open(host, port))
+    let leg = timeout_at(deadline, Leg::open(host, port, source))
         .await
         .ok()?
         .ok()?;
@@ -85,7 +91,7 @@ pub async fn options_ping(host: &str, port: u16, timeout: Duration) -> Option<St
 /// Digest credentials when the target has them.
 pub async fn place_call(target: &SipTarget, timeout: Duration) -> Result<SipCall, TalkdownError> {
     let deadline = Instant::now() + timeout;
-    let leg = timeout_at(deadline, Leg::open(&target.host, target.port))
+    let leg = timeout_at(deadline, Leg::open(&target.host, target.port, None))
         .await
         .map_err(|_| TalkdownError::Unreachable)??;
     let rtp = UdpSocket::bind((leg.local.ip(), 0)).await?;
@@ -264,21 +270,28 @@ struct Leg {
 }
 
 impl Leg {
-    async fn open(host: &str, port: u16) -> std::io::Result<Self> {
+    async fn open(host: &str, port: u16, source: Option<IpAddr>) -> std::io::Result<Self> {
         let peer = tokio::net::lookup_host((host, port))
             .await?
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address"))?;
-        // Connecting a throwaway socket makes the OS pick the local address
-        // that routes to the peer; the SDP and Via must carry that address.
-        let any = if peer.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
+        let local = match source {
+            Some(ip) => ip,
+            None => {
+                // Connecting a throwaway socket makes the OS pick the local
+                // address that routes to the peer; the SDP and Via must carry
+                // that address.
+                let any = if peer.is_ipv4() {
+                    "0.0.0.0:0"
+                } else {
+                    "[::]:0"
+                };
+                let probe = UdpSocket::bind(any).await?;
+                probe.connect(peer).await?;
+                probe.local_addr()?.ip()
+            }
         };
-        let probe = UdpSocket::bind(any).await?;
-        probe.connect(peer).await?;
-        let sock = UdpSocket::bind((probe.local_addr()?.ip(), 0)).await?;
+        let sock = UdpSocket::bind((local, 0)).await?;
         let local = sock.local_addr()?;
         let uri = match (peer.ip(), peer.port()) {
             (IpAddr::V4(ip), 5060) => format!("sip:{ip}"),
@@ -707,7 +720,7 @@ pub(crate) mod tests {
             vec![reply(req, "200 OK", "User-Agent: TSIP\r\n", "")]
         })
         .await;
-        let ua = options_ping("127.0.0.1", port, Duration::from_secs(2)).await;
+        let ua = options_ping("127.0.0.1", port, None, Duration::from_secs(2)).await;
         assert_eq!(ua.as_deref(), Some("TSIP"));
         uas.await.unwrap();
     }
