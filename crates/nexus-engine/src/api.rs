@@ -10637,7 +10637,51 @@ mod tests {
             .expect("the answered call is hung up")
             .unwrap();
         assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
-        assert!(!talk_down_busy(&app).await);
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+    }
+
+    /// A start abandoned after the speaker answered hangs up with the
+    /// retransmitting BYE, not one best-effort datagram: a speaker that loses
+    /// the first BYE still hears the call end, and only then is it free.
+    #[cfg(feature = "gstreamer-webrtc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn talk_down_abandoned_after_the_answer_retransmits_its_bye() {
+        let sip = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sip.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut seen: Vec<String> = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            while sip_methods(&seen).iter().filter(|m| **m == "BYE").count() < 2 {
+                let (n, from) = sip.recv_from(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let resp = if req.starts_with("INVITE") {
+                    Some(reply(&req, "200 OK", SDP, &answer(9, "0")))
+                } else if req.starts_with("BYE") && sip_methods(&seen).contains(&"BYE") {
+                    Some(reply(&req, "200 OK", "", ""))
+                } else {
+                    None
+                };
+                if let Some(resp) = resp {
+                    sip.send_to(resp.as_bytes(), from).await.unwrap();
+                }
+                seen.push(req);
+            }
+            seen
+        });
+        let (app, _store, _dir, _) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+
+        let no_ice = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+        let no_ice = serde_json::json!({ "mode": "live", "sdp_offer": no_ice });
+        let (status, body) = start_talk_down(&app, 1, no_ice).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(3), uas)
+            .await
+            .expect("the lost BYE was retransmitted")
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE", "BYE"]);
+        assert_eq!(seen[2], seen[3], "a retransmission of the same BYE");
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
     }
 
     /// Feeds a 3 s tone through the live path to a real speaker:

@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "gstreamer-webrtc")]
 use super::live::Live;
-use super::sip::{place_call, SipTarget, TalkdownError};
+use super::sip::{place_call, SipCall, SipTarget, TalkdownError};
 use super::{clip, tone_pcm};
 
 /// What this build can play, as the talk-down GET lists it.
@@ -213,21 +213,22 @@ impl TalkdownSessions {
                     StartError::Call(e)
                 }
             })?;
-        // A failed or stopped negotiation drops `call`, which sends its BYE,
-        // then `session`, which releases the speaker.
         #[cfg(feature = "gstreamer-webrtc")]
         let (live, sdp_answer) = match audio {
             Audio::Live {
                 sdp_offer,
                 ice_servers,
             } => {
-                let (live, answer) = tokio::select! {
-                    () = session.cancel.cancelled() => return Err(StartError::Stopped),
+                let negotiated = tokio::select! {
+                    () = session.cancel.cancelled() => Err(StartError::Stopped),
                     negotiated = Live::answer(sdp_offer, ice_servers) => {
-                        negotiated.map_err(StartError::Negotiation)?
+                        negotiated.map_err(StartError::Negotiation)
                     }
                 };
-                (Some(live), Some(answer))
+                match negotiated {
+                    Ok((live, answer)) => (Some(live), Some(answer)),
+                    Err(e) => return Err(hang_up(call, session, e)),
+                }
             }
             _ => (None, None),
         };
@@ -235,7 +236,7 @@ impl TalkdownSessions {
         let sdp_answer = None;
         // A stop that crossed the answer: hang up rather than report success.
         if session.cancel.is_cancelled() {
-            return Err(StartError::Stopped);
+            return Err(hang_up(call, session, StartError::Stopped));
         }
         let id = session.id;
         let task = tokio::spawn(async move {
@@ -283,6 +284,16 @@ impl TalkdownSessions {
             cancel,
         })
     }
+}
+
+/// Refuse a start whose call was answered: hang up with the retransmitting
+/// BYE (dropping `call` sends one best-effort BYE), then release the speaker.
+fn hang_up(call: SipCall, session: Session, e: StartError) -> StartError {
+    tokio::spawn(async move {
+        let _ = call.hangup().await;
+        drop(session);
+    });
+    e
 }
 
 /// A claimed speaker. Dropping it releases the speaker.
