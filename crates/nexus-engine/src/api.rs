@@ -1771,6 +1771,8 @@ async fn delete_camera(
         .await;
         return Err(e.into());
     }
+    // The delete cascaded its speaker assignment; its stop would now 404.
+    s.talkdown.stop_where(|_, camera| camera == Some(id));
     // Same channel as upsert — the reconciler diffs the live set
     // against the DB and stops the supervisor for any removed id.
     let _ = s
@@ -9951,8 +9953,8 @@ mod tests {
 
     /// A session ends as soon as its camera stops pairing with its speaker:
     /// the camera moves to another speaker (by either route), the speaker
-    /// drops the camera, or the speaker is deleted. No stop is sent; the
-    /// camera's stop afterwards finds nothing, and never calls the new speaker.
+    /// drops the camera, or either is deleted. No stop is sent; the camera's
+    /// stop afterwards finds nothing, and never calls the new speaker.
     #[tokio::test]
     async fn talk_down_ends_when_its_camera_and_speaker_part() {
         for change in [
@@ -9960,6 +9962,7 @@ mod tests {
             "b takes camera",
             "a drops camera",
             "delete a",
+            "delete camera",
         ] {
             let (port, _rtp, uas) = fake_speaker().await;
             let (app, store, _dir, a) =
@@ -9988,7 +9991,8 @@ mod tests {
                     format!("/api/v1/admin/speakers/{a}/cameras"),
                     Some(serde_json::json!({ "camera_ids": [] })),
                 ),
-                _ => (Method::DELETE, format!("/api/v1/admin/speakers/{a}"), None),
+                "delete a" => (Method::DELETE, format!("/api/v1/admin/speakers/{a}"), None),
+                _ => (Method::DELETE, "/api/v1/admin/cameras/1".to_string(), None),
             };
             let (status, body) = speaker_call(&app, method, &uri, body).await;
             assert!(status.is_success(), "{change}: {status} {body}");
@@ -10005,7 +10009,12 @@ mod tests {
             );
             let stop = "/api/v1/admin/cameras/1/talk-down/stop";
             let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
-            assert_eq!(status, StatusCode::NO_CONTENT, "{change}: {body}");
+            let want = if change == "delete camera" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::NO_CONTENT
+            };
+            assert_eq!(status, want, "{change}: {body}");
             let mut buf = [0u8; 64];
             assert!(b_sip.try_recv(&mut buf).is_err(), "{change}: b was called");
         }
