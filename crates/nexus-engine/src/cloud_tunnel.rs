@@ -299,9 +299,14 @@ fn build_rpc_dispatcher(
     // reply-bound `RpcCall` dispatch path). Human-actor forced assignments
     // and cancels ride the owner/admin/operator lane and skip this gate.
     let mut policy = SystemMethodPolicy::default();
-    policy.permit("update_assignment");
-    policy.permit("update_cancel");
-    policy.permit("update_rollback");
+    // API autoapply uses owner metadata but a narrowly bound system identity.
+    // Both lists are the ones `VerifiedActor::allows_system_action` enforces.
+    for method in nexus_cloud_client::actor_token::UPDATE_ORCHESTRATOR_ACTIONS
+        .iter()
+        .chain(nexus_cloud_client::actor_token::FLEET_CATEGORIES)
+    {
+        policy.permit(*method);
+    }
     let handler = EngineRpcHandler {
         store: store.clone(),
         replicator_kick: replicator_kick.clone(),
@@ -748,10 +753,9 @@ async fn run(
 /// mirrors the `diag_collect` gate: verify the signature + claims against a
 /// LOGICAL RPC path (there is no HTTP path on an update payload — the cloud
 /// binds `path=update_assignment` / `update_cancel` / `update_rollback`),
-/// then require EITHER a privileged human role (owner/admin/operator) OR a
-/// `system:`-sub token whose logical path is on the dispatcher's
-/// system-method whitelist — the same authorisation the dispatcher applies
-/// to an inbound `rpc_call`.
+/// then require the action's signed permission, falling back to privileged
+/// human roles for legacy tokens. System subjects additionally require the
+/// dispatcher's method allowlist, just as on an inbound `rpc_call`.
 fn verify_update_actor(
     disp: &RpcDispatcher<EngineRpcHandler>,
     token: Option<&str>,
@@ -768,17 +772,27 @@ fn verify_update_actor(
             },
         )
         .map_err(|reason| format!("actor_token invalid: {reason}"))?;
-    if actor.sub.starts_with("system:") {
-        if !disp.policy().allows(logical_path) {
-            return Err(format!(
-                "system sub `{}` not permitted for `{logical_path}`",
-                actor.sub
-            ));
-        }
-    } else if !crate::engine_rpc::is_priviledged_role(&actor.role) {
-        return Err(format!("actor role `{}` lacks privilege", actor.role));
+    if !tunnel_actor_allowed(&actor, disp.policy(), logical_path) {
+        return Err("actor lacks the requested capability".to_string());
     }
     Ok(actor)
+}
+
+/// Both logical-envelope paths keep the system allowlist as an independent
+/// requirement; a signed capability never promotes a system subject.
+fn tunnel_actor_allowed(actor: &VerifiedActor, policy: &SystemMethodPolicy, path: &str) -> bool {
+    let system = actor.sub.starts_with("system:");
+    if system && !policy.allows(path) {
+        return false;
+    }
+    actor.allows_rpc(
+        EnvelopeContext {
+            method: "POST",
+            path,
+        },
+        None,
+        system || crate::engine_rpc::is_priviledged_role(&actor.role),
+    )
 }
 
 /// #759 — apply a `clip_replicated_ack` to the clip whose
@@ -955,7 +969,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         path: "diag_collect",
                     },
                 ) {
-                    Ok(actor) if crate::engine_rpc::is_priviledged_role(&actor.role) => {
+                    Ok(actor) if tunnel_actor_allowed(&actor, disp.policy(), "diag_collect") => {
                         disp.handler()
                             .spawn_diag_collect(payload.clone(), Arc::clone(outbox));
                     }
@@ -963,7 +977,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                         warn!(
                             core_id = %core_id,
                             role = %actor.role,
-                            "diag_collect actor lacks a privileged role; dropping",
+                            "diag_collect actor lacks the requested capability; dropping",
                         );
                     }
                     Err(reason) => {
@@ -1041,17 +1055,18 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                 // TTL and never travels the reply-bound RpcCall path.
                 match other {
                     EnvelopeBody::UpdateAssignment(p) => {
-                        // Routine cohort assignments trust the Ed25519
-                        // manifest signature (re-verified inside the
-                        // handler) and carry no actor_token. Operator
-                        // `force` and orchestrator-issued downgrades DO
-                        // carry one and MUST verify before we apply.
+                        // Legacy routine assignments use the signed manifest.
+                        // Every supplied actor token is authoritative and must
+                        // pass before the handler can persist state or emit progress.
+                        // Force and downgrades still require a token: a
+                        // tokenless assignment may only move to a newer
+                        // version (or re-ack the running one).
                         let forced = p.force.unwrap_or(false) || p.allow_downgrade.unwrap_or(false);
-                        if forced {
+                        if forced || p.actor_token.is_some() {
                             let Some(disp) = dispatcher else {
                                 warn!(
                                     core_id = %core_id,
-                                    "forced update_assignment received but inbound dispatch is disabled (missing enrollment signing key); dropping",
+                                    "update_assignment received but inbound dispatch is disabled (missing enrollment signing key); dropping",
                                 );
                                 continue;
                             };
@@ -1065,18 +1080,30 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                                         core_id = %core_id,
                                         sub = %actor.sub,
                                         assignment_id = %p.assignment_id,
-                                        "forced update_assignment actor_token verified",
+                                        "update_assignment actor_token verified",
                                     );
                                 }
                                 Err(reason) => {
                                     warn!(
                                         core_id = %core_id,
                                         reason = %reason,
-                                        "forced update_assignment actor_token rejected; dropping",
+                                        "update_assignment actor_token rejected; dropping",
                                     );
                                     continue;
                                 }
                             }
+                        } else if !crate::cloud_update::tokenless_target_allowed(&p.target_version)
+                        {
+                            // The manifest signature does not cover the force or
+                            // downgrade flags, so clearing them must not let an
+                            // older signed manifest install without a token.
+                            warn!(
+                                core_id = %core_id,
+                                assignment_id = %p.assignment_id,
+                                target_version = %p.target_version,
+                                "tokenless update_assignment target is not a strictly newer plain version; dropping",
+                            );
+                            continue;
                         }
                         crate::cloud_update::handle_assignment(
                             Arc::clone(store),
@@ -1204,7 +1231,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// [`nexus_types::CameraTalkDown`] already discovers), gated on the camera
 /// actually having one.
 fn heartbeat_caps(hd_transport: Option<nexus_types::HdTransport>) -> Vec<String> {
-    let mut caps = vec!["live_view".to_string()];
+    let mut caps = vec!["live_view".to_string(), "actor_perm_v1".to_string()];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
     caps
 }
@@ -2461,6 +2488,36 @@ mod health_tests {
     use super::*;
     use nexus_pipeline::StubClipRecorder;
 
+    #[test]
+    fn logical_actions_require_their_capability_and_keep_the_system_allowlist() {
+        let mut policy = SystemMethodPolicy::default();
+        policy.permit("update_assignment");
+        let mut actor = VerifiedActor {
+            sub: "human".into(),
+            role: "viewer".into(),
+            perm: Some("diagnostics.collect".into()),
+            jti: "test".into(),
+            org_id: "org".into(),
+            actor_org_id: None,
+        };
+        assert!(tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+        assert!(!tunnel_actor_allowed(&actor, &policy, "update_assignment"));
+        actor.perm = Some("fleet.apply".into());
+        assert!(tunnel_actor_allowed(&actor, &policy, "update_assignment"));
+        actor.sub = "system:update-orchestrator".into();
+        assert!(tunnel_actor_allowed(&actor, &policy, "update_assignment"));
+        assert!(!tunnel_actor_allowed(&actor, &policy, "update_cancel"));
+        actor.perm = Some("diagnostics.collect".into());
+        assert!(!tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+        actor.sub = "human".into();
+        actor.perm = None;
+        assert!(!tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+        actor.role = "owner".into();
+        assert!(tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+        actor.perm = Some("settings.write".into());
+        assert!(!tunnel_actor_allowed(&actor, &policy, "diag_collect"));
+    }
+
     /// The engine must not advertise a capability it cannot perform. Talk-down
     /// audio has no receive-side pipeline here, so no transport may leak the
     /// `talkdown_webrtc` tag onto the heartbeat — a cloud that routed an
@@ -2484,9 +2541,12 @@ mod health_tests {
     /// that cannot advertises none (BUG-225).
     #[test]
     fn the_hd_transport_is_advertised_only_when_the_bridge_can_publish() {
-        assert_eq!(heartbeat_caps(None), ["live_view"]);
+        assert_eq!(heartbeat_caps(None), ["live_view", "actor_perm_v1"]);
         for t in nexus_types::HdTransport::all() {
-            assert_eq!(heartbeat_caps(Some(t)), ["live_view", t.cap_tag()]);
+            assert_eq!(
+                heartbeat_caps(Some(t)),
+                ["live_view", "actor_perm_v1", t.cap_tag()]
+            );
         }
     }
 
@@ -3826,6 +3886,7 @@ mod storage_watermark_tests {
 /// succeeded" cannot stand in for "the cloud is still there".
 #[cfg(test)]
 mod heartbeat_ack_tests {
+    use chrono::Utc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -3938,7 +3999,11 @@ mod heartbeat_ack_tests {
     async fn a_bridge_that_cannot_publish_puts_no_hd_transport_on_the_heartbeat() {
         let bridge = crate::webrtc_bridge::WebRtcBridge::disabled();
         for t in nexus_types::HdTransport::all() {
-            assert_eq!(first_heartbeat_caps(&bridge, t).await, ["live_view"], "{t}");
+            assert_eq!(
+                first_heartbeat_caps(&bridge, t).await,
+                ["live_view", "actor_perm_v1"],
+                "{t}"
+            );
         }
     }
 
@@ -3952,7 +4017,7 @@ mod heartbeat_ack_tests {
         )));
         assert_eq!(
             first_heartbeat_caps(&bridge, nexus_types::HdTransport::Sfu).await,
-            ["live_view", "hd_sfu"]
+            ["live_view", "actor_perm_v1", "hd_sfu"]
         );
     }
 
@@ -3966,9 +4031,9 @@ mod heartbeat_ack_tests {
             std::collections::HashMap::new(),
         )));
         let expected: &[&str] = if nexus_pipeline::MoqSession::plugin_available() {
-            &["live_view", "hd_moq"]
+            &["live_view", "actor_perm_v1", "hd_moq"]
         } else {
-            &["live_view"]
+            &["live_view", "actor_perm_v1"]
         };
         assert_eq!(
             first_heartbeat_caps(&bridge, nexus_types::HdTransport::Moq).await,
@@ -4242,6 +4307,310 @@ mod heartbeat_ack_tests {
             "an acknowledged heartbeat is the only proof the cloud is on the \
              other end of this socket",
         );
+    }
+    fn service_test_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    fn service_test_token(
+        key: &ed25519_dalek::SigningKey,
+        subject: &str,
+        role: &str,
+        path: &str,
+        permission: Option<&str>,
+    ) -> String {
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let now = Utc::now().timestamp();
+        let mut claims = serde_json::json!({"aud":"nexus-edge-rpc","core_id":"core-1","org_id":"org-1","sub":subject,"role":role,"http_method":"POST","path":path,"jti":uuid::Uuid::now_v7().to_string(),"iat":now,"exp":now+60,"iss":"test"});
+        if let Some(permission) = permission {
+            claims["perm"] = serde_json::json!(permission);
+        }
+        let message = format!(
+            "{}.{}",
+            b64.encode(br#"{"alg":"EdDSA","kid":"test"}"#),
+            b64.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        format!(
+            "{message}.{}",
+            b64.encode(key.sign(message.as_bytes()).to_bytes())
+        )
+    }
+
+    fn service_test_dispatcher(
+        key: &ed25519_dalek::SigningKey,
+        store: &Arc<Store>,
+        base: String,
+    ) -> Arc<RpcDispatcher<EngineRpcHandler>> {
+        use ed25519_dalek::pkcs8::EncodePublicKey;
+        let enrollment = CloudEnrollment {
+            core_id: "core-1".into(),
+            gateway_url: "wss://cloud.invalid/v1/tunnel".into(),
+            cert_pem: String::new(),
+            private_key_pem: String::new(),
+            ca_chain_pem: String::new(),
+            entitlement_jwt: String::new(),
+            signing_key_pem: Some(
+                key.verifying_key()
+                    .to_public_key_pem(Default::default())
+                    .unwrap(),
+            ),
+            signing_kid: Some("test".into()),
+            enrolled_at: Utc::now(),
+            attach_replay_after: None,
+            server_cert_pem: None,
+            server_private_key_pem: None,
+            ssh_ca_public_key: None,
+        };
+        build_rpc_dispatcher(
+            &enrollment,
+            store,
+            &Arc::new(Notify::new()),
+            &Arc::new(arc_swap::ArcSwap::from_pointee(base)),
+            &reqwest::Client::new(),
+            None,
+            &Arc::new(crate::remote_shell::RemoteAccess::new(
+                nexus_config::RemoteAccessConfig::default(),
+                false,
+            )),
+        )
+        .unwrap()
+    }
+
+    async fn pump_test_envelope(
+        store: &Arc<Store>,
+        dispatcher: &RpcDispatcher<EngineRpcHandler>,
+        body: EnvelopeBody,
+    ) -> usize {
+        let tunnel = Arc::new(HalfOpenTunnel::default());
+        let outbox = Arc::new(TunnelOutbox::new());
+        outbox.set_handle(Some(tunnel.clone()));
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Envelope {
+            meta: EnvelopeMeta {
+                id: uuid::Uuid::now_v7().to_string(),
+                in_reply_to: None,
+                seq: None,
+                trace: None,
+                ts: Utc::now().to_rfc3339(),
+                v: 1,
+            },
+            body,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let remote_shell = Arc::new(crate::remote_shell::RemoteShellManager::new(
+            Arc::new(crate::remote_shell::RemoteAccess::new(
+                nexus_config::RemoteAccessConfig::default(),
+                false,
+            )),
+            nexus_cloud_client::tunnel::TunnelClient::new(
+                "wss://cloud.invalid/v1/tunnel",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            None,
+            outbox.clone(),
+        ));
+        pump_rpc_dispatch(
+            tunnel.as_ref(),
+            Some(rx),
+            Some(dispatcher),
+            "core-1",
+            &outbox,
+            &Arc::new(nexus_cloud_client::entitlements::EntitlementCache::new()),
+            &Arc::new(crate::cloud_alert_sink::PendingAckRegistry::new()),
+            store,
+            &live_view_manager(),
+            &crate::webrtc_bridge::WebRtcBridge::disabled(),
+            &remote_shell,
+            &TunnelLiveness::new(),
+        )
+        .await;
+        tunnel.sent.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn routine_assignments_verify_every_present_actor_before_state_or_progress() {
+        for (subject, role, permission, signed, allowed) in [
+            ("human", "owner", Some("settings.write"), true, false),
+            ("human", "owner", Some("unknown.permission"), true, false),
+            (
+                "system:notify-svc",
+                "system",
+                Some("fleet.apply"),
+                true,
+                false,
+            ),
+            (
+                "system:api-gateway",
+                "owner",
+                Some("fleet.apply"),
+                true,
+                false,
+            ),
+            ("human", "system", Some("fleet.apply"), true, false),
+            (
+                "system:update-orchestrator",
+                "system",
+                Some("fleet.firmware"),
+                true,
+                true,
+            ),
+            (
+                "system:update-orchestrator",
+                "system",
+                Some("fleet.apply"),
+                true,
+                true,
+            ),
+            ("human", "viewer", Some("fleet.apply"), true, true),
+            ("human", "viewer", Some("fleet.firmware"), true, true),
+            ("human", "owner", None, true, true),
+            ("human", "owner", None, false, true),
+        ] {
+            let (store, _dir) = test_store().await;
+            let key = service_test_key();
+            let dispatcher = service_test_dispatcher(&key, &store, "http://127.0.0.1:1".into());
+            // Already-current assignments mutate state and report success without a manifest fetch.
+            let payload = nexus_cloud_protocol::v1::UpdateAssignmentPayload {
+                actor_token: signed.then(|| {
+                    service_test_token(&key, subject, role, "update_assignment", permission)
+                }),
+                allow_downgrade: Some(false),
+                force: Some(false),
+                artifact_sha256: "a".repeat(64),
+                artifact_url: "https://invalid.test/release".into(),
+                assignment_id: uuid::Uuid::now_v7().to_string(),
+                channel: "review-test".into(),
+                deferral_until: None,
+                manifest_url: None,
+                signature: String::new(),
+                target_version: env!("NEXUS_BUILD_VERSION").into(),
+            };
+            let sent =
+                pump_test_envelope(&store, &dispatcher, EnvelopeBody::UpdateAssignment(payload))
+                    .await;
+            let state = crate::cloud_update::read_state(&store).await;
+            assert_eq!(
+                state.assigned_channel.is_some(),
+                allowed,
+                "{subject} {role} {permission:?} signed={signed}"
+            );
+            assert_eq!(state.last_result.is_some(), allowed);
+            assert_eq!(
+                sent,
+                usize::from(allowed),
+                "denied assignments emit no progress"
+            );
+        }
+    }
+
+    /// The manifest signature does not cover `force` / `allow_downgrade`, so a
+    /// tokenless assignment must never install an older version.
+    #[tokio::test]
+    async fn tokenless_assignments_never_downgrade() {
+        let running = env!("NEXUS_BUILD_VERSION");
+        assert_ne!(running, "0.0.0", "test needs an older version to send");
+        // The accepted case is the idempotent re-ack, which spawns no install
+        // task; strictly newer targets are covered in `cloud_update`.
+        for (target, allowed) in [("0.0.0".to_string(), false), (running.to_string(), true)] {
+            let (store, _dir) = test_store().await;
+            let key = service_test_key();
+            let dispatcher = service_test_dispatcher(&key, &store, "http://127.0.0.1:1".into());
+            let payload = nexus_cloud_protocol::v1::UpdateAssignmentPayload {
+                actor_token: None,
+                allow_downgrade: None,
+                force: None,
+                artifact_sha256: "a".repeat(64),
+                artifact_url: "https://invalid.test/release".into(),
+                assignment_id: uuid::Uuid::now_v7().to_string(),
+                channel: "review-test".into(),
+                deferral_until: None,
+                manifest_url: None,
+                signature: String::new(),
+                target_version: target.clone(),
+            };
+            let sent =
+                pump_test_envelope(&store, &dispatcher, EnvelopeBody::UpdateAssignment(payload))
+                    .await;
+            let state = crate::cloud_update::read_state(&store).await;
+            assert_eq!(state.assigned_channel.is_some(), allowed, "{target}");
+            if !allowed {
+                assert_eq!(sent, 0, "a refused downgrade emits no progress");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_api_gateway_autoapply_reaches_only_its_finite_fleet_routes() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/admin/fleet/rules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let (store, _dir) = test_store().await;
+        let key = service_test_key();
+        let dispatcher = service_test_dispatcher(&key, &store, server.uri());
+        for permission in [Some("fleet.apply"), None] {
+            let token = service_test_token(
+                &key,
+                "system:api-gateway",
+                "owner",
+                "/admin/fleet/rules",
+                permission,
+            );
+            let response = dispatcher
+                .dispatch(
+                    "rules",
+                    EnvelopeContext {
+                        method: "POST",
+                        path: "/admin/fleet/rules",
+                    },
+                    Some(&token),
+                    Some(b"{}"),
+                )
+                .await;
+            assert!(
+                response.is_ok(),
+                "actual autoapply must reach its handler: {response:?}"
+            );
+        }
+        for subject in [
+            "system:notify-svc",
+            "system:update-orchestrator",
+            "system:unknown",
+        ] {
+            let token = service_test_token(
+                &key,
+                subject,
+                "owner",
+                "/admin/fleet/rules",
+                Some("fleet.apply"),
+            );
+            assert!(dispatcher
+                .dispatch(
+                    "rules",
+                    EnvelopeContext {
+                        method: "POST",
+                        path: "/admin/fleet/rules"
+                    },
+                    Some(&token),
+                    Some(b"{}")
+                )
+                .await
+                .is_err());
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }
 

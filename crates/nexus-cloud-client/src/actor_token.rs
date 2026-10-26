@@ -20,7 +20,17 @@
 //! 8. Checks `http_method == envelope.method` and `path == envelope.path`.
 //! 9. Checks `iat <= now + SKEW` and `exp > now - SKEW`. The 30 s skew
 //!    window matches Phase 1.15 (`docs/ARCHITECTURE.md §3.7`).
-//! 10. Consults the [`JtiReplayCache`] — replays are rejected.
+//! 10. When the token carries `perm`, checks that the edge's action table
+//!     maps `(method, path)` to that permission.
+//! 11. Checks the system-action contract: a `system:` subject may only
+//!     invoke its service's exact actions, and a non-system subject may not
+//!     claim the `system` role.
+//! 12. Consults the [`JtiReplayCache`] — replays are rejected.
+//!
+//! The dispatcher then applies [`VerifiedActor::allows_rpc`] before the
+//! handler runs: the signed permission must also match the request body
+//! (PTZ action, camera ids), and a token without `perm` falls back to its
+//! role only for a safe method or a mutating route the action table maps.
 //!
 //! All post-parse rejections collapse to `RejectReason::Invalid(_)` on
 //! the wire to avoid leaking which check failed. The fine-grained
@@ -51,6 +61,25 @@ pub const SHELL_AUDIENCE: &str = "nexus-edge-shell";
 /// Clock-skew window per Phase 1.15. ±30 s on both sides.
 pub const CLOCK_SKEW_SECS: i64 = 30;
 
+/// Logical OTA verbs `system:update-orchestrator` may invoke. The engine's
+/// dispatcher system-method policy is built from this same list.
+pub const UPDATE_ORCHESTRATOR_ACTIONS: &[&str] =
+    &["update_assignment", "update_cancel", "update_rollback"];
+
+/// Fleet categories behind `POST /admin/fleet/<category>`: the only routes
+/// `system:api-gateway` (autoapply) may invoke, and the routes that take
+/// `fleet.apply`. The engine's dispatcher system-method policy is built
+/// from this same list.
+pub const FLEET_CATEGORIES: &[&str] = &[
+    "rules",
+    "text_prompts",
+    "visual_prompts",
+    "detector_config",
+    "delivery_settings",
+    "alert_sinks",
+    "live_view",
+];
+
 /// A single trusted Ed25519 verification key bundled at enrollment.
 ///
 /// The cloud-console may rotate the entitlement signing key without a
@@ -72,8 +101,10 @@ pub struct VerifiedActor {
     /// accounts.
     pub sub: String,
     /// `role` claim — `viewer`, `operator`, `admin`, `owner`, or
-    /// `system:<svc>` for system tokens.
+    /// `system` for internal service tokens.
     pub role: String,
+    /// Exact signed capability; absent only on legacy or separate shell grants.
+    pub perm: Option<String>,
     /// `jti` of the token. Recorded so the audit log can be replayed
     /// against the source `actor_token` if needed.
     pub jti: String,
@@ -94,6 +125,239 @@ pub struct VerifiedActor {
     /// which company they were working for, which is the question an operator
     /// standing at the appliance actually asks.
     pub actor_org_id: Option<String>,
+}
+
+impl VerifiedActor {
+    /// Service actors are confined to existing producers' exact actions, even
+    /// when a legacy token omits its permission. Entitlements use a different JWT.
+    #[must_use]
+    pub fn allows_system_action(&self, envelope: EnvelopeContext<'_>) -> bool {
+        if !self.sub.starts_with("system:") {
+            return self.role != "system" && !self.role.starts_with("system:");
+        }
+        envelope.method == "POST"
+            && match self.sub.as_str() {
+                "system:update-orchestrator" => {
+                    UPDATE_ORCHESTRATOR_ACTIONS.contains(&envelope.path)
+                }
+                "system:api-gateway" => envelope
+                    .path
+                    .strip_prefix("/admin/fleet/")
+                    .is_some_and(|category| FLEET_CATEGORIES.contains(&category)),
+                _ => false,
+            }
+    }
+
+    /// Signed capabilities take precedence over preset roles. Legacy callers
+    /// retain the supplied role decision; shell grants use a separate audience.
+    #[must_use]
+    pub fn allows_rpc(
+        &self,
+        envelope: EnvelopeContext<'_>,
+        body: Option<&[u8]>,
+        legacy_allowed: bool,
+    ) -> bool {
+        if !self.allows_system_action(envelope) {
+            return false;
+        }
+        let Some(permission) = self.perm.as_deref() else {
+            // Role-only fallback, kept only for tokens minted before the cloud
+            // signs `perm`; removed once every cloud mint path signs it (cloud
+            // ADR-090). While it exists, a mutating route still needs an entry
+            // in the action table, so the opaque LAN proxy, raw SOAP and
+            // unmapped routes always require a signed permission.
+            let safe = matches!(
+                envelope.method.to_ascii_uppercase().as_str(),
+                "GET" | "HEAD" | "OPTIONS"
+            );
+            return legacy_allowed && (safe || !rpc_permissions(envelope).is_empty());
+        };
+        rpc_permissions(envelope).contains(&permission)
+            && rpc_body_matches(envelope, permission, body)
+    }
+}
+
+/// The one path normalizer both [`rpc_permissions`] and [`rpc_body_matches`]
+/// use: the query is dropped, the leading `/` is optional and one trailing
+/// `/` is stripped. Encoded, empty and dot segments yield `None`.
+fn rpc_path_parts(path: &str) -> Option<Vec<&str>> {
+    let path = path.split('?').next().unwrap_or(path);
+    if path.contains(['%', '#', '\\'])
+        || path.contains("//")
+        || path.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return None;
+    }
+    let path = path.strip_suffix('/').unwrap_or(path);
+    Some(path.trim_start_matches('/').split('/').collect())
+}
+
+/// Explicit edge action contract. No wildcard grants for unknown admin routes,
+/// raw SOAP, or arbitrary LAN proxy requests. Query data cannot change the path.
+fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
+    let Some(parts) = rpc_path_parts(envelope.path) else {
+        return &[];
+    };
+    let verb = envelope.method.to_ascii_uppercase();
+    let method = verb.as_str();
+    match (method, parts.as_slice()) {
+        ("POST", ["diag_collect"]) => &["diagnostics.collect"],
+        ("POST", ["update_assignment" | "update_cancel" | "update_rollback"]) => {
+            &["fleet.apply", "fleet.firmware"]
+        }
+        ("PUT", ["admin", "remote_access"]) => &["shell.policy"],
+        ("POST", ["admin", "remote-access", "restart-sshd"]) => &["shell.manage"],
+        ("POST", ["admin", "clips", id, "replicate"]) if id.parse::<u64>().is_ok() => {
+            &["clips.expedite"]
+        }
+        ("POST", ["admin", "fleet", category]) if FLEET_CATEGORIES.contains(category) => {
+            &["fleet.apply"]
+        }
+        ("PUT", ["admin", "network", "plan" | "roles"])
+        | ("POST", ["admin", "network", "plan", "apply" | "confirm" | "rollback"]) => {
+            &["settings.network"]
+        }
+        (_, ["admin", "cameras", id, tail @ ..]) if id.parse::<u64>().is_ok() => {
+            camera_rpc_permissions(method, tail)
+        }
+        // The cloud's typed core rename and core delete sign cores.manage.
+        ("PUT", ["admin", "server", "identity"]) | ("DELETE", ["admin", "cloud", "enrollment"]) => {
+            &["settings.write", "cores.manage"]
+        }
+        ("POST", ["admin", "cameras"])
+        | ("POST", ["admin", "cameras", "reprobe"])
+        | ("POST", ["admin", "cameras", "reprobe", "apply"])
+        | ("PUT", ["admin", "storage", "cold"])
+        | ("PUT" | "DELETE", ["admin", "storage", "backends", _])
+        | ("PUT", ["admin", "runtime", "usb_preferred"])
+        | ("PUT", ["admin", "delivery"])
+        | ("PUT" | "DELETE", ["admin", "sinks", "config", _, _])
+        | ("POST", ["admin", "sinks", "config", _, _, "test"])
+        | ("PUT", ["admin", "reid", "config"])
+        | ("PUT", ["admin", "live-view", "transport"])
+        | ("POST", ["admin", "oauth", _, "start"])
+        | ("POST", ["admin", "discovery", "onvif" | "scan"])
+        | (
+            "POST",
+            ["admin", "discovery", "sessions", _, "probe-rtsp" | "onvif-streams" | "cancel"],
+        )
+        | ("POST", ["admin", "visual-prompts"])
+        | ("DELETE", ["admin", "visual-prompts", _])
+        | ("PUT", ["admin", "server", "bind" | "watermarks" | "inference"])
+        | ("POST", ["admin", "server", "restart"])
+        | ("PUT", ["admin", "auth", "config"])
+        | ("POST", ["admin", "auth", "oidc", "test-discovery"])
+        | ("POST", ["admin", "cloud", "enroll"]) => &["settings.write"],
+        ("POST", ["admin", "users"])
+        | ("PUT" | "DELETE", ["admin", "users", _])
+        | ("POST", ["admin", "users", _, "reset-password" | "unlock"]) => &["members.manage"],
+        ("GET", ["admin", "diagnostics", "export"]) => &["diagnostics.read"],
+        (
+            "GET",
+            ["admin", "storage" | "delivery" | "sinks" | "remote_access" | "users" | "audit"
+            | "visual-prompts" | "cameras"],
+        )
+        | ("GET", ["admin", "cameras", "stats"])
+        | ("GET", ["admin", "sinks", "health"])
+        | ("GET", ["admin", "live", "status"])
+        | ("GET", ["admin", "reid", "status"])
+        | ("GET", ["admin", "system", "metrics-history"])
+        | ("GET", ["admin", "live-view", "transport"])
+        | ("GET", ["admin", "oauth", "status"])
+        | ("GET", ["admin", "discovery", "sessions", _])
+        | ("GET", ["admin", "audit", "resource", _, _])
+        | ("GET", ["admin", "visual-prompts", _])
+        | ("GET", ["admin", "fleet", "managed"])
+        | ("GET", ["admin", "server", "bind" | "watermarks" | "inference" | "identity" | "all"])
+        | ("GET", ["admin", "auth", "config"])
+        | ("GET", ["admin", "cloud", "enrollment"])
+        | ("GET", ["admin", "network", "interfaces" | "plan" | "roles"])
+        | ("GET", ["admin", "network", "apply", "status"]) => &["settings.read"],
+        _ => &[],
+    }
+}
+
+fn camera_rpc_permissions(method: &str, tail: &[&str]) -> &'static [&'static str] {
+    match (method, tail) {
+        ("POST", ["ptz"]) => &["live.ptz", "settings.write"],
+        ("POST", ["firmware:upgrade"]) => &["fleet.firmware"],
+        ("PUT", ["network", "interface"]) => &["settings.network"],
+        ("PUT" | "DELETE", [])
+        | ("PUT", ["imaging" | "encoder"])
+        | ("PUT", ["network", "safe"])
+        | ("PUT", ["deviceio", "relays"])
+        | ("POST", ["device"])
+        | ("POST", ["imaging", "focus"])
+        | ("POST", ["deviceio", "osd"])
+        | ("POST" | "DELETE", ["visual-prompts", _]) => &["settings.write"],
+        (
+            "GET",
+            ["stats" | "imaging" | "encoder" | "snapshot" | "network" | "speakers" | "device"
+            | "visual-prompts"],
+        )
+        | ("GET", ["ptz", "presets" | "nodes" | "status" | "config-options"])
+        | ("GET", ["media", "profiles"])
+        | ("GET", ["device", "log"])
+        | ("GET", ["deviceio", "relays" | "inputs" | "audio-sources" | "osds"]) => {
+            &["settings.read"]
+        }
+        _ => &[],
+    }
+}
+
+fn rpc_body_matches(envelope: EnvelopeContext<'_>, permission: &str, body: Option<&[u8]>) -> bool {
+    let Some(parts) = rpc_path_parts(envelope.path) else {
+        return false;
+    };
+    let ["admin", "cameras", camera, tail @ ..] = parts.as_slice() else {
+        return true;
+    };
+    let Ok(camera) = camera.parse::<u64>() else {
+        return true;
+    };
+    let payload = body.and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+    if tail == ["ptz"] && envelope.method.eq_ignore_ascii_case("POST") {
+        let required = match payload
+            .as_ref()
+            .and_then(|v| v.get("action"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(
+                "move" | "relative_move" | "absolute_move" | "stop" | "goto_preset" | "goto_home",
+            ) => "live.ptz",
+            Some("set_preset" | "remove_preset" | "set_home" | "aux") => "settings.write",
+            _ => return false,
+        };
+        if permission != required {
+            return false;
+        }
+    }
+    let mut pending: Vec<&serde_json::Value> = payload.as_ref().into_iter().collect();
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    if matches!(key.as_str(), "camera_id" | "edge_camera_id" | "camera_ids") {
+                        let values: Vec<_> = value
+                            .as_array()
+                            .map_or_else(|| vec![value], |ids| ids.iter().collect());
+                        if values.into_iter().any(|id| {
+                            id.as_u64()
+                                .or_else(|| id.as_str().and_then(|s| s.parse().ok()))
+                                != Some(camera)
+                        }) {
+                            return false;
+                        }
+                    } else {
+                        pending.push(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => pending.extend(values),
+            _ => {}
+        }
+    }
+    true
 }
 
 /// What the verifier was asked to authorise.
@@ -256,14 +520,28 @@ impl Verifier {
         }
 
         self.check_window(claims.iat, claims.exp)?;
+        if claims
+            .perm
+            .as_deref()
+            .is_some_and(|permission| !rpc_permissions(envelope).contains(&permission))
+        {
+            return Err(RejectReason::Invalid(InvalidReason::PermissionMismatch));
+        }
 
-        Ok(VerifiedActor {
+        let actor = VerifiedActor {
             sub: claims.sub,
             role: claims.role,
+            perm: claims.perm,
             jti: claims.jti,
             org_id: claims.org_id,
             actor_org_id: claims.actor_org_id.map(|id| id.to_string()),
-        })
+        };
+        if !actor.allows_system_action(envelope) {
+            return Err(RejectReason::Invalid(
+                InvalidReason::SystemSubNotPermittedForMethod,
+            ));
+        }
+        Ok(actor)
     }
 
     /// Verify a remote-shell `actor_token` — the grant that authorises
@@ -321,6 +599,7 @@ impl Verifier {
         Ok(VerifiedActor {
             sub: claims.sub,
             role: claims.role,
+            perm: None,
             jti: claims.jti,
             org_id: claims.org_id,
             // `ShellActorTokenClaims` has no acting-org field: a shell grant is

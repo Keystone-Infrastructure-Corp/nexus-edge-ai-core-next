@@ -309,6 +309,29 @@ async fn emit_progress(
     }
 }
 
+/// Whether an `update_assignment` that carries no actor token may proceed:
+/// only a re-delivery of the running version (the idempotent ack) or a
+/// strictly newer `MAJOR.MINOR.PATCH`. Any other shape is refused.
+pub(crate) fn tokenless_target_allowed(target: &str) -> bool {
+    tokenless_target_allowed_from(env!("NEXUS_BUILD_VERSION"), target)
+}
+
+fn tokenless_target_allowed_from(running: &str, target: &str) -> bool {
+    fn parse(version: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = version.split('.').map(|part| {
+            // Digits only, like the cloud's `^[0-9]+\.[0-9]+\.[0-9]+$`:
+            // `str::parse` alone would accept a leading `+`.
+            (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| part.parse::<u64>().ok())
+                .flatten()
+        });
+        let parsed = (parts.next()??, parts.next()??, parts.next()??);
+        parts.next().is_none().then_some(parsed)
+    }
+    target == running
+        || matches!((parse(running), parse(target)), (Some(running), Some(target)) if target > running)
+}
+
 /// Entry point for an inbound `update_assignment`. Persists the assigned
 /// channel and spawns the apply task (fire-and-forget — the caller does
 /// not await the long-running download/restart).
@@ -895,6 +918,37 @@ mod tests {
     use super::*;
     use ed25519_dalek::pkcs8::EncodePublicKey;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn tokenless_targets_compare_numerically_and_fail_closed() {
+        for (running, target, allowed) in [
+            ("0.1.9", "0.1.10", true),
+            ("0.1.10", "0.1.9", false),
+            ("0.1.227", "0.1.227", true),
+            ("0.1.227", "0.2.0", true),
+            ("1.0.0", "0.9.9", false),
+            ("0.1.227", "0.1.228-rc.1", false),
+            ("0.1.227", "0.1", false),
+            ("0.1.227", "0.1.228.1", false),
+            ("0.1.227", "0.1.+228", false),
+            ("0.1.227", "v0.1.229", false),
+            ("0.1.227", " 0.1.229", false),
+            ("0.1.227", "0.1.229 ", false),
+            ("0.1.227", "0..1", false),
+            ("0.1.227", "0.1.99999999999999999999", false),
+            ("0.1.0-dev", "9.9.9", false),
+            ("0.1.0-dev", "0.1.0-dev", true),
+            ("0.1.9", "0.1.010", true),
+            ("0.1.1", "0.1.01", false),
+            ("0.1.227", "0.1.\u{ff12}", false),
+        ] {
+            assert_eq!(
+                tokenless_target_allowed_from(running, target),
+                allowed,
+                "{running} -> {target}"
+            );
+        }
+    }
 
     #[test]
     fn release_dir_matches_exact_version_component() {

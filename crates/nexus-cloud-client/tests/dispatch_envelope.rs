@@ -114,14 +114,14 @@ async fn dispatch_envelope_happy_path() {
     let (sk, dispatcher) = build_dispatcher();
     let now = Utc::now().timestamp();
     let jti = uuid::Uuid::now_v7().to_string();
-    let tok = mint(&sk, "k1", &jti, "POST", "/admin/v1/cameras", now);
+    let tok = mint(&sk, "k1", &jti, "POST", "/admin/cameras", now);
 
     let env = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(uuid::Uuid::now_v7().to_string()),
     });
 
@@ -141,13 +141,13 @@ async fn dispatch_envelope_idempotent_retry_with_fresh_jti_is_admitted() {
 
     // Cloud's first attempt.
     let jti1 = uuid::Uuid::now_v7().to_string();
-    let tok1 = mint(&sk, "k1", &jti1, "POST", "/admin/v1/cameras", now);
+    let tok1 = mint(&sk, "k1", &jti1, "POST", "/admin/cameras", now);
     let env1 = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok1),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(request_id.clone()),
     });
     dispatcher
@@ -158,13 +158,13 @@ async fn dispatch_envelope_idempotent_retry_with_fresh_jti_is_admitted() {
     // Cloud retries with the SAME request_id but a FRESHLY-minted token
     // (new jti, new sig) — must be admitted by the replay layer.
     let jti2 = uuid::Uuid::now_v7().to_string();
-    let tok2 = mint(&sk, "k1", &jti2, "POST", "/admin/v1/cameras", now);
+    let tok2 = mint(&sk, "k1", &jti2, "POST", "/admin/cameras", now);
     let env2 = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok2),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(request_id.clone()),
     });
     dispatcher
@@ -179,13 +179,13 @@ async fn dispatch_envelope_true_replay_still_rejected() {
     let now = Utc::now().timestamp();
     let request_id = uuid::Uuid::now_v7().to_string();
     let jti = uuid::Uuid::now_v7().to_string();
-    let tok = mint(&sk, "k1", &jti, "POST", "/admin/v1/cameras", now);
+    let tok = mint(&sk, "k1", &jti, "POST", "/admin/cameras", now);
     let env = rpc_envelope(RpcCallPayload {
         actor_token: Some(tok),
         body: None,
         headers: None,
         method: "POST".into(),
-        path: "/admin/v1/cameras".into(),
+        path: "/admin/cameras".into(),
         request_id: Some(request_id),
     });
 
@@ -335,7 +335,7 @@ async fn dispatch_envelope_mutating_without_actor_token_still_rejected() {
             body: None,
             headers: None,
             method: method.into(),
-            path: "/admin/v1/cameras".into(),
+            path: "/admin/cameras".into(),
             request_id: Some(uuid::Uuid::now_v7().to_string()),
         });
         let err = dispatcher

@@ -176,6 +176,11 @@ impl Handler for EngineRpcHandler {
         actor: &VerifiedActor,
         body: Option<&[u8]>,
     ) -> Result<Vec<u8>, String> {
+        if !actor.allows_rpc(envelope, body, true) {
+            return Err(
+                EngineRpcError::NotFound("no handler for this path".to_string()).into_wire_json(),
+            );
+        }
         // Fast-path: the Expedite endpoint is implemented in-process
         // because it bumps a SQL priority + kicks the cold-replicator
         // `Notify` directly — going through the local admin API would
@@ -189,7 +194,7 @@ impl Handler for EngineRpcHandler {
         }
         // The cloud's remote-access toggle is handled in-process and ONLY
         // here: the local admin API serves the GET but has no setter, so
-        // nothing but a verified, owner-role RPC can switch it.
+        // only a verified shell.policy capability (or legacy Owner) can switch it.
         if envelope.method.eq_ignore_ascii_case("PUT") && is_remote_access_path(envelope.path) {
             return self
                 .handle_put_remote_access(actor, body)
@@ -236,7 +241,7 @@ impl EngineRpcHandler {
     }
 
     /// `PUT /admin/remote_access` `{"enabled": bool}` — switch remote
-    /// access on or off live. Owner role only (anything else is NotFound,
+    /// access on or off live. Requires shell.policy or legacy Owner (NotFound
     /// like every other unauthorised arm). Switching on is refused while
     /// the box owner has `cloud_may_enable = false`; switching off is
     /// always allowed. The choice is persisted so it survives a restart.
@@ -249,7 +254,13 @@ impl EngineRpcHandler {
         struct Req {
             enabled: bool,
         }
-        if actor.role != "owner" {
+        if !actor
+            .perm
+            .as_deref()
+            .map_or(actor.role == "owner", |permission| {
+                permission == "shell.policy"
+            })
+        {
             return Err(EngineRpcError::NotFound(
                 "no handler for this path".to_string(),
             ));
@@ -292,10 +303,15 @@ impl EngineRpcHandler {
         actor: &VerifiedActor,
         _body: Option<&[u8]>,
     ) -> Result<Vec<u8>, EngineRpcError> {
-        // Role gate — owner/admin/operator only. We return NotFound
-        // (rather than Forbidden) for any other role to avoid
-        // leaking the existence of the endpoint to viewers.
-        if !is_priviledged_role(&actor.role) {
+        // Exact signed clip capability, or the legacy preset decision.
+        // Keep the established NotFound response for unauthorized callers.
+        if !actor
+            .perm
+            .as_deref()
+            .map_or(is_priviledged_role(&actor.role), |permission| {
+                permission == "clips.expedite"
+            })
+        {
             return Err(EngineRpcError::NotFound(
                 "no handler for this path".to_string(),
             ));
@@ -421,18 +437,14 @@ impl EngineRpcHandler {
         actor: &VerifiedActor,
         body: Option<&[u8]>,
     ) -> Result<Vec<u8>, String> {
-        // Defence-in-depth role gate. The cloud side already gates
-        // owner/admin on mutating proxies and owner/admin/viewer on
-        // GETs, but a buggy cloud-side ACL change MUST NOT silently
-        // open the surface to viewers. NotFound (not Forbidden) so
-        // we don't leak the existence of the surface to lower-role
-        // tokens.
+        // Enforce the verified action capability again at the side-effect
+        // boundary. Tokens without a capability retain their preset gate.
         //
         // Read-only methods accept the synthesised `anonymous`
         // actor too — ARCHITECTURE.md §5.7 lets the cloud's
         // `send_read_rpc` omit `actor_token`, and the dispatcher
         // synthesises an `anonymous:cloud-read` actor in that case.
-        // Mutating methods always require a privileged role.
+        // Legacy mutating tokens still require a privileged role.
         let is_safe = matches!(
             envelope.method.to_ascii_uppercase().as_str(),
             "GET" | "HEAD" | "OPTIONS"
@@ -442,7 +454,7 @@ impl EngineRpcHandler {
         } else {
             is_priviledged_role(&actor.role)
         };
-        if !role_ok {
+        if !actor.allows_rpc(envelope, body, role_ok) {
             return Err(
                 EngineRpcError::NotFound("no handler for this path".to_string()).into_wire_json(),
             );
@@ -1442,6 +1454,7 @@ mod tests {
             jti: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c101".into(),
             org_id: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c102".into(),
             actor_org_id: None,
+            perm: None,
         };
 
         handler
@@ -1511,6 +1524,7 @@ mod tests {
             jti: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c201".into(),
             org_id: "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c202".into(),
             actor_org_id: None,
+            perm: None,
         }
     }
 
@@ -1707,5 +1721,275 @@ mod tests {
                 Some(access.is_enabled())
             );
         }
+    }
+    fn signed_test_token(
+        key: &ed25519_dalek::SigningKey,
+        role: &str,
+        permission: Option<&str>,
+        method: &str,
+        path: &str,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use ed25519_dalek::Signer as _;
+        let now = chrono::Utc::now().timestamp();
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","kid":"test"}"#);
+        let claims = json!({"iss":"test","aud":"nexus-edge-rpc","sub":"human", "role":role,"perm":permission,"jti":uuid::Uuid::now_v7().to_string(),"core_id":"core","org_id":"org","http_method":method,"path":path,"iat":now-1,"exp":now+60});
+        let input = format!(
+            "{header}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        format!(
+            "{input}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).to_bytes())
+        )
+    }
+
+    fn signed_test_dispatcher(
+        handler: EngineRpcHandler,
+    ) -> (ed25519_dalek::SigningKey, RpcDispatcher<EngineRpcHandler>) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let verifier = nexus_cloud_client::actor_token::VerifierBuilder::new("core")
+            .trusted_key(nexus_cloud_client::actor_token::TrustedKey {
+                kid: "test".to_string(),
+                key: key.verifying_key(),
+            })
+            .build()
+            .unwrap();
+        (
+            key,
+            RpcDispatcher::new(
+                verifier,
+                nexus_cloud_client::dispatcher::SystemMethodPolicy::default(),
+                handler,
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn signed_permissions_gate_real_engine_forwarding_without_promoting_viewers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let app = axum::Router::new().fallback(move || {
+            captured.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(json!({"ok":true})) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut handler, _, _dir) = remote_access_handler(true, false).await;
+        handler.loopback_admin_base = Arc::new(ArcSwap::from_pointee(base));
+        let (key, dispatcher) = signed_test_dispatcher(handler);
+        for (role, permission, method, path, body, allowed) in [
+            (
+                "viewer",
+                Some("settings.write"),
+                "PUT",
+                "/admin/cameras/1",
+                json!({"camera_id":1}),
+                true,
+            ),
+            (
+                "owner",
+                Some("live.ptz"),
+                "PUT",
+                "/admin/cameras/1",
+                json!({}),
+                false,
+            ),
+            (
+                "owner",
+                Some("settings.write"),
+                "PUT",
+                "/admin/cameras/1",
+                json!({"camera_id":2}),
+                false,
+            ),
+            (
+                "viewer",
+                Some("live.ptz"),
+                "POST",
+                "/admin/cameras/1/ptz",
+                json!({"action":"set_home"}),
+                false,
+            ),
+            (
+                "viewer",
+                Some("settings.write"),
+                "POST",
+                "/admin/cameras/1/ptz",
+                json!({"action":"set_home"}),
+                true,
+            ),
+            (
+                "viewer",
+                Some("live.ptz"),
+                "POST",
+                "/admin/cameras/1/ptz",
+                json!({"action":"move"}),
+                true,
+            ),
+            (
+                "viewer",
+                Some("fleet.firmware"),
+                "POST",
+                "/admin/cameras/1/firmware:upgrade",
+                json!({}),
+                true,
+            ),
+            (
+                "owner",
+                Some("settings.write"),
+                "POST",
+                "/admin/cameras/1/firmware:upgrade",
+                json!({}),
+                false,
+            ),
+            (
+                "viewer",
+                Some("settings.network"),
+                "PUT",
+                "/admin/cameras/1/network/interface",
+                json!({}),
+                true,
+            ),
+            (
+                "owner",
+                Some("settings.write"),
+                "PUT",
+                "/admin/network/plan",
+                json!({}),
+                false,
+            ),
+            ("viewer", None, "PUT", "/admin/cameras/1", json!({}), false),
+            ("owner", None, "PUT", "/admin/cameras/1", json!({}), true),
+            // A legacy (perm-less) token never reaches an opaque or unmapped
+            // mutating route, whatever its role.
+            ("owner", None, "POST", "/admin/proxy", json!({}), false),
+            (
+                "owner",
+                None,
+                "POST",
+                "/admin/cameras/1/onvif/raw",
+                json!({}),
+                false,
+            ),
+            ("owner", None, "POST", "/admin/unmapped", json!({}), false),
+            // The cloud's core rename and core delete sign cores.manage.
+            (
+                "viewer",
+                Some("cores.manage"),
+                "PUT",
+                "/admin/server/identity",
+                json!({}),
+                true,
+            ),
+            (
+                "viewer",
+                Some("cores.manage"),
+                "DELETE",
+                "/admin/cloud/enrollment",
+                json!({}),
+                true,
+            ),
+            (
+                "owner",
+                Some("cores.manage"),
+                "PUT",
+                "/admin/server/bind",
+                json!({}),
+                false,
+            ),
+        ] {
+            let token = signed_test_token(&key, role, permission, method, path);
+            let result = dispatcher
+                .dispatch(
+                    "admin_write",
+                    EnvelopeContext { method, path },
+                    Some(&token),
+                    Some(&serde_json::to_vec(&body).unwrap()),
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "{role} {permission:?} {method} {path} {body}: {result:?}"
+            );
+            assert_eq!(
+                calls.swap(0, Ordering::SeqCst),
+                usize::from(allowed),
+                "denied calls must never reach loopback handlers"
+            );
+        }
+        // Tokenless safe reads keep the existing local/read-only contract.
+        assert!(dispatcher
+            .dispatch(
+                "read",
+                EnvelopeContext {
+                    method: "GET",
+                    path: "/admin/cameras"
+                },
+                None,
+                None
+            )
+            .await
+            .is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn signed_shell_policy_controls_the_real_persisted_switch() {
+        let (handler, access, _dir) = remote_access_handler(true, false).await;
+        let (key, dispatcher) = signed_test_dispatcher(handler);
+        let envelope = EnvelopeContext {
+            method: "PUT",
+            path: "/admin/remote_access",
+        };
+        for permission in [Some("settings.write"), Some("unknown.permission")] {
+            let token =
+                signed_test_token(&key, "owner", permission, envelope.method, envelope.path);
+            assert!(dispatcher
+                .dispatch(
+                    "remote_access",
+                    envelope,
+                    Some(&token),
+                    Some(br#"{"enabled":true}"#)
+                )
+                .await
+                .is_err());
+            assert!(!access.is_enabled());
+            assert_eq!(
+                crate::admin_runtime::read_persisted_remote_access_enabled(
+                    &dispatcher.handler().store
+                )
+                .await,
+                None
+            );
+        }
+        let token = signed_test_token(
+            &key,
+            "viewer",
+            Some("shell.policy"),
+            envelope.method,
+            envelope.path,
+        );
+        dispatcher
+            .dispatch(
+                "remote_access",
+                envelope,
+                Some(&token),
+                Some(br#"{"enabled":true}"#),
+            )
+            .await
+            .unwrap();
+        assert!(access.is_enabled());
+        assert_eq!(
+            crate::admin_runtime::read_persisted_remote_access_enabled(&dispatcher.handler().store)
+                .await,
+            Some(true)
+        );
     }
 }
