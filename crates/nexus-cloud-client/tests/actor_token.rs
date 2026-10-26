@@ -656,6 +656,240 @@ async fn signed_camera_and_ptz_actions_bind_the_body_before_the_handler() {
     }
 }
 
+/// Talk-down start and stop sign `live.talkdown` for one camera; speaker
+/// setup, assignment and the test chime sign `settings.write` (cloud ADR-091).
+/// Each route takes only its own permission, whatever the role, and a body
+/// naming another camera is refused before the handler runs.
+#[tokio::test]
+async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingHandler(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Handler for CountingHandler {
+        async fn handle(
+            &self,
+            _: &str,
+            _: EnvelopeContext<'_>,
+            _: &VerifiedActor,
+            _: Option<&[u8]>,
+        ) -> Result<Vec<u8>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+    let (sk, verifier) = build_verifier_with("k1");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = RpcDispatcher::new(
+        verifier,
+        SystemMethodPolicy::default(),
+        CountingHandler(calls.clone()),
+    );
+    let start = json!({"mode":"clip","clip":{"url":"https://blob/x.wav","sha256":"ab"}});
+    let stop = json!({"session_id":"0192f0c4-1f7a-7cc0-8b39-6a54f1c5e0aa"});
+    let speaker = json!({"name":"Gate","host":"10.0.0.9","port":5060,"driver":"sip"});
+    for (method, path, permission, body, allowed) in [
+        (
+            "POST",
+            "/admin/cameras/7/talk-down",
+            "live.talkdown",
+            Some(&start),
+            true,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/stop",
+            "live.talkdown",
+            Some(&stop),
+            true,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/stop",
+            "live.talkdown",
+            None,
+            true,
+        ),
+        (
+            "POST",
+            "/admin/speakers",
+            "settings.write",
+            Some(&speaker),
+            true,
+        ),
+        (
+            "PUT",
+            "/admin/speakers/3",
+            "settings.write",
+            Some(&speaker),
+            true,
+        ),
+        ("DELETE", "/admin/speakers/3", "settings.write", None, true),
+        (
+            "POST",
+            "/admin/speakers/3/test",
+            "settings.write",
+            None,
+            true,
+        ),
+        (
+            "PUT",
+            "/admin/cameras/7/talk-down",
+            "settings.write",
+            None,
+            true,
+        ),
+        // The other permission, or a neighbour's, for the same route.
+        (
+            "POST",
+            "/admin/cameras/7/talk-down",
+            "settings.write",
+            Some(&start),
+            false,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down",
+            "live.ptz",
+            Some(&start),
+            false,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/stop",
+            "settings.write",
+            None,
+            false,
+        ),
+        (
+            "PUT",
+            "/admin/cameras/7/talk-down",
+            "live.talkdown",
+            None,
+            false,
+        ),
+        (
+            "POST",
+            "/admin/speakers",
+            "live.talkdown",
+            Some(&speaker),
+            false,
+        ),
+        (
+            "POST",
+            "/admin/speakers/3/test",
+            "live.talkdown",
+            None,
+            false,
+        ),
+        ("DELETE", "/admin/speakers/3", "settings.read", None, false),
+        // The edge numbers its cameras; no other spelling maps.
+        (
+            "POST",
+            "/admin/cameras/front/talk-down",
+            "live.talkdown",
+            Some(&start),
+            false,
+        ),
+    ] {
+        calls.store(0, Ordering::SeqCst);
+        let mut spec = TokenSpec::fresh(Utc::now().timestamp(), method, path, "k1");
+        spec.role = "viewer".into();
+        spec.perm = Some(permission.into());
+        let bytes = body.map(|b| serde_json::to_vec(b).unwrap());
+        let result = dispatcher
+            .dispatch(
+                "talk-down",
+                EnvelopeContext { method, path },
+                Some(&mint(&sk, &spec)),
+                bytes.as_deref(),
+            )
+            .await;
+        assert_eq!(result.is_ok(), allowed, "{method} {path} {permission}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(allowed),
+            "a refusal must precede the handler: {method} {path} {permission}"
+        );
+    }
+
+    // A speaker's whole camera set is settings, whichever cameras it names.
+    let path = "/admin/speakers/3/cameras";
+    let mut spec = TokenSpec::fresh(Utc::now().timestamp(), "PUT", path, "k1");
+    spec.perm = Some("settings.write".into());
+    let body = serde_json::to_vec(&json!({"camera_ids":[7,8]})).unwrap();
+    assert!(dispatcher
+        .dispatch(
+            "talk-down",
+            EnvelopeContext {
+                method: "PUT",
+                path
+            },
+            Some(&mint(&sk, &spec)),
+            Some(&body),
+        )
+        .await
+        .is_ok());
+
+    // A start or stop whose body names another camera than its path.
+    calls.store(0, Ordering::SeqCst);
+    for (path, body) in [
+        (
+            "/admin/cameras/7/talk-down",
+            json!({"mode":"tone","camera_id":8}),
+        ),
+        (
+            "/admin/cameras/7/talk-down/stop",
+            json!({"camera_ids":[7,8]}),
+        ),
+    ] {
+        let mut spec = TokenSpec::fresh(Utc::now().timestamp(), "POST", path, "k1");
+        spec.perm = Some("live.talkdown".into());
+        let body = serde_json::to_vec(&body).unwrap();
+        let result = dispatcher
+            .dispatch(
+                "talk-down",
+                EnvelopeContext {
+                    method: "POST",
+                    path,
+                },
+                Some(&mint(&sk, &spec)),
+                Some(&body),
+            )
+            .await;
+        assert!(result.is_err(), "{path} reached another camera");
+    }
+    // A token the cloud signed for camera 7 does not start camera 8.
+    let mut spec = TokenSpec::fresh(
+        Utc::now().timestamp(),
+        "POST",
+        "/admin/cameras/7/talk-down",
+        "k1",
+    );
+    spec.perm = Some("live.talkdown".into());
+    let result = dispatcher
+        .dispatch(
+            "talk-down",
+            EnvelopeContext {
+                method: "POST",
+                path: "/admin/cameras/8/talk-down",
+            },
+            Some(&mint(&sk, &spec)),
+            Some(&serde_json::to_vec(&start).unwrap()),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(DispatchError::Reject(RejectReason::Invalid(
+            InvalidReason::PathMismatch
+        )))
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no other camera was reached"
+    );
+}
+
 #[tokio::test]
 async fn signed_permissions_preserve_the_system_method_allowlist() {
     let (sk, verifier) = build_verifier_with("k1");
@@ -849,6 +1083,8 @@ async fn a_perm_less_token_reaches_only_mapped_mutating_routes() {
         ("PUT", "/admin/unmapped", false),
         ("POST", "/admin/cameras", true),
         ("PUT", "/admin/cameras/1", true),
+        ("POST", "/admin/cameras/1/talk-down", true),
+        ("POST", "/admin/speakers", true),
         ("GET", "/admin/unmapped", true),
     ] {
         let mut spec = TokenSpec::fresh(Utc::now().timestamp(), method, path, "k1");

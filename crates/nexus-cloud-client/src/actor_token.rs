@@ -247,7 +247,12 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         | ("POST", ["admin", "server", "restart"])
         | ("PUT", ["admin", "auth", "config"])
         | ("POST", ["admin", "auth", "oidc", "test-discovery"])
-        | ("POST", ["admin", "cloud", "enroll"]) => &["settings.write"],
+        | ("POST", ["admin", "cloud", "enroll"])
+        // Speaker setup, assignment and the test chime (cloud ADR-091).
+        | ("POST", ["admin", "speakers"])
+        | ("PUT" | "DELETE", ["admin", "speakers", _])
+        | ("PUT", ["admin", "speakers", _, "cameras"])
+        | ("POST", ["admin", "speakers", _, "test"]) => &["settings.write"],
         ("POST", ["admin", "users"])
         | ("PUT" | "DELETE", ["admin", "users", _])
         | ("POST", ["admin", "users", _, "reset-password" | "unlock"]) => &["members.manage"],
@@ -272,7 +277,9 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         | ("GET", ["admin", "auth", "config"])
         | ("GET", ["admin", "cloud", "enrollment"])
         | ("GET", ["admin", "network", "interfaces" | "plan" | "roles"])
-        | ("GET", ["admin", "network", "apply", "status"]) => &["settings.read"],
+        | ("GET", ["admin", "network", "apply", "status"])
+        | ("GET", ["admin", "speakers"])
+        | ("GET", ["admin", "speakers", _]) => &["settings.read"],
         _ => &[],
     }
 }
@@ -282,7 +289,12 @@ fn camera_rpc_permissions(method: &str, tail: &[&str]) -> &'static [&'static str
         ("POST", ["ptz"]) => &["live.ptz", "settings.write"],
         ("POST", ["firmware:upgrade"]) => &["fleet.firmware"],
         ("PUT", ["network", "interface"]) => &["settings.network"],
-        ("PUT" | "DELETE", [])
+        // Starting or stopping talk-down is a live act on this camera; its
+        // speaker assignment is a setting (cloud ADR-091).
+        ("POST", ["talk-down"] | ["talk-down", "stop"]) => &["live.talkdown"],
+        ("GET", ["talk-down"]) => &["settings.read", "live.talkdown"],
+        ("PUT", ["talk-down"])
+        | ("PUT" | "DELETE", [])
         | ("PUT", ["imaging" | "encoder"])
         | ("PUT", ["network", "safe"])
         | ("PUT", ["deviceio", "relays"])
