@@ -1772,7 +1772,7 @@ async fn delete_camera(
         return Err(e.into());
     }
     // The delete cascaded its speaker assignment; its stop would now 404.
-    s.talkdown.stop_where(|_, camera| camera == Some(id));
+    s.talkdown.stop_where(|_, camera, _| camera == Some(id));
     // Same channel as upsert — the reconciler diffs the live set
     // against the DB and stops the supervisor for any removed id.
     let _ = s
@@ -10165,6 +10165,75 @@ mod tests {
             started.elapsed() >= std::time::Duration::from_secs(2),
             "camera 1's stop ended camera 2's chime: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A stop that names a session ends only that one: a late stop for the
+    /// camera's ended session leaves its next one playing. Its own id, or no
+    /// id, ends it.
+    #[tokio::test]
+    async fn talk_down_stop_with_a_session_id_ends_only_that_session() {
+        let (port, _rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, _) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        let tone = serde_json::json!({ "mode": "tone" });
+        let stop = "/api/v1/admin/cameras/1/talk-down/stop";
+        let session_id = |body: &str| speaker_json(body)["session_id"].clone();
+
+        let (status, body) = start_talk_down(&app, 1, tone.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let a = session_id(&body);
+        let (status, body) = speaker_call(&app, Method::POST, stop, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .expect("a's BYE")
+            .unwrap();
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+
+        for case in ["a's id", "b's id", "no body", "{}"] {
+            let (port, _rtp, uas) = fake_speaker().await;
+            assign_speaker(&app, 1, "127.0.0.1", port).await;
+            let started = std::time::Instant::now();
+            let (status, body) = start_talk_down(&app, 1, tone.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{case}: {body}");
+            let b = session_id(&body);
+            let stop_body = match case {
+                "a's id" => Some(serde_json::json!({ "session_id": a })),
+                "b's id" => Some(serde_json::json!({ "session_id": b })),
+                "{}" => Some(serde_json::json!({})),
+                _ => None,
+            };
+            let (status, body) = speaker_call(&app, Method::POST, stop, stop_body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{case}: {body}");
+            let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+                .await
+                .unwrap_or_else(|_| panic!("{case}: no BYE"))
+                .unwrap();
+            assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"], "{case}");
+            let ended_early = started.elapsed() < std::time::Duration::from_millis(1500);
+            assert_eq!(
+                ended_early,
+                case != "a's id",
+                "{case}: the BYE came {:?} after the start",
+                started.elapsed()
+            );
+            wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        }
+
+        let bad = serde_json::json!({ "session_id": "not-a-uuid" });
+        let (status, body) = speaker_call(&app, Method::POST, stop, Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let rows = store
+            .list_audit_for_resource("camera", "1", 50)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().any(|r| r.action == "talk_down.stop"
+                && r.after_json
+                    .as_deref()
+                    .is_some_and(|after| speaker_json(after)["session_id"] == a)),
+            "the stop's audit row names the session"
         );
     }
 

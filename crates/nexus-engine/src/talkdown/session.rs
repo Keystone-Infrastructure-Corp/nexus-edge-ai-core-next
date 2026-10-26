@@ -93,8 +93,9 @@ pub enum StartError {
     Negotiation(String),
 }
 
-/// Each busy speaker: the camera that started its session, and the session's cancel.
-type Active = Arc<Mutex<HashMap<SpeakerId, (Option<CameraId>, CancellationToken)>>>;
+/// Each busy speaker: the camera that started its session, the session's id,
+/// and its cancel.
+type Active = Arc<Mutex<HashMap<SpeakerId, (Option<CameraId>, Uuid, CancellationToken)>>>;
 
 /// The engine's talk-down sessions, shared by every handler.
 #[derive(Clone, Default)]
@@ -118,15 +119,18 @@ impl TalkdownSessions {
         self.active.lock().contains_key(&speaker_id)
     }
 
-    /// Cancel every session `ends` picks by its speaker and the camera that
-    /// started it (`None` for a speaker test). Each hangs up, then releases
-    /// its speaker. Returns their speakers.
-    pub fn stop_where(&self, ends: impl Fn(SpeakerId, Option<CameraId>) -> bool) -> Vec<SpeakerId> {
+    /// Cancel every session `ends` picks by its speaker, the camera that
+    /// started it (`None` for a speaker test) and its id. Each hangs up, then
+    /// releases its speaker. Returns their speakers.
+    pub fn stop_where(
+        &self,
+        ends: impl Fn(SpeakerId, Option<CameraId>, Uuid) -> bool,
+    ) -> Vec<SpeakerId> {
         let active = self.active.lock();
         active
             .iter()
-            .filter(|(&speaker_id, (camera_id, _))| ends(speaker_id, *camera_id))
-            .map(|(&speaker_id, (_, cancel))| {
+            .filter(|(&speaker_id, (camera_id, id, _))| ends(speaker_id, *camera_id, *id))
+            .map(|(&speaker_id, (_, _, cancel))| {
                 cancel.cancel();
                 speaker_id
             })
@@ -265,14 +269,15 @@ impl TalkdownSessions {
         speaker_id: SpeakerId,
         camera_id: Option<CameraId>,
     ) -> Result<Session, StartError> {
+        let id = Uuid::now_v7();
         let cancel = CancellationToken::new();
         match self.active.lock().entry(speaker_id) {
             Entry::Occupied(_) => return Err(StartError::Busy),
-            Entry::Vacant(slot) => slot.insert((camera_id, cancel.clone())),
+            Entry::Vacant(slot) => slot.insert((camera_id, id, cancel.clone())),
         };
         Ok(Session {
             active: self.active.clone(),
-            id: Uuid::now_v7(),
+            id,
             speaker_id,
             camera_id,
             cancel,
@@ -317,6 +322,6 @@ mod tests {
         });
         assert!(task.await.unwrap_err().is_panic());
         assert!(!sessions.is_busy(7));
-        assert!(sessions.stop_where(|_, _| true).is_empty());
+        assert!(sessions.stop_where(|_, _, _| true).is_empty());
     }
 }

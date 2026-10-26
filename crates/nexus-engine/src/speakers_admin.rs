@@ -13,7 +13,8 @@
 //!   [`Audio`] on the camera's speaker; answers once the speaker picks up,
 //!   and for `live` audio once the edge has its `sdp_answer` for the SFU
 //! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down/stop` — end
-//!   the session this camera started
+//!   the session this camera started; an optional `{"session_id": …}` ends
+//!   it only when it is that session
 //! * `POST           /api/v1/admin/speakers/{id}/test` — play the chime and
 //!   answer when it has finished
 //!
@@ -32,6 +33,7 @@
 
 use std::net::SocketAddr;
 
+use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -89,6 +91,11 @@ pub(crate) struct CameraIdsInput {
 #[derive(Deserialize)]
 pub(crate) struct TalkDownInput {
     speaker_id: Option<SpeakerId>,
+}
+
+#[derive(Default, Deserialize)]
+struct StopInput {
+    session_id: Option<Uuid>,
 }
 
 /// Who asked, for the audit rows.
@@ -426,7 +433,7 @@ pub(crate) async fn delete_speaker(
         )
         .await
         .map_err(refused(StatusCode::NOT_FOUND))?;
-    s.talkdown.stop_where(|speaker_id, _| speaker_id == id);
+    s.talkdown.stop_where(|speaker_id, _, _| speaker_id == id);
     publish(
         &s,
         serde_json::json!({ "kind": "speaker", "action": "delete", "speaker_id": id }),
@@ -478,7 +485,7 @@ pub(crate) async fn put_speaker_cameras(
         .map_err(refused(StatusCode::BAD_REQUEST))?;
     // A listed camera's session on another speaker, and this speaker's
     // session from a camera no longer listed, have lost their pairing.
-    s.talkdown.stop_where(|speaker_id, camera| {
+    s.talkdown.stop_where(|speaker_id, camera, _| {
         camera.is_some_and(|c| out.camera_ids.contains(&c) != (speaker_id == id))
     });
     publish(
@@ -563,7 +570,7 @@ pub(crate) async fn put_talk_down(
         )
         .await
         .map_err(refused(StatusCode::NOT_FOUND))?;
-    s.talkdown.stop_where(|speaker_id, camera| {
+    s.talkdown.stop_where(|speaker_id, camera, _| {
         camera == Some(camera_id) && Some(speaker_id) != body.speaker_id
     });
     publish(
@@ -650,21 +657,35 @@ pub(crate) async fn start_on(
 
 /// End the session this camera started, on whichever speaker it plays; a
 /// session another camera started on a shared speaker is not this camera's
-/// to end. Idempotent: 204 whether or not there was one.
+/// to end. A body naming a `session_id` ends only that session, so a late
+/// stop for a session that has ended leaves the camera's next one playing.
+/// Idempotent: 204 whether or not there was one.
 pub(crate) async fn stop_talk_down(
     State(s): State<ApiState>,
     Path(camera_id): Path<CameraId>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     session: Option<SessionContext>,
+    body: Bytes,
 ) -> Result<StatusCode, Refusal> {
-    let res = known_camera(&s, camera_id)
-        .await
-        .map(|()| {
-            let stopped = s.talkdown.stop_where(|_, camera| camera == Some(camera_id));
-            serde_json::json!({ "speaker_ids": stopped, "stopped": !stopped.is_empty() })
-        })
-        .map_err(Refusal::from);
+    let res = async {
+        let StopInput { session_id } = if body.is_empty() {
+            StopInput::default()
+        } else {
+            serde_json::from_slice(&body)
+                .map_err(|e| Refusal(StatusCode::BAD_REQUEST, "bad_request", e.to_string()))?
+        };
+        known_camera(&s, camera_id).await?;
+        let stopped = s.talkdown.stop_where(|_, camera, id| {
+            camera == Some(camera_id) && session_id.is_none_or(|want| want == id)
+        });
+        let mut out = serde_json::json!({ "speaker_ids": stopped, "stopped": !stopped.is_empty() });
+        if let Some(id) = session_id {
+            out["session_id"] = serde_json::json!(id);
+        }
+        Ok(out)
+    }
+    .await;
     let caller = Caller {
         s: &s,
         session,
