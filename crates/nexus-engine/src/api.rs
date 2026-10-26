@@ -9952,13 +9952,15 @@ mod tests {
     }
 
     /// Every way camera 1 and its speaker `a` part: the camera moves to `b`
-    /// (by either route), `a` drops the camera, or either is deleted.
-    const PARTINGS: [&str; 5] = [
+    /// (by either route), `a` drops the camera, either is deleted, or `a` is
+    /// edited (a session plays on the speaker as it was read).
+    const PARTINGS: [&str; 6] = [
         "camera to b",
         "b takes camera",
         "a drops camera",
         "delete a",
         "delete camera",
+        "edit a",
     ];
 
     /// The request that makes one of [`PARTINGS`].
@@ -9980,6 +9982,11 @@ mod tests {
                 Some(serde_json::json!({ "camera_ids": [] })),
             ),
             "delete a" => (Method::DELETE, format!("/api/v1/admin/speakers/{a}"), None),
+            "edit a" => (
+                Method::PUT,
+                format!("/api/v1/admin/speakers/{a}"),
+                Some(serde_json::json!({ "name": "spk", "host": "127.0.0.1", "port": 9 })),
+            ),
             _ => (Method::DELETE, "/api/v1/admin/cameras/1".to_string(), None),
         }
     }

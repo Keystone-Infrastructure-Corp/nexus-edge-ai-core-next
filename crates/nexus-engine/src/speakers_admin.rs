@@ -19,7 +19,8 @@
 //!   answer when it has finished
 //!
 //! A session ends as soon as its camera and speaker part: a delete of the
-//! speaker, or an assignment that moves the camera off it.
+//! speaker, an assignment that moves the camera off it, or an edit of the
+//! speaker (the session dialled it as it was).
 //!
 //! A talk-down action refused for a reason the cloud acts on answers
 //! [`Refusal`]'s `{"error": code, "message": …}`: `talk_down_unsupported`,
@@ -394,6 +395,7 @@ pub(crate) async fn update_speaker(
         )
         .await
         .map_err(refused(StatusCode::NOT_FOUND))?;
+    s.talkdown.stop_where(|speaker_id, _, _| speaker_id == id);
     publish(
         &s,
         serde_json::json!({ "kind": "speaker", "action": "update", "speaker_id": id }),
@@ -639,7 +641,7 @@ pub(crate) async fn start_talk_down(
 }
 
 /// Play `audio` on `sp`, which the caller read as the camera's speaker;
-/// refused once the camera no longer pairs with it.
+/// refused once the camera no longer pairs with it as read (an edit too).
 pub(crate) async fn start_on(
     s: &ApiState,
     camera_id: CameraId,
@@ -648,7 +650,7 @@ pub(crate) async fn start_on(
 ) -> Result<(Uuid, Option<String>), Refusal> {
     // A failed re-read cannot confirm the pairing: refuse rather than call.
     let paired = async {
-        matches!(s.store.speaker_for_camera(camera_id).await, Ok(Some(now)) if now.id == sp.id)
+        matches!(s.store.speaker_for_camera(camera_id).await, Ok(Some(now)) if now == *sp)
     };
     let (session_id, sdp_answer, _playing) =
         s.talkdown.start(sp, Some(camera_id), audio, paired).await?;
