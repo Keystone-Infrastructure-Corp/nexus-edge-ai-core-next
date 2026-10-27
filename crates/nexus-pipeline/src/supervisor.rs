@@ -8,6 +8,7 @@
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
@@ -526,6 +527,8 @@ async fn run_camera(
         let mut current_clip: Option<ClipHandle> = None;
         // A refused rotation open must be retried independently of motion sampling.
         let mut reopen_after_rotation = false;
+        let mut open_retry_at: Option<Instant> = None;
+        let mut open_retry_delay = Duration::from_millis(500);
         // Alert snapshot output dir — created once per camera task so the
         // per-alert write path (below) never races a mkdir. Failure to
         // create it is non-fatal: snapshots are best-effort and the
@@ -1038,7 +1041,9 @@ async fn run_camera(
                                         );
                                     }
                                     clip_opened_at = None;
-                                    post_roll.reset();
+                                    // Resizing rotates the file, preserving motion and post-roll.
+                                    reopen_after_rotation = true;
+                                    frames_since_size_stat = 0;
                                 }
                                 rebuild_source = true;
                                 return ControlFlow::Break(());
@@ -1361,10 +1366,14 @@ async fn run_camera(
                 let action = post_roll.tick(frame.captured_mono, has_live_motion);
                 if matches!(action, PostRollAction::CloseNow) {
                     reopen_after_rotation = false;
+                    open_retry_at = None;
+                    open_retry_delay = Duration::from_millis(500);
                 }
                 // Recorder continuity cannot depend on whether Updated rows are due.
                 let should_open = current_clip.is_none()
+                    && open_retry_at.is_none_or(|retry_at| frame.captured_mono >= retry_at)
                     && (reopen_after_rotation
+                        || alert_kept_alive
                         || decisions.iter().any(|d| matches!(d.kind, MotionKind::Born)));
                 if should_open {
                     match recorder
@@ -1380,16 +1389,24 @@ async fn run_camera(
                             current_clip = Some(handle);
                             clip_opened_at = Some(frame.captured_mono);
                             reopen_after_rotation = false;
+                            open_retry_at = None;
+                            open_retry_delay = Duration::from_millis(500);
                         }
-                        Err(RecorderError::Refused) => {
+                        Err(RecorderError::Refused) if open_retry_at.is_none() => {
                             debug!(
                                 camera_id = cfg.id,
                                 "recorder refused open (panic mode); dropping motion frame"
                             );
                         }
-                        Err(e) => {
+                        Err(e) if open_retry_at.is_none() => {
                             warn!(camera_id = cfg.id, "recorder.open failed: {e}");
                         }
+                        Err(_) => {}
+                    }
+                    if current_clip.is_none() {
+                        // Bound retries and log only the first failure in a streak.
+                        open_retry_at = Some(frame.captured_mono + open_retry_delay);
+                        open_retry_delay = open_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
                     }
                 }
                 for d in &decisions {
@@ -1407,8 +1424,8 @@ async fn run_camera(
                 // Stamp events.clip_id for any alerts that fired this
                 // frame, now that the motion lifecycle has had a chance
                 // to open a clip. When `record_motion_clip_on_alert` is
-                // set, an alert on a frame with no open clip force-opens a
-                // native-resolution motion clip so every event has
+                // set, the lifecycle above also opens a
+                // native-resolution motion clip on alerts so every event has
                 // surrounding full-res video — matching the motion clip
                 // (native resolution, pre-roll, post-roll), NOT the
                 // reduced-resolution burned-in alert clip. When the flag is
@@ -1416,42 +1433,6 @@ async fn run_camera(
                 // (clip_id NULL) and the timeline UI shows "no surrounding
                 // video".
                 if !events_to_link.is_empty() {
-                    if current_clip.is_none() && record_motion_clip_on_alert {
-                        match recorder
-                            .open(OpenClip {
-                                camera_id: cfg.id,
-                                started_at: frame.captured_at,
-                                frame_width: current_supervisor_w,
-                                frame_height: current_supervisor_h,
-                            })
-                            .await
-                        {
-                            Ok(handle) => {
-                                debug!(
-                                    camera_id = cfg.id,
-                                    clip_id = handle.clip_id,
-                                    "alert-triggered motion clip opened (no live motion track)"
-                                );
-                                current_clip = Some(handle);
-                                clip_opened_at = Some(frame.captured_mono);
-                            }
-                            Err(RecorderError::Refused) => {
-                                // Watermark sampler has paused new clips
-                                // (panic mode). The event stays unlinked;
-                                // nothing else to do this frame.
-                                debug!(
-                                    camera_id = cfg.id,
-                                    "recorder refused alert-triggered open (panic mode)"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    camera_id = cfg.id,
-                                    "alert-triggered recorder.open failed: {e}"
-                                );
-                            }
-                        }
-                    }
                     if let Some(handle) = current_clip {
                         for event_id in &events_to_link {
                             if let Err(e) = store.link_event_to_clip(event_id, handle.clip_id).await {

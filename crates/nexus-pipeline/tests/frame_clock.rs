@@ -11,6 +11,7 @@
 //! none depends on how fast the machine runs.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -103,7 +104,8 @@ impl FrameSource for Scripted {
 /// recorder. Clip rows come from the stub so motion rows can reference them.
 struct Recording {
     stub: StubClipRecorder,
-    source: Mutex<Option<Box<dyn FrameSource + Send>>>,
+    sources: Mutex<VecDeque<Box<dyn FrameSource + Send>>>,
+    rebuild_on_resize: bool,
     opened: Mutex<Vec<DateTime<Utc>>>,
     open_attempts: Mutex<Vec<DateTime<Utc>>>,
     refused_opens: Vec<usize>,
@@ -180,11 +182,11 @@ impl ClipRecorder for Recording {
         _h: u32,
     ) -> Result<bool, RecorderError> {
         self.resized.fetch_add(1, Ordering::Relaxed);
-        Ok(false)
+        Ok(self.rebuild_on_resize)
     }
 
     fn shared_frame_source(&self, _id: CameraId) -> Option<Box<dyn FrameSource + Send>> {
-        self.source.lock().take()
+        self.sources.lock().pop_front()
     }
 }
 
@@ -260,6 +262,7 @@ struct Scenario {
     refused_opens: Vec<usize>,
     open_io_error: bool,
     inflight_bytes: Option<u64>,
+    rebuild_at: Option<usize>,
 }
 
 impl Scenario {
@@ -277,6 +280,7 @@ impl Scenario {
             refused_opens: Vec::new(),
             open_io_error: false,
             inflight_bytes: None,
+            rebuild_at: None,
         }
     }
 }
@@ -343,7 +347,7 @@ async fn run(s: Scenario) -> Outcome {
 
     let n = s.people.len();
     let pixels = Arc::new(vec![0u8; (W * H * 3) as usize]);
-    let frames = (0..=n)
+    let mut frames: Vec<Frame> = (0..=n)
         .map(|i| Frame {
             camera_id: 1,
             frame_id: i as u64 + 1,
@@ -357,9 +361,20 @@ async fn run(s: Scenario) -> Outcome {
         })
         .collect();
     let (go, go_rx) = mpsc::unbounded_channel();
+    let (restart_go, restart_rx) = mpsc::unbounded_channel();
+    let tail = s.rebuild_at.map(|i| frames.split_off(i + 1));
+    let mut sources: VecDeque<Box<dyn FrameSource + Send>> = VecDeque::new();
+    sources.push_back(Box::new(Scripted { frames, go: go_rx }));
+    if let Some(frames) = tail {
+        sources.push_back(Box::new(Scripted {
+            frames,
+            go: restart_rx,
+        }));
+    }
     let recorder = Arc::new(Recording {
         stub: StubClipRecorder::new(store.clone(), dir.path().join("clips")),
-        source: Mutex::new(Some(Box::new(Scripted { frames, go: go_rx }))),
+        sources: Mutex::new(sources),
+        rebuild_on_resize: s.rebuild_at.is_some(),
         opened: Mutex::new(Vec::new()),
         open_attempts: Mutex::new(Vec::new()),
         refused_opens: s.refused_opens,
@@ -415,7 +430,15 @@ async fn run(s: Scenario) -> Outcome {
         if s.epoch_change_at == Some(i) {
             *recorder.epoch_ended.lock() = *recorder.last_opened.lock();
         }
-        go.send(()).expect("source running");
+        if s.rebuild_at.is_some_and(|at| i > at) {
+            restart_go.send(()).expect("rebuilt source running");
+        } else {
+            go.send(()).expect("source running");
+        }
+        // The resize frame breaks before publishing metadata.
+        if s.rebuild_at == Some(i) {
+            continue;
+        }
         loop {
             let m = tokio::time::timeout(Duration::from_secs(10), metadata.next())
                 .await
@@ -643,12 +666,101 @@ async fn a_failed_rotation_retries_without_a_motion_event() {
         s.open_io_error = open_io_error;
         let o = run(s).await;
         assert_eq!(o.closed, [clock.wall(3)]);
-        assert_eq!(o.opened, [clock.wall(0), clock.wall(5)]);
+        assert_eq!(o.opened, [clock.wall(0), clock.wall(6)]);
         assert_eq!(
             o.open_attempts,
-            [clock.wall(0), clock.wall(3), clock.wall(4), clock.wall(5)]
+            [clock.wall(0), clock.wall(3), clock.wall(4), clock.wall(6)]
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_rotation_backs_off_and_recovers_with_post_roll() {
+    for open_io_error in [false, true] {
+        for step_ms in [0, HOUR_MS, -HOUR_MS] {
+            let clock = Clock::new(500, step_ms, &[4, 80]);
+            let mut people = vec![1; 186];
+            people.extend([0; 6]);
+            let mut s = Scenario::new(&clock, people, IouNaive);
+            s.clips.motion_events_sample_hz = 0.0;
+            s.clips.post_roll_secs = 2;
+            s.epoch_change_at = Some(3);
+            s.refused_opens = (1..=7).collect();
+            s.open_io_error = open_io_error;
+            let o = run(s).await;
+            assert_eq!(
+                o.open_attempts,
+                [0, 3, 4, 6, 10, 18, 34, 66, 126].map(|i| clock.wall(i)),
+                "bounded retries with 30 s cap"
+            );
+            assert_eq!(o.opened, [clock.wall(0), clock.wall(126)]);
+            assert_eq!(o.closed, [clock.wall(3), clock.wall(190)]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_retry_streak_ends_with_post_roll() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut people = vec![1; 70];
+    people.extend([0; 6]);
+    people.extend([1; 6]);
+    let mut s = Scenario::new(&clock, people, IouNaive);
+    s.clips.motion_events_sample_hz = 0.0;
+    s.clips.post_roll_secs = 2;
+    s.epoch_change_at = Some(3);
+    s.refused_opens = (1..=7).collect();
+    let o = run(s).await;
+    assert_eq!(
+        o.open_attempts,
+        [0, 3, 4, 6, 10, 18, 34, 66, 76].map(|i| clock.wall(i))
+    );
+    assert_eq!(
+        o.opened,
+        [clock.wall(0), clock.wall(76)],
+        "new motion does not inherit the 30 s backoff"
+    );
+    assert_eq!(o.closed, [clock.wall(3)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crowd_resize_reopens_without_sampled_motion() {
+    for motion_ends in [false, true] {
+        let clock = Clock::new(10_000, 0, &[]);
+        let people = if motion_ends {
+            vec![20, 20, 0, 0, 0, 0, 0, 0]
+        } else {
+            vec![20; 8]
+        };
+        let mut s = Scenario::new(&clock, people, IouNaive);
+        s.clips.motion_events_sample_hz = 0.0;
+        s.clips.post_roll_secs = 35;
+        s.behavior.supervisor_downscale_crowded_threshold = Some(1);
+        s.behavior.supervisor_downscale_sustained_secs = Some(30);
+        s.behavior.supervisor_downscale_to_width = Some(512);
+        s.rebuild_at = Some(3);
+        let o = run(s).await;
+        assert_eq!(o.opened, [clock.wall(0), clock.wall(4)]);
+        if motion_ends {
+            assert_eq!(o.closed, [clock.wall(3), clock.wall(6)]);
+        } else {
+            assert_eq!(o.closed, [clock.wall(3)]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alerts_share_the_rotation_retry_budget() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1; 22], IouNaive);
+    s.clips.motion_events_sample_hz = 0.0;
+    s.clips.record_motion_clip_on_alert = true;
+    s.rules = vec![person_rule(0, 0)];
+    s.epoch_change_at = Some(3);
+    s.refused_opens = vec![1, 2];
+    let o = run(s).await;
+    assert_eq!(o.open_attempts, [0, 3, 4, 6].map(|i| clock.wall(i)));
+    assert_eq!(o.opened, [clock.wall(0), clock.wall(6)]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
