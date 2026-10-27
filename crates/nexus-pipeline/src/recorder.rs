@@ -225,6 +225,11 @@ pub trait ClipRecorder: Send + Sync {
         Ok(())
     }
 
+    /// Record the operator's explicit codec pin after registering an ingester.
+    /// `None` means auto, even if probing selected a concrete startup codec.
+    #[allow(unused_variables)]
+    fn set_camera_codec_pin(&self, camera_id: CameraId, codec: Option<CodecKind>) {}
+
     /// Hot-remove a per-camera ingester. Mirror of
     /// [`Self::add_camera_ingester`]. Called when a camera is
     /// deleted or disabled. Default impl is a no-op.

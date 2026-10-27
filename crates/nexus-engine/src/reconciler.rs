@@ -811,6 +811,7 @@ async fn start_sessions(
             analysis: None,
         };
     }
+    recorder.set_camera_codec_pin(cam.id, cam.ingest.codec);
     Sessions {
         main_pending: None,
         analysis: apply_analysis_session(recorder, cam, main_codec, supervisor_dims).await,
@@ -865,6 +866,7 @@ fn retry_sessions(args: &ReconcilerArgs, cam: &CameraConfig, entry: &RunningCame
                     camera_id = cam_id,
                     "camera reconciler: ingester registered on retry; clips resume for this camera"
                 );
+                args.recorder.set_camera_codec_pin(cam_id, cam.ingest.codec);
                 sessions.main_pending = None;
             }
             Err(e) => {
@@ -1128,6 +1130,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingRecorder {
         calls: Mutex<Vec<(CameraId, Option<String>, CodecKind)>>,
+        codec_pins: Mutex<Vec<(CameraId, Option<CodecKind>)>>,
     }
 
     #[async_trait::async_trait]
@@ -1148,6 +1151,9 @@ mod tests {
         }
         fn kind(&self) -> &'static str {
             "recording"
+        }
+        fn set_camera_codec_pin(&self, camera_id: CameraId, codec: Option<CodecKind>) {
+            self.codec_pins.lock().push((camera_id, codec));
         }
         fn set_camera_analysis_ingester(
             &self,
@@ -1186,6 +1192,31 @@ mod tests {
             talk_down: CameraTalkDown::default(),
             zones: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn session_registration_preserves_only_explicit_codec_pins() {
+        let rec = RecordingRecorder::default();
+        let mut camera = cam(None);
+        for pin in [None, Some(CodecKind::H264), Some(CodecKind::H265), None] {
+            camera.ingest.codec = pin;
+            start_sessions(&rec, &camera, CodecKind::H264, (512, 288), true).await;
+        }
+        assert_eq!(
+            *rec.codec_pins.lock(),
+            vec![
+                (7, None),
+                (7, Some(CodecKind::H264)),
+                (7, Some(CodecKind::H265)),
+                (7, None)
+            ]
+        );
+        rec.codec_pins.lock().clear();
+        start_sessions(&rec, &camera, CodecKind::H264, (512, 288), false).await;
+        assert!(
+            rec.codec_pins.lock().is_empty(),
+            "failed registration must not pin another ingester"
+        );
     }
 
     /// Boot builds only main ingesters, so before this fix the analysis

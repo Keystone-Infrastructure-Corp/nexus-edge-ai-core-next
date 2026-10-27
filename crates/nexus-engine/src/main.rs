@@ -2656,6 +2656,9 @@ async fn build_gst_recorder(
         .with_alert_clips(alert_clips)
         .with_alert_cold_kick(cold_kick)
         .with_alert_clip_delivery_gate(alert_clip_gate);
+    for cam in cameras {
+        nexus_pipeline::ClipRecorder::set_camera_codec_pin(&rec, cam.id, cam.ingest.codec);
+    }
     // Phase F — the WebRTC bridge shares the recorder's live camera→ingester
     // map rather than a snapshot of it. The reconciler drops and rebuilds an
     // ingester on every restart (URL, detector dims, codec, or `analysis_url`

@@ -513,7 +513,14 @@ impl GstClipRecorder {
         if delivered {
             new_ing.mark_delivered();
         }
-        let prev = taps.write().insert(camera_id, new_ing);
+        let prev = {
+            let mut write = taps.write();
+            // Copy under the replacement lock so a concurrent pin correction is retained.
+            if let Some(existing) = write.get(&camera_id) {
+                new_ing.set_codec_pin(existing.codec_pin());
+            }
+            write.insert(camera_id, new_ing)
+        };
         if let Some(prev_ing) = prev {
             // Same justification as the URL-change replace path in
             // `add_camera_ingester`: any stale `SharedRtspSource`
@@ -752,9 +759,13 @@ impl ClipRecorder for GstClipRecorder {
         // pushes immediately. We push the pre-roll snapshot before
         // even waiting for the state change to complete — the queue
         // inside appsrc absorbs them.
-        pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| RecorderError::Io(std::io::Error::other(format!("set Playing: {e}"))))?;
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            let _ = pipeline.set_state(gst::State::Null);
+            let _ = fs::remove_file(&path).await;
+            return Err(RecorderError::Io(std::io::Error::other(format!(
+                "set Playing: {e}"
+            ))));
+        }
 
         // Snapshot the ring buffer + subscribe to live BEFORE either
         // path can race the other. The subscribe happens-before any
@@ -880,11 +891,13 @@ impl ClipRecorder for GstClipRecorder {
                 Ok(Err(e)) => {
                     pump_handle.abort();
                     let _ = pipeline.set_state(gst::State::Null);
+                    let _ = fs::remove_file(&path).await;
                     return Err(e);
                 }
                 Err(join_err) => {
                     pump_handle.abort();
                     let _ = pipeline.set_state(gst::State::Null);
+                    let _ = fs::remove_file(&path).await;
                     return Err(RecorderError::Io(std::io::Error::other(format!(
                         "preroll spawn_blocking: {join_err}"
                     ))));
@@ -910,6 +923,7 @@ impl ClipRecorder for GstClipRecorder {
             Err(e) => {
                 pump_handle.abort();
                 let _ = pipeline.set_state(gst::State::Null);
+                let _ = fs::remove_file(&path).await;
                 return Err(e.into());
             }
         };
@@ -1417,7 +1431,10 @@ impl ClipRecorder for GstClipRecorder {
             issues.retain(|issue| issue.kind != RecordingKind::Alert);
         }
         for (&camera_id, ingester) in self.ingesters.read().iter() {
-            let configured = ingester.codec().base();
+            let Some(codec_pin) = ingester.codec_pin() else {
+                continue;
+            };
+            let configured = codec_pin.base();
             let detected = ingester.stream_codec().base();
             if configured != detected {
                 issues.push(RecordingDegradation {
@@ -1492,6 +1509,12 @@ impl ClipRecorder for GstClipRecorder {
             info!(camera_id, pre_roll_secs, max_fps, codec = %codec, "pre-roll ingester started (hot-add)");
         }
         Ok(())
+    }
+
+    fn set_camera_codec_pin(&self, camera_id: CameraId, codec: Option<CodecKind>) {
+        if let Some(ingester) = self.ingesters.read().get(&camera_id) {
+            ingester.set_codec_pin(codec);
+        }
     }
 
     fn remove_camera_ingester(&self, camera_id: CameraId) {
@@ -3097,6 +3120,117 @@ mod tests {
             assert!(rec.ingester_registry().read().contains_key(&id));
             rec.remove_camera_ingester(id);
         }
+    }
+
+    #[tokio::test]
+    async fn auto_codec_fallback_does_not_degrade_recording_health() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        ing.set_stream_codec_for_test(CodecKind::H265);
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::from([(1, ing)])).unwrap();
+        assert!(rec.recording_degradations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_codec_pin_mismatch_clears_on_correction_auto_and_removal() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+        rec.add_camera_ingester(
+            1,
+            "rtsp://127.0.0.1:1/main",
+            0,
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .unwrap();
+        let ing = rec.ingesters.read().get(&1).cloned().unwrap();
+        ing.shutdown();
+        ing.set_stream_codec_for_test(CodecKind::H265);
+        rec.set_camera_codec_pin(1, Some(CodecKind::H264));
+        let issues = rec.recording_degradations();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, RecordingKind::Codec);
+        assert!(issues[0]
+            .reason
+            .contains("configured h264 codec differs from detected h265"));
+
+        rec.set_camera_codec_pin(1, Some(CodecKind::H265Plus));
+        assert!(rec.recording_degradations().is_empty());
+        rec.set_camera_codec_pin(1, Some(CodecKind::H264));
+        rec.set_camera_codec_pin(1, None);
+        assert!(rec.recording_degradations().is_empty());
+
+        rec.set_camera_codec_pin(1, Some(CodecKind::H264));
+        assert!(rec.resize_camera_rgb_tap(1, 1024, 576).unwrap());
+        let resized = rec.ingesters.read().get(&1).cloned().unwrap();
+        resized.shutdown();
+        resized.set_stream_codec_for_test(CodecKind::H265);
+        assert_eq!(
+            rec.recording_degradations().len(),
+            1,
+            "resize lost the explicit pin"
+        );
+        rec.remove_camera_ingester(1);
+        assert!(rec.recording_degradations().is_empty());
+        rec.add_camera_ingester(
+            1,
+            "rtsp://127.0.0.1:1/main",
+            0,
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .unwrap();
+        let replacement = rec.ingesters.read().get(&1).cloned().unwrap();
+        replacement.shutdown();
+        replacement.set_stream_codec_for_test(CodecKind::H265);
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "retired pin survived re-registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_motion_insert_removes_partial_file() {
+        gst_init::ensure().unwrap();
+        for name in ["appsrc", "h264parse", "mp4mux", "filesink"] {
+            assert!(
+                gst::ElementFactory::find(name).is_some(),
+                "required GStreamer plugin missing: {name}"
+            );
+        }
+        let (store, _dir, clips_dir) = fixture().await;
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        let rec =
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap();
+        store.pool().close().await;
+        let started_at = Utc::now();
+        let result = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at,
+                frame_width: 512,
+                frame_height: 288,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(RecorderError::Store(_))),
+            "expected failed insert, got {result:?}"
+        );
+        assert!(rec.open.lock().await.is_empty());
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "failed open left an untracked partial clip"
+        );
+        assert!(rec
+            .recording_degradations()
+            .iter()
+            .any(|d| d.kind == RecordingKind::Motion));
     }
 
     #[tokio::test]
