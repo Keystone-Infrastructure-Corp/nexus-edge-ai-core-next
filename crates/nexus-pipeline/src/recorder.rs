@@ -177,6 +177,11 @@ pub trait ClipRecorder: Send + Sync {
     /// `gstreamer`, etc.).
     fn kind(&self) -> &'static str;
 
+    /// Camera-scoped recording failures for local health and cloud heartbeats.
+    fn recording_degradations(&self) -> Vec<crate::recording_health::RecordingDegradation> {
+        Vec::new()
+    }
+
     /// Hot-add a per-camera ingester. Called by the engine's
     /// `config.changed` reconciler when a camera is added or its
     /// ingest URL changes, so the GStreamer recorder can start a
