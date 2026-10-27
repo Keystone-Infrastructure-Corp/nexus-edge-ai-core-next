@@ -105,6 +105,10 @@ struct Recording {
     stub: StubClipRecorder,
     source: Mutex<Option<Box<dyn FrameSource + Send>>>,
     opened: Mutex<Vec<DateTime<Utc>>>,
+    open_attempts: Mutex<Vec<DateTime<Utc>>>,
+    refused_opens: Vec<usize>,
+    open_io_error: bool,
+    inflight_bytes: Option<u64>,
     closed: Mutex<Vec<DateTime<Utc>>>,
     resized: AtomicUsize,
     last_opened: Mutex<Option<ClipId>>,
@@ -115,10 +119,28 @@ struct Recording {
 #[async_trait]
 impl ClipRecorder for Recording {
     async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
-        self.opened.lock().push(args.started_at);
+        let started_at = args.started_at;
+        let attempt = {
+            let mut attempts = self.open_attempts.lock();
+            let attempt = attempts.len();
+            attempts.push(started_at);
+            attempt
+        };
+        if self.refused_opens.contains(&attempt) {
+            return Err(if self.open_io_error {
+                std::io::Error::other("scripted open failure").into()
+            } else {
+                RecorderError::Refused
+            });
+        }
         let handle = self.stub.open(args).await?;
+        self.opened.lock().push(started_at);
         *self.last_opened.lock() = Some(handle.clip_id);
         Ok(handle)
+    }
+
+    async fn inflight_size_bytes(&self, _handle: ClipHandle) -> Option<u64> {
+        self.inflight_bytes
     }
 
     fn ended_on_epoch_change(&self, handle: ClipHandle) -> bool {
@@ -234,6 +256,10 @@ struct Scenario {
     /// The recorder reports the open clip ended on an epoch change from
     /// this frame on.
     epoch_change_at: Option<usize>,
+    graceful_stop: bool,
+    refused_opens: Vec<usize>,
+    open_io_error: bool,
+    inflight_bytes: Option<u64>,
 }
 
 impl Scenario {
@@ -247,6 +273,10 @@ impl Scenario {
             behavior: CameraBehavior::default(),
             low_res: false,
             epoch_change_at: None,
+            graceful_stop: false,
+            refused_opens: Vec::new(),
+            open_io_error: false,
+            inflight_bytes: None,
         }
     }
 }
@@ -257,6 +287,7 @@ struct Outcome {
     alerts: Vec<AlertEvent>,
     motion: Vec<MotionEventRow>,
     opened: Vec<DateTime<Utc>>,
+    open_attempts: Vec<DateTime<Utc>>,
     closed: Vec<DateTime<Utc>>,
     /// Supervisor-frame resize requests made by the time frame `i` was tracked.
     resized: Vec<usize>,
@@ -330,6 +361,10 @@ async fn run(s: Scenario) -> Outcome {
         stub: StubClipRecorder::new(store.clone(), dir.path().join("clips")),
         source: Mutex::new(Some(Box::new(Scripted { frames, go: go_rx }))),
         opened: Mutex::new(Vec::new()),
+        open_attempts: Mutex::new(Vec::new()),
+        refused_opens: s.refused_opens,
+        open_io_error: s.open_io_error,
+        inflight_bytes: s.inflight_bytes,
         closed: Mutex::new(Vec::new()),
         resized: AtomicUsize::new(0),
         last_opened: Mutex::new(None),
@@ -394,7 +429,15 @@ async fn run(s: Scenario) -> Outcome {
         }
         resized.push(recorder.resized.load(Ordering::Relaxed));
     }
-    handle.task.abort();
+    if s.graceful_stop {
+        handle.stop.send(true).expect("supervisor running");
+        tokio::time::timeout(Duration::from_secs(10), handle.task)
+            .await
+            .expect("supervisor stops")
+            .expect("supervisor did not panic");
+    } else {
+        handle.task.abort();
+    }
     tracked.truncate(n);
     resized.truncate(n);
 
@@ -410,6 +453,7 @@ async fn run(s: Scenario) -> Outcome {
         .await
         .expect("list motion rows");
     let opened = recorder.opened.lock().clone();
+    let open_attempts = recorder.open_attempts.lock().clone();
     let closed = recorder.closed.lock().clone();
     let high_res = high.seen.lock().clone();
     let low_res = low.map(|d| d.seen.lock().clone()).unwrap_or_default();
@@ -418,6 +462,7 @@ async fn run(s: Scenario) -> Outcome {
         alerts: fired,
         motion,
         opened,
+        open_attempts,
         closed,
         resized,
         high_res,
@@ -533,6 +578,146 @@ async fn a_clip_that_ended_on_an_epoch_change_is_rotated() {
         [clock.wall(0), clock.wall(3)],
         "reopened on the rotation frame"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epoch_change_between_motion_samples_reopens_recording() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1; 12], Bytetrack);
+    s.epoch_change_at = Some(3);
+    let o = run(s).await;
+    assert_eq!(o.closed, [clock.wall(3)], "rotated at the stream boundary");
+    assert_eq!(
+        o.opened,
+        [clock.wall(0), clock.wall(3)],
+        "continuous live motion must reopen after rotation even between sampled motion events"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epoch_reopen_with_every_frame_sampled() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1; 12], Bytetrack);
+    s.clips.motion_events_sample_hz = 2.0;
+    s.epoch_change_at = Some(3);
+    let o = run(s).await;
+    assert_eq!(o.opened, [clock.wall(0), clock.wall(3)]);
+}
+
+/// Rotation is recorder control, independent of persisted Updated events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_rotation_reopens_when_motion_updates_are_disabled() {
+    for cause in ["epoch", "duration", "size"] {
+        let (gap, boundary, count) = match cause {
+            "duration" => (60_100, 5, 7),
+            "size" => (500, 60, 63),
+            _ => (500, 3, 8),
+        };
+        let clock = Clock::new(gap, 0, &[]);
+        let mut s = Scenario::new(&clock, vec![1; count], Bytetrack);
+        s.clips.motion_events_sample_hz = 0.0;
+        match cause {
+            "epoch" => s.epoch_change_at = Some(boundary),
+            "size" => {
+                s.clips.max_clip_bytes = 1;
+                s.inflight_bytes = Some(1);
+            }
+            _ => {}
+        }
+        let o = run(s).await;
+        assert_eq!(o.closed, [clock.wall(boundary)], "{cause}");
+        assert_eq!(o.opened, [clock.wall(0), clock.wall(boundary)], "{cause}");
+        assert_eq!(o.open_attempts, o.opened, "one open per rotation: {cause}");
+        assert!(o.motion.iter().all(|m| m.kind != MotionEventKind::Updated));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rotation_retries_without_a_motion_event() {
+    for open_io_error in [false, true] {
+        let clock = Clock::new(500, 0, &[]);
+        let mut s = Scenario::new(&clock, vec![1; 8], Bytetrack);
+        s.clips.motion_events_sample_hz = 0.0;
+        s.epoch_change_at = Some(3);
+        s.refused_opens = vec![1, 2];
+        s.open_io_error = open_io_error;
+        let o = run(s).await;
+        assert_eq!(o.closed, [clock.wall(3)]);
+        assert_eq!(o.opened, [clock.wall(0), clock.wall(5)]);
+        assert_eq!(
+            o.open_attempts,
+            [clock.wall(0), clock.wall(3), clock.wall(4), clock.wall(5)]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_does_not_reopen_on_a_died_only_frame() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1, 1, 1, 0, 0, 0], IouNaive);
+    s.clips.post_roll_secs = 0;
+    s.epoch_change_at = Some(3);
+    let o = run(s).await;
+    assert_eq!(o.closed, [clock.wall(3)]);
+    assert_eq!(o.open_attempts, [clock.wall(0)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_stops_retrying_when_motion_ends() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1, 1, 1, 1, 0, 0, 0], IouNaive);
+    s.clips.motion_events_sample_hz = 0.0;
+    s.clips.post_roll_secs = 0;
+    s.epoch_change_at = Some(3);
+    s.refused_opens = vec![1];
+    let o = run(s).await;
+    assert_eq!(o.closed, [clock.wall(3)]);
+    assert_eq!(o.open_attempts, [clock.wall(0), clock.wall(3)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopened_clip_keeps_its_post_roll() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0], IouNaive);
+    s.clips.motion_events_sample_hz = 0.0;
+    s.clips.post_roll_secs = 2;
+    s.epoch_change_at = Some(3);
+    let o = run(s).await;
+    assert_eq!(o.opened, [clock.wall(0), clock.wall(3)]);
+    assert_eq!(o.closed, [clock.wall(3), clock.wall(9)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_preserves_the_remaining_post_roll_deadline() {
+    for boundary in [6, 9] {
+        let clock = Clock::new(500, 0, &[]);
+        let mut s = Scenario::new(&clock, vec![1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0], IouNaive);
+        s.clips.motion_events_sample_hz = 0.0;
+        s.clips.post_roll_secs = 2;
+        s.epoch_change_at = Some(boundary);
+        let o = run(s).await;
+        if boundary == 6 {
+            assert_eq!(o.opened, [clock.wall(0), clock.wall(6)]);
+            assert_eq!(o.closed, [clock.wall(6), clock.wall(9)]);
+        } else {
+            assert_eq!(o.opened, [clock.wall(0)]);
+            assert_eq!(o.closed, [clock.wall(9)]);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_finalizes_a_reopened_clip_once() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1; 8], Bytetrack);
+    s.clips.motion_events_sample_hz = 0.0;
+    s.epoch_change_at = Some(3);
+    s.graceful_stop = true;
+    let o = run(s).await;
+    assert_eq!(o.opened, [clock.wall(0), clock.wall(3)]);
+    assert_eq!(o.closed.len(), 2);
+    assert_eq!(o.closed[0], clock.wall(3));
+    assert!(o.closed[1] > clock.wall(8));
 }
 
 /// Both crowd hysteresis windows (the E3 detector downscale and the E2

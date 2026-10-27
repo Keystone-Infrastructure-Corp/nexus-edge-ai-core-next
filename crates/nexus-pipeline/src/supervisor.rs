@@ -524,6 +524,8 @@ async fn run_camera(
         )
         .with_first_emit_jitter();
         let mut current_clip: Option<ClipHandle> = None;
+        // A refused rotation open must be retried independently of motion sampling.
+        let mut reopen_after_rotation = false;
         // Alert snapshot output dir — created once per camera task so the
         // per-alert write path (below) never races a mkdir. Failure to
         // create it is non-fatal: snapshots are best-effort and the
@@ -539,8 +541,8 @@ async fn run_camera(
         // Monotonic capture stamp of the frame the open clip started on.
         // Used to enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
         // open clip exceeds 5min we force-close it and (if motion
-        // is still active on this frame) the next Born will open a
-        // fresh one. Reset to None on every close.
+        // or post-roll is still active) reopen a fresh one.
+        // Reset to None on every close.
         let mut clip_opened_at: Option<std::time::Instant> = None;
         // Byte cap on the in-flight clip. A corrupt camera H.264
         // stream can balloon a single short clip to multiple GiB
@@ -703,12 +705,11 @@ async fn run_camera(
 
                 // M2.1: enforce MAX_CLIP_DURATION_MS. If the currently
                 // open clip has been writing for >= 5 min, close it now
-                // so a fresh one opens on the next Born (or right below
-                // if motion is still live). Done BEFORE motion/event
+                // so a fresh one opens below if motion or post-roll is
+                // still active. Done BEFORE motion/event
                 // handling so any alerts/motion on this frame attach
                 // to the new clip rather than the about-to-be-closed
                 // one.
-                let mut force_reopen_after_rotation = false;
                 if let (Some(handle), Some(opened_at)) = (current_clip, clip_opened_at) {
                     let age_ms =
                         frame.captured_mono.saturating_duration_since(opened_at).as_millis() as i64;
@@ -776,17 +777,8 @@ async fn run_camera(
                         current_clip = None;
                         clip_opened_at = None;
                         frames_since_size_stat = 0;
-                        // Reset post-roll so the rotation isn't observed
-                        // as a motion-end window.
-                        post_roll.reset();
-                        // If motion was still live (Born was already
-                        // emitted prior to this frame), the upcoming
-                        // motion lifecycle will see Live decisions but
-                        // NOT another Born — so the existing
-                        // open-on-Born trigger won't re-open. Flag it
-                        // so the decisions loop opens on the first
-                        // decision regardless of kind.
-                        force_reopen_after_rotation = emitter.live_track_count(cfg.id) > 0;
+                        // Rotation changes files, not the motion/post-roll lifetime.
+                        reopen_after_rotation = true;
                     }
                 }
 
@@ -1364,49 +1356,47 @@ async fn run_camera(
                 let decisions = info_span!("frame.motion").in_scope(|| {
                     emitter.tick(cfg.id, dynamic_tracked, frame.captured_at, frame.captured_mono)
                 });
-                for d in &decisions {
-                    let should_open = current_clip.is_none()
-                        && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);
-                    if should_open {
-                        match recorder
-                            .open(OpenClip {
-                                camera_id: cfg.id,
-                                started_at: d.captured_at,
-                                frame_width: current_supervisor_w,
-                                frame_height: current_supervisor_h,
-                            })
-                            .await
-                        {
-                            Ok(handle) => {
-                                current_clip = Some(handle);
-                                clip_opened_at = Some(frame.captured_mono);
-                                // One-shot — only the first decision in
-                                // this frame triggers the post-rotation
-                                // reopen.
-                                force_reopen_after_rotation = false;
-                            }
-                            Err(RecorderError::Refused) => {
-                                // Watermark sampler has paused new
-                                // clips. Drop ALL motion events for
-                                // this frame: the schema requires
-                                // clip_id NOT NULL and we have no
-                                // open clip to attach to.
-                                debug!(
-                                    camera_id = cfg.id,
-                                    "recorder refused open (panic mode); dropping motion frame"
-                                );
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(camera_id = cfg.id, "recorder.open failed: {e}");
-                                break;
-                            }
+                let alert_kept_alive = record_motion_clip_on_alert && !events_to_link.is_empty();
+                let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
+                let action = post_roll.tick(frame.captured_mono, has_live_motion);
+                if matches!(action, PostRollAction::CloseNow) {
+                    reopen_after_rotation = false;
+                }
+                // Recorder continuity cannot depend on whether Updated rows are due.
+                let should_open = current_clip.is_none()
+                    && (reopen_after_rotation
+                        || decisions.iter().any(|d| matches!(d.kind, MotionKind::Born)));
+                if should_open {
+                    match recorder
+                        .open(OpenClip {
+                            camera_id: cfg.id,
+                            started_at: frame.captured_at,
+                            frame_width: current_supervisor_w,
+                            frame_height: current_supervisor_h,
+                        })
+                        .await
+                    {
+                        Ok(handle) => {
+                            current_clip = Some(handle);
+                            clip_opened_at = Some(frame.captured_mono);
+                            reopen_after_rotation = false;
+                        }
+                        Err(RecorderError::Refused) => {
+                            debug!(
+                                camera_id = cfg.id,
+                                "recorder refused open (panic mode); dropping motion frame"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(camera_id = cfg.id, "recorder.open failed: {e}");
                         }
                     }
+                }
+                for d in &decisions {
                     let Some(handle) = current_clip else {
                         // Open was refused earlier in this frame and
                         // we have no clip to stamp. Skip silently —
-                        // the next Born will retry recorder.open.
+                        // a pending rotation or the next Born retries the open.
                         continue;
                     };
                     if let Err(e) = insert_motion_decision(&store, handle, d).await {
@@ -1489,9 +1479,6 @@ async fn run_camera(
                 // live tracker track at all — stays open and captures the
                 // full post-roll window instead of closing on the very
                 // next frame.
-                let alert_kept_alive = record_motion_clip_on_alert && !events_to_link.is_empty();
-                let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
-                let action = post_roll.tick(frame.captured_mono, has_live_motion);
                 if matches!(action, PostRollAction::CloseNow) {
                     if let Some(handle) = current_clip.take() {
                         if let Err(e) = recorder
