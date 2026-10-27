@@ -544,11 +544,8 @@ pub fn build_detector_for_yolo_world(
     cfg: &InferenceConfig,
 ) -> Result<Arc<dyn Detector>, InferenceError> {
     match YoloWorldDetector::from_config(cfg) {
-        Ok(d) => {
-            crate::health::clear_degraded("yolo_world");
-            Ok(Arc::new(d))
-        }
-        Err(e) => Ok(crate::health::degraded_detector("yolo_world", e)),
+        Ok(d) => Ok(Arc::new(d)),
+        Err(e) => Ok(crate::health::degraded_detector_for_config(cfg, e)),
     }
 }
 

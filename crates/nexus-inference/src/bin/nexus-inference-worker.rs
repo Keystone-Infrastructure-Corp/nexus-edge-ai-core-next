@@ -14,7 +14,8 @@
 //! pattern in `docs/ARCHITECTURE.md` is designed around.
 //!
 //! ## Configuration
-//! Picks the model kind from `$NEXUS_WORKER_MODEL_KIND` (default `mock`).
+//! Production pools send the resolved `InferenceConfig` in `$NEXUS_WORKER_CONFIG`.
+//! Legacy standalone callers pick `$NEXUS_WORKER_MODEL_KIND` (default `mock`).
 //! For the `yolo` family the worker also reads `$NEXUS_WORKER_MODEL_PATH`
 //! (full path to `yolo26n_640.onnx` or another shipped size), `$NEXUS_WORKER_INPUT_W` /
 //! `$NEXUS_WORKER_INPUT_H` (default 640), and
@@ -35,13 +36,34 @@ use nexus_inference::detectors::{Detector, MockDetector, UnavailableDetector};
 use nexus_inference::worker_proto::{read_msg, write_msg, WorkerRequest, WorkerResponse};
 use tokio::io::{stdin, stdout};
 
-#[tokio::main(flavor = "current_thread")]
+// Real ORT detectors use block_in_place; a current-thread runtime panics on the first frame.
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> ExitCode {
     // Worker logs go to stderr; the parent treats this as opaque
     // diagnostic output. Plain eprintln keeps the binary cheap to build.
     let model_kind = env::var("NEXUS_WORKER_MODEL_KIND").unwrap_or_else(|_| "mock".to_string());
 
-    let detector: Arc<dyn Detector> = build_worker_detector(&model_kind).await;
+    let detector: Arc<dyn Detector> = match env::var("NEXUS_WORKER_CONFIG") {
+        Ok(json) => match serde_json::from_str::<nexus_config::InferenceConfig>(&json) {
+            Ok(cfg) => build_configured_detector(cfg).await,
+            Err(e) => nexus_inference::health::degraded_detector(
+                &model_kind,
+                format!("invalid worker config: {e}"),
+            ),
+        },
+        Err(_) => build_worker_detector(&model_kind).await,
+    };
+    let detector = if model_kind != "mock"
+        && matches!(detector.name(), "mock" | "unavailable")
+        && nexus_inference::health::degradations().is_empty()
+    {
+        nexus_inference::health::degraded_detector(
+            &model_kind,
+            "worker could not construct the configured detector; see worker diagnostics",
+        )
+    } else {
+        detector
+    };
 
     eprintln!(
         "[nexus-inference-worker] ready pid={} model_kind={model_kind}",
@@ -50,6 +72,17 @@ async fn main() -> ExitCode {
 
     let mut stdin = stdin();
     let mut stdout = stdout();
+    if let Err(e) = write_msg(
+        &mut stdout,
+        &WorkerResponse::Health {
+            degradations: nexus_inference::health::degradations(),
+        },
+    )
+    .await
+    {
+        eprintln!("[nexus-inference-worker] startup health write error: {e}");
+        return ExitCode::FAILURE;
+    }
 
     loop {
         let req: WorkerRequest = match read_msg(&mut stdin).await {
@@ -87,6 +120,42 @@ async fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
         }
+    }
+}
+
+async fn build_configured_detector(mut cfg: nexus_config::InferenceConfig) -> Arc<dyn Detector> {
+    // A worker owns one detector; recursively spawning a pool would fork forever.
+    cfg.backend = nexus_config::InferenceBackendKind::InProcess;
+    let mut ctx = nexus_inference::BuildContext::default();
+    if cfg.model.kind == "yoloe_visual"
+        || cfg.model.members.iter().any(|m| m.kind == "yoloe_visual")
+    {
+        if let Ok(url) = env::var("NEXUS_WORKER_DB_URL") {
+            let store_cfg = nexus_config::StoreConfig {
+                url,
+                seed_from_config: false,
+                duckdb_attach: false,
+                duckdb_path: Default::default(),
+            };
+            match nexus_store::Store::open(&store_cfg).await {
+                Ok(store) => {
+                    ctx.visual_prompt_store = Some(Arc::new(
+                        nexus_inference::StoreBackedVisualPromptStore::new(Arc::new(store)),
+                    ));
+                    ctx.visual_embedding_dim = Some(
+                        env::var("NEXUS_WORKER_EMBEDDING_DIM")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(512),
+                    );
+                }
+                Err(e) => return nexus_inference::health::degraded_detector_for_config(&cfg, e),
+            }
+        }
+    }
+    match nexus_inference::build_with_context(&cfg, &ctx) {
+        Ok(layer) => layer.detector,
+        Err(e) => nexus_inference::health::degraded_detector_for_config(&cfg, e),
     }
 }
 

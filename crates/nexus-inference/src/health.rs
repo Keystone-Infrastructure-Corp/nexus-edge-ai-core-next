@@ -27,7 +27,11 @@
 //! worth. A module-level registry keeps the reporting edge-triggered and
 //! local to the failure site.
 
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+
+use nexus_config::InferenceConfig;
 
 use crate::detectors::{Detector, MockDetector, UnavailableDetector};
 
@@ -36,6 +40,9 @@ use crate::detectors::{Detector, MockDetector, UnavailableDetector};
 pub struct DetectorDegradation {
     /// Model kind that failed to build (`yolo`, `yoloe`, `yolo_world`, …).
     pub kind: String,
+    /// Resolved model/EP identity; absent in older health payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
     /// Operator-facing cause, verbatim from the underlying
     /// [`crate::InferenceError`] — includes the resolver's
     /// "missing the shape-matched ONNX … Available in pack: […]"
@@ -43,50 +50,103 @@ pub struct DetectorDegradation {
     pub reason: String,
 }
 
-fn registry() -> &'static RwLock<Vec<DetectorDegradation>> {
-    static REGISTRY: OnceLock<RwLock<Vec<DetectorDegradation>>> = OnceLock::new();
+fn registry() -> &'static RwLock<Vec<(u64, DetectorDegradation)>> {
+    static REGISTRY: OnceLock<RwLock<Vec<(u64, DetectorDegradation)>>> = OnceLock::new();
     REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
 }
 
-/// Record that a detector could not be built and that this engine is
-/// therefore not performing real detection for `kind`.
-///
-/// Deduplicated: the pool builds one detector per worker slot (plus a
-/// `fail_soft` fallback), so the same failure arrives 3–4 times at boot
-/// and would otherwise be reported as several distinct problems.
+/// Manual diagnostics retain their legacy kind-scoped lifecycle. Detector
+/// failures instead belong to the detector that owns the failed session.
 pub fn record_degraded(kind: &str, reason: impl Into<String>) {
     let entry = DetectorDegradation {
         kind: kind.to_string(),
+        layer: None,
         reason: reason.into(),
     };
     if let Ok(mut guard) = registry().write() {
-        if !guard.contains(&entry) {
-            guard.push(entry);
+        if !guard.iter().any(|(id, d)| *id == 0 && *d == entry) {
+            guard.push((0, entry));
         }
     }
 }
 
-/// Clear all recorded degradations. Called when a detector for `kind`
-/// builds successfully, so a healthy rebuild (e.g. after the operator
-/// fixes the preset and restarts) doesn't keep reporting a stale
-/// failure.
+/// Clear manual diagnostics only. A healthy sibling cannot clear a live
+/// detector's failure; dropping that failed detector removes its own entry.
 pub fn clear_degraded(kind: &str) {
     if let Ok(mut guard) = registry().write() {
-        guard.retain(|d| d.kind != kind);
+        guard.retain(|(id, d)| *id != 0 || d.kind != kind);
     }
 }
 
-/// Snapshot of every currently-recorded degradation. Empty == healthy.
+pub(crate) struct DegradationRegistration(u64);
+
+impl Drop for DegradationRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = registry().write() {
+            guard.retain(|(id, _)| *id != self.0);
+        }
+    }
+}
+
+pub(crate) fn register(entry: DetectorDegradation) -> DegradationRegistration {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut guard) = registry().write() {
+        guard.push((id, entry));
+    }
+    DegradationRegistration(id)
+}
+
+/// Snapshot deduplicates equal failures without merging their ownership.
 pub fn degradations() -> Vec<DetectorDegradation> {
-    registry()
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_else(|_| Vec::new())
+    let mut entries = Vec::new();
+    if let Ok(guard) = registry().read() {
+        for (_, entry) in guard.iter() {
+            if !entries.contains(entry) {
+                entries.push(entry.clone());
+            }
+        }
+    }
+    entries
 }
 
 /// `true` when object detection is not fully operational on this engine.
 pub fn is_degraded() -> bool {
     registry().read().map(|g| !g.is_empty()).unwrap_or(false)
+}
+
+pub(crate) fn layer_identity(cfg: &InferenceConfig) -> String {
+    // Fingerprint the resolved model and providers without publishing local paths.
+    let mut identity = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", cfg.model).hash(&mut identity);
+    cfg.ep_priority.hash(&mut identity);
+    format!(
+        "{}@{}x{}/{:016x}",
+        cfg.model.kind,
+        cfg.model.input_width,
+        cfg.model.input_height,
+        identity.finish()
+    )
+}
+
+struct DegradedDetector {
+    inner: Arc<dyn Detector>,
+    _registration: DegradationRegistration,
+}
+
+#[async_trait::async_trait]
+impl Detector for DegradedDetector {
+    async fn detect(
+        &self,
+        frame: &nexus_types::Frame,
+        prompts: &[String],
+    ) -> Result<Vec<nexus_types::Detection>, crate::InferenceError> {
+        self.inner.detect(frame, prompts).await
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
 }
 
 /// `true` iff the operator has explicitly opted in to the synthetic
@@ -120,33 +180,39 @@ pub fn mock_fallback_allowed() -> bool {
 /// has explicitly set `NEXUS_ALLOW_MOCK_DETECTOR=1`; see
 /// [`mock_fallback_allowed`] for why that is not the default.
 pub fn degraded_detector(kind: &str, reason: impl std::fmt::Display) -> Arc<dyn Detector> {
-    let reason = reason.to_string();
+    degraded_detector_in_layer(kind, None, reason)
+}
 
-    if mock_fallback_allowed() {
-        tracing::warn!(
-            kind,
-            reason = %reason,
-            "detector unavailable; NEXUS_ALLOW_MOCK_DETECTOR is set, so substituting the \
-             SYNTHETIC mock detector — it fabricates a 'person' box on every frame and \
-             MUST NOT be used in production"
-        );
-        record_degraded(
-            kind,
-            format!("{reason} (synthetic mock detector substituted)"),
-        );
-        return Arc::new(MockDetector::new());
-    }
+/// Build a fail-soft detector whose health belongs to this resolved layer.
+pub fn degraded_detector_for_config(
+    cfg: &InferenceConfig,
+    reason: impl std::fmt::Display,
+) -> Arc<dyn Detector> {
+    degraded_detector_in_layer(&cfg.model.kind, Some(layer_identity(cfg)), reason)
+}
 
-    tracing::error!(
-        kind,
-        reason = %reason,
-        "DETECTION DISABLED: detector failed to build; this engine will report ZERO \
-         detections for this model kind until the configuration is corrected and the \
-         engine restarted. Check inference.model preset/pack_path against the shapes \
-         present in the model pack"
-    );
-    record_degraded(kind, reason);
-    Arc::new(UnavailableDetector::new())
+fn degraded_detector_in_layer(
+    kind: &str,
+    layer: Option<String>,
+    reason: impl std::fmt::Display,
+) -> Arc<dyn Detector> {
+    let mut reason = reason.to_string();
+    let inner: Arc<dyn Detector> = if mock_fallback_allowed() {
+        tracing::warn!(kind, %reason, "detector unavailable; explicit synthetic mock fallback enabled");
+        reason.push_str(" (synthetic mock detector substituted)");
+        Arc::new(MockDetector::new())
+    } else {
+        tracing::error!(kind, %reason, "DETECTION DISABLED: correct the model configuration and rebuild the layer");
+        Arc::new(UnavailableDetector::new())
+    };
+    Arc::new(DegradedDetector {
+        inner,
+        _registration: register(DetectorDegradation {
+            kind: kind.to_owned(),
+            layer,
+            reason,
+        }),
+    })
 }
 
 #[cfg(test)]

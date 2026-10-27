@@ -347,7 +347,7 @@ impl InferenceRouter {
 /// Every other field is taken from the override as-is — in particular
 /// `top_k` / `min_bbox_area_px` / `nms_spatial_bucket_size_px`, where
 /// `None` is a meaningful "off" a camera may legitimately ask for.
-fn derive_inference_cfg(
+pub(crate) fn derive_inference_cfg(
     default: &InferenceConfig,
     override_model: &ModelConfig,
 ) -> InferenceConfig {
