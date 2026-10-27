@@ -7,7 +7,9 @@ rust-version.workspace = true
 description = "HailoRT 4.x FFI + safe Rust wrappers for Hailo-8 inference (M_HAILO_EP)."
 
 [features]
-default = []
+# Keep the shipped standalone CLI enabled; inference opts out of this HTTP client.
+default = ["probe-cli"]
+probe-cli = ["dep:reqwest"]
 # When enabled on a Linux target, the crate `dlopen`s `libhailort.so.4`
 # at runtime (via `libloading`) and exposes a real inference session.
 # Build-time linking is intentional NOT used: HailoRT is distributed
@@ -25,7 +27,7 @@ linked = ["dep:libloading"]
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking"], optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -34,6 +36,7 @@ libloading = { workspace = true, optional = true }
 [[bin]]
 name = "nexus-hailo-probe"
 path = "src/bin/nexus-hailo-probe.rs"
+required-features = ["probe-cli"]
 
 [lints]
 workspace = true

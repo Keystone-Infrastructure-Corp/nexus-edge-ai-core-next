@@ -205,7 +205,7 @@ impl Detector for UnavailableDetector {
         // as a transient per-frame fault and retries/logs per frame,
         // which would produce one log line per frame per camera. The
         // condition is permanent for the life of the process and is
-        // already reported once, loudly, via `health::record_degraded`.
+        // already reported once, loudly, via `health::degraded_detector`.
         Ok(Vec::new())
     }
 

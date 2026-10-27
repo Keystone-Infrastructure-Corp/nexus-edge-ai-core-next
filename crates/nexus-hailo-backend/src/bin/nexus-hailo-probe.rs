@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn engine_probe_transports_auth_and_layout_without_hardware() {
-        let body = r#"{"devices":[{"serial":"test"}],"output_layout":{"RawYolo26":{"num_classes":80,"scales":[{"stride":8}]}}}"#;
+        let body = r#"{"devices":[{"board_name":"","serial":"test","part_number":"HM218B1C2LAE","fw_version":[4,23,0]}],"output_layout":{"RawYolo26":{"num_classes":80,"scales":[{"stride":8}]}}}"#;
         let result = engine_response("200 OK", body, Some("test-token")).unwrap();
         assert!(result.contains("RawYolo26"));
         assert!(!result.contains("test-token"));

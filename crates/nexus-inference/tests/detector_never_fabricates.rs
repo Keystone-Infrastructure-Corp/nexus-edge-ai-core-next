@@ -79,8 +79,6 @@ async fn unavailable_detector_never_fabricates_detections() {
 /// An unresolvable model kind must degrade loudly, not silently mock.
 #[test]
 fn unknown_model_kind_degrades_instead_of_mocking() {
-    health::clear_degraded("definitely_not_a_real_kind");
-
     let layer = build(&cfg_with_kind("definitely_not_a_real_kind"))
         .expect("engine must still boot so it can report the problem");
 
@@ -99,8 +97,6 @@ fn unknown_model_kind_degrades_instead_of_mocking() {
             .any(|d| d.kind == "definitely_not_a_real_kind"),
         "the degradation must name the offending model kind"
     );
-
-    health::clear_degraded("definitely_not_a_real_kind");
 }
 
 /// `classifier_ensemble` / `ppe` are advertised, operator-selectable
@@ -112,8 +108,6 @@ fn unknown_model_kind_degrades_instead_of_mocking() {
 #[test]
 fn advertised_kinds_with_no_implementation_degrade_instead_of_mocking() {
     for kind in ["classifier_ensemble", "ppe"] {
-        health::clear_degraded(kind);
-
         let layer = build(&cfg_with_kind(kind))
             .expect("engine must still boot so it can report the problem");
 
@@ -129,8 +123,6 @@ fn advertised_kinds_with_no_implementation_degrade_instead_of_mocking() {
              configured, so /health and the cloud heartbeat name something \
              they can find in their own config"
         );
-
-        health::clear_degraded(kind);
     }
 }
 
@@ -179,14 +171,13 @@ fn removing_one_failed_layer_preserves_its_sibling_until_both_are_removed() {
     let first = build(&cfg).unwrap();
     cfg.model.input_width *= 2;
     let second = build(&cfg).unwrap();
-    health::clear_degraded(kind);
     assert_eq!(
         health::degradations()
             .iter()
             .filter(|d| d.kind == kind)
             .count(),
         2,
-        "kind-wide recovery must not clear failures owned by live layers"
+        "same-kind layers retain their separate failures"
     );
     drop(first);
     assert!(health::degradations().iter().any(|d| d.kind == kind));

@@ -2641,7 +2641,8 @@ mod health_tests {
     #[test]
     fn degradations_map_to_wire_issues_and_flip_the_status() {
         let kind = "cloud_tunnel_health_test";
-        nexus_inference::health::record_degraded(kind, "model pack has no 640x640 export");
+        let _failure =
+            nexus_inference::health::degraded_detector(kind, "model pack has no 640x640 export");
 
         let health = edge_health(&[], None, None);
         assert_eq!(health.status, "degraded");
@@ -2655,8 +2656,6 @@ mod health_tests {
         assert_eq!(issue.component, "detector");
         assert_eq!(issue.code, "detector_unavailable");
         assert!(issue.detail.contains("no 640x640 export"));
-
-        nexus_inference::health::clear_degraded(kind);
     }
 
     /// BUG-057 — a stalled live-view source must reach the cloud. It rides

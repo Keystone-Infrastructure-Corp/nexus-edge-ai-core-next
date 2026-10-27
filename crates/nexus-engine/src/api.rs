@@ -5844,6 +5844,14 @@ mod tests {
         for (token, expected) in [
             (None, StatusCode::UNAUTHORIZED),
             (
+                Some(sign_role_jwt(ADMIN_SECRET, "viewer")),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Some(sign_role_jwt(ADMIN_SECRET, "operator")),
+                StatusCode::FORBIDDEN,
+            ),
+            (
                 Some(sign_admin_jwt(ADMIN_SECRET)),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),

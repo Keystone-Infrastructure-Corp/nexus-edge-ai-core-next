@@ -361,15 +361,15 @@ pub fn probe_snapshot() -> Result<Option<serde_json::Value>, InferenceError> {
         return Ok(None);
     };
     // A wedged inference must not make an admin request wait indefinitely.
-    let mut session = detector
+    let session = detector
         .session
         .try_lock_for(std::time::Duration::from_secs(2))
         .ok_or_else(|| InferenceError::Failed("Hailo session is busy; retry the probe".into()))?;
-    let telemetry = session
-        .telemetry()
+    let devices = session
+        .device_infos()
         .map_err(|e| InferenceError::Failed(format!("hailo probe: {e}")))?;
     Ok(Some(serde_json::json!({
-        "devices": telemetry.devices,
+        "devices": devices,
         "input_shape": session.input_shape(),
         "input_frame_size": session.input_frame_size(),
         "output_frame_size": session.output_frame_size(),

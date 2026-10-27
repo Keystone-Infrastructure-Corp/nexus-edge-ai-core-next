@@ -55,29 +55,6 @@ fn registry() -> &'static RwLock<Vec<(u64, DetectorDegradation)>> {
     REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
 }
 
-/// Manual diagnostics retain their legacy kind-scoped lifecycle. Detector
-/// failures instead belong to the detector that owns the failed session.
-pub fn record_degraded(kind: &str, reason: impl Into<String>) {
-    let entry = DetectorDegradation {
-        kind: kind.to_string(),
-        layer: None,
-        reason: reason.into(),
-    };
-    if let Ok(mut guard) = registry().write() {
-        if !guard.iter().any(|(id, d)| *id == 0 && *d == entry) {
-            guard.push((0, entry));
-        }
-    }
-}
-
-/// Clear manual diagnostics only. A healthy sibling cannot clear a live
-/// detector's failure; dropping that failed detector removes its own entry.
-pub fn clear_degraded(kind: &str) {
-    if let Ok(mut guard) = registry().write() {
-        guard.retain(|(id, d)| *id != 0 || d.kind != kind);
-    }
-}
-
 pub(crate) struct DegradationRegistration(u64);
 
 impl Drop for DegradationRegistration {
@@ -121,11 +98,12 @@ pub(crate) fn layer_identity(cfg: &InferenceConfig) -> String {
     format!("{:?}", cfg.model).hash(&mut identity);
     cfg.ep_priority.hash(&mut identity);
     format!(
-        "{}@{}x{}/{:016x}",
+        "{}@{}x{}/{:016x} ep=[{}]",
         cfg.model.kind,
         cfg.model.input_width,
         cfg.model.input_height,
-        identity.finish()
+        identity.finish(),
+        cfg.ep_priority.join(",")
     )
 }
 
@@ -223,30 +201,35 @@ mod tests {
     // their own `kind` namespace rather than on total emptiness.
 
     #[test]
-    fn record_then_clear_roundtrips() {
-        record_degraded("test-roundtrip", "boom");
-        assert!(degradations()
-            .iter()
-            .any(|d| d.kind == "test-roundtrip" && d.reason == "boom"));
-        assert!(is_degraded());
-        clear_degraded("test-roundtrip");
-        assert!(!degradations().iter().any(|d| d.kind == "test-roundtrip"));
+    fn layer_identity_labels_providers_without_disclosing_model_paths() {
+        let mut cfg = InferenceConfig {
+            ep_priority: vec!["hailo".into(), "cpu".into()],
+            model: nexus_config::ModelConfig {
+                pack_path: Some("/private/customer/models".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let first = layer_identity(&cfg);
+        assert!(first.contains("ep=[hailo,cpu]"), "{first}");
+        assert!(!first.contains("/private/customer"));
+        cfg.model.pack_path = Some("/private/other/models".into());
+        assert_ne!(first, layer_identity(&cfg));
     }
 
     #[test]
-    fn duplicate_records_are_deduplicated() {
-        clear_degraded("test-dedup");
-        record_degraded("test-dedup", "same");
-        record_degraded("test-dedup", "same");
-        record_degraded("test-dedup", "same");
-        assert_eq!(
-            degradations()
-                .iter()
-                .filter(|d| d.kind == "test-dedup")
-                .count(),
-            1,
-            "pool builds N workers; one failure must not report N times"
-        );
-        clear_degraded("test-dedup");
+    fn registration_drop_clears_only_its_owned_failure() {
+        let entry = DetectorDegradation {
+            kind: "test-owned-registration".into(),
+            layer: None,
+            reason: "boom".into(),
+        };
+        let first = register(entry.clone());
+        let second = register(entry.clone());
+        assert_eq!(degradations().iter().filter(|d| **d == entry).count(), 1);
+        drop(first);
+        assert!(degradations().contains(&entry));
+        drop(second);
+        assert!(!degradations().contains(&entry));
     }
 }
