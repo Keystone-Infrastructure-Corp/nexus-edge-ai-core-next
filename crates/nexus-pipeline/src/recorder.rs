@@ -177,6 +177,11 @@ pub trait ClipRecorder: Send + Sync {
     /// `gstreamer`, etc.).
     fn kind(&self) -> &'static str;
 
+    /// Camera-scoped recording failures for local health and cloud heartbeats.
+    fn recording_degradations(&self) -> Vec<crate::recording_health::RecordingDegradation> {
+        Vec::new()
+    }
+
     /// Hot-add a per-camera ingester. Called by the engine's
     /// `config.changed` reconciler when a camera is added or its
     /// ingest URL changes, so the GStreamer recorder can start a
@@ -219,6 +224,11 @@ pub trait ClipRecorder: Send + Sync {
     ) -> Result<(), RecorderError> {
         Ok(())
     }
+
+    /// Record the operator's explicit codec pin after registering an ingester.
+    /// `None` means auto, even if probing selected a concrete startup codec.
+    #[allow(unused_variables)]
+    fn set_camera_codec_pin(&self, camera_id: CameraId, codec: Option<CodecKind>) {}
 
     /// Hot-remove a per-camera ingester. Mirror of
     /// [`Self::add_camera_ingester`]. Called when a camera is

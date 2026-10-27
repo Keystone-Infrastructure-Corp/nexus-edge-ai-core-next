@@ -2158,7 +2158,8 @@ impl EngineHealth {
             recorder
                 .into_iter()
                 .chain(exited_supervisors_issue(&self.exited_supervisors()))
-                .chain(unreadable_cameras_issue(&unreadable)),
+                .chain(unreadable_cameras_issue(&unreadable))
+                .chain(recording_issues(self.recorder.recording_degradations())),
         )
     }
 
@@ -2279,7 +2280,11 @@ fn edge_health_from(
         .map(|d| EdgeDegradation {
             component: "detector".to_string(),
             code: "detector_unavailable".to_string(),
-            detail: truncate_detail(&format!("{}: {}", d.kind, d.reason)),
+            detail: truncate_detail(&format!(
+                "{}: {}",
+                d.layer.as_deref().unwrap_or(&d.kind),
+                d.reason
+            )),
         })
         .collect();
     if !stalled_cameras.is_empty() {
@@ -2323,6 +2328,63 @@ fn edge_health_from(
         status: if issues.is_empty() { "ok" } else { "degraded" }.to_string(),
         issues: Some(issues),
     }
+}
+
+fn recording_issues(
+    failures: Vec<nexus_pipeline::recording_health::RecordingDegradation>,
+) -> impl Iterator<Item = EdgeDegradation> {
+    use nexus_pipeline::recording_health::RecordingKind;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut groups: BTreeMap<RecordingKind, BTreeMap<String, BTreeSet<nexus_types::CameraId>>> =
+        BTreeMap::new();
+    for failure in failures {
+        groups
+            .entry(failure.kind)
+            .or_default()
+            .entry(failure.reason)
+            .or_default()
+            .insert(failure.camera_id);
+    }
+    // Group by code before the wire's 16-issue cap, retaining each reason's cameras.
+    groups.into_iter().map(|(kind, reasons)| EdgeDegradation {
+        component: "recorder".into(),
+        code: match kind {
+            RecordingKind::Motion => "recording_unavailable",
+            RecordingKind::Alert => "alert_clip_unavailable",
+            RecordingKind::Codec => "recording_codec_mismatch",
+        }
+        .into(),
+        detail: {
+            let count: usize = reasons.values().map(BTreeSet::len).sum();
+            let descriptions = reasons
+                .into_iter()
+                .map(|(reason, cameras)| {
+                    let noun = if cameras.len() == 1 {
+                        "camera"
+                    } else {
+                        "cameras"
+                    };
+                    let ids = cameras
+                        .into_iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{noun} {ids}: {reason}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let full = format!("{count} camera(s) affected; {descriptions}");
+            let mut detail = truncate_detail(&full);
+            if detail.len() < full.len() {
+                while detail.len() + 3 > HEALTH_DETAIL_MAX {
+                    detail.pop();
+                }
+                detail.push_str("...");
+            }
+            detail
+        },
+    })
 }
 
 /// The clip recorder's contribution to [`EngineHealth`].
@@ -2579,7 +2641,8 @@ mod health_tests {
     #[test]
     fn degradations_map_to_wire_issues_and_flip_the_status() {
         let kind = "cloud_tunnel_health_test";
-        nexus_inference::health::record_degraded(kind, "model pack has no 640x640 export");
+        let _failure =
+            nexus_inference::health::degraded_detector(kind, "model pack has no 640x640 export");
 
         let health = edge_health(&[], None, None);
         assert_eq!(health.status, "degraded");
@@ -2593,8 +2656,6 @@ mod health_tests {
         assert_eq!(issue.component, "detector");
         assert_eq!(issue.code, "detector_unavailable");
         assert!(issue.detail.contains("no 640x640 export"));
-
-        nexus_inference::health::clear_degraded(kind);
     }
 
     /// BUG-057 — a stalled live-view source must reach the cloud. It rides
@@ -2664,6 +2725,134 @@ mod health_tests {
         );
     }
 
+    #[test]
+    fn recording_failures_group_all_51_cameras_before_the_wire_issue_cap() {
+        use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
+        let failures = (1..=51)
+            .map(|camera_id| RecordingDegradation {
+                camera_id,
+                kind: RecordingKind::Motion,
+                reason: "motion clip open refused by disk policy".into(),
+            })
+            .collect();
+        let health = edge_health_from(vec![], &[], None, recording_issues(failures));
+        let issues = health.issues.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "recording_unavailable");
+        let ids = (1..=51)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(issues[0].detail.contains(&ids), "{}", issues[0].detail);
+        assert!(issues[0]
+            .detail
+            .contains("motion clip open refused by disk policy"));
+        assert!(issues[0].detail.len() <= HEALTH_DETAIL_MAX);
+    }
+
+    #[test]
+    fn grouped_recording_health_keeps_reason_ownership_and_partial_recovery() {
+        use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
+        let failure = |camera_id, kind, reason: &str| RecordingDegradation {
+            camera_id,
+            kind,
+            reason: reason.into(),
+        };
+        let first = failure(7, RecordingKind::Motion, "file missing");
+        let second = failure(8, RecordingKind::Motion, "disk policy");
+        let alert = failure(7, RecordingKind::Alert, "encoder failed");
+        let issues: Vec<_> = recording_issues(vec![first, second.clone(), alert.clone()]).collect();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(
+            issues[0].detail,
+            "2 camera(s) affected; camera 8: disk policy; camera 7: file missing"
+        );
+        let recovered: Vec<_> = recording_issues(vec![second, alert]).collect();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered[0].detail,
+            "1 camera(s) affected; camera 8: disk policy"
+        );
+        assert_eq!(recovered[1].code, "alert_clip_unavailable");
+    }
+
+    #[test]
+    fn grouped_recording_health_marks_truncated_detail_and_keeps_total_count() {
+        use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
+        let failures = (1..=51)
+            .map(|id| RecordingDegradation {
+                camera_id: 1_000_000_000_000 + id,
+                kind: RecordingKind::Motion,
+                reason: "é".repeat(HEALTH_DETAIL_MAX),
+            })
+            .collect();
+        let issues: Vec<_> = recording_issues(failures).collect();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].detail.starts_with("51 camera(s) affected;"));
+        assert!(issues[0].detail.ends_with("..."));
+        assert!(issues[0].detail.len() <= HEALTH_DETAIL_MAX);
+    }
+
+    #[test]
+    fn recording_and_layer_failures_reach_local_and_cloud_health() {
+        use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
+        let failures = vec![
+            RecordingDegradation {
+                camera_id: 7,
+                kind: RecordingKind::Motion,
+                reason: "file missing".into(),
+            },
+            RecordingDegradation {
+                camera_id: 8,
+                kind: RecordingKind::Alert,
+                reason: "build refused".into(),
+            },
+            RecordingDegradation {
+                camera_id: 9,
+                kind: RecordingKind::Codec,
+                reason: "configured h264, negotiated h265".into(),
+            },
+        ];
+        let health = edge_health_from(
+            vec![nexus_inference::health::DetectorDegradation {
+                kind: "yolo".into(),
+                layer: Some("yolo@1024x576#test".into()),
+                reason: "model unavailable".into(),
+            }],
+            &[],
+            None,
+            recording_issues(failures),
+        );
+        assert_eq!(health.status, "degraded");
+        let local = crate::api::health_body(health.clone(), true);
+        let issues = local["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 4);
+        assert!(issues
+            .iter()
+            .any(|issue| issue["code"] == "recording_unavailable"
+                && issue["detail"].as_str().unwrap().contains("camera 7")));
+        assert!(issues
+            .iter()
+            .any(|issue| issue["code"] == "alert_clip_unavailable"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue["code"] == "recording_codec_mismatch"));
+        assert!(issues.iter().any(|issue| issue["detail"]
+            .as_str()
+            .unwrap()
+            .contains("yolo@1024x576#test")));
+        let anonymous = crate::api::health_body(health, false);
+        assert!(anonymous["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|issue| issue.get("detail").is_none()));
+        assert_eq!(
+            edge_health_from(vec![], &[], None, recording_issues(vec![])).status,
+            "ok"
+        );
+    }
+
     /// The answers the local UI's tests render (`ui/src/lib/
     /// engineHealth.fixture.json`) are the ones `GET /api/v1/health` gives:
     /// one issue of every code the roll-up raises, for a signed-in caller and
@@ -2681,6 +2870,7 @@ mod health_tests {
         };
         let health = edge_health_from(
             vec![nexus_inference::health::DetectorDegradation {
+                layer: None,
                 kind: "ppe".to_string(),
                 reason: "no detector implementation ships for this model kind".to_string(),
             }],
@@ -3120,6 +3310,7 @@ mod health_tests {
     fn the_recorder_issue_cannot_carry_the_heartbeat_past_the_wire_cap() {
         let detector = (0..HEALTH_ISSUES_MAX)
             .map(|n| nexus_inference::health::DetectorDegradation {
+                layer: None,
                 kind: format!("cap_{n}"),
                 reason: "unavailable".to_string(),
             })

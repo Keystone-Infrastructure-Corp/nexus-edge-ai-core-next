@@ -811,6 +811,7 @@ async fn start_sessions(
             analysis: None,
         };
     }
+    recorder.set_camera_codec_pin(cam.id, cam.ingest.codec);
     Sessions {
         main_pending: None,
         analysis: apply_analysis_session(recorder, cam, main_codec, supervisor_dims).await,
@@ -865,6 +866,7 @@ fn retry_sessions(args: &ReconcilerArgs, cam: &CameraConfig, entry: &RunningCame
                     camera_id = cam_id,
                     "camera reconciler: ingester registered on retry; clips resume for this camera"
                 );
+                args.recorder.set_camera_codec_pin(cam_id, cam.ingest.codec);
                 sessions.main_pending = None;
             }
             Err(e) => {
@@ -1128,6 +1130,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingRecorder {
         calls: Mutex<Vec<(CameraId, Option<String>, CodecKind)>>,
+        codec_pins: Mutex<Vec<(CameraId, Option<CodecKind>)>>,
     }
 
     #[async_trait::async_trait]
@@ -1148,6 +1151,9 @@ mod tests {
         }
         fn kind(&self) -> &'static str {
             "recording"
+        }
+        fn set_camera_codec_pin(&self, camera_id: CameraId, codec: Option<CodecKind>) {
+            self.codec_pins.lock().push((camera_id, codec));
         }
         fn set_camera_analysis_ingester(
             &self,
@@ -1186,6 +1192,31 @@ mod tests {
             talk_down: CameraTalkDown::default(),
             zones: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn session_registration_preserves_only_explicit_codec_pins() {
+        let rec = RecordingRecorder::default();
+        let mut camera = cam(None);
+        for pin in [None, Some(CodecKind::H264), Some(CodecKind::H265), None] {
+            camera.ingest.codec = pin;
+            start_sessions(&rec, &camera, CodecKind::H264, (512, 288), true).await;
+        }
+        assert_eq!(
+            *rec.codec_pins.lock(),
+            vec![
+                (7, None),
+                (7, Some(CodecKind::H264)),
+                (7, Some(CodecKind::H265)),
+                (7, None)
+            ]
+        );
+        rec.codec_pins.lock().clear();
+        start_sessions(&rec, &camera, CodecKind::H264, (512, 288), false).await;
+        assert!(
+            rec.codec_pins.lock().is_empty(),
+            "failed registration must not pin another ingester"
+        );
     }
 
     /// Boot builds only main ingesters, so before this fix the analysis
@@ -2402,6 +2433,7 @@ mod tests {
         mains_tried: AtomicUsize,
         ingesters_removed: AtomicUsize,
         sources_built: AtomicUsize,
+        codec_pins: Mutex<Vec<(CameraId, Option<CodecKind>)>>,
     }
 
     impl SubstreamRecorder {
@@ -2414,6 +2446,7 @@ mod tests {
                 mains_tried: Default::default(),
                 ingesters_removed: Default::default(),
                 sources_built: Default::default(),
+                codec_pins: Default::default(),
             })
         }
 
@@ -2465,6 +2498,9 @@ mod tests {
         }
         fn kind(&self) -> &'static str {
             "substream"
+        }
+        fn set_camera_codec_pin(&self, camera_id: CameraId, codec: Option<CodecKind>) {
+            self.codec_pins.lock().push((camera_id, codec));
         }
         fn add_camera_ingester(
             &self,
@@ -3024,11 +3060,20 @@ mod tests {
         )
         .await;
         let at_start = sessions_of(&args.handles, 7);
+        assert!(
+            recorder.codec_pins.lock().is_empty(),
+            "failed registration must not set a pin"
+        );
 
         let restarts = restarts_per_pass(&args, 3, || recorder.sources_built()).await;
 
         let after = sessions_of(&args.handles, 7);
         abort_all(&args.handles);
+        assert_eq!(
+            *recorder.codec_pins.lock(),
+            [(7, Some(CodecKind::H265))],
+            "successful retry must preserve the configured codec pin exactly once"
+        );
         assert_eq!(
             at_start,
             Sessions {
@@ -3085,11 +3130,20 @@ mod tests {
         )
         .await;
         let at_boot = sessions_of(&args.handles, 7).main_pending;
+        assert!(
+            recorder.codec_pins.lock().is_empty(),
+            "failed registration must not set a pin"
+        );
 
         let restarts = restarts_per_pass(&args, 3, || recorder.sources_built()).await;
 
         let after = sessions_of(&args.handles, 7).main_pending;
         abort_all(&args.handles);
+        assert_eq!(
+            *recorder.codec_pins.lock(),
+            [(7, Some(CodecKind::H265))],
+            "successful retry must preserve the configured codec pin exactly once"
+        );
         assert_eq!(
             (at_boot, after),
             (Some(CodecKind::H265), None),

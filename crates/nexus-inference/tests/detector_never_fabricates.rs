@@ -79,8 +79,6 @@ async fn unavailable_detector_never_fabricates_detections() {
 /// An unresolvable model kind must degrade loudly, not silently mock.
 #[test]
 fn unknown_model_kind_degrades_instead_of_mocking() {
-    health::clear_degraded("definitely_not_a_real_kind");
-
     let layer = build(&cfg_with_kind("definitely_not_a_real_kind"))
         .expect("engine must still boot so it can report the problem");
 
@@ -99,8 +97,6 @@ fn unknown_model_kind_degrades_instead_of_mocking() {
             .any(|d| d.kind == "definitely_not_a_real_kind"),
         "the degradation must name the offending model kind"
     );
-
-    health::clear_degraded("definitely_not_a_real_kind");
 }
 
 /// `classifier_ensemble` / `ppe` are advertised, operator-selectable
@@ -112,8 +108,6 @@ fn unknown_model_kind_degrades_instead_of_mocking() {
 #[test]
 fn advertised_kinds_with_no_implementation_degrade_instead_of_mocking() {
     for kind in ["classifier_ensemble", "ppe"] {
-        health::clear_degraded(kind);
-
         let layer = build(&cfg_with_kind(kind))
             .expect("engine must still boot so it can report the problem");
 
@@ -129,8 +123,6 @@ fn advertised_kinds_with_no_implementation_degrade_instead_of_mocking() {
              configured, so /health and the cloud heartbeat name something \
              they can find in their own config"
         );
-
-        health::clear_degraded(kind);
     }
 }
 
@@ -170,4 +162,156 @@ async fn worker_process_backend_never_fabricates_for_unbacked_kinds() {
 fn explicit_mock_kind_is_still_honoured() {
     let layer = build(&cfg_with_kind("mock")).expect("mock builds");
     assert_eq!(layer.detector.name(), "mock");
+}
+
+#[test]
+fn removing_one_failed_layer_preserves_its_sibling_until_both_are_removed() {
+    let kind = "unavailable-layer-lifetime-regression";
+    let mut cfg = cfg_with_kind(kind);
+    let first = build(&cfg).unwrap();
+    cfg.model.input_width *= 2;
+    let second = build(&cfg).unwrap();
+    assert_eq!(
+        health::degradations()
+            .iter()
+            .filter(|d| d.kind == kind)
+            .count(),
+        2,
+        "same-kind layers retain their separate failures"
+    );
+    drop(first);
+    assert!(health::degradations().iter().any(|d| d.kind == kind));
+    drop(second);
+    assert!(
+        !health::degradations().iter().any(|d| d.kind == kind),
+        "removing the last failed detector must remove its stale health entry"
+    );
+}
+
+#[test]
+fn equal_failures_keep_independent_ownership_and_distinct_packs_keep_distinct_layers() {
+    let kind = "unavailable-same-kind-pack-regression";
+    let mut cfg = cfg_with_kind(kind);
+    cfg.model.pack_path = Some("/models/first".into());
+    let first = build(&cfg).unwrap();
+    let identical = build(&cfg).unwrap();
+    assert_eq!(
+        health::degradations()
+            .iter()
+            .filter(|d| d.kind == kind)
+            .count(),
+        1
+    );
+    drop(first);
+    assert_eq!(
+        health::degradations()
+            .iter()
+            .filter(|d| d.kind == kind)
+            .count(),
+        1
+    );
+    cfg.model.pack_path = Some("/models/second".into());
+    let other = build(&cfg).unwrap();
+    assert_eq!(
+        health::degradations()
+            .iter()
+            .filter(|d| d.kind == kind)
+            .count(),
+        2
+    );
+    drop(identical);
+    assert_eq!(
+        health::degradations()
+            .iter()
+            .filter(|d| d.kind == kind)
+            .count(),
+        1
+    );
+    drop(other);
+    assert!(!health::degradations().iter().any(|d| d.kind == kind));
+}
+
+#[cfg(feature = "ort")]
+#[test]
+fn ensemble_members_resolve_inherited_and_explicit_model_packs() {
+    let inherited = tempfile::tempdir().unwrap();
+    let explicit = tempfile::tempdir().unwrap();
+    let mut cfg = cfg_with_kind("ensemble");
+    cfg.model.pack_path = Some(inherited.path().to_owned());
+    cfg.model.members = vec![
+        ModelConfig {
+            kind: "yolo".into(),
+            ..Default::default()
+        },
+        ModelConfig {
+            kind: "yolo".into(),
+            pack_path: Some(explicit.path().to_owned()),
+            ..Default::default()
+        },
+    ];
+    let layer = build(&cfg).unwrap();
+    let entries = health::degradations();
+    for pack in [inherited.path(), explicit.path()] {
+        assert!(
+            entries
+                .iter()
+                .any(|d| d.reason.contains(&pack.display().to_string())
+                    && d.reason.contains("missing the shape-matched ONNX")),
+            "member should reach the artifact resolver using its effective pack: {entries:?}"
+        );
+    }
+    drop(layer);
+}
+
+#[tokio::test]
+async fn process_worker_reports_owned_failure_without_needing_a_frame() {
+    let worker = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nexus-inference-worker"));
+    let kind = "unavailable-process-health-regression";
+    let first = WorkerProcessBackend::start_with_program(0, &worker, kind, &[]).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !health::degradations().iter().any(|d| d.kind == kind) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker startup must report model health before any detection");
+    drop(first);
+    assert!(!health::degradations().iter().any(|d| d.kind == kind));
+}
+
+#[tokio::test]
+async fn process_workers_keep_resolved_layers_and_health_independent() {
+    let worker = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nexus-inference-worker"));
+    let kind = "unavailable-process-layer-regression";
+    let mut cfg = cfg_with_kind(kind);
+    cfg.model.input_width = 1024;
+    cfg.model.input_height = 576;
+    let first = WorkerProcessBackend::start_with_program_and_config(0, &worker, &cfg).unwrap();
+    cfg.model.input_width = 1536;
+    cfg.model.input_height = 864;
+    let second = WorkerProcessBackend::start_with_program_and_config(1, &worker, &cfg).unwrap();
+    // Receiving a detect response guarantees the preceding startup health was consumed.
+    first.detect(&frame(), &[]).await.unwrap();
+    second.detect(&frame(), &[]).await.unwrap();
+    let entries: Vec<_> = health::degradations()
+        .into_iter()
+        .filter(|d| d.kind == kind)
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert!(entries
+        .iter()
+        .any(|d| d.layer.as_ref().is_some_and(|s| s.contains("@1024x576/"))));
+    assert!(entries
+        .iter()
+        .any(|d| d.layer.as_ref().is_some_and(|s| s.contains("@1536x864/"))));
+    drop(first);
+    assert_eq!(
+        health::degradations()
+            .iter()
+            .filter(|d| d.kind == kind)
+            .count(),
+        1
+    );
+    drop(second);
+    assert!(!health::degradations().iter().any(|d| d.kind == kind));
 }

@@ -125,6 +125,9 @@ use crate::alert_clip::{
 use crate::preroll::NalSample;
 use crate::preroll_ingester::PreRollIngester;
 use crate::recorder::{ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError};
+use crate::recording_health::{
+    RecordingAttempt, RecordingDegradation, RecordingHealthRegistry, RecordingKind,
+};
 use crate::source::gst_init;
 
 /// How long to wait for the per-clip pipeline to drain after we send
@@ -136,6 +139,7 @@ const EOS_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTAINER: &str = "mp4";
 
 pub struct GstClipRecorder {
+    recording_health: RecordingHealthRegistry,
     store: Arc<Store>,
     clips_dir: PathBuf,
     /// Per-camera always-on RTSP feed. The recorder is a passive
@@ -248,6 +252,7 @@ pub struct GstClipRecorder {
 }
 
 struct OpenState {
+    health: RecordingAttempt,
     camera_id: CameraId,
     started_at: DateTime<Utc>,
     path: PathBuf,
@@ -363,6 +368,7 @@ impl GstClipRecorder {
         gst_init::ensure()
             .map_err(|e| RecorderError::Io(std::io::Error::other(format!("gst init: {e}"))))?;
         Ok(Self {
+            recording_health: RecordingHealthRegistry::default(),
             store,
             clips_dir: clips_dir.as_ref().to_path_buf(),
             ingesters: Arc::new(PlRwLock::new(ingesters)),
@@ -507,7 +513,14 @@ impl GstClipRecorder {
         if delivered {
             new_ing.mark_delivered();
         }
-        let prev = taps.write().insert(camera_id, new_ing);
+        let prev = {
+            let mut write = taps.write();
+            // Copy under the replacement lock so a concurrent pin correction is retained.
+            if let Some(existing) = write.get(&camera_id) {
+                new_ing.set_codec_pin(existing.codec_pin());
+            }
+            write.insert(camera_id, new_ing)
+        };
         if let Some(prev_ing) = prev {
             // Same justification as the URL-change replace path in
             // `add_camera_ingester`: any stale `SharedRtspSource`
@@ -700,6 +713,10 @@ impl GstClipRecorder {
 #[async_trait]
 impl ClipRecorder for GstClipRecorder {
     async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
+        let health = self
+            .recording_health
+            .begin(args.camera_id, RecordingKind::Motion);
+        let failure = health.guard("recording could not be opened");
         if *self.panic.lock() {
             return Err(RecorderError::Refused);
         }
@@ -742,9 +759,13 @@ impl ClipRecorder for GstClipRecorder {
         // pushes immediately. We push the pre-roll snapshot before
         // even waiting for the state change to complete — the queue
         // inside appsrc absorbs them.
-        pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| RecorderError::Io(std::io::Error::other(format!("set Playing: {e}"))))?;
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            let _ = pipeline.set_state(gst::State::Null);
+            let _ = fs::remove_file(&path).await;
+            return Err(RecorderError::Io(std::io::Error::other(format!(
+                "set Playing: {e}"
+            ))));
+        }
 
         // Snapshot the ring buffer + subscribe to live BEFORE either
         // path can race the other. The subscribe happens-before any
@@ -870,11 +891,13 @@ impl ClipRecorder for GstClipRecorder {
                 Ok(Err(e)) => {
                     pump_handle.abort();
                     let _ = pipeline.set_state(gst::State::Null);
+                    let _ = fs::remove_file(&path).await;
                     return Err(e);
                 }
                 Err(join_err) => {
                     pump_handle.abort();
                     let _ = pipeline.set_state(gst::State::Null);
+                    let _ = fs::remove_file(&path).await;
                     return Err(RecorderError::Io(std::io::Error::other(format!(
                         "preroll spawn_blocking: {join_err}"
                     ))));
@@ -900,6 +923,7 @@ impl ClipRecorder for GstClipRecorder {
             Err(e) => {
                 pump_handle.abort();
                 let _ = pipeline.set_state(gst::State::Null);
+                let _ = fs::remove_file(&path).await;
                 return Err(e.into());
             }
         };
@@ -916,6 +940,7 @@ impl ClipRecorder for GstClipRecorder {
         self.open.lock().await.insert(
             clip_id,
             OpenState {
+                health,
                 camera_id: args.camera_id,
                 started_at: args.started_at,
                 path,
@@ -935,6 +960,7 @@ impl ClipRecorder for GstClipRecorder {
             preroll_samples = preroll_count,
             "gst recorder opened clip (pre-roll prepended)"
         );
+        failure.complete();
         Ok(ClipHandle {
             clip_id,
             camera_id: args.camera_id,
@@ -949,6 +975,7 @@ impl ClipRecorder for GstClipRecorder {
             .await
             .remove(&handle.clip_id)
             .ok_or(RecorderError::UnknownClip(handle.clip_id))?;
+        let failure = state.health.guard("recording could not be finalized");
 
         // Step 1: signal the live pump to stop and wait for it. Once
         // the pump returns we know no more push_buffer() calls are
@@ -966,9 +993,13 @@ impl ClipRecorder for GstClipRecorder {
             match tokio::time::timeout(Duration::from_secs(2), handle).await {
                 Ok(Ok(s)) => pump_stats = s,
                 Ok(Err(e)) => {
+                    state.health.fail("recording writer failed during close");
                     warn!(error = %e, "live pump task panicked during close")
                 }
                 Err(_) => {
+                    state
+                        .health
+                        .fail("recording writer did not stop before the close timeout");
                     warn!("live pump task did not exit within 2s; proceeding to EOS anyway")
                 }
             }
@@ -986,19 +1017,19 @@ impl ClipRecorder for GstClipRecorder {
             let _ = appsrc.end_of_stream();
             let bus = match pipeline_for_blocking.bus() {
                 Some(b) => b,
-                None => return,
+                None => return false,
             };
             let deadline = std::time::Instant::now() + EOS_DRAIN_TIMEOUT;
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    return;
+                    return false;
                 }
                 let timeout = gst::ClockTime::from_nseconds(remaining.as_nanos() as u64);
                 match bus.timed_pop(Some(timeout)) {
-                    None => return,
+                    None => return false,
                     Some(msg) => match msg.view() {
-                        gst::MessageView::Eos(..) => return,
+                        gst::MessageView::Eos(..) => return true,
                         gst::MessageView::Error(e) => {
                             warn!(
                                 error = %e.error(),
@@ -1006,7 +1037,7 @@ impl ClipRecorder for GstClipRecorder {
                                 src = ?e.src().map(|s| s.path_string()),
                                 "gst recorder bus error during close drain"
                             );
-                            return;
+                            return false;
                         }
                         gst::MessageView::Warning(w) => {
                             warn!(
@@ -1021,7 +1052,11 @@ impl ClipRecorder for GstClipRecorder {
                 }
             }
         });
-        let _ = drain.await;
+        if !matches!(drain.await, Ok(true)) {
+            state
+                .health
+                .fail("recording muxer did not finalize cleanly");
+        }
         let _ = pipeline.set_state(gst::State::Null);
 
         let wall_ms = (args.ended_at - state.started_at).num_milliseconds().max(0);
@@ -1066,6 +1101,7 @@ impl ClipRecorder for GstClipRecorder {
         let too_short =
             duration_ms < crate::recorder::MIN_CLIP_DURATION_MS && !ended_on_epoch_change;
         if let Some(reason) = empty_reason {
+            state.health.fail("recording contained no playable media");
             warn!(
                 camera_id = state.camera_id,
                 clip_id = handle.clip_id,
@@ -1110,6 +1146,7 @@ impl ClipRecorder for GstClipRecorder {
                 }
             }
             self.store.discard_clip_metadata(handle.clip_id).await?;
+            failure.complete();
             return Ok(ClipMeta {
                 clip_id: handle.clip_id,
                 camera_id: state.camera_id,
@@ -1126,10 +1163,11 @@ impl ClipRecorder for GstClipRecorder {
         // larger `moov` overwrote the start of the first `moof`. The clip
         // closes normally and the file stays (its later fragments are intact
         // on the hot tier), but it is marked degraded and never replicated.
-        let layout_fault = read_clip_head(&state.path)
-            .await
+        let inspected_head = read_clip_head(&state.path).await;
+        let layout_fault = inspected_head
+            .as_ref()
             .ok()
-            .and_then(|head| clip_layout_fault(&head));
+            .and_then(|head| clip_layout_fault(head));
 
         // Normal close path: rename in-flight file to spec layout
         // `{start_ms}_{duration_ms}.mp4`, stat for size, stamp the row.
@@ -1189,6 +1227,7 @@ impl ClipRecorder for GstClipRecorder {
         // ClipClose below.
         let rel_for_event = rel.clone();
         let sha256_for_event = sha256.clone();
+        let hash_succeeded = sha256.is_some();
 
         // Make sample loss loud and durable. A dropped sample on a
         // drop-oldest broadcast ring is an evicted IDR, so the clip
@@ -1215,6 +1254,9 @@ impl ClipRecorder for GstClipRecorder {
             );
         }
         if pump_stats.dropped > 0 || layout_fault.is_some() {
+            state
+                .health
+                .fail("recording has missing samples or a damaged media layout");
             if let Err(e) = self
                 .store
                 .mark_clip_degraded(handle.clip_id, pump_stats.dropped as i64)
@@ -1290,6 +1332,15 @@ impl ClipRecorder for GstClipRecorder {
             }
         }
 
+        if !hash_succeeded || inspected_head.is_err() || size_bytes < MIN_PLAYABLE_CLIP_BYTES as i64
+        {
+            state
+                .health
+                .fail("finalized recording could not be verified");
+        } else if pump_stats.dropped == 0 && layout_fault.is_none() {
+            state.health.succeed();
+        }
+        failure.complete();
         Ok(ClipMeta {
             clip_id: handle.clip_id,
             camera_id: state.camera_id,
@@ -1374,6 +1425,28 @@ impl ClipRecorder for GstClipRecorder {
         "gstreamer"
     }
 
+    fn recording_degradations(&self) -> Vec<RecordingDegradation> {
+        let mut issues = self.recording_health.degradations();
+        if !self.alert_clips_active() {
+            issues.retain(|issue| issue.kind != RecordingKind::Alert);
+        }
+        for (&camera_id, ingester) in self.ingesters.read().iter() {
+            let Some(codec_pin) = ingester.codec_pin() else {
+                continue;
+            };
+            let configured = codec_pin.base();
+            let detected = ingester.stream_codec().base();
+            if configured != detected {
+                issues.push(RecordingDegradation {
+                    camera_id,
+                    kind: RecordingKind::Codec,
+                    reason: format!("configured {configured} codec differs from detected {detected}; recording uses the detected codec"),
+                });
+            }
+        }
+        issues
+    }
+
     fn add_camera_ingester(
         &self,
         camera_id: CameraId,
@@ -1438,7 +1511,16 @@ impl ClipRecorder for GstClipRecorder {
         Ok(())
     }
 
+    fn set_camera_codec_pin(&self, camera_id: CameraId, codec: Option<CodecKind>) {
+        if let Some(ingester) = self.ingesters.read().get(&camera_id) {
+            ingester.set_codec_pin(codec);
+        }
+    }
+
     fn remove_camera_ingester(&self, camera_id: CameraId) {
+        self.recording_health.remove(camera_id);
+        self.alert_inflight.lock().remove(&camera_id);
+        self.alert_box_timelines.write().remove(&camera_id);
         // Bind through a `let` statement, not an `if let` scrutinee: under
         // edition 2021 the latter holds the write guard for the whole body,
         // which would block every reader behind this teardown.
@@ -1636,6 +1718,8 @@ impl ClipRecorder for GstClipRecorder {
         if !self.alert_clips_active() {
             return None;
         }
+        let health = self.recording_health.begin(camera_id, RecordingKind::Alert);
+        let failure = health.guard("alert recording could not be started");
         // Honor the disk-full panic watermark, exactly as `open()` does for
         // motion clips. Without this an alert clip is armed on a critically
         // full disk, and its encoder pipeline (blocking appsrc → filesink)
@@ -1659,6 +1743,7 @@ impl ClipRecorder for GstClipRecorder {
                     entry
                         .deadline
                         .store(cur.max(deadline_ms), Ordering::Release);
+                    failure.complete();
                     return Some(entry.alert_clip_id);
                 }
             }
@@ -1673,6 +1758,8 @@ impl ClipRecorder for GstClipRecorder {
         // queueing is the same memory exhaustion with more steps.
         let Ok(build_slot) = self.alert_build_slots.clone().try_acquire_owned() else {
             let shed = self.alert_clips_shed.fetch_add(1, Ordering::Relaxed) + 1;
+            health.fail("alert recording refused because all build slots are busy");
+            failure.complete();
             warn!(
                 camera_id,
                 max_concurrent = MAX_CONCURRENT_ALERT_CLIP_BUILDS,
@@ -1755,7 +1842,9 @@ impl ClipRecorder for GstClipRecorder {
             deadline,
             self.alert_cold_kick.clone(),
             build_slot,
+            health,
         ));
+        failure.complete();
         Some(alert_clip_id)
     }
 }
@@ -2472,7 +2561,10 @@ async fn run_alert_clip_builder(
     deadline: Arc<AtomicI64>,
     cold_kick: Option<Arc<Notify>>,
     build_slot: OwnedSemaphorePermit,
+    health: RecordingAttempt,
 ) {
+    let failure = health.guard("alert recording could not be completed");
+    let build_started = std::time::Instant::now();
     // Collect the post window, deduping against the pre snapshot's tail
     // PTS (a sample can straddle the snapshot/live boundary).
     let pre_tail_pts = pre.iter().filter_map(|s| s.pts).next_back();
@@ -2605,6 +2697,10 @@ async fn run_alert_clip_builder(
                         alert_clip_id, "mark_alert_clip_ready failed: {e}"
                     );
                 } else {
+                    if sha256.is_some() {
+                        health.succeed();
+                        failure.complete();
+                    }
                     info!(
                         camera_id,
                         alert_clip_id,
@@ -2649,6 +2745,12 @@ async fn run_alert_clip_builder(
 
     // Free the build slot last, so the ceiling covers this build's
     // entire memory footprint (BUG-168).
+    info!(
+        camera_id,
+        alert_clip_id,
+        build_ms = build_started.elapsed().as_millis() as u64,
+        "alert clip build finished"
+    );
     drop(build_slot);
 }
 
@@ -2967,6 +3069,13 @@ mod tests {
             })
             .await;
         assert!(matches!(res, Err(RecorderError::Refused)));
+        assert_eq!(
+            rec.recording_degradations().len(),
+            1,
+            "refused motion recording must degrade health"
+        );
+        rec.remove_camera_ingester(1);
+        assert!(rec.recording_degradations().is_empty());
     }
 
     #[tokio::test]
@@ -2983,6 +3092,11 @@ mod tests {
             })
             .await;
         assert!(matches!(res, Err(RecorderError::Refused)));
+        assert_eq!(
+            rec.recording_degradations().len(),
+            1,
+            "refused motion recording must degrade health"
+        );
     }
 
     /// Why the refusal above cannot strand a running camera (BUG-225).
@@ -3006,6 +3120,117 @@ mod tests {
             assert!(rec.ingester_registry().read().contains_key(&id));
             rec.remove_camera_ingester(id);
         }
+    }
+
+    #[tokio::test]
+    async fn auto_codec_fallback_does_not_degrade_recording_health() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        ing.set_stream_codec_for_test(CodecKind::H265);
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::from([(1, ing)])).unwrap();
+        assert!(rec.recording_degradations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_codec_pin_mismatch_clears_on_correction_auto_and_removal() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
+        rec.add_camera_ingester(
+            1,
+            "rtsp://127.0.0.1:1/main",
+            0,
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .unwrap();
+        let ing = rec.ingesters.read().get(&1).cloned().unwrap();
+        ing.shutdown();
+        ing.set_stream_codec_for_test(CodecKind::H265);
+        rec.set_camera_codec_pin(1, Some(CodecKind::H264));
+        let issues = rec.recording_degradations();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, RecordingKind::Codec);
+        assert!(issues[0]
+            .reason
+            .contains("configured h264 codec differs from detected h265"));
+
+        rec.set_camera_codec_pin(1, Some(CodecKind::H265Plus));
+        assert!(rec.recording_degradations().is_empty());
+        rec.set_camera_codec_pin(1, Some(CodecKind::H264));
+        rec.set_camera_codec_pin(1, None);
+        assert!(rec.recording_degradations().is_empty());
+
+        rec.set_camera_codec_pin(1, Some(CodecKind::H264));
+        assert!(rec.resize_camera_rgb_tap(1, 1024, 576).unwrap());
+        let resized = rec.ingesters.read().get(&1).cloned().unwrap();
+        resized.shutdown();
+        resized.set_stream_codec_for_test(CodecKind::H265);
+        assert_eq!(
+            rec.recording_degradations().len(),
+            1,
+            "resize lost the explicit pin"
+        );
+        rec.remove_camera_ingester(1);
+        assert!(rec.recording_degradations().is_empty());
+        rec.add_camera_ingester(
+            1,
+            "rtsp://127.0.0.1:1/main",
+            0,
+            15,
+            512,
+            288,
+            CodecKind::H264,
+        )
+        .unwrap();
+        let replacement = rec.ingesters.read().get(&1).cloned().unwrap();
+        replacement.shutdown();
+        replacement.set_stream_codec_for_test(CodecKind::H265);
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "retired pin survived re-registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_motion_insert_removes_partial_file() {
+        gst_init::ensure().unwrap();
+        for name in ["appsrc", "h264parse", "mp4mux", "filesink"] {
+            assert!(
+                gst::ElementFactory::find(name).is_some(),
+                "required GStreamer plugin missing: {name}"
+            );
+        }
+        let (store, _dir, clips_dir) = fixture().await;
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        let rec =
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap();
+        store.pool().close().await;
+        let started_at = Utc::now();
+        let result = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at,
+                frame_width: 512,
+                frame_height: 288,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(RecorderError::Store(_))),
+            "expected failed insert, got {result:?}"
+        );
+        assert!(rec.open.lock().await.is_empty());
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "failed open left an untracked partial clip"
+        );
+        assert!(rec
+            .recording_degradations()
+            .iter()
+            .any(|d| d.kind == RecordingKind::Motion));
     }
 
     #[tokio::test]
@@ -3037,6 +3262,13 @@ mod tests {
             "a refused alert must be counted as shed, not silently dropped"
         );
 
+        assert!(
+            rec.recording_degradations()
+                .iter()
+                .any(|d| d.camera_id == 1),
+            "refused alert footage must degrade camera health"
+        );
+
         // Freeing the slots stops the shedding: the next alert reaches
         // the (pre-existing) no-ingester refusal instead.
         drop(held);
@@ -3060,6 +3292,54 @@ mod tests {
             MAX_CONCURRENT_ALERT_CLIP_BUILDS
         );
         assert_eq!(rec.alert_clips_shed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_alert_builder_reports_health_and_returns_its_slot() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let window_start = Utc::now();
+        let clip_id = store
+            .insert_alert_clip(&NewAlertClip {
+                camera_id: 1,
+                started_at: window_start,
+                path: alert_clip_rel_path(1, window_start)
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .await
+            .unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let health = RecordingHealthRegistry::default();
+        let (tx, rx) = broadcast::channel(1);
+        drop(tx);
+        let inflight = Arc::new(PlMutex::new(HashMap::new()));
+        run_alert_clip_builder(
+            store.clone(),
+            clips_dir,
+            inflight.clone(),
+            AlertClipsConfig::default(),
+            1,
+            CodecKind::H264,
+            clip_id,
+            window_start,
+            Vec::new(),
+            rx,
+            None,
+            Arc::new(AtomicI64::new(window_start.timestamp_millis())),
+            None,
+            permit,
+            health.begin(1, RecordingKind::Alert),
+        )
+        .await;
+        assert_eq!(
+            store.get_alert_clip(clip_id).await.unwrap().unwrap().state,
+            "failed"
+        );
+        assert_eq!(health.degradations().len(), 1);
+        assert_eq!(health.degradations()[0].kind, RecordingKind::Alert);
+        assert_eq!(slots.available_permits(), 1);
+        assert!(inflight.lock().is_empty());
     }
 
     // -----------------------------------------------------------
@@ -5079,6 +5359,7 @@ mod epoch_tests {
                 Arc::new(AtomicI64::new(Utc::now().timestamp_millis() + 3000)),
                 None,
                 slot,
+                RecordingHealthRegistry::default().begin(1, RecordingKind::Alert),
             )
             .await;
             let row = store.get_alert_clip(alert_clip_id).await.unwrap().unwrap();
@@ -5130,6 +5411,10 @@ mod epoch_tests {
             .await
             .unwrap();
         let slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let health = RecordingHealthRegistry::default();
+        health
+            .begin(1, RecordingKind::Alert)
+            .fail("previous build failed");
         run_alert_clip_builder(
             store.clone(),
             dir.path().to_path_buf(),
@@ -5145,8 +5430,13 @@ mod epoch_tests {
             Arc::new(AtomicI64::new(Utc::now().timestamp_millis() + 3000)),
             None,
             slot,
+            health.begin(1, RecordingKind::Alert),
         )
         .await;
+        assert!(
+            health.degradations().is_empty(),
+            "successful real encoding recovers health"
+        );
         let row = store.get_alert_clip(alert_clip_id).await.unwrap().unwrap();
         assert_eq!(row.state, "ready");
         // First to last frame of the 15 fps segment: 59 / 15 s.
@@ -5162,10 +5452,10 @@ mod epoch_tests {
     /// start of the first `moof` (the #376 shape), and cut right after `moov`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_layout_check_wants_moof_right_after_moov() {
-        if !has_elements(&["x264enc", "mp4mux"]) {
-            eprintln!("skipping: x264enc/mp4mux not available");
-            return;
-        }
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
         let good = record_through_pump(encode(15, "main", 30, Duration::ZERO), Vec::new())
             .await
             .bytes;
@@ -5226,11 +5516,11 @@ mod epoch_tests {
     /// (its later fragments are recoverable) but takes it out of cold
     /// replication; a clean clip closes as before.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_clip_whose_header_overwrote_its_first_fragment_is_kept_but_never_replicated() {
-        if !has_elements(&["x264enc", "mp4mux"]) {
-            eprintln!("skipping: x264enc/mp4mux not available");
-            return;
-        }
+    async fn close_reports_media_and_pump_failures_until_a_clean_recording_recovers() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_camera(dir.path()).await;
         let clips_dir = dir.path().join("clips");
@@ -5240,7 +5530,10 @@ mod epoch_tests {
         let mixed: Vec<NalSample> = a.iter().chain(&b).cloned().collect();
 
         let mut closed = Vec::new();
-        for (n, samples) in [a, mixed].into_iter().enumerate() {
+        for (n, samples) in [a.clone(), mixed, a.clone(), a.clone(), a]
+            .into_iter()
+            .enumerate()
+        {
             let started_at = Utc::now() - chrono::Duration::seconds(60 - 10 * n as i64);
             let path = crate::recorder::inflight_clip_path(&clips_dir, 1, started_at);
             fs::create_dir_all(path.parent().unwrap()).await.unwrap();
@@ -5279,6 +5572,7 @@ mod epoch_tests {
             rec.open.lock().await.insert(
                 clip_id,
                 OpenState {
+                    health: rec.recording_health.begin(1, RecordingKind::Motion),
                     camera_id: 1,
                     started_at,
                     path,
@@ -5288,7 +5582,8 @@ mod epoch_tests {
                     pipeline,
                     appsrc,
                     pump_stop: None,
-                    pump_handle: None,
+                    pump_handle: (n == 3)
+                        .then(|| tokio::spawn(async { panic!("injected writer failure") })),
                     preroll_last_written_pts_ns: last,
                 },
             );
@@ -5302,6 +5597,11 @@ mod epoch_tests {
                 .await
                 .unwrap();
             assert!(!meta.discarded && meta.path.exists(), "clip {n} kept");
+            assert_eq!(
+                rec.recording_degradations().is_empty(),
+                n != 1 && n != 3,
+                "media and writer faults stay degraded until a new clean clip closes"
+            );
             assert!(!rec.ended_on_epoch_change(handle), "close forgets the clip");
             closed.push((clip_id, std::fs::read(&meta.path).unwrap()));
         }
@@ -5337,7 +5637,11 @@ mod epoch_tests {
             .iter()
             .map(|c| c.id)
             .collect();
-        assert_eq!(pending, [*clean], "only the clean clip is replicated");
+        assert_eq!(
+            pending,
+            [*clean, closed[2].0, closed[3].0, closed[4].0],
+            "only clean clips are replicated"
+        );
     }
 
     /// #375/#376: two epoch changes under 3 s apart leave a short clip
@@ -5346,10 +5650,10 @@ mod epoch_tests {
     /// epoch change is still discarded, and a stub file is still failed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_short_clip_is_kept_only_when_it_ended_on_an_epoch_change() {
-        if !has_elements(&["x264enc", "mp4mux"]) {
-            eprintln!("skipping: x264enc/mp4mux not available");
-            return;
-        }
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_camera(dir.path()).await;
         let clips_dir = dir.path().join("clips");
@@ -5361,6 +5665,8 @@ mod epoch_tests {
             ("short, ended on an epoch change", &short[..], true, true),
             ("short, did not", &short[..], false, false),
             ("stub file, ended on an epoch change", &[][..], true, false),
+            ("missing file", &short[..], true, false),
+            ("recovered recording", &short[..], true, true),
         ]
         .into_iter()
         .enumerate()
@@ -5391,12 +5697,16 @@ mod epoch_tests {
                         .unwrap(),
                 );
             }
+            if what == "missing file" {
+                fs::remove_file(&path).await.unwrap();
+            }
             rec.epoch_ended
                 .write()
                 .insert(clip_id, Arc::new(AtomicBool::new(epoch_ended)));
             rec.open.lock().await.insert(
                 clip_id,
                 OpenState {
+                    health: rec.recording_health.begin(1, RecordingKind::Motion),
                     camera_id: 1,
                     started_at,
                     path,
@@ -5423,6 +5733,11 @@ mod epoch_tests {
                 .await
                 .unwrap();
             let row = store.get_clip(clip_id).await.unwrap();
+            assert_eq!(
+                rec.recording_degradations().is_empty(),
+                !samples.is_empty() && what != "missing file",
+                "only missing media, not policy discard, degrades health"
+            );
             if kept {
                 assert!(meta.duration_ms < crate::recorder::MIN_CLIP_DURATION_MS);
                 assert!(!meta.discarded && meta.path.exists(), "{what}: file kept");

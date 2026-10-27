@@ -187,10 +187,12 @@ pub struct PreRollIngester {
     /// their base via [`CodecKind::base`] — GStreamer's stock
     /// parsers handle the SVC bitstream as plain H.264/H.265.
     ///
-    /// This is the *configured* codec, the ingester's identity for the
-    /// recorder's rebuild checks. What the live session actually parses
+    /// This is the startup codec (pin, probe result, or fallback), the
+    /// ingester's identity for rebuild checks. What the live session actually parses
     /// is [`Self::stream_codec`].
     codec: CodecKind,
+    /// Explicit operator pin, separate from the probed or fallback startup codec.
+    codec_pin: Mutex<Option<CodecKind>>,
     /// Codec the supervisor builds each session with. Starts as `codec`
     /// and is replaced by the stream's own when the SDP disagrees
     /// (#359), so a wrongly pinned codec cannot loop `not-linked` forever.
@@ -378,6 +380,7 @@ impl PreRollIngester {
             camera_id,
             url,
             codec,
+            codec_pin: Mutex::new(None),
             stream_codec,
             pre_roll_secs,
             ring,
@@ -399,7 +402,7 @@ impl PreRollIngester {
         &self.url
     }
 
-    /// Codec this ingester was configured with. Identity for the
+    /// Startup codec (pin, probe result, or fallback). Identity for the
     /// recorder's "same URL + codec, keep it" checks; see
     /// [`Self::stream_codec`] for what the session is parsing.
     pub fn codec(&self) -> CodecKind {
@@ -413,6 +416,19 @@ impl PreRollIngester {
     /// the matching parser without an extra config lookup.
     pub fn stream_codec(&self) -> CodecKind {
         *self.stream_codec.lock()
+    }
+
+    pub(crate) fn codec_pin(&self) -> Option<CodecKind> {
+        *self.codec_pin.lock()
+    }
+
+    pub(crate) fn set_codec_pin(&self, codec: Option<CodecKind>) {
+        *self.codec_pin.lock() = codec;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_stream_codec_for_test(&self, codec: CodecKind) {
+        *self.stream_codec.lock() = codec;
     }
 
     /// Pre-roll window the ring was sized for at construction. Used

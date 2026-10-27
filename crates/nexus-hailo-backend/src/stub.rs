@@ -12,12 +12,14 @@ use std::path::Path;
 use crate::error::Error;
 use crate::{OutputLayout, OutputStreamInfo};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceInfo {
     pub board_name: String,
     pub serial: String,
     pub fw_version: (u32, u32, u32),
+    #[serde(rename = "part_number")]
     pub device_id: String,
+    pub product_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -28,7 +30,7 @@ pub struct Telemetry {
     pub utilization_pct: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceTelemetry {
     pub board_name: String,
     pub serial: String,
@@ -75,6 +77,10 @@ impl InferSession {
     }
 
     pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
+        Err(Error::NotAvailable)
+    }
+
+    pub fn device_infos(&self) -> Result<Vec<DeviceInfo>, Error> {
         Err(Error::NotAvailable)
     }
 

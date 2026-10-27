@@ -29,12 +29,14 @@ use crate::{OutputLayout, OutputStreamInfo};
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceInfo {
     pub board_name: String,
     pub serial: String,
     pub fw_version: (u32, u32, u32),
+    #[serde(rename = "part_number")]
     pub device_id: String,
+    pub product_name: String,
 }
 
 /// Live telemetry snapshot of every physical Hailo chip backing an
@@ -69,7 +71,7 @@ pub struct Telemetry {
 /// failed (e.g. a firmware that doesn't support the dvm); identity
 /// fields come from `hailo_identify` and are always populated when the
 /// device handle is valid.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceTelemetry {
     pub board_name: String,
     pub serial: String,
@@ -523,7 +525,15 @@ impl InferSession {
             "hailo_create_vdevice",
         )?;
         let _guard = OwnedVDevice(vdev);
+        Self::device_infos_for(vdev)
+    }
 
+    /// Static identity from the owning session; no sensor reads or sampling updates.
+    pub fn device_infos(&self) -> Result<Vec<DeviceInfo>, Error> {
+        Self::device_infos_for(self._device.0)
+    }
+
+    fn device_infos_for(vdev: hailo_vdevice) -> Result<Vec<DeviceInfo>, Error> {
         // Up to 8 physical devices per vdevice (HailoRT internal max).
         let mut handles: [hailo_device; 8] = [ptr::null_mut(); 8];
         let mut count: usize = 8;
@@ -551,6 +561,7 @@ impl InferSession {
                     id.fw_version.revision,
                 ),
                 device_id: c_array_to_string(&id.part_number, id.part_number_length as usize),
+                product_name: c_array_to_string(&id.product_name, id.product_name_length as usize),
             });
         }
         Ok(out)

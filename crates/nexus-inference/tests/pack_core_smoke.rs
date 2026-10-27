@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use nexus_config::{InferenceBackendKind, InferenceConfig, ModelConfig, PoolWorkerKind};
+use nexus_inference::backends::{DetectorBackend, WorkerProcessBackend};
 use nexus_inference::yolo::YoloOrtDetector;
 use nexus_inference::yolo_world::YoloWorldDetector;
 use nexus_inference::yoloe::YoloeDetector;
@@ -34,6 +35,22 @@ fn pack_dir() -> PathBuf {
         .join("../../models")
         .canonicalize()
         .expect("workspace models/ dir must exist")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_process_worker_runs_the_real_model() {
+    let cfg = mk_cfg("yolo", 512, 288, &pack_dir());
+    let program = Path::new(env!("CARGO_BIN_EXE_nexus-inference-worker"));
+    let worker = WorkerProcessBackend::start_with_program_and_config(0, program, &cfg)
+        .expect("spawn configured worker");
+    worker
+        .detect(&synth_frame(512, 288), &[])
+        .await
+        .expect("real inference must survive the worker runtime");
+    assert!(
+        nexus_inference::health::degradations().is_empty(),
+        "model load must succeed, not silently return the unavailable detector"
+    );
 }
 
 fn mk_cfg(kind: &str, w: u32, h: u32, pack: &Path) -> InferenceConfig {

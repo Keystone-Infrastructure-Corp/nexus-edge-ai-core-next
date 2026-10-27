@@ -72,6 +72,9 @@ pub use yolo_world::YoloWorldDetector;
 pub use yoloe::YoloeDetector;
 pub use yoloe_promptfree::YoloePromptFreeDetector;
 
+mod hailo_probe;
+pub use hailo_probe::snapshot as hailo_probe_snapshot;
+
 // ---------------------------------------------------------------------------
 // Hailo telemetry surface — exposed unconditionally so `nexus-engine`'s
 // `system_metrics` handler can compile on every feature-flag combination
@@ -199,14 +202,9 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
                         Arc::new(ThreadIsolatedBackend::start(slot as i32, det, cfg)?)
                     }
                     PoolWorkerKind::Process => {
-                        // The worker binary builds its own Detector from
-                        // env (NEXUS_WORKER_MODEL_KIND). No detector built
-                        // in this process for the slot.
-                        Arc::new(WorkerProcessBackend::start(
-                            slot as i32,
-                            cfg.model.kind.as_str(),
-                            &cfg.ep_priority,
-                        )?)
+                        // The child builds from the full resolved configuration;
+                        // this process holds only its backend and health registrations.
+                        Arc::new(WorkerProcessBackend::start_with_config(slot as i32, cfg)?)
                     }
                 };
                 backends.push(backend);
@@ -370,12 +368,12 @@ fn build_detector_kind(
         // model rather than resolving to the synthetic mock — the kind
         // stays advertised on the wire, it just reports nothing until
         // something real backs it. See `detector_never_fabricates.rs`.
-        "classifier_ensemble" | "ppe" => Ok(crate::health::degraded_detector(
+        "classifier_ensemble" | "ppe" => Ok(crate::health::degraded_detector_for_config(
             // The kind the operator actually configured, not the alias
             // this arm is filed under — `d.kind` is echoed verbatim to
             // `/health` and into the cloud heartbeat detail, so a `ppe`
             // box must not be told `classifier_ensemble` is degraded.
-            cfg.model.kind.as_str(),
+            cfg,
             "no detector implementation ships for this model kind",
         )),
         // M3.1 — yoloe (open-vocab text-prompt detector). Real ORT path
@@ -409,16 +407,15 @@ fn build_detector_kind(
                 {
                     match crate::yoloe_visual::YoloeVisualDetector::from_config(cfg, dim, store) {
                         Ok(d) => {
-                            crate::health::clear_degraded("yoloe_visual");
                             return Ok(Arc::new(d));
                         }
                         Err(e) => {
-                            return Ok(crate::health::degraded_detector("yoloe_visual", e));
+                            return Ok(crate::health::degraded_detector_for_config(cfg, e));
                         }
                     }
                 }
-                Ok(crate::health::degraded_detector(
-                    "yoloe_visual",
+                Ok(crate::health::degraded_detector_for_config(
+                    cfg,
                     "requires a VisualPromptStore + embedding_dim in BuildContext",
                 ))
             }
@@ -440,7 +437,7 @@ fn build_detector_kind(
                 #[cfg(feature = "ort")]
                 {
                     crate::yoloe::build_detector_for_yoloe(cfg)
-                        .unwrap_or_else(|e| crate::health::degraded_detector("yoloe_promptfree", e))
+                        .unwrap_or_else(|e| crate::health::degraded_detector_for_config(cfg, e))
                 }
                 #[cfg(not(feature = "ort"))]
                 {
@@ -468,8 +465,7 @@ fn build_detector_kind(
                     );
                     continue;
                 }
-                let mut derived = cfg.clone();
-                derived.model = member_cfg.clone();
+                let derived = router::derive_inference_cfg(cfg, member_cfg);
                 match build_detector_with_context(&derived, _ctx) {
                     Ok(det) => members.push(det),
                     Err(e) => warn!(
@@ -485,8 +481,8 @@ fn build_detector_kind(
             )))
         }
         "mock" => Ok(Arc::new(MockDetector::new())),
-        other => Ok(crate::health::degraded_detector(
-            other,
+        other => Ok(crate::health::degraded_detector_for_config(
+            cfg,
             format!(
                 "unknown inference.model.kind {other:?}; expected one of yolo, yolo_world, \
                  yoloe, yoloe_visual, yoloe_promptfree, ensemble, mock"

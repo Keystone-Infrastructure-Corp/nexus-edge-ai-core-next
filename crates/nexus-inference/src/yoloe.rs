@@ -656,11 +656,8 @@ pub fn build_detector_for_yoloe(
     cfg: &InferenceConfig,
 ) -> Result<Arc<dyn Detector>, InferenceError> {
     match YoloeDetector::from_config(cfg) {
-        Ok(d) => {
-            crate::health::clear_degraded("yoloe");
-            Ok(Arc::new(d))
-        }
-        Err(e) => Ok(crate::health::degraded_detector("yoloe", e)),
+        Ok(d) => Ok(Arc::new(d)),
+        Err(e) => Ok(crate::health::degraded_detector_for_config(cfg, e)),
     }
 }
 

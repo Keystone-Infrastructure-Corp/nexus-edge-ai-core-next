@@ -86,3 +86,53 @@ pub(crate) fn snapshot() -> Option<HailoInfo> {
         utilization_pct: raw.utilization_pct,
     })
 }
+
+/// Admin-only live-session probe. The blocking session lock/FFI stays off Tokio workers.
+pub(crate) async fn get_probe(
+    _admin: crate::auth::require_role::AdminContext,
+) -> Result<axum::Json<serde_json::Value>, crate::api::ApiError> {
+    let result = tokio::task::spawn_blocking(nexus_inference::hailo_probe_snapshot)
+        .await
+        .map_err(|_| {
+            crate::api::ApiError(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Hailo probe task failed".into(),
+            )
+        })?;
+    probe_response(result).map(axum::Json)
+}
+
+fn probe_response(
+    result: Result<Option<serde_json::Value>, nexus_inference::InferenceError>,
+) -> Result<serde_json::Value, crate::api::ApiError> {
+    use axum::http::StatusCode;
+    match result {
+        Ok(Some(probe)) => Ok(probe),
+        Ok(None) => Err(crate::api::ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No active Hailo session in this engine process".into(),
+        )),
+        Err(error) => Err(crate::api::ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error.to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_or_failed_session_is_not_reported_as_success() {
+        assert_eq!(
+            probe_response(Ok(None)).unwrap_err().0,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            probe_response(Err(nexus_inference::InferenceError::Failed("busy".into()))).is_err()
+        );
+        let data = serde_json::json!({"devices": [{"serial": "test"}], "output_layout": "Other"});
+        assert_eq!(probe_response(Ok(Some(data.clone()))).unwrap(), data);
+    }
+}

@@ -52,6 +52,11 @@ pub enum WorkerRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerResponse {
+    /// Startup model health, sent before accepting frames.
+    Health {
+        hailo_probe: Option<serde_json::Value>,
+        degradations: Vec<crate::health::DetectorDegradation>,
+    },
     DetectOk {
         req_id: u64,
         detections: Vec<Detection>,
@@ -65,6 +70,7 @@ pub enum WorkerResponse {
 impl WorkerResponse {
     pub fn req_id(&self) -> u64 {
         match self {
+            Self::Health { .. } => 0,
             Self::DetectOk { req_id, .. } | Self::DetectErr { req_id, .. } => *req_id,
         }
     }

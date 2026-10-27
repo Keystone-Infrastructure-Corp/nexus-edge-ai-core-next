@@ -84,3 +84,26 @@ pub struct Detection {
 pub const fn is_supported() -> bool {
     cfg!(all(target_os = "linux", feature = "linked"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_identity_retains_part_number_without_live_sensor_fields() {
+        let identity = DeviceInfo {
+            board_name: String::new(),
+            serial: "test-serial".into(),
+            fw_version: (4, 23, 0),
+            device_id: "HM218B1C2LAE".into(),
+            product_name: "Hailo-8".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(identity).unwrap(),
+            serde_json::json!({
+                "board_name": "", "serial": "test-serial", "fw_version": [4, 23, 0],
+                "part_number": "HM218B1C2LAE", "product_name": "Hailo-8",
+            }),
+        );
+    }
+}

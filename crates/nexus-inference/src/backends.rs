@@ -535,6 +535,8 @@ impl Drop for ThreadIsolatedBackend {
 // ---------------------------------------------------------------------------
 
 pub struct WorkerProcessBackend {
+    _hailo_probe: Arc<crate::hailo_probe::WorkerProbe>,
+    _health: Arc<parking_lot::Mutex<Vec<crate::health::DegradationRegistration>>>,
     slot: i32,
     common: Arc<BackendCommon>,
     inner: Arc<WorkerProcessInner>,
@@ -571,18 +573,43 @@ impl WorkerProcessBackend {
         Self::start_with_program(slot, &program, model_kind, ep_priority)
     }
 
+    /// Production pools forward the complete resolved model, including overrides
+    /// and ensemble members, rather than reconstructing it from ambient env vars.
+    pub fn start_with_config(
+        slot: i32,
+        cfg: &nexus_config::InferenceConfig,
+    ) -> Result<Self, InferenceError> {
+        let program = resolve_worker_program()?;
+        Self::start_with_program_and_config(slot, &program, cfg)
+    }
+
+    pub fn start_with_program_and_config(
+        slot: i32,
+        program: &std::path::Path,
+        cfg: &nexus_config::InferenceConfig,
+    ) -> Result<Self, InferenceError> {
+        Self::spawn(slot, program, &cfg.model.kind, &cfg.ep_priority, Some(cfg))
+    }
+
     /// Like [`start`](Self::start) but with an explicit binary path. The
     /// integration tests use this with `CARGO_BIN_EXE_nexus-inference-worker`
     /// so they don't depend on the worker living next to the test runner.
-    #[expect(
-        clippy::print_stderr,
-        reason = "opt-in (NEXUS_WORKER_LOG_STDERR) echo so test runs without a tracing subscriber still surface a crashing worker"
-    )]
     pub fn start_with_program(
         slot: i32,
         program: &std::path::Path,
         model_kind: &str,
         ep_priority: &[String],
+    ) -> Result<Self, InferenceError> {
+        Self::spawn(slot, program, model_kind, ep_priority, None)
+    }
+
+    #[expect(clippy::print_stderr, reason = "opt-in worker stderr diagnostics")]
+    fn spawn(
+        slot: i32,
+        program: &std::path::Path,
+        model_kind: &str,
+        ep_priority: &[String],
+        cfg: Option<&nexus_config::InferenceConfig>,
     ) -> Result<Self, InferenceError> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -597,6 +624,13 @@ impl WorkerProcessBackend {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        if let Some(cfg) = cfg {
+            let config = serde_json::to_string(cfg)
+                .map_err(|e| InferenceError::Failed(format!("serialize worker config: {e}")))?;
+            cmd.env("NEXUS_WORKER_CONFIG", config);
+        } else {
+            cmd.env_remove("NEXUS_WORKER_CONFIG");
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| InferenceError::Failed(format!("spawn {}: {e}", program.display())))?;
@@ -619,11 +653,23 @@ impl WorkerProcessBackend {
 
         // Reader task — drains responses and dispatches them. Owns
         // `stdout` for the lifetime of the worker.
+        let health = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let reader_health = Arc::downgrade(&health);
+        let hailo_probe = crate::hailo_probe::register_worker();
+        let reader_probe = Arc::downgrade(&hailo_probe);
         let reader_common = common.clone();
         let reader_inner = inner.clone();
         let slot_for_reader = slot;
         tokio::spawn(async move {
-            run_reader(slot_for_reader, stdout, reader_common, reader_inner).await;
+            run_reader(
+                slot_for_reader,
+                stdout,
+                reader_common,
+                reader_inner,
+                reader_health,
+                reader_probe,
+            )
+            .await;
         });
 
         // Stderr forwarder — pumps worker diagnostics onto our tracing
@@ -654,6 +700,8 @@ impl WorkerProcessBackend {
         );
 
         Ok(Self {
+            _health: health,
+            _hailo_probe: hailo_probe,
             slot,
             common,
             inner,
@@ -674,6 +722,8 @@ async fn run_reader(
     stdout: tokio::process::ChildStdout,
     common: Arc<BackendCommon>,
     inner: Arc<WorkerProcessInner>,
+    health: std::sync::Weak<parking_lot::Mutex<Vec<crate::health::DegradationRegistration>>>,
+    probe: std::sync::Weak<crate::hailo_probe::WorkerProbe>,
 ) {
     let mut stdout = stdout;
     loop {
@@ -685,6 +735,22 @@ async fn run_reader(
                     break;
                 }
             };
+        if let crate::worker_proto::WorkerResponse::Health {
+            degradations,
+            hailo_probe,
+        } = msg
+        {
+            if let Some(probe) = probe.upgrade() {
+                *probe.lock() = hailo_probe;
+            }
+            if let Some(health) = health.upgrade() {
+                *health.lock() = degradations
+                    .into_iter()
+                    .map(crate::health::register)
+                    .collect();
+            }
+            continue;
+        }
         let req_id = msg.req_id();
         let reply = inner.pending.lock().remove(&req_id);
         match (msg, reply) {
@@ -694,10 +760,13 @@ async fn run_reader(
             (crate::worker_proto::WorkerResponse::DetectErr { message, .. }, Some(tx)) => {
                 let _ = tx.send(Err(InferenceError::Failed(message)));
             }
-            (m, None) => {
+            (m, _) => {
                 warn!(slot, "worker response for unknown req_id={}", m.req_id());
             }
         }
+    }
+    if let Some(probe) = probe.upgrade() {
+        *probe.lock() = None;
     }
     // Worker is gone. Fail every outstanding request and mark the backend
     // unhealthy so the pool routes around us.

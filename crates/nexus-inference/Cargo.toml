@@ -74,7 +74,7 @@ ndarray = { workspace = true, optional = true }
 # boxes the crate's `linked` feature is off and the public API
 # returns `Error::NotAvailable`, so `--features ep-hailo` still
 # builds cross-platform.
-nexus-hailo-backend = { workspace = true, optional = true }
+nexus-hailo-backend = { workspace = true, optional = true, default-features = false }
 
 # nexus-inference-worker: out-of-process detector worker. Spawned by
 # WorkerProcessBackend and driven over stdio with length-prefixed bincode.
