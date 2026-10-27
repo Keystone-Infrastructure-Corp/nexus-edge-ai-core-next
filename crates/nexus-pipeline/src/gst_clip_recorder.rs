@@ -5452,10 +5452,10 @@ mod epoch_tests {
     /// start of the first `moof` (the #376 shape), and cut right after `moov`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_layout_check_wants_moof_right_after_moov() {
-        if !has_elements(&["x264enc", "mp4mux"]) {
-            eprintln!("skipping: x264enc/mp4mux not available");
-            return;
-        }
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
         let good = record_through_pump(encode(15, "main", 30, Duration::ZERO), Vec::new())
             .await
             .bytes;
@@ -5517,10 +5517,10 @@ mod epoch_tests {
     /// replication; a clean clip closes as before.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_reports_media_and_pump_failures_until_a_clean_recording_recovers() {
-        if !has_elements(&["x264enc", "mp4mux"]) {
-            eprintln!("skipping: x264enc/mp4mux not available");
-            return;
-        }
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_camera(dir.path()).await;
         let clips_dir = dir.path().join("clips");
@@ -5650,10 +5650,10 @@ mod epoch_tests {
     /// epoch change is still discarded, and a stub file is still failed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_short_clip_is_kept_only_when_it_ended_on_an_epoch_change() {
-        if !has_elements(&["x264enc", "mp4mux"]) {
-            eprintln!("skipping: x264enc/mp4mux not available");
-            return;
-        }
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_camera(dir.path()).await;
         let clips_dir = dir.path().join("clips");

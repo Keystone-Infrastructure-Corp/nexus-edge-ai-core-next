@@ -2725,14 +2725,6 @@ mod health_tests {
         );
     }
 
-    /// The answers the local UI's tests render (`ui/src/lib/
-    /// engineHealth.fixture.json`) are the ones `GET /api/v1/health` gives:
-    /// one issue of every code the roll-up raises, for a signed-in caller and
-    /// for anyone else. The UI's issue type was first written against the
-    /// body from before the roll-up, where a detector issue carried its kind
-    /// apart from a detail that did not name it; this fails when the file
-    /// and the engine disagree, so the UI cannot keep rendering a shape the
-    /// engine no longer sends.
     #[test]
     fn recording_failures_group_all_51_cameras_before_the_wire_issue_cap() {
         use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
@@ -2861,6 +2853,14 @@ mod health_tests {
         );
     }
 
+    /// The answers the local UI's tests render (`ui/src/lib/
+    /// engineHealth.fixture.json`) are the ones `GET /api/v1/health` gives:
+    /// one issue of every code the roll-up raises, for a signed-in caller and
+    /// for anyone else. The UI's issue type was first written against the
+    /// body from before the roll-up, where a detector issue carried its kind
+    /// apart from a detail that did not name it; this fails when the file
+    /// and the engine disagree, so the UI cannot keep rendering a shape the
+    /// engine no longer sends.
     #[test]
     fn the_ui_renders_the_health_answers_the_engine_gives() {
         let cap = crate::system_metrics::DecodeCapacity {
