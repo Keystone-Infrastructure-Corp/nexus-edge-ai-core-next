@@ -19,6 +19,7 @@ pub mod motion;
 pub mod outbox;
 pub mod sessions;
 pub mod sinks;
+pub mod speakers;
 pub mod users;
 pub mod visual_prompts;
 pub use alert_clip::{AlertClipColdMark, AlertClipId, AlertClipRow, NewAlertClip};
@@ -208,6 +209,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0037_clip_announce_core",
         include_str!("../migrations/0037_clip_announce_core.sql"),
+    ),
+    (
+        "0038_speakers",
+        include_str!("../migrations/0038_speakers.sql"),
     ),
 ];
 

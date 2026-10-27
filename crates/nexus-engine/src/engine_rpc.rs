@@ -45,6 +45,8 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
+use crate::cloud_audit::build_before_json;
+
 /// Engine-side RPC handler. Owns the `Store` (for clip lookups
 /// and audit), a `Notify` shared with the cold replicator (so the
 /// Expedite fast-path can wake it immediately), and an HTTP client
@@ -725,7 +727,7 @@ impl AuditSink for EngineAuditSink {
             action: action.as_str(),
             resource_kind,
             resource_id: resource_id_owned.as_deref(),
-            before_json: None,
+            before_json: Some(&build_before_json(method, envelope, actor)),
             after_json: None,
             outcome: AuditOutcome::Success,
             ip: None,
@@ -1551,6 +1553,55 @@ mod tests {
         serde_json::from_str::<Value>(err).unwrap()["status"]
             .as_u64()
             .unwrap()
+    }
+
+    /// Phase 11.E2: the sink the tunnel wires must put the rpc path, and the
+    /// org a station operator acted for, into `before_json`. It wrote `None`,
+    /// so the box's own audit never named who the human was working for.
+    #[tokio::test]
+    async fn audit_row_records_the_path_and_the_acting_org_only_when_set() {
+        let (handler, _access, _dir) = remote_access_handler(false, false).await;
+        let sink = EngineAuditSink {
+            store: Arc::clone(&handler.store),
+        };
+        let station = VerifiedActor {
+            actor_org_id: Some("0190f7be-7c6a-7d4f-8f01-d9b1f0c0c999".into()),
+            ..actor_with_role("operator")
+        };
+        for (method, path, actor) in [
+            // A query can carry a SAS signature; it never reaches the row.
+            ("station", "/admin/cameras/7?sig=s3cret&se=2026", station),
+            ("ordinary", "/admin/cameras/8", actor_with_role("operator")),
+        ] {
+            sink.record(
+                method,
+                EnvelopeContext {
+                    method: "PUT",
+                    path,
+                },
+                &actor,
+            )
+            .await;
+        }
+
+        let rows = handler
+            .store
+            .list_audit_filtered(&nexus_store::audit::AuditFilter::default(), 10, 0)
+            .await
+            .unwrap();
+        let before = |action: &str| -> Value {
+            let row = rows.iter().find(|r| r.action == action).unwrap();
+            serde_json::from_str(row.before_json.as_deref().expect("before_json")).unwrap()
+        };
+        let station = before("cloud_rpc.station");
+        assert_eq!(station["path"], "/admin/cameras/7");
+        assert_eq!(
+            station["actor_org_id"],
+            "0190f7be-7c6a-7d4f-8f01-d9b1f0c0c999"
+        );
+        let ordinary = before("cloud_rpc.ordinary");
+        assert_eq!(ordinary["path"], "/admin/cameras/8");
+        assert!(ordinary.get("actor_org_id").is_none(), "{ordinary}");
     }
 
     #[test]

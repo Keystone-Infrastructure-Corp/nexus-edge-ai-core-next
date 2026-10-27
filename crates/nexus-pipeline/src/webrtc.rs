@@ -353,21 +353,7 @@ impl WebRtcSession {
         appsrc.set_caps(Some(&caps));
         appsrc.set_stream_type(AppStreamType::Stream);
 
-        // Apply ICE servers: the first STUN URL → `stun-server`; every
-        // TURN URL → `add-turn-server` (webrtcbin supports several).
-        for server in ice_servers {
-            for url in &server.urls {
-                if let Some(stun) = stun_url_for(url) {
-                    webrtc.set_property("stun-server", stun.as_str());
-                } else if let Some(turn) = turn_url_for(
-                    url,
-                    server.username.as_deref(),
-                    server.credential.as_deref(),
-                ) {
-                    let _added: bool = webrtc.emit_by_name::<bool>("add-turn-server", &[&turn]);
-                }
-            }
-        }
+        apply_ice_servers(&webrtc, ice_servers);
 
         // Pump compressed NALs into appsrc, splicing in at the next IDR.
         let feed = tokio::spawn(feed_loop(appsrc.clone(), nal_rx, camera_id));
@@ -1494,6 +1480,24 @@ fn passthrough_pipeline_desc(codec: CodecKind) -> String {
            ! application/x-rtp,media=video,encoding-name={encoding},clock-rate=90000 \
            ! webrtcbin name=webrtc latency=0 bundle-policy=max-bundle"
     )
+}
+
+/// Apply ICE servers: the first STUN URL → `stun-server`; every
+/// TURN URL → `add-turn-server` (webrtcbin supports several).
+pub(crate) fn apply_ice_servers(webrtc: &gst::Element, ice_servers: &[IceServerCfg]) {
+    for server in ice_servers {
+        for url in &server.urls {
+            if let Some(stun) = stun_url_for(url) {
+                webrtc.set_property("stun-server", stun.as_str());
+            } else if let Some(turn) = turn_url_for(
+                url,
+                server.username.as_deref(),
+                server.credential.as_deref(),
+            ) {
+                let _added: bool = webrtc.emit_by_name::<bool>("add-turn-server", &[&turn]);
+            }
+        }
+    }
 }
 
 /// Normalise a wire `stun:` URL into the `stun://host:port` form

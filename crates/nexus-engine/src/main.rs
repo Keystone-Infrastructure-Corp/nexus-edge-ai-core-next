@@ -64,10 +64,12 @@ mod roster;
 mod setup;
 mod sink_router;
 mod sinks_reload;
+mod speakers_admin;
 mod ssh_ca;
 mod state_hashes;
 mod storage_safety;
 mod system_metrics;
+mod talkdown;
 mod webrtc_bridge;
 // M7 Step 6F2 — only compiled when the `test-injection` feature
 // is on (off in any production build). Wires the dev-only
@@ -1802,6 +1804,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         lan_proxy_enabled: cfg.lan_proxy.enabled,
         remote_access,
         reid_stats: reid_stats.clone(),
+        talkdown: Default::default(),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds
