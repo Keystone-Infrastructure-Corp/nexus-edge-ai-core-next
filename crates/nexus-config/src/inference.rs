@@ -111,10 +111,10 @@ pub enum InferenceBackendKind {
 /// address space with the engine.
 ///
 /// `Process` spawns the `nexus-inference-worker` binary as a child and
-/// drives it over a length-prefixed bincode pipe. This is the production
-/// stance — a panicking model or driver bug only takes the child down,
-/// the engine + pool route around the dead slot, and the fail-soft
-/// fallback keeps the pipeline live until M2's in-place restart lands.
+/// drives it over a length-prefixed bincode pipe. This opt-in mode isolates
+/// a panicking model or driver bug to the child; `Thread` remains the default.
+/// The engine reports unavailable workers as degraded instead of fabricating
+/// detections while the pool routes around the dead slot.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolWorkerKind {

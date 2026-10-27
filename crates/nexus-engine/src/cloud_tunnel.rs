@@ -2334,15 +2334,56 @@ fn recording_issues(
     failures: Vec<nexus_pipeline::recording_health::RecordingDegradation>,
 ) -> impl Iterator<Item = EdgeDegradation> {
     use nexus_pipeline::recording_health::RecordingKind;
-    failures.into_iter().map(|failure| EdgeDegradation {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut groups: BTreeMap<RecordingKind, BTreeMap<String, BTreeSet<nexus_types::CameraId>>> =
+        BTreeMap::new();
+    for failure in failures {
+        groups
+            .entry(failure.kind)
+            .or_default()
+            .entry(failure.reason)
+            .or_default()
+            .insert(failure.camera_id);
+    }
+    // Group by code before the wire's 16-issue cap, retaining each reason's cameras.
+    groups.into_iter().map(|(kind, reasons)| EdgeDegradation {
         component: "recorder".into(),
-        code: match failure.kind {
+        code: match kind {
             RecordingKind::Motion => "recording_unavailable",
             RecordingKind::Alert => "alert_clip_unavailable",
             RecordingKind::Codec => "recording_codec_mismatch",
         }
         .into(),
-        detail: truncate_detail(&format!("camera {}: {}", failure.camera_id, failure.reason)),
+        detail: {
+            let count: usize = reasons.values().map(BTreeSet::len).sum();
+            let descriptions = reasons
+                .into_iter()
+                .map(|(reason, cameras)| {
+                    let noun = if cameras.len() == 1 {
+                        "camera"
+                    } else {
+                        "cameras"
+                    };
+                    let ids = cameras
+                        .into_iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{noun} {ids}: {reason}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let full = format!("{count} camera(s) affected; {descriptions}");
+            let mut detail = truncate_detail(&full);
+            if detail.len() < full.len() {
+                while detail.len() + 3 > HEALTH_DETAIL_MAX {
+                    detail.pop();
+                }
+                detail.push_str("...");
+            }
+            detail
+        },
     })
 }
 
@@ -2693,6 +2734,74 @@ mod health_tests {
     /// apart from a detail that did not name it; this fails when the file
     /// and the engine disagree, so the UI cannot keep rendering a shape the
     /// engine no longer sends.
+    #[test]
+    fn recording_failures_group_all_51_cameras_before_the_wire_issue_cap() {
+        use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
+        let failures = (1..=51)
+            .map(|camera_id| RecordingDegradation {
+                camera_id,
+                kind: RecordingKind::Motion,
+                reason: "motion clip open refused by disk policy".into(),
+            })
+            .collect();
+        let health = edge_health_from(vec![], &[], None, recording_issues(failures));
+        let issues = health.issues.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "recording_unavailable");
+        let ids = (1..=51)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(issues[0].detail.contains(&ids), "{}", issues[0].detail);
+        assert!(issues[0]
+            .detail
+            .contains("motion clip open refused by disk policy"));
+        assert!(issues[0].detail.len() <= HEALTH_DETAIL_MAX);
+    }
+
+    #[test]
+    fn grouped_recording_health_keeps_reason_ownership_and_partial_recovery() {
+        use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
+        let failure = |camera_id, kind, reason: &str| RecordingDegradation {
+            camera_id,
+            kind,
+            reason: reason.into(),
+        };
+        let first = failure(7, RecordingKind::Motion, "file missing");
+        let second = failure(8, RecordingKind::Motion, "disk policy");
+        let alert = failure(7, RecordingKind::Alert, "encoder failed");
+        let issues: Vec<_> = recording_issues(vec![first, second.clone(), alert.clone()]).collect();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(
+            issues[0].detail,
+            "2 camera(s) affected; camera 8: disk policy; camera 7: file missing"
+        );
+        let recovered: Vec<_> = recording_issues(vec![second, alert]).collect();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered[0].detail,
+            "1 camera(s) affected; camera 8: disk policy"
+        );
+        assert_eq!(recovered[1].code, "alert_clip_unavailable");
+    }
+
+    #[test]
+    fn grouped_recording_health_marks_truncated_detail_and_keeps_total_count() {
+        use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
+        let failures = (1..=51)
+            .map(|id| RecordingDegradation {
+                camera_id: 1_000_000_000_000 + id,
+                kind: RecordingKind::Motion,
+                reason: "é".repeat(HEALTH_DETAIL_MAX),
+            })
+            .collect();
+        let issues: Vec<_> = recording_issues(failures).collect();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].detail.starts_with("51 camera(s) affected;"));
+        assert!(issues[0].detail.ends_with("..."));
+        assert!(issues[0].detail.len() <= HEALTH_DETAIL_MAX);
+    }
+
     #[test]
     fn recording_and_layer_failures_reach_local_and_cloud_health() {
         use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
