@@ -196,12 +196,16 @@ impl ClipRecorder for Recording {
 struct People {
     people: Vec<usize>,
     seen: Mutex<Vec<usize>>,
+    recorder: Arc<Recording>,
+    panic_frames: std::ops::Range<usize>,
 }
 
 #[async_trait]
 impl Detector for People {
     async fn detect(&self, f: &Frame, _p: &[String]) -> Result<Vec<Detection>, InferenceError> {
         let i = f.frame_id as usize - 1;
+        // Metadata precedes recorder work, so the driver must not apply the next frame's panic.
+        self.recorder.set_panic(self.panic_frames.contains(&i));
         self.seen.lock().push(i);
         let n = self.people.get(i).copied().unwrap_or(0);
         Ok((0..n)
@@ -392,6 +396,8 @@ async fn run(s: Scenario) -> Outcome {
         Arc::new(People {
             people: s.people.clone(),
             seen: Mutex::new(Vec::new()),
+            recorder: recorder.clone(),
+            panic_frames: s.panic_frames.clone(),
         })
     };
     let high = people();
@@ -430,7 +436,6 @@ async fn run(s: Scenario) -> Outcome {
     let mut tracked = Vec::new();
     let mut resized = Vec::new();
     for i in 0..=n {
-        recorder.set_panic(s.panic_frames.contains(&i));
         if s.epoch_change_at == Some(i) {
             *recorder.epoch_ended.lock() = *recorder.last_opened.lock();
         }
