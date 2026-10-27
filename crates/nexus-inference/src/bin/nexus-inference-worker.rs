@@ -75,6 +75,7 @@ async fn main() -> ExitCode {
     if let Err(e) = write_msg(
         &mut stdout,
         &WorkerResponse::Health {
+            hailo_probe: nexus_inference::hailo_probe_snapshot().ok().flatten(),
             degradations: nexus_inference::health::degradations(),
         },
     )

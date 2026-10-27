@@ -28,7 +28,7 @@ pub struct Telemetry {
     pub utilization_pct: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceTelemetry {
     pub board_name: String,
     pub serial: String,

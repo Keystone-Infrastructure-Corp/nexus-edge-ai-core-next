@@ -54,6 +54,7 @@ pub enum WorkerRequest {
 pub enum WorkerResponse {
     /// Startup model health, sent before accepting frames.
     Health {
+        hailo_probe: Option<serde_json::Value>,
         degradations: Vec<crate::health::DetectorDegradation>,
     },
     DetectOk {

@@ -2158,7 +2158,8 @@ impl EngineHealth {
             recorder
                 .into_iter()
                 .chain(exited_supervisors_issue(&self.exited_supervisors()))
-                .chain(unreadable_cameras_issue(&unreadable)),
+                .chain(unreadable_cameras_issue(&unreadable))
+                .chain(recording_issues(self.recorder.recording_degradations())),
         )
     }
 
@@ -2279,7 +2280,11 @@ fn edge_health_from(
         .map(|d| EdgeDegradation {
             component: "detector".to_string(),
             code: "detector_unavailable".to_string(),
-            detail: truncate_detail(&format!("{}: {}", d.kind, d.reason)),
+            detail: truncate_detail(&format!(
+                "{}: {}",
+                d.layer.as_deref().unwrap_or(&d.kind),
+                d.reason
+            )),
         })
         .collect();
     if !stalled_cameras.is_empty() {
@@ -2323,6 +2328,22 @@ fn edge_health_from(
         status: if issues.is_empty() { "ok" } else { "degraded" }.to_string(),
         issues: Some(issues),
     }
+}
+
+fn recording_issues(
+    failures: Vec<nexus_pipeline::recording_health::RecordingDegradation>,
+) -> impl Iterator<Item = EdgeDegradation> {
+    use nexus_pipeline::recording_health::RecordingKind;
+    failures.into_iter().map(|failure| EdgeDegradation {
+        component: "recorder".into(),
+        code: match failure.kind {
+            RecordingKind::Motion => "recording_unavailable",
+            RecordingKind::Alert => "alert_clip_unavailable",
+            RecordingKind::Codec => "recording_codec_mismatch",
+        }
+        .into(),
+        detail: truncate_detail(&format!("camera {}: {}", failure.camera_id, failure.reason)),
+    })
 }
 
 /// The clip recorder's contribution to [`EngineHealth`].
@@ -2673,6 +2694,66 @@ mod health_tests {
     /// and the engine disagree, so the UI cannot keep rendering a shape the
     /// engine no longer sends.
     #[test]
+    fn recording_and_layer_failures_reach_local_and_cloud_health() {
+        use nexus_pipeline::recording_health::{RecordingDegradation, RecordingKind};
+        let failures = vec![
+            RecordingDegradation {
+                camera_id: 7,
+                kind: RecordingKind::Motion,
+                reason: "file missing".into(),
+            },
+            RecordingDegradation {
+                camera_id: 8,
+                kind: RecordingKind::Alert,
+                reason: "build refused".into(),
+            },
+            RecordingDegradation {
+                camera_id: 9,
+                kind: RecordingKind::Codec,
+                reason: "configured h264, negotiated h265".into(),
+            },
+        ];
+        let health = edge_health_from(
+            vec![nexus_inference::health::DetectorDegradation {
+                kind: "yolo".into(),
+                layer: Some("yolo@1024x576#test".into()),
+                reason: "model unavailable".into(),
+            }],
+            &[],
+            None,
+            recording_issues(failures),
+        );
+        assert_eq!(health.status, "degraded");
+        let local = crate::api::health_body(health.clone(), true);
+        let issues = local["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 4);
+        assert!(issues
+            .iter()
+            .any(|issue| issue["code"] == "recording_unavailable"
+                && issue["detail"].as_str().unwrap().contains("camera 7")));
+        assert!(issues
+            .iter()
+            .any(|issue| issue["code"] == "alert_clip_unavailable"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue["code"] == "recording_codec_mismatch"));
+        assert!(issues.iter().any(|issue| issue["detail"]
+            .as_str()
+            .unwrap()
+            .contains("yolo@1024x576#test")));
+        let anonymous = crate::api::health_body(health, false);
+        assert!(anonymous["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|issue| issue.get("detail").is_none()));
+        assert_eq!(
+            edge_health_from(vec![], &[], None, recording_issues(vec![])).status,
+            "ok"
+        );
+    }
+
+    #[test]
     fn the_ui_renders_the_health_answers_the_engine_gives() {
         let cap = crate::system_metrics::DecodeCapacity {
             binding_engine: "video-enhance".to_string(),
@@ -2681,6 +2762,7 @@ mod health_tests {
         };
         let health = edge_health_from(
             vec![nexus_inference::health::DetectorDegradation {
+                layer: None,
                 kind: "ppe".to_string(),
                 reason: "no detector implementation ships for this model kind".to_string(),
             }],
@@ -3120,6 +3202,7 @@ mod health_tests {
     fn the_recorder_issue_cannot_carry_the_heartbeat_past_the_wire_cap() {
         let detector = (0..HEALTH_ISSUES_MAX)
             .map(|n| nexus_inference::health::DetectorDegradation {
+                layer: None,
                 kind: format!("cap_{n}"),
                 reason: "unavailable".to_string(),
             })

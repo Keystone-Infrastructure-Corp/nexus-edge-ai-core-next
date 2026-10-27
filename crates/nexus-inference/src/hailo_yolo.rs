@@ -354,6 +354,30 @@ pub fn telemetry_snapshot() -> Option<Result<Telemetry, InferenceError>> {
     None
 }
 
+/// Read diagnostics through the live session; never acquire a second device.
+pub fn probe_snapshot() -> Result<Option<serde_json::Value>, InferenceError> {
+    let detector = session_cache().lock().values().find_map(Weak::upgrade);
+    let Some(detector) = detector else {
+        return Ok(None);
+    };
+    // A wedged inference must not make an admin request wait indefinitely.
+    let mut session = detector
+        .session
+        .try_lock_for(std::time::Duration::from_secs(2))
+        .ok_or_else(|| InferenceError::Failed("Hailo session is busy; retry the probe".into()))?;
+    let telemetry = session
+        .telemetry()
+        .map_err(|e| InferenceError::Failed(format!("hailo probe: {e}")))?;
+    Ok(Some(serde_json::json!({
+        "devices": telemetry.devices,
+        "input_shape": session.input_shape(),
+        "input_frame_size": session.input_frame_size(),
+        "output_frame_size": session.output_frame_size(),
+        "outputs": session.output_infos(),
+        "output_layout": session.output_layout(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,7 +24,7 @@ use nexus_hailo_backend::{InferSession, OutputLayout};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const USAGE: &str =
-    "usage: nexus-hailo-probe [--version] [--hef PATH [--images DIR --csv OUT.csv] [--stats]]";
+    "usage: nexus-hailo-probe [--version] [--via-engine [--base-url URL] [--token-file PATH]] [--hef PATH [--images DIR --csv OUT.csv] [--stats]]";
 
 fn main() -> ExitCode {
     let args = match parse_args(env::args().skip(1)) {
@@ -47,6 +47,34 @@ fn main() -> ExitCode {
         )
         .with_target(true)
         .init();
+
+    if args.via_engine {
+        let token = match args
+            .token_file
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()
+        {
+            Ok(value) => value.or_else(|| env::var("NEXUS_ADMIN_TOKEN").ok()),
+            Err(_) => {
+                eprintln!("nexus-hailo-probe: cannot read token file");
+                return ExitCode::from(2);
+            }
+        };
+        return match probe_engine(
+            args.base_url.as_deref().unwrap_or("http://127.0.0.1:8089"),
+            token.as_deref(),
+        ) {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("nexus-hailo-probe: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
 
     if !nexus_hailo_backend::is_supported() {
         eprintln!(
@@ -119,6 +147,9 @@ fn main() -> ExitCode {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
     version: bool,
+    via_engine: bool,
+    base_url: Option<String>,
+    token_file: Option<PathBuf>,
     hef: Option<PathBuf>,
     images: Option<PathBuf>,
     csv: Option<PathBuf>,
@@ -134,6 +165,13 @@ where
     while let Some(a) = args.next() {
         match a.as_str() {
             "--version" => out.version = true,
+            "--via-engine" => out.via_engine = true,
+            "--base-url" => out.base_url = Some(args.next().ok_or("--base-url requires a URL")?),
+            "--token-file" => {
+                out.token_file = Some(PathBuf::from(
+                    args.next().ok_or("--token-file requires a path")?,
+                ))
+            }
             "--stats" => out.stats = true,
             "--hef" => {
                 out.hef =
@@ -156,7 +194,74 @@ where
             other => return Err(format!("unrecognized argument '{other}'")),
         }
     }
+    if out.via_engine
+        && (out.hef.is_some() || out.images.is_some() || out.csv.is_some() || out.stats)
+    {
+        return Err("--via-engine cannot run standalone HEF/image inference".into());
+    }
+    if !out.via_engine && (out.base_url.is_some() || out.token_file.is_some()) {
+        return Err("--base-url and --token-file require --via-engine".into());
+    }
     Ok(out)
+}
+
+/// Query the owning engine without loading HailoRT in this process.
+fn probe_engine(base: &str, token: Option<&str>) -> Result<String, String> {
+    use std::io::Read;
+    let mut url = reqwest::Url::parse(base).map_err(|_| "invalid engine URL")?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    });
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("engine URL must not contain credentials, query or fragment".into());
+    }
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err("use HTTPS, or HTTP on a literal loopback address (use an SSH tunnel for a remote core)".into());
+    }
+    url.set_path("/api/v1/admin/hailo/probe");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "cannot create HTTP client")?;
+    let mut request = client.get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token.trim());
+    }
+    let response = request
+        .send()
+        .map_err(|_| "engine request failed or timed out")?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("engine returned HTTP {status}; check authentication and that a Hailo session is active"));
+    }
+    let mut body = Vec::new();
+    response
+        .take(1_048_577)
+        .read_to_end(&mut body)
+        .map_err(|_| "cannot read engine response")?;
+    if body.len() > 1_048_576 {
+        return Err("engine response exceeds 1 MiB".into());
+    }
+    let data: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| "invalid engine probe response")?;
+    if data
+        .get("devices")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty)
+        || data
+            .get("output_layout")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err("engine probe returned no device identity or HEF output layout".into());
+    }
+    serde_json::to_string_pretty(&data).map_err(|_| "cannot format engine probe response".into())
 }
 
 /// `--stats`: per-output min / max / mean / fraction-positive of the dequantised
@@ -369,6 +474,78 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn via_engine_is_accepted_without_standalone_hardware() {
+        assert!(parse_args(args(&["--via-engine"])).is_ok());
+    }
+
+    #[test]
+    fn engine_mode_rejects_standalone_options_and_orphan_client_options() {
+        for args in [
+            vec!["--via-engine", "--hef", "m.hef"],
+            vec!["--via-engine", "--stats"],
+            vec!["--base-url", "http://127.0.0.1:8089"],
+            vec!["--token-file", "token"],
+        ] {
+            assert!(parse_args(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    fn engine_response(status: &str, body: &str, token: Option<&str>) -> Result<String, String> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let expected_auth = token.map(|t| format!("authorization: bearer {t}"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("get /api/v1/admin/hailo/probe "));
+            if let Some(auth) = expected_auth {
+                assert!(request.contains(&auth));
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let result = probe_engine(&base, token);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn engine_probe_transports_auth_and_layout_without_hardware() {
+        let body = r#"{"devices":[{"serial":"test"}],"output_layout":{"RawYolo26":{"num_classes":80,"scales":[{"stride":8}]}}}"#;
+        let result = engine_response("200 OK", body, Some("test-token")).unwrap();
+        assert!(result.contains("RawYolo26"));
+        assert!(!result.contains("test-token"));
+    }
+
+    #[test]
+    fn engine_probe_does_not_treat_auth_absence_or_bad_payload_as_success() {
+        for (status, body) in [
+            ("401 Unauthorized", "secret server error"),
+            ("503 Service Unavailable", "no session"),
+            ("302 Found", "redirect"),
+            ("200 OK", "not json"),
+            ("200 OK", r#"{"devices":[],"output_layout":"Other"}"#),
+        ] {
+            assert!(engine_response(status, body, None).is_err());
+        }
+        assert!(probe_engine("http://192.0.2.1", Some("secret")).is_err());
+        assert!(probe_engine("https://user:password@example.com", None).is_err());
     }
 
     #[test]

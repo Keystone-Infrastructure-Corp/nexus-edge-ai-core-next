@@ -535,6 +535,7 @@ impl Drop for ThreadIsolatedBackend {
 // ---------------------------------------------------------------------------
 
 pub struct WorkerProcessBackend {
+    _hailo_probe: Arc<crate::hailo_probe::WorkerProbe>,
     _health: Arc<parking_lot::Mutex<Vec<crate::health::DegradationRegistration>>>,
     slot: i32,
     common: Arc<BackendCommon>,
@@ -654,6 +655,8 @@ impl WorkerProcessBackend {
         // `stdout` for the lifetime of the worker.
         let health = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let reader_health = Arc::downgrade(&health);
+        let hailo_probe = crate::hailo_probe::register_worker();
+        let reader_probe = Arc::downgrade(&hailo_probe);
         let reader_common = common.clone();
         let reader_inner = inner.clone();
         let slot_for_reader = slot;
@@ -664,6 +667,7 @@ impl WorkerProcessBackend {
                 reader_common,
                 reader_inner,
                 reader_health,
+                reader_probe,
             )
             .await;
         });
@@ -697,6 +701,7 @@ impl WorkerProcessBackend {
 
         Ok(Self {
             _health: health,
+            _hailo_probe: hailo_probe,
             slot,
             common,
             inner,
@@ -718,6 +723,7 @@ async fn run_reader(
     common: Arc<BackendCommon>,
     inner: Arc<WorkerProcessInner>,
     health: std::sync::Weak<parking_lot::Mutex<Vec<crate::health::DegradationRegistration>>>,
+    probe: std::sync::Weak<crate::hailo_probe::WorkerProbe>,
 ) {
     let mut stdout = stdout;
     loop {
@@ -729,7 +735,14 @@ async fn run_reader(
                     break;
                 }
             };
-        if let crate::worker_proto::WorkerResponse::Health { degradations } = msg {
+        if let crate::worker_proto::WorkerResponse::Health {
+            degradations,
+            hailo_probe,
+        } = msg
+        {
+            if let Some(probe) = probe.upgrade() {
+                *probe.lock() = hailo_probe;
+            }
             if let Some(health) = health.upgrade() {
                 *health.lock() = degradations
                     .into_iter()
@@ -751,6 +764,9 @@ async fn run_reader(
                 warn!(slot, "worker response for unknown req_id={}", m.req_id());
             }
         }
+    }
+    if let Some(probe) = probe.upgrade() {
+        *probe.lock() = None;
     }
     // Worker is gone. Fail every outstanding request and mark the backend
     // unhealthy so the pool routes around us.

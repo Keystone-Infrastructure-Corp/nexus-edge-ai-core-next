@@ -371,6 +371,7 @@ pub fn router(state: ApiState) -> Router {
         // because the scene is static, or because the source died?" in one
         // curl instead of a live-box investigation.
         .route("/v1/admin/live/status", get(get_admin_live_status))
+        .route("/v1/admin/hailo/probe", get(crate::hailo::get_probe))
         // M7 cloud-managed sinks — runtime CRUD over the
         // alert-delivery sink set. `GET /v1/admin/sinks` lists the
         // effective set (file ∪ db, secrets redacted, source +
@@ -5833,6 +5834,33 @@ mod tests {
             talkdown: Default::default(),
         };
         (state, store, dir, sink_registry, bus)
+    }
+
+    #[tokio::test]
+    async fn live_hailo_probe_requires_admin_and_reports_absent_session() {
+        const ADMIN_SECRET: &[u8] = b"hailo-probe-test-secret";
+        let (state, _store, _dir, _reg, _bus) = build_test_state(Some(ADMIN_SECRET)).await;
+        let app = super::router(state);
+        for (token, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (
+                Some(sign_admin_jwt(ADMIN_SECRET)),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/admin/hailo/probe");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(loopback_peer()));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     /// `GET /api/v1/admin/remote_access` reports the live switch and the

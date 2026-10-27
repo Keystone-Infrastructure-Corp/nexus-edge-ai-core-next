@@ -2418,6 +2418,9 @@ name = "nexus-hailo-backend"
 version = "0.1.0"
 dependencies = [
  "libloading 0.8.9",
+ "reqwest",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",

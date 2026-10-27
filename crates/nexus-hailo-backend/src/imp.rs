@@ -69,7 +69,7 @@ pub struct Telemetry {
 /// failed (e.g. a firmware that doesn't support the dvm); identity
 /// fields come from `hailo_identify` and are always populated when the
 /// device handle is valid.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceTelemetry {
     pub board_name: String,
     pub serial: String,

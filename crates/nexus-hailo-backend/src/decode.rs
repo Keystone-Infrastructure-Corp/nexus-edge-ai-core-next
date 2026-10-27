@@ -31,7 +31,7 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum OutputLayout {
     /// `HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS` (22). Single output buffer:
     ///   for each class C in 0..num_classes:
@@ -64,7 +64,7 @@ pub enum OutputLayout {
 
 /// Shape metadata for one output vstream. Plain data — the runtime fills it
 /// in, the decoder reads it, neither needs HailoRT to describe it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct OutputStreamInfo {
     pub name: String,
     pub h: u32,
@@ -85,7 +85,7 @@ pub struct OutputStreamInfo {
 }
 
 /// One anchor-free yolo26 scale (box tensor + class tensor at a given stride).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct RawYolo26Scale {
     pub stride: u32,
     pub h: u32,

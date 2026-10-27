@@ -72,6 +72,9 @@ pub use yolo_world::YoloWorldDetector;
 pub use yoloe::YoloeDetector;
 pub use yoloe_promptfree::YoloePromptFreeDetector;
 
+mod hailo_probe;
+pub use hailo_probe::snapshot as hailo_probe_snapshot;
+
 // ---------------------------------------------------------------------------
 // Hailo telemetry surface — exposed unconditionally so `nexus-engine`'s
 // `system_metrics` handler can compile on every feature-flag combination
