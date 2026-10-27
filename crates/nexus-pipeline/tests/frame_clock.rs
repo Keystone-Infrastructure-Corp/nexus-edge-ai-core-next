@@ -109,7 +109,7 @@ struct Recording {
     opened: Mutex<Vec<DateTime<Utc>>>,
     open_attempts: Mutex<Vec<DateTime<Utc>>>,
     refused_opens: Vec<usize>,
-    open_io_error: bool,
+    io_error_opens: Vec<usize>,
     inflight_bytes: Option<u64>,
     closed: Mutex<Vec<DateTime<Utc>>>,
     resized: AtomicUsize,
@@ -128,12 +128,11 @@ impl ClipRecorder for Recording {
             attempts.push(started_at);
             attempt
         };
+        if self.io_error_opens.contains(&attempt) {
+            return Err(std::io::Error::other("scripted open failure").into());
+        }
         if self.refused_opens.contains(&attempt) {
-            return Err(if self.open_io_error {
-                std::io::Error::other("scripted open failure").into()
-            } else {
-                RecorderError::Refused
-            });
+            return Err(RecorderError::Refused);
         }
         let handle = self.stub.open(args).await?;
         self.opened.lock().push(started_at);
@@ -165,10 +164,12 @@ impl ClipRecorder for Recording {
         })
     }
 
-    fn set_panic(&self, _panic: bool) {}
+    fn set_panic(&self, panic: bool) {
+        self.stub.set_panic(panic);
+    }
 
     fn is_panic(&self) -> bool {
-        false
+        self.stub.is_panic()
     }
 
     fn kind(&self) -> &'static str {
@@ -260,9 +261,10 @@ struct Scenario {
     epoch_change_at: Option<usize>,
     graceful_stop: bool,
     refused_opens: Vec<usize>,
-    open_io_error: bool,
+    io_error_opens: Vec<usize>,
     inflight_bytes: Option<u64>,
     rebuild_at: Option<usize>,
+    panic_frames: std::ops::Range<usize>,
 }
 
 impl Scenario {
@@ -278,9 +280,10 @@ impl Scenario {
             epoch_change_at: None,
             graceful_stop: false,
             refused_opens: Vec::new(),
-            open_io_error: false,
+            io_error_opens: Vec::new(),
             inflight_bytes: None,
             rebuild_at: None,
+            panic_frames: 0..0,
         }
     }
 }
@@ -378,7 +381,7 @@ async fn run(s: Scenario) -> Outcome {
         opened: Mutex::new(Vec::new()),
         open_attempts: Mutex::new(Vec::new()),
         refused_opens: s.refused_opens,
-        open_io_error: s.open_io_error,
+        io_error_opens: s.io_error_opens,
         inflight_bytes: s.inflight_bytes,
         closed: Mutex::new(Vec::new()),
         resized: AtomicUsize::new(0),
@@ -427,6 +430,7 @@ async fn run(s: Scenario) -> Outcome {
     let mut tracked = Vec::new();
     let mut resized = Vec::new();
     for i in 0..=n {
+        recorder.set_panic(s.panic_frames.contains(&i));
         if s.epoch_change_at == Some(i) {
             *recorder.epoch_ended.lock() = *recorder.last_opened.lock();
         }
@@ -662,7 +666,9 @@ async fn an_initial_failed_open_preserves_motion_during_backoff() {
         let mut s = Scenario::new(&clock, vec![1, 2, 3, 3, 3, 3], IouNaive);
         s.clips.motion_events_sample_hz = 0.0;
         s.refused_opens = vec![0, 1];
-        s.open_io_error = open_io_error;
+        if open_io_error {
+            s.io_error_opens = std::mem::take(&mut s.refused_opens);
+        }
         let o = run(s).await;
         assert_eq!(o.open_attempts, [0, 1, 3].map(|i| clock.wall(i)));
         assert_eq!(o.opened, [clock.wall(3)]);
@@ -692,7 +698,9 @@ async fn a_failed_rotation_retries_without_a_motion_event() {
         s.clips.motion_events_sample_hz = 0.0;
         s.epoch_change_at = Some(3);
         s.refused_opens = vec![1, 2];
-        s.open_io_error = open_io_error;
+        if open_io_error {
+            s.io_error_opens = std::mem::take(&mut s.refused_opens);
+        }
         let o = run(s).await;
         assert_eq!(o.closed, [clock.wall(3)]);
         assert_eq!(o.opened, [clock.wall(0), clock.wall(6)]);
@@ -715,7 +723,9 @@ async fn failed_rotation_backs_off_and_recovers_with_post_roll() {
             s.clips.post_roll_secs = 2;
             s.epoch_change_at = Some(3);
             s.refused_opens = (1..=7).collect();
-            s.open_io_error = open_io_error;
+            if open_io_error {
+                s.io_error_opens = std::mem::take(&mut s.refused_opens);
+            }
             let o = run(s).await;
             assert_eq!(
                 o.open_attempts,
@@ -726,6 +736,103 @@ async fn failed_rotation_backs_off_and_recovers_with_post_roll() {
             assert_eq!(o.closed, [clock.wall(3), clock.wall(190)]);
         }
     }
+}
+
+/// Panic refuses once to publish recorder health, then resumes on the first
+/// processed frame after recovery, even after a long pause or a wall-clock step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_recovery_does_not_wait_for_the_open_backoff() {
+    for step_ms in [0, HOUR_MS, -HOUR_MS] {
+        let clock = Clock::new(500, step_ms, &[4, 80]);
+        let mut s = Scenario::new(&clock, vec![1; 90], IouNaive);
+        s.clips.motion_events_sample_hz = 0.0;
+        s.epoch_change_at = Some(3);
+        s.panic_frames = 3..80;
+        let o = run(s).await;
+        assert_eq!(o.open_attempts, [0, 3, 80].map(|i| clock.wall(i)));
+        assert_eq!(o.opened, [clock.wall(0), clock.wall(80)]);
+        assert_eq!(o.closed, [clock.wall(3)]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_refusal_is_reset_when_post_roll_expires() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut people = vec![1; 4];
+    people.extend([0; 6]);
+    people.extend([1; 4]);
+    people.extend([0; 6]);
+    people.extend([1; 4]);
+    let mut s = Scenario::new(&clock, people, IouNaive);
+    s.clips.motion_events_sample_hz = 0.0;
+    s.clips.post_roll_secs = 2;
+    s.panic_frames = 0..18;
+    let o = run(s).await;
+    assert_eq!(
+        o.open_attempts,
+        [0, 10, 20].map(|i| clock.wall(i)),
+        "each burst reports its first refusal; expired demand cannot reopen on recovery"
+    );
+    assert_eq!(o.opened, [clock.wall(20)]);
+}
+
+/// Captures supervisor diagnostics without a global subscriber or extra dependency.
+struct OpenWarnings(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for OpenWarnings {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "nexus_pipeline::supervisor"
+            && *metadata.level() == tracing::Level::WARN
+    }
+
+    fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        event.record(
+            &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                if field.name() == "message" {
+                    let message = format!("{value:?}");
+                    if message.starts_with("recorder.open failed:") {
+                        self.0.lock().push(message);
+                    }
+                }
+            },
+        );
+    }
+}
+
+// The current-thread runtime keeps the subscriber on the spawned supervisor's thread.
+#[tokio::test]
+async fn panic_then_io_failure_warns_once_and_retries_with_error_backoff() {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let _subscriber = tracing::subscriber::set_default(OpenWarnings(logs.clone()));
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1; 100], IouNaive);
+    s.clips.motion_events_sample_hz = 0.0;
+    s.panic_frames = 0..80;
+    s.io_error_opens = vec![1, 2, 4, 6];
+    s.refused_opens = vec![3];
+    // Attempt 5 succeeds on frame 95; the next rotation starts a new error streak.
+    s.epoch_change_at = Some(97);
+    let o = run(s).await;
+    let logs = logs.lock();
+    assert_eq!(
+        logs.len(),
+        2,
+        "one warning per error streak, even after a refusal: {logs:?}"
+    );
+    assert_eq!(
+        o.open_attempts,
+        [0, 80, 81, 83, 87, 95, 97, 98].map(|i| clock.wall(i))
+    );
+    assert_eq!(o.opened, [clock.wall(95), clock.wall(98)]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

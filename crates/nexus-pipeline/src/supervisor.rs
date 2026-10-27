@@ -529,6 +529,8 @@ async fn run_camera(
         let mut pending_open = false;
         let mut open_retry_at: Option<Instant> = None;
         let mut open_retry_delay = Duration::from_millis(500);
+        let mut open_panic_refused = false;
+        let mut open_error_logged = false;
         // Alert snapshot output dir — created once per camera task so the
         // per-alert write path (below) never races a mkdir. Failure to
         // create it is non-fatal: snapshots are best-effort and the
@@ -1368,14 +1370,23 @@ async fn run_camera(
                     pending_open = false;
                     open_retry_at = None;
                     open_retry_delay = Duration::from_millis(500);
+                    open_panic_refused = false;
+                    open_error_logged = false;
                 }
                 // Recorder continuity cannot depend on whether Updated rows are due.
                 let should_open = current_clip.is_none()
-                    && open_retry_at.is_none_or(|retry_at| frame.captured_mono >= retry_at)
+                    && (!open_panic_refused || !recorder.is_panic())
+                    && (open_panic_refused
+                        || open_retry_at.is_none_or(|retry_at| frame.captured_mono >= retry_at))
                     && (pending_open
                         || alert_kept_alive
                         || decisions.iter().any(|d| matches!(d.kind, MotionKind::Born)));
                 if should_open {
+                    if open_panic_refused {
+                        // Panic recovery resumes immediately with a fresh I/O retry budget.
+                        open_panic_refused = false;
+                        open_retry_delay = Duration::from_millis(500);
+                    }
                     match recorder
                         .open(OpenClip {
                             camera_id: cfg.id,
@@ -1391,21 +1402,28 @@ async fn run_camera(
                             pending_open = false;
                             open_retry_at = None;
                             open_retry_delay = Duration::from_millis(500);
+                            open_error_logged = false;
                         }
-                        Err(RecorderError::Refused) if open_retry_at.is_none() => {
-                            debug!(
-                                camera_id = cfg.id,
-                                "recorder refused open (panic mode); dropping motion frame"
-                            );
+                        Err(RecorderError::Refused) => {
+                            // Let the first refusal report health, then wait for disk recovery.
+                            open_panic_refused = recorder.is_panic();
+                            if open_retry_at.is_none() {
+                                debug!(
+                                    camera_id = cfg.id,
+                                    "recorder refused open; dropping motion frame"
+                                );
+                            }
                         }
-                        Err(e) if open_retry_at.is_none() => {
-                            warn!(camera_id = cfg.id, "recorder.open failed: {e}");
+                        Err(e) => {
+                            if !open_error_logged {
+                                warn!(camera_id = cfg.id, "recorder.open failed: {e}");
+                                open_error_logged = true;
+                            }
                         }
-                        Err(_) => {}
                     }
                     if current_clip.is_none() {
                         pending_open = true;
-                        // Bound retries and log only the first failure in a streak.
+                        // Non-panic failures back off; refusals do not suppress the first error warning.
                         open_retry_at = Some(frame.captured_mono + open_retry_delay);
                         open_retry_delay = open_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
                     }
