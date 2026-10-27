@@ -525,8 +525,8 @@ async fn run_camera(
         )
         .with_first_emit_jitter();
         let mut current_clip: Option<ClipHandle> = None;
-        // A refused rotation open must be retried independently of motion sampling.
-        let mut reopen_after_rotation = false;
+        // Failed opens and rotations must retain demand independently of motion sampling.
+        let mut pending_open = false;
         let mut open_retry_at: Option<Instant> = None;
         let mut open_retry_delay = Duration::from_millis(500);
         // Alert snapshot output dir — created once per camera task so the
@@ -781,7 +781,7 @@ async fn run_camera(
                         clip_opened_at = None;
                         frames_since_size_stat = 0;
                         // Rotation changes files, not the motion/post-roll lifetime.
-                        reopen_after_rotation = true;
+                        pending_open = true;
                     }
                 }
 
@@ -1042,7 +1042,7 @@ async fn run_camera(
                                     }
                                     clip_opened_at = None;
                                     // Resizing rotates the file, preserving motion and post-roll.
-                                    reopen_after_rotation = true;
+                                    pending_open = true;
                                     frames_since_size_stat = 0;
                                 }
                                 rebuild_source = true;
@@ -1365,14 +1365,14 @@ async fn run_camera(
                 let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
                 let action = post_roll.tick(frame.captured_mono, has_live_motion);
                 if matches!(action, PostRollAction::CloseNow) {
-                    reopen_after_rotation = false;
+                    pending_open = false;
                     open_retry_at = None;
                     open_retry_delay = Duration::from_millis(500);
                 }
                 // Recorder continuity cannot depend on whether Updated rows are due.
                 let should_open = current_clip.is_none()
                     && open_retry_at.is_none_or(|retry_at| frame.captured_mono >= retry_at)
-                    && (reopen_after_rotation
+                    && (pending_open
                         || alert_kept_alive
                         || decisions.iter().any(|d| matches!(d.kind, MotionKind::Born)));
                 if should_open {
@@ -1388,7 +1388,7 @@ async fn run_camera(
                         Ok(handle) => {
                             current_clip = Some(handle);
                             clip_opened_at = Some(frame.captured_mono);
-                            reopen_after_rotation = false;
+                            pending_open = false;
                             open_retry_at = None;
                             open_retry_delay = Duration::from_millis(500);
                         }
@@ -1404,6 +1404,7 @@ async fn run_camera(
                         Err(_) => {}
                     }
                     if current_clip.is_none() {
+                        pending_open = true;
                         // Bound retries and log only the first failure in a streak.
                         open_retry_at = Some(frame.captured_mono + open_retry_delay);
                         open_retry_delay = open_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
@@ -1413,7 +1414,7 @@ async fn run_camera(
                     let Some(handle) = current_clip else {
                         // Open was refused earlier in this frame and
                         // we have no clip to stamp. Skip silently —
-                        // a pending rotation or the next Born retries the open.
+                        // pending demand retries after backoff while post-roll is active.
                         continue;
                     };
                     if let Err(e) = insert_motion_decision(&store, handle, d).await {

@@ -656,6 +656,35 @@ async fn every_rotation_reopens_when_motion_updates_are_disabled() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_failed_open_preserves_motion_during_backoff() {
+    for open_io_error in [false, true] {
+        let clock = Clock::new(500, 0, &[]);
+        let mut s = Scenario::new(&clock, vec![1, 2, 3, 3, 3, 3], IouNaive);
+        s.clips.motion_events_sample_hz = 0.0;
+        s.refused_opens = vec![0, 1];
+        s.open_io_error = open_io_error;
+        let o = run(s).await;
+        assert_eq!(o.open_attempts, [0, 1, 3].map(|i| clock.wall(i)));
+        assert_eq!(o.opened, [clock.wall(3)]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_failed_open_retries_after_a_single_alert() {
+    let clock = Clock::new(500, 0, &[]);
+    let mut s = Scenario::new(&clock, vec![1; 6], IouNaive);
+    s.clips.motion_events_sample_hz = 0.0;
+    s.clips.record_motion_clip_on_alert = true;
+    s.rules = vec![person_rule(1_000, 10_000)];
+    s.refused_opens = vec![0, 1];
+    let o = run(s).await;
+    assert_eq!(o.open_attempts, [0, 1, 3].map(|i| clock.wall(i)));
+    assert_eq!(o.opened, [clock.wall(3)]);
+    assert_eq!(o.alerts.len(), 1);
+    assert_eq!(o.alerts[0].frame_id, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_rotation_retries_without_a_motion_event() {
     for open_io_error in [false, true] {
         let clock = Clock::new(500, 0, &[]);
