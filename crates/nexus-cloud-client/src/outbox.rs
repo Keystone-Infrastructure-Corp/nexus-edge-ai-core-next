@@ -33,6 +33,7 @@
 //!   `clip_replicated_ack`.
 //! * Cloning the outbox handle is cheap (one `Arc::clone`).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use nexus_cloud_protocol::v1::Envelope;
@@ -55,6 +56,7 @@ pub mod caps {
 pub struct TunnelOutbox {
     inner: RwLock<Option<Arc<dyn TunnelHandle>>>,
     caps: RwLock<std::collections::HashSet<String>>,
+    connects: AtomicU64,
 }
 
 impl TunnelOutbox {
@@ -66,6 +68,7 @@ impl TunnelOutbox {
         Self {
             inner: RwLock::new(None),
             caps: RwLock::new(std::collections::HashSet::new()),
+            connects: AtomicU64::new(0),
         }
     }
 
@@ -76,9 +79,19 @@ impl TunnelOutbox {
     pub fn set_handle(&self, handle: Option<Arc<dyn TunnelHandle>>) {
         let connected = handle.is_some();
         *self.inner.write() = handle;
-        if !connected {
+        if connected {
+            self.connects.fetch_add(1, Ordering::Relaxed);
+        } else {
             self.caps.write().clear();
         }
+    }
+
+    /// How many handles have been installed. Comparing it across polls
+    /// shows every reconnect, including one that finished between two
+    /// polls, which [`Self::is_connected`] cannot.
+    #[must_use]
+    pub fn connects(&self) -> u64 {
+        self.connects.load(Ordering::Relaxed)
     }
 
     /// Replace the advertised cloud capability set. Called from the
