@@ -16,15 +16,20 @@
 //! 1. Once on task startup (best-effort; if the tunnel is still down
 //!    the next tick or bus event will retry).
 //! 2. On every `topic::CONFIG_CHANGED` event whose `kind == "camera"`.
-//! 3. On a 10-second tick if a previous send failed (dirty flag).
+//! 3. On a 10-second tick if a previous send failed (dirty flag), if any
+//!    camera's frame-source liveness differs from the last sent roster,
+//!    or if the tunnel reconnected since the last tick. The cloud derives
+//!    `camera.offline` only from these rosters (BUG-315), so a camera
+//!    that stops streaming must ship one on its own.
 //!
 //! Cloud-side dedup uses the monotonic `roster_revision` carried on
 //! every envelope; we seed it from `Utc::now().timestamp_millis()` at
 //! boot so revisions are monotonic across process restarts.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::StreamExt;
@@ -35,12 +40,13 @@ use nexus_cloud_protocol::v1::{
 };
 use nexus_pipeline::FrameStatsRegistry;
 use nexus_store::Store;
+use nexus_types::CameraId;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
-/// Retry cadence when a publish failed (tunnel disconnected, etc).
+/// Cadence of the retry, liveness and reconnect checks.
 const RETRY_TICK: Duration = Duration::from_secs(10);
 
 /// Derive the wire-protocol `kind` enum value from a camera URL
@@ -68,12 +74,14 @@ fn seed_revision() -> u64 {
 /// Build a `camera_roster` envelope from the current store snapshot.
 ///
 /// `default_model_kind` is `inference.model.kind` — the detector a
-/// camera runs when it has no `model_override`.
+/// camera runs when it has no `model_override`. `online` is one
+/// [`online_cameras`] read, so the roster and the set the publisher
+/// records as sent cannot disagree.
 async fn build_envelope(
     store: &Store,
     revision: u64,
     default_model_kind: &str,
-    frame_stats: &FrameStatsRegistry,
+    online: &BTreeSet<CameraId>,
 ) -> anyhow::Result<Envelope> {
     let cams = store.list_cameras().await?;
     let now = Utc::now();
@@ -121,11 +129,7 @@ async fn build_envelope(
                 // nobody is watching in the live-view grid is still
                 // reported correctly (unlike `live_view::stalled_cameras`,
                 // which only tracks cameras with a live-view subscriber).
-                online: Some(
-                    frame_stats
-                        .snapshot(c.id)
-                        .is_some_and(|s| s.is_online(std::time::Instant::now())),
-                ),
+                online: Some(online.contains(&c.id)),
                 // Phase A: per-camera revision == snapshot revision.
                 // Phase D will introduce real per-row tracking when
                 // cloud-side mutations need optimistic-concurrency.
@@ -151,23 +155,36 @@ async fn build_envelope(
     })
 }
 
-/// Try one publish. Returns true on success, false otherwise.
+/// The cameras whose last frame is inside the offline window at
+/// `now_mono`.
+fn online_cameras(frame_stats: &FrameStatsRegistry, now_mono: Instant) -> BTreeSet<CameraId> {
+    frame_stats
+        .snapshot_all()
+        .into_iter()
+        .filter_map(|(id, s)| s.is_online(now_mono).then_some(id))
+        .collect()
+}
+
+/// Try one publish. Returns the cameras it reported online on success,
+/// `None` otherwise.
 async fn try_publish(
     store: &Store,
     outbox: &TunnelOutbox,
     revision_counter: &AtomicU64,
     default_model_kind: &str,
     frame_stats: &FrameStatsRegistry,
-) -> bool {
+    now_mono: Instant,
+) -> Option<BTreeSet<CameraId>> {
     if !outbox.is_connected() {
-        return false;
+        return None;
     }
     let revision = revision_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let env = match build_envelope(store, revision, default_model_kind, frame_stats).await {
+    let online = online_cameras(frame_stats, now_mono);
+    let env = match build_envelope(store, revision, default_model_kind, &online).await {
         Ok(e) => e,
         Err(e) => {
             warn!(error = %e, "roster publisher: snapshot build failed");
-            return false;
+            return None;
         }
     };
     let count = match &env.body {
@@ -181,13 +198,13 @@ async fn try_publish(
                 roster_revision = revision,
                 "camera_roster published",
             );
-            true
+            Some(online)
         }
         Err(e) => {
             // Disconnected mid-flight or writer closed — caller leaves
             // the dirty flag set and the retry tick handles it.
             debug!(error = %e, "roster publisher: send failed (will retry)");
-            false
+            None
         }
     }
 }
@@ -208,68 +225,106 @@ pub fn spawn(
     default_model_kind: String,
     frame_stats: Arc<FrameStatsRegistry>,
 ) -> JoinHandle<()> {
+    tokio::spawn(run(
+        store,
+        bus,
+        outbox,
+        default_model_kind,
+        frame_stats,
+        RETRY_TICK,
+        Instant::now,
+    ))
+}
+
+/// The publisher loop behind [`spawn`]. `tick` and `now_mono` are
+/// injected so a test can age a camera's last frame past
+/// `CAMERA_OFFLINE_AFTER_MS` without waiting 90 s.
+async fn run(
+    store: Arc<Store>,
+    bus: Arc<dyn Bus>,
+    outbox: Arc<TunnelOutbox>,
+    default_model_kind: String,
+    frame_stats: Arc<FrameStatsRegistry>,
+    tick: Duration,
+    now_mono: impl Fn() -> Instant + Send + 'static,
+) {
     let revision_counter = Arc::new(AtomicU64::new(seed_revision()));
     let dirty = Arc::new(AtomicBool::new(true));
-    tokio::spawn(async move {
-        // Subscribe to config.changed BEFORE the initial publish so
-        // we don't race a fast operator who creates a camera between
-        // boot and subscribe.
-        let mut stream = match bus
-            .subscribe::<serde_json::Value>(topic::CONFIG_CHANGED)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "roster publisher: failed to subscribe to config.changed; \
-                     cameras will be invisible in cloud until restart"
-                );
-                return;
-            }
-        };
-        info!("roster publisher: subscribed to config.changed");
+    // Subscribe to config.changed BEFORE the initial publish so
+    // we don't race a fast operator who creates a camera between
+    // boot and subscribe.
+    let mut stream = match bus
+        .subscribe::<serde_json::Value>(topic::CONFIG_CHANGED)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            error!(
+                error = %e,
+                "roster publisher: failed to subscribe to config.changed; \
+                 cameras will be invisible in cloud until restart"
+            );
+            return;
+        }
+    };
+    info!("roster publisher: subscribed to config.changed");
 
-        loop {
-            tokio::select! {
-                msg = stream.next() => {
-                    match msg {
-                        Some(Ok(v)) => {
-                            // Schema matches the reconciler: only
-                            // {"kind":"camera",...} events trigger
-                            // a roster push. Older publishers that
-                            // omit `kind` get a fresh push too (be
-                            // conservative).
-                            let is_camera_event = v
-                                .get("kind")
-                                .and_then(|k| k.as_str())
-                                .is_none_or(|k| k == "camera");
-                            if is_camera_event {
-                                dirty.store(true, Ordering::Relaxed);
-                                if try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats).await {
-                                    dirty.store(false, Ordering::Relaxed);
-                                }
+    // The cloud derives `camera.offline` only from rosters (BUG-315), so a
+    // liveness flip since the last sent roster, or a reconnect that may
+    // have dropped it, is a roster the cloud still needs.
+    let mut sent_online = BTreeSet::new();
+    let mut seen_connects = 0;
+    // An interval, not a sleep re-armed per loop: any `config.changed`
+    // would restart a sleep and push the liveness check back.
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + tick, tick);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            msg = stream.next() => {
+                match msg {
+                    Some(Ok(v)) => {
+                        // Schema matches the reconciler: only
+                        // {"kind":"camera",...} events trigger
+                        // a roster push. Older publishers that
+                        // omit `kind` get a fresh push too (be
+                        // conservative).
+                        let is_camera_event = v
+                            .get("kind")
+                            .and_then(|k| k.as_str())
+                            .is_none_or(|k| k == "camera");
+                        if is_camera_event {
+                            dirty.store(true, Ordering::Relaxed);
+                            if let Some(online) = try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats, now_mono()).await {
+                                dirty.store(false, Ordering::Relaxed);
+                                sent_online = online;
                             }
                         }
-                        Some(Err(e)) => {
-                            warn!(error = %e, "roster publisher: bus stream error");
-                        }
-                        None => {
-                            warn!("roster publisher: bus stream closed; exiting");
-                            return;
-                        }
+                    }
+                    Some(Err(e)) => {
+                        warn!(error = %e, "roster publisher: bus stream error");
+                    }
+                    None => {
+                        warn!("roster publisher: bus stream closed; exiting");
+                        return;
                     }
                 }
-                () = tokio::time::sleep(RETRY_TICK) => {
-                    if dirty.load(Ordering::Relaxed)
-                        && try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats).await
-                    {
+            }
+            _ = ticker.tick() => {
+                let connects = outbox.connects();
+                if connects != seen_connects || online_cameras(&frame_stats, now_mono()) != sent_online {
+                    seen_connects = connects;
+                    dirty.store(true, Ordering::Relaxed);
+                }
+                if dirty.load(Ordering::Relaxed) {
+                    if let Some(online) = try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats, now_mono()).await {
                         dirty.store(false, Ordering::Relaxed);
+                        sent_online = online;
                     }
                 }
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -375,7 +430,7 @@ mod tests {
             .await
             .unwrap();
 
-        let env = build_envelope(&store, 42, "yolo", &FrameStatsRegistry::new())
+        let env = build_envelope(&store, 42, "yolo", &BTreeSet::new())
             .await
             .expect("build envelope");
         let json = serde_json::to_string(&env).expect("serialize envelope");
@@ -460,7 +515,7 @@ mod tests {
             .await
             .unwrap();
 
-        let env = build_envelope(&store, 7, "yolo_world", &FrameStatsRegistry::new())
+        let env = build_envelope(&store, 7, "yolo_world", &BTreeSet::new())
             .await
             .expect("build envelope");
         let EnvelopeBody::CameraRoster(payload) = env.body else {
@@ -535,9 +590,14 @@ mod tests {
         let frame_stats = FrameStatsRegistry::new();
         frame_stats.observe_frame(1, frame_stats.begin_session(1), Utc::now(), 960, 540);
 
-        let env = build_envelope(&store, 1, "yolo", &frame_stats)
-            .await
-            .expect("build envelope");
+        let env = build_envelope(
+            &store,
+            1,
+            "yolo",
+            &online_cameras(&frame_stats, Instant::now()),
+        )
+        .await
+        .expect("build envelope");
         let EnvelopeBody::CameraRoster(payload) = env.body else {
             panic!("expected a camera_roster body");
         };
@@ -560,5 +620,159 @@ mod tests {
             Some(false),
             "camera with no observed frame must report offline, not unknown"
         );
+    }
+
+    struct Capture(tokio::sync::mpsc::UnboundedSender<Envelope>);
+
+    #[async_trait::async_trait]
+    impl nexus_cloud_client::TunnelHandle for Capture {
+        async fn send(&self, envelope: Envelope) -> Result<(), nexus_cloud_client::TunnelError> {
+            let _ = self.0.send(envelope);
+            Ok(())
+        }
+    }
+
+    /// BUG-315 — the cloud derives `camera.offline` only from roster
+    /// diffs, so the roster must go out when a camera's liveness flips
+    /// and on every reconnect, with no `config.changed` involved. Before
+    /// the fix the only triggers were startup, a camera edit and a
+    /// failed-send retry, so a dead camera waited on an unrelated edit.
+    #[tokio::test]
+    async fn liveness_change_and_reconnect_publish_without_a_config_change() {
+        use nexus_bus::BroadcastBus;
+        use nexus_config::{
+            CameraBehavior, CameraConfig, CameraDetector, CameraIngest, CameraOnvif,
+            CameraTalkDown, StoreConfig,
+        };
+        use nexus_pipeline::stats::CAMERA_OFFLINE_AFTER_MS;
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+        use tokio::time::timeout;
+
+        async fn next_online(rx: &mut UnboundedReceiver<Envelope>, step: &str) -> Option<bool> {
+            let env = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no camera_roster within 2 s: {step}"))
+                .expect("capture open");
+            let EnvelopeBody::CameraRoster(p) = env.body else {
+                panic!("expected a camera_roster body");
+            };
+            p.cameras[0].online
+        }
+        async fn quiet(rx: &mut UnboundedReceiver<Envelope>) -> bool {
+            timeout(Duration::from_millis(150), rx.recv())
+                .await
+                .is_err()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!(
+                    "sqlite://{}?mode=rwc",
+                    dir.path().join("nexus.db").display()
+                ),
+                ..StoreConfig::default()
+            })
+            .await
+            .unwrap(),
+        );
+        store
+            .upsert_camera(&CameraConfig {
+                id: 1,
+                name: "cam".into(),
+                ingest: CameraIngest {
+                    url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                    analysis_url: None,
+                    enabled: true,
+                    max_fps: 0,
+                    codec: None,
+                },
+                detector: CameraDetector {
+                    prompts: vec![],
+                    visual_prompts: vec![],
+                    model_override: None,
+                },
+                behavior: CameraBehavior::default(),
+                onvif: CameraOnvif::default(),
+                talk_down: CameraTalkDown::default(),
+                zones: vec![],
+            })
+            .await
+            .unwrap();
+
+        let frame_stats = Arc::new(FrameStatsRegistry::new());
+        let epoch = frame_stats.begin_session(1);
+        frame_stats.observe_frame(1, epoch, Utc::now(), 960, 540);
+
+        let outbox = Arc::new(TunnelOutbox::new());
+        let (tx, mut rx) = unbounded_channel();
+        outbox.set_handle(Some(Arc::new(Capture(tx))));
+
+        // Shifting this clock ages the last frame without a 90 s wait.
+        let skew_ms = Arc::new(AtomicU64::new(0));
+        let clock = {
+            let skew_ms = skew_ms.clone();
+            move || Instant::now() + Duration::from_millis(skew_ms.load(Ordering::Relaxed))
+        };
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(16));
+        let task = tokio::spawn(run(
+            store,
+            bus.clone(),
+            outbox.clone(),
+            "yolo".into(),
+            frame_stats.clone(),
+            Duration::from_millis(20),
+            clock,
+        ));
+
+        assert_eq!(
+            next_online(&mut rx, "startup roster").await,
+            Some(true),
+            "startup roster"
+        );
+        assert!(quiet(&mut rx).await, "nothing changed, nothing sent");
+
+        // The camera goes dark: no frame for longer than the offline window.
+        // Config churn of other kinds, faster than the tick, must not push
+        // the check back.
+        let churn = tokio::spawn(async move {
+            loop {
+                let _ = bus
+                    .publish(topic::CONFIG_CHANGED, &serde_json::json!({"kind": "rules"}))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        skew_ms.store(CAMERA_OFFLINE_AFTER_MS as u64 + 1_000, Ordering::Relaxed);
+        assert_eq!(
+            next_online(&mut rx, "went offline").await,
+            Some(false),
+            "went offline"
+        );
+        assert!(quiet(&mut rx).await, "offline is sent once, not every tick");
+        churn.abort();
+
+        // Frames resume.
+        skew_ms.store(0, Ordering::Relaxed);
+        frame_stats.observe_frame(1, epoch, Utc::now(), 960, 540);
+        assert_eq!(
+            next_online(&mut rx, "came back").await,
+            Some(true),
+            "came back"
+        );
+
+        // A reconnect quicker than one tick still re-sends: a roster queued
+        // on the old socket may never have reached the cloud.
+        let (tx2, mut rx2) = unbounded_channel();
+        outbox.set_handle(None);
+        outbox.set_handle(Some(Arc::new(Capture(tx2))));
+        assert_eq!(
+            next_online(&mut rx2, "re-sent on reconnect").await,
+            Some(true),
+            "re-sent on reconnect"
+        );
+        assert!(quiet(&mut rx2).await, "once per reconnect");
+
+        task.abort();
     }
 }
