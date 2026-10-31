@@ -1509,10 +1509,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // `topic::CONFIG_CHANGED` and pushes a `camera_roster` envelope
     // to the cloud edge-gateway whenever cameras change (plus an
     // initial push on boot, plus a 10s tick that retries a failed
-    // send and re-sends when a camera's liveness flips or the tunnel
-    // reconnects). The cloud upserts the per-core camera list so the
-    // site dashboard can show cameras the operator configured
-    // locally — even ones that have never produced an alert.
+    // send and re-sends when a camera's liveness flips, the tunnel
+    // reconnects, or the cloud has not acked the last one). The cloud
+    // upserts the per-core camera list so the site dashboard can show
+    // cameras the operator configured locally — even ones that have
+    // never produced an alert.
     let roster_handle = roster::spawn(
         store.clone(),
         bus.clone(),

@@ -946,6 +946,23 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
             EnvelopeBody::ClipReplicatedAck(ack) => {
                 record_clip_replicated_ack(store, env.meta.in_reply_to.as_deref(), ack).await;
             }
+            EnvelopeBody::CameraRosterAck(ack) => {
+                // The roster publisher re-sends until the cloud acks
+                // (BUG-315). `permanent_failure` means "stop retrying this
+                // revision", so it settles the revision like `received`.
+                match ack.status.as_str() {
+                    "received" => {
+                        debug!(core_id = %core_id, roster_revision = ack.accepted_revision, "camera_roster_ack received");
+                    }
+                    "permanent_failure" => {
+                        warn!(core_id = %core_id, roster_revision = ack.accepted_revision, reason = ?ack.reason, "camera_roster permanently rejected by the cloud; not retrying this revision");
+                    }
+                    other => {
+                        debug!(core_id = %core_id, roster_revision = ack.accepted_revision, status = %other, "camera_roster_ack: unknown status, treating as received");
+                    }
+                }
+                outbox.record_roster_ack(ack.accepted_revision);
+            }
             EnvelopeBody::DiagCollect(payload) => {
                 // Phase 7.0a — verified out-of-band here (NOT through the
                 // RpcCall dispatch path, which is reply-bound) because the
@@ -4498,6 +4515,72 @@ mod heartbeat_ack_tests {
             "an acknowledged heartbeat is the only proof the cloud is on the \
              other end of this socket",
         );
+    }
+
+    /// BUG-315 — the roster publisher re-sends until the cloud acks, so
+    /// both statuses must reach the outbox: `permanent_failure` means "stop
+    /// retrying this revision". A late ack for an older one never lowers it.
+    #[tokio::test]
+    async fn a_camera_roster_ack_advances_the_roster_high_water_mark() {
+        use nexus_cloud_protocol::v1::CameraRosterAckPayload;
+
+        let (store, _dir) = test_store().await;
+        let outbox = Arc::new(TunnelOutbox::new());
+        let remote_shell = Arc::new(crate::remote_shell::RemoteShellManager::new(
+            Arc::new(crate::remote_shell::RemoteAccess::new(
+                nexus_config::RemoteAccessConfig::default(),
+                false,
+            )),
+            nexus_cloud_client::tunnel::TunnelClient::new(
+                "wss://cloud.invalid/v1/tunnel",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            None,
+            Arc::clone(&outbox),
+        ));
+        for (revision, status, acked) in [
+            (7, "received", 7),
+            (9, "permanent_failure", 9),
+            (8, "received", 9),
+        ] {
+            let (tx, rx) = mpsc::channel(1);
+            tx.send(Envelope {
+                meta: EnvelopeMeta {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    in_reply_to: None,
+                    seq: None,
+                    trace: None,
+                    ts: Utc::now().to_rfc3339(),
+                    v: 1,
+                },
+                body: EnvelopeBody::CameraRosterAck(CameraRosterAckPayload {
+                    accepted_revision: revision,
+                    reason: None,
+                    status: status.into(),
+                }),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            pump_rpc_dispatch(
+                &HalfOpenTunnel::default(),
+                Some(rx),
+                None,
+                "core-1",
+                &outbox,
+                &Arc::new(nexus_cloud_client::entitlements::EntitlementCache::new()),
+                &Arc::new(crate::cloud_alert_sink::PendingAckRegistry::new()),
+                &store,
+                &live_view_manager(),
+                &crate::webrtc_bridge::WebRtcBridge::disabled(),
+                &remote_shell,
+                &TunnelLiveness::new(),
+            )
+            .await;
+            assert_eq!(outbox.roster_acked(), acked, "{status} ack for {revision}");
+        }
     }
     fn service_test_key() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)

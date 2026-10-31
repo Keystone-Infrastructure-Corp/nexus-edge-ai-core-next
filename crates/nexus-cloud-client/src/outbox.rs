@@ -57,6 +57,7 @@ pub struct TunnelOutbox {
     inner: RwLock<Option<Arc<dyn TunnelHandle>>>,
     caps: RwLock<std::collections::HashSet<String>>,
     connects: AtomicU64,
+    roster_acked: AtomicU64,
 }
 
 impl TunnelOutbox {
@@ -69,6 +70,7 @@ impl TunnelOutbox {
             inner: RwLock::new(None),
             caps: RwLock::new(std::collections::HashSet::new()),
             connects: AtomicU64::new(0),
+            roster_acked: AtomicU64::new(0),
         }
     }
 
@@ -92,6 +94,20 @@ impl TunnelOutbox {
     #[must_use]
     pub fn connects(&self) -> u64 {
         self.connects.load(Ordering::Relaxed)
+    }
+
+    /// Record a `camera_roster_ack` for `revision`. Called from the
+    /// inbound pump; a late ack for an older revision never lowers the
+    /// mark.
+    pub fn record_roster_ack(&self, revision: u64) {
+        self.roster_acked.fetch_max(revision, Ordering::Relaxed);
+    }
+
+    /// The highest `roster_revision` the cloud has acked. Not reset on
+    /// reconnect: revisions are monotonic across sessions and restarts.
+    #[must_use]
+    pub fn roster_acked(&self) -> u64 {
+        self.roster_acked.load(Ordering::Relaxed)
     }
 
     /// Replace the advertised cloud capability set. Called from the
