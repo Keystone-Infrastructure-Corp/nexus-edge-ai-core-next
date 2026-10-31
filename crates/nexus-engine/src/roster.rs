@@ -18,9 +18,10 @@
 //! 2. On every `topic::CONFIG_CHANGED` event whose `kind == "camera"`.
 //! 3. On a 10-second tick if a previous send failed (dirty flag), if any
 //!    camera's frame-source liveness differs from the last sent roster,
-//!    or if the tunnel reconnected since the last tick. The cloud derives
-//!    `camera.offline` only from these rosters (BUG-315), so a camera
-//!    that stops streaming must ship one on its own.
+//!    if the tunnel reconnected since the last tick, or if the cloud has
+//!    not acked the last one a full tick after it was sent. The cloud
+//!    derives `camera.offline` only from these rosters (BUG-315), so a
+//!    camera that stops streaming must ship one on its own.
 //!
 //! Cloud-side dedup uses the monotonic `roster_revision` carried on
 //! every envelope; we seed it from `Utc::now().timestamp_millis()` at
@@ -165,8 +166,8 @@ fn online_cameras(frame_stats: &FrameStatsRegistry, now_mono: Instant) -> BTreeS
         .collect()
 }
 
-/// Try one publish. Returns the cameras it reported online on success,
-/// `None` otherwise.
+/// Try one publish. Returns the revision it sent and the cameras it
+/// reported online on success, `None` otherwise.
 async fn try_publish(
     store: &Store,
     outbox: &TunnelOutbox,
@@ -174,7 +175,7 @@ async fn try_publish(
     default_model_kind: &str,
     frame_stats: &FrameStatsRegistry,
     now_mono: Instant,
-) -> Option<BTreeSet<CameraId>> {
+) -> Option<(u64, BTreeSet<CameraId>)> {
     if !outbox.is_connected() {
         return None;
     }
@@ -198,7 +199,7 @@ async fn try_publish(
                 roster_revision = revision,
                 "camera_roster published",
             );
-            Some(online)
+            Some((revision, online))
         }
         Err(e) => {
             // Disconnected mid-flight or writer closed — caller leaves
@@ -274,6 +275,9 @@ async fn run(
     // have dropped it, is a roster the cloud still needs.
     let mut sent_online = BTreeSet::new();
     let mut seen_connects = 0;
+    // The gateway acks every roster it ingests but sends nothing on a
+    // transient ingest failure, so a queued roster counts only once acked.
+    let mut last_sent: Option<(u64, tokio::time::Instant)> = None;
     // An interval, not a sleep re-armed per loop: any `config.changed`
     // would restart a sleep and push the liveness check back.
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + tick, tick);
@@ -295,9 +299,10 @@ async fn run(
                             .is_none_or(|k| k == "camera");
                         if is_camera_event {
                             dirty.store(true, Ordering::Relaxed);
-                            if let Some(online) = try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats, now_mono()).await {
+                            if let Some((revision, online)) = try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats, now_mono()).await {
                                 dirty.store(false, Ordering::Relaxed);
                                 sent_online = online;
+                                last_sent = Some((revision, tokio::time::Instant::now()));
                             }
                         }
                     }
@@ -316,10 +321,21 @@ async fn run(
                     seen_connects = connects;
                     dirty.store(true, Ordering::Relaxed);
                 }
+                // Re-send a roster still unacked a full tick after it went out;
+                // one sent just before this tick waits for the next. Skipped
+                // while a send is already pending, so an outage does not log
+                // on every tick.
+                if let Some((revision, sent_at)) = last_sent {
+                    if !dirty.load(Ordering::Relaxed) && revision > outbox.roster_acked() && sent_at.elapsed() >= tick {
+                        info!(roster_revision = revision, "roster publisher: cloud has not acked the last roster; re-sending");
+                        dirty.store(true, Ordering::Relaxed);
+                    }
+                }
                 if dirty.load(Ordering::Relaxed) {
-                    if let Some(online) = try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats, now_mono()).await {
+                    if let Some((revision, online)) = try_publish(&store, &outbox, &revision_counter, &default_model_kind, &frame_stats, now_mono()).await {
                         dirty.store(false, Ordering::Relaxed);
                         sent_online = online;
+                        last_sent = Some((revision, tokio::time::Instant::now()));
                     }
                 }
             }
@@ -648,7 +664,13 @@ mod tests {
         use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
         use tokio::time::timeout;
 
-        async fn next_online(rx: &mut UnboundedReceiver<Envelope>, step: &str) -> Option<bool> {
+        // Acks each roster like the cloud does, so an unacked re-send
+        // cannot break the quiet periods below.
+        async fn next_online(
+            rx: &mut UnboundedReceiver<Envelope>,
+            outbox: &TunnelOutbox,
+            step: &str,
+        ) -> Option<bool> {
             let env = timeout(Duration::from_secs(2), rx.recv())
                 .await
                 .unwrap_or_else(|_| panic!("no camera_roster within 2 s: {step}"))
@@ -656,6 +678,7 @@ mod tests {
             let EnvelopeBody::CameraRoster(p) = env.body else {
                 panic!("expected a camera_roster body");
             };
+            outbox.record_roster_ack(p.roster_revision);
             p.cameras[0].online
         }
         async fn quiet(rx: &mut UnboundedReceiver<Envelope>) -> bool {
@@ -726,7 +749,7 @@ mod tests {
         ));
 
         assert_eq!(
-            next_online(&mut rx, "startup roster").await,
+            next_online(&mut rx, &outbox, "startup roster").await,
             Some(true),
             "startup roster"
         );
@@ -745,7 +768,7 @@ mod tests {
         });
         skew_ms.store(CAMERA_OFFLINE_AFTER_MS as u64 + 1_000, Ordering::Relaxed);
         assert_eq!(
-            next_online(&mut rx, "went offline").await,
+            next_online(&mut rx, &outbox, "went offline").await,
             Some(false),
             "went offline"
         );
@@ -756,7 +779,7 @@ mod tests {
         skew_ms.store(0, Ordering::Relaxed);
         frame_stats.observe_frame(1, epoch, Utc::now(), 960, 540);
         assert_eq!(
-            next_online(&mut rx, "came back").await,
+            next_online(&mut rx, &outbox, "came back").await,
             Some(true),
             "came back"
         );
@@ -767,11 +790,80 @@ mod tests {
         outbox.set_handle(None);
         outbox.set_handle(Some(Arc::new(Capture(tx2))));
         assert_eq!(
-            next_online(&mut rx2, "re-sent on reconnect").await,
+            next_online(&mut rx2, &outbox, "re-sent on reconnect").await,
             Some(true),
             "re-sent on reconnect"
         );
         assert!(quiet(&mut rx2).await, "once per reconnect");
+
+        task.abort();
+    }
+
+    /// BUG-315 option 2 — the gateway sends no ack when it fails to ingest
+    /// a roster transiently and keeps the session up, so a roster counted
+    /// as sent when it was queued could be lost for good. Until the cloud
+    /// acks the latest revision, the publisher re-sends.
+    #[tokio::test]
+    async fn an_unacked_roster_is_re_sent_until_the_cloud_acks_it() {
+        use nexus_bus::BroadcastBus;
+        use nexus_config::StoreConfig;
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+        use tokio::time::timeout;
+
+        async fn next_revision(rx: &mut UnboundedReceiver<Envelope>, step: &str) -> u64 {
+            let env = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no camera_roster within 2 s: {step}"))
+                .expect("capture open");
+            let EnvelopeBody::CameraRoster(p) = env.body else {
+                panic!("expected a camera_roster body");
+            };
+            p.roster_revision
+        }
+
+        // No cameras and no frames: liveness never changes, so only the
+        // missing ack can trigger a send after startup.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!(
+                    "sqlite://{}?mode=rwc",
+                    dir.path().join("nexus.db").display()
+                ),
+                ..StoreConfig::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let outbox = Arc::new(TunnelOutbox::new());
+        let (tx, mut rx) = unbounded_channel();
+        outbox.set_handle(Some(Arc::new(Capture(tx))));
+        let task = tokio::spawn(run(
+            store,
+            Arc::new(BroadcastBus::new(16)),
+            outbox.clone(),
+            "yolo".into(),
+            Arc::new(FrameStatsRegistry::new()),
+            Duration::from_millis(20),
+            Instant::now,
+        ));
+
+        let r1 = next_revision(&mut rx, "startup roster").await;
+        let r2 = next_revision(&mut rx, "re-sent while unacked").await;
+        assert!(r2 > r1, "a re-send carries a fresh revision");
+
+        // An ack for an older revision does not settle the latest one.
+        outbox.record_roster_ack(r1);
+        let r3 = next_revision(&mut rx, "re-sent after an older ack").await;
+        assert!(r3 > r2, "a re-send carries a fresh revision");
+
+        outbox.record_roster_ack(r3);
+        assert!(
+            timeout(Duration::from_millis(150), rx.recv())
+                .await
+                .is_err(),
+            "acked, so nothing more is sent"
+        );
 
         task.abort();
     }
