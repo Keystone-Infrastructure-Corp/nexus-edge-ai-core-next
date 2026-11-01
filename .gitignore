@@ -61,6 +61,10 @@ ui/e2e/.engine-state.json
 __pycache__
 *.pyc
 
+# Impeccable is maintained in the cloud-console repository, not here.
+/.agents/skills/impeccable/
+/.github/skills/impeccable/
+
 # OTEL
 otel.log
 
