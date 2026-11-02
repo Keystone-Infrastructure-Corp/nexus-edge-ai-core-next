@@ -862,6 +862,7 @@ async fn run_session(
     // `not-linked`; recording the stream's codec here makes the
     // supervisor rebuild the next session with it instead of looping.
     if let Some(rtsp) = pipeline.by_name("rtsp") {
+        crate::source::select_first_video_stream(&rtsp);
         rtsp.connect_pad_added(move |_, pad| {
             let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
             let Some(s) = caps.structure(0) else {

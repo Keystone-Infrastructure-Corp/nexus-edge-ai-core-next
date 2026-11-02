@@ -775,6 +775,39 @@ pub(crate) mod gst_init {
     }
 }
 
+/// #360 (BUG-327): set up only the camera's first video stream.
+///
+/// Both RTSP pipelines are `gst::parse::launch("rtspsrc … ! …")`, so rtspsrc
+/// links through gst_parse's delayed-link handlers: a `pad-added` and a
+/// `no-more-pads` handler sharing one heap struct, freed when a pad links.
+/// rtspsrc adds each stream's pad from that stream's own thread and emits
+/// `no-more-pads` from whichever thread adds the last one, so with video
+/// plus audio or ONVIF metadata the `no-more-pads` handler can format its
+/// warning from the struct while the video thread frees it: the
+/// `rtpjitterbuffer` segfault in `strlen`. With one stream both signals run
+/// in order on one thread. Nothing here reads audio or metadata. The chosen
+/// stream id is kept so a reconnect selects the same stream again.
+#[cfg(feature = "gstreamer")]
+pub(crate) fn select_first_video_stream(rtspsrc: &gstreamer::Element) {
+    use gstreamer::prelude::*;
+    let chosen = parking_lot::Mutex::new(None::<u32>);
+    rtspsrc.connect("select-stream", false, move |args| {
+        let id = args.get(1).and_then(|v| v.get::<u32>().ok());
+        let video = args
+            .get(2)
+            .and_then(|v| v.get::<gstreamer::Caps>().ok())
+            .is_some_and(|caps| {
+                caps.structure(0)
+                    .is_some_and(|s| s.get::<&str>("media").is_ok_and(|m| m == "video"))
+            });
+        let selected = match id {
+            Some(id) if video => *chosen.lock().get_or_insert(id) == id,
+            _ => false,
+        };
+        Some(selected.to_value())
+    });
+}
+
 /// Copy one RGB plane into the packed `width * height * 3` buffer every
 /// `Frame` consumer reads (the JPEG encoders, the detectors). GStreamer
 /// pads each RGB row to a 4-byte stride, so wherever `width * 3` is not a
@@ -910,6 +943,7 @@ impl RtspSource {
         // log line lets operators correlate "camera I configured as
         // H.264" against "what the camera actually publishes".
         if let Some(rtspsrc) = pipeline.by_name("src") {
+            select_first_video_stream(&rtspsrc);
             let camera_id_snoop = self.camera_id;
             let expected_snoop = self.expected_codec;
             let logged_codec = Arc::new(AtomicBool::new(false));
@@ -1614,6 +1648,31 @@ mod gst_tests {
             );
         }
         crate::jpeg::encode_rgb24(&packed, w, h, 80).expect("the packed frame encodes");
+    }
+
+    /// #360 (BUG-327): an RTSP pipeline must set up only the camera's first
+    /// video stream. With a second stream (audio, ONVIF metadata), gst_parse's
+    /// delayed-link handlers race `no-more-pads` against `pad-added` across
+    /// rtspsrc's per-stream threads and read freed memory: the
+    /// `rtpjitterbuffer` segfault in `strlen`.
+    #[test]
+    fn rtspsrc_sets_up_only_the_first_video_stream() {
+        super::gst_init::ensure().expect("gst init");
+        let src = gst::ElementFactory::make("rtspsrc")
+            .build()
+            .expect("rtspsrc");
+        super::select_first_video_stream(&src);
+        let selects = |id: u32, media: &str| {
+            let caps = gst::Caps::builder("application/x-rtp")
+                .field("media", media)
+                .build();
+            src.emit_by_name::<bool>("select-stream", &[&id, &caps])
+        };
+        assert!(!selects(0, "audio"), "the audio stream was set up");
+        assert!(selects(1, "video"), "the video stream was not set up");
+        assert!(!selects(2, "application"), "the metadata stream was set up");
+        assert!(!selects(3, "video"), "a second video stream was set up");
+        assert!(selects(1, "video"), "a reconnect dropped the chosen stream");
     }
 
     /// A stride narrower than the row, or a plane shorter than its stride
