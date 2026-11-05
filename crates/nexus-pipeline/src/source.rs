@@ -787,8 +787,9 @@ pub(crate) mod gst_init {
 /// segfault in `strlen`. With one stream (one SSRC) both signals run in
 /// order on one thread; a stream that presents two SSRCs at once can still
 /// race, which only dropping the delayed link removes. Nothing here reads
-/// audio or metadata, and only H.264/H.265 can be depayloaded, so a camera
-/// that lists another video codec first still gets its H.264/H.265 track.
+/// audio or metadata, and only the encoding names rtph264depay / rtph265depay
+/// accept (`H264`, `H265`, exactly; not `HEVC`) can link, so a camera that
+/// lists another video track first still gets its H.264/H.265 one.
 /// The first chosen id is kept so at most one stream is ever set up.
 #[cfg(feature = "gstreamer")]
 pub(crate) fn select_first_h26x_video_stream(rtspsrc: &gstreamer::Element) {
@@ -802,9 +803,8 @@ pub(crate) fn select_first_h26x_video_stream(rtspsrc: &gstreamer::Element) {
             .is_some_and(|caps| {
                 caps.structure(0).is_some_and(|s| {
                     s.get::<&str>("media").is_ok_and(|m| m == "video")
-                        && s.get::<&str>("encoding-name").is_ok_and(|e| {
-                            ["H264", "H265", "HEVC"].contains(&e.to_uppercase().as_str())
-                        })
+                        && s.get::<&str>("encoding-name")
+                            .is_ok_and(|e| matches!(e, "H264" | "H265"))
                 })
             });
         let selected = match id {
@@ -1662,21 +1662,38 @@ mod gst_tests {
     /// gst_parse's delayed-link handlers race `no-more-pads` against
     /// `pad-added` across rtspsrc's per-stream threads and read freed memory:
     /// the `rtpjitterbuffer` segfault in `strlen`. A video track the
-    /// depayloader cannot take (MJPEG listed first) must not be the one chosen.
+    /// depayloader cannot take (MJPEG, or an `HEVC`-labelled track:
+    /// rtph265depay accepts only `H265`) must not be the one chosen.
     #[test]
     fn rtspsrc_sets_up_only_the_first_h26x_video_stream() {
         super::gst_init::ensure().expect("gst init");
-        let src = gst::ElementFactory::make("rtspsrc")
-            .build()
-            .expect("rtspsrc");
-        super::select_first_h26x_video_stream(&src);
-        let selects = |id: u32, media: &str, encoding: &str| {
+        let new_src = || {
+            let src = gst::ElementFactory::make("rtspsrc")
+                .build()
+                .expect("rtspsrc");
+            super::select_first_h26x_video_stream(&src);
+            src
+        };
+        let selects = |src: &gst::Element, id: u32, media: &str, encoding: &str| {
             let caps = gst::Caps::builder("application/x-rtp")
                 .field("media", media)
                 .field("encoding-name", encoding)
                 .build();
             src.emit_by_name::<bool>("select-stream", &[&id, &caps])
         };
+
+        let hevc_first = new_src();
+        assert!(
+            !selects(&hevc_first, 0, "video", "HEVC"),
+            "the HEVC-labelled stream, which no depayloader takes, was set up"
+        );
+        assert!(
+            selects(&hevc_first, 1, "video", "H265"),
+            "the H.265 stream after an HEVC-labelled one was not set up"
+        );
+
+        let src = new_src();
+        let selects = |id: u32, media: &str, encoding: &str| selects(&src, id, media, encoding);
         assert!(!selects(0, "audio", "PCMU"), "the audio stream was set up");
         assert!(!selects(1, "video", "JPEG"), "the MJPEG stream was set up");
         assert!(
