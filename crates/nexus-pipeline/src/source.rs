@@ -775,6 +775,46 @@ pub(crate) mod gst_init {
     }
 }
 
+/// #360 (BUG-327): set up only the camera's first H.264/H.265 video stream.
+///
+/// Both RTSP pipelines are `gst::parse::launch("rtspsrc … ! …")`, so rtspsrc
+/// links through gst_parse's delayed-link handlers: a `pad-added` and a
+/// `no-more-pads` handler sharing one heap struct, freed when a pad links.
+/// rtspsrc adds each stream's pad from that stream's own thread and emits
+/// `no-more-pads` from whichever thread adds the last one, so with video
+/// plus audio or ONVIF metadata the `no-more-pads` handler can dereference
+/// the struct while the video thread frees it: the `rtpjitterbuffer`
+/// segfault in `strlen`. With one stream (one SSRC) both signals run in
+/// order on one thread; a stream that presents two SSRCs at once can still
+/// race, which only dropping the delayed link removes. Nothing here reads
+/// audio or metadata, and only the encoding names rtph264depay / rtph265depay
+/// accept (`H264`, `H265`, exactly; not `HEVC`) can link, so a camera that
+/// lists another video track first still gets its H.264/H.265 one.
+/// The first chosen id is kept so at most one stream is ever set up.
+#[cfg(feature = "gstreamer")]
+pub(crate) fn select_first_h26x_video_stream(rtspsrc: &gstreamer::Element) {
+    use gstreamer::prelude::*;
+    let chosen = parking_lot::Mutex::new(None::<u32>);
+    rtspsrc.connect("select-stream", false, move |args| {
+        let id = args.get(1).and_then(|v| v.get::<u32>().ok());
+        let h26x = args
+            .get(2)
+            .and_then(|v| v.get::<gstreamer::Caps>().ok())
+            .is_some_and(|caps| {
+                caps.structure(0).is_some_and(|s| {
+                    s.get::<&str>("media").is_ok_and(|m| m == "video")
+                        && s.get::<&str>("encoding-name")
+                            .is_ok_and(|e| matches!(e, "H264" | "H265"))
+                })
+            });
+        let selected = match id {
+            Some(id) if h26x => *chosen.lock().get_or_insert(id) == id,
+            _ => false,
+        };
+        Some(selected.to_value())
+    });
+}
+
 /// Copy one RGB plane into the packed `width * height * 3` buffer every
 /// `Frame` consumer reads (the JPEG encoders, the detectors). GStreamer
 /// pads each RGB row to a 4-byte stride, so wherever `width * 3` is not a
@@ -910,6 +950,7 @@ impl RtspSource {
         // log line lets operators correlate "camera I configured as
         // H.264" against "what the camera actually publishes".
         if let Some(rtspsrc) = pipeline.by_name("src") {
+            select_first_h26x_video_stream(&rtspsrc);
             let camera_id_snoop = self.camera_id;
             let expected_snoop = self.expected_codec;
             let logged_codec = Arc::new(AtomicBool::new(false));
@@ -1614,6 +1655,63 @@ mod gst_tests {
             );
         }
         crate::jpeg::encode_rgb24(&packed, w, h, 80).expect("the packed frame encodes");
+    }
+
+    /// #360 (BUG-327): an RTSP pipeline must set up only the camera's first
+    /// H.264/H.265 video stream. With a second stream (audio, ONVIF metadata),
+    /// gst_parse's delayed-link handlers race `no-more-pads` against
+    /// `pad-added` across rtspsrc's per-stream threads and read freed memory:
+    /// the `rtpjitterbuffer` segfault in `strlen`. A video track the
+    /// depayloader cannot take (MJPEG, or an `HEVC`-labelled track:
+    /// rtph265depay accepts only `H265`) must not be the one chosen.
+    #[test]
+    fn rtspsrc_sets_up_only_the_first_h26x_video_stream() {
+        super::gst_init::ensure().expect("gst init");
+        let new_src = || {
+            let src = gst::ElementFactory::make("rtspsrc")
+                .build()
+                .expect("rtspsrc");
+            super::select_first_h26x_video_stream(&src);
+            src
+        };
+        let selects = |src: &gst::Element, id: u32, media: &str, encoding: &str| {
+            let caps = gst::Caps::builder("application/x-rtp")
+                .field("media", media)
+                .field("encoding-name", encoding)
+                .build();
+            src.emit_by_name::<bool>("select-stream", &[&id, &caps])
+        };
+
+        let hevc_first = new_src();
+        assert!(
+            !selects(&hevc_first, 0, "video", "HEVC"),
+            "the HEVC-labelled stream, which no depayloader takes, was set up"
+        );
+        assert!(
+            selects(&hevc_first, 1, "video", "H265"),
+            "the H.265 stream after an HEVC-labelled one was not set up"
+        );
+
+        let src = new_src();
+        let selects = |id: u32, media: &str, encoding: &str| selects(&src, id, media, encoding);
+        assert!(!selects(0, "audio", "PCMU"), "the audio stream was set up");
+        assert!(!selects(1, "video", "JPEG"), "the MJPEG stream was set up");
+        assert!(
+            selects(2, "video", "H264"),
+            "the H.264 stream was not set up"
+        );
+        assert!(
+            !selects(3, "application", "VND.ONVIF.METADATA"),
+            "the metadata stream was set up"
+        );
+        assert!(
+            !selects(4, "video", "H265"),
+            "a second video stream was set up"
+        );
+        assert!(
+            selects(2, "video", "H264"),
+            "re-selecting the chosen stream was refused"
+        );
     }
 
     /// A stride narrower than the row, or a plane shorter than its stride
