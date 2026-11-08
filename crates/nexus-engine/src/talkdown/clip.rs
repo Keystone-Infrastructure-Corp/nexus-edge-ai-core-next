@@ -1,7 +1,7 @@
-//! Canned talk-down clips: fetched by read SAS URL (hard rule 7), checked
-//! against the caller's SHA-256, and decoded from 8 kHz mono 16-bit WAV. No
-//! cache: every play fetches. The URL is a bearer credential, so it is never
-//! logged and never put in an error.
+//! Talk-down clip downloads for the library: fetched by read SAS URL (hard
+//! rule 7), checked against the caller's SHA-256, and decoded from 8 kHz mono
+//! 16-bit WAV. The URL is a bearer credential, so it is never logged and
+//! never put in an error.
 
 use std::time::Duration;
 
@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 
 /// Reading stops past this many bytes.
 const MAX_BYTES: usize = 1 << 20;
-// 5 s fetch + the 9 s call bound in session.rs stays inside the cloud's 15 s rpc timeout.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Fetch the clip at `url` and return its samples, or why it was refused.
@@ -18,6 +17,10 @@ pub(super) async fn fetch(url: &str, sha256: &str, allow_http: bool) -> Result<V
     let url = url::Url::parse(url).map_err(|e| format!("clip url is invalid: {e}"))?;
     if !(url.scheme() == "https" || allow_http && url.scheme() == "http") {
         return Err("clip url must be https".into());
+    }
+    // A blob host is a name; an IP literal could aim the fetch at the LAN.
+    if matches!(url.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))) {
+        return Err("clip url must name a host, not an IP address".into());
     }
     let failed = |e: reqwest::Error| format!("clip fetch failed: {}", e.without_url());
     let client = reqwest::Client::builder()
@@ -85,4 +88,20 @@ fn parse_wav(file: &[u8]) -> Result<Vec<i16>, &'static str> {
         rest = tail.get(len + len % 2..).unwrap_or_default();
     }
     Err("clip has no data chunk")
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn ip_literal_hosts_and_plain_http_are_refused_before_any_request() {
+        for (url, allow_http) in [
+            ("https://192.0.2.1/x.wav?sig=SAS", false),
+            ("https://[2001:db8::1]/x.wav?sig=SAS", false),
+            ("http://127.0.0.1:9/x.wav?sig=SAS", true),
+            ("http://blob.example/x.wav?sig=SAS", false),
+        ] {
+            let why = super::fetch(url, "00", allow_http).await.unwrap_err();
+            assert!(!why.contains("SAS"), "URL in the error: {why}");
+        }
+    }
 }

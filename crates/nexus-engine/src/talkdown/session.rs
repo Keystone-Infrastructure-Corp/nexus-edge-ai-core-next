@@ -1,7 +1,7 @@
 //! Talk-down sessions (ADR-091): at most one per speaker. A start claims the
 //! speaker before anything slow happens, and the claim is a guard that
-//! releases the speaker when dropped, so every exit releases it: a refused
-//! clip, an unanswered call, the end of playback, a panic in the play task.
+//! releases the speaker when dropped, so every exit releases it: audio that
+//! is not ready, an unanswered call, the end of playback, a panic in the play task.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -19,17 +19,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::library::Library;
 #[cfg(feature = "gstreamer-webrtc")]
 use super::live::Live;
 use super::sip::{place_call, SipCall, SipTarget, TalkdownError};
-use super::{clip, tone_pcm, Gain};
-
-/// What this build can play, as the talk-down GET lists it.
-pub const MODES: &[&str] = if cfg!(feature = "gstreamer-webrtc") {
-    &["tone", "clip", "live"]
-} else {
-    &["tone", "clip"]
-};
+use super::{tone_pcm, Gain};
 
 /// How long a speaker gets to answer the INVITE.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(8);
@@ -39,14 +33,17 @@ const TONE_MS: u32 = 2000;
 const TAIL_SAMPLES: usize = 300 * 8;
 
 /// A start request's body: `{"mode": "tone"}`,
-/// `{"mode": "clip", "clip": {"url": …, "sha256": …}}` or
+/// `{"mode": "stored", "audio_uid": …, "volume"?: 0-100}` or
 /// `{"mode": "live", "sdp_offer": …, "ice_servers": […]}`.
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum Audio {
     Tone,
-    Clip {
-        clip: ClipRef,
+    /// An item of the core's library; `volume` is the session's.
+    Stored {
+        audio_uid: String,
+        #[serde(default)]
+        volume: Option<u8>,
     },
     /// The SFU's subscriber offer for the operator's microphone track. Parsed
     /// in every build so a build without live audio refuses it by name.
@@ -60,18 +57,11 @@ pub enum Audio {
     },
 }
 
-#[derive(Deserialize)]
-pub struct ClipRef {
-    /// A read SAS URL: a bearer credential.
-    url: String,
-    sha256: String,
-}
-
 impl Audio {
     pub fn mode(&self) -> &'static str {
         match self {
             Self::Tone => "tone",
-            Self::Clip { .. } => "clip",
+            Self::Stored { .. } => "stored",
             Self::Live { .. } => "live",
         }
     }
@@ -102,8 +92,12 @@ pub enum StartError {
     Unpaired,
     /// A stop or a parting ended the session before it played.
     Stopped,
-    /// Why the clip was refused; never contains its URL.
-    Clip(String),
+    /// No library item has the `audio_uid`.
+    AudioNotFound,
+    /// The item is still downloading or rendering, or failed to.
+    AudioNotReady,
+    /// The store could not be read.
+    Internal(String),
     Call(TalkdownError),
     /// This build has no live audio.
     #[cfg(not(feature = "gstreamer-webrtc"))]
@@ -142,18 +136,32 @@ type Active = Arc<Mutex<HashMap<SpeakerId, Claim>>>;
 #[derive(Clone, Default)]
 pub struct TalkdownSessions {
     active: Active,
-    /// Only [`Self::allowing_http`] sets it.
-    allow_http: bool,
+    /// Where `stored` audio comes from; `None` plays no stored audio.
+    library: Option<Library>,
 }
 
 impl TalkdownSessions {
-    /// Sessions that also fetch clips over plain http, for a test clip server.
-    #[cfg(test)]
-    pub fn allowing_http() -> Self {
+    pub fn with_library(library: Library) -> Self {
         Self {
-            allow_http: true,
+            library: Some(library),
             ..Self::default()
         }
+    }
+
+    pub fn library(&self) -> Option<&Library> {
+        self.library.as_ref()
+    }
+
+    /// What these sessions can play, as the talk-down GET lists it.
+    pub fn modes(&self) -> Vec<&'static str> {
+        let mut modes = vec!["tone"];
+        if self.library.is_some() {
+            modes.push("stored");
+        }
+        if cfg!(feature = "gstreamer-webrtc") {
+            modes.push("live");
+        }
+        modes
     }
 
     pub fn is_busy(&self, speaker_id: SpeakerId) -> bool {
@@ -219,8 +227,8 @@ impl TalkdownSessions {
     /// `paired` re-reads whether the camera still pairs with `speaker`. A
     /// parting commits before its `stop_where`, so that stop either finds
     /// this claim, or ran before it and the re-read sees the parting. A stop
-    /// that finds the claim before the audio plays ends the start: the clip
-    /// fetch or the live negotiation is abandoned, a ringing INVITE is
+    /// that finds the claim before the audio plays ends the start: the audio
+    /// load or the live negotiation is abandoned, a ringing INVITE is
     /// CANCELled, and an answered call is hung up.
     pub async fn start(
         &self,
@@ -248,16 +256,24 @@ impl TalkdownSessions {
                 return Err(StartError::Negotiation("the offer has no audio".into()));
             }
         }
-        let session = self.claim(speaker.id, camera_id, origin, output)?;
+        let volume = match audio {
+            Audio::Stored {
+                volume: Some(v), ..
+            } => *v,
+            _ => 100,
+        };
+        // Claim before anything slow, the store read included.
+        let session = self.claim(speaker.id, camera_id, origin, output, volume)?;
         if !paired.await {
             return Err(StartError::Unpaired);
         }
         let load = async {
             match audio {
                 Audio::Tone => Ok(tone_pcm(TONE_MS)),
-                Audio::Clip { clip } => clip::fetch(&clip.url, &clip.sha256, self.allow_http)
-                    .await
-                    .map_err(StartError::Clip),
+                Audio::Stored { audio_uid, .. } => match &self.library {
+                    Some(lib) => lib.pcm(audio_uid).await,
+                    None => Err(StartError::AudioNotFound),
+                },
                 Audio::Live { .. } => Ok(Vec::new()),
             }
         };
@@ -362,10 +378,11 @@ impl TalkdownSessions {
         camera_id: Option<CameraId>,
         origin: Origin,
         output: SpeakerOutput,
+        session_volume: u8,
     ) -> Result<Session, StartError> {
         let id = Uuid::now_v7();
         let cancel = CancellationToken::new();
-        let gain = Gain::new(Gain::compose(&output, 100, output.boost));
+        let gain = Gain::new(Gain::compose(&output, session_volume, output.boost));
         let claim = Claim {
             camera_id,
             id,
@@ -373,7 +390,7 @@ impl TalkdownSessions {
             origin,
             gain: gain.clone(),
             output,
-            session_volume: 100,
+            session_volume,
             boost: output.boost,
         };
         match self.active.lock().entry(speaker_id) {
@@ -441,7 +458,7 @@ mod tests {
     async fn a_session_volume_change_recomposes_the_live_gain_for_its_camera_only() {
         let sessions = TalkdownSessions::default();
         let session = sessions
-            .claim(7, Some(1), Origin::Manual, output())
+            .claim(7, Some(1), Origin::Manual, output(), 100)
             .ok()
             .unwrap();
         assert!((session.gain.get() - 0.1).abs() < 1e-6, "speaker volume 50");
@@ -466,7 +483,7 @@ mod tests {
         // A speaker test (no camera) has no session volume to set.
         drop(session);
         let test = sessions
-            .claim(7, None, Origin::Manual, output())
+            .claim(7, None, Origin::Manual, output(), 100)
             .ok()
             .unwrap();
         assert!(!sessions.set_session_volume(1, 10, false));
@@ -476,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_play_task_still_releases_the_speaker() {
         let sessions = TalkdownSessions::default();
-        let claim = |camera| sessions.claim(7, camera, Origin::Manual, output());
+        let claim = |camera| sessions.claim(7, camera, Origin::Manual, output(), 100);
         let session = claim(Some(1)).ok().unwrap();
         assert!(matches!(claim(None), Err(StartError::Busy)));
         let task = tokio::spawn(async move {

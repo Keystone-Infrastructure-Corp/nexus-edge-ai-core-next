@@ -631,6 +631,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/speakers/{id}/test",
             axum::routing::post(crate::speakers_admin::test_speaker),
         )
+        .route(
+            "/v1/admin/talkdown/audio",
+            get(crate::speakers_admin::list_talkdown_audio),
+        )
         // Phase 7.6 · Step 7.6.3 — ONVIF device control. These drive
         // the per-camera SOAP client (`crate::discovery::onvif_*`)
         // against the camera's edge-resident endpoint + credentials.
@@ -9804,7 +9808,8 @@ mod tests {
             let mut view = talk_down(cam, speaker);
             view["busy"] = false.into();
             view["session_id"] = serde_json::Value::Null;
-            view["modes"] = serde_json::json!(crate::talkdown::session::MODES);
+            view["modes"] =
+                serde_json::json!(crate::talkdown::session::TalkdownSessions::default().modes());
             view
         };
 
@@ -9971,11 +9976,6 @@ mod tests {
             speaker_call(app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let view = speaker_json(&body);
-        assert_eq!(
-            view["modes"],
-            serde_json::json!(crate::talkdown::session::MODES),
-            "{body}"
-        );
         view["busy"]
             .as_bool()
             .unwrap_or_else(|| panic!("busy in {body}"))
@@ -10040,19 +10040,33 @@ mod tests {
             .await;
     }
 
-    /// No audit row for the camera carries the clip URL (a bearer SAS).
-    async fn assert_audit_has_no_url(store: &Store, secret: &str) {
-        let rows = store
-            .list_audit_for_resource("camera", "1", 50)
+    /// Sessions with a library over `store`, fetching over plain http.
+    fn library_sessions(store: &Arc<Store>, bus: &Arc<dyn nexus_bus::Bus>) -> TalkdownSessions {
+        let (library, _worker) =
+            crate::talkdown::library::Library::spawn(store.clone(), bus.clone(), true);
+        TalkdownSessions::with_library(library)
+    }
+
+    /// A ready library item holding `samples`.
+    async fn store_ready_clip(store: &Store, uid: &str, samples: &[i16]) {
+        store
+            .upsert_talkdown_pending(&nexus_store::NewAudio {
+                uid: uid.into(),
+                name: "clip".into(),
+                description: None,
+                kind: nexus_store::AudioKind::Clip,
+                tts_text: None,
+                tts_voice: None,
+                version_token: Some("00".into()),
+            })
             .await
             .unwrap();
-        assert!(rows.iter().any(|r| r.action == "talk_down.start"));
-        for r in &rows {
-            for text in [&r.before_json, &r.after_json].into_iter().flatten() {
-                assert!(!text.contains(secret), "clip URL in the audit row {text}");
-            }
-        }
+        store.set_talkdown_ready(uid, samples).await.unwrap();
     }
+
+    const CLIP_UID: &str = "a1b2c3d4-0000-4000-8000-000000000001";
+    const TTS_UID: &str = "b2c3d4e5-0000-4000-8000-000000000002";
+    const LOCAL_UID: &str = "c0000000-0000-4000-8000-000000000003";
 
     #[tokio::test]
     async fn talk_down_tone_plays_then_hangs_up_and_frees_the_speaker() {
@@ -11112,6 +11126,13 @@ mod tests {
             serde_json::json!({ "mode": "siren" }),
             serde_json::json!({}),
             serde_json::json!({ "mode": "clip" }),
+            // D13: the fetch-by-URL mode is gone.
+            serde_json::json!({
+                "mode": "clip",
+                "clip": { "url": "https://blob.example/x.wav", "sha256": "00" },
+            }),
+            serde_json::json!({ "mode": "stored" }),
+            serde_json::json!({ "mode": "stored", "audio_uid": "u", "volume": 101 }),
         ] {
             let (status, body) = start_talk_down(&app, 1, bad.clone()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
@@ -11120,112 +11141,6 @@ mod tests {
             speaker_call(&app, Method::POST, "/api/v1/admin/speakers/999/test", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert!(!talk_down_busy(&app).await);
-    }
-
-    #[tokio::test]
-    async fn talk_down_clip_plays_the_wav_samples() {
-        let samples: Vec<i16> = (0..800)
-            .map(|i| ((i * 977) % 20_000 - 10_000) as i16)
-            .collect();
-        let clip = wav(1, 8000, &samples);
-        let server = wiremock::MockServer::start().await;
-        serve(&server, "/clip.wav", clip.clone()).await;
-        let url = format!("{}/clip.wav?sv=2024&sig=SAS-SIGNATURE", server.uri());
-        let (port, rtp, uas) = fake_speaker().await;
-        let (app, store, _dir, _) =
-            talkdown_app(TalkdownSessions::allowing_http(), "127.0.0.1", port).await;
-
-        let body = serde_json::json!({
-            "mode": "clip",
-            "clip": { "url": url, "sha256": sha256_hex(&clip).to_uppercase() },
-        });
-        let (status, body) = start_talk_down(&app, 1, body).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(speaker_json(&body)["mode"], "clip");
-
-        let mut buf = [0u8; 2048];
-        // The first packet is the silent frame that opens the media flow.
-        tokio::time::timeout(std::time::Duration::from_secs(1), rtp.recv(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let n = tokio::time::timeout(std::time::Duration::from_secs(1), rtp.recv(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let want: Vec<u8> = samples[..160]
-            .iter()
-            .map(|&s| crate::talkdown::g711::ulaw(s))
-            .collect();
-        assert_eq!(
-            &buf[12..n],
-            want.as_slice(),
-            "the clip's first frame, µ-law"
-        );
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
-        assert_audit_has_no_url(&store, "SAS-SIGNATURE").await;
-    }
-
-    #[tokio::test]
-    async fn talk_down_clip_refusals_place_no_call() {
-        let tone = wav(1, 8000, &crate::talkdown::tone_pcm(100));
-        let server = wiremock::MockServer::start().await;
-        let files = [
-            ("/good.wav", tone.clone()),
-            ("/stereo.wav", wav(2, 8000, &[0; 400])),
-            ("/16k.wav", wav(1, 16_000, &[0; 400])),
-            ("/text.wav", b"not a wave file".to_vec()),
-            ("/big.wav", wav(1, 8000, &vec![0; 512 * 1024 + 1])),
-        ];
-        for (path, body) in &files {
-            serve(&server, path, body.clone()).await;
-        }
-        // A speaker that never hears a request: any INVITE would land here.
-        let speaker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let port = speaker.local_addr().unwrap().port();
-        let (app, store, _dir, _) =
-            talkdown_app(TalkdownSessions::allowing_http(), "127.0.0.1", port).await;
-        let clip = |path: &str, sha: String| {
-            serde_json::json!({
-                "mode": "clip",
-                "clip": { "url": format!("{}{path}?sig=SAS-SIGNATURE", server.uri()), "sha256": sha },
-            })
-        };
-
-        let mut cases = vec![clip("/good.wav", sha256_hex(b"something else"))];
-        cases.extend(
-            files[1..]
-                .iter()
-                .map(|(path, body)| clip(path, sha256_hex(body))),
-        );
-        cases.push(clip("/missing.wav", sha256_hex(b"")));
-        for case in cases {
-            let (status, body) = start_talk_down(&app, 1, case.clone()).await;
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{case}: {body}");
-            assert_eq!(error_code(&body), "clip_invalid", "{case}");
-            assert!(!body.contains("SAS-SIGNATURE"), "URL echoed: {body}");
-        }
-        assert!(!talk_down_busy(&app).await);
-        assert_audit_has_no_url(&store, "SAS-SIGNATURE").await;
-
-        // The engine's own sessions take https only.
-        let (prod, _store, _dir2, _) =
-            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
-        let (status, body) = start_talk_down(&prod, 1, clip("/good.wav", sha256_hex(&tone))).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(error_code(&body), "clip_invalid");
-
-        let mut buf = [0u8; 2048];
-        let heard = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            speaker.recv(&mut buf),
-        )
-        .await;
-        assert!(heard.is_err(), "a refused clip placed a call");
     }
 
     #[tokio::test]
@@ -11241,11 +11156,375 @@ mod tests {
         assert_eq!(speaker_json(&body)["message"], "speaker did not answer");
         assert!(!talk_down_busy(&app).await);
         // A start that gets as far as claiming the speaker is not refused as busy.
-        let bad_clip = serde_json::json!({
-            "mode": "clip", "clip": { "url": "ftp://x/y.wav", "sha256": "00" },
+        let unknown = serde_json::json!({ "mode": "stored", "audio_uid": "nope" });
+        let (status, body) = start_talk_down(&app, 1, unknown).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(error_code(&body), "audio_not_found");
+    }
+
+    #[tokio::test]
+    async fn talk_down_stored_plays_the_library_samples_at_the_body_volume() {
+        let samples: Vec<i16> = (0..800)
+            .map(|i| ((i * 977) % 20_000 - 10_000) as i16)
+            .collect();
+        let (port, rtp, uas) = fake_speaker().await;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        store_ready_clip(&store, CLIP_UID, &samples).await;
+
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        assert!(speaker_json(&body)["modes"]
+            .as_array()
+            .unwrap()
+            .contains(&"stored".into()));
+        let play = serde_json::json!({ "mode": "stored", "audio_uid": CLIP_UID, "volume": 50 });
+        let (status, body) = start_talk_down(&app, 1, play).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body)["mode"], "stored");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let want: Vec<u8> = samples[..160]
+            .iter()
+            .map(|&s| crate::talkdown::g711::ulaw(crate::talkdown::limit(f32::from(s) * 0.1)))
+            .collect();
+        assert_eq!(
+            rtp_frames(&rtp)[0],
+            want,
+            "the first frame at session volume 50"
+        );
+    }
+
+    #[tokio::test]
+    async fn talk_down_stored_refuses_unknown_and_pending_audio_after_claiming() {
+        // A speaker that never hears a request: any INVITE would land here.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let sessions = state.talkdown.clone();
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        store
+            .upsert_talkdown_pending(&nexus_store::NewAudio {
+                uid: CLIP_UID.into(),
+                name: "pending".into(),
+                description: None,
+                kind: nexus_store::AudioKind::Clip,
+                tts_text: None,
+                tts_voice: None,
+                version_token: Some("00".into()),
+            })
+            .await
+            .unwrap();
+        let stored = |uid: &str| serde_json::json!({ "mode": "stored", "audio_uid": uid });
+
+        let (status, body) = start_talk_down(&app, 1, stored("nope")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(error_code(&body), "audio_not_found");
+        let (status, body) = start_talk_down(&app, 1, stored(CLIP_UID)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "audio_not_ready");
+        assert!(!talk_down_busy(&app).await, "a refusal frees the speaker");
+
+        // The claim comes before the store read: a busy speaker answers busy
+        // even for audio that does not exist.
+        let speaker = store.speaker_for_camera(1).await.unwrap().unwrap();
+        let held = sessions.start(
+            crate::talkdown::session::StartRequest {
+                speaker: &speaker,
+                output: store.speaker_output(speaker.id).await.unwrap(),
+                camera_id: Some(1),
+                origin: crate::talkdown::session::Origin::Manual,
+                audio: &crate::talkdown::session::Audio::Tone,
+                event_id: None,
+            },
+            std::future::pending::<bool>(),
+        );
+        tokio::pin!(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut held)
+                .await
+                .is_err(),
+            "parked on its pairing re-read, holding the speaker"
+        );
+        let (status, body) = start_talk_down(&app, 1, stored("nope")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "talk_down_busy");
+
+        let mut buf = [0u8; 2048];
+        let heard =
+            tokio::time::timeout(std::time::Duration::from_millis(200), silent.recv(&mut buf))
+                .await;
+        assert!(heard.is_err(), "a refused play placed a call");
+    }
+
+    // ===============================================================
+    // SPEC-086 — the `talkdown_audio` fleet category
+    // ===============================================================
+
+    async fn talkdown_apply(
+        app: &axum::Router,
+        effective: serde_json::Value,
+        revision: i64,
+    ) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({
+            "effective": effective,
+            "scope": { "type": "org", "id": "00000000-0000-0000-0000-000000000000" },
+            "mode": "merge",
+            "revision": revision,
         });
-        let (status, body) = start_talk_down(&app, 1, bad_clip).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (status, body) = speaker_call(
+            app,
+            Method::POST,
+            "/api/v1/admin/fleet/talkdown_audio",
+            Some(body),
+        )
+        .await;
+        assert!(!body.contains("SAS-SIGNATURE"), "URL echoed: {body}");
+        (status, speaker_json(&body))
+    }
+
+    /// Wait until the item leaves `pending`; returns its status.
+    async fn settled(store: &Store, uid: &str) -> nexus_store::AudioStatus {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let a = store.get_talkdown_audio(uid).await.unwrap().unwrap();
+            if a.status != nexus_store::AudioStatus::Pending {
+                return a.status;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{uid} still pending"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_apply_talkdown_audio_downloads_in_the_background_and_reports_the_hash() {
+        use futures::StreamExt;
+        use nexus_bus::BusExt;
+        use nexus_store::AudioStatus;
+
+        let quiet: Vec<i16> = (0..800)
+            .map(|i| if i % 2 == 0 { 300 } else { -300 })
+            .collect();
+        let first = wav(1, 8000, &quiet);
+        let second = wav(1, 8000, &quiet[..400]);
+        let server = wiremock::MockServer::start().await;
+        serve(&server, "/a.wav", first.clone()).await;
+        serve(&server, "/b.wav", second.clone()).await;
+        // A blob host is a name, never an IP literal.
+        let base = server.uri().replace("127.0.0.1", "localhost");
+        let url = |path: &str| format!("{base}{path}?sv=1&sig=SAS-SIGNATURE");
+        let hits = || async { server.received_requests().await.unwrap().len() };
+
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        let mut changed = bus
+            .subscribe::<serde_json::Value>(nexus_bus::topic::CONFIG_CHANGED)
+            .await
+            .unwrap();
+        // An item made on this core, which no fleet push may touch.
+        store_ready_clip(&store, LOCAL_UID, &[1, 2, 3]).await;
+        assert_eq!(
+            crate::fleet_hash::compute(&store)
+                .await
+                .unwrap()
+                .talkdown_audio,
+            None
+        );
+
+        let clip = |path: &str, sha: String| {
+            serde_json::json!({ "uid": CLIP_UID, "name": "Store closed",
+                "description": "After hours", "kind": "clip", "sha256": sha,
+                "url": url(path), "duration_ms": 100 })
+        };
+        let tts = serde_json::json!({ "uid": TTS_UID, "name": "Leave", "kind": "tts",
+            "text": "Please leave the area now.", "voice": "en_US-female" });
+
+        // Answers at once with every item pending; the worker then fetches,
+        // normalises and readies the clip, and publishes each change.
+        let push = serde_json::json!([clip("/a.wav", sha256_hex(&first)), tts.clone()]);
+        let (status, body) = talkdown_apply(&app, push.clone(), 7).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["category"], "talkdown_audio");
+        assert_eq!(
+            body["items"],
+            serde_json::json!([
+                { "uid": CLIP_UID, "status": "pending" },
+                { "uid": TTS_UID, "status": "pending" },
+            ])
+        );
+        assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Ready);
+        // No text-to-speech on this core yet (Task 10).
+        assert_eq!(settled(&store, TTS_UID).await, AudioStatus::Failed);
+        let pcm = store.talkdown_audio_pcm(CLIP_UID).await.unwrap().unwrap();
+        assert_eq!(pcm.len(), quiet.len());
+        assert!(pcm[0] > 3000, "normalised up from -40 dBFS: {}", pcm[0]);
+        assert_eq!(hits().await, 1);
+        let mut events = 0;
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), changed.next()).await
+        {
+            events += 1;
+        }
+        assert!(events >= 3, "the apply and each item published: {events}");
+
+        // The digest covers the managed, ready clip only.
+        let ready_clip = store.get_talkdown_audio(CLIP_UID).await.unwrap().unwrap();
+        let want = crate::fleet_hash::sha256_canonical(&serde_json::json!([
+            crate::talkdown::library::contract_json(&ready_clip)
+        ]));
+        let hash = crate::fleet_hash::compute(&store)
+            .await
+            .unwrap()
+            .talkdown_audio;
+        assert_eq!(hash.as_deref(), Some(want.as_str()));
+
+        // Unchanged content fetches nothing; a new name is taken in place.
+        let mut renamed = push.clone();
+        renamed[0]["name"] = "Closed".into();
+        let (status, body) = talkdown_apply(&app, renamed, 7).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"][0]["status"], "ready");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(hits().await, 1, "an unchanged clip is not fetched again");
+        let a = store.get_talkdown_audio(CLIP_UID).await.unwrap().unwrap();
+        assert_eq!((a.name.as_str(), a.status), ("Closed", AudioStatus::Ready));
+
+        // An older revision is stale and changes nothing.
+        let (status, body) = talkdown_apply(
+            &app,
+            serde_json::json!([clip("/b.wav", sha256_hex(&second))]),
+            6,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "stale": true }));
+        assert_eq!(store.talkdown_core().await.unwrap().library_revision, 7);
+        assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_some());
+        assert_eq!(hits().await, 1);
+
+        // A changed sha256 fetches again.
+        let (status, body) = talkdown_apply(
+            &app,
+            serde_json::json!([clip("/b.wav", sha256_hex(&second))]),
+            8,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Ready);
+        assert_eq!(hits().await, 2);
+        assert_eq!(
+            store
+                .talkdown_audio_pcm(CLIP_UID)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            400
+        );
+        // The TTS item left the push: merge retracted it; the local item stays.
+        assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_none());
+        assert!(store.get_talkdown_audio(LOCAL_UID).await.unwrap().is_some());
+
+        // A body that does not match its sha256 fails, and leaves the hash.
+        let (status, _) = talkdown_apply(
+            &app,
+            serde_json::json!([clip("/a.wav", sha256_hex(b"something else"))]),
+            9,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Failed);
+        let failed = store.get_talkdown_audio(CLIP_UID).await.unwrap().unwrap();
+        assert!(!failed.error.unwrap().contains("SAS-SIGNATURE"));
+        assert_eq!(
+            crate::fleet_hash::compute(&store)
+                .await
+                .unwrap()
+                .talkdown_audio,
+            Some(crate::fleet_hash::sha256_canonical(&serde_json::json!([])))
+        );
+
+        // `[]` removes every managed item and only those.
+        let (status, body) = talkdown_apply(&app, serde_json::json!([]), 10).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let left: Vec<String> = store
+            .list_talkdown_audio()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.uid)
+            .collect();
+        assert_eq!(left, [LOCAL_UID]);
+
+        // The library list marks what the fleet manages.
+        let (status, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/audio", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let list = speaker_json(&body);
+        assert_eq!(list[0]["uid"], LOCAL_UID);
+        assert_eq!(list[0]["fleet_managed"], false);
+        assert_eq!(list[0]["status"], "ready");
+        assert_eq!(list[0]["kind"], "clip");
+
+        // No audit row holds the SAS URL.
+        let rows = store
+            .list_audit_for_resource("fleet", "talkdown_audio", 50)
+            .await
+            .unwrap();
+        assert!(rows.len() >= 5, "{} fleet.apply rows", rows.len());
+        for r in &rows {
+            for text in [&r.before_json, &r.after_json].into_iter().flatten() {
+                assert!(
+                    !text.contains("SAS-SIGNATURE"),
+                    "URL in the audit row {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_apply_talkdown_audio_refuses_bad_items_and_lists_fleet_items() {
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        let tts = serde_json::json!({ "uid": TTS_UID, "name": "Leave", "kind": "tts",
+            "text": "Please leave.", "voice": "es" });
+        for bad in [
+            serde_json::json!({ "not": "an array" }),
+            serde_json::json!([tts, tts]),
+            serde_json::json!([{ "uid": "x", "name": "n", "kind": "tts", "text": "t", "voice": "v" }]),
+            serde_json::json!([{ "uid": CLIP_UID, "name": "n", "kind": "clip",
+                "sha256": "00", "url": "https://h/x?sig=SAS-SIGNATURE" }]),
+        ] {
+            let (status, body) = talkdown_apply(&app, bad.clone(), 1).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+        assert_eq!(store.count_talkdown_audio().await.unwrap(), 0);
+        assert_eq!(store.talkdown_core().await.unwrap().library_revision, 0);
+
+        let (status, _) = talkdown_apply(&app, serde_json::json!([tts]), 1).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/audio", None).await;
+        let list = speaker_json(&body);
+        assert_eq!(list[0]["uid"], TTS_UID);
+        assert_eq!(list[0]["fleet_managed"], true);
+        assert_eq!(list[0]["kind"], "tts");
+        assert_eq!(list[0]["has_previous"], false);
+        assert!(list[0].get("pcm").is_none());
     }
 
     #[tokio::test]
@@ -11341,10 +11620,7 @@ mod tests {
             .contains("live audio"));
         let (_, body) =
             speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
-        assert_eq!(
-            speaker_json(&body)["modes"],
-            serde_json::json!(["tone", "clip"])
-        );
+        assert_eq!(speaker_json(&body)["modes"], serde_json::json!(["tone"]));
         let mut buf = [0u8; 2048];
         let heard = tokio::time::timeout(
             std::time::Duration::from_millis(300),

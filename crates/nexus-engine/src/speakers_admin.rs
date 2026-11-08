@@ -27,6 +27,9 @@
 //! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down/volume` —
 //!   `{"volume": 0-100, "boost"?: bool}`; only the session this camera
 //!   started, only while it plays, never stored
+//! * `GET            /api/v1/admin/talkdown/audio` — the core's audio
+//!   library: `[{uid, name, description, kind, status, error, duration_ms,
+//!   fleet_managed, has_previous}]`
 //!
 //! A session ends as soon as its camera and speaker part: a delete of the
 //! speaker, an assignment that moves the camera off it, or an edit of the
@@ -34,8 +37,8 @@
 //!
 //! A talk-down action refused for a reason the cloud acts on answers
 //! [`Refusal`]'s `{"error": code, "message": …}`: `talk_down_unsupported`,
-//! `talk_down_busy`, `clip_invalid`, `speaker_unreachable` or
-//! `talk_down_negotiation_failed`.
+//! `talk_down_busy`, `audio_not_found` (404), `audio_not_ready` (409),
+//! `speaker_unreachable` or `talk_down_negotiation_failed`.
 //!
 //! A create or update body is a [`SpeakerConfig`] without `id`. On an update
 //! an absent `password` keeps the stored one and `""` clears it. The password
@@ -61,7 +64,8 @@ use crate::api::{ApiError, ApiState};
 use crate::auth::admin_audit::{audit_admin_action, audit_admin_action_in_tx};
 use crate::auth::require_role::SessionContext;
 use crate::talkdown::health::SpeakerStatus;
-use crate::talkdown::session::{Audio, Origin, StartError, StartRequest, MODES};
+use crate::talkdown::library::{kind_str, status_str};
+use crate::talkdown::session::{Audio, Origin, StartError, StartRequest};
 
 /// A speaker as the API shows it: no password, only whether one is set.
 #[derive(Serialize)]
@@ -283,7 +287,17 @@ impl From<StartError> for Refusal {
                 "talk_down_unsupported",
                 "the session was stopped before it played".into(),
             ),
-            StartError::Clip(why) => Self(StatusCode::UNPROCESSABLE_ENTITY, "clip_invalid", why),
+            StartError::AudioNotFound => Self(
+                StatusCode::NOT_FOUND,
+                "audio_not_found",
+                "no talk-down audio has that uid".into(),
+            ),
+            StartError::AudioNotReady => Self(
+                StatusCode::CONFLICT,
+                "audio_not_ready",
+                "the talk-down audio has not finished downloading".into(),
+            ),
+            StartError::Internal(why) => Self(StatusCode::INTERNAL_SERVER_ERROR, "internal", why),
             StartError::Call(e) => Self(
                 StatusCode::BAD_GATEWAY,
                 "speaker_unreachable",
@@ -594,7 +608,7 @@ pub(crate) async fn get_talk_down(
         .filter(|(camera, _)| *camera == Some(camera_id))
         .map(|(_, id)| id.to_string())
         .into();
-    out["modes"] = serde_json::json!(MODES);
+    out["modes"] = serde_json::json!(s.talkdown.modes());
     Ok(Json(out))
 }
 
@@ -674,6 +688,17 @@ pub(crate) async fn start_talk_down(
         })?;
         let Json(audio) =
             body.map_err(|e| Refusal(StatusCode::BAD_REQUEST, "bad_request", e.body_text()))?;
+        if let Audio::Stored {
+            volume: Some(101..),
+            ..
+        } = audio
+        {
+            return Err(Refusal(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "volume must be 0 to 100".into(),
+            ));
+        }
         let (session_id, sdp_answer) = start_on(&s, camera_id, &sp, &audio).await?;
         let started = serde_json::json!({
             "session_id": session_id,
@@ -982,4 +1007,36 @@ pub(crate) async fn test_on(
             e.to_string(),
         )),
     }
+}
+
+/// The core's audio library, samples left out. `fleet_managed` marks the
+/// items the last `talkdown_audio` fleet apply owns.
+pub(crate) async fn list_talkdown_audio(
+    State(s): State<ApiState>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let managed = s
+        .store
+        .fleet_marker_get("talkdown_audio")
+        .await?
+        .and_then(|m| m.managed_keys)
+        .unwrap_or_default();
+    let items = s.store.list_talkdown_audio().await?;
+    Ok(Json(
+        items
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "uid": a.uid,
+                    "name": a.name,
+                    "description": a.description,
+                    "kind": kind_str(a.kind),
+                    "status": status_str(a.status),
+                    "error": a.error,
+                    "duration_ms": a.duration_ms,
+                    "fleet_managed": managed.contains(&a.uid),
+                    "has_previous": a.has_previous,
+                })
+            })
+            .collect(),
+    ))
 }

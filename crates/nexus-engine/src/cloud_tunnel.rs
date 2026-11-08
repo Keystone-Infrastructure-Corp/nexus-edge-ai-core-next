@@ -1248,13 +1248,20 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// [`nexus_types::CameraTalkDown`] already discovers), gated on the camera
 /// actually having one.
 ///
+/// `talkdown_stored` says this engine plays talk-down audio from its own
+/// library by `audio_uid` and syncs that library through the
+/// `talkdown_audio` fleet category (cloud D13: no fetch-by-URL mode).
 /// `talkdown_hw_volume` is advertised once any speaker's own level is set over
 /// ONVIF (`hw_volume`), so the cloud only offers a device volume where one works.
 fn heartbeat_caps(
     hd_transport: Option<nexus_types::HdTransport>,
     talkdown_hw_volume: bool,
 ) -> Vec<String> {
-    let mut caps = vec!["live_view".to_string(), "actor_perm_v1".to_string()];
+    let mut caps = vec![
+        "live_view".to_string(),
+        "actor_perm_v1".to_string(),
+        "talkdown_stored".to_string(),
+    ];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
     caps.extend(talkdown_hw_volume.then(|| "talkdown_hw_volume".to_string()));
     caps
@@ -2671,7 +2678,7 @@ mod health_tests {
                 "{t} must still advertise the LBR pump: {caps:?}"
             );
             assert!(
-                !caps.iter().any(|c| c.contains("talkdown")),
+                !caps.iter().any(|c| c == "talkdown_webrtc"),
                 "{t} advertised talk-down with no sub-pipeline behind it: {caps:?}"
             );
         }
@@ -2681,11 +2688,14 @@ mod health_tests {
     /// that cannot advertises none (BUG-225).
     #[test]
     fn the_hd_transport_is_advertised_only_when_the_bridge_can_publish() {
-        assert_eq!(heartbeat_caps(None, false), ["live_view", "actor_perm_v1"]);
+        assert_eq!(
+            heartbeat_caps(None, false),
+            ["live_view", "actor_perm_v1", "talkdown_stored"]
+        );
         for t in nexus_types::HdTransport::all() {
             assert_eq!(
                 heartbeat_caps(Some(t), false),
-                ["live_view", "actor_perm_v1", t.cap_tag()]
+                ["live_view", "actor_perm_v1", "talkdown_stored", t.cap_tag()]
             );
         }
     }
@@ -4375,7 +4385,7 @@ mod heartbeat_ack_tests {
         for t in nexus_types::HdTransport::all() {
             assert_eq!(
                 first_heartbeat_caps(&bridge, t).await,
-                ["live_view", "actor_perm_v1"],
+                ["live_view", "actor_perm_v1", "talkdown_stored"],
                 "{t}"
             );
         }
@@ -4391,7 +4401,7 @@ mod heartbeat_ack_tests {
         )));
         assert_eq!(
             first_heartbeat_caps(&bridge, nexus_types::HdTransport::Sfu).await,
-            ["live_view", "actor_perm_v1", "hd_sfu"]
+            ["live_view", "actor_perm_v1", "talkdown_stored", "hd_sfu"]
         );
     }
 
@@ -4405,9 +4415,9 @@ mod heartbeat_ack_tests {
             std::collections::HashMap::new(),
         )));
         let expected: &[&str] = if nexus_pipeline::MoqSession::plugin_available() {
-            &["live_view", "actor_perm_v1", "hd_moq"]
+            &["live_view", "actor_perm_v1", "talkdown_stored", "hd_moq"]
         } else {
-            &["live_view", "actor_perm_v1"]
+            &["live_view", "actor_perm_v1", "talkdown_stored"]
         };
         assert_eq!(
             first_heartbeat_caps(&bridge, nexus_types::HdTransport::Moq).await,

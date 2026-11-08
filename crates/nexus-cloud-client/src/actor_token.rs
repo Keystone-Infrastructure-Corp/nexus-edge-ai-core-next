@@ -78,6 +78,7 @@ pub const FLEET_CATEGORIES: &[&str] = &[
     "delivery_settings",
     "alert_sinks",
     "live_view",
+    "talkdown_audio",
 ];
 
 /// A single trusted Ed25519 verification key bundled at enrollment.
@@ -280,6 +281,7 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         | ("GET", ["admin", "network", "apply", "status"])
         | ("GET", ["admin", "speakers"])
         | ("GET", ["admin", "speakers", _]) => &["settings.read"],
+        ("GET", ["admin", "talkdown", "audio"]) => &["settings.read", "live.talkdown"],
         _ => &[],
     }
 }

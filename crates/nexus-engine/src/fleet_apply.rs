@@ -14,13 +14,14 @@
 //! ```json
 //! { "effective": <category-specific payload>,
 //!   "scope": { "type": "org|site|core|camera", "id": "<uuid>" },
-//!   "mode": "replace|merge" }
+//!   "mode": "replace|merge",
+//!   "revision": <i64, talkdown_audio only> }
 //! ```
 //!
 //! where `effective` is the cloud-resolved (org → site → core folded)
 //! value for the category. The `db_key` segment is one of `rules`,
 //! `text_prompts`, `visual_prompts`, `detector_config`,
-//! `delivery_settings`, `alert_sinks`, `live_view`.
+//! `delivery_settings`, `alert_sinks`, `live_view`, `talkdown_audio`.
 //!
 //! # Apply semantics
 //!
@@ -77,11 +78,21 @@
 //!   An unknown name *without* an `image_url` still yields a `400` so
 //!   the cloud records that target as failed. Media never crosses the
 //!   gateway — only the signed SAS URL does (AGENTS.md §7).
+//! * **`talkdown_audio` syncs the talk-down library** (SPEC-086, ADR-094).
+//!   `effective` is `[{uid, name, description?, kind: "clip", sha256, url}
+//!   | {uid, name, description?, kind: "tts", text, voice}]`. A push whose
+//!   `revision` is older than the last one applied answers 200
+//!   `{"stale": true}` and changes nothing. Otherwise unchanged ready items
+//!   take their new name and description, the rest turn `pending` while
+//!   [`crate::talkdown::library`] downloads or renders them in the
+//!   background, and the answer lists each item's `{uid, status}` under
+//!   `items`. Syncs run one at a time, from the marker read to its write.
 
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nexus_bus::{topic, BusExt};
 use nexus_config::{ModelConfig, RuleConfig, SinkConfig};
@@ -108,6 +119,10 @@ pub struct FleetApplyReq {
     /// that predates Phase 7.5.11, which read as unconditional replace.
     #[serde(default)]
     pub mode: FleetApplyMode,
+    /// The cloud's library revision, read when it planned a
+    /// `talkdown_audio` push; a lower one than the last applied is stale.
+    #[serde(default)]
+    pub revision: Option<i64>,
 }
 
 /// What a fleet apply is allowed to delete. See the module docs.
@@ -140,6 +155,8 @@ impl FleetApplyMode {
 struct AppliedCategory {
     targets: usize,
     managed_keys: Vec<String>,
+    /// Each item's `{uid, status}`; only `talkdown_audio` fills it.
+    items: Vec<Value>,
 }
 
 /// The `scope` half of [`FleetApplyReq`].
@@ -156,6 +173,8 @@ pub struct FleetScope {
 pub struct FleetApplyResponse {
     pub category: String,
     pub targets: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<Value>,
 }
 
 /// A single `visual_prompts` entry. `name` is always consumed; the
@@ -214,7 +233,26 @@ pub async fn post_admin_fleet_apply(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     session: Option<SessionContext>,
     Json(req): Json<FleetApplyReq>,
-) -> Result<Json<FleetApplyResponse>, ApiError> {
+) -> Result<Response, ApiError> {
+    let library = s
+        .talkdown
+        .library()
+        .filter(|_| category == "talkdown_audio");
+    let _sync = match library {
+        Some(lib) => Some(lib.lock().await),
+        None => None,
+    };
+    if library.is_some() && req.revision.is_some() {
+        let last = s.store.talkdown_core().await?.library_revision;
+        if req.revision < Some(last) {
+            tracing::info!(
+                revision = req.revision,
+                last,
+                "stale talkdown_audio push refused"
+            );
+            return Ok(Json(serde_json::json!({ "stale": true })).into_response());
+        }
+    }
     // Keys a previous fleet apply pushed for this category. Under
     // `merge` this is the exact set the fleet is allowed to retract;
     // anything else on the box is operator-local and stays.
@@ -236,6 +274,7 @@ pub async fn post_admin_fleet_apply(
         req.mode,
         &prev_keys,
         req.scope.as_ref().is_some_and(|sc| sc.scope_type == "core"),
+        req.revision,
     )
     .await;
     let outcome = if result.is_ok() {
@@ -260,6 +299,7 @@ pub async fn post_admin_fleet_apply(
     let AppliedCategory {
         targets,
         managed_keys,
+        items,
     } = result?;
     // Record that the category is now fleet-managed (badge source for
     // the local admin UI) along with the canonical hash of what we
@@ -300,7 +340,12 @@ pub async fn post_admin_fleet_apply(
             "fleet apply ok"
         ),
     }
-    Ok(Json(FleetApplyResponse { category, targets }))
+    Ok(Json(FleetApplyResponse {
+        category,
+        targets,
+        items,
+    })
+    .into_response())
 }
 
 /// Response body for `GET /v1/admin/fleet/managed`.
@@ -332,6 +377,7 @@ async fn apply_category(
     mode: FleetApplyMode,
     prev_keys: &[String],
     scope_is_core: bool,
+    revision: Option<i64>,
 ) -> Result<AppliedCategory, ApiError> {
     match category {
         "rules" => apply_rules(s, effective, mode, prev_keys, scope_is_core).await,
@@ -341,6 +387,7 @@ async fn apply_category(
         "delivery_settings" => apply_delivery_settings(s, effective).await,
         "alert_sinks" => apply_alert_sinks(s, effective, mode, prev_keys).await,
         "live_view" => apply_live_view(s, effective).await,
+        "talkdown_audio" => apply_talkdown_audio(s, effective, mode, prev_keys, revision).await,
         other => Err(ApiError(
             StatusCode::NOT_FOUND,
             format!("unknown fleet category: {other:?}"),
@@ -418,6 +465,7 @@ async fn apply_live_view(s: &ApiState, effective: &Value) -> Result<AppliedCateg
     Ok(AppliedCategory {
         targets: 1,
         managed_keys: Vec::new(),
+        items: Vec::new(),
     })
 }
 
@@ -473,6 +521,7 @@ async fn apply_rules(
     Ok(AppliedCategory {
         targets: rules.len(),
         managed_keys: rules.iter().map(|r| r.id.clone()).collect(),
+        items: Vec::new(),
     })
 }
 
@@ -531,6 +580,7 @@ async fn apply_text_prompts(
     Ok(AppliedCategory {
         targets: cameras.len(),
         managed_keys: prompts,
+        items: Vec::new(),
     })
 }
 
@@ -568,6 +618,7 @@ async fn apply_detector_config(
     Ok(AppliedCategory {
         targets: cameras.len(),
         managed_keys: Vec::new(),
+        items: Vec::new(),
     })
 }
 
@@ -634,6 +685,7 @@ async fn apply_delivery_settings(
     Ok(AppliedCategory {
         targets: 1,
         managed_keys: Vec::new(),
+        items: Vec::new(),
     })
 }
 
@@ -747,6 +799,7 @@ async fn apply_alert_sinks(
     Ok(AppliedCategory {
         targets: resolved.len(),
         managed_keys: resolved.into_iter().map(|(sink_id, _)| sink_id).collect(),
+        items: Vec::new(),
     })
 }
 
@@ -862,6 +915,67 @@ async fn apply_visual_prompts(
     Ok(AppliedCategory {
         targets: ids.len(),
         managed_keys: entries.iter().map(|e| e.name.clone()).collect(),
+        items: Vec::new(),
+    })
+}
+
+/// `talkdown_audio` — the talk-down library; see the module docs.
+/// Called holding the library's lock.
+async fn apply_talkdown_audio(
+    s: &ApiState,
+    effective: &Value,
+    mode: FleetApplyMode,
+    prev_keys: &[String],
+    revision: Option<i64>,
+) -> Result<AppliedCategory, ApiError> {
+    let bad = |why: String| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("talkdown_audio payload: {why}"),
+        )
+    };
+    let library = s.talkdown.library().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this core has no talk-down library".into(),
+        )
+    })?;
+    // Never echo serde's error: it can quote a value, and a value can be a URL.
+    let items: Vec<crate::talkdown::library::Item> = serde_json::from_value(effective.clone())
+        .map_err(|_| bad("expected an array of clip or tts items".into()))?;
+    let mut keep = std::collections::HashSet::new();
+    for item in &items {
+        item.validate().map_err(bad)?;
+        if !keep.insert(item.uid()) {
+            return Err(bad(format!("duplicate uid {}", item.uid())));
+        }
+    }
+    // Under `merge` only uids the fleet pushed before; under `replace` every
+    // other item on the core.
+    let retract: Vec<String> = match retractable(mode, prev_keys, &keep) {
+        Some(set) => set.into_iter().map(str::to_owned).collect(),
+        None => s
+            .store
+            .list_talkdown_audio()
+            .await?
+            .into_iter()
+            .map(|a| a.uid)
+            .filter(|uid| !keep.contains(uid.as_str()))
+            .collect(),
+    };
+    let retract: Vec<&str> = retract.iter().map(String::as_str).collect();
+    let statuses = library.sync(&items, &retract).await?;
+    if let Some(revision) = revision {
+        s.store.set_talkdown_core_library_revision(revision).await?;
+    }
+    let _ = s
+        .bus
+        .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
+        .await;
+    Ok(AppliedCategory {
+        targets: items.len(),
+        managed_keys: items.iter().map(|i| i.uid().to_owned()).collect(),
+        items: statuses,
     })
 }
 

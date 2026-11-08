@@ -1688,6 +1688,9 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let model_catalog_handle =
         model_catalog_publish::spawn(model_prompts.clone(), cloud_outbox.clone());
 
+    // SPEC-086 — the talk-down library and its download worker.
+    let (talkdown_library, talkdown_library_handle) =
+        talkdown::library::Library::spawn(store.clone(), bus.clone(), false);
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),
@@ -1829,7 +1832,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         lan_proxy_enabled: cfg.lan_proxy.enabled,
         remote_access,
         reid_stats: reid_stats.clone(),
-        talkdown: Default::default(),
+        talkdown: talkdown::session::TalkdownSessions::with_library(talkdown_library),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds
@@ -2266,6 +2269,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let _ = reconciler_handle.await;
     roster_handle.abort();
     state_hashes_handle.abort();
+    talkdown_library_handle.abort();
     model_catalog_handle.abort();
     // Abort every per-camera supervisor. `drain()` empties the map
     // under one lock acquisition; the reconciler has ended above, so

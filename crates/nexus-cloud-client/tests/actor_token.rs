@@ -684,7 +684,7 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
         SystemMethodPolicy::default(),
         CountingHandler(calls.clone()),
     );
-    let start = json!({"mode":"clip","clip":{"url":"https://blob/x.wav","sha256":"ab"}});
+    let start = json!({"mode":"stored","audio_uid":"a1b2c3d4-0000-4000-8000-000000000001"});
     let stop = json!({"session_id":"0192f0c4-1f7a-7cc0-8b39-6a54f1c5e0aa"});
     let speaker = json!({"name":"Gate","host":"10.0.0.9","port":5060,"driver":"sip"});
     let output = json!({"volume":60,"boost":true,"auto_max_per_hour":6});
@@ -753,6 +753,23 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
             "live.talkdown",
             Some(&volume),
             true,
+        ),
+        // The core's audio library is read by settings readers and talkers.
+        ("GET", "/admin/talkdown/audio", "settings.read", None, true),
+        ("GET", "/admin/talkdown/audio", "live.talkdown", None, true),
+        (
+            "GET",
+            "/admin/talkdown/audio",
+            "settings.write",
+            None,
+            false,
+        ),
+        (
+            "POST",
+            "/admin/talkdown/audio",
+            "settings.write",
+            None,
+            false,
         ),
         // The other permission, or a neighbour's, for the same route.
         (
@@ -1076,6 +1093,14 @@ async fn system_actors_are_bound_to_their_actual_service_actions() {
             "owner",
             "/admin/fleet/live_view",
             None,
+            true,
+        ),
+        // Library sync runs as the gateway's fan-out.
+        (
+            "system:api-gateway",
+            "owner",
+            "/admin/fleet/talkdown_audio",
+            Some("fleet.apply"),
             true,
         ),
         (
