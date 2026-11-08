@@ -94,14 +94,15 @@ fn parse_wav(file: &[u8]) -> Result<Vec<i16>, &'static str> {
 mod tests {
     #[tokio::test]
     async fn ip_literal_hosts_and_plain_http_are_refused_before_any_request() {
-        for (url, allow_http) in [
-            ("https://192.0.2.1/x.wav?sig=SAS", false),
-            ("https://[2001:db8::1]/x.wav?sig=SAS", false),
-            ("http://127.0.0.1:9/x.wav?sig=SAS", true),
-            ("http://blob.example/x.wav?sig=SAS", false),
+        const IP: &str = "clip url must name a host, not an IP address";
+        for (url, allow_http, expect) in [
+            ("https://192.0.2.1/x.wav?sig=SAS", false, IP),
+            ("https://[2001:db8::1]/x.wav?sig=SAS", false, IP),
+            ("http://127.0.0.1:9/x.wav?sig=SAS", true, IP),
+            ("http://blob.example/x.wav?sig=SAS", false, "clip url must be https"),
         ] {
             let why = super::fetch(url, "00", allow_http).await.unwrap_err();
-            assert!(!why.contains("SAS"), "URL in the error: {why}");
+            assert_eq!(why, expect, "{url}");
         }
     }
 }
