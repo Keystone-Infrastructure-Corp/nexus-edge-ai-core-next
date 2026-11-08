@@ -498,9 +498,9 @@ async fn apply_rules(
         }
         // No local speaker check: one speaker deleted on this core would fail
         // every later push; the responder reports it as `no_speaker`.
-        // `true`: a push is this core's own effective rules whatever scope the
-        // operator applied from; the cloud refuses a non-core `speaker_id` on save.
-        rule.validate_talk_down(true)
+        // Whatever scope the operator applied from, a push is this core's own
+        // effective rules, so a `speaker_id` is valid (ADR-095 As built).
+        rule.validate_talk_down()
             .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rule {:?}: {e}", rule.id)))?;
     }
     let keep: std::collections::HashSet<&str> = rules.iter().map(|r| r.id.as_str()).collect();

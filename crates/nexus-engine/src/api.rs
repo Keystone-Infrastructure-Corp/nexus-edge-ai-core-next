@@ -1872,7 +1872,7 @@ async fn upsert_rule(
             format!("invalid CEL in `when`: {msg}"),
         ));
     }
-    validate_rule_talk_down_on_save(&s, &rule, true).await?;
+    validate_rule_talk_down_on_save(&s, &rule).await?;
     let before = s
         .store
         .list_rules()
@@ -1965,7 +1965,7 @@ async fn create_rule(
             format!("invalid CEL in `when`: {msg}"),
         ));
     }
-    validate_rule_talk_down_on_save(&s, &rule, true).await?;
+    validate_rule_talk_down_on_save(&s, &rule).await?;
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
         // Allocate the id INSIDE the tx so two concurrent
@@ -2232,14 +2232,12 @@ async fn get_rules_schema(State(s): State<ApiState>) -> Json<RulesSchemaResp> {
 }
 
 /// ADR-095 save-time check of a rule's talk-down action (shape, D10 window,
-/// and that a named `speaker_id` exists on this core). `scope_is_core`: local
-/// rules and core-scoped fleet applies.
+/// and that a named `speaker_id` exists on this core).
 pub(crate) async fn validate_rule_talk_down_on_save(
     s: &ApiState,
     rule: &RuleConfig,
-    scope_is_core: bool,
 ) -> Result<(), ApiError> {
-    rule.validate_talk_down(scope_is_core)
+    rule.validate_talk_down()
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rule {:?}: {e}", rule.id)))?;
     if let Some(id) = rule.talk_down.as_ref().and_then(|t| t.speaker_id) {
         if s.store.get_speaker(id).await?.is_none() {

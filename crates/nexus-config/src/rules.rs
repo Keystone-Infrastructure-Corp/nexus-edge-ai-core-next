@@ -186,11 +186,11 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Shape check for a rule's talk-down action. `fleet_scope_is_core` is true
-/// for local rules and core-scoped fleet applies — the only places a
-/// `speaker_id` (local to one core) is meaningful. A uid unknown on this core
-/// is accepted: rules and audio arrive in separate pushes.
-pub fn validate_rule_talk_down(td: &RuleTalkDown, fleet_scope_is_core: bool) -> Result<(), String> {
+/// Shape check for a rule's talk-down action. A `speaker_id` (local to one
+/// core) is not checked here: the cloud refuses it on a non-core rule at save,
+/// and every rule a core holds is its own. A uid unknown on this core is
+/// accepted: rules and audio arrive in separate pushes.
+pub fn validate_rule_talk_down(td: &RuleTalkDown) -> Result<(), String> {
     if !(1..=3).contains(&td.steps.len()) {
         return Err(format!("talk_down needs 1-3 steps, got {}", td.steps.len()));
     }
@@ -215,20 +215,17 @@ pub fn validate_rule_talk_down(td: &RuleTalkDown, fleet_scope_is_core: bool) -> 
         sch.validate()
             .map_err(|e| format!("talk_down schedule: {e}"))?;
     }
-    if td.speaker_id.is_some() && !fleet_scope_is_core {
-        return Err("talk_down speaker_id is only allowed on core-scoped or local rules".into());
-    }
     Ok(())
 }
 
 impl RuleConfig {
     /// [`validate_rule_talk_down`] plus the D10 check that needs the rule's own
     /// cooldown: the escalation window must exceed it or the rule can never escalate.
-    pub fn validate_talk_down(&self, fleet_scope_is_core: bool) -> Result<(), String> {
+    pub fn validate_talk_down(&self) -> Result<(), String> {
         let Some(td) = &self.talk_down else {
             return Ok(());
         };
-        validate_rule_talk_down(td, fleet_scope_is_core)?;
+        validate_rule_talk_down(td)?;
         // Only a second step needs the rule to fire again inside the window.
         let cooldown_secs = self.debounce.cooldown_ms / 1000;
         if td.steps.len() > 1 && u64::from(td.escalate_within_secs) <= cooldown_secs {
@@ -283,38 +280,35 @@ mod talk_down_tests {
         assert_eq!((t.escalate_within_secs, t.cooldown_secs), (30, 60));
         assert_eq!(t.steps[0].repeat, 1);
         assert!(!t.play_before_verification);
-        assert!(validate_rule_talk_down(&t, false).is_ok());
+        assert!(validate_rule_talk_down(&t).is_ok());
     }
 
     #[test]
     fn refuses_each_violation() {
-        let bad = |f: &dyn Fn(&mut RuleTalkDown), core: bool| {
+        let bad = |f: &dyn Fn(&mut RuleTalkDown)| {
             let mut t = td();
             f(&mut t);
-            validate_rule_talk_down(&t, core).is_err()
+            validate_rule_talk_down(&t).is_err()
         };
         let step = || td().steps[0].clone();
-        assert!(bad(&|t| t.steps.clear(), false));
-        assert!(bad(&|t| t.steps = vec![step(); 4], false));
-        assert!(bad(&|t| t.steps[0].audio_uid = "nope".into(), false));
+        assert!(bad(&|t| t.steps.clear()));
+        assert!(bad(&|t| t.steps = vec![step(); 4]));
+        assert!(bad(&|t| t.steps[0].audio_uid = "nope".into()));
         // Library items are lowercase hyphenated UUIDs only.
-        assert!(bad(&|t| t.steps[0].audio_uid = UID.to_uppercase(), false));
-        assert!(bad(&|t| t.steps[0].repeat = 0, false));
-        assert!(bad(&|t| t.steps[0].repeat = 4, false));
-        assert!(bad(&|t| t.escalate_within_secs = 9, false));
-        assert!(bad(&|t| t.escalate_within_secs = 301, false));
-        assert!(bad(&|t| t.cooldown_secs = 9, false));
-        assert!(bad(&|t| t.cooldown_secs = 3601, false));
-        assert!(bad(&|t| t.volume = Some(101), false));
+        assert!(bad(&|t| t.steps[0].audio_uid = UID.to_uppercase()));
+        assert!(bad(&|t| t.steps[0].repeat = 0));
+        assert!(bad(&|t| t.steps[0].repeat = 4));
+        assert!(bad(&|t| t.escalate_within_secs = 9));
+        assert!(bad(&|t| t.escalate_within_secs = 301));
+        assert!(bad(&|t| t.cooldown_secs = 9));
+        assert!(bad(&|t| t.cooldown_secs = 3601));
+        assert!(bad(&|t| t.volume = Some(101)));
         assert!(bad(
-            &|t| t.schedule = Some(nexus_types::DeliverySchedule { grid: vec![] }),
-            false
+            &|t| t.schedule = Some(nexus_types::DeliverySchedule { grid: vec![] })
         ));
-        assert!(bad(&|t| t.speaker_id = Some(1), false));
-        assert!(!bad(&|t| t.speaker_id = Some(1), true));
+        assert!(!bad(&|t| t.speaker_id = Some(1)));
         assert!(!bad(
-            &|t| t.schedule = Some(nexus_types::DeliverySchedule::always()),
-            false
+            &|t| t.schedule = Some(nexus_types::DeliverySchedule::always())
         ));
     }
 
@@ -325,13 +319,13 @@ mod talk_down_tests {
             "cooldown_ms": 30000,
             "talk_down": {"steps": two, "escalate_within_secs": 30}
         }));
-        let e = r.validate_talk_down(false).unwrap_err();
+        let e = r.validate_talk_down().unwrap_err();
         assert!(e.contains("30") && e.contains("cooldown"), "{e}");
         let ok = rule(serde_json::json!({
             "cooldown_ms": 29000,
             "talk_down": {"steps": two, "escalate_within_secs": 30}
         }));
-        assert!(ok.validate_talk_down(false).is_ok());
+        assert!(ok.validate_talk_down().is_ok());
     }
 
     /// One step has nothing to escalate to, so a long rule cooldown is fine.
@@ -341,6 +335,6 @@ mod talk_down_tests {
             "cooldown_ms": 600_000,
             "talk_down": {"steps": [{"audio_uid": UID}], "escalate_within_secs": 30}
         }));
-        assert!(r.validate_talk_down(false).is_ok());
+        assert!(r.validate_talk_down().is_ok());
     }
 }
