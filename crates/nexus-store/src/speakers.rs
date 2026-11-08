@@ -120,11 +120,16 @@ impl Store {
         tx: &mut SqliteTx<'_>,
         sp: &SpeakerConfig,
     ) -> Result<(), StoreError> {
+        // SET reads the old row, so `hw_volume` survives only an unchanged
+        // `onvif_endpoint`: a device level holds for the device that set it.
         let res = sqlx::query(
-            "UPDATE speakers SET name = ?, config_json = ?, updated_at = CURRENT_TIMESTAMP \
-             WHERE id = ?",
+            "UPDATE speakers SET name = ?, \
+             hw_volume = CASE WHEN json_extract(config_json, '$.onvif_endpoint') IS ? \
+                         THEN hw_volume ELSE 0 END, \
+             config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(&sp.name)
+        .bind(sp.onvif_endpoint.as_deref())
         .bind(serde_json::to_string(sp)?)
         .bind(sp.id)
         .execute(&mut **tx)

@@ -262,3 +262,58 @@ async fn a_speakers_output_defaults_to_todays_behaviour_and_round_trips() {
         Err(StoreError::NotFound(_))
     ));
 }
+
+/// A device level only holds for the endpoint that set it: changing or
+/// clearing `onvif_endpoint` drops `hw_volume`, so software volume applies
+/// again until the next output write reaches the new device.
+#[tokio::test]
+async fn changing_the_onvif_endpoint_drops_hw_volume() {
+    let (store, _dir) = fresh_store().await;
+    let mut sp = create(&store, "a").await;
+    let update = |sp: SpeakerConfig| {
+        let store = &store;
+        async move {
+            let mut tx = store.begin_tx().await.unwrap();
+            store.update_speaker_tx(&mut tx, &sp).await.unwrap();
+            Store::commit_tx(tx).await.unwrap();
+        }
+    };
+    let hw_on = |store: &Store, id| {
+        let store = store.clone();
+        async move {
+            let mut out = store.speaker_output(id).await.unwrap();
+            out.hw_volume = true;
+            let mut tx = store.begin_tx().await.unwrap();
+            store
+                .set_speaker_output_tx(&mut tx, id, &out)
+                .await
+                .unwrap();
+            Store::commit_tx(tx).await.unwrap();
+        }
+    };
+
+    sp.onvif_endpoint = Some("http://192.0.2.10/onvif/media".into());
+    update(sp.clone()).await;
+    hw_on(&store, sp.id).await;
+    sp.name = "renamed".into();
+    update(sp.clone()).await;
+    assert!(
+        store.speaker_output(sp.id).await.unwrap().hw_volume,
+        "same endpoint keeps it"
+    );
+
+    sp.onvif_endpoint = Some("http://192.0.2.10/onvif/media2".into());
+    update(sp.clone()).await;
+    assert!(
+        !store.speaker_output(sp.id).await.unwrap().hw_volume,
+        "a new endpoint drops it"
+    );
+
+    hw_on(&store, sp.id).await;
+    sp.onvif_endpoint = None;
+    update(sp.clone()).await;
+    assert!(
+        !store.speaker_output(sp.id).await.unwrap().hw_volume,
+        "clearing drops it"
+    );
+}
