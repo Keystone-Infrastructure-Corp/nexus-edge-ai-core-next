@@ -4464,6 +4464,7 @@ mod heartbeat_ack_tests {
                 cert_rotate: None,
                 cloud_capabilities: None,
                 server_ts: chrono::Utc::now().to_rfc3339(),
+                talkdown_auto_allowed: None,
             }),
         })
         .await

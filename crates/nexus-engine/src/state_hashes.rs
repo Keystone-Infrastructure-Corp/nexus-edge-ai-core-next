@@ -62,6 +62,8 @@ fn build_envelope(hashes: &CategoryHashes) -> Envelope {
             visual_prompts_sha256: hashes.visual_prompts.clone(),
             detector_config_sha256: hashes.detector_config.clone(),
             delivery_settings_sha256: hashes.delivery_settings.clone(),
+            // Task 9 reports the library digest; until then the core has none.
+            talkdown_audio_sha256: None,
         }),
     }
 }

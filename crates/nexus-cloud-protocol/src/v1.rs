@@ -239,7 +239,7 @@ pub struct CloseSessionPayload {
     pub reason: String,
 }
 
-/// Edge → Cloud. Phase 7.5.5 (additive on v=1). Periodic + change-triggered digest of the edge's current canonical configuration state, one SHA-256 per fleet-settings category (rules, text_prompts, visual_prompts, detector_config, delivery_settings). Each hash is the lower-hex SHA-256 of the canonical JSON (recursively sorted object keys, arrays in document order, no insignificant whitespace) the edge derives from its local config for that category — byte-identical canonicalisation to the cloud's `fleet/effective` projection, so the cloud compares reported vs projected to surface configuration drift without round-tripping the full config. The edge emits this on startup and (debounced) whenever local config mutates (config.changed / delivery.settings.changed bus signals). A category hash is omitted when that category has no state on the edge. The cloud upserts these into `core_runtime_hashes` keyed on core_id; the edge-gateway resolves org_id from the cores FK. Additive: pre-7.5.5 cloud peers ignore this kind, pre-7.5.5 edges never emit it. No ack — fire-and-forget; the cloud reconciler is the recovery path when the tunnel is down.
+/// Edge → Cloud. Phase 7.5.5 (additive on v=1). Periodic + change-triggered digest of the edge's current canonical configuration state, one SHA-256 per fleet-settings category (rules, text_prompts, visual_prompts, detector_config, delivery_settings, talkdown_audio). Each hash is the lower-hex SHA-256 of the canonical JSON (recursively sorted object keys, arrays in document order, no insignificant whitespace) the edge derives from its local config for that category — byte-identical canonicalisation to the cloud's `fleet/effective` projection, so the cloud compares reported vs projected to surface configuration drift without round-tripping the full config. The edge emits this on startup and (debounced) whenever local config mutates (config.changed / delivery.settings.changed bus signals). A category hash is omitted when that category has no state on the edge. The cloud upserts these into `core_runtime_hashes` keyed on core_id; the edge-gateway resolves org_id from the cores FK. Additive: pre-7.5.5 cloud peers ignore this kind, pre-7.5.5 edges never emit it. No ack — fire-and-forget; the cloud reconciler is the recovery path when the tunnel is down.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreStateHashesPayload {
@@ -254,6 +254,9 @@ pub struct CoreStateHashesPayload {
     /// Lower-hex SHA-256 of the canonical JSON of the edge's full rule set. Omitted when the edge has no rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_sha256: Option<String>,
+    /// Additive on v=1. Lower-hex SHA-256 of the canonical JSON of the fleet-managed talk-down library items that are ready to play on this core (items still downloading or rendering, failed items and locally created items are excluded). Omitted until the core has applied a `talkdown_audio` fleet push. Because this payload has `additionalProperties: false`, the cloud accepts this field before any core sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub talkdown_audio_sha256: Option<String>,
     /// Lower-hex SHA-256 of the canonical JSON of the per-camera detector text prompts. Omitted when no camera has text prompts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_prompts_sha256: Option<String>,
@@ -322,7 +325,7 @@ pub struct DiagReadyPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeDegradation {
-    /// Stable machine-readable cause. Defined codes, each with the `component` it is reported under: `detector_unavailable` (`detector`: a configured model could not be loaded, so the engine reports zero detections for it; one issue per failed model), `camera_source_stalled` (`live_view`: subscribed cameras have produced no new frame for longer than the live-view stall window; one issue naming every such camera), `decode_oversubscribed` (`decode`: a fixed-function video decode engine is oversubscribed, so every camera decoding on it drops or duplicates frames), `recorder_stub` (`recorder`: the clip recorder is the stub while cameras are enabled, or while the camera list cannot be read to count them, so nothing is recorded), `camera_pipeline_stopped` (`pipeline`: a camera's analysis pipeline exited without being stopped, so nothing on it is detected, alerted on or saved as a motion clip until the engine's next supervision pass restarts it; one issue naming every such camera), `camera_config_unreadable` (`store`: stored camera rows this engine build cannot read, so those cameras do not run until each is deleted or saved again; one issue naming every such camera). The cloud notifies when a code joins the set of open codes, never when only a `detail` changes, so a code names a kind of condition, never one occurrence of it. Unknown codes MUST render as the raw string rather than being dropped, so a newer edge can report a condition an older console has no special-casing for.
+    /// Stable machine-readable cause. Defined codes, each with the `component` it is reported under: `detector_unavailable` (`detector`: a configured model could not be loaded, so the engine reports zero detections for it; one issue per failed model), `camera_source_stalled` (`live_view`: subscribed cameras have produced no new frame for longer than the live-view stall window; one issue naming every such camera), `decode_oversubscribed` (`decode`: a fixed-function video decode engine is oversubscribed, so every camera decoding on it drops or duplicates frames), `recorder_stub` (`recorder`: the clip recorder is the stub while cameras are enabled, or while the camera list cannot be read to count them, so nothing is recorded), `camera_pipeline_stopped` (`pipeline`: a camera's analysis pipeline exited without being stopped, so nothing on it is detected, alerted on or saved as a motion clip until the engine's next supervision pass restarts it; one issue naming every such camera), `camera_config_unreadable` (`store`: stored camera rows this engine build cannot read, so those cameras do not run until each is deleted or saved again; one issue naming every such camera), `speaker_offline` (`talkdown`: a configured talk-down speaker has not answered its last reachability check; one issue naming every such speaker), `talkdown_audio_failed` (`talkdown`: synced talk-down library items failed to download or render, so they cannot be played until the next sync re-pushes them), `talkdown_rule_failing` (`talkdown`: rules whose last automatic talk-down attempt in the past 24 h failed because the speaker was missing or unreachable or the audio was missing). The cloud notifies when a code joins the set of open codes, never when only a `detail` changes, so a code names a kind of condition, never one occurrence of it. Unknown codes MUST render as the raw string rather than being dropped, so a newer edge can report a condition an older console has no special-casing for.
     pub code: String,
     /// Subsystem that is impaired, e.g. `detector`. Used to group issues in the UI.
     pub component: String,
@@ -405,7 +408,7 @@ pub struct EvidenceClipRef {
     pub sas_url: String,
 }
 
-/// Cloud → Edge. Reply to a heartbeat. May hint at cert rotation after day 75. Phase M_PERF_CROWD A: optionally carries `cloud_capabilities` so the edge can gate batched / FP16 sighting envelopes on cloud-side support.
+/// Cloud → Edge. Reply to a heartbeat. May hint at cert rotation after day 75. Phase M_PERF_CROWD A: optionally carries `cloud_capabilities` so the edge can gate batched / FP16 sighting envelopes on cloud-side support. Talk-down (additive): optionally carries `talkdown_auto_allowed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatAckPayload {
@@ -415,6 +418,9 @@ pub struct HeartbeatAckPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_capabilities: Option<Vec<String>>,
     pub server_ts: Timestamp,
+    /// Additive on v=1. Whether the core may play a rule's talk-down audio automatically (ADR-095). `false` disallows automatic plays within one heartbeat; manual and live talk-down are unaffected. Omitted means "no change": the core keeps the last value it received, and a core that has never received `true` plays nothing automatically. The cloud sends it only to cores whose latest heartbeat advertised the `talkdown_rules` cap, because this payload has `additionalProperties: false` and an older engine would reject the whole ack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub talkdown_auto_allowed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -430,7 +436,7 @@ pub struct HeartbeatPayload {
     /// Optional. Inference capability profile the edge probed (nexus-probe HardwareProfile), e.g. "hailo" or "intel-npu"; "dev" on unprovisioned/dev builds. Omitted by pre-capability-profile edges. Replaces the former required hardware-tier field (t10..t64) in place on v=1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_profile: Option<String>,
-    /// Phase 10 (additive on v=1). Edge-advertised live-view capabilities. Defined tags: `live_view` (the always-on LBR snapshot pump is available) and `webrtc` (the gstreamer-webrtc HD sub-pipeline is compiled in). The cloud greys the HD control / hides the live wall for cores that do not advertise the matching tag (an N-1 edge, or a build without the gstreamer-webrtc feature). Unknown tags ignored; missing field is treated identically to an empty array (pre-Phase-10 edge).
+    /// Phase 10 (additive on v=1). Edge-advertised live-view capabilities. Defined tags: `live_view` (the always-on LBR snapshot pump is available) and `webrtc` (the gstreamer-webrtc HD sub-pipeline is compiled in). The cloud greys the HD control / hides the live wall for cores that do not advertise the matching tag (an N-1 edge, or a build without the gstreamer-webrtc feature). Talk-down tags (additive on v=1): `talkdown_stored` (the engine stores the org talk-down library and plays items by `audio_uid`; the cloud syncs the library only to cores advertising it), `talkdown_tts` (the engine renders text-to-speech items locally), `talkdown_rules` (the engine plays a rule's talk-down audio automatically and reads `HeartbeatAckPayload.talkdown_auto_allowed`), `talkdown_hw_volume` (at least one speaker's volume is set on the speaker itself through ONVIF rather than as a core-side gain). The cloud stores the latest list in `cores.edge_caps`, replaced on every heartbeat. Unknown tags ignored; missing field is treated identically to an empty array (pre-Phase-10 edge).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caps: Option<Vec<String>>,
     /// Phase 1.15: edge wall-clock for skew tracking (gateway writes EMA to cores.last_skew_ms).
