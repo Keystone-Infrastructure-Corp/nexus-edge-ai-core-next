@@ -183,6 +183,8 @@ struct Seq {
     playing: bool,
     /// When the last step ended.
     ended_at: Option<DateTime<Utc>>,
+    /// When the last attempt failed at the speaker; cleared once a step plays.
+    last_attempt_at: Option<DateTime<Utc>>,
     /// When each sequence (a step 1) started, within the last hour.
     starts: VecDeque<DateTime<Utc>>,
     /// The rule's last fire for this speaker, for the outcome estimate.
@@ -203,6 +205,8 @@ struct Plan {
     /// The sequence's `(step, ended_at)` before this plan, restored if it
     /// never plays: the next step follows a step that ended.
     prev: (usize, Option<DateTime<Utc>>),
+    /// When this plan was decided: a failed attempt's cooldown runs from here.
+    at: DateTime<Utc>,
 }
 
 struct Responder {
@@ -425,6 +429,12 @@ impl Responder {
             if seq.playing {
                 return Err("busy");
             }
+            if seq
+                .last_attempt_at
+                .is_some_and(|t| now - t < cooldown(td.cooldown_secs, seq.starts.len()))
+            {
+                return Err("cooldown");
+            }
             match seq.ended_at {
                 Some(end) if now - end <= Duration::seconds(td.escalate_within_secs.into()) => {
                     if seq.step + 1 < td.steps.len() {
@@ -477,6 +487,7 @@ impl Responder {
             camera_id: ev.camera_id,
             event_id: ev.event_id.to_string(),
             prev,
+            at: now,
         })
     }
 
@@ -496,6 +507,7 @@ impl Responder {
                 camera_id,
                 event_id,
                 prev,
+                at,
             } = plan;
             let key = (rule_id.clone(), speaker.id);
             let step_cfg = &td.steps[step];
@@ -553,6 +565,7 @@ impl Responder {
                 if let Some(seq) = seqs.lock().get_mut(&key) {
                     seq.playing = playing;
                     seq.ended_at = Some(Utc::now());
+                    seq.last_attempt_at = None;
                 }
             };
             match sessions.start(req, paired).await {
@@ -656,6 +669,9 @@ impl Responder {
                             if matches!(call, TalkdownError::Rejected(486 | 480)) {
                                 activity.skip(Some(&rule_id), "busy", 1, Utc::now());
                             } else {
+                                if let Some(seq) = seqs.lock().get_mut(&key) {
+                                    seq.last_attempt_at = Some(at);
+                                }
                                 activity.attempt(&rule_id, "failed", Some("unreachable".into()));
                             }
                             return;
@@ -1532,8 +1548,11 @@ mod tests {
             ("rule", Some("failed"))
         );
         assert!(p.reason.as_deref().unwrap().contains("503"));
-        // The failed step 1 is tried again, not followed by step 2.
-        assert_eq!(g.decide("r1", 1, Utc::now()).await, Ok(0));
+        // The failed step 1 is tried again past the cooldown, not followed by step 2.
+        assert_eq!(
+            g.decide("r1", 1, Utc::now() + Duration::seconds(61)).await,
+            Ok(0)
+        );
         let a = audits(&g.store).await;
         let start = a
             .iter()
@@ -1551,6 +1570,37 @@ mod tests {
             .activity
             .failing(Utc::now() + Duration::hours(25))
             .is_empty());
+    }
+
+    /// A speaker that keeps failing is retried on the doubling cooldown, not
+    /// on every fire until the hourly cap.
+    #[tokio::test]
+    async fn a_failing_speaker_is_retried_on_the_cooldown_not_every_fire() {
+        let (port, _uas) = fake_uas("NEVER", |req| {
+            if req.starts_with("INVITE") {
+                vec![reply(req, "503 Service Unavailable", "", "")]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        let mut g = rig_with(talk_down(), false, port, bus()).await;
+        let t = Utc::now();
+        let s = |n| t + Duration::seconds(n);
+        g.r.handle(&ev("r1", 1, t), t).await.unwrap().await.unwrap();
+        assert_eq!(g.decide("r1", 1, s(30)).await, Err("cooldown"));
+        g.r.handle(&ev("r1", 1, s(61)), s(61))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(
+            g.decide("r1", 1, s(61 + 100)).await,
+            Err("cooldown"),
+            "second failure: 120 s"
+        );
+        assert_eq!(g.decide("r1", 1, s(61 + 121)).await, Ok(0));
+        assert_eq!(plays(&g.store).await.len(), 2);
     }
 
     /// A speaker that answers 486 or 480 is busy on another call: a skip,
