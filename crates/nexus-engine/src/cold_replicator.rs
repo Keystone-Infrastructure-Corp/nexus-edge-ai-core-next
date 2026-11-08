@@ -618,10 +618,10 @@ async fn tick(
     // before each motion upload above; this final pass catches clips
     // that became ready during the last upload and the empty-batch
     // case — an alert clip can be pending when no motion clip is.
-    // Gated on a wired outbox
-    // because console delivery is the feature's whole point: with no
-    // cloud tunnel there is nowhere to deliver, and the evictor's
-    // grace window reclaims the transient hot file anyway.
+    // Gated on a wired outbox because console delivery is the
+    // feature's whole point: with no cloud tunnel there is nowhere to
+    // deliver, and the evictor's grace window reclaims the transient
+    // hot file anyway.
     if drain_alerts {
         drain_alert_clips(cfg, store, &*backend, throttle, &backend_handle, floor).await;
     }
@@ -1194,7 +1194,8 @@ mod tests {
         with_url: Mutex<bool>,
         /// Every `put` path, in call order.
         put_paths: Mutex<Vec<String>>,
-        /// One-shot future run on the first `put`, before it records.
+        /// One-shot future awaited inside the first `put`, after its path
+        /// is recorded — lets a test change state mid-upload.
         first_put_hook:
             Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
     }
