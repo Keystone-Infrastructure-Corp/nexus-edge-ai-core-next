@@ -2708,9 +2708,9 @@ async fn run_alert_clip_builder(
                         size_bytes = stats.size_bytes,
                         "alert clip ready"
                     );
-                    // Wake the cold replicator so it ships this alert
+                    // Wake the alert-clip uploader so it ships this alert
                     // clip to the cloud now (M-Alert-Clip cloud
-                    // delivery) rather than on its 5-min backstop. Only
+                    // delivery) rather than on its 60 s backstop. Only
                     // meaningful when hashed (an un-hashed clip is
                     // skipped by the drain), so gate on `sha256`.
                     if sha256.is_some() {

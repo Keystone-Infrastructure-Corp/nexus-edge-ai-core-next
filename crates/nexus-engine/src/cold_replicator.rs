@@ -1,7 +1,8 @@
 //! M2.2 Phase 1 — cold-mirror replicator.
 //!
-//! A single follower task that copies closed clips from the local
-//! hot tier onto the configured cold backend. Two design rules are
+//! A single follower task that copies closed motion clips from the local
+//! hot tier onto the configured cold backend; alert clips upload on their
+//! own task ([`run_alert_clip_uploader`]). Two design rules are
 //! load-bearing and MUST stay true at every refactor:
 //!
 //! 1. **The replicator NEVER deletes from source.** It only ever
@@ -491,8 +492,8 @@ async fn tick(
     // interval, so a normal "one clip every 30 s" workload is
     // effectively unthrottled at the moment of upload — and a burst
     // after a long quiet period is still smoothed by the bucket's
-    // 1-second capacity ceiling. Resolved up front because both the
-    // motion drain below uses the throttle + backend handle.
+    // 1-second capacity ceiling. Resolved up front for the motion
+    // drain below.
     throttle.set_rate(policy.throttle_bps.max(0) as u64).await;
     let backend_handle = backend.handle().to_string();
 
@@ -866,10 +867,10 @@ pub async fn run_alert_clip_uploader(
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     info!("alert-clip uploader starting");
+    // The first interval tick fires immediately, so clips left ready
+    // across a restart ship at boot.
     let mut interval = tokio::time::interval(ALERT_COLD_RETRY);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // The first interval tick fires immediately; consume it.
-    interval.tick().await;
 
     tokio::pin!(shutdown);
 
@@ -926,9 +927,6 @@ async fn alert_upload_pass(cfg: &ColdReplicatorConfig, store: &Arc<Store>, regis
         );
         return;
     };
-    if !matches!(backend.health().await, HealthStatus::Ok) {
-        return;
-    }
     let enrollment = match store.get_cloud_enrollment().await {
         Ok(e) => e,
         Err(e) => {
@@ -937,6 +935,17 @@ async fn alert_upload_pass(cfg: &ColdReplicatorConfig, store: &Arc<Store>, regis
         }
     };
     let floor = upload_floor(enrollment.as_ref());
+    // Check for work first: this is a local read, while the health probe
+    // below is a network round trip on Azure, every 60 s even when idle.
+    if matches!(
+        store.alert_clips_pending_cold_upload(1, floor, Utc::now()).await,
+        Ok(rows) if rows.is_empty()
+    ) {
+        return;
+    }
+    if !matches!(backend.health().await, HealthStatus::Ok) {
+        return;
+    }
     let backend_handle = backend.handle().to_string();
     while drain_alert_clips(cfg, store, &*backend, &backend_handle, floor).await > 0 {}
 }
@@ -2492,5 +2501,52 @@ mod tests {
             .filter(|p| p.contains("alert-"))
             .count();
         assert_eq!(alert_puts, n, "every ready alert clip uploads in one pass");
+    }
+
+    /// The uploader task wakes on its kick, ships a ready clip, and stops
+    /// on shutdown.
+    #[tokio::test]
+    async fn alert_uploader_ships_a_kicked_clip_and_stops() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = announce_cfg(clips_dir.clone(), Arc::new(TunnelOutbox::new()));
+        let kick = Arc::new(Notify::new());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(run_alert_clip_uploader(
+            cfg,
+            store.clone(),
+            registry,
+            kick.clone(),
+            async {
+                let _ = stop_rx.await;
+            },
+        ));
+        // Let the boot pass run with nothing pending, so only the kick
+        // (not the 60 s backstop) can ship the clip below.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        kick.notify_one();
+
+        let alert = format!("alert-{alert_id}");
+        let shipped = || backend.put_paths.lock().iter().any(|p| p.contains(&alert));
+        for _ in 0..200 {
+            if shipped() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(shipped(), "the kicked clip must upload");
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("uploader must stop on shutdown")
+            .unwrap();
     }
 }
