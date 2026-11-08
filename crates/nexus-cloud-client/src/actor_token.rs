@@ -265,10 +265,11 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         | ("PUT", ["admin", "speakers", _, "cameras" | "output"])
         | ("POST", ["admin", "speakers", _, "test"]) => &["settings.write"],
         // Renders a TTS preview to the cloud's write SAS, for whoever may write
-        // the library (a station: manage_fleet_settings); the local
+        // the library (a station: manage_fleet_settings), or read it: the cloud
+        // sends a reader's preview only with a saved item's own text. The local
         // `tts/preview` is deliberately unmapped.
         ("POST", ["admin", "talkdown", "tts", "preview-upload"]) => {
-            &["settings.write", "fleet.apply"]
+            &["settings.write", "fleet.apply", "live.talkdown"]
         }
         ("POST", ["admin", "users"])
         | ("PUT" | "DELETE", ["admin", "users", _])

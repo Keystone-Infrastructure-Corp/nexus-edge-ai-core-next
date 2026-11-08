@@ -1394,13 +1394,18 @@ fn typed_speech_needs_a_signed_live_talkdown_speak() {
         );
         assert!(!legacy.allows_rpc(start, Some(dup), true), "{role}");
     }
-    // The preview upload follows library writes (settings.write or fleet.apply,
-    // a station's manage_fleet_settings); the local preview is never reached.
+    // The preview upload follows library reads (settings.write or fleet.apply,
+    // a station's manage_fleet_settings, or live.talkdown for a saved item's
+    // text); the local preview is never reached.
     let upload = post("/admin/talkdown/tts/preview-upload");
     let up = bytes(&json!({"text":"t","voice":"en-US-female","upload_url":"https://x/y"}));
-    assert!(actor(Some("settings.write"), "viewer").allows_rpc(upload, Some(&up), false));
-    assert!(actor(Some("fleet.apply"), "viewer").allows_rpc(upload, Some(&up), false));
-    for perm in ["live.talkdown", "live.talkdown_speak", "settings.read"] {
+    for perm in ["settings.write", "fleet.apply", "live.talkdown"] {
+        assert!(
+            actor(Some(perm), "viewer").allows_rpc(upload, Some(&up), false),
+            "{perm}"
+        );
+    }
+    for perm in ["live.talkdown_speak", "settings.read"] {
         assert!(
             !actor(Some(perm), "owner").allows_rpc(upload, Some(&up), true),
             "{perm}"
