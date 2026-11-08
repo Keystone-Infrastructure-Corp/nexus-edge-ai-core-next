@@ -319,7 +319,8 @@ impl Responder {
     /// are read back from the plays log.
     async fn new(d: ResponderDeps) -> Self {
         let mut hourly: HashMap<SpeakerId, VecDeque<DateTime<Utc>>> = HashMap::new();
-        let since = Utc::now() - HOUR;
+        let booted = Utc::now();
+        let since = booted - HOUR;
         let recent = d
             .store
             .list_talkdown_plays(&PlayFilter {
@@ -334,9 +335,12 @@ impl Responder {
                 if let Some(t) = started_at(p) {
                     hourly.entry(p.speaker_id).or_default().push_back(t);
                 }
-            } else if let Some(t) = p.ended_at.as_deref().and_then(sqlite_time) {
+            } else {
                 // A manual session lasts at most 10 minutes, so the hour covers it.
-                d.sessions.restore_manual_end(p.speaker_id, t);
+                // One a restart cut short has no end; it ended no earlier than now.
+                let ended = p.ended_at.as_deref().and_then(sqlite_time);
+                d.sessions
+                    .restore_manual_end(p.speaker_id, ended.unwrap_or(booted));
             }
         }
         // shortcut: the escalation sequence and cooldown restart empty after an engine restart; persist them if restarts prove frequent.
@@ -1200,6 +1204,39 @@ mod tests {
         };
         g.r = Responder::new(d).await;
         assert_eq!(g.decide("r1", 1, Utc::now()).await, Err("holdoff"));
+    }
+
+    /// A restart mid-session leaves the manual row unfinished (`ended_at`
+    /// NULL); the hold-off still runs, from the restart.
+    #[tokio::test]
+    async fn gate_8_the_holdoff_survives_a_restart_during_a_manual_session() {
+        let mut g = rig(talk_down()).await;
+        g.store
+            .insert_talkdown_play(&NewPlay {
+                session_id: "m1".into(),
+                origin: "manual".into(),
+                rule_id: None,
+                step: None,
+                event_id: None,
+                camera_id: Some(1),
+                speaker_id: g.speaker.id,
+                audio_uid: None,
+                mode: "tone".into(),
+            })
+            .await
+            .unwrap();
+        let d = ResponderDeps {
+            store: g.store.clone(),
+            bus: g.r.d.bus.clone(),
+            sessions: TalkdownSessions::default(),
+            evaluator: g.r.d.evaluator.clone(),
+            policy: g.r.d.policy.clone(),
+            activity: Activity::default(),
+        };
+        g.r = Responder::new(d).await;
+        let now = Utc::now();
+        assert_eq!(g.decide("r1", 1, now).await, Err("holdoff"));
+        assert_eq!(g.decide("r1", 1, now + Duration::seconds(121)).await, Ok(0));
     }
 
     #[tokio::test]
