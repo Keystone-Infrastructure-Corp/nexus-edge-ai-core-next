@@ -1531,7 +1531,10 @@ impl Store {
     /// domain mutation + audit-log insert in one tx so a crash
     /// between the two cannot leave them out of sync.
     pub async fn begin_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>, StoreError> {
-        Ok(self.pool.begin().await?)
+        // IMMEDIATE takes the write lock up front: a deferred tx that read
+        // before a concurrent commit cannot upgrade (SQLITE_BUSY_SNAPSHOT, 517,
+        // never retried by the busy timeout). BUG-334.
+        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
     }
 
     /// M6 Phase 4 Step 4.1 — commit a transaction opened via
@@ -1696,6 +1699,40 @@ mod tests {
             registered, sorted,
             "MIGRATIONS must be in ascending id order — that is the apply order"
         );
+    }
+
+    /// BUG-334: a writer that commits between a transaction's first read and
+    /// its first write must not make the transaction fail (SQLITE_BUSY_SNAPSHOT,
+    /// extended code 517, which the busy timeout never retries).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn a_background_write_between_a_tx_read_and_write_does_not_fail_the_tx() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cfg = nexus_config::StoreConfig {
+            url: format!("sqlite:{}?mode=rwc", dir.path().join("nexus.db").display()),
+            seed_from_config: false,
+            duckdb_attach: false,
+            duckdb_path: std::path::PathBuf::from("/tmp/unused.duckdb"),
+        };
+        let store = super::Store::open(&cfg).await.expect("open");
+
+        let mut tx = store.begin_tx().await.unwrap();
+        sqlx::query("SELECT COUNT(*) FROM engine_runtime_settings")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let background = tokio::spawn({
+            let store = store.clone();
+            async move { store.write_runtime_setting("background", Some("1")).await }
+        });
+        // Long enough for a writer that is not held off to commit first.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        store
+            .write_runtime_setting_tx(&mut tx, "in_tx", Some("1"))
+            .await
+            .expect("the tx's first write after its read");
+        super::Store::commit_tx(tx).await.unwrap();
+        background.await.unwrap().expect("the background write");
     }
 
     #[test]
