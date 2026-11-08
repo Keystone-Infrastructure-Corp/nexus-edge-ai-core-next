@@ -338,14 +338,33 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn speak_kills_a_helper_at_the_timeout() {
-        let tts = fake(&["sleep"]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut tts = fake(&["sleep"]);
+        tts.model_dir = dir.path().to_path_buf();
         let start = std::time::Instant::now();
         let err = tts
-            .speak("sleep", "hi", Duration::from_millis(300))
+            .speak("sleep", "hi", Duration::from_secs(1))
             .await
             .unwrap_err();
         assert_eq!(err, "text-to-speech timed out");
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let pid = std::fs::read_to_string(dir.path().join("pid")).unwrap();
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        // The kill is asynchronous: a dying helper is a zombie until reaped.
+        for _ in 0..40 {
+            if !alive() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("helper {} outlived the timeout", pid.trim());
     }
 
     #[tokio::test]
