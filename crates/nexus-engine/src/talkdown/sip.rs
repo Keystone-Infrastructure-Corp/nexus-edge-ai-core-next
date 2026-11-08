@@ -32,6 +32,8 @@ pub enum TalkdownError {
     AuthFailed,
     #[error("speaker answered with neither PCMU nor PCMA")]
     NoCommonCodec,
+    #[error("speaker ended the call")]
+    EndedBySpeaker,
     #[error("talk-down socket error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -239,10 +241,39 @@ impl SipCall {
         Ok(())
     }
 
+    /// Read the SIP socket without waiting. A retransmitted 2xx for the INVITE
+    /// means the speaker missed our ACK: ACK it again, or it drops the call
+    /// ~32 s in. A BYE is answered 200 and ends the call: `EndedBySpeaker`.
+    pub fn pump_sip(&mut self) -> Result<(), TalkdownError> {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match self.leg.sock.try_recv_from(&mut buf) {
+                Ok((n, _)) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            if let Some(resp) = Response::parse(&buf[..n]) {
+                if (200..300).contains(&resp.status)
+                    && resp.answers(&self.leg.call_id, self.invite_cseq, "INVITE")
+                {
+                    let ack =
+                        self.leg
+                            .request("ACK", self.invite_cseq, &branch(), &self.to, "", "");
+                    let _ = self.leg.sock.try_send_to(ack.as_bytes(), self.leg.peer);
+                }
+            } else if let Some(ok) = std::str::from_utf8(&buf[..n])
+                .ok()
+                .filter(|req| req.starts_with("BYE "))
+                .and_then(|req| bye_ok(req, &self.leg.call_id))
+            {
+                let _ = self.leg.sock.try_send_to(ok.as_bytes(), self.leg.peer);
+                self.hung_up = true;
+                return Err(TalkdownError::EndedBySpeaker);
+            }
+        }
+    }
+
     /// Stream `pcm` as 20 ms RTP frames until it ends or `cancel` fires.
-    // shortcut: inbound SIP is not read while playing, so a 2xx retransmitted
-    // after a lost ACK is not re-ACKed and the speaker may drop the call ~32 s
-    // in; read the SIP socket here if long plays on lossy links matter.
     pub async fn play_pcm(
         &mut self,
         pcm: &[i16],
@@ -252,7 +283,10 @@ impl SipCall {
         for frame in pcm.chunks(FRAME_SAMPLES) {
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
-                _ = tick.tick() => self.send_frame(frame).await?,
+                _ = tick.tick() => {
+                    self.pump_sip()?;
+                    self.send_frame(frame).await?;
+                }
             }
         }
         Ok(())
@@ -537,6 +571,26 @@ impl Response {
         });
         cseq_matches && self.header("call-id") == Some(call_id)
     }
+}
+
+/// The 200 answering an in-dialog BYE (its Via/From/To/CSeq echoed), or `None`
+/// when the BYE is for another call.
+fn bye_ok(req: &str, call_id: &str) -> Option<String> {
+    let mut ok = String::from("SIP/2.0 200 OK\r\n");
+    let mut ours = false;
+    for line in req.lines().skip(1).take_while(|l| !l.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "call-id" | "i" => ours = value.trim() == call_id,
+            "via" | "v" | "from" | "f" | "to" | "t" | "cseq" => {}
+            _ => continue,
+        }
+        ok += line;
+        ok += "\r\n";
+    }
+    ours.then(|| ok + "Content-Length: 0\r\n\r\n")
 }
 
 fn token() -> String {
@@ -974,6 +1028,122 @@ pub(crate) mod tests {
         }
         call.hangup().await.unwrap();
         assert_eq!(methods(&uas.await.unwrap()), ["INVITE", "ACK", "BYE"]);
+    }
+
+    /// A speaker that lost our 2xx ACK retransmits its 200 OK; every one is
+    /// ACKed while the clip plays, or the speaker drops the call ~32 s in.
+    #[tokio::test]
+    async fn a_retransmitted_200_is_reacked_during_playback() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            let mut next = async |seen: &mut Vec<String>| {
+                let (n, from) = timeout(Duration::from_secs(3), sock.recv_from(&mut buf))
+                    .await
+                    .expect("fake UAS waited 3 s for a request")
+                    .unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                from
+            };
+            let from = next(&mut seen).await;
+            let invite = seen[0].clone();
+            let ok = reply(&invite, "200 OK", SDP, &answer(rtp_port, "0"));
+            sock.send_to(ok.as_bytes(), from).await.unwrap();
+            next(&mut seen).await; // the first ACK is "lost": the speaker never saw it
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                sock.send_to(ok.as_bytes(), from).await.unwrap();
+                next(&mut seen).await;
+            }
+            next(&mut seen).await;
+            let bye = seen.last().unwrap();
+            sock.send_to(reply(bye, "200 OK", "", "").as_bytes(), from)
+                .await
+                .unwrap();
+            seen
+        });
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // 1.6 s of audio spans all three retransmits.
+        call.play_pcm(&tone_pcm(1600), &CancellationToken::new())
+            .await
+            .unwrap();
+        call.hangup().await.unwrap();
+        let seen = uas.await.unwrap();
+        assert_eq!(
+            methods(&seen),
+            ["INVITE", "ACK", "ACK", "ACK", "ACK", "BYE"],
+            "one ACK for the answer, one per retransmitted 200 OK"
+        );
+        for ack in &seen[1..5] {
+            assert_eq!(header(ack, "CSeq"), Some("1 ACK"));
+            assert!(header(ack, "To").unwrap().ends_with(";tag=uas1"));
+        }
+    }
+
+    /// The speaker hangs up mid-play: the core answers 200 and stops sending.
+    #[tokio::test]
+    async fn a_bye_from_the_speaker_ends_the_play_and_stops_the_rtp() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            let invite = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let ok = reply(&invite, "200 OK", SDP, &answer(rtp_port, "0"));
+            sock.send_to(ok.as_bytes(), from).await.unwrap();
+            sock.recv_from(&mut buf).await.unwrap(); // ACK
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let bye = format!(
+                "BYE sip:nexus@{from} SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{port};branch=z9hG4bKspk\r\n\
+                 From: {to};tag=uas1\r\nTo: {f}\r\nCall-ID: {id}\r\nCSeq: 1 BYE\r\n\
+                 Content-Length: 0\r\n\r\n",
+                to = header(&ok, "To").unwrap().split(';').next().unwrap(),
+                f = header(&invite, "From").unwrap(),
+                id = header(&invite, "Call-ID").unwrap(),
+            );
+            sock.send_to(bye.as_bytes(), from).await.unwrap();
+            let (n, _) = timeout(Duration::from_secs(1), sock.recv_from(&mut buf))
+                .await
+                .expect("the core answered the BYE")
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let started = Instant::now();
+        let err = call
+            .play_pcm(&tone_pcm(2000), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TalkdownError::EndedBySpeaker), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1), "ended early");
+
+        let answer = uas.await.unwrap();
+        assert!(answer.starts_with("SIP/2.0 200 OK\r\n"), "{answer}");
+        assert_eq!(header(&answer, "CSeq"), Some("1 BYE"));
+        // Whatever was in flight drains, then nothing more arrives.
+        let mut buf = [0u8; 2048];
+        while rtp.try_recv(&mut buf).is_ok() {}
+        let more = timeout(Duration::from_millis(150), rtp.recv(&mut buf)).await;
+        assert!(more.is_err(), "RTP kept flowing after the BYE");
+        assert!(call.hung_up, "the drop must not send a second BYE");
     }
 
     #[tokio::test]

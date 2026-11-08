@@ -67,9 +67,12 @@ impl Live {
                 frame = tokio::time::timeout(IDLE_LIMIT, self.frames.recv()) => frame,
             };
             match frame {
-                Ok(Some(frame)) => tokio::time::timeout(SEND_TIMEOUT, call.send_frame(&frame))
-                    .await
-                    .unwrap_or(Err(TalkdownError::Unreachable))?,
+                Ok(Some(frame)) => {
+                    call.pump_sip()?;
+                    tokio::time::timeout(SEND_TIMEOUT, call.send_frame(&frame))
+                        .await
+                        .unwrap_or(Err(TalkdownError::Unreachable))?
+                }
                 Ok(None) => break "receiver_closed",
                 Err(_) => break "no_audio",
             }
