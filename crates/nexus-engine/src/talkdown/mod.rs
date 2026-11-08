@@ -11,6 +11,7 @@ use nexus_store::SpeakerOutput;
 
 pub mod clip;
 pub mod g711;
+pub mod health;
 #[cfg(feature = "gstreamer-webrtc")]
 pub mod live;
 pub mod session;

@@ -1837,6 +1837,14 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // the task does pure read-then-remove work on a 60 s tick.
     discovery::spawn_eviction_sweep(api_state.discovery_sessions.clone());
 
+    // Speaker probes; the task ends with the runtime, like the sweep above.
+    tokio::spawn(talkdown::health::run(
+        store.clone(),
+        api_state.talkdown.clone(),
+        api_state.health.speaker_health(),
+        tokio_util::sync::CancellationToken::new(),
+    ));
+
     if !cli.no_api {
         // M-Admin Phase 0 — operator-persisted bind override
         // wins over `nexus.toml`. Stored as a plain `host:port`

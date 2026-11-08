@@ -2121,6 +2121,8 @@ pub struct EngineHealth {
     unreadable_cameras: Arc<parking_lot::Mutex<Vec<nexus_types::CameraId>>>,
     /// What the store reads [`recorder_issue`] makes have returned.
     last_read: parking_lot::Mutex<LastRead>,
+    /// The talk-down speakers' probe results, which `talkdown::health::run` fills.
+    speaker_health: crate::talkdown::health::SpeakerHealthMap,
 }
 
 /// [`recorder_issue`]'s memory of its store reads.
@@ -2149,6 +2151,7 @@ impl EngineHealth {
             supervisors: reconciler.handles.clone(),
             unreadable_cameras: reconciler.unreadable_cameras.clone(),
             last_read: parking_lot::Mutex::default(),
+            speaker_health: Default::default(),
         }
     }
 
@@ -2171,7 +2174,31 @@ impl EngineHealth {
             supervisors,
             unreadable_cameras: Arc::default(),
             last_read: parking_lot::Mutex::default(),
+            speaker_health: Default::default(),
         }
+    }
+
+    /// The map the speaker prober fills and this roll-up reads.
+    pub(crate) fn speaker_health(&self) -> crate::talkdown::health::SpeakerHealthMap {
+        self.speaker_health.clone()
+    }
+
+    /// `(id, name)` of each speaker whose last probe got no answer.
+    async fn offline_speakers(&self) -> Vec<(nexus_config::SpeakerId, String)> {
+        let ids = self.speaker_health.offline();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let known = self.store.list_speakers().await.unwrap_or_default();
+        ids.into_iter()
+            .map(|id| {
+                let name = known
+                    .iter()
+                    .find(|sp| sp.id == id)
+                    .map(|sp| sp.name.clone());
+                (id, name.unwrap_or_else(|| "unnamed".into()))
+            })
+            .collect()
     }
 
     /// The current roll-up. Recomputed on every call, so a repaired
@@ -2179,6 +2206,7 @@ impl EngineHealth {
     pub(crate) async fn rollup(&self) -> EdgeHealth {
         let recorder = recorder_issue(self).await;
         let unreadable = self.unreadable_cameras.lock().clone();
+        let offline_speakers = self.offline_speakers().await;
         edge_health(
             &self.live_view.stalled_cameras(),
             crate::system_metrics::snapshot().decode_capacity.as_ref(),
@@ -2186,6 +2214,7 @@ impl EngineHealth {
                 .into_iter()
                 .chain(exited_supervisors_issue(&self.exited_supervisors()))
                 .chain(unreadable_cameras_issue(&unreadable))
+                .chain(speaker_offline_issue(&offline_speakers))
                 .chain(recording_issues(self.recorder.recording_degradations())),
         )
     }
@@ -2232,6 +2261,28 @@ fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegr
              on them is detected, alerted on or saved as a motion clip until it is restarted: \
              {ids}",
             exited.len(),
+        )),
+    })
+}
+
+/// The talk-down speakers that did not answer their last probe, as one issue
+/// (`talkdown`/`speaker_offline`; none when every speaker answers).
+fn speaker_offline_issue(offline: &[(nexus_config::SpeakerId, String)]) -> Option<EdgeDegradation> {
+    if offline.is_empty() {
+        return None;
+    }
+    let list = offline
+        .iter()
+        .map(|(id, name)| format!("{name} (#{id})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(EdgeDegradation {
+        component: "talkdown".to_string(),
+        code: "speaker_offline".to_string(),
+        detail: truncate_detail(&format!(
+            "{} talk-down speaker(s) did not answer the last SIP probe, so talk-down on them \
+             will fail until they are back: {list}",
+            offline.len(),
         )),
     })
 }
@@ -4210,9 +4261,14 @@ mod heartbeat_ack_tests {
         }
     }
 
-    /// The first heartbeat's `caps`, for a store holding `speakers` (name, hw_volume).
-    async fn heartbeat_caps_with_speakers(speakers: &[(&str, bool)]) -> Vec<String> {
+    /// The first heartbeat's `caps` and talk-down issues, for a store holding
+    /// `speakers` (name, hw_volume) whose health map marks `offline` offline.
+    async fn heartbeat_with_speakers(
+        speakers: &[(&str, bool)],
+        offline: &[usize],
+    ) -> (Vec<String>, Vec<EdgeDegradation>) {
         let (store, dir) = test_store().await;
+        let mut ids = Vec::new();
         for (name, hw) in speakers {
             let mut sp: nexus_config::SpeakerConfig =
                 serde_json::from_value(serde_json::json!({ "name": name, "host": "192.0.2.10" }))
@@ -4228,6 +4284,7 @@ mod heartbeat_ack_tests {
                 .await
                 .unwrap();
             Store::commit_tx(tx).await.unwrap();
+            ids.push(sp.id);
         }
         let health = EngineHealth::with_real_recorder(
             false,
@@ -4239,6 +4296,9 @@ mod heartbeat_ack_tests {
             live_view_manager(),
             crate::reconciler::HandleMap::default(),
         );
+        for &i in offline {
+            health.speaker_health().mark_offline_for_test(ids[i]);
+        }
         let tunnel = FirstEnvelopeTunnel::default();
         pump_heartbeats(
             &tunnel,
@@ -4252,7 +4312,16 @@ mod heartbeat_ack_tests {
         .await;
         let sent = tunnel.sent.lock();
         match &sent[0].body {
-            EnvelopeBody::Heartbeat(h) => h.caps.clone().expect("caps"),
+            EnvelopeBody::Heartbeat(h) => (
+                h.caps.clone().expect("caps"),
+                h.health
+                    .as_ref()
+                    .and_then(|h| h.issues.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|i| i.component == "talkdown")
+                    .collect(),
+            ),
             other => panic!("expected a heartbeat, got {other:?}"),
         }
     }
@@ -4260,14 +4329,41 @@ mod heartbeat_ack_tests {
     /// `talkdown_hw_volume` only once a speaker has `hw_volume = 1`.
     #[tokio::test]
     async fn the_heartbeat_advertises_hw_volume_only_once_a_speaker_has_it() {
-        let hw = "talkdown_hw_volume".to_string();
-        assert!(!heartbeat_caps_with_speakers(&[]).await.contains(&hw));
-        assert!(!heartbeat_caps_with_speakers(&[("a", false), ("b", false)])
-            .await
-            .contains(&hw));
-        assert!(heartbeat_caps_with_speakers(&[("a", false), ("b", true)])
-            .await
-            .contains(&hw));
+        let (caps, _) = heartbeat_with_speakers(&[], &[]).await;
+        assert!(
+            !caps.contains(&"talkdown_hw_volume".to_string()),
+            "{caps:?}"
+        );
+        let (caps, _) = heartbeat_with_speakers(&[("a", false), ("b", false)], &[]).await;
+        assert!(
+            !caps.contains(&"talkdown_hw_volume".to_string()),
+            "{caps:?}"
+        );
+        let (caps, _) = heartbeat_with_speakers(&[("a", false), ("b", true)], &[]).await;
+        assert!(caps.contains(&"talkdown_hw_volume".to_string()), "{caps:?}");
+    }
+
+    /// One `talkdown/speaker_offline` issue names every offline speaker, and
+    /// there is none while they all answer.
+    #[tokio::test]
+    async fn the_heartbeat_carries_one_speaker_offline_issue_naming_every_offline_speaker() {
+        let (_, issues) =
+            heartbeat_with_speakers(&[("lobby", false), ("dock", false), ("yard", false)], &[])
+                .await;
+        assert!(issues.is_empty(), "{issues:?}");
+        let (_, issues) = heartbeat_with_speakers(
+            &[("lobby", false), ("dock", false), ("yard", false)],
+            &[0, 2],
+        )
+        .await;
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].code, "speaker_offline");
+        let detail = &issues[0].detail;
+        assert!(
+            detail.contains("lobby") && detail.contains("yard"),
+            "{detail}"
+        );
+        assert!(!detail.contains("dock"), "{detail}");
     }
 
     /// BUG-225: a stub recorder's WebRTC bridge is disabled, as is every

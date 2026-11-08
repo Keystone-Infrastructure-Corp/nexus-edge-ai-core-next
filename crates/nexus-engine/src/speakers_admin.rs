@@ -60,6 +60,7 @@ use uuid::Uuid;
 use crate::api::{ApiError, ApiState};
 use crate::auth::admin_audit::{audit_admin_action, audit_admin_action_in_tx};
 use crate::auth::require_role::SessionContext;
+use crate::talkdown::health::SpeakerStatus;
 use crate::talkdown::session::{Audio, Origin, StartError, StartRequest, MODES};
 
 /// A speaker as the API shows it: no password, only whether one is set.
@@ -75,6 +76,10 @@ pub(crate) struct SpeakerView {
     #[serde(skip_serializing_if = "Option::is_none")]
     onvif_endpoint: Option<String>,
     camera_ids: Vec<CameraId>,
+    /// The last probe of the speaker; only on the GETs, and absent until the
+    /// first probe has run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<SpeakerStatus>,
 }
 
 impl SpeakerView {
@@ -89,6 +94,7 @@ impl SpeakerView {
             has_password: sp.password.is_some(),
             onvif_endpoint: sp.onvif_endpoint.clone(),
             camera_ids,
+            health: None,
         }
     }
 
@@ -323,6 +329,14 @@ async fn view(s: &ApiState, sp: &SpeakerConfig) -> Result<SpeakerView, ApiError>
     ))
 }
 
+/// [`view`] with the speaker's last probe, for the GETs. Not for the audit
+/// rows, which record the speaker's configuration only.
+async fn view_with_health(s: &ApiState, sp: &SpeakerConfig) -> Result<SpeakerView, ApiError> {
+    let mut v = view(s, sp).await?;
+    v.health = s.health.speaker_health().get(sp.id);
+    Ok(v)
+}
+
 async fn publish(s: &ApiState, event: serde_json::Value) {
     let _ = s.bus.publish(topic::CONFIG_CHANGED, &event).await;
 }
@@ -343,7 +357,7 @@ pub(crate) async fn list_speakers(
 ) -> Result<Json<Vec<SpeakerView>>, ApiError> {
     let mut out = Vec::new();
     for sp in s.store.list_speakers().await? {
-        out.push(view(&s, &sp).await?);
+        out.push(view_with_health(&s, &sp).await?);
     }
     Ok(Json(out))
 }
@@ -353,7 +367,7 @@ pub(crate) async fn get_speaker(
     Path(id): Path<SpeakerId>,
 ) -> Result<Json<SpeakerView>, ApiError> {
     let sp = stored(&s, id).await?;
-    Ok(Json(view(&s, &sp).await?))
+    Ok(Json(view_with_health(&s, &sp).await?))
 }
 
 pub(crate) async fn create_speaker(

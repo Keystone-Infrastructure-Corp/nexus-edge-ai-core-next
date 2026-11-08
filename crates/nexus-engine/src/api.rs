@@ -10397,6 +10397,37 @@ mod tests {
         assert!(store.list_speakers().await.unwrap().is_empty());
     }
 
+    /// The speakers GETs carry the last probe; before one has run there is none.
+    #[tokio::test]
+    async fn speakers_get_reports_health_once_probed() {
+        let (state, _store, _dir, _reg, _bus) = build_test_state(None).await;
+        let map = state.health.speaker_health();
+        let app = super::router(state);
+        let (_, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({ "name": "spk", "host": "127.0.0.1" })),
+        )
+        .await;
+        let id = speaker_json(&body)["id"].as_i64().unwrap();
+        let uri = format!("/api/v1/admin/speakers/{id}");
+        let (_, body) = speaker_call(&app, Method::GET, &uri, None).await;
+        assert!(speaker_json(&body).get("health").is_none(), "{body}");
+
+        map.mark_offline_for_test(id);
+        let (_, one) = speaker_call(&app, Method::GET, &uri, None).await;
+        let (_, all) = speaker_call(&app, Method::GET, "/api/v1/admin/speakers", None).await;
+        for health in [
+            speaker_json(&one)["health"].clone(),
+            speaker_json(&all)[0]["health"].clone(),
+        ] {
+            assert_eq!(health["online"], false, "{one}");
+            assert_eq!(health["user_agent"], "");
+            assert!(health["since"].is_string());
+        }
+    }
+
     #[tokio::test]
     async fn speaker_output_put_validates_persists_audits_and_leaves_the_session_playing() {
         use futures::StreamExt;
