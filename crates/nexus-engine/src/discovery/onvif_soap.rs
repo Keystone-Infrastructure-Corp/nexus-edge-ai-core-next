@@ -160,15 +160,26 @@ impl OnvifService {
     }
 }
 
-/// One-shot reqwest client tuned for embedded camera HTTP
+/// One-shot reqwest client for SOAP calls to embedded camera HTTP
 /// servers (short timeout, tolerant of the self-signed HTTPS
-/// certs cameras ship on :443).
+/// certs cameras ship on :443). It never follows a redirect: that
+/// would re-send the WS-Security digest in the body to another host.
 pub(crate) fn build_client() -> Result<reqwest::Client, String> {
+    client_with(reqwest::redirect::Policy::none())
+}
+
+/// [`build_client`] for plain HTTP (snapshot GET, SAS PUT): follows
+/// redirects as reqwest does by default, which drops `Authorization`
+/// on a cross-host hop.
+pub(crate) fn build_http_client() -> Result<reqwest::Client, String> {
+    client_with(reqwest::redirect::Policy::default())
+}
+
+fn client_with(redirect: reqwest::redirect::Policy) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(REQ_TIMEOUT)
         .danger_accept_invalid_certs(true)
-        // A redirect would re-send the WS-Security digest to another host.
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(redirect)
         .build()
         .map_err(|e| format!("http client build failed: {e}"))
 }
