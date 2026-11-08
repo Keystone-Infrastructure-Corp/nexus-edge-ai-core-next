@@ -20,6 +20,7 @@ pub mod outbox;
 pub mod sessions;
 pub mod sinks;
 pub mod speakers;
+pub mod talkdown;
 pub mod users;
 pub mod visual_prompts;
 pub use alert_clip::{AlertClipColdMark, AlertClipId, AlertClipRow, NewAlertClip};
@@ -33,6 +34,10 @@ pub use motion::{
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};
+pub use talkdown::{
+    ArmingState, AudioKind, AudioStatus, NewAudio, NewPlay, PlayFilter, TalkdownAudio,
+    TalkdownCore, TalkdownPlay,
+};
 pub use users::{NewUser, User, UserId, UsersError};
 pub use visual_prompts::{NewVisualPrompt, VisualPrompt, VisualPromptError, VisualPromptSummary};
 
@@ -213,6 +218,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0038_speakers",
         include_str!("../migrations/0038_speakers.sql"),
+    ),
+    (
+        "0040_talkdown_library",
+        include_str!("../migrations/0040_talkdown_library.sql"),
     ),
 ];
 
