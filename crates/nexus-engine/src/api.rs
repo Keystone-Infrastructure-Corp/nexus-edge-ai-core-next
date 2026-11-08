@@ -9062,7 +9062,9 @@ mod tests {
     }
 
     /// A `speaker_id` is local to one core, so a fleet apply whose scope is not
-    /// `core` is refused; the same rule at core scope fails only on the speaker.
+    /// `core` is refused. At core scope a speaker this core no longer has is
+    /// accepted: the responder reports it as `no_speaker`, and one deleted
+    /// speaker must not block every later rules push.
     #[tokio::test]
     async fn fleet_apply_rules_validates_talk_down() {
         const SECRET: &[u8] = b"fleet-rules-talkdown-secret";
@@ -9085,6 +9087,15 @@ mod tests {
         let res = fleet_apply_scoped(&app, SECRET, "rules", ok, "org").await;
         assert_eq!(res.status(), StatusCode::OK);
         assert!(store.list_rules().await.unwrap()[0].talk_down.is_some());
+        let unknown_speaker = serde_json::json!([td_rule(
+            "a",
+            0,
+            serde_json::json!({ "steps": steps, "speaker_id": 99 })
+        )]);
+        let res = fleet_apply_scoped(&app, SECRET, "rules", unknown_speaker, "core").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let rules = store.list_rules().await.unwrap();
+        assert_eq!(rules[0].talk_down.as_ref().unwrap().speaker_id, Some(99));
     }
 
     #[tokio::test]
