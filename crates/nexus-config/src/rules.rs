@@ -177,11 +177,12 @@ fn d_repeat() -> u8 {
     1
 }
 
+/// A lowercase hyphenated UUID, the only form library item uids take.
 fn is_uuid(s: &str) -> bool {
     s.len() == 36
         && s.bytes().enumerate().all(|(i, b)| match i {
             8 | 13 | 18 | 23 => b == b'-',
-            _ => b.is_ascii_hexdigit(),
+            _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
         })
 }
 
@@ -296,6 +297,8 @@ mod talk_down_tests {
         assert!(bad(&|t| t.steps.clear(), false));
         assert!(bad(&|t| t.steps = vec![step(); 4], false));
         assert!(bad(&|t| t.steps[0].audio_uid = "nope".into(), false));
+        // Library items are lowercase hyphenated UUIDs only.
+        assert!(bad(&|t| t.steps[0].audio_uid = UID.to_uppercase(), false));
         assert!(bad(&|t| t.steps[0].repeat = 0, false));
         assert!(bad(&|t| t.steps[0].repeat = 4, false));
         assert!(bad(&|t| t.escalate_within_secs = 9, false));
