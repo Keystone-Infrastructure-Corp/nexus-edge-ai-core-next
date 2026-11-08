@@ -77,8 +77,9 @@ impl Item {
     pub fn validate(&self) -> Result<(), String> {
         let chars = |s: &str| s.chars().count();
         let uid = &self.uid;
-        if uuid::Uuid::parse_str(uid).is_err() {
-            return Err(format!("item {uid:?}: uid must be a UUID"));
+        // Rule steps name items in this form only.
+        if uuid::Uuid::parse_str(uid).map(|u| u.hyphenated().to_string()) != Ok(uid.clone()) {
+            return Err(format!("item {uid:?}: uid must be a hyphenated lowercase UUID"));
         }
         if !(1..=80).contains(&chars(&self.name)) {
             return Err(format!("item {uid}: name must be 1 to 80 characters"));
@@ -417,6 +418,10 @@ mod tests {
 
         for (field, bad) in [
             ("uid", json!("not-a-uuid")),
+            // Rule steps name items in the hyphenated lowercase form only.
+            ("uid", json!("A1B2C3D4-0000-4000-8000-000000000001")),
+            ("uid", json!("a1b2c3d4000040008000000000000001")),
+            ("uid", json!("{a1b2c3d4-0000-4000-8000-000000000001}")),
             ("name", json!("")),
             ("name", json!("x".repeat(81))),
             ("description", json!("x".repeat(501))),
