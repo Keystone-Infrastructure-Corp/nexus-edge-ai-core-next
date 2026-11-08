@@ -20,7 +20,7 @@ pub enum AudioKind {
 }
 
 impl AudioKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Clip => "clip",
             Self::Tts => "tts",
@@ -43,6 +43,13 @@ pub enum AudioStatus {
 }
 
 impl AudioStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Pending => "pending",
+            Self::Failed => "failed",
+        }
+    }
     fn parse(s: &str) -> Result<Self, StoreError> {
         match s {
             "ready" => Ok(Self::Ready),

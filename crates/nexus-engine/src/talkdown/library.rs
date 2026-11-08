@@ -133,21 +133,6 @@ pub fn contract_json(a: &TalkdownAudio) -> Value {
     }
 }
 
-pub fn kind_str(kind: AudioKind) -> &'static str {
-    match kind {
-        AudioKind::Clip => "clip",
-        AudioKind::Tts => "tts",
-    }
-}
-
-pub fn status_str(status: AudioStatus) -> &'static str {
-    match status {
-        AudioStatus::Ready => "ready",
-        AudioStatus::Pending => "pending",
-        AudioStatus::Failed => "failed",
-    }
-}
-
 /// Bring `pcm` to -20 dBFS RMS through the soft limiter, so every item
 /// plays at the same loudness and none wraps. Digital silence stays.
 pub fn normalize(pcm: &mut [i16]) {

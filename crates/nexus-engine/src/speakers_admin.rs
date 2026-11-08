@@ -94,7 +94,6 @@ use crate::api::{ApiError, ApiState};
 use crate::auth::admin_audit::{audit_admin_action, audit_admin_action_in_tx};
 use crate::auth::require_role::SessionContext;
 use crate::talkdown::health::SpeakerStatus;
-use crate::talkdown::library::{kind_str, status_str};
 use crate::talkdown::responder::{finish_play, started_at};
 use crate::talkdown::session::{Audio, Origin, StartError, StartRequest};
 use crate::talkdown::tts;
@@ -1222,8 +1221,8 @@ pub(crate) async fn list_talkdown_audio(
                     "uid": a.uid,
                     "name": a.name,
                     "description": a.description,
-                    "kind": kind_str(a.kind),
-                    "status": status_str(a.status),
+                    "kind": a.kind.as_str(),
+                    "status": a.status.as_str(),
                     "error": a.error,
                     "duration_ms": a.duration_ms,
                     "fleet_managed": managed.contains(&a.uid),
@@ -1577,8 +1576,8 @@ pub(crate) async fn talkdown_status(
             "items": items.iter().map(|a| serde_json::json!({
                 "uid": a.uid,
                 "name": a.name,
-                "kind": kind_str(a.kind),
-                "status": status_str(a.status),
+                "kind": a.kind.as_str(),
+                "status": a.status.as_str(),
                 "error": a.error,
             })).collect::<Vec<_>>(),
         },
