@@ -229,7 +229,15 @@ pub async fn post_admin_fleet_apply(
         }
     };
 
-    let result = apply_category(&s, &category, &req.effective, req.mode, &prev_keys).await;
+    let result = apply_category(
+        &s,
+        &category,
+        &req.effective,
+        req.mode,
+        &prev_keys,
+        req.scope.as_ref().is_some_and(|sc| sc.scope_type == "core"),
+    )
+    .await;
     let outcome = if result.is_ok() {
         AuditOutcome::Success
     } else {
@@ -323,9 +331,10 @@ async fn apply_category(
     effective: &Value,
     mode: FleetApplyMode,
     prev_keys: &[String],
+    scope_is_core: bool,
 ) -> Result<AppliedCategory, ApiError> {
     match category {
-        "rules" => apply_rules(s, effective, mode, prev_keys).await,
+        "rules" => apply_rules(s, effective, mode, prev_keys, scope_is_core).await,
         "text_prompts" => apply_text_prompts(s, effective, mode, prev_keys).await,
         "visual_prompts" => apply_visual_prompts(s, effective, mode, prev_keys).await,
         "detector_config" => apply_detector_config(s, effective).await,
@@ -425,6 +434,7 @@ async fn apply_rules(
     effective: &Value,
     mode: FleetApplyMode,
     prev_keys: &[String],
+    scope_is_core: bool,
 ) -> Result<AppliedCategory, ApiError> {
     let rules: Vec<RuleConfig> = serde_json::from_value(effective.clone())
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rules payload: {e}")))?;
@@ -441,6 +451,7 @@ async fn apply_rules(
                 format!("invalid CEL in rule {:?}: {msg}", rule.id),
             ));
         }
+        crate::api::validate_rule_talk_down_on_save(s, rule, scope_is_core).await?;
     }
     let keep: std::collections::HashSet<&str> = rules.iter().map(|r| r.id.as_str()).collect();
     let retract = retractable(mode, prev_keys, &keep);

@@ -244,6 +244,7 @@ fn corpus_to_rule_configs() -> Vec<RuleConfig> {
             enabled: true,
             sinks: Vec::new(),
             verify: false,
+            talk_down: None,
         })
         .collect()
 }
@@ -920,6 +921,7 @@ fn every_corpus_rule_compiles() {
             enabled: true,
             sinks: Vec::new(),
             verify: false,
+            talk_down: None,
         };
         if let Err(e) = engine.compile(&cfg) {
             failures.push(format!("{}: {}", spec.id, e));
@@ -971,6 +973,7 @@ fn golden_fixtures_match_expected_verdicts() {
             enabled: true,
             sinks: Vec::new(),
             verify: false,
+            talk_down: None,
         };
         let compiled = engine
             .compile(&cfg)

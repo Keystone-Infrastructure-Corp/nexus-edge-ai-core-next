@@ -180,6 +180,7 @@ fn rule(id: &str, when: &str) -> RuleConfig {
         enabled: true,
         sinks: Vec::new(),
         verify: false,
+        talk_down: None,
     }
 }
 

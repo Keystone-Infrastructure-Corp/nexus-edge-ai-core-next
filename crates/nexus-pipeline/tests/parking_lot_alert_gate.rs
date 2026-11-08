@@ -107,6 +107,7 @@ fn rule_for(label: &str, cooldown_ms: u64) -> RuleConfig {
         enabled: true,
         sinks: Vec::new(),
         verify: false,
+        talk_down: None,
     }
 }
 

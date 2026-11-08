@@ -1830,6 +1830,7 @@ async fn upsert_rule(
             format!("invalid CEL in `when`: {msg}"),
         ));
     }
+    validate_rule_talk_down_on_save(&s, &rule, true).await?;
     let before = s
         .store
         .list_rules()
@@ -1922,6 +1923,7 @@ async fn create_rule(
             format!("invalid CEL in `when`: {msg}"),
         ));
     }
+    validate_rule_talk_down_on_save(&s, &rule, true).await?;
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
         // Allocate the id INSIDE the tx so two concurrent
@@ -2129,6 +2131,7 @@ async fn validate_rule(Json(req): Json<ValidateRuleReq>) -> Json<ValidateRuleRes
         enabled: true,
         sinks: Vec::new(),
         verify: false,
+        talk_down: None,
     };
     match compile_cel_safely(&stub) {
         Ok(()) => Json(ValidateRuleResp {
@@ -2184,6 +2187,30 @@ async fn get_rules_schema(State(s): State<ApiState>) -> Json<RulesSchemaResp> {
             "group.size",
         ],
     })
+}
+
+/// ADR-095 save-time check of a rule's talk-down action (shape, D10 window,
+/// and that a named `speaker_id` exists on this core). `scope_is_core`: local
+/// rules and core-scoped fleet applies.
+pub(crate) async fn validate_rule_talk_down_on_save(
+    s: &ApiState,
+    rule: &RuleConfig,
+    scope_is_core: bool,
+) -> Result<(), ApiError> {
+    rule.validate_talk_down(scope_is_core)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rule {:?}: {e}", rule.id)))?;
+    if let Some(id) = rule.talk_down.as_ref().and_then(|t| t.speaker_id) {
+        if s.store.get_speaker(id).await?.is_none() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "rule {:?}: talk_down speaker_id {id} is not a speaker on this core",
+                    rule.id
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Wrap [`CelEngine::compile`] in `catch_unwind` so a user-supplied
@@ -7861,6 +7888,7 @@ mod tests {
                 enabled: true,
                 sinks: Vec::new(),
                 verify: false,
+                talk_down: None,
             })
             .await
             .unwrap();
@@ -7905,6 +7933,7 @@ mod tests {
                 enabled: true,
                 sinks: Vec::new(),
                 verify: false,
+                talk_down: None,
             })
             .await
             .unwrap();
@@ -7975,6 +8004,7 @@ mod tests {
                 enabled: true,
                 sinks: Vec::new(),
                 verify: false,
+                talk_down: None,
             })
             .await
             .unwrap();
@@ -8650,10 +8680,20 @@ mod tests {
         category: &str,
         effective: serde_json::Value,
     ) -> axum::http::Response<Body> {
+        fleet_apply_scoped(app, secret, category, effective, "core").await
+    }
+
+    async fn fleet_apply_scoped(
+        app: &axum::Router,
+        secret: &[u8],
+        category: &str,
+        effective: serde_json::Value,
+        scope_type: &str,
+    ) -> axum::http::Response<Body> {
         let token = sign_admin_jwt(secret);
         let body = serde_json::json!({
             "effective": effective,
-            "scope": { "type": "core", "id": "00000000-0000-0000-0000-000000000000" },
+            "scope": { "type": scope_type, "id": "00000000-0000-0000-0000-000000000000" },
         });
         let mut req = Request::builder()
             .method(Method::POST)
@@ -8934,6 +8974,77 @@ mod tests {
 
     /// The fleet-apply route sits behind the admin gate: no bearer
     /// from a remote peer is a 401.
+    const TD_UID: &str = "0190f3a2-7b1c-7e0a-9c55-3f2a1b4c5d6e";
+
+    fn td_rule(id: &str, cooldown_ms: u64, td: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": "td", "when": "object.label == 'person'", "severity": "low",
+            "cooldown_ms": cooldown_ms, "talk_down": td,
+        })
+    }
+
+    /// ADR-095 / D10: upsert refuses a bad talk-down (window not above the rule's
+    /// cooldown, unknown speaker) and accepts a valid one.
+    #[tokio::test]
+    async fn upsert_rule_validates_talk_down() {
+        let (app, store, _dir) = build_test_router(None).await;
+        let put = |body: serde_json::Value| {
+            let mut req = Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/rules/td1")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let app = app.clone();
+            async move { app.oneshot(req).await.unwrap().status() }
+        };
+        let steps = serde_json::json!([{ "audio_uid": TD_UID }]);
+        // window 30 s <= cooldown 60 s
+        let bad = td_rule("td1", 60_000, serde_json::json!({ "steps": steps }));
+        assert_eq!(put(bad).await, StatusCode::BAD_REQUEST);
+        // unknown speaker
+        let spk = td_rule(
+            "td1",
+            0,
+            serde_json::json!({ "steps": steps, "speaker_id": 99 }),
+        );
+        assert_eq!(put(spk).await, StatusCode::BAD_REQUEST);
+        // 0 steps
+        let none = td_rule("td1", 0, serde_json::json!({ "steps": [] }));
+        assert_eq!(put(none).await, StatusCode::BAD_REQUEST);
+        assert!(store.list_rules().await.unwrap().is_empty());
+        let ok = td_rule("td1", 0, serde_json::json!({ "steps": steps }));
+        assert_eq!(put(ok).await, StatusCode::OK);
+        assert!(store.list_rules().await.unwrap()[0].talk_down.is_some());
+    }
+
+    /// A `speaker_id` is local to one core, so a fleet apply whose scope is not
+    /// `core` is refused; the same rule at core scope fails only on the speaker.
+    #[tokio::test]
+    async fn fleet_apply_rules_validates_talk_down() {
+        const SECRET: &[u8] = b"fleet-rules-talkdown-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let steps = serde_json::json!([{ "audio_uid": TD_UID }]);
+        let with_speaker = serde_json::json!([td_rule(
+            "a",
+            0,
+            serde_json::json!({ "steps": steps, "speaker_id": 1 })
+        )]);
+        let res = fleet_apply_scoped(&app, SECRET, "rules", with_speaker, "org").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bad_window =
+            serde_json::json!([td_rule("a", 60_000, serde_json::json!({ "steps": steps }))]);
+        let res = fleet_apply(&app, SECRET, "rules", bad_window).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(store.list_rules().await.unwrap().is_empty());
+        // org-wide rule without a speaker applies; an unknown uid is accepted.
+        let ok = serde_json::json!([td_rule("a", 0, serde_json::json!({ "steps": steps }))]);
+        let res = fleet_apply_scoped(&app, SECRET, "rules", ok, "org").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(store.list_rules().await.unwrap()[0].talk_down.is_some());
+    }
+
     #[tokio::test]
     async fn fleet_apply_requires_admin_bearer() {
         const SECRET: &[u8] = b"fleet-gate-secret";
