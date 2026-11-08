@@ -511,7 +511,13 @@ async fn tick(
     let mut uploaded = 0usize;
     let mut failed = 0usize;
     let mut quarantined = 0usize;
+    let drain_alerts = cfg.outbox.is_some();
     for clip in pending {
+        // Alert clips first (~1 MB each): one waiting behind a long
+        // motion batch is evicted at the 15-min grace before it uploads.
+        if drain_alerts {
+            drain_alert_clips(cfg, store, &*backend, throttle, &backend_handle, floor).await;
+        }
         // Pre-emptive size guard. A clip whose on-disk bytes exceed
         // the cold-upload ceiling (2x the recorder's `max_clip_bytes`
         // cap) can only be a corrupt byte-explosion — it can never
@@ -608,13 +614,15 @@ async fn tick(
         );
     }
 
-    // 4b. Alert clips (M-Alert-Clip cloud delivery). A second drain
-    // pass, independent of the motion batch above — an alert clip can
-    // be pending when no motion clip is. Gated on a wired outbox
+    // 4b. Alert clips (M-Alert-Clip cloud delivery). Also drained
+    // before each motion upload above; this final pass catches clips
+    // that became ready during the last upload and the empty-batch
+    // case — an alert clip can be pending when no motion clip is.
+    // Gated on a wired outbox
     // because console delivery is the feature's whole point: with no
     // cloud tunnel there is nowhere to deliver, and the evictor's
     // grace window reclaims the transient hot file anyway.
-    if cfg.outbox.is_some() {
+    if drain_alerts {
         drain_alert_clips(cfg, store, &*backend, throttle, &backend_handle, floor).await;
     }
 }
@@ -1184,6 +1192,11 @@ mod tests {
         /// When true, `put` returns a URL-form receipt like the Azure
         /// backend does, so the clip gets announced.
         with_url: Mutex<bool>,
+        /// Every `put` path, in call order.
+        put_paths: Mutex<Vec<String>>,
+        /// One-shot future run on the first `put`, before it records.
+        first_put_hook:
+            Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
     }
     impl MockBackend {
         fn new(handle: &str, health: HealthStatus) -> Arc<Self> {
@@ -1194,6 +1207,8 @@ mod tests {
                 existing: Mutex::new(Default::default()),
                 fail: Mutex::new(false),
                 with_url: Mutex::new(false),
+                put_paths: Mutex::new(Vec::new()),
+                first_put_hook: Mutex::new(None),
             })
         }
         fn put_count(&self) -> u32 {
@@ -1226,6 +1241,11 @@ mod tests {
             _expected_sha256: &str,
         ) -> Result<PutReceipt, BackendError> {
             self.puts.fetch_add(1, Ordering::SeqCst);
+            self.put_paths.lock().push(path.to_string());
+            let hook = self.first_put_hook.lock().take();
+            if let Some(hook) = hook {
+                hook.await;
+            }
             if *self.fail.lock() {
                 return Err(BackendError::Other("injected put failure".into()));
             }
@@ -2287,5 +2307,136 @@ mod tests {
             "pre-enrollment clip should upload when --keep-history was set"
         );
         assert_eq!(backend.put_count(), 1, "exactly one put expected");
+    }
+
+    /// Add a second closed motion clip to a `seed_one_pending_clip` store.
+    async fn add_pending_motion_clip(store: &Store, clips_dir: &std::path::Path) {
+        let now = Utc::now();
+        let rel = "1/clip_0002.mp4".to_string();
+        let id = store
+            .open_clip(&NewClip {
+                camera_id: 1,
+                started_at: now - ChronoDuration::seconds(30),
+                hot_path: rel.clone(),
+                codec: "stub".into(),
+                container: "mp4".into(),
+                hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .unwrap();
+        tokio::fs::write(clips_dir.join(&rel), b"clip-bytes")
+            .await
+            .unwrap();
+        store
+            .close_clip(
+                id,
+                &ClipClose {
+                    ended_at: now,
+                    duration_ms: 1000,
+                    size_bytes: 10,
+                    hot_path: Some(rel),
+                    sha256: Some(format!("{:064x}", id)),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Insert a `building` alert clip with its file on disk.
+    async fn insert_alert_clip_file(store: &Store, clips_dir: &std::path::Path) -> i64 {
+        let rel = "alert/1/2026-07-17/1.mp4";
+        tokio::fs::create_dir_all(clips_dir.join("alert/1/2026-07-17"))
+            .await
+            .unwrap();
+        tokio::fs::write(clips_dir.join(rel), b"alert-bytes")
+            .await
+            .unwrap();
+        store
+            .insert_alert_clip(&nexus_store::NewAlertClip {
+                camera_id: 1,
+                started_at: Utc::now(),
+                path: rel.into(),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn run_one_tick(
+        cfg: &ColdReplicatorConfig,
+        store: &Arc<Store>,
+        backend: &Arc<MockBackend>,
+    ) {
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let mut healthy = true;
+        tick(
+            cfg,
+            store,
+            &bus,
+            &registry,
+            &TokenBucket::new(0),
+            &mut healthy,
+        )
+        .await;
+    }
+
+    /// An alert clip that is already ready uploads before any motion
+    /// clip, so a long motion batch cannot hold it past the evictor's
+    /// grace.
+    #[tokio::test]
+    async fn ready_alert_clip_uploads_before_the_motion_batch() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        add_pending_motion_clip(&store, &clips_dir).await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+
+        run_one_tick(&cfg, &store, &backend).await;
+
+        let paths = backend.put_paths.lock().clone();
+        let alert = format!("alert-{alert_id}");
+        assert_eq!(paths.len(), 3, "alert + two motion puts: {paths:?}");
+        assert!(
+            paths[0].contains(&alert),
+            "alert put must be first: {paths:?}"
+        );
+    }
+
+    /// An alert clip that turns ready while the first motion clip is
+    /// uploading goes out before the second motion clip, not after the
+    /// whole batch.
+    #[tokio::test]
+    async fn alert_clip_ready_mid_batch_uploads_before_next_motion_clip() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        add_pending_motion_clip(&store, &clips_dir).await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir).await;
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let hook_store = store.clone();
+        *backend.first_put_hook.lock() = Some(Box::pin(async move {
+            hook_store
+                .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+                .await
+                .unwrap();
+        }));
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+
+        run_one_tick(&cfg, &store, &backend).await;
+
+        let paths = backend.put_paths.lock().clone();
+        let alert = format!("alert-{alert_id}");
+        assert_eq!(paths.len(), 3, "two motion puts + alert: {paths:?}");
+        assert!(
+            paths[1].contains(&alert),
+            "alert put must precede the second motion put: {paths:?}"
+        );
     }
 }
