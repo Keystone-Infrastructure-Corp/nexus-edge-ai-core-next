@@ -69,10 +69,10 @@ pub const BATCH_SIZE: i64 = 32;
 /// an Expedite + candidate alert on the same clip just lands at 2.
 pub const URGENT_CLIP_PRIORITY: i64 = 2;
 
-/// M-Alert-Clip cloud delivery — max alert clips drained per tick.
+/// M-Alert-Clip cloud delivery — max alert clips per drain call.
 /// Alert clips are small (seconds) and few (one per motion burst), so
-/// a small batch is plenty; the drain is a second pass after the
-/// motion batch and shares the same backend + throttle.
+/// a small batch is plenty; the drain runs before each motion upload
+/// and once after the motion batch, sharing the same backend + throttle.
 pub const ALERT_COLD_BATCH: i64 = 8;
 
 /// M-Alert-Clip cloud delivery — minimum spacing between cold-upload
@@ -809,8 +809,8 @@ async fn reannounce(cfg: &ColdReplicatorConfig, store: &Store, now: chrono::Date
 /// M-Alert-Clip cloud delivery — drain up to [`ALERT_COLD_BATCH`]
 /// ready alert clips onto the active cold backend and emit a
 /// `clip_replicated` (`is_alert_clip = true`) envelope for each. Runs
-/// as a second pass inside [`tick`] after the motion drain, reusing
-/// the same backend, throttle, and enrollment floor.
+/// inside [`tick`] before each motion upload and once after the motion
+/// drain, reusing the same backend, throttle, and enrollment floor.
 async fn drain_alert_clips(
     cfg: &ColdReplicatorConfig,
     store: &Arc<Store>,
