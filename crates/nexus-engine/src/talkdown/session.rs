@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use nexus_cloud_protocol::v1::IceServer;
 use nexus_config::{SpeakerConfig, SpeakerId};
+use nexus_store::SpeakerOutput;
 use nexus_types::CameraId;
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -21,7 +22,7 @@ use uuid::Uuid;
 #[cfg(feature = "gstreamer-webrtc")]
 use super::live::Live;
 use super::sip::{place_call, SipCall, SipTarget, TalkdownError};
-use super::{clip, tone_pcm};
+use super::{clip, tone_pcm, Gain};
 
 /// What this build can play, as the talk-down GET lists it.
 pub const MODES: &[&str] = if cfg!(feature = "gstreamer-webrtc") {
@@ -76,6 +77,25 @@ impl Audio {
     }
 }
 
+/// Who started a session. A rule play never pre-empts a manual or live one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    Manual,
+    Rule { rule_id: String, step: u8 },
+}
+
+/// Everything a start needs besides the audio. `output` is the speaker's
+/// stored output, read by the caller.
+pub struct StartRequest<'a> {
+    pub speaker: &'a SpeakerConfig,
+    pub output: SpeakerOutput,
+    pub camera_id: Option<CameraId>,
+    pub origin: Origin,
+    pub audio: &'a Audio,
+    /// The alert this play answers, for a rule play.
+    pub event_id: Option<String>,
+}
+
 pub enum StartError {
     Busy,
     /// The camera no longer pairs with the speaker the caller read.
@@ -93,9 +113,30 @@ pub enum StartError {
     Negotiation(String),
 }
 
-/// Each busy speaker: the camera that started its session, the session's id,
-/// and its cancel.
-type Active = Arc<Mutex<HashMap<SpeakerId, (Option<CameraId>, Uuid, CancellationToken)>>>;
+/// A busy speaker's session. `gain` is shared with the call; the session's
+/// volume and boost are recomposed into it whenever either changes.
+struct Claim {
+    camera_id: Option<CameraId>,
+    id: Uuid,
+    cancel: CancellationToken,
+    /// Read by the rule responder's pre-emption check (Task 13).
+    #[allow(dead_code)]
+    origin: Origin,
+    gain: Gain,
+    output: SpeakerOutput,
+    session_volume: u8,
+    boost: bool,
+}
+
+impl Claim {
+    fn recompose(&self) {
+        self.gain
+            .set(Gain::compose(&self.output, self.session_volume, self.boost));
+    }
+}
+
+/// Each busy speaker's session.
+type Active = Arc<Mutex<HashMap<SpeakerId, Claim>>>;
 
 /// The engine's talk-down sessions, shared by every handler.
 #[derive(Clone, Default)]
@@ -125,7 +166,30 @@ impl TalkdownSessions {
         self.active
             .lock()
             .get(&speaker_id)
-            .map(|(camera, id, _)| (*camera, *id))
+            .map(|c| (c.camera_id, c.id))
+    }
+
+    /// Set the volume (and boost) of the session `camera_id` started; false
+    /// when it has none. The next frame uses it; nothing is persisted.
+    pub fn set_session_volume(&self, camera_id: CameraId, volume: u8, boost: bool) -> bool {
+        let mut active = self.active.lock();
+        let Some(claim) = active.values_mut().find(|c| c.camera_id == Some(camera_id)) else {
+            return false;
+        };
+        claim.session_volume = volume;
+        claim.boost = boost;
+        claim.recompose();
+        true
+    }
+
+    /// The speaker's stored output changed: a session on it follows, without
+    /// ending. The speaker's boost replaces the session's.
+    pub fn set_speaker_output(&self, speaker_id: SpeakerId, output: &SpeakerOutput) {
+        if let Some(claim) = self.active.lock().get_mut(&speaker_id) {
+            claim.output = *output;
+            claim.boost = output.boost;
+            claim.recompose();
+        }
     }
 
     /// Cancel every session `ends` picks by its speaker, the camera that
@@ -138,9 +202,9 @@ impl TalkdownSessions {
         let active = self.active.lock();
         active
             .iter()
-            .filter(|(&speaker_id, (camera_id, id, _))| ends(speaker_id, *camera_id, *id))
-            .map(|(&speaker_id, (_, _, cancel))| {
-                cancel.cancel();
+            .filter(|(&speaker_id, c)| ends(speaker_id, c.camera_id, c.id))
+            .map(|(&speaker_id, c)| {
+                c.cancel.cancel();
                 speaker_id
             })
             .collect()
@@ -160,11 +224,18 @@ impl TalkdownSessions {
     /// CANCELled, and an answered call is hung up.
     pub async fn start(
         &self,
-        speaker: &SpeakerConfig,
-        camera_id: Option<CameraId>,
-        audio: &Audio,
+        req: StartRequest<'_>,
         paired: impl Future<Output = bool>,
     ) -> Result<(Uuid, Option<String>, JoinHandle<Result<(), TalkdownError>>), StartError> {
+        // `event_id` is for the plays log (Task 13).
+        let StartRequest {
+            speaker,
+            output,
+            camera_id,
+            origin,
+            audio,
+            event_id: _,
+        } = req;
         #[cfg(not(feature = "gstreamer-webrtc"))]
         if matches!(audio, Audio::Live { .. }) {
             return Err(StartError::LiveUnsupported);
@@ -177,7 +248,7 @@ impl TalkdownSessions {
                 return Err(StartError::Negotiation("the offer has no audio".into()));
             }
         }
-        let session = self.claim(speaker.id, camera_id)?;
+        let session = self.claim(speaker.id, camera_id, origin, output)?;
         if !paired.await {
             return Err(StartError::Unpaired);
         }
@@ -222,6 +293,7 @@ impl TalkdownSessions {
                     StartError::Call(e)
                 }
             })?;
+        call.set_gain(session.gain.clone());
         #[cfg(feature = "gstreamer-webrtc")]
         let (live, sdp_answer) = match audio {
             Audio::Live {
@@ -265,8 +337,18 @@ impl TalkdownSessions {
                 Ok(()) => call.hangup().await,
                 Err(e) => Err(e),
             };
-            if let Err(e) = &res {
-                tracing::warn!(speaker_id = session.speaker_id, error = %e, "talk-down call failed");
+            match &res {
+                // The speaker's own hang-up, not a fault.
+                Err(TalkdownError::EndedBySpeaker) => {
+                    tracing::info!(
+                        speaker_id = session.speaker_id,
+                        "talk-down: the speaker hung up"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(speaker_id = session.speaker_id, error = %e, "talk-down call failed");
+                }
+                Ok(()) => {}
             }
             res
             // `session` drops here, after the hangup: the speaker is free.
@@ -278,12 +360,25 @@ impl TalkdownSessions {
         &self,
         speaker_id: SpeakerId,
         camera_id: Option<CameraId>,
+        origin: Origin,
+        output: SpeakerOutput,
     ) -> Result<Session, StartError> {
         let id = Uuid::now_v7();
         let cancel = CancellationToken::new();
+        let gain = Gain::new(Gain::compose(&output, 100, output.boost));
+        let claim = Claim {
+            camera_id,
+            id,
+            cancel: cancel.clone(),
+            origin,
+            gain: gain.clone(),
+            output,
+            session_volume: 100,
+            boost: output.boost,
+        };
         match self.active.lock().entry(speaker_id) {
             Entry::Occupied(_) => return Err(StartError::Busy),
-            Entry::Vacant(slot) => slot.insert((camera_id, id, cancel.clone())),
+            Entry::Vacant(slot) => slot.insert(claim),
         };
         Ok(Session {
             active: self.active.clone(),
@@ -291,6 +386,7 @@ impl TalkdownSessions {
             speaker_id,
             camera_id,
             cancel,
+            gain,
         })
     }
 }
@@ -313,6 +409,7 @@ struct Session {
     /// The camera that started it; `None` for an installer's speaker test.
     camera_id: Option<CameraId>,
     cancel: CancellationToken,
+    gain: Gain,
 }
 
 impl Drop for Session {
@@ -331,11 +428,57 @@ impl Drop for Session {
 mod tests {
     use super::*;
 
+    fn output() -> SpeakerOutput {
+        SpeakerOutput {
+            volume: 50,
+            boost: false,
+            hw_volume: false,
+            auto_max_per_hour: 6,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_volume_change_recomposes_the_live_gain_for_its_camera_only() {
+        let sessions = TalkdownSessions::default();
+        let session = sessions
+            .claim(7, Some(1), Origin::Manual, output())
+            .ok()
+            .unwrap();
+        assert!((session.gain.get() - 0.1).abs() < 1e-6, "speaker volume 50");
+
+        assert!(sessions.set_session_volume(1, 50, false));
+        assert!((session.gain.get() - 0.01).abs() < 1e-6);
+        assert!(sessions.set_session_volume(1, 100, true));
+        assert!((session.gain.get() - 0.2).abs() < 1e-6, "boost doubles it");
+        assert!(!sessions.set_session_volume(2, 10, false), "another camera");
+
+        // The speaker's stored output changed: the session follows, still playing.
+        let louder = SpeakerOutput {
+            volume: 100,
+            boost: false,
+            ..output()
+        };
+        sessions.set_speaker_output(7, &louder);
+        assert_eq!(session.gain.get(), 1.0);
+        assert!(sessions.is_busy(7));
+        sessions.set_speaker_output(8, &louder); // no session: a no-op
+
+        // A speaker test (no camera) has no session volume to set.
+        drop(session);
+        let test = sessions
+            .claim(7, None, Origin::Manual, output())
+            .ok()
+            .unwrap();
+        assert!(!sessions.set_session_volume(1, 10, false));
+        drop(test);
+    }
+
     #[tokio::test]
     async fn a_panicking_play_task_still_releases_the_speaker() {
         let sessions = TalkdownSessions::default();
-        let session = sessions.claim(7, Some(1)).ok().unwrap();
-        assert!(matches!(sessions.claim(7, None), Err(StartError::Busy)));
+        let claim = |camera| sessions.claim(7, camera, Origin::Manual, output());
+        let session = claim(Some(1)).ok().unwrap();
+        assert!(matches!(claim(None), Err(StartError::Busy)));
         let task = tokio::spawn(async move {
             let _session = session;
             panic!("play task panicked");

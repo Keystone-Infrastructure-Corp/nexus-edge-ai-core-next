@@ -10,6 +10,7 @@ use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::g711::Codec;
+use super::{limit, Gain};
 
 /// Samples in one 20 ms frame at 8 kHz.
 pub const FRAME_SAMPLES: usize = 160;
@@ -63,6 +64,8 @@ pub struct SipCall {
     ssrc: u32,
     last_sent: Option<Instant>,
     hung_up: bool,
+    /// Applied to every sample sent; the session shares it to change volume mid-call.
+    gain: Gain,
 }
 
 /// Send SIP `OPTIONS`, from `source` when given (else the address that
@@ -188,12 +191,18 @@ pub async fn place_call(
         ssrc: getrandom::u32().unwrap_or_default(),
         last_sent: None,
         hung_up: false,
+        gain: Gain::default(),
     };
     call.send_frame(&[]).await?;
     Ok(call)
 }
 
 impl SipCall {
+    /// Replace the gain applied to every later frame.
+    pub fn set_gain(&mut self, gain: Gain) {
+        self.gain = gain;
+    }
+
     /// Send one 20 ms frame (at most 160 samples, padded with silence) as one
     /// RTP packet. The caller paces.
     pub async fn send_frame(&mut self, pcm: &[i16]) -> Result<(), TalkdownError> {
@@ -225,8 +234,13 @@ impl SipCall {
         packet.extend_from_slice(&self.seq.to_be_bytes());
         packet.extend_from_slice(&self.timestamp.to_be_bytes());
         packet.extend_from_slice(&self.ssrc.to_be_bytes());
+        let gain = self.gain.get();
         let samples = pcm.iter().copied().chain(std::iter::repeat(0));
-        packet.extend(samples.take(FRAME_SAMPLES).map(|s| self.codec.encode(s)));
+        packet.extend(
+            samples
+                .take(FRAME_SAMPLES)
+                .map(|s| self.codec.encode(limit(f32::from(s) * gain))),
+        );
         if let Err(e) = self.rtp.send(&packet).await {
             // The connected socket reports an earlier ICMP port-unreachable
             // (a speaker not listening yet) on this send: lose the frame,
@@ -878,6 +892,92 @@ pub(crate) mod tests {
             assert!(header(in_dialog, "To").unwrap().ends_with(";tag=uas1"));
         }
         assert_eq!(header(&seen[2], "CSeq"), Some("2 BYE"));
+    }
+
+    /// One PCMU call whose first received frames are read after `send` ran on
+    /// it; returns what `send` left in the RTP socket (the opener excluded).
+    async fn frames_sent(send: impl AsyncFnOnce(&mut SipCall)) -> Vec<Vec<u8>> {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let (port, uas) = fake_uas("BYE", move |req| {
+            if req.starts_with("INVITE") {
+                vec![reply(req, "200 OK", SDP, &answer(rtp_port, "0"))]
+            } else if req.starts_with("BYE") {
+                vec![reply(req, "200 OK", "", "")]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        send(&mut call).await;
+        call.hangup().await.unwrap();
+        uas.await.unwrap();
+        let mut buf = [0u8; 2048];
+        let mut frames = Vec::new();
+        while let Ok(n) = rtp.try_recv(&mut buf) {
+            frames.push(buf[12..n].to_vec());
+        }
+        frames.remove(0);
+        frames
+    }
+
+    fn pcmu(sample: f32) -> Vec<u8> {
+        vec![crate::talkdown::g711::ulaw(limit(sample)); FRAME_SAMPLES]
+    }
+
+    /// Volume 50 is -20 dB: a 10 000 sample leaves as 1 000. Boost doubles it,
+    /// and what would pass full scale is limited rather than wrapped.
+    #[tokio::test]
+    async fn the_gain_scales_every_sample_and_the_limiter_prevents_wrap() {
+        let loud = vec![10_000i16; FRAME_SAMPLES];
+        let near_full = vec![30_000i16; FRAME_SAMPLES];
+        let out = nexus_store::SpeakerOutput {
+            volume: 50,
+            boost: true,
+            hw_volume: false,
+            auto_max_per_hour: 6,
+        };
+        let frames = frames_sent(async |call| {
+            call.send_frame(&loud).await.unwrap();
+            call.set_gain(Gain::new(Gain::compose(&out, 100, false)));
+            call.send_frame(&loud).await.unwrap();
+            call.set_gain(Gain::new(Gain::compose(&out, 100, true)));
+            call.send_frame(&loud).await.unwrap();
+            call.set_gain(Gain::new(2.0));
+            call.send_frame(&near_full).await.unwrap();
+        })
+        .await;
+        assert_eq!(frames[0], pcmu(10_000.0), "unity before a gain is set");
+        assert_eq!(frames[1], pcmu(1_000.0), "volume 50");
+        assert_eq!(frames[2], pcmu(2_000.0), "volume 50 with boost");
+        assert_eq!(frames[3], pcmu(60_000.0), "limited, not wrapped");
+        assert!(
+            limit(60_000.0) > 30_000 && frames[3][0] >= 0x80,
+            "positive (µ-law sign bit set), not a wrap"
+        );
+    }
+
+    /// The session changes the gain it shares with the call; the next frame uses it.
+    #[tokio::test]
+    async fn a_shared_gain_change_applies_to_the_next_frame() {
+        let loud = vec![10_000i16; FRAME_SAMPLES];
+        let gain = Gain::new(1.0);
+        let shared = gain.clone();
+        let frames = frames_sent(async |call| {
+            call.set_gain(gain);
+            call.send_frame(&loud).await.unwrap();
+            shared.set(0.1);
+            call.send_frame(&loud).await.unwrap();
+        })
+        .await;
+        assert_eq!(frames, [pcmu(10_000.0), pcmu(1_000.0)]);
     }
 
     /// A host filter that sees a UDP flow start with the speaker's RTP can

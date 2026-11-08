@@ -18,6 +18,12 @@
 //!   it only when it is that session
 //! * `POST           /api/v1/admin/speakers/{id}/test` — play the chime and
 //!   answer when it has finished
+//! * `PUT            /api/v1/admin/speakers/{id}/output` —
+//!   `{"volume": 0-100, "boost": bool, "auto_max_per_hour": 1-60}`; stored,
+//!   and a session on the speaker follows without ending
+//! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down/volume` —
+//!   `{"volume": 0-100, "boost"?: bool}`; only the session this camera
+//!   started, only while it plays, never stored
 //!
 //! A session ends as soon as its camera and speaker part: a delete of the
 //! speaker, an assignment that moves the camera off it, or an edit of the
@@ -43,7 +49,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nexus_bus::{topic, BusExt};
 use nexus_config::{SpeakerConfig, SpeakerDriver, SpeakerId};
-use nexus_store::{AuditOutcome, SqliteTx, Store, StoreError};
+use nexus_store::{AuditOutcome, SpeakerOutput, SqliteTx, Store, StoreError};
 use nexus_types::CameraId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -51,7 +57,7 @@ use uuid::Uuid;
 use crate::api::{ApiError, ApiState};
 use crate::auth::admin_audit::{audit_admin_action, audit_admin_action_in_tx};
 use crate::auth::require_role::SessionContext;
-use crate::talkdown::session::{Audio, StartError, MODES};
+use crate::talkdown::session::{Audio, Origin, StartError, StartRequest, MODES};
 
 /// A speaker as the API shows it: no password, only whether one is set.
 #[derive(Serialize)]
@@ -93,6 +99,35 @@ pub(crate) struct CameraIdsInput {
 #[derive(Deserialize)]
 pub(crate) struct TalkDownInput {
     speaker_id: Option<SpeakerId>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OutputInput {
+    volume: i64,
+    boost: bool,
+    auto_max_per_hour: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VolumeInput {
+    volume: i64,
+    boost: Option<bool>,
+}
+
+/// `value` as a `u8` within `range`, else a 400 naming `what`.
+fn in_range(what: &str, value: i64, range: std::ops::RangeInclusive<u8>) -> Result<u8, ApiError> {
+    u8::try_from(value)
+        .ok()
+        .filter(|v| range.contains(v))
+        .ok_or_else(|| {
+            bad_request(format!(
+                "{what} must be {} to {}",
+                range.start(),
+                range.end()
+            ))
+        })
 }
 
 /// A misspelled field is a 400, not a stop of every session on the camera.
@@ -653,6 +688,15 @@ pub(crate) async fn start_talk_down(
     })
 }
 
+/// The speaker's output. A speaker deleted since the caller read it is the
+/// same refusal as a parting, which the claim's re-read would have made.
+async fn output_of(s: &ApiState, sp: &SpeakerConfig) -> Result<SpeakerOutput, Refusal> {
+    s.store.speaker_output(sp.id).await.map_err(|e| match e {
+        StoreError::NotFound(_) => StartError::Unpaired.into(),
+        e => e.into(),
+    })
+}
+
 /// Play `audio` on `sp`, which the caller read as the camera's speaker;
 /// refused once the camera no longer pairs with it as read (an edit too).
 pub(crate) async fn start_on(
@@ -665,8 +709,15 @@ pub(crate) async fn start_on(
     let paired = async {
         matches!(s.store.speaker_for_camera(camera_id).await, Ok(Some(now)) if now == *sp)
     };
-    let (session_id, sdp_answer, _playing) =
-        s.talkdown.start(sp, Some(camera_id), audio, paired).await?;
+    let req = StartRequest {
+        speaker: sp,
+        output: output_of(s, sp).await?,
+        camera_id: Some(camera_id),
+        origin: Origin::Manual,
+        audio,
+        event_id: None,
+    };
+    let (session_id, sdp_answer, _playing) = s.talkdown.start(req, paired).await?;
     Ok((session_id, sdp_answer))
 }
 
@@ -714,6 +765,114 @@ pub(crate) async fn stop_talk_down(
     res.map(|_| StatusCode::NO_CONTENT)
 }
 
+/// Store the speaker's output. It is not a speaker edit: a session on the
+/// speaker keeps playing and follows the new level.
+pub(crate) async fn put_speaker_output(
+    State(s): State<ApiState>,
+    Path(id): Path<SpeakerId>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<SessionContext>,
+    body: Result<Json<OutputInput>, JsonRejection>,
+) -> Result<Json<SpeakerOutput>, ApiError> {
+    let Json(body) = body.map_err(|e| bad_request(e.body_text()))?;
+    let before = s
+        .store
+        .speaker_output(id)
+        .await
+        .map_err(refused(StatusCode::NOT_FOUND))?;
+    let out = SpeakerOutput {
+        volume: in_range("volume", body.volume, 0..=100)?,
+        boost: body.boost,
+        hw_volume: before.hw_volume,
+        auto_max_per_hour: in_range("auto_max_per_hour", body.auto_max_per_hour, 1..=60)?,
+    };
+    let change: Result<SqliteTx<'_>, StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store.set_speaker_output_tx(&mut tx, id, &out).await?;
+        Ok(tx)
+    }
+    .await;
+    let json = |o: &SpeakerOutput| serde_json::to_string(o).ok();
+    let caller = Caller {
+        s: &s,
+        session,
+        headers,
+        peer,
+    };
+    caller
+        .commit(
+            change,
+            "speaker.output",
+            "speaker",
+            Some(&id.to_string()),
+            json(&before).as_deref(),
+            json(&out).as_deref(),
+        )
+        .await
+        .map_err(refused(StatusCode::NOT_FOUND))?;
+    s.talkdown.set_speaker_output(id, &out);
+    publish(
+        &s,
+        serde_json::json!({ "kind": "speaker", "action": "output", "speaker_id": id }),
+    )
+    .await;
+    Ok(Json(out))
+}
+
+/// The live slider: the volume of the session this camera started on its
+/// speaker, for as long as it plays. Not stored. `boost` defaults to the
+/// speaker's. 404 when the camera has no session of its own.
+pub(crate) async fn set_talk_down_volume(
+    State(s): State<ApiState>,
+    Path(camera_id): Path<CameraId>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<SessionContext>,
+    body: Result<Json<VolumeInput>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    let res = async {
+        let Json(body) =
+            body.map_err(|e| Refusal(StatusCode::BAD_REQUEST, "bad_request", e.body_text()))?;
+        let volume = in_range("volume", body.volume, 0..=100)
+            .map_err(|ApiError(_, why)| Refusal(StatusCode::BAD_REQUEST, "bad_request", why))?;
+        let sp = camera_speaker(&s, camera_id).await?;
+        let boost = match (body.boost, &sp) {
+            (Some(boost), _) => boost,
+            (None, Some(sp)) => s.store.speaker_output(sp.id).await?.boost,
+            (None, None) => false,
+        };
+        if !s.talkdown.set_session_volume(camera_id, volume, boost) {
+            return Err(Refusal(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                format!("camera {camera_id} has no talk-down session"),
+            ));
+        }
+        Ok::<_, Refusal>(serde_json::json!({
+            "camera_id": camera_id,
+            "volume": volume,
+            "boost": boost,
+        }))
+    }
+    .await;
+    let caller = Caller {
+        s: &s,
+        session,
+        headers,
+        peer,
+    };
+    caller
+        .audit(
+            "talk_down.volume",
+            "camera",
+            &camera_id.to_string(),
+            res.as_ref(),
+        )
+        .await;
+    res.map(Json)
+}
+
 /// The installer's check: no camera needed.
 pub(crate) async fn test_speaker(
     State(s): State<ApiState>,
@@ -745,7 +904,15 @@ pub(crate) async fn test_on(
     // before its stop, which either finds this claim or this re-read sees it.
     let unchanged =
         async { matches!(s.store.get_speaker(sp.id).await, Ok(Some(now)) if now == *sp) };
-    let (_, _, playing) = s.talkdown.start(sp, None, &Audio::Tone, unchanged).await?;
+    let req = StartRequest {
+        speaker: sp,
+        output: output_of(s, sp).await?,
+        camera_id: None,
+        origin: Origin::Manual,
+        audio: &Audio::Tone,
+        event_id: None,
+    };
+    let (_, _, playing) = s.talkdown.start(req, unchanged).await?;
     match playing.await {
         Ok(Ok(())) => Ok(serde_json::json!({ "ok": true })),
         Ok(Err(e)) => Err(StartError::Call(e).into()),

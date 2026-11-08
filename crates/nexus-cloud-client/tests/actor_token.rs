@@ -687,6 +687,8 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
     let start = json!({"mode":"clip","clip":{"url":"https://blob/x.wav","sha256":"ab"}});
     let stop = json!({"session_id":"0192f0c4-1f7a-7cc0-8b39-6a54f1c5e0aa"});
     let speaker = json!({"name":"Gate","host":"10.0.0.9","port":5060,"driver":"sip"});
+    let output = json!({"volume":60,"boost":true,"auto_max_per_hour":6});
+    let volume = json!({"volume":40});
     for (method, path, permission, body, allowed) in [
         (
             "POST",
@@ -738,6 +740,20 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
             None,
             true,
         ),
+        (
+            "PUT",
+            "/admin/speakers/3/output",
+            "settings.write",
+            Some(&output),
+            true,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/volume",
+            "live.talkdown",
+            Some(&volume),
+            true,
+        ),
         // The other permission, or a neighbour's, for the same route.
         (
             "POST",
@@ -782,6 +798,34 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
             false,
         ),
         ("DELETE", "/admin/speakers/3", "settings.read", None, false),
+        (
+            "PUT",
+            "/admin/speakers/3/output",
+            "settings.read",
+            Some(&output),
+            false,
+        ),
+        (
+            "PUT",
+            "/admin/speakers/3/output",
+            "live.talkdown",
+            Some(&output),
+            false,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/volume",
+            "settings.read",
+            Some(&volume),
+            false,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/volume",
+            "settings.write",
+            Some(&volume),
+            false,
+        ),
         // The edge numbers its cameras; no other spelling maps.
         (
             "POST",

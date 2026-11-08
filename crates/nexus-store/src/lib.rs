@@ -34,6 +34,7 @@ pub use motion::{
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};
+pub use speakers::SpeakerOutput;
 pub use talkdown::{
     ArmingState, AudioKind, AudioStatus, NewAudio, NewPlay, PlayFilter, TalkdownAudio,
     TalkdownCore, TalkdownPlay,
@@ -218,6 +219,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0038_speakers",
         include_str!("../migrations/0038_speakers.sql"),
+    ),
+    (
+        "0039_speaker_output",
+        include_str!("../migrations/0039_speaker_output.sql"),
     ),
     (
         "0040_talkdown_library",

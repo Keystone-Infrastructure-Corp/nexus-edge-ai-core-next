@@ -251,7 +251,7 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         // Speaker setup, assignment and the test chime (cloud ADR-091).
         | ("POST", ["admin", "speakers"])
         | ("PUT" | "DELETE", ["admin", "speakers", _])
-        | ("PUT", ["admin", "speakers", _, "cameras"])
+        | ("PUT", ["admin", "speakers", _, "cameras" | "output"])
         | ("POST", ["admin", "speakers", _, "test"]) => &["settings.write"],
         ("POST", ["admin", "users"])
         | ("PUT" | "DELETE", ["admin", "users", _])
@@ -289,9 +289,9 @@ fn camera_rpc_permissions(method: &str, tail: &[&str]) -> &'static [&'static str
         ("POST", ["ptz"]) => &["live.ptz", "settings.write"],
         ("POST", ["firmware:upgrade"]) => &["fleet.firmware"],
         ("PUT", ["network", "interface"]) => &["settings.network"],
-        // Starting or stopping talk-down is a live act on this camera; its
-        // speaker assignment is a setting (cloud ADR-091).
-        ("POST", ["talk-down"] | ["talk-down", "stop"]) => &["live.talkdown"],
+        // Starting, stopping or setting the volume of talk-down is a live act
+        // on this camera; its speaker assignment is a setting (cloud ADR-091).
+        ("POST", ["talk-down"] | ["talk-down", "stop" | "volume"]) => &["live.talkdown"],
         ("GET", ["talk-down"]) => &["settings.read", "live.talkdown"],
         ("PUT", ["talk-down"])
         | ("PUT" | "DELETE", [])

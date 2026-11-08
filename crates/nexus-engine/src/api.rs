@@ -620,6 +620,14 @@ pub fn router(state: ApiState) -> Router {
             axum::routing::post(crate::speakers_admin::stop_talk_down),
         )
         .route(
+            "/v1/admin/cameras/{camera_id}/talk-down/volume",
+            axum::routing::post(crate::speakers_admin::set_talk_down_volume),
+        )
+        .route(
+            "/v1/admin/speakers/{id}/output",
+            put(crate::speakers_admin::put_speaker_output),
+        )
+        .route(
             "/v1/admin/speakers/{id}/test",
             axum::routing::post(crate::speakers_admin::test_speaker),
         )
@@ -10098,6 +10106,235 @@ mod tests {
         assert_eq!(after["session_id"], session_id);
         assert_eq!(after["speaker_id"], speaker);
         assert_eq!(after["mode"], "tone");
+    }
+
+    /// Every RTP payload the speaker received, the opening silent frame dropped.
+    fn rtp_frames(rtp: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
+        let mut buf = [0u8; 2048];
+        let mut frames = Vec::new();
+        while let Ok(n) = rtp.try_recv(&mut buf) {
+            frames.push(buf[12..n].to_vec());
+        }
+        frames.remove(0);
+        frames
+    }
+
+    fn is_silent(frame: &[u8]) -> bool {
+        frame.iter().all(|&b| b == 0xff)
+    }
+
+    async fn put_output(
+        app: &axum::Router,
+        speaker: i64,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let uri = format!("/api/v1/admin/speakers/{speaker}/output");
+        speaker_call(app, Method::PUT, &uri, Some(body)).await
+    }
+
+    /// The chime plays at the speaker's stored volume: -20 dB at 50.
+    #[tokio::test]
+    async fn talk_down_tone_plays_at_the_speakers_stored_volume() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        let (status, body) = put_output(
+            &app,
+            speaker,
+            serde_json::json!({ "volume": 50, "boost": false, "auto_max_per_hour": 6 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(store.speaker_output(speaker).await.unwrap().volume, 50);
+
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let frames = rtp_frames(&rtp);
+        let tone = crate::talkdown::tone_pcm(2000);
+        let want: Vec<u8> = tone[..160]
+            .iter()
+            .map(|&s| crate::talkdown::g711::ulaw(crate::talkdown::limit(f32::from(s) * 0.1)))
+            .collect();
+        assert_eq!(frames[0], want, "the chime's first frame at volume 50");
+    }
+
+    #[tokio::test]
+    async fn speaker_output_put_validates_persists_audits_and_leaves_the_session_playing() {
+        use futures::StreamExt;
+        use nexus_bus::BusExt;
+
+        let (port, rtp, uas) = fake_speaker().await;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = TalkdownSessions::default();
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        let speaker = assign_speaker(&app, 1, "127.0.0.1", port).await;
+        let mut changed = bus
+            .subscribe::<serde_json::Value>(nexus_bus::topic::CONFIG_CHANGED)
+            .await
+            .unwrap();
+
+        for bad in [
+            serde_json::json!({ "volume": 101, "boost": false, "auto_max_per_hour": 6 }),
+            serde_json::json!({ "volume": -1, "boost": false, "auto_max_per_hour": 6 }),
+            serde_json::json!({ "volume": 50, "boost": false, "auto_max_per_hour": 0 }),
+            serde_json::json!({ "volume": 50, "boost": false, "auto_max_per_hour": 61 }),
+            serde_json::json!({ "volume": 50, "auto_max_per_hour": 6 }),
+        ] {
+            let (status, body) = put_output(&app, speaker, bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+        let (status, _) = put_output(
+            &app,
+            999,
+            serde_json::json!({ "volume": 50, "boost": false, "auto_max_per_hour": 6 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(store.speaker_output(speaker).await.unwrap().volume, 100);
+
+        // A session is playing; muting the speaker mid-chime silences what is
+        // left of it, and does not hang it up.
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = put_output(
+            &app,
+            speaker,
+            serde_json::json!({ "volume": 0, "boost": true, "auto_max_per_hour": 3 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out = speaker_json(&body);
+        assert_eq!(out["volume"], 0);
+        assert_eq!(out["boost"], true);
+        assert_eq!(out["auto_max_per_hour"], 3);
+        assert!(
+            talk_down_busy(&app).await,
+            "the output change kept the session"
+        );
+
+        let started = std::time::Instant::now();
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let frames = rtp_frames(&rtp);
+        assert!(!is_silent(&frames[0]), "audible before the change");
+        assert!(frames[20..].iter().all(|f| is_silent(f)), "silent after it");
+
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!(
+            (
+                stored.volume,
+                stored.boost,
+                stored.hw_volume,
+                stored.auto_max_per_hour
+            ),
+            (0, true, false, 3)
+        );
+        let rows = store
+            .list_audit_for_resource("speaker", &speaker.to_string(), 50)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.action == "speaker.output")
+            .expect("speaker.output audited");
+        assert_eq!(
+            speaker_json(row.after_json.as_deref().unwrap())["volume"],
+            0
+        );
+        assert_eq!(
+            speaker_json(row.before_json.as_deref().unwrap())["volume"],
+            100
+        );
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), changed.next()).await
+        {
+            events.push(ev.unwrap().to_string());
+        }
+        assert!(
+            events.iter().any(|e| e.contains(r#""action":"output""#)),
+            "config.changed published: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn talk_down_volume_changes_only_the_session_its_camera_started() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        seed_onvif_camera(&store, 2, None).await;
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/cameras/2/talk-down",
+            Some(serde_json::json!({ "speaker_id": speaker })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let volume = |camera: i64, body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let uri = format!("/api/v1/admin/cameras/{camera}/talk-down/volume");
+                speaker_call(&app, Method::POST, &uri, Some(body)).await
+            }
+        };
+        let mute = serde_json::json!({ "volume": 0 });
+
+        // No session, an unknown camera and a bad body.
+        let (status, body) = volume(1, mute.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, _) = volume(999, mute.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        for bad in [
+            serde_json::json!({ "volume": 101 }),
+            serde_json::json!({ "volume": -1 }),
+            serde_json::json!({}),
+        ] {
+            let (status, body) = volume(1, bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Camera 2 shares the speaker but did not start this session.
+        let (status, body) = volume(2, mute.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = volume(1, mute).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body)["volume"], 0);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let frames = rtp_frames(&rtp);
+        assert!(!is_silent(&frames[0]), "audible before the change");
+        assert!(frames[20..].iter().all(|f| is_silent(f)), "silent after it");
+
+        // Not persisted: the speaker keeps its own volume.
+        assert_eq!(store.speaker_output(speaker).await.unwrap().volume, 100);
+        let rows = store
+            .list_audit_for_resource("camera", "1", 50)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().any(|r| r.action == "talk_down.volume"),
+            "audited"
+        );
     }
 
     #[tokio::test]
