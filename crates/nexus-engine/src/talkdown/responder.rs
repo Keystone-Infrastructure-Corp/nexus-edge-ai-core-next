@@ -628,8 +628,6 @@ impl Responder {
                         StartError::Stopped => "stopped",
                         StartError::AudioNotFound => "audio_missing",
                         StartError::AudioNotReady => "audio_not_ready",
-                        // On another call: busy, not a fault an admin has to fix.
-                        StartError::Call(TalkdownError::Rejected(486 | 480)) => "busy",
                         StartError::Call(ref call) => {
                             // An attempt that failed at the speaker: recorded and audited.
                             let session_id = Uuid::now_v7().to_string();
@@ -654,7 +652,12 @@ impl Responder {
                                 after,
                             )
                             .await;
-                            activity.attempt(&rule_id, "failed", Some("unreachable".into()));
+                            // On another call: busy, not a fault an admin has to fix.
+                            if matches!(call, TalkdownError::Rejected(486 | 480)) {
+                                activity.skip(Some(&rule_id), "busy", 1, Utc::now());
+                            } else {
+                                activity.attempt(&rule_id, "failed", Some("unreachable".into()));
+                            }
                             return;
                         }
                         _ => "internal",
@@ -1574,6 +1577,21 @@ mod tests {
             assert_eq!(
                 (r.last_result, r.last_reason.as_deref()),
                 ("skipped", Some("busy")),
+                "{code}"
+            );
+            // It reached the speaker, so ADR-095 (f) still records and audits it.
+            let p = &plays(&g.store).await[0];
+            assert_eq!(
+                (p.origin.as_str(), p.result.as_deref()),
+                ("rule", Some("failed")),
+                "{code}"
+            );
+            assert!(
+                audits(&g.store)
+                    .await
+                    .iter()
+                    .any(|a| a.action == "talk_down.auto_start"
+                        && a.outcome == AuditOutcome::Failure),
                 "{code}"
             );
         }
