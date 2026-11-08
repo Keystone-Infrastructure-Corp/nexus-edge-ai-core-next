@@ -95,11 +95,15 @@ impl Tts {
 
     /// `<bin_dir>/nexus-tts` with the voices of `<models_dir>/models-manifest.json`
     /// whose files are all present, plus the shared non-voice `tts` entries
-    /// (phoneme data). `None`, logged once at info, without the helper or a voice.
+    /// (phoneme data). `None`, logged once at info, without the helper, `nice` or a voice.
     pub fn discover(bin_dir: &Path, models_dir: &Path) -> Option<Self> {
+        Self::discover_with(bin_dir, models_dir, Path::new(NICE_BIN))
+    }
+
+    fn discover_with(bin_dir: &Path, models_dir: &Path, nice: &Path) -> Option<Self> {
         let bin = bin_dir.join("nexus-tts");
-        if !bin.is_file() {
-            tracing::info!("text-to-speech is off: no nexus-tts helper");
+        if !bin.is_file() || !nice.is_file() {
+            tracing::info!("text-to-speech is off: no nexus-tts helper or no nice");
             return None;
         }
         let manifest: serde_json::Value = std::fs::read(models_dir.join("models-manifest.json"))
@@ -425,6 +429,11 @@ pub(crate) mod tests {
         assert_eq!(tts.model_dir, models.join("tts"));
         assert_eq!(tts.voice(None).unwrap().id, "en-US-female");
         assert!(tts.voice(Some("es-ES-male")).is_none());
+        let no_nice = dir.path().join("no-nice");
+        assert!(
+            Tts::discover_with(&bin, &models, &no_nice).is_none(),
+            "no nice, every render would fail"
+        );
     }
 
     /// One real render through the built helper and a voice pack:
