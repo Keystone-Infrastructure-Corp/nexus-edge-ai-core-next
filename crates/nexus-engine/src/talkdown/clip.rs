@@ -99,7 +99,11 @@ mod tests {
             ("https://192.0.2.1/x.wav?sig=SAS", false, IP),
             ("https://[2001:db8::1]/x.wav?sig=SAS", false, IP),
             ("http://127.0.0.1:9/x.wav?sig=SAS", true, IP),
-            ("http://blob.example/x.wav?sig=SAS", false, "clip url must be https"),
+            (
+                "http://blob.example/x.wav?sig=SAS",
+                false,
+                "clip url must be https",
+            ),
         ] {
             let why = super::fetch(url, "00", allow_http).await.unwrap_err();
             assert_eq!(why, expect, "{url}");
