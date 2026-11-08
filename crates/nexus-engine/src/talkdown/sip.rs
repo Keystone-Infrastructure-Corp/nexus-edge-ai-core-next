@@ -285,11 +285,16 @@ impl SipCall {
                 continue;
             };
             let method = req.split(' ').next().unwrap_or_default();
+            // RFC 3311: a body-less UPDATE (a session-timer refresh) carries no offer to answer.
+            let has_body = req
+                .split_once("\r\n\r\n")
+                .is_some_and(|(_, b)| !b.is_empty());
             // shortcut: a refresh is answered with our original offer, not
             // the negotiated codec; upgrade if a speaker rejects it.
             let sdp = match method {
-                "INVITE" | "UPDATE" => offer(self.leg.local.ip(), self.rtp.local_addr()?.port()),
-                "BYE" | "OPTIONS" => String::new(),
+                "INVITE" => offer(self.leg.local.ip(), self.rtp.local_addr()?.port()),
+                "UPDATE" if has_body => offer(self.leg.local.ip(), self.rtp.local_addr()?.port()),
+                "UPDATE" | "BYE" | "OPTIONS" => String::new(),
                 _ => continue,
             };
             let Some(ok) = dialog_ok(req, &self.leg.call_id, self.leg.local, &sdp) else {
@@ -1299,8 +1304,9 @@ pub(crate) mod tests {
             let intruder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let bye = in_dialog(&invite, &ok, "BYE", 1, "");
             intruder.send_to(bye.as_bytes(), from).await.unwrap();
-            let answered = timeout(Duration::from_millis(300), intruder.recv(&mut buf)).await;
-            assert!(answered.is_err(), "the core answered a stranger");
+            // Answers go to the dialog peer, so an answered stranger's BYE shows up here.
+            let answered = timeout(Duration::from_millis(300), sock.recv(&mut buf)).await;
+            assert!(answered.is_err(), "the core answered a stranger's BYE");
         });
         let mut call = place_call(
             &target(port),
@@ -1331,7 +1337,12 @@ pub(crate) mod tests {
             sock.send_to(ok.as_bytes(), from).await.unwrap();
             sock.recv_from(&mut buf).await.unwrap(); // ACK
             let mut answers = Vec::new();
-            for (cseq, method, body) in [(1, "OPTIONS", ""), (2, "INVITE", "v=0\r\n")] {
+            for (cseq, method, body) in [
+                (1, "OPTIONS", ""),
+                (2, "INVITE", "v=0\r\n"),
+                (3, "UPDATE", ""),
+                (4, "UPDATE", "v=0\r\n"),
+            ] {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let req = in_dialog(&invite, &ok, method, cseq, body);
                 sock.send_to(req.as_bytes(), from).await.unwrap();
@@ -1350,15 +1361,25 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        call.play_pcm(&tone_pcm(500), &CancellationToken::new())
+        call.play_pcm(&tone_pcm(1000), &CancellationToken::new())
             .await
             .expect("the play ended");
         let answers = uas.await.unwrap();
-        for (a, cseq) in answers.iter().zip(["1 OPTIONS", "2 INVITE"]) {
+        for (a, cseq) in answers
+            .iter()
+            .zip(["1 OPTIONS", "2 INVITE", "3 UPDATE", "4 UPDATE"])
+        {
             assert!(a.starts_with("SIP/2.0 200 OK\r\n"), "{a}");
             assert_eq!(header(a, "CSeq"), Some(cseq));
         }
         assert!(answers[1].contains("m=audio"), "re-INVITE keeps the SDP");
+        // RFC 3311: no answer without an offer.
+        assert_eq!(header(&answers[2], "Content-Length"), Some("0"));
+        assert!(!answers[2].contains("m=audio"), "{}", answers[2]);
+        assert!(
+            answers[3].contains("m=audio"),
+            "an UPDATE offer is answered"
+        );
     }
 
     #[tokio::test]
