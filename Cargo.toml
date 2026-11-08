@@ -19,6 +19,7 @@ members = [
     "crates/nexus-cloud-client",
     "crates/nexus-reid",
     "crates/nexus-hailo-backend",
+    "crates/nexus-tts",
     "xtask",
 ]
 
