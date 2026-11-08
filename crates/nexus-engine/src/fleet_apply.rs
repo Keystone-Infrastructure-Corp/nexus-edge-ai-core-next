@@ -501,9 +501,8 @@ async fn apply_rules(
         }
         // No local speaker check: one speaker deleted on this core would fail
         // every later push; the responder reports it as `no_speaker`.
-        rule.validate_talk_down(scope_is_core).map_err(|e| {
-            ApiError(StatusCode::BAD_REQUEST, format!("rule {:?}: {e}", rule.id))
-        })?;
+        rule.validate_talk_down(scope_is_core)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rule {:?}: {e}", rule.id)))?;
     }
     let keep: std::collections::HashSet<&str> = rules.iter().map(|r| r.id.as_str()).collect();
     let retract = retractable(mode, prev_keys, &keep);

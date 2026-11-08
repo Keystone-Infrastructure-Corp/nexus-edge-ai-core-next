@@ -79,7 +79,9 @@ impl Item {
         let uid = &self.uid;
         // Rule steps name items in this form only.
         if uuid::Uuid::parse_str(uid).map(|u| u.hyphenated().to_string()) != Ok(uid.clone()) {
-            return Err(format!("item {uid:?}: uid must be a hyphenated lowercase UUID"));
+            return Err(format!(
+                "item {uid:?}: uid must be a hyphenated lowercase UUID"
+            ));
         }
         if !(1..=80).contains(&chars(&self.name)) {
             return Err(format!("item {uid}: name must be 1 to 80 characters"));

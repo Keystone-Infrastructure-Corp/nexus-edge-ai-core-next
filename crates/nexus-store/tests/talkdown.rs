@@ -304,7 +304,11 @@ async fn reset_fleet_library_forgets_the_fleet_and_keeps_local_items() {
     s.reset_talkdown_fleet_library().await.unwrap();
 
     assert_eq!(s.talkdown_core().await.unwrap().library_revision, 0);
-    assert!(s.fleet_marker_get("talkdown_audio").await.unwrap().is_none());
+    assert!(s
+        .fleet_marker_get("talkdown_audio")
+        .await
+        .unwrap()
+        .is_none());
     let left: Vec<String> = s
         .list_talkdown_audio()
         .await
