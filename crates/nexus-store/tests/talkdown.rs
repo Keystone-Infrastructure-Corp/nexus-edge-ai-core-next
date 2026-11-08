@@ -289,6 +289,7 @@ async fn reset_fleet_library_forgets_the_fleet_and_keeps_local_items() {
         s.upsert_talkdown_pending(&clip(uid)).await.unwrap();
     }
     s.set_talkdown_core_library_revision(57).await.unwrap();
+    s.set_talkdown_core_cloud_allowed(true).await.unwrap();
     let keys = vec!["fleet-1".to_string()];
     s.fleet_marker_upsert(&nexus_store::FleetMarkerWrite {
         category: "talkdown_audio",
@@ -303,7 +304,9 @@ async fn reset_fleet_library_forgets_the_fleet_and_keeps_local_items() {
 
     s.reset_talkdown_fleet_library().await.unwrap();
 
-    assert_eq!(s.talkdown_core().await.unwrap().library_revision, 0);
+    let core = s.talkdown_core().await.unwrap();
+    assert_eq!(core.library_revision, 0);
+    assert!(!core.cloud_allowed, "off until the new org's heartbeat ack");
     assert!(s
         .fleet_marker_get("talkdown_audio")
         .await

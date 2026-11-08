@@ -543,6 +543,7 @@ impl Store {
     /// Forget the fleet's talk-down library, on enrolment and unenrolment:
     /// delete the items the fleet pushed (items made on the core stay), its
     /// marker, and the push revision, so the next org starts from revision 0.
+    /// Cloud playback goes off until the next org's heartbeat ack allows it.
     pub async fn reset_talkdown_fleet_library(&self) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -555,9 +556,11 @@ impl Store {
         sqlx::query("DELETE FROM fleet_managed_markers WHERE category = 'talkdown_audio'")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE talkdown_core SET library_revision = 0 WHERE id = 1")
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE talkdown_core SET library_revision = 0, cloud_allowed = 0 WHERE id = 1",
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
