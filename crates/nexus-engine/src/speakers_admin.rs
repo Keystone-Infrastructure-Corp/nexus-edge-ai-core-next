@@ -1037,6 +1037,11 @@ pub(crate) async fn put_speaker_output(
     body: Result<Json<OutputInput>, JsonRejection>,
 ) -> Result<Json<OutputView>, ApiError> {
     let Json(body) = body.map_err(|e| bad_request(e.body_text()))?;
+    // The device call and the commit are one step: an overlapping PUT must not store a level
+    // the device no longer holds. shortcut: one lock for all speakers (output changes are rare
+    // admin actions, device calls are timeout-bounded); go per-speaker if that ever queues.
+    static OUTPUT_PUT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one_at_a_time = OUTPUT_PUT.lock().await;
     let sp = stored(&s, id).await?;
     let before = s
         .store

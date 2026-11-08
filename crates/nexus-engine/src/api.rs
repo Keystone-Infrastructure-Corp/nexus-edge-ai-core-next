@@ -10489,6 +10489,53 @@ mod tests {
         assert_eq!((stored.volume, stored.hw_volume), (100, false));
     }
 
+    /// Two output PUTs on one speaker overlap: A's device call is accepted but
+    /// its reply is held, B runs meanwhile. Whatever the order, the stored
+    /// output must agree with the last Set the device received.
+    #[tokio::test]
+    async fn speaker_output_puts_overlapping_on_one_speaker_commit_the_final_device_level() {
+        use std::sync::atomic::Ordering;
+        let stub = soap_stub().await;
+        stub.hold_set.store(true, Ordering::SeqCst);
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let speaker = create_onvif_speaker(&app, 5060, stub.port).await;
+        let put = |volume: u8| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let body =
+                    serde_json::json!({ "volume": volume, "boost": false, "auto_max_per_hour": 6 });
+                put_output(&app, speaker, body).await
+            })
+        };
+
+        let a = put(20);
+        while stub.sets.lock().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        stub.hold_set.store(false, Ordering::SeqCst);
+        let b = put(80);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stub.release.notify_one();
+        for r in [a.await.unwrap(), b.await.unwrap()] {
+            assert_eq!(r.0, StatusCode::OK, "{}", r.1);
+        }
+
+        // range 10..90: volume 20 is level 26, volume 80 is level 74
+        let last = stub.sets.lock().last().cloned().unwrap();
+        let level = if last.contains("<tt:OutputLevel>74</tt:OutputLevel>") {
+            80
+        } else {
+            20
+        };
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!(
+            (stored.volume, stored.hw_volume),
+            (level, true),
+            "stored output must match the device's last Set: {last}"
+        );
+    }
+
     /// No endpoint: software volume, and nothing to report.
     #[tokio::test]
     async fn speaker_output_put_without_an_onvif_endpoint_is_software_only() {
