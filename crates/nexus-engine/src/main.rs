@@ -838,14 +838,15 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let preferred_usb_label =
         nexus_pipeline::recorder::PreferredUsbLabel::new(initial_label.clone());
 
-    // Phase 2 Step 2.1b / M-Alert-Clip — single `Arc<Notify>` shared
-    // between the cold replicator (consumer) and its producers: the
-    // cloud-tunnel supervisor (post-enrollment backend install) and the
-    // alert-clip builder (a freshly-built alert clip kicks cloud
-    // replication immediately). Created HERE, before the recorder, so
-    // the same Arc reaches both the recorder and the replicator config
-    // built further below.
+    // Phase 2 Step 2.1b — single `Arc<Notify>` shared between the cold
+    // replicator (consumer) and the cloud-tunnel supervisor (producer,
+    // post-enrollment backend install).
     let cold_kick = std::sync::Arc::new(tokio::sync::Notify::new());
+    // M-Alert-Clip — the alert uploader's own wake handle (a `Notify`
+    // wakes one waiter), kicked by the alert-clip builder. Created HERE,
+    // before the recorder, so it reaches both the recorder and the
+    // uploader spawned further below.
+    let alert_cold_kick = std::sync::Arc::new(tokio::sync::Notify::new());
 
     // M-Alert-Clip: live operator gate mirroring
     // `DeliverySettings.attach_alert_clip`. Seeded from the stored
@@ -880,7 +881,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         usb_resolver.clone(),
         preferred_usb_label.clone(),
         cfg.runtime.clips.alert_clips.clone(),
-        cold_kick.clone(),
+        alert_cold_kick.clone(),
         alert_clip_gate.clone(),
         decode_health.clone(),
         analysis_stream.clone(),
@@ -1206,8 +1207,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // supervisor calling `notify_one()` right after installing the
     // Azure backend drains any pre-enrollment clip backlog
     // immediately instead of waiting up to 5 min for the polling
-    // backstop. (Constructed earlier, before the recorder, so the
-    // alert-clip builder shares the same wake handle.)
+    // backstop. (Constructed earlier, before the recorder.)
     // Phase 2 · Step 2.8 — shared tunnel-handle slot. The cloud
     // tunnel reconnect loop publishes the active `Arc<Connection>`
     // into this on connect / clears on disconnect; the cold
@@ -1236,6 +1236,29 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         tokio::spawn(async move {
             cold_replicator::run_cold_replicator(cfg, store, bus, registry, async {
                 let _ = cold_shutdown_rx.await;
+            })
+            .await;
+        })
+    };
+
+    // M-Alert-Clip — alert clips upload on their own task so they never
+    // wait behind the motion replicator's batch. Its `kick` field is
+    // unused here: the uploader takes `alert_cold_kick` directly.
+    let (alert_upload_shutdown_tx, alert_upload_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let alert_upload_handle = {
+        let store = store.clone();
+        let registry = registry.clone();
+        let cfg = cold_replicator::ColdReplicatorConfig {
+            clips_dir: clips_dir.clone(),
+            kick: None,
+            outbox: Some(cloud_outbox.clone()),
+            max_cold_upload_bytes: cfg.runtime.clips.max_clip_bytes.saturating_mul(2),
+        };
+        let kick = alert_cold_kick.clone();
+        tokio::spawn(async move {
+            cold_replicator::run_alert_clip_uploader(cfg, store, registry, kick, async {
+                let _ = alert_upload_shutdown_rx.await;
             })
             .await;
         })
@@ -2194,7 +2217,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // tasks together (one shared deadline, not 5 s each), 15 s recorder drain,
     // 4 s teardown pool, 3 s detector threads = 27 s.
     //
-    // Signals go out to every task together, then all nine handles are
+    // Signals go out to every task together, then all ten handles are
     // awaited concurrently against the one shared deadline. Signalling and
     // awaiting one task at a time would let a slow task (e.g. `cold_handle`,
     // whose loop also runs reannounce) burn the whole 5s before later tasks
@@ -2202,6 +2225,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // even told to stop.
     let tasks_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let _ = cold_shutdown_tx.send(());
+    let _ = alert_upload_shutdown_tx.send(());
     let _ = retention_shutdown_tx.send(());
     let _ = audit_retention_shutdown_tx.send(());
     let _ = alert_clip_evict_shutdown_tx.send(());
@@ -2213,6 +2237,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let _ = tokio::time::timeout_at(tasks_deadline, async {
         tokio::join!(
             cold_handle,
+            alert_upload_handle,
             retention_handle,
             audit_retention_handle,
             alert_clip_evict_handle,
@@ -2458,7 +2483,7 @@ async fn build_recorder(
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     alert_clips: nexus_config::AlertClipsConfig,
-    cold_kick: Arc<tokio::sync::Notify>,
+    alert_cold_kick: Arc<tokio::sync::Notify>,
     alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
@@ -2491,7 +2516,7 @@ async fn build_recorder(
                 usb_resolver,
                 preferred_usb_label,
                 alert_clips,
-                cold_kick,
+                alert_cold_kick,
                 alert_clip_gate,
                 decode_health,
                 analysis_stream,
@@ -2540,7 +2565,7 @@ async fn build_gst_recorder(
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     alert_clips: nexus_config::AlertClipsConfig,
-    cold_kick: Arc<tokio::sync::Notify>,
+    alert_cold_kick: Arc<tokio::sync::Notify>,
     alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
     decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
@@ -2656,7 +2681,7 @@ async fn build_gst_recorder(
         .with_decode_health(decode_health)
         .with_analysis_stream(analysis_stream)
         .with_alert_clips(alert_clips)
-        .with_alert_cold_kick(cold_kick)
+        .with_alert_cold_kick(alert_cold_kick)
         .with_alert_clip_delivery_gate(alert_clip_gate);
     for cam in cameras {
         nexus_pipeline::ClipRecorder::set_camera_codec_pin(&rec, cam.id, cam.ingest.codec);
@@ -2696,7 +2721,7 @@ async fn build_gst_recorder(
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
     preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
     _alert_clips: nexus_config::AlertClipsConfig,
-    _cold_kick: Arc<tokio::sync::Notify>,
+    _alert_cold_kick: Arc<tokio::sync::Notify>,
     _alert_clip_gate: Arc<std::sync::atomic::AtomicBool>,
     _decode_health: Arc<nexus_pipeline::DecodeHealthRegistry>,
     _analysis_stream: Arc<nexus_pipeline::AnalysisStreamRegistry>,
