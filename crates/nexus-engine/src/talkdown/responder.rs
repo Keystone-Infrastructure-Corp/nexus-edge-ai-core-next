@@ -231,7 +231,11 @@ pub fn outcome_window(rule_cooldown_ms: u64) -> Duration {
 
 /// A play's `started_at` (SQLite `YYYY-MM-DD HH:MM:SS`, UTC).
 pub fn started_at(p: &TalkdownPlay) -> Option<DateTime<Utc>> {
-    NaiveDateTime::parse_from_str(&p.started_at, "%Y-%m-%d %H:%M:%S")
+    sqlite_time(&p.started_at)
+}
+
+fn sqlite_time(s: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .ok()
         .map(|n| n.and_utc())
 }
@@ -307,8 +311,8 @@ async fn audit(
 }
 
 impl Responder {
-    /// The hourly counts survive a restart: they are read back from the
-    /// plays log.
+    /// The hourly counts and the manual hold-off survive a restart: they
+    /// are read back from the plays log.
     async fn new(d: ResponderDeps) -> Self {
         let mut hourly: HashMap<SpeakerId, VecDeque<DateTime<Utc>>> = HashMap::new();
         let since = Utc::now() - HOUR;
@@ -321,9 +325,14 @@ impl Responder {
             })
             .await
             .unwrap_or_default();
-        for p in recent.iter().rev().filter(|p| p.origin == "rule") {
-            if let Some(t) = started_at(p) {
-                hourly.entry(p.speaker_id).or_default().push_back(t);
+        for p in recent.iter().rev() {
+            if p.origin == "rule" {
+                if let Some(t) = started_at(p) {
+                    hourly.entry(p.speaker_id).or_default().push_back(t);
+                }
+            } else if let Some(t) = p.ended_at.as_deref().and_then(sqlite_time) {
+                // A manual session lasts at most 10 minutes, so the hour covers it.
+                d.sessions.restore_manual_end(p.speaker_id, t);
             }
         }
         // shortcut: the escalation sequence and cooldown restart empty after an engine restart; persist them if restarts prove frequent.
@@ -1137,6 +1146,41 @@ mod tests {
         assert_eq!(g.decide("r1", 1, s(60)).await, Err("cooldown"));
         // Past the cooldown: a new sequence from step 1.
         assert_eq!(g.decide("r1", 1, s(86)).await, Ok(0));
+    }
+
+    /// The hold-off survives a restart: it is read back from the plays log.
+    #[tokio::test]
+    async fn gate_8_the_holdoff_survives_a_restart() {
+        let mut g = rig(talk_down()).await;
+        let id = g
+            .store
+            .insert_talkdown_play(&NewPlay {
+                session_id: "m1".into(),
+                origin: "manual".into(),
+                rule_id: None,
+                step: None,
+                event_id: None,
+                camera_id: Some(1),
+                speaker_id: g.speaker.id,
+                audio_uid: None,
+                mode: "tone".into(),
+            })
+            .await
+            .unwrap();
+        g.store
+            .finish_talkdown_play(id, "played", None)
+            .await
+            .unwrap();
+        let d = ResponderDeps {
+            store: g.store.clone(),
+            bus: g.r.d.bus.clone(),
+            sessions: TalkdownSessions::default(),
+            evaluator: g.r.d.evaluator.clone(),
+            policy: g.r.d.policy.clone(),
+            activity: Activity::default(),
+        };
+        g.r = Responder::new(d).await;
+        assert_eq!(g.decide("r1", 1, Utc::now()).await, Err("holdoff"));
     }
 
     #[tokio::test]

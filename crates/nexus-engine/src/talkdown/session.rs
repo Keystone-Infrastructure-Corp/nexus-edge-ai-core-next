@@ -242,6 +242,14 @@ impl TalkdownSessions {
         self.manual_ends.lock().get(&speaker_id).copied()
     }
 
+    /// A manual session that ended at `at`, read back from the plays log at
+    /// startup; a later end already recorded wins.
+    pub fn restore_manual_end(&self, speaker_id: SpeakerId, at: DateTime<Utc>) {
+        let mut ends = self.manual_ends.lock();
+        let end = ends.entry(speaker_id).or_insert(at);
+        *end = (*end).max(at);
+    }
+
     /// A manual session that ended at `at`, for another module's test.
     #[cfg(test)]
     pub(crate) fn record_manual_end_for_test(&self, speaker_id: SpeakerId, at: DateTime<Utc>) {
