@@ -12273,6 +12273,7 @@ mod tests {
     async fn unenrolment_resets_the_talkdown_library_revision_and_fleet_items() {
         let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
         state.talkdown = library_sessions(&store, &bus);
+        let library = state.talkdown.library().unwrap().clone();
         let app = super::router(state);
         store_ready_clip(&store, LOCAL_UID, &[1, 2, 3]).await;
         let tts = serde_json::json!([{ "uid": TTS_UID, "name": "Leave", "kind": "tts",
@@ -12280,8 +12281,24 @@ mod tests {
         let (status, _) = talkdown_apply(&app, tts.clone(), 57).await;
         assert_eq!(status, StatusCode::OK);
 
-        let (status, body) =
-            speaker_call(&app, Method::DELETE, "/api/v1/admin/cloud/enrollment", None).await;
+        // An in-flight push holds the library lock: the reset waits for it,
+        // or the push would write the old org's revision back after it.
+        let push = library.lock().await;
+        let mut unenrol = Box::pin(speaker_call(
+            &app,
+            Method::DELETE,
+            "/api/v1/admin/cloud/enrollment",
+            None,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut unenrol)
+                .await
+                .is_err(),
+            "the reset ran during a push"
+        );
+        assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_some());
+        drop(push);
+        let (status, body) = unenrol.await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_none());
         assert!(store.get_talkdown_audio(LOCAL_UID).await.unwrap().is_some());

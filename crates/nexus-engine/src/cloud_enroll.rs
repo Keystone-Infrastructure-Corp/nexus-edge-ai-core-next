@@ -82,6 +82,7 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
         args.label.as_deref(),
         args.keep_history,
         args.history_days,
+        None,
     )
     .await?;
     // Banner. Use eprintln so it shows up even if telemetry is
@@ -161,6 +162,9 @@ fn restart_engine() -> Result<()> {
 /// the HTTP handler that wants to echo `core_id`/`gateway_url`/
 /// `enrolled_at` back to the operator without a follow-up SELECT.
 ///
+/// `library` is the running engine's talk-down library, if any: its lock is
+/// held around the library reset so an in-flight fleet push cannot undo it.
+///
 /// # Errors
 ///
 /// * Time-sync gate fails (clock not synced, no `NEXUS_TIME_SYNC_OVERRIDE`).
@@ -174,6 +178,7 @@ pub async fn perform_enrollment(
     label: Option<&str>,
     keep_history: bool,
     history_days: u32,
+    library: Option<&crate::talkdown::library::Library>,
 ) -> Result<CloudEnrollment> {
     // Phase 1.15 — refuse to enroll a box whose clock isn't synced.
     // The actor_token verifier has a ±30 s skew window; a freshly
@@ -306,6 +311,10 @@ pub async fn perform_enrollment(
         .context("persist cloud_enrollment row")?;
     // A previous org's talk-down library and revision would make every push
     // from this enrolment stale.
+    let _sync = match library {
+        Some(lib) => Some(lib.lock().await),
+        None => None,
+    };
     store
         .reset_talkdown_fleet_library()
         .await
