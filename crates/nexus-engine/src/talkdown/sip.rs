@@ -255,13 +255,17 @@ impl SipCall {
         Ok(())
     }
 
-    /// Read the SIP socket without waiting. A retransmitted 2xx for the INVITE
-    /// means the speaker missed our ACK: ACK it again, or it drops the call
-    /// ~32 s in. A BYE is answered 200 and ends the call: `EndedBySpeaker`.
+    /// Read the SIP socket without waiting. Only datagrams from the dialog peer
+    /// count: anyone else who knows the Call-ID could end a play. A
+    /// retransmitted 2xx for the INVITE means the speaker missed our ACK: ACK
+    /// it again, or it drops the call ~32 s in. A BYE is answered 200 and ends
+    /// the call: `EndedBySpeaker`. OPTIONS, re-INVITE and UPDATE (a session
+    /// timer refresh) are answered 200 and the call goes on.
     pub fn pump_sip(&mut self) -> Result<(), TalkdownError> {
         let mut buf = [0u8; 8192];
         loop {
             let n = match self.leg.sock.try_recv_from(&mut buf) {
+                Ok((_, from)) if from != self.leg.peer => continue,
                 Ok((n, _)) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                 Err(e) => return Err(e.into()),
@@ -275,12 +279,24 @@ impl SipCall {
                             .request("ACK", self.invite_cseq, &branch(), &self.to, "", "");
                     let _ = self.leg.sock.try_send_to(ack.as_bytes(), self.leg.peer);
                 }
-            } else if let Some(ok) = std::str::from_utf8(&buf[..n])
-                .ok()
-                .filter(|req| req.starts_with("BYE "))
-                .and_then(|req| bye_ok(req, &self.leg.call_id))
-            {
-                let _ = self.leg.sock.try_send_to(ok.as_bytes(), self.leg.peer);
+                continue;
+            }
+            let Ok(req) = std::str::from_utf8(&buf[..n]) else {
+                continue;
+            };
+            let method = req.split(' ').next().unwrap_or_default();
+            // shortcut: a refresh is answered with our original offer, not
+            // the negotiated codec; upgrade if a speaker rejects it.
+            let sdp = match method {
+                "INVITE" | "UPDATE" => offer(self.leg.local.ip(), self.rtp.local_addr()?.port()),
+                "BYE" | "OPTIONS" => String::new(),
+                _ => continue,
+            };
+            let Some(ok) = dialog_ok(req, &self.leg.call_id, self.leg.local, &sdp) else {
+                continue;
+            };
+            let _ = self.leg.sock.try_send_to(ok.as_bytes(), self.leg.peer);
+            if method == "BYE" {
                 self.hung_up = true;
                 return Err(TalkdownError::EndedBySpeaker);
             }
@@ -587,9 +603,10 @@ impl Response {
     }
 }
 
-/// The 200 answering an in-dialog BYE (its Via/From/To/CSeq echoed), or `None`
-/// when the BYE is for another call.
-fn bye_ok(req: &str, call_id: &str) -> Option<String> {
+/// The 200 answering an in-dialog request (its Via/From/To/CSeq echoed, our
+/// Contact, `sdp` as the body when given), or `None` when the request is for
+/// another call.
+fn dialog_ok(req: &str, call_id: &str, local: SocketAddr, sdp: &str) -> Option<String> {
     let mut ok = String::from("SIP/2.0 200 OK\r\n");
     let mut ours = false;
     for line in req.lines().skip(1).take_while(|l| !l.is_empty()) {
@@ -604,7 +621,11 @@ fn bye_ok(req: &str, call_id: &str) -> Option<String> {
         ok += line;
         ok += "\r\n";
     }
-    ours.then(|| ok + "Content-Length: 0\r\n\r\n")
+    ok += &format!("Contact: <sip:nexus@{local}>\r\n");
+    if !sdp.is_empty() {
+        ok += "Content-Type: application/sdp\r\n";
+    }
+    ours.then(|| ok + &format!("Content-Length: {}\r\n\r\n{sdp}", sdp.len()))
 }
 
 fn token() -> String {
@@ -1244,6 +1265,100 @@ pub(crate) mod tests {
         let more = timeout(Duration::from_millis(150), rtp.recv(&mut buf)).await;
         assert!(more.is_err(), "RTP kept flowing after the BYE");
         assert!(call.hung_up, "the drop must not send a second BYE");
+    }
+
+    /// A request the speaker sends inside the dialog `invite`/`ok` opened.
+    fn in_dialog(invite: &str, ok: &str, method: &str, cseq: u32, body: &str) -> String {
+        format!(
+            "{method} sip:nexus SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:9;branch=z9hG4bKspk{cseq}\r\n\
+             From: {to};tag=uas1\r\nTo: {f}\r\nCall-ID: {id}\r\nCSeq: {cseq} {method}\r\n\
+             Content-Length: {len}\r\n\r\n{body}",
+            to = header(ok, "To").unwrap().split(';').next().unwrap(),
+            f = header(invite, "From").unwrap(),
+            id = header(invite, "Call-ID").unwrap(),
+            len = body.len(),
+        )
+    }
+
+    /// Anyone on the LAN who knows the Call-ID could end a play with a BYE;
+    /// only the dialog peer's datagrams count.
+    #[tokio::test]
+    async fn a_bye_from_another_source_is_ignored() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            let invite = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let ok = reply(&invite, "200 OK", SDP, &answer(rtp_port, "0"));
+            sock.send_to(ok.as_bytes(), from).await.unwrap();
+            sock.recv_from(&mut buf).await.unwrap(); // ACK
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let intruder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let bye = in_dialog(&invite, &ok, "BYE", 1, "");
+            intruder.send_to(bye.as_bytes(), from).await.unwrap();
+            let answered = timeout(Duration::from_millis(300), intruder.recv(&mut buf)).await;
+            assert!(answered.is_err(), "the core answered a stranger");
+        });
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        call.play_pcm(&tone_pcm(500), &CancellationToken::new())
+            .await
+            .expect("a stranger ended the play");
+        assert!(!call.hung_up);
+        uas.await.unwrap();
+    }
+
+    /// A speaker refreshing its session timer must not lose the call.
+    #[tokio::test]
+    async fn in_dialog_options_and_reinvite_are_answered_and_the_play_continues() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            let invite = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let ok = reply(&invite, "200 OK", SDP, &answer(rtp_port, "0"));
+            sock.send_to(ok.as_bytes(), from).await.unwrap();
+            sock.recv_from(&mut buf).await.unwrap(); // ACK
+            let mut answers = Vec::new();
+            for (cseq, method, body) in [(1, "OPTIONS", ""), (2, "INVITE", "v=0\r\n")] {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let req = in_dialog(&invite, &ok, method, cseq, body);
+                sock.send_to(req.as_bytes(), from).await.unwrap();
+                let (n, _) = timeout(Duration::from_secs(1), sock.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("no answer to {method}"))
+                    .unwrap();
+                answers.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+            answers
+        });
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        call.play_pcm(&tone_pcm(500), &CancellationToken::new())
+            .await
+            .expect("the play ended");
+        let answers = uas.await.unwrap();
+        for (a, cseq) in answers.iter().zip(["1 OPTIONS", "2 INVITE"]) {
+            assert!(a.starts_with("SIP/2.0 200 OK\r\n"), "{a}");
+            assert_eq!(header(a, "CSeq"), Some(cseq));
+        }
+        assert!(answers[1].contains("m=audio"), "re-INVITE keeps the SDP");
     }
 
     #[tokio::test]
