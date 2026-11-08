@@ -167,6 +167,8 @@ pub(crate) fn build_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(REQ_TIMEOUT)
         .danger_accept_invalid_certs(true)
+        // A redirect would re-send the WS-Security digest to another host.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("http client build failed: {e}"))
 }
@@ -546,5 +548,28 @@ mod tests {
         assert_eq!(m.get("Model").map(String::as_str), Some("DS-2CD2042WD-I"));
         assert_eq!(m.get("FirmwareVersion").map(String::as_str), Some("V5.4.5"));
         assert_eq!(m.get("HardwareId").map(String::as_str), Some("88"));
+    }
+
+    #[tokio::test]
+    async fn soap_client_does_not_follow_a_redirect() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let elsewhere = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&elsewhere)
+            .await;
+        let speaker = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("Location", elsewhere.uri().as_str()),
+            )
+            .mount(&speaker)
+            .await;
+        let err = DEVICE
+            .call(&speaker.uri(), "u", "p", "GetDeviceInformation", "")
+            .await
+            .unwrap_err();
+        assert!(err.contains("307"), "{err}");
+        assert!(elsewhere.received_requests().await.unwrap().is_empty());
     }
 }
