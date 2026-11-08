@@ -30,7 +30,7 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, put};
+use axum::routing::{get, put};
 use axum::Json;
 use axum::Router;
 use futures::stream::StreamExt;
@@ -894,6 +894,12 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/network/roles",
             get(crate::admin_network::get_roles).put(crate::admin_network::put_roles),
         )
+        // Rule writes: a rule can trigger announcements, so writing one
+        // needs an admin login (the handlers also take `AdminContext`).
+        // The reads stay on the open `api` router below.
+        .route("/v1/rules", axum::routing::post(create_rule))
+        .route("/v1/rules/{id}", put(upsert_rule).delete(delete_rule))
+        .route("/v1/rules/{id}/delivery", put(put_rule_delivery))
         .route_layer(axum::middleware::from_fn_with_state(
             state.admin_auth.clone(),
             admin_auth::admin_auth_layer,
@@ -941,9 +947,8 @@ pub fn router(state: ApiState) -> Router {
             "/v1/system/static-object-defaults",
             get(get_static_object_defaults),
         )
-        .route("/v1/rules", get(list_rules).post(create_rule))
-        .route("/v1/rules/{id}", put(upsert_rule))
-        .route("/v1/rules/{id}", delete(delete_rule))
+        // Rule writes live in the `admin` router above.
+        .route("/v1/rules", get(list_rules))
         .route("/v1/rules/validate", axum::routing::post(validate_rule))
         .route("/v1/rules/preview", axum::routing::post(preview_rule))
         // CEL editor schema — labels emittable by the loaded detector
@@ -974,15 +979,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/events/{event_id}/delivery", get(get_event_delivery))
         // M7 Step 6 — per-rule delivery policy. GET returns the
         // override (if any) + the resolved effective policy after
-        // the global cascade. PUT sets or clears the override and
-        // emits `rule.delivery_policy.changed` so the dispatcher
-        // re-hydrates the in-memory cache. Mirrors the existing
-        // `/api/v1/rules/{id}` shape — not gated, since the rules
-        // CRUD it lives next to isn't either.
-        .route(
-            "/v1/rules/{id}/delivery",
-            get(get_rule_delivery).put(put_rule_delivery),
-        )
+        // the global cascade. The PUT is in the `admin` router.
+        .route("/v1/rules/{id}/delivery", get(get_rule_delivery))
         // M2.2 cold-mirror — combined hot+cold view (read-only).
         .route("/v1/storage", get(get_storage))
         // M-Admin Phase 5 — detector prompt catalog (read-only).
@@ -1795,9 +1793,10 @@ async fn upsert_rule(
     Path(id): Path<RuleId>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    session: Option<crate::auth::require_role::SessionContext>,
+    admin: crate::auth::require_role::AdminContext,
     Json(mut rule): Json<RuleConfig>,
 ) -> Result<Json<RuleConfig>, ApiError> {
+    let session = Some(admin.0);
     rule.id = id.clone();
     // M-Admin Phase 5 — compile the CEL before we touch the store.
     // Pre-Phase-5 a bad `when` field was silently accepted and only
@@ -1892,9 +1891,10 @@ async fn create_rule(
     State(s): State<ApiState>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    session: Option<crate::auth::require_role::SessionContext>,
+    admin: crate::auth::require_role::AdminContext,
     Json(mut rule): Json<RuleConfig>,
 ) -> Result<Json<RuleConfig>, ApiError> {
+    let session = Some(admin.0);
     // Same defence-in-depth as `create_camera` — zero the id field
     // before the tx so a careless body field can't trick us into
     // update-via-create. The tx will overwrite it with the freshly
@@ -1974,8 +1974,9 @@ async fn delete_rule(
     Path(id): Path<RuleId>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    session: Option<crate::auth::require_role::SessionContext>,
+    admin: crate::auth::require_role::AdminContext,
 ) -> Result<StatusCode, ApiError> {
+    let session = Some(admin.0);
     let before = s
         .store
         .list_rules()
@@ -4495,9 +4496,10 @@ async fn put_rule_delivery(
     Path(rule_id): Path<RuleId>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    session: Option<crate::auth::require_role::SessionContext>,
+    admin: crate::auth::require_role::AdminContext,
     Json(req): Json<PutRuleDeliveryReq>,
 ) -> Result<StatusCode, ApiError> {
+    let session = Some(admin.0);
     let rule_id_str = rule_id.to_string();
     let before = s.store.rule_delivery_policy_get(&rule_id).await.ok();
     let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
@@ -6170,6 +6172,93 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Rules will trigger announcements, so a rule write needs an admin
+    /// login: a LAN peer (or a page in a LAN browser) with no bearer gets
+    /// 401 whether or not a secret is configured, a non-admin session gets
+    /// 403, and reads stay open.
+    #[tokio::test]
+    async fn rule_writes_require_admin_login() {
+        const SECRET: &[u8] = b"rule-write-auth-secret";
+        fn req(method: Method, uri: &str, token: Option<&str>) -> Request<Body> {
+            let mut b = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(t) = token {
+                b = b.header("authorization", format!("Bearer {t}"));
+            }
+            let body = if uri.ends_with("/delivery") {
+                serde_json::json!({ "policy": null })
+            } else {
+                serde_json::json!({
+                    "id": "", "name": "r", "when": "true", "severity": "warning"
+                })
+            };
+            let mut r = b.body(Body::from(body.to_string())).unwrap();
+            r.extensions_mut().insert(ConnectInfo(remote_peer()));
+            r
+        }
+        let writes = [
+            (Method::POST, "/api/v1/rules"),
+            (Method::PUT, "/api/v1/rules/r1"),
+            (Method::PUT, "/api/v1/rules/r1/delivery"),
+            (Method::DELETE, "/api/v1/rules/r1"),
+        ];
+
+        // No secret configured: the loopback-only fallback must still
+        // refuse a LAN peer.
+        let (app, _store, _dir) = build_test_router(None).await;
+        for (m, uri) in &writes {
+            let res = app
+                .clone()
+                .oneshot(req(m.clone(), uri, None))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{m} {uri}");
+        }
+
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let viewer = sign_role_jwt(SECRET, "viewer");
+        let admin = sign_admin_jwt(SECRET);
+        for (m, uri) in &writes {
+            let res = app
+                .clone()
+                .oneshot(req(m.clone(), uri, None))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{m} {uri}");
+            let res = app
+                .clone()
+                .oneshot(req(m.clone(), uri, Some(&viewer)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "viewer {m} {uri}");
+        }
+        // Admin bearer: the PUT creates r1, the delivery PUT and DELETE
+        // then act on it.
+        for ((m, uri), want) in writes.iter().zip([
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::NO_CONTENT,
+            StatusCode::NO_CONTENT,
+        ]) {
+            let res = app
+                .clone()
+                .oneshot(req(m.clone(), uri, Some(&admin)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), want, "admin {m} {uri}");
+        }
+
+        // Reads are unchanged: no bearer, LAN peer.
+        for uri in ["/api/v1/rules", "/api/v1/rules/schema"] {
+            let mut r = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            r.extensions_mut().insert(ConnectInfo(remote_peer()));
+            let res = app.clone().oneshot(r).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "GET {uri}");
+        }
+    }
+
     // ===============================================================
     // Phase 7.6 · Step 7.6.3 — ONVIF device-control admin routes
     // ===============================================================
@@ -7828,6 +7917,10 @@ mod tests {
         let mut req = Request::builder()
             .method(Method::PUT)
             .uri("/api/v1/rules/rule_put/delivery")
+            .header(
+                "authorization",
+                format!("Bearer {}", sign_admin_jwt(SECRET)),
+            )
             .header("content-type", "application/json")
             .body(Body::from(put_body.to_string()))
             .unwrap();
@@ -7894,6 +7987,10 @@ mod tests {
             let mut req = Request::builder()
                 .method(Method::PUT)
                 .uri("/api/v1/rules/rule_clear/delivery")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", sign_admin_jwt(SECRET)),
+                )
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
@@ -7925,6 +8022,10 @@ mod tests {
         let mut req = Request::builder()
             .method(Method::PUT)
             .uri("/api/v1/rules/no_such_rule/delivery")
+            .header(
+                "authorization",
+                format!("Bearer {}", sign_admin_jwt(SECRET)),
+            )
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({"policy":{"enabled":false}}).to_string(),
