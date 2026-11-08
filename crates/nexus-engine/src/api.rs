@@ -9042,8 +9042,9 @@ mod tests {
             async move { app.oneshot(req).await.unwrap().status() }
         };
         let steps = serde_json::json!([{ "audio_uid": TD_UID }]);
-        // window 30 s <= cooldown 60 s
-        let bad = td_rule("td1", 60_000, serde_json::json!({ "steps": steps }));
+        // window 30 s <= cooldown 60 s, with a second step to escalate to
+        let two = serde_json::json!([{ "audio_uid": TD_UID }, { "audio_uid": TD_UID }]);
+        let bad = td_rule("td1", 60_000, serde_json::json!({ "steps": two }));
         assert_eq!(put(bad).await, StatusCode::BAD_REQUEST);
         // unknown speaker
         let spk = td_rule(
@@ -9077,8 +9078,9 @@ mod tests {
         )]);
         let res = fleet_apply_scoped(&app, SECRET, "rules", with_speaker, "org").await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let two = serde_json::json!([{ "audio_uid": TD_UID }, { "audio_uid": TD_UID }]);
         let bad_window =
-            serde_json::json!([td_rule("a", 60_000, serde_json::json!({ "steps": steps }))]);
+            serde_json::json!([td_rule("a", 60_000, serde_json::json!({ "steps": two }))]);
         let res = fleet_apply(&app, SECRET, "rules", bad_window).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert!(store.list_rules().await.unwrap().is_empty());

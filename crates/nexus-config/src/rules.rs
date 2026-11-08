@@ -228,8 +228,9 @@ impl RuleConfig {
             return Ok(());
         };
         validate_rule_talk_down(td, fleet_scope_is_core)?;
+        // Only a second step needs the rule to fire again inside the window.
         let cooldown_secs = self.debounce.cooldown_ms / 1000;
-        if u64::from(td.escalate_within_secs) <= cooldown_secs {
+        if td.steps.len() > 1 && u64::from(td.escalate_within_secs) <= cooldown_secs {
             return Err(format!(
                 "talk_down escalate_within_secs ({}) must be greater than the rule's cooldown ({cooldown_secs} s)",
                 td.escalate_within_secs
@@ -316,16 +317,27 @@ mod talk_down_tests {
 
     #[test]
     fn escalate_window_must_exceed_rule_cooldown() {
+        let two = serde_json::json!([{"audio_uid": UID}, {"audio_uid": UID}]);
         let r = rule(serde_json::json!({
             "cooldown_ms": 30000,
-            "talk_down": {"steps": [{"audio_uid": UID}], "escalate_within_secs": 30}
+            "talk_down": {"steps": two, "escalate_within_secs": 30}
         }));
         let e = r.validate_talk_down(false).unwrap_err();
         assert!(e.contains("30") && e.contains("cooldown"), "{e}");
         let ok = rule(serde_json::json!({
             "cooldown_ms": 29000,
-            "talk_down": {"steps": [{"audio_uid": UID}], "escalate_within_secs": 30}
+            "talk_down": {"steps": two, "escalate_within_secs": 30}
         }));
         assert!(ok.validate_talk_down(false).is_ok());
+    }
+
+    /// One step has nothing to escalate to, so a long rule cooldown is fine.
+    #[test]
+    fn a_single_step_skips_the_escalation_window_check() {
+        let r = rule(serde_json::json!({
+            "cooldown_ms": 600_000,
+            "talk_down": {"steps": [{"audio_uid": UID}], "escalate_within_secs": 30}
+        }));
+        assert!(r.validate_talk_down(false).is_ok());
     }
 }
