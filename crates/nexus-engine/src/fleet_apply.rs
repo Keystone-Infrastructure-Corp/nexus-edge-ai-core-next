@@ -180,6 +180,31 @@ struct FleetVisualPromptEntry {
     description: Option<String>,
 }
 
+/// Signed URLs are bearer credentials: an audit row (and the diagnostics
+/// bundle that carries audit rows) must never hold one.
+fn redact_signed_urls(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                if matches!(k.as_str(), "url" | "image_url") {
+                    *val = Value::String("[redacted]".into());
+                } else {
+                    redact_signed_urls(val);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_signed_urls),
+        _ => {}
+    }
+}
+
+/// The audit row's `after` payload: `effective` with signed URLs redacted.
+fn audit_after(effective: &Value) -> Option<String> {
+    let mut v = effective.clone();
+    redact_signed_urls(&mut v);
+    serde_json::to_string(&v).ok()
+}
+
 /// `POST /v1/admin/fleet/{category}` — apply a cloud-resolved fleet
 /// setting to this core. See module docs for semantics.
 pub async fn post_admin_fleet_apply(
@@ -210,7 +235,7 @@ pub async fn post_admin_fleet_apply(
     } else {
         AuditOutcome::Failure
     };
-    let after_str = serde_json::to_string(&req.effective).ok();
+    let after_str = audit_after(&req.effective);
     crate::auth::admin_audit::audit_admin_action(
         &s.store,
         session.as_ref(),
@@ -1016,5 +1041,19 @@ mod tests {
         assert!(!should_delete(retract.as_ref(), &keep, "operator-local"));
         assert!(!should_delete(retract.as_ref(), &keep, "fleet-a"));
         assert!(!should_delete(retract.as_ref(), &keep, "anything-else"));
+    }
+
+    /// Audit rows ship in diagnostics bundles; a signed URL must not
+    /// reach them, at any depth.
+    #[test]
+    fn audit_after_redacts_signed_urls() {
+        let effective = serde_json::json!([
+            { "name": "a", "image_url": "https://x/a.png?sig=SECRET" },
+            { "name": "b", "clips": [{ "url": "https://x/b.wav?sig=SECRET2" }] }
+        ]);
+        let out = audit_after(&effective).expect("serialises");
+        assert!(!out.contains("sig="), "{out}");
+        assert!(out.contains("\"name\":\"a\""), "{out}");
+        assert!(out.contains("[redacted]"), "{out}");
     }
 }
