@@ -619,6 +619,8 @@ impl Responder {
                         StartError::Stopped => "stopped",
                         StartError::AudioNotFound => "audio_missing",
                         StartError::AudioNotReady => "audio_not_ready",
+                        // On another call: busy, not a fault an admin has to fix.
+                        StartError::Call(TalkdownError::Rejected(486 | 480)) => "busy",
                         StartError::Call(ref call) => {
                             // An attempt that failed at the speaker: recorded and audited.
                             let session_id = Uuid::now_v7().to_string();
@@ -1502,6 +1504,35 @@ mod tests {
             .activity
             .failing(Utc::now() + Duration::hours(25))
             .is_empty());
+    }
+
+    /// A speaker that answers 486 or 480 is busy on another call: a skip,
+    /// not a fault.
+    #[tokio::test]
+    async fn a_busy_answer_from_the_speaker_is_a_busy_skip_not_a_failure() {
+        for code in ["486 Busy Here", "480 Temporarily Unavailable"] {
+            let (port, _uas) = fake_uas("NEVER", move |req| {
+                if req.starts_with("INVITE") {
+                    vec![reply(req, code, "", "")]
+                } else {
+                    vec![]
+                }
+            })
+            .await;
+            let mut g = rig_with(talk_down(), false, port, bus()).await;
+            let task =
+                g.r.handle(&ev("r1", 1, Utc::now()), Utc::now())
+                    .await
+                    .unwrap();
+            task.await.unwrap();
+            assert!(g.r.d.activity.failing(Utc::now()).is_empty(), "{code}");
+            let r = &g.r.d.activity.rules()[0];
+            assert_eq!(
+                (r.last_result, r.last_reason.as_deref()),
+                ("skipped", Some("busy")),
+                "{code}"
+            );
+        }
     }
 
     #[tokio::test]
