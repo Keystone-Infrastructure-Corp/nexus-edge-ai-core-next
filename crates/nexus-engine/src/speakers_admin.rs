@@ -1061,12 +1061,26 @@ pub(crate) async fn put_speaker_output(
         hw_volume,
         auto_max_per_hour,
     };
+    // Compare-and-set: the device call above used `sp`; if the speaker was
+    // edited meanwhile, its result belongs to a device that is no longer this one.
+    let mut edited = false;
     let change: Result<SqliteTx<'_>, StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
-        s.store.set_speaker_output_tx(&mut tx, id, &out).await?;
+        // Read after `begin_tx`: once that is IMMEDIATE (BUG-334) the tx holds the write lock, so no
+        // edit can commit between this read and the write below.
+        edited = s.store.get_speaker(id).await?.is_some_and(|now| now != sp);
+        if !edited {
+            s.store.set_speaker_output_tx(&mut tx, id, &out).await?;
+        }
         Ok(tx)
     }
     .await;
+    if edited {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("speaker {id} was edited while its output was being set; try again"),
+        ));
+    }
     let json = |o: &SpeakerOutput| serde_json::to_string(o).ok();
     let caller = Caller {
         s: &s,

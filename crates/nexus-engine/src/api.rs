@@ -10254,10 +10254,13 @@ mod tests {
 
     /// An ONVIF Media service on loopback with one audio output configuration
     /// (level 40, range 10 to 90). Records every `SetAudioOutputConfiguration`
-    /// body; refuses them with a SOAP fault while `fail_set` is true.
+    /// body; refuses them with a SOAP fault while `fail_set` is true, and
+    /// holds its reply to each until `release` is notified while `hold_set` is true.
     struct SoapStub {
         port: u16,
         fail_set: Arc<std::sync::atomic::AtomicBool>,
+        hold_set: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
         sets: Arc<parking_lot::Mutex<Vec<String>>>,
     }
 
@@ -10269,11 +10272,15 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let fail_set = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let hold_set = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
         let (fail, rec) = (fail_set.clone(), sets.clone());
+        let (hold, gate) = (hold_set.clone(), release.clone());
         tokio::spawn(async move {
             loop {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let (fail, rec) = (fail.clone(), rec.clone());
+                let (hold, gate) = (hold.clone(), gate.clone());
                 tokio::spawn(async move {
                     let mut req = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -10296,6 +10303,9 @@ mod tests {
                     let body = String::from_utf8_lossy(&req[body_at..]).into_owned();
                     let (status, xml) = if body.contains("<trt:SetAudioOutputConfiguration>") {
                         rec.lock().push(body);
+                        if hold.load(Ordering::SeqCst) {
+                            gate.notified().await;
+                        }
                         if fail.load(Ordering::SeqCst) {
                             (
                                 "500 Internal Server Error",
@@ -10322,6 +10332,8 @@ mod tests {
         SoapStub {
             port,
             fail_set,
+            hold_set,
+            release,
             sets,
         }
     }
@@ -10438,6 +10450,43 @@ mod tests {
         let stored = store.speaker_output(speaker).await.unwrap();
         assert_eq!((stored.volume, stored.hw_volume), (70, false));
         assert!(!store.any_hw_volume().await.unwrap());
+    }
+
+    /// The device call can outlive an edit of the speaker: the old device's
+    /// reply must not mark the replacement as holding the hardware volume.
+    #[tokio::test]
+    async fn speaker_output_put_discards_a_device_reply_for_a_speaker_edited_meanwhile() {
+        use std::sync::atomic::Ordering;
+        let stub = soap_stub().await;
+        stub.hold_set.store(true, Ordering::SeqCst);
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let speaker = create_onvif_speaker(&app, 5060, stub.port).await;
+
+        let slow = tokio::spawn({
+            let app = app.clone();
+            async move { put_output(&app, speaker, volume_70()).await }
+        });
+        while stub.sets.lock().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            &format!("/api/v1/admin/speakers/{speaker}"),
+            Some(serde_json::json!({
+                "name": "spk", "host": "127.0.0.1",
+                "onvif_endpoint": format!("http://127.0.0.1:{}/onvif/replacement", stub.port),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        stub.release.notify_one();
+
+        let (status, body) = slow.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!((stored.volume, stored.hw_volume), (100, false));
     }
 
     /// No endpoint: software volume, and nothing to report.
