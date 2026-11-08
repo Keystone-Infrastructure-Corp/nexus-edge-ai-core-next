@@ -30,6 +30,12 @@
 //! * `GET            /api/v1/admin/talkdown/audio` — the core's audio
 //!   library: `[{uid, name, description, kind, status, error, duration_ms,
 //!   fleet_managed, has_previous}]`
+//! * `POST           /api/v1/admin/talkdown/tts/preview` — `{text, voice}`;
+//!   the rendered `audio/wav`. Local only: no RPC action maps it
+//! * `POST           /api/v1/admin/talkdown/tts/preview-upload` —
+//!   `{text, voice, upload_url}`; renders, PUTs the WAV to the cloud's write
+//!   SAS `upload_url` (never logged or echoed) and answers
+//!   `{sha256, duration_ms}`
 //!
 //! A session ends as soon as its camera and speaker part: a delete of the
 //! speaker, an assignment that moves the camera off it, or an edit of the
@@ -38,7 +44,9 @@
 //! A talk-down action refused for a reason the cloud acts on answers
 //! [`Refusal`]'s `{"error": code, "message": …}`: `talk_down_unsupported`,
 //! `talk_down_busy`, `audio_not_found` (404), `audio_not_ready` (409),
-//! `speaker_unreachable` or `talk_down_negotiation_failed`.
+//! `speaker_unreachable`, `talk_down_negotiation_failed`, `tts_unavailable`
+//! (409), `tts_invalid` (422), `tts_failed` (502) or `preview_upload_failed`
+//! (502).
 //!
 //! A create or update body is a [`SpeakerConfig`] without `id`. On an update
 //! an absent `password` keeps the stored one and `""` clears it. The password
@@ -66,6 +74,7 @@ use crate::auth::require_role::SessionContext;
 use crate::talkdown::health::SpeakerStatus;
 use crate::talkdown::library::{kind_str, status_str};
 use crate::talkdown::session::{Audio, Origin, StartError, StartRequest};
+use crate::talkdown::tts;
 
 /// A speaker as the API shows it: no password, only whether one is set.
 #[derive(Serialize)]
@@ -298,6 +307,15 @@ impl From<StartError> for Refusal {
                 "the talk-down audio has not finished downloading".into(),
             ),
             StartError::Internal(why) => Self(StatusCode::INTERNAL_SERVER_ERROR, "internal", why),
+            StartError::TtsUnavailable => Self(
+                StatusCode::CONFLICT,
+                "tts_unavailable",
+                "text-to-speech is not available on this core".into(),
+            ),
+            StartError::TtsInvalid(why) => {
+                Self(StatusCode::UNPROCESSABLE_ENTITY, "tts_invalid", why)
+            }
+            StartError::TtsFailed(why) => Self(StatusCode::BAD_GATEWAY, "tts_failed", why),
             StartError::Call(e) => Self(
                 StatusCode::BAD_GATEWAY,
                 "speaker_unreachable",
@@ -691,6 +709,10 @@ pub(crate) async fn start_talk_down(
         if let Audio::Stored {
             volume: Some(101..),
             ..
+        }
+        | Audio::Tts {
+            volume: Some(101..),
+            ..
         } = audio
         {
             return Err(Refusal(
@@ -700,12 +722,18 @@ pub(crate) async fn start_talk_down(
             ));
         }
         let (session_id, sdp_answer) = start_on(&s, camera_id, &sp, &audio).await?;
-        let started = serde_json::json!({
+        let mut started = serde_json::json!({
             "session_id": session_id,
             "speaker_id": sp.id,
             "camera_id": camera_id,
             "mode": audio.mode(),
         });
+        // Typed speech is audited with what the speaker said (as spoken).
+        if let Audio::Tts { text, .. } = &audio {
+            started["text"] = tts::validate_text(text, tts::ADHOC_MAX_CHARS)
+                .unwrap_or_default()
+                .into();
+        }
         Ok::<_, Refusal>((started, sdp_answer))
     }
     .await;
@@ -1039,4 +1067,79 @@ pub(crate) async fn list_talkdown_audio(
             })
             .collect(),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreviewInput {
+    text: String,
+    voice: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreviewUploadInput {
+    text: String,
+    voice: String,
+    /// A write SAS: a bearer credential, never logged or echoed.
+    upload_url: String,
+}
+
+/// Render `text` in `voice` for a preview, under the library item limits.
+async fn render_preview(s: &ApiState, text: &str, voice: &str) -> Result<Vec<i16>, Refusal> {
+    let tts = s
+        .talkdown
+        .library()
+        .and_then(|l| l.tts())
+        .ok_or(StartError::TtsUnavailable)?;
+    let text = tts::validate_text(text, tts::LIBRARY_MAX_CHARS).map_err(StartError::TtsInvalid)?;
+    if tts.voice(Some(voice)).is_none() {
+        return Err(StartError::TtsInvalid("unknown voice".into()).into());
+    }
+    Ok(tts
+        .speak(voice, &text, tts::PREVIEW_TIMEOUT)
+        .await
+        .map_err(StartError::TtsFailed)?)
+}
+
+/// The local console's preview: the rendered WAV.
+pub(crate) async fn tts_preview(
+    State(s): State<ApiState>,
+    body: Result<Json<PreviewInput>, JsonRejection>,
+) -> Result<Response, Refusal> {
+    let Json(input) =
+        body.map_err(|e| Refusal(StatusCode::BAD_REQUEST, "bad_request", e.body_text()))?;
+    let pcm = render_preview(&s, &input.text, &input.voice).await?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+        tts::wav(&pcm),
+    )
+        .into_response())
+}
+
+/// The cloud's preview (ADR-091 rule 7: media moves only by SAS): render,
+/// PUT the WAV to the cloud-minted write SAS, answer its digest and length.
+pub(crate) async fn tts_preview_upload(
+    State(s): State<ApiState>,
+    body: Result<Json<PreviewUploadInput>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    // A parse error can quote the body, and the body holds the SAS.
+    let Json(input) = body.map_err(|_| {
+        Refusal(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "the body must be {text, voice, upload_url}".into(),
+        )
+    })?;
+    let pcm = render_preview(&s, &input.text, &input.voice).await?;
+    let file = tts::wav(&pcm);
+    let sha256 = crate::fleet_apply::sha256_hex(&file);
+    let allow_http = s.talkdown.library().is_some_and(|l| l.allow_http());
+    tts::upload(&input.upload_url, file, allow_http)
+        .await
+        .map_err(|why| Refusal(StatusCode::BAD_GATEWAY, "preview_upload_failed", why))?;
+    Ok(Json(serde_json::json!({
+        "sha256": sha256,
+        "duration_ms": pcm.len() / 8,
+    })))
 }

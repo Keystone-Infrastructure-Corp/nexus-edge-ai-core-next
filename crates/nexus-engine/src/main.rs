@@ -1688,9 +1688,19 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let model_catalog_handle =
         model_catalog_publish::spawn(model_prompts.clone(), cloud_outbox.clone());
 
-    // SPEC-086 — the talk-down library and its download worker.
+    // SPEC-086 — the talk-down library and its download worker. TTS needs
+    // the release layout: `<root>/bin/nexus-tts` and `<root>/share/models/`.
+    let tts = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.to_path_buf()))
+        .and_then(|bin| {
+            let models = bin.parent()?.join("share/models");
+            talkdown::tts::Tts::discover(&bin, &models)
+        })
+        .map(std::sync::Arc::new);
+    talkdown::tts::AVAILABLE.store(tts.is_some(), std::sync::atomic::Ordering::Relaxed);
     let (talkdown_library, talkdown_library_handle) =
-        talkdown::library::Library::spawn(store.clone(), bus.clone(), false);
+        talkdown::library::Library::spawn(store.clone(), bus.clone(), false, tts);
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),

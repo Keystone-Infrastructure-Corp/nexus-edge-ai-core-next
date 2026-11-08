@@ -23,6 +23,7 @@ use super::library::Library;
 #[cfg(feature = "gstreamer-webrtc")]
 use super::live::Live;
 use super::sip::{place_call, SipCall, SipTarget, TalkdownError};
+use super::tts;
 use super::{tone_pcm, Gain};
 
 /// How long a speaker gets to answer the INVITE.
@@ -33,7 +34,8 @@ const TONE_MS: u32 = 2000;
 const TAIL_SAMPLES: usize = 300 * 8;
 
 /// A start request's body: `{"mode": "tone"}`,
-/// `{"mode": "stored", "audio_uid": …, "volume"?: 0-100}` or
+/// `{"mode": "stored", "audio_uid": …, "volume"?: 0-100}`,
+/// `{"mode": "tts", "text": …, "voice"?: id, "volume"?: 0-100}` or
 /// `{"mode": "live", "sdp_offer": …, "ice_servers": […]}`.
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
@@ -42,6 +44,15 @@ pub enum Audio {
     /// An item of the core's library; `volume` is the session's.
     Stored {
         audio_uid: String,
+        #[serde(default)]
+        volume: Option<u8>,
+    },
+    /// Typed speech, rendered on this core; `voice` defaults to the first
+    /// discovered voice. The text goes into the audit row, never a span.
+    Tts {
+        text: String,
+        #[serde(default)]
+        voice: Option<String>,
         #[serde(default)]
         volume: Option<u8>,
     },
@@ -62,6 +73,7 @@ impl Audio {
         match self {
             Self::Tone => "tone",
             Self::Stored { .. } => "stored",
+            Self::Tts { .. } => "tts",
             Self::Live { .. } => "live",
         }
     }
@@ -98,6 +110,12 @@ pub enum StartError {
     AudioNotReady,
     /// The store could not be read.
     Internal(String),
+    /// This core has no text-to-speech helper or voice.
+    TtsUnavailable,
+    /// The text or the voice was refused; never contains the text.
+    TtsInvalid(String),
+    /// The render failed or timed out.
+    TtsFailed(String),
     Call(TalkdownError),
     /// This build has no live audio.
     #[cfg(not(feature = "gstreamer-webrtc"))]
@@ -155,8 +173,11 @@ impl TalkdownSessions {
     /// What these sessions can play, as the talk-down GET lists it.
     pub fn modes(&self) -> Vec<&'static str> {
         let mut modes = vec!["tone"];
-        if self.library.is_some() {
+        if let Some(library) = &self.library {
             modes.push("stored");
+            if library.tts().is_some() {
+                modes.push("tts");
+            }
         }
         if cfg!(feature = "gstreamer-webrtc") {
             modes.push("live");
@@ -259,8 +280,30 @@ impl TalkdownSessions {
         let volume = match audio {
             Audio::Stored {
                 volume: Some(v), ..
+            }
+            | Audio::Tts {
+                volume: Some(v), ..
             } => *v,
             _ => 100,
+        };
+        // Typed speech is checked before the claim, so a refusal rings nothing.
+        let speech = match audio {
+            Audio::Tts { text, voice, .. } => {
+                let tts = self
+                    .library
+                    .as_ref()
+                    .and_then(|l| l.tts())
+                    .ok_or(StartError::TtsUnavailable)?;
+                let text = tts::validate_text(text, tts::ADHOC_MAX_CHARS)
+                    .map_err(StartError::TtsInvalid)?;
+                let voice = tts
+                    .voice(voice.as_deref())
+                    .ok_or_else(|| StartError::TtsInvalid("unknown voice".into()))?
+                    .id
+                    .clone();
+                Some((tts.clone(), voice, text))
+            }
+            _ => None,
         };
         // Claim before anything slow, the store read included.
         let session = self.claim(speaker.id, camera_id, origin, output, volume)?;
@@ -273,6 +316,13 @@ impl TalkdownSessions {
                 Audio::Stored { audio_uid, .. } => match &self.library {
                     Some(lib) => lib.pcm(audio_uid).await,
                     None => Err(StartError::AudioNotFound),
+                },
+                Audio::Tts { .. } => match &speech {
+                    Some((tts, voice, text)) => tts
+                        .speak(voice, text, tts::ADHOC_TIMEOUT)
+                        .await
+                        .map_err(StartError::TtsFailed),
+                    None => Err(StartError::TtsUnavailable),
                 },
                 Audio::Live { .. } => Ok(Vec::new()),
             }

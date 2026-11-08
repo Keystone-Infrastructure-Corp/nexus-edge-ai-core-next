@@ -635,6 +635,14 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/talkdown/audio",
             get(crate::speakers_admin::list_talkdown_audio),
         )
+        .route(
+            "/v1/admin/talkdown/tts/preview",
+            axum::routing::post(crate::speakers_admin::tts_preview),
+        )
+        .route(
+            "/v1/admin/talkdown/tts/preview-upload",
+            axum::routing::post(crate::speakers_admin::tts_preview_upload),
+        )
         // Phase 7.6 · Step 7.6.3 — ONVIF device control. These drive
         // the per-camera SOAP client (`crate::discovery::onvif_*`)
         // against the camera's edge-resident endpoint + credentials.
@@ -10043,7 +10051,7 @@ mod tests {
     /// Sessions with a library over `store`, fetching over plain http.
     fn library_sessions(store: &Arc<Store>, bus: &Arc<dyn nexus_bus::Bus>) -> TalkdownSessions {
         let (library, _worker) =
-            crate::talkdown::library::Library::spawn(store.clone(), bus.clone(), true);
+            crate::talkdown::library::Library::spawn(store.clone(), bus.clone(), true, None);
         TalkdownSessions::with_library(library)
     }
 
@@ -11268,6 +11276,267 @@ mod tests {
     }
 
     // ===============================================================
+    // SPEC-086 — text-to-speech (Task 10)
+    // ===============================================================
+
+    /// Sessions with a library over `store` and a fake text-to-speech
+    /// helper whose voice ids pick its behaviour (`fake-tts.sh`).
+    fn tts_sessions(
+        store: &Arc<Store>,
+        bus: &Arc<dyn nexus_bus::Bus>,
+        voices: &[&str],
+    ) -> TalkdownSessions {
+        let tts = Arc::new(crate::talkdown::tts::tests::fake(voices));
+        let (library, _worker) =
+            crate::talkdown::library::Library::spawn(store.clone(), bus.clone(), true, Some(tts));
+        TalkdownSessions::with_library(library)
+    }
+
+    async fn talk_down_modes(app: &axum::Router) -> Vec<serde_json::Value> {
+        let (_, body) =
+            speaker_call(app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        speaker_json(&body)["modes"].as_array().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn talk_down_tts_plays_the_rendered_text_and_audits_it() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female", "fail"]);
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        assert!(talk_down_modes(&app).await.contains(&"tts".into()));
+
+        let play = serde_json::json!({ "mode": "tts", "text": "Please leave the area" });
+        let (status, body) = start_talk_down(&app, 1, play).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body)["mode"], "tts");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let frames = rtp_frames(&rtp);
+        // 22 bytes of input, 800 samples each, in 160-sample frames, and the tail.
+        assert!(frames.len() >= 22 * 5, "{} frames", frames.len());
+        assert!(!is_silent(&frames[0]));
+
+        // The audit row records the mode and the text.
+        let rows = store
+            .list_audit_for_resource("camera", "1", 50)
+            .await
+            .unwrap();
+        let start = rows
+            .iter()
+            .find(|r| r.action == "talk_down.start")
+            .expect("a talk_down.start row");
+        let after: serde_json::Value =
+            serde_json::from_str(start.after_json.as_deref().unwrap()).unwrap();
+        assert_eq!(after["mode"], "tts");
+        assert_eq!(after["text"], "Please leave the area");
+    }
+
+    #[tokio::test]
+    async fn talk_down_tts_refuses_bad_text_unknown_voices_and_failed_renders() {
+        // A speaker that never hears a request: any INVITE would land here.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female", "fail"]);
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+
+        for (play, want, code) in [
+            (
+                serde_json::json!({ "mode": "tts", "text": "x".repeat(121) }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tts_invalid",
+            ),
+            (
+                serde_json::json!({ "mode": "tts", "text": " \n " }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tts_invalid",
+            ),
+            (
+                serde_json::json!({ "mode": "tts", "text": "Leave", "voice": "es-ES-male" }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tts_invalid",
+            ),
+            (
+                serde_json::json!({ "mode": "tts", "text": "Leave", "volume": 101 }),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                serde_json::json!({ "mode": "tts", "text": "Leave", "voice": "fail" }),
+                StatusCode::BAD_GATEWAY,
+                "tts_failed",
+            ),
+        ] {
+            let (status, body) = start_talk_down(&app, 1, play.clone()).await;
+            assert_eq!(status, want, "{play}: {body}");
+            assert_eq!(error_code(&body), code, "{play}");
+            assert!(!talk_down_busy(&app).await, "a refusal frees the speaker");
+        }
+        let mut buf = [0u8; 2048];
+        let heard =
+            tokio::time::timeout(std::time::Duration::from_millis(200), silent.recv(&mut buf))
+                .await;
+        assert!(heard.is_err(), "a refused play placed a call");
+        // Duplicate tags cannot smuggle a mode past the permission check.
+        assert!(serde_json::from_str::<crate::talkdown::session::Audio>(
+            r#"{"mode":"tts","mode":"stored","audio_uid":"x","text":"t"}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn talk_down_tts_without_a_helper_is_409_and_not_a_mode() {
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        assert!(!talk_down_modes(&app).await.contains(&"tts".into()));
+        let play = serde_json::json!({ "mode": "tts", "text": "Please leave the area" });
+        let (status, body) = start_talk_down(&app, 1, play).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "tts_unavailable");
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/talkdown/tts/preview",
+            Some(serde_json::json!({ "text": "Hi", "voice": "en-US-female" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "tts_unavailable");
+    }
+
+    #[tokio::test]
+    async fn library_tts_items_render_to_ready_or_fail_with_the_reason() {
+        use nexus_store::AudioStatus;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female", "fail"]);
+        let app = super::router(state);
+        let tts = |uid: &str, voice: &str| {
+            serde_json::json!({ "uid": uid, "name": "Leave", "kind": "tts",
+                "text": "Please leave the area now.", "voice": voice })
+        };
+        // A voice this core lacks is a failed item, not a refused sync.
+        let push = serde_json::json!([
+            tts(TTS_UID, "en-US-female"),
+            tts(LOCAL_UID, "es-ES-male"),
+            tts(CLIP_UID, "fail"),
+        ]);
+        let (status, body) = talkdown_apply(&app, push, 1).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(settled(&store, TTS_UID).await, AudioStatus::Ready);
+        let pcm = store.talkdown_audio_pcm(TTS_UID).await.unwrap().unwrap();
+        assert_eq!(pcm.len(), 27 * 800, "26 characters and the newline");
+        assert_eq!(settled(&store, LOCAL_UID).await, AudioStatus::Failed);
+        let unknown = store.get_talkdown_audio(LOCAL_UID).await.unwrap().unwrap();
+        assert!(unknown.error.unwrap().contains("unknown voice"));
+        assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Failed);
+        let failed = store.get_talkdown_audio(CLIP_UID).await.unwrap().unwrap();
+        assert!(failed.error.unwrap().starts_with("text-to-speech failed"));
+
+        // The ready item plays.
+        let (port, _rtp, uas) = fake_speaker().await;
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        let play = serde_json::json!({ "mode": "stored", "audio_uid": TTS_UID });
+        let (status, body) = start_talk_down(&app, 1, play).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+    }
+
+    /// The local preview answers a WAV; the upload preview PUTs one to the
+    /// cloud's write SAS and answers its digest and length.
+    #[tokio::test]
+    async fn tts_previews_render_a_wav_locally_and_to_a_write_sas() {
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female"]);
+        let app = super::router(state);
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/talkdown/tts/preview")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "text": "Hi there", "voice": "en-US-female" }).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "audio/wav");
+        let file = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&file[..4], b"RIFF");
+        assert_eq!(file.len(), 44 + 9 * 800 * 2);
+
+        for bad in [
+            serde_json::json!({ "text": "Hi", "voice": "es-ES-male" }),
+            serde_json::json!({ "text": "", "voice": "en-US-female" }),
+            serde_json::json!({ "text": "x".repeat(501), "voice": "en-US-female" }),
+        ] {
+            let (status, body) = speaker_call(
+                &app,
+                Method::POST,
+                "/api/v1/admin/talkdown/tts/preview",
+                Some(bad.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
+            assert_eq!(error_code(&body), "tts_invalid");
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let base = server.uri().replace("127.0.0.1", "localhost");
+        let upload = |url: String| serde_json::json!({ "text": "Hi there", "voice": "en-US-female", "upload_url": url });
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/talkdown/tts/preview-upload",
+            Some(upload(format!("{base}/p.wav?sig=SAS-SIGNATURE"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let got = server.received_requests().await.unwrap();
+        assert_eq!(got.len(), 1);
+        let v = speaker_json(&body);
+        assert_eq!(v["sha256"], sha256_hex(&got[0].body));
+        assert_eq!(v["duration_ms"], 900);
+
+        // An IP-literal host is refused, and the URL is never echoed.
+        let ip = format!("{}/p.wav?sig=SAS-SIGNATURE", server.uri());
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/talkdown/tts/preview-upload",
+            Some(upload(ip)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(error_code(&body), "preview_upload_failed");
+        assert!(!body.contains("SAS-SIGNATURE") && !body.contains("127.0.0.1"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    // ===============================================================
     // SPEC-086 — the `talkdown_audio` fleet category
     // ===============================================================
 
@@ -11367,7 +11636,7 @@ mod tests {
             ])
         );
         assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Ready);
-        // No text-to-speech on this core yet (Task 10).
+        // This core has no text-to-speech helper.
         assert_eq!(settled(&store, TTS_UID).await, AudioStatus::Failed);
         let pcm = store.talkdown_audio_pcm(CLIP_UID).await.unwrap().unwrap();
         assert_eq!(pcm.len(), quiet.len());

@@ -18,6 +18,7 @@ pub mod library;
 pub mod live;
 pub mod session;
 pub mod sip;
+pub mod tts;
 
 /// A polite two-note chime (E5 then C5, each fading out) at about -10 dBFS,
 /// 8 kHz mono, `ms` long.

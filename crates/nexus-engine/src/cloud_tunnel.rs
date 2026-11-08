@@ -1253,9 +1253,11 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// `talkdown_audio` fleet category (cloud D13: no fetch-by-URL mode).
 /// `talkdown_hw_volume` is advertised once any speaker's own level is set over
 /// ONVIF (`hw_volume`), so the cloud only offers a device volume where one works.
+/// `talkdown_tts` says startup found the text-to-speech helper and a voice.
 fn heartbeat_caps(
     hd_transport: Option<nexus_types::HdTransport>,
     talkdown_hw_volume: bool,
+    talkdown_tts: bool,
 ) -> Vec<String> {
     let mut caps = vec![
         "live_view".to_string(),
@@ -1264,6 +1266,7 @@ fn heartbeat_caps(
     ];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
     caps.extend(talkdown_hw_volume.then(|| "talkdown_hw_volume".to_string()));
+    caps.extend(talkdown_tts.then(|| "talkdown_tts".to_string()));
     caps
 }
 
@@ -1351,6 +1354,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
                 caps: Some(heartbeat_caps(
                     webrtc.can_publish(hd_transport).then_some(hd_transport),
                     talkdown_hw_volume,
+                    crate::talkdown::tts::AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
                 )),
                 online_cameras,
                 queued_alerts,
@@ -2672,7 +2676,7 @@ mod health_tests {
     #[test]
     fn no_transport_advertises_talk_down() {
         for t in nexus_types::HdTransport::all() {
-            let caps = heartbeat_caps(Some(t), false);
+            let caps = heartbeat_caps(Some(t), false, false);
             assert!(
                 caps.contains(&"live_view".to_string()),
                 "{t} must still advertise the LBR pump: {caps:?}"
@@ -2689,15 +2693,30 @@ mod health_tests {
     #[test]
     fn the_hd_transport_is_advertised_only_when_the_bridge_can_publish() {
         assert_eq!(
-            heartbeat_caps(None, false),
+            heartbeat_caps(None, false, false),
             ["live_view", "actor_perm_v1", "talkdown_stored"]
         );
         for t in nexus_types::HdTransport::all() {
             assert_eq!(
-                heartbeat_caps(Some(t), false),
+                heartbeat_caps(Some(t), false, false),
                 ["live_view", "actor_perm_v1", "talkdown_stored", t.cap_tag()]
             );
         }
+    }
+
+    /// `talkdown_tts` only when startup found the helper and a voice.
+    #[test]
+    fn talkdown_tts_is_advertised_only_when_available() {
+        assert!(!heartbeat_caps(None, false, false).contains(&"talkdown_tts".to_string()));
+        assert_eq!(
+            heartbeat_caps(None, false, true),
+            [
+                "live_view",
+                "actor_perm_v1",
+                "talkdown_stored",
+                "talkdown_tts"
+            ]
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
 use super::session::StartError;
+use super::tts::{self, Tts};
 use super::{clip, limit};
 
 /// Room for every item of one sync (the org cap is 25) and a re-push.
@@ -30,7 +31,7 @@ pub enum Job {
         url: String,
         sha256: String,
     },
-    /// Consumed by the text-to-speech renderer (Task 10).
+    /// Render the item's stored text in its stored voice.
     Render { uid: String },
 }
 
@@ -42,6 +43,10 @@ pub struct Library {
     /// Held by a sync from its marker read to its marker write, and by the
     /// worker while it records a result, so neither acts on a stale row.
     lock: Arc<Mutex<()>>,
+    /// Renders TTS items, typed speech and previews; `None` on a core
+    /// without the helper or a voice.
+    tts: Option<Arc<Tts>>,
+    allow_http: bool,
 }
 
 /// One item of a `talkdown_audio` push. Unknown fields (`duration_ms`)
@@ -87,8 +92,7 @@ impl Item {
                     return Err(format!("item {uid}: sha256 must be 64 hex digits"));
                 }
             }
-            // shortcut: any voice id up to 64 characters is accepted; check it
-            // against the discovered voices once Task 10 adds them.
+            // A voice this core lacks fails its render, not the sync.
             Source::Tts { text, voice } => {
                 if !(1..=500).contains(&chars(text)) {
                     return Err(format!("item {uid}: text must be 1 to 500 characters"));
@@ -163,12 +167,39 @@ pub fn normalize(pcm: &mut [i16]) {
 
 impl Library {
     /// The library and its worker, which runs until every clone is dropped.
-    /// `allow_http` exists for the tests' plain-http clip server only.
-    pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, allow_http: bool) -> (Self, JoinHandle<()>) {
+    /// `allow_http` exists for the tests' plain-http clip and preview servers only.
+    pub fn spawn(
+        store: Arc<Store>,
+        bus: Arc<dyn Bus>,
+        allow_http: bool,
+        tts: Option<Arc<Tts>>,
+    ) -> (Self, JoinHandle<()>) {
         let (jobs, rx) = mpsc::channel(QUEUE);
         let lock = Arc::new(Mutex::new(()));
-        let worker = tokio::spawn(work(store.clone(), bus, lock.clone(), rx, allow_http));
-        (Self { store, jobs, lock }, worker)
+        let worker = tokio::spawn(work(
+            store.clone(),
+            bus,
+            lock.clone(),
+            rx,
+            allow_http,
+            tts.clone(),
+        ));
+        let library = Self {
+            store,
+            jobs,
+            lock,
+            tts,
+            allow_http,
+        };
+        (library, worker)
+    }
+
+    pub fn tts(&self) -> Option<&Arc<Tts>> {
+        self.tts.as_ref()
+    }
+
+    pub fn allow_http(&self) -> bool {
+        self.allow_http
     }
 
     /// The samples of a ready item.
@@ -272,6 +303,7 @@ async fn work(
     lock: Arc<Mutex<()>>,
     mut rx: mpsc::Receiver<Job>,
     allow_http: bool,
+    tts: Option<Arc<Tts>>,
 ) {
     while let Some(job) = rx.recv().await {
         let (uid, token, result) = match job {
@@ -286,11 +318,27 @@ async fn work(
                 });
                 (uid, Some(sha256), result)
             }
-            Job::Render { uid } => (
-                uid,
-                None,
-                Err("text-to-speech is not available on this core".to_string()),
-            ),
+            // One at a time: this worker, and `Tts`'s own lock against
+            // typed speech and previews.
+            Job::Render { uid } => {
+                let Ok(Some(item)) = store.get_talkdown_audio(&uid).await else {
+                    continue;
+                };
+                if item.status == AudioStatus::Ready {
+                    continue;
+                }
+                let result = match (&tts, item.tts_text, item.tts_voice) {
+                    (None, ..) => Err("text-to-speech is not available on this core".to_string()),
+                    (Some(tts), Some(text), Some(voice)) => {
+                        match tts::validate_text(&text, tts::LIBRARY_MAX_CHARS) {
+                            Ok(text) => tts.speak(&voice, &text, tts::LIBRARY_TIMEOUT).await,
+                            Err(why) => Err(why),
+                        }
+                    }
+                    _ => Err("the item has no text or voice".to_string()),
+                };
+                (uid, item.version_token, result)
+            }
         };
         let _held = lock.lock().await;
         // A sync that changed or removed the item since wins.

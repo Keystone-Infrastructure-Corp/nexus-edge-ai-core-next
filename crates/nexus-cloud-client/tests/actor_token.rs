@@ -1256,3 +1256,96 @@ async fn cached_ptz_success_cannot_authorize_a_changed_action_or_camera() {
         ));
     }
 }
+
+/// Typed speech (D12): `live.talkdown_speak` signs a camera talk-down POST
+/// whose body is `mode: "tts"`, and only that; `live.talkdown` signs every
+/// other mode. A token with no signed `perm` never reaches typed speech,
+/// whatever its role, but keeps the legacy fallback for the other modes.
+/// The preview upload signs `settings.write`; the local preview is unmapped.
+#[test]
+fn typed_speech_needs_a_signed_live_talkdown_speak() {
+    let actor = |perm: Option<&str>, role: &str| VerifiedActor {
+        sub: "human".into(),
+        role: role.into(),
+        perm: perm.map(Into::into),
+        jti: "jti".into(),
+        org_id: ORG_ID.into(),
+        actor_org_id: None,
+    };
+    let post = |path| EnvelopeContext {
+        method: "POST",
+        path,
+    };
+    let start = post("/admin/cameras/7/talk-down");
+    let tts = json!({"mode":"tts","text":"Please leave the area"});
+    let stored = json!({"mode":"stored","audio_uid":"a1b2c3d4-0000-4000-8000-000000000001"});
+    let tone = json!({"mode":"tone"});
+    let other_camera = json!({"mode":"tts","text":"Leave","camera_id":8});
+    let bytes = |v: &serde_json::Value| serde_json::to_vec(v).unwrap();
+    for (perm, body, allowed) in [
+        ("live.talkdown_speak", Some(&tts), true),
+        ("live.talkdown", Some(&tts), false),
+        ("live.talkdown_speak", Some(&stored), false),
+        ("live.talkdown_speak", Some(&tone), false),
+        ("live.talkdown", Some(&stored), true),
+        ("live.talkdown", Some(&tone), true),
+        ("live.talkdown_speak", Some(&other_camera), false),
+        ("live.talkdown_speak", None, false),
+        ("settings.write", Some(&tts), false),
+    ] {
+        let b = body.map(bytes);
+        assert_eq!(
+            actor(Some(perm), "viewer").allows_rpc(start, b.as_deref(), false),
+            allowed,
+            "{perm} {body:?}"
+        );
+    }
+    // `live.talkdown_speak` reaches no other talk-down route.
+    for path in [
+        "/admin/cameras/7/talk-down/stop",
+        "/admin/cameras/7/talk-down/volume",
+    ] {
+        assert!(!actor(Some("live.talkdown_speak"), "owner").allows_rpc(
+            post(path),
+            Some(&bytes(&json!({"volume":40}))),
+            true
+        ));
+    }
+    // No signed perm: typed speech is refused for every role; other modes
+    // keep the role fallback.
+    let dup = br#"{"mode":"stored","mode":"tts"}"#;
+    for role in ["owner", "admin", "operator", "viewer"] {
+        let legacy = actor(None, role);
+        assert!(
+            !legacy.allows_rpc(start, Some(&bytes(&tts)), true),
+            "{role}"
+        );
+        assert!(
+            legacy.allows_rpc(start, Some(&bytes(&stored)), true),
+            "{role}"
+        );
+        assert!(
+            legacy.allows_rpc(start, Some(&bytes(&tone)), true),
+            "{role}"
+        );
+        assert!(!legacy.allows_rpc(start, Some(dup), true), "{role}");
+    }
+    // The preview upload is a setting; the local preview is never reached.
+    let upload = post("/admin/talkdown/tts/preview-upload");
+    let up = bytes(&json!({"text":"t","voice":"en-US-female","upload_url":"https://x/y"}));
+    assert!(actor(Some("settings.write"), "viewer").allows_rpc(upload, Some(&up), false));
+    for perm in ["live.talkdown", "live.talkdown_speak", "settings.read"] {
+        assert!(
+            !actor(Some(perm), "owner").allows_rpc(upload, Some(&up), true),
+            "{perm}"
+        );
+    }
+    let preview = post("/admin/talkdown/tts/preview");
+    for perm in ["settings.write", "live.talkdown_speak", "live.talkdown"] {
+        assert!(
+            !actor(Some(perm), "owner").allows_rpc(preview, Some(&up), true),
+            "{perm}"
+        );
+    }
+    assert!(!actor(None, "owner").allows_rpc(preview, Some(&up), true));
+}
