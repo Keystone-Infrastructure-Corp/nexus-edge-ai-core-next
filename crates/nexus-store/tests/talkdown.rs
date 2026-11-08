@@ -280,6 +280,43 @@ async fn core_settings_and_arming_expiry() {
     assert!(!s.talkdown_core().await.unwrap().auto_armed);
 }
 
+/// On enrolment or unenrolment the fleet's items, its marker and the push
+/// revision go; items made on the core stay.
+#[tokio::test]
+async fn reset_fleet_library_forgets_the_fleet_and_keeps_local_items() {
+    let (s, _d) = fresh_store().await;
+    for uid in ["fleet-1", "local-1"] {
+        s.upsert_talkdown_pending(&clip(uid)).await.unwrap();
+    }
+    s.set_talkdown_core_library_revision(57).await.unwrap();
+    let keys = vec!["fleet-1".to_string()];
+    s.fleet_marker_upsert(&nexus_store::FleetMarkerWrite {
+        category: "talkdown_audio",
+        scope_type: Some("org"),
+        scope_id: None,
+        effective_sha256: None,
+        mode: Some("merge"),
+        managed_keys: Some(&keys),
+    })
+    .await
+    .unwrap();
+
+    s.reset_talkdown_fleet_library().await.unwrap();
+
+    assert_eq!(s.talkdown_core().await.unwrap().library_revision, 0);
+    assert!(s.fleet_marker_get("talkdown_audio").await.unwrap().is_none());
+    let left: Vec<String> = s
+        .list_talkdown_audio()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.uid)
+        .collect();
+    assert_eq!(left, ["local-1"]);
+    // Idempotent, and harmless with no marker.
+    s.reset_talkdown_fleet_library().await.unwrap();
+}
+
 #[tokio::test]
 async fn speaker_arming() {
     let (s, _d) = fresh_store().await;

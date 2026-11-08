@@ -338,6 +338,11 @@ pub async fn delete_cloud_enrollment(
         .clear_cloud_enrollment()
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The org's talk-down library leaves with it; the next org starts at revision 0.
+    s.store
+        .reset_talkdown_fleet_library()
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Audit (best-effort by design — clearing already succeeded).
     let before_audit_str = before_audit.as_ref().map(ToString::to_string);

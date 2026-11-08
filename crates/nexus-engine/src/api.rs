@@ -12265,6 +12265,31 @@ mod tests {
         }
     }
 
+    /// A core unenrolled (and later enrolled into another org) drops the old
+    /// org's library and accepts revision 1 again, not `{"stale": true}`.
+    #[tokio::test]
+    async fn unenrolment_resets_the_talkdown_library_revision_and_fleet_items() {
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        store_ready_clip(&store, LOCAL_UID, &[1, 2, 3]).await;
+        let tts = serde_json::json!([{ "uid": TTS_UID, "name": "Leave", "kind": "tts",
+            "text": "Please leave.", "voice": "es" }]);
+        let (status, _) = talkdown_apply(&app, tts.clone(), 57).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) =
+            speaker_call(&app, Method::DELETE, "/api/v1/admin/cloud/enrollment", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_none());
+        assert!(store.get_talkdown_audio(LOCAL_UID).await.unwrap().is_some());
+
+        let (status, body) = talkdown_apply(&app, tts, 1).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(body, serde_json::json!({ "stale": true }));
+        assert_eq!(store.talkdown_core().await.unwrap().library_revision, 1);
+    }
+
     #[tokio::test]
     async fn fleet_apply_talkdown_audio_refuses_bad_items_and_lists_fleet_items() {
         let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;

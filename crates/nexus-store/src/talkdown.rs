@@ -540,6 +540,28 @@ impl Store {
         Ok(())
     }
 
+    /// Forget the fleet's talk-down library, on enrolment and unenrolment:
+    /// delete the items the fleet pushed (items made on the core stay), its
+    /// marker, and the push revision, so the next org starts from revision 0.
+    pub async fn reset_talkdown_fleet_library(&self) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM talkdown_audio WHERE uid IN (SELECT j.value \
+             FROM fleet_managed_markers m, json_each(m.managed_keys) j \
+             WHERE m.category = 'talkdown_audio')",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM fleet_managed_markers WHERE category = 'talkdown_audio'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE talkdown_core SET library_revision = 0 WHERE id = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Store as armed every disarm (core-wide and per speaker) whose
     /// `rearm_at` is at or before `now`; returns how many changed. A
     /// disarm written since the caller read the state keeps its own

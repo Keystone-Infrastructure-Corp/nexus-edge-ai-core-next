@@ -304,6 +304,12 @@ pub async fn perform_enrollment(
         .set_cloud_enrollment(&persisted)
         .await
         .context("persist cloud_enrollment row")?;
+    // A previous org's talk-down library and revision would make every push
+    // from this enrolment stale.
+    store
+        .reset_talkdown_fleet_library()
+        .await
+        .context("reset the talk-down fleet library")?;
     Ok(persisted)
 }
 
