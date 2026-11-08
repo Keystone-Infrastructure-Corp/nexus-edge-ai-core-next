@@ -217,6 +217,40 @@ async fn plays_round_trip_and_prune() {
 }
 
 #[tokio::test]
+async fn plays_filter_by_camera_and_since() {
+    let (s, _d) = fresh_store().await;
+    let at = |camera, session| NewPlay {
+        camera_id: Some(camera),
+        ..play(session, "e")
+    };
+    let old = s.insert_talkdown_play(&at(3, "s1")).await.unwrap();
+    let new = s.insert_talkdown_play(&at(3, "s2")).await.unwrap();
+    s.insert_talkdown_play(&at(4, "s3")).await.unwrap();
+    sqlx::query("UPDATE talkdown_plays SET started_at = datetime('now', '-2 hours') WHERE id = ?")
+        .bind(old)
+        .execute(s.pool())
+        .await
+        .unwrap();
+    let cam3 = PlayFilter {
+        camera_id: Some(3),
+        ..Default::default()
+    };
+    let ids = |v: Vec<nexus_store::TalkdownPlay>| v.iter().map(|p| p.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(s.list_talkdown_plays(&cam3).await.unwrap()),
+        vec![new, old]
+    );
+    let recent = PlayFilter {
+        since: Some(Utc::now() - Duration::hours(1)),
+        ..cam3
+    };
+    assert_eq!(
+        ids(s.list_talkdown_plays(&recent).await.unwrap()),
+        vec![new]
+    );
+}
+
+#[tokio::test]
 async fn core_settings_and_arming_expiry() {
     let (s, _d) = fresh_store().await;
     let c = s.talkdown_core().await.unwrap();
@@ -276,6 +310,30 @@ async fn speaker_arming() {
         Err(StoreError::NotFound(_))
     ));
     assert!(s.speaker_arming(999).await.unwrap().is_none());
+
+    // Elapsed disarms are stored as armed; a later or indefinite one stays.
+    let now = Utc::now();
+    s.set_speaker_arming(sp.id, false, Some(now - Duration::seconds(1)), Some("r"))
+        .await
+        .unwrap();
+    s.set_talkdown_core_arming(false, Some(now + Duration::hours(1)), Some("c"))
+        .await
+        .unwrap();
+    assert_eq!(s.rearm_elapsed_talkdown(now).await.unwrap(), 1);
+    let a = s.speaker_arming(sp.id).await.unwrap().unwrap();
+    assert!(a.armed && a.rearm_at.is_none() && a.reason.is_none());
+    let c = s.talkdown_core().await.unwrap();
+    assert!(!c.auto_armed && c.auto_disarm_reason.as_deref() == Some("c"));
+    s.set_talkdown_core_arming(false, None, Some("indefinite"))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.rearm_elapsed_talkdown(now + Duration::days(30))
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!s.talkdown_core().await.unwrap().auto_armed);
     // The speaker config round-trips untouched by the new columns.
     assert_eq!(s.get_speaker(sp.id).await.unwrap().unwrap().name, "sp");
 }

@@ -1858,6 +1858,22 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         tokio_util::sync::CancellationToken::new(),
     ));
 
+    // ADR-095 — play a rule's stored talk-down audio when the rule fires,
+    // within its bounds, and prune plays older than 90 days daily. Spawned
+    // here rather than beside the cold replicator because it drives the
+    // API's talk-down sessions; it ends with the runtime, like the probes.
+    tokio::spawn(talkdown::responder::run(
+        talkdown::responder::ResponderDeps {
+            store: store.clone(),
+            bus: bus.clone(),
+            sessions: api_state.talkdown.clone(),
+            evaluator: evaluator.clone(),
+            policy: cascading_policy.clone(),
+            activity: api_state.health.talkdown_activity(),
+        },
+        tokio_util::sync::CancellationToken::new(),
+    ));
+
     if !cli.no_api {
         // M-Admin Phase 0 — operator-persisted bind override
         // wins over `nexus.toml`. Stored as a plain `host:port`

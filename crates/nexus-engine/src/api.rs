@@ -643,6 +643,28 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/talkdown/tts/preview-upload",
             axum::routing::post(crate::speakers_admin::tts_preview_upload),
         )
+        // ADR-095 — arming of automatic (rule) plays, the status an admin
+        // checks, and the play history.
+        .route(
+            "/v1/admin/talkdown/arming",
+            put(crate::speakers_admin::put_talkdown_arming),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/talk-down/arming",
+            put(crate::speakers_admin::put_talk_down_arming),
+        )
+        .route(
+            "/v1/admin/speakers/{id}/arming",
+            put(crate::speakers_admin::put_speaker_arming),
+        )
+        .route(
+            "/v1/admin/talkdown/status",
+            get(crate::speakers_admin::talkdown_status),
+        )
+        .route(
+            "/v1/admin/talkdown/plays",
+            get(crate::speakers_admin::list_talkdown_plays),
+        )
         // Phase 7.6 · Step 7.6.3 — ONVIF device control. These drive
         // the per-camera SOAP client (`crate::discovery::onvif_*`)
         // against the camera's edge-resident endpoint + credentials.
@@ -9818,6 +9840,17 @@ mod tests {
             view["session_id"] = serde_json::Value::Null;
             view["modes"] =
                 serde_json::json!(crate::talkdown::session::TalkdownSessions::default().modes());
+            // Nobody playing; a speaker is armed for rule plays by default.
+            for key in [
+                "origin",
+                "rule_id",
+                "rule_name",
+                "rearm_at",
+                "disarm_reason",
+            ] {
+                view[key] = serde_json::Value::Null;
+            }
+            view["armed"] = speaker.map(|_| true).into();
             view
         };
 
@@ -9989,10 +10022,21 @@ mod tests {
             .unwrap_or_else(|| panic!("busy in {body}"))
     }
 
-    /// The session releases the speaker just after the BYE's 200.
+    /// The session releases the speaker just after the BYE's 200, and its
+    /// play row is finished just after that. Waiting for the row too keeps
+    /// a test's next store transaction from racing that write (a deferred
+    /// SQLite transaction fails with SQLITE_BUSY_SNAPSHOT if it does).
     async fn wait_idle(app: &axum::Router, within: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + within;
-        while talk_down_busy(app).await {
+        let unfinished = || async {
+            let (_, body) =
+                speaker_call(app, Method::GET, "/api/v1/admin/talkdown/plays", None).await;
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .is_some_and(|rows| rows.iter().any(|r| r["result"].is_null()))
+        };
+        while talk_down_busy(app).await || unfinished().await {
             assert!(tokio::time::Instant::now() < deadline, "speaker still busy");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -10875,13 +10919,14 @@ mod tests {
             assert!(status.is_success(), "{change}: {status} {body}");
 
             let audio = crate::talkdown::session::Audio::Tone;
-            let refusal = match crate::speakers_admin::start_on(&state, 1, &read, &audio).await {
-                Err(refusal) => axum::response::IntoResponse::into_response(refusal),
-                Ok(_) => {
-                    let seen = uas.await.unwrap();
-                    panic!("{change}: the start called a: {:?}", sip_methods(&seen));
-                }
-            };
+            let refusal =
+                match crate::speakers_admin::start_on(&state, 1, &read, &audio, None).await {
+                    Err(refusal) => axum::response::IntoResponse::into_response(refusal),
+                    Ok(_) => {
+                        let seen = uas.await.unwrap();
+                        panic!("{change}: the start called a: {:?}", sip_methods(&seen));
+                    }
+                };
             assert_eq!(refusal.status(), StatusCode::CONFLICT, "{change}");
             let body = to_bytes(refusal.into_body(), 64 * 1024).await.unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
@@ -11534,6 +11579,450 @@ mod tests {
         assert_eq!(error_code(&body), "preview_upload_failed");
         assert!(!body.contains("SAS-SIGNATURE") && !body.contains("127.0.0.1"));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    // ===============================================================
+    // ADR-095 — plays, arming and status
+    // ===============================================================
+
+    async fn audit_actions(store: &Store) -> Vec<nexus_store::AuditEntry> {
+        store
+            .list_audit_filtered(&nexus_store::AuditFilter::default(), 200, 0)
+            .await
+            .unwrap()
+    }
+
+    /// The finished play rows, once every play has ended.
+    async fn finished_plays(store: &Store, n: usize) -> Vec<nexus_store::TalkdownPlay> {
+        for _ in 0..200 {
+            let plays = store
+                .list_talkdown_plays(&nexus_store::PlayFilter::default())
+                .await
+                .unwrap();
+            if plays.len() == n && plays.iter().all(|p| p.result.is_some()) {
+                return plays;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("{n} finished plays never appeared");
+    }
+
+    /// ADR-095 (a), (g): the start route, which is also the only path a
+    /// cloud RPC has to a play, records a manual play whatever the body
+    /// claims; the play links to the alert it names. The plays route
+    /// filters by alert, camera and time.
+    #[tokio::test]
+    async fn a_camera_start_is_a_manual_play_linked_to_its_alert_whatever_the_body_says() {
+        let (port, _rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        let event = uuid::Uuid::now_v7().to_string();
+        let body = serde_json::json!({
+            "mode": "tone", "event_id": event, "origin": "rule", "rule_id": "r1", "step": 1,
+        });
+        let (status, body) = start_talk_down(&app, 1, body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        let p = &finished_plays(&store, 1).await[0];
+        assert_eq!(
+            (
+                p.origin.as_str(),
+                p.rule_id.as_deref(),
+                p.step,
+                p.mode.as_str()
+            ),
+            ("manual", None, None, "tone")
+        );
+        assert_eq!(p.event_id.as_deref(), Some(event.as_str()));
+        assert_eq!(
+            (p.camera_id, p.speaker_id, p.result.as_deref()),
+            (Some(1), speaker, Some("played"))
+        );
+
+        let rows = |q: String| {
+            let app = app.clone();
+            async move {
+                let (status, body) = speaker_call(
+                    &app,
+                    Method::GET,
+                    &format!("/api/v1/admin/talkdown/plays{q}"),
+                    None,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{q}: {body}");
+                speaker_json(&body).as_array().unwrap().len()
+            }
+        };
+        assert_eq!(rows(format!("?event_id={event}")).await, 1);
+        assert_eq!(rows("?event_id=other".into()).await, 0);
+        assert_eq!(rows("?camera_id=1&limit=5".into()).await, 1);
+        assert_eq!(rows("?camera_id=2".into()).await, 0);
+        assert_eq!(rows("?since=2999-01-01T00:00:00Z".into()).await, 0);
+        let (_, body) = speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/plays", None).await;
+        let row = &speaker_json(&body)[0];
+        assert_eq!(
+            (row["origin"].as_str(), row["result"].as_str()),
+            (Some("manual"), Some("played"))
+        );
+        let (status, _) = speaker_call(
+            &app,
+            Method::GET,
+            "/api/v1/admin/talkdown/plays?limit=0",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = start_talk_down(
+            &app,
+            1,
+            serde_json::json!({ "mode": "tone", "event_id": "not-a-uuid" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// The talk-down GET tells a rule play from an operator's, names the
+    /// rule, and carries the speaker's arming; the camera's stop ends it.
+    #[tokio::test]
+    async fn get_talk_down_shows_a_rule_plays_origin_and_rule_name() {
+        let (port, _rtp, _uas) = fake_speaker().await;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let sessions = state.talkdown.clone();
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        store_ready_clip(&store, CLIP_UID, &[100; 80_000]).await;
+        let rule: nexus_config::RuleConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "Gate rule", "when": "true", "severity": "low",
+        }))
+        .unwrap();
+        store.upsert_rule(&rule).await.unwrap();
+
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        let view = speaker_json(&body);
+        assert_eq!(view["origin"], serde_json::Value::Null, "{view}");
+        assert_eq!(
+            (view["armed"].as_bool(), &view["rearm_at"]),
+            (Some(true), &serde_json::Value::Null)
+        );
+
+        let speaker = store.speaker_for_camera(1).await.unwrap().unwrap();
+        let audio = crate::talkdown::session::Audio::Stored {
+            audio_uid: CLIP_UID.into(),
+            volume: None,
+            repeat: 1,
+        };
+        let req = crate::talkdown::session::StartRequest {
+            speaker: &speaker,
+            output: store.speaker_output(speaker.id).await.unwrap(),
+            camera_id: Some(1),
+            origin: crate::talkdown::session::Origin::Rule {
+                rule_id: "r1".into(),
+                step: 1,
+            },
+            audio: &audio,
+            event_id: None,
+        };
+        let Ok((_, _, playing)) = sessions.start(req, async { true }).await else {
+            panic!("the rule play starts");
+        };
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        let view = speaker_json(&body);
+        assert_eq!(view["busy"], true, "{view}");
+        assert_eq!(view["origin"], "rule", "{view}");
+        assert_eq!(view["rule_id"], "r1");
+        assert_eq!(view["rule_name"], "Gate rule");
+
+        let (status, _) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/cameras/1/talk-down/stop",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(matches!(
+            playing.await.unwrap(),
+            Ok(crate::talkdown::session::Ended::Stopped)
+        ));
+    }
+
+    /// ADR-095: a disarm that is indefinite or longer than 24 h needs a
+    /// reason, which is stored, shown and audited; arming clears it.
+    #[tokio::test]
+    async fn arming_needs_a_reason_past_24_h_and_the_reason_is_stored_and_audited() {
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", 9).await;
+        seed_onvif_camera(&store, 2, None).await;
+        let core = "/api/v1/admin/talkdown/arming";
+        let camera = "/api/v1/admin/cameras/1/talk-down/arming";
+        let put = |uri: &'static str, body: serde_json::Value| {
+            let app = app.clone();
+            async move { speaker_call(&app, Method::PUT, uri, Some(body)).await }
+        };
+        let in_hours = |h: i64| (chrono::Utc::now() + chrono::Duration::hours(h)).to_rfc3339();
+        for (uri, body) in [
+            (core, serde_json::json!({ "armed": false })),
+            (
+                core,
+                serde_json::json!({ "armed": false, "rearm_at": in_hours(25) }),
+            ),
+            (camera, serde_json::json!({ "armed": false })),
+            (
+                core,
+                serde_json::json!({ "armed": false, "rearm_at": in_hours(-1), "reason": "x" }),
+            ),
+            (
+                core,
+                serde_json::json!({ "armed": false, "reason": "x".repeat(201) }),
+            ),
+            (core, serde_json::json!({ "armed": false, "reason": "  " })),
+            (
+                core,
+                serde_json::json!({ "armed": false, "reason": "x", "extra": 1 }),
+            ),
+        ] {
+            let (status, body) = put(uri, body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+        }
+        assert!(
+            store.talkdown_core().await.unwrap().auto_armed,
+            "nothing stored"
+        );
+
+        // Within 24 h: no reason needed.
+        let (status, body) = put(
+            core,
+            serde_json::json!({ "armed": false, "rearm_at": in_hours(2) }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c = store.talkdown_core().await.unwrap();
+        assert!(!c.auto_armed && c.auto_rearm_at.is_some() && c.auto_disarm_reason.is_none());
+
+        // Indefinitely, with a reason: stored and audited.
+        let (status, body) = put(
+            core,
+            serde_json::json!({ "armed": false, "reason": "roof works" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c = store.talkdown_core().await.unwrap();
+        assert_eq!(
+            (
+                c.auto_armed,
+                c.auto_rearm_at,
+                c.auto_disarm_reason.as_deref()
+            ),
+            (false, None, Some("roof works"))
+        );
+        let audits = audit_actions(&store).await;
+        let row = audits
+            .iter()
+            .find(|a| a.action == "talk_down.arming")
+            .unwrap();
+        assert!(
+            row.after_json.as_deref().unwrap().contains("roof works"),
+            "{row:?}"
+        );
+
+        // The camera's speaker; shown on the talk-down GET.
+        let (status, body) = put(
+            camera,
+            serde_json::json!({ "armed": false, "reason": "tenant asked" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let a = store.speaker_arming(speaker).await.unwrap().unwrap();
+        assert_eq!(
+            (a.armed, a.reason.as_deref()),
+            (false, Some("tenant asked"))
+        );
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        let view = speaker_json(&body);
+        assert_eq!(
+            (view["armed"].as_bool(), view["disarm_reason"].as_str()),
+            (Some(false), Some("tenant asked"))
+        );
+        let (status, body) = put(
+            "/api/v1/admin/cameras/2/talk-down/arming",
+            serde_json::json!({ "armed": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "no speaker: {body}");
+
+        // One speaker directly, with the same rules; 404 for an unknown one.
+        let speaker_uri = format!("/api/v1/admin/speakers/{speaker}/arming");
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            &speaker_uri,
+            Some(serde_json::json!({ "armed": false, "rearm_at": in_hours(48) })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "past 24 h needs a reason: {body}"
+        );
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            &speaker_uri,
+            Some(serde_json::json!({ "armed": false, "rearm_at": in_hours(48), "reason": "rewiring" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = speaker_json(&body);
+        assert_eq!(
+            (
+                v["armed"].as_bool(),
+                v["reason"].as_str(),
+                v["speaker_id"].as_i64()
+            ),
+            (Some(false), Some("rewiring"), Some(speaker))
+        );
+        assert!(v["rearm_at"].is_string(), "{v}");
+        let a = store.speaker_arming(speaker).await.unwrap().unwrap();
+        assert_eq!((a.armed, a.reason.as_deref()), (false, Some("rewiring")));
+        let audits = audit_actions(&store).await;
+        assert!(audits.iter().any(|r| r.action == "talk_down.arming"
+            && r.resource_kind.as_deref() == Some("speaker")
+            && r.after_json
+                .as_deref()
+                .is_some_and(|j| j.contains("rewiring"))));
+        let (status, _) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/speakers/999/arming",
+            Some(serde_json::json!({ "armed": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Arming clears the re-arm time and the reason.
+        let (status, _) = put(core, serde_json::json!({ "armed": true, "reason": "done" })).await;
+        assert_eq!(status, StatusCode::OK);
+        let c = store.talkdown_core().await.unwrap();
+        assert!(c.auto_armed && c.auto_disarm_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn talkdown_status_reports_caps_arming_coverage_audio_and_estimated_stats() {
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", 9).await;
+        seed_onvif_camera(&store, 2, None).await;
+        store_ready_clip(&store, CLIP_UID, &[1; 800]).await;
+        let play = |outcome: Option<&str>| nexus_store::NewPlay {
+            session_id: "s".into(),
+            origin: if outcome.is_some() { "rule" } else { "manual" }.into(),
+            rule_id: outcome.map(|_| "r1".into()),
+            step: None,
+            event_id: None,
+            camera_id: Some(1),
+            speaker_id: speaker,
+            audio_uid: None,
+            mode: "stored".into(),
+        };
+        let id = store
+            .insert_talkdown_play(&play(Some("cleared")))
+            .await
+            .unwrap();
+        store
+            .set_talkdown_play_outcome(id, "cleared")
+            .await
+            .unwrap();
+        store.insert_talkdown_play(&play(None)).await.unwrap();
+
+        let (status, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/status", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let s = speaker_json(&body);
+        assert!(
+            s["caps"]
+                .as_array()
+                .unwrap()
+                .contains(&"talkdown_rules".into()),
+            "{s}"
+        );
+        assert_eq!(s["cloud_allowed"], false, "never heard true");
+        assert_eq!(s["armed"]["core"]["armed"], true);
+        assert_eq!(s["armed"]["speakers"][0]["id"], speaker);
+        assert_eq!(s["speakers"][0]["id"], speaker);
+        assert_eq!(
+            s["speakers"][0]["online"],
+            serde_json::Value::Null,
+            "not probed yet"
+        );
+        let coverage = s["coverage"].as_array().unwrap();
+        assert!(coverage.contains(&serde_json::json!({ "camera_id": 1, "camera_name": "cam-1", "speaker_id": speaker })), "{s}");
+        assert!(
+            coverage.contains(
+                &serde_json::json!({ "camera_id": 2, "camera_name": "cam-2", "speaker_id": null })
+            ),
+            "{s}"
+        );
+        assert_eq!(
+            (s["audio"]["ready"].as_u64(), s["audio"]["failed"].as_u64()),
+            (Some(1), Some(0))
+        );
+        assert_eq!(s["audio"]["items"][0]["uid"], CLIP_UID);
+        assert_eq!(s["rules"], serde_json::json!([]));
+        assert_eq!(s["stats"]["24h"]["plays"], 1, "rule plays only");
+        assert_eq!(s["stats"]["7d"]["cleared"], 1);
+        assert_eq!(s["stats"]["24h"]["persisted"], 0);
+        assert_eq!(s["outcomes_estimated"], true);
+        assert_eq!(s["voices"], serde_json::json!([]), "no text-to-speech here");
+
+        // The speakers GETs carry each speaker's stored output.
+        let (_, body) = speaker_call(
+            &app,
+            Method::GET,
+            &format!("/api/v1/admin/speakers/{speaker}"),
+            None,
+        )
+        .await;
+        let out = &speaker_json(&body)["output"];
+        assert_eq!(
+            out,
+            &serde_json::json!({ "volume": 100, "boost": false, "hw_volume": false, "auto_max_per_hour": 6 }),
+            "{body}"
+        );
+        let (_, body) = speaker_call(&app, Method::GET, "/api/v1/admin/speakers", None).await;
+        assert_eq!(&speaker_json(&body)[0]["output"], out);
+        // ...but the audit rows record the configuration only.
+        let audits = audit_actions(&store).await;
+        let created = audits
+            .iter()
+            .find(|r| r.action == "speaker.create")
+            .and_then(|r| r.after_json.clone())
+            .unwrap();
+        assert!(
+            !created.contains("output") && created.contains("camera_ids"),
+            "{created}"
+        );
+    }
+
+    /// The status lists the voices the text-to-speech helper offers.
+    #[tokio::test]
+    async fn talkdown_status_lists_the_tts_voices() {
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female"]);
+        let app = super::router(state);
+        let (status, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/status", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            speaker_json(&body)["voices"],
+            serde_json::json!([{ "id": "en-US-female", "label": "en-US-female", "language": "en-US" }])
+        );
     }
 
     // ===============================================================

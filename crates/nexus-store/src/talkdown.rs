@@ -116,6 +116,9 @@ pub struct NewPlay {
 pub struct PlayFilter {
     pub event_id: Option<String>,
     pub speaker_id: Option<i64>,
+    pub camera_id: Option<i64>,
+    /// Plays that started at or after this.
+    pub since: Option<DateTime<Utc>>,
     /// Newest first; `None` means 100.
     pub limit: Option<i64>,
 }
@@ -181,6 +184,11 @@ fn play_row(r: &SqliteRow) -> Result<TalkdownPlay, StoreError> {
 
 fn pcm_to_bytes(pcm: &[i16]) -> Vec<u8> {
     pcm.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+/// `started_at`'s form: SQLite's `YYYY-MM-DD HH:MM:SS` UTC, which sorts as text.
+fn sqlite_ts(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn ts(t: DateTime<Utc>) -> String {
@@ -447,10 +455,13 @@ impl Store {
         let rows = sqlx::query(
             "SELECT * FROM talkdown_plays \
              WHERE (?1 IS NULL OR event_id = ?1) AND (?2 IS NULL OR speaker_id = ?2) \
-             ORDER BY id DESC LIMIT ?3",
+               AND (?3 IS NULL OR camera_id = ?3) AND (?4 IS NULL OR started_at >= ?4) \
+             ORDER BY id DESC LIMIT ?5",
         )
         .bind(&f.event_id)
         .bind(f.speaker_id)
+        .bind(f.camera_id)
+        .bind(f.since.map(sqlite_ts))
         .bind(f.limit.unwrap_or(100))
         .fetch_all(&self.pool)
         .await?;
@@ -459,9 +470,8 @@ impl Store {
 
     /// Delete plays that started before `before`; returns the count removed.
     pub async fn prune_talkdown_plays(&self, before: DateTime<Utc>) -> Result<u64, StoreError> {
-        // `started_at` is SQLite's `YYYY-MM-DD HH:MM:SS` UTC, which sorts as text.
         let res = sqlx::query("DELETE FROM talkdown_plays WHERE started_at < ?")
-            .bind(before.format("%Y-%m-%d %H:%M:%S").to_string())
+            .bind(sqlite_ts(before))
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())
@@ -521,6 +531,27 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Store as armed every disarm (core-wide and per speaker) whose
+    /// `rearm_at` is at or before `now`; returns how many changed. A
+    /// disarm written since the caller read the state keeps its own
+    /// `rearm_at`, so this never re-arms it early.
+    pub async fn rearm_elapsed_talkdown(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
+        let now = ts(now);
+        let mut n = 0;
+        for table in ["talkdown_core", "speakers"] {
+            n += sqlx::query(&format!(
+                "UPDATE {table} SET auto_armed = 1, auto_rearm_at = NULL, \
+                 auto_disarm_reason = NULL \
+                 WHERE auto_armed = 0 AND auto_rearm_at IS NOT NULL AND auto_rearm_at <= ?"
+            ))
+            .bind(&now)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        }
+        Ok(n)
     }
 
     pub async fn set_speaker_arming(

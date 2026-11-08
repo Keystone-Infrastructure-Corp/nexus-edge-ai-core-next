@@ -289,7 +289,13 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         | ("GET", ["admin", "network", "apply", "status"])
         | ("GET", ["admin", "speakers"])
         | ("GET", ["admin", "speakers", _]) => &["settings.read"],
-        ("GET", ["admin", "talkdown", "audio"]) => &["settings.read", "live.talkdown"],
+        ("GET", ["admin", "talkdown", "audio" | "status" | "plays"]) => {
+            &["settings.read", "live.talkdown"]
+        }
+        // Arming automatic (rule) talk-down is a live act (cloud ADR-095).
+        ("PUT", ["admin", "talkdown", "arming"] | ["admin", "speakers", _, "arming"]) => {
+            &["live.talkdown"]
+        }
         _ => &[],
     }
 }
@@ -302,9 +308,12 @@ fn camera_rpc_permissions(method: &str, tail: &[&str]) -> &'static [&'static str
         // Starting, stopping or setting the volume of talk-down is a live act
         // on this camera; its speaker assignment is a setting (cloud ADR-091).
         // Typed speech (`mode: "tts"`) takes `live.talkdown_speak` instead,
-        // matched on the body.
+        // matched on the body. Arming automatic plays is a live act too
+        // (cloud ADR-095).
         ("POST", ["talk-down"]) => &["live.talkdown", "live.talkdown_speak"],
-        ("POST", ["talk-down", "stop" | "volume"]) => &["live.talkdown"],
+        ("POST", ["talk-down", "stop" | "volume"]) | ("PUT", ["talk-down", "arming"]) => {
+            &["live.talkdown"]
+        }
         ("GET", ["talk-down"]) => &["settings.read", "live.talkdown"],
         ("PUT", ["talk-down"])
         | ("PUT" | "DELETE", [])

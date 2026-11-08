@@ -2,13 +2,19 @@
 //! speaker before anything slow happens, and the claim is a guard that
 //! releases the speaker when dropped, so every exit releases it: audio that
 //! is not ready, an unanswered call, the end of playback, a panic in the play task.
+//!
+//! ADR-095 (d): a manual or live start pre-empts a rule play on the speaker
+//! and a rule start never pre-empts anything; a rule start plays stored
+//! audio only (b).
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use nexus_cloud_protocol::v1::IceServer;
 use nexus_config::{SpeakerConfig, SpeakerId};
 use nexus_store::SpeakerOutput;
@@ -32,6 +38,11 @@ const TONE_MS: u32 = 2000;
 /// 300 ms of silence after the audio, so the BYE does not cut off what the
 /// speaker still has buffered.
 const TAIL_SAMPLES: usize = 300 * 8;
+/// How long a manual start waits for the rule play it pre-empted to hang up.
+const PREEMPT_WAIT: Duration = Duration::from_secs(3);
+const PREEMPT_POLL: Duration = Duration::from_millis(50);
+/// The silence between a rule step's repeats.
+const REPEAT_GAP_SAMPLES: usize = 8000;
 
 /// A start request's body: `{"mode": "tone"}`,
 /// `{"mode": "stored", "audio_uid": …, "volume"?: 0-100}`,
@@ -46,6 +57,10 @@ pub enum Audio {
         audio_uid: String,
         #[serde(default)]
         volume: Option<u8>,
+        /// How many times a rule step plays the item, with 1 s of silence
+        /// between; never read from a request body (0 plays it once).
+        #[serde(skip)]
+        repeat: u8,
     },
     /// Typed speech, rendered on this core; `voice` defaults to the first
     /// discovered voice. The text goes into the audit row, never a span.
@@ -86,6 +101,16 @@ pub enum Origin {
     Rule { rule_id: String, step: u8 },
 }
 
+/// How a play that reached the speaker ended without a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    Played,
+    /// A stop or a parting cancelled it.
+    Stopped,
+    /// A manual or live start took the speaker from this rule play.
+    Preempted,
+}
+
 /// Everything a start needs besides the audio. `output` is the speaker's
 /// stored output, read by the caller.
 pub struct StartRequest<'a> {
@@ -94,7 +119,8 @@ pub struct StartRequest<'a> {
     pub camera_id: Option<CameraId>,
     pub origin: Origin,
     pub audio: &'a Audio,
-    /// The alert this play answers, for a rule play.
+    /// The alert this play answers. The plays log records it (the caller
+    /// writes the row: `speakers_admin::start_on`, the rule responder).
     pub event_id: Option<String>,
 }
 
@@ -131,9 +157,9 @@ struct Claim {
     camera_id: Option<CameraId>,
     id: Uuid,
     cancel: CancellationToken,
-    /// Read by the rule responder's pre-emption check (Task 13).
-    #[allow(dead_code)]
     origin: Origin,
+    /// Set when a manual start cancelled this rule play.
+    preempted: Arc<AtomicBool>,
     gain: Gain,
     output: SpeakerOutput,
     session_volume: u8,
@@ -150,10 +176,14 @@ impl Claim {
 /// Each busy speaker's session.
 type Active = Arc<Mutex<HashMap<SpeakerId, Claim>>>;
 
+/// When each speaker's last manual or live session ended.
+type ManualEnds = Arc<Mutex<HashMap<SpeakerId, DateTime<Utc>>>>;
+
 /// The engine's talk-down sessions, shared by every handler.
 #[derive(Clone, Default)]
 pub struct TalkdownSessions {
     active: Active,
+    manual_ends: ManualEnds,
     /// Where `stored` audio comes from; `None` plays no stored audio.
     library: Option<Library>,
 }
@@ -196,6 +226,26 @@ impl TalkdownSessions {
             .lock()
             .get(&speaker_id)
             .map(|c| (c.camera_id, c.id))
+    }
+
+    /// Who started the speaker's session, if one holds it.
+    pub fn origin_of(&self, speaker_id: SpeakerId) -> Option<Origin> {
+        self.active
+            .lock()
+            .get(&speaker_id)
+            .map(|c| c.origin.clone())
+    }
+
+    /// When the speaker's last manual or live session ended (ADR-095's
+    /// hold-off); `None` if none has since the engine started.
+    pub fn manual_ended_at(&self, speaker_id: SpeakerId) -> Option<DateTime<Utc>> {
+        self.manual_ends.lock().get(&speaker_id).copied()
+    }
+
+    /// A manual session that ended at `at`, for another module's test.
+    #[cfg(test)]
+    pub(crate) fn record_manual_end_for_test(&self, speaker_id: SpeakerId, at: DateTime<Utc>) {
+        self.manual_ends.lock().insert(speaker_id, at);
     }
 
     /// Set the volume (and boost) of the session `camera_id` started; false
@@ -255,8 +305,14 @@ impl TalkdownSessions {
         &self,
         req: StartRequest<'_>,
         paired: impl Future<Output = bool>,
-    ) -> Result<(Uuid, Option<String>, JoinHandle<Result<(), TalkdownError>>), StartError> {
-        // `event_id` is for the plays log (Task 13).
+    ) -> Result<
+        (
+            Uuid,
+            Option<String>,
+            JoinHandle<Result<Ended, TalkdownError>>,
+        ),
+        StartError,
+    > {
         let StartRequest {
             speaker,
             output,
@@ -265,6 +321,12 @@ impl TalkdownSessions {
             audio,
             event_id: _,
         } = req;
+        // ADR-095 (b): automation plays a stored item, never anything else.
+        if matches!(origin, Origin::Rule { .. }) && !matches!(audio, Audio::Stored { .. }) {
+            return Err(StartError::Internal(
+                "a rule play plays stored audio only".into(),
+            ));
+        }
         #[cfg(not(feature = "gstreamer-webrtc"))]
         if matches!(audio, Audio::Live { .. }) {
             return Err(StartError::LiveUnsupported);
@@ -305,16 +367,31 @@ impl TalkdownSessions {
             }
             _ => None,
         };
-        // Claim before anything slow, the store read included.
-        let session = self.claim(speaker.id, camera_id, origin, output, volume)?;
+        // Claim before anything slow, the store read included. A manual
+        // start that cancelled a rule play waits for it to hang up.
+        // shortcut: polls for the pre-empted call's release; use a per-speaker Notify if 3 s proves short.
+        let deadline = tokio::time::Instant::now() + PREEMPT_WAIT;
+        let mut preempted = false;
+        let session = loop {
+            match self.claim(speaker.id, camera_id, origin.clone(), output, volume) {
+                Ok(session) => break session,
+                Err(Refused::Preempting) if tokio::time::Instant::now() < deadline => {
+                    preempted = true;
+                    tokio::time::sleep(PREEMPT_POLL).await;
+                }
+                Err(_) => return Err(StartError::Busy),
+            }
+        };
         if !paired.await {
             return Err(StartError::Unpaired);
         }
         let load = async {
             match audio {
                 Audio::Tone => Ok(tone_pcm(TONE_MS)),
-                Audio::Stored { audio_uid, .. } => match &self.library {
-                    Some(lib) => lib.pcm(audio_uid).await,
+                Audio::Stored {
+                    audio_uid, repeat, ..
+                } => match &self.library {
+                    Some(lib) => lib.pcm(audio_uid).await.map(|pcm| repeated(pcm, *repeat)),
                     None => Err(StartError::AudioNotFound),
                 },
                 Audio::Tts { .. } => match &speech {
@@ -345,20 +422,33 @@ impl TalkdownSessions {
         // forever. The extra second lets its own deadline CANCEL first.
         // shortcut: the play task's RTP and BYE sends are not bounded the same
         // way; bound them too if a socket ever stalls after the answer.
-        let answered = tokio::time::timeout(
-            ANSWER_TIMEOUT + Duration::from_secs(1),
-            place_call(&target, ANSWER_TIMEOUT, &session.cancel),
-        )
-        .await;
-        let mut call = answered
-            .unwrap_or(Err(TalkdownError::Unreachable))
-            .map_err(|e| {
-                if session.cancel.is_cancelled() {
-                    StartError::Stopped
-                } else {
-                    StartError::Call(e)
+        let answered = loop {
+            let answered = tokio::time::timeout(
+                ANSWER_TIMEOUT + Duration::from_secs(1),
+                place_call(&target, ANSWER_TIMEOUT, &session.cancel),
+            )
+            .await
+            .unwrap_or(Err(TalkdownError::Unreachable));
+            // A single-line speaker still holding the pre-empted rule
+            // call's dialog answers 486 (or 480) until that BYE lands.
+            match answered {
+                Err(TalkdownError::Rejected(486 | 480))
+                    if preempted
+                        && !session.cancel.is_cancelled()
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(PREEMPT_POLL).await;
                 }
-            })?;
+                answered => break answered,
+            }
+        };
+        let mut call = answered.map_err(|e| {
+            if session.cancel.is_cancelled() {
+                StartError::Stopped
+            } else {
+                StartError::Call(e)
+            }
+        })?;
         call.set_gain(session.gain.clone());
         #[cfg(feature = "gstreamer-webrtc")]
         let (live, sdp_answer) = match audio {
@@ -399,8 +489,15 @@ impl TalkdownSessions {
             };
             #[cfg(not(feature = "gstreamer-webrtc"))]
             let played = call.play_pcm(&pcm, &session.cancel).await;
+            let ended = if session.preempted.load(Ordering::Relaxed) {
+                Ended::Preempted
+            } else if session.cancel.is_cancelled() {
+                Ended::Stopped
+            } else {
+                Ended::Played
+            };
             let res = match played {
-                Ok(()) => call.hangup().await,
+                Ok(()) => call.hangup().await.map(|()| ended),
                 Err(e) => Err(e),
             };
             match &res {
@@ -414,7 +511,7 @@ impl TalkdownSessions {
                 Err(e) => {
                     tracing::warn!(speaker_id = session.speaker_id, error = %e, "talk-down call failed");
                 }
-                Ok(()) => {}
+                Ok(_) => {}
             }
             res
             // `session` drops here, after the hangup: the speaker is free.
@@ -429,33 +526,63 @@ impl TalkdownSessions {
         origin: Origin,
         output: SpeakerOutput,
         session_volume: u8,
-    ) -> Result<Session, StartError> {
+    ) -> Result<Session, Refused> {
         let id = Uuid::now_v7();
         let cancel = CancellationToken::new();
+        let preempted = Arc::new(AtomicBool::new(false));
         let gain = Gain::new(Gain::compose(&output, session_volume, output.boost));
+        let manual = origin == Origin::Manual;
         let claim = Claim {
             camera_id,
             id,
             cancel: cancel.clone(),
             origin,
+            preempted: preempted.clone(),
             gain: gain.clone(),
             output,
             session_volume,
             boost: output.boost,
         };
         match self.active.lock().entry(speaker_id) {
-            Entry::Occupied(_) => return Err(StartError::Busy),
+            // ADR-095 (d): an operator always wins over automation.
+            Entry::Occupied(o) if manual && matches!(o.get().origin, Origin::Rule { .. }) => {
+                o.get().preempted.store(true, Ordering::Relaxed);
+                o.get().cancel.cancel();
+                return Err(Refused::Preempting);
+            }
+            Entry::Occupied(_) => return Err(Refused::Busy),
             Entry::Vacant(slot) => slot.insert(claim),
         };
         Ok(Session {
             active: self.active.clone(),
+            manual_ends: manual.then(|| self.manual_ends.clone()),
             id,
             speaker_id,
             camera_id,
             cancel,
+            preempted,
             gain,
         })
     }
+}
+
+/// Why a claim was refused.
+#[derive(Debug)]
+enum Refused {
+    Busy,
+    /// A rule play holds the speaker and has been cancelled for this
+    /// manual claim; it frees the speaker once it has hung up.
+    Preempting,
+}
+
+/// `pcm` `repeat` times (0 counts as once), 1 s of silence between.
+fn repeated(pcm: Vec<i16>, repeat: u8) -> Vec<i16> {
+    let mut out = pcm.clone();
+    for _ in 1..repeat {
+        out.resize(out.len() + REPEAT_GAP_SAMPLES, 0);
+        out.extend_from_slice(&pcm);
+    }
+    out
 }
 
 /// Refuse a start whose call was answered: hang up with the retransmitting
@@ -471,16 +598,24 @@ fn hang_up(call: SipCall, session: Session, e: StartError) -> StartError {
 /// A claimed speaker. Dropping it releases the speaker.
 struct Session {
     active: Active,
+    /// Where a manual session records its end, for the rule hold-off.
+    manual_ends: Option<ManualEnds>,
     id: Uuid,
     speaker_id: SpeakerId,
     /// The camera that started it; `None` for an installer's speaker test.
     camera_id: Option<CameraId>,
     cancel: CancellationToken,
+    preempted: Arc<AtomicBool>,
     gain: Gain,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Recorded before the release, so a rule start that finds the
+        // speaker free also finds the hold-off.
+        if let Some(ends) = &self.manual_ends {
+            ends.lock().insert(self.speaker_id, Utc::now());
+        }
         self.active.lock().remove(&self.speaker_id);
         tracing::info!(
             session_id = %self.id,
@@ -545,7 +680,7 @@ mod tests {
         let sessions = TalkdownSessions::default();
         let claim = |camera| sessions.claim(7, camera, Origin::Manual, output(), 100);
         let session = claim(Some(1)).ok().unwrap();
-        assert!(matches!(claim(None), Err(StartError::Busy)));
+        assert!(matches!(claim(None), Err(Refused::Busy)));
         let task = tokio::spawn(async move {
             let _session = session;
             panic!("play task panicked");
@@ -553,5 +688,194 @@ mod tests {
         assert!(task.await.unwrap_err().is_panic());
         assert!(!sessions.is_busy(7));
         assert!(sessions.stop_where(|_, _, _| true).is_empty());
+    }
+
+    fn rule(step: u8) -> Origin {
+        Origin::Rule {
+            rule_id: "r1".into(),
+            step,
+        }
+    }
+
+    /// ADR-095 (d): a manual claim cancels a rule play; a rule claim never
+    /// cancels anything, rule or manual.
+    #[tokio::test]
+    async fn a_manual_claim_preempts_a_rule_play_and_a_rule_claim_preempts_nothing() {
+        let sessions = TalkdownSessions::default();
+        let held = sessions.claim(7, Some(1), rule(1), output(), 100).unwrap();
+        assert!(matches!(
+            sessions.claim(7, Some(1), rule(1), output(), 100),
+            Err(Refused::Busy)
+        ));
+        assert!(
+            !held.cancel.is_cancelled(),
+            "a rule claim pre-empts nothing"
+        );
+        assert_eq!(sessions.origin_of(7), Some(rule(1)));
+
+        assert!(matches!(
+            sessions.claim(7, Some(1), Origin::Manual, output(), 100),
+            Err(Refused::Preempting)
+        ));
+        assert!(held.cancel.is_cancelled() && held.preempted.load(Ordering::Relaxed));
+        drop(held);
+
+        let manual = sessions
+            .claim(7, Some(1), Origin::Manual, output(), 100)
+            .unwrap();
+        assert!(matches!(
+            sessions.claim(7, Some(1), rule(2), output(), 100),
+            Err(Refused::Busy)
+        ));
+        assert!(matches!(
+            sessions.claim(7, None, Origin::Manual, output(), 100),
+            Err(Refused::Busy)
+        ));
+        assert!(
+            !manual.cancel.is_cancelled(),
+            "a manual play is never pre-empted"
+        );
+    }
+
+    /// The hold-off's input: only a manual session records its end.
+    #[tokio::test]
+    async fn a_manual_session_records_its_end_and_a_rule_session_does_not() {
+        let sessions = TalkdownSessions::default();
+        drop(sessions.claim(7, Some(1), rule(1), output(), 100).unwrap());
+        assert_eq!(sessions.manual_ended_at(7), None);
+        let before = Utc::now();
+        drop(
+            sessions
+                .claim(7, Some(1), Origin::Manual, output(), 100)
+                .unwrap(),
+        );
+        assert!(sessions.manual_ended_at(7).is_some_and(|t| t >= before));
+        assert_eq!(sessions.manual_ended_at(8), None);
+    }
+
+    #[test]
+    fn a_step_repeats_its_audio_with_a_second_of_silence_between() {
+        assert_eq!(repeated(vec![1, 2], 0), [1, 2]);
+        assert_eq!(repeated(vec![1, 2], 1), [1, 2]);
+        let twice = repeated(vec![1, 2], 2);
+        assert_eq!(twice.len(), 2 + 8000 + 2);
+        assert_eq!((&twice[..2], &twice[8002..]), (&[1, 2][..], &[1, 2][..]));
+        assert!(twice[2..8002].iter().all(|&s| s == 0));
+        assert_eq!(repeated(vec![5], 3).iter().filter(|&&s| s == 5).count(), 3);
+    }
+
+    /// ADR-095 (b): a rule start refuses anything but a stored item, before
+    /// it claims the speaker.
+    #[tokio::test]
+    async fn a_rule_start_plays_stored_audio_only() {
+        let sessions = TalkdownSessions::default();
+        let sp: SpeakerConfig = serde_json::from_value(
+            serde_json::json!({ "id": 7, "name": "s", "host": "127.0.0.1", "port": 9 }),
+        )
+        .unwrap();
+        let req = StartRequest {
+            speaker: &sp,
+            output: output(),
+            camera_id: Some(1),
+            origin: rule(1),
+            audio: &Audio::Tone,
+            event_id: None,
+        };
+        let res = sessions.start(req, async { true }).await;
+        assert!(matches!(res, Err(StartError::Internal(_))));
+        assert!(!sessions.is_busy(7));
+    }
+
+    /// A manual start takes the speaker from a rule play: the rule play ends
+    /// `Preempted`, and the manual call retries past the speaker's 486 (its
+    /// line still held) within the 3 s budget.
+    #[tokio::test]
+    async fn a_manual_start_preempts_a_rule_play_and_retries_past_486() {
+        use crate::talkdown::sip::tests::{answer, fake_uas, reply, SDP};
+        use std::sync::atomic::AtomicUsize;
+
+        let rtp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let invites = Arc::new(AtomicUsize::new(0));
+        let n = invites.clone();
+        let (port, _uas) = fake_uas("NEVER", move |req| {
+            if req.starts_with("INVITE") {
+                match n.fetch_add(1, Ordering::SeqCst) {
+                    1 => vec![reply(req, "486 Busy Here", "", "")],
+                    _ => vec![reply(req, "200 OK", SDP, &answer(rtp_port, "0"))],
+                }
+            } else if req.starts_with("BYE") {
+                vec![reply(req, "200 OK", "", "")]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            nexus_store::Store::open(&nexus_config::StoreConfig {
+                url: format!("sqlite://{}?mode=rwc", dir.path().join("n.db").display()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        store
+            .upsert_talkdown_pending(&nexus_store::NewAudio {
+                uid: "u1".into(),
+                name: "clip".into(),
+                description: None,
+                kind: nexus_store::AudioKind::Clip,
+                tts_text: None,
+                tts_voice: None,
+                version_token: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_talkdown_ready("u1", &[100; 80_000])
+            .await
+            .unwrap();
+        let bus: Arc<dyn nexus_bus::Bus> = Arc::new(nexus_bus::BroadcastBus::new(8));
+        let (library, _worker) = Library::spawn(store, bus, true, None);
+        let sessions = TalkdownSessions::with_library(library);
+        let sp: SpeakerConfig = serde_json::from_value(serde_json::json!({
+            "id": 7, "name": "s", "host": "127.0.0.1", "port": port
+        }))
+        .unwrap();
+        let stored = Audio::Stored {
+            audio_uid: "u1".into(),
+            volume: None,
+            repeat: 1,
+        };
+        let start = |origin, audio| StartRequest {
+            speaker: &sp,
+            output: output(),
+            camera_id: Some(1),
+            origin,
+            audio,
+            event_id: None,
+        };
+        let Ok((_, _, rule_play)) = sessions
+            .start(start(rule(1), &stored), async { true })
+            .await
+        else {
+            panic!("the rule play starts");
+        };
+
+        let started = std::time::Instant::now();
+        let manual = sessions
+            .start(start(Origin::Manual, &Audio::Tone), async { true })
+            .await;
+        let Ok((_, _, manual_play)) = manual else {
+            panic!("the manual start pre-empts the rule play");
+        };
+        assert!(started.elapsed() < PREEMPT_WAIT, "{:?}", started.elapsed());
+        assert!(matches!(rule_play.await.unwrap(), Ok(Ended::Preempted)));
+        assert_eq!(invites.load(Ordering::SeqCst), 3, "rule, 486, retry");
+        assert_eq!(sessions.origin_of(7), Some(Origin::Manual));
+        sessions.stop_where(|_, _, _| true);
+        assert!(matches!(manual_play.await.unwrap(), Ok(Ended::Stopped)));
     }
 }

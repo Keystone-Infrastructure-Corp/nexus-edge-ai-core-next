@@ -2,7 +2,8 @@
 //! `sip` is the only driver: a direct-IP SIP call streaming G.711 RTP.
 //! [`session`] runs the calls the admin endpoints in `crate::speakers_admin`
 //! start, one per speaker; [`library`] holds the stored audio they play
-//! ([`clip`] downloads it), and `live`
+//! ([`clip`] downloads it), [`responder`] plays a rule's audio when the rule
+//! fires (ADR-095), and `live`
 //! (built with `gstreamer-webrtc`) receives an operator's microphone for one.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,6 +17,7 @@ pub mod health;
 pub mod library;
 #[cfg(feature = "gstreamer-webrtc")]
 pub mod live;
+pub mod responder;
 pub mod session;
 pub mod sip;
 pub mod tts;

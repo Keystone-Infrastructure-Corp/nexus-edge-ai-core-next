@@ -689,6 +689,7 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
     let speaker = json!({"name":"Gate","host":"10.0.0.9","port":5060,"driver":"sip"});
     let output = json!({"volume":60,"boost":true,"auto_max_per_hour":6});
     let volume = json!({"volume":40});
+    let arming = json!({"armed":false,"reason":"works"});
     for (method, path, permission, body, allowed) in [
         (
             "POST",
@@ -771,6 +772,69 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
             None,
             false,
         ),
+        // ADR-095: arming automatic plays is a live act; their status and
+        // history are read by settings readers and talkers.
+        (
+            "PUT",
+            "/admin/talkdown/arming",
+            "live.talkdown",
+            Some(&arming),
+            true,
+        ),
+        (
+            "PUT",
+            "/admin/talkdown/arming",
+            "settings.write",
+            Some(&arming),
+            false,
+        ),
+        (
+            "PUT",
+            "/admin/cameras/7/talk-down/arming",
+            "live.talkdown",
+            Some(&arming),
+            true,
+        ),
+        (
+            "PUT",
+            "/admin/cameras/7/talk-down/arming",
+            "settings.write",
+            Some(&arming),
+            false,
+        ),
+        (
+            "PUT",
+            "/admin/speakers/3/arming",
+            "live.talkdown",
+            Some(&arming),
+            true,
+        ),
+        (
+            "PUT",
+            "/admin/speakers/3/arming",
+            "settings.write",
+            Some(&arming),
+            false,
+        ),
+        ("GET", "/admin/talkdown/status", "settings.read", None, true),
+        ("GET", "/admin/talkdown/status", "live.talkdown", None, true),
+        (
+            "GET",
+            "/admin/talkdown/status",
+            "settings.write",
+            None,
+            false,
+        ),
+        ("GET", "/admin/talkdown/plays", "settings.read", None, true),
+        ("GET", "/admin/talkdown/plays", "live.talkdown", None, true),
+        (
+            "GET",
+            "/admin/talkdown/plays?event_id=e1&limit=5",
+            "live.talkdown",
+            None,
+            true,
+        ),
+        ("GET", "/admin/talkdown/plays", "fleet.apply", None, false),
         // The other permission, or a neighbour's, for the same route.
         (
             "POST",
