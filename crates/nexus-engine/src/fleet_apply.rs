@@ -273,7 +273,6 @@ pub async fn post_admin_fleet_apply(
         &req.effective,
         req.mode,
         &prev_keys,
-        req.scope.as_ref().is_some_and(|sc| sc.scope_type == "core"),
         req.revision,
     )
     .await;
@@ -376,11 +375,10 @@ async fn apply_category(
     effective: &Value,
     mode: FleetApplyMode,
     prev_keys: &[String],
-    scope_is_core: bool,
     revision: Option<i64>,
 ) -> Result<AppliedCategory, ApiError> {
     match category {
-        "rules" => apply_rules(s, effective, mode, prev_keys, scope_is_core).await,
+        "rules" => apply_rules(s, effective, mode, prev_keys).await,
         "text_prompts" => apply_text_prompts(s, effective, mode, prev_keys).await,
         "visual_prompts" => apply_visual_prompts(s, effective, mode, prev_keys).await,
         "detector_config" => apply_detector_config(s, effective).await,
@@ -482,7 +480,6 @@ async fn apply_rules(
     effective: &Value,
     mode: FleetApplyMode,
     prev_keys: &[String],
-    scope_is_core: bool,
 ) -> Result<AppliedCategory, ApiError> {
     let rules: Vec<RuleConfig> = serde_json::from_value(effective.clone())
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rules payload: {e}")))?;
@@ -501,7 +498,9 @@ async fn apply_rules(
         }
         // No local speaker check: one speaker deleted on this core would fail
         // every later push; the responder reports it as `no_speaker`.
-        rule.validate_talk_down(scope_is_core)
+        // `true`: a push is this core's own effective rules whatever scope the
+        // operator applied from; the cloud refuses a non-core `speaker_id` on save.
+        rule.validate_talk_down(true)
             .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rule {:?}: {e}", rule.id)))?;
     }
     let keep: std::collections::HashSet<&str> = rules.iter().map(|r| r.id.as_str()).collect();

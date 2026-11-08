@@ -9062,8 +9062,11 @@ mod tests {
         assert!(store.list_rules().await.unwrap()[0].talk_down.is_some());
     }
 
-    /// A `speaker_id` is local to one core, so a fleet apply whose scope is not
-    /// `core` is refused. At core scope a speaker this core no longer has is
+    /// A rules push is this core's resolved effective rules whatever scope the
+    /// operator applied from, and the cloud refuses a `speaker_id` on a
+    /// non-core rule when it is saved (ADR-095). So a core-authored
+    /// `speaker_id` applies under every envelope scope, and the talk-down
+    /// shape is still checked under each. A speaker this core no longer has is
     /// accepted: the responder reports it as `no_speaker`, and one deleted
     /// speaker must not block every later rules push.
     #[tokio::test]
@@ -9071,19 +9074,28 @@ mod tests {
         const SECRET: &[u8] = b"fleet-rules-talkdown-secret";
         let (app, store, _dir) = build_test_router(Some(SECRET)).await;
         let steps = serde_json::json!([{ "audio_uid": TD_UID }]);
+        let two = serde_json::json!([{ "audio_uid": TD_UID }, { "audio_uid": TD_UID }]);
+        let bad_window = serde_json::json!([td_rule(
+            "a",
+            60_000,
+            serde_json::json!({ "steps": two, "speaker_id": 1 })
+        )]);
+        for scope in ["org", "site", "camera", "core"] {
+            let res = fleet_apply_scoped(&app, SECRET, "rules", bad_window.clone(), scope).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{scope}");
+        }
+        assert!(store.list_rules().await.unwrap().is_empty());
         let with_speaker = serde_json::json!([td_rule(
             "a",
             0,
             serde_json::json!({ "steps": steps, "speaker_id": 1 })
         )]);
-        let res = fleet_apply_scoped(&app, SECRET, "rules", with_speaker, "org").await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let two = serde_json::json!([{ "audio_uid": TD_UID }, { "audio_uid": TD_UID }]);
-        let bad_window =
-            serde_json::json!([td_rule("a", 60_000, serde_json::json!({ "steps": two }))]);
-        let res = fleet_apply(&app, SECRET, "rules", bad_window).await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        assert!(store.list_rules().await.unwrap().is_empty());
+        for scope in ["org", "site", "camera", "core"] {
+            let res = fleet_apply_scoped(&app, SECRET, "rules", with_speaker.clone(), scope).await;
+            assert_eq!(res.status(), StatusCode::OK, "{scope}");
+            let rules = store.list_rules().await.unwrap();
+            assert_eq!(rules[0].talk_down.as_ref().unwrap().speaker_id, Some(1));
+        }
         // org-wide rule without a speaker applies; an unknown uid is accepted.
         let ok = serde_json::json!([td_rule("a", 0, serde_json::json!({ "steps": steps }))]);
         let res = fleet_apply_scoped(&app, SECRET, "rules", ok, "org").await;
