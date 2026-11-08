@@ -213,6 +213,7 @@ async fn a_speakers_output_defaults_to_todays_behaviour_and_round_trips() {
         auto_max_per_hour: 6,
     };
     assert_eq!(store.speaker_output(a.id).await.unwrap(), default);
+    assert!(!store.any_hw_volume().await.unwrap());
 
     let out = SpeakerOutput {
         volume: 35,
@@ -228,6 +229,7 @@ async fn a_speakers_output_defaults_to_todays_behaviour_and_round_trips() {
     Store::commit_tx(tx).await.unwrap();
     assert_eq!(store.speaker_output(a.id).await.unwrap(), out);
     assert_eq!(store.speaker_output(b.id).await.unwrap(), default, "only a");
+    assert!(store.any_hw_volume().await.unwrap(), "a has hw_volume");
 
     // An output change is not a speaker edit: the stored config is untouched.
     assert_eq!(store.get_speaker(a.id).await.unwrap(), Some(a.clone()));

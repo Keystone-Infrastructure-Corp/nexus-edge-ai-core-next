@@ -1247,9 +1247,16 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// Opus decode → PCMU/PCMA → the camera's RTSP backchannel, whose URL and codec
 /// [`nexus_types::CameraTalkDown`] already discovers), gated on the camera
 /// actually having one.
-fn heartbeat_caps(hd_transport: Option<nexus_types::HdTransport>) -> Vec<String> {
+///
+/// `talkdown_hw_volume` is advertised once any speaker's own level is set over
+/// ONVIF (`hw_volume`), so the cloud only offers a device volume where one works.
+fn heartbeat_caps(
+    hd_transport: Option<nexus_types::HdTransport>,
+    talkdown_hw_volume: bool,
+) -> Vec<String> {
     let mut caps = vec!["live_view".to_string(), "actor_perm_v1".to_string()];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
+    caps.extend(talkdown_hw_volume.then(|| "talkdown_hw_volume".to_string()));
     caps
 }
 
@@ -1283,6 +1290,8 @@ async fn pump_heartbeats<H: TunnelHandle>(
         // each tick so a cloud fleet flip is reflected in the advertised caps
         // within one heartbeat, no restart.
         let hd_transport = crate::admin_runtime::read_hd_transport(&store).await;
+        // A failed read advertises nothing: a cap is a claim, not a guess.
+        let talkdown_hw_volume = store.any_hw_volume().await.unwrap_or(false);
         // Phase 9 (M_OTA) — report the OTA status block so the
         // orchestrator can drive its rollout state machine + reconcile
         // committed versions. `recording_active` is best-effort false
@@ -1334,6 +1343,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
                 name,
                 caps: Some(heartbeat_caps(
                     webrtc.can_publish(hd_transport).then_some(hd_transport),
+                    talkdown_hw_volume,
                 )),
                 online_cameras,
                 queued_alerts,
@@ -2604,7 +2614,7 @@ mod health_tests {
     #[test]
     fn no_transport_advertises_talk_down() {
         for t in nexus_types::HdTransport::all() {
-            let caps = heartbeat_caps(Some(t));
+            let caps = heartbeat_caps(Some(t), false);
             assert!(
                 caps.contains(&"live_view".to_string()),
                 "{t} must still advertise the LBR pump: {caps:?}"
@@ -2620,10 +2630,10 @@ mod health_tests {
     /// that cannot advertises none (BUG-225).
     #[test]
     fn the_hd_transport_is_advertised_only_when_the_bridge_can_publish() {
-        assert_eq!(heartbeat_caps(None), ["live_view", "actor_perm_v1"]);
+        assert_eq!(heartbeat_caps(None, false), ["live_view", "actor_perm_v1"]);
         for t in nexus_types::HdTransport::all() {
             assert_eq!(
-                heartbeat_caps(Some(t)),
+                heartbeat_caps(Some(t), false),
                 ["live_view", "actor_perm_v1", t.cap_tag()]
             );
         }
@@ -4198,6 +4208,66 @@ mod heartbeat_ack_tests {
             EnvelopeBody::Heartbeat(h) => h.caps.clone().expect("the heartbeat carries caps"),
             other => panic!("expected a heartbeat, got {other:?}"),
         }
+    }
+
+    /// The first heartbeat's `caps`, for a store holding `speakers` (name, hw_volume).
+    async fn heartbeat_caps_with_speakers(speakers: &[(&str, bool)]) -> Vec<String> {
+        let (store, dir) = test_store().await;
+        for (name, hw) in speakers {
+            let mut sp: nexus_config::SpeakerConfig =
+                serde_json::from_value(serde_json::json!({ "name": name, "host": "192.0.2.10" }))
+                    .unwrap();
+            let mut tx = store.begin_tx().await.unwrap();
+            store.create_speaker_tx(&mut tx, &mut sp).await.unwrap();
+            Store::commit_tx(tx).await.unwrap();
+            let mut out = store.speaker_output(sp.id).await.unwrap();
+            out.hw_volume = *hw;
+            let mut tx = store.begin_tx().await.unwrap();
+            store
+                .set_speaker_output_tx(&mut tx, sp.id, &out)
+                .await
+                .unwrap();
+            Store::commit_tx(tx).await.unwrap();
+        }
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+            crate::reconciler::HandleMap::default(),
+        );
+        let tunnel = FirstEnvelopeTunnel::default();
+        pump_heartbeats(
+            &tunnel,
+            "core-1",
+            store,
+            &TunnelLiveness::new(),
+            &FrameStatsRegistry::new(),
+            &health,
+            &crate::webrtc_bridge::WebRtcBridge::disabled(),
+        )
+        .await;
+        let sent = tunnel.sent.lock();
+        match &sent[0].body {
+            EnvelopeBody::Heartbeat(h) => h.caps.clone().expect("caps"),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+    }
+
+    /// `talkdown_hw_volume` only once a speaker has `hw_volume = 1`.
+    #[tokio::test]
+    async fn the_heartbeat_advertises_hw_volume_only_once_a_speaker_has_it() {
+        let hw = "talkdown_hw_volume".to_string();
+        assert!(!heartbeat_caps_with_speakers(&[]).await.contains(&hw));
+        assert!(!heartbeat_caps_with_speakers(&[("a", false), ("b", false)])
+            .await
+            .contains(&hw));
+        assert!(heartbeat_caps_with_speakers(&[("a", false), ("b", true)])
+            .await
+            .contains(&hw));
     }
 
     /// BUG-225: a stub recorder's WebRTC bridge is disabled, as is every

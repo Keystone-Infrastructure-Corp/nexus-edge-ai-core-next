@@ -20,7 +20,10 @@
 //!   answer when it has finished
 //! * `PUT            /api/v1/admin/speakers/{id}/output` —
 //!   `{"volume": 0-100, "boost": bool, "auto_max_per_hour": 1-60}`; stored,
-//!   and a session on the speaker follows without ending
+//!   and a session on the speaker follows without ending. A speaker with an
+//!   `onvif_endpoint` gets the volume on the device itself (`hw_volume`
+//!   true, the software level then stays at unity); one that refuses stays
+//!   on software volume and the answer carries `hw_error`
 //! * `POST           /api/v1/admin/cameras/{camera_id}/talk-down/volume` —
 //!   `{"volume": 0-100, "boost"?: bool}`; only the session this camera
 //!   started, only while it plays, never stored
@@ -69,6 +72,8 @@ pub(crate) struct SpeakerView {
     driver: SpeakerDriver,
     username: Option<String>,
     has_password: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onvif_endpoint: Option<String>,
     camera_ids: Vec<CameraId>,
 }
 
@@ -82,6 +87,7 @@ impl SpeakerView {
             driver: sp.driver,
             username: sp.username.clone(),
             has_password: sp.password.is_some(),
+            onvif_endpoint: sp.onvif_endpoint.clone(),
             camera_ids,
         }
     }
@@ -765,8 +771,32 @@ pub(crate) async fn stop_talk_down(
     res.map(|_| StatusCode::NO_CONTENT)
 }
 
+/// The answer to a `PUT …/output`: the stored output, and why the device
+/// would not take the volume when the speaker has an `onvif_endpoint` and
+/// refused.
+#[derive(Serialize)]
+pub(crate) struct OutputView {
+    #[serde(flatten)]
+    output: SpeakerOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hw_error: Option<String>,
+}
+
+/// Set the speaker's own output level to `volume` (0-100 of the device's
+/// `OutputLevelRange`). The error is the device's refusal; it never carries
+/// the speaker's password, which only feeds the WS-Security digest.
+async fn set_device_volume(sp: &SpeakerConfig, endpoint: &str, volume: u8) -> Result<(), String> {
+    use crate::discovery::onvif_media::{get_audio_output_level, set_audio_output_level};
+    let user = sp.username.as_deref().unwrap_or_default();
+    let pass = sp.password.as_deref().unwrap_or_default();
+    let cfg = get_audio_output_level(endpoint, user, pass).await?;
+    set_audio_output_level(endpoint, user, pass, &cfg, cfg.level_for(volume)).await
+}
+
 /// Store the speaker's output. It is not a speaker edit: a session on the
-/// speaker keeps playing and follows the new level.
+/// speaker keeps playing and follows the new level. A speaker with an
+/// `onvif_endpoint` takes the volume on the device (`hw_volume`); when it
+/// refuses, the software level stays in charge and `hw_error` says why.
 pub(crate) async fn put_speaker_output(
     State(s): State<ApiState>,
     Path(id): Path<SpeakerId>,
@@ -774,18 +804,31 @@ pub(crate) async fn put_speaker_output(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     session: Option<SessionContext>,
     body: Result<Json<OutputInput>, JsonRejection>,
-) -> Result<Json<SpeakerOutput>, ApiError> {
+) -> Result<Json<OutputView>, ApiError> {
     let Json(body) = body.map_err(|e| bad_request(e.body_text()))?;
+    let sp = stored(&s, id).await?;
     let before = s
         .store
         .speaker_output(id)
         .await
         .map_err(refused(StatusCode::NOT_FOUND))?;
+    let volume = in_range("volume", body.volume, 0..=100)?;
+    let auto_max_per_hour = in_range("auto_max_per_hour", body.auto_max_per_hour, 1..=60)?;
+    let (hw_volume, hw_error) = match sp.onvif_endpoint.as_deref() {
+        None => (false, None),
+        Some(endpoint) => match set_device_volume(&sp, endpoint, volume).await {
+            Ok(()) => (true, None),
+            Err(e) => {
+                tracing::warn!(speaker_id = id, error = %e, "speaker refused its hardware volume");
+                (false, Some(e))
+            }
+        },
+    };
     let out = SpeakerOutput {
-        volume: in_range("volume", body.volume, 0..=100)?,
+        volume,
         boost: body.boost,
-        hw_volume: before.hw_volume,
-        auto_max_per_hour: in_range("auto_max_per_hour", body.auto_max_per_hour, 1..=60)?,
+        hw_volume,
+        auto_max_per_hour,
     };
     let change: Result<SqliteTx<'_>, StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
@@ -817,7 +860,10 @@ pub(crate) async fn put_speaker_output(
         serde_json::json!({ "kind": "speaker", "action": "output", "speaker_id": id }),
     )
     .await;
-    Ok(Json(out))
+    Ok(Json(OutputView {
+        output: out,
+        hw_error,
+    }))
 }
 
 /// The live slider: the volume of the session this camera started on its

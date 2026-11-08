@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
 use super::onvif_soap::{
-    build_client, local_name, parent_is, post_soap, ws_security_header, xml_escape,
+    build_client, local_name, parent_is, post_soap, ws_security_header, xml_escape, MEDIA1,
 };
 
 /// Authoritative stream entry returned by the ONVIF Media
@@ -708,6 +708,206 @@ fn parse_audio_outputs_response(body: &str) -> Result<Vec<AudioOutput>, String> 
     Ok(out)
 }
 
+/// A speaker's first ONVIF audio output configuration and the range its
+/// `OutputLevel` may take. `SetAudioOutputConfiguration` replaces the whole
+/// configuration, so the fields it must send back are kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioOutputLevel {
+    pub token: String,
+    pub name: String,
+    pub output_token: String,
+    pub send_primacy: Option<String>,
+    pub level: i32,
+    pub min: i32,
+    pub max: i32,
+}
+
+impl AudioOutputLevel {
+    /// The device level for a 0-100 `volume`: `min + volume/100 * (max - min)`, rounded.
+    pub fn level_for(&self, volume: u8) -> i32 {
+        let span = i64::from(self.max) - i64::from(self.min);
+        let v = i64::from(volume.min(100));
+        self.min + ((span * v + 50) / 100) as i32
+    }
+}
+
+/// Read the speaker's output level and range (`GetAudioOutputConfigurations`,
+/// then `GetAudioOutputConfigurationOptions` for the first configuration).
+/// Media1 only; `endpoint` is the speaker's validated `onvif_endpoint`.
+/// shortcut: only the first audio output configuration, a multi-output device
+/// needs a token choice.
+pub async fn get_audio_output_level(
+    endpoint: &str,
+    username: &str,
+    password: &str,
+) -> Result<AudioOutputLevel, String> {
+    let configs = MEDIA1
+        .call(
+            endpoint,
+            username,
+            password,
+            "GetAudioOutputConfigurations",
+            "<trt:GetAudioOutputConfigurations/>",
+        )
+        .await?;
+    let mut cfg = parse_audio_output_configurations(&configs)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the speaker reports no audio output configuration".to_string())?;
+    let body = format!(
+        "<trt:GetAudioOutputConfigurationOptions><trt:ConfigurationToken>{}</trt:ConfigurationToken></trt:GetAudioOutputConfigurationOptions>",
+        xml_escape(&cfg.token)
+    );
+    let options = MEDIA1
+        .call(
+            endpoint,
+            username,
+            password,
+            "GetAudioOutputConfigurationOptions",
+            &body,
+        )
+        .await?;
+    (cfg.min, cfg.max) = parse_output_level_range(&options)?;
+    Ok(cfg)
+}
+
+/// Set the output level and ask the device to keep it across a reboot.
+pub async fn set_audio_output_level(
+    endpoint: &str,
+    username: &str,
+    password: &str,
+    cfg: &AudioOutputLevel,
+    level: i32,
+) -> Result<(), String> {
+    let primacy = cfg.send_primacy.as_deref().map_or(String::new(), |p| {
+        format!("<tt:SendPrimacy>{}</tt:SendPrimacy>", xml_escape(p))
+    });
+    let body = format!(
+        "<trt:SetAudioOutputConfiguration><trt:Configuration token=\"{token}\"><tt:Name>{name}</tt:Name><tt:UseCount>1</tt:UseCount><tt:OutputToken>{out}</tt:OutputToken>{primacy}<tt:OutputLevel>{level}</tt:OutputLevel></trt:Configuration><trt:ForcePersistence>true</trt:ForcePersistence></trt:SetAudioOutputConfiguration>",
+        token = xml_escape(&cfg.token),
+        name = xml_escape(&cfg.name),
+        out = xml_escape(&cfg.output_token),
+    );
+    MEDIA1
+        .call(
+            endpoint,
+            username,
+            password,
+            "SetAudioOutputConfiguration",
+            &body,
+        )
+        .await
+        .map(drop)
+}
+
+/// Every `<Configurations token=…>` of a `GetAudioOutputConfigurationsResponse`
+/// (`min` and `max` stay 0: they come from the options). Local names only.
+fn parse_audio_output_configurations(body: &str) -> Result<Vec<AudioOutputLevel>, String> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut current: Option<AudioOutputLevel> = None;
+    let mut text = String::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Err(e) => return Err(format!("xml parse error: {e}")),
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let name = local_name(&e.name());
+                if name == "Configurations" {
+                    let token = e
+                        .attributes()
+                        .flatten()
+                        .find(|a| local_name(&a.key) == "token")
+                        .map(|a| a.unescape_value().unwrap_or_default().to_string())
+                        .unwrap_or_default();
+                    current = Some(AudioOutputLevel {
+                        token,
+                        ..Default::default()
+                    });
+                }
+                stack.push(name);
+                text.clear();
+            }
+            Ok(Event::Text(t)) => {
+                if let Ok(s) = t.unescape() {
+                    text.push_str(&s);
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = local_name(&e.name());
+                let in_config = parent_is(&stack, "Configurations");
+                stack.pop();
+                if let Some(c) = current.as_mut().filter(|_| in_config) {
+                    let t = text.trim();
+                    match name.as_str() {
+                        "Name" => c.name = t.to_string(),
+                        "OutputToken" => c.output_token = t.to_string(),
+                        "SendPrimacy" => c.send_primacy = Some(t.to_string()),
+                        "OutputLevel" => {
+                            c.level = t.parse().map_err(|_| format!("bad OutputLevel {t:?}"))?;
+                        }
+                        _ => {}
+                    }
+                }
+                if name == "Configurations" {
+                    out.extend(current.take().filter(|c| !c.token.is_empty()));
+                }
+                text.clear();
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// `(Min, Max)` of the `<OutputLevelRange>` of a
+/// `GetAudioOutputConfigurationOptionsResponse`; a missing or empty range is an error.
+fn parse_output_level_range(body: &str) -> Result<(i32, i32), String> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let (mut min, mut max) = (None, None);
+    let mut text = String::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Err(e) => return Err(format!("xml parse error: {e}")),
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                stack.push(local_name(&e.name()));
+                text.clear();
+            }
+            Ok(Event::Text(t)) => {
+                if let Ok(s) = t.unescape() {
+                    text.push_str(&s);
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = local_name(&e.name());
+                let in_range = parent_is(&stack, "OutputLevelRange");
+                stack.pop();
+                if in_range {
+                    let v = text.trim().parse::<i32>().ok();
+                    match name.as_str() {
+                        "Min" => min = v,
+                        "Max" => max = v,
+                        _ => {}
+                    }
+                }
+                text.clear();
+            }
+            _ => {}
+        }
+    }
+    match (min, max) {
+        (Some(min), Some(max)) if min < max => Ok((min, max)),
+        _ => Err("the speaker reports no usable OutputLevelRange".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,5 +1167,88 @@ mod tests {
             }
         }
         assert!(env.contains("<trt:GetAudioOutputs/>"), "{env}");
+    }
+
+    const CONFIGS_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+              xmlns:tt="http://www.onvif.org/ver10/schema">
+  <env:Body>
+    <trt:GetAudioOutputConfigurationsResponse>
+      <trt:Configurations token="AudioOutputConfigToken">
+        <tt:Name>AudioOutputConfig</tt:Name>
+        <tt:UseCount>1</tt:UseCount>
+        <tt:OutputToken>AudioOutputToken_1</tt:OutputToken>
+        <tt:SendPrimacy>www.onvif.org/ver20/HalfDuplex/Auto</tt:SendPrimacy>
+        <tt:OutputLevel>40</tt:OutputLevel>
+      </trt:Configurations>
+      <trt:Configurations token="Second">
+        <tt:Name>Second</tt:Name>
+        <tt:OutputToken>AudioOutputToken_2</tt:OutputToken>
+        <tt:OutputLevel>5</tt:OutputLevel>
+      </trt:Configurations>
+    </trt:GetAudioOutputConfigurationsResponse>
+  </env:Body>
+</env:Envelope>"#;
+
+    const OPTIONS_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+              xmlns:tt="http://www.onvif.org/ver10/schema">
+  <env:Body>
+    <trt:GetAudioOutputConfigurationOptionsResponse>
+      <trt:Options>
+        <tt:OutputTokensAvailable>AudioOutputToken_1</tt:OutputTokensAvailable>
+        <tt:SendPrimacyOptions>www.onvif.org/ver20/HalfDuplex/Auto</tt:SendPrimacyOptions>
+        <tt:OutputLevelRange>
+          <tt:Min>10</tt:Min>
+          <tt:Max>90</tt:Max>
+        </tt:OutputLevelRange>
+      </trt:Options>
+    </trt:GetAudioOutputConfigurationOptionsResponse>
+  </env:Body>
+</env:Envelope>"#;
+
+    #[test]
+    fn parses_audio_output_configurations_and_level_range() {
+        let cfgs = parse_audio_output_configurations(CONFIGS_RESPONSE).expect("parses");
+        assert_eq!(cfgs.len(), 2);
+        assert_eq!(
+            cfgs[0],
+            AudioOutputLevel {
+                token: "AudioOutputConfigToken".into(),
+                name: "AudioOutputConfig".into(),
+                output_token: "AudioOutputToken_1".into(),
+                send_primacy: Some("www.onvif.org/ver20/HalfDuplex/Auto".into()),
+                level: 40,
+                min: 0,
+                max: 0,
+            }
+        );
+        assert_eq!((cfgs[1].token.as_str(), cfgs[1].level), ("Second", 5));
+        assert_eq!(cfgs[1].send_primacy, None);
+        assert_eq!(parse_output_level_range(OPTIONS_RESPONSE), Ok((10, 90)));
+        assert!(parse_audio_output_configurations("<a/>")
+            .unwrap()
+            .is_empty());
+        for bad in ["<a/>", "<tt:OutputLevelRange xmlns:tt=\"x\"><tt:Min>5</tt:Min><tt:Max>5</tt:Max></tt:OutputLevelRange>"] {
+            assert!(parse_output_level_range(bad).is_err(), "{bad}");
+        }
+        assert!(parse_audio_output_configurations("<a><b></a>").is_err());
+    }
+
+    #[test]
+    fn level_for_maps_volume_onto_the_devices_range() {
+        let cfg = |min, max| AudioOutputLevel {
+            min,
+            max,
+            ..Default::default()
+        };
+        assert_eq!(cfg(0, 100).level_for(70), 70);
+        assert_eq!(cfg(10, 90).level_for(0), 10);
+        assert_eq!(cfg(10, 90).level_for(100), 90);
+        assert_eq!(cfg(10, 90).level_for(70), 66);
+        assert_eq!(cfg(0, 7).level_for(50), 4, "rounded");
+        assert_eq!(cfg(0, 100).level_for(250), 100, "clamped");
     }
 }

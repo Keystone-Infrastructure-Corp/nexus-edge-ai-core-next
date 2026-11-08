@@ -10163,6 +10163,240 @@ mod tests {
         assert_eq!(frames[0], want, "the chime's first frame at volume 50");
     }
 
+    /// An ONVIF Media service on loopback with one audio output configuration
+    /// (level 40, range 10 to 90). Records every `SetAudioOutputConfiguration`
+    /// body; refuses them with a SOAP fault while `fail_set` is true.
+    struct SoapStub {
+        port: u16,
+        fail_set: Arc<std::sync::atomic::AtomicBool>,
+        sets: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    async fn soap_stub() -> SoapStub {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const ENV: &str = r#"<?xml version="1.0"?><env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><env:Body>"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fail_set = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (fail, rec) = (fail_set.clone(), sets.clone());
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let (fail, rec) = (fail.clone(), rec.clone());
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let body_at = loop {
+                        let n = sock.read(&mut buf).await.unwrap();
+                        req.extend_from_slice(&buf[..n]);
+                        if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&req[..body_at]).to_ascii_lowercase();
+                    let want: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse().unwrap());
+                    while req.len() < body_at + want {
+                        let n = sock.read(&mut buf).await.unwrap();
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    let body = String::from_utf8_lossy(&req[body_at..]).into_owned();
+                    let (status, xml) = if body.contains("<trt:SetAudioOutputConfiguration>") {
+                        rec.lock().push(body);
+                        if fail.load(Ordering::SeqCst) {
+                            (
+                                "500 Internal Server Error",
+                                format!(
+                                    r#"{ENV}<env:Fault><env:Code><env:Value>env:Receiver</env:Value></env:Code><env:Reason><env:Text xml:lang="en">volume locked by the speaker</env:Text></env:Reason></env:Fault></env:Body></env:Envelope>"#
+                                ),
+                            )
+                        } else {
+                            ("200 OK", format!("{ENV}<trt:SetAudioOutputConfigurationResponse/></env:Body></env:Envelope>"))
+                        }
+                    } else if body.contains("<trt:GetAudioOutputConfigurationOptions>") {
+                        ("200 OK", format!("{ENV}<trt:GetAudioOutputConfigurationOptionsResponse><trt:Options><tt:OutputLevelRange><tt:Min>10</tt:Min><tt:Max>90</tt:Max></tt:OutputLevelRange></trt:Options></trt:GetAudioOutputConfigurationOptionsResponse></env:Body></env:Envelope>"))
+                    } else {
+                        ("200 OK", format!("{ENV}<trt:GetAudioOutputConfigurationsResponse><trt:Configurations token=\"AudioOutputConfigToken\"><tt:Name>AudioOutputConfig</tt:Name><tt:UseCount>1</tt:UseCount><tt:OutputToken>AudioOutputToken_1</tt:OutputToken><tt:OutputLevel>40</tt:OutputLevel></trt:Configurations></trt:GetAudioOutputConfigurationsResponse></env:Body></env:Envelope>"))
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                        xml.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        SoapStub {
+            port,
+            fail_set,
+            sets,
+        }
+    }
+
+    /// Create a speaker with credentials, a SIP `port` and an ONVIF endpoint on `endpoint_port`.
+    async fn create_onvif_speaker(app: &axum::Router, sip_port: u16, endpoint_port: u16) -> i64 {
+        let (status, body) = speaker_call(
+            app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({
+                "name": "spk", "host": "127.0.0.1", "port": sip_port,
+                "username": "admin", "password": "hunter2",
+                "onvif_endpoint": format!("http://127.0.0.1:{endpoint_port}/onvif/media_service"),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("hunter2"), "{body}");
+        speaker_json(&body)["id"].as_i64().unwrap()
+    }
+
+    fn volume_70() -> serde_json::Value {
+        serde_json::json!({ "volume": 70, "boost": false, "auto_max_per_hour": 6 })
+    }
+
+    /// Volume goes onto the device (`min + 0.7 * (max - min)`, kept across a
+    /// reboot), `hw_volume` is stored, and the chime then plays at unity.
+    #[tokio::test]
+    async fn speaker_output_put_sets_the_level_on_the_device_and_leaves_software_at_unity() {
+        let stub = soap_stub().await;
+        let (port, rtp, uas) = fake_speaker().await;
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let speaker = create_onvif_speaker(&app, port, stub.port).await;
+
+        let (status, body) = put_output(&app, speaker, volume_70()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out = speaker_json(&body);
+        assert_eq!(
+            (out["volume"].as_u64(), out["hw_volume"].as_bool()),
+            (Some(70), Some(true))
+        );
+        assert!(
+            out.get("hw_error").is_none() && !body.contains("hunter2"),
+            "{body}"
+        );
+        let sets = stub.sets.lock().clone();
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        for want in [
+            "<tt:OutputLevel>66</tt:OutputLevel>",
+            r#"token="AudioOutputConfigToken""#,
+            "<tt:OutputToken>AudioOutputToken_1</tt:OutputToken>",
+            "<trt:ForcePersistence>true</trt:ForcePersistence>",
+        ] {
+            assert!(sets[0].contains(want), "{want} in {}", sets[0]);
+        }
+        assert!(
+            !sets[0].contains("hunter2"),
+            "the password is only a digest input"
+        );
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!((stored.volume, stored.hw_volume), (70, true));
+        assert!(store.any_hw_volume().await.unwrap());
+
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            &format!("/api/v1/admin/speakers/{speaker}/test"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        uas.await.unwrap();
+        let tone = crate::talkdown::tone_pcm(2000);
+        let want: Vec<u8> = tone[..160]
+            .iter()
+            .map(|&s| crate::talkdown::g711::ulaw(crate::talkdown::limit(f32::from(s))))
+            .collect();
+        assert_eq!(rtp_frames(&rtp)[0], want, "software level stays at unity");
+
+        let rows = store
+            .list_audit_for_resource("speaker", &speaker.to_string(), 50)
+            .await
+            .unwrap();
+        assert!(rows.iter().any(|r| r.action == "speaker.output"));
+        for r in &rows {
+            let text = format!("{:?}{:?}", r.before_json, r.after_json);
+            assert!(!text.contains("hunter2"), "{text}");
+        }
+    }
+
+    /// A speaker that refuses falls back to software volume with `hw_error`,
+    /// and one that took the volume earlier gives it up when it stops taking it.
+    #[tokio::test]
+    async fn speaker_output_put_falls_back_to_software_when_the_device_refuses() {
+        use std::sync::atomic::Ordering;
+        let stub = soap_stub().await;
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let speaker = create_onvif_speaker(&app, 5060, stub.port).await;
+
+        let (_, body) = put_output(&app, speaker, volume_70()).await;
+        assert_eq!(speaker_json(&body)["hw_volume"], true, "{body}");
+
+        stub.fail_set.store(true, Ordering::SeqCst);
+        let (status, body) = put_output(&app, speaker, volume_70()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out = speaker_json(&body);
+        assert_eq!(out["hw_volume"], false, "{body}");
+        let err = out["hw_error"].as_str().expect("hw_error");
+        assert!(err.contains("volume locked by the speaker"), "{err}");
+        assert!(!body.contains("hunter2"), "{body}");
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!((stored.volume, stored.hw_volume), (70, false));
+        assert!(!store.any_hw_volume().await.unwrap());
+    }
+
+    /// No endpoint: software volume, and nothing to report.
+    #[tokio::test]
+    async fn speaker_output_put_without_an_onvif_endpoint_is_software_only() {
+        let (state, _store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let (_, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({ "name": "spk", "host": "127.0.0.1" })),
+        )
+        .await;
+        let speaker = speaker_json(&body)["id"].as_i64().unwrap();
+        let (status, body) = put_output(&app, speaker, volume_70()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out = speaker_json(&body);
+        assert_eq!(out["hw_volume"], false);
+        assert!(out.get("hw_error").is_none(), "{body}");
+    }
+
+    /// An endpoint on another host or scheme is refused when the speaker is
+    /// saved, so its credentials can't be sent anywhere else.
+    #[tokio::test]
+    async fn speaker_save_refuses_an_onvif_endpoint_off_the_speakers_host() {
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        for endpoint in ["http://192.0.2.99/onvif", "ftp://127.0.0.1/onvif"] {
+            let (status, body) = speaker_call(
+                &app,
+                Method::POST,
+                "/api/v1/admin/speakers",
+                Some(serde_json::json!({
+                    "name": "spk", "host": "127.0.0.1", "password": "hunter2",
+                    "onvif_endpoint": endpoint,
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {body}");
+            assert!(
+                body.contains("onvif_endpoint") && !body.contains("hunter2"),
+                "{body}"
+            );
+        }
+        assert!(store.list_speakers().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn speaker_output_put_validates_persists_audits_and_leaves_the_session_playing() {
         use futures::StreamExt;

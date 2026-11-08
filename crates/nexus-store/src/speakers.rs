@@ -62,6 +62,14 @@ impl Store {
         })
     }
 
+    /// Whether any speaker's own level is set over ONVIF (`hw_volume = 1`).
+    pub async fn any_hw_volume(&self) -> Result<bool, StoreError> {
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM speakers WHERE hw_volume = 1)")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get::<i64, _>(0)? != 0)
+    }
+
     /// Fails with the schema's CHECK on an out-of-range value.
     pub async fn set_speaker_output_tx(
         &self,
