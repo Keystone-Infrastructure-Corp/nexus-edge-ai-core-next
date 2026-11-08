@@ -173,7 +173,8 @@ impl VerifiedActor {
                 "GET" | "HEAD" | "OPTIONS"
             );
             // Typed speech is never a role decision (D12).
-            if talk_down_body(envelope, body) == Some(true) {
+            let payload = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+            if talk_down_body(envelope, payload.as_ref()) == Some(true) {
                 return false;
             }
             return legacy_allowed && (safe || !rpc_permissions(envelope).is_empty());
@@ -366,7 +367,7 @@ fn rpc_body_matches(envelope: EnvelopeContext<'_>, permission: &str, body: Optio
             return false;
         }
     }
-    if let Some(tts) = talk_down_body(envelope, body) {
+    if let Some(tts) = talk_down_body(envelope, payload.as_ref()) {
         if permission
             != if tts {
                 "live.talkdown_speak"
@@ -408,7 +409,10 @@ fn rpc_body_matches(envelope: EnvelopeContext<'_>, permission: &str, body: Optio
 /// For a camera talk-down start, whether its body asks for typed speech
 /// (`mode: "tts"`); `None` for any other route. A body that does not parse
 /// is not typed speech: the engine refuses it too.
-fn talk_down_body(envelope: EnvelopeContext<'_>, body: Option<&[u8]>) -> Option<bool> {
+fn talk_down_body(
+    envelope: EnvelopeContext<'_>,
+    payload: Option<&serde_json::Value>,
+) -> Option<bool> {
     let parts = rpc_path_parts(envelope.path)?;
     let ["admin", "cameras", camera, "talk-down"] = parts.as_slice() else {
         return None;
@@ -416,7 +420,6 @@ fn talk_down_body(envelope: EnvelopeContext<'_>, body: Option<&[u8]>) -> Option<
     if !envelope.method.eq_ignore_ascii_case("POST") || camera.parse::<u64>().is_err() {
         return None;
     }
-    let payload = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
     Some(payload.is_some_and(|v| v.get("mode").and_then(serde_json::Value::as_str) == Some("tts")))
 }
 
