@@ -181,7 +181,7 @@ struct Seq {
     /// The index of the last step started.
     step: usize,
     playing: bool,
-    /// When the last step ended (or failed to start).
+    /// When the last step ended.
     ended_at: Option<DateTime<Utc>>,
     /// When each sequence (a step 1) started, within the last hour.
     starts: VecDeque<DateTime<Utc>>,
@@ -200,6 +200,9 @@ struct Plan {
     output: SpeakerOutput,
     camera_id: CameraId,
     event_id: String,
+    /// The sequence's `(step, ended_at)` before this plan, restored if it
+    /// never plays: the next step follows a step that ended.
+    prev: (usize, Option<DateTime<Utc>>),
 }
 
 struct Responder {
@@ -450,6 +453,7 @@ impl Responder {
         plays.push_back(now);
         let mut seqs = self.seqs.lock();
         let seq = seqs.entry(key).or_default();
+        let prev = (seq.step, seq.ended_at);
         seq.step = step;
         seq.playing = true;
         if step == 0 {
@@ -463,6 +467,7 @@ impl Responder {
             output,
             camera_id: ev.camera_id,
             event_id: ev.event_id.to_string(),
+            prev,
         })
     }
 
@@ -481,6 +486,7 @@ impl Responder {
                 output,
                 camera_id,
                 event_id,
+                prev,
             } = plan;
             let key = (rule_id.clone(), speaker.id);
             let step_cfg = &td.steps[step];
@@ -602,7 +608,11 @@ impl Responder {
                     }
                 }
                 Err(e) => {
-                    end(false);
+                    // Never played: the attempt still counts in `starts` and the hourly cap.
+                    if let Some(seq) = seqs.lock().get_mut(&key) {
+                        (seq.step, seq.ended_at) = prev;
+                        seq.playing = false;
+                    }
                     let reason = match e {
                         StartError::Busy => "busy",
                         StartError::Unpaired => "no_speaker",
@@ -1415,6 +1425,40 @@ mod tests {
         );
     }
 
+    /// D10, ADR-095 (e): a step that never played does not advance the
+    /// sequence, though it still counts against the hourly cap.
+    #[tokio::test]
+    async fn a_step_that_found_the_speaker_busy_is_tried_again_not_skipped() {
+        let mut g = rig(talk_down()).await;
+        let now = Utc::now();
+        let plan = g.r.decide(&ev("r1", 1, now), now).await.unwrap();
+        assert_eq!(plan.step, 0);
+        // A manual session takes the speaker between the gates and the start.
+        let speaker = g.speaker.clone();
+        let req = StartRequest {
+            speaker: &speaker,
+            output: g.store.speaker_output(speaker.id).await.unwrap(),
+            camera_id: Some(1),
+            origin: Origin::Manual,
+            audio: &Audio::Tone,
+            event_id: None,
+        };
+        let sessions = g.sessions.clone();
+        let mut held = Box::pin(sessions.start(req, std::future::pending::<bool>()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut held)
+                .await
+                .is_err()
+        );
+        g.r.play(plan).await.unwrap();
+        drop(held);
+        g.sessions
+            .record_manual_end_for_test(g.speaker.id, now - Duration::hours(1));
+        let then = now + Duration::seconds(5);
+        assert_eq!(g.decide("r1", 1, then).await, Ok(0), "step 1 again");
+        assert_eq!(g.r.hourly[&g.speaker.id].len(), 2, "both attempts count");
+    }
+
     /// ADR-095 (f): an attempt that fails at the speaker is recorded and
     /// audited, and the rule reads as failing.
     #[tokio::test]
@@ -1439,6 +1483,8 @@ mod tests {
             ("rule", Some("failed"))
         );
         assert!(p.reason.as_deref().unwrap().contains("503"));
+        // The failed step 1 is tried again, not followed by step 2.
+        assert_eq!(g.decide("r1", 1, Utc::now()).await, Ok(0));
         let a = audits(&g.store).await;
         let start = a
             .iter()
