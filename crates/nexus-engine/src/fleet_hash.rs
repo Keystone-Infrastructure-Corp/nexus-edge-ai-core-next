@@ -626,6 +626,44 @@ mod tests {
         );
     }
 
+    /// FROZEN cross-repo vector for rules bound to talk-down audio
+    /// (SPEC-086 / ADR-095). r1 omits every defaulted binding field and
+    /// carries a null `schedule`; r2 sets all of them. Persisted and hashed
+    /// through the store exactly as a fleet apply does, so the typed
+    /// `RuleTalkDown` round-trip fills the defaults and drops the `None`s.
+    ///
+    /// It MUST equal the cloud's `rules_talk_down_frozen_vector` in
+    /// api-gateway `fleet/hash.rs` over the same input (`normalize_rule`).
+    #[tokio::test]
+    async fn rules_talk_down_frozen_vector() {
+        let input = json!([
+          {"id": "r2", "name": "Loiter after hours", "when": "object.label == 'person'", "severity": "critical", "verify": true,
+           "talk_down": {"steps": [{"audio_uid": "b2c3d4e5-0000-4000-8000-000000000002", "repeat": 3}],
+             "escalate_within_secs": 120, "cooldown_secs": 600, "schedule": {"grid": vec![vec![true; 48]; 7]},
+             "volume": 0, "speaker_id": 7, "play_before_verification": true}},
+          {"id": "r1", "name": "Person Detected", "when": "object.label == 'person'", "severity": "warning",
+           "talk_down": {"steps": [{"audio_uid": "a1b2c3d4-0000-4000-8000-000000000001"},
+             {"audio_uid": "b2c3d4e5-0000-4000-8000-000000000002", "repeat": 2}],
+             "escalate_within_secs": 45, "schedule": null, "volume": 80}}
+        ]);
+        let store = open_store().await;
+        for entry in input.as_array().unwrap() {
+            let rule: nexus_config::RuleConfig =
+                serde_json::from_value(entry.clone()).expect("bound rule deserializes");
+            store.upsert_rule(&rule).await.unwrap();
+        }
+
+        let r1 = &store.list_rules().await.unwrap()[0];
+        assert_eq!(
+            canonical_json(&serde_json::to_value(r1).unwrap()),
+            r#"{"camera_filter":null,"consecutive_frames":2,"cooldown_ms":30000,"enabled":true,"id":"r1","min_track_age_ms":500,"name":"Person Detected","severity":"warning","sinks":[],"talk_down":{"cooldown_secs":60,"escalate_within_secs":45,"play_before_verification":false,"steps":[{"audio_uid":"a1b2c3d4-0000-4000-8000-000000000001","repeat":1},{"audio_uid":"b2c3d4e5-0000-4000-8000-000000000002","repeat":2}],"volume":80},"verify":false,"when":"object.label == 'person'","zones":null}"#
+        );
+        assert_eq!(
+            compute(&store).await.unwrap().rules.as_deref(),
+            Some("3dce388876dd125d58e239a23f06c50522426321018210abdfec2eb348730f1c")
+        );
+    }
+
     /// On a fresh store: no rules, no cameras → both `None`; delivery
     /// is always present (seeded singleton).
     #[tokio::test]
