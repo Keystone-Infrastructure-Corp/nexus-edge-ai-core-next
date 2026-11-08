@@ -172,10 +172,14 @@ impl VerifiedActor {
                 envelope.method.to_ascii_uppercase().as_str(),
                 "GET" | "HEAD" | "OPTIONS"
             );
-            // Typed speech is never a role decision (D12).
-            let payload = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
-            if talk_down_body(envelope, payload.as_ref()) == Some(true) {
-                return false;
+            // Typed speech is never a role decision (D12). Only a talk-down
+            // start's body is parsed.
+            if talk_down_body(envelope, None).is_some() {
+                let payload =
+                    body.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+                if talk_down_body(envelope, payload.as_ref()) == Some(true) {
+                    return false;
+                }
             }
             return legacy_allowed && (safe || !rpc_permissions(envelope).is_empty());
         };
