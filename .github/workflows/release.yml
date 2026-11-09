@@ -464,7 +464,8 @@ jobs:
       - name: install ONNX Runtime ${{ env.ORT_VERSION }} (for cargo link)
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
             | sudo tar -xz -C /opt
           sudo mv "/opt/onnxruntime-linux-x64-${ORT_VERSION}" /opt/onnxruntime
 
@@ -517,14 +518,18 @@ jobs:
       # wrapper crate, which nexus-tts does not use; it is not linked.)
       - name: cargo build nexus-tts (text-to-speech helper)
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/tts-archives
           PIPER_PHONEMIZE_ARCHIVE_DIR: ${{ runner.temp }}/tts-archives
         run: |
           set -euo pipefail
           mkdir -p "$SHERPA_ONNX_ARCHIVE_DIR"
           cd "$SHERPA_ONNX_ARCHIVE_DIR"
-          curl -fsSLO https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-static-lib.tar.bz2
-          curl -fsSLO https://github.com/csukuangfj/piper-phonemize/releases/download/v1.5.9/piper-phonemize-v1.5.9-linux-x64-static-lib.tar.bz2
+          # Through the API, not the /releases/download/ redirect: for these two
+          # repos (very long release lists) that redirect takes ~10 s and GitHub
+          # answers 504; the asset API returns in under 2 s.
+          gh release download v2.0.1 -R k2-fsa/sherpa-onnx -p sherpa-onnx-v2.0.1-linux-x64-static-lib.tar.bz2
+          gh release download v1.5.9 -R csukuangfj/piper-phonemize -p piper-phonemize-v1.5.9-linux-x64-static-lib.tar.bz2
           sha256sum --strict -c - <<'SUMS'
           55cfadf65ba50d0afc1a802b7a337942819e51c94a5b5a384def1978f7c70871  sherpa-onnx-v2.0.1-linux-x64-static-lib.tar.bz2
           89bb62ee003f11f43ec198d035b781cec91739f02bc406de347a12da7622e6d6  piper-phonemize-v1.5.9-linux-x64-static-lib.tar.bz2
