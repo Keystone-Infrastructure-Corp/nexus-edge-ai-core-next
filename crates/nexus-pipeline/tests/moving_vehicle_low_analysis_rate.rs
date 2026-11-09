@@ -46,6 +46,7 @@ fn field_rule(consecutive_frames: u32, cooldown_ms: u64) -> RuleConfig {
         enabled: true,
         sinks: Vec::new(),
         verify: false,
+        talk_down: None,
     }
 }
 

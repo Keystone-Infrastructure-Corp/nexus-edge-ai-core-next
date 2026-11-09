@@ -30,6 +30,10 @@ pub struct SpeakerConfig {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// The speaker's ONVIF Media service URL (http or https, on `host`), used
+    /// to set its output level on the device. Absent: software volume only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onvif_endpoint: Option<String>,
 }
 
 fn default_sip_port() -> u16 {
@@ -47,6 +51,7 @@ impl std::fmt::Debug for SpeakerConfig {
             .field("driver", &self.driver)
             .field("username", &self.username)
             .field("has_password", &self.password.is_some())
+            .field("onvif_endpoint", &self.onvif_endpoint)
             .finish()
     }
 }
@@ -89,6 +94,35 @@ impl SpeakerConfig {
         let password = self.password.as_deref().unwrap_or_default();
         if password.chars().any(char::is_control) {
             return Err("password must not contain a control character".into());
+        }
+        if let Some(endpoint) = &self.onvif_endpoint {
+            self.validate_onvif_endpoint(endpoint)?;
+        }
+        Ok(())
+    }
+
+    /// The endpoint receives the speaker's credentials, so it must be http(s)
+    /// on the speaker's own host (no pivoting to another device) and carry no
+    /// credentials of its own.
+    fn validate_onvif_endpoint(&self, endpoint: &str) -> Result<(), String> {
+        let bad = |why: &str| Err(format!("onvif_endpoint {why}"));
+        let Ok(url) = url::Url::parse(endpoint) else {
+            return bad("must be a URL");
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return bad("must be an http or https URL");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return bad("must not carry credentials");
+        }
+        let url_host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+        let same = url_host.eq_ignore_ascii_case(&self.host)
+            || matches!(
+                (url_host.parse::<std::net::IpAddr>(), self.host.parse::<std::net::IpAddr>()),
+                (Ok(a), Ok(b)) if a == b
+            );
+        if !same {
+            return bad("must be on the speaker's host");
         }
         Ok(())
     }
@@ -155,6 +189,46 @@ mod tests {
         // The password only feeds the MD5 digest, never the header line.
         sp.password = Some(r#"p@ss "w0rd"\!"#.into());
         assert_eq!(sp.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_confines_the_onvif_endpoint_to_the_speakers_host() {
+        let with = |host: &str, endpoint: &str| {
+            let mut sp = speaker(host);
+            sp.onvif_endpoint = Some(endpoint.into());
+            sp.validate()
+        };
+        for (host, ok) in [
+            ("192.0.2.10", "http://192.0.2.10/onvif/media_service"),
+            ("192.0.2.10", "https://192.0.2.10:8443/onvif/media"),
+            ("Speaker-1.lan", "http://speaker-1.LAN:8080/onvif"),
+            ("fe80::1", "http://[fe80::1]/onvif"),
+            ("fe80::1", "http://[fe80:0:0:0:0:0:0:1]/onvif"),
+        ] {
+            assert_eq!(with(host, ok), Ok(()), "{ok}");
+        }
+        for (host, bad) in [
+            ("192.0.2.10", "http://192.0.2.11/onvif"),
+            ("192.0.2.10", "http://192.0.2.10.evil.example/onvif"),
+            ("192.0.2.10", "http://admin:pw@192.0.2.10/onvif"),
+            ("192.0.2.10", "http://evil.example@192.0.2.10/onvif"),
+            ("192.0.2.10", "ftp://192.0.2.10/onvif"),
+            ("192.0.2.10", "file:///etc/passwd"),
+            ("192.0.2.10", "192.0.2.10/onvif"),
+            ("192.0.2.10", ""),
+        ] {
+            let err = with(host, bad).unwrap_err();
+            assert!(err.contains("onvif_endpoint"), "{bad:?}: {err}");
+            assert!(!err.contains("pw"), "{err}");
+        }
+        let mut sp = speaker("192.0.2.10");
+        sp.onvif_endpoint = Some("http://192.0.2.10/onvif".into());
+        let json = serde_json::to_value(&sp).unwrap();
+        assert_eq!(json["onvif_endpoint"], "http://192.0.2.10/onvif");
+        assert!(serde_json::to_value(speaker("192.0.2.10"))
+            .unwrap()
+            .get("onvif_endpoint")
+            .is_none());
     }
 
     #[test]

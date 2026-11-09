@@ -105,6 +105,7 @@ mod tests {
             enabled: true,
             sinks,
             verify: false,
+            talk_down: None,
         }
     }
 

@@ -25,6 +25,9 @@
 #         `models/yolo_world_v2_s_*.onnx models/yoloe26_s_*.onnx \`
 #         `models/dinov2_s_224.onnx \`
 #         `models/models-manifest.json`
+#      plus, from v7, the text-to-speech voices as one asset built from
+#      a models/ tree holding them: `tar -C models -cf tts.tar tts`, then
+#      `gh release upload models-vN tts.tar`.
 #
 # `yolo26n.pt` is not a public ultralytics checkpoint, so the operator
 # must run step 1 locally — GH-hosted runners cannot regenerate it.
@@ -84,9 +87,11 @@ jobs:
   #   │   │                                ep-tensorrt,ep-hailo,ep-rocm,ep-vulkan)
   #   │   ├── nexus-probe
   #   │   ├── nexus-doctor
-  #   │   └── nexus-hailo-probe           (--features linked; dlopens
-  #   │                                    libhailort at runtime, inert
-  #   │                                    if HailoRT is not installed)
+  #   │   ├── nexus-hailo-probe           (--features linked; dlopens
+  #   │   │                                libhailort at runtime, inert
+  #   │   │                                if HailoRT is not installed)
+  #   │   └── nexus-tts                   (text-to-speech helper the engine
+  #   │                                    spawns; --features sherpa, static)
   #   ├── lib/onnxruntime/                (libonnxruntime.so + OpenVINO
   #   │                                    EP + intel CPU/GPU/NPU plugins,
   #   │                                    extracted from the wheel)
@@ -345,6 +350,8 @@ jobs:
       #         `models/yolo_world_v2_s_*.onnx models/yoloe26_s_*.onnx \`
       #         `models/dinov2_s_224.onnx \`
       #         `models/models-manifest.json`
+      #      plus, from v7, `tar -C models -cf tts.tar tts` uploaded as
+      #      `tts.tar` (the voices nest under tts/, release assets are flat).
       #
       # `--prerelease` on the models-* tag keeps it off the "Latest"
       # badge so it doesn't surface to operators downloading the engine.
@@ -386,9 +393,23 @@ jobs:
             --pattern 'yolo_world_v2_s_*_hailo.hef' \
             --pattern 'yoloe26_s_*_hailo.hef' \
             --pattern 'dinov2_s_*_hailo.hef' \
+            --pattern 'tts.tar' \
             --pattern 'models-manifest.json' \
             --dir models/ \
             --clobber
+          # Text-to-speech voices (pack v7+) ride as one tar because they
+          # nest under tts/. Required whenever the manifest lists them, and
+          # every file must match its manifest sha256.
+          tts_sums=$(jq -r '.models[].artifacts[] | select(.backend=="sherpa-onnx") | "\(.sha256)  \(.path)"' models/models-manifest.json)
+          if [[ -n "$tts_sums" ]]; then
+            if [ ! -s models/tts.tar ]; then
+              echo "::error::models-manifest.json lists text-to-speech voices but $PACK_TAG has no 'tts.tar' asset (see the pack-bump steps above)."
+              exit 1
+            fi
+            tar -xf models/tts.tar -C models
+            rm models/tts.tar
+            (cd models && sha256sum --strict -c - <<< "$tts_sums")
+          fi
           echo "Staged model pack from $PACK_TAG:"
           ls -la models/
           # Detectors ship as native-16:9 static-shape exports on the
@@ -486,6 +507,31 @@ jobs:
           cargo build --release -p nexus-hailo-backend \
             --features linked --bin nexus-hailo-probe
 
+      # nexus-tts links sherpa-onnx (Apache-2.0, bundles its own
+      # onnxruntime) and piper-phonemize/espeak-ng (GPL-3.0-or-later)
+      # statically. Their build scripts would otherwise download these
+      # archives unpinned; feeding them from a checked directory keeps the
+      # link inputs reproducible. Bump the crate pins in
+      # crates/nexus-tts/Cargo.toml and these together.
+      # (piper-phonemize-sys still fetches espeak-ng-data.tar.bz2 for its
+      # wrapper crate, which nexus-tts does not use; it is not linked.)
+      - name: cargo build nexus-tts (text-to-speech helper)
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/tts-archives
+          PIPER_PHONEMIZE_ARCHIVE_DIR: ${{ runner.temp }}/tts-archives
+        run: |
+          set -euo pipefail
+          mkdir -p "$SHERPA_ONNX_ARCHIVE_DIR"
+          cd "$SHERPA_ONNX_ARCHIVE_DIR"
+          curl -fsSLO https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-static-lib.tar.bz2
+          curl -fsSLO https://github.com/csukuangfj/piper-phonemize/releases/download/v1.5.9/piper-phonemize-v1.5.9-linux-x64-static-lib.tar.bz2
+          sha256sum --strict -c - <<'SUMS'
+          55cfadf65ba50d0afc1a802b7a337942819e51c94a5b5a384def1978f7c70871  sherpa-onnx-v2.0.1-linux-x64-static-lib.tar.bz2
+          89bb62ee003f11f43ec198d035b781cec91739f02bc406de347a12da7622e6d6  piper-phonemize-v1.5.9-linux-x64-static-lib.tar.bz2
+          SUMS
+          cd "$GITHUB_WORKSPACE"
+          cargo build --release -p nexus-tts --features sherpa --bin nexus-tts
+
       - uses: actions/setup-node@v5
         with: { node-version: "22" }
 
@@ -582,6 +628,7 @@ jobs:
           install -m 0755 target/release/nexus-probe  "$R/bin/"
           install -m 0755 target/release/nexus-doctor "$R/bin/"
           install -m 0755 target/release/nexus-hailo-probe "$R/bin/"
+          install -m 0755 target/release/nexus-tts "$R/bin/"
 
           # Bundled gst-plugins-rs rtpgccbwe (paced congestion control),
           # built by the rtp-plugin job against gst 1.24. Optional — the
@@ -612,6 +659,8 @@ jobs:
               jq -r '.models[].artifacts[] | select(.backend=="onnx") | .path' models/models-manifest.json | sort -u
           )
           cp -a "${onnx[@]}" models/models-manifest.json "$R/share/models/"
+          # Text-to-speech voices, already sha256-checked at download.
+          if [ -d models/tts ]; then cp -a models/tts "$R/share/models/"; fi
           # Hailo-8 HEFs (pack v4+) — tolerated-missing per the pattern
           # whitelist in the download step. Operators on non-Hailo boxes
           # never look at these files; on Hailo boxes the engine resolves

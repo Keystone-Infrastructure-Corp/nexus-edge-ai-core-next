@@ -10,6 +10,7 @@ use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::g711::Codec;
+use super::{limit, Gain};
 
 /// Samples in one 20 ms frame at 8 kHz.
 pub const FRAME_SAMPLES: usize = 160;
@@ -32,6 +33,8 @@ pub enum TalkdownError {
     AuthFailed,
     #[error("speaker answered with neither PCMU nor PCMA")]
     NoCommonCodec,
+    #[error("speaker ended the call")]
+    EndedBySpeaker,
     #[error("talk-down socket error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -61,6 +64,8 @@ pub struct SipCall {
     ssrc: u32,
     last_sent: Option<Instant>,
     hung_up: bool,
+    /// Applied to every sample sent; the session shares it to change volume mid-call.
+    gain: Gain,
 }
 
 /// Send SIP `OPTIONS`, from `source` when given (else the address that
@@ -186,12 +191,18 @@ pub async fn place_call(
         ssrc: getrandom::u32().unwrap_or_default(),
         last_sent: None,
         hung_up: false,
+        gain: Gain::default(),
     };
     call.send_frame(&[]).await?;
     Ok(call)
 }
 
 impl SipCall {
+    /// Replace the gain applied to every later frame.
+    pub fn set_gain(&mut self, gain: Gain) {
+        self.gain = gain;
+    }
+
     /// Send one 20 ms frame (at most 160 samples, padded with silence) as one
     /// RTP packet. The caller paces.
     pub async fn send_frame(&mut self, pcm: &[i16]) -> Result<(), TalkdownError> {
@@ -223,8 +234,13 @@ impl SipCall {
         packet.extend_from_slice(&self.seq.to_be_bytes());
         packet.extend_from_slice(&self.timestamp.to_be_bytes());
         packet.extend_from_slice(&self.ssrc.to_be_bytes());
+        let gain = self.gain.get();
         let samples = pcm.iter().copied().chain(std::iter::repeat(0));
-        packet.extend(samples.take(FRAME_SAMPLES).map(|s| self.codec.encode(s)));
+        packet.extend(
+            samples
+                .take(FRAME_SAMPLES)
+                .map(|s| self.codec.encode(limit(f32::from(s) * gain))),
+        );
         if let Err(e) = self.rtp.send(&packet).await {
             // The connected socket reports an earlier ICMP port-unreachable
             // (a speaker not listening yet) on this send: lose the frame,
@@ -239,10 +255,60 @@ impl SipCall {
         Ok(())
     }
 
+    /// Read the SIP socket without waiting. Only datagrams from the dialog peer
+    /// count: anyone else who knows the Call-ID could end a play. A
+    /// retransmitted 2xx for the INVITE means the speaker missed our ACK: ACK
+    /// it again, or it drops the call ~32 s in. A BYE is answered 200 and ends
+    /// the call: `EndedBySpeaker`. OPTIONS, re-INVITE and UPDATE (a session
+    /// timer refresh) are answered 200 and the call goes on.
+    pub fn pump_sip(&mut self) -> Result<(), TalkdownError> {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match self.leg.sock.try_recv_from(&mut buf) {
+                Ok((_, from)) if from != self.leg.peer => continue,
+                Ok((n, _)) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            if let Some(resp) = Response::parse(&buf[..n]) {
+                if (200..300).contains(&resp.status)
+                    && resp.answers(&self.leg.call_id, self.invite_cseq, "INVITE")
+                {
+                    let ack =
+                        self.leg
+                            .request("ACK", self.invite_cseq, &branch(), &self.to, "", "");
+                    let _ = self.leg.sock.try_send_to(ack.as_bytes(), self.leg.peer);
+                }
+                continue;
+            }
+            let Ok(req) = std::str::from_utf8(&buf[..n]) else {
+                continue;
+            };
+            let method = req.split(' ').next().unwrap_or_default();
+            // RFC 3311: a body-less UPDATE (a session-timer refresh) carries no offer to answer.
+            let has_body = req
+                .split_once("\r\n\r\n")
+                .is_some_and(|(_, b)| !b.is_empty());
+            // shortcut: a refresh is answered with our original offer, not
+            // the negotiated codec; upgrade if a speaker rejects it.
+            let sdp = match method {
+                "INVITE" => offer(self.leg.local.ip(), self.rtp.local_addr()?.port()),
+                "UPDATE" if has_body => offer(self.leg.local.ip(), self.rtp.local_addr()?.port()),
+                "UPDATE" | "BYE" | "OPTIONS" => String::new(),
+                _ => continue,
+            };
+            let Some(ok) = dialog_ok(req, &self.leg.call_id, self.leg.local, &sdp) else {
+                continue;
+            };
+            let _ = self.leg.sock.try_send_to(ok.as_bytes(), self.leg.peer);
+            if method == "BYE" {
+                self.hung_up = true;
+                return Err(TalkdownError::EndedBySpeaker);
+            }
+        }
+    }
+
     /// Stream `pcm` as 20 ms RTP frames until it ends or `cancel` fires.
-    // shortcut: inbound SIP is not read while playing, so a 2xx retransmitted
-    // after a lost ACK is not re-ACKed and the speaker may drop the call ~32 s
-    // in; read the SIP socket here if long plays on lossy links matter.
     pub async fn play_pcm(
         &mut self,
         pcm: &[i16],
@@ -252,7 +318,10 @@ impl SipCall {
         for frame in pcm.chunks(FRAME_SAMPLES) {
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
-                _ = tick.tick() => self.send_frame(frame).await?,
+                _ = tick.tick() => {
+                    self.pump_sip()?;
+                    self.send_frame(frame).await?;
+                }
             }
         }
         Ok(())
@@ -537,6 +606,31 @@ impl Response {
         });
         cseq_matches && self.header("call-id") == Some(call_id)
     }
+}
+
+/// The 200 answering an in-dialog request (its Via/From/To/CSeq echoed, our
+/// Contact, `sdp` as the body when given), or `None` when the request is for
+/// another call.
+fn dialog_ok(req: &str, call_id: &str, local: SocketAddr, sdp: &str) -> Option<String> {
+    let mut ok = String::from("SIP/2.0 200 OK\r\n");
+    let mut ours = false;
+    for line in req.lines().skip(1).take_while(|l| !l.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "call-id" | "i" => ours = value.trim() == call_id,
+            "via" | "v" | "from" | "f" | "to" | "t" | "cseq" => {}
+            _ => continue,
+        }
+        ok += line;
+        ok += "\r\n";
+    }
+    ok += &format!("Contact: <sip:nexus@{local}>\r\n");
+    if !sdp.is_empty() {
+        ok += "Content-Type: application/sdp\r\n";
+    }
+    ours.then(|| ok + &format!("Content-Length: {}\r\n\r\n{sdp}", sdp.len()))
 }
 
 fn token() -> String {
@@ -826,6 +920,92 @@ pub(crate) mod tests {
         assert_eq!(header(&seen[2], "CSeq"), Some("2 BYE"));
     }
 
+    /// One PCMU call whose first received frames are read after `send` ran on
+    /// it; returns what `send` left in the RTP socket (the opener excluded).
+    async fn frames_sent(send: impl AsyncFnOnce(&mut SipCall)) -> Vec<Vec<u8>> {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let (port, uas) = fake_uas("BYE", move |req| {
+            if req.starts_with("INVITE") {
+                vec![reply(req, "200 OK", SDP, &answer(rtp_port, "0"))]
+            } else if req.starts_with("BYE") {
+                vec![reply(req, "200 OK", "", "")]
+            } else {
+                vec![]
+            }
+        })
+        .await;
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        send(&mut call).await;
+        call.hangup().await.unwrap();
+        uas.await.unwrap();
+        let mut buf = [0u8; 2048];
+        let mut frames = Vec::new();
+        while let Ok(n) = rtp.try_recv(&mut buf) {
+            frames.push(buf[12..n].to_vec());
+        }
+        frames.remove(0);
+        frames
+    }
+
+    fn pcmu(sample: f32) -> Vec<u8> {
+        vec![crate::talkdown::g711::ulaw(limit(sample)); FRAME_SAMPLES]
+    }
+
+    /// Volume 50 is -20 dB: a 10 000 sample leaves as 1 000. Boost doubles it,
+    /// and what would pass full scale is limited rather than wrapped.
+    #[tokio::test]
+    async fn the_gain_scales_every_sample_and_the_limiter_prevents_wrap() {
+        let loud = vec![10_000i16; FRAME_SAMPLES];
+        let near_full = vec![30_000i16; FRAME_SAMPLES];
+        let out = nexus_store::SpeakerOutput {
+            volume: 50,
+            boost: true,
+            hw_volume: false,
+            auto_max_per_hour: 6,
+        };
+        let frames = frames_sent(async |call| {
+            call.send_frame(&loud).await.unwrap();
+            call.set_gain(Gain::new(Gain::compose(&out, 100, false)));
+            call.send_frame(&loud).await.unwrap();
+            call.set_gain(Gain::new(Gain::compose(&out, 100, true)));
+            call.send_frame(&loud).await.unwrap();
+            call.set_gain(Gain::new(2.0));
+            call.send_frame(&near_full).await.unwrap();
+        })
+        .await;
+        assert_eq!(frames[0], pcmu(10_000.0), "unity before a gain is set");
+        assert_eq!(frames[1], pcmu(1_000.0), "volume 50");
+        assert_eq!(frames[2], pcmu(2_000.0), "volume 50 with boost");
+        assert_eq!(frames[3], pcmu(60_000.0), "limited, not wrapped");
+        assert!(
+            limit(60_000.0) > 30_000 && frames[3][0] >= 0x80,
+            "positive (µ-law sign bit set), not a wrap"
+        );
+    }
+
+    /// The session changes the gain it shares with the call; the next frame uses it.
+    #[tokio::test]
+    async fn a_shared_gain_change_applies_to_the_next_frame() {
+        let loud = vec![10_000i16; FRAME_SAMPLES];
+        let gain = Gain::new(1.0);
+        let shared = gain.clone();
+        let frames = frames_sent(async |call| {
+            call.set_gain(gain);
+            call.send_frame(&loud).await.unwrap();
+            shared.set(0.1);
+            call.send_frame(&loud).await.unwrap();
+        })
+        .await;
+        assert_eq!(frames, [pcmu(10_000.0), pcmu(1_000.0)]);
+    }
+
     /// A host filter that sees a UDP flow start with the speaker's RTP can
     /// hold every packet we later send on it (bench, 2026-10-25), so the call
     /// opens its media flow itself the moment it is answered.
@@ -974,6 +1154,232 @@ pub(crate) mod tests {
         }
         call.hangup().await.unwrap();
         assert_eq!(methods(&uas.await.unwrap()), ["INVITE", "ACK", "BYE"]);
+    }
+
+    /// A speaker that lost our 2xx ACK retransmits its 200 OK; every one is
+    /// ACKed while the clip plays, or the speaker drops the call ~32 s in.
+    #[tokio::test]
+    async fn a_retransmitted_200_is_reacked_during_playback() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            let mut next = async |seen: &mut Vec<String>| {
+                let (n, from) = timeout(Duration::from_secs(3), sock.recv_from(&mut buf))
+                    .await
+                    .expect("fake UAS waited 3 s for a request")
+                    .unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                from
+            };
+            let from = next(&mut seen).await;
+            let invite = seen[0].clone();
+            let ok = reply(&invite, "200 OK", SDP, &answer(rtp_port, "0"));
+            sock.send_to(ok.as_bytes(), from).await.unwrap();
+            next(&mut seen).await; // the first ACK is "lost": the speaker never saw it
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                sock.send_to(ok.as_bytes(), from).await.unwrap();
+                next(&mut seen).await;
+            }
+            next(&mut seen).await;
+            let bye = seen.last().unwrap();
+            sock.send_to(reply(bye, "200 OK", "", "").as_bytes(), from)
+                .await
+                .unwrap();
+            seen
+        });
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // 1.6 s of audio spans all three retransmits.
+        call.play_pcm(&tone_pcm(1600), &CancellationToken::new())
+            .await
+            .unwrap();
+        call.hangup().await.unwrap();
+        let seen = uas.await.unwrap();
+        assert_eq!(
+            methods(&seen),
+            ["INVITE", "ACK", "ACK", "ACK", "ACK", "BYE"],
+            "one ACK for the answer, one per retransmitted 200 OK"
+        );
+        for ack in &seen[1..5] {
+            assert_eq!(header(ack, "CSeq"), Some("1 ACK"));
+            assert!(header(ack, "To").unwrap().ends_with(";tag=uas1"));
+        }
+    }
+
+    /// The speaker hangs up mid-play: the core answers 200 and stops sending.
+    #[tokio::test]
+    async fn a_bye_from_the_speaker_ends_the_play_and_stops_the_rtp() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            let invite = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let ok = reply(&invite, "200 OK", SDP, &answer(rtp_port, "0"));
+            sock.send_to(ok.as_bytes(), from).await.unwrap();
+            sock.recv_from(&mut buf).await.unwrap(); // ACK
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let bye = format!(
+                "BYE sip:nexus@{from} SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{port};branch=z9hG4bKspk\r\n\
+                 From: {to};tag=uas1\r\nTo: {f}\r\nCall-ID: {id}\r\nCSeq: 1 BYE\r\n\
+                 Content-Length: 0\r\n\r\n",
+                to = header(&ok, "To").unwrap().split(';').next().unwrap(),
+                f = header(&invite, "From").unwrap(),
+                id = header(&invite, "Call-ID").unwrap(),
+            );
+            sock.send_to(bye.as_bytes(), from).await.unwrap();
+            let (n, _) = timeout(Duration::from_secs(1), sock.recv_from(&mut buf))
+                .await
+                .expect("the core answered the BYE")
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let started = Instant::now();
+        let err = call
+            .play_pcm(&tone_pcm(2000), &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TalkdownError::EndedBySpeaker), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1), "ended early");
+
+        let answer = uas.await.unwrap();
+        assert!(answer.starts_with("SIP/2.0 200 OK\r\n"), "{answer}");
+        assert_eq!(header(&answer, "CSeq"), Some("1 BYE"));
+        // Whatever was in flight drains, then nothing more arrives.
+        let mut buf = [0u8; 2048];
+        while rtp.try_recv(&mut buf).is_ok() {}
+        let more = timeout(Duration::from_millis(150), rtp.recv(&mut buf)).await;
+        assert!(more.is_err(), "RTP kept flowing after the BYE");
+        assert!(call.hung_up, "the drop must not send a second BYE");
+    }
+
+    /// A request the speaker sends inside the dialog `invite`/`ok` opened.
+    fn in_dialog(invite: &str, ok: &str, method: &str, cseq: u32, body: &str) -> String {
+        format!(
+            "{method} sip:nexus SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:9;branch=z9hG4bKspk{cseq}\r\n\
+             From: {to};tag=uas1\r\nTo: {f}\r\nCall-ID: {id}\r\nCSeq: {cseq} {method}\r\n\
+             Content-Length: {len}\r\n\r\n{body}",
+            to = header(ok, "To").unwrap().split(';').next().unwrap(),
+            f = header(invite, "From").unwrap(),
+            id = header(invite, "Call-ID").unwrap(),
+            len = body.len(),
+        )
+    }
+
+    /// Anyone on the LAN who knows the Call-ID could end a play with a BYE;
+    /// only the dialog peer's datagrams count.
+    #[tokio::test]
+    async fn a_bye_from_another_source_is_ignored() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            let invite = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let ok = reply(&invite, "200 OK", SDP, &answer(rtp_port, "0"));
+            sock.send_to(ok.as_bytes(), from).await.unwrap();
+            sock.recv_from(&mut buf).await.unwrap(); // ACK
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let intruder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let bye = in_dialog(&invite, &ok, "BYE", 1, "");
+            intruder.send_to(bye.as_bytes(), from).await.unwrap();
+            // Answers go to the dialog peer, so an answered stranger's BYE shows up here.
+            let answered = timeout(Duration::from_millis(300), sock.recv(&mut buf)).await;
+            assert!(answered.is_err(), "the core answered a stranger's BYE");
+        });
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        call.play_pcm(&tone_pcm(500), &CancellationToken::new())
+            .await
+            .expect("a stranger ended the play");
+        assert!(!call.hung_up);
+        uas.await.unwrap();
+    }
+
+    /// A speaker refreshing its session timer must not lose the call.
+    #[tokio::test]
+    async fn in_dialog_options_and_reinvite_are_answered_and_the_play_continues() {
+        let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let uas = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            let invite = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let ok = reply(&invite, "200 OK", SDP, &answer(rtp_port, "0"));
+            sock.send_to(ok.as_bytes(), from).await.unwrap();
+            sock.recv_from(&mut buf).await.unwrap(); // ACK
+            let mut answers = Vec::new();
+            for (cseq, method, body) in [
+                (1, "OPTIONS", ""),
+                (2, "INVITE", "v=0\r\n"),
+                (3, "UPDATE", ""),
+                (4, "UPDATE", "v=0\r\n"),
+            ] {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let req = in_dialog(&invite, &ok, method, cseq, body);
+                sock.send_to(req.as_bytes(), from).await.unwrap();
+                let (n, _) = timeout(Duration::from_secs(1), sock.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("no answer to {method}"))
+                    .unwrap();
+                answers.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+            answers
+        });
+        let mut call = place_call(
+            &target(port),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        call.play_pcm(&tone_pcm(1000), &CancellationToken::new())
+            .await
+            .expect("the play ended");
+        let answers = uas.await.unwrap();
+        for (a, cseq) in answers
+            .iter()
+            .zip(["1 OPTIONS", "2 INVITE", "3 UPDATE", "4 UPDATE"])
+        {
+            assert!(a.starts_with("SIP/2.0 200 OK\r\n"), "{a}");
+            assert_eq!(header(a, "CSeq"), Some(cseq));
+        }
+        assert!(answers[1].contains("m=audio"), "re-INVITE keeps the SDP");
+        // RFC 3311: no answer without an offer.
+        assert_eq!(header(&answers[2], "Content-Length"), Some("0"));
+        assert!(!answers[2].contains("m=audio"), "{}", answers[2]);
+        assert!(
+            answers[3].contains("m=audio"),
+            "an UPDATE offer is answered"
+        );
     }
 
     #[tokio::test]

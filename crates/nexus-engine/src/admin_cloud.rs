@@ -248,6 +248,7 @@ pub async fn post_cloud_enroll(
         req.label.as_deref(),
         req.keep_history,
         req.history_days,
+        s.talkdown.library(),
     )
     .await
     .map_err(|e| enrollment_failure(&e))?;
@@ -338,6 +339,17 @@ pub async fn delete_cloud_enrollment(
         .clear_cloud_enrollment()
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The org's talk-down library leaves with it; the next org starts at revision 0.
+    // Under the library lock, so an in-flight fleet push cannot write it back.
+    let sync = match s.talkdown.library() {
+        Some(lib) => Some(lib.lock().await),
+        None => None,
+    };
+    s.store
+        .reset_talkdown_fleet_library()
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop(sync);
 
     // Audit (best-effort by design — clearing already succeeded).
     let before_audit_str = before_audit.as_ref().map(ToString::to_string);

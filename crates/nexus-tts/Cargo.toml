@@ -1,0 +1,35 @@
+[package]
+name = "nexus-tts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Text-to-speech helper process: UTF-8 text on stdin, raw s16le 8 kHz mono on stdout"
+
+[[bin]]
+name = "nexus-tts"
+path = "src/main.rs"
+
+[features]
+# The synthesiser. Off by default: both crates' build scripts download
+# prebuilt static libraries from GitHub at build time, so plain workspace
+# builds (CI, macOS dev boxes, offline) leave it out. release.yml turns it
+# on and feeds the archives from a sha256-pinned local directory.
+sherpa = ["dep:sherpa-onnx", "dep:piper-phonemize-sys"]
+
+[dependencies]
+clap = { workspace = true }
+# Apache-2.0. Statically links its own onnxruntime, which is why this runs
+# as a separate process from the engine (which dlopens a different one).
+sherpa-onnx = { version = "=2.0.1", optional = true, default-features = false, features = ["static"] }
+# GPL-3.0-or-later (espeak-ng inside; allowlisted, AGENTS.md rule 1).
+# sherpa-onnx 2.x no longer phonemises Piper voices itself. The raw -sys
+# crate is used, not `piper-phonemize`, because that wrapper always unpacks
+# its embedded espeak-ng-data into a fixed, reusable path under $TMPDIR.
+piper-phonemize-sys = { version = "=1.5.9", optional = true, default-features = false, features = ["static"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -7,9 +7,25 @@
 
 use nexus_config::{SpeakerConfig, SpeakerId};
 use nexus_types::CameraId;
+use serde::Serialize;
 use sqlx::Row;
 
 use crate::{SqliteTx, Store, StoreError};
+
+/// A speaker's output (migration `0039_speaker_output.sql`). Not part of
+/// [`SpeakerConfig`]: an output change is not a speaker edit, so it does not
+/// hang up a session. `volume` 100 and no boost is today's behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SpeakerOutput {
+    /// 0-100; 100 is unity.
+    pub volume: u8,
+    /// Up to +6 dB, through the limiter.
+    pub boost: bool,
+    /// The speaker's own level is set over ONVIF, so no software volume.
+    pub hw_volume: bool,
+    /// Rule plays allowed per hour on this speaker, 1-60.
+    pub auto_max_per_hour: u8,
+}
 
 impl Store {
     pub async fn list_speakers(&self) -> Result<Vec<SpeakerConfig>, StoreError> {
@@ -28,6 +44,54 @@ impl Store {
             .await?;
         row.map(|r| Ok(serde_json::from_str(r.try_get(0)?)?))
             .transpose()
+    }
+
+    pub async fn speaker_output(&self, id: SpeakerId) -> Result<SpeakerOutput, StoreError> {
+        let row = sqlx::query(
+            "SELECT volume, boost, hw_volume, auto_max_per_hour FROM speakers WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("speaker {id}")))?;
+        Ok(SpeakerOutput {
+            volume: row.try_get(0)?,
+            boost: row.try_get::<i64, _>(1)? != 0,
+            hw_volume: row.try_get::<i64, _>(2)? != 0,
+            auto_max_per_hour: row.try_get(3)?,
+        })
+    }
+
+    /// Whether any speaker's own level is set over ONVIF (`hw_volume = 1`).
+    pub async fn any_hw_volume(&self) -> Result<bool, StoreError> {
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM speakers WHERE hw_volume = 1)")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get::<i64, _>(0)? != 0)
+    }
+
+    /// Fails with the schema's CHECK on an out-of-range value.
+    pub async fn set_speaker_output_tx(
+        &self,
+        tx: &mut SqliteTx<'_>,
+        id: SpeakerId,
+        out: &SpeakerOutput,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE speakers SET volume = ?, boost = ?, hw_volume = ?, auto_max_per_hour = ? \
+             WHERE id = ?",
+        )
+        .bind(out.volume)
+        .bind(out.boost)
+        .bind(out.hw_volume)
+        .bind(out.auto_max_per_hour)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("speaker {id}")));
+        }
+        Ok(())
     }
 
     /// INSERT a new speaker and stamp the assigned rowid into `sp.id`, as
@@ -56,11 +120,16 @@ impl Store {
         tx: &mut SqliteTx<'_>,
         sp: &SpeakerConfig,
     ) -> Result<(), StoreError> {
+        // SET reads the old row, so `hw_volume` survives only an unchanged
+        // `onvif_endpoint`: a device level holds for the device that set it.
         let res = sqlx::query(
-            "UPDATE speakers SET name = ?, config_json = ?, updated_at = CURRENT_TIMESTAMP \
-             WHERE id = ?",
+            "UPDATE speakers SET name = ?, \
+             hw_volume = CASE WHEN json_extract(config_json, '$.onvif_endpoint') IS ? \
+                         THEN hw_volume ELSE 0 END, \
+             config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(&sp.name)
+        .bind(sp.onvif_endpoint.as_deref())
         .bind(serde_json::to_string(sp)?)
         .bind(sp.id)
         .execute(&mut **tx)

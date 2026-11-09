@@ -29,8 +29,9 @@
 //!
 //! The dispatcher then applies [`VerifiedActor::allows_rpc`] before the
 //! handler runs: the signed permission must also match the request body
-//! (PTZ action, camera ids), and a token without `perm` falls back to its
-//! role only for a safe method or a mutating route the action table maps.
+//! (PTZ action, talk-down mode, camera ids), and a token without `perm`
+//! falls back to its role only for a safe method or a mutating route the
+//! action table maps, never for typed speech.
 //!
 //! All post-parse rejections collapse to `RejectReason::Invalid(_)` on
 //! the wire to avoid leaking which check failed. The fine-grained
@@ -78,6 +79,7 @@ pub const FLEET_CATEGORIES: &[&str] = &[
     "delivery_settings",
     "alert_sinks",
     "live_view",
+    "talkdown_audio",
 ];
 
 /// A single trusted Ed25519 verification key bundled at enrollment.
@@ -170,6 +172,15 @@ impl VerifiedActor {
                 envelope.method.to_ascii_uppercase().as_str(),
                 "GET" | "HEAD" | "OPTIONS"
             );
+            // Typed speech is never a role decision (D12). Only a talk-down
+            // start's body is parsed.
+            if talk_down_body(envelope, None).is_some() {
+                let payload =
+                    body.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+                if talk_down_body(envelope, payload.as_ref()) == Some(true) {
+                    return false;
+                }
+            }
             return legacy_allowed && (safe || !rpc_permissions(envelope).is_empty());
         };
         rpc_permissions(envelope).contains(&permission)
@@ -251,8 +262,15 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         // Speaker setup, assignment and the test chime (cloud ADR-091).
         | ("POST", ["admin", "speakers"])
         | ("PUT" | "DELETE", ["admin", "speakers", _])
-        | ("PUT", ["admin", "speakers", _, "cameras"])
+        | ("PUT", ["admin", "speakers", _, "cameras" | "output"])
         | ("POST", ["admin", "speakers", _, "test"]) => &["settings.write"],
+        // Renders a TTS preview to the cloud's write SAS, for whoever may write
+        // the library (a station: manage_fleet_settings), or read it: the cloud
+        // sends a reader's preview only with a saved item's own text. The local
+        // `tts/preview` is deliberately unmapped.
+        ("POST", ["admin", "talkdown", "tts", "preview-upload"]) => {
+            &["settings.write", "fleet.apply", "live.talkdown"]
+        }
         ("POST", ["admin", "users"])
         | ("PUT" | "DELETE", ["admin", "users", _])
         | ("POST", ["admin", "users", _, "reset-password" | "unlock"]) => &["members.manage"],
@@ -280,6 +298,13 @@ fn rpc_permissions(envelope: EnvelopeContext<'_>) -> &'static [&'static str] {
         | ("GET", ["admin", "network", "apply", "status"])
         | ("GET", ["admin", "speakers"])
         | ("GET", ["admin", "speakers", _]) => &["settings.read"],
+        ("GET", ["admin", "talkdown", "audio" | "status" | "plays"]) => {
+            &["settings.read", "live.talkdown"]
+        }
+        // Arming automatic (rule) talk-down is a live act (cloud ADR-095).
+        ("PUT", ["admin", "talkdown", "arming"] | ["admin", "speakers", _, "arming"]) => {
+            &["live.talkdown"]
+        }
         _ => &[],
     }
 }
@@ -289,9 +314,15 @@ fn camera_rpc_permissions(method: &str, tail: &[&str]) -> &'static [&'static str
         ("POST", ["ptz"]) => &["live.ptz", "settings.write"],
         ("POST", ["firmware:upgrade"]) => &["fleet.firmware"],
         ("PUT", ["network", "interface"]) => &["settings.network"],
-        // Starting or stopping talk-down is a live act on this camera; its
-        // speaker assignment is a setting (cloud ADR-091).
-        ("POST", ["talk-down"] | ["talk-down", "stop"]) => &["live.talkdown"],
+        // Starting, stopping or setting the volume of talk-down is a live act
+        // on this camera; its speaker assignment is a setting (cloud ADR-091).
+        // Typed speech (`mode: "tts"`) takes `live.talkdown_speak` instead,
+        // matched on the body. Arming automatic plays is a live act too
+        // (cloud ADR-095).
+        ("POST", ["talk-down"]) => &["live.talkdown", "live.talkdown_speak"],
+        ("POST", ["talk-down", "stop" | "volume"]) | ("PUT", ["talk-down", "arming"]) => {
+            &["live.talkdown"]
+        }
         ("GET", ["talk-down"]) => &["settings.read", "live.talkdown"],
         ("PUT", ["talk-down"])
         | ("PUT" | "DELETE", [])
@@ -344,6 +375,17 @@ fn rpc_body_matches(envelope: EnvelopeContext<'_>, permission: &str, body: Optio
             return false;
         }
     }
+    if let Some(tts) = talk_down_body(envelope, payload.as_ref()) {
+        if permission
+            != if tts {
+                "live.talkdown_speak"
+            } else {
+                "live.talkdown"
+            }
+        {
+            return false;
+        }
+    }
     let mut pending: Vec<&serde_json::Value> = payload.as_ref().into_iter().collect();
     while let Some(value) = pending.pop() {
         match value {
@@ -370,6 +412,23 @@ fn rpc_body_matches(envelope: EnvelopeContext<'_>, permission: &str, body: Optio
         }
     }
     true
+}
+
+/// For a camera talk-down start, whether its body asks for typed speech
+/// (`mode: "tts"`); `None` for any other route. A body that does not parse
+/// is not typed speech: the engine refuses it too.
+fn talk_down_body(
+    envelope: EnvelopeContext<'_>,
+    payload: Option<&serde_json::Value>,
+) -> Option<bool> {
+    let parts = rpc_path_parts(envelope.path)?;
+    let ["admin", "cameras", camera, "talk-down"] = parts.as_slice() else {
+        return None;
+    };
+    if !envelope.method.eq_ignore_ascii_case("POST") || camera.parse::<u64>().is_err() {
+        return None;
+    }
+    Some(payload.is_some_and(|v| v.get("mode").and_then(serde_json::Value::as_str) == Some("tts")))
 }
 
 /// What the verifier was asked to authorise.

@@ -684,9 +684,12 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
         SystemMethodPolicy::default(),
         CountingHandler(calls.clone()),
     );
-    let start = json!({"mode":"clip","clip":{"url":"https://blob/x.wav","sha256":"ab"}});
+    let start = json!({"mode":"stored","audio_uid":"a1b2c3d4-0000-4000-8000-000000000001"});
     let stop = json!({"session_id":"0192f0c4-1f7a-7cc0-8b39-6a54f1c5e0aa"});
     let speaker = json!({"name":"Gate","host":"10.0.0.9","port":5060,"driver":"sip"});
+    let output = json!({"volume":60,"boost":true,"auto_max_per_hour":6});
+    let volume = json!({"volume":40});
+    let arming = json!({"armed":false,"reason":"works"});
     for (method, path, permission, body, allowed) in [
         (
             "POST",
@@ -738,6 +741,100 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
             None,
             true,
         ),
+        (
+            "PUT",
+            "/admin/speakers/3/output",
+            "settings.write",
+            Some(&output),
+            true,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/volume",
+            "live.talkdown",
+            Some(&volume),
+            true,
+        ),
+        // The core's audio library is read by settings readers and talkers.
+        ("GET", "/admin/talkdown/audio", "settings.read", None, true),
+        ("GET", "/admin/talkdown/audio", "live.talkdown", None, true),
+        (
+            "GET",
+            "/admin/talkdown/audio",
+            "settings.write",
+            None,
+            false,
+        ),
+        (
+            "POST",
+            "/admin/talkdown/audio",
+            "settings.write",
+            None,
+            false,
+        ),
+        // ADR-095: arming automatic plays is a live act; their status and
+        // history are read by settings readers and talkers.
+        (
+            "PUT",
+            "/admin/talkdown/arming",
+            "live.talkdown",
+            Some(&arming),
+            true,
+        ),
+        (
+            "PUT",
+            "/admin/talkdown/arming",
+            "settings.write",
+            Some(&arming),
+            false,
+        ),
+        (
+            "PUT",
+            "/admin/cameras/7/talk-down/arming",
+            "live.talkdown",
+            Some(&arming),
+            true,
+        ),
+        (
+            "PUT",
+            "/admin/cameras/7/talk-down/arming",
+            "settings.write",
+            Some(&arming),
+            false,
+        ),
+        (
+            "PUT",
+            "/admin/speakers/3/arming",
+            "live.talkdown",
+            Some(&arming),
+            true,
+        ),
+        (
+            "PUT",
+            "/admin/speakers/3/arming",
+            "settings.write",
+            Some(&arming),
+            false,
+        ),
+        ("GET", "/admin/talkdown/status", "settings.read", None, true),
+        ("GET", "/admin/talkdown/status", "live.talkdown", None, true),
+        (
+            "GET",
+            "/admin/talkdown/status",
+            "settings.write",
+            None,
+            false,
+        ),
+        ("GET", "/admin/talkdown/plays", "settings.read", None, true),
+        ("GET", "/admin/talkdown/plays", "live.talkdown", None, true),
+        (
+            "GET",
+            "/admin/talkdown/plays?event_id=e1&limit=5",
+            "live.talkdown",
+            None,
+            true,
+        ),
+        ("GET", "/admin/talkdown/plays", "fleet.apply", None, false),
         // The other permission, or a neighbour's, for the same route.
         (
             "POST",
@@ -782,6 +879,34 @@ async fn talk_down_and_speaker_routes_take_only_their_signed_permission() {
             false,
         ),
         ("DELETE", "/admin/speakers/3", "settings.read", None, false),
+        (
+            "PUT",
+            "/admin/speakers/3/output",
+            "settings.read",
+            Some(&output),
+            false,
+        ),
+        (
+            "PUT",
+            "/admin/speakers/3/output",
+            "live.talkdown",
+            Some(&output),
+            false,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/volume",
+            "settings.read",
+            Some(&volume),
+            false,
+        ),
+        (
+            "POST",
+            "/admin/cameras/7/talk-down/volume",
+            "settings.write",
+            Some(&volume),
+            false,
+        ),
         // The edge numbers its cameras; no other spelling maps.
         (
             "POST",
@@ -1034,6 +1159,14 @@ async fn system_actors_are_bound_to_their_actual_service_actions() {
             None,
             true,
         ),
+        // Library sync runs as the gateway's fan-out.
+        (
+            "system:api-gateway",
+            "owner",
+            "/admin/fleet/talkdown_audio",
+            Some("fleet.apply"),
+            true,
+        ),
         (
             "system:api-gateway",
             "owner",
@@ -1186,4 +1319,104 @@ async fn cached_ptz_success_cannot_authorize_a_changed_action_or_camera() {
             )))
         ));
     }
+}
+
+/// Typed speech (D12): `live.talkdown_speak` signs a camera talk-down POST
+/// whose body is `mode: "tts"`, and only that; `live.talkdown` signs every
+/// other mode. A token with no signed `perm` never reaches typed speech,
+/// whatever its role, but keeps the legacy fallback for the other modes.
+/// The preview upload signs `settings.write`; the local preview is unmapped.
+#[test]
+fn typed_speech_needs_a_signed_live_talkdown_speak() {
+    let actor = |perm: Option<&str>, role: &str| VerifiedActor {
+        sub: "human".into(),
+        role: role.into(),
+        perm: perm.map(Into::into),
+        jti: "jti".into(),
+        org_id: ORG_ID.into(),
+        actor_org_id: None,
+    };
+    let post = |path| EnvelopeContext {
+        method: "POST",
+        path,
+    };
+    let start = post("/admin/cameras/7/talk-down");
+    let tts = json!({"mode":"tts","text":"Please leave the area"});
+    let stored = json!({"mode":"stored","audio_uid":"a1b2c3d4-0000-4000-8000-000000000001"});
+    let tone = json!({"mode":"tone"});
+    let other_camera = json!({"mode":"tts","text":"Leave","camera_id":8});
+    let bytes = |v: &serde_json::Value| serde_json::to_vec(v).unwrap();
+    for (perm, body, allowed) in [
+        ("live.talkdown_speak", Some(&tts), true),
+        ("live.talkdown", Some(&tts), false),
+        ("live.talkdown_speak", Some(&stored), false),
+        ("live.talkdown_speak", Some(&tone), false),
+        ("live.talkdown", Some(&stored), true),
+        ("live.talkdown", Some(&tone), true),
+        ("live.talkdown_speak", Some(&other_camera), false),
+        ("live.talkdown_speak", None, false),
+        ("settings.write", Some(&tts), false),
+    ] {
+        let b = body.map(bytes);
+        assert_eq!(
+            actor(Some(perm), "viewer").allows_rpc(start, b.as_deref(), false),
+            allowed,
+            "{perm} {body:?}"
+        );
+    }
+    // `live.talkdown_speak` reaches no other talk-down route.
+    for path in [
+        "/admin/cameras/7/talk-down/stop",
+        "/admin/cameras/7/talk-down/volume",
+    ] {
+        assert!(!actor(Some("live.talkdown_speak"), "owner").allows_rpc(
+            post(path),
+            Some(&bytes(&json!({"volume":40}))),
+            true
+        ));
+    }
+    // No signed perm: typed speech is refused for every role; other modes
+    // keep the role fallback.
+    let dup = br#"{"mode":"stored","mode":"tts"}"#;
+    for role in ["owner", "admin", "operator", "viewer"] {
+        let legacy = actor(None, role);
+        assert!(
+            !legacy.allows_rpc(start, Some(&bytes(&tts)), true),
+            "{role}"
+        );
+        assert!(
+            legacy.allows_rpc(start, Some(&bytes(&stored)), true),
+            "{role}"
+        );
+        assert!(
+            legacy.allows_rpc(start, Some(&bytes(&tone)), true),
+            "{role}"
+        );
+        assert!(!legacy.allows_rpc(start, Some(dup), true), "{role}");
+    }
+    // The preview upload follows library reads (settings.write or fleet.apply,
+    // a station's manage_fleet_settings, or live.talkdown for a saved item's
+    // text); the local preview is never reached.
+    let upload = post("/admin/talkdown/tts/preview-upload");
+    let up = bytes(&json!({"text":"t","voice":"en-US-female","upload_url":"https://x/y"}));
+    for perm in ["settings.write", "fleet.apply", "live.talkdown"] {
+        assert!(
+            actor(Some(perm), "viewer").allows_rpc(upload, Some(&up), false),
+            "{perm}"
+        );
+    }
+    for perm in ["live.talkdown_speak", "settings.read"] {
+        assert!(
+            !actor(Some(perm), "owner").allows_rpc(upload, Some(&up), true),
+            "{perm}"
+        );
+    }
+    let preview = post("/admin/talkdown/tts/preview");
+    for perm in ["settings.write", "live.talkdown_speak", "live.talkdown"] {
+        assert!(
+            !actor(Some(perm), "owner").allows_rpc(preview, Some(&up), true),
+            "{perm}"
+        );
+    }
+    assert!(!actor(None, "owner").allows_rpc(preview, Some(&up), true));
 }

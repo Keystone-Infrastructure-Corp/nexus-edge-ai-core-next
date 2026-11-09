@@ -359,8 +359,8 @@ where
 }
 
 // M6 Phase 4 Step 4.1 — `Option<SessionContext>` for handlers that
-// live OUTSIDE the admin gate (e.g. `/api/v1/rules/{id}/delivery`
-// PUT, `/api/v1/cameras/{id}` PUT/DELETE). These routes are not yet
+// live OUTSIDE the admin gate (e.g. `/api/v1/cameras/{id}`
+// PUT/DELETE). These routes are not yet
 // behind `admin_auth_layer`, so a request may legitimately arrive
 // without a bearer. The audit-hooks Step 4.1 then records the
 // mutation with actor `system:unknown` rather than 401'ing — the

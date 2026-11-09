@@ -370,7 +370,7 @@ jobs:
           packages: pkg-config libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice
           # 5 -> 7. 6 was burned by a run that cached the failed install above.
           # 7 -> 8: gstreamer1.0-nice for the talk-down live loopback tests.
-          version: 8
+          version: 9
 
       # The caching action reports success whenever the cache *restores*,
       # regardless of whether the packages it was supposed to provide are

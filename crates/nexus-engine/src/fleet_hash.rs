@@ -28,6 +28,11 @@
 //! * **delivery_settings** — `{enabled, schedule, timezone}` (the
 //!   `updated_at` field is excluded — the cloud has no equivalent).
 //!   Always present (the edge seeds a singleton row).
+//! * **talkdown_audio** — `None` until a fleet apply has written the
+//!   category's marker; then the marker's managed items that are `ready`,
+//!   sorted by `uid`, each as the cloud projects it (cloud `fleet/hash.rs`):
+//!   `{uid, name, description, kind, sha256}` for a clip and
+//!   `{uid, name, description, kind, text, voice}` for TTS.
 //!
 //! When a per-camera category is non-uniform the hash is `None`, which
 //! the cloud renders as drift against its single projected value.
@@ -55,7 +60,7 @@ use nexus_store::Store;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// The five per-category canonical hashes. A `None` field means the edge
+/// The per-category canonical hashes. A `None` field means the edge
 /// has no (uniform) state for that category.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CategoryHashes {
@@ -64,6 +69,7 @@ pub struct CategoryHashes {
     pub visual_prompts: Option<String>,
     pub detector_config: Option<String>,
     pub delivery_settings: Option<String>,
+    pub talkdown_audio: Option<String>,
 }
 
 /// Compute the per-category canonical hashes from the live store state.
@@ -76,12 +82,14 @@ pub async fn compute(store: &Store) -> anyhow::Result<CategoryHashes> {
     let visual_prompts =
         hash_visual_prompts(store, &cameras, managed.keys("visual_prompts")).await?;
     let delivery_settings = hash_delivery_settings(store).await?;
+    let talkdown_audio = hash_talkdown_audio(store).await?;
     Ok(CategoryHashes {
         rules,
         text_prompts,
         visual_prompts,
         detector_config,
         delivery_settings,
+        talkdown_audio,
     })
 }
 
@@ -252,6 +260,31 @@ async fn hash_delivery_settings(store: &Store) -> anyhow::Result<Option<String>>
         "timezone": s.timezone,
     });
     Ok(Some(sha256_canonical(&value)))
+}
+
+/// talkdown_audio — None until a fleet apply has written the marker; then the
+/// fleet-managed items that are ready, sorted by uid, in exactly the shape the
+/// cloud projects (cloud `fleet/hash.rs`). Pending and failed items are left
+/// out on purpose: the difference makes the cloud re-push them.
+async fn hash_talkdown_audio(store: &Store) -> anyhow::Result<Option<String>> {
+    let Some(marker) = store.fleet_marker_get("talkdown_audio").await? else {
+        return Ok(None);
+    };
+    let managed: std::collections::HashSet<String> = marker
+        .managed_keys
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mut items = store.list_talkdown_audio().await?;
+    items.retain(|a| a.status == nexus_store::AudioStatus::Ready && managed.contains(&a.uid));
+    items.sort_by(|a, b| a.uid.cmp(&b.uid));
+    let arr = Value::Array(
+        items
+            .iter()
+            .map(crate::talkdown::library::contract_json)
+            .collect(),
+    );
+    Ok(Some(sha256_canonical(&arr)))
 }
 
 /// Lower-hex SHA-256 of the canonical JSON of `value`. This is the public
@@ -593,6 +626,44 @@ mod tests {
         );
     }
 
+    /// FROZEN cross-repo vector for rules bound to talk-down audio
+    /// (SPEC-086 / ADR-095). r1 omits every defaulted binding field and
+    /// carries a null `schedule`; r2 sets all of them. Persisted and hashed
+    /// through the store exactly as a fleet apply does, so the typed
+    /// `RuleTalkDown` round-trip fills the defaults and drops the `None`s.
+    ///
+    /// It MUST equal the cloud's `rules_talk_down_frozen_vector` in
+    /// api-gateway `fleet/hash.rs` over the same input (`normalize_rule`).
+    #[tokio::test]
+    async fn rules_talk_down_frozen_vector() {
+        let input = json!([
+          {"id": "r2", "name": "Loiter after hours", "when": "object.label == 'person'", "severity": "critical", "verify": true,
+           "talk_down": {"steps": [{"audio_uid": "b2c3d4e5-0000-4000-8000-000000000002", "repeat": 3}],
+             "escalate_within_secs": 120, "cooldown_secs": 600, "schedule": {"grid": vec![vec![true; 48]; 7]},
+             "volume": 0, "speaker_id": 7, "play_before_verification": true}},
+          {"id": "r1", "name": "Person Detected", "when": "object.label == 'person'", "severity": "warning",
+           "talk_down": {"steps": [{"audio_uid": "a1b2c3d4-0000-4000-8000-000000000001"},
+             {"audio_uid": "b2c3d4e5-0000-4000-8000-000000000002", "repeat": 2}],
+             "escalate_within_secs": 45, "schedule": null, "volume": 80}}
+        ]);
+        let store = open_store().await;
+        for entry in input.as_array().unwrap() {
+            let rule: nexus_config::RuleConfig =
+                serde_json::from_value(entry.clone()).expect("bound rule deserializes");
+            store.upsert_rule(&rule).await.unwrap();
+        }
+
+        let r1 = &store.list_rules().await.unwrap()[0];
+        assert_eq!(
+            canonical_json(&serde_json::to_value(r1).unwrap()),
+            r#"{"camera_filter":null,"consecutive_frames":2,"cooldown_ms":30000,"enabled":true,"id":"r1","min_track_age_ms":500,"name":"Person Detected","severity":"warning","sinks":[],"talk_down":{"cooldown_secs":60,"escalate_within_secs":45,"play_before_verification":false,"steps":[{"audio_uid":"a1b2c3d4-0000-4000-8000-000000000001","repeat":1},{"audio_uid":"b2c3d4e5-0000-4000-8000-000000000002","repeat":2}],"volume":80},"verify":false,"when":"object.label == 'person'","zones":null}"#
+        );
+        assert_eq!(
+            compute(&store).await.unwrap().rules.as_deref(),
+            Some("3dce388876dd125d58e239a23f06c50522426321018210abdfec2eb348730f1c")
+        );
+    }
+
     /// On a fresh store: no rules, no cameras → both `None`; delivery
     /// is always present (seeded singleton).
     #[tokio::test]
@@ -606,6 +677,152 @@ mod tests {
         assert!(
             hashes.delivery_settings.is_some(),
             "delivery settings singleton is always reported"
+        );
+        assert!(
+            hashes.talkdown_audio.is_none(),
+            "no marker, no library hash"
+        );
+    }
+
+    /// The shared cross-repo vector (`/tmp/nx-talkdown-audio-hash-vector.json`
+    /// at authoring time), as the effective payload the cloud pushes: uids
+    /// unsorted, a null description, and a clip's `url` and `duration_ms`
+    /// that the contract never hashes.
+    const TALKDOWN_VECTOR: &str = r#"[
+  {"uid": "b2c3d4e5-0000-4000-8000-000000000002", "name": "Leave the area", "description": null, "kind": "tts", "text": "Please leave the area now.", "voice": "en_US-female"},
+  {"uid": "a1b2c3d4-0000-4000-8000-000000000001", "name": "Store closed", "description": "After hours", "kind": "clip", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "url": "https://example.blob.core.windows.net/media/org-x/talkdown/9f86.wav?sv=1&sig=abc", "duration_ms": 4200}
+]"#;
+
+    /// FROZEN cross-repo vector. It MUST equal the cloud's
+    /// `project_runtime_sha(Category::TalkdownAudio, …)` frozen vector in
+    /// api-gateway `fleet/hash.rs` over the same input.
+    const TALKDOWN_VECTOR_SHA: &str =
+        "220511e10290d563042b6723a97e8b06bb3f7000a8243a557f174559b32e8806";
+
+    /// Store the vector's items as ready rows (as a sync then the worker
+    /// would) under a `talkdown_audio` marker owning both.
+    async fn store_vector(store: &Store) -> Vec<String> {
+        let items: Vec<Value> = serde_json::from_str(TALKDOWN_VECTOR).unwrap();
+        let mut uids = Vec::new();
+        for v in &items {
+            let s = |k: &str| v[k].as_str().map(str::to_owned);
+            let tts = v["kind"] == "tts";
+            store
+                .upsert_talkdown_pending(&nexus_store::NewAudio {
+                    uid: s("uid").unwrap(),
+                    name: s("name").unwrap(),
+                    description: s("description"),
+                    kind: if tts {
+                        nexus_store::AudioKind::Tts
+                    } else {
+                        nexus_store::AudioKind::Clip
+                    },
+                    tts_text: s("text"),
+                    tts_voice: s("voice"),
+                    version_token: if tts { Some("t".into()) } else { s("sha256") },
+                })
+                .await
+                .unwrap();
+            store
+                .set_talkdown_ready(&s("uid").unwrap(), &[1, 2, 3])
+                .await
+                .unwrap();
+            uids.push(s("uid").unwrap());
+        }
+        store
+            .fleet_marker_upsert(&nexus_store::FleetMarkerWrite {
+                category: "talkdown_audio",
+                scope_type: Some("org"),
+                scope_id: None,
+                effective_sha256: None,
+                mode: Some("merge"),
+                managed_keys: Some(&uids),
+            })
+            .await
+            .unwrap();
+        uids
+    }
+
+    #[tokio::test]
+    async fn talkdown_audio_frozen_vector() {
+        let store = open_store().await;
+        store_vector(&store).await;
+        let arr = json!([
+            { "uid": "a1b2c3d4-0000-4000-8000-000000000001", "name": "Store closed",
+              "description": "After hours", "kind": "clip",
+              "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" },
+            { "uid": "b2c3d4e5-0000-4000-8000-000000000002", "name": "Leave the area",
+              "description": null, "kind": "tts",
+              "text": "Please leave the area now.", "voice": "en_US-female" },
+        ]);
+        assert_eq!(
+            canonical_json(&arr),
+            r#"[{"description":"After hours","kind":"clip","name":"Store closed","sha256":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08","uid":"a1b2c3d4-0000-4000-8000-000000000001"},{"description":null,"kind":"tts","name":"Leave the area","text":"Please leave the area now.","uid":"b2c3d4e5-0000-4000-8000-000000000002","voice":"en_US-female"}]"#
+        );
+        assert_eq!(sha256_canonical(&arr), TALKDOWN_VECTOR_SHA);
+        let hashes = compute(&store).await.unwrap();
+        assert_eq!(hashes.talkdown_audio.as_deref(), Some(TALKDOWN_VECTOR_SHA));
+    }
+
+    /// Only managed, ready items count: a pending item changes the digest,
+    /// its readiness changes it back, and a local item never counts.
+    #[tokio::test]
+    async fn talkdown_audio_hashes_only_managed_ready_items() {
+        let store = open_store().await;
+        let uids = store_vector(&store).await;
+        let ready = compute(&store).await.unwrap().talkdown_audio;
+        assert_eq!(ready.as_deref(), Some(TALKDOWN_VECTOR_SHA));
+
+        let local = nexus_store::NewAudio {
+            uid: "c0000000-0000-4000-8000-000000000003".into(),
+            name: "local".into(),
+            description: None,
+            kind: nexus_store::AudioKind::Clip,
+            tts_text: None,
+            tts_voice: None,
+            version_token: Some("ab".into()),
+        };
+        store.upsert_talkdown_pending(&local).await.unwrap();
+        store.set_talkdown_ready(&local.uid, &[1]).await.unwrap();
+        assert_eq!(compute(&store).await.unwrap().talkdown_audio, ready);
+
+        let clip = store.get_talkdown_audio(&uids[1]).await.unwrap().unwrap();
+        store
+            .upsert_talkdown_pending(&nexus_store::NewAudio {
+                uid: clip.uid.clone(),
+                name: clip.name.clone(),
+                description: clip.description.clone(),
+                kind: clip.kind,
+                tts_text: None,
+                tts_voice: None,
+                version_token: clip.version_token.clone(),
+            })
+            .await
+            .unwrap();
+        let pending = compute(&store).await.unwrap().talkdown_audio;
+        assert!(
+            pending.is_some() && pending != ready,
+            "a pending item is left out"
+        );
+        store.set_talkdown_ready(&clip.uid, &[4]).await.unwrap();
+        assert_eq!(compute(&store).await.unwrap().talkdown_audio, ready);
+
+        // An empty managed set is the digest of `[]`, which the cloud
+        // projects for an org that deleted its last item.
+        store
+            .fleet_marker_upsert(&nexus_store::FleetMarkerWrite {
+                category: "talkdown_audio",
+                scope_type: None,
+                scope_id: None,
+                effective_sha256: None,
+                mode: Some("merge"),
+                managed_keys: Some(&[]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            compute(&store).await.unwrap().talkdown_audio,
+            Some(sha256_canonical(&json!([])))
         );
     }
 

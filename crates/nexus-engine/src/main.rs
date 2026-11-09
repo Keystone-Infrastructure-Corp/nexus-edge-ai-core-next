@@ -1688,6 +1688,19 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let model_catalog_handle =
         model_catalog_publish::spawn(model_prompts.clone(), cloud_outbox.clone());
 
+    // SPEC-086 — the talk-down library and its download worker. TTS needs
+    // the release layout: `<root>/bin/nexus-tts` and `<root>/share/models/`.
+    let tts = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.to_path_buf()))
+        .and_then(|bin| {
+            let models = bin.parent()?.join("share/models");
+            talkdown::tts::Tts::discover(&bin, &models)
+        })
+        .map(std::sync::Arc::new);
+    talkdown::tts::AVAILABLE.store(tts.is_some(), std::sync::atomic::Ordering::Relaxed);
+    let (talkdown_library, talkdown_library_handle) =
+        talkdown::library::Library::spawn(store.clone(), bus.clone(), false, tts);
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),
@@ -1829,13 +1842,37 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         lan_proxy_enabled: cfg.lan_proxy.enabled,
         remote_access,
         reid_stats: reid_stats.clone(),
-        talkdown: Default::default(),
+        talkdown: talkdown::session::TalkdownSessions::with_library(talkdown_library),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds
     // its own Arc on the DashMap; no shutdown signal needed because
     // the task does pure read-then-remove work on a 60 s tick.
     discovery::spawn_eviction_sweep(api_state.discovery_sessions.clone());
+
+    // Speaker probes; the task ends with the runtime, like the sweep above.
+    tokio::spawn(talkdown::health::run(
+        store.clone(),
+        api_state.talkdown.clone(),
+        api_state.health.speaker_health(),
+        tokio_util::sync::CancellationToken::new(),
+    ));
+
+    // ADR-095 — play a rule's stored talk-down audio when the rule fires,
+    // within its bounds, and prune plays older than 90 days daily. Spawned
+    // here rather than beside the cold replicator because it drives the
+    // API's talk-down sessions; it ends with the runtime, like the probes.
+    tokio::spawn(talkdown::responder::run(
+        talkdown::responder::ResponderDeps {
+            store: store.clone(),
+            bus: bus.clone(),
+            sessions: api_state.talkdown.clone(),
+            evaluator: evaluator.clone(),
+            policy: cascading_policy.clone(),
+            activity: api_state.health.talkdown_activity(),
+        },
+        tokio_util::sync::CancellationToken::new(),
+    ));
 
     if !cli.no_api {
         // M-Admin Phase 0 — operator-persisted bind override
@@ -2258,6 +2295,7 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     let _ = reconciler_handle.await;
     roster_handle.abort();
     state_hashes_handle.abort();
+    talkdown_library_handle.abort();
     model_catalog_handle.abort();
     // Abort every per-camera supervisor. `drain()` empties the map
     // under one lock acquisition; the reconciler has ended above, so

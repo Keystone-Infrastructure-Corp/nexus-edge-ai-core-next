@@ -160,13 +160,26 @@ impl OnvifService {
     }
 }
 
-/// One-shot reqwest client tuned for embedded camera HTTP
+/// One-shot reqwest client for SOAP calls to embedded camera HTTP
 /// servers (short timeout, tolerant of the self-signed HTTPS
-/// certs cameras ship on :443).
+/// certs cameras ship on :443). It never follows a redirect: that
+/// would re-send the WS-Security digest in the body to another host.
 pub(crate) fn build_client() -> Result<reqwest::Client, String> {
+    client_with(reqwest::redirect::Policy::none())
+}
+
+/// [`build_client`] for plain HTTP (snapshot GET, SAS PUT): follows
+/// redirects as reqwest does by default, which drops `Authorization`
+/// on a cross-host hop.
+pub(crate) fn build_http_client() -> Result<reqwest::Client, String> {
+    client_with(reqwest::redirect::Policy::default())
+}
+
+fn client_with(redirect: reqwest::redirect::Policy) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(REQ_TIMEOUT)
         .danger_accept_invalid_certs(true)
+        .redirect(redirect)
         .build()
         .map_err(|e| format!("http client build failed: {e}"))
 }
@@ -546,5 +559,28 @@ mod tests {
         assert_eq!(m.get("Model").map(String::as_str), Some("DS-2CD2042WD-I"));
         assert_eq!(m.get("FirmwareVersion").map(String::as_str), Some("V5.4.5"));
         assert_eq!(m.get("HardwareId").map(String::as_str), Some("88"));
+    }
+
+    #[tokio::test]
+    async fn soap_client_does_not_follow_a_redirect() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let elsewhere = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&elsewhere)
+            .await;
+        let speaker = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("Location", elsewhere.uri().as_str()),
+            )
+            .mount(&speaker)
+            .await;
+        let err = DEVICE
+            .call(&speaker.uri(), "u", "p", "GetDeviceInformation", "")
+            .await
+            .unwrap_err();
+        assert!(err.contains("307"), "{err}");
+        assert!(elsewhere.received_requests().await.unwrap().is_empty());
     }
 }

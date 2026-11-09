@@ -62,6 +62,7 @@ fn build_envelope(hashes: &CategoryHashes) -> Envelope {
             visual_prompts_sha256: hashes.visual_prompts.clone(),
             detector_config_sha256: hashes.detector_config.clone(),
             delivery_settings_sha256: hashes.delivery_settings.clone(),
+            talkdown_audio_sha256: hashes.talkdown_audio.clone(),
         }),
     }
 }
@@ -176,4 +177,26 @@ pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, outbox: Arc<TunnelOutbox>) ->
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_envelope_carries_the_talkdown_audio_hash() {
+        let hashes = CategoryHashes {
+            talkdown_audio: Some("ab".into()),
+            ..CategoryHashes::default()
+        };
+        let EnvelopeBody::CoreStateHashes(p) = build_envelope(&hashes).body else {
+            panic!("not a core_state_hashes envelope");
+        };
+        assert_eq!(p.talkdown_audio_sha256.as_deref(), Some("ab"));
+        let EnvelopeBody::CoreStateHashes(p) = build_envelope(&CategoryHashes::default()).body
+        else {
+            panic!("not a core_state_hashes envelope");
+        };
+        assert_eq!(p.talkdown_audio_sha256, None);
+    }
 }

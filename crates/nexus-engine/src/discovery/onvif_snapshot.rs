@@ -21,7 +21,7 @@
 //! admin-passthrough routes added in Phase 7.6.3
 //! (`crate::device_control`).
 
-use super::onvif_soap::{build_client, first_text, xml_escape, MEDIA1};
+use super::onvif_soap::{build_http_client, first_text, xml_escape, MEDIA1};
 
 /// Cap on a fetched snapshot. A 4K JPEG is well under this; the
 /// cap protects against a misbehaving / hostile endpoint streaming
@@ -52,7 +52,7 @@ pub async fn fetch_snapshot(
     profile_token: &str,
 ) -> Result<Vec<u8>, String> {
     let uri = get_snapshot_uri(endpoint, username, password, profile_token).await?;
-    let client = build_client()?;
+    let client = build_http_client()?;
     let resp = client
         .get(&uri)
         .basic_auth(username, Some(password))
@@ -87,7 +87,7 @@ pub async fn fetch_snapshot(
 /// blob PUT requires the `x-ms-blob-type: BlockBlob` header; without
 /// it the service returns `400`.
 pub async fn put_snapshot_to_sas(sas_url: &str, jpeg: &[u8]) -> Result<usize, String> {
-    let client = build_client()?;
+    let client = build_http_client()?;
     let resp = client
         .put(sas_url)
         .header("x-ms-blob-type", "BlockBlob")
@@ -160,6 +160,37 @@ mod tests {
             first_text(&body, "Uri").as_deref(),
             Some("http://192.168.1.64/onvif-http/snapshot?Profile_1")
         );
+    }
+
+    /// Only the SOAP call refuses redirects; the image fetch follows one.
+    #[tokio::test]
+    async fn fetch_snapshot_follows_a_same_host_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let camera = MockServer::start().await;
+        let soap = wrap(&format!(
+            "<trt:GetSnapshotUriResponse><trt:MediaUri><tt:Uri>{}/old</tt:Uri>\
+             </trt:MediaUri></trt:GetSnapshotUriResponse>",
+            camera.uri()
+        ));
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(soap))
+            .mount(&camera)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/old"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/snap"))
+            .mount(&camera)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/snap"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"JPEG".to_vec()))
+            .mount(&camera)
+            .await;
+        let jpeg = fetch_snapshot(&camera.uri(), "u", "p", "prof")
+            .await
+            .unwrap();
+        assert_eq!(jpeg, b"JPEG");
     }
 
     #[tokio::test]

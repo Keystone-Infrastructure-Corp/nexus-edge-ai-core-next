@@ -30,7 +30,7 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, put};
+use axum::routing::{get, put};
 use axum::Json;
 use axum::Router;
 use futures::stream::StreamExt;
@@ -620,8 +620,50 @@ pub fn router(state: ApiState) -> Router {
             axum::routing::post(crate::speakers_admin::stop_talk_down),
         )
         .route(
+            "/v1/admin/cameras/{camera_id}/talk-down/volume",
+            axum::routing::post(crate::speakers_admin::set_talk_down_volume),
+        )
+        .route(
+            "/v1/admin/speakers/{id}/output",
+            put(crate::speakers_admin::put_speaker_output),
+        )
+        .route(
             "/v1/admin/speakers/{id}/test",
             axum::routing::post(crate::speakers_admin::test_speaker),
+        )
+        .route(
+            "/v1/admin/talkdown/audio",
+            get(crate::speakers_admin::list_talkdown_audio),
+        )
+        .route(
+            "/v1/admin/talkdown/tts/preview",
+            axum::routing::post(crate::speakers_admin::tts_preview),
+        )
+        .route(
+            "/v1/admin/talkdown/tts/preview-upload",
+            axum::routing::post(crate::speakers_admin::tts_preview_upload),
+        )
+        // ADR-095 — arming of automatic (rule) plays, the status an admin
+        // checks, and the play history.
+        .route(
+            "/v1/admin/talkdown/arming",
+            put(crate::speakers_admin::put_talkdown_arming),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/talk-down/arming",
+            put(crate::speakers_admin::put_talk_down_arming),
+        )
+        .route(
+            "/v1/admin/speakers/{id}/arming",
+            put(crate::speakers_admin::put_speaker_arming),
+        )
+        .route(
+            "/v1/admin/talkdown/status",
+            get(crate::speakers_admin::talkdown_status),
+        )
+        .route(
+            "/v1/admin/talkdown/plays",
+            get(crate::speakers_admin::list_talkdown_plays),
         )
         // Phase 7.6 · Step 7.6.3 — ONVIF device control. These drive
         // the per-camera SOAP client (`crate::discovery::onvif_*`)
@@ -894,6 +936,12 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/network/roles",
             get(crate::admin_network::get_roles).put(crate::admin_network::put_roles),
         )
+        // Rule writes: a rule can trigger announcements, so writing one
+        // needs an admin login (the handlers also take `AdminContext`).
+        // The reads stay on the open `api` router below.
+        .route("/v1/rules", axum::routing::post(create_rule))
+        .route("/v1/rules/{id}", put(upsert_rule).delete(delete_rule))
+        .route("/v1/rules/{id}/delivery", put(put_rule_delivery))
         .route_layer(axum::middleware::from_fn_with_state(
             state.admin_auth.clone(),
             admin_auth::admin_auth_layer,
@@ -941,9 +989,8 @@ pub fn router(state: ApiState) -> Router {
             "/v1/system/static-object-defaults",
             get(get_static_object_defaults),
         )
-        .route("/v1/rules", get(list_rules).post(create_rule))
-        .route("/v1/rules/{id}", put(upsert_rule))
-        .route("/v1/rules/{id}", delete(delete_rule))
+        // Rule writes live in the `admin` router above.
+        .route("/v1/rules", get(list_rules))
         .route("/v1/rules/validate", axum::routing::post(validate_rule))
         .route("/v1/rules/preview", axum::routing::post(preview_rule))
         // CEL editor schema — labels emittable by the loaded detector
@@ -974,15 +1021,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/events/{event_id}/delivery", get(get_event_delivery))
         // M7 Step 6 — per-rule delivery policy. GET returns the
         // override (if any) + the resolved effective policy after
-        // the global cascade. PUT sets or clears the override and
-        // emits `rule.delivery_policy.changed` so the dispatcher
-        // re-hydrates the in-memory cache. Mirrors the existing
-        // `/api/v1/rules/{id}` shape — not gated, since the rules
-        // CRUD it lives next to isn't either.
-        .route(
-            "/v1/rules/{id}/delivery",
-            get(get_rule_delivery).put(put_rule_delivery),
-        )
+        // the global cascade. The PUT is in the `admin` router.
+        .route("/v1/rules/{id}/delivery", get(get_rule_delivery))
         // M2.2 cold-mirror — combined hot+cold view (read-only).
         .route("/v1/storage", get(get_storage))
         // M-Admin Phase 5 — detector prompt catalog (read-only).
@@ -1795,9 +1835,10 @@ async fn upsert_rule(
     Path(id): Path<RuleId>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    session: Option<crate::auth::require_role::SessionContext>,
+    admin: crate::auth::require_role::AdminContext,
     Json(mut rule): Json<RuleConfig>,
 ) -> Result<Json<RuleConfig>, ApiError> {
+    let session = Some(admin.0);
     rule.id = id.clone();
     // M-Admin Phase 5 — compile the CEL before we touch the store.
     // Pre-Phase-5 a bad `when` field was silently accepted and only
@@ -1831,6 +1872,7 @@ async fn upsert_rule(
             format!("invalid CEL in `when`: {msg}"),
         ));
     }
+    validate_rule_talk_down_on_save(&s, &rule).await?;
     let before = s
         .store
         .list_rules()
@@ -1892,9 +1934,10 @@ async fn create_rule(
     State(s): State<ApiState>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    session: Option<crate::auth::require_role::SessionContext>,
+    admin: crate::auth::require_role::AdminContext,
     Json(mut rule): Json<RuleConfig>,
 ) -> Result<Json<RuleConfig>, ApiError> {
+    let session = Some(admin.0);
     // Same defence-in-depth as `create_camera` — zero the id field
     // before the tx so a careless body field can't trick us into
     // update-via-create. The tx will overwrite it with the freshly
@@ -1922,6 +1965,7 @@ async fn create_rule(
             format!("invalid CEL in `when`: {msg}"),
         ));
     }
+    validate_rule_talk_down_on_save(&s, &rule).await?;
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
         // Allocate the id INSIDE the tx so two concurrent
@@ -1974,8 +2018,9 @@ async fn delete_rule(
     Path(id): Path<RuleId>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    session: Option<crate::auth::require_role::SessionContext>,
+    admin: crate::auth::require_role::AdminContext,
 ) -> Result<StatusCode, ApiError> {
+    let session = Some(admin.0);
     let before = s
         .store
         .list_rules()
@@ -2128,6 +2173,7 @@ async fn validate_rule(Json(req): Json<ValidateRuleReq>) -> Json<ValidateRuleRes
         enabled: true,
         sinks: Vec::new(),
         verify: false,
+        talk_down: None,
     };
     match compile_cel_safely(&stub) {
         Ok(()) => Json(ValidateRuleResp {
@@ -2183,6 +2229,28 @@ async fn get_rules_schema(State(s): State<ApiState>) -> Json<RulesSchemaResp> {
             "group.size",
         ],
     })
+}
+
+/// ADR-095 save-time check of a rule's talk-down action (shape, D10 window,
+/// and that a named `speaker_id` exists on this core).
+pub(crate) async fn validate_rule_talk_down_on_save(
+    s: &ApiState,
+    rule: &RuleConfig,
+) -> Result<(), ApiError> {
+    rule.validate_talk_down()
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("rule {:?}: {e}", rule.id)))?;
+    if let Some(id) = rule.talk_down.as_ref().and_then(|t| t.speaker_id) {
+        if s.store.get_speaker(id).await?.is_none() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "rule {:?}: talk_down speaker_id {id} is not a speaker on this core",
+                    rule.id
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Wrap [`CelEngine::compile`] in `catch_unwind` so a user-supplied
@@ -4495,9 +4563,10 @@ async fn put_rule_delivery(
     Path(rule_id): Path<RuleId>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    session: Option<crate::auth::require_role::SessionContext>,
+    admin: crate::auth::require_role::AdminContext,
     Json(req): Json<PutRuleDeliveryReq>,
 ) -> Result<StatusCode, ApiError> {
+    let session = Some(admin.0);
     let rule_id_str = rule_id.to_string();
     let before = s.store.rule_delivery_policy_get(&rule_id).await.ok();
     let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
@@ -6170,6 +6239,93 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Rules will trigger announcements, so a rule write needs an admin
+    /// login: a LAN peer (or a page in a LAN browser) with no bearer gets
+    /// 401 whether or not a secret is configured, a non-admin session gets
+    /// 403, and reads stay open.
+    #[tokio::test]
+    async fn rule_writes_require_admin_login() {
+        const SECRET: &[u8] = b"rule-write-auth-secret";
+        fn req(method: Method, uri: &str, token: Option<&str>) -> Request<Body> {
+            let mut b = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(t) = token {
+                b = b.header("authorization", format!("Bearer {t}"));
+            }
+            let body = if uri.ends_with("/delivery") {
+                serde_json::json!({ "policy": null })
+            } else {
+                serde_json::json!({
+                    "id": "", "name": "r", "when": "true", "severity": "warning"
+                })
+            };
+            let mut r = b.body(Body::from(body.to_string())).unwrap();
+            r.extensions_mut().insert(ConnectInfo(remote_peer()));
+            r
+        }
+        let writes = [
+            (Method::POST, "/api/v1/rules"),
+            (Method::PUT, "/api/v1/rules/r1"),
+            (Method::PUT, "/api/v1/rules/r1/delivery"),
+            (Method::DELETE, "/api/v1/rules/r1"),
+        ];
+
+        // No secret configured: the loopback-only fallback must still
+        // refuse a LAN peer.
+        let (app, _store, _dir) = build_test_router(None).await;
+        for (m, uri) in &writes {
+            let res = app
+                .clone()
+                .oneshot(req(m.clone(), uri, None))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{m} {uri}");
+        }
+
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let viewer = sign_role_jwt(SECRET, "viewer");
+        let admin = sign_admin_jwt(SECRET);
+        for (m, uri) in &writes {
+            let res = app
+                .clone()
+                .oneshot(req(m.clone(), uri, None))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{m} {uri}");
+            let res = app
+                .clone()
+                .oneshot(req(m.clone(), uri, Some(&viewer)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "viewer {m} {uri}");
+        }
+        // Admin bearer: the PUT creates r1, the delivery PUT and DELETE
+        // then act on it.
+        for ((m, uri), want) in writes.iter().zip([
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::NO_CONTENT,
+            StatusCode::NO_CONTENT,
+        ]) {
+            let res = app
+                .clone()
+                .oneshot(req(m.clone(), uri, Some(&admin)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), want, "admin {m} {uri}");
+        }
+
+        // Reads are unchanged: no bearer, LAN peer.
+        for uri in ["/api/v1/rules", "/api/v1/rules/schema"] {
+            let mut r = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            r.extensions_mut().insert(ConnectInfo(remote_peer()));
+            let res = app.clone().oneshot(r).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "GET {uri}");
+        }
+    }
+
     // ===============================================================
     // Phase 7.6 · Step 7.6.3 — ONVIF device-control admin routes
     // ===============================================================
@@ -7772,6 +7928,7 @@ mod tests {
                 enabled: true,
                 sinks: Vec::new(),
                 verify: false,
+                talk_down: None,
             })
             .await
             .unwrap();
@@ -7816,6 +7973,7 @@ mod tests {
                 enabled: true,
                 sinks: Vec::new(),
                 verify: false,
+                talk_down: None,
             })
             .await
             .unwrap();
@@ -7828,6 +7986,10 @@ mod tests {
         let mut req = Request::builder()
             .method(Method::PUT)
             .uri("/api/v1/rules/rule_put/delivery")
+            .header(
+                "authorization",
+                format!("Bearer {}", sign_admin_jwt(SECRET)),
+            )
             .header("content-type", "application/json")
             .body(Body::from(put_body.to_string()))
             .unwrap();
@@ -7882,6 +8044,7 @@ mod tests {
                 enabled: true,
                 sinks: Vec::new(),
                 verify: false,
+                talk_down: None,
             })
             .await
             .unwrap();
@@ -7894,6 +8057,10 @@ mod tests {
             let mut req = Request::builder()
                 .method(Method::PUT)
                 .uri("/api/v1/rules/rule_clear/delivery")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", sign_admin_jwt(SECRET)),
+                )
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
@@ -7925,6 +8092,10 @@ mod tests {
         let mut req = Request::builder()
             .method(Method::PUT)
             .uri("/api/v1/rules/no_such_rule/delivery")
+            .header(
+                "authorization",
+                format!("Bearer {}", sign_admin_jwt(SECRET)),
+            )
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({"policy":{"enabled":false}}).to_string(),
@@ -8549,10 +8720,20 @@ mod tests {
         category: &str,
         effective: serde_json::Value,
     ) -> axum::http::Response<Body> {
+        fleet_apply_scoped(app, secret, category, effective, "core").await
+    }
+
+    async fn fleet_apply_scoped(
+        app: &axum::Router,
+        secret: &[u8],
+        category: &str,
+        effective: serde_json::Value,
+        scope_type: &str,
+    ) -> axum::http::Response<Body> {
         let token = sign_admin_jwt(secret);
         let body = serde_json::json!({
             "effective": effective,
-            "scope": { "type": "core", "id": "00000000-0000-0000-0000-000000000000" },
+            "scope": { "type": scope_type, "id": "00000000-0000-0000-0000-000000000000" },
         });
         let mut req = Request::builder()
             .method(Method::POST)
@@ -8833,6 +9014,102 @@ mod tests {
 
     /// The fleet-apply route sits behind the admin gate: no bearer
     /// from a remote peer is a 401.
+    const TD_UID: &str = "0190f3a2-7b1c-7e0a-9c55-3f2a1b4c5d6e";
+
+    fn td_rule(id: &str, cooldown_ms: u64, td: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": "td", "when": "object.label == 'person'", "severity": "low",
+            "cooldown_ms": cooldown_ms, "talk_down": td,
+        })
+    }
+
+    /// ADR-095 / D10: upsert refuses a bad talk-down (window not above the rule's
+    /// cooldown, unknown speaker) and accepts a valid one.
+    #[tokio::test]
+    async fn upsert_rule_validates_talk_down() {
+        let (app, store, _dir) = build_test_router(None).await;
+        let put = |body: serde_json::Value| {
+            let mut req = Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/rules/td1")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let app = app.clone();
+            async move { app.oneshot(req).await.unwrap().status() }
+        };
+        let steps = serde_json::json!([{ "audio_uid": TD_UID }]);
+        // window 30 s <= cooldown 60 s, with a second step to escalate to
+        let two = serde_json::json!([{ "audio_uid": TD_UID }, { "audio_uid": TD_UID }]);
+        let bad = td_rule("td1", 60_000, serde_json::json!({ "steps": two }));
+        assert_eq!(put(bad).await, StatusCode::BAD_REQUEST);
+        // unknown speaker
+        let spk = td_rule(
+            "td1",
+            0,
+            serde_json::json!({ "steps": steps, "speaker_id": 99 }),
+        );
+        assert_eq!(put(spk).await, StatusCode::BAD_REQUEST);
+        // 0 steps
+        let none = td_rule("td1", 0, serde_json::json!({ "steps": [] }));
+        assert_eq!(put(none).await, StatusCode::BAD_REQUEST);
+        assert!(store.list_rules().await.unwrap().is_empty());
+        let ok = td_rule("td1", 0, serde_json::json!({ "steps": steps }));
+        assert_eq!(put(ok).await, StatusCode::OK);
+        assert!(store.list_rules().await.unwrap()[0].talk_down.is_some());
+    }
+
+    /// A rules push is this core's resolved effective rules whatever scope the
+    /// operator applied from, and the cloud refuses a `speaker_id` on a
+    /// non-core rule when it is saved (ADR-095). So a core-authored
+    /// `speaker_id` applies under every envelope scope, and the talk-down
+    /// shape is still checked under each. A speaker this core no longer has is
+    /// accepted: the responder reports it as `no_speaker`, and one deleted
+    /// speaker must not block every later rules push.
+    #[tokio::test]
+    async fn fleet_apply_rules_validates_talk_down() {
+        const SECRET: &[u8] = b"fleet-rules-talkdown-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let steps = serde_json::json!([{ "audio_uid": TD_UID }]);
+        let two = serde_json::json!([{ "audio_uid": TD_UID }, { "audio_uid": TD_UID }]);
+        let bad_window = serde_json::json!([td_rule(
+            "a",
+            60_000,
+            serde_json::json!({ "steps": two, "speaker_id": 1 })
+        )]);
+        for scope in ["org", "site", "camera", "core"] {
+            let res = fleet_apply_scoped(&app, SECRET, "rules", bad_window.clone(), scope).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{scope}");
+        }
+        assert!(store.list_rules().await.unwrap().is_empty());
+        let with_speaker = serde_json::json!([td_rule(
+            "a",
+            0,
+            serde_json::json!({ "steps": steps, "speaker_id": 1 })
+        )]);
+        for scope in ["org", "site", "camera", "core"] {
+            let res = fleet_apply_scoped(&app, SECRET, "rules", with_speaker.clone(), scope).await;
+            assert_eq!(res.status(), StatusCode::OK, "{scope}");
+            let rules = store.list_rules().await.unwrap();
+            assert_eq!(rules[0].talk_down.as_ref().unwrap().speaker_id, Some(1));
+        }
+        // org-wide rule without a speaker applies; an unknown uid is accepted.
+        let ok = serde_json::json!([td_rule("a", 0, serde_json::json!({ "steps": steps }))]);
+        let res = fleet_apply_scoped(&app, SECRET, "rules", ok, "org").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(store.list_rules().await.unwrap()[0].talk_down.is_some());
+        let unknown_speaker = serde_json::json!([td_rule(
+            "a",
+            0,
+            serde_json::json!({ "steps": steps, "speaker_id": 99 })
+        )]);
+        let res = fleet_apply_scoped(&app, SECRET, "rules", unknown_speaker, "core").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let rules = store.list_rules().await.unwrap();
+        assert_eq!(rules[0].talk_down.as_ref().unwrap().speaker_id, Some(99));
+    }
+
     #[tokio::test]
     async fn fleet_apply_requires_admin_bearer() {
         const SECRET: &[u8] = b"fleet-gate-secret";
@@ -9584,7 +9861,19 @@ mod tests {
             let mut view = talk_down(cam, speaker);
             view["busy"] = false.into();
             view["session_id"] = serde_json::Value::Null;
-            view["modes"] = serde_json::json!(crate::talkdown::session::MODES);
+            view["modes"] =
+                serde_json::json!(crate::talkdown::session::TalkdownSessions::default().modes());
+            // Nobody playing; a speaker is armed for rule plays by default.
+            for key in [
+                "origin",
+                "rule_id",
+                "rule_name",
+                "rearm_at",
+                "disarm_reason",
+            ] {
+                view[key] = serde_json::Value::Null;
+            }
+            view["armed"] = speaker.map(|_| true).into();
             view
         };
 
@@ -9751,20 +10040,26 @@ mod tests {
             speaker_call(app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let view = speaker_json(&body);
-        assert_eq!(
-            view["modes"],
-            serde_json::json!(crate::talkdown::session::MODES),
-            "{body}"
-        );
         view["busy"]
             .as_bool()
             .unwrap_or_else(|| panic!("busy in {body}"))
     }
 
-    /// The session releases the speaker just after the BYE's 200.
+    /// The session releases the speaker just after the BYE's 200, and its
+    /// play row is finished just after that. Waiting for the row too keeps
+    /// a test's next store transaction from racing that write (a deferred
+    /// SQLite transaction fails with SQLITE_BUSY_SNAPSHOT if it does).
     async fn wait_idle(app: &axum::Router, within: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + within;
-        while talk_down_busy(app).await {
+        let unfinished = || async {
+            let (_, body) =
+                speaker_call(app, Method::GET, "/api/v1/admin/talkdown/plays", None).await;
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .is_some_and(|rows| rows.iter().any(|r| r["result"].is_null()))
+        };
+        while talk_down_busy(app).await || unfinished().await {
             assert!(tokio::time::Instant::now() < deadline, "speaker still busy");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -9820,19 +10115,33 @@ mod tests {
             .await;
     }
 
-    /// No audit row for the camera carries the clip URL (a bearer SAS).
-    async fn assert_audit_has_no_url(store: &Store, secret: &str) {
-        let rows = store
-            .list_audit_for_resource("camera", "1", 50)
+    /// Sessions with a library over `store`, fetching over plain http.
+    fn library_sessions(store: &Arc<Store>, bus: &Arc<dyn nexus_bus::Bus>) -> TalkdownSessions {
+        let (library, _worker) =
+            crate::talkdown::library::Library::spawn(store.clone(), bus.clone(), true, None);
+        TalkdownSessions::with_library(library)
+    }
+
+    /// A ready library item holding `samples`.
+    async fn store_ready_clip(store: &Store, uid: &str, samples: &[i16]) {
+        store
+            .upsert_talkdown_pending(&nexus_store::NewAudio {
+                uid: uid.into(),
+                name: "clip".into(),
+                description: None,
+                kind: nexus_store::AudioKind::Clip,
+                tts_text: None,
+                tts_voice: None,
+                version_token: Some("00".into()),
+            })
             .await
             .unwrap();
-        assert!(rows.iter().any(|r| r.action == "talk_down.start"));
-        for r in &rows {
-            for text in [&r.before_json, &r.after_json].into_iter().flatten() {
-                assert!(!text.contains(secret), "clip URL in the audit row {text}");
-            }
-        }
+        store.set_talkdown_ready(uid, samples).await.unwrap();
     }
+
+    const CLIP_UID: &str = "a1b2c3d4-0000-4000-8000-000000000001";
+    const TTS_UID: &str = "b2c3d4e5-0000-4000-8000-000000000002";
+    const LOCAL_UID: &str = "c0000000-0000-4000-8000-000000000003";
 
     #[tokio::test]
     async fn talk_down_tone_plays_then_hangs_up_and_frees_the_speaker() {
@@ -9886,6 +10195,596 @@ mod tests {
         assert_eq!(after["session_id"], session_id);
         assert_eq!(after["speaker_id"], speaker);
         assert_eq!(after["mode"], "tone");
+    }
+
+    /// Every RTP payload the speaker received, the opening silent frame dropped.
+    fn rtp_frames(rtp: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
+        let mut buf = [0u8; 2048];
+        let mut frames = Vec::new();
+        while let Ok(n) = rtp.try_recv(&mut buf) {
+            frames.push(buf[12..n].to_vec());
+        }
+        frames.remove(0);
+        frames
+    }
+
+    fn is_silent(frame: &[u8]) -> bool {
+        frame.iter().all(|&b| b == 0xff)
+    }
+
+    async fn put_output(
+        app: &axum::Router,
+        speaker: i64,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let uri = format!("/api/v1/admin/speakers/{speaker}/output");
+        speaker_call(app, Method::PUT, &uri, Some(body)).await
+    }
+
+    /// The chime plays at the speaker's stored volume: -20 dB at 50.
+    #[tokio::test]
+    async fn talk_down_tone_plays_at_the_speakers_stored_volume() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        let (status, body) = put_output(
+            &app,
+            speaker,
+            serde_json::json!({ "volume": 50, "boost": false, "auto_max_per_hour": 6 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(store.speaker_output(speaker).await.unwrap().volume, 50);
+
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let frames = rtp_frames(&rtp);
+        let tone = crate::talkdown::tone_pcm(2000);
+        let want: Vec<u8> = tone[..160]
+            .iter()
+            .map(|&s| crate::talkdown::g711::ulaw(crate::talkdown::limit(f32::from(s) * 0.1)))
+            .collect();
+        assert_eq!(frames[0], want, "the chime's first frame at volume 50");
+    }
+
+    /// An ONVIF Media service on loopback with one audio output configuration
+    /// (level 40, range 10 to 90). Records every `SetAudioOutputConfiguration`
+    /// body; refuses them with a SOAP fault while `fail_set` is true, and
+    /// holds its reply to each until `release` is notified while `hold_set` is true.
+    struct SoapStub {
+        port: u16,
+        fail_set: Arc<std::sync::atomic::AtomicBool>,
+        hold_set: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+        sets: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    async fn soap_stub() -> SoapStub {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const ENV: &str = r#"<?xml version="1.0"?><env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><env:Body>"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fail_set = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let hold_set = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (fail, rec) = (fail_set.clone(), sets.clone());
+        let (hold, gate) = (hold_set.clone(), release.clone());
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let (fail, rec) = (fail.clone(), rec.clone());
+                let (hold, gate) = (hold.clone(), gate.clone());
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let body_at = loop {
+                        let n = sock.read(&mut buf).await.unwrap();
+                        req.extend_from_slice(&buf[..n]);
+                        if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&req[..body_at]).to_ascii_lowercase();
+                    let want: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse().unwrap());
+                    while req.len() < body_at + want {
+                        let n = sock.read(&mut buf).await.unwrap();
+                        req.extend_from_slice(&buf[..n]);
+                    }
+                    let body = String::from_utf8_lossy(&req[body_at..]).into_owned();
+                    let (status, xml) = if body.contains("<trt:SetAudioOutputConfiguration>") {
+                        rec.lock().push(body);
+                        if hold.load(Ordering::SeqCst) {
+                            gate.notified().await;
+                        }
+                        if fail.load(Ordering::SeqCst) {
+                            (
+                                "500 Internal Server Error",
+                                format!(
+                                    r#"{ENV}<env:Fault><env:Code><env:Value>env:Receiver</env:Value></env:Code><env:Reason><env:Text xml:lang="en">volume locked by the speaker</env:Text></env:Reason></env:Fault></env:Body></env:Envelope>"#
+                                ),
+                            )
+                        } else {
+                            ("200 OK", format!("{ENV}<trt:SetAudioOutputConfigurationResponse/></env:Body></env:Envelope>"))
+                        }
+                    } else if body.contains("<trt:GetAudioOutputConfigurationOptions>") {
+                        ("200 OK", format!("{ENV}<trt:GetAudioOutputConfigurationOptionsResponse><trt:Options><tt:OutputLevelRange><tt:Min>10</tt:Min><tt:Max>90</tt:Max></tt:OutputLevelRange></trt:Options></trt:GetAudioOutputConfigurationOptionsResponse></env:Body></env:Envelope>"))
+                    } else {
+                        ("200 OK", format!("{ENV}<trt:GetAudioOutputConfigurationsResponse><trt:Configurations token=\"AudioOutputConfigToken\"><tt:Name>AudioOutputConfig</tt:Name><tt:UseCount>1</tt:UseCount><tt:OutputToken>AudioOutputToken_1</tt:OutputToken><tt:OutputLevel>40</tt:OutputLevel></trt:Configurations></trt:GetAudioOutputConfigurationsResponse></env:Body></env:Envelope>"))
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                        xml.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        SoapStub {
+            port,
+            fail_set,
+            hold_set,
+            release,
+            sets,
+        }
+    }
+
+    /// Create a speaker with credentials, a SIP `port` and an ONVIF endpoint on `endpoint_port`.
+    async fn create_onvif_speaker(app: &axum::Router, sip_port: u16, endpoint_port: u16) -> i64 {
+        let (status, body) = speaker_call(
+            app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({
+                "name": "spk", "host": "127.0.0.1", "port": sip_port,
+                "username": "admin", "password": "hunter2",
+                "onvif_endpoint": format!("http://127.0.0.1:{endpoint_port}/onvif/media_service"),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("hunter2"), "{body}");
+        speaker_json(&body)["id"].as_i64().unwrap()
+    }
+
+    fn volume_70() -> serde_json::Value {
+        serde_json::json!({ "volume": 70, "boost": false, "auto_max_per_hour": 6 })
+    }
+
+    /// Volume goes onto the device (`min + 0.7 * (max - min)`, kept across a
+    /// reboot), `hw_volume` is stored, and the chime then plays at unity.
+    #[tokio::test]
+    async fn speaker_output_put_sets_the_level_on_the_device_and_leaves_software_at_unity() {
+        let stub = soap_stub().await;
+        let (port, rtp, uas) = fake_speaker().await;
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let speaker = create_onvif_speaker(&app, port, stub.port).await;
+
+        let (status, body) = put_output(&app, speaker, volume_70()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out = speaker_json(&body);
+        assert_eq!(
+            (out["volume"].as_u64(), out["hw_volume"].as_bool()),
+            (Some(70), Some(true))
+        );
+        assert!(
+            out.get("hw_error").is_none() && !body.contains("hunter2"),
+            "{body}"
+        );
+        let sets = stub.sets.lock().clone();
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        for want in [
+            "<tt:OutputLevel>66</tt:OutputLevel>",
+            r#"token="AudioOutputConfigToken""#,
+            "<tt:OutputToken>AudioOutputToken_1</tt:OutputToken>",
+            "<trt:ForcePersistence>true</trt:ForcePersistence>",
+        ] {
+            assert!(sets[0].contains(want), "{want} in {}", sets[0]);
+        }
+        assert!(
+            !sets[0].contains("hunter2"),
+            "the password is only a digest input"
+        );
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!((stored.volume, stored.hw_volume), (70, true));
+        assert!(store.any_hw_volume().await.unwrap());
+
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            &format!("/api/v1/admin/speakers/{speaker}/test"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        uas.await.unwrap();
+        let tone = crate::talkdown::tone_pcm(2000);
+        let want: Vec<u8> = tone[..160]
+            .iter()
+            .map(|&s| crate::talkdown::g711::ulaw(crate::talkdown::limit(f32::from(s))))
+            .collect();
+        assert_eq!(rtp_frames(&rtp)[0], want, "software level stays at unity");
+
+        let rows = store
+            .list_audit_for_resource("speaker", &speaker.to_string(), 50)
+            .await
+            .unwrap();
+        assert!(rows.iter().any(|r| r.action == "speaker.output"));
+        for r in &rows {
+            let text = format!("{:?}{:?}", r.before_json, r.after_json);
+            assert!(!text.contains("hunter2"), "{text}");
+        }
+    }
+
+    /// A speaker that refuses falls back to software volume with `hw_error`,
+    /// and one that took the volume earlier gives it up when it stops taking it.
+    #[tokio::test]
+    async fn speaker_output_put_falls_back_to_software_when_the_device_refuses() {
+        use std::sync::atomic::Ordering;
+        let stub = soap_stub().await;
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let speaker = create_onvif_speaker(&app, 5060, stub.port).await;
+
+        let (_, body) = put_output(&app, speaker, volume_70()).await;
+        assert_eq!(speaker_json(&body)["hw_volume"], true, "{body}");
+
+        stub.fail_set.store(true, Ordering::SeqCst);
+        let (status, body) = put_output(&app, speaker, volume_70()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out = speaker_json(&body);
+        assert_eq!(out["hw_volume"], false, "{body}");
+        let err = out["hw_error"].as_str().expect("hw_error");
+        assert!(err.contains("volume locked by the speaker"), "{err}");
+        assert!(!body.contains("hunter2"), "{body}");
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!((stored.volume, stored.hw_volume), (70, false));
+        assert!(!store.any_hw_volume().await.unwrap());
+    }
+
+    /// The device call can outlive an edit of the speaker: the old device's
+    /// reply must not mark the replacement as holding the hardware volume.
+    #[tokio::test]
+    async fn speaker_output_put_discards_a_device_reply_for_a_speaker_edited_meanwhile() {
+        use std::sync::atomic::Ordering;
+        let stub = soap_stub().await;
+        stub.hold_set.store(true, Ordering::SeqCst);
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let speaker = create_onvif_speaker(&app, 5060, stub.port).await;
+
+        let slow = tokio::spawn({
+            let app = app.clone();
+            async move { put_output(&app, speaker, volume_70()).await }
+        });
+        while stub.sets.lock().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            &format!("/api/v1/admin/speakers/{speaker}"),
+            Some(serde_json::json!({
+                "name": "spk", "host": "127.0.0.1",
+                "onvif_endpoint": format!("http://127.0.0.1:{}/onvif/replacement", stub.port),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        stub.release.notify_one();
+
+        let (status, body) = slow.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!((stored.volume, stored.hw_volume), (100, false));
+    }
+
+    /// Two output PUTs on one speaker overlap: A's device call is accepted but
+    /// its reply is held, B runs meanwhile. Whatever the order, the stored
+    /// output must agree with the last Set the device received.
+    #[tokio::test]
+    async fn speaker_output_puts_overlapping_on_one_speaker_commit_the_final_device_level() {
+        use std::sync::atomic::Ordering;
+        let stub = soap_stub().await;
+        stub.hold_set.store(true, Ordering::SeqCst);
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let speaker = create_onvif_speaker(&app, 5060, stub.port).await;
+        let put = |volume: u8| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let body =
+                    serde_json::json!({ "volume": volume, "boost": false, "auto_max_per_hour": 6 });
+                put_output(&app, speaker, body).await
+            })
+        };
+
+        let a = put(20);
+        while stub.sets.lock().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        stub.hold_set.store(false, Ordering::SeqCst);
+        let b = put(80);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stub.release.notify_one();
+        for r in [a.await.unwrap(), b.await.unwrap()] {
+            assert_eq!(r.0, StatusCode::OK, "{}", r.1);
+        }
+
+        // range 10..90: volume 20 is level 26, volume 80 is level 74
+        let last = stub.sets.lock().last().cloned().unwrap();
+        let level = if last.contains("<tt:OutputLevel>74</tt:OutputLevel>") {
+            80
+        } else {
+            20
+        };
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!(
+            (stored.volume, stored.hw_volume),
+            (level, true),
+            "stored output must match the device's last Set: {last}"
+        );
+    }
+
+    /// No endpoint: software volume, and nothing to report.
+    #[tokio::test]
+    async fn speaker_output_put_without_an_onvif_endpoint_is_software_only() {
+        let (state, _store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        let (_, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({ "name": "spk", "host": "127.0.0.1" })),
+        )
+        .await;
+        let speaker = speaker_json(&body)["id"].as_i64().unwrap();
+        let (status, body) = put_output(&app, speaker, volume_70()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out = speaker_json(&body);
+        assert_eq!(out["hw_volume"], false);
+        assert!(out.get("hw_error").is_none(), "{body}");
+    }
+
+    /// An endpoint on another host or scheme is refused when the speaker is
+    /// saved, so its credentials can't be sent anywhere else.
+    #[tokio::test]
+    async fn speaker_save_refuses_an_onvif_endpoint_off_the_speakers_host() {
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+        for endpoint in ["http://192.0.2.99/onvif", "ftp://127.0.0.1/onvif"] {
+            let (status, body) = speaker_call(
+                &app,
+                Method::POST,
+                "/api/v1/admin/speakers",
+                Some(serde_json::json!({
+                    "name": "spk", "host": "127.0.0.1", "password": "hunter2",
+                    "onvif_endpoint": endpoint,
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {body}");
+            assert!(
+                body.contains("onvif_endpoint") && !body.contains("hunter2"),
+                "{body}"
+            );
+        }
+        assert!(store.list_speakers().await.unwrap().is_empty());
+    }
+
+    /// The speakers GETs carry the last probe; before one has run there is none.
+    #[tokio::test]
+    async fn speakers_get_reports_health_once_probed() {
+        let (state, _store, _dir, _reg, _bus) = build_test_state(None).await;
+        let map = state.health.speaker_health();
+        let app = super::router(state);
+        let (_, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/speakers",
+            Some(serde_json::json!({ "name": "spk", "host": "127.0.0.1" })),
+        )
+        .await;
+        let id = speaker_json(&body)["id"].as_i64().unwrap();
+        let uri = format!("/api/v1/admin/speakers/{id}");
+        let (_, body) = speaker_call(&app, Method::GET, &uri, None).await;
+        assert!(speaker_json(&body).get("health").is_none(), "{body}");
+
+        map.mark_offline_for_test(id);
+        let (_, one) = speaker_call(&app, Method::GET, &uri, None).await;
+        let (_, all) = speaker_call(&app, Method::GET, "/api/v1/admin/speakers", None).await;
+        for health in [
+            speaker_json(&one)["health"].clone(),
+            speaker_json(&all)[0]["health"].clone(),
+        ] {
+            assert_eq!(health["online"], false, "{one}");
+            assert_eq!(health["user_agent"], "");
+            assert!(health["since"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn speaker_output_put_validates_persists_audits_and_leaves_the_session_playing() {
+        use futures::StreamExt;
+        use nexus_bus::BusExt;
+
+        let (port, rtp, uas) = fake_speaker().await;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = TalkdownSessions::default();
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        let speaker = assign_speaker(&app, 1, "127.0.0.1", port).await;
+        let mut changed = bus
+            .subscribe::<serde_json::Value>(nexus_bus::topic::CONFIG_CHANGED)
+            .await
+            .unwrap();
+
+        for bad in [
+            serde_json::json!({ "volume": 101, "boost": false, "auto_max_per_hour": 6 }),
+            serde_json::json!({ "volume": -1, "boost": false, "auto_max_per_hour": 6 }),
+            serde_json::json!({ "volume": 50, "boost": false, "auto_max_per_hour": 0 }),
+            serde_json::json!({ "volume": 50, "boost": false, "auto_max_per_hour": 61 }),
+            serde_json::json!({ "volume": 50, "auto_max_per_hour": 6 }),
+        ] {
+            let (status, body) = put_output(&app, speaker, bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+        let (status, _) = put_output(
+            &app,
+            999,
+            serde_json::json!({ "volume": 50, "boost": false, "auto_max_per_hour": 6 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(store.speaker_output(speaker).await.unwrap().volume, 100);
+
+        // A session is playing; muting the speaker mid-chime silences what is
+        // left of it, and does not hang it up.
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = put_output(
+            &app,
+            speaker,
+            serde_json::json!({ "volume": 0, "boost": true, "auto_max_per_hour": 3 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out = speaker_json(&body);
+        assert_eq!(out["volume"], 0);
+        assert_eq!(out["boost"], true);
+        assert_eq!(out["auto_max_per_hour"], 3);
+        assert!(
+            talk_down_busy(&app).await,
+            "the output change kept the session"
+        );
+
+        let started = std::time::Instant::now();
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let frames = rtp_frames(&rtp);
+        assert!(!is_silent(&frames[0]), "audible before the change");
+        assert!(frames[20..].iter().all(|f| is_silent(f)), "silent after it");
+
+        let stored = store.speaker_output(speaker).await.unwrap();
+        assert_eq!(
+            (
+                stored.volume,
+                stored.boost,
+                stored.hw_volume,
+                stored.auto_max_per_hour
+            ),
+            (0, true, false, 3)
+        );
+        let rows = store
+            .list_audit_for_resource("speaker", &speaker.to_string(), 50)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.action == "speaker.output")
+            .expect("speaker.output audited");
+        assert_eq!(
+            speaker_json(row.after_json.as_deref().unwrap())["volume"],
+            0
+        );
+        assert_eq!(
+            speaker_json(row.before_json.as_deref().unwrap())["volume"],
+            100
+        );
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), changed.next()).await
+        {
+            events.push(ev.unwrap().to_string());
+        }
+        assert!(
+            events.iter().any(|e| e.contains(r#""action":"output""#)),
+            "config.changed published: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn talk_down_volume_changes_only_the_session_its_camera_started() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        seed_onvif_camera(&store, 2, None).await;
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/cameras/2/talk-down",
+            Some(serde_json::json!({ "speaker_id": speaker })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let volume = |camera: i64, body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let uri = format!("/api/v1/admin/cameras/{camera}/talk-down/volume");
+                speaker_call(&app, Method::POST, &uri, Some(body)).await
+            }
+        };
+        let mute = serde_json::json!({ "volume": 0 });
+
+        // No session, an unknown camera and a bad body.
+        let (status, body) = volume(1, mute.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, _) = volume(999, mute.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        for bad in [
+            serde_json::json!({ "volume": 101 }),
+            serde_json::json!({ "volume": -1 }),
+            serde_json::json!({}),
+        ] {
+            let (status, body) = volume(1, bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+
+        let (status, body) = start_talk_down(&app, 1, serde_json::json!({ "mode": "tone" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Camera 2 shares the speaker but did not start this session.
+        let (status, body) = volume(2, mute.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = volume(1, mute).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body)["volume"], 0);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let frames = rtp_frames(&rtp);
+        assert!(!is_silent(&frames[0]), "audible before the change");
+        assert!(frames[20..].iter().all(|f| is_silent(f)), "silent after it");
+
+        // Not persisted: the speaker keeps its own volume.
+        assert_eq!(store.speaker_output(speaker).await.unwrap().volume, 100);
+        let rows = store
+            .list_audit_for_resource("camera", "1", 50)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().any(|r| r.action == "talk_down.volume"),
+            "audited"
+        );
     }
 
     #[tokio::test]
@@ -10139,13 +11038,14 @@ mod tests {
             assert!(status.is_success(), "{change}: {status} {body}");
 
             let audio = crate::talkdown::session::Audio::Tone;
-            let refusal = match crate::speakers_admin::start_on(&state, 1, &read, &audio).await {
-                Err(refusal) => axum::response::IntoResponse::into_response(refusal),
-                Ok(_) => {
-                    let seen = uas.await.unwrap();
-                    panic!("{change}: the start called a: {:?}", sip_methods(&seen));
-                }
-            };
+            let refusal =
+                match crate::speakers_admin::start_on(&state, 1, &read, &audio, None).await {
+                    Err(refusal) => axum::response::IntoResponse::into_response(refusal),
+                    Ok(_) => {
+                        let seen = uas.await.unwrap();
+                        panic!("{change}: the start called a: {:?}", sip_methods(&seen));
+                    }
+                };
             assert_eq!(refusal.status(), StatusCode::CONFLICT, "{change}");
             let body = to_bytes(refusal.into_body(), 64 * 1024).await.unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
@@ -10398,6 +11298,13 @@ mod tests {
             serde_json::json!({ "mode": "siren" }),
             serde_json::json!({}),
             serde_json::json!({ "mode": "clip" }),
+            // D13: the fetch-by-URL mode is gone.
+            serde_json::json!({
+                "mode": "clip",
+                "clip": { "url": "https://blob.example/x.wav", "sha256": "00" },
+            }),
+            serde_json::json!({ "mode": "stored" }),
+            serde_json::json!({ "mode": "stored", "audio_uid": "u", "volume": 101 }),
         ] {
             let (status, body) = start_talk_down(&app, 1, bad.clone()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
@@ -10406,112 +11313,6 @@ mod tests {
             speaker_call(&app, Method::POST, "/api/v1/admin/speakers/999/test", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert!(!talk_down_busy(&app).await);
-    }
-
-    #[tokio::test]
-    async fn talk_down_clip_plays_the_wav_samples() {
-        let samples: Vec<i16> = (0..800)
-            .map(|i| ((i * 977) % 20_000 - 10_000) as i16)
-            .collect();
-        let clip = wav(1, 8000, &samples);
-        let server = wiremock::MockServer::start().await;
-        serve(&server, "/clip.wav", clip.clone()).await;
-        let url = format!("{}/clip.wav?sv=2024&sig=SAS-SIGNATURE", server.uri());
-        let (port, rtp, uas) = fake_speaker().await;
-        let (app, store, _dir, _) =
-            talkdown_app(TalkdownSessions::allowing_http(), "127.0.0.1", port).await;
-
-        let body = serde_json::json!({
-            "mode": "clip",
-            "clip": { "url": url, "sha256": sha256_hex(&clip).to_uppercase() },
-        });
-        let (status, body) = start_talk_down(&app, 1, body).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(speaker_json(&body)["mode"], "clip");
-
-        let mut buf = [0u8; 2048];
-        // The first packet is the silent frame that opens the media flow.
-        tokio::time::timeout(std::time::Duration::from_secs(1), rtp.recv(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let n = tokio::time::timeout(std::time::Duration::from_secs(1), rtp.recv(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let want: Vec<u8> = samples[..160]
-            .iter()
-            .map(|&s| crate::talkdown::g711::ulaw(s))
-            .collect();
-        assert_eq!(
-            &buf[12..n],
-            want.as_slice(),
-            "the clip's first frame, µ-law"
-        );
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
-        assert_audit_has_no_url(&store, "SAS-SIGNATURE").await;
-    }
-
-    #[tokio::test]
-    async fn talk_down_clip_refusals_place_no_call() {
-        let tone = wav(1, 8000, &crate::talkdown::tone_pcm(100));
-        let server = wiremock::MockServer::start().await;
-        let files = [
-            ("/good.wav", tone.clone()),
-            ("/stereo.wav", wav(2, 8000, &[0; 400])),
-            ("/16k.wav", wav(1, 16_000, &[0; 400])),
-            ("/text.wav", b"not a wave file".to_vec()),
-            ("/big.wav", wav(1, 8000, &vec![0; 512 * 1024 + 1])),
-        ];
-        for (path, body) in &files {
-            serve(&server, path, body.clone()).await;
-        }
-        // A speaker that never hears a request: any INVITE would land here.
-        let speaker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let port = speaker.local_addr().unwrap().port();
-        let (app, store, _dir, _) =
-            talkdown_app(TalkdownSessions::allowing_http(), "127.0.0.1", port).await;
-        let clip = |path: &str, sha: String| {
-            serde_json::json!({
-                "mode": "clip",
-                "clip": { "url": format!("{}{path}?sig=SAS-SIGNATURE", server.uri()), "sha256": sha },
-            })
-        };
-
-        let mut cases = vec![clip("/good.wav", sha256_hex(b"something else"))];
-        cases.extend(
-            files[1..]
-                .iter()
-                .map(|(path, body)| clip(path, sha256_hex(body))),
-        );
-        cases.push(clip("/missing.wav", sha256_hex(b"")));
-        for case in cases {
-            let (status, body) = start_talk_down(&app, 1, case.clone()).await;
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{case}: {body}");
-            assert_eq!(error_code(&body), "clip_invalid", "{case}");
-            assert!(!body.contains("SAS-SIGNATURE"), "URL echoed: {body}");
-        }
-        assert!(!talk_down_busy(&app).await);
-        assert_audit_has_no_url(&store, "SAS-SIGNATURE").await;
-
-        // The engine's own sessions take https only.
-        let (prod, _store, _dir2, _) =
-            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
-        let (status, body) = start_talk_down(&prod, 1, clip("/good.wav", sha256_hex(&tone))).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(error_code(&body), "clip_invalid");
-
-        let mut buf = [0u8; 2048];
-        let heard = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            speaker.recv(&mut buf),
-        )
-        .await;
-        assert!(heard.is_err(), "a refused clip placed a call");
     }
 
     #[tokio::test]
@@ -10527,11 +11328,1122 @@ mod tests {
         assert_eq!(speaker_json(&body)["message"], "speaker did not answer");
         assert!(!talk_down_busy(&app).await);
         // A start that gets as far as claiming the speaker is not refused as busy.
-        let bad_clip = serde_json::json!({
-            "mode": "clip", "clip": { "url": "ftp://x/y.wav", "sha256": "00" },
+        let unknown = serde_json::json!({ "mode": "stored", "audio_uid": "nope" });
+        let (status, body) = start_talk_down(&app, 1, unknown).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(error_code(&body), "audio_not_found");
+    }
+
+    #[tokio::test]
+    async fn talk_down_stored_plays_the_library_samples_at_the_body_volume() {
+        let samples: Vec<i16> = (0..800)
+            .map(|i| ((i * 977) % 20_000 - 10_000) as i16)
+            .collect();
+        let (port, rtp, uas) = fake_speaker().await;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        store_ready_clip(&store, CLIP_UID, &samples).await;
+
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        assert!(speaker_json(&body)["modes"]
+            .as_array()
+            .unwrap()
+            .contains(&"stored".into()));
+        let play = serde_json::json!({ "mode": "stored", "audio_uid": CLIP_UID, "volume": 50 });
+        let (status, body) = start_talk_down(&app, 1, play).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body)["mode"], "stored");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let want: Vec<u8> = samples[..160]
+            .iter()
+            .map(|&s| crate::talkdown::g711::ulaw(crate::talkdown::limit(f32::from(s) * 0.1)))
+            .collect();
+        assert_eq!(
+            rtp_frames(&rtp)[0],
+            want,
+            "the first frame at session volume 50"
+        );
+    }
+
+    #[tokio::test]
+    async fn talk_down_stored_refuses_unknown_and_pending_audio_after_claiming() {
+        // A speaker that never hears a request: any INVITE would land here.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let sessions = state.talkdown.clone();
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        store
+            .upsert_talkdown_pending(&nexus_store::NewAudio {
+                uid: CLIP_UID.into(),
+                name: "pending".into(),
+                description: None,
+                kind: nexus_store::AudioKind::Clip,
+                tts_text: None,
+                tts_voice: None,
+                version_token: Some("00".into()),
+            })
+            .await
+            .unwrap();
+        let stored = |uid: &str| serde_json::json!({ "mode": "stored", "audio_uid": uid });
+
+        let (status, body) = start_talk_down(&app, 1, stored("nope")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(error_code(&body), "audio_not_found");
+        let (status, body) = start_talk_down(&app, 1, stored(CLIP_UID)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "audio_not_ready");
+        assert!(!talk_down_busy(&app).await, "a refusal frees the speaker");
+
+        // The claim comes before the store read: a busy speaker answers busy
+        // even for audio that does not exist.
+        let speaker = store.speaker_for_camera(1).await.unwrap().unwrap();
+        let held = sessions.start(
+            crate::talkdown::session::StartRequest {
+                speaker: &speaker,
+                output: store.speaker_output(speaker.id).await.unwrap(),
+                camera_id: Some(1),
+                origin: crate::talkdown::session::Origin::Manual,
+                audio: &crate::talkdown::session::Audio::Tone,
+                event_id: None,
+            },
+            std::future::pending::<bool>(),
+        );
+        tokio::pin!(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut held)
+                .await
+                .is_err(),
+            "parked on its pairing re-read, holding the speaker"
+        );
+        let (status, body) = start_talk_down(&app, 1, stored("nope")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "talk_down_busy");
+
+        let mut buf = [0u8; 2048];
+        let heard =
+            tokio::time::timeout(std::time::Duration::from_millis(200), silent.recv(&mut buf))
+                .await;
+        assert!(heard.is_err(), "a refused play placed a call");
+    }
+
+    // ===============================================================
+    // SPEC-086 — text-to-speech (Task 10)
+    // ===============================================================
+
+    /// Sessions with a library over `store` and a fake text-to-speech
+    /// helper whose voice ids pick its behaviour (`fake-tts.sh`).
+    fn tts_sessions(
+        store: &Arc<Store>,
+        bus: &Arc<dyn nexus_bus::Bus>,
+        voices: &[&str],
+    ) -> TalkdownSessions {
+        let tts = Arc::new(crate::talkdown::tts::tests::fake(voices));
+        let (library, _worker) =
+            crate::talkdown::library::Library::spawn(store.clone(), bus.clone(), true, Some(tts));
+        TalkdownSessions::with_library(library)
+    }
+
+    async fn talk_down_modes(app: &axum::Router) -> Vec<serde_json::Value> {
+        let (_, body) =
+            speaker_call(app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        speaker_json(&body)["modes"].as_array().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn talk_down_tts_plays_the_rendered_text_and_audits_it() {
+        let (port, rtp, uas) = fake_speaker().await;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female", "fail"]);
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        assert!(talk_down_modes(&app).await.contains(&"tts".into()));
+
+        let play = serde_json::json!({ "mode": "tts", "text": "Please leave the area" });
+        let (status, body) = start_talk_down(&app, 1, play).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(speaker_json(&body)["mode"], "tts");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+        wait_idle(&app, std::time::Duration::from_secs(1)).await;
+        let frames = rtp_frames(&rtp);
+        // 22 bytes of input, 800 samples each, in 160-sample frames, and the tail.
+        assert!(frames.len() >= 22 * 5, "{} frames", frames.len());
+        assert!(!is_silent(&frames[0]));
+
+        // The audit row records the mode and the text.
+        let rows = store
+            .list_audit_for_resource("camera", "1", 50)
+            .await
+            .unwrap();
+        let start = rows
+            .iter()
+            .find(|r| r.action == "talk_down.start")
+            .expect("a talk_down.start row");
+        let after: serde_json::Value =
+            serde_json::from_str(start.after_json.as_deref().unwrap()).unwrap();
+        assert_eq!(after["mode"], "tts");
+        assert_eq!(after["text"], "Please leave the area");
+    }
+
+    #[tokio::test]
+    async fn talk_down_tts_refuses_bad_text_unknown_voices_and_failed_renders() {
+        // A speaker that never hears a request: any INVITE would land here.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female", "fail"]);
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+
+        for (play, want, code) in [
+            (
+                serde_json::json!({ "mode": "tts", "text": "x".repeat(121) }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tts_invalid",
+            ),
+            (
+                serde_json::json!({ "mode": "tts", "text": " \n " }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tts_invalid",
+            ),
+            (
+                serde_json::json!({ "mode": "tts", "text": "Leave", "voice": "es-ES-male" }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tts_invalid",
+            ),
+            (
+                serde_json::json!({ "mode": "tts", "text": "Leave", "volume": 101 }),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                serde_json::json!({ "mode": "tts", "text": "Leave", "voice": "fail" }),
+                StatusCode::BAD_GATEWAY,
+                "tts_failed",
+            ),
+        ] {
+            let (status, body) = start_talk_down(&app, 1, play.clone()).await;
+            assert_eq!(status, want, "{play}: {body}");
+            assert_eq!(error_code(&body), code, "{play}");
+            assert!(!talk_down_busy(&app).await, "a refusal frees the speaker");
+        }
+        let mut buf = [0u8; 2048];
+        let heard =
+            tokio::time::timeout(std::time::Duration::from_millis(200), silent.recv(&mut buf))
+                .await;
+        assert!(heard.is_err(), "a refused play placed a call");
+        // Duplicate tags cannot smuggle a mode past the permission check.
+        assert!(serde_json::from_str::<crate::talkdown::session::Audio>(
+            r#"{"mode":"tts","mode":"stored","audio_uid":"x","text":"t"}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn talk_down_tts_without_a_helper_is_409_and_not_a_mode() {
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        assert!(!talk_down_modes(&app).await.contains(&"tts".into()));
+        let play = serde_json::json!({ "mode": "tts", "text": "Please leave the area" });
+        let (status, body) = start_talk_down(&app, 1, play).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "tts_unavailable");
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/talkdown/tts/preview",
+            Some(serde_json::json!({ "text": "Hi", "voice": "en-US-female" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "tts_unavailable");
+    }
+
+    #[tokio::test]
+    async fn library_tts_items_render_to_ready_or_fail_with_the_reason() {
+        use nexus_store::AudioStatus;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female", "fail"]);
+        let app = super::router(state);
+        let tts = |uid: &str, voice: &str| {
+            serde_json::json!({ "uid": uid, "name": "Leave", "kind": "tts",
+                "text": "Please leave the area now.", "voice": voice })
+        };
+        // A voice this core lacks is a failed item, not a refused sync.
+        let push = serde_json::json!([
+            tts(TTS_UID, "en-US-female"),
+            tts(LOCAL_UID, "es-ES-male"),
+            tts(CLIP_UID, "fail"),
+        ]);
+        let (status, body) = talkdown_apply(&app, push, 1).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(settled(&store, TTS_UID).await, AudioStatus::Ready);
+        let pcm = store.talkdown_audio_pcm(TTS_UID).await.unwrap().unwrap();
+        assert_eq!(pcm.len(), 27 * 800, "26 characters and the newline");
+        assert_eq!(settled(&store, LOCAL_UID).await, AudioStatus::Failed);
+        let unknown = store.get_talkdown_audio(LOCAL_UID).await.unwrap().unwrap();
+        assert!(unknown.error.unwrap().contains("unknown voice"));
+        assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Failed);
+        let failed = store.get_talkdown_audio(CLIP_UID).await.unwrap().unwrap();
+        assert!(failed.error.unwrap().starts_with("text-to-speech failed"));
+
+        // The ready item plays.
+        let (port, _rtp, uas) = fake_speaker().await;
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        let play = serde_json::json!({ "mode": "stored", "audio_uid": TTS_UID });
+        let (status, body) = start_talk_down(&app, 1, play).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
+    }
+
+    /// The local preview answers a WAV; the upload preview PUTs one to the
+    /// cloud's write SAS and answers its digest and length.
+    #[tokio::test]
+    async fn tts_previews_render_a_wav_locally_and_to_a_write_sas() {
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female"]);
+        let app = super::router(state);
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/talkdown/tts/preview")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "text": "Hi there", "voice": "en-US-female" }).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "audio/wav");
+        let file = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&file[..4], b"RIFF");
+        assert_eq!(file.len(), 44 + 9 * 800 * 2);
+
+        for bad in [
+            serde_json::json!({ "text": "Hi", "voice": "es-ES-male" }),
+            serde_json::json!({ "text": "", "voice": "en-US-female" }),
+            serde_json::json!({ "text": "x".repeat(501), "voice": "en-US-female" }),
+        ] {
+            let (status, body) = speaker_call(
+                &app,
+                Method::POST,
+                "/api/v1/admin/talkdown/tts/preview",
+                Some(bad.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
+            assert_eq!(error_code(&body), "tts_invalid");
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let base = server.uri().replace("127.0.0.1", "localhost");
+        let upload = |url: String| serde_json::json!({ "text": "Hi there", "voice": "en-US-female", "upload_url": url });
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/talkdown/tts/preview-upload",
+            Some(upload(format!("{base}/p.wav?sig=SAS-SIGNATURE"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let got = server.received_requests().await.unwrap();
+        assert_eq!(got.len(), 1);
+        let v = speaker_json(&body);
+        assert_eq!(v["sha256"], sha256_hex(&got[0].body));
+        assert_eq!(v["duration_ms"], 900);
+
+        // An IP-literal host is refused, and the URL is never echoed.
+        let ip = format!("{}/p.wav?sig=SAS-SIGNATURE", server.uri());
+        let (status, body) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/talkdown/tts/preview-upload",
+            Some(upload(ip)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(error_code(&body), "preview_upload_failed");
+        assert!(!body.contains("SAS-SIGNATURE") && !body.contains("127.0.0.1"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    // ===============================================================
+    // ADR-095 — plays, arming and status
+    // ===============================================================
+
+    async fn audit_actions(store: &Store) -> Vec<nexus_store::AuditEntry> {
+        store
+            .list_audit_filtered(&nexus_store::AuditFilter::default(), 200, 0)
+            .await
+            .unwrap()
+    }
+
+    /// The finished play rows, once every play has ended.
+    async fn finished_plays(store: &Store, n: usize) -> Vec<nexus_store::TalkdownPlay> {
+        for _ in 0..200 {
+            let plays = store
+                .list_talkdown_plays(&nexus_store::PlayFilter::default())
+                .await
+                .unwrap();
+            if plays.len() == n && plays.iter().all(|p| p.result.is_some()) {
+                return plays;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("{n} finished plays never appeared");
+    }
+
+    /// ADR-095 (a), (g): the start route, which is also the only path a
+    /// cloud RPC has to a play, records a manual play whatever the body
+    /// claims; the play links to the alert it names. The plays route
+    /// filters by alert, camera and time.
+    #[tokio::test]
+    async fn a_camera_start_is_a_manual_play_linked_to_its_alert_whatever_the_body_says() {
+        let (port, _rtp, uas) = fake_speaker().await;
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", port).await;
+        let event = uuid::Uuid::now_v7().to_string();
+        let body = serde_json::json!({
+            "mode": "tone", "event_id": event, "origin": "rule", "rule_id": "r1", "step": 1,
         });
-        let (status, body) = start_talk_down(&app, 1, bad_clip).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (status, body) = start_talk_down(&app, 1, body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), uas)
+            .await
+            .unwrap()
+            .unwrap();
+        let p = &finished_plays(&store, 1).await[0];
+        assert_eq!(
+            (
+                p.origin.as_str(),
+                p.rule_id.as_deref(),
+                p.step,
+                p.mode.as_str()
+            ),
+            ("manual", None, None, "tone")
+        );
+        assert_eq!(p.event_id.as_deref(), Some(event.as_str()));
+        assert_eq!(
+            (p.camera_id, p.speaker_id, p.result.as_deref()),
+            (Some(1), speaker, Some("played"))
+        );
+
+        let rows = |q: String| {
+            let app = app.clone();
+            async move {
+                let (status, body) = speaker_call(
+                    &app,
+                    Method::GET,
+                    &format!("/api/v1/admin/talkdown/plays{q}"),
+                    None,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{q}: {body}");
+                speaker_json(&body).as_array().unwrap().len()
+            }
+        };
+        assert_eq!(rows(format!("?event_id={event}")).await, 1);
+        assert_eq!(rows("?event_id=other".into()).await, 0);
+        assert_eq!(rows("?camera_id=1&limit=5".into()).await, 1);
+        assert_eq!(rows("?camera_id=2".into()).await, 0);
+        assert_eq!(rows("?since=2999-01-01T00:00:00Z".into()).await, 0);
+        let (_, body) = speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/plays", None).await;
+        let row = &speaker_json(&body)[0];
+        assert_eq!(
+            (row["origin"].as_str(), row["result"].as_str()),
+            (Some("manual"), Some("played"))
+        );
+        let (status, _) = speaker_call(
+            &app,
+            Method::GET,
+            "/api/v1/admin/talkdown/plays?limit=0",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = start_talk_down(
+            &app,
+            1,
+            serde_json::json!({ "mode": "tone", "event_id": "not-a-uuid" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// The talk-down GET tells a rule play from an operator's, names the
+    /// rule, and carries the speaker's arming; the camera's stop ends it.
+    #[tokio::test]
+    async fn get_talk_down_shows_a_rule_plays_origin_and_rule_name() {
+        let (port, _rtp, _uas) = fake_speaker().await;
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let sessions = state.talkdown.clone();
+        let app = super::router(state);
+        seed_onvif_camera(&store, 1, None).await;
+        assign_speaker(&app, 1, "127.0.0.1", port).await;
+        store_ready_clip(&store, CLIP_UID, &[100; 80_000]).await;
+        let rule: nexus_config::RuleConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "Gate rule", "when": "true", "severity": "low",
+        }))
+        .unwrap();
+        store.upsert_rule(&rule).await.unwrap();
+
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        let view = speaker_json(&body);
+        assert_eq!(view["origin"], serde_json::Value::Null, "{view}");
+        assert_eq!(
+            (view["armed"].as_bool(), &view["rearm_at"]),
+            (Some(true), &serde_json::Value::Null)
+        );
+
+        let speaker = store.speaker_for_camera(1).await.unwrap().unwrap();
+        let audio = crate::talkdown::session::Audio::Stored {
+            audio_uid: CLIP_UID.into(),
+            volume: None,
+            repeat: 1,
+        };
+        let req = crate::talkdown::session::StartRequest {
+            speaker: &speaker,
+            output: store.speaker_output(speaker.id).await.unwrap(),
+            camera_id: Some(1),
+            origin: crate::talkdown::session::Origin::Rule {
+                rule_id: "r1".into(),
+                step: 1,
+            },
+            audio: &audio,
+            event_id: None,
+        };
+        let Ok((_, _, playing)) = sessions.start(req, async { true }).await else {
+            panic!("the rule play starts");
+        };
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        let view = speaker_json(&body);
+        assert_eq!(view["busy"], true, "{view}");
+        assert_eq!(view["origin"], "rule", "{view}");
+        assert_eq!(view["rule_id"], "r1");
+        assert_eq!(view["rule_name"], "Gate rule");
+
+        let (status, _) = speaker_call(
+            &app,
+            Method::POST,
+            "/api/v1/admin/cameras/1/talk-down/stop",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(matches!(
+            playing.await.unwrap(),
+            Ok(crate::talkdown::session::Ended::Stopped)
+        ));
+    }
+
+    /// ADR-095: a disarm that is indefinite or longer than 24 h needs a
+    /// reason, which is stored, shown and audited; arming clears it.
+    #[tokio::test]
+    async fn arming_needs_a_reason_past_24_h_and_the_reason_is_stored_and_audited() {
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", 9).await;
+        seed_onvif_camera(&store, 2, None).await;
+        let core = "/api/v1/admin/talkdown/arming";
+        let camera = "/api/v1/admin/cameras/1/talk-down/arming";
+        let put = |uri: &'static str, body: serde_json::Value| {
+            let app = app.clone();
+            async move { speaker_call(&app, Method::PUT, uri, Some(body)).await }
+        };
+        let in_hours = |h: i64| (chrono::Utc::now() + chrono::Duration::hours(h)).to_rfc3339();
+        for (uri, body) in [
+            (core, serde_json::json!({ "armed": false })),
+            (
+                core,
+                serde_json::json!({ "armed": false, "rearm_at": in_hours(25) }),
+            ),
+            (camera, serde_json::json!({ "armed": false })),
+            (
+                core,
+                serde_json::json!({ "armed": false, "rearm_at": in_hours(-1), "reason": "x" }),
+            ),
+            (
+                core,
+                serde_json::json!({ "armed": false, "reason": "x".repeat(201) }),
+            ),
+            (core, serde_json::json!({ "armed": false, "reason": "  " })),
+            (
+                core,
+                serde_json::json!({ "armed": false, "reason": "x", "extra": 1 }),
+            ),
+        ] {
+            let (status, body) = put(uri, body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+        }
+        assert!(
+            store.talkdown_core().await.unwrap().auto_armed,
+            "nothing stored"
+        );
+
+        // Within 24 h: no reason needed.
+        let (status, body) = put(
+            core,
+            serde_json::json!({ "armed": false, "rearm_at": in_hours(2) }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c = store.talkdown_core().await.unwrap();
+        assert!(!c.auto_armed && c.auto_rearm_at.is_some() && c.auto_disarm_reason.is_none());
+
+        // Indefinitely, with a reason: stored and audited.
+        let (status, body) = put(
+            core,
+            serde_json::json!({ "armed": false, "reason": "roof works" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c = store.talkdown_core().await.unwrap();
+        assert_eq!(
+            (
+                c.auto_armed,
+                c.auto_rearm_at,
+                c.auto_disarm_reason.as_deref()
+            ),
+            (false, None, Some("roof works"))
+        );
+        let audits = audit_actions(&store).await;
+        let row = audits
+            .iter()
+            .find(|a| a.action == "talk_down.arming")
+            .unwrap();
+        assert!(
+            row.after_json.as_deref().unwrap().contains("roof works"),
+            "{row:?}"
+        );
+
+        // The camera's speaker; shown on the talk-down GET.
+        let (status, body) = put(
+            camera,
+            serde_json::json!({ "armed": false, "reason": "tenant asked" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let a = store.speaker_arming(speaker).await.unwrap().unwrap();
+        assert_eq!(
+            (a.armed, a.reason.as_deref()),
+            (false, Some("tenant asked"))
+        );
+        let (_, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
+        let view = speaker_json(&body);
+        assert_eq!(
+            (view["armed"].as_bool(), view["disarm_reason"].as_str()),
+            (Some(false), Some("tenant asked"))
+        );
+        let (status, body) = put(
+            "/api/v1/admin/cameras/2/talk-down/arming",
+            serde_json::json!({ "armed": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "no speaker: {body}");
+
+        // One speaker directly, with the same rules; 404 for an unknown one.
+        let speaker_uri = format!("/api/v1/admin/speakers/{speaker}/arming");
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            &speaker_uri,
+            Some(serde_json::json!({ "armed": false, "rearm_at": in_hours(48) })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "past 24 h needs a reason: {body}"
+        );
+        let (status, body) = speaker_call(
+            &app,
+            Method::PUT,
+            &speaker_uri,
+            Some(serde_json::json!({ "armed": false, "rearm_at": in_hours(48), "reason": "rewiring" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = speaker_json(&body);
+        assert_eq!(
+            (
+                v["armed"].as_bool(),
+                v["reason"].as_str(),
+                v["speaker_id"].as_i64()
+            ),
+            (Some(false), Some("rewiring"), Some(speaker))
+        );
+        assert!(v["rearm_at"].is_string(), "{v}");
+        let a = store.speaker_arming(speaker).await.unwrap().unwrap();
+        assert_eq!((a.armed, a.reason.as_deref()), (false, Some("rewiring")));
+        let audits = audit_actions(&store).await;
+        assert!(audits.iter().any(|r| r.action == "talk_down.arming"
+            && r.resource_kind.as_deref() == Some("speaker")
+            && r.after_json
+                .as_deref()
+                .is_some_and(|j| j.contains("rewiring"))));
+        let (status, _) = speaker_call(
+            &app,
+            Method::PUT,
+            "/api/v1/admin/speakers/999/arming",
+            Some(serde_json::json!({ "armed": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Arming clears the re-arm time and the reason.
+        let (status, _) = put(core, serde_json::json!({ "armed": true, "reason": "done" })).await;
+        assert_eq!(status, StatusCode::OK);
+        let c = store.talkdown_core().await.unwrap();
+        assert!(c.auto_armed && c.auto_disarm_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn talkdown_status_reports_caps_arming_coverage_audio_and_estimated_stats() {
+        let (app, store, _dir, speaker) =
+            talkdown_app(TalkdownSessions::default(), "127.0.0.1", 9).await;
+        seed_onvif_camera(&store, 2, None).await;
+        store_ready_clip(&store, CLIP_UID, &[1; 800]).await;
+        let play = |outcome: Option<&str>| nexus_store::NewPlay {
+            session_id: "s".into(),
+            origin: if outcome.is_some() { "rule" } else { "manual" }.into(),
+            rule_id: outcome.map(|_| "r1".into()),
+            step: None,
+            event_id: None,
+            camera_id: Some(1),
+            speaker_id: speaker,
+            audio_uid: None,
+            mode: "stored".into(),
+        };
+        let id = store
+            .insert_talkdown_play(&play(Some("cleared")))
+            .await
+            .unwrap();
+        store
+            .set_talkdown_play_outcome(id, "cleared")
+            .await
+            .unwrap();
+        store.insert_talkdown_play(&play(None)).await.unwrap();
+
+        let (status, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/status", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let s = speaker_json(&body);
+        assert!(
+            s["caps"]
+                .as_array()
+                .unwrap()
+                .contains(&"talkdown_rules".into()),
+            "{s}"
+        );
+        assert_eq!(s["cloud_allowed"], false, "never heard true");
+        assert_eq!(s["armed"]["core"]["armed"], true);
+        assert_eq!(s["armed"]["speakers"][0]["id"], speaker);
+        assert_eq!(s["speakers"][0]["id"], speaker);
+        assert_eq!(
+            s["speakers"][0]["online"],
+            serde_json::Value::Null,
+            "not probed yet"
+        );
+        let coverage = s["coverage"].as_array().unwrap();
+        assert!(coverage.contains(&serde_json::json!({ "camera_id": 1, "camera_name": "cam-1", "speaker_id": speaker })), "{s}");
+        assert!(
+            coverage.contains(
+                &serde_json::json!({ "camera_id": 2, "camera_name": "cam-2", "speaker_id": null })
+            ),
+            "{s}"
+        );
+        assert_eq!(
+            (s["audio"]["ready"].as_u64(), s["audio"]["failed"].as_u64()),
+            (Some(1), Some(0))
+        );
+        assert_eq!(s["audio"]["items"][0]["uid"], CLIP_UID);
+        assert_eq!(s["rules"], serde_json::json!([]));
+        assert_eq!(s["stats"]["24h"]["plays"], 1, "rule plays only");
+        assert_eq!(s["stats"]["7d"]["cleared"], 1);
+        assert_eq!(s["stats"]["24h"]["persisted"], 0);
+        assert_eq!(s["outcomes_estimated"], true);
+        assert_eq!(s["voices"], serde_json::json!([]), "no text-to-speech here");
+
+        // The speakers GETs carry each speaker's stored output.
+        let (_, body) = speaker_call(
+            &app,
+            Method::GET,
+            &format!("/api/v1/admin/speakers/{speaker}"),
+            None,
+        )
+        .await;
+        let out = &speaker_json(&body)["output"];
+        assert_eq!(
+            out,
+            &serde_json::json!({ "volume": 100, "boost": false, "hw_volume": false, "auto_max_per_hour": 6 }),
+            "{body}"
+        );
+        let (_, body) = speaker_call(&app, Method::GET, "/api/v1/admin/speakers", None).await;
+        assert_eq!(&speaker_json(&body)[0]["output"], out);
+        // ...but the audit rows record the configuration only.
+        let audits = audit_actions(&store).await;
+        let created = audits
+            .iter()
+            .find(|r| r.action == "speaker.create")
+            .and_then(|r| r.after_json.clone())
+            .unwrap();
+        assert!(
+            !created.contains("output") && created.contains("camera_ids"),
+            "{created}"
+        );
+    }
+
+    /// The status lists the voices the text-to-speech helper offers.
+    #[tokio::test]
+    async fn talkdown_status_lists_the_tts_voices() {
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = tts_sessions(&store, &bus, &["en-US-female"]);
+        let app = super::router(state);
+        let (status, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/status", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            speaker_json(&body)["voices"],
+            serde_json::json!([{ "id": "en-US-female", "label": "en-US-female", "language": "en-US" }])
+        );
+    }
+
+    // ===============================================================
+    // SPEC-086 — the `talkdown_audio` fleet category
+    // ===============================================================
+
+    async fn talkdown_apply(
+        app: &axum::Router,
+        effective: serde_json::Value,
+        revision: i64,
+    ) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({
+            "effective": effective,
+            "scope": { "type": "org", "id": "00000000-0000-0000-0000-000000000000" },
+            "mode": "merge",
+            "revision": revision,
+        });
+        let (status, body) = speaker_call(
+            app,
+            Method::POST,
+            "/api/v1/admin/fleet/talkdown_audio",
+            Some(body),
+        )
+        .await;
+        assert!(!body.contains("SAS-SIGNATURE"), "URL echoed: {body}");
+        (status, speaker_json(&body))
+    }
+
+    /// Wait until the item leaves `pending`; returns its status.
+    async fn settled(store: &Store, uid: &str) -> nexus_store::AudioStatus {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let a = store.get_talkdown_audio(uid).await.unwrap().unwrap();
+            if a.status != nexus_store::AudioStatus::Pending {
+                return a.status;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{uid} still pending"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_apply_talkdown_audio_downloads_in_the_background_and_reports_the_hash() {
+        use futures::StreamExt;
+        use nexus_bus::BusExt;
+        use nexus_store::AudioStatus;
+
+        let quiet: Vec<i16> = (0..800)
+            .map(|i| if i % 2 == 0 { 300 } else { -300 })
+            .collect();
+        let first = wav(1, 8000, &quiet);
+        let second = wav(1, 8000, &quiet[..400]);
+        let server = wiremock::MockServer::start().await;
+        serve(&server, "/a.wav", first.clone()).await;
+        serve(&server, "/b.wav", second.clone()).await;
+        // A blob host is a name, never an IP literal.
+        let base = server.uri().replace("127.0.0.1", "localhost");
+        let url = |path: &str| format!("{base}{path}?sv=1&sig=SAS-SIGNATURE");
+        let hits = || async { server.received_requests().await.unwrap().len() };
+
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        let mut changed = bus
+            .subscribe::<serde_json::Value>(nexus_bus::topic::CONFIG_CHANGED)
+            .await
+            .unwrap();
+        // An item made on this core, which no fleet push may touch.
+        store_ready_clip(&store, LOCAL_UID, &[1, 2, 3]).await;
+        assert_eq!(
+            crate::fleet_hash::compute(&store)
+                .await
+                .unwrap()
+                .talkdown_audio,
+            None
+        );
+
+        let clip = |path: &str, sha: String| {
+            serde_json::json!({ "uid": CLIP_UID, "name": "Store closed",
+                "description": "After hours", "kind": "clip", "sha256": sha,
+                "url": url(path), "duration_ms": 100 })
+        };
+        let tts = serde_json::json!({ "uid": TTS_UID, "name": "Leave", "kind": "tts",
+            "text": "Please leave the area now.", "voice": "en_US-female" });
+
+        // Answers at once with every item pending; the worker then fetches,
+        // normalises and readies the clip, and publishes each change.
+        let push = serde_json::json!([clip("/a.wav", sha256_hex(&first)), tts.clone()]);
+        let (status, body) = talkdown_apply(&app, push.clone(), 7).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["category"], "talkdown_audio");
+        assert_eq!(
+            body["items"],
+            serde_json::json!([
+                { "uid": CLIP_UID, "status": "pending" },
+                { "uid": TTS_UID, "status": "pending" },
+            ])
+        );
+        assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Ready);
+        // This core has no text-to-speech helper.
+        assert_eq!(settled(&store, TTS_UID).await, AudioStatus::Failed);
+        let pcm = store.talkdown_audio_pcm(CLIP_UID).await.unwrap().unwrap();
+        assert_eq!(pcm.len(), quiet.len());
+        assert!(pcm[0] > 3000, "normalised up from -40 dBFS: {}", pcm[0]);
+        assert_eq!(hits().await, 1);
+        let mut events = 0;
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), changed.next()).await
+        {
+            events += 1;
+        }
+        assert!(events >= 3, "the apply and each item published: {events}");
+
+        // The digest covers the managed, ready clip only.
+        let ready_clip = store.get_talkdown_audio(CLIP_UID).await.unwrap().unwrap();
+        let want = crate::fleet_hash::sha256_canonical(&serde_json::json!([
+            crate::talkdown::library::contract_json(&ready_clip)
+        ]));
+        let hash = crate::fleet_hash::compute(&store)
+            .await
+            .unwrap()
+            .talkdown_audio;
+        assert_eq!(hash.as_deref(), Some(want.as_str()));
+
+        // Unchanged content fetches nothing; a new name is taken in place.
+        let mut renamed = push.clone();
+        renamed[0]["name"] = "Closed".into();
+        let (status, body) = talkdown_apply(&app, renamed, 7).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"][0]["status"], "ready");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(hits().await, 1, "an unchanged clip is not fetched again");
+        let a = store.get_talkdown_audio(CLIP_UID).await.unwrap().unwrap();
+        assert_eq!((a.name.as_str(), a.status), ("Closed", AudioStatus::Ready));
+
+        // An older revision is stale and changes nothing.
+        let (status, body) = talkdown_apply(
+            &app,
+            serde_json::json!([clip("/b.wav", sha256_hex(&second))]),
+            6,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "stale": true }));
+        assert_eq!(store.talkdown_core().await.unwrap().library_revision, 7);
+        assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_some());
+        assert_eq!(hits().await, 1);
+
+        // A changed sha256 fetches again.
+        let (status, body) = talkdown_apply(
+            &app,
+            serde_json::json!([clip("/b.wav", sha256_hex(&second))]),
+            8,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Ready);
+        assert_eq!(hits().await, 2);
+        assert_eq!(
+            store
+                .talkdown_audio_pcm(CLIP_UID)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            400
+        );
+        // The TTS item left the push: merge retracted it; the local item stays.
+        assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_none());
+        assert!(store.get_talkdown_audio(LOCAL_UID).await.unwrap().is_some());
+
+        // A body that does not match its sha256 fails, and leaves the hash.
+        let (status, _) = talkdown_apply(
+            &app,
+            serde_json::json!([clip("/a.wav", sha256_hex(b"something else"))]),
+            9,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settled(&store, CLIP_UID).await, AudioStatus::Failed);
+        let failed = store.get_talkdown_audio(CLIP_UID).await.unwrap().unwrap();
+        assert!(!failed.error.unwrap().contains("SAS-SIGNATURE"));
+        assert_eq!(
+            crate::fleet_hash::compute(&store)
+                .await
+                .unwrap()
+                .talkdown_audio,
+            Some(crate::fleet_hash::sha256_canonical(&serde_json::json!([])))
+        );
+
+        // `[]` removes every managed item and only those.
+        let (status, body) = talkdown_apply(&app, serde_json::json!([]), 10).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let left: Vec<String> = store
+            .list_talkdown_audio()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.uid)
+            .collect();
+        assert_eq!(left, [LOCAL_UID]);
+
+        // The library list marks what the fleet manages.
+        let (status, body) =
+            speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/audio", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let list = speaker_json(&body);
+        assert_eq!(list[0]["uid"], LOCAL_UID);
+        assert_eq!(list[0]["fleet_managed"], false);
+        assert_eq!(list[0]["status"], "ready");
+        assert_eq!(list[0]["kind"], "clip");
+
+        // No audit row holds the SAS URL.
+        let rows = store
+            .list_audit_for_resource("fleet", "talkdown_audio", 50)
+            .await
+            .unwrap();
+        assert!(rows.len() >= 5, "{} fleet.apply rows", rows.len());
+        for r in &rows {
+            for text in [&r.before_json, &r.after_json].into_iter().flatten() {
+                assert!(
+                    !text.contains("SAS-SIGNATURE"),
+                    "URL in the audit row {text}"
+                );
+            }
+        }
+    }
+
+    /// A core unenrolled (and later enrolled into another org) drops the old
+    /// org's library and accepts revision 1 again, not `{"stale": true}`.
+    #[tokio::test]
+    async fn unenrolment_resets_the_talkdown_library_revision_and_fleet_items() {
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let library = state.talkdown.library().unwrap().clone();
+        let app = super::router(state);
+        store_ready_clip(&store, LOCAL_UID, &[1, 2, 3]).await;
+        let tts = serde_json::json!([{ "uid": TTS_UID, "name": "Leave", "kind": "tts",
+            "text": "Please leave.", "voice": "es" }]);
+        let (status, _) = talkdown_apply(&app, tts.clone(), 57).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // An in-flight push holds the library lock: the reset waits for it,
+        // or the push would write the old org's revision back after it.
+        let push = library.lock().await;
+        let mut unenrol = Box::pin(speaker_call(
+            &app,
+            Method::DELETE,
+            "/api/v1/admin/cloud/enrollment",
+            None,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut unenrol)
+                .await
+                .is_err(),
+            "the reset ran during a push"
+        );
+        assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_some());
+        drop(push);
+        let (status, body) = unenrol.await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(store.get_talkdown_audio(TTS_UID).await.unwrap().is_none());
+        assert!(store.get_talkdown_audio(LOCAL_UID).await.unwrap().is_some());
+
+        let (status, body) = talkdown_apply(&app, tts, 1).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(body, serde_json::json!({ "stale": true }));
+        assert_eq!(store.talkdown_core().await.unwrap().library_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn fleet_apply_talkdown_audio_refuses_bad_items_and_lists_fleet_items() {
+        let (mut state, store, _dir, _reg, bus) = build_test_state(None).await;
+        state.talkdown = library_sessions(&store, &bus);
+        let app = super::router(state);
+        let tts = serde_json::json!({ "uid": TTS_UID, "name": "Leave", "kind": "tts",
+            "text": "Please leave.", "voice": "es" });
+        for bad in [
+            serde_json::json!({ "not": "an array" }),
+            serde_json::json!([tts, tts]),
+            serde_json::json!([{ "uid": "x", "name": "n", "kind": "tts", "text": "t", "voice": "v" }]),
+            serde_json::json!([{ "uid": CLIP_UID, "name": "n", "kind": "clip",
+                "sha256": "00", "url": "https://h/x?sig=SAS-SIGNATURE" }]),
+        ] {
+            let (status, body) = talkdown_apply(&app, bad.clone(), 1).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        }
+        assert_eq!(store.count_talkdown_audio().await.unwrap(), 0);
+        assert_eq!(store.talkdown_core().await.unwrap().library_revision, 0);
+
+        let (status, _) = talkdown_apply(&app, serde_json::json!([tts]), 1).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = speaker_call(&app, Method::GET, "/api/v1/admin/talkdown/audio", None).await;
+        let list = speaker_json(&body);
+        assert_eq!(list[0]["uid"], TTS_UID);
+        assert_eq!(list[0]["fleet_managed"], true);
+        assert_eq!(list[0]["kind"], "tts");
+        assert_eq!(list[0]["has_previous"], false);
+        assert!(list[0].get("pcm").is_none());
     }
 
     #[tokio::test]
@@ -10627,10 +12539,7 @@ mod tests {
             .contains("live audio"));
         let (_, body) =
             speaker_call(&app, Method::GET, "/api/v1/admin/cameras/1/talk-down", None).await;
-        assert_eq!(
-            speaker_json(&body)["modes"],
-            serde_json::json!(["tone", "clip"])
-        );
+        assert_eq!(speaker_json(&body)["modes"], serde_json::json!(["tone"]));
         let mut buf = [0u8; 2048];
         let heard = tokio::time::timeout(
             std::time::Duration::from_millis(300),

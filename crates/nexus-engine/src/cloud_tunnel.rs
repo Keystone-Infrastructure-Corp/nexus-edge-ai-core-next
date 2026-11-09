@@ -795,6 +795,20 @@ fn tunnel_actor_allowed(actor: &VerifiedActor, policy: &SystemMethodPolicy, path
     )
 }
 
+/// ADR-095 — store the cloud's allowance for automatic talk-down plays when
+/// the ack carries it. An ack without it changes nothing, so a core keeps
+/// what it last heard (and one that never heard `true` plays nothing).
+async fn record_talkdown_allowance(
+    store: &Store,
+    ack: &nexus_cloud_protocol::v1::HeartbeatAckPayload,
+) {
+    if let Some(allowed) = ack.talkdown_auto_allowed {
+        if let Err(e) = store.set_talkdown_core_cloud_allowed(allowed).await {
+            warn!(error = %e, "heartbeat_ack: could not store the talk-down allowance");
+        }
+    }
+}
+
 /// #759 — apply a `clip_replicated_ack` to the clip whose
 /// `clip_replicated` it answers (`in_reply_to`), ending the cold
 /// replicator's re-announce loop for it. `permanent_failure` records
@@ -1056,6 +1070,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                     // stays healthy across a half-open connection.
                     liveness.mark_ack();
                     outbox.update_caps(ack.cloud_capabilities.as_deref());
+                    record_talkdown_allowance(store, ack).await;
                     debug!(
                         core_id = %core_id,
                         cap_count = ack.cloud_capabilities.as_ref().map_or(0, Vec::len),
@@ -1247,9 +1262,30 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// Opus decode → PCMU/PCMA → the camera's RTSP backchannel, whose URL and codec
 /// [`nexus_types::CameraTalkDown`] already discovers), gated on the camera
 /// actually having one.
-fn heartbeat_caps(hd_transport: Option<nexus_types::HdTransport>) -> Vec<String> {
-    let mut caps = vec!["live_view".to_string(), "actor_perm_v1".to_string()];
+///
+/// `talkdown_stored` says this engine plays talk-down audio from its own
+/// library by `audio_uid` and syncs that library through the
+/// `talkdown_audio` fleet category (cloud D13: no fetch-by-URL mode).
+/// `talkdown_hw_volume` is advertised once any speaker's own level is set over
+/// ONVIF (`hw_volume`), so the cloud only offers a device volume where one works.
+/// `talkdown_tts` says startup found the text-to-speech helper and a voice.
+/// `talkdown_rules` says this engine plays a rule's talk-down audio
+/// automatically (ADR-095) and reads `HeartbeatAckPayload.talkdown_auto_allowed`;
+/// the cloud sends that field only to cores advertising it.
+pub(crate) fn heartbeat_caps(
+    hd_transport: Option<nexus_types::HdTransport>,
+    talkdown_hw_volume: bool,
+    talkdown_tts: bool,
+) -> Vec<String> {
+    let mut caps = vec![
+        "live_view".to_string(),
+        "actor_perm_v1".to_string(),
+        "talkdown_stored".to_string(),
+        "talkdown_rules".to_string(),
+    ];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
+    caps.extend(talkdown_hw_volume.then(|| "talkdown_hw_volume".to_string()));
+    caps.extend(talkdown_tts.then(|| "talkdown_tts".to_string()));
     caps
 }
 
@@ -1283,6 +1319,8 @@ async fn pump_heartbeats<H: TunnelHandle>(
         // each tick so a cloud fleet flip is reflected in the advertised caps
         // within one heartbeat, no restart.
         let hd_transport = crate::admin_runtime::read_hd_transport(&store).await;
+        // A failed read advertises nothing: a cap is a claim, not a guess.
+        let talkdown_hw_volume = store.any_hw_volume().await.unwrap_or(false);
         // Phase 9 (M_OTA) — report the OTA status block so the
         // orchestrator can drive its rollout state machine + reconcile
         // committed versions. `recording_active` is best-effort false
@@ -1334,6 +1372,8 @@ async fn pump_heartbeats<H: TunnelHandle>(
                 name,
                 caps: Some(heartbeat_caps(
                     webrtc.can_publish(hd_transport).then_some(hd_transport),
+                    talkdown_hw_volume,
+                    crate::talkdown::tts::AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
                 )),
                 online_cameras,
                 queued_alerts,
@@ -2111,6 +2151,10 @@ pub struct EngineHealth {
     unreadable_cameras: Arc<parking_lot::Mutex<Vec<nexus_types::CameraId>>>,
     /// What the store reads [`recorder_issue`] makes have returned.
     last_read: parking_lot::Mutex<LastRead>,
+    /// The talk-down speakers' probe results, which `talkdown::health::run` fills.
+    speaker_health: crate::talkdown::health::SpeakerHealthMap,
+    /// What the rule responder did, which `talkdown::responder::run` fills.
+    talkdown_activity: crate::talkdown::responder::Activity,
 }
 
 /// [`recorder_issue`]'s memory of its store reads.
@@ -2139,6 +2183,8 @@ impl EngineHealth {
             supervisors: reconciler.handles.clone(),
             unreadable_cameras: reconciler.unreadable_cameras.clone(),
             last_read: parking_lot::Mutex::default(),
+            speaker_health: Default::default(),
+            talkdown_activity: Default::default(),
         }
     }
 
@@ -2161,14 +2207,62 @@ impl EngineHealth {
             supervisors,
             unreadable_cameras: Arc::default(),
             last_read: parking_lot::Mutex::default(),
+            speaker_health: Default::default(),
+            talkdown_activity: Default::default(),
         }
+    }
+
+    /// The map the speaker prober fills and this roll-up reads.
+    pub(crate) fn speaker_health(&self) -> crate::talkdown::health::SpeakerHealthMap {
+        self.speaker_health.clone()
+    }
+
+    /// What the rule responder records and this roll-up and the talk-down
+    /// status read.
+    pub(crate) fn talkdown_activity(&self) -> crate::talkdown::responder::Activity {
+        self.talkdown_activity.clone()
+    }
+
+    /// `(uid, name)` of each library item whose download or render failed;
+    /// none when the store does not answer within [`HEALTH_STORE_READ_TIMEOUT`].
+    async fn failed_audio(&self) -> Vec<(String, String)> {
+        tokio::time::timeout(HEALTH_STORE_READ_TIMEOUT, self.store.list_talkdown_audio())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.status == nexus_store::AudioStatus::Failed)
+            .map(|a| (a.uid, a.name))
+            .collect()
+    }
+
+    /// `(id, name)` of each speaker whose last probe got no answer.
+    async fn offline_speakers(&self) -> Vec<(nexus_config::SpeakerId, String)> {
+        let ids = self.speaker_health.offline();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let known = self.store.list_speakers().await.unwrap_or_default();
+        ids.into_iter()
+            .map(|id| {
+                let name = known
+                    .iter()
+                    .find(|sp| sp.id == id)
+                    .map(|sp| sp.name.clone());
+                (id, name.unwrap_or_else(|| "unnamed".into()))
+            })
+            .collect()
     }
 
     /// The current roll-up. Recomputed on every call, so a repaired
     /// condition clears on the next heartbeat or probe.
     pub(crate) async fn rollup(&self) -> EdgeHealth {
-        let recorder = recorder_issue(self).await;
+        // Side by side, so a stalled store costs one read timeout, not two.
+        let (recorder, failed_audio) = tokio::join!(recorder_issue(self), self.failed_audio());
         let unreadable = self.unreadable_cameras.lock().clone();
+        let offline_speakers = self.offline_speakers().await;
+        let failing_rules = self.talkdown_activity.failing(chrono::Utc::now());
         edge_health(
             &self.live_view.stalled_cameras(),
             crate::system_metrics::snapshot().decode_capacity.as_ref(),
@@ -2176,6 +2270,9 @@ impl EngineHealth {
                 .into_iter()
                 .chain(exited_supervisors_issue(&self.exited_supervisors()))
                 .chain(unreadable_cameras_issue(&unreadable))
+                .chain(speaker_offline_issue(&offline_speakers))
+                .chain(talkdown_rule_failing_issue(&failing_rules))
+                .chain(talkdown_audio_failed_issue(&failed_audio))
                 .chain(recording_issues(self.recorder.recording_degradations())),
         )
     }
@@ -2222,6 +2319,71 @@ fn exited_supervisors_issue(exited: &[nexus_types::CameraId]) -> Option<EdgeDegr
              on them is detected, alerted on or saved as a motion clip until it is restarted: \
              {ids}",
             exited.len(),
+        )),
+    })
+}
+
+/// The rules whose last talk-down attempt in 24 h failed for a reason an
+/// admin must fix (no speaker, missing audio, an unreachable speaker), as
+/// one issue (`talkdown`/`talkdown_rule_failing`).
+fn talkdown_rule_failing_issue(failing: &[(String, String)]) -> Option<EdgeDegradation> {
+    if failing.is_empty() {
+        return None;
+    }
+    let list = failing
+        .iter()
+        .map(|(rule, reason)| format!("{rule} ({reason})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(EdgeDegradation {
+        component: "talkdown".to_string(),
+        code: "talkdown_rule_failing".to_string(),
+        detail: truncate_detail(&format!(
+            "{} rule(s) could not play their talk-down audio on their last attempt in 24 h: {list}",
+            failing.len(),
+        )),
+    })
+}
+
+/// The library items whose download or render failed, as one issue
+/// (`talkdown`/`talkdown_audio_failed`); a re-push retries them.
+fn talkdown_audio_failed_issue(failed: &[(String, String)]) -> Option<EdgeDegradation> {
+    if failed.is_empty() {
+        return None;
+    }
+    let list = failed
+        .iter()
+        .map(|(uid, name)| format!("{name} ({uid})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(EdgeDegradation {
+        component: "talkdown".to_string(),
+        code: "talkdown_audio_failed".to_string(),
+        detail: truncate_detail(&format!(
+            "{} talk-down audio item(s) failed to download or render and cannot play: {list}",
+            failed.len(),
+        )),
+    })
+}
+
+/// The talk-down speakers that did not answer their last probe, as one issue
+/// (`talkdown`/`speaker_offline`; none when every speaker answers).
+fn speaker_offline_issue(offline: &[(nexus_config::SpeakerId, String)]) -> Option<EdgeDegradation> {
+    if offline.is_empty() {
+        return None;
+    }
+    let list = offline
+        .iter()
+        .map(|(id, name)| format!("{name} (#{id})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(EdgeDegradation {
+        component: "talkdown".to_string(),
+        code: "speaker_offline".to_string(),
+        detail: truncate_detail(&format!(
+            "{} talk-down speaker(s) did not answer the last SIP probe, so talk-down on them \
+             will fail until they are back: {list}",
+            offline.len(),
         )),
     })
 }
@@ -2604,13 +2766,13 @@ mod health_tests {
     #[test]
     fn no_transport_advertises_talk_down() {
         for t in nexus_types::HdTransport::all() {
-            let caps = heartbeat_caps(Some(t));
+            let caps = heartbeat_caps(Some(t), false, false);
             assert!(
                 caps.contains(&"live_view".to_string()),
                 "{t} must still advertise the LBR pump: {caps:?}"
             );
             assert!(
-                !caps.iter().any(|c| c.contains("talkdown")),
+                !caps.iter().any(|c| c == "talkdown_webrtc"),
                 "{t} advertised talk-down with no sub-pipeline behind it: {caps:?}"
             );
         }
@@ -2620,13 +2782,43 @@ mod health_tests {
     /// that cannot advertises none (BUG-225).
     #[test]
     fn the_hd_transport_is_advertised_only_when_the_bridge_can_publish() {
-        assert_eq!(heartbeat_caps(None), ["live_view", "actor_perm_v1"]);
+        assert_eq!(
+            heartbeat_caps(None, false, false),
+            [
+                "live_view",
+                "actor_perm_v1",
+                "talkdown_stored",
+                "talkdown_rules"
+            ]
+        );
         for t in nexus_types::HdTransport::all() {
             assert_eq!(
-                heartbeat_caps(Some(t)),
-                ["live_view", "actor_perm_v1", t.cap_tag()]
+                heartbeat_caps(Some(t), false, false),
+                [
+                    "live_view",
+                    "actor_perm_v1",
+                    "talkdown_stored",
+                    "talkdown_rules",
+                    t.cap_tag()
+                ]
             );
         }
+    }
+
+    /// `talkdown_tts` only when startup found the helper and a voice.
+    #[test]
+    fn talkdown_tts_is_advertised_only_when_available() {
+        assert!(!heartbeat_caps(None, false, false).contains(&"talkdown_tts".to_string()));
+        assert_eq!(
+            heartbeat_caps(None, false, true),
+            [
+                "live_view",
+                "actor_perm_v1",
+                "talkdown_stored",
+                "talkdown_rules",
+                "talkdown_tts"
+            ]
+        );
     }
 
     #[test]
@@ -4200,6 +4392,207 @@ mod heartbeat_ack_tests {
         }
     }
 
+    /// The first heartbeat's `caps` and talk-down issues, for a store holding
+    /// `speakers` (name, hw_volume) whose health map marks `offline` offline.
+    async fn heartbeat_with_speakers(
+        speakers: &[(&str, bool)],
+        offline: &[usize],
+    ) -> (Vec<String>, Vec<EdgeDegradation>) {
+        let (store, dir) = test_store().await;
+        let mut ids = Vec::new();
+        for (name, hw) in speakers {
+            let mut sp: nexus_config::SpeakerConfig =
+                serde_json::from_value(serde_json::json!({ "name": name, "host": "192.0.2.10" }))
+                    .unwrap();
+            let mut tx = store.begin_tx().await.unwrap();
+            store.create_speaker_tx(&mut tx, &mut sp).await.unwrap();
+            Store::commit_tx(tx).await.unwrap();
+            let mut out = store.speaker_output(sp.id).await.unwrap();
+            out.hw_volume = *hw;
+            let mut tx = store.begin_tx().await.unwrap();
+            store
+                .set_speaker_output_tx(&mut tx, sp.id, &out)
+                .await
+                .unwrap();
+            Store::commit_tx(tx).await.unwrap();
+            ids.push(sp.id);
+        }
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+            crate::reconciler::HandleMap::default(),
+        );
+        for &i in offline {
+            health.speaker_health().mark_offline_for_test(ids[i]);
+        }
+        let tunnel = FirstEnvelopeTunnel::default();
+        pump_heartbeats(
+            &tunnel,
+            "core-1",
+            store,
+            &TunnelLiveness::new(),
+            &FrameStatsRegistry::new(),
+            &health,
+            &crate::webrtc_bridge::WebRtcBridge::disabled(),
+        )
+        .await;
+        let sent = tunnel.sent.lock();
+        match &sent[0].body {
+            EnvelopeBody::Heartbeat(h) => (
+                h.caps.clone().expect("caps"),
+                h.health
+                    .as_ref()
+                    .and_then(|h| h.issues.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|i| i.component == "talkdown")
+                    .collect(),
+            ),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+    }
+
+    /// ADR-095: a failed library item and a rule whose last attempt failed
+    /// for a reason an admin must fix each surface as one `talkdown` issue.
+    #[tokio::test]
+    async fn failed_talkdown_audio_and_failing_rules_are_heartbeat_issues() {
+        let (store, dir) = test_store().await;
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+            crate::reconciler::HandleMap::default(),
+        );
+        let talkdown = |h: EdgeHealth| -> Vec<EdgeDegradation> {
+            h.issues
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| i.component == "talkdown")
+                .collect()
+        };
+        assert!(talkdown(health.rollup().await).is_empty());
+        store
+            .upsert_talkdown_pending(&nexus_store::NewAudio {
+                uid: "u-dock".into(),
+                name: "Dock warning".into(),
+                description: None,
+                kind: nexus_store::AudioKind::Clip,
+                tts_text: None,
+                tts_voice: None,
+                version_token: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_talkdown_failed("u-dock", "download failed")
+            .await
+            .unwrap();
+        let activity = health.talkdown_activity();
+        activity.failed_for_test("r-yard", "audio_missing");
+        activity.failed_for_test("r-busy", "busy");
+        let issues = talkdown(health.rollup().await);
+        let codes: Vec<_> = issues.iter().map(|i| i.code.as_str()).collect();
+        assert_eq!(codes, ["talkdown_rule_failing", "talkdown_audio_failed"]);
+        assert!(
+            issues[0].detail.contains("r-yard (audio_missing)"),
+            "{}",
+            issues[0].detail
+        );
+        assert!(
+            !issues[0].detail.contains("r-busy"),
+            "a busy speaker is not a fault"
+        );
+        assert!(
+            issues[1].detail.contains("Dock warning"),
+            "{}",
+            issues[1].detail
+        );
+    }
+
+    /// ADR-095: the ack's allowance is stored and survives a restart; an ack
+    /// without it changes nothing.
+    #[tokio::test]
+    async fn the_heartbeat_ack_allowance_is_stored_kept_when_omitted_and_survives_a_restart() {
+        let ack = |allowed| nexus_cloud_protocol::v1::HeartbeatAckPayload {
+            talkdown_auto_allowed: allowed,
+            ..serde_json::from_value(serde_json::json!({ "server_ts": "2026-11-07T00:00:00Z" }))
+                .unwrap()
+        };
+        let (store, dir) = test_store().await;
+        let allowed = |s: Arc<Store>| async move { s.talkdown_core().await.unwrap().cloud_allowed };
+        assert!(
+            !allowed(store.clone()).await,
+            "never heard true: disallowed"
+        );
+        record_talkdown_allowance(&store, &ack(Some(true))).await;
+        assert!(allowed(store.clone()).await);
+        record_talkdown_allowance(&store, &ack(None)).await;
+        assert!(allowed(store.clone()).await, "omitted keeps the last value");
+        record_talkdown_allowance(&store, &ack(Some(false))).await;
+        drop(store);
+        let reopened = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!(
+                    "sqlite://{}?mode=rwc",
+                    dir.path().join("nexus.db").display()
+                ),
+                ..StoreConfig::default()
+            })
+            .await
+            .unwrap(),
+        );
+        assert!(!allowed(reopened).await, "false survives a restart");
+    }
+
+    /// `talkdown_hw_volume` only once a speaker has `hw_volume = 1`.
+    #[tokio::test]
+    async fn the_heartbeat_advertises_hw_volume_only_once_a_speaker_has_it() {
+        let (caps, _) = heartbeat_with_speakers(&[], &[]).await;
+        assert!(
+            !caps.contains(&"talkdown_hw_volume".to_string()),
+            "{caps:?}"
+        );
+        let (caps, _) = heartbeat_with_speakers(&[("a", false), ("b", false)], &[]).await;
+        assert!(
+            !caps.contains(&"talkdown_hw_volume".to_string()),
+            "{caps:?}"
+        );
+        let (caps, _) = heartbeat_with_speakers(&[("a", false), ("b", true)], &[]).await;
+        assert!(caps.contains(&"talkdown_hw_volume".to_string()), "{caps:?}");
+    }
+
+    /// One `talkdown/speaker_offline` issue names every offline speaker, and
+    /// there is none while they all answer.
+    #[tokio::test]
+    async fn the_heartbeat_carries_one_speaker_offline_issue_naming_every_offline_speaker() {
+        let (_, issues) =
+            heartbeat_with_speakers(&[("lobby", false), ("dock", false), ("yard", false)], &[])
+                .await;
+        assert!(issues.is_empty(), "{issues:?}");
+        let (_, issues) = heartbeat_with_speakers(
+            &[("lobby", false), ("dock", false), ("yard", false)],
+            &[0, 2],
+        )
+        .await;
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].code, "speaker_offline");
+        let detail = &issues[0].detail;
+        assert!(
+            detail.contains("lobby") && detail.contains("yard"),
+            "{detail}"
+        );
+        assert!(!detail.contains("dock"), "{detail}");
+    }
+
     /// BUG-225: a stub recorder's WebRTC bridge is disabled, as is every
     /// bridge on a build without `gstreamer-webrtc`, and a disabled bridge
     /// drops every HD start. The heartbeat must not offer HD from it.
@@ -4209,7 +4602,12 @@ mod heartbeat_ack_tests {
         for t in nexus_types::HdTransport::all() {
             assert_eq!(
                 first_heartbeat_caps(&bridge, t).await,
-                ["live_view", "actor_perm_v1"],
+                [
+                    "live_view",
+                    "actor_perm_v1",
+                    "talkdown_stored",
+                    "talkdown_rules"
+                ],
                 "{t}"
             );
         }
@@ -4225,7 +4623,13 @@ mod heartbeat_ack_tests {
         )));
         assert_eq!(
             first_heartbeat_caps(&bridge, nexus_types::HdTransport::Sfu).await,
-            ["live_view", "actor_perm_v1", "hd_sfu"]
+            [
+                "live_view",
+                "actor_perm_v1",
+                "talkdown_stored",
+                "talkdown_rules",
+                "hd_sfu"
+            ]
         );
     }
 
@@ -4239,9 +4643,20 @@ mod heartbeat_ack_tests {
             std::collections::HashMap::new(),
         )));
         let expected: &[&str] = if nexus_pipeline::MoqSession::plugin_available() {
-            &["live_view", "actor_perm_v1", "hd_moq"]
+            &[
+                "live_view",
+                "actor_perm_v1",
+                "talkdown_stored",
+                "talkdown_rules",
+                "hd_moq",
+            ]
         } else {
-            &["live_view", "actor_perm_v1"]
+            &[
+                "live_view",
+                "actor_perm_v1",
+                "talkdown_stored",
+                "talkdown_rules",
+            ]
         };
         assert_eq!(
             first_heartbeat_caps(&bridge, nexus_types::HdTransport::Moq).await,
@@ -4464,6 +4879,7 @@ mod heartbeat_ack_tests {
                 cert_rotate: None,
                 cloud_capabilities: None,
                 server_ts: chrono::Utc::now().to_rfc3339(),
+                talkdown_auto_allowed: None,
             }),
         })
         .await

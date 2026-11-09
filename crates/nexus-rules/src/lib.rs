@@ -354,6 +354,14 @@ impl RuleEvaluator {
             .map(|r| r.config.sinks.clone())
     }
 
+    /// ADR-095 — the rule's talk-down action and its `verify` flag from the live
+    /// rule set; `None` when the rule is unknown or has no `talk_down`.
+    pub fn talk_down_for(&self, rule_id: &str) -> Option<(nexus_config::RuleTalkDown, bool)> {
+        let rules = self.rules.load();
+        let c = &rules.iter().find(|r| r.config.id == rule_id)?.config;
+        Some((c.talk_down.clone()?, c.verify))
+    }
+
     /// Evaluate every rule against every tracked object on a frame.
     /// Returns the events that should be persisted + published.
     ///
@@ -724,6 +732,7 @@ mod tests {
             enabled: true,
             sinks: Vec::new(),
             verify: false,
+            talk_down: None,
         };
         let eng = CelEngine::new();
         let compiled = eng.compile(&cfg).unwrap();
@@ -754,6 +763,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn talk_down_for_returns_action_and_verify() {
+        let mut with = rule_with_zones(None);
+        with.verify = true;
+        with.talk_down = Some(
+            serde_json::from_value(serde_json::json!({
+                "steps": [{ "audio_uid": "0190f3a2-7b1c-7e0a-9c55-3f2a1b4c5d6e" }]
+            }))
+            .unwrap(),
+        );
+        let without = RuleConfig {
+            id: "plain".into(),
+            talk_down: None,
+            ..rule_with_zones(None)
+        };
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[with.clone(), without]).unwrap();
+        assert_eq!(
+            ev.talk_down_for("zone_gated"),
+            Some((with.talk_down.unwrap(), true))
+        );
+        assert_eq!(ev.talk_down_for("plain"), None);
+        assert_eq!(ev.talk_down_for("missing"), None);
+    }
+
     fn rule_with_zones(zones: Option<Vec<String>>) -> RuleConfig {
         RuleConfig {
             id: "zone_gated".into(),
@@ -774,6 +807,7 @@ mod tests {
             enabled: true,
             sinks: Vec::new(),
             verify: false,
+            talk_down: None,
         }
     }
 

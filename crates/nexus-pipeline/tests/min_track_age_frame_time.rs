@@ -70,6 +70,7 @@ fn evaluator() -> RuleEvaluator {
         enabled: true,
         sinks: Vec::new(),
         verify: false,
+        talk_down: None,
     };
     RuleEvaluator::new(&RulesConfig::default(), &[rule]).unwrap()
 }

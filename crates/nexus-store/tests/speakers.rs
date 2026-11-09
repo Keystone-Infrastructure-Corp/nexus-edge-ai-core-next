@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use nexus_config::{CameraConfig, SpeakerConfig, SpeakerDriver, SpeakerId, StoreConfig};
-use nexus_store::{Store, StoreError};
+use nexus_store::{SpeakerOutput, Store, StoreError};
 use nexus_types::CameraId;
 use tempfile::TempDir;
 
@@ -199,4 +199,121 @@ async fn a_camera_has_at_most_one_speaker() {
             "camera {camera} speaker {speaker:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_speakers_output_defaults_to_todays_behaviour_and_round_trips() {
+    let (store, _dir) = fresh_store().await;
+    let a = create(&store, "a").await;
+    let b = create(&store, "b").await;
+    let default = SpeakerOutput {
+        volume: 100,
+        boost: false,
+        hw_volume: false,
+        auto_max_per_hour: 6,
+    };
+    assert_eq!(store.speaker_output(a.id).await.unwrap(), default);
+    assert!(!store.any_hw_volume().await.unwrap());
+
+    let out = SpeakerOutput {
+        volume: 35,
+        boost: true,
+        hw_volume: true,
+        auto_max_per_hour: 12,
+    };
+    let mut tx = store.begin_tx().await.unwrap();
+    store
+        .set_speaker_output_tx(&mut tx, a.id, &out)
+        .await
+        .unwrap();
+    Store::commit_tx(tx).await.unwrap();
+    assert_eq!(store.speaker_output(a.id).await.unwrap(), out);
+    assert_eq!(store.speaker_output(b.id).await.unwrap(), default, "only a");
+    assert!(store.any_hw_volume().await.unwrap(), "a has hw_volume");
+
+    // An output change is not a speaker edit: the stored config is untouched.
+    assert_eq!(store.get_speaker(a.id).await.unwrap(), Some(a.clone()));
+
+    // The schema bounds the hourly cap and the volume; an unknown id is reported.
+    for bad in [
+        SpeakerOutput { volume: 101, ..out },
+        SpeakerOutput {
+            auto_max_per_hour: 0,
+            ..out
+        },
+        SpeakerOutput {
+            auto_max_per_hour: 61,
+            ..out
+        },
+    ] {
+        let mut tx = store.begin_tx().await.unwrap();
+        assert!(store
+            .set_speaker_output_tx(&mut tx, a.id, &bad)
+            .await
+            .is_err());
+    }
+    let mut tx = store.begin_tx().await.unwrap();
+    assert!(matches!(
+        store.set_speaker_output_tx(&mut tx, 999, &out).await,
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        store.speaker_output(999).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+/// A device level only holds for the endpoint that set it: changing or
+/// clearing `onvif_endpoint` drops `hw_volume`, so software volume applies
+/// again until the next output write reaches the new device.
+#[tokio::test]
+async fn changing_the_onvif_endpoint_drops_hw_volume() {
+    let (store, _dir) = fresh_store().await;
+    let mut sp = create(&store, "a").await;
+    let update = |sp: SpeakerConfig| {
+        let store = &store;
+        async move {
+            let mut tx = store.begin_tx().await.unwrap();
+            store.update_speaker_tx(&mut tx, &sp).await.unwrap();
+            Store::commit_tx(tx).await.unwrap();
+        }
+    };
+    let hw_on = |store: &Store, id| {
+        let store = store.clone();
+        async move {
+            let mut out = store.speaker_output(id).await.unwrap();
+            out.hw_volume = true;
+            let mut tx = store.begin_tx().await.unwrap();
+            store
+                .set_speaker_output_tx(&mut tx, id, &out)
+                .await
+                .unwrap();
+            Store::commit_tx(tx).await.unwrap();
+        }
+    };
+
+    sp.onvif_endpoint = Some("http://192.0.2.10/onvif/media".into());
+    update(sp.clone()).await;
+    hw_on(&store, sp.id).await;
+    sp.name = "renamed".into();
+    update(sp.clone()).await;
+    assert!(
+        store.speaker_output(sp.id).await.unwrap().hw_volume,
+        "same endpoint keeps it"
+    );
+
+    sp.onvif_endpoint = Some("http://192.0.2.10/onvif/media2".into());
+    update(sp.clone()).await;
+    assert!(
+        !store.speaker_output(sp.id).await.unwrap().hw_volume,
+        "a new endpoint drops it"
+    );
+
+    hw_on(&store, sp.id).await;
+    sp.onvif_endpoint = None;
+    update(sp.clone()).await;
+    assert!(
+        !store.speaker_output(sp.id).await.unwrap().hw_volume,
+        "clearing drops it"
+    );
 }

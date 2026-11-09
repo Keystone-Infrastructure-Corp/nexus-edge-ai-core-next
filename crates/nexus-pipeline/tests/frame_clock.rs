@@ -248,6 +248,7 @@ fn person_rule(min_track_age_ms: u64, cooldown_ms: u64) -> RuleConfig {
         enabled: true,
         sinks: Vec::new(),
         verify: false,
+        talk_down: None,
     }
 }
 
