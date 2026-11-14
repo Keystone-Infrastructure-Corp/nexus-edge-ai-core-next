@@ -442,13 +442,27 @@ pub async fn admin_auth_layer(
     if let Some(key) = &state.key {
         let token = extract_bearer(&req).ok_or(AdminAuthError::Missing)?;
         let claims = verify_token(token, key)?;
-        tracing::info!(
-            sub = claims.sub.as_deref().unwrap_or("<none>"),
-            exp = claims.exp,
-            path = %req.uri().path(),
-            method = %req.method(),
-            "admin write authorised by HS256 bearer"
-        );
+        // Reads poll constantly from the console; keep them out of INFO.
+        if matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ) {
+            tracing::debug!(
+                sub = claims.sub.as_deref().unwrap_or("<none>"),
+                exp = claims.exp,
+                path = %req.uri().path(),
+                method = %req.method(),
+                "admin read authorised by HS256 bearer"
+            );
+        } else {
+            tracing::info!(
+                sub = claims.sub.as_deref().unwrap_or("<none>"),
+                exp = claims.exp,
+                path = %req.uri().path(),
+                method = %req.method(),
+                "admin write authorised by HS256 bearer"
+            );
+        }
         let ctx = SessionContext {
             user_id: 0,
             role: Role::Admin,
