@@ -406,7 +406,8 @@ jobs:
               echo "::error::models-manifest.json lists text-to-speech voices but $PACK_TAG has no 'tts.tar' asset (see the pack-bump steps above)."
               exit 1
             fi
-            tar -xf models/tts.tar -C models
+            # A pack built on macOS carries AppleDouble `._*` files (BUG-337).
+            tar --exclude='._*' --exclude='.DS_Store' --exclude='__MACOSX' -xf models/tts.tar -C models
             rm models/tts.tar
             (cd models && sha256sum --strict -c - <<< "$tts_sums")
           fi
@@ -841,7 +842,9 @@ jobs:
           # release dir from the VERSION file, so the top-level name is moot.
           topdir="${TAG#v}"
           mv stage "$topdir"
-          tar -czf "${name}.tar.gz" "$topdir"
+          # Root-owned entries so no extractor depends on --no-same-owner;
+          # the runner's uid 1001 is nexus-remote on a box (BUG-337).
+          tar --owner=0 --group=0 --numeric-owner -czf "${name}.tar.gz" "$topdir"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
           ls -lh "${name}.tar.gz" "${name}.tar.gz.sha256"
           # Hoist the in-tarball MANIFEST.json.sig (if signing ran)
@@ -854,6 +857,23 @@ jobs:
             echo "have_sig=0" >> "$GITHUB_OUTPUT"
           fi
           echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: verify tarball owners and metadata
+        env:
+          NAME: ${{ steps.pack.outputs.name }}
+        run: |
+          set -euo pipefail
+          # BUG-337: a non-root entry lands owned by a box account; a `._*`
+          # AppleDouble file ships as junk next to real model files.
+          not_root=$(tar --numeric-owner -tvzf "${NAME}.tar.gz" | awk '$2 != "0/0" && n++ < 20')
+          if [[ -n "$not_root" ]]; then
+            echo "::error::release tarball has entries not owned by 0/0:"; echo "$not_root"; exit 1
+          fi
+          mac_meta=$(tar -tzf "${NAME}.tar.gz" | grep -m 20 -E '(^|/)(\._[^/]*|\.DS_Store|__MACOSX)(/|$)' || true)
+          if [[ -n "$mac_meta" ]]; then
+            echo "::error::release tarball carries macOS metadata:"; echo "$mac_meta"; exit 1
+          fi
+          echo "tarball entries are all 0/0 and free of macOS metadata"
 
       - name: attach assets to release
         env:
