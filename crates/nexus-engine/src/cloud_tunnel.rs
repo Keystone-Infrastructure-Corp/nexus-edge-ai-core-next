@@ -1289,6 +1289,20 @@ pub(crate) fn heartbeat_caps(
     caps
 }
 
+/// Seconds since this engine process started. Must survive tunnel reconnects:
+/// the cloud reads any decrease in `uptime_s` as a core restart (BUG-338).
+fn process_uptime_secs() -> u64 {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(std::process::id());
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new(),
+    );
+    sys.process(pid).map_or(0, |p| p.run_time())
+}
+
 async fn pump_heartbeats<H: TunnelHandle>(
     handle: &H,
     _core_id: &str,
@@ -1303,7 +1317,6 @@ async fn pump_heartbeats<H: TunnelHandle>(
     liveness.mark_authenticated();
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let start = std::time::Instant::now();
     let mut seq: u64 = 0;
     loop {
         interval.tick().await;
@@ -1385,7 +1398,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
                 // device manifest) is a follow-up; the cloud treats the
                 // omitted field as "unknown" until then.
                 capability_profile: None,
-                uptime_s: start.elapsed().as_secs(),
+                uptime_s: process_uptime_secs(),
                 // See `build.rs` — release-tag at CI build-time, falls
                 // back to `CARGO_PKG_VERSION` for local dev builds.
                 version: env!("NEXUS_BUILD_VERSION").to_string(),
@@ -4388,6 +4401,43 @@ mod heartbeat_ack_tests {
         let sent = tunnel.sent.lock();
         match &sent[0].body {
             EnvelopeBody::Heartbeat(h) => h.caps.clone().expect("the heartbeat carries caps"),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+    }
+
+    /// BUG-338: `uptime_s` is time since the engine process started, not since
+    /// this tunnel session's handshake. The cloud reads any decrease as a
+    /// restart, so a per-session clock raises "Core restarted unexpectedly" on
+    /// every reconnect. A session that has just begun in a process that is
+    /// already over six seconds old must not report 0.
+    #[tokio::test]
+    async fn heartbeat_uptime_is_process_uptime_not_session_uptime() {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let (store, dir) = test_store().await;
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+            crate::reconciler::HandleMap::default(),
+        );
+        let tunnel = FirstEnvelopeTunnel::default();
+        pump_heartbeats(
+            &tunnel,
+            "core-1",
+            store,
+            &TunnelLiveness::new(),
+            &FrameStatsRegistry::new(),
+            &health,
+            &crate::webrtc_bridge::WebRtcBridge::disabled(),
+        )
+        .await;
+        let sent = tunnel.sent.lock();
+        match &sent[0].body {
+            EnvelopeBody::Heartbeat(h) => assert!(h.uptime_s >= 6, "uptime_s = {}", h.uptime_s),
             other => panic!("expected a heartbeat, got {other:?}"),
         }
     }
