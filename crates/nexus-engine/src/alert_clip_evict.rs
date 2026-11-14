@@ -179,7 +179,7 @@ mod tests {
     use super::*;
     use crate::retention::tests::fixture;
 
-    /// BUG-343: a build interrupted by an engine restart stayed
+    /// BUG-344: a build interrupted by an engine restart stayed
     /// `building` forever.
     #[tokio::test]
     async fn interrupted_building_clip_is_failed_and_its_files_removed() {

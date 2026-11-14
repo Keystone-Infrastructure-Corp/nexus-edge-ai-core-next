@@ -1290,7 +1290,7 @@ pub(crate) fn heartbeat_caps(
 }
 
 /// Seconds since this engine process started. Must survive tunnel reconnects:
-/// the cloud reads any decrease in `uptime_s` as a core restart (BUG-338).
+/// the cloud reads any decrease in `uptime_s` as a core restart (BUG-339).
 fn process_uptime_secs() -> u64 {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let pid = Pid::from_u32(std::process::id());
@@ -1303,7 +1303,7 @@ fn process_uptime_secs() -> u64 {
     sys.process(pid).map_or(0, |p| p.run_time())
 }
 
-/// The probed capability profile, reported in every heartbeat (BUG-339).
+/// The probed capability profile, reported in every heartbeat (BUG-340).
 static CAPABILITY_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Record the probed profile once at engine start; later calls are ignored.
@@ -1400,7 +1400,7 @@ async fn pump_heartbeats<H: TunnelHandle>(
                 queued_alerts,
                 release,
                 health,
-                // Probed once at engine start (BUG-339); `None` only until
+                // Probed once at engine start (BUG-340); `None` only until
                 // that probe finishes, which the cloud reads as "unknown".
                 capability_profile: CAPABILITY_PROFILE.get().cloned(),
                 uptime_s: process_uptime_secs(),
@@ -4410,7 +4410,7 @@ mod heartbeat_ack_tests {
         }
     }
 
-    /// BUG-338: `uptime_s` is time since the engine process started, not since
+    /// BUG-339: `uptime_s` is time since the engine process started, not since
     /// this tunnel session's handshake. The cloud reads any decrease as a
     /// restart, so a per-session clock raises "Core restarted unexpectedly" on
     /// every reconnect. A session that has just begun in a process that is
@@ -4447,7 +4447,7 @@ mod heartbeat_ack_tests {
         }
     }
 
-    /// BUG-339: the heartbeat reported `capability_profile: None`, so the
+    /// BUG-340: the heartbeat reported `capability_profile: None`, so the
     /// console showed "profile: unknown" for every core.
     #[tokio::test]
     async fn heartbeat_carries_the_probed_capability_profile() {

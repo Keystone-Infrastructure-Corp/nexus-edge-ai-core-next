@@ -145,7 +145,7 @@ fn spawn_with_tick(
         let mut dirty = true;
         let mut last: Option<CategoryHashes> = None;
         // The gateway reconciles a reconnected core only against hashes sent
-        // on the new session (BUG-336), so every reconnect owes a report.
+        // on the new session (BUG-337), so every reconnect owes a report.
         // `connects()`, not `is_connected()`, so a fast drop is not missed.
         let mut seen_connects = outbox.connects();
 
@@ -230,7 +230,7 @@ mod tests {
         }
     }
 
-    /// BUG-336 follow-up: the gateway reconciles a core only against hashes
+    /// BUG-337 follow-up: the gateway reconciles a core only against hashes
     /// sent on the new session, so a reconnect with no engine restart and no
     /// config edit must still publish `core_state_hashes`.
     #[tokio::test]

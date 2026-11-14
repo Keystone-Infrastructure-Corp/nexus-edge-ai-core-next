@@ -365,7 +365,7 @@ do_apply() {
     # <version>, so (no --strip-components) the tree lands at
     # releases/<version>/. --no-same-owner: as root, tar would otherwise
     # restore the archive's uid, which older tarballs carry as the CI
-    # runner's 1001 = nexus-remote on a box (BUG-337).
+    # runner's 1001 = nexus-remote on a box (BUG-338).
     if ! tar --no-same-owner -xzf "$staged_tarball" -C "$releases_dir"; then
         die "tar extract failed: $staged_tarball -> $releases_dir"
     fi

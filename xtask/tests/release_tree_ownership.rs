@@ -1,4 +1,4 @@
-//! Release trees must end root-owned and free of macOS metadata (BUG-337).
+//! Release trees must end root-owned and free of macOS metadata (BUG-338).
 //!
 //! GNU tar run as root restores the archive's owners, and CI packs as the
 //! runner's uid 1001, which on an appliance is `nexus-remote` — the support
