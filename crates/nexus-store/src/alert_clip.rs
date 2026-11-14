@@ -221,6 +221,18 @@ impl Store {
         Ok(())
     }
 
+    /// `(id, path)` of every row still `building`. At engine start these
+    /// belong to a previous process, whose build died with it.
+    pub async fn building_alert_clips(&self) -> Result<Vec<(AlertClipId, String)>, StoreError> {
+        let rows = sqlx::query("SELECT id, path FROM alert_clips WHERE state = 'building'")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<i64, _>(0), r.get::<String, _>(1)))
+            .collect())
+    }
+
     /// Mark a `building` alert clip `failed` (build/encode error). The
     /// dispatcher then delivers the alarm clip-less once the build
     /// timeout elapses.

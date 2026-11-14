@@ -806,6 +806,8 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     if let Err(e) = tokio::fs::create_dir_all(&clips_dir).await {
         warn!(path = %clips_dir.display(), error = %e, "could not pre-create clips_dir");
     }
+    // BUG-343: before the recorder exists, so no build of this process can be swept.
+    alert_clip_evict::fail_interrupted_alert_clips(&store, &clips_dir).await;
 
     // M2.2 Phase 3: USB hot-plug registry + watcher. Constructed
     // BEFORE the recorder so the recorder builder can clone the

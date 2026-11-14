@@ -134,3 +134,79 @@ pub async fn reclaim_evictable_alert_clips(
     }
     reclaimed
 }
+
+/// Boot-time: resolve alert clips a previous process left `building`.
+/// Run before the recorder exists, so no build of this process can be
+/// swept. Marks them `failed` (the build never finished) and unlinks the
+/// partial and any final-path file; a file that cannot be unlinked leaves
+/// its row `building` to retry next boot.
+pub async fn fail_interrupted_alert_clips(store: &Store, clips_dir: &Path) {
+    let rows = match store.building_alert_clips().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "alert-clip boot reconcile: building_alert_clips failed");
+            return;
+        }
+    };
+    for (id, rel) in rows {
+        let fin = clips_dir.join(&rel);
+        let partial = fin.with_extension("partial.mp4");
+        let mut removed = true;
+        for p in [&partial, &fin] {
+            match tokio::fs::remove_file(p).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(id, path = %p.display(), error = %e, "alert-clip boot reconcile: remove_file failed");
+                    removed = false;
+                }
+            }
+        }
+        if removed {
+            match store.mark_alert_clip_failed(id).await {
+                Ok(()) => info!(
+                    id,
+                    "alert-clip boot reconcile: interrupted build marked failed"
+                ),
+                Err(e) => warn!(id, error = %e, "alert-clip boot reconcile: mark failed errored"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::retention::tests::fixture;
+
+    /// BUG-343: a build interrupted by an engine restart stayed
+    /// `building` forever.
+    #[tokio::test]
+    async fn interrupted_building_clip_is_failed_and_its_files_removed() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+        let rel = format!(
+            "alert/1/{}/{}.mp4",
+            now.format("%Y-%m-%d"),
+            now.timestamp_millis()
+        );
+        let id = store
+            .insert_alert_clip(&nexus_store::NewAlertClip {
+                camera_id: 1,
+                started_at: now,
+                path: rel.clone(),
+            })
+            .await
+            .unwrap();
+        let partial = clips_dir.join(&rel).with_extension("partial.mp4");
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        std::fs::write(&partial, b"half").unwrap();
+
+        fail_interrupted_alert_clips(&store, &clips_dir).await;
+
+        assert!(!partial.exists(), "partial must be removed");
+        assert!(store.building_alert_clips().await.unwrap().is_empty());
+        // Terminal: a late ready stamp must not resurrect it.
+        assert!(store.mark_alert_clip_ready(id, 1, 1, None).await.is_err());
+    }
+}
