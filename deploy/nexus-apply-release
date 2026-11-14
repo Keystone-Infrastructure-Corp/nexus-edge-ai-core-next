@@ -424,6 +424,9 @@ do_prune() {
         warn "refusing to prune: $releases_dir is not a 'releases' directory"
         return 0
     fi
+    # The OTA that first ships this fix is applied by the OLD applier (no chown);
+    # by prune time the refreshed one runs, so take the kept trees back here.
+    chown -hR root:root "$releases_dir" || warn "could not chown $releases_dir to root"
     declare -A keep=()
     local curv dir name removed=0
     [[ -d "$releases_dir/$version" ]] && keep["$version"]=1

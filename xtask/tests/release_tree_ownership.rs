@@ -55,6 +55,27 @@ fn applier_extracts_without_archive_owners_and_chowns_every_release() {
 }
 
 #[test]
+fn prune_takes_back_release_trees_without_following_symlinks() {
+    let applier = read("deploy/nexus-apply-release");
+    let body = applier
+        .split("do_prune() {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("do_prune body");
+    // The OTA that first ships the fix is applied by the OLD applier, which
+    // never chowns; the post-health prune runs the refreshed one.
+    let chown = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.starts_with('#') && l.contains(r#"chown -hR root:root "$releases_dir""#))
+        .expect("do_prune must chown the releases dir to root, with -h");
+    assert!(
+        !chown.contains("die"),
+        "prune must never fail the caller: {chown}"
+    );
+}
+
+#[test]
 fn release_tarball_is_packed_as_root_and_verified() {
     let wf = read(".github/workflows/release.yml");
     let pack = wf
