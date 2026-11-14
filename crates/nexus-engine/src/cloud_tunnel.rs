@@ -1303,6 +1303,14 @@ fn process_uptime_secs() -> u64 {
     sys.process(pid).map_or(0, |p| p.run_time())
 }
 
+/// The probed capability profile, reported in every heartbeat (BUG-339).
+static CAPABILITY_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the probed profile once at engine start; later calls are ignored.
+pub fn set_capability_profile(profile: String) {
+    let _ = CAPABILITY_PROFILE.set(profile);
+}
+
 async fn pump_heartbeats<H: TunnelHandle>(
     handle: &H,
     _core_id: &str,
@@ -1392,12 +1400,9 @@ async fn pump_heartbeats<H: TunnelHandle>(
                 queued_alerts,
                 release,
                 health,
-                // Optional cloud-side capability diagnostic (wire `v=1`,
-                // repurposed in place). Populating it with the engine's real
-                // probed capability profile (from config `ep_priority` / the
-                // device manifest) is a follow-up; the cloud treats the
-                // omitted field as "unknown" until then.
-                capability_profile: None,
+                // Probed once at engine start (BUG-339); `None` only until
+                // that probe finishes, which the cloud reads as "unknown".
+                capability_profile: CAPABILITY_PROFILE.get().cloned(),
                 uptime_s: process_uptime_secs(),
                 // See `build.rs` — release-tag at CI build-time, falls
                 // back to `CARGO_PKG_VERSION` for local dev builds.
@@ -4438,6 +4443,42 @@ mod heartbeat_ack_tests {
         let sent = tunnel.sent.lock();
         match &sent[0].body {
             EnvelopeBody::Heartbeat(h) => assert!(h.uptime_s >= 6, "uptime_s = {}", h.uptime_s),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+    }
+
+    /// BUG-339: the heartbeat reported `capability_profile: None`, so the
+    /// console showed "profile: unknown" for every core.
+    #[tokio::test]
+    async fn heartbeat_carries_the_probed_capability_profile() {
+        set_capability_profile("hailo".into());
+        let (store, dir) = test_store().await;
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+            crate::reconciler::HandleMap::default(),
+        );
+        let tunnel = FirstEnvelopeTunnel::default();
+        pump_heartbeats(
+            &tunnel,
+            "core-1",
+            store,
+            &TunnelLiveness::new(),
+            &FrameStatsRegistry::new(),
+            &health,
+            &crate::webrtc_bridge::WebRtcBridge::disabled(),
+        )
+        .await;
+        let sent = tunnel.sent.lock();
+        match &sent[0].body {
+            EnvelopeBody::Heartbeat(h) => {
+                assert_eq!(h.capability_profile.as_deref(), Some("hailo"));
+            }
             other => panic!("expected a heartbeat, got {other:?}"),
         }
     }

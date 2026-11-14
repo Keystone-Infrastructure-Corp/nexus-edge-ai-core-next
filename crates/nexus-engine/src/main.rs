@@ -1547,6 +1547,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         frame_stats.clone(),
     );
 
+    // BUG-339 — probe the capability profile once, off the runtime (it shells
+    // out to lspci / nvidia-smi), for every heartbeat to report.
+    tokio::task::spawn_blocking(|| {
+        cloud_tunnel::set_capability_profile(nexus_probe::build_manifest().recommended_profile);
+    });
     // Phase 7.5.5 — fleet-state-hash publisher. Subscribes to
     // `topic::CONFIG_CHANGED` + `topic::DELIVERY_SETTINGS_CHANGED` and
     // pushes a `core_state_hashes` envelope (one canonical SHA-256 per

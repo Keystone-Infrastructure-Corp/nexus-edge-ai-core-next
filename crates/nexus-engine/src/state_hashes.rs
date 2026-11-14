@@ -17,7 +17,9 @@
 //!    two topics). The debounce coalesces a burst of edits into one
 //!    envelope and keeps end-to-end latency well under the 6 s
 //!    acceptance budget.
-//! 3. The hashes are recomputed from the live store each time, so the
+//! 3. After every tunnel reconnect, so the cloud can re-push any fleet
+//!    change made while the tunnel was down.
+//! 4. The hashes are recomputed from the live store each time, so the
 //!    report always reflects committed state.
 //!
 //! Hashing is delegated to [`crate::fleet_hash`], which mirrors the
@@ -97,6 +99,15 @@ async fn try_publish(store: &Store, outbox: &TunnelOutbox) -> Option<CategoryHas
 /// handle so the engine shutdown path can abort it alongside the other
 /// long-lived tasks.
 pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, outbox: Arc<TunnelOutbox>) -> JoinHandle<()> {
+    spawn_with_tick(store, bus, outbox, RETRY_TICK)
+}
+
+fn spawn_with_tick(
+    store: Arc<Store>,
+    bus: Arc<dyn Bus>,
+    outbox: Arc<TunnelOutbox>,
+    retry_tick: Duration,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Subscribe BEFORE the initial publish so an edit between boot
         // and subscribe still triggers a fresh report.
@@ -133,12 +144,16 @@ pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, outbox: Arc<TunnelOutbox>) ->
         // unchanged re-send. We owe an initial report at boot.
         let mut dirty = true;
         let mut last: Option<CategoryHashes> = None;
+        // The gateway reconciles a reconnected core only against hashes sent
+        // on the new session (BUG-336), so every reconnect owes a report.
+        // `connects()`, not `is_connected()`, so a fast drop is not missed.
+        let mut seen_connects = outbox.connects();
 
         loop {
             // If something is owed, wait out the debounce window while
             // still draining further events; otherwise idle on the
             // retry tick.
-            let wait = if dirty { DEBOUNCE } else { RETRY_TICK };
+            let wait = if dirty { DEBOUNCE } else { retry_tick };
             tokio::select! {
                 msg = config_stream.next() => {
                     match msg {
@@ -161,6 +176,11 @@ pub fn spawn(store: Arc<Store>, bus: Arc<dyn Bus>, outbox: Arc<TunnelOutbox>) ->
                     }
                 }
                 () = tokio::time::sleep(wait) => {
+                    let connects = outbox.connects();
+                    if connects != seen_connects {
+                        seen_connects = connects;
+                        dirty = true;
+                    }
                     if dirty {
                         if let Some(hashes) = try_publish(&store, &outbox).await {
                             // Only clear the owe-flag once a fresh
@@ -198,5 +218,65 @@ mod tests {
             panic!("not a core_state_hashes envelope");
         };
         assert_eq!(p.talkdown_audio_sha256, None);
+    }
+
+    struct Capture(tokio::sync::mpsc::UnboundedSender<Envelope>);
+
+    #[async_trait::async_trait]
+    impl nexus_cloud_client::TunnelHandle for Capture {
+        async fn send(&self, envelope: Envelope) -> Result<(), nexus_cloud_client::TunnelError> {
+            let _ = self.0.send(envelope);
+            Ok(())
+        }
+    }
+
+    /// BUG-336 follow-up: the gateway reconciles a core only against hashes
+    /// sent on the new session, so a reconnect with no engine restart and no
+    /// config edit must still publish `core_state_hashes`.
+    #[tokio::test]
+    async fn a_reconnect_republishes_state_hashes_without_a_config_change() {
+        use nexus_bus::BroadcastBus;
+        use nexus_config::StoreConfig;
+        use tokio::sync::mpsc::unbounded_channel;
+        use tokio::time::timeout;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!(
+                    "sqlite://{}?mode=rwc",
+                    dir.path().join("nexus.db").display()
+                ),
+                ..StoreConfig::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let outbox = Arc::new(TunnelOutbox::new());
+        let (tx, mut rx) = unbounded_channel();
+        outbox.set_handle(Some(Arc::new(Capture(tx))));
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(16));
+        let task = spawn_with_tick(store, bus, outbox.clone(), Duration::from_millis(20));
+
+        let first = timeout(Duration::from_secs(5), rx.recv()).await;
+        assert!(first.is_ok(), "startup core_state_hashes");
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "nothing changed, nothing sent"
+        );
+
+        // A reconnect quicker than one tick still counts.
+        let (tx2, mut rx2) = unbounded_channel();
+        outbox.set_handle(None);
+        outbox.set_handle(Some(Arc::new(Capture(tx2))));
+        let env = timeout(Duration::from_secs(5), rx2.recv())
+            .await
+            .expect("core_state_hashes after reconnect")
+            .expect("capture open");
+        assert!(matches!(env.body, EnvelopeBody::CoreStateHashes(_)));
+
+        task.abort();
     }
 }
