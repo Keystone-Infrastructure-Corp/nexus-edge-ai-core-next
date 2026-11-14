@@ -150,7 +150,10 @@ pub async fn fail_interrupted_alert_clips(store: &Store, clips_dir: &Path) {
     };
     for (id, rel) in rows {
         let fin = clips_dir.join(&rel);
-        let partial = fin.with_extension("partial.mp4");
+        let partial = nexus_pipeline::alert_clip::alert_clip_inflight_path(
+            clips_dir,
+            std::path::Path::new(&rel),
+        );
         let mut removed = true;
         for p in [&partial, &fin] {
             match tokio::fs::remove_file(p).await {

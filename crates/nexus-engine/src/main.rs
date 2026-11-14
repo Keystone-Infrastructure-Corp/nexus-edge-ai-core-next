@@ -207,6 +207,7 @@ impl Cli {
 }
 
 fn main() -> Result<()> {
+    cloud_tunnel::mark_engine_start();
     // Make bundled GStreamer plugins (libgstrsrtp.so → rtpgccbwe, used for
     // WebRTC congestion control) discoverable before any pipeline calls
     // gst::init().

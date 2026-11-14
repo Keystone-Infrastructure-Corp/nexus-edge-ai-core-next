@@ -1289,18 +1289,21 @@ pub(crate) fn heartbeat_caps(
     caps
 }
 
-/// Seconds since this engine process started. Must survive tunnel reconnects:
-/// the cloud reads any decrease in `uptime_s` as a core restart (BUG-339).
+/// Start of this engine image, forced first thing in `main` (which runs again
+/// after the console's self-`execv`, so a restart resets it and a tunnel
+/// reconnect does not; sysinfo's PID start time would survive `execv`).
+static ENGINE_START: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Force the engine-image start clock; call first thing in `main`.
+pub fn mark_engine_start() {
+    std::sync::LazyLock::force(&ENGINE_START);
+}
+
+/// Seconds since this engine image started. The cloud reads any decrease in
+/// `uptime_s` as a core restart (BUG-339), so it must not reset on reconnect.
 fn process_uptime_secs() -> u64 {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    let pid = Pid::from_u32(std::process::id());
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        ProcessRefreshKind::new(),
-    );
-    sys.process(pid).map_or(0, |p| p.run_time())
+    ENGINE_START.elapsed().as_secs()
 }
 
 /// The probed capability profile, reported in every heartbeat (BUG-340).
@@ -4417,6 +4420,7 @@ mod heartbeat_ack_tests {
     /// already over six seconds old must not report 0.
     #[tokio::test]
     async fn heartbeat_uptime_is_process_uptime_not_session_uptime() {
+        mark_engine_start();
         tokio::time::sleep(Duration::from_secs(6)).await;
         let (store, dir) = test_store().await;
         let health = EngineHealth::with_real_recorder(
