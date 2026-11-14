@@ -292,6 +292,7 @@ nexus-storage-cloud = { path = "crates/nexus-storage-cloud" }
 nexus-sinks = { path = "crates/nexus-sinks" }
 nexus-cloud-protocol = { path = "crates/nexus-cloud-protocol" }
 nexus-cloud-client = { path = "crates/nexus-cloud-client" }
+nexus-probe = { path = "crates/nexus-probe" }
 # M_HAILO_EP — Hailo-8 FFI + safe wrappers. See crate README.
 nexus-hailo-backend = { path = "crates/nexus-hailo-backend", default-features = false }
 # Runtime `dlopen` + `dlsym` of libhailort.so.4 — keeps the engine binary

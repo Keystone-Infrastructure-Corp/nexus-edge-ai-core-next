@@ -207,6 +207,7 @@ impl Cli {
 }
 
 fn main() -> Result<()> {
+    cloud_tunnel::mark_engine_start();
     // Make bundled GStreamer plugins (libgstrsrtp.so → rtpgccbwe, used for
     // WebRTC congestion control) discoverable before any pipeline calls
     // gst::init().
@@ -806,6 +807,8 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     if let Err(e) = tokio::fs::create_dir_all(&clips_dir).await {
         warn!(path = %clips_dir.display(), error = %e, "could not pre-create clips_dir");
     }
+    // BUG-344: before the recorder exists, so no build of this process can be swept.
+    alert_clip_evict::fail_interrupted_alert_clips(&store, &clips_dir).await;
 
     // M2.2 Phase 3: USB hot-plug registry + watcher. Constructed
     // BEFORE the recorder so the recorder builder can clone the
@@ -1545,6 +1548,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
         frame_stats.clone(),
     );
 
+    // BUG-340 — probe the capability profile once, off the runtime (it shells
+    // out to lspci / nvidia-smi), for every heartbeat to report.
+    tokio::task::spawn_blocking(|| {
+        cloud_tunnel::set_capability_profile(nexus_probe::build_manifest().recommended_profile);
+    });
     // Phase 7.5.5 — fleet-state-hash publisher. Subscribes to
     // `topic::CONFIG_CHANGED` + `topic::DELIVERY_SETTINGS_CHANGED` and
     // pushes a `core_state_hashes` envelope (one canonical SHA-256 per

@@ -363,10 +363,16 @@ do_apply() {
 
     # Extract the staged tarball. Its single top-level dir is the bare
     # <version>, so (no --strip-components) the tree lands at
-    # releases/<version>/.
-    if ! tar -xzf "$staged_tarball" -C "$releases_dir"; then
+    # releases/<version>/. --no-same-owner: as root, tar would otherwise
+    # restore the archive's uid, which older tarballs carry as the CI
+    # runner's 1001 = nexus-remote on a box (BUG-338).
+    if ! tar --no-same-owner -xzf "$staged_tarball" -C "$releases_dir"; then
         die "tar extract failed: $staged_tarball -> $releases_dir"
     fi
+    # Also take back releases kept for rollback that older appliers extracted
+    # with the archive's owners; -h so a planted symlink is not followed.
+    chown -hR root:root "$releases_dir" \
+        || die "could not chown $releases_dir to root"
     [[ -d "$release_path" ]] \
         || die "extracted release dir missing: $release_path (tarball top-level != bare version?)"
     log "extracted release: $release_path"

@@ -90,6 +90,7 @@ nexus-rules = { workspace = true }
 nexus-tracker = { workspace = true }
 nexus-inference = { workspace = true }
 nexus-pipeline = { workspace = true }
+nexus-probe = { workspace = true }
 nexus-storage = { workspace = true }
 # M7 — alert delivery. Defines `AlertSink`, `SinkRegistry`, and the
 # `SinkDispatcher` background task that drains `alert_sink_outbox`.
