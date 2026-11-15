@@ -18,21 +18,31 @@ permissions: {}
 
 jobs:
   claude:
-    # The action itself also rejects actors without write access and bots.
+    # The action itself also rejects actors without write access and bots. Mentions are
+    # also gated here on the commenter's association, so outsiders on a public repo never
+    # start the job or mint the App token, and PR review mentions never run fork code.
     if: >-
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association) &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issues' && github.event.action == 'opened' &&
-        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude'))) ||
+        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)) ||
       (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'factory:medium') ||
       (github.event_name == 'pull_request' && github.event.label.name == 'factory:fix-ci' &&
         github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
-    # Label-triggered builds: 180 min, one at a time per repo. @claude mentions: 60 min, unqueued.
+    # Label-triggered builds: 180 min, one group per issue or PR. @claude mentions: 60 min,
+    # one group per run. A shared group silently cancelled pending builds, so the cost
+    # guard is timeout-minutes only.
     timeout-minutes: ${{ github.event.action == 'labeled' && 180 || 60 }}
     concurrency:
-      group: ${{ github.event.action == 'labeled' && format('claude-build-{0}', github.repository) || format('claude-{0}', github.run_id) }}
+      group: ${{ github.event.action == 'labeled' && format('claude-build-{0}', github.event.issue.number || github.event.pull_request.number) || format('claude-{0}', github.run_id) }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -49,9 +59,12 @@ jobs:
           ISSUE: ${{ github.event.issue.number }}
           PR: ${{ github.event.pull_request.number }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = issues ]; then
-            spec=$(jq -r '[.issue.labels[].name | select(startswith("spec:")) | sub("^spec:"; "")] | first // ""' "$GITHUB_EVENT_PATH")
+            # Read labels live: the event payload can predate labels added in the same call.
+            spec=$(gh issue view "$ISSUE" --repo "$REPO" --json labels \
+              --jq '[.labels[].name | select(startswith("spec:")) | sub("^spec:"; "")] | first // ""')
             # The label text goes into the prompt, so accept only the SPEC-NNN shape.
             if ! printf '%s' "$spec" | grep -Eq '^SPEC-[0-9]+$'; then
               echo "::error::factory:medium needs a spec:SPEC-NNN label (found '${spec}')"
@@ -64,12 +77,12 @@ jobs:
           echo "text=$text" >> "$GITHUB_OUTPUT"
 
       # The action works in $GITHUB_WORKSPACE, so the repo is checked out there.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event.pull_request.head.ref || '' }}
           fetch-depth: 0
 
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         id: app
         with:
           app-id: ${{ secrets.FACTORY_APP_ID }}
@@ -79,15 +92,21 @@ jobs:
 
       # checkout only writes inside the workspace; move it beside the repo so
       # `../nexus-home` resolves as it does locally.
-      - uses: actions/checkout@v5
+      # Sparse: the plugin needs only these; reference/ and .agents/memory/ stay private.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: ${{ github.repository_owner }}/nexus-home
           token: ${{ steps.app.outputs.token }}
           path: .nexus-home
           persist-credentials: false
+          sparse-checkout: |
+            .claude-plugin
+            .agents/skills
+            hooks
+            bin
       - run: mv .nexus-home ../nexus-home
 
-      - uses: anthropics/claude-code-action@v1
+      - uses: anthropics/claude-code-action@f3b070c88125d33dbae5653df5f143101d4ea9dc # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Claude Code prefers an API key over the OAuth token when both are set,
@@ -97,3 +116,8 @@ jobs:
           plugins: nexus@nexus-home
           # An empty prompt keeps @claude mentions in interactive (tag) mode.
           prompt: ${{ steps.prompt.outputs.text }}
+          # Intake labels issues as the factory App, and the action rejects bots not named
+          # here. If the App's slug differs, change nexus-factory.
+          allowed_bots: ${{ github.event.action == 'labeled' && 'nexus-factory' || '' }}
+          # Setting allowed_bots turns off the action's default auto permission mode.
+          claude_args: ${{ github.event.action == 'labeled' && '--permission-mode auto' || '' }}

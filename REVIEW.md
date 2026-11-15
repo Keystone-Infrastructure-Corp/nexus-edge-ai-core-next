@@ -11,15 +11,16 @@ data. Mark each one:
 - **P0**: breaks production, leaks data across tenants or to the public, loses or
   corrupts data, or exposes a secret.
 - **P1**: a correctness or security bug a user or attacker can reach, or a broken
-  hard rule.
+  AGENTS.md rule.
 
 Give `file:line` evidence for every finding, and say what goes wrong and when. If you
 cannot point at a line, do not post the finding.
 
 ## The checklist
 
-The hard rules in this repo's AGENTS.md are the checklist. Check each changed file
-against every rule that applies to it. A broken hard rule is at least P1.
+The rules in the repo's AGENTS.md, including its `## Code Review Rules` section, are
+the checklist. Check each changed file against every rule that applies to it. A broken
+rule is at least P1.
 
 Also flag:
 

@@ -1,7 +1,7 @@
 name: Build request
 description: >-
-  Work that has no spec yet. It goes to design first, not to a builder: run
-  `brainstorming`, then `writing-plans`, then open a SPEC PR.
+  Work that has no spec yet. It goes to design first, not to a builder: write
+  a design and a plan, then open a SPEC PR citing the plan.
 title: "Build request: "
 labels: ["factory:needs-spec"]
 body:
@@ -10,9 +10,9 @@ body:
       value: |
         This issue does not start a build. Next steps:
 
-        1. Run `brainstorming` to produce the design.
-        2. Run `writing-plans` to produce the plan.
-        3. Open a SPEC PR that cites both in `source:` and sets `factory:` and `repo:`.
+        1. Write a design and a plan (for example with the superpowers
+           `brainstorming` and `writing-plans` skills).
+        2. Open a SPEC PR citing the plan in `source:` that sets `factory:` and `repo:`.
            Merging it with `status: Approved` opens the work-order issue.
   - type: textarea
     id: what

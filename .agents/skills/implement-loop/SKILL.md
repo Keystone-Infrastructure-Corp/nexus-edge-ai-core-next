@@ -54,7 +54,7 @@ Add these to the core's unit prompt:
    Rust verifies run inside the worktree as `CARGO_TARGET_DIR="$TARGET" cargo <verify args>`.
    Read AGENTS.md. Keep the supplied base fixed: never rebase or merge, per AGENTS.md's
    unit exception. Cap terminal output.
-   A fresh worktree has no node_modules: run `npm --prefix "$WT/ui" ci` (Node 22) before any
+   A fresh worktree has no node_modules: run `(cd "$WT/ui" && npm ci)` (Node 22) before any
    npm verify. Install Playwright browsers once per machine with
    `npm --prefix "$WT/ui" run e2e:install` before its first E2E run.
    Edge UI E2E: `E2E_PORT=<port> npm --prefix "$WT/ui" run e2e`, following the E2E
@@ -100,7 +100,7 @@ unverified. It runs the `nexus-pipeline` `gstreamer`/`gstreamer-webrtc`,
 and `nexus-reid` `ep-cpu` `cargo check --locked` variants from `.github/workflows/ci.yml`.
 No cloud `cargo deny`, cloud RLS, migration, or Azure gates are invented for edge; licence
 review still applies.
-Edge UI: first `npm --prefix "$TOP/ui" ci` (Node 22), then
+Edge UI: first `(cd "$TOP/ui" && npm ci)` (Node 22), then
 `npm --prefix "$TOP/ui" run lint` · `npm --prefix "$TOP/ui" run typecheck` ·
 `npm --prefix "$TOP/ui" run test` · `npm --prefix "$TOP/ui" run build` ·
 run `npm --prefix "$TOP/ui" run e2e:install` once per machine before first E2E, then

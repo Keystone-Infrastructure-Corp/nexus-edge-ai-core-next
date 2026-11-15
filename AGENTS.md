@@ -40,13 +40,12 @@ Clone `nexus-home` beside this repo (`../nexus-home`), then run
    error. A weights file in `--models-dir` that no manifest `path` names fails too.
    **No face-recognition model at the edge in v1 (hard product invariant).** Names
    containing (any case) `AdaFace`, `ArcFace`, `InsightFace`, `Buffalo`, `FaceNet`,
-   `SphereFace`, `CosFace` or `MagFace` fail unconditionally (MS-Celeb-1M retractions,
-   InsightFace's non-commercial relicense, the cloud's pseudonymous identity vault). Body
+   `SphereFace`, `CosFace` or `MagFace` fail unconditionally. Body
    and clothing appearance (DINOv2-S default, OSNet-x1.0 opt-in) is the substrate.
 3. **Repo boundary is sacred (R1–R3).** No cloud-side crate here; the cloud never
    depends on this repo. The only cross-repo artifact is the generated
    [v1.rs](crates/nexus-cloud-protocol/src/v1.rs) plus `v1.CHECKSUM` of the cloud's
-   `proto/v1.json` (not carried here). Only the cloud's `check-wire-parity` checks it: it
+   `proto/v1.json`. Only the cloud's `check-wire-parity` checks it: it
    reads our `main` and fails when the cloud accepts an edge message or bus topic that
    our mirror or non-test source lacks.
 4. **Wire version follows the cloud's `v`.** Breaking changes start in the cloud and
@@ -57,7 +56,7 @@ Clone `nexus-home` beside this repo (`../nexus-home`), then run
 6. **No camera credentials over the tunnel (R5b).** RTSP URLs, ONVIF secrets and
    per-camera credentials stay on the edge. A cloud `rpc_call` that creates a camera is
    opaque pass-through to the local admin API.
-7. **Re-ID privacy (Wedge Phases 4–5).** The future `crates/nexus-reid` emits appearance
+7. **Re-ID privacy.** The future `crates/nexus-reid` emits appearance
    embeddings only, never face embeddings. Sightings go up as `entity_sighting` envelopes
    tagged with a per-core opaque `entity_local_id`; the cloud assigns identity, and the
    edge never calls an identity-resolution API. Local SQLite never stores `name`,
@@ -67,7 +66,9 @@ Clone `nexus-home` beside this repo (`../nexus-home`), then run
    as the unprivileged `nexus` user under `nexus-engine.service`: no Docker, no sidecar
    updater, no shared socket. OTA privileged work goes only through the root-owned
    applier `/usr/local/sbin/nexus-apply-release`, the single argv-independent grant in
-   [nexus-update](deploy/sudoers.d/nexus-update). Never add per-command sudoers rules or
+   [nexus-update](deploy/sudoers.d/nexus-update); it delegates deps to
+   `/usr/local/sbin/nexus-apply-deps`. Both stay outside the OTA-writable tree and
+   enforce their own arg/package allowlists. Never add per-command sudoers rules or
    general `apt`, `tar`, `ln`, `systemctl` or `rm` power. See
    [OTA update handler](docs/DEV_NOTES.md#ota-update-handler-phase-9).
 
@@ -81,8 +82,7 @@ privileged command against them. Also flag test gates on `cfg(debug_assertions)`
 
 1. **Think first.** State assumptions; ask when the answer changes the design
    (`implement-loop` records it and continues).
-2. **Simplicity.** Nothing speculative; on an appliance every abstraction costs size and
-   startup.
+2. **Simplicity.** Nothing speculative.
 3. **Surgical changes.** Touch only what the task needs, in the surrounding style.
    Mention unrelated dead code (above all under `#[cfg(...)]` gates), don't delete it.
 4. **Goal-driven.** Plan as `step → verify:` pairs that name a real gate from Commands.
@@ -118,13 +118,12 @@ The local admin console is the npm project [ui/](ui/). It uses npm and
   the root, `cargo build -p nexus-engine --features test-injection`.
 
 **CI gates:** all of the above except `dev`, plus `cargo check`. Clippy uses
-`[workspace.lints.clippy]` in the root `Cargo.toml` (`clippy.toml` allows `unwrap`/`expect`/`panic`/prints in tests); `-D warnings` fails warn-level lints.
+`[workspace.lints.clippy]` in the root `Cargo.toml` (`clippy.toml` allows `unwrap`/`expect`/`panic`/prints in tests).
 `system-libs` (GStreamer + ORT on Linux, `models-v6` smoke tests) runs on pushes to
 `main` and on PRs labelled `system-libs`.
 
 **Linux-gated code:** macOS clippy misses `#[cfg(target_os = "linux")]` blocks and `nix`
-integer widths. If you touch them, run CI's clippy in a Linux container (e.g.
-`rust:1-slim-bookworm` fed a `git archive`) before pushing.
+integer widths. If you touch them, run CI's clippy in a Linux container before pushing.
 
 ## Conventions
 
@@ -134,12 +133,15 @@ integer widths. If you touch them, run CI's clippy in a Linux container (e.g.
 - Cargo features gate optional hardware (`gstreamer`, `ep-*`, `gstreamer-webrtc`) and
   `test-injection`. NEVER gate testing behaviour on `cfg(debug_assertions)`.
 - **Per-camera frame contract:** one RGB 16:9 supervisor frame on the stride-32 ladder
-  (512×288 / 1024×576 / 1536×864) feeds detector, tracker and re-ID. Models are native
-  16:9: no stretch, no letterbox. Clips record at native resolution, so scale bboxes by
-  each clip's `frame_width`/`frame_height` from the tracks API; never hard-code. See
-  `supervisor_frame_for` in [source.rs](crates/nexus-pipeline/src/source.rs) and
+  (512×288 / 1024×576 / 1536×864) feeds detector, tracker and re-ID;
+  `CameraBehavior::supervisor_width` can analyse at a larger rung than the model input.
+  Models are native 16:9: no stretch, no letterbox. The camera→supervisor step does
+  letterbox a non-16:9 camera (`videoscale add-borders=true`). Clips record at native
+  resolution, so scale bboxes by each clip's `frame_width`/`frame_height` from the tracks
+  API; never hard-code. See `supervisor_frame_for` in
+  [source.rs](crates/nexus-pipeline/src/source.rs) and
   [yolo.rs](crates/nexus-inference/src/yolo.rs).
-- **UI** (React, Tailwind, shadcn/ui): TanStack Router in
+- **UI:** TanStack Router in
   `ui/src/router.tsx`, one page per route in `ui/src/pages/`, typed clients in
   `ui/src/api/`. Server state uses TanStack Query, never hand-rolled `useEffect` +
   `fetch`. Forms `react-hook-form` + `zod`, toasts `sonner`, icons `lucide-react`.
@@ -169,5 +171,5 @@ boxes: `ssh-remote-ops`.
 
 ## Out of scope (do not propose without discussion)
 
-Anything against the hard rules, a frame source that bypasses the supervisor frame, and
+A frame source that bypasses the supervisor frame, and
 new non-trivial deps without a license and binary-size justification in the PR.
