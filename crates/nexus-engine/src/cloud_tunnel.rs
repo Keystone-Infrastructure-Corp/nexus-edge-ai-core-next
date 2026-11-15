@@ -1289,6 +1289,31 @@ pub(crate) fn heartbeat_caps(
     caps
 }
 
+/// Start of this engine image, forced first thing in `main` (which runs again
+/// after the console's self-`execv`, so a restart resets it and a tunnel
+/// reconnect does not; sysinfo's PID start time would survive `execv`).
+static ENGINE_START: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Force the engine-image start clock; call first thing in `main`.
+pub fn mark_engine_start() {
+    std::sync::LazyLock::force(&ENGINE_START);
+}
+
+/// Seconds since this engine image started. The cloud reads any decrease in
+/// `uptime_s` as a core restart (BUG-339), so it must not reset on reconnect.
+fn process_uptime_secs() -> u64 {
+    ENGINE_START.elapsed().as_secs()
+}
+
+/// The probed capability profile, reported in every heartbeat (BUG-340).
+static CAPABILITY_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the probed profile once at engine start; later calls are ignored.
+pub fn set_capability_profile(profile: String) {
+    let _ = CAPABILITY_PROFILE.set(profile);
+}
+
 async fn pump_heartbeats<H: TunnelHandle>(
     handle: &H,
     _core_id: &str,
@@ -1303,7 +1328,6 @@ async fn pump_heartbeats<H: TunnelHandle>(
     liveness.mark_authenticated();
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let start = std::time::Instant::now();
     let mut seq: u64 = 0;
     loop {
         interval.tick().await;
@@ -1379,13 +1403,10 @@ async fn pump_heartbeats<H: TunnelHandle>(
                 queued_alerts,
                 release,
                 health,
-                // Optional cloud-side capability diagnostic (wire `v=1`,
-                // repurposed in place). Populating it with the engine's real
-                // probed capability profile (from config `ep_priority` / the
-                // device manifest) is a follow-up; the cloud treats the
-                // omitted field as "unknown" until then.
-                capability_profile: None,
-                uptime_s: start.elapsed().as_secs(),
+                // Probed once at engine start (BUG-340); `None` only until
+                // that probe finishes, which the cloud reads as "unknown".
+                capability_profile: CAPABILITY_PROFILE.get().cloned(),
+                uptime_s: process_uptime_secs(),
                 // See `build.rs` — release-tag at CI build-time, falls
                 // back to `CARGO_PKG_VERSION` for local dev builds.
                 version: env!("NEXUS_BUILD_VERSION").to_string(),
@@ -4388,6 +4409,80 @@ mod heartbeat_ack_tests {
         let sent = tunnel.sent.lock();
         match &sent[0].body {
             EnvelopeBody::Heartbeat(h) => h.caps.clone().expect("the heartbeat carries caps"),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+    }
+
+    /// BUG-339: `uptime_s` is time since the engine process started, not since
+    /// this tunnel session's handshake. The cloud reads any decrease as a
+    /// restart, so a per-session clock raises "Core restarted unexpectedly" on
+    /// every reconnect. A session that has just begun in a process that is
+    /// already over six seconds old must not report 0.
+    #[tokio::test]
+    async fn heartbeat_uptime_is_process_uptime_not_session_uptime() {
+        mark_engine_start();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let (store, dir) = test_store().await;
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+            crate::reconciler::HandleMap::default(),
+        );
+        let tunnel = FirstEnvelopeTunnel::default();
+        pump_heartbeats(
+            &tunnel,
+            "core-1",
+            store,
+            &TunnelLiveness::new(),
+            &FrameStatsRegistry::new(),
+            &health,
+            &crate::webrtc_bridge::WebRtcBridge::disabled(),
+        )
+        .await;
+        let sent = tunnel.sent.lock();
+        match &sent[0].body {
+            EnvelopeBody::Heartbeat(h) => assert!(h.uptime_s >= 6, "uptime_s = {}", h.uptime_s),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+    }
+
+    /// BUG-340: the heartbeat reported `capability_profile: None`, so the
+    /// console showed "profile: unknown" for every core.
+    #[tokio::test]
+    async fn heartbeat_carries_the_probed_capability_profile() {
+        set_capability_profile("hailo".into());
+        let (store, dir) = test_store().await;
+        let health = EngineHealth::with_real_recorder(
+            false,
+            Arc::new(nexus_pipeline::StubClipRecorder::new(
+                store.clone(),
+                dir.path().join("clips"),
+            )),
+            store.clone(),
+            live_view_manager(),
+            crate::reconciler::HandleMap::default(),
+        );
+        let tunnel = FirstEnvelopeTunnel::default();
+        pump_heartbeats(
+            &tunnel,
+            "core-1",
+            store,
+            &TunnelLiveness::new(),
+            &FrameStatsRegistry::new(),
+            &health,
+            &crate::webrtc_bridge::WebRtcBridge::disabled(),
+        )
+        .await;
+        let sent = tunnel.sent.lock();
+        match &sent[0].body {
+            EnvelopeBody::Heartbeat(h) => {
+                assert_eq!(h.capability_profile.as_deref(), Some("hailo"));
+            }
             other => panic!("expected a heartbeat, got {other:?}"),
         }
     }

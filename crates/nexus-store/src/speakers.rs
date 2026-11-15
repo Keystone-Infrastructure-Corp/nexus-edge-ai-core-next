@@ -78,8 +78,8 @@ impl Store {
         out: &SpeakerOutput,
     ) -> Result<(), StoreError> {
         let res = sqlx::query(
-            "UPDATE speakers SET volume = ?, boost = ?, hw_volume = ?, auto_max_per_hour = ? \
-             WHERE id = ?",
+            "UPDATE speakers SET volume = ?, boost = ?, hw_volume = ?, auto_max_per_hour = ?, \
+             updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         )
         .bind(out.volume)
         .bind(out.boost)

@@ -360,14 +360,14 @@ async fn walk_clip_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use nexus_config::{CameraConfig, StoreConfig};
     use nexus_store::NewClip;
     use std::path::PathBuf;
     use url::Url;
 
-    async fn fixture() -> (Arc<Store>, tempfile::TempDir, PathBuf) {
+    pub(crate) async fn fixture() -> (Arc<Store>, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tmpdir");
         let db_path = dir.path().join("nexus.db");
         let store = Arc::new(

@@ -317,3 +317,38 @@ async fn changing_the_onvif_endpoint_drops_hw_volume() {
         "clearing drops it"
     );
 }
+
+#[tokio::test]
+async fn changing_output_bumps_the_speakers_updated_at() {
+    let (store, _dir) = fresh_store().await;
+    let a = create(&store, "a").await;
+    // CURRENT_TIMESTAMP has one-second resolution: age the row so the bump is visible.
+    sqlx::query("UPDATE speakers SET updated_at = '2000-01-01 00:00:00' WHERE id = ?")
+        .bind(a.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let out = SpeakerOutput {
+        volume: 50,
+        boost: false,
+        hw_volume: false,
+        auto_max_per_hour: 6,
+    };
+    let mut tx = store.begin_tx().await.unwrap();
+    store
+        .set_speaker_output_tx(&mut tx, a.id, &out)
+        .await
+        .unwrap();
+    Store::commit_tx(tx).await.unwrap();
+
+    let (updated_at,): (String,) = sqlx::query_as("SELECT updated_at FROM speakers WHERE id = ?")
+        .bind(a.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_ne!(
+        updated_at, "2000-01-01 00:00:00",
+        "output change left updated_at stale"
+    );
+}
