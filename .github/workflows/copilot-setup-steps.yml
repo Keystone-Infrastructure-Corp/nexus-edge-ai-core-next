@@ -37,7 +37,7 @@ jobs:
       - name: Check for the factory App secrets
         id: secrets
         env:
-          HAS_APP: ${{ secrets.FACTORY_APP_ID != '' }}
+          HAS_APP: ${{ secrets.FACTORY_APP_ID != '' && secrets.FACTORY_APP_PRIVATE_KEY != '' }}
         run: echo "has_app=$HAS_APP" >> "$GITHUB_OUTPUT"
       - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         if: steps.secrets.outputs.has_app == 'true'
