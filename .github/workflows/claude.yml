@@ -21,13 +21,18 @@ jobs:
     # The action itself also rejects actors without write access and bots. Mentions are
     # also gated here on the commenter's association, so outsiders on a public repo never
     # start the job or mint the App token, and PR review mentions never run fork code.
+    # `@claude review` belongs to Claude Code Review (its own GitHub App), so it is
+    # skipped here; otherwise one comment would start two Claude runs.
     if: >-
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
+        !contains(github.event.comment.body, '@claude review') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') &&
+        !contains(github.event.comment.body, '@claude review') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
         github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') &&
+        !contains(github.event.review.body, '@claude review') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association) &&
         github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issues' && github.event.action == 'opened' &&
@@ -51,6 +56,22 @@ jobs:
       id-token: write # the action's Claude GitHub App token exchange
       actions: read # read CI results and logs
     steps:
+      # An issue_comment payload has no head repo, so the job `if:` cannot tell a fork PR
+      # apart. Refuse it before any checkout or secret: the action would check out the
+      # fork's branch, and with it the fork's AGENTS.md and .claude/settings.json hooks.
+      - name: Refuse pull requests from forks
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        env:
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fork=$(gh pr view "$PR" --repo "$REPO" --json isCrossRepository --jq .isCrossRepository)
+          if [ "$fork" != false ]; then
+            echo "::error::@claude does not run on pull requests from forks (got '$fork')"
+            exit 1
+          fi
+
       - name: Write the build prompt
         id: prompt
         if: github.event.action == 'labeled'
@@ -114,6 +135,10 @@ jobs:
           anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
           plugin_marketplaces: ${{ github.workspace }}/../nexus-home
           plugins: nexus@nexus-home
+          # The action mints its own token; the job's `actions: read` does not reach it,
+          # and factory:fix-ci needs it to read failed-run logs.
+          additional_permissions: |
+            actions: read
           # An empty prompt keeps @claude mentions in interactive (tag) mode.
           prompt: ${{ steps.prompt.outputs.text }}
           # Intake labels issues as the factory App, and the action rejects bots not named
