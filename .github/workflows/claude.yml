@@ -93,14 +93,15 @@ jobs:
             fi
             text="Work order #$ISSUE in $REPO. Run implement-loop for $spec: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md, and follow it on the vault record $spec. Work on a new branch. When the loop passes, push it and open a draft pull request whose body starts with \"Closes #$ISSUE\" and carries the ledger. If you stop short, comment on #$ISSUE with what is left and why."
           else
-            text="Pull request #$PR in $REPO has failing checks. Read them with \`gh pr checks $PR\` and \`gh run view <run-id> --log-failed\`. Read AGENTS.md, find the root cause, make the smallest fix, run the failing gate locally where you can, and push the fix to the PR branch $BRANCH. Then comment on #$PR with the cause, the fix and what you ran."
+            text="Pull request #$PR in $REPO has failing checks. This run starts on the merge commit, so first run \`git checkout $BRANCH\`. Read the checks with \`gh pr checks $PR\` and \`gh run view <run-id> --log-failed\`. Read AGENTS.md, find the root cause, make the smallest fix, run the failing gate locally where you can, and push the fix to the PR branch $BRANCH. Then comment on #$PR with the cause, the fix and what you ran."
           fi
           echo "text=$text" >> "$GITHUB_OUTPUT"
 
-      # The action works in $GITHUB_WORKSPACE, so the repo is checked out there.
+      # The action works in $GITHUB_WORKSPACE, so the repo is checked out there, at the
+      # event's default ref: no step checks out a PR head. For a mention on a PR the action
+      # checks out the PR branch itself (forks are refused above); fix-ci's prompt does it.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ github.event.pull_request.head.ref || '' }}
           fetch-depth: 0
 
       - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2

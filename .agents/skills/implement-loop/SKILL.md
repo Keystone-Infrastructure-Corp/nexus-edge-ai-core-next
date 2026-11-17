@@ -8,7 +8,9 @@ description: Edge extension of the shared Nexus implement-loop — edge worktree
 This extends the shared implement-loop core at
 `../nexus-home/.agents/skills/implement-loop-core/SKILL.md` (or
 `$NEXUS_HOME/.agents/skills/implement-loop-core/SKILL.md` when nexus-home is not beside
-this repo). Read the core first, then this file; if the core is missing, stop and ask for it.
+this repo). Read the core first, then this file. With no nexus-home checkout, read the core
+from GitHub: `gh api repos/Keystone-Infrastructure-Corp/nexus-home/contents/.agents/skills/implement-loop-core/SKILL.md -H 'Accept: application/vnd.github.raw'`.
+Stop and ask for it only if that fails too.
 Where this file is stricter than the core, it wins for this repo.
 
 Read `AGENTS.md` and `.github/workflows/ci.yml` before planning. Their hardware,
