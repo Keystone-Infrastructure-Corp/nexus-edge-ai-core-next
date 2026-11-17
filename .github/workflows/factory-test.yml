@@ -1,0 +1,24 @@
+# Canonical copy: nexus-home/ci/.github/workflows/factory-test.yml. Copy it verbatim.
+# Tests this repo's copies of the factory workflows offline when any of them changes.
+name: Factory test
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/claude.yml"
+      - ".github/workflows/factory-*.yml"
+      - ".github/factory/**"
+
+permissions:
+  contents: read
+
+jobs:
+  factory-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: shellcheck .github/factory/test-workflows.sh
+      - run: bash .github/factory/test-workflows.sh
