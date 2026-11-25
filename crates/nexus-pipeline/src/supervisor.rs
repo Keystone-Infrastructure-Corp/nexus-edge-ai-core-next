@@ -1578,13 +1578,20 @@ async fn run_camera(
         let _ = clip_opened_at;
         emitter.forget_camera(cfg.id);
         // A stop request is the reconciler replacing or removing this
-        // generation; ending on its own before any frame is a failure.
-        if !zones_acknowledged && !*stop.borrow() {
-            stats.zone_application().fail(
-                cfg.id,
-                zone_generation,
-                crate::zone_application::ZoneApplicationError::SupervisorExited,
-            );
+        // generation. Ending on its own before any frame is a failure; after
+        // one, nothing runs its zones any more.
+        if !*stop.borrow() {
+            if zones_acknowledged {
+                stats
+                    .zone_application()
+                    .stop_generation(cfg.id, zone_generation);
+            } else {
+                stats.zone_application().fail(
+                    cfg.id,
+                    zone_generation,
+                    crate::zone_application::ZoneApplicationError::SupervisorExited,
+                );
+            }
         }
 
         let _ = bus

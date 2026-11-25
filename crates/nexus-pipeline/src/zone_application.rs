@@ -85,6 +85,15 @@ struct Entry {
     applied: Option<(String, DateTime<Utc>)>,
 }
 
+impl Entry {
+    fn stop(&mut self) {
+        self.stopping = true;
+        self.acknowledged = false;
+        self.failed = None;
+        self.started_at = Instant::now();
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// The last generation handed out, process-wide, so a number names one
@@ -162,10 +171,20 @@ impl ZoneApplicationRegistry {
     /// acknowledges. The applied revision stays for comparison.
     pub fn stop(&self, camera_id: CameraId) {
         if let Some(e) = self.inner.lock().cameras.get_mut(&camera_id) {
-            e.stopping = true;
-            e.acknowledged = false;
-            e.failed = None;
-            e.started_at = Instant::now();
+            e.stop();
+        }
+    }
+
+    /// [`Self::stop`] for `generation`, which ended unasked after it
+    /// acknowledged. Ignored unless it is the camera's current generation.
+    pub fn stop_generation(&self, camera_id: CameraId, generation: u64) {
+        let mut inner = self.inner.lock();
+        if let Some(e) = inner
+            .cameras
+            .get_mut(&camera_id)
+            .filter(|e| e.generation == generation)
+        {
+            e.stop();
         }
     }
 
@@ -468,6 +487,41 @@ mod tests {
                 None
             ),
             "a valid acknowledgement after the timeout recovers"
+        );
+    }
+
+    /// A generation that acknowledged and then ended unasked reads like a
+    /// stopped one; a late stop of it leaves the newer generation alone.
+    #[test]
+    fn an_ended_generation_stops_reading_applied_and_only_itself() {
+        let a = zone_revision(&zones("A"));
+        let r = ZoneApplicationRegistry::default();
+        let g1 = r.start(7);
+        r.acknowledge(7, g1, &a, at(0));
+        r.stop_generation(7, g1);
+        let ended = Instant::now();
+        r.acknowledge(7, g1, &a, at(1));
+        assert_eq!(
+            read(&r, &a, ended),
+            (
+                a.clone(),
+                Some(a.clone()),
+                g1,
+                ZoneApplicationState::Applying,
+                None
+            )
+        );
+        assert_eq!(
+            read(&r, &a, ended + APPLICATION_TIMEOUT).4,
+            Some(ZoneApplicationError::ApplicationTimeout)
+        );
+        let g2 = r.start(7);
+        r.acknowledge(7, g2, &a, at(2));
+        r.stop_generation(7, g1);
+        assert_eq!(
+            read(&r, &a, Instant::now() + APPLICATION_TIMEOUT).3,
+            ZoneApplicationState::Applied,
+            "the ended generation stopped its replacement"
         );
     }
 

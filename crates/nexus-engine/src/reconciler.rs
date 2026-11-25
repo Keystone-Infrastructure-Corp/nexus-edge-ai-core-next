@@ -2564,6 +2564,53 @@ mod tests {
         );
     }
 
+    /// SPEC-088 Z-5 — a supervisor that applied its zones and then ends on
+    /// its own runs them no more: the read says applying from that moment,
+    /// failed once the timeout passes with no replacement, not applied until
+    /// the next reconcile pass. The replacement generation applies as usual.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_that_ends_after_applying_its_zones_stops_reading_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::EndsOnce)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+
+        reconcile(&args).await.expect("first pass");
+        wait_until("the supervisor ended", || {
+            supervisor_ended(&args.handles, 7)
+        })
+        .await;
+        let ended = std::time::Instant::now();
+        let exited = zones_status(&args, 7, ended).await.expect("reported");
+        let late = zones_status(&args, 7, ended + APPLICATION_TIMEOUT)
+            .await
+            .expect("reported");
+        reconcile(&args).await.expect("pass that restarts it");
+        wait_until("the replacement applied the zones", || {
+            args.frame_stats
+                .zone_application()
+                .snapshot(7, &a, std::time::Instant::now())
+                .is_some_and(|s| {
+                    s.state == ZoneApplicationState::Applied && s.generation > exited.generation
+                })
+        })
+        .await;
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (exited.applied_revision, exited.state, exited.error_code),
+            (Some(a.clone()), ZoneApplicationState::Applying, None),
+            "a supervisor that applied its zones and ended on its own still reads applied"
+        );
+        assert_eq!(
+            (late.state, late.error_code),
+            (
+                ZoneApplicationState::Failed,
+                Some(ZoneApplicationError::ApplicationTimeout)
+            )
+        );
+    }
+
     /// SPEC-088 — a camera that is deleted, or disabled, reports nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_removed_camera_reports_no_zone_application() {
