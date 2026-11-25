@@ -30,6 +30,7 @@ pub mod param_sets;
 pub mod post_roll;
 pub mod preroll;
 pub mod recorder;
+pub mod recording_activity;
 pub mod recording_health;
 pub mod sink_router;
 pub mod skip_policy;

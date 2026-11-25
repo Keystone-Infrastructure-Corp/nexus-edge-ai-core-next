@@ -344,6 +344,51 @@ pub enum TileGridConfig {
     G3x3,
 }
 
+/// SPEC-089 per-camera recording activity mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingPolicyMode {
+    /// Live track count plus alerts decides recording, as before SPEC-089.
+    #[default]
+    Legacy,
+    /// Legacy writes footage; the fresh-evidence policy runs beside it, measured only.
+    Shadow,
+    /// The fresh-evidence policy decides recording.
+    Observed,
+}
+
+/// SPEC-089 `recording_policy` of a camera. Dormant: nothing reads it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingPolicyConfig {
+    #[serde(default)]
+    pub mode: RecordingPolicyMode,
+    /// No successful analysis for this long puts recording in degraded coverage.
+    #[serde(
+        default = "default_analysis_stale_after_ms",
+        deserialize_with = "bounded_analysis_stale_after_ms"
+    )]
+    pub analysis_stale_after_ms: u64,
+}
+
+fn default_analysis_stale_after_ms() -> u64 {
+    10_000
+}
+
+/// Refused when decoded, so every camera write path rejects it. Above a
+/// minute a dead detector could hide that long behind "quiet".
+fn bounded_analysis_stale_after_ms<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<u64, D::Error> {
+    let ms = u64::deserialize(d)?;
+    if (1..=60_000).contains(&ms) {
+        Ok(ms)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "analysis_stale_after_ms must be 1..=60000, got {ms}"
+        )))
+    }
+}
+
 /// One configured camera. Wire shape (TOML + JSON) is flat — every
 /// field of the nested groups (`ingest`, `detector`, `behavior`)
 /// appears at the top level thanks to `#[serde(flatten)]`. The
