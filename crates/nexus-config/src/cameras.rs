@@ -327,6 +327,10 @@ pub struct CameraBehavior {
     /// analysed frames, so size it against the camera's analysed fps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tile_discovery_revisit_secs: Option<u32>,
+    /// SPEC-089 — how recording activity is decided. `None` (default) is
+    /// legacy and is never serialized, so an old core sees no new key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_policy: Option<RecordingPolicyConfig>,
 }
 
 /// M_TILE_REINFER (G1) — wire-shape tile grid preset.
@@ -357,7 +361,7 @@ pub enum RecordingPolicyMode {
     Observed,
 }
 
-/// SPEC-089 `recording_policy` of a camera. Dormant: nothing reads it yet.
+/// SPEC-089 `recording_policy` of a camera ([`CameraBehavior::recording_policy`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingPolicyConfig {
     #[serde(default)]
@@ -534,6 +538,47 @@ mod tests {
         let mut b = a.clone();
         b.min_bbox_area_px_override = Some(40);
         assert_ne!(a, b);
+    }
+
+    /// SPEC-089 — the flattened `recording_policy` key parses where every
+    /// camera write decodes it, and a camera without one keeps its exact
+    /// pre-SPEC-089 JSON, so an old core sees no new key.
+    #[test]
+    fn recording_policy_is_an_optional_top_level_camera_key() {
+        let old = r#"{"id":7,"name":"Lot","url":"rtsp://10.0.0.5/stream","enabled":true,"max_fps":0,"prompts":[],"visual_prompts":[],"model_override":null,"parking_lot_mode":true,"zones":[]}"#;
+        let camera: CameraConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(camera.behavior.recording_policy, None);
+        assert_eq!(serde_json::to_string(&camera).unwrap(), old);
+
+        let shadow = old.replace(
+            r#""parking_lot_mode":true"#,
+            r#""parking_lot_mode":true,"recording_policy":{"mode":"shadow"}"#,
+        );
+        let camera: CameraConfig = serde_json::from_str(&shadow).unwrap();
+        let policy = camera.behavior.recording_policy.expect("parsed");
+        assert_eq!(policy.mode, RecordingPolicyMode::Shadow);
+        assert_eq!(policy.analysis_stale_after_ms, 10_000);
+        let round_trip: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&camera).unwrap()).unwrap();
+        assert_eq!(
+            round_trip["recording_policy"],
+            serde_json::json!({"mode": "shadow", "analysis_stale_after_ms": 10_000})
+        );
+
+        // The bound on the nested value still applies through the flatten.
+        let invalid = old.replace(
+            r#""zones":[]"#,
+            r#""zones":[],"recording_policy":{"analysis_stale_after_ms":0}"#,
+        );
+        assert!(serde_json::from_str::<CameraConfig>(&invalid).is_err());
+        let toml_camera: CameraConfig = toml::from_str(
+            "name = \"c1\"\nurl = \"rtsp://example/cam\"\nrecording_policy = { mode = \"shadow\" }",
+        )
+        .unwrap();
+        assert_eq!(
+            toml_camera.behavior.recording_policy.map(|p| p.mode),
+            Some(RecordingPolicyMode::Shadow)
+        );
     }
 
     /// Every outside camera write (config load, the admin API's PUT and POST)

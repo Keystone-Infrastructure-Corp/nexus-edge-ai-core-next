@@ -282,6 +282,8 @@ fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Op
         supervisor_width: _,
         detector_downscale_to_width: _,
         detector_downscale_to_height: _,
+        // SPEC-089: a mode change must not restart (gap) the camera; the recording controller applies it live.
+        recording_policy: _,
     } = want;
 
     if *parking_lot_mode != started.parking_lot_mode {
@@ -4138,10 +4140,11 @@ mod tests {
 
     /// The exclusions in [`changed_behavior_field`] are a decision, not an
     /// oversight, so they are pinned like any other behaviour. A restart
-    /// cannot apply these three; the two downscale targets would come back
+    /// cannot apply the first three; the two downscale targets would come back
     /// on the high-res detector, because the router builds its layer set
     /// once at boot. If a future change makes any of them restart-applicable,
-    /// delete its arm here in the same commit.
+    /// delete its arm here in the same commit. `recording_policy` must not
+    /// gap recording to change mode (SPEC-089).
     #[test]
     fn the_deliberately_excluded_behavior_fields_do_not_change_the_key() {
         let before = CameraBehavior {
@@ -4156,6 +4159,12 @@ mod tests {
             }),
             ("detector_downscale_to_height", |b| {
                 b.detector_downscale_to_height = Some(320)
+            }),
+            ("recording_policy", |b| {
+                b.recording_policy = Some(nexus_config::RecordingPolicyConfig {
+                    mode: nexus_config::RecordingPolicyMode::Shadow,
+                    analysis_stale_after_ms: 10_000,
+                })
             }),
         ];
 
