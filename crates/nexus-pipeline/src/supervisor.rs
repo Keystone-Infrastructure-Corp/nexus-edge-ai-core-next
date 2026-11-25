@@ -234,6 +234,9 @@ pub struct CameraHandle {
     /// once the supervisor has returned, since its receiver drops with it.
     /// Dropping this sender requests nothing.
     pub stop: watch::Sender<bool>,
+    /// SPEC-088 — the zone generation this supervisor runs, which the
+    /// reconciler names when it stops it.
+    pub zone_generation: u64,
 }
 
 /// Aborts its task on drop, so a task the supervisor spawns ends with it —
@@ -311,7 +314,7 @@ pub fn spawn_camera(
     // SPEC-088 — the revision of the zones this task freezes, and the
     // generation that must acknowledge it, both fixed before the task runs.
     let zone_revision = crate::zone_application::zone_revision(&cfg.zones);
-    let zone_generation = stats.zone_application().start(camera_id);
+    let zone_generation = stats.zone_application().start(camera_id, &zone_revision);
     let task = tokio::spawn(run_camera(
         cfg,
         detector,
@@ -345,6 +348,7 @@ pub fn spawn_camera(
         camera_id,
         task,
         stop,
+        zone_generation,
     }
 }
 
@@ -485,7 +489,8 @@ async fn run_camera(
         let mut detected: u64 = 0;
         let prompts = cfg.detector.prompts.clone();
         let zones = cfg.zones.clone();
-        let mut zones_acknowledged = false;
+        // SPEC-088 — the last request this generation acknowledged.
+        let mut zones_acknowledged = None;
         // Phase 8.1: equipment classes the static filter should also
         // promote to anchors (captured before the annotator config moves).
         let anchor_classes = annotator_cfg.static_anchor_classes.clone();
@@ -652,6 +657,12 @@ async fn run_camera(
                 None => continue,
             };
             decoded += 1;
+            // SPEC-088 — the request this frame may acknowledge, taken before
+            // it is processed, so a save that lands mid-frame is not credited
+            // to it.
+            let zone_request = stats
+                .zone_application()
+                .current_request(cfg.id, zone_generation);
             // Count frames the source produced that this loop never saw.
             //
             // It has to be HERE, not in the tap above: the tap drains
@@ -1523,16 +1534,18 @@ async fn run_camera(
 
                 // SPEC-088 — this frame went through the zone filters and
                 // everything downstream of them, so this generation now runs
-                // its zones. A frame that ended early (gate drop, detector
-                // error, source rebuild) returned above without getting here.
-                if !zones_acknowledged {
+                // its zones for the request current when the frame began. A
+                // frame that ended early (gate drop, detector error, source
+                // rebuild) returned above without getting here.
+                if let Some(request) = zone_request.filter(|r| zones_acknowledged != Some(*r)) {
                     stats.zone_application().acknowledge(
                         cfg.id,
                         zone_generation,
+                        request,
                         &zone_revision,
                         chrono::Utc::now(),
                     );
-                    zones_acknowledged = true;
+                    zones_acknowledged = Some(request);
                 }
 
                 ControlFlow::Continue(())
@@ -1581,14 +1594,14 @@ async fn run_camera(
         // generation. Ending on its own before any frame is a failure; after
         // one, nothing runs its zones any more.
         if !*stop.borrow() {
-            if zones_acknowledged {
-                stats
-                    .zone_application()
-                    .stop_generation(cfg.id, zone_generation);
-            } else {
-                stats.zone_application().fail(
+            let registry = stats.zone_application();
+            if zones_acknowledged.is_some() {
+                registry.stop(cfg.id, zone_generation);
+            } else if let Some(request) = registry.current_request(cfg.id, zone_generation) {
+                registry.fail(
                     cfg.id,
                     zone_generation,
+                    request,
                     crate::zone_application::ZoneApplicationError::SupervisorExited,
                 );
             }

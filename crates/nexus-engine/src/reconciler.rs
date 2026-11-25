@@ -86,6 +86,9 @@ pub struct RunningCameraEntry {
     /// supervisor. Each pass registers it again without restarting the
     /// camera ([`retry_sessions`]); the no-change guard never reads it.
     sessions: Sessions,
+    /// SPEC-088 — the supervisor's zone generation, which [`stop_camera`]
+    /// names when it stops it.
+    zone_generation: u64,
 }
 
 impl RunningCameraEntry {
@@ -603,6 +606,17 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         .filter(|c| c.ingest.enabled)
         .map(|c| c.id)
         .collect();
+    // SPEC-088 — a pass reads the saved zones and enabled flags, so it is a
+    // request too: a save that bypassed the API's (which requests on its own)
+    // still lets the generation started for it acknowledge.
+    let zone_application = args.frame_stats.zone_application();
+    for cam in &live {
+        zone_application.request(
+            cam.id,
+            &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+            cam.ingest.enabled,
+        );
+    }
 
     // 1. Remove anything that is gone-or-disabled, or whose row this build
     //    cannot read: boot would not have started it either.
@@ -621,9 +635,11 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             // restart the pump reports `stalled` for the gap and clears
             // itself when frames resume.
             args.live_view.stop(id);
-            // A restart keeps the last applied zone revision for comparison;
-            // a camera that is gone or disabled has nothing left to report.
-            args.frame_stats.zone_application().remove(id);
+            // A disabled camera reads inactive, its last acknowledgement kept
+            // for comparison; one that is gone has nothing left to report.
+            if !live.iter().any(|c| c.id == id) {
+                zone_application.remove(id);
+            }
         }
     }
 
@@ -741,19 +757,23 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
     // a clip after the snapshot that nothing would finalize. The price is that
     // a finished task in the map no longer always means a crash:
     // [`RunningCameraEntry::exited_on_its_own`] tells the two apart.
-    let stopping = args
-        .handles
-        .lock()
-        .get(&cam_id)
-        .map(|entry| (entry.stop.clone(), entry.task.clone()));
-    if let Some((stop, task)) = stopping {
+    let stopping = args.handles.lock().get(&cam_id).map(|entry| {
+        (
+            entry.stop.clone(),
+            entry.task.clone(),
+            entry.zone_generation,
+        )
+    });
+    if let Some((stop, task, zone_generation)) = stopping {
         // Only an earlier pass that aborted it and could not see it end left
         // a stop request behind in the map: look again, without waiting.
         let ended = if *stop.borrow() {
             task.is_finished()
         } else {
             // From here on the generation's zones no longer count as applied.
-            args.frame_stats.zone_application().stop(cam_id);
+            args.frame_stats
+                .zone_application()
+                .stop(cam_id, zone_generation);
             // Stop, not abort: an aborted supervisor never reaches the close of
             // its open motion clip, which is abandoned (BUG-285). The receiver
             // drops when `run_camera` returns, which is what `closed` awaits.
@@ -1210,6 +1230,7 @@ pub(crate) fn spawn_supervisor(
         stop: Arc::new(handle.stop),
         key: start.key,
         sessions: start.sessions,
+        zone_generation: handle.zone_generation,
     }
 }
 
@@ -2291,7 +2312,7 @@ mod tests {
     }
 
     /// Camera `id`'s zone status as the stats read builds it: the revision
-    /// saved now against what its running generation acknowledged.
+    /// and enabled flag saved now against what its generations acknowledged.
     async fn zones_status(
         args: &ReconcilerArgs,
         id: CameraId,
@@ -2303,10 +2324,43 @@ mod tests {
             .await
             .expect("read cameras");
         let saved = cameras.into_iter().find(|c| c.id == id)?;
+        Some(args.frame_stats.zone_application().snapshot(
+            id,
+            &zone_revision(&saved.zones),
+            saved.ingest.enabled,
+            now,
+        ))
+    }
+
+    /// Camera 7's status, enabled with `desired` saved, read now.
+    fn status(args: &ReconcilerArgs, desired: &str) -> ZonesRuntime {
         args.frame_stats
             .zone_application()
-            .snapshot(id, &zone_revision(&saved.zones), now)
+            .snapshot(7, desired, true, std::time::Instant::now())
     }
+
+    /// What the API's camera save does: persist, then tell the registry.
+    async fn save(args: &ReconcilerArgs, camera: &CameraConfig) {
+        args.store.upsert_camera(camera).await.expect("save camera");
+        args.frame_stats.zone_application().request(
+            camera.id,
+            &zone_revision(&camera.zones),
+            camera.ingest.enabled,
+        );
+    }
+
+    fn corner() -> ZoneConfig {
+        ZoneConfig {
+            id: "z1".into(),
+            name: "Corner".into(),
+            polygon: vec![(0.0, 0.0), (0.2, 0.0), (0.0, 0.2)],
+            kind: ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
+        }
+    }
+
+    /// The time a stale acknowledgement claims, which no read may show.
+    const STALE: chrono::DateTime<chrono::Utc> = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
 
     /// SPEC-088 — a save is applied only once the generation started with it
     /// has processed a frame: between the save and that frame the read says
@@ -2318,11 +2372,7 @@ mod tests {
         let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
         let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
         let registry = args.frame_stats.zone_application();
-        let applied = |desired: &str| {
-            registry
-                .snapshot(7, desired, std::time::Instant::now())
-                .is_some_and(|s| s.state == ZoneApplicationState::Applied)
-        };
+        let applied = |desired: &str| status(&args, desired).state == ZoneApplicationState::Applied;
         let unzoned = zone_revision(&[]);
 
         reconcile(&args).await.expect("first pass");
@@ -2334,6 +2384,9 @@ mod tests {
             applied(&unzoned)
         })
         .await;
+        let first_request = registry
+            .current_request(7, first.generation)
+            .expect("the first generation runs the saved zones");
 
         let mut camera = cam(None);
         camera.zones.push(ZoneConfig {
@@ -2381,21 +2434,26 @@ mod tests {
             applied(&zoned)
         })
         .await;
-        let now = registry
-            .snapshot(7, &zoned, std::time::Instant::now())
-            .expect("still reported");
+        let now = status(&args, &zoned);
         assert_eq!(
-            (now.applied_revision.as_deref(), now.generation),
-            (Some(zoned.as_str()), restarted.generation)
+            (
+                now.applied_revision.as_deref(),
+                now.generation,
+                now.applied_generation
+            ),
+            (
+                Some(zoned.as_str()),
+                restarted.generation,
+                Some(restarted.generation)
+            )
         );
         assert!(now.applied_at.is_some());
 
-        registry.acknowledge(7, first.generation, &unzoned, chrono::Utc::now());
-        let after_stale = registry.snapshot(7, &zoned, std::time::Instant::now());
+        registry.acknowledge(7, first.generation, first_request, &unzoned, STALE);
+        let after_stale = status(&args, &zoned);
         abort_all(&args.handles);
         assert_eq!(
-            after_stale,
-            Some(now),
+            after_stale, now,
             "the stopped generation's late acknowledgement must be ignored"
         );
     }
@@ -2412,10 +2470,7 @@ mod tests {
         let a = zone_revision(&[]);
         reconcile(&args).await.expect("first pass");
         wait_until("the first generation applied A", || {
-            args.frame_stats
-                .zone_application()
-                .snapshot(7, &a, std::time::Instant::now())
-                .is_some_and(|s| s.state == ZoneApplicationState::Applied)
+            status(&args, &a).state == ZoneApplicationState::Applied
         })
         .await;
 
@@ -2587,12 +2642,8 @@ mod tests {
             .expect("reported");
         reconcile(&args).await.expect("pass that restarts it");
         wait_until("the replacement applied the zones", || {
-            args.frame_stats
-                .zone_application()
-                .snapshot(7, &a, std::time::Instant::now())
-                .is_some_and(|s| {
-                    s.state == ZoneApplicationState::Applied && s.generation > exited.generation
-                })
+            let s = status(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.generation > exited.generation
         })
         .await;
         abort_all(&args.handles);
@@ -2611,31 +2662,356 @@ mod tests {
         );
     }
 
-    /// SPEC-088 — a camera that is deleted, or disabled, reports nothing.
+    /// SPEC-088 — a restart with the same zones applies nothing until the
+    /// new generation processes a frame of its own, and the old generation's
+    /// late callbacks, carrying its token, count for nothing afterwards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_removed_camera_reports_no_zone_application() {
+    async fn a_same_zones_restart_reads_applying_until_the_new_generation_acknowledges() {
         let dir = tempfile::tempdir().expect("tempdir");
         let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
         let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
         let registry = args.frame_stats.zone_application();
-        let unzoned = zone_revision(&[]);
-        let read = || registry.snapshot(7, &unzoned, std::time::Instant::now());
-
+        let a = zone_revision(&[]);
         reconcile(&args).await.expect("first pass");
-        assert!(read().is_some());
+        wait_until("the first generation applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let g1 = entry_of(&args.handles, 7).zone_generation;
+        let stale = registry.current_request(7, g1).expect("g1 runs A");
+
+        assert!(stop_camera(&args, 7).await, "the supervisor stops");
+        let stopped = status(&args, &a);
+        registry.acknowledge(7, g1, stale, &a, STALE);
+        let after_stale = status(&args, &a);
+        reconcile(&args).await.expect("pass that restarts it");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("the restarted generation applied A", || {
+            status(&args, &a).applied_generation == Some(g2)
+        })
+        .await;
+        let applied = status(&args, &a);
+        registry.acknowledge(7, g1, stale, &a, STALE);
+        registry.fail(7, g1, stale, ZoneApplicationError::SupervisorExited);
+        let after_late = status(&args, &a);
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (
+                stopped.applied_revision.as_deref(),
+                stopped.generation,
+                stopped.applied_generation,
+                stopped.state
+            ),
+            (
+                Some(a.as_str()),
+                g1,
+                Some(g1),
+                ZoneApplicationState::Applying
+            ),
+            "a stopped generation still read applied"
+        );
+        assert_eq!(
+            after_stale, stopped,
+            "a stopped generation's acknowledgement counted"
+        );
+        assert!(g2 > g1, "the restart is a new generation");
+        assert_eq!(
+            (applied.generation, applied.state),
+            (g2, ZoneApplicationState::Applied)
+        );
+        assert_eq!(
+            after_late, applied,
+            "the old generation's late callbacks counted"
+        );
+    }
+
+    /// SPEC-088 — A→B→A through restarts: while the generation running B is
+    /// current, A saved again cannot be satisfied by A's earlier generation
+    /// or acknowledged by B's; only the replacement A generation applies it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_to_b_to_a_through_restarts_is_applied_only_by_the_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        let a = zone_revision(&[]);
+        let mut b_cam = cam(None);
+        b_cam.zones.push(corner());
+        let b = zone_revision(&b_cam.zones);
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let g1 = entry_of(&args.handles, 7).zone_generation;
+        let token_a = registry.current_request(7, g1).expect("g1 runs A");
+
+        save(&args, &b_cam).await;
+        reconcile(&args).await.expect("pass that starts B");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("g2 applied B", || {
+            status(&args, &b).applied_generation == Some(g2)
+        })
+        .await;
+        let token_b = registry.current_request(7, g2).expect("g2 runs B");
+
+        save(&args, &cam(None)).await;
+        let requested = status(&args, &a);
+        registry.acknowledge(7, g1, token_a, &a, STALE);
+        registry.acknowledge(7, g2, token_b, &b, STALE);
+        let after_stale = status(&args, &a);
+        reconcile(&args).await.expect("pass that starts A again");
+        let g3 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("g3 applied A", || {
+            status(&args, &a).applied_generation == Some(g3)
+        })
+        .await;
+        let applied = status(&args, &a);
+        registry.acknowledge(7, g1, token_a, &a, STALE);
+        registry.acknowledge(7, g2, token_b, &b, STALE);
+        registry.fail(7, g1, token_a, ZoneApplicationError::SupervisorExited);
+        registry.fail(7, g2, token_b, ZoneApplicationError::SupervisorExited);
+        let after_late = status(&args, &a);
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (
+                requested.applied_revision.as_deref(),
+                requested.generation,
+                requested.applied_generation,
+                requested.state
+            ),
+            (
+                Some(b.as_str()),
+                g2,
+                Some(g2),
+                ZoneApplicationState::Applying
+            ),
+            "A saved again read applied while B's generation runs"
+        );
+        assert_eq!(
+            after_stale, requested,
+            "A/g1 or B/g2 acknowledged the new A request"
+        );
+        assert!(g3 > g2 && g2 > g1);
+        assert_eq!(
+            (
+                applied.applied_revision.as_deref(),
+                applied.generation,
+                applied.state
+            ),
+            (Some(a.as_str()), g3, ZoneApplicationState::Applied)
+        );
+        assert_eq!(
+            after_late, applied,
+            "an earlier generation's late callback counted"
+        );
+    }
+
+    /// SPEC-088 — A→B→A saved between two passes, with the generation
+    /// running A never stopped: the acknowledgement taken before B no longer
+    /// counts, and that same generation's next frame applies A again,
+    /// without a restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_to_b_to_a_between_passes_reapplies_on_the_running_generations_next_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        let a = zone_revision(&[]);
+        let mut b_cam = cam(None);
+        b_cam.zones.push(corner());
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let before = entry_of(&args.handles, 7);
+        let g1 = before.zone_generation;
+        let first = registry.current_request(7, g1).expect("g1 runs A");
+
+        let saved_at = chrono::Utc::now();
+        save(&args, &b_cam).await;
+        save(&args, &cam(None)).await;
+        let again = registry.current_request(7, g1);
+        registry.acknowledge(7, g1, first, &a, STALE);
+        wait_until("g1's next frame applied the new request for A", || {
+            let s = status(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.applied_at.is_some_and(|t| t >= saved_at)
+        })
+        .await;
+        let applied = status(&args, &a);
+        reconcile(&args).await.expect("pass after A→B→A");
+        let unchanged = Arc::ptr_eq(&entry_of(&args.handles, 7).task, &before.task);
+        abort_all(&args.handles);
+
+        assert!(
+            again.is_some_and(|t| t != first),
+            "A→B→A is not a new request: {again:?} after {first:?}"
+        );
+        assert_eq!(
+            (applied.generation, applied.applied_generation),
+            (g1, Some(g1)),
+            "a restart applied it, not the running generation"
+        );
+        assert!(unchanged, "A→B→A between passes restarted the camera");
+    }
+
+    /// SPEC-088 — disabled is inactive at once, from the saved flag a read
+    /// sees, with no deadline and no late callback able to change it; a save
+    /// while disabled starts nothing; enabling needs a fresh generation's
+    /// acknowledgement; deletion alone forgets the camera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_camera_reads_inactive_and_enabling_needs_a_fresh_acknowledgement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        let a = zone_revision(&[]);
+        let later = || std::time::Instant::now() + 2 * APPLICATION_TIMEOUT;
+        let read = |s: ZonesRuntime| {
+            (
+                s.desired_revision,
+                s.applied_revision,
+                s.generation,
+                s.applied_generation,
+                s.state,
+                s.error_code,
+            )
+        };
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let g1 = entry_of(&args.handles, 7).zone_generation;
+        let token = registry.current_request(7, g1).expect("g1 runs A");
+        let inactive_a = (
+            a.clone(),
+            Some(a.clone()),
+            g1,
+            Some(g1),
+            ZoneApplicationState::Inactive,
+            None,
+        );
+
         let mut disabled = cam(None);
         disabled.ingest.enabled = false;
         args.store.upsert_camera(&disabled).await.expect("disable");
+        let at_once = zones_status(&args, 7, std::time::Instant::now()).await;
+        registry.acknowledge(7, g1, token, &a, STALE);
+        registry.fail(7, g1, token, ZoneApplicationError::SupervisorExited);
+        let after_late = zones_status(&args, 7, std::time::Instant::now()).await;
         reconcile(&args).await.expect("pass after the disable");
-        assert_eq!(read(), None, "disabled");
+        let stopped = !args.handles.lock().contains_key(&7);
+        let long_after = zones_status(&args, 7, later()).await;
 
-        args.store.upsert_camera(&cam(None)).await.expect("enable");
+        let mut disabled_b = disabled.clone();
+        disabled_b.zones.push(corner());
+        let b = zone_revision(&disabled_b.zones);
+        save(&args, &disabled_b).await;
+        reconcile(&args)
+            .await
+            .expect("pass after a save while disabled");
+        let started = args.handles.lock().contains_key(&7);
+        let saved_disabled = zones_status(&args, 7, later()).await;
+
+        let mut enabled_b = disabled_b.clone();
+        enabled_b.ingest.enabled = true;
+        save(&args, &enabled_b).await;
+        let enabled = zones_status(&args, 7, std::time::Instant::now()).await;
         reconcile(&args).await.expect("pass after the enable");
-        assert!(read().is_some());
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("g2 applied B", || {
+            status(&args, &b).applied_generation == Some(g2)
+        })
+        .await;
+        let applied = zones_status(&args, 7, std::time::Instant::now()).await;
+
         args.store.delete_camera(7).await.expect("delete");
         reconcile(&args).await.expect("pass after the delete");
+        let deleted = zones_status(&args, 7, std::time::Instant::now()).await;
+        args.store
+            .upsert_camera(&cam(None))
+            .await
+            .expect("re-create");
+        let recreated = zones_status(&args, 7, std::time::Instant::now()).await;
         abort_all(&args.handles);
-        assert_eq!(read(), None, "deleted");
+
+        assert_eq!(
+            at_once.map(read),
+            Some(inactive_a.clone()),
+            "a disable read before the pass"
+        );
+        assert_eq!(
+            after_late.map(read),
+            Some(inactive_a.clone()),
+            "a late callback counted"
+        );
+        assert!(stopped, "the disabled camera still runs");
+        assert_eq!(
+            long_after.map(read),
+            Some(inactive_a),
+            "inactive is not timed out"
+        );
+        assert!(!started, "a save while disabled started a generation");
+        assert_eq!(
+            saved_disabled.map(read),
+            Some((
+                b.clone(),
+                Some(a.clone()),
+                g1,
+                Some(g1),
+                ZoneApplicationState::Inactive,
+                None
+            ))
+        );
+        assert_eq!(
+            enabled.map(|s| (s.state, s.error_code)),
+            Some((ZoneApplicationState::Applying, None)),
+            "an enable read applied or failed before any generation ran B"
+        );
+        assert!(g2 > g1);
+        assert_eq!(
+            applied.map(|s| (s.applied_revision, s.state)),
+            Some((Some(b), ZoneApplicationState::Applied))
+        );
+        assert_eq!(deleted, None, "a deleted camera is reported");
+        assert_eq!(
+            recreated.map(|s| (s.applied_revision, s.applied_generation)),
+            Some((None, None)),
+            "the deleted camera's history outlived it"
+        );
+    }
+
+    /// SPEC-088 — a pass is a request too: zones saved by a writer that
+    /// bypasses the API's save, and read by nobody, still let the generation
+    /// the pass starts for them acknowledge, rather than time out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_requests_the_zones_it_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &zone_revision(&[])).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let mut b_cam = cam(None);
+        b_cam.zones.push(corner());
+        args.store
+            .upsert_camera(&b_cam)
+            .await
+            .expect("save B behind the API");
+        reconcile(&args).await.expect("pass that starts B");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("g2 can acknowledge B with no read", || {
+            registry.current_request(7, g2).is_some()
+        })
+        .await;
+        abort_all(&args.handles);
     }
 
     /// What [`GatedOpenRecorder`] saw, in the order it saw it.
@@ -2894,6 +3270,7 @@ mod tests {
                 main_pending: None,
                 analysis: None,
             },
+            zone_generation: 0,
         };
         args.handles.lock().insert(7, original.clone());
         let is_original = |h: &HandleMap| {

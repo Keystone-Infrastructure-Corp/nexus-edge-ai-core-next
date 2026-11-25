@@ -1471,6 +1471,13 @@ async fn reprobe_apply(
                 )
                 .await?;
                 nexus_store::Store::commit_tx(tx).await?;
+                // SPEC-088 — the row written back carries zones and the
+                // enabled flag too: a save like any other.
+                s.frame_stats.zone_application().request(
+                    cam.id,
+                    &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+                    cam.ingest.enabled,
+                );
                 applied_any = true;
             }
         }
@@ -1692,6 +1699,13 @@ async fn upsert_camera(
         .await;
         return Err(e.into());
     }
+    // SPEC-088 — every save is a request, so A→B→A saved before the next
+    // reconcile pass or read still needs a new acknowledgement.
+    s.frame_stats.zone_application().request(
+        id,
+        &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+        cam.ingest.enabled,
+    );
     // Fire-and-forget: the engine's `config.changed` reconciler
     // listens for this and hot-starts a supervisor + pre-roll
     // ingester for the new (or modified) camera. `action` lets the
@@ -1801,6 +1815,12 @@ async fn create_camera(
         .await;
         return Err(e.into());
     }
+    // SPEC-088 — as `upsert_camera`.
+    s.frame_stats.zone_application().request(
+        cam.id,
+        &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+        cam.ingest.enabled,
+    );
     let _ = s
         .bus
         .publish(
@@ -1869,6 +1889,8 @@ async fn delete_camera(
     }
     // The delete cascaded its speaker assignment; its stop would now 404.
     s.talkdown.stop_where(|_, camera, _| camera == Some(id));
+    // SPEC-088 — a deleted camera has no zone application left to report.
+    s.frame_stats.zone_application().remove(id);
     // Same channel as upsert — the reconciler diffs the live set
     // against the DB and stops the supervisor for any removed id.
     let _ = s
@@ -2963,17 +2985,18 @@ struct CameraFrameStatsView {
     /// right now (substream vs. mainstream fallback) and at what geometry
     /// / rate. `null` if this camera has no supervisor spawned yet.
     analysis_stream: Option<nexus_pipeline::AnalysisStreamStatus>,
-    /// SPEC-088 — the zone revision saved now against the one the running
-    /// supervisor generation acknowledged. Absent when no generation of the
-    /// camera has started in this process (or its row cannot be read), which
-    /// a reader takes as "not reported", never as applied.
+    /// SPEC-088 — the zone revision and enabled flag saved now against what
+    /// the camera's supervisor generations acknowledged. Absent only for a
+    /// camera whose row is not saved or cannot be read, which a reader takes
+    /// as "not reported", never as applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     zones_runtime: Option<nexus_pipeline::zone_application::ZonesRuntime>,
 }
 
-/// SPEC-088 — each camera's zone application status, its desired revision
-/// hashed from the zones in the store now, so a read straight after a save
-/// already reports the saved zones, never the running ones as applied.
+/// SPEC-088 — each saved camera's zone application status, its desired
+/// revision hashed from the zones in the store now and its enabled flag read
+/// with them, so a read straight after a save already reports the saved
+/// zones, never the running ones as applied.
 async fn zones_runtime(
     s: &ApiState,
     now: std::time::Instant,
@@ -2988,16 +3011,20 @@ async fn zones_runtime(
     let registry = s.frame_stats.zone_application();
     cameras
         .iter()
-        .filter_map(|cam| {
+        .map(|cam| {
             let desired = nexus_pipeline::zone_application::zone_revision(&cam.zones);
-            Some((cam.id, registry.snapshot(cam.id, &desired, now)?))
+            (
+                cam.id,
+                registry.snapshot(cam.id, &desired, cam.ingest.enabled, now),
+            )
         })
         .collect()
 }
 
 /// 404 only when there is nothing to report: no frame since the supervisor
-/// last (re)started, and no zone application either. A restarting camera
-/// reads as no frame yet, with its zone status, rather than as missing.
+/// last (re)started, and no saved camera to report zone application for. A
+/// restarting camera reads as no frame yet, with its zone status, rather than
+/// as missing.
 async fn get_camera_stats(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -8017,11 +8044,13 @@ mod tests {
     }
 
     /// SPEC-088 — `zones_runtime` on the camera-stats read, in the shape the
-    /// cloud console is built against: all seven keys with explicit `null`s,
-    /// the desired revision hashed from the zones saved now, the batch and the
-    /// single read agreeing, and no object for a camera this process has
-    /// started no generation of. A restarting camera with no frame yet is
-    /// answered, not a 404, so its pending or failed status is not hidden.
+    /// cloud console is built against: all eight keys with explicit `null`s,
+    /// the desired revision and enabled flag read from the store now, and the
+    /// batch and the single read agreeing. Every saved camera answers, an
+    /// enabled one with no generation yet included, so a pending or failed
+    /// application is not hidden; a disabled one is inactive. Each save is a
+    /// new request, so A→B→A saved with no read between still needs a new
+    /// acknowledgement. A deleted camera is forgotten.
     #[tokio::test]
     async fn camera_stats_report_zone_application_in_the_agreed_shape() {
         use nexus_pipeline::zone_application::{zone_revision, ZoneApplicationError};
@@ -8061,6 +8090,18 @@ mod tests {
             );
             one.get("zones_runtime").cloned()
         }
+        /// Save `camera` through the API, as an operator does.
+        async fn put(app: &axum::Router, camera: &nexus_config::CameraConfig) {
+            let mut req = Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/v1/cameras/{}", camera.id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(camera).unwrap()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert!(res.status().is_success(), "save: {}", res.status());
+        }
 
         let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
         store_default_camera(&store, true).await;
@@ -8073,14 +8114,34 @@ mod tests {
             chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 11, 24, 16, 30, 0).unwrap();
 
         assert_eq!(
-            get(&app, &format!("/api/v1/cameras/{id}/stats")).await.0,
+            get(&app, &format!("/api/v1/cameras/{}/stats", id + 1))
+                .await
+                .0,
             StatusCode::NOT_FOUND,
-            "no frame and no generation is still nothing to report"
+            "a camera that is not saved and has no frame has nothing to report"
         );
-        assert_eq!(get(&app, "/api/v1/cameras/stats").await.1, json!([]));
 
         let a = zone_revision(&camera.zones);
-        let g1 = registry().start(id);
+        let unstarted = zones_runtime(&app, id)
+            .await
+            .expect("an enabled camera with no generation is reported");
+        let g0 = unstarted["generation"].as_u64().expect("a generation");
+        assert_eq!(
+            unstarted,
+            json!({
+                "schema_version": 1,
+                "desired_revision": a,
+                "applied_revision": null,
+                "generation": g0,
+                "applied_generation": null,
+                "state": "applying",
+                "applied_at": null,
+                "error_code": null,
+            })
+        );
+
+        let g1 = registry().start(id, &a);
+        assert!(g1 > g0, "a start is a newer generation");
         assert_eq!(
             zones_runtime(&app, id).await,
             Some(json!({
@@ -8088,26 +8149,31 @@ mod tests {
                 "desired_revision": a,
                 "applied_revision": null,
                 "generation": g1,
+                "applied_generation": null,
                 "state": "applying",
                 "applied_at": null,
                 "error_code": null,
             }))
         );
 
-        registry().acknowledge(id, g1, &a, applied_at);
-        assert_eq!(
-            zones_runtime(&app, id).await,
-            Some(json!({
-                "schema_version": 1,
-                "desired_revision": a,
-                "applied_revision": a,
-                "generation": g1,
-                "state": "applied",
-                "applied_at": "2026-11-24T16:30:00Z",
-                "error_code": null,
-            }))
-        );
+        let first = registry()
+            .current_request(id, g1)
+            .expect("g1 runs the saved zones");
+        registry().acknowledge(id, g1, first, &a, applied_at);
+        let applied_a = json!({
+            "schema_version": 1,
+            "desired_revision": a,
+            "applied_revision": a,
+            "generation": g1,
+            "applied_generation": g1,
+            "state": "applied",
+            "applied_at": "2026-11-24T16:30:00Z",
+            "error_code": null,
+        });
+        assert_eq!(zones_runtime(&app, id).await, Some(applied_a.clone()));
 
+        // A→B→A through the API's save, with no read or reconcile between.
+        let a_camera = camera.clone();
         camera.zones = vec![nexus_config::ZoneConfig {
             id: "z1".into(),
             name: "Driveway".into(),
@@ -8117,15 +8183,35 @@ mod tests {
         }];
         let b = zone_revision(&camera.zones);
         assert!(b.starts_with("sha256:") && b.len() == 7 + 64 && b != a);
-        let mut req = Request::builder()
-            .method(Method::PUT)
-            .uri(format!("/api/v1/cameras/{id}"))
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&camera).unwrap()))
-            .unwrap();
-        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert!(res.status().is_success(), "save zones: {}", res.status());
+        put(&app, &camera).await;
+        put(&app, &a_camera).await;
+        let again = registry().current_request(id, g1).expect("g1 runs A");
+        assert_ne!(again, first, "the API's saves of B and A were no requests");
+        let reapplying = json!({
+            "schema_version": 1,
+            "desired_revision": a,
+            "applied_revision": a,
+            "generation": g1,
+            "applied_generation": g1,
+            "state": "applying",
+            "applied_at": "2026-11-24T16:30:00Z",
+            "error_code": null,
+        });
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(reapplying.clone()),
+            "the A acknowledged before B was credited to the A saved after it"
+        );
+        registry().acknowledge(id, g1, first, &a, applied_at);
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(reapplying),
+            "a stale token counted"
+        );
+        registry().acknowledge(id, g1, again, &a, applied_at);
+        assert_eq!(zones_runtime(&app, id).await, Some(applied_a));
+
+        put(&app, &camera).await;
         assert_eq!(
             zones_runtime(&app, id).await,
             Some(json!({
@@ -8133,6 +8219,7 @@ mod tests {
                 "desired_revision": b,
                 "applied_revision": a,
                 "generation": g1,
+                "applied_generation": g1,
                 "state": "applying",
                 "applied_at": "2026-11-24T16:30:00Z",
                 "error_code": null,
@@ -8140,8 +8227,9 @@ mod tests {
             "a read straight after a save reports the saved zones, not the old verdict"
         );
 
-        let g2 = registry().start(id);
-        registry().fail(id, g2, ZoneApplicationError::SupervisorExited);
+        let g2 = registry().start(id, &b);
+        let request = registry().current_request(id, g2).expect("g2 runs B");
+        registry().fail(id, g2, request, ZoneApplicationError::SupervisorExited);
         assert_eq!(
             zones_runtime(&app, id).await,
             Some(json!({
@@ -8149,19 +8237,51 @@ mod tests {
                 "desired_revision": b,
                 "applied_revision": a,
                 "generation": g2,
+                "applied_generation": g1,
                 "state": "failed",
                 "applied_at": "2026-11-24T16:30:00Z",
                 "error_code": "supervisor_exited",
             }))
         );
 
-        registry().remove(id);
+        camera.ingest.enabled = false;
+        put(&app, &camera).await;
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": b,
+                "applied_revision": a,
+                "generation": g2,
+                "applied_generation": g1,
+                "state": "inactive",
+                "applied_at": "2026-11-24T16:30:00Z",
+                "error_code": null,
+            })),
+            "a disabled camera is inactive, neither applied nor failed"
+        );
+
+        let mut req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/api/v1/cameras/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert!(res.status().is_success(), "delete: {}", res.status());
         let epoch = frame_stats.begin_session(id);
         frame_stats.observe_frame(id, epoch, chrono::Utc::now(), 512, 288);
         assert_eq!(
             zones_runtime(&app, id).await,
             None,
-            "a camera with no generation in this process omits the object"
+            "a camera that is not saved omits the object"
+        );
+        assert_eq!(
+            registry()
+                .snapshot(id, &b, true, std::time::Instant::now())
+                .applied_revision,
+            None,
+            "the delete kept the camera's history"
         );
     }
 
