@@ -21,7 +21,7 @@
 //! 5. **Age unmatched tracks.** Confirmed tracks demote to lost.
 //!    Tentative ones just bump `missed_frames`.
 //! 6. **Spawn.** Every still-unmatched detection above
-//!    `low_confidence` becomes a new track (Tentative unless
+//!    `new_track_confidence` (default `low_confidence`) becomes a new track (Tentative unless
 //!    `confirm_frames <= 1`, in which case Confirmed immediately —
 //!    the v1 default).
 //! 7. **Emit.** Confirmed and Lost tracks get returned. Tentative ones
@@ -215,8 +215,9 @@ impl Tracker for ByteTrackTracker {
         }
 
         // ---- 6. Spawn tracks for still-unmatched detections >= low_conf. ----
+        let spawn_confidence = cfg.new_track_confidence.unwrap_or(cfg.low_confidence);
         for (i, d) in detections.iter_mut().enumerate() {
-            if det_used[i] || d.confidence < cfg.low_confidence {
+            if det_used[i] || d.confidence < spawn_confidence {
                 continue;
             }
             let id = state.next_id;
@@ -636,6 +637,20 @@ mod tests {
 
     fn cfg_default() -> ByteTrackConfig {
         ByteTrackConfig::default()
+    }
+
+    /// With `new_track_confidence` set, a weak detection keeps an existing
+    /// track matched but a weak detection on its own starts nothing.
+    #[test]
+    fn weak_detection_recovers_a_track_but_does_not_start_one() {
+        let mut cfg = cfg_default();
+        cfg.new_track_confidence = Some(0.3);
+        let t = ByteTrackTracker::new(cfg);
+        let born = t.update(vec![det("person", 0.0, 0.9)], *T);
+        let out = t.update(vec![det("person", 1.0, 0.2), det("person", 500.0, 0.2)], *T);
+        assert_eq!(out.len(), 1, "the lone weak detection started a track");
+        assert_eq!(out[0].track_id, born[0].track_id);
+        assert_eq!(out[0].attributes["tracking.predicted_only"], false);
     }
 
     #[test]
