@@ -608,7 +608,9 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     //    cannot read: boot would not have started it either.
     for id in current.keys().copied().collect::<Vec<_>>() {
         if !live_enabled.contains(&id) {
-            stop_camera(args, id).await;
+            if !stop_camera(args, id).await {
+                continue;
+            }
             // Reap the LBR pump here and *only* here. A camera that is gone
             // or disabled has no frames to pump, so its encode task would
             // poll a cache entry that will never be refilled. The restart
@@ -642,12 +644,18 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                 continue;
             }
             Some(entry) => {
-                // A finished task here was not stopped by us: `stop_camera`
-                // runs in this task, so no pass sees an entry mid-stop.
-                if entry.task.is_finished() {
+                // `stop_camera` runs in this task, so the only entry a pass
+                // sees mid-stop is one an earlier pass aborted and could not
+                // see end; any other finished task was not stopped by us.
+                if entry.exited_on_its_own() {
                     error!(
                         camera_id = cam_id,
                         "camera reconciler: supervisor exited without being stopped; restarting"
+                    );
+                } else if *entry.stop.borrow() {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: checking again on a supervisor that outlived its abort"
                     );
                 } else if entry.key.url != want.url {
                     info!(
@@ -693,7 +701,9 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         "camera reconciler: camera behavior changed; restarting supervisor"
                     );
                 }
-                stop_camera(args, cam_id).await;
+                if !stop_camera(args, cam_id).await {
+                    continue;
+                }
             }
             None => {}
         }
@@ -718,7 +728,11 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
 /// while merely holding an open clip still leaves it to that drain.
 const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
+/// Whether the camera's supervisor has ended and its camera was torn down.
+/// `false` means it outlived its abort: it stays in the map, nothing else is
+/// torn down, and the caller must not start a replacement; a later pass
+/// checks on it again without waiting.
+async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
     // The entry stays in the map until the supervisor has ended. Shutdown
     // (`main.rs`) aborts the reconciler without joining it, then aborts every
     // supervisor it finds in the map before the recorder's shutdown snapshot.
@@ -733,30 +747,48 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
         .get(&cam_id)
         .map(|entry| (entry.stop.clone(), entry.task.clone()));
     if let Some((stop, task)) = stopping {
-        // Stop, not abort: an aborted supervisor never reaches the close of
-        // its open motion clip, which is abandoned (BUG-285). The receiver
-        // drops when `run_camera` returns, which is what `closed` awaits.
-        let _ = stop.send(true);
-        if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
-            .await
-            .is_ok()
-        {
-            info!(camera_id = cam_id, "camera reconciler: stopped supervisor");
+        // Only an earlier pass that aborted it and could not see it end left
+        // a stop request behind in the map: look again, without waiting.
+        let ended = if *stop.borrow() {
+            task.is_finished()
         } else {
-            task.abort();
-            // The abort lands at the supervisor's next await; until it has,
-            // the entry stays in shutdown's sweep. Bounded, because a
-            // supervisor wedged in synchronous code never reaches one.
-            let ended = tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
+            // Stop, not abort: an aborted supervisor never reaches the close of
+            // its open motion clip, which is abandoned (BUG-285). The receiver
+            // drops when `run_camera` returns, which is what `closed` awaits.
+            let _ = stop.send(true);
+            if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
                 .await
-                .is_ok();
+                .is_ok()
+            {
+                info!(camera_id = cam_id, "camera reconciler: stopped supervisor");
+                true
+            } else {
+                task.abort();
+                // The abort lands at the supervisor's next await; until it has,
+                // the entry stays in shutdown's sweep. Bounded, because a
+                // supervisor wedged in synchronous code never reaches one.
+                let ended = tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
+                    .await
+                    .is_ok();
+                warn!(
+                    camera_id = cam_id,
+                    timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
+                    ended,
+                    "camera reconciler: supervisor did not stop in time; aborted it, and any \
+                     clip it had open is abandoned"
+                );
+                ended
+            }
+        };
+        if !ended {
+            // Removing it would hide a live supervisor from shutdown's sweep
+            // and start a second one for the camera beside it.
             warn!(
                 camera_id = cam_id,
-                timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
-                ended,
-                "camera reconciler: supervisor did not stop in time; aborted it, and any \
-                 clip it had open is abandoned"
+                "camera reconciler: aborted supervisor is still running; keeping it tracked \
+                 and not restarting the camera until it ends"
             );
+            return false;
         }
         args.handles.lock().remove(&cam_id);
     }
@@ -779,6 +811,7 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     args.frame_stats.clear(cam_id);
     args.decode_health.clear(cam_id);
     args.analysis_stream.clear(cam_id);
+    true
 }
 
 /// Attach or detach a camera's SPEC-069 analysis substream session, and
@@ -2732,6 +2765,82 @@ mod tests {
             recorder.calls(),
             [GateCall::OpenBlocked],
             "the aborted supervisor's open completed after its stop"
+        );
+    }
+
+    /// SPEC-088 review — a supervisor wedged in synchronous code (blocking
+    /// storage work, say) outlives both of `stop_camera`'s waits, its abort
+    /// included. It must stay in the map, where shutdown's sweep finds it,
+    /// with no replacement started beside it, and later passes must not wait
+    /// for it again; once it has ended, one pass starts exactly one
+    /// replacement.
+    #[tokio::test]
+    async fn a_supervisor_that_outlives_its_abort_stays_tracked_and_unreplaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let mut toggled = cam(None);
+        toggled.behavior.parking_lot_mode = true;
+        let args = reconciler_args(recorder, dir.path(), &[toggled]).await;
+        // Started for the camera before the toggle, on a runtime of its own so
+        // it can block a thread where no abort lands until the test lets it go.
+        let wedge_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let (unwedge, wedged) = std::sync::mpsc::channel::<()>();
+        let original = RunningCameraEntry {
+            task: Arc::new(wedge_rt.spawn(async move {
+                let _stop_rx = stop_rx;
+                let _ = wedged.recv();
+                std::future::pending::<()>().await
+            })),
+            stop: Arc::new(stop),
+            key: EntryKey::wanted(&args, &cam(None)),
+            sessions: Sessions {
+                main_pending: None,
+                analysis: None,
+            },
+        };
+        args.handles.lock().insert(7, original.clone());
+        let is_original = |h: &HandleMap| {
+            h.lock()
+                .get(&7)
+                .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
+        };
+
+        // Both waits elapse on the paused clock; the abort cannot land.
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        let kept = !stopped && is_original(&args.handles);
+        // Real time from here: a pass that waited for it again would take 40 s.
+        let pass = tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&args)).await;
+        let unreplaced = is_original(&args.handles);
+
+        unwedge.send(()).expect("wedged task waits");
+        wait_until("the aborted supervisor ended", || {
+            original.task.is_finished()
+        })
+        .await;
+        reconcile(&args).await.expect("pass after it ended");
+        let replacement = entry_of(&args.handles, 7);
+        reconcile(&args).await.expect("pass with nothing to change");
+        let after = entry_of(&args.handles, 7);
+        abort_all(&args.handles);
+        wedge_rt.shutdown_background();
+
+        assert!(kept, "a supervisor that outlived its abort left the map");
+        assert!(
+            matches!(pass, Ok(Ok(()))),
+            "a later pass waited for the aborted supervisor again"
+        );
+        assert!(unreplaced, "a replacement started beside a live supervisor");
+        assert!(
+            !Arc::ptr_eq(&replacement.task, &original.task)
+                && !replacement.task.is_finished()
+                && Arc::ptr_eq(&after.task, &replacement.task),
+            "once it ended, exactly one replacement must start"
         );
     }
 
