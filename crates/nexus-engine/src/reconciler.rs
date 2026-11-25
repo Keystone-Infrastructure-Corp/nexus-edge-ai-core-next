@@ -1075,7 +1075,8 @@ pub(crate) fn spawn_supervisor(
                 requested,
                 effective,
                 "camera reconciler: score_threshold is below what this camera's shared \
-                 inference layer was built with at boot; restart the engine to apply it"
+                 inference layer was built with at boot, so `effective` applies until \
+                 the engine restarts"
             );
         } else {
             info!(

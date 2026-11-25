@@ -270,17 +270,25 @@ pub fn map_tile_dets_to_frame(tile_dets: &[Detection], roi: TileRoi) -> Vec<Dete
 const MERGE_IOU: f32 = 0.5;
 
 /// Merge stage-2 (tile) detections, already in parent-frame coordinates,
-/// into stage-1: class-aware NMS so an object both passes saw (or two
-/// adjacent tiles saw) reaches the tracker once, then the global `top_k`.
+/// into stage-1 so an object both passes saw (or two adjacent tiles saw)
+/// reaches the tracker once, then apply the global `top_k`. Stage-1 is
+/// kept whole: its boxes never suppress each other here, and a stage-2
+/// box that overlaps a same-label stage-1 box is the one dropped.
 // shortcut: plain IoU, so a tile-edge fragment of a box stage-1 saw whole
 // can survive (IoU < 0.5); upgrade to overlapping tiles if that shows up.
 pub fn merge_stage2(
-    mut stage1: Vec<Detection>,
+    stage1: Vec<Detection>,
     stage2: Vec<Detection>,
     top_k: Option<usize>,
 ) -> Vec<Detection> {
-    stage1.extend(stage2);
-    let mut merged = nexus_inference::nms::nms_per_label(stage1, MERGE_IOU, None);
+    let mut stage2 = nexus_inference::nms::nms_per_label(stage2, MERGE_IOU, None);
+    stage2.retain(|d| {
+        !stage1
+            .iter()
+            .any(|s| s.label == d.label && nexus_inference::nms::iou(&s.bbox, &d.bbox) > MERGE_IOU)
+    });
+    let mut merged = stage1;
+    merged.extend(stage2);
     if let Some(k) = top_k {
         nexus_inference::caps::apply_top_k(&mut merged, k);
     }
@@ -298,11 +306,17 @@ pub struct DiscoveryScheduler {
 }
 
 impl DiscoveryScheduler {
-    pub fn new(cells: &[u32], revisit: std::time::Duration) -> Self {
+    /// Cells outside `grid` and repeats are dropped here, so they cannot
+    /// take a budget slot.
+    pub fn new(cells: &[u32], grid: TileGridConfig, revisit: std::time::Duration) -> Self {
+        let (rows, cols) = grid.dims();
+        let mut cells: Vec<u32> = cells.iter().copied().filter(|c| *c < rows * cols).collect();
+        cells.sort_unstable();
+        cells.dedup();
         Self {
-            cells: cells.to_vec(),
-            revisit,
             last: vec![None; cells.len()],
+            cells,
+            revisit,
         }
     }
 
@@ -828,7 +842,7 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("person".to_string(), 601.0, 0.8),
+                ("person".to_string(), 600.0, 0.6),
                 ("vehicle.car".to_string(), 601.0, 0.7),
                 ("person".to_string(), 812.0, 0.4),
             ]
@@ -840,7 +854,18 @@ mod tests {
             Some(1),
         );
         assert_eq!(capped.len(), 1);
-        assert_eq!(capped[0].confidence, 0.8);
+        assert_eq!(capped[0].confidence, 0.6);
+    }
+
+    /// Two overlapping same-label stage-1 boxes (one person behind
+    /// another) both survive a merge, as they did before any tile ran.
+    #[test]
+    fn merge_never_suppresses_stage1_against_itself() {
+        let stage1 = vec![
+            labelled("person", 600.0, 0.6),
+            labelled("person", 603.0, 0.5),
+        ];
+        assert_eq!(merge_stage2(stage1, Vec::new(), None).len(), 2);
     }
 
     /// With no stage-1 detections at all, configured discovery cells are
@@ -848,9 +873,13 @@ mod tests {
     #[test]
     fn discovery_tiles_run_when_stage1_is_empty() {
         let now = std::time::Instant::now();
-        let mut d = DiscoveryScheduler::new(&[2, 99], std::time::Duration::from_secs(5));
+        let mut d = DiscoveryScheduler::new(
+            &[2, 99, 2],
+            TileGridConfig::G3x3,
+            std::time::Duration::from_secs(5),
+        );
         let tiles = plan_tiles(&[], 1536, 864, TileGridConfig::G3x3, 3, Some(&mut d), now);
-        // Cell 2 = top-right of the 3×3 grid; the out-of-range 99 is ignored.
+        // Cell 2 = top-right of the 3×3 grid; 99 and the repeat are dropped.
         assert_eq!(
             tiles,
             vec![TileRoi {
@@ -870,7 +899,7 @@ mod tests {
         let cells: Vec<u32> = (0..9).collect();
         let revisit = std::time::Duration::from_secs(8);
         let frame = std::time::Duration::from_millis(667);
-        let mut d = DiscoveryScheduler::new(&cells, revisit);
+        let mut d = DiscoveryScheduler::new(&cells, TileGridConfig::G3x3, revisit);
         let start = std::time::Instant::now();
         let mut last = [start; 9];
         let mut worst = std::time::Duration::ZERO;
@@ -890,7 +919,11 @@ mod tests {
     #[test]
     fn discovery_takes_priority_within_the_tile_budget() {
         let now = std::time::Instant::now();
-        let mut d = DiscoveryScheduler::new(&[8], std::time::Duration::from_secs(5));
+        let mut d = DiscoveryScheduler::new(
+            &[8],
+            TileGridConfig::G3x3,
+            std::time::Duration::from_secs(5),
+        );
         let crowd = vec![det_at(10.0, 10.0), det_at(600.0, 10.0)];
         let tiles = plan_tiles(
             &crowd,

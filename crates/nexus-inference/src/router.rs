@@ -323,7 +323,7 @@ impl InferenceRouter {
     /// for an ensemble, whose members carry their own thresholds.
     pub fn score_thresholds_for_camera(&self, cam: &CameraConfig) -> Option<(f32, f32)> {
         let model = cam.detector.model_override.as_ref();
-        if model.is_some_and(|m| m.kind == "ensemble") {
+        if model.map_or(&self.default_key.kind, |m| &m.kind) == "ensemble" {
             return None;
         }
         let requested = model.map_or(self.default_threshold, |m| m.score_threshold);
@@ -853,6 +853,23 @@ mod tests {
         assert_eq!(router.layer_keys().len(), 1);
         assert_eq!(detection_count(&router, &plain).await, 0);
         assert_eq!(detection_count(&router, &loose).await, 1);
+    }
+
+    /// An ensemble's top-level threshold is ignored by its builder (members
+    /// carry their own), so it must not be applied on top either, whether
+    /// the ensemble is a camera's override or `inference.model` itself.
+    #[tokio::test]
+    async fn a_default_ensemble_is_not_filtered_by_the_top_level_threshold() {
+        let mut cfg = cfg_with_kind("ensemble");
+        cfg.model.score_threshold = 0.99;
+        cfg.model.members = vec![ModelConfig {
+            kind: "mock".into(),
+            ..Default::default()
+        }];
+        let plain = cam(1, None);
+        let router = InferenceRouter::build(&cfg, std::slice::from_ref(&plain)).unwrap();
+        assert_eq!(router.score_thresholds_for_camera(&plain), None);
+        assert_eq!(detection_count(&router, &plain).await, 1);
     }
 
     /// A threshold edited after boot is applied when it is at or above what

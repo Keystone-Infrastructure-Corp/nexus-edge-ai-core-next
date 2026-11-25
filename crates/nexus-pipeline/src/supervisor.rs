@@ -450,6 +450,10 @@ async fn run_camera(
         let mut tile_discovery = (!cfg.behavior.tile_discovery_cells.is_empty()).then(|| {
             crate::tile::DiscoveryScheduler::new(
                 &cfg.behavior.tile_discovery_cells,
+                cfg.behavior
+                    .tile_grid
+                    .map(Into::into)
+                    .unwrap_or(crate::tile::TileGridConfig::G2x2),
                 Duration::from_secs(cfg.behavior.tile_discovery_revisit_secs.unwrap_or(5).into()),
             )
         });

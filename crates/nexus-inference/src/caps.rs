@@ -123,16 +123,6 @@ impl Detector for MinScoreDetector {
         Ok(dets)
     }
 
-    async fn detect_crop(
-        &self,
-        crop: &Frame,
-        prompts: &[String],
-    ) -> Result<Vec<Detection>, InferenceError> {
-        let mut dets = self.inner.detect_crop(crop, prompts).await?;
-        dets.retain(|d| d.confidence >= self.min_score);
-        Ok(dets)
-    }
-
     async fn push_camera_config(&self, update: &CameraConfigUpdate) {
         self.inner.push_camera_config(update).await;
     }

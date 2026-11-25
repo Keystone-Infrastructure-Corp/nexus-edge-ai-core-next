@@ -214,7 +214,7 @@ impl Tracker for ByteTrackTracker {
             }
         }
 
-        // ---- 6. Spawn tracks for still-unmatched detections >= low_conf. ----
+        // ---- 6. Spawn tracks for still-unmatched detections. ----
         let spawn_confidence = cfg.new_track_confidence.unwrap_or(cfg.low_confidence);
         for (i, d) in detections.iter_mut().enumerate() {
             if det_used[i] || d.confidence < spawn_confidence {
