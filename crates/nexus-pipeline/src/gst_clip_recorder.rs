@@ -5999,6 +5999,67 @@ mod epoch_tests {
         assert!(finalized_playable(&store, &clips_dir, clip.clip_id).await);
     }
 
+    /// SPEC-088 Z-4: an open cancelled after its writer started, with four
+    /// seconds of pre-roll in the ring, keeps that footage: its clip is
+    /// closed, finalized and plays back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_cancelled_after_its_writer_started_keeps_its_preroll_playable() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 10, CodecKind::H264).unwrap();
+        ing.shutdown();
+        for sample in encode(15, "main", 60, Duration::ZERO) {
+            ing.push_preroll_for_test(sample);
+        }
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap(),
+        );
+        let started_at = Utc::now();
+        // Holding the open map parks `open` at its last await, after the
+        // pre-roll was pushed and the row was inserted.
+        let held = rec.open.lock().await;
+        let opener = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.open(OpenClip {
+                    camera_id: 1,
+                    started_at,
+                    frame_width: 320,
+                    frame_height: 240,
+                })
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.get_clip(1).await.unwrap().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "open never inserted its row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        opener.abort();
+        assert!(opener.await.unwrap_err().is_cancelled());
+        drop(held);
+        rec.shutdown().await;
+
+        assert!(rec.open.lock().await.is_empty(), "clip left registered");
+        assert!(
+            store.get_clip(1).await.unwrap().is_some(),
+            "the cancelled open discarded its pre-roll"
+        );
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "the in-flight file was left behind"
+        );
+        assert!(finalized_playable(&store, &clips_dir, 1).await);
+    }
+
     /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is
     /// joined, then the recorder shuts down. One was closing (stalled on its
     /// pump), one held a clip, and one still mid-poll starts an open after

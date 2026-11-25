@@ -431,6 +431,12 @@ impl PreRollIngester {
         *self.stream_codec.lock() = codec;
     }
 
+    /// Fill the pre-roll ring the way a session's tap would.
+    #[cfg(test)]
+    pub(crate) fn push_preroll_for_test(&self, sample: NalSample) {
+        self.ring.lock().push(sample);
+    }
+
     /// Pre-roll window the ring was sized for at construction. Used
     /// by the recorder when it needs to rebuild this ingester at
     /// new RGB dims (M_PERF_CROWD E2). `0` is a valid disable
