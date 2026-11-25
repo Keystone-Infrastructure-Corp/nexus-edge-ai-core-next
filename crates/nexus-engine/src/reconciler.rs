@@ -28,11 +28,12 @@
 //! or removed, and a change to most — not all — of the camera's
 //! `behavior` block ([`changed_behavior_field`] names the three it
 //! deliberately ignores). Rules are not a trigger either, because they
-//! hot-reload through the rule evaluator. Detector prompts and zones are not
-//! triggers and do not hot-reload: each is frozen in the supervisor's `cfg`
-//! snapshot the same way behavior was, and nothing in this process pushes
-//! them to a live task today, so an edit to either still needs a process
-//! restart.
+//! hot-reload through the rule evaluator. Zones are a trigger: `run_camera`
+//! reads them once, so a saved edit restarts that camera alone (SPEC-088).
+//! Detector prompts are not a trigger and do not hot-reload: they are frozen
+//! in the supervisor's `cfg` snapshot the same way behavior was, and nothing
+//! in this process pushes them to a live task today, so an edit to them still
+//! needs a process restart.
 //!
 //! A registration the recorder refused, and a substream session the
 //! SPEC-069 fallback shut down, are not restart triggers: each pass
@@ -46,7 +47,7 @@ use futures::StreamExt;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::TrackerConfig;
 use nexus_config::{
-    AnnotatorConfig, CameraBehavior, CameraConfig, ClipsConfig, StaticObjectConfig,
+    AnnotatorConfig, CameraBehavior, CameraConfig, ClipsConfig, StaticObjectConfig, ZoneConfig,
 };
 use nexus_inference::InferenceRouter;
 use nexus_pipeline::{
@@ -143,6 +144,11 @@ pub(crate) struct EntryKey {
     /// (BUG-285). Which fields that covers is decided in
     /// [`changed_behavior_field`], not here.
     behavior: CameraBehavior,
+    /// The camera's zones, in saved order and as saved. `run_camera` reads
+    /// them once into its exclusion and min-area filters, the annotator and
+    /// the rules, so a restart is the only way to apply an edit (SPEC-088,
+    /// #399). Nothing is sorted or rewritten: only a real edit differs.
+    zones: Vec<ZoneConfig>,
 }
 
 /// Field by field rather than derived, because the behavior half compares
@@ -158,6 +164,7 @@ impl PartialEq for EntryKey {
             analysis_url,
             score_threshold,
             behavior,
+            zones,
         } = self;
         *url == other.url
             && *supervisor_dims == other.supervisor_dims
@@ -165,6 +172,7 @@ impl PartialEq for EntryKey {
             && *analysis_url == other.analysis_url
             && *score_threshold == other.score_threshold
             && changed_behavior_field(behavior, &other.behavior).is_none()
+            && *zones == other.zones
     }
 }
 
@@ -182,6 +190,7 @@ impl EntryKey {
                 .as_ref()
                 .map(|m| m.score_threshold.to_bits()),
             behavior: cam.behavior.clone(),
+            zones: cam.zones.clone(),
         }
     }
 
@@ -618,7 +627,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         let cam_id = cam.id;
         let want = EntryKey::wanted(args, &cam);
         match current.get(&cam_id) {
-            // `==` compares url, dims, codec, analysis_url, then behavior.
+            // `==` compares url, dims, codec, analysis_url, score threshold, behavior, then zones.
             Some(entry) if entry.key == want && !entry.task.is_finished() => {
                 // No change — supervisor still alive, URL still the
                 // same, supervisor dims still match, ingest codec
@@ -667,6 +676,11 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                     info!(
                         camera_id = cam_id,
                         "camera reconciler: score threshold changed; restarting supervisor"
+                    );
+                } else if entry.key.zones != want.zones {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: camera zones changed; restarting supervisor"
                     );
                 } else {
                     info!(
@@ -726,9 +740,16 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
             info!(camera_id = cam_id, "camera reconciler: stopped supervisor");
         } else {
             task.abort();
+            // The abort lands at the supervisor's next await; until it has,
+            // the entry stays in shutdown's sweep. Bounded, because a
+            // supervisor wedged in synchronous code never reaches one.
+            let ended = tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
+                .await
+                .is_ok();
             warn!(
                 camera_id = cam_id,
                 timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
+                ended,
                 "camera reconciler: supervisor did not stop in time; aborted it, and any \
                  clip it had open is abandoned"
             );
@@ -1158,7 +1179,7 @@ mod tests {
     use super::*;
     use nexus_config::{
         CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown, RecorderKind,
-        TileGridConfig,
+        TileGridConfig, ZoneKind,
     };
     use nexus_pipeline::{ClipFinal, ClipHandle, ClipMeta, OpenClip, RecorderError};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1885,17 +1906,29 @@ mod tests {
     }
 
     /// Accepts every clip and logs each open, close and ingester removal in
-    /// call order, so a test can see whether a restart finalized the clip
-    /// its old supervisor had open, and while the ingester recording it
-    /// still existed. Frames come from a `VirtualSource` that never ends.
+    /// call order, by camera, so a test can see whether a restart finalized
+    /// the clip its old supervisor had open, and while the ingester recording
+    /// it still existed. Clip ids count from 1 per camera. Frames come from a
+    /// `VirtualSource` that never ends; it counts the sources each camera's
+    /// supervisors built, one per start.
     #[derive(Default)]
     struct ClipLogRecorder {
-        calls: Mutex<Vec<ClipCall>>,
+        calls: Mutex<Vec<(CameraId, ClipCall)>>,
+        sources_built: Mutex<HashMap<CameraId, usize>>,
     }
 
     impl ClipLogRecorder {
         fn calls(&self) -> Vec<ClipCall> {
-            self.calls.lock().clone()
+            self.calls.lock().iter().map(|(_, call)| *call).collect()
+        }
+
+        fn calls_of(&self, camera_id: CameraId) -> Vec<ClipCall> {
+            self.calls
+                .lock()
+                .iter()
+                .filter(|(id, _)| *id == camera_id)
+                .map(|(_, call)| *call)
+                .collect()
         }
 
         fn opens(&self) -> usize {
@@ -1904,13 +1937,30 @@ mod tests {
                 .filter(|c| matches!(c, ClipCall::Open(_)))
                 .count()
         }
+
+        fn opens_of(&self, camera_id: CameraId) -> usize {
+            self.calls_of(camera_id)
+                .iter()
+                .filter(|c| matches!(c, ClipCall::Open(_)))
+                .count()
+        }
+
+        fn sources_built(&self, camera_id: CameraId) -> usize {
+            self.sources_built
+                .lock()
+                .get(&camera_id)
+                .copied()
+                .unwrap_or(0)
+        }
     }
 
     #[async_trait::async_trait]
     impl ClipRecorder for ClipLogRecorder {
         async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
-            let clip_id = self.opens() as i64 + 1;
-            self.calls.lock().push(ClipCall::Open(clip_id));
+            let clip_id = self.opens_of(args.camera_id) as i64 + 1;
+            self.calls
+                .lock()
+                .push((args.camera_id, ClipCall::Open(clip_id)));
             Ok(ClipHandle {
                 clip_id,
                 camera_id: args.camera_id,
@@ -1921,7 +1971,9 @@ mod tests {
             handle: ClipHandle,
             _args: ClipFinal,
         ) -> Result<ClipMeta, RecorderError> {
-            self.calls.lock().push(ClipCall::Close(handle.clip_id));
+            self.calls
+                .lock()
+                .push((handle.camera_id, ClipCall::Close(handle.clip_id)));
             Ok(ClipMeta {
                 clip_id: handle.clip_id,
                 camera_id: handle.camera_id,
@@ -1940,13 +1992,16 @@ mod tests {
         fn kind(&self) -> &'static str {
             "clip-log"
         }
-        fn remove_camera_ingester(&self, _camera_id: CameraId) {
-            self.calls.lock().push(ClipCall::IngesterRemoved);
+        fn remove_camera_ingester(&self, camera_id: CameraId) {
+            self.calls
+                .lock()
+                .push((camera_id, ClipCall::IngesterRemoved));
         }
         fn shared_frame_source(
             &self,
             camera_id: CameraId,
         ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
+            *self.sources_built.lock().entry(camera_id).or_insert(0) += 1;
             Some(Box::new(nexus_pipeline::VirtualSource {
                 camera_id,
                 width: 512,
@@ -2016,6 +2071,172 @@ mod tests {
             ],
             "the restart must close the old supervisor's open clip, while its ingester still \
              exists, before the replacement opens one: an aborted supervisor abandons the clip"
+        );
+    }
+
+    fn entry_of(handles: &HandleMap, camera_id: CameraId) -> RunningCameraEntry {
+        handles
+            .lock()
+            .get(&camera_id)
+            .cloned()
+            .expect("camera running")
+    }
+
+    /// One zone-only edit to a camera, and whether its next supervisor must
+    /// still see the mock detector's person, whose box centre sits near
+    /// (0.5, 0.65) of the frame: seen, it opens a clip; filtered out by the
+    /// zones, it never reaches the motion lifecycle.
+    type ZoneEdit = (&'static str, fn(&mut Vec<ZoneConfig>), bool);
+
+    /// SPEC-088 (#399) — `run_camera` reads `cfg.zones` once, and the key left
+    /// them out, so a saved zone edit published `config.changed`, the guard
+    /// matched, and the camera kept filtering with the zones it started with
+    /// until the engine restarted. Each edit changes one thing about camera
+    /// 7's zones; the person shows which zones the replacement runs. Camera 8
+    /// is the neighbour that must not notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zone_only_edit_restarts_only_affected_camera_and_finalizes_clip() {
+        const OVER_PERSON: [(f32, f32); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        const CORNER: [(f32, f32); 3] = [(0.0, 0.0), (0.2, 0.0), (0.0, 0.2)];
+        let edits: [ZoneEdit; 6] = [
+            (
+                "add an exclusion zone over the person",
+                |z| {
+                    z.push(ZoneConfig {
+                        id: "z1".into(),
+                        name: "Driveway".into(),
+                        polygon: OVER_PERSON.to_vec(),
+                        kind: ZoneKind::Exclusion,
+                        min_bbox_area_px_override: None,
+                    })
+                },
+                false,
+            ),
+            (
+                "change its kind to inclusion",
+                |z| z[0].kind = ZoneKind::Inclusion,
+                true,
+            ),
+            (
+                "give it a minimum area above the person's box",
+                |z| z[0].min_bbox_area_px_override = Some(u32::MAX),
+                false,
+            ),
+            (
+                "move its polygon off the person",
+                |z| z[0].polygon = CORNER.to_vec(),
+                true,
+            ),
+            ("rename it", |z| z[0].name = "Gate".into(), true),
+            ("remove it", Vec::clear, true),
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args =
+            reconciler_args(recorder.clone(), dir.path(), &[cam(None), cam_with_id(8)]).await;
+        // The frame of the current session the analysis loop last finished,
+        // zone filter included. A restart clears it.
+        let analysed = |camera_id| {
+            args.cache
+                .get(camera_id)
+                .and_then(|e| e.objects_frame_id)
+                .unwrap_or(0)
+        };
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: both cameras opened a clip", || {
+            recorder.opens_of(7) == 1 && recorder.opens_of(8) == 1
+        })
+        .await;
+        // A supervisor that sees the person opens its clip by this frame, so
+        // one that analyses well past it without opening one has filtered
+        // the person out.
+        let filtered_by = 3 * analysed(7) + 5;
+        let neighbour = entry_of(&args.handles, 8);
+        let mut camera = cam(None);
+
+        for (what, edit, sees_person) in edits {
+            let before = entry_of(&args.handles, 7);
+            let logged = recorder.calls_of(7).len();
+            let opens = recorder.opens_of(7) as i64;
+            let clip_open = recorder.calls_of(7).last() == Some(&ClipCall::Open(opens));
+            let sources = recorder.sources_built(7);
+            edit(&mut camera.zones);
+            args.store.upsert_camera(&camera).await.expect(what);
+            reconcile(&args).await.expect(what);
+
+            let now = entry_of(&args.handles, 7);
+            if Arc::ptr_eq(&now.task, &before.task) {
+                abort_all(&args.handles);
+                panic!(
+                    "{what}: the saved zones did not restart camera 7, so it keeps filtering \
+                     with the zones its supervisor started with until the engine restarts"
+                );
+            }
+            assert_eq!(
+                now.key.zones, camera.zones,
+                "{what}: the new supervisor is recorded as running exactly the saved zones"
+            );
+            if sees_person {
+                wait_until(&format!("{what}: the person must open a clip"), || {
+                    recorder.opens_of(7) as i64 == opens + 1
+                })
+                .await;
+            } else {
+                wait_until(&format!("{what}: the replacement must analyse"), || {
+                    analysed(7) > filtered_by
+                })
+                .await;
+                assert!(
+                    args.cache.get(7).is_some_and(|e| e.objects.is_empty()),
+                    "{what}: the zones must keep the person out of the frame's objects"
+                );
+            }
+            let want: Vec<ClipCall> = [
+                clip_open.then_some(ClipCall::Close(opens)),
+                Some(ClipCall::IngesterRemoved),
+                sees_person.then_some(ClipCall::Open(opens + 1)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            assert_eq!(
+                recorder.calls_of(7)[logged..],
+                want,
+                "{what}: one stop that finalizes the open clip once, while its ingester exists, \
+                 then one start that runs the saved zones"
+            );
+            assert_eq!(recorder.sources_built(7), sources + 1, "{what}: one start");
+        }
+
+        // Saving the same zones again is not an edit.
+        let before = entry_of(&args.handles, 7);
+        let logged = recorder.calls_of(7).len();
+        args.store
+            .upsert_camera(&camera)
+            .await
+            .expect("identical save");
+        reconcile(&args)
+            .await
+            .expect("pass after an identical save");
+        let unchanged = Arc::ptr_eq(&entry_of(&args.handles, 7).task, &before.task);
+        let now_neighbour = entry_of(&args.handles, 8);
+        abort_all(&args.handles);
+        assert!(unchanged, "an identical save restarted camera 7");
+        assert_eq!(
+            recorder.calls_of(7).len(),
+            logged,
+            "an identical save stopped or reopened camera 7's recording"
+        );
+        assert!(
+            Arc::ptr_eq(&now_neighbour.task, &neighbour.task),
+            "camera 7's zone edits restarted camera 8"
+        );
+        assert!(
+            !recorder.calls_of(8).contains(&ClipCall::IngesterRemoved)
+                && recorder.sources_built(8) == 1,
+            "camera 7's zone edits stopped or restarted camera 8's recording"
         );
     }
 
@@ -2198,6 +2419,48 @@ mod tests {
         );
     }
 
+    /// SPEC-088 Z-4 — the forced stop. A supervisor parked inside
+    /// `recorder.open` cannot honour a stop, so after
+    /// [`SUPERVISOR_STOP_TIMEOUT`] `stop_camera` aborts it. The abort lands at
+    /// the supervisor's next await, and its entry used to leave the map at
+    /// once, out of shutdown's sweep while a supervisor still mid-poll could
+    /// finish that open. `stop_camera` must return only once the aborted
+    /// supervisor has ended, and its open must never complete.
+    #[tokio::test]
+    async fn a_forced_stop_ends_the_supervisor_before_it_leaves_the_map() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = GatedOpenRecorder::new();
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until(
+            "precondition: the supervisor is blocked inside recorder.open",
+            || recorder.calls() == [GateCall::OpenBlocked],
+        )
+        .await;
+        let original = entry_of(&args.handles, 7);
+
+        // Nothing below waits on I/O, so the stop's timeout can elapse on the
+        // runtime's paused clock.
+        tokio::time::pause();
+        stop_camera(&args, 7).await;
+        let ended = original.task.is_finished();
+        let in_map = args.handles.lock().contains_key(&7);
+        recorder.release();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            ended,
+            "stop_camera returned before the supervisor it aborted had ended"
+        );
+        assert!(!in_map, "a stopped camera stays out of the map");
+        assert_eq!(
+            recorder.calls(),
+            [GateCall::OpenBlocked],
+            "the aborted supervisor's open completed after its stop"
+        );
+    }
+
     /// One named `CameraBehavior` edit, for the tables below.
     type BehaviorMutation = (&'static str, fn(&mut CameraBehavior));
 
@@ -2212,6 +2475,7 @@ mod tests {
             analysis_url: None,
             score_threshold: None,
             behavior: behavior.clone(),
+            zones: vec![],
         }
     }
 
