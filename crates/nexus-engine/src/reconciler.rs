@@ -752,6 +752,8 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
         let ended = if *stop.borrow() {
             task.is_finished()
         } else {
+            // From here on the generation's zones no longer count as applied.
+            args.frame_stats.zone_application().stop(cam_id);
             // Stop, not abort: an aborted supervisor never reaches the close of
             // its open motion clip, which is abandoned (BUG-285). The receiver
             // drops when `run_camera` returns, which is what `closed` awaits.
@@ -2395,6 +2397,48 @@ mod tests {
             after_stale,
             Some(now),
             "the stopped generation's late acknowledgement must be ignored"
+        );
+    }
+
+    /// SPEC-088 review — the sequence the review found: A applied, B saved,
+    /// the generation running A stopped, and A saved again before the
+    /// replacement starts (it may be awaiting its codec probe or hydration).
+    /// No supervisor runs A, so the read must not say applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_generation_does_not_read_applied_before_its_replacement_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+        reconcile(&args).await.expect("first pass");
+        wait_until("the first generation applied A", || {
+            args.frame_stats
+                .zone_application()
+                .snapshot(7, &a, std::time::Instant::now())
+                .is_some_and(|s| s.state == ZoneApplicationState::Applied)
+        })
+        .await;
+
+        let mut b = cam(None);
+        b.zones.push(ZoneConfig {
+            id: "z1".into(),
+            name: "Corner".into(),
+            polygon: vec![(0.0, 0.0), (0.2, 0.0), (0.0, 0.2)],
+            kind: ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
+        });
+        args.store.upsert_camera(&b).await.expect("save B");
+        assert!(stop_camera(&args, 7).await, "the supervisor stops");
+        args.store.upsert_camera(&cam(None)).await.expect("save A");
+        let read = zones_status(&args, 7, std::time::Instant::now())
+            .await
+            .expect("still reported");
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (read.desired_revision, read.applied_revision, read.state),
+            (a.clone(), Some(a), ZoneApplicationState::Applying),
+            "a stopped generation's zones read applied"
         );
     }
 

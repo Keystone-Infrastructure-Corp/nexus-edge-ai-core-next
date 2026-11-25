@@ -78,6 +78,9 @@ struct Entry {
     started_at: Instant,
     /// Whether the current generation acknowledged `applied`.
     acknowledged: bool,
+    /// The current generation began stopping ([`ZoneApplicationRegistry::stop`]),
+    /// so nothing it reports counts any more.
+    stopping: bool,
     failed: Option<ZoneApplicationError>,
     applied: Option<(String, DateTime<Utc>)>,
 }
@@ -111,6 +114,7 @@ impl ZoneApplicationRegistry {
                 generation,
                 started_at: Instant::now(),
                 acknowledged: false,
+                stopping: false,
                 failed: None,
                 applied,
             },
@@ -131,7 +135,7 @@ impl ZoneApplicationRegistry {
         if let Some(entry) = inner
             .cameras
             .get_mut(&camera_id)
-            .filter(|e| e.generation == generation)
+            .filter(|e| e.generation == generation && !e.stopping)
         {
             entry.acknowledged = true;
             entry.failed = None;
@@ -146,9 +150,22 @@ impl ZoneApplicationRegistry {
         if let Some(entry) = inner
             .cameras
             .get_mut(&camera_id)
-            .filter(|e| e.generation == generation)
+            .filter(|e| e.generation == generation && !e.stopping)
         {
             entry.failed = Some(code);
+        }
+    }
+
+    /// The camera's current generation began stopping: what it applied no
+    /// longer runs, so the camera reads applying, or failed once
+    /// [`APPLICATION_TIMEOUT`] has passed since now, until the next generation
+    /// acknowledges. The applied revision stays for comparison.
+    pub fn stop(&self, camera_id: CameraId) {
+        if let Some(e) = self.inner.lock().cameras.get_mut(&camera_id) {
+            e.stopping = true;
+            e.acknowledged = false;
+            e.failed = None;
+            e.started_at = Instant::now();
         }
     }
 
@@ -322,6 +339,50 @@ mod tests {
             read(&r, &a, now).3,
             ZoneApplicationState::Applying,
             "a save back to A is not applied by the generation running B"
+        );
+    }
+
+    /// The review's sequence: A applied, B saved, the generation running A
+    /// begins stopping, and A is saved again before the replacement starts.
+    /// Nothing runs A any more: applying, failed after the timeout if no
+    /// replacement comes, and the stopping generation's late acknowledgement
+    /// cannot bring it back. The applied revision stays for comparison.
+    #[test]
+    fn a_stopping_generation_no_longer_counts_as_applied() {
+        let (a, b) = (zone_revision(&zones("A")), zone_revision(&zones("B")));
+        let r = ZoneApplicationRegistry::default();
+        let g1 = r.start(7);
+        r.acknowledge(7, g1, &a, at(0));
+        assert_eq!(
+            read(&r, &b, Instant::now()).3,
+            ZoneApplicationState::Applying
+        );
+        r.stop(7);
+        let stopped = Instant::now();
+        r.acknowledge(7, g1, &a, at(1));
+        r.fail(7, g1, ZoneApplicationError::SupervisorExited);
+        assert_eq!(
+            read(&r, &a, stopped),
+            (
+                a.clone(),
+                Some(a.clone()),
+                g1,
+                ZoneApplicationState::Applying,
+                None
+            ),
+            "a stopping generation's zones read applied"
+        );
+        assert_eq!(r.snapshot(7, &a, stopped).unwrap().applied_at, Some(at(0)));
+        assert_eq!(
+            read(&r, &a, stopped + APPLICATION_TIMEOUT).4,
+            Some(ZoneApplicationError::ApplicationTimeout),
+            "a stop with no replacement fails after the timeout"
+        );
+        let g2 = r.start(7);
+        r.acknowledge(7, g2, &a, at(2));
+        assert_eq!(
+            read(&r, &a, Instant::now()).3,
+            ZoneApplicationState::Applied
         );
     }
 
