@@ -99,7 +99,7 @@
 //! in (e.g. ingester build error) still triggers a `Refused` with a
 //! one-shot warn log at `open()` time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -134,6 +134,10 @@ use crate::source::gst_init;
 /// EOS at close time. 5s is generous; in practice mp4mux flushes in
 /// well under a second once it sees EOS at the appsrc head.
 const EOS_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often `shutdown` looks for a clip an in-flight open registered while
+/// another owned task is still running.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
 /// Container stamped on every row this recorder writes.
 const CONTAINER: &str = "mp4";
@@ -751,13 +755,15 @@ impl GstClipRecorder {
 
 impl Writers {
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
-        let epoch_ended = self.epoch_ended.write().remove(&handle.clip_id);
         let mut state = self
             .open
             .lock()
             .await
             .remove(&handle.clip_id)
             .ok_or(RecorderError::UnknownClip(handle.clip_id))?;
+        // Taken only by the close that won the clip: a racing close of the
+        // same clip (shutdown's drain) must not take its epoch flag.
+        let epoch_ended = self.epoch_ended.write().remove(&handle.clip_id);
         let failure = state.health.guard("recording could not be finalized");
 
         // Step 1: signal the live pump to stop and wait for it. Once
@@ -1465,46 +1471,58 @@ impl ClipRecorder for GstClipRecorder {
     }
 
     async fn shutdown(&self) {
-        // Opens and closes whose caller was cancelled finish first: each
-        // start hands its clip over (it is in `open` below) or finalizes it.
-        self.in_flight.closed().await;
-        // Snapshot the (clip_id, camera_id) of every in-flight clip
-        // under one lock, then release it so `close()` can re-lock
-        // and `remove()` each one. Cloning the keys avoids holding
-        // the lock across the per-clip EOS drain (which awaits the
-        // bus for up to `EOS_DRAIN_TIMEOUT`).
-        let handles: Vec<ClipHandle> = {
-            let open = self.open.lock().await;
-            open.iter()
-                .map(|(clip_id, st)| ClipHandle {
-                    clip_id: *clip_id,
-                    camera_id: st.camera_id,
-                })
-                .collect()
-        };
-        if handles.is_empty() {
-            return;
-        }
-        info!(
-            count = handles.len(),
-            "gst recorder: draining in-flight clips on shutdown (EOS + moov flush)"
-        );
-        let ended_at = Utc::now();
-        for handle in handles {
-            // Reuse the full `close()` finalise path (EOS → moov
-            // flush → rename → row stamp). A concurrent supervisor
-            // close of the same clip is safe: whichever calls
-            // `open.remove()` first wins, the loser gets
-            // `UnknownClip` which we swallow.
-            match self.close(handle, ClipFinal { ended_at }).await {
-                Ok(_) | Err(RecorderError::UnknownClip(_)) => {}
-                Err(e) => warn!(
-                    clip_id = handle.clip_id,
-                    camera_id = handle.camera_id,
-                    error = %e,
-                    "gst recorder: failed to finalise clip during shutdown drain"
-                ),
+        // Every registered clip is finalized in an owned task of its own, at
+        // once, so one stalled writer or owned open/close cannot hold back
+        // another camera's clip. An open still in flight registers its clip
+        // (or finalizes it itself) later, so keep picking up new clips until
+        // no owned task is left (SPEC-088 Z-4).
+        let mut draining = HashSet::new();
+        loop {
+            // Read before the snapshot: once idle, every open that was in
+            // flight has registered its clip.
+            let idle = self.in_flight.is_closed();
+            // Cloning the keys avoids holding the lock across a close.
+            let handles: Vec<ClipHandle> = {
+                let open = self.open.lock().await;
+                open.iter()
+                    .filter(|(clip_id, _)| !draining.contains(*clip_id))
+                    .map(|(clip_id, st)| ClipHandle {
+                        clip_id: *clip_id,
+                        camera_id: st.camera_id,
+                    })
+                    .collect()
+            };
+            if handles.is_empty() && idle {
+                return;
             }
+            if !handles.is_empty() {
+                info!(
+                    count = handles.len(),
+                    "gst recorder: draining in-flight clips on shutdown (EOS + moov flush)"
+                );
+            }
+            for handle in handles {
+                draining.insert(handle.clip_id);
+                // Reuse the full `close()` finalise path (EOS → moov
+                // flush → rename → row stamp). A concurrent supervisor
+                // close of the same clip is safe: whichever calls
+                // `open.remove()` first wins, the loser gets
+                // `UnknownClip` which we swallow.
+                let writers = self.writers();
+                self.spawn_owned(async move {
+                    let ended_at = Utc::now();
+                    match writers.close(handle, ClipFinal { ended_at }).await {
+                        Ok(_) | Err(RecorderError::UnknownClip(_)) => {}
+                        Err(e) => warn!(
+                            clip_id = handle.clip_id,
+                            camera_id = handle.camera_id,
+                            error = %e,
+                            "gst recorder: failed to finalise clip during shutdown drain"
+                        ),
+                    }
+                });
+            }
+            let _ = tokio::time::timeout(SHUTDOWN_POLL, self.in_flight.closed()).await;
         }
     }
 
@@ -5639,6 +5657,7 @@ mod epoch_tests {
         );
     }
 
+    /// A store with cameras 1, 2 and 3.
     async fn store_with_camera(dir: &Path) -> Arc<Store> {
         let store = Arc::new(
             Store::open(&StoreConfig {
@@ -5650,26 +5669,269 @@ mod epoch_tests {
             .await
             .unwrap(),
         );
+        for id in 1..=3 {
+            store
+                .upsert_camera(&CameraConfig {
+                    id,
+                    name: "front".into(),
+                    ingest: nexus_config::CameraIngest {
+                        url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                        analysis_url: None,
+                        enabled: true,
+                        max_fps: 0,
+                        codec: None,
+                    },
+                    detector: nexus_config::CameraDetector::default(),
+                    behavior: nexus_config::CameraBehavior::default(),
+                    onvif: Default::default(),
+                    talk_down: Default::default(),
+                    zones: vec![],
+                })
+                .await
+                .unwrap();
+        }
         store
-            .upsert_camera(&CameraConfig {
-                id: 1,
-                name: "front".into(),
-                ingest: nexus_config::CameraIngest {
-                    url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
-                    analysis_url: None,
-                    enabled: true,
-                    max_fps: 0,
-                    codec: None,
-                },
-                detector: nexus_config::CameraDetector::default(),
-                behavior: nexus_config::CameraBehavior::default(),
-                onvif: Default::default(),
-                talk_down: Default::default(),
-                zones: vec![],
+    }
+
+    /// Register a clip of `camera_id` holding four seconds of media, the way
+    /// `open` leaves one, with `pump_handle` as its live pump. Returns its
+    /// handle, in-flight path and writer.
+    async fn register_clip(
+        rec: &GstClipRecorder,
+        store: &Store,
+        clips_dir: &Path,
+        camera_id: CameraId,
+        started_at: DateTime<Utc>,
+        pump_handle: Option<tokio::task::JoinHandle<PumpStats>>,
+    ) -> (ClipHandle, PathBuf, gst::Pipeline) {
+        let path = crate::recorder::inflight_clip_path(clips_dir, camera_id, started_at);
+        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        let clip_id = store
+            .open_clip(&NewClip {
+                camera_id,
+                started_at,
+                hot_path: crate::recorder::clip_rel_path(clips_dir, &path),
+                codec: "h264".into(),
+                container: CONTAINER.into(),
+                hot_handle: "local".into(),
+                frame_width: 320,
+                frame_height: 240,
             })
             .await
             .unwrap();
-        store
+        let (pipeline, appsrc) = GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut last = None;
+        for s in &encode(15, "main", 60, Duration::ZERO) {
+            last = Some(
+                push_sample(&appsrc, s, Duration::ZERO, last, FALLBACK_FRAME_INTERVAL_NS).unwrap(),
+            );
+        }
+        let writer = pipeline.clone();
+        rec.open.lock().await.insert(
+            clip_id,
+            OpenState {
+                health: rec.recording_health.begin(camera_id, RecordingKind::Motion),
+                camera_id,
+                started_at,
+                path: path.clone(),
+                effective_dir: clips_dir.to_path_buf(),
+                hot_handle: "local".into(),
+                codec: CodecKind::H264,
+                pipeline,
+                appsrc,
+                pump_stop: None,
+                pump_handle,
+                preroll_last_written_pts_ns: last,
+            },
+        );
+        (ClipHandle { clip_id, camera_id }, path, writer)
+    }
+
+    /// Whether `clip_id`'s row is closed and its final file decodes.
+    async fn finalized_playable(store: &Store, clips_dir: &Path, clip_id: ClipId) -> bool {
+        let row = store.get_clip(clip_id).await.unwrap().unwrap();
+        row.ended_at.is_some() && row.hot_path.is_some_and(|p| decodes(&clips_dir.join(p)))
+    }
+
+    /// Wait up to 10 s for `clip_id`'s row to be closed.
+    async fn wait_until_closed(store: &Store, clip_id: ClipId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store
+            .get_clip(clip_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .ended_at
+            .is_none()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "clip {clip_id} never closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Start closing `handle` from a caller that is then aborted, not joined,
+    /// as `main` aborts supervisors, once the close took the clip.
+    async fn close_then_abort_caller(rec: &Arc<GstClipRecorder>, handle: ClipHandle) {
+        let closer = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.close(
+                    handle,
+                    ClipFinal {
+                        ended_at: Utc::now(),
+                    },
+                )
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while rec.open.lock().await.contains_key(&handle.clip_id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "close never took the clip"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        closer.abort();
+    }
+
+    /// SPEC-088 Z-4: `main` gives shutdown 15 s. A close stalled on its
+    /// writer (here its pump, which never stops) must not hold back another
+    /// camera's clip: that one is finalized while the stalled close runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_close_does_not_hold_back_another_cameras_clip_at_shutdown() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (stalled, _, stalled_writer) = register_clip(
+            &rec,
+            &store,
+            &clips_dir,
+            1,
+            started_at,
+            Some(tokio::spawn(std::future::pending::<PumpStats>())),
+        )
+        .await;
+        let (healthy, _, _) = register_clip(&rec, &store, &clips_dir, 2, started_at, None).await;
+        close_then_abort_caller(&rec, stalled).await;
+
+        let shutdown = tokio::spawn({
+            let rec = rec.clone();
+            async move { rec.shutdown().await }
+        });
+        wait_until_closed(&store, healthy.clip_id).await;
+        assert_eq!(
+            stalled_writer.current_state(),
+            gst::State::Playing,
+            "camera 2's clip waited for camera 1's stalled close"
+        );
+        shutdown.await.unwrap();
+
+        assert_eq!(stalled_writer.current_state(), gst::State::Null);
+        assert!(finalized_playable(&store, &clips_dir, healthy.clip_id).await);
+        assert!(finalized_playable(&store, &clips_dir, stalled.clip_id).await);
+    }
+
+    /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is
+    /// joined, then the recorder shuts down. One was closing (stalled on its
+    /// pump), one held a clip, and one still mid-poll starts an open after
+    /// the drain began. Shutdown must outlast all of them and leave no
+    /// writer and no in-flight file behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_after_mains_aborts_leaves_no_writer_behind() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let ing = PreRollIngester::new(3, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(3, ing)])).unwrap(),
+        );
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (stalled, _, stalled_writer) = register_clip(
+            &rec,
+            &store,
+            &clips_dir,
+            1,
+            started_at,
+            Some(tokio::spawn(std::future::pending::<PumpStats>())),
+        )
+        .await;
+        let (held, _, _) = register_clip(&rec, &store, &clips_dir, 2, started_at, None).await;
+        close_then_abort_caller(&rec, stalled).await;
+
+        let shutdown = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(15), rec.shutdown())
+                    .await
+                    .is_ok()
+            }
+        });
+        wait_until_closed(&store, held.clip_id).await;
+        // The drain is under way and the stalled close keeps it going. Holding
+        // the open map parks the late open after its writer started and its
+        // row exists, where its aborted caller leaves it to its own task.
+        let late_at = Utc::now();
+        let open_map = rec.open.lock().await;
+        let opener = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.open(OpenClip {
+                    camera_id: 3,
+                    started_at: late_at,
+                    frame_width: 512,
+                    frame_height: 288,
+                })
+                .await
+            }
+        });
+        let late = held.clip_id + 1;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.get_clip(late).await.unwrap().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the late open never inserted its row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown ended before the late open"
+        );
+        opener.abort();
+        drop(open_map);
+        assert!(shutdown.await.unwrap(), "shutdown overran main's 15 s");
+
+        assert!(rec.open.lock().await.is_empty(), "a clip left registered");
+        assert_eq!(stalled_writer.current_state(), gst::State::Null);
+        assert!(finalized_playable(&store, &clips_dir, held.clip_id).await);
+        assert!(finalized_playable(&store, &clips_dir, stalled.clip_id).await);
+        // The late clip has no media, so it is discarded, not left open.
+        assert!(store
+            .get_clip(late)
+            .await
+            .unwrap()
+            .is_none_or(|row| row.ended_at.is_some()));
+        assert!(
+            !rec.clip_path(3, late_at).exists(),
+            "the late open's writer was left behind"
+        );
     }
 
     /// #376 at close: muxing two SPS into one file makes mp4mux rewrite a
@@ -5811,8 +6073,8 @@ mod epoch_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_close_cancelled_after_it_took_the_clip_still_finalizes_it() {
         assert!(
-            has_elements(&["x264enc", "mp4mux"]),
-            "required GStreamer plugins missing: x264enc/mp4mux"
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
         );
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_camera(dir.path()).await;
@@ -5820,57 +6082,23 @@ mod epoch_tests {
         let rec =
             Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
         let started_at = Utc::now() - chrono::Duration::seconds(30);
-        let path = crate::recorder::inflight_clip_path(&clips_dir, 1, started_at);
-        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
-        let clip_id = store
-            .open_clip(&NewClip {
-                camera_id: 1,
-                started_at,
-                hot_path: crate::recorder::clip_rel_path(&clips_dir, &path),
-                codec: "h264".into(),
-                container: CONTAINER.into(),
-                hot_handle: "local".into(),
-                frame_width: 320,
-                frame_height: 240,
-            })
-            .await
-            .unwrap();
-        let (pipeline, appsrc) = GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
-        pipeline.set_state(gst::State::Playing).unwrap();
-        let mut last = None;
-        for s in &encode(15, "main", 60, Duration::ZERO) {
-            last = Some(
-                push_sample(&appsrc, s, Duration::ZERO, last, FALLBACK_FRAME_INTERVAL_NS).unwrap(),
-            );
-        }
-        let writer = pipeline.clone();
-        rec.open.lock().await.insert(
-            clip_id,
-            OpenState {
-                health: rec.recording_health.begin(1, RecordingKind::Motion),
-                camera_id: 1,
-                started_at,
-                path: path.clone(),
-                effective_dir: clips_dir.clone(),
-                hot_handle: "local".into(),
-                codec: CodecKind::H264,
-                pipeline,
-                appsrc,
-                pump_stop: None,
-                // A pump that never stops parks `close` in its 2 s pump
-                // wait, after it took the clip out of the open map.
-                pump_handle: Some(tokio::spawn(std::future::pending::<PumpStats>())),
-                preroll_last_written_pts_ns: last,
-            },
-        );
+        // A pump that never stops parks `close` in its 2 s pump wait, after
+        // it took the clip out of the open map.
+        let (handle, path, writer) = register_clip(
+            &rec,
+            &store,
+            &clips_dir,
+            1,
+            started_at,
+            Some(tokio::spawn(std::future::pending::<PumpStats>())),
+        )
+        .await;
+        let clip_id = handle.clip_id;
         let closer = tokio::spawn({
             let rec = rec.clone();
             async move {
                 rec.close(
-                    ClipHandle {
-                        clip_id,
-                        camera_id: 1,
-                    },
+                    handle,
                     ClipFinal {
                         ended_at: started_at + chrono::Duration::seconds(8),
                     },
@@ -5895,9 +6123,11 @@ mod epoch_tests {
             gst::State::Null,
             "writer left running"
         );
-        let row = store.get_clip(clip_id).await.unwrap().unwrap();
-        assert!(row.ended_at.is_some(), "clip row left without an end");
         assert!(!path.exists(), "in-flight file never finalized");
+        assert!(
+            finalized_playable(&store, &clips_dir, clip_id).await,
+            "the finalized clip does not decode"
+        );
     }
 
     /// #375/#376: two epoch changes under 3 s apart leave a short clip
