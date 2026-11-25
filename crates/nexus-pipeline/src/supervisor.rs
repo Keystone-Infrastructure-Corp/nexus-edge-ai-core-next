@@ -308,6 +308,10 @@ pub fn spawn_camera(
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let (stop, stop_rx) = watch::channel(false);
+    // SPEC-088 — the revision of the zones this task freezes, and the
+    // generation that must acknowledge it, both fixed before the task runs.
+    let zone_revision = crate::zone_application::zone_revision(&cfg.zones);
+    let zone_generation = stats.zone_application().start(camera_id);
     let task = tokio::spawn(run_camera(
         cfg,
         detector,
@@ -334,6 +338,8 @@ pub fn spawn_camera(
         sink_router,
         alert_clip_gate,
         stop_rx,
+        zone_generation,
+        zone_revision,
     ));
     CameraHandle {
         camera_id,
@@ -389,6 +395,8 @@ async fn run_camera(
     sink_router: Arc<dyn SinkRouter>,
     alert_clip_gate: Arc<dyn AlertClipScheduleGate>,
     mut stop: watch::Receiver<bool>,
+    zone_generation: u64,
+    zone_revision: String,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -477,6 +485,7 @@ async fn run_camera(
         let mut detected: u64 = 0;
         let prompts = cfg.detector.prompts.clone();
         let zones = cfg.zones.clone();
+        let mut zones_acknowledged = false;
         // Phase 8.1: equipment classes the static filter should also
         // promote to anchors (captured before the annotator config moves).
         let anchor_classes = annotator_cfg.static_anchor_classes.clone();
@@ -1512,6 +1521,20 @@ async fn run_camera(
                     }
                 }
 
+                // SPEC-088 — this frame went through the zone filters and
+                // everything downstream of them, so this generation now runs
+                // its zones. A frame that ended early (gate drop, detector
+                // error, source rebuild) returned above without getting here.
+                if !zones_acknowledged {
+                    stats.zone_application().acknowledge(
+                        cfg.id,
+                        zone_generation,
+                        &zone_revision,
+                        chrono::Utc::now(),
+                    );
+                    zones_acknowledged = true;
+                }
+
                 ControlFlow::Continue(())
             }
             .instrument(frame_span)
@@ -1554,6 +1577,15 @@ async fn run_camera(
         // shutdown path.
         let _ = clip_opened_at;
         emitter.forget_camera(cfg.id);
+        // A stop request is the reconciler replacing or removing this
+        // generation; ending on its own before any frame is a failure.
+        if !zones_acknowledged && !*stop.borrow() {
+            stats.zone_application().fail(
+                cfg.id,
+                zone_generation,
+                crate::zone_application::ZoneApplicationError::SupervisorExited,
+            );
+        }
 
         let _ = bus
             .publish(

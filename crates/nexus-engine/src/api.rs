@@ -2908,18 +2908,58 @@ struct CameraFrameStatsView {
     /// right now (substream vs. mainstream fallback) and at what geometry
     /// / rate. `null` if this camera has no supervisor spawned yet.
     analysis_stream: Option<nexus_pipeline::AnalysisStreamStatus>,
+    /// SPEC-088 — the zone revision saved now against the one the running
+    /// supervisor generation acknowledged. Absent when no generation of the
+    /// camera has started in this process (or its row cannot be read), which
+    /// a reader takes as "not reported", never as applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zones_runtime: Option<nexus_pipeline::zone_application::ZonesRuntime>,
 }
 
+/// SPEC-088 — each camera's zone application status, its desired revision
+/// hashed from the zones in the store now, so a read straight after a save
+/// already reports the saved zones, never the running ones as applied.
+async fn zones_runtime(
+    s: &ApiState,
+    now: std::time::Instant,
+) -> std::collections::HashMap<CameraId, nexus_pipeline::zone_application::ZonesRuntime> {
+    let cameras = match s.store.list_readable_cameras().await {
+        Ok((cameras, _unreadable)) => cameras,
+        Err(e) => {
+            tracing::warn!(error = %e, "camera stats: saved zones unreadable; zone application not reported");
+            return std::collections::HashMap::new();
+        }
+    };
+    let registry = s.frame_stats.zone_application();
+    cameras
+        .iter()
+        .filter_map(|cam| {
+            let desired = nexus_pipeline::zone_application::zone_revision(&cam.zones);
+            Some((cam.id, registry.snapshot(cam.id, &desired, now)?))
+        })
+        .collect()
+}
+
+/// 404 only when there is nothing to report: no frame since the supervisor
+/// last (re)started, and no zone application either. A restarting camera
+/// reads as no frame yet, with its zone status, rather than as missing.
 async fn get_camera_stats(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
 ) -> Result<Json<CameraFrameStatsView>, ApiError> {
-    let snap = s
-        .frame_stats
-        .snapshot(id)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
     let now = std::time::Instant::now();
-    Ok(Json(build_camera_stats_view(&s, id, &snap, now)))
+    let zones = zones_runtime(&s, now).await.remove(&id);
+    let snap = match (s.frame_stats.snapshot(id), &zones) {
+        (Some(snap), _) => snap,
+        (None, Some(_)) => nexus_pipeline::CameraFrameStats::default(),
+        (None, None) => {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                "no stats for camera".into(),
+            ))
+        }
+    };
+    Ok(Json(build_camera_stats_view(&s, id, &snap, now, zones)))
 }
 
 /// Shared by `GET /v1/cameras/:id/stats` and the batch
@@ -2930,6 +2970,7 @@ fn build_camera_stats_view(
     id: CameraId,
     snap: &nexus_pipeline::CameraFrameStats,
     now: std::time::Instant,
+    zones_runtime: Option<nexus_pipeline::zone_application::ZonesRuntime>,
 ) -> CameraFrameStatsView {
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
@@ -2978,22 +3019,26 @@ fn build_camera_stats_view(
         decode_summary: summary,
         decode_ceiling_fps,
         analysis_stream: analysis,
+        zones_runtime,
     }
 }
 
 /// SPEC-069 Phase 1 (P2) — batch counterpart to `GET /v1/cameras/:id/stats`.
-/// Returns every camera the frame-stats registry has ever seen a frame
-/// from, in the same shape, so a fleet-wide decode-capacity dashboard
-/// doesn't have to make one request per camera.
+/// Returns every camera the single read answers for, in the same shape, so a
+/// fleet-wide decode-capacity dashboard doesn't have to make one request per
+/// camera.
 async fn get_all_camera_stats(
     State(s): State<ApiState>,
 ) -> Result<Json<Vec<CameraFrameStatsView>>, ApiError> {
     let now = std::time::Instant::now();
-    let views = s
-        .frame_stats
-        .snapshot_all()
+    let mut zones = zones_runtime(&s, now).await;
+    let mut stats = s.frame_stats.snapshot_all();
+    for id in zones.keys() {
+        stats.entry(*id).or_default();
+    }
+    let views = stats
         .into_iter()
-        .map(|(id, snap)| build_camera_stats_view(&s, id, &snap, now))
+        .map(|(id, snap)| build_camera_stats_view(&s, id, &snap, now, zones.remove(&id)))
         .collect();
     Ok(Json(views))
 }
@@ -7588,6 +7633,155 @@ mod tests {
             res.status(),
             StatusCode::OK,
             "GET /api/v1/admin/cameras/stats must serve the batch roster"
+        );
+    }
+
+    /// SPEC-088 — `zones_runtime` on the camera-stats read, in the shape the
+    /// cloud console is built against: all seven keys with explicit `null`s,
+    /// the desired revision hashed from the zones saved now, the batch and the
+    /// single read agreeing, and no object for a camera this process has
+    /// started no generation of. A restarting camera with no frame yet is
+    /// answered, not a 404, so its pending or failed status is not hidden.
+    #[tokio::test]
+    async fn camera_stats_report_zone_application_in_the_agreed_shape() {
+        use nexus_pipeline::zone_application::{zone_revision, ZoneApplicationError};
+        use serde_json::json;
+
+        async fn get(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, body)
+        }
+        /// The single read's `zones_runtime`, once the batch row agrees.
+        async fn zones_runtime(
+            app: &axum::Router,
+            id: nexus_types::CameraId,
+        ) -> Option<serde_json::Value> {
+            let (status, one) = get(app, &format!("/api/v1/cameras/{id}/stats")).await;
+            assert_eq!(status, StatusCode::OK, "{one}");
+            let (status, all) = get(app, "/api/v1/cameras/stats").await;
+            assert_eq!(status, StatusCode::OK, "{all}");
+            let row = all
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["camera_id"] == id))
+                .cloned()
+                .unwrap_or_else(|| panic!("camera {id} has a batch row: {all}"));
+            assert_eq!(
+                row.get("zones_runtime"),
+                one.get("zones_runtime"),
+                "the batch and the single read disagree"
+            );
+            one.get("zones_runtime").cloned()
+        }
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mut camera = store.list_cameras().await.expect("list cameras")[0].clone();
+        let id = camera.id;
+        let frame_stats = state.frame_stats.clone();
+        let registry = || frame_stats.zone_application();
+        let app = super::router(state);
+        let applied_at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 11, 24, 16, 30, 0).unwrap();
+
+        assert_eq!(
+            get(&app, &format!("/api/v1/cameras/{id}/stats")).await.0,
+            StatusCode::NOT_FOUND,
+            "no frame and no generation is still nothing to report"
+        );
+        assert_eq!(get(&app, "/api/v1/cameras/stats").await.1, json!([]));
+
+        let a = zone_revision(&camera.zones);
+        let g1 = registry().start(id);
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": a,
+                "applied_revision": null,
+                "generation": g1,
+                "state": "applying",
+                "applied_at": null,
+                "error_code": null,
+            }))
+        );
+
+        registry().acknowledge(id, g1, &a, applied_at);
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": a,
+                "applied_revision": a,
+                "generation": g1,
+                "state": "applied",
+                "applied_at": "2026-11-24T16:30:00Z",
+                "error_code": null,
+            }))
+        );
+
+        camera.zones = vec![nexus_config::ZoneConfig {
+            id: "z1".into(),
+            name: "Driveway".into(),
+            polygon: vec![(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)],
+            kind: nexus_config::ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
+        }];
+        let b = zone_revision(&camera.zones);
+        assert!(b.starts_with("sha256:") && b.len() == 7 + 64 && b != a);
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/v1/cameras/{id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&camera).unwrap()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert!(res.status().is_success(), "save zones: {}", res.status());
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": b,
+                "applied_revision": a,
+                "generation": g1,
+                "state": "applying",
+                "applied_at": "2026-11-24T16:30:00Z",
+                "error_code": null,
+            })),
+            "a read straight after a save reports the saved zones, not the old verdict"
+        );
+
+        let g2 = registry().start(id);
+        registry().fail(id, g2, ZoneApplicationError::SupervisorExited);
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": b,
+                "applied_revision": a,
+                "generation": g2,
+                "state": "failed",
+                "applied_at": "2026-11-24T16:30:00Z",
+                "error_code": "supervisor_exited",
+            }))
+        );
+
+        registry().remove(id);
+        let epoch = frame_stats.begin_session(id);
+        frame_stats.observe_frame(id, epoch, chrono::Utc::now(), 512, 288);
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            None,
+            "a camera with no generation in this process omits the object"
         );
     }
 

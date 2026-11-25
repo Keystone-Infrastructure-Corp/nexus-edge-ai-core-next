@@ -25,6 +25,8 @@ use nexus_types::CameraId;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
+use crate::zone_application::ZoneApplicationRegistry;
+
 /// Sliding window over which `fps_ema` is averaged. Two seconds is
 /// long enough to smooth typical source jitter (camera frame timing,
 /// gate back-pressure) without making the reading laggy when fps
@@ -44,8 +46,9 @@ const FPS_WINDOW_MAX_SAMPLES: usize = 240;
 /// that is actually gone stays silent far longer than this.
 pub const CAMERA_OFFLINE_AFTER_MS: i64 = 90_000;
 
-/// Snapshot returned to API callers. Cheap to clone.
-#[derive(Debug, Clone)]
+/// Snapshot returned to API callers. Cheap to clone. The default is a camera
+/// with no frame observed yet.
+#[derive(Debug, Clone, Default)]
 pub struct CameraFrameStats {
     /// Wall-clock timestamp of the most recent frame, in UTC.
     pub last_frame_at: Option<DateTime<Utc>>,
@@ -228,11 +231,20 @@ struct Slot {
 #[derive(Default)]
 pub struct FrameStatsRegistry {
     inner: RwLock<HashMap<CameraId, Arc<Mutex<Slot>>>>,
+    /// SPEC-088 — kept here because every supervisor and the stats read
+    /// already share this registry. [`Self::clear`] leaves it alone, so a
+    /// restart keeps the camera's last applied revision for comparison.
+    zone_application: ZoneApplicationRegistry,
 }
 
 impl FrameStatsRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Which zone revision each camera's running supervisor applied.
+    pub fn zone_application(&self) -> &ZoneApplicationRegistry {
+        &self.zone_application
     }
 
     fn slot(&self, camera_id: CameraId) -> Option<Arc<Mutex<Slot>>> {
