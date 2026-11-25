@@ -17,6 +17,7 @@ pub mod fleet;
 pub mod metrics;
 pub mod motion;
 pub mod outbox;
+pub mod recording_activity;
 pub mod recording_delivery;
 pub mod sessions;
 pub mod sinks;
@@ -34,6 +35,7 @@ pub use motion::{
     NewClip, NewMotionEvent, PerCameraClipStats, StorageBackendRow,
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
+pub use recording_activity::{RecordingActivityEpisode, RecordingActivityMinute};
 pub use recording_delivery::{
     CameraDelivery, DeliveryCounters, DeliveryQueue, DeliveryWindow, InFlight, PartitionTotals,
     QueuePartition, RecordingDeliverySnapshot, RecordingSource, SourceCounters, TransferGuard,
@@ -237,6 +239,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0041_recording_delivery",
         include_str!("../migrations/0041_recording_delivery.sql"),
+    ),
+    (
+        "0042_recording_activity_diagnostics",
+        include_str!("../migrations/0042_recording_activity_diagnostics.sql"),
     ),
 ];
 

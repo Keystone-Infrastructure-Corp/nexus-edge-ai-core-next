@@ -37,6 +37,8 @@ use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{
     ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError, MAX_CLIP_DURATION_MS,
 };
+use crate::recording_activity::AnalysisOutcome;
+use crate::recording_diagnostics::{EvidenceCounts, ShadowRecording, ShadowWrites};
 use crate::sink_router::{AlertClipScheduleGate, SinkRouter};
 use crate::skip_policy::DetectorSkipPolicy;
 use crate::source::{FrameSource, VirtualSource};
@@ -594,6 +596,17 @@ async fn run_camera(
         // no open clip force-opens a native-resolution motion clip and
         // each alert frame keeps it open through `post_roll_secs`.
         let record_motion_clip_on_alert = clips_cfg.record_motion_clip_on_alert;
+        // SPEC-089 — the fresh-evidence policy measured beside legacy on the
+        // same frames. It never calls the recorder; `None` in legacy mode.
+        let mut shadow = ShadowRecording::start(
+            stats.recording_activity(),
+            cfg.id,
+            zone_generation,
+            cfg.behavior.recording_policy,
+            tracker.name(),
+            clips_cfg.post_roll_secs,
+            clips_cfg.pre_roll_secs,
+        );
 
         info!(camera_id = cfg.id, "pipeline running");
 
@@ -851,6 +864,17 @@ async fn run_camera(
                         Ok(d) => d,
                         Err(e) => {
                             error!(camera_id = cfg.id, "detect failed: {e}");
+                            if let Some(shadow) = shadow.as_mut() {
+                                let writes = shadow.frame(
+                                    frame.captured_mono,
+                                    frame.captured_at,
+                                    AnalysisOutcome::Failed,
+                                    EvidenceCounts::default(),
+                                    false,
+                                    current_clip.map(|h| h.clip_id),
+                                );
+                                persist_shadow(&store, shadow, writes).await;
+                            }
                             return ControlFlow::Continue(());
                         }
                     }
@@ -1119,9 +1143,11 @@ async fn run_camera(
                 // per-track state, the L7 cache, the FRAME_METADATA bus
                 // event, or the rule evaluator. No-op when the camera
                 // has no exclusion zones (the common case).
+                let mut excluded = 0;
                 {
                     let _g = info_span!("frame.zone_filter").entered();
                     let dropped = filter_excluded_zones(&frame, &zones, &mut tracked);
+                    excluded += dropped;
                     if dropped > 0 {
                         debug!(
                             camera_id = cfg.id,
@@ -1137,6 +1163,7 @@ async fn run_camera(
                     // `ModelConfig::min_bbox_area_px` (which fires at the
                     // inference wrapper before tracking).
                     let dropped = filter_zone_min_area(&frame, &zones, &mut tracked);
+                    excluded += dropped;
                     if dropped > 0 {
                         debug!(
                             camera_id = cfg.id,
@@ -1532,6 +1559,30 @@ async fn run_camera(
                     }
                 }
 
+                // SPEC-089 — after legacy decided this frame, so the shadow
+                // trace compares against the clip legacy actually holds.
+                if let Some(shadow) = shadow.as_mut() {
+                    let counts = shadow.counts(
+                        dynamic_tracks(&tracked_arc, static_filter.is_some()),
+                        tracked_arc.len(),
+                        excluded,
+                    );
+                    let outcome = if skip_detector {
+                        AnalysisOutcome::Skipped
+                    } else {
+                        AnalysisOutcome::Success
+                    };
+                    let writes = shadow.frame(
+                        frame.captured_mono,
+                        frame.captured_at,
+                        outcome,
+                        counts,
+                        alert_kept_alive,
+                        current_clip.map(|h| h.clip_id),
+                    );
+                    persist_shadow(&store, shadow, writes).await;
+                }
+
                 // SPEC-088 — this frame went through the zone filters and
                 // everything downstream of them, so this generation now runs
                 // its zones for the request current when the frame began. A
@@ -1607,6 +1658,10 @@ async fn run_camera(
         // `clip_opened_at` is reset for invariant clarity even on the
         // shutdown path.
         let _ = clip_opened_at;
+        if let Some(shadow) = shadow.as_mut() {
+            let writes = shadow.finish();
+            persist_shadow(&store, shadow, writes).await;
+        }
         emitter.forget_camera(cfg.id);
 
         let _ = bus
@@ -1686,6 +1741,23 @@ fn build_source(
                 cfg.ingest.max_fps
             },
         }),
+    }
+}
+
+/// SPEC-089 — persist what a shadow frame finished. A summary the store
+/// refuses is reported on the camera's diagnostics, not retried: the trace
+/// says it has a gap.
+// shortcut: awaited on the analysis loop like motion rows (at most a minute row and a clip row per change), move off-loop if store latency ever shows in frame timing.
+async fn persist_shadow(store: &Store, shadow: &ShadowRecording, writes: ShadowWrites) {
+    if let Some(minute) = writes.minute {
+        if let Err(e) = store.insert_recording_activity_minute(&minute).await {
+            shadow.collector_failed(format!("minute summary not saved: {e}"));
+        }
+    }
+    if let Some(episode) = writes.episode {
+        if let Err(e) = store.insert_recording_activity_episode(&episode).await {
+            shadow.collector_failed(format!("episode summary not saved: {e}"));
+        }
     }
 }
 

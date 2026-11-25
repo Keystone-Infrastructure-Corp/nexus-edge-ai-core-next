@@ -3036,6 +3036,55 @@ struct CameraFrameStatsView {
     /// never as applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     zones_runtime: Option<ZonesReceipt>,
+    /// SPEC-089 — the fresh-evidence recording policy's runtime. Present only
+    /// while the camera's supervisor runs it in shadow; absent for legacy, an
+    /// unsupported tracker, or no running supervisor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recording_activity: Option<RecordingActivityView>,
+}
+
+/// SPEC-089 — the supervisor's runtime snapshot plus what only the recorder knows.
+#[derive(serde::Serialize)]
+struct RecordingActivityView {
+    #[serde(flatten)]
+    runtime: nexus_pipeline::recording_diagnostics::RecordingActivityRuntime,
+    /// Bytes of legacy's open clip so far; `null` when none is open or the
+    /// recorder cannot tell.
+    active_clip_bytes: Option<u64>,
+    /// The recorder's current motion-recording failure for this camera.
+    recorder_error: Option<String>,
+}
+
+async fn recording_activity(
+    s: &ApiState,
+    id: CameraId,
+    now: std::time::Instant,
+) -> Option<RecordingActivityView> {
+    let runtime = s.frame_stats.recording_activity().snapshot(id, now)?;
+    let active_clip_bytes = match runtime.active_clip_id {
+        Some(clip_id) => {
+            s.recorder
+                .inflight_size_bytes(nexus_pipeline::ClipHandle {
+                    clip_id,
+                    camera_id: id,
+                })
+                .await
+        }
+        None => None,
+    };
+    let recorder_error = s
+        .recorder
+        .recording_degradations()
+        .into_iter()
+        .find(|d| {
+            d.camera_id == id && d.kind == nexus_pipeline::recording_health::RecordingKind::Motion
+        })
+        .map(|d| d.reason);
+    Some(RecordingActivityView {
+        runtime,
+        active_clip_bytes,
+        recorder_error,
+    })
 }
 
 /// SPEC-088 — a camera's `zones_runtime`: its receipt, or `read_error` with
@@ -3125,7 +3174,10 @@ async fn get_camera_stats(
             ))
         }
     };
-    Ok(Json(build_camera_stats_view(&s, id, &snap, now, zones)))
+    let activity = recording_activity(&s, id, now).await;
+    Ok(Json(build_camera_stats_view(
+        &s, id, &snap, now, zones, activity,
+    )))
 }
 
 /// Shared by `GET /v1/cameras/:id/stats` and the batch
@@ -3137,6 +3189,7 @@ fn build_camera_stats_view(
     snap: &nexus_pipeline::CameraFrameStats,
     now: std::time::Instant,
     zones_runtime: Option<ZonesReceipt>,
+    recording_activity: Option<RecordingActivityView>,
 ) -> CameraFrameStatsView {
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
@@ -3186,6 +3239,7 @@ fn build_camera_stats_view(
         decode_ceiling_fps,
         analysis_stream: analysis,
         zones_runtime,
+        recording_activity,
     }
 }
 
@@ -3202,15 +3256,16 @@ async fn get_all_camera_stats(
     for id in zones.iter().flat_map(|zones| zones.keys()) {
         stats.entry(*id).or_default();
     }
-    let views = stats
-        .into_iter()
-        .map(|(id, snap)| {
-            let receipt = zones
-                .as_mut()
-                .map_or(Some(ZONES_READ_ERROR), |zones| zones.remove(&id));
-            build_camera_stats_view(&s, id, &snap, now, receipt)
-        })
-        .collect();
+    let mut views = Vec::with_capacity(stats.len());
+    for (id, snap) in stats {
+        let receipt = zones
+            .as_mut()
+            .map_or(Some(ZONES_READ_ERROR), |zones| zones.remove(&id));
+        let activity = recording_activity(&s, id, now).await;
+        views.push(build_camera_stats_view(
+            &s, id, &snap, now, receipt, activity,
+        ));
+    }
     Ok(Json(views))
 }
 
@@ -8685,6 +8740,152 @@ mod tests {
             res.status(),
             StatusCode::OK,
             "GET /api/v1/admin/cameras/stats must serve the batch roster"
+        );
+    }
+
+    /// SPEC-089 — `recording_activity` on the camera-stats read: absent for a
+    /// legacy camera, every key present (explicit `null`s) while a shadow
+    /// supervisor runs, the open legacy clip's bytes read from the recorder,
+    /// the single and the batch read agreeing, and absent again once that
+    /// supervisor ends.
+    #[tokio::test]
+    async fn camera_stats_report_shadow_recording_activity_in_the_agreed_shape() {
+        use nexus_pipeline::recording_activity::AnalysisOutcome;
+        use nexus_pipeline::recording_diagnostics::{EvidenceCounts, ShadowRecording};
+        use serde_json::json;
+
+        async fn activity(
+            app: &axum::Router,
+            id: nexus_types::CameraId,
+        ) -> Option<serde_json::Value> {
+            let mut reads = Vec::new();
+            for uri in [
+                format!("/api/v1/cameras/{id}/stats"),
+                "/api/v1/cameras/stats".into(),
+            ] {
+                let mut req = Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+                let res = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                let body: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap())
+                        .unwrap();
+                let row = match body.as_array() {
+                    Some(rows) => rows.iter().find(|r| r["camera_id"] == id).cloned().unwrap(),
+                    None => body,
+                };
+                reads.push(row.get("recording_activity").cloned());
+            }
+            assert_eq!(reads[0], reads[1], "the batch and the single read disagree");
+            reads.pop().unwrap()
+        }
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let id = store.list_cameras().await.unwrap()[0].id;
+        let frame_stats = state.frame_stats.clone();
+        let recorder = state.recorder.clone();
+        let app = super::router(state);
+        assert_eq!(activity(&app, id).await, None, "legacy reports nothing");
+
+        let policy = nexus_config::RecordingPolicyConfig {
+            mode: nexus_config::RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 10_000,
+        };
+        let mut shadow = ShadowRecording::start(
+            frame_stats.recording_activity(),
+            id,
+            7,
+            Some(policy),
+            "bytetrack",
+            2,
+            5,
+        )
+        .expect("bytetrack has an observed/predicted contract");
+        let clip = recorder
+            .open(nexus_pipeline::OpenClip {
+                camera_id: id,
+                started_at: chrono::Utc::now(),
+                frame_width: 512,
+                frame_height: 288,
+            })
+            .await
+            .unwrap();
+        let counts = EvidenceCounts {
+            observed: 1,
+            predicted: 2,
+            stationary: 3,
+            excluded: 4,
+        };
+        let writes = shadow.frame(
+            std::time::Instant::now(),
+            chrono::Utc::now(),
+            AnalysisOutcome::Success,
+            counts,
+            false,
+            Some(clip.clip_id),
+        );
+        assert!(writes.minute.is_none() && writes.episode.is_none());
+
+        let mut got = activity(&app, id).await.expect("a shadow camera reports");
+        // Ages and elapsed time count from the frame to the read.
+        for age in ["last_success_age_ms", "last_qualifying_age_ms"] {
+            assert!(got[age].is_u64(), "{age}: {got}");
+            got[age] = json!(0);
+        }
+        let open_ms = got["elapsed"]["legacy_open"]["degraded_coverage"].take();
+        assert!(open_ms.is_u64(), "{got}");
+        for recorded in ["legacy_recorded_ms", "shadow_recorded_ms"] {
+            // Five seconds of pre-roll before the frame, plus the elapsed time.
+            assert_eq!(
+                got[recorded].take(),
+                json!(5_000 + open_ms.as_u64().unwrap())
+            );
+        }
+        let revision = got["policy_revision"].take();
+        assert!(
+            revision.as_str().unwrap().starts_with("sha256:"),
+            "{revision}"
+        );
+        let none = json!({"activity": 0, "post_roll": 0, "degraded_coverage": 0, "quiet": 0});
+        assert_eq!(
+            got,
+            json!({
+                "schema_version": 1,
+                "mode": "shadow",
+                "generation": 7,
+                "policy_revision": null,
+                "active_clip_id": clip.clip_id,
+                "legacy_open": true,
+                "shadow_open": true,
+                "reason": "degraded_coverage",
+                "last_success_age_ms": 0,
+                "last_qualifying_age_ms": 0,
+                "last_failure_age_ms": null,
+                "counts": {"observed": 1, "predicted": 2, "static": 3, "excluded": 4},
+                "transitions": 1,
+                "trace_incomplete": false,
+                "collector_error": null,
+                "elapsed": {
+                    "legacy_open": {"activity": 0, "post_roll": 0, "degraded_coverage": null, "quiet": 0},
+                    "legacy_closed": none,
+                },
+                "legacy_recorded_ms": null,
+                "shadow_recorded_ms": null,
+                "active_clip_bytes": 0,
+                "recorder_error": null,
+            })
+        );
+
+        drop(shadow);
+        assert_eq!(
+            activity(&app, id).await,
+            None,
+            "an ended supervisor reports nothing"
         );
     }
 

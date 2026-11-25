@@ -67,6 +67,8 @@ const KEEP_TABLES: &[&str] = &[
     "fleet_managed_markers",
     "motion_clips",
     "motion_events",
+    "recording_activity_episodes", // SPEC-089 shadow summaries: counters, clip ids
+    "recording_activity_minutes",
     "rules",
     "schema_migrations",
     "storage_backends", // config_json redacted

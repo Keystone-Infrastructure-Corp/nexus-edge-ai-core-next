@@ -4,7 +4,8 @@
 //! Pure: no I/O, no async, no clock. Every time is elapsed monotonic
 //! milliseconds from the caller (capture stamps for evidence, the
 //! controller's clock for [`RecordingActivityPolicy::tick`]); nothing here
-//! reads wall or UTC time. Dormant until a controller wires it in.
+//! reads wall or UTC time. SPEC-089 Task 2 runs it in shadow beside legacy
+//! recording ([`crate::recording_diagnostics`]); nothing here writes footage.
 
 use nexus_config::TrackerBackendKind;
 use nexus_types::TrackedObject;
@@ -31,7 +32,8 @@ pub struct Observation {
     pub outcome: AnalysisOutcome,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecordingReason {
     Activity,
     PostRoll,
@@ -72,6 +74,8 @@ pub struct RecordingActivityPolicy {
     degraded_since_ms: u64,
     recovery_passes: u32,
     recovery_started_ms: Option<u64>,
+    /// Generation and through-sequence of the last [`EvidenceSummary`] applied.
+    applied: Option<(u64, u64)>,
 }
 
 impl RecordingActivityPolicy {
@@ -85,6 +89,43 @@ impl RecordingActivityPolicy {
             degraded_since_ms: started_ms,
             recovery_passes: 0,
             recovery_started_ms: None,
+            applied: None,
+        }
+    }
+
+    /// Apply a coalesced [`EvidenceSummary`]. Idempotent: a summary at or
+    /// below the generation/through-sequence already applied changes
+    /// nothing, so a repeated or older read never counts a pass twice.
+    /// `now_ms` is the consumer's clock: a success run that is no longer
+    /// fresh proves nothing about analysis now and cannot end degradation.
+    pub fn apply_summary(&mut self, summary: &EvidenceSummary, now_ms: u64) {
+        let mark = (summary.generation, summary.through_sequence);
+        let applied_through = match self.applied {
+            Some(applied) if mark <= applied => return,
+            Some((generation, through)) if generation == summary.generation => through,
+            // A new generation: every failure in its summary is new.
+            _ => 0,
+        };
+        self.applied = Some(mark);
+        if let Some(at) = summary.last_activity_ms {
+            self.activity(at);
+        }
+        if let Some((at, _)) = summary
+            .last_failure
+            .filter(|&(_, sequence)| sequence > applied_through)
+        {
+            self.degrade(at);
+        }
+        self.last_success_ms = self.last_success_ms.max(summary.last_success_ms);
+        let fresh_run = summary
+            .run
+            .filter(|run| now_ms.saturating_sub(run.last_ms) <= self.stale_after_ms);
+        // The producer resets a run on every failure and stale gap, so a
+        // fresh run that met the gate is sustained health after them.
+        if let Some(at) = fresh_run.and_then(|run| run.recovered_ms) {
+            if self.degraded {
+                self.recover(at);
+            }
         }
     }
 
@@ -173,11 +214,115 @@ impl RecordingActivityPolicy {
         self.recovery_started_ms = Some(started);
         self.recovery_passes += 1;
         if self.recovery_passes >= RECOVERY_PASSES && at - started >= RECOVERY_SPAN_MS {
-            self.degraded = false;
-            self.recovery_passes = 0;
-            self.recovery_started_ms = None;
-            // The recovery instant counts as activity once: one post-roll window.
-            self.activity(at);
+            self.recover(at);
         }
+    }
+
+    fn recover(&mut self, at: u64) {
+        self.degraded = false;
+        self.recovery_passes = 0;
+        self.recovery_started_ms = None;
+        // The recovery instant counts as activity once: one post-roll window.
+        self.activity(at);
+    }
+}
+
+/// The current run of consecutive successful passes, as far as recovery
+/// needs it: bounded however many passes it spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuccessRun {
+    pub first_ms: u64,
+    pub last_ms: u64,
+    /// Saturates at the recovery gate's pass count.
+    pub passes: u32,
+    /// The pass at which this run first met the recovery gate.
+    pub recovered_ms: Option<u64>,
+}
+
+/// SPEC-089 coalesced evidence: every generation/sequence-validated
+/// [`Observation`] of one camera generation reduced into a fixed-size
+/// summary, so a consumer that reads only the latest one still sees the
+/// newest qualifying activity, a failure and the recovery after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvidenceSummary {
+    pub generation: u64,
+    /// Sequence of the last observation reduced; `0` before the first.
+    pub through_sequence: u64,
+    /// Latest capture time with a qualifying observation.
+    pub last_activity_ms: Option<u64>,
+    pub last_success_ms: Option<u64>,
+    /// Capture time and sequence of the latest failed analysis.
+    pub last_failure: Option<(u64, u64)>,
+    /// Reset by a failure and by a gap past the stale deadline.
+    pub run: Option<SuccessRun>,
+    stale_after_ms: u64,
+}
+
+impl EvidenceSummary {
+    pub fn new(generation: u64, stale_after_ms: u64) -> Self {
+        Self {
+            generation,
+            through_sequence: 0,
+            last_activity_ms: None,
+            last_success_ms: None,
+            last_failure: None,
+            run: None,
+            stale_after_ms,
+        }
+    }
+
+    /// Reduce one observation numbered `sequence` (from 1) in `generation`.
+    /// Returns `false`, changing nothing, for an older generation or a
+    /// sequence already reduced; a newer generation starts a fresh summary.
+    pub fn reduce(&mut self, generation: u64, sequence: u64, observation: Observation) -> bool {
+        if generation < self.generation
+            || (generation == self.generation && sequence <= self.through_sequence)
+        {
+            return false;
+        }
+        if generation > self.generation {
+            *self = Self::new(generation, self.stale_after_ms);
+        }
+        self.through_sequence = sequence;
+        let at = observation.captured_ms.min(observation.received_ms);
+        match observation.outcome {
+            AnalysisOutcome::Skipped => {}
+            AnalysisOutcome::Failed => {
+                self.last_failure = Some((at, sequence));
+                self.run = None;
+            }
+            AnalysisOutcome::Success => {
+                if observation.qualifying_observed > 0 {
+                    self.last_activity_ms = self.last_activity_ms.max(Some(at));
+                }
+                // A reordered pass, or one captured before the latest
+                // failure, proves nothing newer about health.
+                if self.last_success_ms.is_some_and(|s| at <= s)
+                    || self.last_failure.is_some_and(|(f, _)| at < f)
+                {
+                    return true;
+                }
+                self.last_success_ms = Some(at);
+                let mut run = match self.run {
+                    Some(run) if at - run.last_ms <= self.stale_after_ms => run,
+                    _ => SuccessRun {
+                        first_ms: at,
+                        last_ms: at,
+                        passes: 0,
+                        recovered_ms: None,
+                    },
+                };
+                run.passes = (run.passes + 1).min(RECOVERY_PASSES);
+                run.last_ms = at;
+                if run.recovered_ms.is_none()
+                    && run.passes >= RECOVERY_PASSES
+                    && at - run.first_ms >= RECOVERY_SPAN_MS
+                {
+                    run.recovered_ms = Some(at);
+                }
+                self.run = Some(run);
+            }
+        }
+        true
     }
 }
