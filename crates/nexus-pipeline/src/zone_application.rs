@@ -4,7 +4,7 @@
 //! save, reconcile pass and read tells the registry the revision saved now
 //! and whether the camera is enabled ([`ZoneApplicationRegistry::request`]);
 //! every change of either is a new request with a new [`RequestToken`], A→B→A
-//! included. Each supervisor start is a new generation
+//! included, in commit order ([`ZoneApplicationRegistry::saves`]). Each supervisor start is a new generation
 //! ([`ZoneApplicationRegistry::start`]) running the zones it froze. Before
 //! each frame it takes the current request's token
 //! ([`ZoneApplicationRegistry::current_request`]), which it gets only while it
@@ -234,6 +234,7 @@ fn persist_floor(path: &Path, floor: u64) {
 
 pub struct ZoneApplicationRegistry {
     inner: Mutex<Inner>,
+    saves: tokio::sync::RwLock<()>,
 }
 
 impl Default for ZoneApplicationRegistry {
@@ -261,7 +262,18 @@ impl ZoneApplicationRegistry {
                 last_request: 0,
                 cameras: HashMap::new(),
             }),
+            saves: tokio::sync::RwLock::new(()),
         }
+    }
+
+    /// Writers of a camera's zones or enabled flag hold this for writing from
+    /// before their commit until they have told [`Self::request`] (or
+    /// [`Self::remove`]); readers that request what they read hold it for
+    /// reading from before the read. So the registry sees every saved change,
+    /// in commit order, and no stale read after it: a save racing another
+    /// cannot find its change already requested by an earlier one.
+    pub fn saves(&self) -> &tokio::sync::RwLock<()> {
+        &self.saves
     }
 
     /// Keep generations above every earlier boot's, whatever the wall clock

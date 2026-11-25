@@ -593,6 +593,9 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
 ///   * restarts the supervisor + ingester for any enabled camera
 ///     whose ingest URL has changed, or whose supervisor has exited.
 async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
+    let zone_application = args.frame_stats.zone_application();
+    // SPEC-088 — no save commits between this read and its requests below.
+    let reading = zone_application.saves().read().await;
     let (live, unreadable) = args.store.list_readable_cameras().await?;
     *args.unreadable_cameras.lock() = unreadable;
 
@@ -609,7 +612,6 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     // SPEC-088 — a pass reads the saved zones and enabled flags, so it is a
     // request too: a save that bypassed the API's (which requests on its own)
     // still lets the generation started for it acknowledge.
-    let zone_application = args.frame_stats.zone_application();
     for cam in &live {
         zone_application.request(
             cam.id,
@@ -617,6 +619,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             cam.ingest.enabled,
         );
     }
+    drop(reading);
 
     // 1. Remove anything that is gone-or-disabled, or whose row this build
     //    cannot read: boot would not have started it either.
@@ -2339,8 +2342,10 @@ mod tests {
             .snapshot(7, desired, true, std::time::Instant::now())
     }
 
-    /// What the API's camera save does: persist, then tell the registry.
+    /// What the API's camera save does: persist, then tell the registry,
+    /// under the registry's save lock.
     async fn save(args: &ReconcilerArgs, camera: &CameraConfig) {
+        let _saving = args.frame_stats.zone_application().saves().write().await;
         args.store.upsert_camera(camera).await.expect("save camera");
         args.frame_stats.zone_application().request(
             camera.id,

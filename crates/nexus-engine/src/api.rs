@@ -1450,6 +1450,8 @@ async fn reprobe_apply(
                 cam.ingest.analysis_url = Some(url);
                 let after_str = camera_audit_json(cam);
                 let resource_id = cam.id.to_string();
+                // SPEC-088 — as `upsert_camera`.
+                let saving = s.frame_stats.zone_application().saves().write().await;
                 // Same tx-merge as `upsert_camera`: the mutation and its
                 // audit row commit together, so the log can never be
                 // missing a row for a change that landed. A bulk action
@@ -1478,6 +1480,7 @@ async fn reprobe_apply(
                     &nexus_pipeline::zone_application::zone_revision(&cam.zones),
                     cam.ingest.enabled,
                 );
+                drop(saving);
                 applied_any = true;
             }
         }
@@ -1656,6 +1659,9 @@ async fn upsert_camera(
     let after_str = camera_audit_json(&cam);
     let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
+    // SPEC-088 — no other save commits, and no read requests, between this
+    // commit and the request below, so the registry sees saves in order.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     // M6 Phase 4 Step 4.1 (tx-merge) — the domain mutation
     // and the success audit row commit together in one SQLite
     // tx. If the audit write fails, the tx drops and the camera
@@ -1706,6 +1712,7 @@ async fn upsert_camera(
         &nexus_pipeline::zone_application::zone_revision(&cam.zones),
         cam.ingest.enabled,
     );
+    drop(saving);
     // Fire-and-forget: the engine's `config.changed` reconciler
     // listens for this and hot-starts a supervisor + pre-roll
     // ingester for the new (or modified) camera. `action` lets the
@@ -1772,6 +1779,8 @@ async fn create_camera(
             }
         }
     }
+    // SPEC-088 — as `upsert_camera`.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
         s.store.create_camera_tx(&mut tx, &mut cam).await?;
@@ -1821,6 +1830,7 @@ async fn create_camera(
         &nexus_pipeline::zone_application::zone_revision(&cam.zones),
         cam.ingest.enabled,
     );
+    drop(saving);
     let _ = s
         .bus
         .publish(
@@ -1850,6 +1860,9 @@ async fn delete_camera(
         .and_then(|(all, _)| all.into_iter().find(|c| c.id == id));
     let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
+    // SPEC-088 — as `upsert_camera`: a re-create cannot commit before the
+    // registry forgot this camera.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     // M6 Phase 4 Step 4.1 (tx-merge) — see upsert_camera.
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
@@ -1891,6 +1904,7 @@ async fn delete_camera(
     s.talkdown.stop_where(|_, camera, _| camera == Some(id));
     // SPEC-088 — a deleted camera has no zone application left to report.
     s.frame_stats.zone_application().remove(id);
+    drop(saving);
     // Same channel as upsert — the reconciler diffs the live set
     // against the DB and stops the supervisor for any removed id.
     let _ = s
@@ -3001,6 +3015,9 @@ async fn zones_runtime(
     s: &ApiState,
     now: std::time::Instant,
 ) -> std::collections::HashMap<CameraId, nexus_pipeline::zone_application::ZonesRuntime> {
+    let registry = s.frame_stats.zone_application();
+    // No save commits between this read and the requests it makes.
+    let _reading = registry.saves().read().await;
     let cameras = match s.store.list_readable_cameras().await {
         Ok((cameras, _unreadable)) => cameras,
         Err(e) => {
@@ -3008,7 +3025,6 @@ async fn zones_runtime(
             return std::collections::HashMap::new();
         }
     };
-    let registry = s.frame_stats.zone_application();
     cameras
         .iter()
         .map(|cam| {
@@ -8282,6 +8298,94 @@ mod tests {
                 .applied_revision,
             None,
             "the delete kept the camera's history"
+        );
+    }
+
+    /// SPEC-088 — the registry sees saves in commit order. With A applied
+    /// by g1, B is committed by a save that has not told the registry yet,
+    /// and A is saved through the API meanwhile: A cannot commit before B's
+    /// save has told the registry, so A is a new request, and g1's
+    /// acknowledgement from before B cannot certify it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_behind_a_paused_save_is_a_new_request() {
+        use nexus_pipeline::zone_application::zone_revision;
+
+        async fn put(app: axum::Router, camera: nexus_config::CameraConfig) -> StatusCode {
+            let mut req = Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/v1/cameras/{}", camera.id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&camera).unwrap()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            app.oneshot(req).await.unwrap().status()
+        }
+        async fn state_of(app: &axum::Router, id: nexus_types::CameraId) -> serde_json::Value {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/cameras/{id}/stats"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["zones_runtime"]["state"]
+                .clone()
+        }
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let a_camera = store.list_cameras().await.expect("list cameras")[0].clone();
+        let id = a_camera.id;
+        let mut b_camera = a_camera.clone();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let (a, b) = (
+            zone_revision(&a_camera.zones),
+            zone_revision(&b_camera.zones),
+        );
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+        registry.request(id, &a, true);
+        let g1 = registry.start(id, &a);
+        let first = registry.current_request(id, g1).expect("g1 runs A");
+        registry.acknowledge(id, g1, first, &a, chrono::Utc::now());
+        assert_eq!(state_of(&app, id).await, "applied");
+
+        // B's save: committed, and paused before it tells the registry,
+        // holding what a save holds there.
+        let paused = registry.saves().write().await;
+        store.upsert_camera(&b_camera).await.expect("commit B");
+        let mut save_a = tokio::spawn(put(app.clone(), a_camera.clone()));
+        let a_while_b_paused =
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut save_a)
+                .await
+                .ok();
+        let b_still_saved = store.list_cameras().await.expect("list cameras")[0]
+            .zones
+            .clone();
+        registry.request(id, &b, true);
+        drop(paused);
+        let a_committed_while_b_paused = a_while_b_paused.is_some();
+        let saved_a = match a_while_b_paused {
+            Some(done) => done,
+            None => save_a.await,
+        };
+        assert_eq!(saved_a.expect("save A"), StatusCode::OK);
+
+        assert!(
+            !a_committed_while_b_paused && b_still_saved == b_camera.zones,
+            "A committed while B's save had not told the registry"
+        );
+        let again = registry.current_request(id, g1);
+        assert!(
+            again.is_some() && again != Some(first),
+            "the save of A is not the latest request, or is the one g1 acknowledged before B"
+        );
+        assert_eq!(
+            state_of(&app, id).await,
+            "applying",
+            "g1's acknowledgement from before B certified the A saved after it"
         );
     }
 
