@@ -42,10 +42,10 @@ jobs:
       (github.event_name == 'pull_request' && github.event.label.name == 'factory:fix-ci' &&
         github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
-    # Label-triggered builds: 180 min, one group per issue or PR. @claude mentions: 60 min,
-    # one group per run. A shared group silently cancelled pending builds, so the cost
-    # guard is timeout-minutes only.
-    timeout-minutes: ${{ github.event.action == 'labeled' && 180 || 60 }}
+    # 180 min, since a mention that changes code runs implement-loop too. Label-triggered
+    # builds: one group per issue or PR. @claude mentions: one group per run. A shared
+    # group silently cancelled pending builds, so the cost guard is timeout-minutes only.
+    timeout-minutes: 180
     concurrency:
       group: ${{ github.event.action == 'labeled' && format('claude-build-{0}', github.event.issue.number || github.event.pull_request.number) || format('claude-{0}', github.run_id) }}
       cancel-in-progress: false
@@ -93,7 +93,7 @@ jobs:
             fi
             text="Work order #$ISSUE in $REPO. Run implement-loop for $spec: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md, and follow it on the vault record $spec. Work on a new branch. When the loop passes, push it and open a draft pull request whose body starts with \"Closes #$ISSUE\" and carries the ledger. If you stop short, comment on #$ISSUE with what is left and why."
           else
-            text="Pull request #$PR in $REPO has failing checks. Fix them with implement-loop: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. The task is to make the failing checks pass; read them with \`gh pr checks $PR\` and \`gh run view <run-id> --log-failed\`. Base the loop's worktree on origin/$BRANCH, not origin/main, and when the loop passes push its commits to $BRANCH. Then comment on #$PR with the cause, the fix, what you ran and the ledger."
+            text="Pull request #$PR in $REPO has failing checks. Fix them with implement-loop: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. The task is to make the failing checks pass; read them with \`gh pr checks $PR\` and \`gh run view <run-id> --log-failed\`. Base the loop's worktree on origin/$BRANCH and rebase only onto that branch, never origin/main. When the loop passes, push its commits to $BRANCH as a fast-forward with \`git push origin HEAD:$BRANCH\`, never force, then comment on #$PR with the cause, the fix, what you ran and the ledger. If you stop short, comment on #$PR with what is left and why."
           fi
           echo "text=$text" >> "$GITHUB_OUTPUT"
 
@@ -151,7 +151,6 @@ jobs:
           claude_args: >-
             ${{ github.event.action == 'labeled' && '--permission-mode auto' || '' }}
             --append-system-prompt "Every code change goes through the implement-loop skill:
-            read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. When the loop passes,
-            push its commits: on a pull request, base the loop on the PR branch and push back
-            to it; for an issue, push a new branch and open a draft pull request. Every review
-            goes through the requesting-code-review skill."
+            read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. A unit or reviewer
+            the loop dispatches starts no other loop. Every review goes through the
+            requesting-code-review skill, posts its findings, and changes nothing unless asked."

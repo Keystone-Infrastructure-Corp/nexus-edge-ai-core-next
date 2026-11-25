@@ -5,8 +5,9 @@ Canonical copy: `nexus-home/ci/REVIEW.md`. Every repo carries a verbatim copy.
 Every review that can run the `requesting-code-review` skill does, with this file as the
 fresh reviewer's checklist: implement-loop's final review on every change, and any
 `@claude` request for a review other than `@claude review`. P0 and P1 are the skill's
-Critical and Important; its Minor tier is not reported. Copilot code review, Codex and
-Claude Code Review cannot run a skill, so they apply this file directly.
+Critical and Important, and only they are posted on a PR; implement-loop records Minor
+findings in its ledger. Copilot code review, Codex and Claude Code Review cannot run a
+skill, so they apply this file directly.
 
 ## What to report
 
@@ -42,6 +43,8 @@ Also flag:
   output, snapshots, vendored code and knowledge-graph exports.
 - Suggestions, refactors and "consider" comments that fix no bug.
 - Anything already raised on the PR.
+- Whether a change went through implement-loop or requesting-code-review. The PR's
+  ledger is the evidence, not the diff.
 
 ## Close every review with
 

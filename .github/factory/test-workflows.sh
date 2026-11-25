@@ -129,11 +129,22 @@ if [ -f "$C" ]; then
     done
     : >"$TMP/out"
     GITHUB_EVENT_NAME=pull_request BRANCH=fix-x GITHUB_OUTPUT="$TMP/out" bash -e "$TMP/step.sh" >/dev/null 2>&1 || true
-    if grep -qF 'implement-loop' "$TMP/out" && grep -qF 'on origin/fix-x' "$TMP/out"; then
-      ok "fix-ci prompt runs implement-loop on the PR branch"
+    if grep -qF 'implement-loop' "$TMP/out" && grep -qF 'on origin/fix-x' "$TMP/out" &&
+       grep -qF 'git push origin HEAD:fix-x' "$TMP/out"; then
+      ok "fix-ci prompt runs implement-loop on the PR branch and fast-forwards it"
     else
-      bad "fix-ci prompt lacks implement-loop on origin/fix-x"
+      bad "fix-ci prompt lacks implement-loop on origin/fix-x or the fast-forward push"
     fi
+  fi
+
+  # The appended rule must reach claude as one argument: the action's arg parser expands
+  # $VAR inside double quotes and splits on a stray quote.
+  args="$(awk '/^ *claude_args: >-$/ { f = 1; next } f { if ($0 !~ /^            /) exit; print }' "$C")"
+  if grep -qF -- '--append-system-prompt "' <<<"$args" && [ "$(tr -cd '"' <<<"$args" | wc -c)" -eq 2 ] &&
+     ! grep -q '[$`]' <<<"${args//'${{'/}" && grep -qF 'implement-loop' <<<"$args"; then
+    ok "claude_args appends the implement-loop rule as one argument"
+  else
+    bad "claude_args lacks a single quoted --append-system-prompt rule"
   fi
 else
   echo "skip claude.yml (not adopted)"
@@ -163,8 +174,9 @@ if [ -f "$R" ]; then
         got=no; grep -q assignees "$GH_STUB_LOG" && got=yes
         commented=no; grep -q 'issue comment' "$GH_STUB_LOG" && commented=yes
         told=no; grep -qF "custom_instructions]=Build $s with the implement-loop skill" "$GH_STUB_LOG" && told=yes
+        hint=yes; [ "$name" = "no token" ] && ! grep -q 'implement-loop' "$GH_STUB_LOG" && hint=no
         if [ "$rc" -eq 0 ] && [ "$got" = "$assign" ] && { [ "$assign" = no ] || [ "$told" = yes ]; } &&
-           { [ "$assign" = yes ] || [ "$commented" = yes ]; }; then
+           { [ "$assign" = yes ] || [ "$commented" = yes ]; } && [ "$hint" = yes ]; then
           ok "small route: $name -> assign=$got"
         else
           bad "small route: $name -> assign=$got commented=$commented exit $rc, want assign=$assign"
