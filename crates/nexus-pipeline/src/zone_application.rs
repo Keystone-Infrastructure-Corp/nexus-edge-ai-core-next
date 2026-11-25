@@ -7,11 +7,15 @@
 //! ([`ZoneApplicationRegistry::acknowledge`]). A read passes the revision saved
 //! now ([`ZoneApplicationRegistry::snapshot`]); it is never stored here, so two
 //! reads racing a save each answer against the store they read. In memory
-//! only, so a process boot has applied nothing. An acknowledgement says one
-//! frame was processed with the zones, not that analysis stays healthy: that
-//! is the frame stats' job.
+//! only, so a process boot has applied nothing; only a floor under the next
+//! boot's generations is persisted
+//! ([`ZoneApplicationRegistry::load_generation_floor`]). An acknowledgement
+//! says one frame was processed with the zones, not that analysis stays
+//! healthy: that is the frame stats' job.
 
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
@@ -20,6 +24,7 @@ use nexus_types::CameraId;
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 /// How long a generation has, from its start, to acknowledge its zones before
 /// it reads `failed` with [`ZoneApplicationError::ApplicationTimeout`].
@@ -98,12 +103,43 @@ struct Inner {
     /// The last generation handed out, process-wide, so a number names one
     /// supervisor even across a camera's deletion and re-creation.
     last_generation: u64,
+    /// The floor file and the highest generation it covers: none above that
+    /// is handed out before a higher floor is written. `None` until
+    /// [`ZoneApplicationRegistry::load_generation_floor`].
+    floor: Option<(PathBuf, u64)>,
     cameras: HashMap<CameraId, Entry>,
 }
 
 /// The highest boot seed: 2^32 starts below 2^53 − 1, the largest integer a
 /// JSON reader holds exactly. Unix-epoch ms × 1000 reaches it in 2255.
 const MAX_BOOT_SEED: u64 = (1 << 53) - (1 << 32);
+
+/// Generations reserved on disk at a time: one write per this many starts,
+/// and small enough that a restart loop (5 s apart) never outruns the clock.
+const FLOOR_BLOCK: u64 = 1 << 20;
+
+/// Write `floor` to `path` through a synced temp file, a rename and a synced
+/// directory, so a crash or power loss leaves the old floor or the new one.
+fn write_floor(path: &Path, floor: u64) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(format!("{floor}\n").as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => std::fs::File::open(dir)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+/// [`write_floor`], failing open (R6): the floor only guards the next boot,
+/// so this process keeps handing out rising generations either way.
+fn persist_floor(path: &Path, floor: u64) {
+    if let Err(e) = write_floor(path, floor) {
+        warn!(path = %path.display(), error = %e,
+            "could not persist the zone generation floor; a restart with the clock set back may read stale");
+    }
+}
 
 pub struct ZoneApplicationRegistry {
     inner: Mutex<Inner>,
@@ -119,8 +155,9 @@ impl ZoneApplicationRegistry {
     /// A registry whose generations count up from `boot` in unix-epoch
     /// milliseconds × 1000, so a reader that saw an earlier process's
     /// generations sees this one's as newer (that process started at most
-    /// 1000 supervisors per millisecond it ran). Assumes the wall clock does
-    /// not step back across a restart; if it does, the reader takes the lower
+    /// 1000 supervisors per millisecond it ran). Without a floor
+    /// ([`Self::load_generation_floor`]) this assumes the wall clock does not
+    /// step back across a restart; if it does, the reader takes the lower
     /// generation for stale and shows applying until it reloads (SPEC-088).
     fn booted_at(boot: SystemTime) -> Self {
         let ms = boot.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
@@ -129,20 +166,51 @@ impl ZoneApplicationRegistry {
         Self {
             inner: Mutex::new(Inner {
                 last_generation: seed,
+                floor: None,
                 cameras: HashMap::new(),
             }),
         }
     }
 
+    /// Keep generations above every earlier boot's, whatever the wall clock
+    /// did: start above the floor in `floor_file` (or the clock seed, if
+    /// higher), and persist a new floor a block higher before handing out any
+    /// generation. Call before the first [`Self::start`]. A missing or corrupt
+    /// file falls back to the clock seed and is rewritten. Remaining
+    /// assumptions: the file survives restarts, or the clock does not step
+    /// back across them ([`Self::booted_at`]); and the floor stays below the
+    /// JSON-safe seed cap, which takes billions of restarts or a clock past
+    /// 2255.
+    pub fn load_generation_floor(&self, floor_file: PathBuf) {
+        let mut inner = self.inner.lock();
+        match std::fs::read_to_string(&floor_file).map(|s| s.trim().parse::<u64>()) {
+            // Capped like the clock seed, so a generation stays JSON-safe.
+            Ok(Ok(floor)) => {
+                inner.last_generation = inner.last_generation.max(floor.min(MAX_BOOT_SEED));
+            }
+            Ok(Err(e)) => warn!(path = %floor_file.display(), error = %e,
+                "zone generation floor is corrupt; seeding from the wall clock"),
+            Err(e) => warn!(path = %floor_file.display(), error = %e,
+                "zone generation floor unreadable; seeding from the wall clock"),
+        }
+        let reserved = inner.last_generation + FLOOR_BLOCK;
+        persist_floor(&floor_file, reserved);
+        inner.floor = Some((floor_file, reserved));
+    }
+
     /// Start a new supervisor generation for `camera_id` and return its
     /// number: higher than every one handed out before in this process, and
-    /// in earlier ones ([`Self::booted_at`]).
+    /// in earlier ones ([`Self::load_generation_floor`], [`Self::booted_at`]).
     /// Nothing is applied until it acknowledges; the camera's last applied
     /// revision is kept for comparison.
     pub fn start(&self, camera_id: CameraId) -> u64 {
         let mut inner = self.inner.lock();
         inner.last_generation += 1;
         let generation = inner.last_generation;
+        if let Some((path, reserved)) = inner.floor.as_mut().filter(|(_, r)| generation > *r) {
+            *reserved += FLOOR_BLOCK;
+            persist_floor(path, *reserved);
+        }
         let applied = inner.cameras.remove(&camera_id).and_then(|e| e.applied);
         inner.cameras.insert(
             camera_id,
@@ -485,6 +553,107 @@ mod tests {
             UNIX_EPOCH + Duration::from_secs(40_000 * 365 * 86_400),
         );
         assert!(far.start(7) < 1 << 53, "beyond a JSON-safe integer");
+    }
+
+    fn floor_in(path: &std::path::Path) -> u64 {
+        std::fs::read_to_string(path)
+            .expect("the floor file exists")
+            .trim()
+            .parse()
+            .expect("the floor file holds a number")
+    }
+
+    /// The review's clock rollback: the clock steps back an hour across a
+    /// restart, and the restart still starts above every generation the
+    /// earlier boot could hand out without persisting a higher floor first.
+    #[test]
+    fn a_restart_starts_above_the_earlier_boots_floor_even_when_the_clock_went_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zone_generation_floor");
+        let boot = UNIX_EPOCH + Duration::from_millis(1_795_000_000_000);
+        let first = ZoneApplicationRegistry::booted_at(boot);
+        first.load_generation_floor(path.clone());
+        let mut last = 0;
+        for camera in 0..1000 {
+            last = first.start(camera % 3);
+        }
+        let floor = floor_in(&path);
+        assert!(
+            last <= floor,
+            "generation {last} handed out above floor {floor}"
+        );
+
+        let earlier = boot - Duration::from_secs(3600);
+        assert!(
+            ZoneApplicationRegistry::booted_at(earlier).start(7) < last,
+            "the clock alone would have gone back"
+        );
+        let restarted = ZoneApplicationRegistry::booted_at(earlier);
+        restarted.load_generation_floor(path.clone());
+        assert!(restarted.start(7) > floor, "the restart went back");
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_floor_falls_back_to_the_clock_and_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zone_generation_floor");
+        let boot = UNIX_EPOCH + Duration::from_millis(1_795_000_000_000);
+        let seeded = ZoneApplicationRegistry::booted_at(boot).start(7);
+        for contents in [None, Some("not a number"), Some(""), Some("-5")] {
+            if let Some(c) = contents {
+                std::fs::write(&path, c).unwrap();
+            }
+            let r = ZoneApplicationRegistry::booted_at(boot);
+            r.load_generation_floor(path.clone());
+            let g = r.start(7);
+            assert_eq!(g, seeded, "{contents:?} does not seed from the clock");
+            assert!(floor_in(&path) >= g, "{contents:?} was not rewritten");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// A state directory that cannot be written (a file stands in its place,
+    /// which no user, root included, can write under) loses the floor across
+    /// restarts but never this process's generations, past a block included.
+    #[test]
+    fn an_unwritable_floor_still_hands_out_rising_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("state");
+        std::fs::write(&not_a_dir, "").unwrap();
+        let path = not_a_dir.join("zone_generation_floor");
+        let r = ZoneApplicationRegistry::default();
+        r.load_generation_floor(path.clone());
+        let mut last = 0;
+        for _ in 0..FLOOR_BLOCK + 2 {
+            let g = r.start(7);
+            assert!(g > last, "generation {g} after {last}");
+            last = g;
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn handing_out_a_whole_block_persists_the_next_one_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zone_generation_floor");
+        let r = ZoneApplicationRegistry::default();
+        r.load_generation_floor(path.clone());
+        let floor = floor_in(&path);
+        let mut g = 0;
+        while g < floor {
+            g = r.start(7);
+        }
+        assert_eq!(
+            (g, floor_in(&path)),
+            (floor, floor),
+            "the block was cut short"
+        );
+        assert_eq!(r.start(7), floor + 1);
+        assert_eq!(
+            floor_in(&path),
+            floor + FLOOR_BLOCK,
+            "the next block was not persisted"
+        );
     }
 
     #[test]
