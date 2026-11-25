@@ -101,13 +101,6 @@ if [ -f "$C" ]; then
   rule "$C" skip "factory:small label" issues '"action":"labeled","label":{"name":"factory:small"}'
   rule "$C" run "factory:fix-ci, same-repo PR" pull_request "\"action\":\"labeled\",\"label\":{\"name\":\"factory:fix-ci\"},$SAME"
   rule "$C" skip "factory:fix-ci, fork PR" pull_request "\"action\":\"labeled\",\"label\":{\"name\":\"factory:fix-ci\"},$FORK"
-  # A person opening a ready PR, or marking one ready, starts a requesting-code-review run.
-  pr() { echo "\"action\":\"$1\",\"sender\":{\"type\":\"$2\"},\"pull_request\":{\"draft\":$3,\"head\":{\"repo\":{\"full_name\":\"$4\"}}}"; }
-  rule "$C" run "person opens a ready PR" pull_request "$(pr opened User false o/r)"
-  rule "$C" run "person marks a PR ready" pull_request "$(pr ready_for_review User false o/r)"
-  rule "$C" skip "draft PR opened" pull_request "$(pr opened User true o/r)"
-  rule "$C" skip "bot opens a ready PR" pull_request "$(pr opened Bot false o/r)"
-  rule "$C" skip "fork opens a ready PR" pull_request "$(pr opened User false x/r)"
 
   # Only a same-repository PR passes the fork guard; anything else stops the job.
   if script "$C" "Refuse pull requests from forks" isCrossRepository; then
@@ -122,9 +115,8 @@ if [ -f "$C" ]; then
     done
   fi
 
-  # factory:medium builds only a valid spec; factory:fix-ci loops on the PR branch; a ready
-  # PR gets a requesting-code-review run.
-  if script "$C" "Write the prompt" GITHUB_OUTPUT; then
+  # factory:medium builds only a valid spec; factory:fix-ci loops on the PR branch.
+  if script "$C" "Write the build prompt" GITHUB_OUTPUT; then
     for c in "valid|[$SPEC]|0|Run implement-loop for SPEC-086" "none|[]|1|" "malformed|[$BADSPEC]|1|"; do
       IFS='|' read -r name labels want text <<<"$c"
       : >"$TMP/out"; rc=0
@@ -136,18 +128,11 @@ if [ -f "$C" ]; then
       fi
     done
     : >"$TMP/out"
-    GITHUB_EVENT_NAME=pull_request ACTION=labeled BRANCH=fix-x GITHUB_OUTPUT="$TMP/out" bash -e "$TMP/step.sh" >/dev/null 2>&1 || true
+    GITHUB_EVENT_NAME=pull_request BRANCH=fix-x GITHUB_OUTPUT="$TMP/out" bash -e "$TMP/step.sh" >/dev/null 2>&1 || true
     if grep -qF 'implement-loop' "$TMP/out" && grep -qF 'on origin/fix-x' "$TMP/out"; then
       ok "fix-ci prompt runs implement-loop on the PR branch"
     else
       bad "fix-ci prompt lacks implement-loop on origin/fix-x"
-    fi
-    : >"$TMP/out"
-    GITHUB_EVENT_NAME=pull_request ACTION=ready_for_review BASE=main HEAD_SHA=abc1 GITHUB_OUTPUT="$TMP/out" bash -e "$TMP/step.sh" >/dev/null 2>&1 || true
-    if grep -qF 'requesting-code-review' "$TMP/out" && grep -qF 'merge-base origin/main abc1' "$TMP/out"; then
-      ok "review prompt runs requesting-code-review on the PR range"
-    else
-      bad "review prompt lacks requesting-code-review or the PR range"
     fi
   fi
 else
