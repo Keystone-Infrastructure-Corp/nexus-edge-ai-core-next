@@ -405,6 +405,18 @@ impl ZoneApplicationRegistry {
         }
     }
 
+    /// Whether `generation` is the camera's current generation and still
+    /// running. A supervisor kept running across a reconcile pass must be,
+    /// or nothing it processes can be acknowledged: a camera deleted and
+    /// re-created before the pass has a new entry no supervisor started.
+    pub fn runs(&self, camera_id: CameraId, generation: u64) -> bool {
+        self.inner
+            .lock()
+            .cameras
+            .get(&camera_id)
+            .is_some_and(|e| e.generation == generation && e.running.is_some())
+    }
+
     /// The camera was deleted: it has nothing left to report.
     pub fn remove(&self, camera_id: CameraId) {
         self.inner.lock().cameras.remove(&camera_id);

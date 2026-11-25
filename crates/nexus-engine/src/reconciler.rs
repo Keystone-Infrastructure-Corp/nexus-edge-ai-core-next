@@ -652,7 +652,11 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         let want = EntryKey::wanted(args, &cam);
         match current.get(&cam_id) {
             // `==` compares url, dims, codec, analysis_url, score threshold, behavior, then zones.
-            Some(entry) if entry.key == want && !entry.task.is_finished() => {
+            Some(entry)
+                if entry.key == want
+                    && !entry.task.is_finished()
+                    && zone_application.runs(cam_id, entry.zone_generation) =>
+            {
                 // No change — supervisor still alive, URL still the
                 // same, supervisor dims still match, ingest codec
                 // still matches what's in the DB. Skip (we
@@ -711,6 +715,12 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                     info!(
                         camera_id = cam_id,
                         "camera reconciler: camera zones changed; restarting supervisor"
+                    );
+                } else if entry.key == want {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: supervisor's zone generation is no longer current \
+                         (camera deleted and re-created); restarting supervisor"
                     );
                 } else {
                     info!(
@@ -3017,6 +3027,47 @@ mod tests {
         })
         .await;
         abort_all(&args.handles);
+    }
+
+    /// SPEC-088 — a running camera deleted and re-created with the same id
+    /// and config before any pass saw the delete: the registry forgot the
+    /// running supervisor's generation, so the next pass restarts it rather
+    /// than keep a supervisor nothing it processes can acknowledge, and the
+    /// camera reads applied again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_camera_deleted_and_re_created_before_a_pass_applies_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let g1 = entry_of(&args.handles, 7).zone_generation;
+
+        // What the API's delete does, then the same row saved again.
+        args.store.delete_camera(7).await.expect("delete");
+        args.frame_stats.zone_application().remove(7);
+        save(&args, &cam(None)).await;
+        reconcile(&args).await.expect("pass after the re-create");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while status(&args, &a).state != ZoneApplicationState::Applied
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let read = status(&args, &a);
+        abort_all(&args.handles);
+
+        assert!(g2 > g1, "the pass kept the supervisor the registry forgot");
+        assert_eq!(
+            (read.state, read.generation, read.applied_generation),
+            (ZoneApplicationState::Applied, g2, Some(g2)),
+            "the re-created camera never applied its zones"
+        );
     }
 
     /// What [`GatedOpenRecorder`] saw, in the order it saw it.
