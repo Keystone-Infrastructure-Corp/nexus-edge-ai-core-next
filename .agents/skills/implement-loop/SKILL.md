@@ -30,7 +30,8 @@ TARGET=/tmp/nx-$SLUG-target-edge
   ledger. Record canonical path, branch, base, target directory, and owned processes.
 - Refresh/rebase the integration tree onto `origin/main` before dispatch and before every
   top-level commit, per `AGENTS.md`, preserving local work; resolve conflicts and rerun
-  affected gates if the base changes.
+  affected gates if the base changes. A PR follow-up or `@claude` run never rebases,
+  per the core.
 - Record each original dispatched base SHA in the ledger; it never changes for that unit
   even if origin/main or the integration tree advances. Units never rebase or merge;
   redispatch from a fresh pinned base when needed. When accepting a report, the ancestor

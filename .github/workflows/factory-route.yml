@@ -47,11 +47,13 @@ jobs:
           fi
           if [ -z "$COPILOT_ASSIGN_TOKEN" ]; then
             gh issue comment "$ISSUE" --repo "$REPO" --body \
-              "factory:small: \`COPILOT_ASSIGN_TOKEN\` is not set, so this was not assigned. Owner: use Assign → Copilot on this issue."
+              "factory:small: \`COPILOT_ASSIGN_TOKEN\` is not set, so this was not assigned. Owner: assign Copilot on this issue and tell it to build $SPEC with the implement-loop skill."
             exit 0
           fi
+          # Every build runs implement-loop; the repo's AGENTS.md says so too, as a backstop.
           GH_TOKEN="$COPILOT_ASSIGN_TOKEN" gh api --method POST \
-            "/repos/$REPO/issues/$ISSUE/assignees" -f 'assignees[]=copilot-swe-agent[bot]' >/dev/null
+            "/repos/$REPO/issues/$ISSUE/assignees" -f 'assignees[]=copilot-swe-agent[bot]' \
+            -f "agent_assignment[custom_instructions]=Build $SPEC with the implement-loop skill: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md, and follow it on the vault record $SPEC. Its final review runs the requesting-code-review skill." >/dev/null
 
       - name: Hand large builds to the owner
         if: github.event.label.name == 'factory:large'

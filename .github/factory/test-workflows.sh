@@ -115,7 +115,7 @@ if [ -f "$C" ]; then
     done
   fi
 
-  # factory:medium builds only a valid spec; factory:fix-ci starts on the PR branch.
+  # factory:medium builds only a valid spec; factory:fix-ci loops on the PR branch.
   if script "$C" "Write the build prompt" GITHUB_OUTPUT; then
     for c in "valid|[$SPEC]|0|Run implement-loop for SPEC-086" "none|[]|1|" "malformed|[$BADSPEC]|1|"; do
       IFS='|' read -r name labels want text <<<"$c"
@@ -129,7 +129,25 @@ if [ -f "$C" ]; then
     done
     : >"$TMP/out"
     GITHUB_EVENT_NAME=pull_request BRANCH=fix-x GITHUB_OUTPUT="$TMP/out" bash -e "$TMP/step.sh" >/dev/null 2>&1 || true
-    if grep -qF 'git checkout fix-x' "$TMP/out"; then ok "fix-ci prompt checks out the PR branch"; else bad "fix-ci prompt lacks git checkout"; fi
+    if grep -qF 'implement-loop' "$TMP/out" && grep -qF 'on a fresh origin/fix-x' "$TMP/out" &&
+       grep -qF 'never rebase' "$TMP/out" && grep -qF 'git push origin HEAD:fix-x' "$TMP/out" &&
+       grep -qF 'If the push is rejected or you stop short' "$TMP/out" &&
+       ! grep -qF 'origin/main' "$TMP/out"; then
+      ok "fix-ci prompt runs implement-loop on the PR branch and fast-forwards it"
+    else
+      bad "fix-ci prompt lacks implement-loop on a fresh origin/fix-x, never rebase, the fast-forward push or the rejected-push comment, or names origin/main"
+    fi
+  fi
+
+  # The appended rule must reach claude as one argument: the action's arg parser expands
+  # $VAR inside double quotes and splits on a stray quote.
+  args="$(awk '/^ *claude_args: >-$/ { f = 1; next } f { if ($0 !~ /^            /) exit; print }' "$C")"
+  if grep -qF -- '--append-system-prompt "' <<<"$args" && [ "$(tr -cd '"' <<<"$args" | wc -c)" -eq 2 ] &&
+     ! grep -q '[$`]' <<<"${args//'${{'/}" && grep -qF 'implement-loop' <<<"$args" &&
+     grep -qF 'starts no other loop' <<<"$args" && grep -qF 'a review someone asked for' <<<"$args"; then
+    ok "claude_args appends the implement-loop rule as one argument"
+  else
+    bad "claude_args lacks a single quoted --append-system-prompt rule with the loop guard and review scope"
   fi
 else
   echo "skip claude.yml (not adopted)"
@@ -158,7 +176,10 @@ if [ -f "$R" ]; then
         SPEC="$s" COPILOT_ASSIGN_TOKEN="$token" bash -e "$TMP/step.sh" >/dev/null 2>&1 || rc=$?
         got=no; grep -q assignees "$GH_STUB_LOG" && got=yes
         commented=no; grep -q 'issue comment' "$GH_STUB_LOG" && commented=yes
-        if [ "$rc" -eq 0 ] && [ "$got" = "$assign" ] && { [ "$assign" = yes ] || [ "$commented" = yes ]; }; then
+        told=no; grep -qF "custom_instructions]=Build $s with the implement-loop skill" "$GH_STUB_LOG" && told=yes
+        hint=yes; [ "$name" = "no token" ] && ! grep -q 'implement-loop' "$GH_STUB_LOG" && hint=no
+        if [ "$rc" -eq 0 ] && [ "$got" = "$assign" ] && { [ "$assign" = no ] || [ "$told" = yes ]; } &&
+           { [ "$assign" = yes ] || [ "$commented" = yes ]; } && [ "$hint" = yes ]; then
           ok "small route: $name -> assign=$got"
         else
           bad "small route: $name -> assign=$got commented=$commented exit $rc, want assign=$assign"

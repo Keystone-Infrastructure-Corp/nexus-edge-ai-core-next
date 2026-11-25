@@ -96,9 +96,11 @@ These bind even when no skill loads:
   (camera → GStreamer → inference → tracker → rules → sinks, or engine → tunnel → cloud)
   to find where it breaks; write the failing test before the fix. **Three failed fixes
   means the design is wrong.** Once root-caused, look for siblings.
-- **Review is not self-review.** A fresh reviewer subagent gets the base/head SHAs and
-  requirements, never this session's history. Verify each finding, push back with
-  reasons, clarify every unclear item first. No performative agreement.
+- **Every code change runs `implement-loop`; every review runs `requesting-code-review`.**
+  A unit or reviewer the loop dispatches is part of that run and starts no other. The
+  fresh reviewer gets the base/head SHAs and requirements, never this session's history.
+  Verify each finding, push back with reasons, clarify every unclear item first. No
+  performative agreement.
 
 Context budget: search before opening whole files, read definitions before consumers,
 and don't load large generated files or re-read unchanged ones.
@@ -150,7 +152,8 @@ integer widths. If you touch them, run CI's clippy in a Linux container before p
 ## Workflow
 
 1. **Rebase before committing:** `git fetch && git rebase origin/main`; never a merge
-   `git pull`. `implement-loop` units work from a pinned SHA and never rebase or merge.
+   `git pull`. `implement-loop` units work from a pinned SHA and never rebase or merge. A
+   PR follow-up or `@claude` run never rebases (see `implement-loop`).
 2. Pick a step from the wedge plan or a milestone doc; cross-repo work gets companion PRs.
 3. One PR per logical change, titled `[<crate>] <verb> <object>`, or
    `[Phase N · Step M] <verb> <object>` for wedge work.
