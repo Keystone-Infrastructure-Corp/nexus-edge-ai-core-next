@@ -162,6 +162,11 @@ export interface CameraConfig {
   tile_trigger?: number;
   tile_max_per_frame?: number;
   tile_grid?: TileGridConfig;
+  // Discovery crops: row-major `tile_grid` cell indices re-inferred on a
+  // schedule even when the first pass found nothing in them, and how many
+  // seconds until a cell is due again (default 5). No editor yet: API only.
+  tile_discovery_cells?: number[];
+  tile_discovery_revisit_secs?: number;
   // M_NATIVE_ASPECT — analysis (supervisor) frame width, decoupled from
   // the detector input width. Undefined = derive from the model input.
   // Must be a native-16:9 ladder rung (512 | 1024 | 1536 | 2048) >= the

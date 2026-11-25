@@ -263,6 +263,8 @@ fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Op
         tile_trigger,
         tile_max_per_frame,
         tile_grid,
+        tile_discovery_cells,
+        tile_discovery_revisit_secs,
         // Excluded — see the doc comment above. Named, not `..`, so a new
         // field cannot join them by accident.
         supervisor_width: _,
@@ -301,6 +303,10 @@ fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Op
         Some("tile_max_per_frame")
     } else if *tile_grid != started.tile_grid {
         Some("tile_grid")
+    } else if *tile_discovery_cells != started.tile_discovery_cells {
+        Some("tile_discovery_cells")
+    } else if *tile_discovery_revisit_secs != started.tile_discovery_revisit_secs {
+        Some("tile_discovery_revisit_secs")
     } else {
         None
     }
@@ -2248,6 +2254,10 @@ mod tests {
             ("tile_trigger", |b| b.tile_trigger = Some(12)),
             ("tile_max_per_frame", |b| b.tile_max_per_frame = Some(4)),
             ("tile_grid", |b| b.tile_grid = Some(TileGridConfig::G3x3)),
+            ("tile_discovery_cells", |b| b.tile_discovery_cells = vec![2]),
+            ("tile_discovery_revisit_secs", |b| {
+                b.tile_discovery_revisit_secs = Some(8)
+            }),
         ];
 
         for (field, mutate) in mutations {
