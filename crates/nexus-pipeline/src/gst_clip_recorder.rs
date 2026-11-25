@@ -744,6 +744,27 @@ impl GstClipRecorder {
         }
     }
 
+    /// Finalize `handle` in an owned task for a drain ([`ClipRecorder::shutdown`],
+    /// [`ClipRecorder::drain_camera`]), through the full `close()` path (EOS →
+    /// moov flush → rename → row stamp). A concurrent supervisor close of the
+    /// same clip is safe: whichever calls `open.remove()` first wins, the
+    /// loser gets `UnknownClip`, which is swallowed.
+    fn spawn_drain_close(&self, handle: ClipHandle) -> tokio::task::JoinHandle<()> {
+        let writers = self.writers();
+        self.spawn_owned(async move {
+            let ended_at = Utc::now();
+            match writers.close(handle, ClipFinal { ended_at }).await {
+                Ok(_) | Err(RecorderError::UnknownClip(_)) => {}
+                Err(e) => warn!(
+                    clip_id = handle.clip_id,
+                    camera_id = handle.camera_id,
+                    error = %e,
+                    "gst recorder: failed to finalise clip during drain"
+                ),
+            }
+        })
+    }
+
     /// Spawn `fut` as a task `shutdown` waits for.
     fn spawn_owned<T: Send + 'static>(
         &self,
@@ -1521,26 +1542,36 @@ impl ClipRecorder for GstClipRecorder {
             }
             for handle in handles {
                 draining.insert(handle.clip_id);
-                // Reuse the full `close()` finalise path (EOS → moov
-                // flush → rename → row stamp). A concurrent supervisor
-                // close of the same clip is safe: whichever calls
-                // `open.remove()` first wins, the loser gets
-                // `UnknownClip` which we swallow.
-                let writers = self.writers();
-                self.spawn_owned(async move {
-                    let ended_at = Utc::now();
-                    match writers.close(handle, ClipFinal { ended_at }).await {
-                        Ok(_) | Err(RecorderError::UnknownClip(_)) => {}
-                        Err(e) => warn!(
-                            clip_id = handle.clip_id,
-                            camera_id = handle.camera_id,
-                            error = %e,
-                            "gst recorder: failed to finalise clip during shutdown drain"
-                        ),
-                    }
-                });
+                self.spawn_drain_close(handle);
             }
             let _ = tokio::time::timeout(SHUTDOWN_POLL, self.in_flight.closed()).await;
+        }
+    }
+
+    async fn drain_camera(&self, camera_id: CameraId) {
+        let handles: Vec<ClipHandle> = {
+            let open = self.open.lock().await;
+            open.iter()
+                .filter(|(_, st)| st.camera_id == camera_id)
+                .map(|(clip_id, _)| ClipHandle {
+                    clip_id: *clip_id,
+                    camera_id,
+                })
+                .collect()
+        };
+        if !handles.is_empty() {
+            info!(
+                camera_id,
+                count = handles.len(),
+                "gst recorder: finalizing clips a stopped supervisor left open (EOS + moov flush)"
+            );
+        }
+        let closes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| self.spawn_drain_close(handle))
+            .collect();
+        for close in closes {
+            let _ = close.await;
         }
     }
 
@@ -6058,6 +6089,70 @@ mod epoch_tests {
             "the in-flight file was left behind"
         );
         assert!(finalized_playable(&store, &clips_dir, 1).await);
+    }
+
+    /// SPEC-088 Z-4: a supervisor aborted while it held an open clip (wedged
+    /// in a store write past the reconciler's stop deadline) never closes it.
+    /// Before the camera's ingester goes and a replacement opens, the
+    /// reconciler drains the camera: its clip is finalized once (row ended,
+    /// file renamed, playable) and no longer recording, while another
+    /// camera's clip stays open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_camera_finalizes_the_clip_its_aborted_supervisor_held() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 10, CodecKind::H264).unwrap();
+        ing.shutdown();
+        for sample in encode(15, "main", 60, Duration::ZERO) {
+            ing.push_preroll_for_test(sample);
+        }
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap(),
+        );
+        let started_at = Utc::now();
+        let held = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at,
+                frame_width: 320,
+                frame_height: 240,
+            })
+            .await
+            .expect("the supervisor took its clip");
+        let (other, _, _) = register_clip(&rec, &store, &clips_dir, 2, started_at, None).await;
+
+        tokio::time::timeout(Duration::from_secs(15), rec.drain_camera(1))
+            .await
+            .expect("the drain returns");
+
+        let open = rec.open.lock().await.keys().copied().collect::<Vec<_>>();
+        assert_eq!(open, [other.clip_id], "only camera 1's clip is drained");
+        assert!(
+            finalized_playable(&store, &clips_dir, held.clip_id).await,
+            "the held clip was not finalized playable"
+        );
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "the in-flight file was left behind"
+        );
+        let late = rec
+            .close(
+                held,
+                ClipFinal {
+                    ended_at: Utc::now(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(late, Err(RecorderError::UnknownClip(_))),
+            "the clip was closed twice: {late:?}"
+        );
+        rec.shutdown().await;
     }
 
     /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is

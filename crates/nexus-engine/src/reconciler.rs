@@ -753,8 +753,9 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
 /// the live pump plus `EOS_DRAIN_TIMEOUT` (5 s) for the drain — so a normal
 /// close finishes inside it. An abort that lands inside an open or close no
 /// longer abandons the clip: `GstClipRecorder` runs both in tasks it owns and
-/// its shutdown drain waits for them (SPEC-088 Z-4). A supervisor aborted
-/// while merely holding an open clip still leaves it to that drain.
+/// its shutdown drain waits for them (SPEC-088 Z-4). A clip an aborted
+/// supervisor merely held is finalized by [`stop_camera`]'s drain of the
+/// camera, also bounded by this.
 const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Whether the camera's supervisor has ended and its camera was torn down.
@@ -810,7 +811,7 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
                     timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
                     ended,
                     "camera reconciler: supervisor did not stop in time; aborted it, and any \
-                     clip it had open is abandoned"
+                     clip it had open is finalized before the camera is torn down"
                 );
                 ended
             }
@@ -828,6 +829,18 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
         args.handles.lock().remove(&cam_id);
     }
     // Only now that the supervisor is done: its clip closes on this ingester.
+    // An aborted one skipped the close of a clip it held, which would keep
+    // recording beside the replacement's (SPEC-088 Z-4). Past the bound the
+    // close runs on in the recorder's owned task, which shutdown waits for.
+    if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, args.recorder.drain_camera(cam_id))
+        .await
+        .is_err()
+    {
+        warn!(
+            camera_id = cam_id,
+            "camera reconciler: a clip the stopped supervisor left open is still being finalized"
+        );
+    }
     args.recorder.remove_camera_ingester(cam_id);
     // The substream session lives in a separate map and would otherwise
     // keep its RTSP connection and decode chain alive with no
@@ -1999,9 +2012,38 @@ mod tests {
     struct ClipLogRecorder {
         calls: Mutex<Vec<(CameraId, ClipCall)>>,
         sources_built: Mutex<HashMap<CameraId, usize>>,
+        /// Set by [`Self::wedge_store_on_open`]: the store whose every pooled
+        /// connection the next open checks out.
+        wedge: Mutex<Option<Arc<Store>>>,
+        /// The connections a wedged open holds.
+        wedged: Mutex<Vec<sqlx::pool::PoolConnection<sqlx::Sqlite>>>,
     }
 
     impl ClipLogRecorder {
+        /// The next open hands its clip over with every connection of
+        /// `store`'s pool checked out, so the supervisor's next store write
+        /// waits for one, as on a store too busy to answer.
+        fn wedge_store_on_open(&self, store: Arc<Store>) {
+            *self.wedge.lock() = Some(store);
+        }
+
+        /// Give back the connections a wedged open took.
+        fn unwedge_store(&self) {
+            self.wedged.lock().clear();
+        }
+
+        /// The clips of `camera_id` opened and not closed.
+        fn open_clips(&self, camera_id: CameraId) -> Vec<i64> {
+            let calls = self.calls_of(camera_id);
+            calls
+                .iter()
+                .filter_map(|c| match c {
+                    ClipCall::Open(id) if !calls.contains(&ClipCall::Close(*id)) => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        }
+
         fn calls(&self) -> Vec<ClipCall> {
             self.calls.lock().iter().map(|(_, call)| *call).collect()
         }
@@ -2042,6 +2084,17 @@ mod tests {
     impl ClipRecorder for ClipLogRecorder {
         async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
             let clip_id = self.opens_of(args.camera_id) as i64 + 1;
+            let wedge = self.wedge.lock().take();
+            if let Some(store) = wedge {
+                for _ in 0..store.pool().options().get_max_connections() {
+                    let conn = store
+                        .pool()
+                        .acquire()
+                        .await
+                        .expect("check out a connection");
+                    self.wedged.lock().push(conn);
+                }
+            }
             self.calls
                 .lock()
                 .push((args.camera_id, ClipCall::Open(clip_id)));
@@ -2075,6 +2128,13 @@ mod tests {
         }
         fn kind(&self) -> &'static str {
             "clip-log"
+        }
+        async fn drain_camera(&self, camera_id: CameraId) {
+            for clip_id in self.open_clips(camera_id) {
+                self.calls
+                    .lock()
+                    .push((camera_id, ClipCall::Close(clip_id)));
+            }
         }
         fn remove_camera_ingester(&self, camera_id: CameraId) {
             self.calls
@@ -2155,6 +2215,54 @@ mod tests {
             ],
             "the restart must close the old supervisor's open clip, while its ingester still \
              exists, before the replacement opens one: an aborted supervisor abandons the clip"
+        );
+    }
+
+    /// SPEC-088 Z-4 — the forced stop after the handoff. A supervisor holding
+    /// an open clip waits on the store (every pooled connection taken, as
+    /// when the store cannot answer) past [`SUPERVISOR_STOP_TIMEOUT`], and
+    /// `stop_camera` aborts it there, which skips its close. The clip must be
+    /// finalized, once, before the camera's ingester goes and before the
+    /// replacement opens one: left open, it keeps recording beside the
+    /// replacement's, with no end, until the process exits.
+    #[tokio::test]
+    async fn a_forced_stop_finalizes_the_clip_the_aborted_supervisor_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        recorder.wedge_store_on_open(args.store.clone());
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor holds an open clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+
+        // Nothing below waits on I/O, so the stop's timeout elapses on the
+        // runtime's paused clock while the supervisor waits on the store.
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        let ended = original.task.is_finished();
+        recorder.unwedge_store();
+        reconcile(&args)
+            .await
+            .expect("pass that starts the replacement");
+        wait_until("the replacement opened a clip", || recorder.opens() == 2).await;
+        abort_all(&args.handles);
+
+        assert!(stopped && ended, "the wedged supervisor was not stopped");
+        assert_eq!(
+            recorder.calls_of(7),
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "the clip the aborted supervisor held must be finalized once, while its ingester \
+             exists, before the replacement opens one"
         );
     }
 
