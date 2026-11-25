@@ -2880,9 +2880,11 @@ mod tests {
             .expect("runtime");
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
         let (unwedge, wedged) = std::sync::mpsc::channel::<()>();
+        let (entering, entered) = std::sync::mpsc::channel::<()>();
         let original = RunningCameraEntry {
             task: Arc::new(wedge_rt.spawn(async move {
                 let _stop_rx = stop_rx;
+                let _ = entering.send(());
                 let _ = wedged.recv();
                 std::future::pending::<()>().await
             })),
@@ -2900,6 +2902,11 @@ mod tests {
                 .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
         };
 
+        // No await is left between its signal and its block: an abort sent
+        // from here cannot land before it.
+        entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the supervisor never reached its blocking receive");
         // Both waits elapse on the paused clock; the abort cannot land.
         tokio::time::pause();
         let stopped = stop_camera(&args, 7).await;
