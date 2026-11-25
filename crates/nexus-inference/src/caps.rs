@@ -98,6 +98,50 @@ impl Detector for MinBBoxAreaDetector {
     }
 }
 
+/// A camera's own score threshold on top of a detector it shares with
+/// cameras that asked for a lower one. See `InferenceRouter`.
+pub struct MinScoreDetector {
+    inner: Arc<dyn Detector>,
+    min_score: f32,
+}
+
+impl MinScoreDetector {
+    pub fn new(inner: Arc<dyn Detector>, min_score: f32) -> Self {
+        Self { inner, min_score }
+    }
+}
+
+#[async_trait]
+impl Detector for MinScoreDetector {
+    async fn detect(
+        &self,
+        frame: &Frame,
+        prompts: &[String],
+    ) -> Result<Vec<Detection>, InferenceError> {
+        let mut dets = self.inner.detect(frame, prompts).await?;
+        dets.retain(|d| d.confidence >= self.min_score);
+        Ok(dets)
+    }
+
+    async fn detect_crop(
+        &self,
+        crop: &Frame,
+        prompts: &[String],
+    ) -> Result<Vec<Detection>, InferenceError> {
+        let mut dets = self.inner.detect_crop(crop, prompts).await?;
+        dets.retain(|d| d.confidence >= self.min_score);
+        Ok(dets)
+    }
+
+    async fn push_camera_config(&self, update: &CameraConfigUpdate) {
+        self.inner.push_camera_config(update).await;
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+}
+
 pub struct TopKDetector {
     inner: Arc<dyn Detector>,
     k: usize,

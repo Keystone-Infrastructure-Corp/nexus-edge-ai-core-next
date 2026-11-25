@@ -132,6 +132,10 @@ pub(crate) struct EntryKey {
     /// registration recorded here would restart the camera, main recording
     /// ingester included, on every pass (BUG-224).
     analysis_url: Option<String>,
+    /// The camera's own `model_override.score_threshold`, as bits. The
+    /// router wraps the shared detector with it at spawn, so only a
+    /// respawn applies an edit.
+    score_threshold: Option<u32>,
     /// The camera's `behavior` block. Most of it is consumed once inside
     /// `run_camera` — the static-object filter, the detector-skip policy,
     /// the crowd-hysteresis pair, the tile grid — and then frozen in that
@@ -152,12 +156,14 @@ impl PartialEq for EntryKey {
             supervisor_dims,
             codec,
             analysis_url,
+            score_threshold,
             behavior,
         } = self;
         *url == other.url
             && *supervisor_dims == other.supervisor_dims
             && *codec == other.codec
             && *analysis_url == other.analysis_url
+            && *score_threshold == other.score_threshold
             && changed_behavior_field(behavior, &other.behavior).is_none()
     }
 }
@@ -170,6 +176,11 @@ impl EntryKey {
             supervisor_dims: supervisor_dims_for(cam, args.default_detector_width),
             codec: cam.ingest.codec,
             analysis_url: cam.ingest.analysis_url.as_ref().map(ToString::to_string),
+            score_threshold: cam
+                .detector
+                .model_override
+                .as_ref()
+                .map(|m| m.score_threshold.to_bits()),
             behavior: cam.behavior.clone(),
         }
     }
@@ -646,6 +657,11 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         camera_id = cam_id,
                         "camera reconciler: analysis stream changed; restarting supervisor"
                     );
+                } else if entry.key.score_threshold != want.score_threshold {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: score threshold changed; restarting supervisor"
+                    );
                 } else {
                     info!(
                         camera_id = cam_id,
@@ -1046,6 +1062,22 @@ pub(crate) fn spawn_supervisor(
     let (sup_w, sup_h) = start.key.supervisor_dims;
     let detector = args.router.detector_for_camera(&cam);
     let detector_low_res = args.router.detector_for_camera_low_res(&cam);
+    if let Some((requested, effective)) = args.router.score_thresholds_for_camera(&cam) {
+        if effective > requested {
+            warn!(
+                camera_id = cam.id,
+                requested,
+                effective,
+                "camera reconciler: score_threshold is below what this camera's shared \
+                 inference layer was built with at boot; restart the engine to apply it"
+            );
+        } else {
+            info!(
+                camera_id = cam.id,
+                requested, effective, "camera reconciler: detector score threshold"
+            );
+        }
+    }
     // The router builds its layer set once at boot, so a downscale target
     // edited since then has no layer and adaptive downscale is silently off
     // for this camera until the process restarts. Say so: this is reachable
@@ -1794,6 +1826,49 @@ mod tests {
         abort_all(&args.handles);
     }
 
+    /// The router wraps the shared detector with the camera's own
+    /// `score_threshold` when the supervisor is spawned, so an edit that
+    /// leaves the old supervisor running changes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_score_threshold_edit_restarts_the_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        let original = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 spawned");
+
+        let mut edited = cam(None);
+        edited.detector.model_override = Some(nexus_config::ModelConfig {
+            kind: "mock".into(),
+            score_threshold: 0.2,
+            ..Default::default()
+        });
+        args.store
+            .upsert_camera(&edited)
+            .await
+            .expect("edit the score threshold");
+        reconcile(&args).await.expect("pass after the edit");
+
+        let now = args
+            .handles
+            .lock()
+            .get(&7)
+            .cloned()
+            .expect("camera 7 running");
+        let restarted = !Arc::ptr_eq(&now.task, &original.task);
+        abort_all(&args.handles);
+        assert!(
+            restarted,
+            "the supervisor kept the detector wrapped at the old threshold"
+        );
+    }
+
     /// What [`ClipLogRecorder`] was asked to do, in the order it was asked.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ClipCall {
@@ -2128,6 +2203,7 @@ mod tests {
             supervisor_dims: (512, 288),
             codec: c.ingest.codec,
             analysis_url: None,
+            score_threshold: None,
             behavior: behavior.clone(),
         }
     }

@@ -52,7 +52,7 @@ pub mod hailo_yolo;
 pub use backends::{
     BackendState, DetectorBackend, InProcessBackend, ThreadIsolatedBackend, WorkerProcessBackend,
 };
-pub use caps::{MinBBoxAreaDetector, TopKDetector};
+pub use caps::{MinBBoxAreaDetector, MinScoreDetector, TopKDetector};
 pub use detectors::{
     label_matches_any_prompt, Detector, InferenceError, MockDetector, OpenVocabDetector,
     UnavailableDetector,

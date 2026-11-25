@@ -43,7 +43,7 @@ use tracing::{error, info, warn};
 use crate::detectors::{Detector, InferenceError};
 use crate::pool::DetectorPool;
 use crate::visual_prompts::VisualPromptStore;
-use crate::{build_with_context, BuildContext, InferenceLayer};
+use crate::{build_with_context, BuildContext, InferenceLayer, MinScoreDetector};
 
 /// Composite identity key for an inference layer. Two cameras share a
 /// layer iff they would produce equal `LayerKey`s. Built from the
@@ -74,6 +74,12 @@ pub struct InferenceRouter {
     /// Default identity — used by every camera that doesn't override.
     default_key: LayerKey,
     layers: BTreeMap<LayerKey, InferenceLayer>,
+    /// `inference.model.score_threshold`: what a camera with no override asks for.
+    default_threshold: f32,
+    /// The score threshold each layer's detector was built with. A layer
+    /// is shared, so this is a floor: nothing below it ever leaves the
+    /// detector, whatever a camera on it asks for.
+    floors: BTreeMap<LayerKey, f32>,
 }
 
 impl InferenceRouter {
@@ -110,7 +116,41 @@ impl InferenceRouter {
         let default_key = LayerKey::from_model(&default_cfg.model);
         let mut layers: BTreeMap<LayerKey, InferenceLayer> = BTreeMap::new();
 
-        let default_layer = build_with_context(default_cfg, &ctx)?;
+        // Each shared layer is built at the LOWEST threshold any camera on
+        // it asks for; `detector_for_camera` re-applies each camera's own.
+        // Built at the first camera's instead, a camera asking for less
+        // lost its candidates inside the detector, by camera order.
+        let mut floors: BTreeMap<LayerKey, f32> = BTreeMap::new();
+        floors.insert(default_key.clone(), default_cfg.model.score_threshold);
+        for cam in cameras {
+            let base = cam.detector.model_override.as_ref();
+            let mut keys: Vec<LayerKey> = base.map(LayerKey::from_model).into_iter().collect();
+            if let (Some(dw), Some(dh)) = (
+                cam.behavior.detector_downscale_to_width,
+                cam.behavior.detector_downscale_to_height,
+            ) {
+                keys.push(LayerKey {
+                    kind: base.map_or(&default_cfg.model.kind, |m| &m.kind).clone(),
+                    input_w: dw,
+                    input_h: dh,
+                });
+            }
+            let threshold = base.map_or(default_cfg.model.score_threshold, |m| m.score_threshold);
+            for key in keys {
+                floors
+                    .entry(key)
+                    .and_modify(|f| *f = f.min(threshold))
+                    .or_insert(threshold);
+            }
+        }
+        let with_floor = |mut cfg: InferenceConfig, key: &LayerKey| {
+            if let Some(floor) = floors.get(key) {
+                cfg.model.score_threshold = *floor;
+            }
+            cfg
+        };
+        let default_layer =
+            build_with_context(&with_floor(default_cfg.clone(), &default_key), &ctx)?;
         info!(
             key = %default_key.display(),
             "router: built default inference layer"
@@ -118,8 +158,8 @@ impl InferenceRouter {
         layers.insert(default_key.clone(), default_layer);
 
         // Walk overrides, dedup by (kind, input_w, input_h). Two
-        // cameras that pick the same kind+size share one layer (and
-        // the per-camera score_threshold is honored at the rule layer).
+        // cameras that pick the same kind+size share one layer (each
+        // camera's score_threshold is re-applied in `detector_for_camera`).
         // The (kind, size) key matters: as of v0.1.19 we ship three
         // per-size yolo26n ONNXs and the engine's `from_config` picks
         // the file by input_width — two cameras with kind=yolo but
@@ -143,7 +183,7 @@ impl InferenceRouter {
                 })
                 .map(|c| c.id)
                 .collect();
-            let derived = derive_inference_cfg(default_cfg, override_cfg);
+            let derived = with_floor(derive_inference_cfg(default_cfg, override_cfg), &key);
             match build_with_context(&derived, &ctx) {
                 Ok(layer) => {
                     // A fail-soft build still returns Ok, with a detector
@@ -205,7 +245,7 @@ impl InferenceRouter {
             if layers.contains_key(&key) {
                 continue;
             }
-            let derived = derive_inference_cfg(default_cfg, &low_model);
+            let derived = with_floor(derive_inference_cfg(default_cfg, &low_model), &key);
             match build_with_context(&derived, &ctx) {
                 Ok(layer) => {
                     info!(
@@ -229,6 +269,8 @@ impl InferenceRouter {
         Ok(Self {
             default_key,
             layers,
+            default_threshold: default_cfg.model.score_threshold,
+            floors,
         })
     }
 
@@ -248,7 +290,7 @@ impl InferenceRouter {
             .as_ref()
             .map(LayerKey::from_model)
             .unwrap_or_else(|| self.default_key.clone());
-        match self.layers.get(&key) {
+        let detector = match self.layers.get(&key) {
             Some(layer) => layer.detector.clone(),
             None => {
                 // Build-time warning already explained why we don't have
@@ -259,7 +301,38 @@ impl InferenceRouter {
                     .detector
                     .clone()
             }
+        };
+        self.with_camera_threshold(cam, detector)
+    }
+
+    /// Re-apply the camera's own threshold on top of a shared layer's.
+    fn with_camera_threshold(
+        &self,
+        cam: &CameraConfig,
+        detector: Arc<dyn Detector>,
+    ) -> Arc<dyn Detector> {
+        match self.score_thresholds_for_camera(cam) {
+            Some((_, effective)) => Arc::new(MinScoreDetector::new(detector, effective)),
+            None => detector,
         }
+    }
+
+    /// `(requested, effective)` score threshold for a camera's main
+    /// detector. They differ only when the camera asks for less than its
+    /// shared layer was built with at boot, which a restart fixes. `None`
+    /// for an ensemble, whose members carry their own thresholds.
+    pub fn score_thresholds_for_camera(&self, cam: &CameraConfig) -> Option<(f32, f32)> {
+        let model = cam.detector.model_override.as_ref();
+        if model.is_some_and(|m| m.kind == "ensemble") {
+            return None;
+        }
+        let requested = model.map_or(self.default_threshold, |m| m.score_threshold);
+        let key = model
+            .map(LayerKey::from_model)
+            .filter(|k| self.layers.contains_key(k))
+            .unwrap_or_else(|| self.default_key.clone());
+        let floor = self.floors.get(&key).copied().unwrap_or(requested);
+        Some((requested, requested.max(floor)))
     }
 
     /// M_PERF_CROWD Phase E3 — low-res detector for a camera that
@@ -288,7 +361,9 @@ impl InferenceRouter {
             input_w: dw,
             input_h: dh,
         };
-        self.layers.get(&key).map(|l| l.detector.clone())
+        self.layers
+            .get(&key)
+            .map(|l| self.with_camera_threshold(cam, l.detector.clone()))
     }
 
     /// Default identity's pool, for back-compat with the existing
@@ -697,6 +772,109 @@ mod tests {
         assert_eq!(
             derived.model.pack_path,
             Some(std::path::PathBuf::from("/override/pack"))
+        );
+    }
+
+    fn open_vocab_cam(id: i64, threshold: f32, size: u32) -> CameraConfig {
+        let mut c = cam(id, None);
+        c.detector.model_override = Some(ModelConfig {
+            kind: "open_vocab".into(),
+            score_threshold: threshold,
+            input_width: size,
+            input_height: size,
+            ..Default::default()
+        });
+        c
+    }
+
+    async fn detection_count(router: &InferenceRouter, cam: &CameraConfig) -> usize {
+        let frame = nexus_types::Frame {
+            camera_id: cam.id,
+            frame_id: 1,
+            captured_at: chrono::Utc::now(),
+            captured_mono: std::time::Instant::now(),
+            width: 64,
+            height: 64,
+            format: nexus_types::PixelFormat::Rgb24,
+            data: Arc::new(vec![0u8; 64 * 64 * 3]),
+            trace_id: "router-test".into(),
+        };
+        router
+            .detector_for_camera(cam)
+            .detect(&frame, &[])
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Two cameras share one `(kind, size)` layer but ask for different
+    /// score thresholds. The mock body emits one 0.92 box, so the 0.95
+    /// camera must see nothing and the 0.50 camera must see it, whichever
+    /// camera the router met first.
+    #[tokio::test]
+    async fn shared_layer_applies_each_cameras_own_threshold_in_either_order() {
+        let cfg = cfg_with_kind("mock");
+        let strict = open_vocab_cam(1, 0.95, 640);
+        let loose = open_vocab_cam(2, 0.50, 640);
+        for cams in [
+            vec![strict.clone(), loose.clone()],
+            vec![loose.clone(), strict.clone()],
+        ] {
+            let router = InferenceRouter::build(&cfg, &cams).unwrap();
+            assert_eq!(router.layer_keys().len(), 2, "one shared override layer");
+            assert_eq!(detection_count(&router, &strict).await, 0);
+            assert_eq!(detection_count(&router, &loose).await, 1);
+            assert_eq!(
+                router.score_thresholds_for_camera(&strict),
+                Some((0.95, 0.95))
+            );
+            assert_eq!(
+                router.score_thresholds_for_camera(&loose),
+                Some((0.50, 0.50))
+            );
+        }
+    }
+
+    /// An override that resolves to the DEFAULT layer's identity still gets
+    /// its own threshold, lower or higher than `inference.model`'s.
+    #[tokio::test]
+    async fn override_on_the_default_layer_keeps_its_own_threshold() {
+        let mut cfg = cfg_with_kind("open_vocab");
+        cfg.model.score_threshold = 0.95;
+        let plain = cam(1, None);
+        let loose = open_vocab_cam(2, 0.50, 0);
+        let mut loose = loose;
+        if let Some(m) = loose.detector.model_override.as_mut() {
+            m.input_width = cfg.model.input_width;
+            m.input_height = cfg.model.input_height;
+        }
+        let cams = vec![plain.clone(), loose.clone()];
+        let router = InferenceRouter::build(&cfg, &cams).unwrap();
+        assert_eq!(router.layer_keys().len(), 1);
+        assert_eq!(detection_count(&router, &plain).await, 0);
+        assert_eq!(detection_count(&router, &loose).await, 1);
+    }
+
+    /// A threshold edited after boot is applied when it is at or above what
+    /// the layer was built with, and reported as not effective when below:
+    /// the layer already discarded those candidates.
+    #[tokio::test]
+    async fn threshold_edited_after_boot_reports_requested_and_effective() {
+        let cfg = cfg_with_kind("mock");
+        let boot = open_vocab_cam(1, 0.50, 640);
+        let router = InferenceRouter::build(&cfg, std::slice::from_ref(&boot)).unwrap();
+
+        let raised = open_vocab_cam(1, 0.95, 640);
+        assert_eq!(
+            router.score_thresholds_for_camera(&raised),
+            Some((0.95, 0.95))
+        );
+        assert_eq!(detection_count(&router, &raised).await, 0);
+
+        let lowered = open_vocab_cam(1, 0.20, 640);
+        assert_eq!(
+            router.score_thresholds_for_camera(&lowered),
+            Some((0.20, 0.50))
         );
     }
 }
