@@ -498,7 +498,9 @@ export function CameraEditor({
     // only ever reads sooner: every 2 s just after a save. Paused while the
     // page is hidden, re-read at once when it is visible again.
     refetchInterval: (q) => {
-      if (isDenied(q.state.error)) return false;
+      // A denied stats or saved-zone read stops every read, the decode
+      // refresh included; unsupported stops only the zone polling.
+      if ([q.state.error, snapQ.error].some(isDenied)) return false;
       const zone = zonePollMs(q.state);
       return zone === false ? DECODE_REFRESH_MS : Math.min(zone, DECODE_REFRESH_MS);
     },

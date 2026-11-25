@@ -222,6 +222,26 @@ test.describe("zone application", () => {
     await expect(page.getByText("Applied to camera")).toHaveCount(0);
   });
 
+  test("a denied saved-zone read stops every stats read", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    await page.route(`**/api/v1/admin/cameras/${cameraId}/config-snapshot`, (route) =>
+      route.fulfill({ status: 403, json: { error: "e2e: forbidden" } }),
+    );
+    const statsUrl = `/api/v1/cameras/${cameraId}/stats`;
+    const reads: number[] = [];
+    page.on("request", (r) => {
+      if (new URL(r.url()).pathname === statsUrl) reads.push(Date.now());
+    });
+    await page.goto(`/cameras/${cameraId}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Cannot verify: no access to the saved zones");
+
+    // Not even the editor's shared decode refresh reads on.
+    const from = Date.now();
+    await page.waitForTimeout(7_000);
+    expect(reads.filter((t) => t >= from)).toHaveLength(0);
+  });
+
   test("a save applies only on a fresh receipt for the saved zones", async ({ page }) => {
     cameraId = await createCamera(page, [DOOR]);
     const revA = await zonesRevision(page, cameraId);
