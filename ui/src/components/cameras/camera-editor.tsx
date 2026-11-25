@@ -1,10 +1,17 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import {
   AlertTriangle,
   X,
 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 
+import { getCameraConfigSnapshot } from "@/api/admin";
 import {
   attachVisualPrompt,
   detachVisualPrompt,
@@ -16,17 +23,20 @@ import {
 import {
   getCameraStats,
   getStaticObjectDefaults,
+  type CameraFrameStats,
 } from "@/api/system";
 import type {
   CameraConfig,
+  CameraConfigSnapshot,
   CameraOnvif,
   CodecKind,
   ModelOverride,
   ModelPromptsCatalog,
   ModelPromptsEntry,
+  ZoneConfig,
 } from "@/api/types";
 import { DecodeVerdictChip } from "@/components/DecodeVerdictChip";
-import { Badge } from "@/components/ui/badge";
+import { Badge, type BadgeProps } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -45,6 +55,20 @@ import {
   decodeVerdictPresentation,
 } from "@/lib/decodeCapacity";
 import { detectorInputFor, supervisorDimsFor } from "@/lib/supervisor-frame";
+import {
+  deriveZoneApplication,
+  isDenied,
+  nextAcceptanceSeq,
+  parseConfigSnapshot,
+  receiptGeneration,
+  zoneApplicationPollMs,
+  type AcceptanceEpoch,
+  type ReceiptRead,
+  type SavedSnapshot,
+  type Tagged,
+  type ZoneApplication,
+  type ZoneDraftState,
+} from "@/lib/zone-application";
 import { ZonesEditor } from "@/components/cameras/zones-editor";
 
 // ---------------------------------------------------------------------------
@@ -58,16 +82,16 @@ import { ZonesEditor } from "@/components/cameras/zones-editor";
  *
  * Every branch below distinguishes "not read yet" from a real answer: a
  * pending or failed stats request says so rather than rendering Healthy.
+ * The editor owns the stats read, which zone application shares.
  */
-function CameraDecodeSection({ cameraId }: { cameraId: number }) {
+function CameraDecodeSection({
+  stats: s,
+  read,
+}: {
+  stats: CameraFrameStats | undefined;
+  read: boolean;
+}) {
   const [showCounters, setShowCounters] = useState(false);
-  const q = useQuery({
-    queryKey: ["cameras", "stats", cameraId],
-    queryFn: () => getCameraStats(cameraId),
-    refetchInterval: 5_000,
-  });
-  const read = q.isSuccess;
-  const s = q.data;
   const p = decodeVerdictPresentation(s?.decode_verdict, read);
   const analysis = analysisStreamLabel(s?.analysis_stream);
 
@@ -145,6 +169,84 @@ function round2(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(2);
 }
 
+// ---------------------------------------------------------------------------
+// SPEC-088 zone application status.
+// ---------------------------------------------------------------------------
+
+/** The decode section's refresh of the stats read zone application shares. */
+const DECODE_REFRESH_MS = 5_000;
+const statsKey = (id: number) => ["cameras", "stats", id] as const;
+const snapshotKey = (id: number) => ["cameras", "config-snapshot", id] as const;
+
+/** Drop any request in flight and start a new one, rather than joining it. */
+function restartQuery(qc: QueryClient, queryKey: readonly unknown[]) {
+  void qc
+    .cancelQueries({ queryKey, exact: true })
+    .then(() => qc.invalidateQueries({ queryKey, exact: true }));
+}
+
+/**
+ * The zone side of the editor. `synced` is the zones array the draft last
+ * matched, installed from a snapshot (`base` = its revision) or sent in a
+ * save (`base` = null): the draft's zones are dirty when they are another
+ * array. `installed` is the snapshot shown, with the acceptance seq of its
+ * installation; `saveSeq` the seq of the latest save start or end;
+ * `awaiting` a settled save whose snapshot is not installed yet;
+ * `generation` the newest supervisor generation read here.
+ */
+type ZoneView = {
+  synced: ZoneConfig[] | undefined;
+  base: string | null;
+  installed: { read: Tagged<CameraConfigSnapshot>; seq: number } | null;
+  saveSeq: number;
+  savedAt: number | null;
+  awaiting: boolean;
+  generation: number;
+};
+
+const APPLICATION_BADGE: Record<
+  ZoneApplication["kind"],
+  { label: string; variant: BadgeProps["variant"] }
+> = {
+  unread: { label: "Reading", variant: "secondary" },
+  unsupported: { label: "Unverified", variant: "secondary" },
+  inactive: { label: "Inactive", variant: "secondary" },
+  applying: { label: "Applying", variant: "default" },
+  applied: { label: "Applied", variant: "success" },
+  failed: { label: "Failed", variant: "destructive" },
+  disconnected: { label: "Unconfirmed", variant: "warning" },
+  changed_elsewhere: { label: "Changed", variant: "warning" },
+  unsaved: { label: "Unsaved", variant: "secondary" },
+};
+
+const clock = (at: number | string) => new Date(at).toLocaleTimeString();
+
+/** Only the verdict is a live region: the read time changes with every poll. */
+function ZoneApplicationStatus({ application: a }: { application: ZoneApplication }) {
+  const badge = APPLICATION_BADGE[a.kind];
+  return (
+    <div
+      data-testid="zone-application"
+      data-state={a.kind}
+      className="space-y-1 rounded-md border border-border bg-muted/20 p-2.5 text-xs"
+    >
+      <div role="status" aria-live="polite">
+        <div className="flex items-start gap-2">
+          <Badge variant={badge.variant} className="shrink-0">
+            {badge.label}
+          </Badge>
+          <span className="font-semibold">{a.title}</span>
+        </div>
+        <p className="mt-1 text-muted-foreground">{a.detail}</p>
+      </div>
+      <p className="tabular-nums text-muted-foreground">
+        {a.kind === "applied" && a.appliedAt ? `Applied ${clock(a.appliedAt)} · ` : ""}
+        {a.readAt !== null ? `Last read ${clock(a.readAt)}` : "No successful read yet"}
+      </p>
+    </div>
+  );
+}
+
 /**
  * Derive the conventional ONVIF device-service URL from an RTSP URL's host —
  * `rtsp://…@192.168.1.64:554/s1` → `http://192.168.1.64/onvif/device_service`.
@@ -172,8 +274,10 @@ export function CameraEditor({
   camera: CameraConfig;
   existing: CameraConfig[];
   onClose: () => void;
-  onSaved: () => void;
+  /** `created`: the save added a new camera rather than updating one. */
+  onSaved: (created: boolean) => void;
 }) {
+  const qc = useQueryClient();
   const [draft, setDraft] = useState<CameraConfig>(camera);
   const [error, setError] = useState<string | null>(null);
   // Tracks whether the operator has hand-edited the ONVIF endpoint. While
@@ -290,12 +394,142 @@ export function CameraEditor({
     return { text, cost, exact };
   })();
 
+  // SPEC-088 — does the running camera use the zones shown? Installing a
+  // saved-zone snapshot, or a save starting or ending, advances the
+  // acceptance epoch; only a stats request begun after it can certify them.
+  // The draft stays the full-config write base: a save sends it whole, with
+  // the zones on screen, and nothing from the snapshot but its zones.
+  const [zoneView, setZoneView] = useState<ZoneView>(() => ({
+    synced: camera.zones,
+    base: null,
+    installed: null,
+    saveSeq: 0,
+    savedAt: null,
+    awaiting: false,
+    generation: -1,
+  }));
+
   const mutation = useMutation({
     mutationFn: (cfg: CameraConfig) => upsertCamera(cfg),
-    onSuccess: onSaved,
-    onError: (e: unknown) =>
-      setError(e instanceof Error ? e.message : String(e)),
+    onMutate: () => setZoneView((v) => ({ ...v, saveSeq: nextAcceptanceSeq() })),
+    onSuccess: (_saved, cfg) => {
+      // The PUT answer carries no revision and is not applied: the
+      // post-save snapshot and a fresh receipt decide. Typing since the save
+      // began stays, because the draft is never replaced by the answer.
+      setZoneView((v) => ({
+        ...v,
+        saveSeq: nextAcceptanceSeq(),
+        savedAt: Date.now(),
+        awaiting: true,
+        synced: cfg.zones,
+        base: null,
+      }));
+      if (!isNew) toast.success("Camera saved");
+      onSaved(isNew);
+    },
+    onError: (e: unknown) => {
+      setZoneView((v) => ({ ...v, saveSeq: nextAcceptanceSeq() }));
+      setError(e instanceof Error ? e.message : String(e));
+    },
   });
+  const saving = mutation.isPending;
+
+  const snapQ = useQuery({
+    queryKey: snapshotKey(camera.id),
+    enabled: !isNew,
+    queryFn: async ({ signal }) => {
+      const seq = nextAcceptanceSeq();
+      return { seq, body: parseConfigSnapshot(await getCameraConfigSnapshot(camera.id, signal)) };
+    },
+    // Read on open, after a save and to reconcile a mismatch; never on a timer.
+    staleTime: Infinity,
+    gcTime: 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  // Install a snapshot read begun after the latest save; a clean view shows
+  // its zones, a dirty edit keeps the operator's.
+  const snap = snapQ.data;
+  if (snap && snap !== zoneView.installed?.read && !saving && snap.seq > zoneView.saveSeq) {
+    const clean = draft.zones === zoneView.synced;
+    setZoneView((v) => ({
+      ...v,
+      installed: { read: snap, seq: nextAcceptanceSeq() },
+      awaiting: false,
+      ...(clean ? { synced: snap.body.settings.zones, base: snap.body.zones_revision } : {}),
+    }));
+    if (clean) setDraft((d) => ({ ...d, zones: snap.body.settings.zones }));
+  }
+
+  const sentZones = saving ? mutation.variables?.zones : zoneView.synced;
+  const zoneDraft: ZoneDraftState = {
+    phase:
+      draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
+    base: zoneView.base,
+  };
+  const saved: SavedSnapshot = {
+    snapshot: zoneView.installed?.read.body ?? null,
+    error: snapQ.error,
+  };
+  const epoch: AcceptanceEpoch = {
+    seq: Math.max(zoneView.saveSeq, zoneView.installed?.seq ?? 0),
+    generation: zoneView.generation,
+  };
+  const zonePollMs = (read: ReceiptRead & { error: unknown }) =>
+    zoneApplicationPollMs(
+      deriveZoneApplication(saved, read, zoneDraft, epoch),
+      [read.error, snapQ.error],
+      zoneView.savedAt,
+    );
+  const statsQ = useQuery({
+    queryKey: statsKey(camera.id),
+    enabled: !isNew,
+    queryFn: async () => {
+      const seq = nextAcceptanceSeq();
+      return { seq, body: await getCameraStats(camera.id) };
+    },
+    // One read for decode health (every 5 s) and zone application, which
+    // only ever reads sooner: every 2 s just after a save. Paused while the
+    // page is hidden, re-read at once when it is visible again.
+    refetchInterval: (q) => {
+      if (isDenied(q.state.error)) return false;
+      const zone = zonePollMs(q.state);
+      return zone === false ? DECODE_REFRESH_MS : Math.min(zone, DECODE_REFRESH_MS);
+    },
+    refetchOnWindowFocus: (q) => (zonePollMs(q.state) === false ? false : "always"),
+  });
+  const readGeneration =
+    statsQ.data?.body.camera_id === camera.id ? receiptGeneration(statsQ.data.body) : undefined;
+  if (readGeneration !== undefined && readGeneration > zoneView.generation) {
+    setZoneView((v) => (readGeneration > v.generation ? { ...v, generation: readGeneration } : v));
+  }
+  const application = deriveZoneApplication(saved, statsQ, zoneDraft, epoch);
+  const pollMs = zoneApplicationPollMs(application, [statsQ.error, snapQ.error], zoneView.savedAt);
+
+  // The post-save snapshot is requested once the save has settled.
+  useEffect(() => {
+    if (zoneView.awaiting && !saving) restartQuery(qc, snapshotKey(camera.id));
+  }, [qc, camera.id, zoneView.awaiting, saving]);
+  // A newly installed snapshot needs a stats read begun after it.
+  const installedSeq = zoneView.installed?.seq;
+  useEffect(() => {
+    if (installedSeq !== undefined) restartQuery(qc, statsKey(camera.id));
+  }, [qc, camera.id, installedSeq]);
+  // A mismatch or a failed snapshot read reloads the saved zones at once,
+  // then at most once per receipt interval, never while a save is pending.
+  const receiptKind = application.kind === "unsaved" ? application.receipt.kind : application.kind;
+  const reconcile =
+    !isNew &&
+    pollMs !== false &&
+    !saving &&
+    !snapQ.isFetching &&
+    (receiptKind === "changed_elsewhere" || snapQ.isError);
+  const reconciledAt = useRef(-Infinity);
+  useEffect(() => {
+    if (!reconcile || Date.now() - reconciledAt.current < pollMs) return;
+    reconciledAt.current = Date.now();
+    void qc.refetchQueries({ queryKey: snapshotKey(camera.id), exact: true });
+  }, [qc, camera.id, reconcile, pollMs, statsQ.dataUpdatedAt, statsQ.errorUpdatedAt]);
 
   const set = <K extends keyof CameraConfig>(
     k: K,
@@ -357,7 +591,9 @@ export function CameraEditor({
           </div>
         ) : null}
 
-        {isNew ? null : <CameraDecodeSection cameraId={draft.id} />}
+        {isNew ? null : (
+          <CameraDecodeSection stats={statsQ.data?.body} read={statsQ.isSuccess} />
+        )}
 
         {restartRequired ? (
           <div className="flex items-start gap-2 border-b border-warning/40 bg-warning/10 px-5 py-3 text-xs">
@@ -914,6 +1150,7 @@ export function CameraEditor({
           title="Zones"
           description="Draw polygon zones on the live snapshot. Click to add vertices, double-click to close, drag a vertex to move it, right-click a vertex to delete it. Coordinates are stored normalized 0..1 of the source frame."
         >
+          {isNew ? null : <ZoneApplicationStatus application={application} />}
           <ZonesEditor
             cameraId={draft.id}
             isNew={isNew}
