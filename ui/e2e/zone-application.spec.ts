@@ -175,6 +175,13 @@ const polygon = (page: Page, zone: Zone) =>
 // otherwise at the editor's 5 s stats refresh.
 const POLL = { timeout: 15_000 };
 
+/** Applied never shows, checked every 200 ms for `ms`. */
+async function neverApplied(page: Page, ms: number) {
+  for (const until = Date.now() + ms; Date.now() < until; await page.waitForTimeout(200)) {
+    expect(await page.getByText("Applied to camera").count()).toBe(0);
+  }
+}
+
 test.describe("zone application", () => {
   test.describe.configure({ timeout: 90_000 });
   let cameraId: number | null = null;
@@ -258,6 +265,43 @@ test.describe("zone application", () => {
     // A generation older than one already read cannot recover the verdict.
     receipt.set(applied(1));
     await expect(status).toContainText("Saved; applying to camera", POLL);
+  });
+
+  test("a save pending when the editor closes stays pending when it reopens", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const revA = await zonesRevision(page, cameraId);
+    const receipt = await controlReceipt(page, cameraId);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${cameraId}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+    let releasePut = () => {};
+    const putHeld = new Promise<void>((resolve) => (releasePut = resolve));
+    await page.route(`**/api/v1/cameras/${cameraId}`, async (route) => {
+      if (route.request().method() === "PUT") await putHeld;
+      await route.continue();
+    });
+    await page.getByRole("button", { name: /^save$/i }).click();
+    await expect(status).toContainText("Saving to camera…");
+
+    // Closed and reopened mid-save, with the engine still reporting the
+    // old zones freshly applied: the reopened editor knows the save.
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(status).toHaveCount(0);
+    await page.getByRole("row").filter({ hasText: "e2e zones" }).getByRole("button").first().click();
+    await expect(status).toContainText("Saving to camera…");
+    await neverApplied(page, 6_000);
+
+    receipt.set(applying(2, 1, () => revA));
+    releasePut();
+    await expect(status).toContainText("Saved; applying to camera", POLL);
+    await expect(zoneRow(page, "Gate")).toBeVisible();
+    await neverApplied(page, 3_000);
+
+    receipt.set(applied(2));
+    await expect(status).toContainText("Applied to camera", POLL);
   });
 
   test("a stats request begun before the save cannot certify it", async ({ page }) => {

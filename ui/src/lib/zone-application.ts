@@ -73,6 +73,18 @@ let acceptanceSeq = 0;
  */
 export const nextAcceptanceSeq = () => ++acceptanceSeq;
 
+const zoneSaveSeqs = new Map<number, number>();
+/**
+ * A save of the camera started or ended. Kept per camera outside any editor,
+ * so one closed and reopened mid-save still fences out every read begun
+ * before the save ended.
+ */
+export const markZoneSave = (cameraId: number) => {
+  zoneSaveSeqs.set(cameraId, nextAcceptanceSeq());
+};
+/** The acceptance seq of the camera's latest save start or end in this tab. */
+export const zoneSaveSeq = (cameraId: number) => zoneSaveSeqs.get(cameraId) ?? 0;
+
 /** A read tagged with the acceptance seq taken when its request began. */
 export type Tagged<T> = { seq: number; body: T };
 

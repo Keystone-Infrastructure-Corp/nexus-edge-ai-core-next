@@ -1,4 +1,5 @@
 import {
+  useIsMutating,
   useMutation,
   useQuery,
   useQueryClient,
@@ -58,10 +59,12 @@ import { detectorInputFor, supervisorDimsFor } from "@/lib/supervisor-frame";
 import {
   deriveZoneApplication,
   isDenied,
+  markZoneSave,
   nextAcceptanceSeq,
   parseConfigSnapshot,
   receiptGeneration,
   zoneApplicationPollMs,
+  zoneSaveSeq,
   type AcceptanceEpoch,
   type ReceiptRead,
   type SavedSnapshot,
@@ -177,6 +180,7 @@ function round2(n: number): string {
 const DECODE_REFRESH_MS = 5_000;
 const statsKey = (id: number) => ["cameras", "stats", id] as const;
 const snapshotKey = (id: number) => ["cameras", "config-snapshot", id] as const;
+const saveKey = (id: number) => ["cameras", "save", id] as const;
 
 /** Drop any request in flight and start a new one, rather than joining it. */
 function restartQuery(qc: QueryClient, queryKey: readonly unknown[]) {
@@ -190,15 +194,14 @@ function restartQuery(qc: QueryClient, queryKey: readonly unknown[]) {
  * matched, installed from a snapshot (`base` = its revision) or sent in a
  * save (`base` = null): the draft's zones are dirty when they are another
  * array. `installed` is the snapshot shown, with the acceptance seq of its
- * installation; `saveSeq` the seq of the latest save start or end;
- * `awaiting` a settled save whose snapshot is not installed yet;
- * `generation` the newest supervisor generation read here.
+ * installation; `awaiting` a settled save whose snapshot is not installed
+ * yet; `generation` the newest supervisor generation read here. The latest
+ * save start or end is per camera, outside the editor (`zoneSaveSeq`).
  */
 type ZoneView = {
   synced: ZoneConfig[] | undefined;
   base: string | null;
   installed: { read: Tagged<CameraConfigSnapshot>; seq: number } | null;
-  saveSeq: number;
   savedAt: number | null;
   awaiting: boolean;
   generation: number;
@@ -403,22 +406,23 @@ export function CameraEditor({
     synced: camera.zones,
     base: null,
     installed: null,
-    saveSeq: 0,
     savedAt: null,
     awaiting: false,
     generation: -1,
   }));
 
+  // The save, its fence and its post-save snapshot read outlive this editor:
+  // a reopened one sees the save pending, and its settling refreshes it.
   const mutation = useMutation({
+    mutationKey: saveKey(camera.id),
     mutationFn: (cfg: CameraConfig) => upsertCamera(cfg),
-    onMutate: () => setZoneView((v) => ({ ...v, saveSeq: nextAcceptanceSeq() })),
+    onMutate: () => markZoneSave(camera.id),
     onSuccess: (_saved, cfg) => {
       // The PUT answer carries no revision and is not applied: the
       // post-save snapshot and a fresh receipt decide. Typing since the save
       // began stays, because the draft is never replaced by the answer.
       setZoneView((v) => ({
         ...v,
-        saveSeq: nextAcceptanceSeq(),
         savedAt: Date.now(),
         awaiting: true,
         synced: cfg.zones,
@@ -427,12 +431,14 @@ export function CameraEditor({
       if (!isNew) toast.success("Camera saved");
       onSaved(isNew);
     },
-    onError: (e: unknown) => {
-      setZoneView((v) => ({ ...v, saveSeq: nextAcceptanceSeq() }));
-      setError(e instanceof Error ? e.message : String(e));
+    onError: (e: unknown) => setError(e instanceof Error ? e.message : String(e)),
+    // A failed PUT may still have committed: read what is saved either way.
+    onSettled: () => {
+      markZoneSave(camera.id);
+      restartQuery(qc, snapshotKey(camera.id));
     },
   });
-  const saving = mutation.isPending;
+  const saving = useIsMutating({ mutationKey: saveKey(camera.id) }) > 0;
 
   const snapQ = useQuery({
     queryKey: snapshotKey(camera.id),
@@ -450,7 +456,7 @@ export function CameraEditor({
   // Install a snapshot read begun after the latest save; a clean view shows
   // its zones, a dirty edit keeps the operator's.
   const snap = snapQ.data;
-  if (snap && snap !== zoneView.installed?.read && !saving && snap.seq > zoneView.saveSeq) {
+  if (snap && snap !== zoneView.installed?.read && !saving && snap.seq > zoneSaveSeq(camera.id)) {
     const clean = draft.zones === zoneView.synced;
     setZoneView((v) => ({
       ...v,
@@ -461,7 +467,7 @@ export function CameraEditor({
     if (clean) setDraft((d) => ({ ...d, zones: snap.body.settings.zones }));
   }
 
-  const sentZones = saving ? mutation.variables?.zones : zoneView.synced;
+  const sentZones = mutation.isPending ? mutation.variables?.zones : zoneView.synced;
   const zoneDraft: ZoneDraftState = {
     phase:
       draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
@@ -472,7 +478,7 @@ export function CameraEditor({
     error: snapQ.error,
   };
   const epoch: AcceptanceEpoch = {
-    seq: Math.max(zoneView.saveSeq, zoneView.installed?.seq ?? 0),
+    seq: Math.max(zoneSaveSeq(camera.id), zoneView.installed?.seq ?? 0),
     generation: zoneView.generation,
   };
   const zonePollMs = (read: ReceiptRead & { error: unknown }) =>
@@ -506,10 +512,6 @@ export function CameraEditor({
   const application = deriveZoneApplication(saved, statsQ, zoneDraft, epoch);
   const pollMs = zoneApplicationPollMs(application, [statsQ.error, snapQ.error], zoneView.savedAt);
 
-  // The post-save snapshot is requested once the save has settled.
-  useEffect(() => {
-    if (zoneView.awaiting && !saving) restartQuery(qc, snapshotKey(camera.id));
-  }, [qc, camera.id, zoneView.awaiting, saving]);
   // A newly installed snapshot needs a stats read begun after it.
   const installedSeq = zoneView.installed?.seq;
   useEffect(() => {
@@ -578,8 +580,8 @@ export function CameraEditor({
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button onClick={onSubmit} disabled={mutation.isPending}>
-            {mutation.isPending ? "Saving…" : "Save"}
+          <Button onClick={onSubmit} disabled={saving}>
+            {saving ? "Saving…" : "Save"}
           </Button>
         </>
       }
