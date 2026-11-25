@@ -134,7 +134,7 @@ if [ -f "$C" ]; then
        grep -qF 'If you stop short' "$TMP/out"; then
       ok "fix-ci prompt runs implement-loop on the PR branch and fast-forwards it"
     else
-      bad "fix-ci prompt lacks implement-loop on origin/fix-x or the fast-forward push"
+      bad "fix-ci prompt lacks implement-loop on origin/fix-x, never origin/main, the fast-forward push or the stop-short comment"
     fi
   fi
 
@@ -143,10 +143,10 @@ if [ -f "$C" ]; then
   args="$(awk '/^ *claude_args: >-$/ { f = 1; next } f { if ($0 !~ /^            /) exit; print }' "$C")"
   if grep -qF -- '--append-system-prompt "' <<<"$args" && [ "$(tr -cd '"' <<<"$args" | wc -c)" -eq 2 ] &&
      ! grep -q '[$`]' <<<"${args//'${{'/}" && grep -qF 'implement-loop' <<<"$args" &&
-     grep -qF 'starts no other loop' <<<"$args"; then
+     grep -qF 'starts no other loop' <<<"$args" && grep -qF 'a review someone asked for' <<<"$args"; then
     ok "claude_args appends the implement-loop rule as one argument"
   else
-    bad "claude_args lacks a single quoted --append-system-prompt rule"
+    bad "claude_args lacks a single quoted --append-system-prompt rule with the loop guard and review scope"
   fi
 else
   echo "skip claude.yml (not adopted)"

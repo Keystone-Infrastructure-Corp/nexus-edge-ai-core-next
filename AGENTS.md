@@ -152,7 +152,8 @@ integer widths. If you touch them, run CI's clippy in a Linux container before p
 ## Workflow
 
 1. **Rebase before committing:** `git fetch && git rebase origin/main`; never a merge
-   `git pull`. `implement-loop` units work from a pinned SHA and never rebase or merge.
+   `git pull`. `implement-loop` units work from a pinned SHA and never rebase or merge. A
+   PR follow-up rebases only onto its PR branch (see `implement-loop`).
 2. Pick a step from the wedge plan or a milestone doc; cross-repo work gets companion PRs.
 3. One PR per logical change, titled `[<crate>] <verb> <object>`, or
    `[Phase N · Step M] <verb> <object>` for wedge work.
