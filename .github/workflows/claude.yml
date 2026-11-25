@@ -12,7 +12,7 @@ on:
   issues:
     types: [opened, labeled]
   pull_request:
-    types: [labeled]
+    types: [labeled, opened, ready_for_review]
 
 permissions: {}
 
@@ -22,7 +22,8 @@ jobs:
     # also gated here on the commenter's association, so outsiders on a public repo never
     # start the job or mint the App token, and PR review mentions never run fork code.
     # `@claude review` belongs to Claude Code Review (its own GitHub App), so it is
-    # skipped here; otherwise one comment would start two Claude runs.
+    # skipped here; otherwise one comment would start two Claude runs. A same-repo PR a
+    # person opens ready, or marks ready, gets a requesting-code-review run.
     if: >-
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
         !contains(github.event.comment.body, '@claude review') &&
@@ -39,7 +40,12 @@ jobs:
         (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)) ||
       (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'factory:medium') ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'factory:fix-ci' &&
+      (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+        github.event.label.name == 'factory:fix-ci' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request' &&
+        (github.event.action == 'opened' || github.event.action == 'ready_for_review') &&
+        !github.event.pull_request.draft && github.event.sender.type != 'Bot' &&
         github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     # Label-triggered builds: 180 min, one group per issue or PR. @claude mentions: 60 min,
@@ -72,14 +78,17 @@ jobs:
             exit 1
           fi
 
-      - name: Write the build prompt
+      - name: Write the prompt
         id: prompt
-        if: github.event.action == 'labeled'
+        if: github.event.action == 'labeled' || github.event_name == 'pull_request'
         env:
           REPO: ${{ github.repository }}
           ISSUE: ${{ github.event.issue.number }}
           PR: ${{ github.event.pull_request.number }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ACTION: ${{ github.event.action }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = issues ]; then
@@ -92,14 +101,17 @@ jobs:
               exit 1
             fi
             text="Work order #$ISSUE in $REPO. Run implement-loop for $spec: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md, and follow it on the vault record $spec. Work on a new branch. When the loop passes, push it and open a draft pull request whose body starts with \"Closes #$ISSUE\" and carries the ledger. If you stop short, comment on #$ISSUE with what is left and why."
+          elif [ "$ACTION" = labeled ]; then
+            text="Pull request #$PR in $REPO has failing checks. Fix them with implement-loop: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. The task is to make the failing checks pass; read them with \`gh pr checks $PR\` and \`gh run view <run-id> --log-failed\`. Base the loop's worktree on origin/$BRANCH, not origin/main, and when the loop passes push its commits to $BRANCH. Then comment on #$PR with the cause, the fix, what you ran and the ledger."
           else
-            text="Pull request #$PR in $REPO has failing checks. This run starts on the merge commit, so first run \`git checkout $BRANCH\`. Read the checks with \`gh pr checks $PR\` and \`gh run view <run-id> --log-failed\`. Read AGENTS.md, find the root cause, make the smallest fix, run the failing gate locally where you can, and push the fix to the PR branch $BRANCH. Then comment on #$PR with the cause, the fix and what you ran."
+            text="Review pull request #$PR in $REPO with the requesting-code-review skill. HEAD_SHA is $HEAD_SHA and BASE_SHA is \`git merge-base origin/$BASE $HEAD_SHA\`. The requirements are the PR description, plus the issue it closes and the spec that issue names, if any. Dispatch the skill's fresh reviewer on the strongest tier with REVIEW.md as its checklist; it reports only REVIEW.md's P0 and P1 findings, each with file:line. Post one comment with \`gh pr comment $PR\`: the findings, or \"No P0 or P1 findings.\", and what the reviewer could not check. Do not edit files or push commits."
           fi
           echo "text=$text" >> "$GITHUB_OUTPUT"
 
       # The action works in $GITHUB_WORKSPACE, so the repo is checked out there, at the
       # event's default ref: no step checks out a PR head. For a mention on a PR the action
-      # checks out the PR branch itself (forks are refused above); fix-ci's prompt does it.
+      # checks out the PR branch itself (forks are refused above); fix-ci's loop bases its
+      # worktree on origin/<branch>, and the review reads the PR's commits from history.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
@@ -145,5 +157,12 @@ jobs:
           # Intake labels issues as the factory App, and the action rejects bots not named
           # here. If the App's slug differs, change nexus-factory.
           allowed_bots: ${{ github.event.action == 'labeled' && 'nexus-factory' || '' }}
-          # Setting allowed_bots turns off the action's default auto permission mode.
-          claude_args: ${{ github.event.action == 'labeled' && '--permission-mode auto' || '' }}
+          # Setting allowed_bots turns off the action's default auto permission mode. The
+          # appended rule reaches @claude mentions, which have no prompt of their own.
+          claude_args: >-
+            ${{ github.event.action == 'labeled' && '--permission-mode auto' || '' }}
+            --append-system-prompt "Every code change goes through the implement-loop skill:
+            read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. When the loop passes,
+            push its commits: on a pull request, base the loop on the PR branch and push back
+            to it; for an issue, push a new branch and open a draft pull request. Every review
+            goes through the requesting-code-review skill."
