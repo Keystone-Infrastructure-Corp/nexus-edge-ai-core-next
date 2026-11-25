@@ -2,7 +2,8 @@
 # FACTORY_APP_ID and FACTORY_APP_PRIVATE_KEY only as Agents secrets (repo or
 # org Settings > Secrets and variables > Agents), never as Actions or
 # environment secrets. Validation runs (pull_request, workflow_dispatch) see
-# Actions secrets instead; the nexus-home steps skip when neither is set.
+# Actions secrets instead. The nexus-home steps skip when the kind a run sees
+# is not set.
 # GitHub allows only these job keys here (others are ignored, so the secrets
 # flag is a step output, not job env): steps, permissions, runs-on, services,
 # snapshot, timeout-minutes (59 or less).

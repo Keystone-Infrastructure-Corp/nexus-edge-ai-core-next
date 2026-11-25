@@ -131,10 +131,11 @@ if [ -f "$C" ]; then
     GITHUB_EVENT_NAME=pull_request BRANCH=fix-x GITHUB_OUTPUT="$TMP/out" bash -e "$TMP/step.sh" >/dev/null 2>&1 || true
     if grep -qF 'implement-loop' "$TMP/out" && grep -qF 'on a fresh origin/fix-x' "$TMP/out" &&
        grep -qF 'never rebase' "$TMP/out" && grep -qF 'git push origin HEAD:fix-x' "$TMP/out" &&
-       grep -qF 'If the push is rejected or you stop short' "$TMP/out"; then
+       grep -qF 'If the push is rejected or you stop short' "$TMP/out" &&
+       ! grep -qF 'origin/main' "$TMP/out"; then
       ok "fix-ci prompt runs implement-loop on the PR branch and fast-forwards it"
     else
-      bad "fix-ci prompt lacks implement-loop on a fresh origin/fix-x, never rebase, the fast-forward push or the rejected-push comment"
+      bad "fix-ci prompt lacks implement-loop on a fresh origin/fix-x, never rebase, the fast-forward push or the rejected-push comment, or names origin/main"
     fi
   fi
 
