@@ -1439,7 +1439,10 @@ async fn reprobe_apply(
     let probed = run_reprobe(&s, Some(&ids)).await?;
     // One read for the whole batch. Re-reading inside the loop made this
     // 53 full table scans on a 53-camera core, and opened a
-    // read-modify-write race with any concurrent camera edit.
+    // read-modify-write race with any concurrent camera edit. SPEC-088 —
+    // read and written inside the save boundary, as `upsert_camera`, so a
+    // zone save cannot land between the read and the write and be set back.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     let mut cams = s.store.list_cameras().await?;
     let mut out = Vec::with_capacity(probed.len());
     let mut applied_any = false;
@@ -1450,8 +1453,6 @@ async fn reprobe_apply(
                 cam.ingest.analysis_url = Some(url);
                 let after_str = camera_audit_json(cam);
                 let resource_id = cam.id.to_string();
-                // SPEC-088 — as `upsert_camera`.
-                let saving = s.frame_stats.zone_application().saves().write().await;
                 // Same tx-merge as `upsert_camera`: the mutation and its
                 // audit row commit together, so the log can never be
                 // missing a row for a change that landed. A bulk action
@@ -1480,12 +1481,12 @@ async fn reprobe_apply(
                     &nexus_pipeline::zone_application::zone_revision(&cam.zones),
                     cam.ingest.enabled,
                 );
-                drop(saving);
                 applied_any = true;
             }
         }
         out.push(proposal);
     }
+    drop(saving);
     // The reconciler is the only thing that starts an analysis session on a
     // live engine, and it is driven purely by this event. Without the
     // publish the rows change, the console reports "applied", and not one
@@ -8386,6 +8387,160 @@ mod tests {
             state_of(&app, id).await,
             "applying",
             "g1's acknowledgement from before B certified the A saved after it"
+        );
+    }
+
+    /// An admin JSON request from a loopback peer; its status.
+    async fn send_admin(
+        app: axum::Router,
+        token: String,
+        method: Method,
+        uri: String,
+        body: String,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// SPEC-088 — every full-camera writer saves inside the registry's
+    /// boundary. An ONVIF port change reads the camera, waits on the camera,
+    /// then persists: zones B saved and acknowledged while it waited survive
+    /// it, or the store holds A while the registry reads B applied, and a
+    /// later save of B reads applied without a new acknowledgement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_network_rewrite_waiting_on_the_camera_keeps_a_zone_save() {
+        use axum::response::IntoResponse;
+        use nexus_pipeline::zone_application::zone_revision;
+        const SECRET: &[u8] = b"network-rewrite-zone-save-secret";
+
+        // The camera answers only once released, holding the handler
+        // between its read and its write.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let stub = {
+            let (entered, release) = (entered.clone(), release.clone());
+            axum::Router::new().fallback(move || {
+                let (entered, release) = (entered.clone(), release.clone());
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    (StatusCode::OK, "<ok/>").into_response()
+                }
+            })
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, stub.into_make_service()).await;
+        });
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
+        let mut a_camera = fleet_test_camera(31, "cam-31");
+        a_camera.zones = vec![snapshot_zone("a", 0.2)];
+        a_camera.onvif = nexus_config::CameraOnvif {
+            endpoint: Some(format!("http://{addr}/onvif/device_service")),
+            username: Some("admin".into()),
+            password: Some("secret".into()),
+        };
+        store.upsert_camera(&a_camera).await.unwrap();
+        let mut b_camera = a_camera.clone();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let b = zone_revision(&b_camera.zones);
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+        let token = sign_admin_jwt(SECRET);
+
+        let rewrite = tokio::spawn(send_admin(
+            app.clone(),
+            token.clone(),
+            Method::PUT,
+            "/api/v1/admin/cameras/31/network/safe".into(),
+            serde_json::json!({
+                "action": "set_network_protocols",
+                "protocols": [{ "name": "RTSP", "enabled": true, "port": 8554 }],
+            })
+            .to_string(),
+        ));
+        entered.notified().await;
+        let saved_b = send_admin(
+            app.clone(),
+            token,
+            Method::PUT,
+            "/api/v1/cameras/31".into(),
+            serde_json::to_string(&b_camera).unwrap(),
+        )
+        .await;
+        assert_eq!(saved_b, StatusCode::OK);
+        let g1 = registry.start(31, &b);
+        let b_request = registry.current_request(31, g1).expect("g1 runs B");
+        registry.acknowledge(31, g1, b_request, &b, chrono::Utc::now());
+        release.notify_one();
+        assert_eq!(rewrite.await.unwrap(), StatusCode::OK);
+
+        let saved = store.list_cameras().await.unwrap().remove(0);
+        assert_eq!(
+            saved.ingest.url.port(),
+            Some(8554),
+            "the port rewrite landed"
+        );
+        assert_eq!(
+            saved.zones, b_camera.zones,
+            "the rewrite wrote back the zones it read before B was saved and acknowledged"
+        );
+    }
+
+    /// SPEC-088 — as above for a fleet push: one that read the cameras
+    /// before a zone save committed and writes after it keeps the save.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fleet_push_across_a_zone_save_keeps_the_save() {
+        use nexus_pipeline::zone_application::zone_revision;
+        const SECRET: &[u8] = b"fleet-push-zone-save-secret";
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
+        let mut a_camera = fleet_test_camera(1, "front");
+        a_camera.zones = vec![snapshot_zone("a", 0.2)];
+        store.upsert_camera(&a_camera).await.unwrap();
+        let mut b_camera = a_camera.clone();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let b = zone_revision(&b_camera.zones);
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+
+        // B's save as the API makes it: the boundary, then its write
+        // transaction, held open so a push that read A first waits on it.
+        let saving = registry.saves().write().await;
+        let mut tx = store.begin_tx().await.unwrap();
+        store.upsert_camera_tx(&mut tx, &b_camera).await.unwrap();
+        let push = tokio::spawn({
+            let app = app.clone();
+            async move {
+                fleet_apply(&app, SECRET, "text_prompts", serde_json::json!(["person"]))
+                    .await
+                    .status()
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        Store::commit_tx(tx).await.unwrap();
+        registry.request(1, &b, true);
+        let g1 = registry.start(1, &b);
+        let b_request = registry.current_request(1, g1).expect("g1 runs B");
+        registry.acknowledge(1, g1, b_request, &b, chrono::Utc::now());
+        drop(saving);
+        assert_eq!(push.await.unwrap(), StatusCode::OK);
+
+        let saved = store.list_cameras().await.unwrap().remove(0);
+        assert_eq!(saved.detector.prompts, vec!["person"], "the push landed");
+        assert_eq!(
+            saved.zones, b_camera.zones,
+            "the push wrote back the zones it read before B was saved and acknowledged"
         );
     }
 

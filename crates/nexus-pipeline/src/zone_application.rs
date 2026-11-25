@@ -266,9 +266,10 @@ impl ZoneApplicationRegistry {
         }
     }
 
-    /// Writers of a camera's zones or enabled flag hold this for writing from
-    /// before their commit until they have told [`Self::request`] (or
-    /// [`Self::remove`]); readers that request what they read hold it for
+    /// Every writer of a camera row (a whole row carries the zones and the
+    /// enabled flag) holds this for writing from before it reads what it
+    /// writes back, or before its commit, until it has told [`Self::request`]
+    /// (or [`Self::remove`]); readers that request what they read hold it for
     /// reading from before the read. So the registry sees every saved change,
     /// in commit order, and no stale read after it: a save racing another
     /// cannot find its change already requested by an earlier one.

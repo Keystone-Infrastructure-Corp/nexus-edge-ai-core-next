@@ -552,8 +552,9 @@ async fn apply_text_prompts(
     })?;
     let keep: std::collections::HashSet<&str> = prompts.iter().map(String::as_str).collect();
     let retract = retractable(mode, prev_keys, &keep);
+    // SPEC-088 — see `save_cameras`.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     let mut cameras = s.store.list_cameras().await?;
-    let mut tx = s.store.begin_tx().await?;
     for cam in &mut cameras {
         cam.detector.prompts = match mode {
             FleetApplyMode::Replace => prompts.clone(),
@@ -572,9 +573,9 @@ async fn apply_text_prompts(
                 merged
             }
         };
-        s.store.upsert_camera_tx(&mut tx, cam).await?;
     }
-    nexus_store::Store::commit_tx(tx).await?;
+    save_cameras(s, &cameras).await?;
+    drop(saving);
     let _ = s
         .bus
         .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
@@ -584,6 +585,29 @@ async fn apply_text_prompts(
         managed_keys: prompts,
         items: Vec::new(),
     })
+}
+
+/// Write back every camera in one transaction and tell the zone registry
+/// what each now holds (SPEC-088). The caller holds the registry's save
+/// boundary from before it read `cameras` until this returns, so a zone
+/// save cannot land between that read and this write and be set back.
+async fn save_cameras(
+    s: &ApiState,
+    cameras: &[nexus_config::CameraConfig],
+) -> Result<(), ApiError> {
+    let mut tx = s.store.begin_tx().await?;
+    for cam in cameras {
+        s.store.upsert_camera_tx(&mut tx, cam).await?;
+    }
+    nexus_store::Store::commit_tx(tx).await?;
+    for cam in cameras {
+        s.frame_stats.zone_application().request(
+            cam.id,
+            &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+            cam.ingest.enabled,
+        );
+    }
+    Ok(())
 }
 
 /// `detector_config` — `effective` is a [`ModelConfig`] object,
@@ -606,13 +630,14 @@ async fn apply_detector_config(
             format!("detector_config payload: {why}"),
         )
     })?;
+    // SPEC-088 — see `save_cameras`.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     let mut cameras = s.store.list_cameras().await?;
-    let mut tx = s.store.begin_tx().await?;
     for cam in &mut cameras {
         cam.detector.model_override = Some(model.clone());
-        s.store.upsert_camera_tx(&mut tx, cam).await?;
     }
-    nexus_store::Store::commit_tx(tx).await?;
+    save_cameras(s, &cameras).await?;
+    drop(saving);
     let _ = s
         .bus
         .publish(topic::CONFIG_CHANGED, &serde_json::json!({}))
