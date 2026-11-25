@@ -153,4 +153,5 @@ jobs:
             --append-system-prompt "Every code change goes through the implement-loop skill:
             read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. A unit or reviewer
             the loop dispatches starts no other loop. Every review goes through the
-            requesting-code-review skill, posts its findings, and changes nothing unless asked."
+            requesting-code-review skill; a review someone asked for posts its findings and
+            changes nothing unless asked."

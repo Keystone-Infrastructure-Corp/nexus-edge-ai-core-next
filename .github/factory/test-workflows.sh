@@ -130,7 +130,8 @@ if [ -f "$C" ]; then
     : >"$TMP/out"
     GITHUB_EVENT_NAME=pull_request BRANCH=fix-x GITHUB_OUTPUT="$TMP/out" bash -e "$TMP/step.sh" >/dev/null 2>&1 || true
     if grep -qF 'implement-loop' "$TMP/out" && grep -qF 'on origin/fix-x' "$TMP/out" &&
-       grep -qF 'git push origin HEAD:fix-x' "$TMP/out"; then
+       grep -qF 'never origin/main' "$TMP/out" && grep -qF 'git push origin HEAD:fix-x' "$TMP/out" &&
+       grep -qF 'If you stop short' "$TMP/out"; then
       ok "fix-ci prompt runs implement-loop on the PR branch and fast-forwards it"
     else
       bad "fix-ci prompt lacks implement-loop on origin/fix-x or the fast-forward push"
@@ -141,7 +142,8 @@ if [ -f "$C" ]; then
   # $VAR inside double quotes and splits on a stray quote.
   args="$(awk '/^ *claude_args: >-$/ { f = 1; next } f { if ($0 !~ /^            /) exit; print }' "$C")"
   if grep -qF -- '--append-system-prompt "' <<<"$args" && [ "$(tr -cd '"' <<<"$args" | wc -c)" -eq 2 ] &&
-     ! grep -q '[$`]' <<<"${args//'${{'/}" && grep -qF 'implement-loop' <<<"$args"; then
+     ! grep -q '[$`]' <<<"${args//'${{'/}" && grep -qF 'implement-loop' <<<"$args" &&
+     grep -qF 'starts no other loop' <<<"$args"; then
     ok "claude_args appends the implement-loop rule as one argument"
   else
     bad "claude_args lacks a single quoted --append-system-prompt rule"
