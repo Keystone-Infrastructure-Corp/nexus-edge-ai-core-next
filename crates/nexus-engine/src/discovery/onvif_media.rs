@@ -283,6 +283,53 @@ struct ProfileSummary {
     /// `@token` of the profile's video-source configuration (the
     /// OSD `ConfigurationToken`).
     video_source_config_token: Option<String>,
+    /// `@token` of the profile's video-encoder configuration (the
+    /// token `GetVideoEncoderConfigurations` lists).
+    video_encoder_config_token: Option<String>,
+}
+
+/// One Media1 profile's encoder binding: the video-encoder
+/// configuration it streams and its `GetStreamUri` answer (`None`
+/// when that call failed or carried no URI). Edge-internal: the URI
+/// may embed credentials (R5b), so it is neither serialised nor logged.
+pub struct ProfileStream {
+    pub profile_token: String,
+    pub encoder_token: Option<String>,
+    pub uri: Option<String>,
+}
+
+/// Media1 `GetProfiles` plus one RTP-Unicast/RTSP `GetStreamUri` per
+/// profile, keeping each profile's video-encoder configuration token.
+/// Media1 only: its tokens are the ones the encoder routes read and
+/// write. A failed `GetStreamUri` leaves that profile's `uri` `None`
+/// instead of dropping the profile, so the caller can tell
+/// "unresolved" from "no match".
+pub async fn query_profile_streams(
+    xaddr: &str,
+    username: &str,
+    password: &str,
+) -> Result<Vec<ProfileStream>, String> {
+    let url = xaddr
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "empty xaddr".to_string())?;
+    let client = build_client()?;
+    let profiles = get_profiles(&client, url, username, password, MediaVer::V1).await?;
+    let mut out = Vec::with_capacity(profiles.len());
+    // Serial, like `collect_stream_uris`: cheap firmware 503s parallel SOAP.
+    for p in profiles {
+        let body = build_get_stream_uri_envelope(username, password, MediaVer::V1, &p.token);
+        let uri = post_soap(&client, url, &MediaVer::V1.action("GetStreamUri"), &body)
+            .await
+            .ok()
+            .and_then(|text| parse_stream_uri_response(&text));
+        out.push(ProfileStream {
+            profile_token: p.token,
+            encoder_token: p.video_encoder_config_token,
+            uri,
+        });
+    }
+    Ok(out)
 }
 
 async fn get_profiles(
@@ -451,6 +498,7 @@ fn parse_profiles_response(body: &str) -> Result<Vec<ProfileSummary>, String> {
                         resolution: None,
                         video_source_token: None,
                         video_source_config_token: None,
+                        video_encoder_config_token: None,
                     });
                     vec_seen_for_profile = false;
                 }
@@ -471,6 +519,21 @@ fn parse_profiles_response(body: &str) -> Result<Vec<ProfileSummary>, String> {
                                 }
                             }
                         }
+                    }
+                }
+                // Same for the (first) video-encoder configuration:
+                // Media1 `<tt:VideoEncoderConfiguration>`, Media2
+                // `<tr2:VideoEncoder>`.
+                if (name == "VideoEncoderConfiguration" || name == "VideoEncoder")
+                    && !vec_seen_for_profile
+                {
+                    if let Some(prof) = current.as_mut() {
+                        prof.video_encoder_config_token = e
+                            .attributes()
+                            .flatten()
+                            .find(|a| local_name(&a.key) == "token")
+                            .map(|a| a.unescape_value().unwrap_or_default().to_string())
+                            .filter(|v| !v.is_empty());
                     }
                 }
                 stack.push(name);
@@ -968,6 +1031,15 @@ mod tests {
         );
         assert_eq!(profiles[1].token, "Profile_2");
         assert_eq!(profiles[1].resolution.as_deref(), Some("640x480"));
+        // SPEC-090: each profile names the encoder configuration it streams.
+        assert_eq!(
+            profiles[0].video_encoder_config_token.as_deref(),
+            Some("VideoEncoder_1")
+        );
+        assert_eq!(
+            profiles[1].video_encoder_config_token.as_deref(),
+            Some("VideoEncoder_2")
+        );
     }
 
     #[test]

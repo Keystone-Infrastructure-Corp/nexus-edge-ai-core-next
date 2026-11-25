@@ -6801,6 +6801,399 @@ mod tests {
         let _ = to_bytes(res.into_body(), usize::MAX).await;
     }
 
+    /// SPEC-090 — a Media1 camera with a 2592x1520/4096 kbps main encoder
+    /// (`VE_main`, profile `Profile_1`) and a 1280x720/2048 kbps sub encoder
+    /// (`VE_sub`) shared by `Profile_2` and `Profile_3`. Options differ per
+    /// configuration token (no token: a generic 8192 kbps cap). Records
+    /// every SOAP body; `reject_set` faults `SetVideoEncoderConfiguration`.
+    async fn serve_encoder_stub(
+        reject_set: bool,
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::response::IntoResponse;
+        fn soap(inner: &str) -> String {
+            format!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body>{inner}</s:Body></s:Envelope>"#
+            )
+        }
+        fn options(res: &[(u32, u32)], bitrate_max: u32) -> String {
+            let res: String = res
+                .iter()
+                .map(|(w, h)| format!("<tt:ResolutionsAvailable><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:ResolutionsAvailable>"))
+                .collect();
+            soap(&format!(
+                "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:H264>{res}<tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>200</tt:Max></tt:GovLengthRange><tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>25</tt:Max></tt:FrameRateRange></tt:H264><tt:Extension><tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>{bitrate_max}</tt:Max></tt:BitrateRange></tt:H264></tt:Extension></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"
+            ))
+        }
+        fn config(token: &str, w: u32, h: u32, fps: u32, kbps: u32, gov: u32) -> String {
+            format!(
+                "<trt:Configurations token=\"{token}\"><tt:Name>{token}</tt:Name><tt:UseCount>1</tt:UseCount><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution><tt:Quality>5</tt:Quality><tt:RateControl><tt:FrameRateLimit>{fps}</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>{kbps}</tt:BitrateLimit></tt:RateControl><tt:H264><tt:GovLength>{gov}</tt:GovLength><tt:H264Profile>Main</tt:H264Profile></tt:H264></trt:Configurations>"
+            )
+        }
+        const PROFILES: [(&str, &str, u32); 3] = [
+            ("Profile_1", "VE_main", 101),
+            ("Profile_2", "VE_sub", 102),
+            ("Profile_3", "VE_sub", 103),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let stub = move |body: String| {
+            log.lock().unwrap().push(body.clone());
+            async move {
+                if body.contains("GetVideoEncoderConfigurationOptions") {
+                    let xml = if body.contains("ConfigurationToken>VE_sub<") {
+                        options(&[(1280, 720), (640, 360)], 4096)
+                    } else if body.contains("ConfigurationToken>VE_main<") {
+                        options(&[(2592, 1520), (1920, 1080)], 16384)
+                    } else {
+                        options(&[(2592, 1520), (1280, 720)], 8192)
+                    };
+                    return (StatusCode::OK, xml).into_response();
+                }
+                if body.contains("GetVideoEncoderConfigurations") {
+                    let xml = soap(&format!(
+                        "<trt:GetVideoEncoderConfigurationsResponse>{}{}</trt:GetVideoEncoderConfigurationsResponse>",
+                        config("VE_main", 2592, 1520, 20, 4096, 40),
+                        config("VE_sub", 1280, 720, 15, 2048, 30),
+                    ));
+                    return (StatusCode::OK, xml).into_response();
+                }
+                if body.contains("GetProfiles") {
+                    let profiles: String = PROFILES
+                        .iter()
+                        .map(|(p, ve, _)| format!("<trt:Profiles token=\"{p}\"><tt:Name>{p}</tt:Name><tt:VideoEncoderConfiguration token=\"{ve}\"><tt:Encoding>H264</tt:Encoding></tt:VideoEncoderConfiguration></trt:Profiles>"))
+                        .collect();
+                    let xml = soap(&format!(
+                        "<trt:GetProfilesResponse>{profiles}</trt:GetProfilesResponse>"
+                    ));
+                    return (StatusCode::OK, xml).into_response();
+                }
+                if let Some((_, _, ch)) = PROFILES
+                    .iter()
+                    .find(|(p, _, _)| body.contains(&format!("ProfileToken>{p}<")))
+                {
+                    let xml = soap(&format!(
+                        "<trt:GetStreamUriResponse><trt:MediaUri><tt:Uri>rtsp://192.168.1.64:554/Streaming/Channels/{ch}</tt:Uri></trt:MediaUri></trt:GetStreamUriResponse>"
+                    ));
+                    return (StatusCode::OK, xml).into_response();
+                }
+                if body.contains("SetVideoEncoderConfiguration") && !reject_set {
+                    let xml = soap("<trt:SetVideoEncoderConfigurationResponse/>");
+                    return (StatusCode::OK, xml).into_response();
+                }
+                (StatusCode::INTERNAL_SERVER_ERROR, "rejected").into_response()
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(stub);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        (addr, seen)
+    }
+
+    /// A camera whose stored recording URL (credentials, implicit port)
+    /// is `VE_sub`'s `Profile_2` stream on the [`serve_encoder_stub`].
+    async fn seed_encoder_camera(store: &Store, id: i64, onvif: SocketAddr) {
+        let cam = nexus_config::CameraConfig {
+            id,
+            name: format!("cam-{id}"),
+            ingest: nexus_config::CameraIngest {
+                url: "rtsp://admin:secret@192.168.1.64/Streaming/Channels/102"
+                    .parse()
+                    .unwrap(),
+                analysis_url: Some(
+                    "rtsp://admin:secret@192.168.1.64/Streaming/Channels/103"
+                        .parse()
+                        .unwrap(),
+                ),
+                enabled: true,
+                max_fps: 0,
+                codec: None,
+            },
+            detector: nexus_config::CameraDetector::default(),
+            behavior: nexus_config::CameraBehavior::default(),
+            onvif: nexus_config::CameraOnvif {
+                endpoint: Some(format!("http://{onvif}/onvif/device_service")),
+                username: Some("admin".into()),
+                password: Some("secret".into()),
+            },
+            talk_down: Default::default(),
+            zones: vec![],
+        };
+        store.upsert_camera(&cam).await.unwrap();
+    }
+
+    async fn encoder_call(
+        app: &axum::Router,
+        token: &str,
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        let mut req = match body {
+            Some(b) => {
+                builder = builder.header("content-type", "application/json");
+                builder.body(Body::from(b.to_string())).unwrap()
+            }
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// SPEC-090 D-6 — the encoder GET says which configuration feeds the
+    /// recording stream (not the analysis substream), lists every profile
+    /// sharing it, and carries no stream URI or credential.
+    #[tokio::test]
+    async fn encoder_get_reports_which_configuration_feeds_recording() {
+        const SECRET: &[u8] = b"encoder-bindings-secret";
+        let (onvif, _seen) = serve_encoder_stub(false).await;
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_encoder_camera(&store, 31, onvif).await;
+        let token = sign_admin_jwt(SECRET);
+        let (status, body) = encoder_call(
+            &app,
+            &token,
+            Method::GET,
+            "/api/v1/admin/cameras/31/encoder",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["bindings"],
+            serde_json::json!([
+                { "configuration_token": "VE_main", "profile_tokens": ["Profile_1"], "used_for_recording": false },
+                { "configuration_token": "VE_sub", "profile_tokens": ["Profile_2", "Profile_3"], "used_for_recording": true },
+            ]),
+            "{v}"
+        );
+        assert_eq!(v["bindings_reason"], serde_json::Value::Null, "{v}");
+        assert_eq!(v["configs"].as_array().map(Vec::len), Some(2), "{v}");
+        // Default (no token) options stay today's generic read.
+        assert_eq!(v["options"]["bitrate_range"]["max"], 8192, "{v}");
+        assert!(
+            !body.contains("rtsp"),
+            "no stream URI leaves the edge: {body}"
+        );
+        assert!(
+            !body.contains("secret"),
+            "no credential leaves the edge: {body}"
+        );
+    }
+
+    /// `?configuration_token=` selects whose options come back; a token
+    /// the camera does not list is a `400`, not a silent fallback.
+    #[tokio::test]
+    async fn encoder_get_returns_options_for_the_selected_configuration() {
+        const SECRET: &[u8] = b"encoder-options-secret";
+        let (onvif, _seen) = serve_encoder_stub(false).await;
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_encoder_camera(&store, 32, onvif).await;
+        let token = sign_admin_jwt(SECRET);
+        let (status, body) = encoder_call(
+            &app,
+            &token,
+            Method::GET,
+            "/api/v1/admin/cameras/32/encoder?configuration_token=VE_sub",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["options"]["bitrate_range"]["max"], 4096, "{v}");
+        assert_eq!(
+            v["options"]["resolutions"],
+            serde_json::json!([[1280, 720], [640, 360]]),
+            "{v}"
+        );
+        let (status, body) = encoder_call(
+            &app,
+            &token,
+            Method::GET,
+            "/api/v1/admin/cameras/32/encoder?configuration_token=VE_nope",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    fn sub_config_json(bitrate: u32) -> serde_json::Value {
+        serde_json::json!({
+            "token": "VE_sub", "name": "VE_sub", "use_count": 1, "encoding": "H264",
+            "width": 1280, "height": 720, "quality": 5.0, "frame_rate_limit": 15,
+            "encoding_interval": 1, "bitrate_limit": bitrate, "gov_length": 30,
+            "profile": "Main"
+        })
+    }
+
+    fn set_bodies(seen: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.contains("SetVideoEncoderConfiguration"))
+            .cloned()
+            .collect()
+    }
+
+    /// The PUT validates against the *selected* configuration before any
+    /// write: an unknown token, or a bitrate `VE_main`'s (and the generic)
+    /// options allow but `VE_sub`'s do not, is a `400` with no SOAP write.
+    #[tokio::test]
+    async fn encoder_put_rejects_unknown_token_and_out_of_range_values_without_writing() {
+        const SECRET: &[u8] = b"encoder-put-validate-secret";
+        let (onvif, seen) = serve_encoder_stub(false).await;
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_encoder_camera(&store, 33, onvif).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut unknown = sub_config_json(1536);
+        unknown["token"] = "VE_nope".into();
+        for config in [unknown, sub_config_json(8000)] {
+            let (status, body) = encoder_call(
+                &app,
+                &token,
+                Method::PUT,
+                "/api/v1/admin/cameras/33/encoder",
+                Some(serde_json::json!({ "config": config, "force_persistence": true })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{config}: {body}");
+        }
+        assert!(
+            set_bodies(&seen).is_empty(),
+            "no write may reach the camera"
+        );
+    }
+
+    /// A valid PUT writes only the selected token, keeps the untouched
+    /// fields, forwards `force_persistence` as sent, and audits success.
+    #[tokio::test]
+    async fn encoder_put_writes_only_the_selected_configuration_with_explicit_persistence() {
+        const SECRET: &[u8] = b"encoder-put-write-secret";
+        let (onvif, seen) = serve_encoder_stub(false).await;
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_encoder_camera(&store, 34, onvif).await;
+        let token = sign_admin_jwt(SECRET);
+        let (status, body) = encoder_call(
+            &app,
+            &token,
+            Method::PUT,
+            "/api/v1/admin/cameras/34/encoder",
+            Some(serde_json::json!({ "config": sub_config_json(1536), "force_persistence": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let sets = set_bodies(&seen);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        let set = &sets[0];
+        assert!(set.contains("token=\"VE_sub\""), "{set}");
+        assert!(!set.contains("VE_main"), "{set}");
+        assert!(
+            set.contains("<tt:BitrateLimit>1536</tt:BitrateLimit>"),
+            "{set}"
+        );
+        assert!(
+            set.contains("<tt:Width>1280</tt:Width><tt:Height>720</tt:Height>"),
+            "{set}"
+        );
+        assert!(
+            set.contains("<tt:FrameRateLimit>15</tt:FrameRateLimit>"),
+            "{set}"
+        );
+        assert!(set.contains("<tt:GovLength>30</tt:GovLength>"), "{set}");
+        assert!(set.contains("<tt:Encoding>H264</tt:Encoding>"), "{set}");
+        assert!(
+            set.contains("<trt:ForcePersistence>true</trt:ForcePersistence>"),
+            "{set}"
+        );
+        let rows = store
+            .list_audit_for_resource("camera", "34", 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.action == "camera.onvif.encoder.set")
+            .expect("expected a camera.onvif.encoder.set audit row");
+        assert!(matches!(
+            row.outcome,
+            nexus_store::audit::AuditOutcome::Success
+        ));
+    }
+
+    /// A camera that rejects the write surfaces as `502` and a Failure
+    /// audit row — never a false success.
+    #[tokio::test]
+    async fn encoder_put_reports_camera_rejection() {
+        const SECRET: &[u8] = b"encoder-put-reject-secret";
+        let (onvif, seen) = serve_encoder_stub(true).await;
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_encoder_camera(&store, 35, onvif).await;
+        let token = sign_admin_jwt(SECRET);
+        let (status, body) = encoder_call(
+            &app,
+            &token,
+            Method::PUT,
+            "/api/v1/admin/cameras/35/encoder",
+            Some(
+                serde_json::json!({ "config": sub_config_json(1536), "force_persistence": false }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(set_bodies(&seen).len(), 1);
+        let rows = store
+            .list_audit_for_resource("camera", "35", 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.action == "camera.onvif.encoder.set")
+            .expect("expected a camera.onvif.encoder.set audit row");
+        assert!(matches!(
+            row.outcome,
+            nexus_store::audit::AuditOutcome::Failure
+        ));
+    }
+
+    /// The encoder surface stays admin-only: an operator's GET and PUT
+    /// are `403` before any camera call.
+    #[tokio::test]
+    async fn encoder_operator_rejected_before_any_camera_call() {
+        const SECRET: &[u8] = b"encoder-operator-secret";
+        let (onvif, seen) = serve_encoder_stub(false).await;
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        seed_encoder_camera(&store, 36, onvif).await;
+        let token = sign_role_jwt(SECRET, "operator");
+        let (status, _) = encoder_call(
+            &app,
+            &token,
+            Method::GET,
+            "/api/v1/admin/cameras/36/encoder?configuration_token=VE_sub",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = encoder_call(
+            &app,
+            &token,
+            Method::PUT,
+            "/api/v1/admin/cameras/36/encoder",
+            Some(serde_json::json!({ "config": sub_config_json(1536), "force_persistence": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(seen.lock().unwrap().is_empty(), "no SOAP call before RBAC");
+    }
+
     /// `/speakers` is operator-readable (talk-down is an operator
     /// action, like PTZ) and returns the stored talk-down capability.
     /// With no ONVIF endpoint the live `GetAudioOutputs` probe is
