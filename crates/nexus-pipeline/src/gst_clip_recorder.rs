@@ -115,7 +115,7 @@ use nexus_store::{AlertClipId, ClipClose, ClipId, NewAlertClip, NewClip, Store};
 use nexus_types::{CameraId, CodecKind};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
-use tokio::sync::{broadcast, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::alert_clip::{
@@ -173,12 +173,15 @@ pub struct GstClipRecorder {
     panic: PlMutex<bool>,
     /// Per-clip GStreamer + pump state. Held under a tokio Mutex
     /// because the close path awaits on the pump shutdown and the
-    /// bus drain.
-    open: Mutex<HashMap<ClipId, OpenState>>,
+    /// bus drain. Shared with the open/close tasks (see [`Writers`]).
+    open: Arc<Mutex<HashMap<ClipId, OpenState>>>,
     /// Per open clip, set by its live pump when a sample of another
     /// stream epoch ended the clip's media (#375/#376). Kept out of
     /// [`Self::open`] because the supervisor reads it on every frame.
-    epoch_ended: PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>,
+    epoch_ended: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>>,
+    /// Every running open/close task holds a receiver; `shutdown` waits
+    /// on `closed()` until none is left (SPEC-088 Z-4).
+    in_flight: watch::Sender<()>,
     /// M2.2: optional bus for publishing `CLIP_CLOSED` so the cold
     /// replicator can pick up new clips event-driven instead of
     /// waiting on its 5-min polling backstop. None in tests that
@@ -374,8 +377,9 @@ impl GstClipRecorder {
             ingesters: Arc::new(PlRwLock::new(ingesters)),
             analysis_ingesters: Arc::new(PlRwLock::new(HashMap::new())),
             panic: PlMutex::new(false),
-            open: Mutex::new(HashMap::new()),
-            epoch_ended: PlRwLock::new(HashMap::new()),
+            open: Arc::new(Mutex::new(HashMap::new())),
+            epoch_ended: Arc::new(PlRwLock::new(HashMap::new())),
+            in_flight: watch::channel(()).0,
             bus: None,
             usb_resolver: None,
             preferred_usb_label: crate::recorder::PreferredUsbLabel::default(),
@@ -710,263 +714,42 @@ impl GstClipRecorder {
     }
 }
 
-#[async_trait]
-impl ClipRecorder for GstClipRecorder {
-    async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
-        let health = self
-            .recording_health
-            .begin(args.camera_id, RecordingKind::Motion);
-        let failure = health.guard("recording could not be opened");
-        if *self.panic.lock() {
-            return Err(RecorderError::Refused);
+/// What starting and finalizing a clip needs, owned so the work runs in a
+/// task that a cancelled `open`/`close` caller cannot drop (SPEC-088 Z-4).
+#[derive(Clone)]
+struct Writers {
+    store: Arc<Store>,
+    clips_dir: PathBuf,
+    bus: Option<Arc<dyn nexus_bus::Bus>>,
+    open: Arc<Mutex<HashMap<ClipId, OpenState>>>,
+    epoch_ended: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>>,
+}
+
+impl GstClipRecorder {
+    fn writers(&self) -> Writers {
+        Writers {
+            store: self.store.clone(),
+            clips_dir: self.clips_dir.clone(),
+            bus: self.bus.clone(),
+            open: self.open.clone(),
+            epoch_ended: self.epoch_ended.clone(),
         }
-        let ingester = match self.ingesters.read().get(&args.camera_id) {
-            Some(i) => i.clone(),
-            None => {
-                warn!(
-                    camera_id = args.camera_id,
-                    "GstClipRecorder: no PreRollIngester for this camera; refusing open. \
-                     The engine's config.changed reconciler should have built one — \
-                     check the engine log for `failed to start pre-roll ingester` warnings."
-                );
-                return Err(RecorderError::Refused);
-            }
-        };
-        let codec = ingester.stream_codec();
-
-        // Resolve USB hot-tier routing once at open(). The choice
-        // is captured into `OpenState` so close() finishes the clip
-        // in the same dir even if the volume detaches mid-recording.
-        // `preferred_usb_label.get()` reads the *current* admin
-        // setting; an in-flight clip ignores subsequent PUTs.
-        let preferred = self.preferred_usb_label.get();
-        let (effective_dir, hot_handle) = crate::recorder::effective_clips_dir(
-            &self.clips_dir,
-            preferred.as_deref(),
-            self.usb_resolver
-                .as_deref()
-                .map(|r| r as &dyn crate::recorder::UsbResolver),
-        );
-
-        let path =
-            crate::recorder::inflight_clip_path(&effective_dir, args.camera_id, args.started_at);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        let (pipeline, appsrc) = Self::build_pipeline(&path, codec)?;
-        // set_state(Playing) returns Async; appsrc starts accepting
-        // pushes immediately. We push the pre-roll snapshot before
-        // even waiting for the state change to complete — the queue
-        // inside appsrc absorbs them.
-        if let Err(e) = pipeline.set_state(gst::State::Playing) {
-            let _ = pipeline.set_state(gst::State::Null);
-            let _ = fs::remove_file(&path).await;
-            return Err(RecorderError::Io(std::io::Error::other(format!(
-                "set Playing: {e}"
-            ))));
-        }
-
-        // Snapshot the ring buffer + subscribe to live BEFORE either
-        // path can race the other. The subscribe happens-before any
-        // sample produced after `subscribe()` returns, so we won't
-        // double-count samples that straddle the snapshot boundary
-        // (the snapshot is a copy of what's *already* buffered, the
-        // broadcast carries everything from this moment forward).
-        // There is a small overlap: a sample currently in the ring
-        // buffer might also arrive on the broadcast a few moments
-        // later. That's fine — we de-dup by PTS in the pump (skip
-        // anything <= last_pushed_pts).
-        let snapshot = ingester.snapshot();
-        let live_rx = ingester.subscribe();
-
-        // Determine the rebase anchor. mp4mux wants PTS to start at
-        // (or near) zero for a sane track timeline. The first sample
-        // is guaranteed to be a keyframe (ring buffer invariant) but
-        // may have no PTS during stream startup; fall back to
-        // Duration::ZERO in that case.
-        let base_pts = snapshot
-            .iter()
-            .find_map(|s| s.pts)
-            .unwrap_or(Duration::ZERO);
-
-        // Push the snapshot synchronously so close()-immediately-after-open()
-        // still produces a file with the pre-roll content. Wrapped
-        // in spawn_blocking because appsrc.push_buffer() with
-        // block=true can stall briefly on filesink/disk pressure
-        // (and we MUST NOT block the tokio worker on a GStreamer
-        // synchronous call).
-        //
-        // Pre-pass: coalesce any consecutive samples sharing a PTS
-        // into one combined sample so the recorder's h264parse sees
-        // a complete AU per push. See `coalesce_same_pts` for why
-        // the InSight cameras need this.
-        let snapshot_tail_pts = snapshot.iter().filter_map(|s| s.pts).next_back();
-        // The clip's stream epoch (#375/#376). A ring snapshot holds exactly
-        // one; when it is empty the pump adopts the first live keyframe's.
-        let clip_epoch = snapshot.first().map(|s| s.epoch);
-        let snapshot_for_blocking: Vec<NalSample> = {
-            let mut pending: Option<NalSample> = None;
-            let mut out: Vec<NalSample> = Vec::with_capacity(snapshot.len());
-            for s in snapshot {
-                if let Some(flushed) = coalesce_same_pts(&mut pending, s, codec) {
-                    out.push(flushed);
-                }
-            }
-            // Drain any tail. If it's a header-only stub (no slice
-            // NAL), drop it — pushing it would just create the
-            // 35-byte "missing picture" pathology we're guarding
-            // against.
-            if let Some(last) = pending.take() {
-                if contains_slice_nal(&last.data, codec) {
-                    out.push(last);
-                } else {
-                    debug!(
-                        camera_id = args.camera_id,
-                        size = last.data.len(),
-                        "dropping snapshot tail: header-only stub (no slice NAL)"
-                    );
-                }
-            }
-            out
-        };
-        // Live pump: forwards every new broadcast sample into appsrc
-        // until close() signals stop.
-        //
-        // SPAWNED BEFORE the pre-roll prepend and the `motion_clips`
-        // INSERT, on purpose. `live_rx` was subscribed at the top of
-        // this function, and tokio's broadcast silently overwrites the
-        // OLDEST buffered sample once its 512-slot ring wraps (~8 s at
-        // 30 fps). The oldest sample is the GOP's IDR, so anything that
-        // keeps this task from polling `live_rx` costs the recording
-        // every keyframe from that point on -- which is exactly what
-        // the serial pre-roll push plus the SQLite INSERT below used to
-        // do: clips played back fine for the pre-roll window and then
-        // decayed into a keyframe-less, undecodable tail. The pump now
-        // drains from t=0 and buffers what it reads until `gate_tx`
-        // hands it the clip id and the pre-roll's PTS cursor.
-        let (gate_tx, gate_rx) = oneshot::channel::<PumpGate>();
-        let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
-        let epoch_ended = Arc::new(AtomicBool::new(false));
-        let pump_handle = tokio::spawn(run_live_pump(
-            args.camera_id,
-            codec,
-            appsrc.clone(),
-            live_rx,
-            // An empty prepend leaves the pump to start the clip on its
-            // first keyframe and rebase there.
-            (!snapshot_for_blocking.is_empty()).then_some(base_pts),
-            gate_rx,
-            pump_stop_rx,
-            clip_epoch,
-            epoch_ended.clone(),
-        ));
-
-        let appsrc_for_blocking = appsrc.clone();
-        let (preroll_count, preroll_last_written_pts_ns) =
-            match tokio::task::spawn_blocking(move || {
-                let mut n = 0usize;
-                let mut last_written: Option<u64> = None;
-                for sample in &snapshot_for_blocking {
-                    let written = push_sample(
-                        &appsrc_for_blocking,
-                        sample,
-                        base_pts,
-                        last_written,
-                        FALLBACK_FRAME_INTERVAL_NS,
-                    )
-                    .map_err(|e| {
-                        RecorderError::Io(std::io::Error::other(format!(
-                            "push pre-roll sample: {e}"
-                        )))
-                    })?;
-                    last_written = Some(written);
-                    n += 1;
-                }
-                Ok::<(usize, Option<u64>), RecorderError>((n, last_written))
-            })
-            .await
-            {
-                Ok(Ok((n, last))) => (n, last),
-                Ok(Err(e)) => {
-                    pump_handle.abort();
-                    let _ = pipeline.set_state(gst::State::Null);
-                    let _ = fs::remove_file(&path).await;
-                    return Err(e);
-                }
-                Err(join_err) => {
-                    pump_handle.abort();
-                    let _ = pipeline.set_state(gst::State::Null);
-                    let _ = fs::remove_file(&path).await;
-                    return Err(RecorderError::Io(std::io::Error::other(format!(
-                        "preroll spawn_blocking: {join_err}"
-                    ))));
-                }
-            };
-
-        let rel = crate::recorder::clip_rel_path(&self.clips_dir, &path);
-        let new = NewClip {
-            camera_id: args.camera_id,
-            started_at: args.started_at,
-            hot_path: rel,
-            codec: codec.base().into(),
-            container: CONTAINER.into(),
-            // M2.2: "local" or "usb-<label>" depending on the hot
-            // tier resolution above. Cold pointer is left null for
-            // the replicator to fill in after the close-time hash.
-            hot_handle: hot_handle.clone(),
-            frame_width: args.frame_width,
-            frame_height: args.frame_height,
-        };
-        let clip_id = match self.store.open_clip(&new).await {
-            Ok(id) => id,
-            Err(e) => {
-                pump_handle.abort();
-                let _ = pipeline.set_state(gst::State::Null);
-                let _ = fs::remove_file(&path).await;
-                return Err(e.into());
-            }
-        };
-
-        // Open the gate. The pump flushes whatever it buffered while
-        // the prepend + INSERT ran, then streams normally.
-        let _ = gate_tx.send(PumpGate {
-            clip_id,
-            last_pushed_pts: snapshot_tail_pts,
-            last_written_pts_ns: preroll_last_written_pts_ns,
-        });
-
-        self.epoch_ended.write().insert(clip_id, epoch_ended);
-        self.open.lock().await.insert(
-            clip_id,
-            OpenState {
-                health,
-                camera_id: args.camera_id,
-                started_at: args.started_at,
-                path,
-                effective_dir,
-                hot_handle,
-                codec,
-                pipeline,
-                appsrc,
-                pump_stop: Some(pump_stop_tx),
-                pump_handle: Some(pump_handle),
-                preroll_last_written_pts_ns,
-            },
-        );
-        info!(
-            camera_id = args.camera_id,
-            clip_id,
-            preroll_samples = preroll_count,
-            "gst recorder opened clip (pre-roll prepended)"
-        );
-        failure.complete();
-        Ok(ClipHandle {
-            clip_id,
-            camera_id: args.camera_id,
-        })
     }
 
+    /// Spawn `fut` as a task `shutdown` waits for.
+    fn spawn_owned<T: Send + 'static>(
+        &self,
+        fut: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        let in_flight = self.in_flight.subscribe();
+        tokio::spawn(async move {
+            let _in_flight = in_flight;
+            fut.await
+        })
+    }
+}
+
+impl Writers {
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
         let epoch_ended = self.epoch_ended.write().remove(&handle.clip_id);
         let mut state = self
@@ -1352,6 +1135,319 @@ impl ClipRecorder for GstClipRecorder {
             discarded: false,
         })
     }
+}
+
+#[async_trait]
+impl ClipRecorder for GstClipRecorder {
+    async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
+        let health = self
+            .recording_health
+            .begin(args.camera_id, RecordingKind::Motion);
+        let failure = health.guard("recording could not be opened");
+        if *self.panic.lock() {
+            return Err(RecorderError::Refused);
+        }
+        let ingester = match self.ingesters.read().get(&args.camera_id) {
+            Some(i) => i.clone(),
+            None => {
+                warn!(
+                    camera_id = args.camera_id,
+                    "GstClipRecorder: no PreRollIngester for this camera; refusing open. \
+                     The engine's config.changed reconciler should have built one — \
+                     check the engine log for `failed to start pre-roll ingester` warnings."
+                );
+                return Err(RecorderError::Refused);
+            }
+        };
+        let codec = ingester.stream_codec();
+
+        // Resolve USB hot-tier routing once at open(). The choice
+        // is captured into `OpenState` so close() finishes the clip
+        // in the same dir even if the volume detaches mid-recording.
+        // `preferred_usb_label.get()` reads the *current* admin
+        // setting; an in-flight clip ignores subsequent PUTs.
+        let preferred = self.preferred_usb_label.get();
+        let (effective_dir, hot_handle) = crate::recorder::effective_clips_dir(
+            &self.clips_dir,
+            preferred.as_deref(),
+            self.usb_resolver
+                .as_deref()
+                .map(|r| r as &dyn crate::recorder::UsbResolver),
+        );
+
+        let path =
+            crate::recorder::inflight_clip_path(&effective_dir, args.camera_id, args.started_at);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        let (pipeline, appsrc) = Self::build_pipeline(&path, codec)?;
+        // From PLAYING on there is a writer, so the rest runs in a task the
+        // caller's cancellation cannot drop: the clip ends up handed over,
+        // finalized, or never started (SPEC-088 Z-4).
+        let writers = self.writers();
+        let closer = writers.clone();
+        let start = async move {
+            // set_state(Playing) returns Async; appsrc starts accepting
+            // pushes immediately. We push the pre-roll snapshot before
+            // even waiting for the state change to complete — the queue
+            // inside appsrc absorbs them.
+            if let Err(e) = pipeline.set_state(gst::State::Playing) {
+                let _ = pipeline.set_state(gst::State::Null);
+                let _ = fs::remove_file(&path).await;
+                return Err(RecorderError::Io(std::io::Error::other(format!(
+                    "set Playing: {e}"
+                ))));
+            }
+
+            // Snapshot the ring buffer + subscribe to live BEFORE either
+            // path can race the other. The subscribe happens-before any
+            // sample produced after `subscribe()` returns, so we won't
+            // double-count samples that straddle the snapshot boundary
+            // (the snapshot is a copy of what's *already* buffered, the
+            // broadcast carries everything from this moment forward).
+            // There is a small overlap: a sample currently in the ring
+            // buffer might also arrive on the broadcast a few moments
+            // later. That's fine — we de-dup by PTS in the pump (skip
+            // anything <= last_pushed_pts).
+            let snapshot = ingester.snapshot();
+            let live_rx = ingester.subscribe();
+
+            // Determine the rebase anchor. mp4mux wants PTS to start at
+            // (or near) zero for a sane track timeline. The first sample
+            // is guaranteed to be a keyframe (ring buffer invariant) but
+            // may have no PTS during stream startup; fall back to
+            // Duration::ZERO in that case.
+            let base_pts = snapshot
+                .iter()
+                .find_map(|s| s.pts)
+                .unwrap_or(Duration::ZERO);
+
+            // Push the snapshot synchronously so close()-immediately-after-open()
+            // still produces a file with the pre-roll content. Wrapped
+            // in spawn_blocking because appsrc.push_buffer() with
+            // block=true can stall briefly on filesink/disk pressure
+            // (and we MUST NOT block the tokio worker on a GStreamer
+            // synchronous call).
+            //
+            // Pre-pass: coalesce any consecutive samples sharing a PTS
+            // into one combined sample so the recorder's h264parse sees
+            // a complete AU per push. See `coalesce_same_pts` for why
+            // the InSight cameras need this.
+            let snapshot_tail_pts = snapshot.iter().filter_map(|s| s.pts).next_back();
+            // The clip's stream epoch (#375/#376). A ring snapshot holds exactly
+            // one; when it is empty the pump adopts the first live keyframe's.
+            let clip_epoch = snapshot.first().map(|s| s.epoch);
+            let snapshot_for_blocking: Vec<NalSample> = {
+                let mut pending: Option<NalSample> = None;
+                let mut out: Vec<NalSample> = Vec::with_capacity(snapshot.len());
+                for s in snapshot {
+                    if let Some(flushed) = coalesce_same_pts(&mut pending, s, codec) {
+                        out.push(flushed);
+                    }
+                }
+                // Drain any tail. If it's a header-only stub (no slice
+                // NAL), drop it — pushing it would just create the
+                // 35-byte "missing picture" pathology we're guarding
+                // against.
+                if let Some(last) = pending.take() {
+                    if contains_slice_nal(&last.data, codec) {
+                        out.push(last);
+                    } else {
+                        debug!(
+                            camera_id = args.camera_id,
+                            size = last.data.len(),
+                            "dropping snapshot tail: header-only stub (no slice NAL)"
+                        );
+                    }
+                }
+                out
+            };
+            // Live pump: forwards every new broadcast sample into appsrc
+            // until close() signals stop.
+            //
+            // SPAWNED BEFORE the pre-roll prepend and the `motion_clips`
+            // INSERT, on purpose. `live_rx` was subscribed at the top of
+            // this function, and tokio's broadcast silently overwrites the
+            // OLDEST buffered sample once its 512-slot ring wraps (~8 s at
+            // 30 fps). The oldest sample is the GOP's IDR, so anything that
+            // keeps this task from polling `live_rx` costs the recording
+            // every keyframe from that point on -- which is exactly what
+            // the serial pre-roll push plus the SQLite INSERT below used to
+            // do: clips played back fine for the pre-roll window and then
+            // decayed into a keyframe-less, undecodable tail. The pump now
+            // drains from t=0 and buffers what it reads until `gate_tx`
+            // hands it the clip id and the pre-roll's PTS cursor.
+            let (gate_tx, gate_rx) = oneshot::channel::<PumpGate>();
+            let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
+            let epoch_ended = Arc::new(AtomicBool::new(false));
+            let pump_handle = tokio::spawn(run_live_pump(
+                args.camera_id,
+                codec,
+                appsrc.clone(),
+                live_rx,
+                // An empty prepend leaves the pump to start the clip on its
+                // first keyframe and rebase there.
+                (!snapshot_for_blocking.is_empty()).then_some(base_pts),
+                gate_rx,
+                pump_stop_rx,
+                clip_epoch,
+                epoch_ended.clone(),
+            ));
+
+            let appsrc_for_blocking = appsrc.clone();
+            let (preroll_count, preroll_last_written_pts_ns) =
+                match tokio::task::spawn_blocking(move || {
+                    let mut n = 0usize;
+                    let mut last_written: Option<u64> = None;
+                    for sample in &snapshot_for_blocking {
+                        let written = push_sample(
+                            &appsrc_for_blocking,
+                            sample,
+                            base_pts,
+                            last_written,
+                            FALLBACK_FRAME_INTERVAL_NS,
+                        )
+                        .map_err(|e| {
+                            RecorderError::Io(std::io::Error::other(format!(
+                                "push pre-roll sample: {e}"
+                            )))
+                        })?;
+                        last_written = Some(written);
+                        n += 1;
+                    }
+                    Ok::<(usize, Option<u64>), RecorderError>((n, last_written))
+                })
+                .await
+                {
+                    Ok(Ok((n, last))) => (n, last),
+                    Ok(Err(e)) => {
+                        pump_handle.abort();
+                        let _ = pipeline.set_state(gst::State::Null);
+                        let _ = fs::remove_file(&path).await;
+                        return Err(e);
+                    }
+                    Err(join_err) => {
+                        pump_handle.abort();
+                        let _ = pipeline.set_state(gst::State::Null);
+                        let _ = fs::remove_file(&path).await;
+                        return Err(RecorderError::Io(std::io::Error::other(format!(
+                            "preroll spawn_blocking: {join_err}"
+                        ))));
+                    }
+                };
+
+            let rel = crate::recorder::clip_rel_path(&writers.clips_dir, &path);
+            let new = NewClip {
+                camera_id: args.camera_id,
+                started_at: args.started_at,
+                hot_path: rel,
+                codec: codec.base().into(),
+                container: CONTAINER.into(),
+                // M2.2: "local" or "usb-<label>" depending on the hot
+                // tier resolution above. Cold pointer is left null for
+                // the replicator to fill in after the close-time hash.
+                hot_handle: hot_handle.clone(),
+                frame_width: args.frame_width,
+                frame_height: args.frame_height,
+            };
+            let clip_id = match writers.store.open_clip(&new).await {
+                Ok(id) => id,
+                Err(e) => {
+                    pump_handle.abort();
+                    let _ = pipeline.set_state(gst::State::Null);
+                    let _ = fs::remove_file(&path).await;
+                    return Err(e.into());
+                }
+            };
+
+            // Open the gate. The pump flushes whatever it buffered while
+            // the prepend + INSERT ran, then streams normally.
+            let _ = gate_tx.send(PumpGate {
+                clip_id,
+                last_pushed_pts: snapshot_tail_pts,
+                last_written_pts_ns: preroll_last_written_pts_ns,
+            });
+
+            writers.epoch_ended.write().insert(clip_id, epoch_ended);
+            writers.open.lock().await.insert(
+                clip_id,
+                OpenState {
+                    health,
+                    camera_id: args.camera_id,
+                    started_at: args.started_at,
+                    path,
+                    effective_dir,
+                    hot_handle,
+                    codec,
+                    pipeline,
+                    appsrc,
+                    pump_stop: Some(pump_stop_tx),
+                    pump_handle: Some(pump_handle),
+                    preroll_last_written_pts_ns,
+                },
+            );
+            info!(
+                camera_id = args.camera_id,
+                clip_id,
+                preroll_samples = preroll_count,
+                "gst recorder opened clip (pre-roll prepended)"
+            );
+            failure.complete();
+            Ok(ClipHandle {
+                clip_id,
+                camera_id: args.camera_id,
+            })
+        };
+        let (started_tx, started_rx) = oneshot::channel();
+        let (taken_tx, taken_rx) = oneshot::channel::<()>();
+        self.spawn_owned(async move {
+            let handle = match start.await {
+                Ok(handle) => handle,
+                Err(e) => {
+                    let _ = started_tx.send(Err(e));
+                    return;
+                }
+            };
+            let _ = started_tx.send(Ok(handle));
+            // The caller was cancelled before it took the clip.
+            if taken_rx.await.is_err() {
+                match closer
+                    .close(
+                        handle,
+                        ClipFinal {
+                            ended_at: Utc::now(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) | Err(RecorderError::UnknownClip(_)) => {}
+                    Err(e) => warn!(
+                        clip_id = handle.clip_id,
+                        camera_id = handle.camera_id,
+                        error = %e,
+                        "gst recorder: failed to finalise a clip whose open was cancelled"
+                    ),
+                }
+            }
+        });
+        let started = started_rx
+            .await
+            .map_err(|_| RecorderError::Io(std::io::Error::other("clip open task failed")))?;
+        let _ = taken_tx.send(());
+        started
+    }
+
+    async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
+        // Spawned so a cancelled caller cannot abandon a clip it already
+        // took out of `open` (SPEC-088 Z-4).
+        let writers = self.writers();
+        self.spawn_owned(async move { writers.close(handle, args).await })
+            .await
+            .map_err(|e| {
+                RecorderError::Io(std::io::Error::other(format!("clip close task: {e}")))
+            })?
+    }
 
     async fn inflight_size_bytes(&self, handle: ClipHandle) -> Option<u64> {
         let path = {
@@ -1369,6 +1465,9 @@ impl ClipRecorder for GstClipRecorder {
     }
 
     async fn shutdown(&self) {
+        // Opens and closes whose caller was cancelled finish first: each
+        // start hands its clip over (it is in `open` below) or finalizes it.
+        self.in_flight.closed().await;
         // Snapshot the (clip_id, camera_id) of every in-flight clip
         // under one lock, then release it so `close()` can re-lock
         // and `remove()` each one. Cloning the keys avoids holding
@@ -3231,6 +3330,68 @@ mod tests {
             .recording_degradations()
             .iter()
             .any(|d| d.kind == RecordingKind::Motion));
+    }
+
+    /// SPEC-088 Z-4: the reconciler's forced stop aborts a supervisor while
+    /// `open` is pending. Once the writer is PLAYING and its row exists the
+    /// clip must still end up finalized, and `shutdown` must wait for that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_cancelled_after_its_writer_started_still_finalizes_the_clip() {
+        gst_init::ensure().unwrap();
+        for name in ["appsrc", "h264parse", "mp4mux", "filesink"] {
+            assert!(
+                gst::ElementFactory::find(name).is_some(),
+                "required GStreamer plugin missing: {name}"
+            );
+        }
+        let (store, _dir, clips_dir) = fixture().await;
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap(),
+        );
+        let started_at = Utc::now();
+        // Holding the open map parks `open` at its last await, after the
+        // pipeline went PLAYING and the row was inserted.
+        let held = rec.open.lock().await;
+        let opener = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.open(OpenClip {
+                    camera_id: 1,
+                    started_at,
+                    frame_width: 512,
+                    frame_height: 288,
+                })
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.get_clip(1).await.unwrap().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "open never inserted its row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        opener.abort();
+        assert!(opener.await.unwrap_err().is_cancelled());
+        drop(held);
+        rec.shutdown().await;
+
+        assert!(rec.open.lock().await.is_empty(), "clip left registered");
+        assert!(
+            store
+                .get_clip(1)
+                .await
+                .unwrap()
+                .is_none_or(|row| row.ended_at.is_some()),
+            "clip row left without an end"
+        );
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "an untracked writer's file was left behind"
+        );
     }
 
     #[tokio::test]
@@ -5642,6 +5803,101 @@ mod epoch_tests {
             [*clean, closed[2].0, closed[3].0, closed[4].0],
             "only clean clips are replicated"
         );
+    }
+
+    /// SPEC-088 Z-4: the reconciler's forced stop aborts a supervisor while
+    /// `close` waits on its writer, after the clip left the open map. The
+    /// close must still finish, and `shutdown` must wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_cancelled_after_it_took_the_clip_still_finalizes_it() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let path = crate::recorder::inflight_clip_path(&clips_dir, 1, started_at);
+        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        let clip_id = store
+            .open_clip(&NewClip {
+                camera_id: 1,
+                started_at,
+                hot_path: crate::recorder::clip_rel_path(&clips_dir, &path),
+                codec: "h264".into(),
+                container: CONTAINER.into(),
+                hot_handle: "local".into(),
+                frame_width: 320,
+                frame_height: 240,
+            })
+            .await
+            .unwrap();
+        let (pipeline, appsrc) = GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut last = None;
+        for s in &encode(15, "main", 60, Duration::ZERO) {
+            last = Some(
+                push_sample(&appsrc, s, Duration::ZERO, last, FALLBACK_FRAME_INTERVAL_NS).unwrap(),
+            );
+        }
+        let writer = pipeline.clone();
+        rec.open.lock().await.insert(
+            clip_id,
+            OpenState {
+                health: rec.recording_health.begin(1, RecordingKind::Motion),
+                camera_id: 1,
+                started_at,
+                path: path.clone(),
+                effective_dir: clips_dir.clone(),
+                hot_handle: "local".into(),
+                codec: CodecKind::H264,
+                pipeline,
+                appsrc,
+                pump_stop: None,
+                // A pump that never stops parks `close` in its 2 s pump
+                // wait, after it took the clip out of the open map.
+                pump_handle: Some(tokio::spawn(std::future::pending::<PumpStats>())),
+                preroll_last_written_pts_ns: last,
+            },
+        );
+        let closer = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.close(
+                    ClipHandle {
+                        clip_id,
+                        camera_id: 1,
+                    },
+                    ClipFinal {
+                        ended_at: started_at + chrono::Duration::seconds(8),
+                    },
+                )
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !rec.open.lock().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "close never took the clip"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        closer.abort();
+        assert!(closer.await.unwrap_err().is_cancelled());
+        rec.shutdown().await;
+
+        assert_eq!(
+            writer.current_state(),
+            gst::State::Null,
+            "writer left running"
+        );
+        let row = store.get_clip(clip_id).await.unwrap().unwrap();
+        assert!(row.ended_at.is_some(), "clip row left without an end");
+        assert!(!path.exists(), "in-flight file never finalized");
     }
 
     /// #375/#376: two epoch changes under 3 s apart leave a short clip
