@@ -711,10 +711,11 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
 /// in a pass, so normal closes are serialized too.
 ///
 /// It sits well above the recorder's own worst-case close — up to 2 s for
-/// the live pump plus `EOS_DRAIN_TIMEOUT` (5 s) for the drain — because an
-/// abort that lands *inside* that close is worse than none: the clip has
-/// already left the recorder's open map, so neither its finalization nor the
-/// recorder-wide shutdown drain will ever reach it.
+/// the live pump plus `EOS_DRAIN_TIMEOUT` (5 s) for the drain — so a normal
+/// close finishes inside it. An abort that lands inside an open or close no
+/// longer abandons the clip: `GstClipRecorder` runs both in tasks it owns and
+/// its shutdown drain waits for them (SPEC-088 Z-4). A supervisor aborted
+/// while merely holding an open clip still leaves it to that drain.
 const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
