@@ -12,7 +12,7 @@
 //! is the frame stats' job.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use nexus_config::ZoneConfig;
@@ -94,7 +94,6 @@ impl Entry {
     }
 }
 
-#[derive(Default)]
 struct Inner {
     /// The last generation handed out, process-wide, so a number names one
     /// supervisor even across a camera's deletion and re-creation.
@@ -102,14 +101,42 @@ struct Inner {
     cameras: HashMap<CameraId, Entry>,
 }
 
-#[derive(Default)]
+/// The highest boot seed: 2^32 starts below 2^53 − 1, the largest integer a
+/// JSON reader holds exactly. Unix-epoch ms × 1000 reaches it in 2255.
+const MAX_BOOT_SEED: u64 = (1 << 53) - (1 << 32);
+
 pub struct ZoneApplicationRegistry {
     inner: Mutex<Inner>,
 }
 
+impl Default for ZoneApplicationRegistry {
+    fn default() -> Self {
+        Self::booted_at(SystemTime::now())
+    }
+}
+
 impl ZoneApplicationRegistry {
+    /// A registry whose generations count up from `boot` in unix-epoch
+    /// milliseconds × 1000, so a reader that saw an earlier process's
+    /// generations sees this one's as newer (that process started at most
+    /// 1000 supervisors per millisecond it ran). Assumes the wall clock does
+    /// not step back across a restart; if it does, the reader takes the lower
+    /// generation for stale and shows applying until it reloads (SPEC-088).
+    fn booted_at(boot: SystemTime) -> Self {
+        let ms = boot.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let seed =
+            u64::try_from(ms.saturating_mul(1000)).map_or(MAX_BOOT_SEED, |s| s.min(MAX_BOOT_SEED));
+        Self {
+            inner: Mutex::new(Inner {
+                last_generation: seed,
+                cameras: HashMap::new(),
+            }),
+        }
+    }
+
     /// Start a new supervisor generation for `camera_id` and return its
-    /// number: higher than every one handed out before in this process.
+    /// number: higher than every one handed out before in this process, and
+    /// in earlier ones ([`Self::booted_at`]).
     /// Nothing is applied until it acknowledges; the camera's last applied
     /// revision is kept for comparison.
     pub fn start(&self, camera_id: CameraId) -> u64 {
@@ -415,13 +442,49 @@ mod tests {
             None,
             "no generation, nothing to report"
         );
-        assert_eq!(r.start(7), 1);
+        r.start(7);
         let s = r.snapshot(7, &a, now).unwrap();
         assert_eq!(
             (s.applied_revision, s.applied_at, s.state),
             (None, None, ZoneApplicationState::Applying),
             "a started task is not an applied one"
         );
+    }
+
+    /// A reader treats a generation lower than one it saw as stale, so a
+    /// restarted process must hand out higher generations than the last one.
+    #[test]
+    fn a_fresh_process_starts_above_every_earlier_boots_generations() {
+        let earlier = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let r = ZoneApplicationRegistry::default();
+        assert!(
+            u128::from(r.start(7)) > earlier * 1000,
+            "a restart's first generation is below the earlier boot's"
+        );
+    }
+
+    #[test]
+    fn generations_rise_within_a_boot_and_past_it_and_stay_json_safe() {
+        let boot = UNIX_EPOCH + Duration::from_millis(1_795_000_000_000);
+        let first = ZoneApplicationRegistry::booted_at(boot);
+        let mut last = 0;
+        // A thousand starts in the boot's first millisecond: a boot one
+        // millisecond later still starts above them.
+        for camera in 0..1000 {
+            let g = first.start(camera % 3);
+            assert!(g > last, "generation {g} after {last}");
+            last = g;
+        }
+        let restarted = ZoneApplicationRegistry::booted_at(boot + Duration::from_millis(1));
+        assert!(restarted.start(7) > last, "the restart went back");
+
+        let far = ZoneApplicationRegistry::booted_at(
+            UNIX_EPOCH + Duration::from_secs(40_000 * 365 * 86_400),
+        );
+        assert!(far.start(7) < 1 << 53, "beyond a JSON-safe integer");
     }
 
     #[test]
