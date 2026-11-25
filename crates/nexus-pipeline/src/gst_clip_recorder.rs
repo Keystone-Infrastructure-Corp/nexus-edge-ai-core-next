@@ -1508,7 +1508,9 @@ impl ClipRecorder for GstClipRecorder {
                     })
                     .collect()
             };
-            if handles.is_empty() && idle {
+            // And after it: a close registered since may have taken the
+            // last clip out of `open` and still own its writer.
+            if handles.is_empty() && idle && self.in_flight.is_closed() {
                 return;
             }
             if !handles.is_empty() {
@@ -5931,6 +5933,70 @@ mod epoch_tests {
         assert_eq!(stalled_writer.current_state(), gst::State::Null);
         assert!(finalized_playable(&store, &clips_dir, healthy.clip_id).await);
         assert!(finalized_playable(&store, &clips_dir, stalled.clip_id).await);
+    }
+
+    /// SPEC-088 Z-4: shutdown reads `idle` before its snapshot. An aborted
+    /// supervisor's close registered after that read can take the last clip
+    /// out of `open` before the snapshot; the snapshot is then empty while
+    /// that close still owns the writer, and shutdown must wait for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_waits_for_a_close_that_took_its_clip_after_the_idle_read() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        // The late close waits at its pump until the test lets it finish.
+        let (finish, pump_gate) = oneshot::channel::<()>();
+        let pump = tokio::spawn(async move {
+            let _ = pump_gate.await;
+            PumpStats::default()
+        });
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, writer) =
+            register_clip(&rec, &store, &clips_dir, 1, started_at, Some(pump)).await;
+
+        // With this poll's coop budget spent, shutdown's map lock yields
+        // without queueing: shutdown stops after reading `idle`, before its
+        // snapshot.
+        let mut shutdown = std::pin::pin!(rec.shutdown());
+        let begun = std::future::poll_fn(|cx| {
+            for _ in 0..1024 {
+                let spend = std::pin::pin!(tokio::task::consume_budget());
+                if std::future::Future::poll(spend, cx).is_pending() {
+                    break;
+                }
+            }
+            std::task::Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx))
+        })
+        .await;
+        assert!(begun.is_pending() && *rec.shutting_down.lock());
+        assert!(
+            rec.in_flight.is_closed() && rec.open.lock().await.contains_key(&clip.clip_id),
+            "shutdown took its snapshot before the late close began"
+        );
+
+        close_then_abort_caller(&rec, clip).await;
+        let returned = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx))
+        })
+        .await
+        .is_ready();
+        let _ = finish.send(());
+        assert!(
+            !returned,
+            "shutdown returned while the late close still owned the writer"
+        );
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("shutdown returns");
+
+        assert_eq!(writer.current_state(), gst::State::Null);
+        assert!(finalized_playable(&store, &clips_dir, clip.clip_id).await);
     }
 
     /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is
