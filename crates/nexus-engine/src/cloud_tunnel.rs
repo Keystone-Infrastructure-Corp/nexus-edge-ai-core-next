@@ -1272,6 +1272,9 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// `talkdown_rules` says this engine plays a rule's talk-down audio
 /// automatically (ADR-095) and reads `HeartbeatAckPayload.talkdown_auto_allowed`;
 /// the cloud sends that field only to cores advertising it.
+/// `camera_config_snapshot_v1` says this engine serves
+/// `GET /admin/cameras/{id}/config-snapshot` (SPEC-088) and maps it to a
+/// camera `settings.read`; both ship in every build, so it is unconditional.
 pub(crate) fn heartbeat_caps(
     hd_transport: Option<nexus_types::HdTransport>,
     talkdown_hw_volume: bool,
@@ -1282,6 +1285,7 @@ pub(crate) fn heartbeat_caps(
         "actor_perm_v1".to_string(),
         "talkdown_stored".to_string(),
         "talkdown_rules".to_string(),
+        "camera_config_snapshot_v1".to_string(),
     ];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
     caps.extend(talkdown_hw_volume.then(|| "talkdown_hw_volume".to_string()));
@@ -2809,7 +2813,8 @@ mod health_tests {
                 "live_view",
                 "actor_perm_v1",
                 "talkdown_stored",
-                "talkdown_rules"
+                "talkdown_rules",
+                "camera_config_snapshot_v1"
             ]
         );
         for t in nexus_types::HdTransport::all() {
@@ -2820,6 +2825,7 @@ mod health_tests {
                     "actor_perm_v1",
                     "talkdown_stored",
                     "talkdown_rules",
+                    "camera_config_snapshot_v1",
                     t.cap_tag()
                 ]
             );
@@ -2837,6 +2843,7 @@ mod health_tests {
                 "actor_perm_v1",
                 "talkdown_stored",
                 "talkdown_rules",
+                "camera_config_snapshot_v1",
                 "talkdown_tts"
             ]
         );
@@ -4701,7 +4708,8 @@ mod heartbeat_ack_tests {
                     "live_view",
                     "actor_perm_v1",
                     "talkdown_stored",
-                    "talkdown_rules"
+                    "talkdown_rules",
+                    "camera_config_snapshot_v1"
                 ],
                 "{t}"
             );
@@ -4723,6 +4731,7 @@ mod heartbeat_ack_tests {
                 "actor_perm_v1",
                 "talkdown_stored",
                 "talkdown_rules",
+                "camera_config_snapshot_v1",
                 "hd_sfu"
             ]
         );
@@ -4743,6 +4752,7 @@ mod heartbeat_ack_tests {
                 "actor_perm_v1",
                 "talkdown_stored",
                 "talkdown_rules",
+                "camera_config_snapshot_v1",
                 "hd_moq",
             ]
         } else {
@@ -4751,6 +4761,7 @@ mod heartbeat_ack_tests {
                 "actor_perm_v1",
                 "talkdown_stored",
                 "talkdown_rules",
+                "camera_config_snapshot_v1",
             ]
         };
         assert_eq!(

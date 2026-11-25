@@ -593,6 +593,12 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
         )
+        // SPEC-088 — the camera's zones bound to their revision, read-only,
+        // behind the same gate as the camera list.
+        .route(
+            "/v1/admin/cameras/{camera_id}/config-snapshot",
+            get(get_camera_config_snapshot),
+        )
         // ADR-091 — IP speakers and each camera's talk-down speaker. Same
         // gate as the camera routes above; see `crate::speakers_admin`.
         .route(
@@ -1332,6 +1338,55 @@ async fn get_auth_info(State(s): State<ApiState>) -> Json<serde_json::Value> {
 
 async fn list_cameras(State(s): State<ApiState>) -> Result<Json<Vec<CameraConfig>>, ApiError> {
     Ok(Json(s.store.list_cameras().await?))
+}
+
+/// SPEC-088 — `GET /v1/admin/cameras/{camera_id}/config-snapshot`. The
+/// revision metadata sits beside `settings`, never inside it. No `parking` or
+/// `parking_revision`: this build reports no parking, and a reader takes
+/// their absence as unsupported, never as a default.
+#[derive(serde::Serialize)]
+struct CameraConfigSnapshot {
+    schema_version: u32,
+    camera_id: CameraId,
+    settings: CameraZoneSettingsView,
+    zones_revision: String,
+}
+
+/// The settings the snapshot binds to a revision, copied field by field: no
+/// stream URL, ONVIF or talk-down field, credential or other camera config.
+#[derive(serde::Serialize)]
+struct CameraZoneSettingsView {
+    zones: Vec<nexus_config::ZoneConfig>,
+}
+
+/// The camera's zones and the revision hashed from them, both taken from the
+/// one stored row this read decodes, so a save racing the read cannot pair
+/// one write's zones with another's revision. A row this build cannot decode
+/// answers a generic error, never the decode error, which can quote the row.
+async fn get_camera_config_snapshot(
+    State(s): State<ApiState>,
+    Path(id): Path<CameraId>,
+) -> Result<Json<CameraConfigSnapshot>, ApiError> {
+    let (cameras, unreadable) = s.store.list_readable_cameras().await?;
+    let Some(camera) = cameras.into_iter().find(|c| c.id == id) else {
+        return Err(if unreadable.contains(&id) {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "camera config unreadable".into(),
+            )
+        } else {
+            ApiError(StatusCode::NOT_FOUND, "camera not found".into())
+        });
+    };
+    let zones_revision = nexus_pipeline::zone_application::zone_revision(&camera.zones);
+    Ok(Json(CameraConfigSnapshot {
+        schema_version: 1,
+        camera_id: id,
+        settings: CameraZoneSettingsView {
+            zones: camera.zones,
+        },
+        zones_revision,
+    }))
 }
 
 /// Body for `POST /v1/admin/cameras/reprobe`. An absent list means
@@ -7554,6 +7609,331 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "POST /api/v1/admin/cameras without bearer must 401, not bypass the admin gate"
         );
+    }
+
+    /// `GET /api/v1/admin/cameras/{id}/config-snapshot`: status and body.
+    async fn get_config_snapshot(
+        app: &axum::Router,
+        id: &str,
+        bearer: Option<&str>,
+        peer: SocketAddr,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/admin/cameras/{id}/config-snapshot"));
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// An admitted snapshot read, parsed.
+    async fn read_config_snapshot(app: &axum::Router, id: &str, token: &str) -> serde_json::Value {
+        let (status, body) = get_config_snapshot(app, id, Some(token), loopback_peer()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// The snapshot's zones, decoded as the console would read them.
+    fn snapshot_zones(snap: &serde_json::Value) -> Vec<nexus_config::ZoneConfig> {
+        serde_json::from_value(snap["settings"]["zones"].clone()).unwrap()
+    }
+
+    fn snapshot_zone(id: &str, x: f32) -> nexus_config::ZoneConfig {
+        nexus_config::ZoneConfig {
+            id: id.into(),
+            name: format!("zone {id}"),
+            polygon: vec![(x, 0.1), (0.9, 0.1), (0.5, 0.9)],
+            kind: nexus_config::ZoneKind::Exclusion,
+            min_bbox_area_px_override: Some(64),
+        }
+    }
+
+    /// Every value any span or event records while installed, at every level.
+    struct CapturedLogs(Arc<std::sync::Mutex<String>>);
+
+    impl CapturedLogs {
+        fn push(&self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let mut logs = self.0.lock().unwrap();
+            logs.push_str(&format!("{}={value:?}\n", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for CapturedLogs {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            attrs.record(&mut |f: &tracing::field::Field, v: &dyn std::fmt::Debug| self.push(f, v));
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            values
+                .record(&mut |f: &tracing::field::Field, v: &dyn std::fmt::Debug| self.push(f, v));
+        }
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut |f: &tracing::field::Field, v: &dyn std::fmt::Debug| self.push(f, v));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// SPEC-088 — the config snapshot is the camera's zones and their
+    /// revision, and nothing else the stored camera holds: no stream URL, no
+    /// ONVIF or talk-down field, no name, no credential, in the body or in
+    /// what the request logs. The legacy list still returns them all
+    /// (BUG-311 stays open); this view does not claim to fix it.
+    #[tokio::test]
+    async fn camera_config_snapshot_is_the_zones_and_never_a_credential() {
+        use nexus_pipeline::zone_application::zone_revision;
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-sentinel-secret";
+        const SENTINELS: [&str; 14] = [
+            "name-sentinel-n0",
+            "main-user-s1",
+            "main-pass-s2",
+            "main-host-s3",
+            "ana-user-s4",
+            "ana-pass-s5",
+            "ana-host-s6",
+            "onvif-host-s7",
+            "onvif-user-s8",
+            "onvif-pass-s9",
+            "talk-codec-s10",
+            "talk-user-s11",
+            "talk-pass-s12",
+            "talk-host-s13",
+        ];
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let mut camera = store.list_cameras().await.unwrap()[0].clone();
+        camera.name = "name-sentinel-n0".into();
+        camera.ingest.url = "rtsp://main-user-s1:main-pass-s2@main-host-s3.test/main"
+            .parse()
+            .unwrap();
+        camera.ingest.analysis_url = Some(
+            "rtsp://ana-user-s4:ana-pass-s5@ana-host-s6.test/sub"
+                .parse()
+                .unwrap(),
+        );
+        camera.onvif.endpoint = Some("http://onvif-host-s7.test/onvif/device_service".into());
+        camera.onvif.username = Some("onvif-user-s8".into());
+        camera.onvif.password = Some("onvif-pass-s9".into());
+        camera.talk_down.speaker_present = true;
+        camera.talk_down.backchannel_codec = Some("talk-codec-s10".into());
+        camera.talk_down.backchannel_url =
+            Some("rtsp://talk-user-s11:talk-pass-s12@talk-host-s13.test/back".into());
+        camera.zones = vec![snapshot_zone("door", 0.1), snapshot_zone("drive", 0.2)];
+        store.upsert_camera(&camera).await.unwrap();
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let (status, legacy) = {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/admin/cameras")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+        assert_eq!(status, StatusCode::OK, "{legacy}");
+        for sentinel in SENTINELS {
+            assert!(
+                legacy.contains(sentinel),
+                "fixture: the legacy list returns the stored {sentinel} (BUG-311)"
+            );
+        }
+
+        let logs = Arc::new(std::sync::Mutex::new(String::new()));
+        let guard = tracing::subscriber::set_default(CapturedLogs(logs.clone()));
+        let (status, body) =
+            get_config_snapshot(&app, &camera.id.to_string(), Some(&token), loopback_peer()).await;
+        drop(guard);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let logs = logs.lock().unwrap().clone();
+        assert!(
+            logs.contains("config-snapshot"),
+            "fixture: the capture saw the request: {logs}"
+        );
+        for sentinel in SENTINELS {
+            assert!(
+                !body.contains(sentinel),
+                "{sentinel} in the snapshot: {body}"
+            );
+            assert!(!logs.contains(sentinel), "{sentinel} in the logs: {logs}");
+        }
+
+        let snap: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let keys = |v: &serde_json::Value| {
+            let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(&snap),
+            ["camera_id", "schema_version", "settings", "zones_revision"],
+            "no parking_revision: this build reports no parking"
+        );
+        assert_eq!(
+            keys(&snap["settings"]),
+            ["zones"],
+            "no parking: unsupported"
+        );
+        assert_eq!(snap["schema_version"], 1);
+        assert_eq!(snap["camera_id"], camera.id);
+        assert_eq!(snapshot_zones(&snap), camera.zones);
+        assert_eq!(snap["zones_revision"], zone_revision(&camera.zones));
+    }
+
+    /// SPEC-088 — one snapshot's zones and revision come from one stored
+    /// object: after each of A → B → A the read answers that write, and
+    /// reads racing a writer flipping A and B never pair one write's zones
+    /// with the other's revision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn camera_config_snapshot_pairs_zones_with_their_revision_under_writes() {
+        use nexus_pipeline::zone_application::zone_revision;
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-pairing-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let mut a = store.list_cameras().await.unwrap()[0].clone();
+        a.zones = vec![snapshot_zone("a", 0.1)];
+        let mut b = a.clone();
+        b.zones = vec![snapshot_zone("b", 0.3), snapshot_zone("c", 0.4)];
+        let (rev_a, rev_b) = (zone_revision(&a.zones), zone_revision(&b.zones));
+        assert_ne!(rev_a, rev_b);
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let id = a.id.to_string();
+
+        for (camera, rev) in [(&a, &rev_a), (&b, &rev_b), (&a, &rev_a)] {
+            store.upsert_camera(camera).await.unwrap();
+            let snap = read_config_snapshot(&app, &id, &token).await;
+            assert_eq!(snapshot_zones(&snap), camera.zones);
+            assert_eq!(snap["zones_revision"], **rev);
+        }
+
+        let writer = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                for i in 0..40 {
+                    store
+                        .upsert_camera(if i % 2 == 0 { &b } else { &a })
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        for _ in 0..40 {
+            let snap = read_config_snapshot(&app, &id, &token).await;
+            let rev = snap["zones_revision"].as_str().unwrap();
+            assert_eq!(rev, zone_revision(&snapshot_zones(&snap)), "{snap}");
+            assert!(rev == rev_a || rev == rev_b, "{snap}");
+        }
+        writer.await.unwrap();
+    }
+
+    /// SPEC-088 — the snapshot sits behind the admin gate the camera list
+    /// does, answers only for the camera it names, and a refusal carries no
+    /// camera config in place of the snapshot.
+    #[tokio::test]
+    async fn camera_config_snapshot_keeps_the_admin_gate_and_its_camera() {
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-gate-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let mut camera = store.list_cameras().await.unwrap()[0].clone();
+        camera.zones = vec![snapshot_zone("gate", 0.1)];
+        store.upsert_camera(&camera).await.unwrap();
+        let id = camera.id.to_string();
+        let stranger = sign_admin_jwt(b"some-other-box-secret");
+        for (bearer, peer) in [
+            (None, remote_peer()),
+            (None, loopback_peer()),
+            (Some(stranger.as_str()), loopback_peer()),
+        ] {
+            let (status, body) = get_config_snapshot(&app, &id, bearer, peer).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert!(!body.contains("gate") && !body.contains("rtsp"), "{body}");
+        }
+
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let other = (camera.id + 1000).to_string();
+        let (status, body) = get_config_snapshot(&app, &other, Some(&token), loopback_peer()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.contains("gate") && !body.contains("rtsp"), "{body}");
+        assert_eq!(
+            read_config_snapshot(&app, &id, &token).await["camera_id"],
+            camera.id
+        );
+    }
+
+    /// SPEC-088 — a row this build cannot decode answers its own read with a
+    /// generic error, not as missing and not with the decode error, which can
+    /// quote the row; every other camera's snapshot still answers.
+    #[tokio::test]
+    async fn camera_config_snapshot_of_an_unreadable_row_is_an_error_not_missing() {
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-unreadable-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let camera = store.list_cameras().await.unwrap()[0].clone();
+        let mut other = camera.clone();
+        other.id += 1;
+        store.upsert_camera(&other).await.unwrap();
+        sqlx::query(
+            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = ?",
+        )
+        .bind(other.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let (status, body) =
+            get_config_snapshot(&app, &other.id.to_string(), Some(&token), loopback_peer()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body, r#"{"error":"camera config unreadable"}"#);
+        assert_eq!(
+            read_config_snapshot(&app, &camera.id.to_string(), &token).await["camera_id"],
+            camera.id
+        );
+    }
+
+    /// SPEC-088 — `camera_config_snapshot_v1` is on the heartbeat, and both
+    /// things it promises exist: the gated route and the cloud's camera
+    /// `settings.read` mapping for it.
+    #[tokio::test]
+    async fn camera_config_snapshot_capability_has_its_route_and_permission() {
+        use nexus_cloud_client::actor_token::{EnvelopeContext, VerifiedActor};
+        assert!(crate::cloud_tunnel::heartbeat_caps(None, false, false)
+            .iter()
+            .any(|c| c == "camera_config_snapshot_v1"));
+        let reader = VerifiedActor {
+            sub: "human".into(),
+            role: "viewer".into(),
+            perm: Some("settings.read".into()),
+            jti: "jti".into(),
+            org_id: "org".into(),
+            actor_org_id: None,
+        };
+        assert!(reader.allows_rpc(
+            EnvelopeContext {
+                method: "GET",
+                path: "/admin/cameras/7/config-snapshot",
+            },
+            None,
+            false
+        ));
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-cap-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let id = store.list_cameras().await.unwrap()[0].id.to_string();
+        let snap = read_config_snapshot(&app, &id, &sign_admin_jwt(ADMIN_SECRET)).await;
+        assert_eq!(snap["schema_version"], 1);
     }
 
     /// SPEC-069 Phase 1 — the decode/analysis telemetry is only useful

@@ -336,7 +336,7 @@ fn camera_rpc_permissions(method: &str, tail: &[&str]) -> &'static [&'static str
         (
             "GET",
             ["stats" | "imaging" | "encoder" | "snapshot" | "network" | "speakers" | "device"
-            | "visual-prompts"],
+            | "visual-prompts" | "config-snapshot"],
         )
         | ("GET", ["ptz", "presets" | "nodes" | "status" | "config-options"])
         | ("GET", ["media", "profiles"])
