@@ -1,6 +1,6 @@
 # AGENTS.md — Guidance for Coding Agents
 
-**Preferred model:** Claude Opus 5 when available, unless the host or operator picks another.
+**Preferred model:** Claude Opus 5 when available; the host's or operator's choice wins.
 
 ## What this repo is
 
@@ -17,12 +17,11 @@ cloud repo's `docs/edge-core/` and `docs/product/`.
 
 ## Setup
 
-Clone `nexus-home` beside this repo (`../nexus-home`), then run
-`../nexus-home/bin/nexus-setup` once.
+Clone `nexus-home` beside this repo; run `../nexus-home/bin/nexus-setup` once.
 
 ## Hard rules
 
-`R1`–`R8` are rules in the cloud repo's `docs/REPO_BOUNDARY.md`.
+`R1`–`R8` refer to the cloud repo's `docs/REPO_BOUNDARY.md`.
 
 1. **License: AGPL-3.0-or-later** ([LICENSE](LICENSE), workspace `Cargo.toml`). New
    top-level deps must be AGPL-compatible: review enforces Apache-2.0, MIT,
@@ -37,27 +36,27 @@ Clone `nexus-home` beside this repo (`../nexus-home`), then run
    `Apache-2.0`, `MIT`, `BSD-3-Clause`, `Apache-2.0 WITH LLVM-exception`, `AGPL-3.0`,
    `GPL-3.0`) and `weights_dataset_license` (e.g. `COCO:CC-BY-4.0`). A dataset tagged
    `research`, `academic`, `non-commercial` or another denylisted token is always an
-   error. A weights file in `--models-dir` that no manifest `path` names fails too.
+   error, as is a weights file in `--models-dir` that no manifest `path` names.
    **No face-recognition model at the edge in v1 (hard product invariant).** Names
    containing (any case) `AdaFace`, `ArcFace`, `InsightFace`, `Buffalo`, `FaceNet`,
-   `SphereFace`, `CosFace` or `MagFace` fail unconditionally. Body
-   and clothing appearance (DINOv2-S default, OSNet-x1.0 opt-in) is the substrate.
+   `SphereFace`, `CosFace` or `MagFace` fail unconditionally. Body and clothing
+   appearance (DINOv2-S default, OSNet-x1.0 opt-in) is the substrate.
 3. **Repo boundary is sacred (R1–R3).** No cloud-side crate here; the cloud never
    depends on this repo. The only cross-repo artifact is the generated
    [v1.rs](crates/nexus-cloud-protocol/src/v1.rs) plus `v1.CHECKSUM` of the cloud's
-   `proto/v1.json`. Only the cloud's `check-wire-parity` checks it: it
-   reads our `main` and fails when the cloud accepts an edge message or bus topic that
-   our mirror or non-test source lacks.
+   `proto/v1.json`. Only the cloud's `check-wire-parity` checks it: it reads our `main`
+   and fails when the cloud accepts an edge message or bus topic our mirror or non-test
+   source lacks.
 4. **Wire version follows the cloud's `v`.** Breaking changes start in the cloud and
-   arrive via `cargo xtask sync-cloud-protocol --core <path>`, run from the cloud repo.
-   Never hand-edit the vendored copy. See the cloud's `docs/WIRE_PROTOCOL.md`.
+   arrive via `cargo xtask sync-cloud-protocol --core <path>`, run from the cloud repo;
+   never hand-edit the vendored copy (see the cloud's `docs/WIRE_PROTOCOL.md`).
 5. **Fail-open locally (R6).** Detection, recording, rules and local admin/UI work
    without the cloud; cloud features degrade to local-only and never block the pipeline.
 6. **No camera credentials over the tunnel (R5b).** RTSP URLs, ONVIF secrets and
    per-camera credentials stay on the edge. A cloud `rpc_call` that creates a camera is
    opaque pass-through to the local admin API.
-7. **Re-ID privacy.** The future `crates/nexus-reid` emits appearance
-   embeddings only, never face embeddings. Sightings go up as `entity_sighting` envelopes
+7. **Re-ID privacy.** The future `crates/nexus-reid` emits appearance embeddings only,
+   never face embeddings. Sightings go up as `entity_sighting` envelopes
    tagged with a per-core opaque `entity_local_id`; the cloud assigns identity, and the
    edge never calls an identity-resolution API. Local SQLite never stores `name`,
    `email`, `phone` or any personal identifier with `entity_local_id`; M6 operator labels
@@ -92,30 +91,30 @@ privileged command against them. Also flag test gates on `cfg(debug_assertions)`
 Follow `systematic-debugging`, `requesting-code-review` and `receiving-code-review`.
 These bind even when no skill loads:
 
-- **No fix without a root cause.** Reproduce first. Instrument each stage boundary once
+- **No fix without a root cause.** Reproduce; instrument each stage boundary once
   (camera → GStreamer → inference → tracker → rules → sinks, or engine → tunnel → cloud)
-  to find where it breaks; write the failing test before the fix. **Three failed fixes
+  to find the break; write the failing test first. **Three failed fixes
   means the design is wrong.** Once root-caused, look for siblings.
 - **Every code change runs `implement-loop`; every review runs `requesting-code-review`.**
   A unit or reviewer the loop dispatches is part of that run and starts no other. The
   fresh reviewer gets the base/head SHAs and requirements, never this session's history.
-  Verify each finding, push back with reasons, clarify every unclear item first. No
+  Verify each finding, push back with reasons, clarify unclear items first; no
   performative agreement.
 
-Context budget: search before opening whole files, read definitions before consumers,
-and don't load large generated files or re-read unchanged ones.
+Context budget: search before opening files, read definitions before consumers, skip
+re-reads and large generated files.
 
 ## Commands
 
-The local admin console is the npm project [ui/](ui/). It uses npm and
-`package-lock.json`, never pnpm (CI runs `npm ci` on Node 22).
+The local admin console is [ui/](ui/): npm and `package-lock.json`, never pnpm (CI:
+`npm ci`, Node 22).
 
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
-  warnings`, `cargo test --workspace`, `cargo xtask check-models`, `cargo xtask
-  check-span-cardinality`, and `cargo test -p nexus-types --features ts`, after which
+  warnings`, `cargo test --workspace`, `cargo xtask check-models`,
+  `check-span-cardinality`, and `cargo test -p nexus-types --features ts`, after which
   `ui/src/api/types/` must show no diff.
-- UI, from `ui/`: `npm ci`, `npm run dev`, `npm test` (Vitest), `npm run lint`, `npm run
-  typecheck`, `npm run build`, `npm run e2e` (Playwright; `npm run e2e:install` once).
+- UI, from `ui/`: `npm ci`, `npm test` (Vitest), `npm run` `dev`, `lint`, `typecheck`,
+  `build`, `e2e` (Playwright; `e2e:install` once).
   E2E serves `ui/dist` from `target/debug/nexus-engine`: first `npm run build` and, from
   the root, `cargo build -p nexus-engine --features test-injection`.
 
@@ -125,7 +124,7 @@ The local admin console is the npm project [ui/](ui/). It uses npm and
 `main` and on PRs labelled `system-libs`.
 
 **Linux-gated code:** macOS clippy misses `#[cfg(target_os = "linux")]` blocks and `nix`
-integer widths. If you touch them, run CI's clippy in a Linux container before pushing.
+integer widths; after touching them, run CI's clippy in a Linux container before pushing.
 
 ## Conventions
 
@@ -143,17 +142,16 @@ integer widths. If you touch them, run CI's clippy in a Linux container before p
   API; never hard-code. See `supervisor_frame_for` in
   [source.rs](crates/nexus-pipeline/src/source.rs) and
   [yolo.rs](crates/nexus-inference/src/yolo.rs).
-- **UI:** TanStack Router in
-  `ui/src/router.tsx`, one page per route in `ui/src/pages/`, typed clients in
-  `ui/src/api/`. Server state uses TanStack Query, never hand-rolled `useEffect` +
+- **UI:** TanStack Router in `ui/src/router.tsx`, one page per route in `ui/src/pages/`,
+  typed clients in `ui/src/api/`. Server state uses TanStack Query, never hand-rolled `useEffect` +
   `fetch`. Forms `react-hook-form` + `zod`, toasts `sonner`, icons `lucide-react`.
   Playwright (`ui/e2e/`) stays at `workers: 1`: admin settings are a global singleton.
 
 ## Workflow
 
 1. **Rebase before committing:** `git fetch && git rebase origin/main`; never a merge
-   `git pull`. `implement-loop` units work from a pinned SHA and never rebase or merge. A
-   PR follow-up or `@claude` run never rebases (see `implement-loop`).
+   `git pull`. `implement-loop` units (pinned SHA), PR follow-ups and `@claude` runs
+   never rebase, and units never merge (see `implement-loop`).
 2. Pick a step from the wedge plan or a milestone doc; cross-repo work gets companion PRs.
 3. One PR per logical change, titled `[<crate>] <verb> <object>`, or
    `[Phase N · Step M] <verb> <object>` for wedge work.
@@ -162,8 +160,8 @@ integer widths. If you touch them, run CI's clippy in a Linux container before p
 
 ## Field notes
 
-Before debugging environment, CI or test trouble, scan `.agents/memory/INDEX.md`. Record
-a new trap there in the same PR.
+Before debugging env, CI or test trouble, scan `.agents/memory/INDEX.md`; record a new
+trap there in the same PR.
 
 ## Terminal output
 
