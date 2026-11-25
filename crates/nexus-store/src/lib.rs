@@ -17,6 +17,7 @@ pub mod fleet;
 pub mod metrics;
 pub mod motion;
 pub mod outbox;
+pub mod recording_delivery;
 pub mod sessions;
 pub mod sinks;
 pub mod speakers;
@@ -33,6 +34,11 @@ pub use motion::{
     NewClip, NewMotionEvent, PerCameraClipStats, StorageBackendRow,
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
+pub use recording_delivery::{
+    CameraDelivery, DeliveryCounters, DeliveryQueue, DeliveryWindow, PartitionTotals,
+    QueuePartition, RecordingDeliverySnapshot, RecordingSource, SourceCounters,
+    ALERT_COLD_RETRY_SECS,
+};
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};
 pub use speakers::SpeakerOutput;
 pub use talkdown::{
@@ -227,6 +233,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0040_talkdown_library",
         include_str!("../migrations/0040_talkdown_library.sql"),
+    ),
+    (
+        "0041_recording_delivery",
+        include_str!("../migrations/0041_recording_delivery.sql"),
     ),
 ];
 

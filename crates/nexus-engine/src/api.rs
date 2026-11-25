@@ -3739,6 +3739,10 @@ struct StorageResponse {
     /// which USB volumes are attached and whether the recorder
     /// will route new clips to one of them.
     usb: UsbSection,
+    /// SPEC-090 — versioned recording generation / upload-queue /
+    /// delivery snapshot (`schema_version` 1). `null` when it could not
+    /// be read, never zero-filled. Payload bytes, not network usage.
+    recording_delivery: Option<nexus_store::RecordingDeliverySnapshot>,
 }
 
 #[derive(serde::Serialize)]
@@ -3946,12 +3950,31 @@ async fn get_storage(State(s): State<ApiState>) -> Result<Json<StorageResponse>,
         preferred_active,
     };
 
+    // The floor decides the before-enrollment partition, so an unreadable
+    // enrollment yields no snapshot rather than a misclassified one.
+    let recording_delivery = match s.store.get_cloud_enrollment().await {
+        Ok(enrollment) => s
+            .store
+            .recording_delivery_stats(
+                chrono::Utc::now(),
+                crate::cold_replicator::upload_floor(enrollment.as_ref()),
+            )
+            .await
+            .inspect_err(|e| tracing::warn!(error = %e, "storage: recording_delivery_stats failed"))
+            .ok(),
+        Err(e) => {
+            tracing::warn!(error = %e, "storage: get_cloud_enrollment failed; no recording_delivery");
+            None
+        }
+    };
+
     Ok(Json(StorageResponse {
         hot,
         cold,
         backends,
         cold_only_count: stats.cold_only_count,
         usb,
+        recording_delivery,
     }))
 }
 
@@ -14289,5 +14312,47 @@ mod tests {
             stopped.elapsed() >= std::time::Duration::from_secs(2),
             "hung up on the idle limit"
         );
+    }
+
+    async fn get_storage_json(app: axum::Router) -> serde_json::Value {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/storage")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 256 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// SPEC-090 — the storage-status read carries the versioned
+    /// `recording_delivery` snapshot, and a failed read leaves it `null`
+    /// instead of zero-filling it; the rest of the response is unchanged.
+    #[tokio::test]
+    async fn storage_response_carries_recording_delivery_snapshot_or_null() {
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        let app = super::router(state);
+
+        let body = get_storage_json(app.clone()).await;
+        let rd = &body["recording_delivery"];
+        assert_eq!(rd["schema_version"], 1, "{body}");
+        assert!(rd["sampled_at"].is_string(), "{body}");
+        assert_eq!(rd["ordinary"]["ready"]["count"], 0, "{body}");
+        assert!(rd["ordinary"]["ready"]["oldest_capture_at"].is_null());
+        assert!(rd["ordinary"]["quarantined"].is_object());
+        assert!(rd["alert"]["quarantined"].is_null(), "unsupported is null");
+        assert_eq!(rd["windows"][0]["window_seconds"], 3600);
+        assert_eq!(rd["windows"][1]["window_seconds"], 86400);
+        assert!(body["hot"].is_object() && body["usb"].is_object());
+
+        sqlx::query("DROP TABLE recording_delivery_baseline")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let body = get_storage_json(app).await;
+        assert!(body["recording_delivery"].is_null(), "{body}");
+        assert!(body["hot"].is_object(), "the rest still answers: {body}");
     }
 }

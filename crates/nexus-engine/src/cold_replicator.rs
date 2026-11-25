@@ -37,7 +37,7 @@ use nexus_cloud_client::{
 use nexus_cloud_protocol::v1::Envelope;
 use nexus_storage::{BackendError, HealthStatus, Registry};
 use nexus_store::cloud::CloudEnrollment;
-use nexus_store::{AlertClipColdMark, AlertClipRow, ClipColdMark, ClipRow, Store};
+use nexus_store::{AlertClipColdMark, AlertClipRow, ClipColdMark, ClipRow, RecordingSource, Store};
 use nexus_types::AlertEvent;
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -81,8 +81,9 @@ pub const ALERT_COLD_BATCH: i64 = 8;
 /// newer than `now - ALERT_COLD_RETRY` is held out of the pending set,
 /// so a persistently-unreachable backend is retried at ~1/min rather
 /// than every tick. The evictor's grace window is the ultimate
-/// backstop that reclaims a stuck alert clip from the hot tier.
-pub const ALERT_COLD_RETRY: Duration = Duration::from_secs(60);
+/// backstop that reclaims a stuck alert clip from the hot tier. Owned by
+/// the store so the SPEC-090 backoff partition uses the same value.
+pub const ALERT_COLD_RETRY: Duration = Duration::from_secs(nexus_store::ALERT_COLD_RETRY_SECS);
 
 /// #759 — max clips per table re-announced per polling backstop.
 pub const ANNOUNCE_BATCH: i64 = 32;
@@ -615,9 +616,22 @@ async fn tick(
 /// Phase 2 · Step 2.9 — the earliest `started_at` the current
 /// enrollment sends to the cloud: the `--keep-history` cutoff, else
 /// `enrolled_at`. `None` (not enrolled) means no floor. Applied to the
-/// upload drain and to re-announces alike.
-fn upload_floor(enrollment: Option<&CloudEnrollment>) -> Option<chrono::DateTime<Utc>> {
-    enrollment.map(|e| e.attach_replay_after.unwrap_or(e.enrolled_at))
+/// upload drain, to re-announces and to the SPEC-090 delivery snapshot.
+pub(crate) fn upload_floor(enrollment: Option<&CloudEnrollment>) -> Option<chrono::DateTime<Utc>> {
+    enrollment.map(CloudEnrollment::upload_floor)
+}
+
+/// SPEC-090 — count a transfer as it starts, so attempted bytes include
+/// retries and transfers that never finish. Accounting never blocks an
+/// upload: a failed write is only logged.
+async fn record_attempt(store: &Store, source: RecordingSource, id: i64, bytes: usize) {
+    let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+    if let Err(e) = store
+        .record_upload_attempt(source, id, Utc::now(), bytes)
+        .await
+    {
+        warn!(id, ?source, error = %e, "cold replicator: record_upload_attempt failed");
+    }
 }
 
 /// Phase 2 · Step 2.9 — `attached_history: true` iff (a) the operator
@@ -1003,6 +1017,7 @@ async fn upload_alert_clip_one(
             // No throttle: alert clips bypass it like the urgent lane
             // (small evidence), and sharing the bucket would clamp a big
             // motion upload's accumulated credit and stall it.
+            record_attempt(store, RecordingSource::Alert, clip.id, bytes.len()).await;
             let receipt = backend
                 .put(&cold_path, &bytes, sha256)
                 .await
@@ -1149,6 +1164,7 @@ async fn upload_one(
         );
     }
 
+    record_attempt(store, RecordingSource::Ordinary, clip.id, bytes.len()).await;
     let receipt = backend
         .put(&cold_path, &bytes, sha256)
         .await
@@ -2548,5 +2564,123 @@ mod tests {
             .await
             .expect("uploader must stop on shutdown")
             .unwrap();
+    }
+
+    /// One motion tick against `backend`, outside the task loop.
+    async fn run_tick(store: &Arc<Store>, clips_dir: &std::path::Path, backend: &Arc<MockBackend>) {
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = ColdReplicatorConfig {
+            clips_dir: clips_dir.to_path_buf(),
+            kick: None,
+            outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
+        };
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(8));
+        let mut healthy = true;
+        tick(
+            &cfg,
+            store,
+            &bus,
+            &registry,
+            &TokenBucket::new(0),
+            &mut healthy,
+        )
+        .await;
+    }
+
+    /// Core counters of the 1 h window just after the real clock.
+    async fn hour_counters(store: &Store) -> nexus_store::SourceCounters {
+        let snap = store
+            .recording_delivery_stats(Utc::now() + ChronoDuration::minutes(2), None)
+            .await
+            .unwrap();
+        snap.windows[0].core
+    }
+
+    /// SPEC-090 — a failed transfer counts its bytes and a failure; the
+    /// retry counts its bytes again as a retry, and delivery counts once.
+    #[tokio::test]
+    async fn recording_delivery_counts_attempts_failures_and_one_delivery() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        backend.set_fail(true);
+        run_tick(&store, &clips_dir, &backend).await;
+
+        let c = hour_counters(&store).await.ordinary;
+        assert_eq!(
+            (c.attempted_bytes, c.failure_count, c.retry_count),
+            (10, 1, 0)
+        );
+        assert_eq!(c.delivered_bytes, 0);
+        assert_eq!(c.generated_bytes, 10, "finalization was counted at close");
+
+        backend.set_fail(false);
+        sqlx::query("UPDATE motion_clips SET cold_next_attempt_at = NULL WHERE id = ?")
+            .bind(clip_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        run_tick(&store, &clips_dir, &backend).await;
+        run_tick(&store, &clips_dir, &backend).await;
+
+        let c = hour_counters(&store).await;
+        assert_eq!(backend.put_count(), 2);
+        assert_eq!(
+            c.ordinary.attempted_bytes, 20,
+            "the retry's bytes count too"
+        );
+        assert_eq!(c.ordinary.retry_count, 1);
+        assert_eq!(c.ordinary.failure_count, 1);
+        assert_eq!(c.ordinary.delivered_bytes, 10, "delivered once");
+        assert_eq!(c.alert, nexus_store::DeliveryCounters::default());
+    }
+
+    /// A missing hot file is a failed attempt with no transfer: a failure,
+    /// no attempted bytes, and the clip moves to backoff.
+    #[tokio::test]
+    async fn recording_delivery_missing_hot_file_counts_failure_not_transfer() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        tokio::fs::remove_file(clips_dir.join("1/clip_0001.mp4"))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        run_tick(&store, &clips_dir, &backend).await;
+
+        assert_eq!(backend.put_count(), 0);
+        let c = hour_counters(&store).await.ordinary;
+        assert_eq!((c.failure_count, c.attempted_bytes), (1, 0));
+        let parts = store
+            .upload_queue_partitions(nexus_store::RecordingSource::Ordinary, Utc::now(), None)
+            .await
+            .unwrap();
+        assert_eq!(parts, vec![(clip_id, nexus_store::QueuePartition::Backoff)]);
+    }
+
+    /// The alert uploader counts its own transfer and delivery, apart
+    /// from the ordinary queue.
+    #[tokio::test]
+    async fn recording_delivery_counts_alert_upload_separately() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+
+        alert_upload_pass(&cfg, &store, &registry).await;
+
+        let c = hour_counters(&store).await;
+        assert_eq!(c.alert.attempted_bytes, 11);
+        assert_eq!(c.alert.delivered_bytes, 11);
+        assert_eq!(c.alert.generated_bytes, 11);
+        assert_eq!(c.ordinary.attempted_bytes, 0, "no motion tick ran");
     }
 }

@@ -35,6 +35,7 @@ use nexus_types::{BBox, CameraId, TrackId};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+use crate::recording_delivery::{add_to_bucket, DeliveryCounters, RecordingSource, MOTION_GATES};
 use crate::{Store, StoreError};
 
 // ---------------------------------------------------------------------------
@@ -435,11 +436,15 @@ impl Store {
     /// the final clip bytes; the cold replicator gates upload on
     /// this being non-NULL.
     pub async fn close_clip(&self, clip_id: ClipId, close: &ClipClose) -> Result<(), StoreError> {
-        Self::close_clip_on(&self.pool, clip_id, close).await
+        let mut tx = self.pool.begin().await?;
+        Self::close_clip_on(&mut *tx, clip_id, close).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
-    async fn close_clip_on<'e>(
-        exec: impl sqlx::SqliteExecutor<'e>,
+    /// Close stamp plus SPEC-090 generation accounting, inside the caller's transaction.
+    async fn close_clip_on(
+        conn: &mut sqlx::SqliteConnection,
         clip_id: ClipId,
         close: &ClipClose,
     ) -> Result<(), StoreError> {
@@ -461,7 +466,7 @@ impl Store {
                 .bind(hot_path)
                 .bind(sha)
                 .bind(clip_id)
-                .execute(exec)
+                .execute(&mut *conn)
                 .await?
             }
             (Some(hot_path), None) => {
@@ -475,7 +480,7 @@ impl Store {
                 .bind(close.size_bytes)
                 .bind(hot_path)
                 .bind(clip_id)
-                .execute(exec)
+                .execute(&mut *conn)
                 .await?
             }
             (None, Some(sha)) => {
@@ -489,7 +494,7 @@ impl Store {
                 .bind(close.size_bytes)
                 .bind(sha)
                 .bind(clip_id)
-                .execute(exec)
+                .execute(&mut *conn)
                 .await?
             }
             (None, None) => {
@@ -502,12 +507,32 @@ impl Store {
                 .bind(close.duration_ms)
                 .bind(close.size_bytes)
                 .bind(clip_id)
-                .execute(exec)
+                .execute(&mut *conn)
                 .await?
             }
         };
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
+        }
+        // SPEC-090 — count generation once, at the first finalization.
+        let counted = sqlx::query(
+            "UPDATE motion_clips SET acct_generated = 1
+              WHERE id = ? AND acct_generated = 0
+              RETURNING camera_id, size_bytes, duration_ms",
+        )
+        .bind(clip_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(r) = counted {
+            let generated = DeliveryCounters::generated(r.get(1), r.get(2));
+            add_to_bucket(
+                conn,
+                r.get(0),
+                RecordingSource::Ordinary,
+                close.ended_at,
+                &generated,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -628,14 +653,36 @@ impl Store {
     /// soft candidate before falling back to a hard one
     /// (cf. [`Self::find_soft_evict_candidate`] /
     /// [`Self::find_hard_evict_candidate`]).
+    ///
+    /// SPEC-090 — every evictor deletes through here, so a clip deleted
+    /// while still in the upload queue (finalized, undelivered, not before
+    /// the enrollment floor) is counted as evicted before upload in the
+    /// same transaction.
     pub async fn cascade_delete_clip_metadata(&self, clip_id: ClipId) -> Result<(), StoreError> {
-        let res = sqlx::query("DELETE FROM motion_clips WHERE id = ?")
-            .bind(clip_id)
-            .execute(&self.pool)
+        let floor = self.eviction_floor().await;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(&format!(
+            "DELETE FROM motion_clips WHERE id = ?1
+             RETURNING camera_id, size_bytes, ({} AND {}) AS lost",
+            MOTION_GATES.queue, MOTION_GATES.after_floor
+        ))
+        .bind(clip_id)
+        .bind(floor)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("motion_clip id={clip_id}")))?;
+        if row.get::<bool, _>(2) {
+            let evicted = DeliveryCounters::evicted(row.get(1));
+            add_to_bucket(
+                &mut tx,
+                row.get(0),
+                RecordingSource::Ordinary,
+                Utc::now(),
+                &evicted,
+            )
             .await?;
-        if res.rows_affected() == 0 {
-            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -958,27 +1005,32 @@ impl Store {
         limit: i64,
         floor: Option<chrono::DateTime<Utc>>,
     ) -> Result<Vec<ClipRow>, StoreError> {
-        let now = Utc::now().to_rfc3339();
-        // A NULL bind disables the floor predicate; otherwise compare
+        self.clips_pending_cold_upload_at(limit, floor, Utc::now())
+            .await
+    }
+
+    /// [`Self::clips_pending_cold_upload`] with an explicit backoff clock.
+    /// The WHERE is built from the same gates as the SPEC-090 queue
+    /// partitions ([`Self::upload_queue_partitions`]), so their `ready`
+    /// partition is exactly this selection at the same `now` and `floor`.
+    pub async fn clips_pending_cold_upload_at(
+        &self,
+        limit: i64,
+        floor: Option<chrono::DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ClipRow>, StoreError> {
+        // A NULL floor disables the floor gate; otherwise compare
         // against the RFC3339 rendering that matches how `started_at`
         // is stored, so string ordering equals chronological ordering.
-        let floor_str = floor.map(|f| f.to_rfc3339());
         let rows = sqlx::query(&format!(
             "{CLIP_SELECT_COLUMNS_BASE}
-              WHERE cold_handle IS NULL
-                AND ended_at IS NOT NULL
-                AND sha256 IS NOT NULL
-                AND hot_handle IS NOT NULL
-                AND hot_path IS NOT NULL
-                AND cold_quarantined = 0
-                AND (cold_next_attempt_at IS NULL OR cold_next_attempt_at <= ?)
-                AND (? IS NULL OR started_at >= ?)
+              WHERE {}
               ORDER BY priority DESC, ended_at ASC
-              LIMIT ?"
+              LIMIT ?3",
+            MOTION_GATES.ready_where()
         ))
-        .bind(now)
-        .bind(&floor_str)
-        .bind(&floor_str)
+        .bind(now.to_rfc3339())
+        .bind(floor.map(|f| f.to_rfc3339()))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -1126,12 +1178,15 @@ impl Store {
     /// can never see an intermediate inconsistent state.
     ///
     /// Idempotent for re-runs against the same `(clip_id, mark)` —
-    /// last write wins.
+    /// last write wins. SPEC-090 — delivery is counted once, at the
+    /// first mark, in the same transaction; a re-mark or an overwritten
+    /// receipt changes the pointer only.
     pub async fn mark_cold_replicated(
         &self,
         clip_id: ClipId,
         mark: &ClipColdMark,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE motion_clips
                 SET cold_handle = ?, cold_path = ?, cold_uploaded_at = ?
@@ -1141,11 +1196,34 @@ impl Store {
         .bind(&mark.cold_path)
         .bind(mark.cold_uploaded_at.to_rfc3339())
         .bind(clip_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
         }
+        let counted = sqlx::query(
+            "UPDATE motion_clips SET acct_delivered = 1
+              WHERE id = ? AND acct_delivered = 0
+              RETURNING camera_id, size_bytes",
+        )
+        .bind(clip_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(r) = counted {
+            let delivered = DeliveryCounters {
+                delivered_bytes: r.get::<i64, _>(1).max(0),
+                ..DeliveryCounters::default()
+            };
+            add_to_bucket(
+                &mut tx,
+                r.get(0),
+                RecordingSource::Ordinary,
+                mark.cold_uploaded_at,
+                &delivered,
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1297,7 +1375,8 @@ impl Store {
     /// and the attempt ceiling) and passes the derived
     /// `next_attempt_at` / `quarantined` values; the store just
     /// persists them atomically so a single UPDATE never leaves the
-    /// row half-written.
+    /// row half-written. SPEC-090 — the failure is counted in the same
+    /// transaction.
     pub async fn record_cold_upload_failure(
         &self,
         clip_id: ClipId,
@@ -1306,25 +1385,31 @@ impl Store {
         next_attempt_at: Option<DateTime<Utc>>,
         quarantined: bool,
     ) -> Result<(), StoreError> {
-        let res = sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let camera_id: CameraId = sqlx::query_scalar(
             "UPDATE motion_clips
                 SET cold_attempts = cold_attempts + 1,
                     cold_last_attempt_at = ?,
                     cold_last_error = ?,
                     cold_next_attempt_at = ?,
                     cold_quarantined = ?
-              WHERE id = ?",
+              WHERE id = ?
+              RETURNING camera_id",
         )
         .bind(now.to_rfc3339())
         .bind(error)
         .bind(next_attempt_at.map(|t| t.to_rfc3339()))
         .bind(quarantined as i64)
         .bind(clip_id)
-        .execute(&self.pool)
-        .await?;
-        if res.rows_affected() == 0 {
-            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
-        }
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("motion_clip id={clip_id}")))?;
+        let failed = DeliveryCounters {
+            failure_count: 1,
+            ..DeliveryCounters::default()
+        };
+        add_to_bucket(&mut tx, camera_id, RecordingSource::Ordinary, now, &failed).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1894,7 +1979,7 @@ fn motion_event_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<MotionEvent
     })
 }
 
-fn parse_ts(s: &str) -> Result<DateTime<Utc>, StoreError> {
+pub(crate) fn parse_ts(s: &str) -> Result<DateTime<Utc>, StoreError> {
     // RFC3339 covers everything we explicitly write
     // (`Utc::now().to_rfc3339()`), but SQLite's `CURRENT_TIMESTAMP`
     // default emits `YYYY-MM-DD HH:MM:SS` (no `T`, no zone). The

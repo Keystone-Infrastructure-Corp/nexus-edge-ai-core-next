@@ -20,6 +20,7 @@ use sqlx::Row;
 
 use nexus_types::CameraId;
 
+use crate::recording_delivery::{add_to_bucket, DeliveryCounters, RecordingSource, ALERT_GATES};
 use crate::{Store, StoreError};
 
 /// Primary key of an `alert_clips` row.
@@ -194,6 +195,8 @@ impl Store {
     /// is `None` when hashing the finalized MP4 failed — the clip still
     /// serves local sinks, but the cold replicator skips NULL-sha256
     /// rows (the cloud `clip_replicated` envelope requires `sha256_hex`).
+    /// SPEC-090 — generation is counted in the same transaction; the
+    /// one-way `building -> ready` transition makes it count once.
     pub async fn mark_alert_clip_ready(
         &self,
         id: AlertClipId,
@@ -201,23 +204,27 @@ impl Store {
         size_bytes: i64,
         sha256: Option<&str>,
     ) -> Result<(), StoreError> {
-        let res = sqlx::query(
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let camera_id: CameraId = sqlx::query_scalar(
             "UPDATE alert_clips
                 SET state = 'ready', duration_ms = ?, size_bytes = ?, sha256 = ?, ready_at = ?
-              WHERE id = ? AND state = 'building'",
+              WHERE id = ? AND state = 'building'
+              RETURNING camera_id",
         )
         .bind(duration_ms)
         .bind(size_bytes)
         .bind(sha256)
-        .bind(Utc::now().to_rfc3339())
+        .bind(now.to_rfc3339())
         .bind(id)
-        .execute(&self.pool)
-        .await?;
-        if res.rows_affected() == 0 {
-            return Err(StoreError::NotFound(format!(
-                "alert_clip id={id} not in 'building' state"
-            )));
-        }
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!("alert_clip id={id} not in 'building' state"))
+        })?;
+        let generated = DeliveryCounters::generated(size_bytes, duration_ms);
+        add_to_bucket(&mut tx, camera_id, RecordingSource::Alert, now, &generated).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -247,23 +254,48 @@ impl Store {
     /// Mark a `ready` alert clip `evicted` after its hot file has been
     /// reclaimed. Keeps the row (audit trail: this alert HAD a clip)
     /// but flips state so the dispatcher never re-attaches it.
+    ///
+    /// SPEC-090 — every alert evictor (the delivered/grace sweep and the
+    /// missing-file scan) ends here, so an undelivered clip at or after
+    /// the enrollment floor is counted as evicted before upload, once.
     pub async fn mark_alert_clip_evicted(&self, id: AlertClipId) -> Result<(), StoreError> {
-        sqlx::query("UPDATE alert_clips SET state = 'evicted' WHERE id = ? AND state = 'ready'")
-            .bind(id)
-            .execute(&self.pool)
+        let floor = self.eviction_floor().await;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(&format!(
+            "UPDATE alert_clips SET state = 'evicted' WHERE id = ?1 AND state = 'ready'
+             RETURNING camera_id, size_bytes, (cold_uploaded_at IS NULL AND {}) AS lost",
+            ALERT_GATES.after_floor
+        ))
+        .bind(id)
+        .bind(floor)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(r) = row.filter(|r| r.get::<bool, _>(2)) {
+            let evicted = DeliveryCounters::evicted(r.get(1));
+            add_to_bucket(
+                &mut tx,
+                r.get(0),
+                RecordingSource::Alert,
+                Utc::now(),
+                &evicted,
+            )
             .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
     /// Stamp the cold pointer after a successful cold-replication PUT
     /// (M-Alert-Clip cloud delivery). Records where the clip landed so
     /// the P6 evictor can reclaim the hot file. Mirrors
-    /// [`Store::mark_cold_replicated`] for motion clips.
+    /// [`Store::mark_cold_replicated`] for motion clips, including its
+    /// SPEC-090 count-once delivery accounting.
     pub async fn mark_alert_clip_cold_replicated(
         &self,
         id: AlertClipId,
         mark: &AlertClipColdMark,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE alert_clips
                 SET cold_handle = ?, cold_path = ?, cold_uploaded_at = ?
@@ -273,11 +305,34 @@ impl Store {
         .bind(&mark.cold_path)
         .bind(mark.cold_uploaded_at.to_rfc3339())
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("alert_clip id={id}")));
         }
+        let counted = sqlx::query(
+            "UPDATE alert_clips SET acct_delivered = 1
+              WHERE id = ? AND acct_delivered = 0
+              RETURNING camera_id, size_bytes",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(r) = counted {
+            let delivered = DeliveryCounters {
+                delivered_bytes: r.get::<i64, _>(1).max(0),
+                ..DeliveryCounters::default()
+            };
+            add_to_bucket(
+                &mut tx,
+                r.get(0),
+                RecordingSource::Alert,
+                mark.cold_uploaded_at,
+                &delivered,
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -383,24 +438,35 @@ impl Store {
     /// every replicator tick. Unlike motion clips there is no
     /// quarantine flag: the evictor's grace window is the ultimate
     /// backstop that removes a stuck alert clip from the hot tier.
+    /// SPEC-090 — the failure is counted in the same transaction.
     pub async fn record_alert_clip_cold_failure(
         &self,
         id: AlertClipId,
         now: DateTime<Utc>,
         error: &str,
     ) -> Result<(), StoreError> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let camera_id: Option<CameraId> = sqlx::query_scalar(
             "UPDATE alert_clips
                 SET cold_attempts = cold_attempts + 1,
                     cold_last_attempt_at = ?,
                     cold_last_error = ?
-              WHERE id = ?",
+              WHERE id = ?
+              RETURNING camera_id",
         )
         .bind(now.to_rfc3339())
         .bind(error)
         .bind(id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        if let Some(camera_id) = camera_id {
+            let failed = DeliveryCounters {
+                failure_count: 1,
+                ..DeliveryCounters::default()
+            };
+            add_to_bucket(&mut tx, camera_id, RecordingSource::Alert, now, &failed).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -417,20 +483,16 @@ impl Store {
         floor: Option<DateTime<Utc>>,
         retry_cutoff: DateTime<Utc>,
     ) -> Result<Vec<AlertClipRow>, StoreError> {
-        let floor_str = floor.map(|f| f.to_rfc3339());
+        // Built from the same gates as the SPEC-090 alert queue partitions.
         let rows = sqlx::query(&format!(
             "SELECT {ALERT_CLIP_COLUMNS} FROM alert_clips
-              WHERE state = 'ready'
-                AND cold_uploaded_at IS NULL
-                AND sha256 IS NOT NULL
-                AND (cold_last_attempt_at IS NULL OR cold_last_attempt_at <= ?)
-                AND (? IS NULL OR started_at >= ?)
+              WHERE {}
               ORDER BY ready_at ASC
-              LIMIT ?"
+              LIMIT ?3",
+            ALERT_GATES.ready_where()
         ))
         .bind(retry_cutoff.to_rfc3339())
-        .bind(&floor_str)
-        .bind(&floor_str)
+        .bind(floor.map(|f| f.to_rfc3339()))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

@@ -564,6 +564,53 @@ pub(crate) mod tests {
         assert!(store.get_clip(recent_id).await.unwrap().is_some());
     }
 
+    /// SPEC-090 — retention deleting a finalized, undelivered clip is an
+    /// explicit eviction-before-upload loss; deleting a still-open one is
+    /// not (it was never generated).
+    #[tokio::test]
+    async fn recording_delivery_retention_counts_eviction_before_upload() {
+        let (store, _dir, clips_dir) = fixture().await;
+        let now = Utc::now();
+        let started = now - chrono::Duration::days(60);
+        let (closed, _) = seed_clip(&store, &clips_dir, 1, started, "cam1/a.mp4").await;
+        store
+            .close_clip(
+                closed,
+                &nexus_store::ClipClose {
+                    ended_at: started + chrono::Duration::seconds(30),
+                    duration_ms: 30_000,
+                    size_bytes: 12,
+                    hot_path: None,
+                    sha256: Some("a".repeat(64)),
+                },
+            )
+            .await
+            .unwrap();
+        seed_clip(&store, &clips_dir, 1, started, "cam1/open.mp4").await;
+
+        let res = sweep_once(
+            &store,
+            &clips_dir,
+            now - chrono::Duration::days(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.evicted, 2);
+        let snap = store
+            .recording_delivery_stats(Utc::now() + chrono::Duration::minutes(2), None)
+            .await
+            .unwrap();
+        let lost = snap.windows[0].core.ordinary;
+        assert_eq!(
+            (
+                lost.evicted_before_upload_bytes,
+                lost.evicted_before_upload_count
+            ),
+            (12, 1)
+        );
+    }
+
     /// The grace window must not become a way to never collect
     /// anything: a young orphan is spared, and the SAME file is
     /// collected once its mtime ages past the window.
