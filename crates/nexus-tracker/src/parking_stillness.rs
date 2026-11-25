@@ -522,6 +522,82 @@ mod tests {
         }
     }
 
+    /// Frame 512x288 analysis pixels, 100x100 px box: the frozen diagonal is
+    /// in pixels, so no per-axis frame normalization can skew a direction.
+    const BOX_DIAGONAL_PX: f32 = 141.421_36;
+
+    /// Replay a box moving at `(vx, vy)` px/s from `(200, 100)` for 8 s at
+    /// `fps`, with the trajectory rotated by `deg` and every length scaled.
+    fn pixel_replay(v: (f32, f32), deg: f32, scale: f32, fps: f64) -> Vec<bool> {
+        let (sin, cos) = deg.to_radians().sin_cos();
+        let mut w = StillnessWindow::new(StillnessParams::new(5.0, 0.05, 0.20, 3.0).unwrap());
+        capture_ms(fps, false, 8.0)
+            .into_iter()
+            .map(|ms| {
+                let t = ms as f32 / 1000.0;
+                let (x, y) = (200.0 + v.0 * t, 100.0 + v.1 * t);
+                let c = ((x * cos - y * sin) * scale, (x * sin + y * cos) * scale);
+                w.observe(ms, c, BOX_DIAGONAL_PX * scale, true)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stillness_is_isotropic_in_analysis_frame_pixels() {
+        let d = std::f32::consts::FRAC_1_SQRT_2;
+        // (name, velocity px/s, promotes): 8 px/s is 0.0566 diagonals/s.
+        let cases: [(&str, (f32, f32), bool); 6] = [
+            ("8 px/s horizontal", (8.0, 0.0), false),
+            ("8 px/s vertical", (0.0, 8.0), false),
+            ("8 px/s diagonal", (8.0 * d, 8.0 * d), false),
+            ("4 px/s horizontal", (4.0, 0.0), true),
+            ("4 px/s vertical", (0.0, 4.0), true),
+            ("4 px/s diagonal", (4.0 * d, 4.0 * d), true),
+        ];
+        for fps in [2.0, 30.0] {
+            for (name, v, promotes) in cases {
+                let base = pixel_replay(v, 0.0, 1.0, fps);
+                assert_eq!(base.contains(&true), promotes, "{name} at {fps} fps");
+                for (deg, scale) in [(90.0, 1.0), (45.0, 1.0), (0.0, 2.0), (45.0, 2.0)] {
+                    assert_eq!(
+                        pixel_replay(v, deg, scale, fps),
+                        base,
+                        "{name} at {fps} fps, rotated {deg}, scaled {scale}"
+                    );
+                }
+            }
+        }
+        // Equal Euclidean length gives an identical decision in every direction.
+        for fps in [2.0, 30.0] {
+            let h = pixel_replay((8.0, 0.0), 0.0, 1.0, fps);
+            assert_eq!(pixel_replay((0.0, 8.0), 0.0, 1.0, fps), h);
+            assert_eq!(pixel_replay((8.0 * d, 8.0 * d), 0.0, 1.0, fps), h);
+        }
+    }
+
+    #[test]
+    fn non_finite_geometry_or_a_nonpositive_diagonal_never_promotes() {
+        let bad: [((f32, f32), f32); 8] = [
+            ((100.0, Y), 0.0),
+            ((100.0, Y), -141.42),
+            ((100.0, Y), f32::NAN),
+            ((100.0, Y), f32::INFINITY),
+            ((100.0, Y), f32::NEG_INFINITY),
+            ((f32::NAN, Y), 141.42),
+            ((100.0, f32::INFINITY), 141.42),
+            ((f32::NEG_INFINITY, Y), 141.42),
+        ];
+        for fps in [2.0, 30.0] {
+            for (center, diagonal) in bad {
+                let mut w = StillnessWindow::new(params());
+                let promoted = capture_ms(fps, false, 12.0)
+                    .into_iter()
+                    .any(|ms| w.observe(ms, center, diagonal, true));
+                assert!(!promoted, "{center:?} {diagonal} at {fps} fps");
+            }
+        }
+    }
+
     #[test]
     fn params_must_be_finite_and_positive() {
         let names = [
