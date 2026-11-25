@@ -186,6 +186,9 @@ pub struct GstClipRecorder {
     /// Every running open/close task holds a receiver; `shutdown` waits
     /// on `closed()` until none is left (SPEC-088 Z-4).
     in_flight: watch::Sender<()>,
+    /// Set when `shutdown` begins. Every open checks it before its writer
+    /// starts, so none starts that shutdown cannot see (SPEC-088 Z-4).
+    shutting_down: Arc<PlMutex<bool>>,
     /// M2.2: optional bus for publishing `CLIP_CLOSED` so the cold
     /// replicator can pick up new clips event-driven instead of
     /// waiting on its 5-min polling backstop. None in tests that
@@ -384,6 +387,7 @@ impl GstClipRecorder {
             open: Arc::new(Mutex::new(HashMap::new())),
             epoch_ended: Arc::new(PlRwLock::new(HashMap::new())),
             in_flight: watch::channel(()).0,
+            shutting_down: Arc::new(PlMutex::new(false)),
             bus: None,
             usb_resolver: None,
             preferred_usb_label: crate::recorder::PreferredUsbLabel::default(),
@@ -1146,6 +1150,9 @@ impl Writers {
 #[async_trait]
 impl ClipRecorder for GstClipRecorder {
     async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
+        if *self.shutting_down.lock() {
+            return Err(RecorderError::Refused);
+        }
         let health = self
             .recording_health
             .begin(args.camera_id, RecordingKind::Motion);
@@ -1193,7 +1200,14 @@ impl ClipRecorder for GstClipRecorder {
         // finalized, or never started (SPEC-088 Z-4).
         let writers = self.writers();
         let closer = writers.clone();
+        let shutting_down = self.shutting_down.clone();
         let start = async move {
+            // Again in the task `spawn_owned` already counted: under this
+            // lock, either the task sees shutdown begun or shutdown's idle
+            // check sees the task (SPEC-088 Z-4).
+            if *shutting_down.lock() {
+                return Err(RecorderError::Refused);
+            }
             // set_state(Playing) returns Async; appsrc starts accepting
             // pushes immediately. We push the pre-roll snapshot before
             // even waiting for the state change to complete — the queue
@@ -1475,7 +1489,9 @@ impl ClipRecorder for GstClipRecorder {
         // once, so one stalled writer or owned open/close cannot hold back
         // another camera's clip. An open still in flight registers its clip
         // (or finalizes it itself) later, so keep picking up new clips until
-        // no owned task is left (SPEC-088 Z-4).
+        // no owned task is left (SPEC-088 Z-4). No open starts a writer after
+        // this, so none can start once the loop below has seen it idle.
+        *self.shutting_down.lock() = true;
         let mut draining = HashSet::new();
         loop {
             // Read before the snapshot: once idle, every open that was in
@@ -3410,6 +3426,80 @@ mod tests {
             !rec.clip_path(1, started_at).exists(),
             "an untracked writer's file was left behind"
         );
+    }
+
+    /// SPEC-088 Z-4: an aborted supervisor still mid-poll can call `open`
+    /// while, or after, `shutdown` runs. An open whose writer task starts
+    /// after shutdown began, and any open after shutdown returned, must be
+    /// refused before a writer, row or file exists: nothing would finalize it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn opens_racing_or_after_shutdown_are_refused() {
+        gst_init::ensure().unwrap();
+        let (store, _dir, clips_dir) = fixture().await;
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        let rec =
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap();
+        let open = |started_at| {
+            rec.open(OpenClip {
+                camera_id: 1,
+                started_at,
+                frame_width: 512,
+                frame_height: 288,
+            })
+        };
+        let (raced_at, late_at) = (Utc::now(), Utc::now() + chrono::Duration::seconds(5));
+
+        // On this one thread, drive the open until it hands its writer to a
+        // task of its own, which cannot run before this test yields.
+        let mut racing = std::pin::pin!(open(raced_at));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while rec.in_flight.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open never started its writer task"
+            );
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(racing.as_mut(), cx))
+            })
+            .await;
+            assert!(polled.is_pending(), "open returned before its writer task");
+            if rec.in_flight.is_closed() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        // Shutdown begins before that task's first poll.
+        let mut shutdown = std::pin::pin!(rec.shutdown());
+        let begun = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx))
+        })
+        .await;
+        assert!(begun.is_pending(), "shutdown ended with an open in flight");
+        let raced = tokio::time::timeout(Duration::from_secs(10), racing)
+            .await
+            .expect("the racing open returns");
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("shutdown returns");
+        let late = open(late_at).await;
+
+        assert!(
+            matches!(raced, Err(RecorderError::Refused)),
+            "an open whose writer task started after shutdown began: {raced:?}"
+        );
+        assert!(
+            matches!(late, Err(RecorderError::Refused)),
+            "an open after shutdown returned: {late:?}"
+        );
+        assert!(rec.open.lock().await.is_empty(), "a clip left registered");
+        assert!(rec.in_flight.is_closed(), "a writer task outlived shutdown");
+        assert!(
+            store.get_clip(1).await.unwrap().is_none(),
+            "a refused open wrote a row"
+        );
+        for at in [raced_at, late_at] {
+            assert!(!rec.clip_path(1, at).exists(), "a refused open left a file");
+        }
     }
 
     #[tokio::test]
@@ -5846,8 +5936,8 @@ mod epoch_tests {
     /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is
     /// joined, then the recorder shuts down. One was closing (stalled on its
     /// pump), one held a clip, and one still mid-poll starts an open after
-    /// the drain began. Shutdown must outlast all of them and leave no
-    /// writer and no in-flight file behind.
+    /// the drain began, which is refused. Shutdown must outlast the others
+    /// and leave no writer and no in-flight file behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_after_mains_aborts_leaves_no_writer_behind() {
         assert!(
@@ -5884,50 +5974,34 @@ mod epoch_tests {
             }
         });
         wait_until_closed(&store, held.clip_id).await;
-        // The drain is under way and the stalled close keeps it going. Holding
-        // the open map parks the late open after its writer started and its
-        // row exists, where its aborted caller leaves it to its own task.
+        // The drain is under way and the stalled close keeps it going.
         let late_at = Utc::now();
-        let open_map = rec.open.lock().await;
-        let opener = tokio::spawn({
-            let rec = rec.clone();
-            async move {
-                rec.open(OpenClip {
-                    camera_id: 3,
-                    started_at: late_at,
-                    frame_width: 512,
-                    frame_height: 288,
-                })
-                .await
-            }
-        });
-        let late = held.clip_id + 1;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while store.get_clip(late).await.unwrap().is_none() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the late open never inserted its row"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let late = rec
+            .open(OpenClip {
+                camera_id: 3,
+                started_at: late_at,
+                frame_width: 512,
+                frame_height: 288,
+            })
+            .await;
         assert!(
             !shutdown.is_finished(),
             "shutdown ended before the late open"
         );
-        opener.abort();
-        drop(open_map);
         assert!(shutdown.await.unwrap(), "shutdown overran main's 15 s");
 
         assert!(rec.open.lock().await.is_empty(), "a clip left registered");
         assert_eq!(stalled_writer.current_state(), gst::State::Null);
         assert!(finalized_playable(&store, &clips_dir, held.clip_id).await);
         assert!(finalized_playable(&store, &clips_dir, stalled.clip_id).await);
-        // The late clip has no media, so it is discarded, not left open.
-        assert!(store
-            .get_clip(late)
-            .await
-            .unwrap()
-            .is_none_or(|row| row.ended_at.is_some()));
+        assert!(
+            matches!(late, Err(RecorderError::Refused)),
+            "an open after the drain began: {late:?}"
+        );
+        assert!(
+            store.get_clip(held.clip_id + 1).await.unwrap().is_none(),
+            "the late open wrote a row"
+        );
         assert!(
             !rec.clip_path(3, late_at).exists(),
             "the late open's writer was left behind"
