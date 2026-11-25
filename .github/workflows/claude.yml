@@ -93,7 +93,7 @@ jobs:
             fi
             text="Work order #$ISSUE in $REPO. Run implement-loop for $spec: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md, and follow it on the vault record $spec. Work on a new branch. When the loop passes, push it and open a draft pull request whose body starts with \"Closes #$ISSUE\" and carries the ledger. If you stop short, comment on #$ISSUE with what is left and why."
           else
-            text="Pull request #$PR in $REPO has failing checks. Fix them with implement-loop: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. The task is to make the failing checks pass; read them with \`gh pr checks $PR\` and \`gh run view <run-id> --log-failed\`. Base the loop's worktree on origin/$BRANCH and rebase only onto that branch, never origin/main. When the loop passes, push its commits to $BRANCH as a fast-forward with \`git push origin HEAD:$BRANCH\`, never force, then comment on #$PR with the cause, the fix, what you ran and the ledger. If you stop short, comment on #$PR with what is left and why."
+            text="Pull request #$PR in $REPO has failing checks. Fix them with implement-loop: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. The task is to make the failing checks pass; read them with \`gh pr checks $PR\` and \`gh run view <run-id> --log-failed\`. Base the loop's worktree on a fresh origin/$BRANCH and never rebase. When the loop passes, push its commits to $BRANCH as a fast-forward with \`git push origin HEAD:$BRANCH\`, never force, then comment on #$PR with the cause, the fix, what you ran and the ledger. If the push is rejected or you stop short, comment on #$PR with what is left and why."
           fi
           echo "text=$text" >> "$GITHUB_OUTPUT"
 
