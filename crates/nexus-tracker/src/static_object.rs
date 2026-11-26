@@ -166,7 +166,8 @@ struct ParkingV2 {
     zones: Vec<Vec<(f32, f32)>>,
     /// Capture milliseconds count from the first classified frame.
     origin: Option<Instant>,
-    /// Analysis-frame size; a change resets every candidate.
+    /// Analysis-frame size; a change resets every candidate and rescales
+    /// every anchor.
     geometry: Option<(u32, u32)>,
     /// Classified frames so far.
     seq: u64,
@@ -275,16 +276,28 @@ impl StaticObjectFilter {
         let Some(v2) = &self.parking_v2 else {
             return Cow::Borrowed(&self.anchors);
         };
-        let (fw, fh) = (frame.width.max(1) as f32, frame.height.max(1) as f32);
+        let size = (frame.width, frame.height);
+        let (fw, fh) = (size.0.max(1) as f32, size.1.max(1) as f32);
         Cow::Owned(
             self.anchors
                 .iter()
+                .map(|a| {
+                    // Anchors stay in the last classified frame's pixels
+                    // until `classify` sees a resize and rescales them.
+                    let (center_x, center_y) = v2.geometry.map_or((a.center_x, a.center_y), |g| {
+                        rescale((a.center_x, a.center_y), g, size)
+                    });
+                    StaticAnchor {
+                        center_x,
+                        center_y,
+                        ..a.clone()
+                    }
+                })
                 .filter(|a| {
                     v2.zones
                         .iter()
                         .any(|z| point_in_normalized_polygon(a.center_x / fw, a.center_y / fh, z))
                 })
-                .cloned()
                 .collect(),
         )
     }
@@ -659,7 +672,13 @@ impl StaticObjectFilter {
             .saturating_duration_since(origin)
             .as_millis() as u64;
         let geometry = (frame.width, frame.height);
-        if v2.geometry.replace(geometry).is_some_and(|g| g != geometry) {
+        if let Some(old) = v2.geometry.replace(geometry).filter(|g| *g != geometry) {
+            // Each anchor keeps its place in the view (BUG-258), now in the
+            // new geometry's pixels.
+            for a in anchors.iter_mut() {
+                (a.center_x, a.center_y) = rescale((a.center_x, a.center_y), old, geometry);
+                dirty = true;
+            }
             // Pixels of the old geometry say nothing about the new one.
             for t in v2.tracks.values_mut() {
                 t.window.miss();
@@ -991,6 +1010,14 @@ impl StaticObjectFilter {
 
 fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
     (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+/// A pixel point of a `from`-sized frame in a `to`-sized frame of the same view.
+fn rescale((x, y): (f32, f32), from: (u32, u32), to: (u32, u32)) -> (f32, f32) {
+    (
+        x * to.0.max(1) as f32 / from.0.max(1) as f32,
+        y * to.1.max(1) as f32 / from.1.max(1) as f32,
+    )
 }
 
 fn is_vehicle_label(label: &str) -> bool {
@@ -2234,6 +2261,35 @@ mod tests {
             .into_iter()
             .find(|&ms| is_object_static(&v2_step(&mut f, ms, (1920, 1200), vec![car()])[0]));
         assert_eq!(first, Some(10_000), "no elapsed time is inherited");
+    }
+
+    /// A resize keeps each anchor at its place in the view: the annotator
+    /// sees it there from the first resized frame, and the car's fresh dwell
+    /// in the new geometry matches it instead of placing a second one.
+    #[test]
+    fn v2_a_resize_keeps_each_anchor_at_its_place_in_the_view() {
+        let mut f = v2_filter();
+        park_all(&mut f, &[(1, 400.0, 500.0)]);
+        assert_eq!(anchor_centers(&f), vec![(400.0, 500.0)]);
+        let half = (960, 540);
+        let mut fr = frame(1, 0, 7_600);
+        (fr.width, fr.height) = half;
+        let scoped: Vec<_> = f
+            .scoped_anchors(&fr)
+            .iter()
+            .map(|a| (a.center_x, a.center_y))
+            .collect();
+        assert_eq!(
+            scoped,
+            vec![(200.0, 250.0)],
+            "before the frame is classified"
+        );
+        let mut out = Vec::new();
+        for ms in capture_ms(1.45, 7_600, 14_000) {
+            out = v2_step(&mut f, ms, half, vec![vehicle(1, 200.0, 250.0)]);
+        }
+        assert!(is_object_static(&out[0]), "dwelled again");
+        assert_eq!(anchor_centers(&f), vec![(200.0, 250.0)], "not duplicated");
     }
 
     /// Leaving where it parked starts the car's next alert episode.

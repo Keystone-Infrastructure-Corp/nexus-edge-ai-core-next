@@ -896,7 +896,7 @@ async fn an_ambiguous_id_inside_the_anchor_radius_is_alerted_and_recorded_until_
 
 /// A stream resized mid-dwell: every candidate starts over in the new
 /// geometry, so the car is visible, and alerted as the new box it is, until
-/// it dwells again.
+/// it dwells again, at its anchor rescaled to the new geometry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resized_stream_starts_every_dwell_over() {
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -923,8 +923,8 @@ async fn a_resized_stream_starts_every_dwell_over() {
     assert_eq!(o.motion_at(MotionEventKind::Died), vec![5_520, 15_870]);
     assert_eq!(
         o.anchors,
-        vec![(128.0, 144.0), (256.0, 288.0)],
-        "the old geometry's anchor is left to expire"
+        vec![(256.0, 288.0)],
+        "the anchor keeps its place in the view, not duplicated"
     );
 }
 
