@@ -668,8 +668,8 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             }
             Some(entry) => {
                 // `stop_camera` runs in this task, so the only entry a pass
-                // sees mid-stop is one an earlier pass aborted and could not
-                // see end; any other finished task was not stopped by us.
+                // sees mid-stop is one an earlier pass could not finish
+                // stopping; any other finished task was not stopped by us.
                 if entry.exited_on_its_own() {
                     error!(
                         camera_id = cam_id,
@@ -678,7 +678,8 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                 } else if *entry.stop.borrow() {
                     info!(
                         camera_id = cam_id,
-                        "camera reconciler: checking again on a supervisor that outlived its abort"
+                        "camera reconciler: checking again on a camera still stopping (its \
+                         supervisor outlived its abort, or its recorder work was not drained)"
                     );
                 } else if entry.key.url != want.url {
                     info!(
@@ -755,17 +756,21 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
 /// longer abandons the clip: `GstClipRecorder` runs both in tasks it owns and
 /// its shutdown drain waits for them (SPEC-088 Z-4). A clip an aborted
 /// supervisor merely held is finalized by [`stop_camera`]'s drain of the
-/// camera, also bounded by this.
+/// camera, also bounded by this; a camera not drained within it stays
+/// stopping.
 const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Whether the camera's supervisor has ended and its camera was torn down.
-/// `false` means it outlived its abort: it stays in the map, nothing else is
-/// torn down, and the caller must not start a replacement; a later pass
-/// checks on it again without waiting.
+/// Whether the camera's supervisor has ended, the recorder work it left is
+/// done and its camera was torn down. `false` means the camera is still
+/// stopping: its supervisor outlived its abort, or the recorder has not
+/// drained the camera. It stays in the map, nothing else is torn down, and
+/// the caller must not start a replacement; a later pass checks on it again
+/// without waiting.
 async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
-    // The entry stays in the map until the supervisor has ended. Shutdown
-    // (`main.rs`) aborts the reconciler without joining it, then aborts every
-    // supervisor it finds in the map before the recorder's shutdown snapshot.
+    // The entry stays in the map until the supervisor has ended and the
+    // recorder has drained the camera. Shutdown (`main.rs`) aborts the
+    // reconciler without joining it, then aborts every supervisor it finds in
+    // the map before the recorder's shutdown snapshot.
     // An entry removed up front would leave a supervisor that is still mid-stop
     // (a frame paused in `recorder.open`, say) out of that sweep, free to open
     // a clip after the snapshot that nothing would finalize. The price is that
@@ -778,10 +783,12 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
             entry.zone_generation,
         )
     });
+    // Only an earlier pass that could not finish the stop left a stop request
+    // behind in the map: look again, without waiting.
+    let mut recheck = false;
     if let Some((stop, task, zone_generation)) = stopping {
-        // Only an earlier pass that aborted it and could not see it end left
-        // a stop request behind in the map: look again, without waiting.
-        let ended = if *stop.borrow() {
+        recheck = *stop.borrow();
+        let ended = if recheck {
             task.is_finished()
         } else {
             // From here on the generation's zones no longer count as applied.
@@ -791,7 +798,8 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
             // Stop, not abort: an aborted supervisor never reaches the close of
             // its open motion clip, which is abandoned (BUG-285). The receiver
             // drops when `run_camera` returns, which is what `closed` awaits.
-            let _ = stop.send(true);
+            // Stored even with no receiver left, so the entry reads as stopping.
+            stop.send_replace(true);
             if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
                 .await
                 .is_ok()
@@ -826,21 +834,32 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
             );
             return false;
         }
-        args.handles.lock().remove(&cam_id);
     }
     // Only now that the supervisor is done: its clip closes on this ingester.
-    // An aborted one skipped the close of a clip it held, which would keep
-    // recording beside the replacement's (SPEC-088 Z-4). Past the bound the
-    // close runs on in the recorder's owned task, which shutdown waits for.
-    if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, args.recorder.drain_camera(cam_id))
-        .await
-        .is_err()
-    {
+    // An aborted one skipped the close of a clip it held, or left an open or
+    // close in flight, which would keep recording beside the replacement's
+    // (SPEC-088 Z-4). Until the drain succeeds the camera stays stopping, as
+    // a supervisor that outlived its abort does; the recorder's owned tasks
+    // run on meanwhile, and shutdown waits for them.
+    let bound = if recheck {
+        std::time::Duration::ZERO
+    } else {
+        SUPERVISOR_STOP_TIMEOUT
+    };
+    let drained = match tokio::time::timeout(bound, args.recorder.drain_camera(cam_id)).await {
+        Ok(drained) => drained.map_err(|e| e.to_string()),
+        Err(_) => Err("still in flight".to_owned()),
+    };
+    if let Err(error) = drained {
         warn!(
             camera_id = cam_id,
-            "camera reconciler: a clip the stopped supervisor left open is still being finalized"
+            error,
+            "camera reconciler: the stopped supervisor's recorder work is not finished; keeping \
+             the camera stopping and not restarting it until a pass has drained it"
         );
+        return false;
     }
+    args.handles.lock().remove(&cam_id);
     args.recorder.remove_camera_ingester(cam_id);
     // The substream session lives in a separate map and would otherwise
     // keep its RTSP connection and decode chain alive with no
@@ -2017,6 +2036,16 @@ mod tests {
         wedge: Mutex<Option<Arc<Store>>>,
         /// The connections a wedged open holds.
         wedged: Mutex<Vec<sqlx::pool::PoolConnection<sqlx::Sqlite>>>,
+        /// What the next drains do, in order; once used up, each succeeds.
+        drains: Mutex<std::collections::VecDeque<Drain>>,
+    }
+
+    /// A [`ClipLogRecorder`] drain that does not succeed.
+    enum Drain {
+        /// Never finishes, as a close or open stalled in the recorder.
+        Stalls,
+        /// Reports a clip it could not finalize.
+        Fails,
     }
 
     impl ClipLogRecorder {
@@ -2129,11 +2158,21 @@ mod tests {
         fn kind(&self) -> &'static str {
             "clip-log"
         }
-        async fn drain_camera(&self, camera_id: CameraId) {
-            for clip_id in self.open_clips(camera_id) {
-                self.calls
-                    .lock()
-                    .push((camera_id, ClipCall::Close(clip_id)));
+        async fn drain_camera(&self, camera_id: CameraId) -> Result<(), RecorderError> {
+            let next = self.drains.lock().pop_front();
+            match next {
+                Some(Drain::Stalls) => std::future::pending().await,
+                Some(Drain::Fails) => Err(RecorderError::Io(std::io::Error::other(
+                    "a clip could not be finalized",
+                ))),
+                None => {
+                    for clip_id in self.open_clips(camera_id) {
+                        self.calls
+                            .lock()
+                            .push((camera_id, ClipCall::Close(clip_id)));
+                    }
+                    Ok(())
+                }
             }
         }
         fn remove_camera_ingester(&self, camera_id: CameraId) {
@@ -2263,6 +2302,79 @@ mod tests {
             ],
             "the clip the aborted supervisor held must be finalized once, while its ingester \
              exists, before the replacement opens one"
+        );
+    }
+
+    /// SPEC-088 Z-4 — the supervisor has ended, but the recorder work it left
+    /// (an open yet to register its clip, a close that took one) is not done
+    /// within the stop's bound, or a clip could not be finalized. The camera
+    /// must stay stopping: entry kept, ingester kept, no replacement. Later
+    /// passes check again without waiting, and only a drain that succeeds
+    /// lets one pass tear the camera down and start one replacement.
+    #[tokio::test]
+    async fn a_camera_stays_stopping_until_its_recorder_drain_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let is_original = |h: &HandleMap| {
+            h.lock()
+                .get(&7)
+                .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
+        };
+        recorder
+            .drains
+            .lock()
+            .extend([Drain::Stalls, Drain::Stalls, Drain::Fails]);
+
+        // The drain's bound elapses on the paused clock.
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        let kept = !stopped && is_original(&args.handles) && original.task.is_finished();
+        // Real time from here: a pass that waited for the drain again would
+        // take 20 s.
+        let stalled =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&args)).await;
+        let unreplaced_while_stalled = is_original(&args.handles);
+        reconcile(&args).await.expect("pass whose drain fails");
+        let unreplaced_after_failure = is_original(&args.handles);
+        let before_success = recorder.calls_of(7);
+        reconcile(&args).await.expect("pass whose drain succeeds");
+        wait_until("the replacement opened a clip", || recorder.opens() == 2).await;
+        let replacement = entry_of(&args.handles, 7);
+        abort_all(&args.handles);
+
+        assert!(kept, "a camera whose drain timed out left the map");
+        assert!(
+            matches!(stalled, Ok(Ok(()))),
+            "a later pass waited for the drain again"
+        );
+        assert!(
+            unreplaced_while_stalled && unreplaced_after_failure,
+            "a replacement started before the camera's drain succeeded"
+        );
+        assert_eq!(
+            before_success,
+            [ClipCall::Open(1), ClipCall::Close(1)],
+            "the camera was torn down before its drain succeeded"
+        );
+        assert!(!Arc::ptr_eq(&replacement.task, &original.task));
+        assert_eq!(
+            recorder.calls_of(7),
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "once the drain succeeded, one pass tears the camera down and starts one replacement"
         );
     }
 
